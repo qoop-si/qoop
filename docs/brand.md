@@ -67,9 +67,11 @@ pet beside it.
 ```
 
 Every dot is cream but the tail, in ember as in the SVGs. Each dot is a cell of its own, so the
-tail is exact. The last row of the column is the menu row: the version at the left, `menu «` at
-the right with `settings` before it (from 24 columns; a click opens the settings page), and
-the q sits on the four rows right above it. The picked pet stands on the menu
+tail is exact. The last row of the column is the menu row: the version at the left with a word
+after it (`online` in green, `offline` in orange, `local` in grey; `online` and `local` open the
+web app), `menu`, the settings cog and `«` at the right (a click on the cog opens the settings
+page; where icons are not drawn it is `set`, from 24 columns), and the q sits on the four rows
+right above it. The picked pet stands on the menu
 row at the right, five rows of half blocks with its feet on the row above the menu, and adds
 only a blank row above the q, so no word moves whatever the pet. Sixteen columns hold the q
 and the widest pet side by side, fewer than the narrowest the column drags to.

@@ -121,6 +121,20 @@ fn say(state: &mut State, text: String) {
     });
 }
 
+/// What a click on `offline` says: why the hub is not reached, as the state file tells it.
+fn hub_down_notice() -> String {
+    hub_notice(qoop_runtime::paths::read_hub_down()).to_string()
+}
+
+fn hub_notice(why: qoop_runtime::paths::HubDown) -> &'static str {
+    match why {
+        qoop_runtime::paths::HubDown::Unreached => "hub unreachable, the bridge keeps trying",
+        qoop_runtime::paths::HubDown::BridgeQuiet => {
+            "the bridge is not running: `qoop bridge reload`"
+        }
+    }
+}
+
 /// The toast to draw, if one is still standing.
 fn toast_text(state: &State) -> Option<&str> {
     state
@@ -1404,6 +1418,8 @@ impl State {
             sidebar::Act::Menu => Some(Clicked::Menu),
             sidebar::Act::Site => Some(Clicked::Site),
             sidebar::Act::SettingsPage => Some(Clicked::SettingsPage),
+            sidebar::Act::App => Some(Clicked::App),
+            sidebar::Act::HubDown => Some(Clicked::HubDown),
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
@@ -5392,8 +5408,12 @@ enum Clicked {
     Menu,
     /// The version on the foot: the site, in the browser.
     Site,
-    /// The foot's `settings`: the settings page, in a tab.
+    /// The foot's cog: the settings page, in a tab.
     SettingsPage,
+    /// The foot's `online` or `local`: the web app, in the browser.
+    App,
+    /// The foot's `offline`: the news that the hub is not reached.
+    HubDown,
     /// A tab of the inbox, or a count on its folded row.
     InboxTab(sidebar::InboxTab),
     /// The inbox's caret.
@@ -6913,6 +6933,13 @@ where
                                     }
                                     Some(Clicked::Site) => {
                                         crate::hyperlink::open_in_browser(sidebar::SITE);
+                                    }
+                                    Some(Clicked::App) => {
+                                        crate::hyperlink::open_in_browser(sidebar::APP);
+                                    }
+                                    Some(Clicked::HubDown) => {
+                                        say(&mut state, hub_down_notice());
+                                        dirty = true;
                                     }
                                     Some(Clicked::Menu) => {
                                         state.menu_kind = MenuKind::Main;
@@ -18047,6 +18074,71 @@ mod tests {
             Some(Clicked::Search)
         ));
     }
+    /// Every row of the search box is the same click, and no row beside it is.
+    #[test]
+    fn the_whole_search_box_is_one_click() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let rows: Vec<u16> = (1..s.lines)
+            .filter(|row| matches!(s.clicked(*row, 5), Some(Clicked::Search)))
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            rows[2] - rows[0],
+            2,
+            "the three rows are together: {rows:?}"
+        );
+    }
+
+    /// The foot answers by its words: the settings mark opens the page, the hub word opens
+    /// the web app (this build has no bridge under test, so it reads `local`), and `menu`
+    /// still opens the menu.
+    #[test]
+    fn the_foot_words_are_clicks_of_their_own() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let foot = (screen::SIDEBAR_TOP + screen::column_rows(s.lines as usize) - 1) as u16;
+        let cols: Vec<(u16, Option<Clicked>)> = (1..=sidebar::WIDTH as u16)
+            .map(|col| (col, s.clicked(foot, col)))
+            .collect();
+        let at = |want: fn(&Clicked) -> bool| -> Vec<u16> {
+            cols.iter()
+                .filter(|(_, c)| c.as_ref().is_some_and(want))
+                .map(|(col, _)| *col)
+                .collect()
+        };
+        let w = sidebar::WIDTH as u16;
+        // Icons are off under test: `set` after `menu `.
+        assert_eq!(
+            at(|c| matches!(c, Clicked::Menu)),
+            vec![w - 10, w - 9, w - 8, w - 7]
+        );
+        assert_eq!(
+            at(|c| matches!(c, Clicked::SettingsPage)),
+            vec![w - 5, w - 4, w - 3]
+        );
+        let local = at(|c| matches!(c, Clicked::App));
+        assert_eq!(local.len(), "local".len(), "{local:?}");
+        assert_eq!(
+            at(|c| matches!(c, Clicked::Site)).len(),
+            sidebar::VERSION.len()
+        );
+        assert!(at(|c| matches!(c, Clicked::HubDown)).is_empty());
+    }
+
+    /// What `offline` says: a bridge that lost the hub keeps trying, a quiet one needs a reload.
+    #[test]
+    fn the_offline_notice_says_whether_the_bridge_still_tries() {
+        assert_eq!(
+            hub_notice(qoop_runtime::paths::HubDown::Unreached),
+            "hub unreachable, the bridge keeps trying"
+        );
+        assert_eq!(
+            hub_notice(qoop_runtime::paths::HubDown::BridgeQuiet),
+            "the bridge is not running: `qoop bridge reload`"
+        );
+    }
+
     /// `f` folds the space of the pick and `l` opens it again; `h` folds it and stands on its
     /// rule, so the pick never sits on a row the fold hid.
     #[test]

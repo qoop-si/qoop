@@ -212,9 +212,12 @@ const SPACES_TITLE_ROW: usize = qoop_tui::screen::SIDEBAR_TOP + qoop_tui::sideba
 /// the row under it.
 const TAB_NAMES_ROW: usize = 1;
 
+/// How far under the column's title the list starts: the title row, then the search box.
+const LIST_BELOW_TITLE: usize = 1 + qoop_tui::sidebar::SEARCH_ROWS;
+
 /// The screen row the first space's rule is drawn on: under the title and the search box. The
 /// next space's rule follows it directly while the first space holds no agent.
-const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 2;
+const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + LIST_BELOW_TITLE;
 
 /// Every row of the list under the column's title, from its first row down to the bottom
 /// of the column: the space rules and the agents under them.
@@ -223,7 +226,7 @@ const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + 2;
 /// test would be a second copy of that arithmetic, and a wrong one the first time either
 /// changed.
 fn agents_panel(screen: &Screen) -> Vec<String> {
-    let Some(first) = agents_title_row(screen).map(|row| row + 2) else {
+    let Some(first) = agents_title_row(screen).map(|row| row + LIST_BELOW_TITLE) else {
         return Vec::new();
     };
     // The column stops where the status rows start. Reading into them picked up the notice,
@@ -273,7 +276,7 @@ fn unbox(line: &str) -> String {
 /// The screen row the list under the title starts on: [`agents_panel`]'s first row.
 fn first_agent_row_of(screen: &Screen) -> usize {
     agents_title_row(screen)
-        .map(|row| row + 2)
+        .map(|row| row + LIST_BELOW_TITLE)
         .unwrap_or_else(|| panic!("the column title is not on screen:\n{screen}"))
 }
 
@@ -746,7 +749,8 @@ impl Interface {
     fn wait_for_agents_raw(&mut self, want: impl Fn(&str) -> bool, within: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < within {
-            let Some(first) = agents_title_row(&self.screen).map(|row| row + 2) else {
+            let Some(first) = agents_title_row(&self.screen).map(|row| row + LIST_BELOW_TITLE)
+            else {
                 let _ = self.wait_for("this needle never appears", Duration::from_millis(120));
                 continue;
             };
@@ -783,7 +787,7 @@ impl Interface {
     /// Found by its shape rather than by arithmetic: a rule opens with its fold column and
     /// the space's name, and agents move the rules down as they come and go.
     fn space_row(&self, nth: usize) -> Option<usize> {
-        let first = agents_title_row(&self.screen)? + 2;
+        let first = agents_title_row(&self.screen)? + LIST_BELOW_TITLE;
         let last = (ROWS as usize).saturating_sub(qoop_tui::screen::STATUS);
         (first..=last)
             .filter(|&row| self.panel_line(row).is_some_and(|line| is_rule_line(&line)))

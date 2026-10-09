@@ -388,6 +388,30 @@ pub fn read_hub_link() -> HubLink {
     hub_link_from(text.as_deref(), now)
 }
 
+/// Why the hub is not reached, as the state file says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubDown {
+    /// The bridge runs and says it lost the hub: it keeps trying on its own.
+    Unreached,
+    /// The bridge went quiet: its last line is a stale `connected`, or it cannot be read.
+    BridgeQuiet,
+}
+
+/// The reason a down hub state line gives. The bridge renews a `disconnected` line on every
+/// retry, so its stamp says when it last tried, never since when the hub is lost: no time is
+/// read from it.
+pub fn hub_down_from(text: Option<&str>) -> HubDown {
+    match text.and_then(|t| t.split_whitespace().next()) {
+        Some("disconnected") => HubDown::Unreached,
+        _ => HubDown::BridgeQuiet,
+    }
+}
+
+/// Why the hub is not reached, as the file says now.
+pub fn read_hub_down() -> HubDown {
+    hub_down_from(std::fs::read_to_string(hub_state_path()).ok().as_deref())
+}
+
 /// A dotted version into its numbers: `v1.2.3`, `1.2` and `1` all parse, and anything
 /// else is refused rather than guessed at, so a tag nobody can parse never outranks
 /// the build in hand.
@@ -595,6 +619,20 @@ mod tests {
         );
         assert_eq!(hub_link_from(Some("connected"), now), HubLink::Down);
         assert_eq!(hub_link_from(Some(""), now), HubLink::Down);
+    }
+
+    #[test]
+    fn a_down_hub_says_whether_the_bridge_still_tries() {
+        assert_eq!(
+            hub_down_from(Some("disconnected 1750000000\n")),
+            HubDown::Unreached
+        );
+        assert_eq!(
+            hub_down_from(Some("connected 1750000000")),
+            HubDown::BridgeQuiet
+        );
+        assert_eq!(hub_down_from(Some("")), HubDown::BridgeQuiet);
+        assert_eq!(hub_down_from(None), HubDown::BridgeQuiet);
     }
 
     /// A test daemon names its runtime directory, and its state stays there: resolving the

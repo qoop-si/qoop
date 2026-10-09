@@ -314,7 +314,7 @@ pub enum Hit {
     Tabs,
     /// The `spaces` title, with the order word and the `+` at its right.
     Title,
-    /// The search box under the title.
+    /// The search box under the title, all three of its rows.
     Search,
     /// The foot of the column: the brand, `menu`, and the mark that folds the column.
     Foot,
@@ -358,8 +358,12 @@ pub enum Act {
     View,
     /// Everything that is not a space, a tab or an agent.
     Menu,
-    /// The foot's `settings`: every setting on one page, as the menu's settings row opens it.
+    /// The foot's cog: every setting on one page, as the menu's settings row opens it.
     SettingsPage,
+    /// The foot's `online` or `local`: the web app, to sign in and pair there.
+    App,
+    /// The foot's `offline`: nothing opens, the status line says the hub is not reached.
+    HubDown,
     /// Fold the whole column away to its strip, and back.
     Collapse,
     /// A tab of the inbox: its list, from the top, and the inbox open again if it was folded.
@@ -916,6 +920,7 @@ fn parts(
         count,
         update_available().as_deref(),
         hub_link(),
+        c.icons,
     );
     let foot = feet.len().min(height);
     let room = height - foot;
@@ -928,8 +933,8 @@ fn parts(
     if head.len() < room {
         head.push((title_line(c), Some(Hit::Title)));
     }
-    if head.len() < room {
-        head.push((search_line(c), Some(Hit::Search)));
+    if head.len() + SEARCH_ROWS <= room {
+        head.extend(search_rows(c));
     }
     let body = room - head.len();
     let skip = feet.len() - foot;
@@ -979,7 +984,7 @@ pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
         return false;
     }
     let room = height - STAGE_FOOT_ROWS;
-    inbox_height(c, room) + 3 + content(c).len() <= room
+    inbox_height(c, room) + 2 + SEARCH_ROWS + content(c).len() <= room
 }
 
 /// Whether a picked pet can be drawn at all: it is half blocks in its own inks, so without
@@ -1328,20 +1333,23 @@ fn item_row(c: &Column, item: &Item) -> Line {
 }
 
 /// How many rows the inbox takes at the top of a column with `room` rows above the foot:
-/// none when the title, the search box and a row of the tree would not fit under its tab row,
-/// one when folded, else the tab row and as many list rows as were dragged that leave the
-/// title, the box and one tree row. Never more because news came, so the tree stays where it
-/// was.
+/// none when it would leave the title, the search box and a row of the tree no room (folded,
+/// its one row; open, its tab row, a list row and its edge), one when folded, else the tab
+/// row and as many list rows as were dragged that leave the edge, the title, the box and one
+/// tree row. Never more because news came, so the tree stays where it was.
 fn inbox_height(c: &Column, room: usize) -> usize {
-    if room < 4 {
+    let least = if c.inbox.folded {
+        3 + SEARCH_ROWS
+    } else {
+        5 + SEARCH_ROWS
+    };
+    if room < least {
         return 0;
     }
     if c.inbox.folded {
         return 1;
     }
-    // What is left once its edge, the title, the search box and one row of the tree are paid
-    // for.
-    1 + c.inbox.rows.max(1).min(room.saturating_sub(5).max(1))
+    1 + c.inbox.rows.max(1).min(room - (4 + SEARCH_ROWS))
 }
 
 /// The edge under the inbox: the column's own ember corners, turning up at each end, and its
@@ -1374,6 +1382,7 @@ fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avat
         Some(0),
         update_available().as_deref(),
         hub_link(),
+        c.icons,
     );
     height.saturating_sub(feet.len())
 }
@@ -1386,7 +1395,7 @@ pub(crate) fn inbox_room(
     height: usize,
     avatar: Option<&qoop_runtime::avatar::Avatar>,
 ) -> usize {
-    room_of(c, height, avatar).saturating_sub(5)
+    room_of(c, height, avatar).saturating_sub(4 + SEARCH_ROWS)
 }
 
 /// The inbox's first list row after one notch of the wheel over its list, never past
@@ -1528,44 +1537,110 @@ fn title_line(c: &Column) -> Line {
     }
 }
 
-/// The search box under the title, as the settings page draws its own: a `/`, what is typed
-/// (or `search` in the faint ink while nothing is) and, while keys go there, the caret.
-fn search_line(c: &Column) -> Line {
+/// The rows of the search box: a border, the field, a border.
+pub const SEARCH_ROWS: usize = 3;
+
+/// The search box under the title: a rounded box drawn with the inbox tray's corners. Idle it
+/// reads ` /  search 6 agents`; typing, its border brightens and it shows a `/`, what is typed
+/// (its end, when it is longer than the room), the caret, and how many agents it found out of
+/// all of them, flush right.
+fn search_rows(c: &Column) -> Vec<Row> {
     use crate::theme::Role;
     let (query, typing) = c
         .nav
         .map_or(("", false), |nav| (nav.query.as_str(), nav.typing));
+    let inner = c.width.saturating_sub(4);
+    let border = if typing { Role::Detail } else { Role::Rule };
+    let (found, all) = search_counts(c);
     let caret = if typing { "\u{258f}" } else { "" };
     let lead = " / ";
-    // A search longer than the room shows its end, where the typing is.
-    let room = c.width.saturating_sub(crate::width::width(lead) + 1);
-    let skip = query.chars().count().saturating_sub(room);
-    let tail: String = query.chars().skip(skip).collect();
-    let mut runs = vec![(1, 1, Role::Title)];
-    let text = if query.is_empty() {
-        let at = crate::width::width(lead);
+    let lead_w = crate::width::width(lead);
+    // Runs in the field's own columns; the box shifts them by its left edge below.
+    let mut runs = Vec::new();
+    let field = if query.is_empty() {
         if typing {
-            runs.push((at, 1, Role::Brand));
+            runs.push((1, 1, Role::Title));
+            runs.push((lead_w, 1, Role::Brand));
         }
-        format!("{lead}{caret}search")
+        // The caret takes the blank before the word, so the word never moves when it comes.
+        let blank = if typing { "" } else { " " };
+        format!("{lead}{caret}{blank}search {all} {}", plural(all))
     } else {
-        let end = crate::width::width(lead) + crate::width::width(&tail);
-        runs.push((
-            crate::width::width(lead),
-            crate::width::width(&tail),
-            Role::Focused,
-        ));
-        if typing {
-            runs.push((end, 1, Role::Brand));
+        let count = format!("{found} of {all}");
+        let count_w = crate::width::width(&count);
+        // The count goes when the room left for what is typed would be too small to read.
+        let room = inner.saturating_sub(lead_w + 1 + 1 + count_w + 1);
+        let counted = room >= 4;
+        let room = if counted {
+            room
+        } else {
+            inner.saturating_sub(lead_w + 1)
+        };
+        // A search longer than the room shows its end, where the typing is.
+        let mut tail = query;
+        while crate::width::width(tail) > room {
+            let mut chars = tail.chars();
+            chars.next();
+            tail = chars.as_str();
         }
-        format!("{lead}{tail}{caret}")
+        let tail_w = crate::width::width(tail);
+        runs.push((1, 1, Role::Title));
+        runs.push((lead_w, tail_w, Role::Focused));
+        if typing {
+            runs.push((lead_w + tail_w, 1, Role::Brand));
+        }
+        let left = format!("{lead}{tail}{caret}");
+        if counted {
+            let pad = inner.saturating_sub(crate::width::width(&left) + count_w + 1);
+            format!("{left}{}{count} ", " ".repeat(pad))
+        } else {
+            left
+        }
     };
-    Line {
-        text: fit(&text, c.width),
-        colour: Some(Role::Faint),
-        runs,
+    let edge = |l: char, r: char| Line {
+        text: fit(&format!(" {l}{}{r} ", "\u{2500}".repeat(inner)), c.width),
+        colour: None,
+        runs: vec![(1, inner + 2, border)],
         ..Line::default()
-    }
+    };
+    let mut boxed_runs = vec![(1, 1, border), (2 + inner, 1, border)];
+    boxed_runs.extend(runs.into_iter().map(|(at, len, role)| (2 + at, len, role)));
+    let middle = Line {
+        text: fit(
+            &format!(" \u{2502}{}\u{2502} ", fit_to(&field, inner)),
+            c.width,
+        ),
+        colour: Some(Role::Faint),
+        runs: boxed_runs,
+        ..Line::default()
+    };
+    vec![
+        (edge('\u{256d}', '\u{256e}'), Some(Hit::Search)),
+        (middle, Some(Hit::Search)),
+        (edge('\u{2570}', '\u{256f}'), Some(Hit::Search)),
+    ]
+}
+
+/// `agent` or `agents` after a count.
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "agent" } else { "agents" }
+}
+
+/// How many agents the search finds out of all the column lists: what the box says it is
+/// looking through, and what it found.
+fn search_counts(c: &Column) -> (usize, usize) {
+    let all = c.agents.iter().filter(|a| a.agent);
+    (
+        all.clone().filter(|a| agent_found(c, a)).count(),
+        all.count(),
+    )
+}
+
+/// Whether the search finds this agent, by everything the column shows of it and its space.
+fn agent_found(c: &Column, agent: &AgentRow) -> bool {
+    fits(query_of(c), || {
+        agent_text(agent, c.spaces.iter().find(|s| s.id == agent.workspace))
+    })
 }
 
 /// The keys of the column while the keyboard has it, for the line at its foot: the key, what
@@ -1645,12 +1720,7 @@ fn title_mode(view: View) -> &'static str {
 fn content(c: &Column) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     let query = query_of(c);
-    let listed = c.agents.iter().filter(|a| {
-        a.agent
-            && fits(query, || {
-                agent_text(a, c.spaces.iter().find(|s| s.id == a.workspace))
-            })
-    });
+    let listed = c.agents.iter().filter(|a| a.agent && agent_found(c, a));
     match c.view {
         View::Priority => {
             // The same agents sorted so what wants a person is on top. Recency breaks
@@ -3004,44 +3074,66 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             if collapsed {
                 return Some(Act::Collapse);
             }
-            // `menu « ` closes the row: the word, a space, the mark and a space. Where the
-            // column has room, `settings` and two spaces come before it.
-            let end = c.width.saturating_sub(FOOT_TAIL - MENU_LABEL.len());
-            let start = end.saturating_sub(MENU_LABEL.len());
-            let settings_start = c.width.saturating_sub(FOOT_TAIL + 2 + SETTINGS_LABEL.len());
-            let settings_end = settings_start + SETTINGS_LABEL.len();
-            // The version's own cells, when the row shows it: the site, not the fold.
-            let version =
-                version_link_at(c.width).filter(|at| col > *at && col <= at + VERSION.len());
-            Some(if col > start && col <= end {
-                Act::Menu
-            } else if version.is_some() {
-                Act::Site
-            } else if c.width >= SETTINGS_FROM && col > settings_start && col <= settings_end {
-                Act::SettingsPage
-            } else {
-                Act::Collapse
-            })
+            Some(foot_act(
+                c.width,
+                c.icons,
+                col,
+                update_available().as_deref(),
+                hub_link(),
+            ))
         }
     }
 }
 
-/// The columns `menu « ` takes at the right of the foot.
-const FOOT_TAIL: usize = 7;
+/// What a click on the menu row means at one based column `col`: the word `menu` opens the
+/// menu, the cog after it the settings page, the version the site, the hub word the web app
+/// (or, with the hub down, the news that it is). Anywhere else folds the column.
+fn foot_act(width: usize, icons: bool, col: usize, update: Option<&str>, hub: HubLink) -> Act {
+    let at = col.saturating_sub(1);
+    let on = |from: usize, len: usize| (from..from + len).contains(&at);
+    let tail = foot_tail(width, icons);
+    let tail_at = width.saturating_sub(crate::width::width(&tail));
+    let cog_at = tail_at + MENU_LABEL.len() + 1;
+    let (_, word) = foot_lead(width, crate::width::width(&tail), update, hub);
+    if on(tail_at, MENU_LABEL.len()) {
+        Act::Menu
+    } else if settings_mark(width, icons).is_some_and(|mark| on(cog_at, crate::width::width(&mark)))
+    {
+        Act::SettingsPage
+    } else if version_link_in(width, icons, update).is_some_and(|from| on(from, VERSION.len())) {
+        Act::Site
+    } else if word.is_some_and(|(from, word, _)| on(from, word.len())) {
+        if hub == HubLink::Down {
+            Act::HubDown
+        } else {
+            Act::App
+        }
+    } else {
+        Act::Collapse
+    }
+}
 
 const MENU_LABEL: &str = "menu";
 
-const SETTINGS_LABEL: &str = "settings";
-
-/// The narrowest column the foot names `settings` in: the version still fits beside it.
+/// The narrowest column the foot spells settings as a word in, where icons are not drawn:
+/// the version still fits beside it.
 const SETTINGS_FROM: usize = 24;
 
-/// What closes the foot's last row: `settings` when there is room, then `menu « `.
-fn foot_tail(width: usize) -> String {
-    if width >= SETTINGS_FROM {
-        format!("{SETTINGS_LABEL}  {MENU_LABEL} \u{ab} ")
+/// What opens the settings page on the foot: the cog where icons are drawn, else `set` in a
+/// column with room for it, else nothing (the menu has the same row).
+fn settings_mark(width: usize, icons: bool) -> Option<String> {
+    if icons {
+        Some(crate::icons::SETTINGS.to_string())
     } else {
-        format!("{MENU_LABEL} \u{ab} ")
+        (width >= SETTINGS_FROM).then(|| "set".to_string())
+    }
+}
+
+/// What closes the foot's last row: `menu`, the settings mark when there is one, then `« `.
+fn foot_tail(width: usize, icons: bool) -> String {
+    match settings_mark(width, icons) {
+        Some(mark) => format!("{MENU_LABEL} {mark} \u{ab} "),
+        None => format!("{MENU_LABEL} \u{ab} "),
     }
 }
 
@@ -3395,8 +3487,8 @@ const Q_FOOT_ROWS: usize = Q_LOGO.len() + 1;
 /// has room for the pet.
 const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 
-/// The foot of the open column, its last row always the menu row: the version and the online
-/// dot at the left and `menu « ` at the right.
+/// The foot of the open column, its last row always the menu row: the version and the hub
+/// word at the left and `menu <cog> « ` at the right.
 ///
 /// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
 /// in ember. While the pet stands (`pet`) one blank row goes on top and the pet stands at the
@@ -3414,39 +3506,33 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 ///  ●   ●        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///      ●        ▀▀▀▀▀▀
-///  0.5.0 ●  settings  menu «
+///  0.5.0 online         menu ⚙ «
 /// ```
 ///
-/// A dot is a plain `●`, which every terminal draws. Whatever the pet, the words sit in the
-/// same rows counted from the bottom: nothing a person reads ever moves. The menu row answers
-/// a click the way the foot always has (the menu at its word, the fold elsewhere); the other
-/// rows are text and answer nothing.
+/// Whatever the pet, the words sit in the same rows counted from the bottom: nothing a person
+/// reads ever moves. The menu row answers a click by the word under it (see [`foot_act`]) and
+/// folds the column elsewhere; the other rows are text and answer nothing.
 fn foot_rows(
     width: usize,
     pet: bool,
     count: Option<usize>,
     update: Option<&str>,
     hub: HubLink,
+    icons: bool,
 ) -> Vec<Row> {
     use crate::theme::Role;
-    let tail = foot_tail(width);
-    // The menu closes the last row: `menu « ` flush right, `settings` and the version before it.
-    let version = version_text(width, crate::width::width(&tail), update);
-    // The dot is the interface's daemon, which it is connected to whenever it is drawn (it
-    // ends with the stream), and the hub the phone bridge says it reaches: green when both,
-    // warm and hollow when the bridge is there and the hub is not, quiet and small when there
-    // is no bridge. The glyph differs as well as the ink, for a terminal with no colour.
-    let (ink, glyph) = online_dot(hub);
-    let dotted = format!("{version} {glyph}");
-    let online = (!version.is_empty()
-        && crate::width::width(&dotted) + 1 + crate::width::width(&tail) <= width)
-        .then(|| crate::width::width(&version) + 1);
-    let lead = if online.is_some() { dotted } else { version };
+    let tail = foot_tail(width, icons);
+    // The menu closes the last row: `menu <cog> « ` flush right, the version and the hub word
+    // before it.
+    let (lead, word) = foot_lead(width, crate::width::width(&tail), update, hub);
     let gap = width.saturating_sub(crate::width::width(&lead) + crate::width::width(&tail));
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
-        runs: online.map(|at| (at, 1, ink)).into_iter().collect(),
+        runs: word
+            .map(|(at, word, ink)| (at, word.len(), ink))
+            .into_iter()
+            .collect(),
         ..Line::default()
     };
     let menu_row = (menu_row, Some(Hit::Foot));
@@ -3495,20 +3581,38 @@ fn foot_rows(
     out
 }
 
-/// The online dot's ink and glyph for what the bridge says about the hub: a full green dot
-/// when it is reached, a hollow warm one when a bridge is there and the hub is not, a small
-/// quiet one when there is no bridge.
-fn online_dot(hub: HubLink) -> (crate::theme::Role, char) {
+/// The word and ink for what the bridge says about the hub, after the version: green
+/// `online` when it is reached, warm `offline` when a bridge is there and the hub is not,
+/// quiet `local` when there is no bridge. A word and not a glyph, so a terminal with no
+/// colour still tells them apart.
+fn hub_word(hub: HubLink) -> (&'static str, crate::theme::Role) {
     use crate::theme::Role;
     match hub {
-        HubLink::Up => (Role::Done, ONLINE),
-        HubLink::Down => (Role::Blocked, '\u{25cb}'),
-        HubLink::Absent => (Role::Faint, '\u{b7}'),
+        HubLink::Up => ("online", Role::Done),
+        HubLink::Down => ("offline", Role::Blocked),
+        HubLink::Absent => ("local", Role::Faint),
     }
 }
 
-/// The `●` that says the interface is connected to its daemon, and to the hub if there is one.
-const ONLINE: char = '\u{25cf}';
+/// The left of the menu row, beside a tail of `tail` columns: the version, then the hub word
+/// with the column it starts at and its ink when they all fit with a blank before the tail.
+/// The word goes first when the column narrows, the version after it.
+fn foot_lead(
+    width: usize,
+    tail: usize,
+    update: Option<&str>,
+    hub: HubLink,
+) -> (String, Option<(usize, &'static str, crate::theme::Role)>) {
+    let version = version_text(width, tail, update);
+    let (word, ink) = hub_word(hub);
+    let worded = format!("{version} {word}");
+    if !version.is_empty() && crate::width::width(&worded) + 1 + tail <= width {
+        let at = crate::width::width(&version) + 1;
+        (worded, Some((at, word, ink)))
+    } else {
+        (version, None)
+    }
+}
 
 /// One row of the count box: its text and the runs in it, from the box's own left edge.
 type BoxRow = (String, Vec<(usize, usize, crate::theme::Role)>);
@@ -3572,19 +3676,35 @@ fn box_line(
 
 /// Where the version starts on the menu row, when the row shows it: the column its link
 /// covers. The word is [`VERSION`]; a newer version after it is not part of the link.
-pub(crate) fn version_link_at(width: usize) -> Option<usize> {
-    version_link_in(width, update_available().as_deref())
+pub(crate) fn version_link_at(width: usize, icons: bool) -> Option<usize> {
+    version_link_in(width, icons, update_available().as_deref())
 }
 
 /// [`version_link_at`] for a given update notice.
-fn version_link_in(width: usize, update: Option<&str>) -> Option<usize> {
-    let tail = foot_tail(width);
+fn version_link_in(width: usize, icons: bool, update: Option<&str>) -> Option<usize> {
+    let tail = foot_tail(width, icons);
     let shown = version_text(width, crate::width::width(&tail), update);
     (!shown.is_empty()).then_some(1)
 }
 
 /// Where this program lives on the web, which the version links to.
 pub(crate) const SITE: &str = "https://qoop.si";
+
+/// The web app, which `online` and `local` link to: sign in and pair a machine there.
+pub(crate) const APP: &str = "https://qoop.si/app";
+
+/// Where the hub word stands on the menu row and what it says, when the row shows it: the
+/// column its link covers, for a hub word that links (not `offline`).
+pub(crate) fn app_link_at(
+    width: usize,
+    icons: bool,
+) -> Option<(usize, &'static str, crate::theme::Role)> {
+    let tail = crate::width::width(&foot_tail(width, icons));
+    let hub = hub_link();
+    foot_lead(width, tail, update_available().as_deref(), hub)
+        .1
+        .filter(|_| hub != HubLink::Down)
+}
 
 /// The version as the menu row opens with it: ` 0.5.0`, or ` 0.5.0>0.6.0` when a newer
 /// one was seen, beside a tail of `tail` columns with at least a space between. A version
@@ -4360,7 +4480,7 @@ mod tests {
     #[test]
     fn an_agent_is_two_rows_under_its_space_rule() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 1, 1, 14);
+        let lines = render(&spaces, &agents, 1, 1, 16);
         let texts = unboxed(&lines);
         let head = texts
             .iter()
@@ -4415,7 +4535,7 @@ mod tests {
     #[test]
     fn an_agent_row_carries_its_state_on_the_dot_and_a_title_or_rule_carries_none() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 1, 1, 14);
+        let lines = render(&spaces, &agents, 1, 1, 16);
         // A title has a look of its own, and it is never a state's: a heading that
         // came out the colour of `blocked` would be a heading somebody answers.
         assert_eq!(lines[1].colour, Some(crate::theme::Role::Title));
@@ -4576,8 +4696,8 @@ mod tests {
             .collect();
         for focused in 1..=30u32 {
             let home = i64::from((focused - 1) / 3 + 1);
-            let drawn: Vec<Hit> = (0..15)
-                .filter_map(|row| hit(&spaces, &agents, home, focused, 15, row))
+            let drawn: Vec<Hit> = (0..17)
+                .filter_map(|row| hit(&spaces, &agents, home, focused, 17, row))
                 .collect();
             assert!(
                 drawn.contains(&Hit::Terminal(focused)),
@@ -4590,18 +4710,21 @@ mod tests {
         }
         // With no agent to keep, the focused space's rule is what stays.
         for focused_space in 1..=10i64 {
-            let drawn: Vec<Hit> = (0..15)
-                .filter_map(|row| hit(&spaces, &agents, focused_space, 99, 15, row))
+            let drawn: Vec<Hit> = (0..17)
+                .filter_map(|row| hit(&spaces, &agents, focused_space, 99, 17, row))
                 .collect();
             assert!(
                 drawn.contains(&Hit::Space(focused_space)),
                 "space {focused_space} fell out: {drawn:?}"
             );
         }
-        // A tree that fits never scrolls: the first rule sits under the next row and the
-        // title.
+        // A tree that fits never scrolls: the first rule sits under the next row, the title
+        // and the search box.
         let (spaces, agents) = sample();
-        assert_eq!(hit(&spaces, &agents, 3, 3, 15, 3), Some(Hit::Space(1)));
+        assert_eq!(
+            hit(&spaces, &agents, 3, 3, 17, 2 + SEARCH_ROWS),
+            Some(Hit::Space(1))
+        );
     }
 
     /// The wheel moves a long list past the keyboard's agent, all the way to the last row
@@ -4715,7 +4838,12 @@ mod tests {
                         None
                     } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
                         Some(Hit::Title)
-                    } else if in_tree && text == " / search" {
+                    } else if in_tree
+                        && (text.starts_with(" \u{256d}")
+                            || text.starts_with(" \u{2570}")
+                            || text.starts_with(" \u{2502} /"))
+                    {
+                        // The search box: its border, its field, its border.
                         Some(Hit::Search)
                     } else if text.ends_with('\u{ab}') {
                         // The menu row, the foot's last: the version and `menu «`.
@@ -4786,7 +4914,7 @@ mod tests {
     #[test]
     fn an_agent_in_a_space_the_client_has_not_heard_of_still_draws_its_row() {
         let agents = vec![agent(4, 77, "codex", "blocked")];
-        let lines = render(&[], &agents, 1, 4, 10);
+        let lines = render(&[], &agents, 1, 4, 12);
         assert!(
             lines
                 .iter()
@@ -4796,7 +4924,7 @@ mod tests {
         );
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(4, 77, "codex", "idle"), agent(5, 1, "claude", "idle")];
-        let rows = tree_rows(&spaces, &agents, 5, 14, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 5, 16, &Seen::new(), &Shut::new());
         assert_eq!(order(&rows), vec![5, 4], "the stranger follows the tree");
         let stray = tree_row(&rows, 4);
         assert!(
@@ -5094,7 +5222,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 9);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 11);
         assert!(
             lines.iter().any(|l| l.text.contains("behind")),
             "{:?}",
@@ -5133,7 +5261,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 9);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 11);
         assert!(
             lines.iter().any(|l| l.text.contains("behind docker")),
             "{:?}",
@@ -5150,7 +5278,7 @@ mod tests {
     fn a_wide_name_does_not_cost_the_row_a_space_the_column_put_there() {
         let agents = vec![agent(1, 1, "\u{4e2d}\u{4e2d}", "idle")];
         let spaces = vec![space(1, "\u{4e2d}\u{6587}")];
-        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
         // The space's own rule: the space after its name is one this module wrote, and
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
@@ -5173,7 +5301,7 @@ mod tests {
             &[space(1, "app")],
             &agents,
             1,
-            10,
+            12,
             &Seen::new(),
             &Shut::new(),
         );
@@ -5285,7 +5413,7 @@ mod tests {
             &agents,
             1,
             1,
-            14,
+            16,
             0,
             View::Tree,
             &Seen::new(),
@@ -5322,7 +5450,7 @@ mod tests {
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The q alone, its tail in ember, then the menu.
-        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up);
+        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up, false);
         assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
@@ -5344,10 +5472,7 @@ mod tests {
         // screen, and `menu « ` closing the row.
         let (menu, hit) = &rows[4];
         assert!(menu.text.starts_with(&format!(" {VERSION} ")), "{menu:?}");
-        assert!(
-            menu.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
-            "{menu:?}"
-        );
+        assert!(menu.text.ends_with(&foot_tail(WIDTH, false)), "{menu:?}");
         assert_eq!(menu.colour, Some(crate::theme::Role::Faint));
         assert_eq!(*hit, Some(Hit::Foot));
 
@@ -5367,7 +5492,8 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let menu_at = WIDTH - 6;
+        // Icons are off in this column, so the tail is `menu set « `.
+        let menu_at = WIDTH - 10;
         assert_eq!(act(Hit::Foot, menu_at, &c, false), Some(Act::Menu));
         assert_eq!(act(Hit::Foot, WIDTH - 1, &c, false), Some(Act::Collapse));
         assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Site));
@@ -5387,8 +5513,8 @@ mod tests {
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, false, None, None, HubLink::Up);
-            let stands = foot_rows(width, true, Some(0), None, HubLink::Up);
+            let gave_way = foot_rows(width, false, None, None, HubLink::Up, false);
+            let stands = foot_rows(width, true, Some(0), None, HubLink::Up, false);
             assert_eq!(stands.len(), STAGE_FOOT_ROWS);
             let added = STAGE_FOOT_ROWS - gave_way.len();
             let blank_at = COUNT_BOX_ROWS;
@@ -5400,74 +5526,151 @@ mod tests {
         }
     }
 
-    /// The menu row shows the version and, right after it, the green online dot, while the
-    /// tail keeps its place at the right; the link starts where the version does.
+    /// The menu row shows the version and, right after it, the hub word, while the tail keeps
+    /// its place at the right; the link starts where the version does.
     #[test]
-    fn the_menu_row_carries_the_version_then_the_online_dot() {
-        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            let rows = foot_rows(width, false, None, None, HubLink::Up);
-            let (menu, hit) = rows.last().expect("the menu row");
-            assert_eq!(*hit, Some(Hit::Foot));
-            assert_eq!(crate::width::width(&menu.text), width);
-            assert!(
-                menu.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
-                "{menu:?}"
-            );
-            let version = format!(" {VERSION}");
-            assert!(menu.text.starts_with(&version), "{menu:?}");
-            assert_eq!(version_link_at(width), Some(1));
-            let dot_at = crate::width::width(&version) + 1;
-            // The dot goes first when the row is tight: the version and the tail are kept.
-            let room = dot_at + 1 + 1 + crate::width::width(&foot_tail(width)) <= width;
-            if room {
-                assert_eq!(menu.text.chars().nth(dot_at), Some(ONLINE), "{menu:?}");
-                assert_eq!(menu.runs, vec![(dot_at, 1, crate::theme::Role::Done)]);
-            } else {
-                assert!(
-                    !menu.text.contains(ONLINE) && menu.runs.is_empty(),
-                    "{menu:?}"
-                );
+    fn the_menu_row_carries_the_version_then_the_hub_word() {
+        for icons in [false, true] {
+            for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+                let rows = foot_rows(width, false, None, None, HubLink::Up, icons);
+                let (menu, hit) = rows.last().expect("the menu row");
+                assert_eq!(*hit, Some(Hit::Foot));
+                assert_eq!(crate::width::width(&menu.text), width);
+                let tail = foot_tail(width, icons);
+                assert!(menu.text.ends_with(&tail), "{menu:?}");
+                let version = format!(" {VERSION}");
+                assert!(menu.text.starts_with(&version), "{menu:?}");
+                assert_eq!(version_link_at(width, icons), Some(1));
+                let word_at = crate::width::width(&version) + 1;
+                // The word goes first when the row is tight: the version and the tail are kept.
+                let room = word_at + "online".len() + 1 + crate::width::width(&tail) <= width;
+                if room {
+                    assert!(menu.text[word_at..].starts_with("online"), "{menu:?}");
+                    assert_eq!(
+                        menu.runs,
+                        vec![(word_at, "online".len(), crate::theme::Role::Done)]
+                    );
+                } else {
+                    assert!(
+                        !menu.text.contains("online") && menu.runs.is_empty(),
+                        "{menu:?}"
+                    );
+                }
+                assert!(room || width < WIDTH, "the word shows at the default width");
             }
-            assert!(room || width < WIDTH, "the dot shows at the default width");
         }
-        // No room for the version, no link and no dot hanging in the air.
-        let tight = foot_rows(8, false, None, None, HubLink::Up);
+        // No room for the version, no link and no word hanging in the air.
+        let tight = foot_rows(8, false, None, None, HubLink::Up, false);
+        let text = &tight.last().unwrap().0.text;
         assert!(
-            !tight
-                .last()
-                .unwrap()
-                .0
-                .text
-                .contains([ONLINE, '\u{25cb}', '\u{b7}'])
+            !text.contains("online") && !text.contains(VERSION),
+            "{text:?}"
         );
-        assert_eq!(version_link_at(8), None);
+        assert_eq!(version_link_at(8, false), None);
     }
 
-    /// The dot says what the bridge says about the hub: a full green one when reached, a
-    /// hollow warm one when a bridge is there and the hub is not, a small quiet one when
-    /// there is no bridge. The glyph differs as well as the ink, so a terminal with no colour
-    /// tells the three apart; all sit in the same cell.
+    /// The word says what the bridge says about the hub: green `online` when reached, warm
+    /// `offline` when a bridge is there and the hub is not, faint `local` when there is no
+    /// bridge. The three differ as words, so a terminal with no colour tells them apart.
     #[test]
-    fn the_online_dot_follows_the_hub_state() {
+    fn the_hub_word_follows_the_hub_state() {
         use crate::theme::Role;
-        let dot = |hub| {
-            let rows = foot_rows(WIDTH, false, None, None, hub);
+        let word = |hub| {
+            let rows = foot_rows(WIDTH, false, None, None, hub, false);
             let menu = &rows.last().unwrap().0;
             let at = crate::width::width(&format!(" {VERSION}")) + 1;
-            (menu.text.chars().nth(at), menu.runs.clone())
+            let (word, _) = hub_word(hub);
+            assert_eq!(&menu.text[at..at + word.len()], word);
+            menu.runs.clone()
         };
         let at = crate::width::width(&format!(" {VERSION}")) + 1;
+        assert_eq!(word(HubLink::Up), vec![(at, 6, Role::Done)]);
+        assert_eq!(word(HubLink::Down), vec![(at, 7, Role::Blocked)]);
+        assert_eq!(word(HubLink::Absent), vec![(at, 5, Role::Faint)]);
+    }
+
+    /// `online` and `local` open the web app, `offline` says the hub is down, and the cells
+    /// around each word fold the column as the rest of the foot does.
+    #[test]
+    fn the_hub_word_answers_a_click_by_what_it_says() {
+        let word_at = crate::width::width(&format!(" {VERSION}")) + 1;
+        for (hub, word, want) in [
+            (HubLink::Up, "online", Act::App),
+            (HubLink::Absent, "local", Act::App),
+            (HubLink::Down, "offline", Act::HubDown),
+        ] {
+            for icons in [false, true] {
+                // 1-based columns: the word is columns word_at + 1 to word_at + its length.
+                for col in word_at + 1..=word_at + word.len() {
+                    assert_eq!(foot_act(WIDTH, icons, col, None, hub), want, "{word} {col}");
+                }
+                assert_eq!(
+                    foot_act(WIDTH, icons, word_at, None, hub),
+                    Act::Collapse,
+                    "the blank before {word}"
+                );
+                assert_eq!(
+                    foot_act(WIDTH, icons, word_at + word.len() + 1, None, hub),
+                    Act::Collapse,
+                    "the blank after {word}"
+                );
+            }
+        }
+        // Too narrow for the word: it is not drawn and its cells fold the column.
         assert_eq!(
-            dot(HubLink::Up),
-            (Some('\u{25cf}'), vec![(at, 1, Role::Done)])
+            foot_act(20, true, word_at + 1, None, HubLink::Up),
+            Act::Collapse
         );
+    }
+
+    /// The settings mark stands after `menu`: the cog where icons are drawn, `set` where they
+    /// are not and the column has room, nothing in a narrow column without icons (the menu
+    /// has the same row). It opens the settings page and the cells around it do not.
+    #[test]
+    fn the_settings_mark_follows_menu_and_opens_the_page() {
+        let cog = crate::icons::SETTINGS;
+        let tail = foot_tail(WIDTH, true);
+        assert_eq!(tail, format!("{MENU_LABEL} {cog} \u{ab} "));
+        assert_eq!(crate::width::width(&tail), 9);
+        assert_eq!(foot_tail(WIDTH, false), format!("{MENU_LABEL} set \u{ab} "));
         assert_eq!(
-            dot(HubLink::Down),
-            (Some('\u{25cb}'), vec![(at, 1, Role::Blocked)])
+            foot_tail(SETTINGS_FROM - 1, false),
+            format!("{MENU_LABEL} \u{ab} ")
         );
-        assert_eq!(
-            dot(HubLink::Absent),
-            (Some('\u{b7}'), vec![(at, 1, Role::Faint)])
+        assert!(!foot_tail(WIDTH, true).contains("settings"));
+        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up, true);
+        let text = &rows.last().unwrap().0.text;
+        assert!(text.ends_with(&tail), "{text:?}");
+        // With icons the cog is one cell, 1-based column WIDTH - 3.
+        let cog_col = WIDTH - 3;
+        let word_at = crate::width::width(&format!(" {VERSION}")) + 1;
+        for col in 1..=WIDTH {
+            let want = match col {
+                c if c == cog_col => Act::SettingsPage,
+                c if (WIDTH - 8..=WIDTH - 5).contains(&c) => Act::Menu,
+                c if (2..=1 + VERSION.len()).contains(&c) => Act::Site,
+                c if (word_at + 1..=word_at + 6).contains(&c) => Act::App,
+                _ => Act::Collapse,
+            };
+            assert_eq!(
+                foot_act(WIDTH, true, col, None, HubLink::Up),
+                want,
+                "col {col}"
+            );
+        }
+        // Without icons `set` is three cells after `menu `.
+        for col in WIDTH - 5..=WIDTH - 3 {
+            assert_eq!(
+                foot_act(WIDTH, false, col, None, HubLink::Up),
+                Act::SettingsPage,
+                "col {col}"
+            );
+        }
+        // A narrow column without icons has no mark, and nothing in it opens the page.
+        let narrow = SETTINGS_FROM - 1;
+        assert!(
+            (1..=narrow)
+                .all(|col| foot_act(narrow, false, col, None, HubLink::Up) != Act::SettingsPage)
         );
     }
 
@@ -5476,9 +5679,9 @@ mod tests {
     /// foot still folds the column.
     #[test]
     fn the_version_link_covers_only_the_version() {
-        let rows = foot_rows(WIDTH, false, None, Some("9.9.9"), HubLink::Up);
+        let rows = foot_rows(WIDTH, false, None, Some("9.9.9"), HubLink::Up, false);
         let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
-        let at = version_link_in(WIDTH, Some("9.9.9")).expect("shown");
+        let at = version_link_in(WIDTH, false, Some("9.9.9")).expect("shown");
         let word: String = text[at..at + VERSION.len()].iter().collect();
         assert_eq!(word, VERSION);
         assert_eq!(text[at + VERSION.len()], '>', "the notice follows the link");
@@ -5500,7 +5703,7 @@ mod tests {
             "folded strip"
         );
         // Where the row has no room for the version, nothing is a link.
-        assert_eq!(version_link_in(8, None), None);
+        assert_eq!(version_link_in(8, false, None), None);
     }
 
     /// The logo is the q of `docs/brand/make.py` alone at every width: one dot a cell with a
@@ -5531,7 +5734,7 @@ mod tests {
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
             for pet in [false, true] {
-                let rows = foot_rows(width, pet, None, None, HubLink::Up);
+                let rows = foot_rows(width, pet, None, None, HubLink::Up, false);
                 let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
                 for (i, (line, hit)) in logo.iter().enumerate() {
                     assert_eq!(
@@ -5679,7 +5882,7 @@ mod tests {
                 let (last, hit) = rows.last().expect("a row");
                 assert_eq!(*hit, Some(Hit::Foot), "height {height}: {last:?}");
                 assert!(
-                    last.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+                    last.text.ends_with(&foot_tail(WIDTH, false)),
                     "height {height}: {last:?}"
                 );
             }
@@ -5691,7 +5894,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Option<&str>| {
-            foot_rows(width, false, None, update, HubLink::Up)
+            foot_rows(width, false, None, update, HubLink::Up, false)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -5700,7 +5903,7 @@ mod tests {
         let wide = menu(SIDEBAR_MAX, Some("0.10.0"));
         assert!(wide.starts_with(&format!(" {VERSION}>0.10.0 ")), "{wide:?}");
         // Exactly room for the version, a space and the tail: the notice gives way.
-        let snug = crate::width::width(&format!(" {VERSION}")) + 1 + FOOT_TAIL;
+        let snug = crate::width::width(&format!(" {VERSION}")) + 1 + crate::width::width(&tail);
         let fits = menu(snug, Some("0.10.0"));
         assert_eq!(fits, format!(" {VERSION} {tail}"));
         // One column less and the version goes too, never cut.
@@ -5775,7 +5978,7 @@ mod tests {
         }
         let (menu_row, hit) = &rows[29];
         assert!(
-            menu_row.text.ends_with(&format!("{MENU_LABEL} \u{ab} ")),
+            menu_row.text.ends_with(&foot_tail(WIDTH, false)),
             "{menu_row:?}"
         );
         assert_eq!(*hit, Some(Hit::Foot));
@@ -5783,7 +5986,7 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
         for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
@@ -5815,8 +6018,8 @@ mod tests {
             WIDTH,
             None,
         );
-        let freed =
-            30 - STAGE_FOOT_ROWS..30 - foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let freed = 30 - STAGE_FOOT_ROWS
+            ..30 - foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -6289,7 +6492,7 @@ mod tests {
         // failed colour and reaching the failed terminal.
         let spaces = vec![space(2, "webshop")];
         let agents = vec![agent(2, 2, "claude", "failed")];
-        let lines = render(&spaces, &agents, 2, 99, 10);
+        let lines = render(&spaces, &agents, 2, 99, 12);
         let mark = cell_mark(crate::theme::of("failed"), false, 0);
         // Column zero is a blank, ahead of the mark.
         let prefix = format!(" {mark}claude");
@@ -6304,7 +6507,7 @@ mod tests {
             Some((BOX_LEAD, 2, crate::theme::of("failed")))
         );
         assert_eq!(
-            hit(&spaces, &agents, 2, 99, 10, row),
+            hit(&spaces, &agents, 2, 99, 12, row),
             Some(Hit::Terminal(2))
         );
         // An unseen failed finish keeps its X: failed is never news.
@@ -6588,11 +6791,7 @@ mod tests {
                     .filter(|col| act(Hit::Foot, *col, &c, false) == Some(Act::SettingsPage))
                     .filter_map(|col| foot.chars().nth(col - 1))
                     .collect();
-                let named = if width >= SETTINGS_FROM {
-                    SETTINGS_LABEL
-                } else {
-                    ""
-                };
+                let named = if width >= SETTINGS_FROM { "set" } else { "" };
                 assert_eq!(settings, named, "width {width}: {foot:?}");
                 for col in [1, width - 1, width] {
                     assert_eq!(
@@ -6658,12 +6857,14 @@ mod tests {
     fn the_tree_opens_right_under_the_title() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "idle")];
-        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
         assert_eq!(rows[0].1, Some(Hit::Tabs));
         assert_eq!(rows[1].1, Some(Hit::Title));
-        assert_eq!(rows[2].1, Some(Hit::Search));
-        assert_eq!(rows[3].1, Some(Hit::Space(1)));
-        assert_eq!(rows[4].1, Some(Hit::Terminal(1)));
+        for row in &rows[2..2 + SEARCH_ROWS] {
+            assert_eq!(row.1, Some(Hit::Search));
+        }
+        assert_eq!(rows[2 + SEARCH_ROWS].1, Some(Hit::Space(1)));
+        assert_eq!(rows[3 + SEARCH_ROWS].1, Some(Hit::Terminal(1)));
     }
 
     /// A blocked agent is listed in the inbox at the top, where a person looks first,
@@ -6686,7 +6887,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let rows = rows_folded(&c, 16, None);
+        let rows = rows_folded(&c, 18, None);
         let texts = texts(&rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>());
         assert!(texts[1].starts_with(" \u{282f}\u{2807}codex"), "{texts:?}");
         assert_eq!(rows[1].1, Some(Hit::Next(Some(1))));
@@ -7035,12 +7236,12 @@ mod tests {
         unseen.insert((7, 3));
         // Finished unread, which would be the done sage for a free agent.
         let agents = vec![busy.clone(), free];
-        let rows = tree_rows(&spaces, &agents, 1, 11, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents, 1, 13, &seen, &shut);
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, Role::Background))
         );
-        let rows = tree_rows(&spaces, &agents[1..], 1, 11, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents[1..], 1, 13, &seen, &shut);
         assert_eq!(tree_row(&rows, 8).indicator.map(|i| i.2), Some(Role::Idle));
 
         let column = column(
@@ -7326,7 +7527,7 @@ mod tests {
                 &shut,
             );
             c.usage = Some(&usage);
-            rows_folded(&c, 13, None)
+            rows_folded(&c, 15, None)
         };
         let wide = at(30);
         let row = tree_row(&wide, 1);
@@ -7602,7 +7803,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -7611,10 +7812,10 @@ mod tests {
                 .take_while(|(_, hit)| *hit != Some(Hit::Title))
                 .count();
             let room = h.saturating_sub(foot);
-            let inbox = if room < 4 {
+            let inbox = if room < 5 + SEARCH_ROWS {
                 0
             } else {
-                1 + INBOX_ROWS.min(room.saturating_sub(5).max(1))
+                1 + INBOX_ROWS.min(room - (4 + SEARCH_ROWS))
             };
             // The open inbox's edge, when it and the title both fit.
             let edge = usize::from(inbox > 1 && inbox + 1 < room);
@@ -7669,8 +7870,8 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
-        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 5);
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4 - SEARCH_ROWS);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
 
@@ -7859,7 +8060,7 @@ mod tests {
         use crate::theme::Role;
         let spaces = vec![space(1, "app")];
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
-        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
         let check = |agents: &[AgentRow], height: usize, pet: Option<&_>, number: &str| {
             let c = opened(column(
                 &spaces,
@@ -7933,7 +8134,7 @@ mod tests {
         assert!(!avatar_fits(12, WIDTH, true));
         check(&few, 14, Some(&art_pet()), "1");
         // Where even the logo's rows leave no room beside it, there is no box.
-        let narrow = foot_rows(12, false, Some(0), None, HubLink::Up);
+        let narrow = foot_rows(12, false, Some(0), None, HubLink::Up, false);
         assert!(
             narrow
                 .iter()
@@ -7953,7 +8154,7 @@ mod tests {
             agent(4, 2, "codex", "idle"),
         ];
         let shut = Shut::from([1]);
-        let rows = tree_rows(&spaces, &agents, 2, 14, &Seen::new(), &shut);
+        let rows = tree_rows(&spaces, &agents, 2, 16, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
         assert!(app.text.starts_with("\u{25b8}app (3)"), "{:?}", app.text);
@@ -8082,7 +8283,7 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let mut agents = vec![agent(1, 1, "sh", "unknown")];
         agents[0].agent = true;
-        let rows = tree_rows(&spaces, &agents, 1, 11, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
         assert_eq!(unbox(&tree_row(&rows, 1).text), " \u{2810}\u{2800}sh");
     }
 
@@ -8092,7 +8293,7 @@ mod tests {
     fn an_unread_done_draws_in_its_space_with_the_done_dot() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "claude", "done")];
-        let rows = tree_rows(&spaces, &agents, 2, 11, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 2, 13, &Seen::new(), &Shut::new());
         assert_eq!(
             tree_row(&rows, 1).indicator,
             Some((BOX_LEAD, 2, crate::theme::of("done")))
@@ -8471,7 +8672,7 @@ mod tests {
         let mut row = agent(1, 1, program, "idle");
         row.cwd = cwd.map(str::to_string);
         second_of(
-            &tree_rows(&spaces, &[row], 9, 11, &Seen::new(), &Shut::new()),
+            &tree_rows(&spaces, &[row], 9, 13, &Seen::new(), &Shut::new()),
             1,
         )
         .clone()
@@ -8524,16 +8725,16 @@ mod tests {
         a.cwd = Some("/home/u/x".into());
         let mut b = agent(2, 2, "codex", "idle");
         b.cwd = Some("/home/u/x".into());
-        let rows = tree_rows(&spaces, &[a, b], 9, 16, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &[a, b], 9, 18, &Seen::new(), &Shut::new());
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = unboxed(&lines);
-        assert_eq!(texts[3], rule_row(&rows, 1).text.trim_end());
-        assert_eq!(texts[4], " \u{2810}\u{2800}claude");
-        assert_eq!(texts[5], "   \u{2514} claude \u{b7} x");
-        assert!(texts[6].is_empty(), "{texts:?}");
-        assert_eq!(texts[7], rule_row(&rows, 2).text.trim_end());
-        assert_eq!(texts[8], " \u{2810}\u{2800}codex");
-        assert_eq!(texts[9], "   \u{2514} codex \u{b7} x");
+        assert_eq!(texts[5], rule_row(&rows, 1).text.trim_end());
+        assert_eq!(texts[6], " \u{2810}\u{2800}claude");
+        assert_eq!(texts[7], "   \u{2514} claude \u{b7} x");
+        assert!(texts[8].is_empty(), "{texts:?}");
+        assert_eq!(texts[9], rule_row(&rows, 2).text.trim_end());
+        assert_eq!(texts[10], " \u{2810}\u{2800}codex");
+        assert_eq!(texts[11], "   \u{2514} codex \u{b7} x");
     }
 
     /// A long worktree shortens with an ellipsis while the tab keeps every letter it
@@ -8712,9 +8913,9 @@ mod tests {
             agent_at(2, 1, "claude", "idle", 5000),
             agent(3, 1, "gemini", "blocked"),
         ];
-        // The least that holds the title, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, None, None, HubLink::Up).len() + 4;
-        for height in [least, least + 1, 10, 14, 30] {
+        // The least that holds the title, the search box, one row of list and the foot, then more.
+        let least = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len() + 6;
+        for height in [least, least + 1, 12, 16, 30] {
             let rows = rows12(
                 &spaces,
                 &agents,
@@ -8803,7 +9004,7 @@ mod tests {
                 &agents,
                 1,
                 9,
-                20,
+                22,
                 0,
                 View::Tree,
                 &Seen::new(),
@@ -8829,7 +9030,12 @@ mod tests {
             let c = clicks(&spaces, &agents, View::Tree, width, &none);
             assert_eq!(act(Hit::Title, width, &c, false), Some(Act::NewSpace));
             assert_eq!(act(Hit::Title, width - 2, &c, false), Some(Act::View));
-            assert_eq!(act(Hit::Foot, width - 3, &c, false), Some(Act::Menu));
+            let menu_col = if width >= SETTINGS_FROM {
+                width - 10
+            } else {
+                width - 6
+            };
+            assert_eq!(act(Hit::Foot, menu_col, &c, false), Some(Act::Menu));
             assert_eq!(act(Hit::Foot, width, &c, false), Some(Act::Collapse));
         }
         // The default width is what `render` paints, row for row.
@@ -8872,7 +9078,7 @@ mod tests {
         let idle = agent(8, 1, "claude", "idle");
         assert_eq!(priority_of(&idle, focused, &seen, &unseen), 6);
         // In the tree it wears the mauve mark, and is never next.
-        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 11, &seen, &Shut::new());
+        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 13, &seen, &Shut::new());
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, crate::theme::Role::Sleeping))
@@ -9835,10 +10041,13 @@ mod tests {
         assert_eq!(resolve(&nav(Terminal(9), 0), &[]), None);
     }
 
-    /// The search box is a row under the title that a click focuses: the settings page's
-    /// `/`, the placeholder in the faint ink, the typed words with the caret while typing.
+    /// The search box is three rows under the title that a click on any of them focuses: a
+    /// rounded border, the field, a border. Idle it reads `search N agents` in the faint ink;
+    /// typing, the border brightens and the field shows the `/`, the words, the caret and how
+    /// many agents they found out of all.
     #[test]
     fn the_search_box_sits_under_the_title_and_shows_the_query() {
+        use crate::theme::Role;
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let mut c = column(
@@ -9854,39 +10063,195 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let rows = rows_folded(&c, 20, None);
-        let at = rows
-            .iter()
-            .position(|(_, h)| *h == Some(Hit::Title))
-            .expect("a title");
-        assert_eq!(rows[at + 1].1, Some(Hit::Search));
-        assert_eq!(rows[at + 1].0.text.trim_end(), " / search");
-        assert_eq!(act(Hit::Search, 3, &c, false), Some(Act::Search));
+        let all = agents.iter().filter(|a| a.agent).count();
+        let box_of = |c: &Column| {
+            let rows = rows_folded(c, 30, None);
+            let at = rows
+                .iter()
+                .position(|(_, h)| *h == Some(Hit::Title))
+                .expect("a title");
+            for row in &rows[at + 1..at + 4] {
+                assert_eq!(row.1, Some(Hit::Search));
+                assert_eq!(crate::width::width(&row.0.text), WIDTH, "{:?}", row.0);
+            }
+            assert_ne!(rows[at + 4].1, Some(Hit::Search), "the box is three rows");
+            rows[at + 1..at + 4]
+                .iter()
+                .map(|(line, _)| line.clone())
+                .collect::<Vec<_>>()
+        };
+        let bar = "\u{2500}".repeat(WIDTH - 4);
+        let idle = box_of(&c);
+        assert_eq!(idle[0].text, format!(" \u{256d}{bar}\u{256e} "));
+        assert_eq!(idle[2].text, format!(" \u{2570}{bar}\u{256f} "));
+        assert!(
+            idle[1]
+                .text
+                .starts_with(&format!(" \u{2502} /  search {all} agents")),
+            "{:?}",
+            idle[1].text
+        );
+        assert!(idle[1].text.ends_with("\u{2502} "));
+        assert_eq!(idle[0].runs, vec![(1, WIDTH - 2, Role::Rule)]);
+        assert_eq!(
+            idle[1].runs,
+            vec![(1, 1, Role::Rule), (WIDTH - 2, 1, Role::Rule)]
+        );
+        assert_eq!(idle[1].colour, Some(Role::Faint));
+        for col in 1..=WIDTH {
+            assert_eq!(act(Hit::Search, col, &c, false), Some(Act::Search));
+        }
+        // Typing: the border brightens, the caret takes the blank before the word.
+        let nav = Nav {
+            typing: true,
+            ..Nav::default()
+        };
+        c.nav = Some(&nav);
+        let empty = box_of(&c);
+        assert!(
+            empty[1]
+                .text
+                .starts_with(&format!(" \u{2502} / \u{258f}search {all} agents")),
+            "{:?}",
+            empty[1].text
+        );
+        assert_eq!(empty[0].runs, vec![(1, WIDTH - 2, Role::Detail)]);
+        // The words, the caret, and the count at the right edge.
         let nav = Nav {
             query: "co".into(),
             typing: true,
             ..Nav::default()
         };
         c.nav = Some(&nav);
-        let line = search_line(&c);
-        assert_eq!(line.text.trim_end(), " / co\u{258f}");
-        assert_eq!(crate::width::width(&line.text), WIDTH);
-        assert!(line.runs.contains(&(3, 2, crate::theme::Role::Focused)));
-        assert!(line.runs.contains(&(5, 1, crate::theme::Role::Brand)));
-        // A query longer than the room shows its end, where the typing is.
+        let (found, total) = search_counts(&c);
+        assert_eq!(total, all);
+        assert!(
+            found > 0 && found < total,
+            "the sample has a few that match"
+        );
+        let typed = box_of(&c);
+        let count = format!("{found} of {total}");
+        assert!(
+            typed[1].text.starts_with(" \u{2502} / co\u{258f}"),
+            "{:?}",
+            typed[1].text
+        );
+        assert!(
+            typed[1].text.ends_with(&format!("{count} \u{2502} ")),
+            "{:?}",
+            typed[1].text
+        );
+        assert_eq!(typed[0].runs, vec![(1, WIDTH - 2, Role::Detail)]);
+        assert_eq!(
+            typed[1].runs,
+            vec![
+                (1, 1, Role::Detail),
+                (WIDTH - 2, 1, Role::Detail),
+                (3, 1, Role::Title),
+                (5, 2, Role::Focused),
+                (7, 1, Role::Brand),
+            ]
+        );
+        // A query longer than the room shows its end, where the typing is, and the count stays.
         let long = Nav {
             query: "x".repeat(80) + "end",
             typing: true,
             ..Nav::default()
         };
         c.nav = Some(&long);
-        let line = search_line(&c);
-        assert_eq!(crate::width::width(&line.text), WIDTH);
-        assert!(
-            line.text.trim_end().ends_with("end\u{258f}"),
-            "{:?}",
-            line.text
+        let line = &box_of(&c)[1];
+        assert!(line.text.contains("end\u{258f}"), "{:?}", line.text);
+        assert!(line.text.contains(" of "), "{:?}", line.text);
+    }
+
+    /// A column too narrow to read the words beside the count drops the count and keeps the
+    /// words and the box whole.
+    #[test]
+    fn a_narrow_search_box_drops_the_count_before_the_words() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let nav = Nav {
+            query: "api".into(),
+            typing: true,
+            ..Nav::default()
+        };
+        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+            let mut c = column(
+                &spaces,
+                &agents,
+                1,
+                1,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                NOW,
+                width,
+                &shut,
+            );
+            c.nav = Some(&nav);
+            for (line, _) in search_rows(&c) {
+                assert_eq!(crate::width::width(&line.text), width, "{line:?}");
+            }
+            let middle = &search_rows(&c)[1].0.text;
+            assert!(middle.contains("api\u{258f}"), "width {width}: {middle:?}");
+        }
+        // Wide letters count by their columns: the caret and the count stay in the box.
+        let wide = Nav {
+            query: "程".repeat(40),
+            typing: true,
+            ..Nav::default()
+        };
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
         );
+        c.nav = Some(&wide);
+        let middle = &search_rows(&c)[1].0.text;
+        assert!(
+            middle.contains("\u{258f}") && middle.contains(" of "),
+            "{middle:?}"
+        );
+    }
+
+    /// The count says how many agents the search finds, out of all of them, whatever the
+    /// order below is.
+    #[test]
+    fn the_search_counts_what_it_finds_out_of_all_the_agents() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let all = agents.iter().filter(|a| a.agent).count();
+        assert_eq!(search_counts(&c), (all, all));
+        let nav = Nav {
+            query: "zzz-no-such".into(),
+            ..Nav::default()
+        };
+        c.nav = Some(&nav);
+        assert_eq!(search_counts(&c), (0, all));
+        assert_eq!(plural(1), "agent");
+        assert_eq!(plural(0), "agents");
     }
 
     /// While the keyboard has the column, the last row of the list names its keys, as many as
@@ -9913,7 +10278,7 @@ mod tests {
         c.nav = Some(&nav);
         let rows = rows_folded(&c, 24, None);
         assert_eq!(rows.len(), plain.len());
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up).len();
+        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
         let line = &rows[rows.len() - foot - 1].0;
         assert!(
             line.text.contains("j/k move  enter open  q back"),

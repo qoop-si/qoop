@@ -603,20 +603,50 @@ pub(crate) fn avatar_overlay_paint(
 /// terminal to open on its own click. Stamped over the same cells in the same ink, so the
 /// column looks as it did; empty where the row does not show the version, the column is
 /// folded, or the target is not safe to write.
-pub(crate) fn version_link_paint(column_rows: usize, collapsed: bool, width: usize) -> String {
-    let (Some(col), false, true) = (sidebar::version_link_at(width), collapsed, column_rows > 0)
-    else {
+pub(crate) fn version_link_paint(
+    column_rows: usize,
+    collapsed: bool,
+    width: usize,
+    icons: bool,
+) -> String {
+    let (Some(col), false) = (sidebar::version_link_at(width, icons), collapsed) else {
         return String::new();
     };
-    let Some(uri) = crate::hyperlink::clean_uri(sidebar::SITE) else {
+    link_paint(
+        column_rows,
+        col,
+        theme::Role::Faint,
+        sidebar::SITE,
+        sidebar::VERSION,
+    )
+}
+
+/// The hub word on the menu row (`online`, `local`), written again as a link to the web app
+/// the same way; empty for `offline`, which links nowhere, and where the row does not show it.
+pub(crate) fn app_link_paint(
+    column_rows: usize,
+    collapsed: bool,
+    width: usize,
+    icons: bool,
+) -> String {
+    let (Some((col, word, role)), false) = (sidebar::app_link_at(width, icons), collapsed) else {
+        return String::new();
+    };
+    link_paint(column_rows, col, role, sidebar::APP, word)
+}
+
+/// `text` stamped at column `col` (zero based) of the menu row, in the ink of `role`, as a
+/// link to `uri`. Empty without a menu row or when the target is not safe to write.
+fn link_paint(column_rows: usize, col: usize, role: theme::Role, uri: &str, text: &str) -> String {
+    let Some(uri) = crate::hyperlink::clean_uri(uri).filter(|_| column_rows > 0) else {
         return String::new();
     };
     format!(
         "{}{}{}{}{}{}",
         at(SIDEBAR_TOP + column_rows - 1, col + 1),
-        theme::fg(theme::Role::Faint),
+        theme::fg(role),
         crate::hyperlink::open(uri),
-        sidebar::VERSION,
+        text,
         crate::hyperlink::CLOSE,
         theme::RESET,
     )
@@ -998,13 +1028,21 @@ pub fn paint(frame: &Frame) -> String {
         }
     }
 
-    // The version links to the site: an overlay on the menu row, so the column's own rows stay
+    // The version links to the site and the hub word to the web app: an overlay on the menu row, so the column's own rows stay
     // plain text for every gate.
     if wide_enough && !spotlight {
+        let icons = crate::icons::on();
         out.push_str(&version_link_paint(
             column_rows,
             frame.collapsed,
             frame.sidebar_width,
+            icons,
+        ));
+        out.push_str(&app_link_paint(
+            column_rows,
+            frame.collapsed,
+            frame.sidebar_width,
+            icons,
         ));
     }
 
@@ -3446,7 +3484,7 @@ mod tests {
     /// cells the column already drew it in, and nowhere else.
     #[test]
     fn the_version_on_the_menu_row_is_a_link_to_the_site() {
-        let out = version_link_paint(38, false, sidebar::WIDTH);
+        let out = version_link_paint(38, false, sidebar::WIDTH, false);
         let row = SIDEBAR_TOP + 38 - 1;
         assert_eq!(
             out,
@@ -3460,8 +3498,30 @@ mod tests {
             )
         );
         // Folded, or too short to have a menu row: no bytes.
-        assert!(version_link_paint(38, true, sidebar::WIDTH).is_empty());
-        assert!(version_link_paint(0, false, sidebar::WIDTH).is_empty());
+        assert!(version_link_paint(38, true, sidebar::WIDTH, false).is_empty());
+        assert!(version_link_paint(0, false, sidebar::WIDTH, false).is_empty());
+    }
+
+    /// The hub word on the menu row is written again as a link to the web app, over the
+    /// cells the column drew it in. No bridge under test, so the word is `local`.
+    #[test]
+    fn the_hub_word_on_the_menu_row_is_a_link_to_the_app() {
+        let out = app_link_paint(38, false, sidebar::WIDTH, false);
+        let row = SIDEBAR_TOP + 38 - 1;
+        assert_eq!(
+            out,
+            format!(
+                "{}{}\x1b]8;;https://qoop.si/app\x1b\\local{}{}",
+                at(row, 3 + sidebar::VERSION.len()),
+                theme::fg(theme::Role::Faint),
+                crate::hyperlink::CLOSE,
+                theme::RESET,
+            )
+        );
+        assert!(app_link_paint(38, true, sidebar::WIDTH, false).is_empty());
+        assert!(app_link_paint(0, false, sidebar::WIDTH, false).is_empty());
+        // Too narrow for the word beside the tail: no link in the air.
+        assert!(app_link_paint(38, false, 16, false).is_empty());
     }
 
     /// A screen relayed from another machine can hold an escape in a cell. The styled path
