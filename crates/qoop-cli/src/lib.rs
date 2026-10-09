@@ -161,7 +161,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("paths") => places::run(&args[2..]),
         Some("qass") => qass::run_qass(&args),
         Some("update") => update::run(&args),
-        Some("pair" | "devices" | "bridge") => phone_command(phone, &args),
+        Some("pair" | "devices" | "bridge" | "login" | "logout") => phone_command(phone, &args),
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
         Some("--version" | "-V") => {
@@ -252,6 +252,9 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 the notch, started at login\n\
                  \x20 qoop stop       end the daemon and every tab; `qoop` brings them back\n\
                  \x20 qoop pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
+                 \x20 qoop login [--hub URL]  link this machine to your account: it then shows\n\
+                 \x20                 on qoop.si/app and on your phone\n\
+                 \x20 qoop logout [--hub URL]  unlink this machine from its account\n\
                  \x20 qoop devices ls  the phones paired with this machine\n\
                  \x20 qoop devices rm <name>  unpair one; its open streams close at once\n\
                  \x20 qoop bridge     run the phones' end in the foreground (the service\n\

@@ -34,7 +34,7 @@ is left out and the rest of the file is still read.
 |---|---|
 | `QOOP_SESSION` | which session to open (the `--session` flag wins over it) |
 | `QOOP_IDLE_TIMEOUT_MINUTES` | close terminals idle this long with nothing running in the background; read by the daemon, so set it where the daemon starts. See [Sessions](#sessions) |
-| `QOOP_RELEASE_BASE` | where `qoop update` and the install script look for releases (a mirror, or `file:///path`) |
+| `QOOP_RELEASE_BASE` | where `qoop update` and the install script look for releases (a mirror, GitHub's API, or `file:///path`; default `https://qoop.si/releases`) |
 
 ## Agent detection
 

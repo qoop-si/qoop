@@ -163,8 +163,7 @@ lists every folder qoop writes to and how big each is.
 On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
 skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
 `QOOP_DEST`), and it says so if that directory is not on your PATH. The releases are
-private, so it and `qoop update` need a GitHub token: `GH_TOKEN` or `GITHUB_TOKEN`, or a
-`gh` login.
+read from `https://qoop.si/releases`, which `qoop update` reads too; no token is needed.
 
 A tab you are not using can sleep: it ends, nothing of it takes CPU or memory, and waking
 it brings back the same number, name, split, directory and scrollback, the last screen
@@ -262,8 +261,7 @@ and its tabs keep running through it where both qoops can hand them over. Otherw
 moves at the first moment nothing there is working: a running command, a busy agent or a
 background job holds it, and the interface says once what it is waiting on. Tabs keep their
 numbers and agents come back in their own conversations. A build from main between releases
-is never sent anywhere, a private release needs `gh auth login` or `GH_TOKEN` on this Mac,
-and a machine whose qoop is from before this needs one update by hand there (`qoop stop`,
+is never sent anywhere, and a machine whose qoop is from before this needs one update by hand there (`qoop stop`,
 then the install script or `qoop update`) and follows on its own after that.
 
 ### Your phone
@@ -282,9 +280,9 @@ bridge`) is not part of this repository.
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.
 
 Prebuilt binaries for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64, glibc
-2.17 and newer) live on GitHub Releases, all built on one Mac by the release script of the qoop app (it builds
-this repository's crates with the phone part): GitHub only hosts the files, nothing is compiled
-there. `qoop update --check` notes
+2.17 and newer) live at qoop.si/releases (and on GitHub Releases), all built on one Mac by the release script
+of the qoop app (it builds this repository's crates with the phone part): the sites only host
+the files, nothing is compiled there. `qoop update --check` notes
 what is newest, the sidebar signs itself `0.3.0>0.4.0` while something is, `ctrl-a U` says
 how it installs, and `qoop update` installs it and moves every machine onto it, keeping running
 tabs running where it can. How a release is cut and how an update lands:

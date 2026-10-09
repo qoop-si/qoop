@@ -158,7 +158,7 @@ fn every_documented_subcommand_is_identical_with_the_network_gone() {
 }
 
 /// The one yes row: `qoop update` fails closed with the network gone, having touched
-/// nothing. It names GitHub in the failure, exits nonzero, and leaves no notice behind.
+/// nothing. It says it could not reach the releases, exits nonzero, and leaves no notice behind.
 #[test]
 fn update_fails_closed_with_the_network_gone() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -184,7 +184,7 @@ fn update_fails_closed_with_the_network_gone() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("GitHub"),
+        stderr.contains("cannot reach the releases"),
         "`qoop update --check` failed without saying what it could not reach: {stderr}"
     );
     assert!(
@@ -240,7 +240,7 @@ fn update_refuses_an_argument_it_does_not_know() {
     let (_, stderr, code) = run(&["update".to_string(), "--chek".to_string()], true);
     assert_eq!(code, Some(1));
     assert!(
-        stderr.contains("--chek") && !stderr.contains("GitHub"),
+        stderr.contains("--chek") && !stderr.contains("cannot reach"),
         "the unknown argument went on to the network: {stderr}"
     );
 }

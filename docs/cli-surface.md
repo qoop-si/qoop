@@ -89,10 +89,12 @@ a claim nobody has to keep.
 | `qoop space rm <id\|name>` | remove a space with no tab in it, awake or asleep: refused with how many it holds otherwise, as is a name two spaces share (use the id) and the default space. Works through the running daemon and never starts one; its tabs are never closed for it | no |
 | `qoop stop` | end qoop now: every terminal ends and what was awake comes back on the next start; a tab that was asleep stays asleep | no |
 | `qoop pair [--hub URL]` | pair a phone: print a QR code and a link, then take the six digit code the phone shows; the machine key and the bridge service appear only once a phone is paired | yes |
+| `qoop login [--hub URL]` | link this machine to an account: print a code and a link, sign in there, answer `y` here; the machine then shows on qoop.si/app and on the account's phones, and every saved remote joins it | yes |
+| `qoop logout [--hub URL]` | unlink this machine from its account; its key, paired phones and bridge stay | yes |
 | `qoop devices ls` | the phones paired with this machine, with their key fingerprints | no |
 | `qoop devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
 | `qoop bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoop while it runs; `qoop bridge reload` puts the installed bridge service back on the binary now on disk (nothing when there is none), after a replaced binary | yes |
-| `qoop update [--check]` | ask GitHub Releases for the newest binary for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it, then ask this machine's daemon and each saved remote's to move onto it (a working agent or a running command is never ended: a daemon that can hand its tabs over keeps them running and waits for nothing, any other moves once nothing there is working, then ends idle tabs and restores them, agents resumed in their conversations); `--check` only notes what is newest | yes |
+| `qoop update [--check]` | ask qoop.si for the newest release for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it, then ask this machine's daemon and each saved remote's to move onto it (a working agent or a running command is never ended: a daemon that can hand its tabs over keeps them running and waits for nothing, any other moves once nothing there is working, then ends idle tabs and restores them, agents resumed in their conversations); `--check` only notes what is newest | yes |
 | `qoop --handoff-formats` | the handover layout this build takes over from, which a daemon about to move onto it asks first; a build from before it fails the question | no |
 | `qoop --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoop --help` | this surface | no |
@@ -115,19 +117,19 @@ A word that is not a subcommand is an error naming it, not the interface: `qoop 
 says so and exits 1. Every error prints as one `qoop: ...` line on stderr and exits
 nonzero.
 
-The phone commands (pair, devices and bridge) are part of the qoop release, not of this
-repository: a build from source says it has no phone support for them, and a bridge reload does
-nothing.
+The phone and account commands (pair, devices, bridge, login and logout) are part of the
+release, not of this repository: a build from source says it has no phone support for them,
+and a bridge reload does nothing.
 
-Three rows say yes, and each is the point of its row: `qoop update` reaches GitHub
-Releases, and `qoop pair` and `qoop bridge` reach the hub a phone uses, and only once a
-person has asked for a phone. Nothing else touches the network: no control plane, no
+Five rows say yes, and each is the point of its row: `qoop update` reaches qoop.si for the
+releases, and `qoop pair`, `qoop bridge`, `qoop login` and `qoop logout` reach the hub, and
+only once a person has asked for a phone or an account. Nothing else touches the network: no control plane, no
 background version check, and a machine that never pairs a phone never opens a
 connection to a hub. Anything else that ever needs the network is an addition to this
 table with a yes, plus a row in the gate saying what happens when it is unreachable.
 
 The gate skips the rows that say yes: with the network blackholed `qoop update` fails
-closed with "cannot reach GitHub Releases" and `qoop pair` fails naming the hub it could
+closed with "cannot reach the releases" and `qoop pair` fails naming the hub it could
 not reach, leaving no key, device list or service behind; both are the failure a person
 without a network gets, and asserting byte-identical output for them would be asserting
 that the network is reachable.

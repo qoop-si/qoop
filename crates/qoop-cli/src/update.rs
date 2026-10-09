@@ -1,4 +1,4 @@
-//! `qoop update`: replace this binary with the newest GitHub Release.
+//! `qoop update`: replace this binary with the newest release.
 //!
 //! The one subcommand that needs the network, and it says so in
 //! `docs/cli-surface.md`. Everything else behaves the same offline; this one fails
@@ -57,7 +57,7 @@ fn translated() -> bool {
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
 }
 
-/// `qoop update` checks GitHub Releases, installs the newest binary and moves every machine
+/// `qoop update` checks the releases, installs the newest binary and moves every machine
 /// onto it; `qoop update --check` only leaves what it saw in the notice file the interface
 /// reads.
 pub fn run(args: &[String]) -> std::io::Result<()> {
@@ -97,7 +97,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         )));
     };
     let latest = fetch_latest(asset)
-        .map_err(|detail| std::io::Error::other(format!("cannot reach GitHub Releases: {detail}")));
+        .map_err(|detail| std::io::Error::other(format!("cannot reach the releases: {detail}")));
     if check_only {
         let latest = latest?;
         if !paths::is_newer_version(&latest.version, current) {

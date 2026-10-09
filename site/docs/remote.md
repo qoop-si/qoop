@@ -20,5 +20,8 @@ new tab, a split, a new space made while you are in one.
 If the connection drops, its spaces read as offline within about fifteen seconds and come
 back on their own, with the same tabs, at most ten seconds after the network does.
 
-qoop has to be installed on the other machine already. `qoop agents`, `send` and `read`
-speak only to this machine's daemon.
+If qoop is not on the other machine, `qoop remote add` offers to install it there, with its
+hooks and skill. On Linux, the server needs `sudo loginctl enable-linger <user>` once so that
+what runs there outlives your ssh session. Once this machine is linked with `qoop login`, the
+server also shows on qoop.si/app and on your phone. `qoop agents`, `send` and `read` speak
+only to this machine's daemon.

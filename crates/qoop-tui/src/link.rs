@@ -301,11 +301,17 @@ trap - EXIT
 "#;
 
 /// Commit: link the staged file into place, unless a qoop appeared there meanwhile, which
-/// counts as done.
-const COMMIT: &str = r#"ln "$1" "$d/qoop" 2>/dev/null || [ -e "$d/qoop" ]
+/// counts as done and is left alone. A qoop just put there installs its hooks and skills, as
+/// one that was swapped in does; best effort, since `qoop hooks install` on that machine
+/// does the same later and a refusal is no reason to undo the install.
+const COMMIT: &str = r#"fresh=
+if ln "$1" "$d/qoop" 2>/dev/null; then fresh=1; else [ -e "$d/qoop" ]; fi
 [ -e "$d/qoro" ] || [ -L "$d/qoro" ] || ln -s qoop "$d/qoro"
 rm -f "$1"
 printf '%s\n' MARKER
+if [ -n "$fresh" ]; then
+  for w in hooks skills; do "$d/qoop" "$w" install </dev/null >/dev/null 2>&1 || true; done
+fi
 "#;
 
 /// Abort: take the staged file away.
@@ -363,10 +369,7 @@ pub async fn update(target: &str, version: &str) -> io::Result<Update> {
     let release = match release {
         Ok(release) => release,
         Err(e) => {
-            let github = qoop_runtime::legacy::var(qoop_runtime::release::RELEASE_BASE_ENV)
-                .unwrap_or_default()
-                .is_empty();
-            let anonymous = github
+            let anonymous = qoop_runtime::release::reads_github()
                 && tokio::task::spawn_blocking(qoop_runtime::release::github_token)
                     .await
                     .map_err(io::Error::other)?
@@ -410,8 +413,8 @@ pub async fn update(target: &str, version: &str) -> io::Result<Update> {
 /// What a release of this version that could not be read comes to. Only a release that
 /// is not there is the quiet case: the tag answers 404, or the release has no binary for
 /// that machine. Anything else (no network, a limit reached, an answer that is not the
-/// API's) is said, and so is a 404 asked without a token, since the releases are private
-/// and without one nothing is found at all.
+/// API's) is said, and so is a 404 asked of GitHub without a token, since that repository is
+/// private and without one nothing is found at all.
 fn no_release(error: String, anonymous: bool) -> io::Result<Update> {
     if error.contains("the release carries no") {
         return Ok(Update::NoRelease);
@@ -855,6 +858,46 @@ mod tests {
         assert_eq!(
             std::fs::read_link(old).expect("the old name"),
             std::path::Path::new("qoop")
+        );
+    }
+
+    /// The qoop just linked into place installs its hooks and skills; one that arrived meanwhile
+    /// is not asked to.
+    #[test]
+    fn a_fresh_install_sets_up_its_hooks_and_skills() {
+        let home = tempfile::tempdir().expect("home");
+        let binary = noting("0.0.2");
+        let out = stage(home.path(), &binary, binary.len());
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        let after = text.split_once(RELAY_MARKER).expect("marker").1.trim();
+        let (path, _) = after.split_once('\n').unwrap_or((after, ""));
+        let out = step(home.path(), &guarded(COMMIT, path), b"");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("ran")).expect("ran"),
+            "hooks install\nskills install\n"
+        );
+
+        let other = tempfile::tempdir().expect("home");
+        let bin = other.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let staged = bin.join(".qoop-install.abc123");
+        std::fs::write(&staged, &binary).expect("staged");
+        std::fs::write(bin.join("qoop"), &binary).expect("theirs");
+        let out = step(
+            other.path(),
+            &guarded(COMMIT, &staged.to_string_lossy()),
+            b"",
+        );
+        assert!(out.status.success());
+        assert!(
+            !other.path().join("ran").exists(),
+            "a qoop that was already there was run"
         );
     }
 

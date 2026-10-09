@@ -305,7 +305,7 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(crate::legacy::STATE_LOCK)
 }
 
-/// Where `qoop update --check` leaves the newest version it saw on GitHub Releases.
+/// Where `qoop update --check` leaves the newest version it saw in the releases.
 ///
 /// A plain file holding a version like `0.4.0`, so the interface can show it without
 /// touching the network: the TUI never fetches, it only reads this file. Built without

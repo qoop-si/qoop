@@ -56,7 +56,7 @@ name, so the old build finds its tabs.
 ## Checking and installing
 
 ```
-qoop update --check   # ask GitHub Releases what is newest, note it, change nothing
+qoop update --check   # ask the releases what is newest, note it, change nothing
 qoop update           # install the newest release and move every machine onto it
 ```
 
@@ -65,18 +65,18 @@ sessions (`update-available` under the runtime directory). The interface never
 touches the network; it only reads that file. Any other argument is refused
 before anything reaches the network, so a mistyped `--check` never installs.
 
-The repository is private, so a GitHub token is needed: `GH_TOKEN` or
-`GITHUB_TOKEN` from the environment, else whatever `gh auth token` prints. The
-assets are fetched by their API URL with `Accept: application/octet-stream`
-(the browser download URL 404s for a private repository, token or not). The
-token is handed to curl on stdin as a config line (`-K -`, which every curl understands),
-never on its command line, and only for `api.github.com`. The redirect to the storage host
-is followed by a second request without the token, because curl older than 7.58 forwarded
-a custom Authorization header on redirects. `scripts/install.sh` fetches the same way,
-needs no python (Linux boxes often have none), and falls back to `sha256sum` where
-`shasum` is missing. `QOOP_RELEASE_BASE` points both at a mirror or at a local directory
+The releases are read from `https://qoop.si/releases`, anonymously: `<base>/latest` and
+`<base>/tags/v<version>` answer in the shape of the GitHub releases API (`tag_name` and
+`assets[]` with `name` and `url`), and each asset is fetched by its `url` as it stands.
+`scripts/install.sh` reads the same, needs no python (Linux boxes often have none), and falls
+back to `sha256sum` where `shasum` is missing. `QOOP_RELEASE_BASE` points both at a mirror, at
+GitHub's own API (`https://api.github.com/repos/pat/qoop/releases`) or at a local directory
 (`file:///path` holding a `latest` file in the API's shape), which is how the platform pick
-is tested with no network; the token never goes there.
+is tested with no network. Only the GitHub API gets a token: `GH_TOKEN` or `GITHUB_TOKEN`
+from the environment, else whatever `gh auth token` prints, handed to curl on stdin as a
+config line (`-K -`, which every curl understands), never on its command line. The redirect
+to the storage host is followed by a second request without the token, because curl older
+than 7.58 forwarded a custom Authorization header on redirects.
 
 The install replaces the file and then asks each daemon to move onto it. A daemon that can
 hand its tabs to the new binary does it at once and nothing running is touched ("Tabs keep
@@ -89,7 +89,7 @@ replaces anything, and the swap is one atomic rename onto the file itself: launc
 a symlink on PATH, the link is followed and stays a link.
 
 With the network gone the command fails closed on the install: nothing is downloaded, no
-notice is left behind, the failure names GitHub and the exit is nonzero. It still asks the
+notice is left behind, the failure says it could not reach the releases and the exit is nonzero. It still asks the
 daemons to move onto the qoop already on disk, which needs no network. That is the one yes
 row in `docs/cli-surface.md`, and the gate asserts the failure.
 
@@ -106,8 +106,7 @@ check and no prompt to restart: eight terminals open and nobody typing still cos
 A remote machine needs no hand update once its qoop knows how to move. When the interface
 connects to a machine whose daemon runs an older version than this Mac's qoop, and a release
 of this Mac's version exists for that machine's platform, it fetches that release here
-(checksum verified, the same token rules as above, so a private release needs `gh auth login`
-or `GH_TOKEN` on this Mac), puts the binary in place of the qoop there in the background with
+(checksum verified, the same source as above), puts the binary in place of the qoop there in the background with
 one atomic rename beside the real file, and asks the daemon over there to move onto it. A
 daemon that can hand its tabs over moves at once and they keep running (next sections). Any
 other moves at the first moment nothing on it is working: a running command, a busy agent,

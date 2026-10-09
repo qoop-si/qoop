@@ -1,4 +1,4 @@
-//! GitHub Releases: which tarball a platform uses, how to find it and fetch it, and
+//! Releases: which tarball a platform uses, how to find it and fetch it, and
 //! whether what arrived is what was published.
 //!
 //! Shared by `qoop update`, which replaces this binary, and by the interface when it puts
@@ -11,13 +11,36 @@ use std::process::Command;
 
 use crate::paths;
 
-/// The repository whose Releases carry the binaries.
-pub const RELEASES: &str = "https://api.github.com/repos/pat/qoop/releases";
+/// Where the binaries are published. `<base>/latest` and `<base>/tags/v<version>` answer in
+/// the shape of the GitHub releases API, and each asset's `url` is fetched as it stands.
+pub const RELEASES: &str = "https://qoop.si/releases";
 
-/// Where the releases are read from instead, when set: a mirror, or a directory given as a
+/// Where the releases are read from instead, when set: a mirror, GitHub's own API
+/// (`https://api.github.com/repos/<owner>/<repo>/releases`), or a directory given as a
 /// `file://` URL holding a `latest` file in the API's own shape. The same variable
 /// `scripts/install.sh` reads, so a platform pick can be tested with no network at all.
 pub const RELEASE_BASE_ENV: &str = "QOOP_RELEASE_BASE";
+
+/// The base every release is read from: the override when set, else [`RELEASES`].
+pub fn release_base() -> String {
+    base_of(crate::legacy::var(RELEASE_BASE_ENV).ok())
+}
+
+fn base_of(over: Option<String>) -> String {
+    over.filter(|base| !base.is_empty())
+        .unwrap_or_else(|| RELEASES.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Whether the releases are read from the GitHub API, the one source that needs a token.
+pub fn reads_github() -> bool {
+    is_github(&release_base())
+}
+
+fn is_github(base: &str) -> bool {
+    base.starts_with("https://api.github.com/")
+}
 
 /// The tarball the release script packs for a platform, named by its target triple.
 ///
@@ -42,7 +65,7 @@ pub struct Release {
     pub checksum_url: Option<String>,
 }
 
-/// Read the newest release off the GitHub API with curl, which is what keeps this
+/// Read the newest release off the releases API with curl, which is what keeps this
 /// updater free of HTTP dependencies. curl honours the proxy environment, so a
 /// blackholed network fails here rather than hanging.
 pub fn fetch_latest(asset: &str) -> Result<Release, String> {
@@ -57,11 +80,7 @@ pub fn fetch_tagged(version: &str, asset: &str) -> Result<Release, String> {
 }
 
 fn fetch_release(which: &str, asset: &str) -> Result<Release, String> {
-    let base = crate::legacy::var(RELEASE_BASE_ENV)
-        .ok()
-        .filter(|base| !base.is_empty())
-        .unwrap_or_else(|| RELEASES.to_string());
-    let body = curl(&format!("{}/{which}", base.trim_end_matches('/')))?;
+    let body = curl(&format!("{}/{which}", release_base()))?;
     let json: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| format!("the releases API answered what is not JSON: {e}"))?;
     fetch_latest_parsing(&json, asset)
@@ -347,6 +366,20 @@ mod tests {
         );
         assert_eq!(asset_for("windows", "x86_64"), None);
         assert_eq!(asset_for("freebsd", "x86_64"), None);
+    }
+
+    /// The one place the base is decided: qoop.si unless the variable says otherwise, a trailing
+    /// slash never doubled, GitHub only when it is named.
+    #[test]
+    fn the_release_base_defaults_to_qoop_si_and_the_variable_overrides_it() {
+        assert_eq!(base_of(None), "https://qoop.si/releases");
+        assert_eq!(base_of(Some(String::new())), "https://qoop.si/releases");
+        assert!(!is_github(&base_of(None)));
+        assert_eq!(base_of(Some("file:///tmp/rel/".into())), "file:///tmp/rel");
+        assert!(!is_github("file:///tmp/rel"));
+        let github = base_of(Some("https://api.github.com/repos/pat/qoop/releases".into()));
+        assert_eq!(github, "https://api.github.com/repos/pat/qoop/releases");
+        assert!(is_github(&github));
     }
 
     #[test]

@@ -3,8 +3,10 @@
 ## From a release
 
 ```
-gh api -H 'Accept: application/vnd.github.raw' repos/pat/qoop/contents/scripts/install.sh | sh
+curl -fsSL https://qoop.si/i/<your link> | sh
 ```
+
+Your link is on qoop.si/app after you sign in, and in the mail with your seat. It works once.
 
 The script picks the build for your machine (macOS arm64 or Intel, Linux x86_64 or arm64),
 checks its sha256, starts it once to confirm the version, puts it at `~/.local/bin/qoop`
@@ -12,9 +14,9 @@ checks its sha256, starts it once to confirm the version, puts it at `~/.local/b
 Run it as yourself, not with sudo; it says so if `~/.local/bin` is not on your `PATH`, and it
 leaves a `qoop` already at that path alone.
 
-The releases are private for now, so the script and `qoop update` need a GitHub token:
-`GH_TOKEN` or `GITHUB_TOKEN`, or a logged in `gh`. The token is only ever sent to
-`api.github.com`, on curl's standard input, never on a command line.
+It ends by printing the next command, `qoop login`, with the full path and the line to add to
+your shell profile when `~/.local/bin` is not on your `PATH` yet. The script and `qoop update`
+read the releases from `https://qoop.si/releases` over https; no account or token is involved.
 
 Linux builds need glibc 2.17 or newer (CentOS 7 and anything since). On a musl system such as
 Alpine the script says so and stops: build from source there.

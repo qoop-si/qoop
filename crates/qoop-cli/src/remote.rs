@@ -72,7 +72,8 @@ fn add(rest: &[String]) -> io::Result<()> {
     list.push(remote);
     saved::save_to(&file, &list)?;
     println!(
-        "added {name}: qoop {} on {}. its spaces show in `qoop` as {name}:<space>",
+        "added {name}: qoop {} on {}. its spaces show in `qoop` as {name}:<space>, and \
+         the server shows on qoop.si/app and your phone once it joins",
         hello.version, hello.platform
     );
     Ok(())
