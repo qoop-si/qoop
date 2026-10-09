@@ -609,7 +609,25 @@ pub(crate) fn version_link_paint(
     width: usize,
     icons: bool,
 ) -> String {
-    let (Some(col), false) = (sidebar::version_link_at(width, icons), collapsed) else {
+    version_link_paint_in(
+        column_rows,
+        collapsed,
+        width,
+        icons,
+        sidebar::pending_now().get(),
+    )
+}
+
+/// [`version_link_paint`] for a given state of the foot: nothing while `restart for update`
+/// stands where the version does, since the site is not what those words open.
+fn version_link_paint_in(
+    column_rows: usize,
+    collapsed: bool,
+    width: usize,
+    icons: bool,
+    pending: sidebar::Pending,
+) -> String {
+    let (Some(col), false) = (sidebar::version_link_in(width, icons, pending), collapsed) else {
         return String::new();
     };
     link_paint(
@@ -3499,6 +3517,18 @@ mod tests {
         );
         // Folded, or too short to have a menu row: no bytes.
         assert!(version_link_paint(38, true, sidebar::WIDTH, false).is_empty());
+        // The words that replace the version are not stamped over with it, nor linked.
+        let ready =
+            version_link_paint_in(38, false, sidebar::WIDTH, false, sidebar::Pending::Ready);
+        assert!(ready.is_empty(), "{ready:?}");
+        let newer = version_link_paint_in(
+            38,
+            false,
+            sidebar::WIDTH,
+            false,
+            sidebar::Pending::Newer("9.9.9"),
+        );
+        assert!(newer.contains(sidebar::VERSION), "{newer:?}");
         assert!(version_link_paint(0, false, sidebar::WIDTH, false).is_empty());
     }
 

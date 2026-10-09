@@ -99,8 +99,22 @@ The foot of the left column signs the build it is (`qoop 0.3.1`), and when a
 check saw something newer it signs where this build stands
 (`qoop 0.3.1>0.4.0`). `ctrl-a U` says the same in words: which release is
 waiting and that installing it means running `qoop update` outside. The interface itself
-never checks: eight terminals open and nobody typing still costs nothing. A release build's
-daemon does, next section.
+never checks: eight terminals open and nobody typing still costs nothing.
+
+When the daemon runs an older qoop than the file on disk (an update was installed and the
+daemon has not moved, because a window is open, or nothing could be handed over live), the
+foot says so in the blue of a working agent, in place of the version: `restart for update`,
+else `restart` in a narrow column, else the version as before. The words come from asking the
+daemon, every half minute, whether a newer qoop is on disk (`UpdateState`, read only; a daemon
+that does not know the question is asked once and never again), so they are at most that
+late. A click on them asks the daemon to move now, live. The windows of that daemon end with
+the move, and the one that was clicked starts the new qoop in its own place, in the same
+terminal, on the same space and tab; any other window is back at its shell and running `qoop`
+brings it back. Type-ahead in flight is lost. A daemon that cannot hand its tabs over live
+moves nothing and says why on the hint row: the old way, which ends idle agents and resumes
+them, is only ever `qoop update` typed by hand. The phone's Terminals tab shows the same words,
+beside the pet, for each online Mac in this state; they are read only there, since a tap would
+close the Mac's open windows.
 
 ## Updating on its own
 

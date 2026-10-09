@@ -196,6 +196,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             keep_tabs: false,
             quiet: false,
         },
+        // Reads whether a newer qoop is on disk: nothing typed.
+        ControlRequest::UpdateState { id: "x30".into() },
         // A task is a record about the work: text kept by the daemon, never typed.
         ControlRequest::TaskWrite {
             id: "x28".into(),
@@ -248,6 +250,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
+            | ControlRequest::UpdateState { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }

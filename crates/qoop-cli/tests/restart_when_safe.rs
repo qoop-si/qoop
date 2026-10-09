@@ -1843,7 +1843,7 @@ fn an_ask_that_ends_no_tab_holds_where_the_old_way_would_move() {
         }) => why,
         other => panic!("not held: {other:?}"),
     };
-    assert!(why.contains("cannot hand its tabs over live"), "{why}");
+    assert!(why.contains("cannot restart live"), "{why}");
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(d.starts(), 1, "moved the old way: {}", d.log_text());
     d.wait_for_row(1, "stayed", |_| true);
@@ -1874,7 +1874,7 @@ fn a_latched_old_way_after_the_arm_still_ends_no_tab() {
         }) => why,
         other => panic!("not held: {other:?}"),
     };
-    assert!(why.contains("cannot hand its tabs over live"), "{why}");
+    assert!(why.contains("cannot restart live"), "{why}");
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(d.starts(), 1, "moved the old way: {}", d.log_text());
     assert!(
@@ -2015,4 +2015,77 @@ fn the_opt_out_file_calls_off_an_unattended_move_already_waiting() {
     let _ = d.arm(NEXT);
     wait_for_starts(&d, 2, Duration::from_secs(30));
     assert_eq!(d.starts(), 2, "{}", d.log_text());
+}
+
+/// What the foot and the phone ask: whether a newer qoop than this daemon runs is on disk. The
+/// binary is run once per file, however many ask, and again when the file is replaced.
+#[test]
+fn the_daemon_says_when_a_newer_qoop_is_on_disk_and_runs_the_file_once() {
+    let d = Daemon::start_installed();
+    let ready = |d: &Daemon| match d.ask_as_watcher(ControlRequest::UpdateState {
+        id: format!("state-{}", unique()),
+    }) {
+        Some(ControlResponse::UpdateState { ready, .. }) => ready,
+        other => panic!("no answer: {other:?}"),
+    };
+    assert_eq!(ready(&d), None, "nothing newer is there");
+
+    // A newer one, which counts its own runs.
+    let runs = d.dir.path().join("runs");
+    let counting = d.exe.with_file_name("counting");
+    std::fs::write(
+        &counting,
+        format!(
+            "#!/bin/sh\necho x >> '{}'\necho 'qoop {NEXT}'\n",
+            runs.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&counting, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::rename(&counting, &d.exe).expect("replace");
+    let socket = d.socket();
+    let asks: Vec<_> = (0..4)
+        .map(|_| {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    let (stream, inbuf) = qoop_runtime::client::connect_observer(&socket, "state")
+                        .await
+                        .ok()?;
+                    let mut c = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
+                    c.control(
+                        &ControlRequest::UpdateState {
+                            id: format!("state-{}", unique()),
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await
+                })
+            })
+        })
+        .collect();
+    for ask in asks {
+        match ask.join().expect("thread") {
+            Some(ControlResponse::UpdateState { ready, .. }) => {
+                assert_eq!(ready.as_deref(), Some(NEXT))
+            }
+            other => panic!("no answer: {other:?}"),
+        }
+    }
+    assert_eq!(ready(&d).as_deref(), Some(NEXT));
+    // Four asks at once and one after: the file was run for the first only.
+    let ran = std::fs::read_to_string(&runs)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(ran, 1, "the file was run {ran} times for five asks");
+
+    // The file is replaced by one that is not newer: asked again, it is run again.
+    install_script(&d.exe, VERSION, "");
+    assert_eq!(ready(&d), None);
+    assert_eq!(d.starts(), 1);
 }

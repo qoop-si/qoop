@@ -422,6 +422,12 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         quiet: bool,
     },
+    /// Whether a newer qoop than this daemon runs is on disk: the version it could move onto,
+    /// answered as `UpdateState`. Read only, and what the foot of the interface and the
+    /// phone ask every half minute or so. A daemon from before it answers `unknown variant`.
+    UpdateState {
+        id: String,
+    },
     /// Write to a task: open one, move it, record its plan, evidence or done claim, or
     /// close it.
     ///
@@ -569,6 +575,7 @@ impl ControlRequest {
             | Self::SaveUpload { id, .. }
             | Self::SetSplit { id, .. }
             | Self::RestartWhenSafe { id, .. }
+            | Self::UpdateState { id }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
             | Self::ReloadAgentManifests { id }
@@ -735,6 +742,14 @@ pub enum ControlResponse {
         /// daemon already runs that version or a newer one, so there is nothing to move to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         waiting_on: Option<String>,
+    },
+    /// What an `UpdateState` found: the version the qoop on disk says it is when that is newer
+    /// than the one this daemon runs (which is what a click on `restart for update` asks to
+    /// move onto), and nothing when there is none or this daemon cannot move.
+    UpdateState {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready: Option<String>,
     },
     /// A `TaskWrite` landed on `task`.
     TaskWritten {
@@ -1263,6 +1278,7 @@ impl ControlResponse {
             | Self::NewsNoted { id }
             | Self::SplitSaved { id }
             | Self::RestartArmed { id, .. }
+            | Self::UpdateState { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }
             | Self::Failed { id, .. } => id,

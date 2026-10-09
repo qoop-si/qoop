@@ -421,6 +421,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
 
 /// Start the daemon if there is not one, then attach.
 fn run_client() -> std::io::Result<()> {
+    let exe = own_path();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
 
@@ -467,13 +468,43 @@ fn run_client() -> std::io::Result<()> {
             (Vec::new(), Some(notice))
         }
     };
-    rt.block_on(qoop_tui::mux::run(Some(&socket), remotes, notice, None))
+    let ran = rt.block_on(qoop_tui::mux::run(Some(&socket), remotes, notice, None));
+    restart_in_place(exe, ran)
+}
+
+/// This binary's path, resolved through any link before an update can rename a new file over
+/// it: on Linux the running path then reads `<path> (deleted)`.
+fn own_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// After an interface that ended because its daemon moved onto a newer qoop at the person's
+/// click: this process becomes the qoop on disk with the arguments it had, so the same
+/// terminal, space and tab are back at once (the last place is kept on disk). The terminal
+/// was restored when the interface ended. Quitting never gets here: only the daemon closing
+/// its side after that click does.
+fn restart_in_place(
+    exe: Option<std::path::PathBuf>,
+    ran: std::io::Result<()>,
+) -> std::io::Result<()> {
+    if ran.is_err() || !qoop_tui::run::restarting() {
+        return ran;
+    }
+    let Some(exe) = exe else { return ran };
+    use std::os::unix::process::CommandExt;
+    let failed = Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+    Err(std::io::Error::other(format!(
+        "qoop moved to the new version but {} could not be started: {failed}",
+        exe.display()
+    )))
 }
 
 /// `qoop --space <id|name>`: the interface with one space in it and nothing else. The
 /// space is made when the name is new, and woken, or given a tab, when there is nothing in
 /// it to show. Remotes are left out: their spaces would be filtered away anyway.
 fn run_space(args: &[String]) -> std::io::Result<()> {
+    let exe = own_path();
     let [_, _, wanted] = args else {
         return Err(usage("usage: qoop --space <id|name>"));
     };
@@ -482,12 +513,13 @@ fn run_space(args: &[String]) -> std::io::Result<()> {
     ensure_daemon(&socket)?;
     let space = supervise::open_space(wanted)?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(qoop_tui::mux::run(
+    let ran = rt.block_on(qoop_tui::mux::run(
         Some(&socket),
         Vec::new(),
         None,
         Some(space),
-    ))
+    ));
+    restart_in_place(exe, ran)
 }
 
 /// `qoop --remote <name|target>`: the interface for another machine's qoop alone.

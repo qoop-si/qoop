@@ -445,6 +445,69 @@ async fn send_to_pane(
     wr.write_all(&frame).await
 }
 
+/// The id of the interface's own question whether the daemon could move onto a newer qoop.
+const UPDATE_STATE_ID: &str = "update-state";
+
+/// The id of the ask a click on `restart for update` makes.
+const RESTART_CLICK_ID: &str = "restart-click";
+
+/// How many acknowledgement ticks (two seconds each) lie between two such questions: half a
+/// minute. The first is asked at once, on the first tick.
+const UPDATE_STATE_EVERY: u32 = 15;
+
+/// What the interface knows of its own part in an update: when to ask, whether the daemon
+/// knows the question, and whether it has just been told to move.
+#[derive(Default)]
+struct UpdateAsk {
+    ticks: u32,
+    /// The daemon predates the question and said so: not asked again on this connection.
+    refused: bool,
+    /// A click asked the daemon to move and nothing has said it will not: when its side of
+    /// the stream then closes, that is the move, and this process starts the new qoop in
+    /// its place.
+    clicked: bool,
+}
+
+impl UpdateAsk {
+    /// Whether this acknowledgement tick is the one to ask on.
+    fn due(&mut self) -> bool {
+        if self.refused {
+            return false;
+        }
+        self.ticks += 1;
+        (self.ticks - 1).is_multiple_of(UPDATE_STATE_EVERY)
+    }
+}
+
+/// Set when the daemon's side of the stream closed after a click asked it to move: the
+/// process then becomes the qoop on disk (see `qoop-cli`), so the person stays where they
+/// were. Quitting never sets it.
+static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the interface ended because the daemon moved onto a newer qoop at its click.
+pub fn restarting() -> bool {
+    RESTARTING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The daemon's side of the stream closed. After a click that asked it to move, that is the
+/// move.
+fn daemon_closed(update: &UpdateAsk) {
+    if update.clicked {
+        RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What a click on `restart for update` asks: the live move only, with the windows left
+/// to this click. A daemon that cannot hand its tabs over live says why and moves nothing.
+fn restart_click(version: String) -> ControlRequest {
+    ControlRequest::RestartWhenSafe {
+        id: RESTART_CLICK_ID.into(),
+        version,
+        keep_tabs: true,
+        quiet: false,
+    }
+}
+
 struct State {
     rows: Vec<AgentRow>,
     focused: u32,
@@ -790,6 +853,8 @@ struct State {
     /// of them is due. Empty on a quiet screen, so nothing is armed (ADR-009).
     notes: Vec<crate::notify::Note>,
     notes_due: Option<std::time::Instant>,
+    /// What asking the daemon whether it could move onto a newer qoop has come to.
+    update: UpdateAsk,
     /// Where a desktop note goes, decided once at start.
     route: crate::notify::Route,
     /// Whether the hint row still owes the person why notes have nowhere to go: said once,
@@ -1417,6 +1482,7 @@ impl State {
             sidebar::Act::NewSpace => Some(Clicked::NewSpace),
             sidebar::Act::Menu => Some(Clicked::Menu),
             sidebar::Act::Site => Some(Clicked::Site),
+            sidebar::Act::Restart => Some(Clicked::Restart),
             sidebar::Act::SettingsPage => Some(Clicked::SettingsPage),
             sidebar::Act::App => Some(Clicked::App),
             sidebar::Act::HubDown => Some(Clicked::HubDown),
@@ -5408,6 +5474,8 @@ enum Clicked {
     Menu,
     /// The version on the foot: the site, in the browser.
     Site,
+    /// `restart for update` on the foot: the daemon moves onto the newer qoop.
+    Restart,
     /// The foot's cog: the settings page, in a tab.
     SettingsPage,
     /// The foot's `online` or `local`: the web app, in the browser.
@@ -5700,6 +5768,7 @@ where
         news_refused: false,
         notes: Vec::new(),
         notes_due: None,
+        update: UpdateAsk::default(),
         route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
         nowhere: false,
         config: crate::config::Config::default(),
@@ -6128,6 +6197,13 @@ where
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     if sidebar::refresh_files() {
                         dirty = true;
+                    }
+                    if state.update.due() {
+                        wr.write_all(&client::encode_control_seq(
+                            &ControlRequest::UpdateState { id: UPDATE_STATE_ID.into() },
+                            &mut control_seq,
+                        )?)
+                        .await?;
                     }
                     if config_moved(&mut state) {
                         let read = crate::config::read();
@@ -6933,6 +7009,18 @@ where
                                     }
                                     Some(Clicked::Site) => {
                                         crate::hyperlink::open_in_browser(sidebar::SITE);
+                                    }
+                                    Some(Clicked::Restart) => {
+                                        if let Some(version) = sidebar::ready_version() {
+                                            state.update.clicked = true;
+                                            state.hint = Some("restarting for update".into());
+                                            wr.write_all(&client::encode_control_seq(
+                                                &restart_click(version),
+                                                &mut control_seq,
+                                            )?)
+                                            .await?;
+                                            dirty = true;
+                                        }
                                     }
                                     Some(Clicked::App) => {
                                         crate::hyperlink::open_in_browser(sidebar::APP);
@@ -7907,6 +7995,7 @@ where
                 n = rd.read(&mut read) => {
                     let n = n?;
                     if n == 0 {
+                        daemon_closed(&state.update);
                         return Ok(());
                     }
                     inbuf.extend_from_slice(&read[..n]);
@@ -11117,6 +11206,26 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             }
             *dirty = true;
         }
+        // A daemon that does not know the question is not asked again on this connection. Any
+        // other failure of it is not worth a line: the words are only an offer.
+        ControlResponse::Failed { id, reason } if id == UPDATE_STATE_ID => {
+            if reason.contains("unknown variant") || reason.contains("older qoop") {
+                state.update.refused = true;
+            }
+        }
+        // One too old to read the id answers with none, naming the question.
+        ControlResponse::Failed { id, reason }
+            if id.is_empty()
+                && qoop_runtime::control::too_old_for(&reason, Some("UpdateState")) =>
+        {
+            state.update.refused = true;
+        }
+        // The click refused outright: nothing moves.
+        ControlResponse::Failed { id, reason } if id == RESTART_CLICK_ID => {
+            state.update.clicked = false;
+            state.hint = Some(reason);
+            *dirty = true;
+        }
         ControlResponse::Failed { id, reason, .. } => {
             if state.probing.as_deref() == Some(id.as_str()) {
                 state.probing = None;
@@ -11237,12 +11346,27 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // hint row, which stays until the person does something: the notice row is
         // cleared by the next render of the tab in front of them, which a working agent
         // sends many times a second, so a line said there was painted once and never read.
+        // The click's own answer, with something in the way: nothing is moving, so the stream
+        // closing later is not the move.
+        ControlResponse::RestartArmed {
+            id,
+            waiting_on: Some(line),
+        } if id == RESTART_CLICK_ID => {
+            state.update.clicked = false;
+            state.hint = Some(line);
+            *dirty = true;
+        }
         ControlResponse::RestartArmed {
             waiting_on: Some(line),
             ..
         } => {
             state.hint = Some(line);
             *dirty = true;
+        }
+        ControlResponse::UpdateState { ready, .. } => {
+            if sidebar::set_ready(ready) {
+                *dirty = true;
+            }
         }
         ControlResponse::RemoteAdded { name, .. } => {
             state.connecting = None;
@@ -13046,6 +13170,7 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
             config: crate::config::Config::default(),
@@ -14281,6 +14406,7 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
             config: crate::config::Config::default(),
@@ -14417,6 +14543,7 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
             config: crate::config::Config::default(),
@@ -18260,5 +18387,153 @@ mod tests {
         assert!(fold_refused(&mut s));
         mode_input(&mut s, b"\x1b", 0x01, &mut request);
         assert!(!fold_refused(&mut s));
+    }
+
+    /// The daemon's answer to the question fills what the foot reads, the question is asked on
+    /// the first tick and every fifteenth after it, and a daemon that does not know it is not
+    /// asked again: any other failure is not that.
+    #[test]
+    fn the_answer_fills_ready_and_an_old_daemon_mutes_the_question() {
+        let mut s = state();
+        let (mut request, mut dirty) = (0u64, false);
+        let state_of = |ready: Option<&str>| ControlResponse::UpdateState {
+            id: UPDATE_STATE_ID.into(),
+            ready: ready.map(str::to_string),
+        };
+        apply(&mut s, state_of(Some("9.9.9")), &mut request, &mut dirty);
+        assert!(dirty, "the foot was not repainted");
+        assert_eq!(sidebar::ready_version().as_deref(), Some("9.9.9"));
+        dirty = false;
+        apply(&mut s, state_of(Some("9.9.9")), &mut request, &mut dirty);
+        assert!(!dirty, "repainted for the same answer");
+        apply(&mut s, state_of(None), &mut request, &mut dirty);
+        assert!(dirty && sidebar::ready_version().is_none());
+
+        let mut ask = UpdateAsk::default();
+        let due: Vec<bool> = (0..31).map(|_| ask.due()).collect();
+        assert_eq!(
+            due.iter()
+                .enumerate()
+                .filter(|(_, d)| **d)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>(),
+            vec![0, 15, 30]
+        );
+
+        let failed = |id: &str, reason: &str| ControlResponse::Failed {
+            id: id.into(),
+            reason: reason.into(),
+        };
+        apply(
+            &mut s,
+            failed(UPDATE_STATE_ID, "the store is busy"),
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!s.update.refused, "a passing failure muted the question");
+        apply(
+            &mut s,
+            failed(
+                UPDATE_STATE_ID,
+                "this daemon is older than the client: unknown variant `UpdateState`",
+            ),
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.update.refused);
+        assert!(
+            (0..100).all(|_| !s.update.due()),
+            "asked an old daemon again"
+        );
+        // One too old to read the id.
+        let mut t = state();
+        apply(
+            &mut t,
+            failed("", "unknown variant `UpdateState`"),
+            &mut request,
+            &mut dirty,
+        );
+        assert!(t.update.refused);
+        // And neither painted a line.
+        assert!(s.hint.is_none() && t.hint.is_none());
+    }
+
+    /// The click asks for the live move and leaves the windows to itself; when the daemon's
+    /// side then closes, that is the move and this process starts the new qoop, while a
+    /// close with no click (the person quit, the daemon crashed) never does. A daemon that
+    /// says why it will not move, or refuses, takes the move back.
+    #[test]
+    fn a_click_asks_for_the_live_move_and_only_a_close_after_it_restarts() {
+        assert_eq!(
+            restart_click("9.9.9".into()),
+            ControlRequest::RestartWhenSafe {
+                id: RESTART_CLICK_ID.into(),
+                version: "9.9.9".into(),
+                keep_tabs: true,
+                quiet: false,
+            }
+        );
+        RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        daemon_closed(&UpdateAsk::default());
+        assert!(!restarting(), "a close with no click restarted");
+        daemon_closed(&UpdateAsk {
+            clicked: true,
+            ..UpdateAsk::default()
+        });
+        assert!(restarting(), "the close after a click was not the move");
+        RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let (mut request, mut dirty) = (0u64, false);
+        let mut s = state();
+        s.update.clicked = true;
+        // Nothing in the way, still answering: the move is on.
+        apply(
+            &mut s,
+            ControlResponse::RestartArmed {
+                id: RESTART_CLICK_ID.into(),
+                waiting_on: None,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.update.clicked);
+        // A daemon that cannot go live says why, and nothing moves.
+        apply(
+            &mut s,
+            ControlResponse::RestartArmed {
+                id: RESTART_CLICK_ID.into(),
+                waiting_on: Some("this qoop cannot hand its tabs over live".into()),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!s.update.clicked);
+        assert_eq!(
+            s.hint.as_deref(),
+            Some("this qoop cannot hand its tabs over live")
+        );
+        s.update.clicked = true;
+        apply(
+            &mut s,
+            ControlResponse::Failed {
+                id: RESTART_CLICK_ID.into(),
+                reason: "gone".into(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!s.update.clicked);
+        // Somebody else's waiting line (the mux's, about a remote) is not the click's answer.
+        s.update.clicked = true;
+        apply(
+            &mut s,
+            ControlResponse::RestartArmed {
+                id: crate::mux::UPDATE_NOTICE.into(),
+                waiting_on: Some("devbox now runs qoop 9.9.9".into()),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.update.clicked);
     }
 }

@@ -387,6 +387,10 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "see whether the daemon could move onto a newer qoop (the foot's words)",
+            method: || Method::Control(ControlRequest::UpdateState { id: "a".into() }),
+        },
+        Action {
             name: "type into the focused terminal",
             method: || Method::Terminal("Input"),
         },
@@ -631,6 +635,7 @@ fn every_control_method_is_reachable_from_some_action() {
             keep_tabs: false,
             quiet: false,
         },
+        ControlRequest::UpdateState { id: String::new() },
         ControlRequest::TaskWrite {
             id: String::new(),
             terminal: None,
@@ -680,6 +685,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SaveUpload { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
+            | ControlRequest::UpdateState { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }

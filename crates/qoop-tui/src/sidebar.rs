@@ -325,6 +325,8 @@ pub enum Hit {
 pub enum Act {
     /// The version on the foot: open the site in the browser.
     Site,
+    /// `restart for update` on the foot: move the daemon onto the qoop on disk.
+    Restart,
     Space(i64),
     /// Fold a space's agents away under its rule, or open them again.
     Fold(i64),
@@ -918,7 +920,7 @@ fn parts(
         c.width,
         pet,
         count,
-        update_available().as_deref(),
+        pending_now().get(),
         hub_link(),
         c.icons,
     );
@@ -1380,7 +1382,7 @@ fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avat
         c.width,
         pet,
         Some(0),
-        update_available().as_deref(),
+        pending_now().get(),
         hub_link(),
         c.icons,
     );
@@ -3078,7 +3080,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
                 c.width,
                 c.icons,
                 col,
-                update_available().as_deref(),
+                pending_now().get(),
                 hub_link(),
             ))
         }
@@ -3088,15 +3090,17 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
 /// What a click on the menu row means at one based column `col`: the word `menu` opens the
 /// menu, the cog after it the settings page, the version the site, the hub word the web app
 /// (or, with the hub down, the news that it is). Anywhere else folds the column.
-fn foot_act(width: usize, icons: bool, col: usize, update: Option<&str>, hub: HubLink) -> Act {
+fn foot_act(width: usize, icons: bool, col: usize, update: Pending, hub: HubLink) -> Act {
     let at = col.saturating_sub(1);
     let on = |from: usize, len: usize| (from..from + len).contains(&at);
     let tail = foot_tail(width, icons);
     let tail_at = width.saturating_sub(crate::width::width(&tail));
     let cog_at = tail_at + MENU_LABEL.len() + 1;
-    let (_, word) = foot_lead(width, crate::width::width(&tail), update, hub);
+    let (lead, word) = foot_lead(width, crate::width::width(&tail), update, hub);
     if on(tail_at, MENU_LABEL.len()) {
         Act::Menu
+    } else if restart_words(&lead).is_some_and(|len| on(1, len)) {
+        Act::Restart
     } else if settings_mark(width, icons).is_some_and(|mark| on(cog_at, crate::width::width(&mark)))
     {
         Act::SettingsPage
@@ -3516,7 +3520,7 @@ fn foot_rows(
     width: usize,
     pet: bool,
     count: Option<usize>,
-    update: Option<&str>,
+    update: Pending,
     hub: HubLink,
     icons: bool,
 ) -> Vec<Row> {
@@ -3526,12 +3530,16 @@ fn foot_rows(
     // before it.
     let (lead, word) = foot_lead(width, crate::width::width(&tail), update, hub);
     let gap = width.saturating_sub(crate::width::width(&lead) + crate::width::width(&tail));
+    // `restart for update` in the static ink of a working agent: blue, since green is the
+    // `online` word beside it, orange is the q's tail and `offline`, and faint is what a
+    // notice must not be.
+    let restart = restart_words(&lead).map(|len| (1, len, Role::Working));
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
-        runs: word
-            .map(|(at, word, ink)| (at, word.len(), ink))
+        runs: restart
             .into_iter()
+            .chain(word.map(|(at, word, ink)| (at, word.len(), ink)))
             .collect(),
         ..Line::default()
     };
@@ -3600,7 +3608,7 @@ fn hub_word(hub: HubLink) -> (&'static str, crate::theme::Role) {
 fn foot_lead(
     width: usize,
     tail: usize,
-    update: Option<&str>,
+    update: Pending,
     hub: HubLink,
 ) -> (String, Option<(usize, &'static str, crate::theme::Role)>) {
     let version = version_text(width, tail, update);
@@ -3675,16 +3683,14 @@ fn box_line(
 }
 
 /// Where the version starts on the menu row, when the row shows it: the column its link
-/// covers. The word is [`VERSION`]; a newer version after it is not part of the link.
-pub(crate) fn version_link_at(width: usize, icons: bool) -> Option<usize> {
-    version_link_in(width, icons, update_available().as_deref())
-}
-
-/// [`version_link_at`] for a given update notice.
-fn version_link_in(width: usize, icons: bool, update: Option<&str>) -> Option<usize> {
+/// covers. The word is [`VERSION`]; a newer version after it is not part of the link, and
+/// there is none while `restart for update` stands in its place.
+pub(crate) fn version_link_in(width: usize, icons: bool, update: Pending) -> Option<usize> {
     let tail = foot_tail(width, icons);
     let shown = version_text(width, crate::width::width(&tail), update);
-    (!shown.is_empty()).then_some(1)
+    // Not over the words that replace it: they are not the version, and the site is not what
+    // they open.
+    (!shown.is_empty() && restart_words(&shown).is_none()).then_some(1)
 }
 
 /// Where this program lives on the web, which the version links to.
@@ -3701,7 +3707,7 @@ pub(crate) fn app_link_at(
 ) -> Option<(usize, &'static str, crate::theme::Role)> {
     let tail = crate::width::width(&foot_tail(width, icons));
     let hub = hub_link();
-    foot_lead(width, tail, update_available().as_deref(), hub)
+    foot_lead(width, tail, pending_now().get(), hub)
         .1
         .filter(|_| hub != HubLink::Down)
 }
@@ -3710,13 +3716,90 @@ pub(crate) fn app_link_at(
 /// one was seen, beside a tail of `tail` columns with at least a space between. A version
 /// cut short reads as another version, so each form shows whole or not at all: the notice
 /// goes first, then the version itself.
-fn version_text(width: usize, tail: usize, update: Option<&str>) -> String {
+fn version_text(width: usize, tail: usize, update: Pending) -> String {
     let fits = |text: &String| crate::width::width(text) + 1 + tail <= width;
-    update
-        .map(|new| format!(" {VERSION}>{new}"))
-        .filter(fits)
+    let words = (update == Pending::Ready)
+        .then(|| [RESTART_LONG, RESTART_SHORT].map(String::from))
+        .into_iter()
+        .flatten()
+        .find(fits);
+    words
+        .or_else(|| match update {
+            Pending::Newer(new) => Some(format!(" {VERSION}>{new}")).filter(fits),
+            _ => None,
+        })
         .or_else(|| Some(format!(" {VERSION}")).filter(fits))
         .unwrap_or_default()
+}
+
+/// The words that replace the version when the daemon runs an older qoop than the one on
+/// disk, long and short.
+const RESTART_LONG: &str = " restart for update";
+const RESTART_SHORT: &str = " restart";
+
+/// How many columns of `lead` (from its second column, after the blank) are the restart words,
+/// when it starts with them.
+fn restart_words(lead: &str) -> Option<usize> {
+    [RESTART_LONG, RESTART_SHORT]
+        .into_iter()
+        .find(|words| lead.starts_with(words))
+        .map(|words| words.len() - 1)
+}
+
+/// What the foot has to say about a newer qoop than this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pending<'a> {
+    /// Nothing: the version alone.
+    None,
+    /// `qoop update --check` saw this version: shown after the running one.
+    Newer(&'a str),
+    /// The daemon runs an older qoop than the file on disk: the words replace the version.
+    Ready,
+}
+
+/// [`Pending`] as the statics last held it, owning what it points at.
+pub(crate) struct PendingNow {
+    newer: Option<String>,
+    ready: bool,
+}
+
+impl PendingNow {
+    pub(crate) fn get(&self) -> Pending<'_> {
+        if self.ready {
+            Pending::Ready
+        } else {
+            self.newer.as_deref().map_or(Pending::None, Pending::Newer)
+        }
+    }
+}
+
+pub(crate) fn pending_now() -> PendingNow {
+    PendingNow {
+        newer: update_available(),
+        // Never under test, like `refresh_files`: the paints the suite asserts never depend on
+        // another test's daemon.
+        ready: !cfg!(test) && ready_version().is_some(),
+    }
+}
+
+/// The version the daemon could move onto, as the interface last heard it. Process wide for
+/// the same reason as `FILES`, and apart from it because `refresh_files` overwrites that
+/// whole tuple every two seconds.
+static READY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// What the daemon said it could move onto, if anything. True when that changed.
+pub(crate) fn set_ready(ready: Option<String>) -> bool {
+    let mut held = READY.write().unwrap_or_else(|e| e.into_inner());
+    if *held == ready {
+        return false;
+    }
+    *held = ready;
+    true
+}
+
+/// The version `restart for update` would move onto.
+pub(crate) fn ready_version() -> Option<String> {
+    READY.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Which build this is, read from the crate rather than written down twice.
@@ -5450,7 +5533,7 @@ mod tests {
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The q alone, its tail in ember, then the menu.
-        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up, false);
+        let rows = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false);
         assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
         for (line, _) in &rows {
             assert_eq!(
@@ -5513,8 +5596,8 @@ mod tests {
     #[test]
     fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, false, None, None, HubLink::Up, false);
-            let stands = foot_rows(width, true, Some(0), None, HubLink::Up, false);
+            let gave_way = foot_rows(width, false, None, Pending::None, HubLink::Up, false);
+            let stands = foot_rows(width, true, Some(0), Pending::None, HubLink::Up, false);
             assert_eq!(stands.len(), STAGE_FOOT_ROWS);
             let added = STAGE_FOOT_ROWS - gave_way.len();
             let blank_at = COUNT_BOX_ROWS;
@@ -5532,7 +5615,7 @@ mod tests {
     fn the_menu_row_carries_the_version_then_the_hub_word() {
         for icons in [false, true] {
             for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-                let rows = foot_rows(width, false, None, None, HubLink::Up, icons);
+                let rows = foot_rows(width, false, None, Pending::None, HubLink::Up, icons);
                 let (menu, hit) = rows.last().expect("the menu row");
                 assert_eq!(*hit, Some(Hit::Foot));
                 assert_eq!(crate::width::width(&menu.text), width);
@@ -5540,7 +5623,7 @@ mod tests {
                 assert!(menu.text.ends_with(&tail), "{menu:?}");
                 let version = format!(" {VERSION}");
                 assert!(menu.text.starts_with(&version), "{menu:?}");
-                assert_eq!(version_link_at(width, icons), Some(1));
+                assert_eq!(version_link_in(width, icons, Pending::None), Some(1));
                 let word_at = crate::width::width(&version) + 1;
                 // The word goes first when the row is tight: the version and the tail are kept.
                 let room = word_at + "online".len() + 1 + crate::width::width(&tail) <= width;
@@ -5560,13 +5643,13 @@ mod tests {
             }
         }
         // No room for the version, no link and no word hanging in the air.
-        let tight = foot_rows(8, false, None, None, HubLink::Up, false);
+        let tight = foot_rows(8, false, None, Pending::None, HubLink::Up, false);
         let text = &tight.last().unwrap().0.text;
         assert!(
             !text.contains("online") && !text.contains(VERSION),
             "{text:?}"
         );
-        assert_eq!(version_link_at(8, false), None);
+        assert_eq!(version_link_in(8, false, Pending::None), None);
     }
 
     /// The word says what the bridge says about the hub: green `online` when reached, warm
@@ -5576,7 +5659,7 @@ mod tests {
     fn the_hub_word_follows_the_hub_state() {
         use crate::theme::Role;
         let word = |hub| {
-            let rows = foot_rows(WIDTH, false, None, None, hub, false);
+            let rows = foot_rows(WIDTH, false, None, Pending::None, hub, false);
             let menu = &rows.last().unwrap().0;
             let at = crate::width::width(&format!(" {VERSION}")) + 1;
             let (word, _) = hub_word(hub);
@@ -5602,15 +5685,19 @@ mod tests {
             for icons in [false, true] {
                 // 1-based columns: the word is columns word_at + 1 to word_at + its length.
                 for col in word_at + 1..=word_at + word.len() {
-                    assert_eq!(foot_act(WIDTH, icons, col, None, hub), want, "{word} {col}");
+                    assert_eq!(
+                        foot_act(WIDTH, icons, col, Pending::None, hub),
+                        want,
+                        "{word} {col}"
+                    );
                 }
                 assert_eq!(
-                    foot_act(WIDTH, icons, word_at, None, hub),
+                    foot_act(WIDTH, icons, word_at, Pending::None, hub),
                     Act::Collapse,
                     "the blank before {word}"
                 );
                 assert_eq!(
-                    foot_act(WIDTH, icons, word_at + word.len() + 1, None, hub),
+                    foot_act(WIDTH, icons, word_at + word.len() + 1, Pending::None, hub),
                     Act::Collapse,
                     "the blank after {word}"
                 );
@@ -5618,7 +5705,7 @@ mod tests {
         }
         // Too narrow for the word: it is not drawn and its cells fold the column.
         assert_eq!(
-            foot_act(20, true, word_at + 1, None, HubLink::Up),
+            foot_act(20, true, word_at + 1, Pending::None, HubLink::Up),
             Act::Collapse
         );
     }
@@ -5638,7 +5725,7 @@ mod tests {
             format!("{MENU_LABEL} \u{ab} ")
         );
         assert!(!foot_tail(WIDTH, true).contains("settings"));
-        let rows = foot_rows(WIDTH, false, None, None, HubLink::Up, true);
+        let rows = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, true);
         let text = &rows.last().unwrap().0.text;
         assert!(text.ends_with(&tail), "{text:?}");
         // With icons the cog is one cell, 1-based column WIDTH - 3.
@@ -5653,7 +5740,7 @@ mod tests {
                 _ => Act::Collapse,
             };
             assert_eq!(
-                foot_act(WIDTH, true, col, None, HubLink::Up),
+                foot_act(WIDTH, true, col, Pending::None, HubLink::Up),
                 want,
                 "col {col}"
             );
@@ -5661,17 +5748,16 @@ mod tests {
         // Without icons `set` is three cells after `menu `.
         for col in WIDTH - 5..=WIDTH - 3 {
             assert_eq!(
-                foot_act(WIDTH, false, col, None, HubLink::Up),
+                foot_act(WIDTH, false, col, Pending::None, HubLink::Up),
                 Act::SettingsPage,
                 "col {col}"
             );
         }
         // A narrow column without icons has no mark, and nothing in it opens the page.
         let narrow = SETTINGS_FROM - 1;
-        assert!(
-            (1..=narrow)
-                .all(|col| foot_act(narrow, false, col, None, HubLink::Up) != Act::SettingsPage)
-        );
+        assert!((1..=narrow).all(
+            |col| foot_act(narrow, false, col, Pending::None, HubLink::Up) != Act::SettingsPage
+        ));
     }
 
     /// The link and the click cover the version word and nothing else: with an update notice
@@ -5679,9 +5765,16 @@ mod tests {
     /// foot still folds the column.
     #[test]
     fn the_version_link_covers_only_the_version() {
-        let rows = foot_rows(WIDTH, false, None, Some("9.9.9"), HubLink::Up, false);
+        let rows = foot_rows(
+            WIDTH,
+            false,
+            None,
+            Pending::Newer("9.9.9"),
+            HubLink::Up,
+            false,
+        );
         let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
-        let at = version_link_in(WIDTH, false, Some("9.9.9")).expect("shown");
+        let at = version_link_in(WIDTH, false, Pending::Newer("9.9.9")).expect("shown");
         let word: String = text[at..at + VERSION.len()].iter().collect();
         assert_eq!(word, VERSION);
         assert_eq!(text[at + VERSION.len()], '>', "the notice follows the link");
@@ -5703,7 +5796,7 @@ mod tests {
             "folded strip"
         );
         // Where the row has no room for the version, nothing is a link.
-        assert_eq!(version_link_in(8, false, None), None);
+        assert_eq!(version_link_in(8, false, Pending::None), None);
     }
 
     /// The logo is the q of `docs/brand/make.py` alone at every width: one dot a cell with a
@@ -5734,7 +5827,7 @@ mod tests {
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
             for pet in [false, true] {
-                let rows = foot_rows(width, pet, None, None, HubLink::Up, false);
+                let rows = foot_rows(width, pet, None, Pending::None, HubLink::Up, false);
                 let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
                 for (i, (line, hit)) in logo.iter().enumerate() {
                     assert_eq!(
@@ -5893,25 +5986,101 @@ mod tests {
     /// notice cut to `0.4.0>0.` reads as another version. The menu keeps its place.
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
-        let menu = |width: usize, update: Option<&str>| {
+        let menu = |width: usize, update: Pending| {
             foot_rows(width, false, None, update, HubLink::Up, false)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
         };
         let tail = format!("{MENU_LABEL} \u{ab} ");
-        let wide = menu(SIDEBAR_MAX, Some("0.10.0"));
+        let wide = menu(SIDEBAR_MAX, Pending::Newer("0.10.0"));
         assert!(wide.starts_with(&format!(" {VERSION}>0.10.0 ")), "{wide:?}");
         // Exactly room for the version, a space and the tail: the notice gives way.
         let snug = crate::width::width(&format!(" {VERSION}")) + 1 + crate::width::width(&tail);
-        let fits = menu(snug, Some("0.10.0"));
+        let fits = menu(snug, Pending::Newer("0.10.0"));
         assert_eq!(fits, format!(" {VERSION} {tail}"));
         // One column less and the version goes too, never cut.
-        let tight = menu(snug - 1, Some("0.10.0"));
+        let tight = menu(snug - 1, Pending::Newer("0.10.0"));
         assert_eq!(tight.trim_start(), tail, "{tight:?}");
         assert_eq!(crate::width::width(&tight), snug - 1);
-        let plain = menu(WIDTH, None);
+        let plain = menu(WIDTH, Pending::None);
         assert!(!plain.contains('>'), "{plain:?}");
+    }
+
+    /// `restart for update` takes the place of the version, whole or not at all, in the static
+    /// ink of a working agent; a click on any column of it restarts and never opens the site,
+    /// the hub word gives way before it does, and the version link is not stamped over it.
+    #[test]
+    fn restart_for_update_replaces_the_version_whole_in_every_width_and_hub_state() {
+        use crate::theme::Role;
+        let mut seen = (false, false, false);
+        for width in 24..=60 {
+            for hub in [HubLink::Up, HubLink::Down, HubLink::Absent] {
+                for icons in [false, true] {
+                    for (pending, shown) in [
+                        (Pending::None, false),
+                        (Pending::Newer("9.9.9"), false),
+                        (Pending::Ready, true),
+                    ] {
+                        let rows = foot_rows(width, false, None, pending, hub, icons);
+                        let (row, _) = rows.last().expect("the menu row");
+                        let ctx = format!("{width} {hub:?} {icons} {pending:?}: {:?}", row.text);
+                        assert!(crate::width::width(&row.text) <= width, "{ctx}");
+                        let long = row.text.starts_with(RESTART_LONG);
+                        let short = !long && row.text.starts_with(RESTART_SHORT);
+                        let words = long || short;
+                        // Whole or not at all: a cut `restart fo` is another word.
+                        if words {
+                            let after =
+                                &row.text[if long { RESTART_LONG } else { RESTART_SHORT }.len()..];
+                            assert!(after.starts_with(' '), "{ctx}");
+                        }
+                        assert!(shown || !words, "{ctx}");
+                        let run = row.runs.iter().find(|r| r.2 == Role::Working);
+                        assert_eq!(run.is_some(), words, "{ctx}");
+                        if words {
+                            let len = if long { RESTART_LONG } else { RESTART_SHORT }.len() - 1;
+                            assert_eq!(run, Some(&(1, len, Role::Working)), "{ctx}");
+                            assert_eq!(version_link_in(width, icons, pending), None, "{ctx}");
+                            // Every column of the words restarts; the site is not under them.
+                            for col in 2..=1 + len {
+                                assert_eq!(
+                                    foot_act(width, icons, col, pending, hub),
+                                    Act::Restart,
+                                    "{ctx} col {col}"
+                                );
+                            }
+                            seen.0 |= long;
+                            seen.1 |= short;
+                            seen.2 |= long
+                                && !row.text.contains("online")
+                                && !row.text.contains("offline")
+                                && !row.text.contains("local");
+                        } else if !shown {
+                            for col in 1..=width {
+                                assert_ne!(
+                                    foot_act(width, icons, col, pending, hub),
+                                    Act::Restart,
+                                    "{ctx} col {col}"
+                                );
+                            }
+                        } else {
+                            // Too narrow for the words: the version, or nothing.
+                            assert!(
+                                row.text.starts_with(&format!(" {VERSION}"))
+                                    || row.text.trim_start().starts_with(MENU_LABEL),
+                                "{ctx}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.0 && seen.1,
+            "the long and the short words never showed: {seen:?}"
+        );
+        assert!(seen.2, "the hub word never gave way to the long words");
     }
 
     fn art_pet() -> qoop_runtime::avatar::Avatar {
@@ -5986,7 +6155,7 @@ mod tests {
         // over the foot the column keeps without it carry agents instead.
         let crowded = at(crowd());
         assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        let kept = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
             assert!(carries_agents(row), "{row:?}");
         }
@@ -6019,7 +6188,7 @@ mod tests {
             None,
         );
         let freed = 30 - STAGE_FOOT_ROWS
-            ..30 - foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+            ..30 - foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         assert!(
             plain[freed.clone()].iter().all(carries_agents),
             "thirty agents must reach the rows a pet would have reserved: {:?}",
@@ -7803,7 +7972,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -7870,7 +8039,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4 - SEARCH_ROWS);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -8060,7 +8229,7 @@ mod tests {
         use crate::theme::Role;
         let spaces = vec![space(1, "app")];
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
-        let kept = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        let kept = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         let check = |agents: &[AgentRow], height: usize, pet: Option<&_>, number: &str| {
             let c = opened(column(
                 &spaces,
@@ -8134,7 +8303,7 @@ mod tests {
         assert!(!avatar_fits(12, WIDTH, true));
         check(&few, 14, Some(&art_pet()), "1");
         // Where even the logo's rows leave no room beside it, there is no box.
-        let narrow = foot_rows(12, false, Some(0), None, HubLink::Up, false);
+        let narrow = foot_rows(12, false, Some(0), Pending::None, HubLink::Up, false);
         assert!(
             narrow
                 .iter()
@@ -8914,7 +9083,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, the search box, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len() + 6;
+        let least = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len() + 6;
         for height in [least, least + 1, 12, 16, 30] {
             let rows = rows12(
                 &spaces,
@@ -10278,7 +10447,7 @@ mod tests {
         c.nav = Some(&nav);
         let rows = rows_folded(&c, 24, None);
         assert_eq!(rows.len(), plain.len());
-        let foot = foot_rows(WIDTH, false, None, None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
         let line = &rows[rows.len() - foot - 1].0;
         assert!(
             line.text.contains("j/k move  enter open  q back"),

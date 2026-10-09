@@ -3276,6 +3276,8 @@ fn dispatch(
         ControlRequest::SaveUpload { .. } => Dispatch::Apart,
         // Runs the binary on disk and waits for a first look across every space.
         ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
+        // The first answer after a swap runs that binary.
+        ControlRequest::UpdateState { .. } => Dispatch::Apart,
         _ => Dispatch::Inline(None),
     }
 }
@@ -4704,6 +4706,10 @@ async fn handle_control(
                     .then(|| WINDOW_OPEN.to_string()),
             }
         }
+        ControlRequest::UpdateState { .. } => ControlResponse::UpdateState {
+            id,
+            ready: books.restart.ready().await,
+        },
         ControlRequest::RestartWhenSafe {
             version,
             keep_tabs,
@@ -5921,6 +5927,19 @@ pub struct Restart {
     wake: tokio::sync::Notify,
     /// The connections, to tell a quiet move whether a window is open. Set with `exe`.
     connections: std::sync::OnceLock<Arc<ConnectionRegistry>>,
+    /// What the binary at `exe` last said its version is, and the stamp of the file it said it
+    /// of: the binary is run again only when the file changed. Held across the run, so
+    /// sessions asking at once after a swap start one process between them.
+    disk: tokio::sync::Mutex<Disk>,
+}
+
+/// A file's modification time and size, which change when a swap puts another one there.
+type Stamp = (Option<std::time::SystemTime>, u64);
+
+#[derive(Default)]
+struct Disk {
+    stamp: Option<Stamp>,
+    version: Option<String>,
 }
 
 impl Default for Restart {
@@ -5940,11 +5959,34 @@ impl Default for Restart {
             quiet: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             connections: std::sync::OnceLock::new(),
+            disk: tokio::sync::Mutex::default(),
         }
     }
 }
 
 impl Restart {
+    /// The version the qoop on disk says it is, when that is newer than this daemon's own;
+    /// `None` when it is not, when it cannot be read, and for a daemon that cannot move.
+    async fn ready(&self) -> Option<String> {
+        let exe = self.exe.get()?;
+        let stamp = std::fs::metadata(exe)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        let mut disk = self.disk.lock().await;
+        if disk.stamp != stamp || stamp.is_none() {
+            // Not remembered when it did not answer: the next ask tries again.
+            let said = version_on_disk(exe).await.ok();
+            disk.stamp = said.as_ref().and(stamp);
+            disk.version = said.and_then(|line| {
+                let version = line.trim().split_once(' ')?.1.to_string();
+                crate::paths::parse_version(&version).map(|_| version)
+            });
+        }
+        disk.version
+            .clone()
+            .filter(|v| crate::paths::is_newer_version(v, env!("CARGO_PKG_VERSION")))
+    }
+
     /// Whether a move onto a new binary is ending things right now.
     fn gated(&self) -> bool {
         self.gate.load(std::sync::atomic::Ordering::SeqCst)
@@ -5980,8 +6022,9 @@ impl Restart {
 const WINDOW_OPEN: &str = "a qoop window is open here, the restart is offered in its foot";
 
 /// Why an arm that never ends a tab waits for a binary that cannot take tabs over.
-const NOT_LIVE: &str = "this qoop cannot hand its tabs over live; `qoop update` restarts idle \
-                        agents, only when you run it";
+/// Short enough for the hint row of a narrow window: it is what a click on `restart for update`
+/// answers.
+const NOT_LIVE: &str = "this qoop cannot restart live; `qoop update` restarts idle agents";
 
 impl Bookkeeping {
     pub fn new(
