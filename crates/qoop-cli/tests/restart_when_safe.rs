@@ -165,6 +165,8 @@ impl Daemon {
         self.ask(ControlRequest::RestartWhenSafe {
             id: format!("arm-{}", unique()),
             version: version.into(),
+            keep_tabs: false,
+            quiet: false,
         })
     }
 
@@ -1550,4 +1552,413 @@ fn stage(exe: &Path) {
     if std::fs::hard_link(built, exe).is_err() {
         std::fs::copy(built, exe).expect("copy the binary");
     }
+}
+
+// A move nobody asked for by hand: it ends no tab and waits for every window to close.
+
+/// How a test client presents itself to the daemon.
+enum Presence {
+    /// A window, `qoop attach` or a phone's stream: a person.
+    Person,
+    /// A watcher (the bridge's, the notch's): nobody.
+    Watcher,
+    /// The Mac's own reconnecting link to this machine, named by its key.
+    Link(&'static str),
+}
+
+/// A connection held open until it is dropped.
+struct Connected {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Daemon {
+    fn socket(&self) -> PathBuf {
+        qoop_testkit::socket_in(self.dir.path())
+    }
+
+    /// Connect and stay connected, handshaken, until the result is dropped.
+    fn connect(&self, presence: Presence) -> Connected {
+        let socket = self.socket();
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let held = rt.block_on(async {
+                match presence {
+                    Presence::Person => qoop_runtime::client::connect(&socket, "window-test")
+                        .await
+                        .map(|(stream, _)| stream),
+                    Presence::Watcher => {
+                        qoop_runtime::client::connect_observer(&socket, "watcher-test")
+                            .await
+                            .map(|(stream, _)| stream)
+                    }
+                    Presence::Link(key) => {
+                        let stream = tokio::net::UnixStream::connect(&socket).await?;
+                        qoop_runtime::client::handshake(stream, "link-test", Some(key))
+                            .await
+                            .map(|(stream, _, _)| stream)
+                    }
+                }
+            });
+            let _ = ready_tx.send(held.is_ok());
+            let _ = stopped.recv();
+            drop(held);
+        });
+        assert!(ready.recv().expect("a connection"), "the daemon refused it");
+        Connected {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    /// The ask a daemon's own timer makes, answered or not (a daemon that moves closes it).
+    fn arm_unattended(&self) -> Option<ControlResponse> {
+        self.arm_with(true, true)
+    }
+
+    /// As `qoop update --auto` asks: a watcher, so the asker is not itself an open window.
+    fn arm_with(&self, keep_tabs: bool, quiet: bool) -> Option<ControlResponse> {
+        let socket = self.socket();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (stream, inbuf) = qoop_runtime::client::connect_observer(&socket, "arm-test")
+                .await
+                .ok()?;
+            let mut c = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
+            c.control(
+                &ControlRequest::RestartWhenSafe {
+                    id: format!("arm-{}", unique()),
+                    version: NEXT.into(),
+                    keep_tabs,
+                    quiet,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        })
+    }
+
+    /// The same ask on a thread of its own, for one that is answered only after a hand over.
+    fn arm_in_background(&self, keep_tabs: bool, quiet: bool) -> std::thread::JoinHandle<()> {
+        let socket = self.socket();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let Ok((stream, inbuf)) =
+                    qoop_runtime::client::connect_observer(&socket, "arm-test").await
+                else {
+                    return;
+                };
+                let mut c = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
+                let _ = c
+                    .control(
+                        &ControlRequest::RestartWhenSafe {
+                            id: format!("arm-{}", unique()),
+                            version: NEXT.into(),
+                            keep_tabs,
+                            quiet,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await;
+            });
+        })
+    }
+
+    fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn wait_for_log(&self, needle: &str) {
+        let deadline = Instant::now() + PATIENCE;
+        while !self.log_text().contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "never logged {needle:?}: {}",
+                self.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// What the daemon says it is waiting on, from an ask that changes nothing.
+    fn waiting_on(&self, keep_tabs: bool, quiet: bool) -> String {
+        match self.arm_with(keep_tabs, quiet) {
+            Some(ControlResponse::RestartArmed {
+                waiting_on: Some(why),
+                ..
+            }) => why,
+            other => panic!("not waiting on anything: {other:?}"),
+        }
+    }
+}
+
+/// The hand over takes this long, so a window can arrive in the middle of it.
+const SLOW_ADOPT_CHECK: &str = "if [ \"$2\" = --adopt-check ]; then sleep 4; fi\n";
+
+/// With no window open the unattended ask moves the daemon at once, on the same process, and
+/// the command in the tab runs through it.
+#[test]
+fn an_unattended_ask_with_no_window_moves_live_and_ends_no_tab() {
+    let mut d = Daemon::start();
+    d.send(
+        1,
+        "echo SHELL=$$; sh -c 'echo PID=$$; sleep 100; echo DONE-$$'",
+    );
+    d.wait_for_screen(1, "PID=");
+    let screen = text(&d.run(&["read", "1"]).stdout);
+    let command = number_after(&screen, "PID=").expect("the command's pid");
+
+    let _ = d.arm_unattended();
+    wait_for_starts(&d, 2, Duration::from_secs(30));
+    let log = d.log_text();
+    assert!(d.running(), "the daemon exited instead of moving: {log}");
+    assert_eq!(d.starts(), 2, "{log}");
+    assert!(parent_of(command).is_some(), "the command was ended: {log}");
+    assert!(
+        zombies_of(d.child.id()).len() <= 1,
+        "a move left more than one zombie"
+    );
+}
+
+/// A person's window holds the move, however long the asks keep coming and the tabs keep
+/// changing; once it is gone the daemon moves by itself within its minute, no click needed.
+#[test]
+fn a_window_holds_the_unattended_ask_until_it_closes_and_then_the_daemon_moves_alone() {
+    let mut d = Daemon::start();
+    let window = d.connect(Presence::Person);
+    let why = match d.arm_unattended() {
+        Some(ControlResponse::RestartArmed {
+            waiting_on: Some(why),
+            ..
+        }) => why,
+        other => panic!("not held by the window: {other:?}"),
+    };
+    assert!(why.contains("window is open"), "{why}");
+
+    // Looks happen as the tab changes; none of them moves.
+    for _ in 0..3 {
+        d.send(1, "true");
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    assert_eq!(
+        d.starts(),
+        1,
+        "moved under an open window: {}",
+        d.log_text()
+    );
+    // The same ask again changes nothing and is answered with the same reason.
+    assert!(d.waiting_on(true, true).contains("window is open"));
+
+    drop(window);
+    let left = Instant::now();
+    wait_for_starts(&d, 2, Duration::from_secs(90));
+    assert_eq!(d.starts(), 2, "never moved: {}", d.log_text());
+    assert!(
+        left.elapsed() < Duration::from_secs(75),
+        "took {:?} after the window left",
+        left.elapsed()
+    );
+    assert!(d.running());
+}
+
+/// Watchers and the Mac's own reconnecting link are nobody's window; a plain connection is.
+#[test]
+fn only_a_person_holds_a_quiet_move_not_a_watcher_or_a_reconnecting_link() {
+    let mut d = Daemon::start();
+    let _watcher = d.connect(Presence::Watcher);
+    let _link = d.connect(Presence::Link("mac-link"));
+    let _ = d.arm_unattended();
+    wait_for_starts(&d, 2, Duration::from_secs(30));
+    assert_eq!(
+        d.starts(),
+        2,
+        "held by a watcher or a link: {}",
+        d.log_text()
+    );
+    assert!(d.running());
+}
+
+/// A window that attaches while the tabs are parked would die at the exec: the move is dropped
+/// instead, every tab carries on, a tab can be made at once (the gate is down) and the arm
+/// is still there for when the window leaves.
+#[test]
+fn a_window_attaching_during_the_hand_over_drops_the_move_and_ends_no_tab() {
+    let mut d = Daemon::start_installed();
+    install_script(&d.exe, NEXT, SLOW_ADOPT_CHECK);
+    d.send(1, "sleep 100");
+    d.wait_for_row(1, "ran sleep", running_sleep);
+
+    let asked = d.arm_in_background(true, true);
+    d.wait_for_log("taking the startup lock to hand the tabs over");
+    let window = d.connect(Presence::Person);
+    asked.join().expect("the ask");
+    d.wait_for_log("a qoop window is open here");
+    assert_eq!(d.starts(), 1, "moved with a window open: {}", d.log_text());
+    assert!(d.running());
+
+    // Nobody was ended and nothing is refused: the very next tab opens.
+    d.wait_for_row(1, "kept its command", running_sleep);
+    let late = d.new_tab();
+    d.wait_for_row(late, "opened", |_| true);
+    // The arm is alive: it says what it waits on, and moves once the window has gone.
+    assert!(d.waiting_on(true, true).contains("window is open"));
+    drop(window);
+    d.send(late, "true");
+    wait_for_starts(&d, 2, Duration::from_secs(90));
+    assert_eq!(d.starts(), 2, "{}", d.log_text());
+    d.wait_for_row(1, "kept its command", running_sleep);
+}
+
+/// The old way ends idle tabs and brings them back, which an unattended move never does:
+/// onto a binary that cannot take tabs over it holds, with the reason, and a person's own
+/// ask (which allows the old way) is the one thing that moves it, at once.
+#[test]
+fn an_ask_that_ends_no_tab_holds_where_the_old_way_would_move() {
+    let mut d = Daemon::start_waiting();
+    let why = match d.arm_with(true, false) {
+        Some(ControlResponse::RestartArmed {
+            waiting_on: Some(why),
+            ..
+        }) => why,
+        other => panic!("not held: {other:?}"),
+    };
+    assert!(why.contains("cannot hand its tabs over live"), "{why}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(d.starts(), 1, "moved the old way: {}", d.log_text());
+    d.wait_for_row(1, "stayed", |_| true);
+
+    // `qoop update` by hand: the weaker ask wins and wakes the look.
+    let _ = d.arm(NEXT);
+    wait_for_starts(&d, 2, Duration::from_secs(30));
+    assert_eq!(d.starts(), 2, "{}", d.log_text());
+    assert!(d.running());
+}
+
+/// A hand over that fails for good latches the daemon to the old way; with nothing allowed to
+/// end a tab the arm holds there instead, and the tab runs on.
+#[test]
+fn a_latched_old_way_after_the_arm_still_ends_no_tab() {
+    let d = Daemon::start_installed();
+    install_script(
+        &d.exe,
+        NEXT,
+        "if [ \"$2\" = --adopt-check ]; then exit 1; fi\n",
+    );
+    d.send(1, "sleep 100");
+    d.wait_for_row(1, "ran sleep", running_sleep);
+    let why = match d.arm_with(true, false) {
+        Some(ControlResponse::RestartArmed {
+            waiting_on: Some(why),
+            ..
+        }) => why,
+        other => panic!("not held: {other:?}"),
+    };
+    assert!(why.contains("cannot hand its tabs over live"), "{why}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(d.starts(), 1, "moved the old way: {}", d.log_text());
+    assert!(
+        d.log_text()
+            .contains("cannot read what this daemon hands over")
+    );
+    d.wait_for_row(1, "kept its command", running_sleep);
+    let late = d.new_tab();
+    d.wait_for_row(late, "opened", |_| true);
+}
+
+/// A click asks for a live move with the window still open: it moves within a couple of
+/// seconds plus the hand over, ends no tab, and a timer's ask arriving in the middle of the
+/// hand over does not take the click's permission back.
+#[test]
+fn a_click_moves_a_held_arm_at_once_and_a_timer_ask_after_it_does_not_hold_it_again() {
+    let mut d = Daemon::start_installed();
+    install_script(&d.exe, NEXT, SLOW_ADOPT_CHECK);
+    d.send(1, "sleep 100");
+    d.wait_for_row(1, "ran sleep", running_sleep);
+    let _window = d.connect(Presence::Person);
+    assert!(matches!(
+        d.arm_unattended(),
+        Some(ControlResponse::RestartArmed {
+            waiting_on: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(d.starts(), 1);
+
+    let clicked = Instant::now();
+    let click = d.arm_in_background(true, false);
+    d.wait_for_log("taking the startup lock to hand the tabs over");
+    let seconds_to_start = clicked.elapsed();
+    // The timer comes round while the tabs are parked.
+    let timer = d.arm_in_background(true, true);
+    wait_for_starts(&d, 2, Duration::from_secs(30));
+    let _ = (click.join(), timer.join());
+    assert_eq!(
+        d.starts(),
+        2,
+        "the timer's ask held the click: {}",
+        d.log_text()
+    );
+    assert!(d.running());
+    assert!(
+        seconds_to_start < Duration::from_secs(8),
+        "the hand over began after {seconds_to_start:?}"
+    );
+    d.wait_for_row(1, "kept its command", running_sleep);
+}
+
+/// A move called off (here, an exec that fails) leaves nothing behind: the next ask is a
+/// new arm with the flags it sent, not the click's that came before.
+#[test]
+fn flags_of_a_click_do_not_outlive_the_arm_it_made() {
+    let d = Daemon::start_installed();
+    // The adopt check passes, then the file can no longer be run: the exec fails.
+    install_script(
+        &d.exe,
+        NEXT,
+        "if [ \"$2\" = --adopt-check ]; then chmod 000 \"$0\"; exit 0; fi\n",
+    );
+    let _window = d.connect(Presence::Person);
+    // A click: no quiet, so the open window does not hold it.
+    let _ = d.arm_with(true, false);
+    d.wait_for_log("could not be started");
+    assert_eq!(d.starts(), 1);
+    // Put the binary back, and let the timer ask: held by the window, as a new arm is.
+    std::fs::set_permissions(&d.exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    install_script(&d.exe, NEXT, "");
+    let why = match d.arm_unattended() {
+        Some(ControlResponse::RestartArmed {
+            waiting_on: Some(why),
+            ..
+        }) => why,
+        other => panic!("the timer's ask was not held: {other:?}"),
+    };
+    assert!(why.contains("window is open"), "{why}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        d.starts(),
+        1,
+        "the click's permission outlived its arm: {}",
+        d.log_text()
+    );
 }

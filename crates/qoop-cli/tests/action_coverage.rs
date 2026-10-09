@@ -381,6 +381,8 @@ fn actions() -> Vec<Action> {
                 Method::Control(ControlRequest::RestartWhenSafe {
                     id: "a".into(),
                     version: "0.0.0".into(),
+                    keep_tabs: false,
+                    quiet: false,
                 })
             },
         },
@@ -626,6 +628,8 @@ fn every_control_method_is_reachable_from_some_action() {
         ControlRequest::RestartWhenSafe {
             id: String::new(),
             version: String::new(),
+            keep_tabs: false,
+            quiet: false,
         },
         ControlRequest::TaskWrite {
             id: String::new(),

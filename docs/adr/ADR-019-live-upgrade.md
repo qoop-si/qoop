@@ -107,3 +107,17 @@ daemon that can hand its tabs to the new binary does it at once and they keep ru
 other waits for the first moment nothing there is working. The refusals quoted above are
 history. The daemon still downloads nothing: `qoop update` does, and the daemon only checks that the
 file on disk is the version it was asked to move onto.
+
+## Amendment, 2026-10-10: the daemon schedules the update, a child does it
+
+"The daemon does not check for versions" is superseded in a narrow way. A release build's daemon
+starts `qoop update --auto` as a separate process 3 to 10 minutes after it starts and every six
+hours, so the network, the checksum and the swap stay out of the daemon, and a hung or failing
+check cannot hurt it (the child is killed after ten minutes, and `no-auto-update` in the config
+directory turns it off). What the daemon adds is only the rules of the move. `RestartWhenSafe`
+carries `keep_tabs` (never end a tab: the move happens only when every tab can be handed over
+live) and `quiet` (only with no client connected, since a live move cuts every client's
+connection), so an update nobody asked for by hand ends no agent and closes no window. A person
+who runs `qoop update` still allows the old way, as before. The daemon checks the binary on disk
+exactly as it did, and a binary that was not built by the release script never starts the
+child.

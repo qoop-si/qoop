@@ -21,7 +21,7 @@ fn places() -> Vec<Place> {
     vec![
         Place {
             name: "config",
-            what: "your settings: config.toml, remotes, paired phones, hooks",
+            what: "your settings: config.toml, remotes, paired phones, hooks, no-auto-update",
             path: Some(paths::config_dir()),
         },
         Place {
@@ -44,7 +44,7 @@ fn places() -> Vec<Place> {
         },
         Place {
             name: "logs",
-            what: "the bridge, hub and tunnel logs",
+            what: "the bridge, hub and tunnel logs, update.log",
             path: paths::logs_dir(),
         },
         Place {

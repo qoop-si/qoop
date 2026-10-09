@@ -373,7 +373,15 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         let daemon = match Daemon::bind_adopting(&dir, &state, &shell(), handed).await {
             Ok(d) => match exe {
-                Ok(exe) => d.leaving_when_idle().restarting_into(exe),
+                Ok(exe) => {
+                    // Only a binary the release script built looks for newer ones: a
+                    // build made by hand, a test's, a copy someone put on their PATH never
+                    // forks a child on its own.
+                    if update::release_built() {
+                        tokio::spawn(update::auto_timer(exe.clone()));
+                    }
+                    d.leaving_when_idle().restarting_into(exe)
+                }
                 Err(e) => {
                     eprintln!("qoopd: where this binary is could not be read: {e}");
                     d.leaving_when_idle()
@@ -3527,6 +3535,8 @@ mod tests {
         let request = ControlRequest::RestartWhenSafe {
             id: "ask-1".into(),
             version: "9.9.9".into(),
+            keep_tabs: false,
+            quiet: false,
         };
         let daemon = async move {
             let mut read = [0u8; 4096];

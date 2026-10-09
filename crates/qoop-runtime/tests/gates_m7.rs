@@ -193,6 +193,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         ControlRequest::RestartWhenSafe {
             id: "x27".into(),
             version: "0.0.0".into(),
+            keep_tabs: false,
+            quiet: false,
         },
         // A task is a record about the work: text kept by the daemon, never typed.
         ControlRequest::TaskWrite {

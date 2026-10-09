@@ -216,6 +216,12 @@ impl TestDaemon {
     }
 
     pub async fn start_with_shell(shell: &Path) -> Self {
+        Self::start_moving_onto(shell, None).await
+    }
+
+    /// A daemon that can be asked to move onto the binary at `exe` (`RestartWhenSafe`), which
+    /// is a stand-in the test wrote: a move that happens replaces this very process.
+    pub async fn start_moving_onto(shell: &Path, exe: Option<&Path>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         // `tempdir` creates 0755 and the daemon refuses anything group or other accessible.
         // Tightening here rather than loosening the check is the point.
@@ -226,6 +232,10 @@ impl TestDaemon {
         let daemon = {
             let _binding = BINDING.lock().await;
             let daemon = Daemon::bind(dir.path(), shell).await.expect("bind");
+            let daemon = match exe {
+                Some(exe) => daemon.restarting_into(exe.to_path_buf()),
+                None => daemon,
+            };
             // A bind opens nothing by itself now; the tests were written against a daemon
             // that always had terminal 1, and that is still the daemon they start.
             daemon.open_first_terminal().await.expect("first terminal");

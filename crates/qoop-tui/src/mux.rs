@@ -155,6 +155,10 @@ fn restart_when_safe(version: String) -> ControlRequest {
     ControlRequest::RestartWhenSafe {
         id: RESTART_ID.into(),
         version,
+        // Nobody at that machine asked for this: its tabs are never ended, and a window of
+        // a person there is never closed. Its own link to this Mac is not one.
+        keep_tabs: true,
+        quiet: true,
     }
 }
 
@@ -2939,6 +2943,8 @@ mod tests {
             asked.contains(&ControlRequest::RestartWhenSafe {
                 id: RESTART_ID.into(),
                 version: "9.0.0".into(),
+                keep_tabs: true,
+                quiet: true,
             }),
             "{asked:?}"
         );

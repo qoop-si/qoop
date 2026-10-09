@@ -408,9 +408,19 @@ pub enum ControlRequest {
     /// new binary with the same numbers, each agent resumed into its own conversation; a tab
     /// asleep stays asleep. Asking again while it waits is answered with what it is waiting
     /// on.
+    ///
+    /// `keep_tabs` and `quiet` are for a move nobody asked for by hand. `keep_tabs`: never end
+    /// a tab, so the daemon moves only when it can hand every tab over live. `quiet`: move
+    /// only with no client connected, since a live move cuts every client's connection. Asked
+    /// again while it waits, a later ask can only weaken them. A daemon from before them
+    /// ignores both, which is why a sender checks the version it runs first.
     RestartWhenSafe {
         id: String,
         version: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_tabs: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quiet: bool,
     },
     /// Write to a task: open one, move it, record its plan, evidence or done claim, or
     /// close it.
@@ -1501,6 +1511,47 @@ mod tests {
         assert_eq!(explained.source.as_deref(), Some("ScreenHeuristic"));
         assert_eq!(explained.rule.as_deref(), Some("needs_approval"));
         assert_eq!(explained.manifest.as_deref(), Some("claude"));
+    }
+
+    /// The two promises of an unattended move are new: a request without them reads as it
+    /// always did (neither), one with neither on the wire is the old bytes, and a daemon from
+    /// before them, which ignores keys it does not know, reads the same request without them.
+    #[test]
+    fn a_restart_ask_without_the_promises_is_the_old_ask() {
+        let old: ControlRequest =
+            serde_json::from_str(r#"{"op":"RestartWhenSafe","id":"u","version":"1.0.0"}"#)
+                .expect("decode");
+        assert!(matches!(
+            old,
+            ControlRequest::RestartWhenSafe {
+                keep_tabs: false,
+                quiet: false,
+                ..
+            }
+        ));
+        let plain = serde_json::to_string(&old).expect("encode");
+        assert!(
+            !plain.contains("keep_tabs") && !plain.contains("quiet"),
+            "{plain}"
+        );
+        let kept = ControlRequest::RestartWhenSafe {
+            id: "u".into(),
+            version: "1.0.0".into(),
+            keep_tabs: true,
+            quiet: true,
+        };
+        let wire = serde_json::to_string(&kept).expect("encode");
+        assert!(wire.contains(r#""keep_tabs":true"#) && wire.contains(r#""quiet":true"#));
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(&wire).expect("decode"),
+            kept
+        );
+        // What an older daemon does with a key it does not know.
+        let ignored: ControlRequest = serde_json::from_str(
+            r#"{"op":"ListWorkspaces","id":"x","keep_tabs":true,"quiet":true}"#,
+        )
+        .expect("an unknown key is ignored");
+        assert!(matches!(ignored, ControlRequest::ListWorkspaces { .. }));
     }
 
     /// A sleeping row carries when it slept; a row from an older daemon

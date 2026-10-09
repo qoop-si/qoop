@@ -380,6 +380,22 @@ impl ConnectionRegistry {
             .count()
     }
 
+    /// [`holders`](Self::holders) without the reconnecting links the Mac keeps to this
+    /// machine (their hello names a link they `replaces`): they come back by themselves
+    /// after a move, a person's own window does not. What a move nobody asked for waits on.
+    pub fn quiet_holders(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.welcomed.load(Ordering::Relaxed)
+                    && !c.observer.load(Ordering::Relaxed)
+                    && c.replaces.get().is_none()
+            })
+            .count()
+    }
+
     /// Connections accepted whose hello has not been answered yet.
     pub fn pending(&self) -> usize {
         self.inner
@@ -1292,6 +1308,7 @@ impl Daemon {
     /// it the request is refused.
     pub fn restarting_into(self, exe: PathBuf) -> Self {
         let _ = self.books.restart.exe.set(exe);
+        let _ = self.books.restart.connections.set(self.connections.clone());
         if let Some(dir) = self.socket.parent() {
             let _ = self.books.restart.dir.set(dir.to_path_buf());
         }
@@ -4683,7 +4700,12 @@ async fn handle_control(
                 waiting_on: None,
             }
         }
-        ControlRequest::RestartWhenSafe { version, .. } => {
+        ControlRequest::RestartWhenSafe {
+            version,
+            keep_tabs,
+            quiet,
+            ..
+        } => {
             let restart = &books.restart;
             let Some(exe) = restart.exe.get().cloned() else {
                 return ControlResponse::Failed {
@@ -4707,20 +4729,39 @@ async fn handle_control(
             let mut waiting = restart.waiting.subscribe();
             // Under the lock, so a task calling the move off for an older request either
             // sees this one and carries on, or has let go of `armed` and one starts here.
-            let start = {
+            let (start, wake) = {
+                use std::sync::atomic::Ordering::SeqCst;
                 let mut arms = restart.wanted.lock().unwrap();
+                // Only a live arm for this very version keeps what it was promised: a
+                // timer's ask never undoes a click's. One that was called off, or was for
+                // another version, leaves nothing behind for this ask to inherit.
+                let same = restart.armed.load(SeqCst) && arms.1 == wanted;
                 arms.0 += 1;
                 arms.1 = wanted.clone();
-                restart
-                    .no_handoff
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                restart
-                    .failures
-                    .store(0, std::sync::atomic::Ordering::SeqCst);
-                !restart
-                    .armed
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                let (was_keep, was_quiet) = (restart.keeps_tabs(), restart.quiet.load(SeqCst));
+                let (keep, quiet) = if same {
+                    (was_keep && keep_tabs, was_quiet && quiet)
+                } else {
+                    (keep_tabs, quiet)
+                };
+                restart.keep_tabs.store(keep, SeqCst);
+                restart.quiet.store(quiet, SeqCst);
+                let reset = restart.no_handoff.swap(false, SeqCst);
+                let failed = restart.failures.swap(0, SeqCst) > 0;
+                let start = !restart.armed.swap(true, SeqCst);
+                (
+                    start,
+                    !start && (reset || failed || (keep, quiet) != (was_keep, was_quiet)),
+                )
             };
+            if wake {
+                // What the task is waiting on was true of the ask before this one: look
+                // again now, and answer with what the look finds.
+                restart.waiting.send_replace(None);
+                waiting.mark_unchanged();
+                restart.wake.notify_one();
+                let _ = tokio::time::timeout(FIRST_LOOK_PATIENCE, waiting.changed()).await;
+            }
             if start {
                 // What an earlier arm left (a move called off, an exec that failed) is not
                 // what this one is waiting on.
@@ -5865,6 +5906,17 @@ pub struct Restart {
     /// off until somebody asks again, which the count tells apart from a request that
     /// came in meanwhile.
     wanted: std::sync::Mutex<(u64, String)>,
+    /// What the live arm promised, as the asks for its version said: never end a tab, and move
+    /// only with no client connected. Changed only under the `wanted` lock, and an ask for the
+    /// version already armed can only clear them (a click or `qoop update` weakens what a
+    /// timer's ask set, never the other way round).
+    keep_tabs: std::sync::atomic::AtomicBool,
+    quiet: std::sync::atomic::AtomicBool,
+    /// Rung when an ask changes what the armed task would do, so it looks at once and not at
+    /// the next event or minute.
+    wake: tokio::sync::Notify,
+    /// The connections, to tell a quiet move whether a window is open. Set with `exe`.
+    connections: std::sync::OnceLock<Arc<ConnectionRegistry>>,
 }
 
 impl Default for Restart {
@@ -5880,6 +5932,10 @@ impl Default for Restart {
             gate: std::sync::atomic::AtomicBool::new(false),
             waiting: watch::channel(None).0,
             wanted: std::sync::Mutex::default(),
+            keep_tabs: std::sync::atomic::AtomicBool::new(false),
+            quiet: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            connections: std::sync::OnceLock::new(),
         }
     }
 }
@@ -5889,7 +5945,28 @@ impl Restart {
     fn gated(&self) -> bool {
         self.gate.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn keeps_tabs(&self) -> bool {
+        self.keep_tabs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the arm is a quiet one and a client is, or is just about to be, connected.
+    /// Accepted but not yet welcomed counts: an exec drops it mid handshake.
+    fn window_holds(&self) -> bool {
+        self.quiet.load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .connections
+                .get()
+                .is_some_and(|c| c.quiet_holders() + c.pending() > 0)
+    }
 }
+
+/// Why a quiet arm waits.
+const WINDOW_OPEN: &str = "a qoop window is open here, the restart is offered in its foot";
+
+/// Why an arm that never ends a tab waits for a binary that cannot take tabs over.
+const NOT_LIVE: &str = "this qoop cannot hand its tabs over live; `qoop update` restarts idle \
+                        agents, only when you run it";
 
 impl Bookkeeping {
     pub fn new(
@@ -7165,6 +7242,25 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                 Ok(Moving {
                     handed: Some(handed),
                     ..
+                }) if into.books.restart.window_holds() => {
+                    // The hand over took seconds, and a window attached meanwhile would die
+                    // at the exec: every paused tab carries on, the gate comes down so a
+                    // tab can be made again, and the arm stays and waits. Not `call_off`,
+                    // which is the failed exec's and ends the arm.
+                    into.books
+                        .restart
+                        .gate
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    into.books
+                        .restart
+                        .waiting
+                        .send_replace(Some(WINDOW_OPEN.into()));
+                    eprintln!("qoopd: the move onto the new version waits: {WINDOW_OPEN}");
+                    drop(handed);
+                }
+                Ok(Moving {
+                    handed: Some(handed),
+                    ..
                 }) => {
                     // Only returns when the exec did not happen: the file is gone, the
                     // descriptors closed, and every paused tab carries on as it was.
@@ -7208,6 +7304,7 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                 }
             }
             _ = tokio::time::sleep(LOOK_AGAIN_AFTER) => {}
+            _ = into.books.restart.wake.notified() => {}
         }
         // Longer after every hand over that failed with tabs parked: each try freezes
         // every tab that answered, so a tab that cannot be paused must not make them
@@ -7261,6 +7358,11 @@ async fn restart_look(
     replaced: &mut Option<u64>,
 ) -> Result<Moving, String> {
     let books = &into.books;
+    // Before anything is locked or looked at: a move nobody asked for by hand does not
+    // start while a person has qoop open.
+    if books.restart.window_holds() {
+        return Err(WINDOW_OPEN.into());
+    }
     let mut held = BTreeMap::new();
     lock_spaces(books, &mut held).await?;
     // Only what is awake is looked at and written down. A tab marked asleep is not running,
@@ -7280,6 +7382,12 @@ async fn restart_look(
         .no_handoff
         .load(std::sync::atomic::Ordering::SeqCst)
         && handoff_on_disk(exe).await;
+    // The old way ends every tab and brings it back: not for a move that promised no tab
+    // would be ended, whatever the reason it cannot go live (this covers the latch set
+    // after failed hand overs too, which looks again through here).
+    if books.restart.keeps_tabs() && !live {
+        return Err(NOT_LIVE.into());
+    }
     // Handed over, a tab is not asked to be idle: it keeps running through the move.
     let checkpoints = if live {
         Vec::new()
@@ -7318,6 +7426,10 @@ async fn restart_look(
         lock_spaces(books, &mut held).await?;
         if awake() != streams {
             return Err("a tab came or went while the tabs were written down".into());
+        }
+        // A window that came during the look: after this the tabs are ended or parked.
+        if books.restart.window_holds() {
+            return Err(WINDOW_OPEN.into());
         }
         if live {
             // Nothing is ended, so nothing says the daemon is going: a tab ending now is
@@ -7523,11 +7635,6 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
         .get()
         .cloned()
         .ok_or("this daemon does not know its runtime directory")?;
-    eprintln!("qoopd: taking the startup lock to hand the tabs over");
-    let startup =
-        take_startup_lock(&dir, tokio::time::Instant::now() + STARTUP_LOCK_PATIENCE).await?;
-    // From here tabs are parked, so one deadline for everything that follows.
-    let deadline = tokio::time::Instant::now() + HANDOVER_PATIENCE;
     let (streams, left): (Vec<u32>, Vec<u32>) = streams.iter().partition(|stream| {
         adoptable(
             into.agents.master_of(**stream),
@@ -7535,6 +7642,16 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
         )
         .is_ok()
     });
+    // Before the lock is taken and before anything is paused: the move that promised no tab
+    // would be ended does not go on with one that would be.
+    if let Some(stream) = left.first().filter(|_| restart.keeps_tabs()) {
+        return Err(format!("tab {stream} cannot be handed over live"));
+    }
+    eprintln!("qoopd: taking the startup lock to hand the tabs over");
+    let startup =
+        take_startup_lock(&dir, tokio::time::Instant::now() + STARTUP_LOCK_PATIENCE).await?;
+    // From here tabs are parked, so one deadline for everything that follows.
+    let deadline = tokio::time::Instant::now() + HANDOVER_PATIENCE;
     if !left.is_empty() {
         eprintln!("qoopd: tabs {left:?} cannot be handed over and are ended by the move");
         let table = fresh_process_table().await?;

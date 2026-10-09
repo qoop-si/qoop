@@ -98,8 +98,53 @@ row in `docs/cli-surface.md`, and the gate asserts the failure.
 The foot of the left column signs the build it is (`qoop 0.3.1`), and when a
 check saw something newer it signs where this build stands
 (`qoop 0.3.1>0.4.0`). `ctrl-a U` says the same in words: which release is
-waiting and that installing it means running `qoop update` outside. There is no background
-check and no prompt to restart: eight terminals open and nobody typing still costs nothing.
+waiting and that installing it means running `qoop update` outside. The interface itself
+never checks: eight terminals open and nobody typing still costs nothing. A release build's
+daemon does, next section.
+
+## Updating on its own
+
+A binary the release script built (it sets `QOOP_RELEASE_BUILD=1`; no other build has it, a
+copy made by hand included) has its daemon start `qoop update --auto` 3 to 10 minutes after
+the daemon starts and every six hours after that. The daemon only schedules: the child does
+the network, the install and the ask, is killed after ten minutes, and appends what it says
+to `update.log` in the logs directory (`qoop paths logs`; moved aside at 100 KB). A file
+named `no-auto-update` in the config directory (`qoop paths config`) turns it off; it is
+looked for at every tick, so no restart is needed.
+
+`--auto` is `qoop update` with these differences, and it is not in `--help`:
+
+- It does nothing at all in a build without the release mark, when the directory of the
+  binary is not the user's to write, or when there is no release for the platform.
+- It refuses a release that lists no checksum, and one whose binary speaks another codec
+  generation than this one (that is left to `qoop update`, with the usual notice).
+- The swap lock (`.qoop-swap.lock`, the directory the update of a remote takes) is held only
+  for the swap. When another update holds it, `--auto` gives way and logs it.
+- It asks only this machine's daemon, never the saved remotes, and it asks as a watcher, so it
+  is not a window.
+- The ask promises that no tab is ended and no window is closed. The daemon then moves only
+  when it can hand every tab over live, and only with no `qoop` window, `qoop attach` or phone
+  stream connected (watchers, such as the notch and the phone bridge's own, and the Mac's
+  reconnecting link to a remote do not count). Otherwise it stays on the old version and says
+  why in the answer, and looks again within a minute of whatever held it going away. A
+  window that connects while the tabs are being handed over drops the move, and every tab
+  carries on.
+- Asked with nothing newer released, it asks again whenever the daemon runs an older version
+  than the file on disk, so a machine that missed its move catches up within one tick.
+
+A daemon from before 0.9.2 ignores the promises, so it is never sent them; it moves when
+`qoop update` is run by hand. The push to a remote carries the same two promises. A person's
+own `qoop` window on that machine (an ssh session) holds the push; the Mac's own reconnecting
+link does not.
+
+Trust is TLS plus the checksum beside each tarball. It catches corruption, not a compromised
+host: the opt out file is the answer for anyone who wants to decide each update by hand. A
+release that must not spread is removed from the host (the hub falls back to the one before
+it, and a downgrade is never installed).
+
+Each move leaves one zombie process, the finished `--auto` child that asked for it: the
+daemon becomes the new binary in place and nothing reaps it. It is harmless and goes with the
+daemon.
 
 ## Other machines follow this one
 
@@ -138,7 +183,8 @@ the new one, nothing is ended: commands, agents and their conversations simply c
 section). Otherwise nothing that is working is ended, but idle tabs are ended and restored
 and every agent is resumed in its own conversation. Either way a `qoop` window open on that
 machine closes (run `qoop` again, everything is back), and a window attached to a remote
-reconnects by itself. The remote's bridge service, when it has
+reconnects by itself. (The automatic path never does this: [Updating on its
+own](#updating-on-its-own).) The remote's bridge service, when it has
 one, is put back on the new file in the same step, since launchd refuses to start a service
 whose program file was replaced.
 

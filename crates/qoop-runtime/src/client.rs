@@ -221,6 +221,18 @@ where
     handshake_as(stream, client_id, false, replaces).await
 }
 
+/// [`handshake`] as one that only watches, over any byte stream: the asker of a move that
+/// must not count as a window of its own.
+pub async fn handshake_observer<S>(
+    stream: S,
+    client_id: &str,
+) -> io::Result<(S, BytesMut, qoop_proto::ServerWelcome)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    handshake_as(stream, client_id, true, None).await
+}
+
 async fn handshake_as<S>(
     mut stream: S,
     client_id: &str,
