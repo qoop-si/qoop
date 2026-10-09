@@ -70,7 +70,7 @@ mkdir -p "$T/home"
 sh scripts/install.sh >/dev/null || fail "happy path exited nonzero"
 [ -x "$QOOP_DEST" ] || fail "binary missing at QOOP_DEST"
 [ "$("$QOOP_DEST" --version)" = "qoop 9.9.9" ] || fail "installed binary reports wrong version"
-[ "$(readlink "$T/dest/qoro")" = "qoop" ] || fail "the old name is not a link to qoop"
+[ ! -e "$T/dest/qoro" ] && [ ! -L "$T/dest/qoro" ] || fail "a fresh install left the old name behind"
 grep -q "hooks install" "$T/calls" || fail "hooks install was not delegated"
 grep -q "skills install" "$T/calls" || fail "skills install was not delegated"
 grep -q "bridge reload" "$T/calls" || fail "bridge reload was not delegated"
@@ -121,12 +121,12 @@ if [ "$(uname -s)" = "Darwin" ]; then rc=.bash_profile; else rc=.bashrc; fi
 case "$out" in *">> ~/$rc"*) ;; *) fail "wrong profile for bash: $out" ;; esac
 
 # A file of the person's beside the destination is never staged over or removed, and nothing
-# but the binary and its old-name link is left there.
+# but the binary is left there.
 mkdir -p "$T/dest7"
 echo keep > "$T/dest7/qoop.qoop-new"
 QOOP_DEST="$T/dest7/qoop" sh scripts/install.sh >/dev/null || fail "install beside a stray file exited nonzero"
 [ "$(cat "$T/dest7/qoop.qoop-new")" = keep ] || fail "a file beside the destination was touched"
-[ "$(find "$T/dest7" -type f -o -type l | wc -l | tr -d ' ')" = 3 ] || fail "install left stray files in dest7"
+[ "$(find "$T/dest7" -type f -o -type l | wc -l | tr -d ' ')" = 2 ] || fail "install left stray files in dest7"
 
 # A manifest that points outside its own base is refused before anything is downloaded.
 mkdir -p "$T/elsewhere"

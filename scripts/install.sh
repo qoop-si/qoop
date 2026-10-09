@@ -232,12 +232,6 @@ main() {
     mv "$TMPNEW" "$DEST"
     TMPNEW=""
     echo "installed $("$DEST" --version) to $DEST"
-    # The old name stays a link to the new one: agents already running, scripts and machines
-    # not yet updated still say `qoro`.
-    old="$(dirname "$DEST")/qoro"
-    if [ "$(basename "$DEST")" = "qoop" ] && [ ! -e "$old" ] && [ ! -L "$old" ]; then
-        ln -s qoop "$old"
-    fi
 
     # A first install: no config.toml and no pet yet, read before the steps below, which may
     # write the config (the notch). A binary that says nothing (the install check) is not one.
