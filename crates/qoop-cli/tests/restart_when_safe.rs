@@ -1632,6 +1632,15 @@ impl Daemon {
 
     /// As `qoop update --auto` asks: a watcher, so the asker is not itself an open window.
     fn arm_with(&self, keep_tabs: bool, quiet: bool) -> Option<ControlResponse> {
+        self.ask_as_watcher(ControlRequest::RestartWhenSafe {
+            id: format!("arm-{}", unique()),
+            version: NEXT.into(),
+            keep_tabs,
+            quiet,
+        })
+    }
+
+    fn ask_as_watcher(&self, request: ControlRequest) -> Option<ControlResponse> {
         let socket = self.socket();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1642,16 +1651,7 @@ impl Daemon {
                 .await
                 .ok()?;
             let mut c = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
-            c.control(
-                &ControlRequest::RestartWhenSafe {
-                    id: format!("arm-{}", unique()),
-                    version: NEXT.into(),
-                    keep_tabs,
-                    quiet,
-                },
-                Duration::from_secs(30),
-            )
-            .await
+            c.control(&request, Duration::from_secs(30)).await
         })
     }
 
@@ -1961,4 +1961,58 @@ fn flags_of_a_click_do_not_outlive_the_arm_it_made() {
         "the click's permission outlived its arm: {}",
         d.log_text()
     );
+}
+
+/// A quiet ask for the version a daemon already runs is how the update that finishes a
+/// reload of the bridge and the notch learns nobody would be cut off: answered with what
+/// holds it if a person is connected, with nothing if not. Watchers and the Mac's own
+/// reconnecting link are nobody.
+#[test]
+fn a_quiet_ask_for_the_version_already_running_says_whether_a_person_is_connected() {
+    let d = Daemon::start_installed();
+    let asks = |d: &Daemon| match d.ask_as_watcher(ControlRequest::RestartWhenSafe {
+        id: format!("probe-{}", unique()),
+        version: VERSION.into(),
+        keep_tabs: true,
+        quiet: true,
+    }) {
+        Some(ControlResponse::RestartArmed { waiting_on, .. }) => waiting_on,
+        other => panic!("not armed: {other:?}"),
+    };
+    assert_eq!(asks(&d), None);
+    let _watcher = d.connect(Presence::Watcher);
+    let _link = d.connect(Presence::Link("mac-link"));
+    assert_eq!(asks(&d), None, "held by a watcher or a link");
+    let window = d.connect(Presence::Person);
+    let held = asks(&d).expect("a person is connected");
+    assert!(held.contains("window is open"), "{held}");
+    drop(window);
+    assert_eq!(asks(&d), None);
+    assert_eq!(d.starts(), 1);
+}
+
+/// Turning automatic updates off calls off a move an earlier tick armed, at the next look,
+/// not at the next tick of the timer; a move asked for by hand is not touched by the file.
+#[test]
+fn the_opt_out_file_calls_off_an_unattended_move_already_waiting() {
+    let d = Daemon::start();
+    let window = d.connect(Presence::Person);
+    assert!(d.arm_unattended().is_some());
+    assert_eq!(d.starts(), 1);
+
+    let file = d.dir.path().join("config/qoop/no-auto-update");
+    std::fs::create_dir_all(file.parent().expect("dir")).expect("config dir");
+    std::fs::write(&file, "").expect("opt out");
+    // A look happens when a tab changes.
+    d.send(1, "true");
+    d.wait_for_log("is called off: automatic updates are turned off here");
+    drop(window);
+    d.send(1, "true");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(d.starts(), 1, "moved after the opt out: {}", d.log_text());
+
+    // A person's own ask is theirs: it arms again and moves, the file notwithstanding.
+    let _ = d.arm(NEXT);
+    wait_for_starts(&d, 2, Duration::from_secs(30));
+    assert_eq!(d.starts(), 2, "{}", d.log_text());
 }

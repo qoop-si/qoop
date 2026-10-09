@@ -1212,6 +1212,17 @@ pub fn readiness_of(
     }
 }
 
+/// The first daemon version that keeps what `RestartWhenSafe`'s `keep_tabs` and `quiet` promise.
+/// An older one ignores both fields and moves the old way (tabs ended, windows closed), so no
+/// move nobody asked for by hand is ever sent to it.
+pub const KEEPS_PROMISES_FROM: &str = "0.9.2";
+
+/// Whether a daemon running `version` keeps those promises.
+pub fn keeps_promises(version: &str) -> bool {
+    crate::paths::parse_version(version)
+        .is_some_and(|v| Some(v) >= crate::paths::parse_version(KEEPS_PROMISES_FROM))
+}
+
 /// Whether a refusal is a daemon older than the request: it says `unknown variant`, and when
 /// the request is a single one that `variant` names, that it is that one. A daemon that could
 /// not read the request's id answers with none, so callers match on this and not on the id.

@@ -2469,7 +2469,9 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     // A terminal in front of the person that draws all the time, as an agent at work does.
     ui.type_in(b"i=0; while :; do i=$((i+1)); echo tick$i; sleep 0.1; done\n");
-    let waiting = "waiting on tab 9: sleep is running in it";
+    // The played daemon welcomes as 0.0.1, which predates the promises of a move nobody asked
+    // for by hand, so it is not asked and the Mac says so instead.
+    let waiting = "old runs qoop 0.0.1, which moves onto the new one when you run `qoop update`";
     assert!(
         ui.wait_for(waiting, Duration::from_secs(40)).is_some(),
         "the line never painted: {}\n{}",

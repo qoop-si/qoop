@@ -110,7 +110,9 @@ the daemon starts and every six hours after that. The daemon only schedules: the
 the network, the install and the ask, is killed after ten minutes, and appends what it says
 to `update.log` in the logs directory (`qoop paths logs`; moved aside at 100 KB). A file
 named `no-auto-update` in the config directory (`qoop paths config`) turns it off; it is
-looked for at every tick, so no restart is needed.
+looked for at every tick and at every look of a move that is waiting, so no restart is needed
+and a move an earlier tick armed is called off (a move asked for by hand is not). This all
+works from 0.9.2 on.
 
 `--auto` is `qoop update` with these differences, and it is not in `--help`:
 
@@ -122,6 +124,12 @@ looked for at every tick, so no restart is needed.
   for the swap. When another update holds it, `--auto` gives way and logs it.
 - It asks only this machine's daemon, never the saved remotes, and it asks as a watcher, so it
   is not a window.
+- It does not reload the notch and the phone's bridge service at the swap, which would cut a
+  phone's live stream: it leaves a mark (`reload-pending` beside the notice). A run that finds
+  the mark does the reload once the daemon runs the new version and no client is connected,
+  which is right after the move when the move went through, and otherwise at a later tick.
+  Until then the bridge and the notch run the binary before. A swap by hand (`qoop update`)
+  still reloads them at once.
 - The ask promises that no tab is ended and no window is closed. The daemon then moves only
   when it can hand every tab over live, and only with no `qoop` window, `qoop attach` or phone
   stream connected (watchers, such as the notch and the phone bridge's own, and the Mac's
@@ -133,9 +141,13 @@ looked for at every tick, so no restart is needed.
   than the file on disk, so a machine that missed its move catches up within one tick.
 
 A daemon from before 0.9.2 ignores the promises, so it is never sent them; it moves when
-`qoop update` is run by hand. The push to a remote carries the same two promises. A person's
-own `qoop` window on that machine (an ssh session) holds the push; the Mac's own reconnecting
-link does not.
+`qoop update` is run by hand. The same goes for the Mac's push to a remote: when the remote's
+daemon is older than 0.9.2 only the file is swapped there (the hint row says the daemon
+moves when you run `qoop update`), and from 0.9.2 on the push carries the same two promises.
+A person's own `qoop` window on that machine (an ssh session) holds the push; the Mac's own
+reconnecting link does not. A push does not reload the bridge there either: it leaves the
+mark, which that machine's own check acts on, so a remote whose daemon has no check needs
+`qoop bridge reload` there.
 
 Trust is TLS plus the checksum beside each tarball. It catches corruption, not a compromised
 host: the opt out file is the answer for anyone who wants to decide each update by hand. A

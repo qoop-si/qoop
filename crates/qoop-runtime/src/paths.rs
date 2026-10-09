@@ -117,6 +117,11 @@ pub fn config_dir() -> PathBuf {
     )
 }
 
+/// The file whose presence turns automatic updates off on this machine.
+pub fn no_auto_update_path() -> PathBuf {
+    config_dir().join("no-auto-update")
+}
+
 /// The same answer from given values, so a test never sets the process environment.
 fn config_dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
     xdg.map(PathBuf::from)

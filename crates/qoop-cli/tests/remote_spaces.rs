@@ -711,7 +711,8 @@ async fn install_onto_a_bare_machine(tui: &mut Tui, bare: &Path) {
 
 /// A machine whose qoop is older than this one, running a daemon from before
 /// `RestartWhenSafe`: the release of this version is put on its disk once, in place of the
-/// old file, and the ask to move is refused and said once. The link coming back after that
+/// old file, and its daemon is not asked to move (it would ignore that a move nobody asked
+/// for ends no tab and closes no window): that is said once. The link coming back after that
 /// pushes nothing and asks nothing again, and the machine of the same version never had
 /// anything pushed at all.
 async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
@@ -762,17 +763,16 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
                 {
                     panic!("the older machine was not added: {reason}")
                 }
-                Incoming::Control(ControlResponse::Failed { id, reason })
-                    if id == "remote-update" =>
-                {
-                    Some(reason.clone())
-                }
+                Incoming::Control(ControlResponse::RestartArmed {
+                    id,
+                    waiting_on: Some(line),
+                }) if id == "remote-update" => Some(line.clone()),
                 _ => None,
             },
         )
         .await;
     assert!(
-        said.starts_with("old.example ") && said.contains("next restarts its qoop"),
+        said.starts_with("old.example ") && said.contains("when you run `qoop update`"),
         "{said}"
     );
     assert_eq!(
@@ -786,7 +786,11 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(left, vec!["qoop".to_string()], "a staged copy was left");
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "an old daemon was asked to move"
+    );
 
     // Still connected, more traffic to that machine: its refusals are its own, and the ask
     // to move is neither repeated nor said again.
@@ -815,6 +819,11 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
                 {
                     panic!("said again: {reason}")
                 }
+                Incoming::Control(ControlResponse::RestartArmed { id, .. })
+                    if id == "remote-update" =>
+                {
+                    panic!("said again")
+                }
                 _ => None,
             },
         )
@@ -824,7 +833,7 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
         "old.example runs an older qoop that cannot do this yet"
     );
     assert_eq!(welcomed.load(Ordering::SeqCst), 1, "the link dropped");
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked to move again");
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "asked to move");
 
     // The daemon goes away and the link comes back to one still on 0.0.1: nothing is
     // pushed or asked again.
@@ -843,9 +852,12 @@ async fn push_onto_an_older_machine(tui: &mut Tui, old: &Path, swaps: &Path) {
         if let Incoming::Control(ControlResponse::Failed { id, reason }) = incoming {
             assert_ne!(id, "remote-update", "said again: {reason}");
         }
+        if let Incoming::Control(ControlResponse::RestartArmed { id, .. }) = incoming {
+            assert_ne!(id, "remote-update", "said again");
+        }
     })
     .await;
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked to move again");
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "asked to move");
     let swapped = std::fs::read_to_string(swaps).unwrap_or_default();
     assert_eq!(
         swapped.lines().collect::<Vec<_>>(),

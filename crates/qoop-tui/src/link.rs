@@ -364,9 +364,10 @@ pub enum Update {
 /// otherwise be handed whatever was built here last. The qoop replaced is the one
 /// `remote_command` runs, swapped atomically beside itself, and only while it still says it
 /// is the version this asked about; one that changed meanwhile (another window or another
-/// Mac swapped first) counts as done. A qoop there as new as this one, or newer, is left
+/// Mac swapped first) counts as done. `reload` is whether the bridge service there is put back
+/// on the new file at once: only for an update a person asked for. A qoop there as new as this one, or newer, is left
 /// alone: nothing is ever moved backwards.
-pub async fn update(target: &str, version: &str) -> io::Result<Update> {
+pub async fn update(target: &str, version: &str, reload: bool) -> io::Result<Update> {
     let Probe::Ready { version: disk } = probe(target).await? else {
         return Err(io::Error::other("no qoop is there any more"));
     };
@@ -400,7 +401,7 @@ pub async fn update(target: &str, version: &str) -> io::Result<Update> {
         .map_err(io::Error::other)?;
     let swapped = run(
         target,
-        &swap_command(&disk, version, binary.len()),
+        &swap_command(&disk, version, binary.len(), reload),
         Some(binary),
     )
     .await?;
@@ -463,7 +464,10 @@ const SWAPPED_MEANWHILE: i32 = 6;
 /// is not on that machine); what fails is said after the marker and never fails the swap.
 /// It also puts the bridge service there back on the new file: launchd refuses to start a
 /// service whose program file was replaced, so a macOS machine's bridge would otherwise die
-/// at its next start. That reload gets `BRIDGE_WAIT` seconds, kept by a watcher since not
+/// at its next start. That reload is for a swap a person asked for (`$4` is 1): an automatic
+/// one would cut a phone's live stream, so it only leaves a mark (`qoop update --mark-reload`)
+/// for the daemon's own check over there to act on once nothing is connected. The reload gets
+/// `BRIDGE_WAIT` seconds, kept by a watcher since not
 /// every machine has `timeout`, and a reload that fails or runs out is said like the others.
 /// `qoop update` waits out exit 7 by matching its sentence ("update of qoop is in progress"),
 /// so the two are reworded together.
@@ -499,6 +503,10 @@ printf '%s\n' MARKER
 for w in hooks skills; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoop $w install on it"
 done
+if [ "$4" != 1 ]; then
+  "$r" update --mark-reload </dev/null >/dev/null 2>&1 || true
+  exit 0
+fi
 "$r" bridge reload </dev/null >/dev/null 2>&1 &
 b=$!
 ( sleep BRIDGE_WAIT; kill "$b" ) >/dev/null 2>&1 &
@@ -512,9 +520,9 @@ kill "$k" 2>/dev/null || true
 const BRIDGE_WAIT: u32 = if cfg!(test) { 1 } else { 15 };
 
 /// The ssh command for `SWAP`, from the version on disk to `new`, `size` bytes on stdin.
-fn swap_command(disk: &str, new: &str, size: usize) -> String {
+fn swap_command(disk: &str, new: &str, size: usize, reload: bool) -> String {
     format!(
-        "sh -c {} qoop {} {} {}",
+        "sh -c {} qoop {} {} {} {}",
         shell_quote(
             &SWAP
                 .replace("MARKER", RELAY_MARKER)
@@ -522,7 +530,8 @@ fn swap_command(disk: &str, new: &str, size: usize) -> String {
         ),
         shell_quote(disk),
         shell_quote(new),
-        shell_quote(&size.to_string())
+        shell_quote(&size.to_string()),
+        if reload { "1" } else { "0" }
     )
 }
 
@@ -1028,10 +1037,20 @@ mod tests {
     /// Run `SWAP` from `disk` to `new` with `binary` on stdin, in a home of its own and on a
     /// PATH with no qoop on it: the one found is the home's, never one of this machine's.
     fn swap(home: &std::path::Path, disk: &str, new: &str, binary: &[u8]) -> std::process::Output {
+        swap_with(home, disk, new, binary, true)
+    }
+
+    fn swap_with(
+        home: &std::path::Path,
+        disk: &str,
+        new: &str,
+        binary: &[u8],
+        reload: bool,
+    ) -> std::process::Output {
         use std::io::Write;
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(swap_command(disk, new, binary.len()))
+            .arg(swap_command(disk, new, binary.len(), reload))
             .env("HOME", home)
             .env("PATH", "/usr/bin:/bin")
             .stdin(std::process::Stdio::piped())
@@ -1096,12 +1115,27 @@ mod tests {
     fn noting(version: &str) -> Vec<u8> {
         format!(
             "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop {version}';;\n\
-             hooks|skills|bridge) echo \"$*\" >> \"$HOME/ran\"; \
+             hooks|skills|bridge|update) echo \"$*\" >> \"$HOME/ran\"; \
              [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; \
              [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-hang\" ] && exec sleep 30; \
              [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-fail\" ] && exit 1; exit 0;;\nesac\n"
         )
         .into_bytes()
+    }
+
+    /// An automatic swap never reloads the bridge there (a phone's live stream would be cut
+    /// with nobody asked): it leaves the mark for that machine's own check, and the hooks
+    /// and skills are refreshed as ever.
+    #[test]
+    fn an_automatic_swap_marks_the_bridge_for_later_instead_of_reloading_it() {
+        let home = tempfile::tempdir().expect("home");
+        installed(home.path(), &says("0.0.1"));
+        let out = swap_with(home.path(), "0.0.1", "0.0.2", &noting("0.0.2"), false);
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("ran")).expect("ran"),
+            "hooks install\nskills install\nupdate --mark-reload\n"
+        );
     }
 
     /// The qoop just put there refreshes its hooks and skills and reloads its bridge, and a

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use qoop_remote::saved::{self, Remote};
-use qoop_runtime::control::{ControlRequest, ControlResponse};
+use qoop_runtime::control::{ControlRequest, ControlResponse, keeps_promises};
 use qoop_runtime::release::{Release, asset_for, check_sha256, download, fetch_latest};
 use qoop_runtime::{client, paths};
 use qoop_tui::link::{self, Update, plain};
@@ -48,10 +48,6 @@ const BUSY_WAIT: Duration = if cfg!(test) {
 
 /// A staged copy of an install that was killed halfway is swept after this long.
 const STALE_STAGE: Duration = Duration::from_secs(30 * 60);
-
-/// The daemons that keep what `keep_tabs` and `quiet` promise start here: an older one
-/// ignores both fields and would move, ending tabs and closing windows, as asked by hand.
-const FLAGS_FROM: &str = "0.9.2";
 
 /// The lock a swap of the binary holds, a directory beside it, which the script that
 /// updates a remote (`link.rs`) takes by the same name.
@@ -108,14 +104,20 @@ fn this_platform() -> (&'static str, &'static str) {
 pub fn run(args: &[String]) -> std::io::Result<()> {
     // Anything else is refused before the network: a mistyped `--check` read as no
     // flag at all would install instead of looking.
-    if let Some(other) = args
-        .iter()
-        .skip(2)
-        .find(|a| !matches!(a.as_str(), "--check" | "--help" | "-h" | "--auto"))
-    {
+    if let Some(other) = args.iter().skip(2).find(|a| {
+        !matches!(
+            a.as_str(),
+            "--check" | "--help" | "-h" | "--auto" | "--mark-reload"
+        )
+    }) {
         return Err(std::io::Error::other(format!(
             "unknown argument {other}; usage: qoop update [--check]"
         )));
+    }
+    // What the swap of a remote runs from the new qoop there when it does not reload the
+    // services: the reload is left for that machine's own check.
+    if args.iter().any(|a| a == "--mark-reload") {
+        return mark_reload();
     }
     if args.iter().any(|a| a == "--auto") {
         return if args.len() == 3 {
@@ -218,6 +220,13 @@ fn run_auto() -> std::io::Result<()> {
     match runtime.block_on(this_machine(&version, true)) {
         Ok(line) => {
             println!("this machine: {line}");
+            // Whatever the install left for the notch and the bridge is done now if the
+            // move went through and nobody is connected, else a later run does it.
+            let exe = std::env::current_exe()?;
+            let alone = runtime.block_on(alone_on(&version));
+            if reload_if_marked(&reload_mark(), alone, || reload_services(&exe)) {
+                println!("the notch and the bridge are on {version}");
+            }
             Ok(())
         }
         Err(line) => {
@@ -398,7 +407,7 @@ where
 /// The lock's refusal is told by its sentence in `link.rs`; reword them together.
 async fn put_on(target: &str, version: &str) -> std::io::Result<Update> {
     put_on_with(
-        |target, version| async move { link::update(&target, &version).await },
+        |target, version| async move { link::update(&target, &version, true).await },
         target,
         version,
     )
@@ -514,11 +523,6 @@ where
     }
 }
 
-/// Whether a daemon running `version` honours `keep_tabs` and `quiet`.
-fn keeps_promises(version: &str) -> bool {
-    paths::parse_version(version).is_some_and(|v| Some(v) >= paths::parse_version(FLAGS_FROM))
-}
-
 /// One daemon's answer to the ask to move, as a line. What it says is plain text first.
 fn arm_line(answer: std::io::Result<ControlResponse>, version: &str) -> Line {
     match answer {
@@ -588,20 +592,112 @@ fn install(latest: &Release, current: &str, auto: bool) -> std::io::Result<Insta
     {
         let _ = qoop_runtime::legacy::keep_old_name(&real);
     }
-    refresh_integrations(&exe);
-    // A running notch is the old build's; launchd starts the new one in its place.
+    after_swap(&exe, auto, &reload_mark(), reload_services)?;
+    Ok(installed)
+}
+
+/// What follows a swap, once the lock is gone. The hooks and skills are files, refreshed
+/// always. The notch and the phone's bridge are put back on the new file at once only when a
+/// person asked for this: doing it unattended would cut a phone's live stream. The
+/// unattended run leaves a mark, and a later one acts on it when nobody is connected.
+fn after_swap(
+    exe: &Path,
+    auto: bool,
+    mark: &Path,
+    reload: impl FnOnce(&Path),
+) -> std::io::Result<()> {
+    refresh_integrations(exe);
+    if auto {
+        write_mark(mark)
+    } else {
+        reload(exe);
+        // Done by hand, so nothing is left for a later run.
+        let _ = std::fs::remove_file(mark);
+        Ok(())
+    }
+}
+
+/// Where the mark is kept that the notch and the bridge still run the binary before this one:
+/// beside the notice, in the runtime directory, which a reboot clears along with the
+/// services it is about.
+fn reload_mark() -> PathBuf {
+    paths::update_notice_path().with_file_name("reload-pending")
+}
+
+fn mark_reload() -> std::io::Result<()> {
+    write_mark(&reload_mark())
+}
+
+fn write_mark(mark: &Path) -> std::io::Result<()> {
+    if let Some(parent) = mark.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(mark, "")
+}
+
+/// A running notch is the old build's; launchd starts the new one in its place. The same for
+/// a phone's bridge service, which would otherwise keep the old build or, once launchd has
+/// pinned the replaced file, never start again. Asked of the new binary, which is the one
+/// the service must run from now on.
+fn reload_services(exe: &Path) {
     crate::notch::restart_if_installed();
-    // The same for a phone's bridge service, which would otherwise keep the old build or,
-    // once launchd has pinned the replaced file, never start again.
-    // Asked of the new binary, which is the one the service must run from now on.
-    let reload = Command::new(&exe)
+    let reload = Command::new(exe)
         .args(["bridge", "reload"])
         .stdout(Stdio::null())
         .status();
     if !reload.is_ok_and(|status| status.success()) {
         eprintln!("qoop: the bridge service was not reloaded; run `qoop bridge reload`");
     }
-    Ok(installed)
+}
+
+/// Act on the mark of a reload left for later, when nobody is connected to be cut off. Said
+/// for a test with the reload handed in; the mark goes only once the reload ran.
+fn reload_if_marked(mark: &Path, alone: bool, reload: impl FnOnce()) -> bool {
+    if !alone || !mark.exists() {
+        return false;
+    }
+    reload();
+    let _ = std::fs::remove_file(mark);
+    true
+}
+
+/// Whether this machine's daemon runs `version` (or newer), or none runs, and no client is
+/// connected to it: a quiet ask answers "already there" with what holds it, if anything. A
+/// daemon that does not keep the promises is never asked.
+async fn alone_on(version: &str) -> bool {
+    let socket = match paths::runtime_dir() {
+        Ok(dir) => paths::socket_path(&dir),
+        Err(_) => return false,
+    };
+    match hello(&socket).await {
+        Ok((stream, inbuf, running)) => {
+            if paths::is_newer_version(version, &running) || !keeps_promises(&running) {
+                return false;
+            }
+            let request = ControlRequest::RestartWhenSafe {
+                id: crate::request_id("update"),
+                version: version.to_string(),
+                keep_tabs: true,
+                quiet: true,
+            };
+            matches!(
+                crate::ask_over(stream, inbuf, &request, ASK_TO_MOVE).await,
+                Ok(ControlResponse::RestartArmed {
+                    waiting_on: None,
+                    ..
+                })
+            )
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// What `scripts/install.sh` does after it puts a binary down: the new build's own `hooks
@@ -848,7 +944,7 @@ fn sweep_stale_stages(dir: &Path) {
 /// The file whose presence turns the daemon's own checks off. Looked for at every tick, so
 /// it needs no restart and holds for a daemon started from any shell.
 fn opt_out_path() -> PathBuf {
-    paths::config_dir().join("no-auto-update")
+    paths::no_auto_update_path()
 }
 
 /// Run `exe update --auto` now and then, for as long as this daemon lives: the first time 3
@@ -982,9 +1078,9 @@ mod tests {
 
     use super::{
         AUTO_LIMIT, BytesMut, ControlResponse, Installed, LOG_LIMIT, Line, Release, SWAP_LOCK,
-        Update, arm_line, auto_every, auto_once, auto_version, came_back, install_to,
-        keeps_promises, move_daemon, note, put_on_with, release_built, remote_line_with,
-        retry_busy, run,
+        Update, after_swap, arm_line, auto_every, auto_once, auto_version, came_back, install_to,
+        keeps_promises, move_daemon, note, put_on_with, release_built, reload_if_marked,
+        remote_line_with, retry_busy, run,
     };
 
     const MAC_ARM: &str = "qoop-aarch64-apple-darwin.tar.gz";
@@ -1867,6 +1963,39 @@ mod tests {
                 .len(),
             LOG_LIMIT + 1
         );
+    }
+
+    /// Unattended, a swap leaves the notch and the bridge alone and only marks them; by hand
+    /// it puts them back at once. The mark is acted on later, once and only when nobody is
+    /// connected.
+    #[test]
+    fn an_unattended_swap_marks_the_services_and_a_later_run_reloads_them_when_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = installed(dir.path(), "0.9.3");
+        let mark = dir.path().join("rt/reload-pending");
+        let reloaded = std::cell::Cell::new(0);
+        after_swap(&exe, true, &mark, |_| reloaded.set(reloaded.get() + 1)).expect("after");
+        assert_eq!(
+            reloaded.get(),
+            0,
+            "an unattended swap reloaded the services"
+        );
+        assert!(mark.exists());
+
+        // Somebody is connected: nothing, and the mark stays for the next run.
+        assert!(!reload_if_marked(&mark, false, || reloaded.set(reloaded.get() + 1)));
+        assert_eq!((reloaded.get(), mark.exists()), (0, true));
+        // Nobody is: once, and the mark goes.
+        assert!(reload_if_marked(&mark, true, || reloaded.set(reloaded.get() + 1)));
+        assert_eq!((reloaded.get(), mark.exists()), (1, false));
+        // Nothing marked, nothing to do.
+        assert!(!reload_if_marked(&mark, true, || reloaded.set(reloaded.get() + 1)));
+        assert_eq!(reloaded.get(), 1);
+
+        super::write_mark(&mark).expect("mark");
+        after_swap(&exe, false, &mark, |_| reloaded.set(reloaded.get() + 1)).expect("after");
+        assert_eq!(reloaded.get(), 2, "a swap by hand left the services alone");
+        assert!(!mark.exists());
     }
 
     /// A binary the release script did not build never updates itself, whatever starts it.

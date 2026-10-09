@@ -4692,12 +4692,16 @@ async fn handle_control(
         }
         // Not newer than what runs here (or not a version at all): already there, and a
         // second window asking after the first moved it must not move it again.
-        ControlRequest::RestartWhenSafe { version, .. }
+        //
+        // A quiet ask also learns whether a client is connected: how an update that finishes
+        // with a reload of the bridge and the notch finds out nobody would be cut off.
+        ControlRequest::RestartWhenSafe { version, quiet, .. }
             if !crate::paths::is_newer_version(&version, env!("CARGO_PKG_VERSION")) =>
         {
             ControlResponse::RestartArmed {
                 id,
-                waiting_on: None,
+                waiting_on: (quiet && books.restart.clients_connected())
+                    .then(|| WINDOW_OPEN.to_string()),
             }
         }
         ControlRequest::RestartWhenSafe {
@@ -5950,14 +5954,25 @@ impl Restart {
         self.keep_tabs.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Whether the arm is a quiet one and a client is, or is just about to be, connected.
-    /// Accepted but not yet welcomed counts: an exec drops it mid handshake.
+    /// Whether a client is, or is just about to be, connected. Accepted but not yet welcomed
+    /// counts: an exec drops it mid handshake.
+    fn clients_connected(&self) -> bool {
+        self.connections
+            .get()
+            .is_some_and(|c| c.quiet_holders() + c.pending() > 0)
+    }
+
+    /// Whether the arm is a quiet one and a client is connected.
     fn window_holds(&self) -> bool {
+        self.quiet.load(std::sync::atomic::Ordering::SeqCst) && self.clients_connected()
+    }
+
+    /// Whether the arm is one nobody asked for by hand and automatic updates were turned off
+    /// since. The `no-auto-update` file is looked for at every look, as the timer looks at
+    /// every tick.
+    fn opted_out(&self) -> bool {
         self.quiet.load(std::sync::atomic::Ordering::SeqCst)
-            && self
-                .connections
-                .get()
-                .is_some_and(|c| c.quiet_holders() + c.pending() > 0)
+            && crate::paths::no_auto_update_path().exists()
     }
 }
 
@@ -7231,6 +7246,15 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
     let mut changes = into.agents.subscribe();
     loop {
         let looked = tokio::time::Instant::now();
+        if into.books.restart.opted_out() {
+            let asked = into.books.restart.wanted.lock().unwrap().0;
+            let why = "automatic updates are turned off here (no-auto-update)";
+            into.books.restart.waiting.send_replace(Some(why.into()));
+            if call_off(&into.books.restart, asked) {
+                eprintln!("qoopd: the move onto the new version is called off: {why}");
+                return;
+            }
+        }
         if !into
             .books
             .stopping

@@ -25,7 +25,7 @@ use qoop_remote::Remote;
 use qoop_runtime::client::{self, Connection, Incoming};
 use qoop_runtime::control::{
     AgentRow, ControlRequest, ControlResponse, EventMessage, LinkState, Pane, WorkspaceRow,
-    too_old_for,
+    keeps_promises, too_old_for,
 };
 use qoop_runtime::daemon::ClientWire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -150,6 +150,13 @@ const RESTART_ID: &str = "mux-restart";
 /// The id of a status line the mux says about putting a newer qoop on a remote. Nobody
 /// asked for it, and the interface shows a refusal it cannot place as a line, like any other.
 pub(crate) const UPDATE_NOTICE: &str = "remote-update";
+
+/// What is said of a machine whose daemon predates the promises of an unattended move: the
+/// new qoop is on its disk, and it would end tabs and close windows to move onto it, so it
+/// is left to the person.
+fn left_for_a_hand_update(name: &str, running: &str) -> String {
+    format!("{name} runs qoop {running}, which moves onto the new one when you run `qoop update`")
+}
 
 fn restart_when_safe(version: String) -> ControlRequest {
     ControlRequest::RestartWhenSafe {
@@ -701,7 +708,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
         let (name, target) = (l.name.clone(), remote.target.clone());
         let events = self.events.clone();
         tokio::spawn(async move {
-            let message = match crate::link::update(&target, here).await {
+            let message = match crate::link::update(&target, here, false).await {
                 Ok(crate::link::Update::OnDisk(version, warning)) => {
                     if let Some(warning) = warning {
                         let _ = events
@@ -1345,12 +1352,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 l.send(&ControlRequest::ListAgents {
                     id: "mux-agents".into(),
                 });
+                let mut line = moved;
                 if let Some(version) = l.arm.take()
                     && qoop_runtime::paths::is_newer_version(&version, &l.server_version)
                 {
-                    l.send(&restart_when_safe(version));
+                    if keeps_promises(&l.server_version) {
+                        l.send(&restart_when_safe(version));
+                    } else {
+                        line = Some(left_for_a_hand_update(&l.name, &l.server_version));
+                    }
                 }
-                if let Some(line) = moved {
+                if let Some(line) = line {
                     self.respond(&ControlResponse::RestartArmed {
                         id: UPDATE_NOTICE.into(),
                         waiting_on: Some(line),
@@ -1365,11 +1377,24 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 // Down, or going down with its pump gone before the mux has heard: asked on
                 // the next connection, if its daemon is still older then.
+                let mut said = None;
                 let unsent = l.conn.is_none()
                     || (qoop_runtime::paths::is_newer_version(&version, &l.server_version)
-                        && !l.send(&restart_when_safe(version.clone())));
+                        && if keeps_promises(&l.server_version) {
+                            !l.send(&restart_when_safe(version.clone()))
+                        } else {
+                            said = Some(left_for_a_hand_update(&l.name, &l.server_version));
+                            false
+                        });
                 if unsent {
                     l.arm = Some(version);
+                }
+                if let Some(line) = said {
+                    self.respond(&ControlResponse::RestartArmed {
+                        id: UPDATE_NOTICE.into(),
+                        waiting_on: Some(line),
+                    })
+                    .await?;
                 }
                 Ok(())
             }
@@ -2988,8 +3013,8 @@ mod tests {
         );
     }
 
-    /// Two windows, one remote on 0.5.0. A moves it to 0.6.0 while B's push is under way;
-    /// B's swap finds 0.6.0 already there and comes back with that, by which time B's link
+    /// Two windows, one remote on 0.9.1. A moves it to 0.9.2 while B's push is under way;
+    /// B's swap finds 0.9.2 already there and comes back with that, by which time B's link
     /// is up again to the daemon A moved. B asks nothing: asked, the daemon would end and
     /// resume every tab a second time. Nor is a version that does not parse ever asked for.
     #[tokio::test]
@@ -3024,7 +3049,7 @@ mod tests {
             server_version: version.into(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        mux.on_link(up(1, tx, "0.5.0")).await.expect("up");
+        mux.on_link(up(1, tx, "0.9.1")).await.expect("up");
         mux.on_link(FromLink::Down {
             link: 1,
             conn: 1,
@@ -3033,7 +3058,7 @@ mod tests {
         .await
         .expect("down");
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        mux.on_link(up(2, tx2, "0.6.0")).await.expect("up again");
+        mux.on_link(up(2, tx2, "0.9.2")).await.expect("up again");
         // The move is news: the line that said it would come is replaced.
         let mut down = BytesMut::from(&std::mem::take(&mut mux.down)[..]);
         let mut said = Vec::new();
@@ -3045,11 +3070,11 @@ mod tests {
         assert!(
             said.contains(&ControlResponse::RestartArmed {
                 id: UPDATE_NOTICE.into(),
-                waiting_on: Some("devbox now runs qoop 0.6.0".into()),
+                waiting_on: Some("devbox now runs qoop 0.9.2".into()),
             }),
             "{said:?}"
         );
-        for version in ["0.6.0", "not a version"] {
+        for version in ["0.9.2", "not a version"] {
             mux.on_link(FromLink::Arm {
                 link: 1,
                 version: version.into(),
@@ -3060,7 +3085,7 @@ mod tests {
         assert_eq!(
             restarts(&mut rx2),
             0,
-            "a daemon on 0.6.0 was asked to move to it"
+            "a daemon on 0.9.2 was asked to move to it"
         );
         assert_eq!(mux.links[1].as_ref().expect("link").arm, None);
 
@@ -3070,13 +3095,13 @@ mod tests {
         mux.links[1].as_mut().expect("link").conn = Some((3, dead));
         mux.on_link(FromLink::Arm {
             link: 1,
-            version: "0.7.0".into(),
+            version: "0.9.3".into(),
         })
         .await
         .expect("arm");
         assert_eq!(
             mux.links[1].as_ref().expect("link").arm.as_deref(),
-            Some("0.7.0")
+            Some("0.9.3")
         );
         mux.links[1].as_mut().expect("link").arm = None;
         let (tx3, mut rx3) = mpsc::unbounded_channel();
@@ -3085,7 +3110,108 @@ mod tests {
         // A newer one than it runs still is.
         mux.on_link(FromLink::Arm {
             link: 1,
-            version: "0.7.0".into(),
+            version: "0.9.3".into(),
+        })
+        .await
+        .expect("arm");
+        assert_eq!(restarts(&mut rx3), 1);
+    }
+
+    /// A daemon from before the promises of an unattended move ignores them and would move
+    /// the old way, ending tabs and closing windows: the Mac swaps the file there and says
+    /// so, and asks it nothing, whether the link was up when the swap finished or came up
+    /// after it.
+    #[tokio::test]
+    async fn a_daemon_that_predates_the_promises_is_never_asked_to_move_by_itself() {
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![None, Some(Link::new("devbox".into(), None))],
+            home: 1,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 1,
+            order: Vec::new(),
+            order_file: None,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        let restarts = |rx: &mut mpsc::UnboundedReceiver<BytesMut>| {
+            let mut asked = 0;
+            while let Ok(bytes) = rx.try_recv() {
+                if let ControlRequest::RestartWhenSafe { .. } = body_of::<ControlRequest>(&bytes) {
+                    asked += 1;
+                }
+            }
+            asked
+        };
+        let up = |conn, writer, version: &str| FromLink::Up {
+            link: 1,
+            conn,
+            writer,
+            server_version: version.into(),
+        };
+        // Up, then the swap finishes: the push is dropped, and the person is told.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mux.on_link(up(1, tx, "0.9.1")).await.expect("up");
+        mux.down.clear();
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "0.9.3".into(),
+        })
+        .await
+        .expect("arm");
+        assert_eq!(restarts(&mut rx), 0, "a 0.9.1 daemon was asked to move");
+        assert_eq!(mux.links[1].as_ref().expect("link").arm, None);
+        let said = String::from_utf8_lossy(&mux.down).to_string();
+        assert!(
+            said.contains("moves onto the new one when you run"),
+            "{said}"
+        );
+
+        // The swap finished while it was down, and it comes back as 0.9.1.
+        mux.on_link(FromLink::Down {
+            link: 1,
+            conn: 1,
+            reason: String::new(),
+        })
+        .await
+        .expect("down");
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "0.9.3".into(),
+        })
+        .await
+        .expect("arm");
+        assert_eq!(
+            mux.links[1].as_ref().expect("link").arm.as_deref(),
+            Some("0.9.3")
+        );
+        mux.down.clear();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        mux.on_link(up(2, tx2, "0.9.1")).await.expect("up again");
+        assert_eq!(restarts(&mut rx2), 0, "a 0.9.1 daemon was asked to move");
+        assert_eq!(mux.links[1].as_ref().expect("link").arm, None);
+        let said = String::from_utf8_lossy(&mux.down).to_string();
+        assert!(
+            said.contains("moves onto the new one when you run"),
+            "{said}"
+        );
+
+        // One that keeps them is asked, with both.
+        mux.on_link(FromLink::Down {
+            link: 1,
+            conn: 2,
+            reason: String::new(),
+        })
+        .await
+        .expect("down");
+        let (tx3, mut rx3) = mpsc::unbounded_channel();
+        mux.on_link(up(3, tx3, "0.9.2")).await.expect("up");
+        mux.on_link(FromLink::Arm {
+            link: 1,
+            version: "0.9.3".into(),
         })
         .await
         .expect("arm");
