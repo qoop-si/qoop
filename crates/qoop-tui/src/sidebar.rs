@@ -439,7 +439,7 @@ impl InboxTab {
 }
 
 /// The inbox's list rows before anyone drags its edge.
-pub const INBOX_ROWS: usize = 3;
+pub const INBOX_ROWS: usize = 5;
 
 /// The rows above the title of an open inbox at its first height: the tab row, its list
 /// and the edge under it.
@@ -1953,21 +1953,17 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         slots.push(String::new());
         slots
     };
-    // A space of another machine wears a dot before its name, in the colour of its link
-    // (a full green one connected, a small dim one parked, a hollow warm one when it does not
-    // answer: the glyph differs for a terminal with no colour), and the remote mark
-    // before the dot where icons are drawn; not while it asks, when the question needs the
-    // room.
-    let remote = (!armed)
+    // A space of another machine wears the remote mark before its name, in the colour of
+    // its link, where icons are drawn; not while it asks, when the question needs the room.
+    let remote = (c.icons && !armed)
         .then_some(space.link)
         .flatten()
         .map(|link| match link {
-            qoop_runtime::control::LinkState::Up => (Role::Done, ONLINE),
-            qoop_runtime::control::LinkState::Parked => (Role::Faint, '\u{b7}'),
-            _ => (Role::Blocked, '\u{25cb}'),
+            qoop_runtime::control::LinkState::Up => Role::Done,
+            qoop_runtime::control::LinkState::Parked => Role::Faint,
+            _ => Role::Blocked,
         });
-    let glyph = if c.icons { 2 } else { 0 };
-    let lead = if remote.is_some() { glyph + 2 } else { 0 };
+    let lead = if remote.is_some() { 2 } else { 0 };
     // The columns a name has once the fold, the mark and the slot are paid for.
     let room = |slot: &str| {
         left_w
@@ -1992,11 +1988,8 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     if fold != " " {
         runs.push((0, 1, Role::Faint));
     }
-    if let Some((role, _)) = remote {
-        if c.icons {
-            runs.push((NAME_AT, 1, role));
-        }
-        runs.push((NAME_AT + glyph, 1, role));
+    if let Some(role) = remote {
+        runs.push((NAME_AT, 1, role));
     }
     if !slot.is_empty() {
         runs.push((
@@ -2010,10 +2003,10 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     };
     runs = runs.into_iter().filter_map(clip).collect();
     let accent = clip((NAME_AT + lead, name_w, ink));
-    let prefix = match (remote, c.icons) {
-        (Some((_, dot)), true) => format!("{} {dot} ", crate::icons::REMOTE),
-        (Some((_, dot)), false) => format!("{dot} "),
-        (None, _) => String::new(),
+    let prefix = if remote.is_some() {
+        format!("{} ", crate::icons::REMOTE)
+    } else {
+        String::new()
     };
     let left = fit(&format!("{fold}{prefix}{name}{slot}"), left_w);
     // The cells of the block, all in the fold's faint grey: controls are furniture, the
@@ -7794,8 +7787,9 @@ mod tests {
         assert_eq!(rows[1].0.text.trim_end(), " nothing needs you");
         assert_eq!(rows.len(), 40);
         // The inbox is the height it is dragged to, not the pet's: the title sits right
-        // under the default three list rows and the edge.
+        // under the default five list rows and the edge.
         assert_eq!(rows[TITLE_ROW].1, Some(Hit::Title));
+        assert_eq!(INBOX_ROWS, 5);
         assert_eq!(TITLE_ROW, 1 + INBOX_ROWS + 1);
         assert!(pet_shown(&c, 40, true));
     }
@@ -9480,8 +9474,7 @@ mod tests {
     }
 
     /// With icons an asleep tab wears the zzz, and a space of another machine the remote mark
-    /// and its link's dot in its link's colour, its name pushed over by exactly those and a
-    /// blank each.
+    /// in its link's colour, its name pushed over by exactly the mark and a blank.
     #[test]
     fn with_icons_asleep_tabs_and_remote_spaces_wear_their_marks() {
         let none = (Seen::new(), Unseen::new(), Shut::new());
@@ -9504,25 +9497,17 @@ mod tests {
         c.icons = true;
         let rule = first_rule(&c);
         assert!(
-            rule.text.starts_with(&format!(
-                "\u{25be}{} {ONLINE} mars:qoop",
-                crate::icons::REMOTE
-            )),
+            rule.text
+                .starts_with(&format!("\u{25be}{} mars:qoop", crate::icons::REMOTE)),
             "{:?}",
             rule.text
         );
         assert!(rule.runs.contains(&(NAME_AT, 1, crate::theme::Role::Done)));
-        assert!(
-            rule.runs
-                .contains(&(NAME_AT + 2, 1, crate::theme::Role::Done))
-        );
-        assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 4));
+        assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 2));
         c.icons = false;
         assert!(
-            first_rule(&c)
-                .text
-                .starts_with(&format!("\u{25be}{ONLINE} mars:qoop")),
-            "the dot without the icon"
+            first_rule(&c).text.starts_with("\u{25be}mars:qoop"),
+            "no mark without icons"
         );
     }
 
@@ -9601,34 +9586,35 @@ mod tests {
     }
 
     /// A space of another machine is drawn with its machine before its name and no chip,
-    /// whatever its link, behind a dot in the colour of that link: green while connected,
-    /// dim while parked, warm when it does not answer. The dot needs no icon font.
+    /// whatever its link: the link is in the settings box. With icons the remote mark alone
+    /// stands before the name, in the link's colour, and no dot follows it.
     #[test]
     fn a_remote_space_is_named_with_its_machine_and_no_chip() {
         use crate::theme::Role;
-        for (link, name, ink, dot) in [
-            (LinkState::Up, "ubox:webshop", Role::Done, '\u{25cf}'),
-            (LinkState::Parked, "ubox:webshop", Role::Faint, '\u{b7}'),
-            (
-                LinkState::Down,
-                "ubox:webshop (connecting)",
-                Role::Blocked,
-                '\u{25cb}',
-            ),
+        for (link, name, ink) in [
+            (LinkState::Up, "ubox:webshop", Role::Done),
+            (LinkState::Parked, "ubox:webshop", Role::Faint),
+            (LinkState::Down, "ubox:webshop (connecting)", Role::Blocked),
         ] {
             let mut row = space(1, name);
             row.link = Some(link);
             let spaces = vec![row];
             let none = (Seen::new(), Unseen::new(), Shut::new());
-            let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
+            let mut c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
             let rule = rule_styled(&c, 1);
-            assert!(rule.text.starts_with(&format!(" {dot} {name}")), "{rule:?}");
+            assert!(rule.text.starts_with(&format!(" {name}")), "{rule:?}");
+            c.icons = true;
+            let rule = rule_styled(&c, 1);
+            let want = format!(" {} {name}", crate::icons::REMOTE);
+            assert!(rule.text.starts_with(&want), "{rule:?}");
             assert!(rule.runs.contains(&(NAME_AT, 1, ink)), "{rule:?}");
+            assert_eq!(rule.accent.map(|a| a.0), Some(NAME_AT + 2), "{rule:?}");
         }
-        // A space of this machine has no link, so no dot.
+        // A space of this machine has no link, so no mark, icons or not.
         let spaces = vec![space(1, "ubox:webshop")];
         let none = (Seen::new(), Unseen::new(), Shut::new());
-        let c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
+        let mut c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
+        c.icons = true;
         assert!(rule_styled(&c, 1).text.starts_with(" ubox:webshop"));
     }
 
