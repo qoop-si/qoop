@@ -617,6 +617,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-width",
 ]
 

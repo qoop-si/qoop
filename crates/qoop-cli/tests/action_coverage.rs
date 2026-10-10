@@ -197,6 +197,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "change a machine's sleep settings from another device",
+            method: || {
+                Method::Control(ControlRequest::SleepSettings {
+                    id: "a".into(),
+                    idle_minutes: Some(30),
+                    exit_when_asleep: None,
+                })
+            },
+        },
+        Action {
             name: "start a workspace",
             method: || {
                 Method::Control(ControlRequest::CreateWorkspace {
@@ -651,6 +661,11 @@ fn every_control_method_is_reachable_from_some_action() {
             quiet: false,
         },
         ControlRequest::UpdateState { id: String::new() },
+        ControlRequest::SleepSettings {
+            id: String::new(),
+            idle_minutes: None,
+            exit_when_asleep: None,
+        },
         ControlRequest::TaskWrite {
             id: String::new(),
             terminal: None,
@@ -702,6 +717,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::UpdateState { .. }
+            | ControlRequest::SleepSettings { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }

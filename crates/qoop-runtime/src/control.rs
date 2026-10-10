@@ -436,6 +436,19 @@ pub enum ControlRequest {
     UpdateState {
         id: String,
     },
+    /// This machine's sleep settings, read or changed: `[sleep] idle_minutes` and
+    /// `[daemon] exit_when_asleep` in its `config.toml`, the file `qoop settings` edits. With
+    /// neither field it is a read; with one or both it writes them in one rewrite of the file
+    /// and answers what the file now says. Setting a value never sleeps or ends anything: the
+    /// idle pass that follows vets every tab as it always does. A daemon from before it answers
+    /// `unknown variant`.
+    SleepSettings {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_minutes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_when_asleep: Option<bool>,
+    },
     /// Write to a task: open one, move it, record its plan, evidence or done claim, or
     /// close it.
     ///
@@ -590,6 +603,7 @@ impl ControlRequest {
             | Self::SetSplit { id, .. }
             | Self::RestartWhenSafe { id, .. }
             | Self::UpdateState { id }
+            | Self::SleepSettings { id, .. }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
             | Self::ReloadAgentManifests { id }
@@ -764,6 +778,17 @@ pub enum ControlResponse {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ready: Option<String>,
+    },
+    /// What a `SleepSettings` found in the file: the minutes a tab idles before it sleeps by
+    /// itself (`0` is never) and whether the daemon leaves once nothing is awake. `problem`
+    /// says why a value in the file could not be used (it then shows its default); a file that
+    /// is not TOML is a `Failed`, not defaults.
+    SleepSettings {
+        id: String,
+        idle_minutes: u64,
+        exit_when_asleep: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        problem: Option<String>,
     },
     /// A `TaskWrite` landed on `task`.
     TaskWritten {
@@ -1297,6 +1322,7 @@ impl ControlResponse {
             | Self::SplitSaved { id }
             | Self::RestartArmed { id, .. }
             | Self::UpdateState { id, .. }
+            | Self::SleepSettings { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }
             | Self::Failed { id, .. } => id,
@@ -1481,6 +1507,59 @@ mod tests {
         // And an index with none says nothing about them, for an older client.
         let json = serde_json::to_string(&answer).expect("encode");
         assert!(!json.contains("splits"), "{json}");
+    }
+
+    #[test]
+    fn sleep_settings_cross_the_wire_and_a_bare_one_is_a_read() {
+        let read = ControlRequest::SleepSettings {
+            id: "s".into(),
+            idle_minutes: None,
+            exit_when_asleep: None,
+        };
+        let json = serde_json::to_string(&read).expect("encode");
+        assert_eq!(json, r#"{"op":"SleepSettings","id":"s"}"#);
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(&json).expect("decode"),
+            read
+        );
+
+        let write = ControlRequest::SleepSettings {
+            id: "w".into(),
+            idle_minutes: Some(15),
+            exit_when_asleep: Some(false),
+        };
+        let json = serde_json::to_string(&write).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(&json).expect("decode"),
+            write
+        );
+        assert_eq!(write.request_id(), "w");
+
+        let answer = ControlResponse::SleepSettings {
+            id: "w".into(),
+            idle_minutes: 15,
+            exit_when_asleep: false,
+            problem: None,
+        };
+        let json = serde_json::to_string(&answer).expect("encode");
+        assert!(!json.contains("problem"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ControlResponse>(&json).expect("decode"),
+            answer
+        );
+        assert_eq!(answer.request_id(), "w");
+    }
+
+    #[test]
+    fn a_daemon_without_an_op_refuses_it_in_words_a_client_can_test_for() {
+        let said = serde_json::from_slice::<ControlRequest>(br#"{"op":"FromTheFuture","id":"x"}"#)
+            .expect_err("unknown")
+            .to_string();
+        assert!(too_old_for(&said, Some("FromTheFuture")), "{said}");
+        assert!(
+            !too_old_for("some other refusal", Some("FromTheFuture")),
+            "{said}"
+        );
     }
 
     #[test]

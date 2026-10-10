@@ -667,42 +667,7 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             ));
         }
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|_| {
-        format!(
-            "{} is not TOML; fix it first (qoop config says where)",
-            path.display()
-        )
-    })?;
-    match key.split_once('.') {
-        Some((table, leaf)) => {
-            if !doc.contains_key(table) {
-                doc.insert(table, toml_edit::Item::Table(toml_edit::Table::new()));
-            }
-            // A `[table]`, dotted keys or `{ inline }`: written the way the file has it.
-            let Some(table) = doc[table].as_table_like_mut() else {
-                return Err(format!("{table} is not a table in {}", path.display()));
-            };
-            table.insert(leaf, item);
-        }
-        None => doc[key] = item,
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    // Through a link to where the file really is (a dotfiles checkout stays linked), with
-    // its permissions; whole or not at all, so a reader never meets half a file.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let staged = target.with_extension(format!("toml.{}.new", std::process::id()));
-    std::fs::write(&staged, doc.to_string()).map_err(|e| e.to_string())?;
-    if let Ok(meta) = std::fs::metadata(&target) {
-        let _ = std::fs::set_permissions(&staged, meta.permissions());
-    }
-    std::fs::rename(&staged, &target).map_err(|e| e.to_string())
+    qoop_runtime::config::edit(path, &[(key, item)])
 }
 
 /// `ctrl-b` is `0x02`, for the letters a prefix may be.
@@ -720,6 +685,57 @@ fn prefix_byte(name: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set` now writes through the runtime's one core; every key still lands, reads back,
+    /// keeps what was around it, and a file that is not TOML is refused with the old words.
+    #[test]
+    fn every_key_is_written_through_the_shared_core_and_read_back() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\nunknown = 1\n[extra]\nkept = true\n").expect("write");
+        let sound = sounds_here()[0];
+        let values = [
+            ("prefix", "ctrl-b"),
+            ("theme", "light"),
+            ("icons", "off"),
+            ("notify.desktop", "false"),
+            ("notify.sound", "true"),
+            ("notify.done_sound", sound),
+            ("notify.alert_sound", sound),
+            ("notch.enabled", "false"),
+            ("sleep.idle_minutes", "30"),
+            ("sleep.qass_idle_minutes", "0"),
+            ("daemon.exit_when_asleep", "false"),
+            ("qass.agent", "codex"),
+        ];
+        assert_eq!(values.len(), KEYS.len());
+        for (key, value) in values {
+            assert!(KEYS.contains(&key), "{key}");
+            set(&path, key, value).unwrap_or_else(|why| panic!("{key}: {why}"));
+        }
+        let read = read_from(&path);
+        // The reader names only the two keys of its own that it does not know.
+        let named: Vec<_> = read.problems.iter().map(|p| p.what.as_str()).collect();
+        assert_eq!(
+            named,
+            ["there is no setting unknown", "there is no setting extra"]
+        );
+        assert_eq!(read.config.prefix, 0x02);
+        assert_eq!(read.config.theme, Theme::Light);
+        assert_eq!(read.config.lifecycle.idle_minutes, 30);
+        assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));
+        assert!(!read.config.lifecycle.exit_when_asleep);
+        assert_eq!(read.qass_agent, "codex");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("# mine") && text.contains("unknown = 1") && text.contains("kept = true")
+        );
+
+        std::fs::write(&path, "[sleep\n").expect("write");
+        let said = set(&path, "theme", "dark").expect_err("refused");
+        assert!(said.contains("is not TOML; fix it first"), "{said}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "[sleep\n");
+    }
 
     #[test]
     fn qass_agent_is_read_and_checked() {

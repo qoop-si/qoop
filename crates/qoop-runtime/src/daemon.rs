@@ -3026,6 +3026,10 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
     let mut changes = into.agents.subscribe();
     let mut timeouts = IdleTimeouts::read();
     let mut read_at = std::time::Instant::now();
+    // Set by a nudge: the file is read at the next look whatever the clock says. A flag and
+    // not an earlier `read_at`, since an `Instant` minus a duration can underflow just
+    // after boot.
+    let mut read_now = false;
     if timeouts.shortest() > 0 {
         // One startup delay under 30 seconds, from the wall clock rather than a
         // new dependency, so a fleet armed together does not sleep in one herd.
@@ -3046,9 +3050,10 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
         // The file again when a few seconds have gone by since the last look, so turning
         // idle sleep on, off or to another number needs no restart. A clock check, not a
         // timer: nothing wakes this task to do it.
-        if read_at.elapsed() >= CONFIG_LOOK {
+        if read_now || read_at.elapsed() >= CONFIG_LOOK {
             timeouts = IdleTimeouts::read();
             read_at = std::time::Instant::now();
+            read_now = false;
         }
         if timeouts.shortest() == 0 || into.agents.streams().is_empty() {
             // Parked: an agent changing or a terminal being made announces, which ends this
@@ -3056,10 +3061,17 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
             // wakeups of its own). A lagged wait is a nudge like any other; a closed
             // channel cannot happen while this task holds the registry, but break rather
             // than spin if it ever does.
-            match changes.recv().await {
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            // A change of the file through the socket ends it too, and is read at once.
+            tokio::select! {
+                () = into.books.nudge.notified() => {
+                    read_now = true;
+                    continue;
+                }
+                got = changes.recv() => match got {
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
         let tick =
@@ -4728,6 +4740,33 @@ async fn handle_control(
             id,
             ready: books.restart.ready().await,
         },
+        // One small local file, read and written inline like `config::read` is elsewhere.
+        // Only the file changes: no tab is slept or ended here, the idle pass that follows
+        // vets each one as it always does.
+        ControlRequest::SleepSettings {
+            idle_minutes,
+            exit_when_asleep,
+            ..
+        } => {
+            let path = crate::config::path();
+            if idle_minutes.is_some() || exit_when_asleep.is_some() {
+                if let Err(reason) =
+                    crate::config::write_sleep(&path, idle_minutes, exit_when_asleep)
+                {
+                    return ControlResponse::Failed { id, reason };
+                }
+                books.nudge.notify_one();
+            }
+            match crate::config::read_strict(&path) {
+                Ok((life, problem)) => ControlResponse::SleepSettings {
+                    id,
+                    idle_minutes: life.idle_minutes,
+                    exit_when_asleep: life.exit_when_asleep,
+                    problem,
+                },
+                Err(reason) => ControlResponse::Failed { id, reason },
+            }
+        }
         ControlRequest::RestartWhenSafe {
             version,
             keep_tabs,
@@ -5882,6 +5921,9 @@ pub struct Bookkeeping {
     /// say, held here so idle sleep and the lists read them without a store round trip.
     /// Written after the store, so a failed write changes neither.
     pub awake: Arc<std::sync::Mutex<KeptAwake>>,
+    /// Told when `config.toml` was changed through the socket, so an idle sleep loop parked
+    /// with both timeouts off looks at the file now and not at the next agent change.
+    pub nudge: Arc<tokio::sync::Notify>,
 }
 
 /// What [`Bookkeeping::awake`] holds.
@@ -6069,6 +6111,7 @@ impl Bookkeeping {
             locks: Arc::default(),
             restart: Arc::default(),
             awake: Arc::default(),
+            nudge: Arc::default(),
         }
     }
 

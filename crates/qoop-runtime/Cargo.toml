@@ -23,6 +23,8 @@ qoop-detect = { path = "../qoop-detect" }
 rusqlite = { workspace = true }
 # config.toml, the same file and crate the interface reads it with.
 toml = { workspace = true }
+# Writes it keeping its comments; the version the interface already uses.
+toml_edit = "0.22"
 unicode-width = "0.2"
 tempfile = { workspace = true }
 
