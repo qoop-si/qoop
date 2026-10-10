@@ -117,8 +117,9 @@ fn an_update_leaves_hooks_and_skills_current() {
         "an absent agent got files"
     );
     let skills = qoop(root, &exe, &["skills", "status"]);
+    assert_eq!(line_of(&skills, "claude"), "claude     installed");
     assert!(
-        line_of(&skills, "claude").starts_with("claude     installed;"),
+        line_of(&skills, "qass").starts_with("qass       installed, in its folder"),
         "{}",
         String::from_utf8_lossy(&skills.stdout)
     );

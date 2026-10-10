@@ -208,9 +208,10 @@ impl Frame<'_> {
 
     /// The pieces the left column is drawn from, at this frame's clock and tick.
     pub fn column(&self) -> sidebar::Column<'_> {
+        let (spaces, agents) = sidebar::shown(self.spaces, self.rows);
         sidebar::Column {
-            spaces: self.spaces,
-            agents: self.rows,
+            spaces,
+            agents,
             focused_space: self.space.unwrap_or_default(),
             focused_terminal: if self.focused != 0 {
                 self.focused
@@ -1085,10 +1086,12 @@ pub fn paint(frame: &Frame) -> String {
     };
     // A transient message wins, then the single next thing to do, then where the keyboard
     // is. Never empty: a blank row is a row that has to be explained.
+    // qass's own idling and finishing is not the owner's to see to: only what he watches.
+    let (_, watched) = sidebar::shown(frame.spaces, frame.rows);
     let (notice, notice_role) = match (
         message,
         triage(
-            frame.rows,
+            watched,
             frame.spaces,
             frame.focused,
             frame.seen,
@@ -1097,7 +1100,7 @@ pub fn paint(frame: &Frame) -> String {
     ) {
         (Some(message), _) => (
             message.to_string(),
-            waiting(frame.rows, frame.focused, frame.seen, frame.unseen),
+            waiting(watched, frame.focused, frame.seen, frame.unseen),
         ),
         // Being somewhere other than the bottom wins over what needs a person, because it
         // is the one thing on this row that explains what the pane is showing: a screen
@@ -1117,7 +1120,7 @@ pub fn paint(frame: &Frame) -> String {
         }
         (None, Some(next)) => (
             next,
-            waiting(frame.rows, frame.focused, frame.seen, frame.unseen),
+            waiting(watched, frame.focused, frame.seen, frame.unseen),
         ),
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
@@ -2213,7 +2216,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("w", "new space"),
             ("W", "close empty"),
             ("R", "settings"),
-            ("Q", "qass page"),
+            ("Q", "qass, back"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree or rank"),
@@ -5296,7 +5299,7 @@ mod tests {
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
-            Action::QassPage => (const { place(38) }, Some("ctrl-a Q")),
+            Action::Qass => (const { place(38) }, Some("ctrl-a Q")),
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
         }
     }
@@ -5339,7 +5342,7 @@ mod tests {
             Action::CloseSpace,
             Action::Rename,
             Action::SpaceSettings,
-            Action::QassPage,
+            Action::Qass,
             Action::Collapse,
             Action::Update,
             Action::Menu,

@@ -81,14 +81,14 @@ what he can do, or that he need not do anything.
    it stopped (below, "Asleep or gone") and write a card for one that left a question or
    unfinished work.
 2. If you have a Monitor tool (Claude Code: ToolSearch `select:Monitor`), start
-   `Monitor(command: "QOOP_SLEEP_SAFE=1 <this skill's dir>/watch.sh", timeout_ms: 1800000,
+   `Monitor(command: "QOOP_SLEEP_SAFE=1 \"<this skill's dir>/watch.sh\"", timeout_ms: 1800000,
    description: "qass fleet")`, and when it expires start it again at once. Without one
    (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
    owner, first run `qoop agents --json`, compare it with `goals.md`, and handle every
    agent that stopped since your last look as an event line below.
 3. Give him the summary (its shape is under "How you talk to the owner").
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
-   resume and compaction; under another agent, read that file now.
+   resume and compaction; else read it now. Notes, scratch, skill dir: your folder's AGENTS.md.
 
 ## On every event line
 
@@ -130,8 +130,8 @@ name, in the same form as here, and key the agent as `ubox/T2` in goals.md and c
 (`escalate.sh E12 ubox/2 ...`); to the owner it is its name and "(ubox)":
 
 ```
-<this skill's dir>/on.sh ubox context 2 --last 1 --lines 40
-<this skill's dir>/on.sh ubox prompt 2 --generation 3 -- '<one line>'
+"<this skill's dir>/on.sh" ubox context 2 --last 1 --lines 40
+"<this skill's dir>/on.sh" ubox prompt 2 --generation 3 -- '<one line>'
 ```
 
 Plan files and `wend` live on this Mac only: a remote worker's stage comes from its task
@@ -250,7 +250,7 @@ hour in all. In `mode propose` write only after the owner approves it with
 ## Propose mode
 
 Instead of writing, add `P<n> · <handle>: send '<text>' to T<n> g<G> because <why>` under
-`Waiting on you`, record it with `<this skill's dir>/escalate.sh P<n> <terminal> later
+`Waiting on you`, record it with `"<this skill's dir>/escalate.sh" P<n> <terminal> later
 <handle>`, and show him one line: what you would tell which agent (by name) and why, then
 "onay: `ok <handle>`". When he answers "ok <handle>", send exactly that proposal.
 Starting a worker of your own and its first brief need no ok (see "Spawning").
@@ -272,13 +272,13 @@ Mine:   <the option you would pick, and why, in one line>
 
 He may always answer in his own words instead of a letter.
 Two to four options, each one line and plainly different from the others; the last line
-always invites his own answer. Take each card's number from `<this skill's dir>/escalate.sh
+always invites his own answer. Take each card's number from `"<this skill's dir>/escalate.sh"
 next E` (a proposal's from `next P`): a number is never used twice, so an old "E6 yes" never
 fits a new card. Then run, **alone in its message**, with the options word for word as on
 the card:
 
 ```
-<this skill's dir>/escalate.sh E<n> <terminal|-> now|later <handle> 'A: <option>' 'B: <option>'
+"<this skill's dir>/escalate.sh" E<n> <terminal|-> now|later <handle> 'A: <option>' 'B: <option>'
 ```
 
 The handle is one word of the agent's sidebar name, lowercase and without Turkish letters
@@ -332,7 +332,7 @@ When the owner asks for a new agent, or for a goal that is separate from every r
 worker's, in any mode:
 
 ```
-<this skill's dir>/spawn.sh <repo> <branch> [--agent claude|opencode] [--space NAME]   # prints "<n> <G>"
+"<this skill's dir>/spawn.sh" <repo> <branch> [--agent claude|opencode] [--space NAME]   # prints "<n> <G>"
 qoop prompt <n> --generation <G> -- '<goal, done criteria, fence>'
 ```
 

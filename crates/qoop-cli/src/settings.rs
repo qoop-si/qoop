@@ -169,7 +169,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
     out
 }
 
-/// What qass may run on here: the agents its skill installs beside that are on `PATH`, the
+/// What qass may run on here: the agents it starts on that are on `PATH`, the
 /// `[agents]` names, and whatever the file names now.
 pub(crate) fn qass_agents(read: &config::Read) -> Vec<String> {
     let mut out: Vec<String> = config::QASS_AGENTS

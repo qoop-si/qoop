@@ -1,7 +1,8 @@
 //! `qoop qass`: open qass, the assistant over every agent, in one step.
 //!
 //! The one already running is shown; one asleep in the `qass` space is woken; otherwise a
-//! new one starts in its own folder (`qoop paths qass-data`) on the agent `config.toml`
+//! new one starts in its own folder (`qoop paths qass-data`, where its skill, notes and
+//! scratch live) on the agent `config.toml`
 //! names (`[qass] agent`: claude, codex, gemini, opencode, or a person's own `[agents]`
 //! line), told to start its qass skill. Closing it is the `x` on its row, or `qoop close`.
 
@@ -154,9 +155,9 @@ fn launch_line(
 fn launch(agent: &str, read: &config::Read) -> std::io::Result<(Option<String>, Vec<String>)> {
     let (line, words, program) = launch_line(agent, &read.agents).map_err(std::io::Error::other)?;
     if !crate::skills::qass_installed_for(&program) {
-        return Err(std::io::Error::other(format!(
-            "qass is not installed for {program}; run `qoop skills install {program}` first"
-        )));
+        return Err(std::io::Error::other(
+            "qass is not set up; run `qoop skills install` first",
+        ));
     }
     Ok((line, words))
 }
@@ -198,9 +199,9 @@ fn unix_of(time: std::time::SystemTime) -> Option<i64> {
 fn blocker(agent: &str, read: &config::Read) -> Option<String> {
     match launch_line(agent, &read.agents) {
         Err(why) => Some(why),
-        Ok((_, _, program)) if !crate::skills::qass_installed_for(&program) => Some(format!(
-            "qass is not installed for {program}; run `qoop skills install {program}`"
-        )),
+        Ok((_, _, program)) if !crate::skills::qass_installed_for(&program) => {
+            Some("qass is not set up; run `qoop skills install`".to_string())
+        }
         Ok(_) => None,
     }
 }
@@ -254,6 +255,12 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     } else {
         let read = config::read();
         let (typed, command) = launch(&read.qass_agent, &read)?;
+        // No qass runs or sleeps: none can still be using the copies older installs left
+        // in each agent's own skills.
+        crate::skills::remove_old_qass();
+        if program_of(typed.as_deref().unwrap_or(&read.qass_agent)) == "gemini" {
+            crate::skills::trust_qass_for_gemini()?;
+        }
         std::fs::create_dir_all(&folder)?;
         let opts = supervise::NewOpts {
             name: Some("qass".into()),

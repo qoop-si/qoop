@@ -16,7 +16,6 @@ struct Place {
 }
 
 fn places() -> Vec<Place> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     let runtime = paths::runtime_dir().ok();
     vec![
         Place {
@@ -54,13 +53,13 @@ fn places() -> Vec<Place> {
         },
         Place {
             name: "qass-data",
-            what: "qass: its goals, the gate's log, its working folder",
+            what: "qass's home, where it always starts: its skill, notes, goals and scratch",
             path: paths::qass_data_dir(),
         },
         Place {
             name: "skills",
-            what: "the qass skill, where Claude Code reads it",
-            path: home.map(|h| h.join(".claude/skills/qass")),
+            what: "the qass skill, in qass's home (`.agents/skills/qass` holds the same)",
+            path: paths::qass_data_dir().map(|d| d.join(".claude/skills/qass")),
         },
     ]
 }

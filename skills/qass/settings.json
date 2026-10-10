@@ -5,7 +5,7 @@
   },
   "hooks": {
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; echo \"qass: after a wake or a resume the fleet watcher is not running; start it again (Start, step 2) before anything else.\"; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 2) from that dir before anything else.\"; true" }] }
     ]
   }
 }

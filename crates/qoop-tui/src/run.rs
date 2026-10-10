@@ -285,6 +285,23 @@ enum Blocked {
     },
     /// An agent's last answer read from its transcript, or why it could not be.
     Answer(u32, Result<crate::answer::Answer, String>),
+    /// `qoop qass` ran for `ctrl-a Q`: what it said when it could not start or wake qass.
+    Qass(Result<(), String>),
+}
+
+/// `qoop qass`, which wakes qass or starts it in its own space and shows it: from this
+/// same binary, so a build under test starts its own. Runs on the blocking pool.
+fn start_qass() -> Result<(), String> {
+    let out = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .arg("qass")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(said.trim().trim_start_matches("qoop: ").to_string())
 }
 
 /// The newest assistant message of an agent's transcript, as a page, or why there is none.
@@ -633,6 +650,11 @@ struct State {
     message: Option<String>,
     /// A terminal to move to once the loop can write the subscription for it.
     pending_focus: Option<u32>,
+    /// Where the keyboard was before it went to qass's space, for `ctrl-a Q` to go back to.
+    qass_back: Option<u32>,
+    /// When `ctrl-a Q` last asked `qoop qass` to start or wake it, so a second press before
+    /// its tab is listed does not start a second qass.
+    qass_asked: Option<std::time::Instant>,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
     /// A terminal to show once an index lists it, and until when: one `qoop focus` named
@@ -1738,7 +1760,7 @@ impl State {
             Some(hit) => (Some(hit), self.space_of_hit(hit)?),
             None => (None, self.space_of_hit(hit_of(within.checked_sub(1)?)?)?),
         };
-        let ids: Vec<i64> = self.spaces.iter().map(|s| s.id).collect();
+        let ids: Vec<i64> = self.shown().0.iter().map(|s| s.id).collect();
         if !ids.contains(&owner) {
             return None;
         }
@@ -2169,9 +2191,10 @@ impl State {
 
     /// The pieces the left column is drawn from, at a given clock and animation frame.
     fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
+        let (spaces, agents) = self.shown();
         sidebar::Column {
-            spaces: &self.spaces,
-            agents: &self.rows,
+            spaces,
+            agents,
             focused_space: self.space.unwrap_or_default(),
             focused_terminal: self.column_terminal(),
             tick,
@@ -2189,6 +2212,28 @@ impl State {
             icons: crate::icons::on(),
             nav: self.modes.side.as_ref(),
         }
+    }
+
+    /// The spaces and rows the owner's lists show: all but qass's ([`sidebar::shown`]).
+    fn shown(&self) -> (&[qoop_runtime::control::WorkspaceRow], &[AgentRow]) {
+        sidebar::shown(&self.spaces, &self.rows)
+    }
+
+    /// `ctrl-a tab`'s next: the first of the queue the next row reads, qass never in it.
+    fn up_next(&self) -> Option<u32> {
+        sidebar::queue(
+            self.shown().1,
+            self.focused,
+            &self.seen_done,
+            &self.unseen_finished,
+        )
+        .first()
+        .map(|row| row.terminal)
+    }
+
+    /// Whether the space on screen is qass's.
+    fn in_qass(&self) -> bool {
+        self.space.is_some() && self.space == sidebar::qass_space(&self.spaces)
     }
 
     /// The tab after the focused one, wrapping, within the space on screen.
@@ -2219,12 +2264,14 @@ impl State {
     /// The awake space after the focused one, wrapping. A sleeping space is passed over:
     /// going there wakes nothing, so it is only reached on purpose.
     fn next_space(&self, forward: bool) -> Option<i64> {
-        let at = self
-            .spaces
+        let (spaces, _) = self.shown();
+        let n = spaces.len();
+        // From qass's space, which is on no list, the first step lands on the first space
+        // or the last one.
+        let at = spaces
             .iter()
             .position(|w| Some(w.id) == self.space)
-            .unwrap_or(0);
-        let n = self.spaces.len();
+            .unwrap_or(if forward { n.saturating_sub(1) } else { 0 });
         (1..=n)
             .map(|step| {
                 if forward {
@@ -2233,7 +2280,7 @@ impl State {
                     (at + n - step) % n
                 }
             })
-            .map(|next| &self.spaces[next])
+            .map(|next| &spaces[next])
             .find(|w| !w.asleep)
             .map(|w| w.id)
     }
@@ -5718,6 +5765,8 @@ where
         message: Some(CONNECTING.to_string()),
         hint: notice,
         pending_focus: None,
+        qass_back: None,
+        qass_asked: None,
         last: LastFocus::read(last_focus),
         show_when_listed: None,
         elsewhere: None,
@@ -6028,7 +6077,10 @@ where
                 state.prefix_pending = keys.prefix_pending();
                 dirty = true;
             }
-            state.last.keep(state.focused);
+            // A restart comes back where the owner works, never inside qass.
+            if !state.in_qass() {
+                state.last.keep(state.focused);
+            }
             if dirty && presented.elapsed() >= FRAME {
                 // An open answer lays out for the pane before the frame borrows the state:
                 // once per width, so a long answer is not wrapped again every frame.
@@ -7682,21 +7734,19 @@ where
                                     dirty = true;
                                 }
                             }
-                            // A page of its own like settings: `qoop qass page`, `exec` so the
-                            // tab goes when the page closes. Not a menu row: the menu has no
-                            // room for a twentieth row on an 80 by 24 window.
-                            Action::QassPage => {
-                                request += 1;
-                                let space = state.space;
-                                let ask = start_agent_terminal(
-                                    &mut state,
-                                    request,
-                                    "exec qoop qass page",
-                                    space,
-                                    Some("qass page".to_string()),
-                                );
-                                wr.write_all(&client::encode_control_seq(&ask, &mut control_seq)?)
-                                    .await?;
+                            // qass in its own space, or back from it. Its page stays
+                            // `qoop qass page`.
+                            Action::Qass => {
+                                match qass_toggle(&mut state, &mut control_seq, &mut seqs)? {
+                                    QassStep::Moved(Some(bytes)) => wr.write_all(&bytes).await?,
+                                    QassStep::Moved(None) => {}
+                                    QassStep::Start => {
+                                        let tx = blocking_tx.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = tx.send(Blocked::Qass(start_qass()));
+                                        });
+                                    }
+                                }
                                 dirty = true;
                             }
 
@@ -7730,14 +7780,7 @@ where
                             // goes there. Standing on a finished agent reads it, so the next
                             // press finds the one after: wants, then failed, then done.
                             Action::UpNext => {
-                                let next = sidebar::queue(
-                                    &state.rows,
-                                    state.focused,
-                                    &state.seen_done,
-                                    &state.unseen_finished,
-                                )
-                                .first()
-                                .map(|row| row.terminal);
+                                let next = state.up_next();
                                 match next {
                                     Some(picked) => {
                                         if let Some(bytes) = focus(
@@ -8429,6 +8472,13 @@ where
                         apply_usage(&mut state, at, targets, found);
                         dirty = true;
                     }
+                    Blocked::Qass(said) => {
+                        if let Err(why) = said {
+                            state.qass_asked = None;
+                            state.message = Some(why);
+                            dirty = true;
+                        }
+                    }
                     // Only the answer last asked for, and only while its agent still has the
                     // keyboard: a slow read for a terminal left behind opens nothing.
                     Blocked::Answer(terminal, _) if answer_for != Some(terminal) || state.focused != terminal => {
@@ -8881,8 +8931,10 @@ fn news_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> 
     if state.news_refused {
         return None;
     }
+    // qass's own finished turns are not news: it finishes one on every event it handles.
     let news: Vec<u32> = state
-        .rows
+        .shown()
+        .1
         .iter()
         .filter(|r| !crate::mux::is_remote_workspace(r.workspace))
         .filter(|r| sidebar::is_new(r, state.focused, &state.seen_done, &state.unseen_finished))
@@ -10045,12 +10097,24 @@ fn move_focus(
     // panel crossing spaces, and every layout and subscription below is per
     // space. Leaving the bar on the old space would show tabs that do not
     // contain the focused one.
+    let was_space = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == from)
+        .map(|r| r.workspace)
+        .or(state.space);
     state.space = state
         .rows
         .iter()
         .find(|r| r.terminal == to)
         .map(|r| r.workspace)
         .or(state.space);
+    // Into qass from the owner's own work: remembered for `ctrl-a Q` to go back to.
+    if state.in_qass() && was_space != state.space {
+        state.qass_back = Some(from).filter(|t| *t != 0);
+        // A start asked for has arrived.
+        state.qass_asked = None;
+    }
     // A tab outside the tree on screen brings its own tree, and the one it
     // replaces is parked for the way back.
     if let Some(space) = state.space {
@@ -10160,6 +10224,94 @@ fn move_focus(
 /// Whether the program on this screen asked to hear about focus (`CSI ? 1004 h`).
 fn wants_focus_events(snapshot: Option<&SnapshotWire>) -> bool {
     snapshot.is_some_and(|s| s.modes.focus_events)
+}
+
+/// Where the keyboard goes when qass's space, on screen, has nothing left in it: back where
+/// it was before qass, else the owner's first tab. Never left in a space no list shows.
+fn out_of_qass(state: &State, rows: &[AgentRow]) -> Option<u32> {
+    let qass = sidebar::qass_space(&state.spaces);
+    // On its way there counts: a focus picked before the space list said which is qass's.
+    let headed = state.pending_focus.unwrap_or(state.focused);
+    if !state.in_qass()
+        && !rows
+            .iter()
+            .any(|r| r.terminal == headed && Some(r.workspace) == qass)
+    {
+        return None;
+    }
+    state
+        .qass_back
+        .filter(|t| rows.iter().any(|r| r.terminal == *t))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| {
+                    Some(r.workspace) != qass && r.state != "sleeping" && !state.is_pane(r.terminal)
+                })
+                .map(|r| r.terminal)
+        })
+}
+
+/// What `ctrl-a Q` did: moved the keyboard (with the bytes that move sends), or found no
+/// qass to show and wants `qoop qass` run.
+enum QassStep {
+    Moved(Option<BytesMut>),
+    Start,
+}
+
+/// `ctrl-a Q`. In qass's space: back where the keyboard was before it, else the first awake
+/// space. Elsewhere: qass's tab when it is listed, else `qoop qass` (it wakes or starts
+/// qass, and its own `focus` brings it here), asked once until it answers.
+fn qass_toggle(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<QassStep> {
+    if state.in_qass() {
+        let back = state
+            .qass_back
+            .take()
+            .filter(|t| state.shown().1.iter().any(|r| r.terminal == *t));
+        if let Some(back) = back {
+            return focus(state, back, control_seq, seqs).map(QassStep::Moved);
+        }
+        let (spaces, _) = state.shown();
+        let Some(space) = spaces
+            .iter()
+            .find(|w| !w.asleep)
+            .or(spaces.first())
+            .map(|w| w.id)
+        else {
+            state.message = Some("qass is the only space open".to_string());
+            return Ok(QassStep::Moved(None));
+        };
+        return enter_space(state, space, control_seq, seqs).map(QassStep::Moved);
+    }
+    // Its agent, awake. A shell left in its space is not qass, and a sleeping tab is woken
+    // by `qoop qass`, which finds qass by its folder.
+    let qass = sidebar::qass_space(&state.spaces);
+    let tab = state
+        .rows
+        .iter()
+        .find(|r| {
+            Some(r.workspace) == qass
+                && r.agent
+                && r.state != "sleeping"
+                && !state.is_pane(r.terminal)
+        })
+        .map(|r| r.terminal);
+    if let Some(tab) = tab {
+        return focus(state, tab, control_seq, seqs).map(QassStep::Moved);
+    }
+    if state
+        .qass_asked
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(15))
+    {
+        state.message = Some("qass is on its way".to_string());
+        return Ok(QassStep::Moved(None));
+    }
+    state.qass_asked = Some(std::time::Instant::now());
+    state.message = Some("opening qass".to_string());
+    Ok(QassStep::Start)
 }
 
 /// Put a space on screen, and the keyboard in one of its terminals.
@@ -10455,7 +10607,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 *dirty = true;
             }
         }
-        ControlResponse::Workspaces { workspaces, .. } => {
+        ControlResponse::Workspaces { mut workspaces, .. } => {
+            // qass's space last, before anything below picks a first space.
+            sidebar::qass_last(&mut workspaces, &mut []);
             if state.space.is_none() {
                 state.space = workspaces.first().map(|w| w.id);
                 // The bar just parked somewhere: a keyboard adopted from
@@ -10500,7 +10654,17 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 && workspaces
                     .iter()
                     .any(|w| Some(w.id) == state.space && w.asleep);
+            let first_list = state.spaces.is_empty();
             state.spaces = workspaces;
+            sidebar::qass_last(&mut state.spaces, &mut state.rows);
+            // The index came first and the client opened before it knew which space is
+            // qass's: an interface never opens inside it on its own.
+            if first_list
+                && state.qass_back.is_none()
+                && let Some(out) = out_of_qass(state, &state.rows)
+            {
+                state.pending_focus = Some(out);
+            }
             // A fold outlives nothing it folded: a space that went away takes its fold
             // with it, so a later space reusing the id does not start folded.
             let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
@@ -10727,6 +10891,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .resume
                 .take()
                 .and_then(|t| agents.iter().find(|r| r.terminal == t))
+                .filter(|r| Some(r.workspace) != sidebar::qass_space(&state.spaces))
             {
                 state.space = Some(row.workspace);
                 state.pending_focus = Some(row.terminal);
@@ -10745,7 +10910,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                         .iter()
                         .find(|r| r.workspace == s && !state.is_pane(r.terminal)),
                     None => {
-                        let min = agents.iter().map(|r| r.workspace).min();
+                        let qass = sidebar::qass_space(&state.spaces);
+                        let min = agents
+                            .iter()
+                            .map(|r| r.workspace)
+                            .filter(|w| Some(*w) != qass)
+                            .min();
                         agents
                             .iter()
                             .find(|r| Some(r.workspace) == min && !state.is_pane(r.terminal))
@@ -10827,6 +10997,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     .and_then(|space| state.spaces.iter().find(|w| w.id == space))
                     .is_some_and(|w| !w.sleeping.is_empty());
                 if state.pending_focus.is_none() && !dozing {
+                    state.pending_focus = out_of_qass(state, &agents);
+                }
+                if state.pending_focus.is_none() && !dozing {
                     state.message = Some(format!(
                         "this space is empty, {} c starts a terminal",
                         crate::keys::prefix_name()
@@ -10880,9 +11053,16 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // notification: it is what the person's own terminal emulator turns into a
             // badge or a bounce, and it is the one channel that works with no account, no
             // daemon of somebody else's, and no network.
+            // qass finishes a turn on every event it handles: only its asking is news.
+            let qass = sidebar::qass_space(&state.spaces);
             for row in &agents {
                 let before = state.was.get(&row.terminal).cloned();
-                let wants_someone = matches!(row.state.as_str(), "blocked" | "failed" | "done");
+                let is_qass = Some(row.workspace) == qass;
+                let wants_someone = match row.state.as_str() {
+                    "blocked" | "failed" => true,
+                    "done" => !is_qass,
+                    _ => false,
+                };
                 if wants_someone && before.as_ref().is_some_and(|b| *b != row.state) {
                     let runtime = match row.state.as_str() {
                         "blocked" => AgentRuntimeState::Blocked,
@@ -10912,6 +11092,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 // restore, `/clear`), and one that settles to idle did nothing.
                 let was_working = before.as_deref() == Some("working");
                 if was_working
+                    && !is_qass
                     && matches!(row.state.as_str(), "idle" | "done")
                     && row.terminal != state.focused
                 {
@@ -10930,7 +11111,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 // The one under the keyboard, finishing while the person is in another
                 // window: nothing on this screen changes for them, so only the desktop
                 // can say it.
-                if was_working && row.state == "idle" && row.terminal == state.focused {
+                if was_working && !is_qass && row.state == "idle" && row.terminal == state.focused {
                     note(state, row, AgentRuntimeState::Done);
                 }
                 // Back to work, or under the keyboard: no longer news.
@@ -10949,6 +11130,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .map(|r| (r.terminal, r.state.clone()))
                 .collect();
             state.rows = agents;
+            sidebar::qass_last(&mut state.spaces, &mut state.rows);
             name_sessions(state, request);
             // A space being closed waits for this: the daemon counts store rows and the
             // index reads the live registry, so the index showing a space empty is the
@@ -11082,6 +11264,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == terminal) {
                 row.workspace = workspace;
             }
+            sidebar::qass_last(&mut state.spaces, &mut state.rows);
             let beside = state
                 .drop_after_move
                 .take_if(|(asked, ..)| *asked == id)
@@ -11229,6 +11412,9 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                             })
                             .map(|r| r.terminal)
                     });
+                if state.pending_focus.is_none() {
+                    state.pending_focus = out_of_qass(state, &state.rows);
+                }
                 if state.pending_focus.is_none() {
                     state.message = Some(format!(
                         "this space is empty, {} c starts a terminal",
@@ -13131,6 +13317,8 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
+            qass_asked: None,
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14367,6 +14555,8 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
+            qass_asked: None,
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14504,6 +14694,8 @@ mod tests {
             message: None,
             hint: None,
             pending_focus: None,
+            qass_back: None,
+            qass_asked: None,
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -17974,6 +18166,155 @@ mod tests {
                 terminal: 7,
             })
         );
+    }
+
+    /// The owner's two spaces and qass's, as an index leaves them: qass's space and tab last.
+    fn qass_state() -> State {
+        let mut state = state();
+        state.spaces = vec![space(1, "app"), space(9, "qass"), space(3, "dub")];
+        state.rows = vec![
+            agent(1, 1, "claude", "idle"),
+            agent(5, 9, "claude", "idle"),
+            agent(3, 3, "claude", "idle"),
+        ];
+        sidebar::qass_last(&mut state.spaces, &mut state.rows);
+        state.space = Some(1);
+        state.focused = 1;
+        state
+    }
+
+    /// `ctrl-a Q` shows qass and goes back to the very tab it left; no list of the owner's
+    /// spaces or agents holds qass, and `ctrl-a s` steps over its space.
+    #[test]
+    fn ctrl_a_capital_q_goes_to_qass_and_back() {
+        let mut state = qass_state();
+        let (spaces, rows) = state.shown();
+        assert_eq!(spaces.iter().map(|w| w.id).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(rows.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 3]);
+        let column = state.column(0, 0);
+        assert!(column.spaces.iter().all(|w| w.name != "qass"));
+        assert!(column.agents.iter().all(|r| r.terminal != 5));
+        assert_eq!(state.next_space(true), Some(3));
+        assert_eq!(state.next_space(false), Some(3));
+
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        state.space = Some(3);
+        state.focused = 3;
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Moved(_)
+        ));
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        assert!(state.in_qass());
+        // From qass, the space keys land on the owner's first or last space.
+        assert_eq!(state.next_space(true), Some(1));
+        assert_eq!(state.next_space(false), Some(3));
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!((state.focused, state.space), (3, Some(3)));
+    }
+
+    /// A second space a rename called `qass` is kept off the lists with its tabs, and qass
+    /// stays the first so named, sorted once or twice.
+    #[test]
+    fn a_second_space_named_qass_stays_hidden_and_qass_stays_put() {
+        let mut state = qass_state();
+        state.spaces.insert(0, space(11, "qass"));
+        state.rows.insert(0, agent(8, 11, "claude", "idle"));
+        sidebar::qass_last(&mut state.spaces, &mut state.rows);
+        sidebar::qass_last(&mut state.spaces, &mut state.rows);
+        let (spaces, rows) = state.shown();
+        assert_eq!(spaces.iter().map(|w| w.id).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(rows.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(sidebar::qass_space(&state.spaces), Some(11));
+    }
+
+    /// With no qass listed, `ctrl-a Q` asks `qoop qass` once: a second press while that
+    /// answer is on its way starts no second qass.
+    #[test]
+    fn ctrl_a_capital_q_starts_qass_once() {
+        let mut state = qass_state();
+        state.rows.retain(|r| r.terminal != 5);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Start
+        ));
+        assert!(matches!(
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap(),
+            QassStep::Moved(None)
+        ));
+        assert_eq!(state.message.as_deref(), Some("qass is on its way"));
+        assert_eq!(state.focused, 1);
+    }
+
+    /// A client opening on a daemon where qass's space has the lowest id, with its index in
+    /// before the space list: the keyboard ends up in the owner's space, and qass's unread
+    /// finish is neither news nor `ctrl-a tab`'s next.
+    #[test]
+    fn a_new_client_opens_beside_qass_never_in_it() {
+        let mut s = state();
+        // A client that has heard nothing yet.
+        s.rows.clear();
+        s.spaces.clear();
+        s.space = None;
+        s.focused = 0;
+        s.adopted = false;
+        let (mut request, mut dirty) = (0u64, false);
+        apply(
+            &mut s,
+            ControlResponse::Agents {
+                id: "index".into(),
+                agents: vec![agent(5, 2, "claude", "done"), agent(7, 4, "claude", "idle")],
+                splits: Vec::new(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        apply(
+            &mut s,
+            ControlResponse::Workspaces {
+                id: "spaces".into(),
+                workspaces: vec![space(2, "qass"), space(4, "app")],
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.pending_focus, Some(7));
+        // As the loop leaves it once that focus is drained, and qass finishing again.
+        s.focused = 7;
+        s.space = Some(4);
+        s.seen_done.clear();
+        let full = sidebar::queue(&s.rows, 7, &s.seen_done, &s.unseen_finished);
+        assert!(
+            full.iter().any(|r| r.terminal == 5),
+            "qass's finish is unread"
+        );
+        assert_eq!(s.up_next(), None);
+        s.news_sent = None;
+        match news_request(&mut s, &mut request) {
+            Some(ControlRequest::News { terminals, .. }) => assert!(!terminals.contains(&5)),
+            other => assert!(other.is_none(), "{other:?}"),
+        }
+    }
+
+    /// qass's tab going while it is on screen sends the keyboard back to the owner's tab,
+    /// never leaves it in a space no list shows.
+    #[test]
+    fn qass_leaving_sends_the_keyboard_back() {
+        let mut state = qass_state();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let left: Vec<AgentRow> = state
+            .rows
+            .iter()
+            .filter(|r| r.terminal != 5)
+            .cloned()
+            .collect();
+        assert_eq!(out_of_qass(&state, &left), Some(1));
+        state.qass_back = None;
+        assert_eq!(out_of_qass(&state, &left), Some(1));
+        state.space = Some(3);
+        assert_eq!(out_of_qass(&state, &left), None, "only from qass's space");
     }
 
     /// `ctrl-a s/S` pass a sleeping space by, and with every other space asleep stay put.

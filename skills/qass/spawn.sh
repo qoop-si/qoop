@@ -18,7 +18,9 @@ where=()
 while [ $# -ge 2 ]; do
     case "$1" in
         --agent) agent="$2" ;;
-        --space) where=(--space "$2") ;;
+        # qass's own space is on no list the owner sees: a worker there would vanish.
+        --space) [ "$2" != qass ] || { echo "spawn: the space qass is qass's own; pick another" >&2; exit 1; }
+                 where=(--space "$2") ;;
         *) echo "spawn: unknown $1" >&2; exit 1 ;;
     esac
     shift 2

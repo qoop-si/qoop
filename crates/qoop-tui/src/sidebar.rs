@@ -1016,6 +1016,48 @@ fn waited(c: &Column, agent: &AgentRow) -> Option<String> {
     })
 }
 
+/// The space qass lives in (`qoop qass`): a place of its own, reached by `ctrl-a Q` and
+/// kept off every list of the owner's spaces and agents. A remote's spaces are named
+/// `machine:name`, so only this machine's is meant.
+pub const QASS_SPACE: &str = "qass";
+
+/// The local qass space, if there is one: the first so named, in the daemon's order, as
+/// `qoop qass` and the daemon find it. [`qass_last`] keeps that order among them.
+pub fn qass_space(spaces: &[WorkspaceRow]) -> Option<i64> {
+    spaces.iter().find(|w| w.name == QASS_SPACE).map(|w| w.id)
+}
+
+/// Every space named `qass`: qass's, and any other a rename gave the name, all kept off the
+/// owner's lists with their tabs.
+fn qass_named(spaces: &[WorkspaceRow]) -> Vec<i64> {
+    spaces
+        .iter()
+        .filter(|w| w.name == QASS_SPACE)
+        .map(|w| w.id)
+        .collect()
+}
+
+/// Put the qass spaces and their tabs after everything else, keeping every other order, so
+/// that what the owner sees is a prefix of each list ([`shown`]).
+pub fn qass_last(spaces: &mut [WorkspaceRow], rows: &mut [AgentRow]) {
+    spaces.sort_by_key(|w| w.name == QASS_SPACE);
+    let qass = qass_named(spaces);
+    rows.sort_by_key(|r| qass.contains(&r.workspace));
+}
+
+/// The spaces and rows the owner's lists show: everything before qass, as [`qass_last`]
+/// left them.
+pub fn shown<'a>(
+    spaces: &'a [WorkspaceRow],
+    rows: &'a [AgentRow],
+) -> (&'a [WorkspaceRow], &'a [AgentRow]) {
+    let qass = qass_named(spaces);
+    (
+        &spaces[..spaces.partition_point(|w| w.name != QASS_SPACE)],
+        &rows[..rows.partition_point(|r| !qass.contains(&r.workspace))],
+    )
+}
+
 /// Everyone waiting on a person, in the order they are best seen to: everyone who wants
 /// something, then everyone who failed, then everyone who finished unread, each kind in
 /// daemon order. The agent the keyboard is on is left out: it is already in front of the
