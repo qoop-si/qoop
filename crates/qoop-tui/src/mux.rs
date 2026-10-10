@@ -343,6 +343,7 @@ impl Link {
             closable: false,
             ink: None,
             link: state(LinkState::Down),
+            goal: None,
         }]
     }
 }
@@ -2605,6 +2606,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         };
         let far = workspace_out(1, 3).expect("fits");
         for (link, rows) in [
@@ -2684,6 +2686,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         };
         let far = workspace_out(1, 3).expect("fits");
         let set = |mux: &mut Mux<Vec<u8>>, link: usize, rows: Vec<WorkspaceRow>| {
@@ -2776,6 +2779,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         };
         let (r1, r2, r3) = (
             workspace_out(1, 1).expect("fits"),
@@ -2911,6 +2915,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         };
         let mut remote = Link::new("devbox".into(), None);
         assert_eq!(links(&remote), [Some(LinkState::Down)], "never listed");
@@ -3314,6 +3319,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         };
         mux.answer(
             0,

@@ -103,7 +103,7 @@ pub enum TaskError {
 }
 
 /// One line, no control characters: a goal is shown in lists and injected into agents.
-fn one_line(text: &str) -> String {
+pub fn one_line(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -130,7 +130,18 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
-fn within(what: &'static str, text: &str, max: usize) -> Result<(), StoreError> {
+/// A goal as it is kept: one line, not empty, within `GOAL_MAX`. Checked before anything is
+/// written, so a refused goal leaves no task opened on its way.
+pub fn goal_text(goal: &str) -> Result<String, StoreError> {
+    let goal = one_line(goal);
+    if goal.is_empty() {
+        return Err(TaskError::Empty("the goal").into());
+    }
+    within("the goal", &goal, GOAL_MAX)?;
+    Ok(goal)
+}
+
+pub(crate) fn within(what: &'static str, text: &str, max: usize) -> Result<(), StoreError> {
     let len = text.chars().count();
     if len > max {
         return Err(TaskError::TooLong { what, len, max }.into());
@@ -356,6 +367,26 @@ impl Store {
         Ok(t.stage != stage || t.claimed_at.is_some())
     }
 
+    /// Rewrite an open task's goal: what the owner wants, in plain words, with its done bar.
+    /// The first goal is the owner's cut prompt; this replaces it as the ask becomes clear or
+    /// changes. The old text stays in the events. Answers whether the goal changed.
+    pub fn set_task_goal(&self, task: i64, goal: &str, now: i64) -> Result<bool, StoreError> {
+        let goal = goal_text(goal)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let t = open_row(&tx, task)?;
+        // The same words again change nothing: no event, and the task does not look touched.
+        if t.goal == goal {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE task SET goal = ?2, updated_at = ?3 WHERE id = ?1",
+            params![task, goal, now],
+        )?;
+        event(&tx, task, "goal", &goal, now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Record the task's contract: goal, acceptance, plan, how it will be verified, risks.
     pub fn task_plan(&self, task: i64, text: &str, now: i64) -> Result<(), StoreError> {
         self.task_text(task, "plan", "the plan", text, PLAN_MAX, now)
@@ -454,6 +485,46 @@ impl Store {
             "SELECT {COLUMNS} FROM task WHERE closed_at IS NULL ORDER BY id"
         ))?;
         let rows = stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Tasks checked and closed (verified or failed) at or after `since`, newest first, at
+    /// most `limit`. Superseded and abandoned ones ended without a check, so they are not
+    /// news.
+    pub fn closed_tasks_since(&self, since: i64, limit: usize) -> Result<Vec<TaskRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM task WHERE closed_at >= ?1 AND outcome IN ('verified', 'failed') \
+             ORDER BY closed_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![since, limit as i64], row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A task's newest events of one kind, newest first: the plan of a task with many
+    /// evidence lines is still found.
+    pub fn task_events_of(
+        &self,
+        task: i64,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskEventRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task, at, kind, body FROM task_event \
+             WHERE task = ?1 AND kind = ?2 ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![task, kind, limit as i64], |r| {
+                Ok(TaskEventRow {
+                    id: r.get(0)?,
+                    task: r.get(1)?,
+                    at: r.get(2)?,
+                    kind: r.get(3)?,
+                    body: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -747,5 +818,83 @@ mod tests {
             rest.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
             ["check 1", "check 0", "x"]
         );
+    }
+
+    /// The goal is rewritten in place, cleaned like an opened one, kept in the events,
+    /// refused when too long or once closed; the space goal follows the same text rules,
+    /// clears on empty, and dies with its space so a reused id starts blank.
+    #[test]
+    fn goals_are_rewritten_cleaned_and_bounded() {
+        let (s, ws, t) = store_with_terminal();
+        let id = s.open_task(t, "dostum bak su", false, 10).unwrap();
+        assert!(
+            s.set_task_goal(
+                id,
+                " wend search\nwithout\u{202E} embeddings\u{E0041}; done when top10 >= 45% ",
+                11
+            )
+            .unwrap()
+        );
+        let row = s.task(id).unwrap().unwrap();
+        assert_eq!(
+            row.goal,
+            "wend search without embeddings; done when top10 >= 45%"
+        );
+        assert_eq!(row.updated_at, 11);
+        assert!(
+            !s.set_task_goal(id, &row.goal, 12).unwrap(),
+            "same text is no change"
+        );
+        let events = s.task_events(id, None, 10).unwrap();
+        assert_eq!(events[0].kind, "goal");
+        assert_eq!(
+            events.last().unwrap().body,
+            "dostum bak su",
+            "the first words stay"
+        );
+        assert!(matches!(
+            task_err(
+                s.set_task_goal(id, &"x".repeat(GOAL_MAX + 1), 13)
+                    .unwrap_err()
+            ),
+            TaskError::TooLong { .. }
+        ));
+        assert!(matches!(
+            task_err(s.set_task_goal(id, " \n ", 13).unwrap_err()),
+            TaskError::Empty(_)
+        ));
+        s.close_task(id, Outcome::Verified, "", 14).unwrap();
+        assert!(matches!(
+            task_err(s.set_task_goal(id, "late", 15).unwrap_err()),
+            TaskError::Closed(_)
+        ));
+        assert_eq!(s.task_events_of(id, "goal", 5).unwrap().len(), 1);
+        assert_eq!(s.closed_tasks_since(14, 5).unwrap().len(), 1);
+        assert!(s.closed_tasks_since(15, 5).unwrap().is_empty());
+
+        let goal_of = |s: &Store, ws: i64| {
+            s.workspaces()
+                .unwrap()
+                .into_iter()
+                .find(|w| w.id == ws)
+                .and_then(|w| w.goal)
+        };
+        assert!(
+            s.set_space_goal(ws, "ship the\nphone\u{200B} app", 20)
+                .unwrap()
+        );
+        assert_eq!(goal_of(&s, ws).as_deref(), Some("ship the phone app"));
+        assert!(s.set_space_goal(ws, "  ", 21).unwrap());
+        assert_eq!(goal_of(&s, ws), None, "empty clears");
+        assert!(
+            s.set_space_goal(ws + 100, "x", 22)
+                .is_ok_and(|found| !found)
+        );
+        assert!(s.set_space_goal(ws, &"y".repeat(GOAL_MAX + 1), 23).is_err());
+        let other = s.create_workspace("other", 24).unwrap();
+        assert!(s.set_space_goal(other, "gone soon", 25).unwrap());
+        s.delete_workspace(other).unwrap();
+        let again = s.create_workspace("again", 26).unwrap();
+        assert_eq!(goal_of(&s, again), None, "a reused id starts with no goal");
     }
 }

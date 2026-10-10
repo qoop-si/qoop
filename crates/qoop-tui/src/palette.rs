@@ -389,6 +389,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }
     }
 

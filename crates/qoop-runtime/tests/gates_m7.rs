@@ -107,6 +107,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             workspace: 1,
             ink: Some(2),
         },
+        ControlRequest::SetSpaceGoal {
+            id: "x14d".into(),
+            workspace: 1,
+            goal: "ship the phone app".into(),
+        },
         ControlRequest::MoveWorkspace {
             id: "x14c".into(),
             workspace: 1,
@@ -236,6 +241,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::SetSpaceGoal { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }

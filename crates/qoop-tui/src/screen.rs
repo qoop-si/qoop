@@ -3394,6 +3394,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }]
     }
 
@@ -5662,6 +5663,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }];
         let rows = [row(1, "claude", "working")];
         let painted = paint(&Frame {
@@ -6028,6 +6030,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }];
         let palette = Palette::open();
         let painted = paint(&Frame {
@@ -6449,6 +6452,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }];
         let states = [
             "blocked", "failed", "working", "working", "done", "idle", "idle", "idle", "idle",

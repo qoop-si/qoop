@@ -19,7 +19,8 @@ pub(crate) const RULES: &str = "You are running inside qoop, which keeps a task 
 terminal. It may open one by itself when you edit a file; `qoop task show` says whether there is \
 one, and `qoop task new \"<outcome>\"` opens it. For real work (changing files, a multi-step investigation), give it a plan \
 with `qoop task plan -` (acceptance, steps, how you will verify it), move it with `qoop task \
-stage <stage>` (investigating, planning, implementing, reviewing, verifying, waiting-human), add \
+stage <stage>` (investigating, planning, implementing, reviewing, verifying, waiting-human), keep \
+`qoop task goal \"<what the owner wants; done when ...>\"` true to his words, add \
 `qoop task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
 finish with `qoop task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
 or stop as usual. If a `qoop task` command fails, carry on with the work.";
@@ -36,12 +37,16 @@ const QASS_SPACE: &str = crate::qass::SPACE;
 
 const USAGE: &str = "usage:
   qoop task new [--replace] <goal>     open this terminal's task
+  qoop task goal [--id N] <text|->     what the owner wants and when it is done, in plain words
+                                       (--id: another terminal's task, for qass)
   qoop task stage <stage>              investigating|planning|implementing|reviewing|verifying|waiting-human
   qoop task plan <text|->              acceptance, plan, how it will be verified, risks
   qoop task evidence <text|->          a check that proves an acceptance point, and its result
   qoop task done [summary]             claim it is done; it is checked outside the agent
   qoop task close <id> --verified|--failed [reason]
   qoop task ls [--json]                open tasks
+  qoop task board [--dir DIR]          every space's goal and open tasks as Markdown; --dir
+                                       writes README.md and space-<id>.md there
   qoop task show [id] [--before E] [--json]   no id: this terminal's open task
   qoop task begin                      this terminal's open task, opened now if none (hooks)
   qoop task rules [--turn]             what an agent in qoop is told at session start
@@ -63,7 +68,7 @@ fn here() -> (Option<u32>, Option<String>) {
 }
 
 /// The words after the subcommand as one text, or standard input for `-`.
-fn text(words: &[String]) -> std::io::Result<String> {
+pub(crate) fn text(words: &[String]) -> std::io::Result<String> {
     if words.len() == 1 && words[0] == "-" {
         // Bounded: one request is one frame, and the longest text kept is far below this.
         let mut all = String::new();
@@ -72,24 +77,12 @@ fn text(words: &[String]) -> std::io::Result<String> {
             .read_to_string(&mut all)?;
         if all.len() > STDIN_MAX {
             return Err(std::io::Error::other(format!(
-                "over {STDIN_MAX} bytes on standard input; a plan is at most 2500 characters"
+                "over {STDIN_MAX} bytes on standard input; the longest text kept is 2500 characters"
             )));
         }
         return Ok(all);
     }
     Ok(words.join(" "))
-}
-
-/// An older daemon's refusal of a method it does not know tells the caller to restart it,
-/// which would end every tab. Said plainly instead.
-fn explain(reason: String) -> std::io::Error {
-    if reason.starts_with("this daemon is older") {
-        return std::io::Error::other(
-            "the running qoop daemon is older than this command and has no tasks; it picks \
-             them up the next time it restarts on its own",
-        );
-    }
-    std::io::Error::other(reason)
 }
 
 fn ask(request: ControlRequest, patience: std::time::Duration) -> std::io::Result<ControlResponse> {
@@ -127,7 +120,7 @@ fn write(task: Option<i64>, action: TaskOp) -> std::io::Result<i64> {
     };
     match ask(request, std::time::Duration::from_secs(10))? {
         ControlResponse::TaskWritten { task, .. } => Ok(task),
-        ControlResponse::Failed { reason, .. } => Err(explain(reason)),
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
         other => Err(std::io::Error::other(format!(
             "unexpected answer: {other:?}"
         ))),
@@ -168,7 +161,7 @@ fn read(
             more,
             space,
         }),
-        ControlResponse::Failed { reason, .. } => Err(explain(reason)),
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
         other => Err(std::io::Error::other(format!(
             "unexpected answer: {other:?}"
         ))),
@@ -236,6 +229,33 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             println!("task #{id}");
             Ok(())
         }
+        Some("goal") => {
+            // Only a leading `--id <n>` names another task: a goal may mention the flag.
+            let (task, words) = match rest.split_first() {
+                Some((flag, tail)) if flag == "--id" => {
+                    let (n, words) = tail.split_first().ok_or_else(|| usage(USAGE))?;
+                    let n: i64 = n
+                        .trim_start_matches('#')
+                        .parse()
+                        .map_err(|_| usage(USAGE))?;
+                    (Some(n), words)
+                }
+                _ => (None, rest),
+            };
+            if words.is_empty() {
+                return Err(usage(USAGE));
+            }
+            match write(task, TaskOp::Goal { goal: text(words)? })? {
+                0 => Err(std::io::Error::other(
+                    "not recorded: this terminal's space keeps no task (qass's own, or one qoop \
+                     cannot name yet)",
+                )),
+                id => {
+                    println!("task #{id}");
+                    Ok(())
+                }
+            }
+        }
         Some("stage") => {
             let [stage] = raw.as_slice() else {
                 return Err(usage(USAGE));
@@ -282,6 +302,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             )
             .map(drop)
         }
+        Some("board") => match raw.as_slice() {
+            [] => crate::board::run(None),
+            [flag, dir] if flag == "--dir" => crate::board::run(Some(std::path::Path::new(dir))),
+            _ => Err(usage(USAGE)),
+        },
         Some("ls") => {
             let found = read(None, None, false, std::time::Duration::from_secs(10))?;
             if has("--json") {
@@ -410,20 +435,6 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_older_daemon_is_never_restarted_on_its_own_advice() {
-        let said = explain(
-            "this daemon is older than the client that called it: it does not know the method \
-             that was asked for (unknown variant). `qoop stop`, then `qoop`, picks up the new \
-             daemon; what is open comes back."
-                .into(),
-        )
-        .to_string();
-        assert!(!said.contains("qoop stop"), "{said}");
-        assert!(said.contains("older than this command"), "{said}");
-        assert_eq!(explain("no task #4".into()).to_string(), "no task #4");
-    }
 
     #[test]
     fn the_rules_stay_short() {

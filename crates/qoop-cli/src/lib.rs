@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod avatar;
+mod board;
 mod config;
 mod hooks;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
@@ -67,9 +68,22 @@ pub fn main_with(phone: Option<Phone>) {
     // returning the error from `main` prints: every refusal below is worded for a person.
     // Exit 2 when the command was called wrong, 1 when it failed.
     if let Err(e) = run(phone) {
-        eprintln!("qoop: {e}");
+        eprintln!("qoop: {}", worded(&e));
         std::process::exit(if is_usage(&e) { 2 } else { 1 });
     }
+}
+
+/// A refusal as a person reads it. A running daemon older than this binary answers a method
+/// it does not know with "`qoop stop`, then `qoop`": advice that ends every tab, and that an
+/// agent reading this output would follow. Every command's error passes here.
+fn worded(e: &std::io::Error) -> String {
+    let said = e.to_string();
+    if said.contains("this daemon is older than the client") {
+        return "the running qoop daemon is older than this command; it learns it the next \
+                time it restarts on its own"
+            .to_string();
+    }
+    said
 }
 
 /// A command called wrong, as opposed to one that failed: exits 2.
@@ -146,7 +160,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("wake") => supervise::run_wake(&args),
         Some("close") => supervise::run_close(&args),
         Some("worktree") => worktree::run(&args),
-        Some("space") => supervise::run_space_rm(&args),
+        Some("space") => supervise::run_space(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("task") => task::run(&args),
@@ -189,7 +203,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop setup ...  capture, inspect, trust and run a Setup\n\
                    \x20 qoop hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoop hook-report --session-id S  report only the agent's conversation id\n\
-                  \x20 qoop task new|stage|plan|evidence|done|close|ls|show|rules  the work this\n\
+                  \x20 qoop task new|goal|stage|plan|evidence|done|close|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
@@ -215,6 +229,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
                   \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
+                  \x20 qoop space goal <id|name> [text|-]  what you want from a space: print it, set it, an empty text clears it\n\
                   \x20 qoop close <terminal>  end a terminal and what it started\n\
                   \x20 qoop history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
@@ -2821,14 +2836,15 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
         } else {
             "stopped".to_string()
         };
-        rows.push((space.id, space.name, state, tabs, sleeping));
+        rows.push((space.id, space.name, state, tabs, sleeping, space.goal));
     }
     if json {
         let list: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(id, name, state, tabs, sleeping)| {
+            .map(|(id, name, state, tabs, sleeping, goal)| {
                 serde_json::json!({
-                    "id": id, "name": name, "state": state, "tabs": tabs, "sleeping": sleeping
+                    "id": id, "name": name, "state": state, "tabs": tabs, "sleeping": sleeping,
+                    "goal": goal
                 })
             })
             .collect();
@@ -2838,7 +2854,7 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     if rows.is_empty() {
         println!("no spaces yet. `qoop` starts one.");
     }
-    for (id, name, state, tabs, sleeping) in rows {
+    for (id, name, state, tabs, sleeping, goal) in rows {
         let tabs = match tabs {
             1 => "1 tab".to_string(),
             n => format!("{n} tabs"),
@@ -2850,6 +2866,9 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
             format!("  asleep: {}", numbers.join(" "))
         };
         println!("{id:>3}  {name:<20} {state:<14} {tabs}{sleeping}");
+        if let Some(goal) = goal {
+            println!("     goal: {goal}");
+        }
     }
     Ok(())
 }
@@ -2934,6 +2953,23 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// An older daemon's "`qoop stop`, then `qoop`" never reaches a person or an agent as
+    /// advice; every other refusal is said as it is.
+    #[test]
+    fn an_older_daemon_is_never_restarted_on_its_own_advice() {
+        let said = super::worded(&std::io::Error::other(
+            "this daemon is older than the client that called it: it does not know the method \
+             that was asked for (unknown variant `SetSpaceGoal`). `qoop stop`, then `qoop`, \
+             picks up the new daemon; what is open comes back.",
+        ));
+        assert!(!said.contains("qoop stop"), "{said}");
+        assert!(said.contains("older than this command"), "{said}");
+        assert_eq!(
+            super::worded(&std::io::Error::other("no task #4")),
+            "no task #4"
+        );
+    }
+
     /// What the update reloads the services with is this binary's path with every link resolved,
     /// taken before it can be replaced: never `current_exe` read afterwards, which on Linux says
     /// `<path> (deleted)`.

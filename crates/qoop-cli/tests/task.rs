@@ -509,3 +509,114 @@ $Q task ls > ls.out 2>&1"#,
     let (_, ls, _) = daemon.run(&["task", "ls"]);
     assert_eq!(ls.lines().count(), 1, "qass opened nothing: {ls}");
 }
+
+/// A goal set before any edit opens the task and lands on it; qass rewrites it by id; the
+/// space's goal is set, printed, listed and cleared; the board shows both, on stdout and as
+/// a folder.
+#[test]
+fn goals_reach_the_row_the_space_and_the_board() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let work = daemon.inside(
+        "1",
+        "goals",
+        r#"$Q task goal "login works; done when e2e passes" > goal.out 2>&1"#,
+    );
+    assert_eq!(
+        read(&work, "goal.out").trim(),
+        "task #1",
+        "{}",
+        read(&work, "goal.out")
+    );
+
+    // After a done claim and a newer request, a goal is new work: it lands on a new task and
+    // the claimed one is closed as superseded, never rewritten.
+    let work = daemon.inside(
+        "1",
+        "next",
+        r#"$Q task done "login fixed" > done.out 2>&1
+sleep 1
+$Q hook-report --state working --event user --label "now the signup page" > report.out 2>&1
+$Q task goal "signup works; done when e2e passes" > goal.out 2>&1
+$Q task goal > empty.out 2>&1; echo $? > empty.rc"#,
+    );
+    assert_eq!(
+        read(&work, "goal.out").trim(),
+        "task #2",
+        "{}",
+        read(&work, "goal.out")
+    );
+    assert_eq!(
+        read(&work, "empty.rc").trim(),
+        "2",
+        "an empty goal is a usage error"
+    );
+    let (_, show, _) = daemon.run(&["task", "show", "1", "--json"]);
+    assert!(show.contains(r#""outcome": "superseded""#), "{show}");
+    assert!(
+        show.contains("login works; done when e2e passes"),
+        "the old goal stays: {show}"
+    );
+    assert_eq!(
+        row_task(&daemon, 1)["goal"],
+        "signup works; done when e2e passes"
+    );
+
+    let (ok, out, err) = daemon.run(&[
+        "task",
+        "goal",
+        "--id",
+        "2",
+        "signup",
+        "works",
+        "on",
+        "the\nphone",
+    ]);
+    assert!(ok, "goal by id: {err}");
+    assert_eq!(out.trim(), "task #2");
+    assert_eq!(row_task(&daemon, 1)["goal"], "signup works on the phone");
+    let long = "x".repeat(301);
+    let (ok, _, err) = daemon.run(&["task", "goal", "--id", "2", &long]);
+    assert!(!ok && err.contains("300"), "a long goal is refused: {err}");
+
+    let (ok, _, err) = daemon.run(&["space", "goal", "1", "checkout", "works"]);
+    assert!(ok, "space goal: {err}");
+    let (_, out, _) = daemon.run(&["space", "goal", "1"]);
+    assert_eq!(out.trim(), "checkout works");
+    let (_, out, _) = daemon.run(&["ls", "--json"]);
+    assert!(out.contains(r#""goal":"checkout works""#), "{out}");
+
+    let (ok, out, err) = daemon.run(&["task", "board"]);
+    assert!(ok, "board: {err}");
+    assert!(out.contains("| checkout works | 1 | 0 |"), "{out}");
+    assert!(out.contains("Goal: signup works on the phone"), "{out}");
+    let folder = dir.path().join("board");
+    let (ok, _, err) = daemon.run(&["task", "board", "--dir", folder.to_str().unwrap()]);
+    assert!(ok, "board --dir: {err}");
+    assert!(read(&folder, "README.md").contains("(space-1.md)"));
+    assert!(read(&folder, "space-1.md").contains("Goal: checkout works"));
+
+    let (ok, _, err) = daemon.run(&["space", "goal", "1", ""]);
+    assert!(ok, "clear: {err}");
+    let (_, out, _) = daemon.run(&["space", "goal", "1"]);
+    assert!(out.contains("has no goal"), "{out}");
+
+    // qass keeps no task: its goal is refused out loud, never recorded quietly.
+    let (ok, out, err) = daemon.run(&["new", "--space", "qass"]);
+    assert!(ok, "{err}");
+    let qass = out.trim().to_string();
+    std::thread::sleep(Duration::from_millis(500));
+    let work = daemon.inside(
+        &qass,
+        "qass-goal",
+        r#"$Q task goal "qass notes" > goal.out 2>&1; echo $? > goal.rc"#,
+    );
+    assert_eq!(read(&work, "goal.rc").trim(), "1");
+    assert!(
+        read(&work, "goal.out").contains("not recorded"),
+        "{}",
+        read(&work, "goal.out")
+    );
+    let (_, ls, _) = daemon.run(&["task", "ls"]);
+    assert_eq!(ls.lines().count(), 1, "qass opened nothing: {ls}");
+}

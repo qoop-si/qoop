@@ -14,4 +14,6 @@ the files below, not here.
   you learned about the fleet, the repos, the machines). Read it at every start; keep it short
   and rewrite it whole.
 - State: `@QASS_DATA@/goals.md`, as the skill says.
+- Board: `@QASS_DATA@/board/`, every space's goal and open tasks, written by `qoop task board`
+  on every wake. Read it, never edit it; it is safe to delete.
 - Scratchpad: `@QASS_DATA@/scratch/`, for anything temporary. Nothing else here is scratch.

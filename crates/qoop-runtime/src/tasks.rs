@@ -83,9 +83,20 @@ pub(crate) async fn write(
         Err(reason) => return failed(id, reason),
     };
     let now = now();
-    if let TaskOp::Begin = action {
+    // A goal from a terminal lands on its live task: begun first, exactly as a hook's
+    // Begin would, so a goal set before the first edit, or after a done claim and a new
+    // request, is never written onto the old task.
+    let goal_here = matches!(action, TaskOp::Goal { .. }) && task.is_none();
+    if matches!(action, TaskOp::Begin) || goal_here {
         let Some(terminal) = speaker else {
-            return failed(id, "a task is begun from inside a qoop terminal");
+            return failed(
+                id,
+                if goal_here {
+                    "no task named, and not inside a qoop terminal"
+                } else {
+                    "a task is begun from inside a qoop terminal"
+                },
+            );
         };
         // qass edits its own files; it never has a task of its own.
         // An unread name could be qass's: nothing is opened on a guess, the next edit asks again.
@@ -96,12 +107,26 @@ pub(crate) async fn write(
             Some((goal, at)) => (goal, Some(at)),
             None => (String::new(), None),
         };
+        let wanted = match action {
+            TaskOp::Goal { goal } => Some(goal),
+            _ => None,
+        };
         return match store
-            .run(move |s| s.begin_task(i64::from(terminal), &goal, asked_at, now))
+            .run(move |s| {
+                let wanted = wanted
+                    .map(|g| qoop_store::task::goal_text(&g))
+                    .transpose()?;
+                let (task, opened) = s.begin_task(i64::from(terminal), &goal, asked_at, now)?;
+                let changed = match &wanted {
+                    Some(wanted) => s.set_task_goal(task, wanted, now)?,
+                    None => false,
+                };
+                Ok((task, opened || changed))
+            })
             .await
         {
-            Ok((task, opened)) => {
-                if opened {
+            Ok((task, shown)) => {
+                if shown {
                     agents.announce(terminal);
                 }
                 ControlResponse::TaskWritten { id, task }
@@ -163,6 +188,7 @@ pub(crate) async fn write(
         .run(move |s| match action {
             TaskOp::New { .. } | TaskOp::Begin => unreachable!("handled above"),
             TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
+            TaskOp::Goal { goal } => s.set_task_goal(task, &goal, now),
             TaskOp::Plan { text } => s.task_plan(task, &text, now).map(|()| false),
             TaskOp::Evidence { text } => s.task_evidence(task, &text, now).map(|()| false),
             TaskOp::Done { summary } => s.claim_task_done(task, &summary, now).map(|()| true),

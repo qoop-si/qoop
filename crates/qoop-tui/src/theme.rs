@@ -903,6 +903,7 @@ mod tests {
             closable: true,
             ink,
             link: None,
+            goal: None,
         };
         let spaces = [row(1, Some(4)), row(2, None), row(3, Some(7))];
         assert_eq!(space_in(&spaces, 1), Role::Space(4));

@@ -926,6 +926,7 @@ async fn pre_feature_daemon(
                                     closable: true,
                                     ink: None,
                                     link: None,
+                                    goal: None,
                                 }],
                             },
                             "ListAgents" => ControlResponse::Agents {

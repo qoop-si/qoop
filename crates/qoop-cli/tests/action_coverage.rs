@@ -166,6 +166,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "say what a space is for",
+            method: || {
+                Method::Control(ControlRequest::SetSpaceGoal {
+                    id: "a".into(),
+                    workspace: 1,
+                    goal: "ship the phone app".into(),
+                })
+            },
+        },
+        Action {
             name: "move a workspace in the list",
             method: || {
                 Method::Control(ControlRequest::MoveWorkspace {
@@ -579,6 +589,11 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             ink: None,
         },
+        ControlRequest::SetSpaceGoal {
+            id: String::new(),
+            workspace: 0,
+            goal: String::new(),
+        },
         ControlRequest::MoveWorkspace {
             id: String::new(),
             workspace: 0,
@@ -671,6 +686,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::MoveTerminal { .. }
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
+            | ControlRequest::SetSpaceGoal { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::Subscribe { .. }

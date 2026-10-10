@@ -3762,6 +3762,7 @@ async fn handle_control(
                     closable: row.id != workspace,
                     ink: row.ink,
                     link: None,
+                    goal: row.goal,
                 });
             }
             ControlResponse::Workspaces { id, workspaces }
@@ -4023,6 +4024,19 @@ async fn handle_control(
                 },
             }
         }
+        ControlRequest::SetSpaceGoal {
+            workspace, goal, ..
+        } => match store.set_space_goal(workspace, goal).await {
+            Ok(false) => ControlResponse::Failed {
+                id,
+                reason: format!("there is no workspace {workspace}"),
+            },
+            Ok(true) => ControlResponse::Renamed { id },
+            Err(e) => ControlResponse::Failed {
+                id,
+                reason: format!("the space goal was not saved: {e}"),
+            },
+        },
         ControlRequest::MoveWorkspace {
             workspace, before, ..
         } => match store.move_workspace(workspace, before).await {
@@ -4641,9 +4655,13 @@ async fn handle_control(
             task,
             action,
         } => {
-            // A begin skips qass's own space, so it needs the space's name; nothing else does.
+            // A begin, and a goal that begins first, skip qass's own space, so they need the
+            // space's name; nothing else does.
             let space = match (&action, terminal.and_then(|t| terminals.workspace_of(t))) {
-                (crate::control::TaskOp::Begin, Some(space)) => space_name(store, space).await,
+                (
+                    crate::control::TaskOp::Begin | crate::control::TaskOp::Goal { .. },
+                    Some(space),
+                ) => space_name(store, space).await,
                 _ => None,
             };
             // Boxed, like the listing: this arm's future is part of every request's.

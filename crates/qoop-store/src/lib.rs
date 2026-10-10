@@ -73,6 +73,8 @@ pub struct WorkspaceRow {
     /// The colour a person picked for it, one of the six space inks. `None` is the
     /// colour its id gives it.
     pub ink: Option<u8>,
+    /// What the owner wants from the work in this space, one line, when he said.
+    pub goal: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,6 +283,14 @@ impl Store {
              CREATE TABLE IF NOT EXISTS awake_terminal (
                  terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE
              );
+             -- What the owner wants from the work in a space, one line. Cascaded like the
+             -- rest, because ids are reused. New table, no version bump: an older binary
+             -- ignores it.
+             CREATE TABLE IF NOT EXISTS space_goal (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+                 goal TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
              -- Where a person put each space in the list. A space never placed has no row
              -- and comes after the placed ones, by id, so a new one lands at the end.
              -- Cascaded like the rest, because ids are reused. New table, no version bump:
@@ -407,6 +417,34 @@ impl Store {
         }
     }
 
+    /// Set what the owner wants from a space; an empty text clears it.
+    /// One line, at most `task::GOAL_MAX` characters (refused, never cut). Answers false
+    /// when there is no such space.
+    pub fn set_space_goal(&self, id: i64, goal: &str, now: i64) -> Result<bool, StoreError> {
+        let goal = task::one_line(goal);
+        task::within("the goal", &goal, task::GOAL_MAX)?;
+        let exists = self
+            .conn
+            .query_row("SELECT 1 FROM workspace WHERE id = ?1", params![id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        if goal.is_empty() {
+            self.conn
+                .execute("DELETE FROM space_goal WHERE workspace = ?1", params![id])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO space_goal (workspace, goal, updated_at) VALUES (?1, ?2, ?3)",
+                params![id, goal, now],
+            )?;
+        }
+        Ok(true)
+    }
+
     /// Keep a space awake, or let idle sleep take its tabs again. Answers false when there
     /// is no such space.
     pub fn set_keep_awake_workspace(&self, id: i64, on: bool) -> Result<bool, StoreError> {
@@ -491,8 +529,9 @@ impl Store {
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT w.id, w.name, w.created_at, i.ink FROM workspace w \
+            "SELECT w.id, w.name, w.created_at, i.ink, g.goal FROM workspace w \
                  LEFT JOIN workspace_ink i ON i.workspace = w.id \
+                 LEFT JOIN space_goal g ON g.workspace = w.id \
                  LEFT JOIN workspace_order o ON o.workspace = w.id \
                  ORDER BY o.position IS NULL, o.position, w.id",
         )?;
@@ -506,6 +545,7 @@ impl Store {
                     ink: r
                         .get::<_, Option<i64>>(3)?
                         .and_then(|ink| u8::try_from(ink).ok()),
+                    goal: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

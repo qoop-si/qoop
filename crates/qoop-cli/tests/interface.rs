@@ -2538,6 +2538,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                             closable: true,
                             ink: None,
                             link: None,
+                            goal: None,
                         }],
                     },
                     "ListAgents" => ControlResponse::Agents {

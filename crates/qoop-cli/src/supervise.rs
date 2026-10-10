@@ -1620,29 +1620,85 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
     })
 }
 
+const SPACE_USAGE: &str = "usage:
+  qoop space rm <id|name>              remove a space with no tab in it
+  qoop space goal <id|name> [text|-]   what the owner wants from it: no text prints it,
+                                       an empty text clears it";
+
+/// `qoop space rm|goal`.
+pub(crate) fn run_space(args: &[String]) -> std::io::Result<()> {
+    match (
+        args.get(2).map(String::as_str),
+        args.get(3..).unwrap_or_default(),
+    ) {
+        (Some("rm"), [wanted]) => space_rm(wanted),
+        (Some("goal"), [wanted, words @ ..]) => {
+            let goal = if words.is_empty() {
+                None
+            } else {
+                Some(crate::task::text(words)?)
+            };
+            space_goal(wanted, goal)
+        }
+        _ => Err(super::usage(SPACE_USAGE)),
+    }
+}
+
+/// A link to the running daemon, never starting one, named plainly when nothing runs.
+async fn space_link(name: &str) -> std::io::Result<Link> {
+    Link::open(name).await.map_err(|e| {
+        if daemon_gone(&e) {
+            std::io::Error::other("nothing is awake: `qoop` or `qoop wake` starts it")
+        } else {
+            e
+        }
+    })
+}
+
+/// Print a space's goal, or set it (an empty text clears it).
+fn space_goal(wanted: &str, goal: Option<String>) -> std::io::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut link = space_link("qoop-space-goal").await?;
+        let spaces = link.spaces().await?;
+        let space = resolve_space(&spaces, wanted)?;
+        let row = spaces
+            .iter()
+            .find(|s| s.id == space)
+            .expect("resolved above");
+        let Some(goal) = goal else {
+            match &row.goal {
+                Some(goal) => println!("{goal}"),
+                None => println!("space {} ({}) has no goal", row.id, row.name),
+            }
+            return Ok(());
+        };
+        match link
+            .ask(&ControlRequest::SetSpaceGoal {
+                id: super::request_id("space-goal"),
+                workspace: space,
+                goal,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Renamed { .. } => Ok(()),
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a space goal")),
+        }
+    })
+}
+
 /// `qoop space rm <id|name>`: drop an empty space, as `ctrl-a W` does.
 ///
 /// Only an empty one: a space with a tab in it, awake or asleep, is refused with how many,
 /// and the daemon checks the same again, because it is the one that knows. A name two
 /// spaces share is refused rather than guessed. Never starts a daemon: with none running
 /// there is no space to remove.
-pub(crate) fn run_space_rm(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoop space rm <id|name>";
-    let (Some("rm"), [wanted]) = (
-        args.get(2).map(String::as_str),
-        args.get(3..).unwrap_or_default(),
-    ) else {
-        return Err(super::usage(help));
-    };
+fn space_rm(wanted: &str) -> std::io::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let mut link = Link::open("qoop-space-rm").await.map_err(|e| {
-            if daemon_gone(&e) {
-                std::io::Error::other("nothing is awake: `qoop` or `qoop wake` starts it")
-            } else {
-                e
-            }
-        })?;
+        let mut link = space_link("qoop-space-rm").await?;
         let spaces = link.spaces().await?;
         let space = resolve_space(&spaces, wanted)?;
         let row = spaces
@@ -2096,6 +2152,7 @@ mod tests {
                 closable: true,
                 ink: None,
                 link: None,
+                goal: None,
             },
             WorkspaceRow {
                 keep_awake: false,
@@ -2107,6 +2164,7 @@ mod tests {
                 closable: true,
                 ink: None,
                 link: None,
+                goal: None,
             },
         ];
         assert_eq!(pick_space(&spaces, "2").unwrap(), Some(2));
@@ -2123,6 +2181,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }];
         assert_eq!(
             pick_space(&named, "2024").unwrap(),

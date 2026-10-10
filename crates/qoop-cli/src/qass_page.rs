@@ -82,7 +82,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// "3 min ago", from a unix time.
-fn ago(then: Option<i64>, now: i64) -> String {
+pub(crate) fn ago(then: Option<i64>, now: i64) -> String {
     let Some(then) = then else {
         return "never".to_string();
     };

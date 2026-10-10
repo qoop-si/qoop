@@ -184,6 +184,11 @@ impl StoreHandle {
         self.run(move |s| s.set_workspace_ink(id, ink)).await
     }
 
+    pub async fn set_space_goal(&self, id: i64, goal: String) -> Result<bool, HandleError> {
+        let at = now();
+        self.run(move |s| s.set_space_goal(id, &goal, at)).await
+    }
+
     pub async fn set_keep_awake(
         &self,
         workspace: i64,

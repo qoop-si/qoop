@@ -4271,6 +4271,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }
     }
 
@@ -9451,6 +9452,7 @@ mod tests {
             closable,
             ink: None,
             link: None,
+            goal: None,
         };
         let agents = (1..=held as u32)
             .filter(|_| !asleep)
@@ -10062,6 +10064,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            goal: None,
         }];
         let agents: Vec<AgentRow> = (1..=3).map(|n| agent(n, 1, "claude", "idle")).collect();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());

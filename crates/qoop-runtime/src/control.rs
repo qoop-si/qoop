@@ -146,6 +146,14 @@ pub enum ControlRequest {
         workspace: i64,
         ink: Option<u8>,
     },
+    /// Say what the owner wants from the work in a workspace, one line; an empty text
+    /// clears it. Answered `Renamed`, like the colour, and announced to nobody: clients see
+    /// it on their next list.
+    SetSpaceGoal {
+        id: String,
+        workspace: i64,
+        goal: String,
+    },
     /// Put a workspace just before `before` in the list, or last. Answered `Renamed`, like
     /// the colour; the list is read again by whoever asked, and by the others at their next
     /// listing.
@@ -473,6 +481,11 @@ pub enum TaskOp {
     Stage {
         stage: String,
     },
+    /// Rewrite the goal: what the owner wants, in plain words, with its done bar. From a
+    /// terminal it lands on that terminal's live task, begun first as `Begin` does.
+    Goal {
+        goal: String,
+    },
     Plan {
         text: String,
     },
@@ -550,6 +563,7 @@ impl ControlRequest {
             | Self::MoveTerminal { id, .. }
             | Self::RenameWorkspace { id, .. }
             | Self::SetWorkspaceInk { id, .. }
+            | Self::SetSpaceGoal { id, .. }
             | Self::MoveWorkspace { id, .. }
             | Self::SetKeepAwake { id, .. }
             | Self::Shutdown { id, .. }
@@ -950,6 +964,10 @@ pub struct WorkspaceRow {
     /// true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_awake: bool,
+    /// What the owner wants from the work in it, one line, when he said. Absent from a
+    /// daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
 }
 
 /// Whether the machine behind a space answers.
