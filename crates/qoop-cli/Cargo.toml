@@ -11,6 +11,7 @@ name = "qoop"
 path = "src/main.rs"
 
 [dependencies]
+libc = { workspace = true }
 qoop-setup = { path = "../qoop-setup" }
 qoop-runtime = { path = "../qoop-runtime" }
 qoop-tui = { path = "../qoop-tui" }
@@ -32,5 +33,4 @@ qoop-proto = { path = "../qoop-proto" }
 serde_json = { workspace = true }
 qoop-store = { path = "../qoop-store" }
 qoop-testkit = { path = "../qoop-testkit" }
-libc = { workspace = true }
 tempfile = { workspace = true }

@@ -987,7 +987,7 @@ mod tests {
         assert!(!read_from(&file).config.notch);
         std::fs::write(
             &file,
-            "# mine\ntheme = \"dark\"  # night\nlater = 1\n[notify]\nsound = true\n",
+            "# mine\ntheme = \"dark\"  # night\nlater = 1\n[notify]\nsound = true # beep\n",
         )
         .unwrap();
         set(&file, "notify.sound", "false").unwrap();
@@ -998,6 +998,8 @@ mod tests {
             text.starts_with("# mine\ntheme = \"dark\"  # night\nlater = 1\n"),
             "{text}"
         );
+        // A changed value keeps the comment on its line.
+        assert!(text.contains("sound = false # beep"), "{text}");
         let (config, _) = parse(&text);
         assert_eq!(
             (config.prefix, config.sound, config.notch),

@@ -184,11 +184,14 @@ pub fn edit(path: &Path, edits: &[(&str, toml_edit::Item)]) -> Result<(), String
         std::process::id(),
         STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::write(&staged, doc.to_string()).map_err(|e| e.to_string())?;
-    if let Ok(meta) = std::fs::metadata(&target) {
-        let _ = std::fs::set_permissions(&staged, meta.permissions());
-    }
-    std::fs::rename(&staged, &target).map_err(|e| {
+    let written = std::fs::write(&staged, doc.to_string()).and_then(|()| {
+        if let Ok(meta) = std::fs::metadata(&target) {
+            let _ = std::fs::set_permissions(&staged, meta.permissions());
+        }
+        std::fs::rename(&staged, &target)
+    });
+    // A full disk or a refused rename leaves no half-written stage behind.
+    written.map_err(|e| {
         let _ = std::fs::remove_file(&staged);
         e.to_string()
     })
@@ -425,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn writers_at_once_each_stage_their_own_file_and_none_is_lost() {
+    fn writers_at_once_take_turns_and_none_is_lost() {
         let (dir, path) = file_with("# kept\n");
         let handles: Vec<_> = (0..32)
             .map(|n| {

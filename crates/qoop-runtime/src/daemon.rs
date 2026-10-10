@@ -3014,6 +3014,53 @@ async fn qass_space(into: &Restore) -> Result<Option<i64>, ()> {
     Ok(all.into_iter().find(|w| w.name == "qass").map(|w| w.id))
 }
 
+/// What ended a parked idle sleep loop.
+#[derive(Debug, PartialEq)]
+enum Park {
+    /// `config.toml` was changed through the socket: read it now.
+    Nudged,
+    /// An agent changed or a terminal was made (a lagged wait counts too).
+    Changed,
+    /// The channel closed.
+    Closed,
+}
+
+/// The idle sleep loop's wait while it has nothing to time: an agent change or a nudge ends it.
+async fn park<T: Clone>(
+    changes: &mut tokio::sync::broadcast::Receiver<T>,
+    nudge: &tokio::sync::Notify,
+) -> Park {
+    tokio::select! {
+        () = nudge.notified() => Park::Nudged,
+        got = changes.recv() => match got {
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Park::Changed,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => Park::Closed,
+        },
+    }
+}
+
+#[cfg(test)]
+mod park_tests {
+    use super::{Park, park};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_nudge_ends_the_park_and_nothing_else_does() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<u8>(4);
+        let nudge = tokio::sync::Notify::new();
+        // Nothing happens: still parked.
+        let quiet = tokio::time::timeout(Duration::from_millis(100), park(&mut rx, &nudge)).await;
+        assert!(quiet.is_err(), "left the park with nothing to wake it");
+        // A nudge sent before the wait is kept (`notify_one` stores a permit) and ends it.
+        nudge.notify_one();
+        assert_eq!(park(&mut rx, &nudge).await, Park::Nudged);
+        tx.send(1).unwrap();
+        assert_eq!(park(&mut rx, &nudge).await, Park::Changed);
+        drop(tx);
+        assert_eq!(park(&mut rx, &nudge).await, Park::Closed);
+    }
+}
+
 /// The idle reaper: close terminals idle past the configured timeout.
 ///
 /// One task for the whole daemon, spawned only when armed. It parks while
@@ -3062,16 +3109,13 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
             // channel cannot happen while this task holds the registry, but break rather
             // than spin if it ever does.
             // A change of the file through the socket ends it too, and is read at once.
-            tokio::select! {
-                () = into.books.nudge.notified() => {
+            match park(&mut changes, &into.books.nudge).await {
+                Park::Nudged => {
                     read_now = true;
                     continue;
                 }
-                got = changes.recv() => match got {
-                    Ok(_) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
+                Park::Changed => continue,
+                Park::Closed => break,
             }
         }
         let tick =

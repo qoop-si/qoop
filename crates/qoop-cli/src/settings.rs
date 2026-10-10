@@ -13,7 +13,6 @@ use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qoop_runtime::avatar::{self, Avatar};
-use qoop_runtime::paths;
 use qoop_tui::config::{self, Theme};
 use qoop_tui::notify;
 use qoop_tui::theme::{self, Role};
@@ -410,7 +409,22 @@ pub(crate) fn part_titles(pet: &Avatar) -> [(&'static str, String, Option<u8>); 
 
 /// This machine's name for the page, or a plain word when it cannot be read.
 fn host() -> String {
-    paths::host_name().unwrap_or_else(|| "this machine".to_string())
+    let mut name = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `name.len()` bytes into the buffer owned here.
+    let got = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    let full = if got == 0 {
+        String::from_utf8_lossy(&name).into_owned()
+    } else {
+        String::new()
+    };
+    short_host(&full).unwrap_or_else(|| "this machine".to_string())
+}
+
+/// A host name up to the first dot (`devbox.local` is `devbox`), `None` when there is none.
+fn short_host(full: &str) -> Option<String> {
+    let full = full.split('\0').next().unwrap_or_default();
+    let short = full.split('.').next().unwrap_or(full);
+    (!short.is_empty()).then(|| short.to_string())
 }
 
 /// Where the keyboard is.
@@ -862,5 +876,13 @@ mod tests {
         assert!(frame.contains("machines"), "{frame:?}");
         assert!(frame.contains("agent finished"), "{frame:?}");
         assert!(frame.contains("settings on devbox"), "{frame:?}");
+    }
+
+    #[test]
+    fn the_host_name_is_cut_at_the_first_dot() {
+        assert_eq!(short_host("devbox.local\0\0").as_deref(), Some("devbox"));
+        assert_eq!(short_host("onyx").as_deref(), Some("onyx"));
+        assert_eq!(short_host(""), None);
+        assert_eq!(short_host("\0\0"), None);
     }
 }

@@ -39,6 +39,7 @@ libc = "0.2"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
+toml_edit = "0.22"
 
 [profile.release]
 debug = 1

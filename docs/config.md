@@ -9,8 +9,9 @@ The interface reads it when it starts, and again within two seconds of any chang
 (`qoop settings`, `qoop config set`, an editor). `[sleep]`
 and `[daemon]` are the daemon's, read from the same file: `daemon.exit_when_asleep` each
 time it falls quiet, `sleep.idle_minutes` and `sleep.qass_idle_minutes` at its next idle check, a few
-minutes at most, and from "never" at the next agent activity, or at once when the change was made from a phone or the web app (no restart either way). A daemon on another
-machine reads that machine's file. There is no other
+minutes at most, and from "never" at the next agent activity (no restart either way); a change
+made through the daemon's socket is looked at at once. A daemon on another machine reads that
+machine's file. There is no other
 place any of these is set: an environment variable would change with whoever happened to
 start the daemon, a terminal, the notch or an ssh relay.
 
@@ -50,16 +51,16 @@ exit_when_asleep = true
 
 `sleep.idle_minutes`, `sleep.qass_idle_minutes` and `daemon.exit_when_asleep` belong to the machine
 whose file they are in: each machine has its own RAM and its own agents, so there is no account-wide
-copy. To change a remote's, use the phone or the web app (Settings, under that computer: "Idle tabs
-sleep" and "Leave when asleep"), `qoop settings` in a tab on that machine (the page names the machine
-it is on), or `ssh host qoop config set sleep.idle_minutes 30`. The phone and the web app change the
-first and the last key only, through that machine's running daemon: a machine with no session running
-has nothing to answer, and the app says so.
+copy. To change a remote's, use `qoop settings` in a tab on that machine (the page names the machine
+it is on), `ssh host qoop config set sleep.idle_minutes 30`, or the phone and web app from the release
+that adds them there. Through that machine's running daemon (`SleepSettings` on its socket) only
+`sleep.idle_minutes` and `daemon.exit_when_asleep` can be read and changed: a machine with no session
+running has nothing to answer.
 
-When a change takes effect: `sleep.idle_minutes` within one idle check of the daemon (a minute to five
-minutes, set by the number), also when it was off before and the change came from the phone or the web
-app; `daemon.exit_when_asleep` the next time the daemon falls quiet, which is when the last interface
-detaches. A setting never puts anything to sleep by itself. Turning idle sleep on after tabs have been
+When a change takes effect: the daemon looks at the file at once when the change came through its
+socket, and a tab then sleeps after its idle minutes plus up to one idle check (a minute to five minutes,
+set by the number), also when idle sleep was off before; `daemon.exit_when_asleep` the next time the
+daemon falls quiet, which is when the last interface detaches. A setting never puts anything to sleep by itself. Turning idle sleep on after tabs have been
 idle for hours can make the next pass sleep several at once, each one vetted as always: a tab that is
 working, waiting on you or kept awake is passed by.
 

@@ -290,27 +290,6 @@ async fn a_file_that_is_not_toml_is_said_and_never_shown_as_defaults() {
     assert!(problem.expect("a problem").contains("idle_minutes"));
 }
 
-/// A setting only writes the file. The tab running a task is passed by whenever the idle pass
-/// comes, and nothing is slept or ended by the setting itself, here or a few seconds on.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_setting_never_sleeps_or_ends_a_tab() {
-    let rt = Runtime::new("never");
-    let daemon = Daemon::start(&rt);
-    let mut c = daemon.client(&rt, "phone").await;
-    let (space, _idle, _busy) = space_with_two_tabs(&mut c).await;
-
-    assert_eq!(
-        body(settings(&mut c, "w", Some(1), None).await),
-        said(1, true)
-    );
-    for _ in 0..2 {
-        let row = space_row(&mut c, space).await;
-        assert_eq!(row.terminals, 2, "{row:?}");
-        assert!(row.sleeping.is_empty() && !row.asleep, "{row:?}");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-}
-
 /// Turn idle sleep on from the socket on a daemon that has sat quiet with it off. Nothing
 /// else happens afterwards (no tab made, no agent change): the setting alone makes the daemon
 /// look at the file, and the pass that follows sleeps the idle tab and passes the busy one by.
@@ -363,21 +342,36 @@ async fn turning_idle_sleep_on_acts_with_no_other_activity_and_spares_the_busy_t
     assert!(!log.contains(&format!("tab {busy} of space")), "{log}");
 }
 
-/// `exit_when_asleep = false` set through the socket is honoured: with nothing awake and
-/// nobody attached the daemon stays, where by default it leaves within about ten seconds.
-#[tokio::test(flavor = "multi_thread")]
-async fn leave_when_asleep_off_keeps_a_quiet_daemon_up() {
-    let rt = Runtime::new("stay");
+/// Whether a quiet daemon (nothing awake, nobody attached) has left 16 seconds after its last
+/// client went, with `exit_when_asleep` set through the socket first when `leave` says so.
+async fn quiet_daemon_left(name: &str, leave: Option<bool>) -> bool {
+    let rt = Runtime::new(name);
     let mut daemon = Daemon::start(&rt);
     let mut c = daemon.client(&rt, "phone").await;
-    assert_eq!(
-        body(settings(&mut c, "w", None, Some(false)).await),
-        said(0, false)
-    );
+    let want = said(0, leave.unwrap_or(true));
+    assert_eq!(body(settings(&mut c, "w", None, leave).await), want);
     drop(c);
-    std::thread::sleep(Duration::from_secs(16));
+    let deadline = Instant::now() + Duration::from_secs(16);
+    while Instant::now() < deadline {
+        if daemon.ended() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// `exit_when_asleep = false` set through the socket is honoured: with nothing awake and
+/// nobody attached the daemon stays, where by default (the same setup, the key left alone) it
+/// leaves within about ten seconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn leave_when_asleep_off_keeps_a_quiet_daemon_up() {
     assert!(
-        !daemon.ended(),
+        quiet_daemon_left("leave", None).await,
+        "by default a quiet daemon leaves"
+    );
+    assert!(
+        !quiet_daemon_left("stay", Some(false)).await,
         "the daemon left though the setting says stay"
     );
 }

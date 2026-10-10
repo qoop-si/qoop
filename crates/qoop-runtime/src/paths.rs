@@ -612,21 +612,6 @@ pub fn wait_for_socket(dir: &std::path::Path, socket: &std::path::Path) -> std::
     result
 }
 
-/// This machine's name up to the first dot (`devbox.local` is `devbox`), as the system gives it;
-/// `None` when it cannot be read or is empty.
-pub fn host_name() -> Option<String> {
-    let mut name = [0u8; 256];
-    // SAFETY: `gethostname` writes at most `name.len()` bytes into the buffer owned here.
-    let got = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
-    if got != 0 {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&name);
-    let full = text.split('\0').next().unwrap_or_default();
-    let short = full.split('.').next().unwrap_or(full);
-    (!short.is_empty()).then(|| short.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,17 +825,6 @@ mod tests {
             verify_private_dir(&dir).is_err(),
             "the override is verified like any other path"
         );
-    }
-
-    #[test]
-    fn the_host_name_is_short_and_matches_the_system_one() {
-        let name = host_name().expect("a hostname");
-        assert!(!name.contains('.') && !name.contains('\0'), "{name:?}");
-        let said = std::process::Command::new("hostname")
-            .output()
-            .expect("run hostname");
-        let full = String::from_utf8_lossy(&said.stdout);
-        assert!(full.trim().starts_with(&name), "{full:?} vs {name:?}");
     }
 
     #[test]
