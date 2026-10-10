@@ -947,6 +947,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every terminal ever given this name, open or closed, newest first: where a
+    /// conversation that outlived its tab is found again. A closed tab keeps its last
+    /// conversation's id even after its agent left.
+    pub fn named_terminals(&self, title: &str) -> Result<Vec<TerminalRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace, title, cwd, argv, agent, agent_session, created_at, closed_at
+             FROM terminal WHERE title = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![title], |r| {
+                Ok(TerminalRow {
+                    id: r.get(0)?,
+                    workspace: r.get(1)?,
+                    title: r.get(2)?,
+                    cwd: r.get(3)?,
+                    argv: r.get(4)?,
+                    agent: r.get(5)?,
+                    agent_session: r.get(6)?,
+                    created_at: r.get(7)?,
+                    closed_at: r.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn set_title(&self, id: i64, title: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE terminal SET title = ?2 WHERE id = ?1",
@@ -1141,7 +1167,50 @@ fn write_checkpoint(tx: &rusqlite::Transaction<'_>, c: &Checkpoint) -> Result<()
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// Every tab of a name is found again, closed ones too, newest first, with the id its
+    /// last conversation left even after its agent went.
+    #[test]
+    fn a_named_tab_outlives_its_agent() {
+        let mut store = Store::in_memory().expect("store");
+        let space = store.create_workspace("qass", 1).expect("space");
+        for id in [1, 2, 3] {
+            store
+                .create_terminal(id, space, "/q", "zsh", 1)
+                .expect("terminal");
+        }
+        store.set_title(1, "qass").expect("title");
+        store.set_title(3, "qass").expect("title");
+        store
+            .set_agent(1, Some("claude"), Some("old"))
+            .expect("agent");
+        store
+            .set_agent(3, Some("codex"), Some("new"))
+            .expect("agent");
+        store.set_agent(3, None, None).expect("agent left");
+        store.close_terminal(3, 2).expect("close");
+        let found = store.named_terminals("qass").expect("query");
+        let seen: Vec<_> = found
+            .iter()
+            .map(|t| {
+                (
+                    t.id,
+                    t.agent.as_deref(),
+                    t.agent_session.as_deref(),
+                    t.closed_at,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (3, None, Some("new"), Some(2)),
+                (1, Some("claude"), Some("old"), None)
+            ]
+        );
+    }
 
     fn store() -> Store {
         Store::in_memory().expect("open")

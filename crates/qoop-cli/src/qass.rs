@@ -6,7 +6,7 @@
 //! names (`[qass] agent`: claude, codex, gemini, opencode, or a person's own `[agents]`
 //! line), told to start its qass skill. Closing it is the `x` on its row, or `qoop close`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use qoop_runtime::paths;
@@ -152,14 +152,225 @@ fn launch_line(
 }
 
 /// The same, refused when qass's skill is not where that program reads skills.
-fn launch(agent: &str, read: &config::Read) -> std::io::Result<(Option<String>, Vec<String>)> {
+fn launch(
+    agent: &str,
+    read: &config::Read,
+) -> std::io::Result<(Option<String>, Vec<String>, String)> {
     let (line, words, program) = launch_line(agent, &read.agents).map_err(std::io::Error::other)?;
     if !crate::skills::qass_installed_for(&program) {
         return Err(std::io::Error::other(
             "qass is not set up; run `qoop skills install` first",
         ));
     }
-    Ok((line, words))
+    Ok((line, words, program))
+}
+
+/// Where `qoop qass` writes which program it last started qass on, in qass's folder: an id is
+/// only carried on by the program that made it.
+const LAST_AGENT: &str = "last-agent";
+
+/// The id of qass's conversation, as its agent's hook last reported it from qass's folder
+/// ([`note_session`]): the daemon forgets a closed tab's id, this file keeps it. A fresh start
+/// clears it, so it always belongs to the program `LAST_AGENT` names.
+const LAST_SESSION: &str = "last-session";
+
+/// A hook reporting from inside qass's folder speaks for qass: its conversation's id is kept
+/// there for `qoop qass` to carry on. Anything else, or an id that is not a plain word, is
+/// left alone.
+pub(crate) fn note_session(session: &str) {
+    let Some(folder) = paths::qass_data_dir().and_then(|f| f.canonicalize().ok()) else {
+        return;
+    };
+    let here = std::env::current_dir().and_then(|d| d.canonicalize());
+    let plain = session.len() <= 128
+        && !session.is_empty()
+        && !session.starts_with('-')
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !plain || here.ok() != Some(folder.clone()) {
+        return;
+    }
+    let path = folder.join(LAST_SESSION);
+    if std::fs::read_to_string(&path).is_ok_and(|kept| kept.trim() == session) {
+        return;
+    }
+    let _ = std::fs::write(path, format!("{session}\n"));
+}
+
+/// The conversation qass carries on, on `program`. Claude: the newest conversation Claude
+/// still keeps of qass's (`claude_newest`). Another agent: the id its hook last reported from
+/// qass's folder (`session`), when qass last started on this program (`last`); else the newest
+/// qass tab's, while that tab still says it ran this program. With none, qass starts afresh.
+fn carry(
+    program: &str,
+    tabs: &[qoop_store::TerminalRow],
+    last: Option<&str>,
+    session: Option<&str>,
+    claude_newest: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if program == "claude" {
+        return claude_newest();
+    }
+    if last == Some(program)
+        && let Some(id) = session
+    {
+        return Some(id.to_string());
+    }
+    let tab = tabs.first()?;
+    (tab.agent.as_deref() == Some(program))
+        .then(|| tab.agent_session.clone())
+        .flatten()
+}
+
+/// Whether the agent still keeps that conversation on disk, where qoop can see it: resuming
+/// one it never wrote down (a first turn that never finished) leaves a bare shell. Gemini
+/// writes a chat file holding the id, and lists it only once it holds a reply of its own;
+/// Codex writes a rollout file named with it; Claude's is checked
+/// by [`claude_newest`], and opencode, which keeps its own in a database, is taken at its word.
+fn still_kept(program: &str, id: &str, home: &Path) -> bool {
+    let files = |dir: PathBuf, depth: usize| -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut todo = vec![(dir, 0)];
+        while let Some((dir, level)) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() && level < depth => todo.push((path, level + 1)),
+                    Ok(t) if t.is_file() => found.push(path),
+                    _ => {}
+                }
+            }
+        }
+        found
+    };
+    let named = |path: &PathBuf| {
+        path.file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(id))
+    };
+    match program {
+        // Gemini names each chat file after the first eight characters of its id.
+        "gemini" => files(home.join(".gemini/tmp"), 2)
+            .iter()
+            .filter(|p| p.parent().is_some_and(|d| d.ends_with("chats")))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(id.get(..8).unwrap_or(id)))
+            })
+            .any(|p| {
+                std::fs::read_to_string(p).is_ok_and(|text| {
+                    text.contains(id)
+                        && (text.contains(r#""type":"gemini""#)
+                            || text.contains(r#""type": "gemini""#))
+                })
+            }),
+        "codex" => {
+            let codex = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".codex"));
+            files(codex.join("sessions"), 4).iter().any(named)
+        }
+        _ => true,
+    }
+}
+
+/// The newest of qass's Claude conversations that holds a message: the ones qoop kept the
+/// ids of, and those in the folder's own project directory (Claude names it after the
+/// folder, every character but a letter or digit made `-`), newest first. A file with no
+/// message (a title only) cannot be carried on.
+fn claude_newest(ids: &[&str], folder: &Path) -> Option<String> {
+    // Where Claude keeps its projects: `CLAUDE_CONFIG_DIR` first, as Claude reads it.
+    let roots: Vec<PathBuf> = [
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| Path::new(&d).join("projects")),
+        std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude/projects")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    claude_newest_in(&roots, ids, folder)
+}
+
+fn claude_newest_in(roots: &[PathBuf], ids: &[&str], folder: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let slug: String = folder
+        .canonicalize()
+        .ok()?
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let here = roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root.join(&slug)).ok())
+        .flat_map(|dir| dir.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"));
+    let kept = ids
+        .iter()
+        .filter_map(|id| qoop_runtime::daemon::claude_transcript_in(roots, id));
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = kept
+        .chain(here)
+        .filter_map(|path| Some((modified(&path)?, path)))
+        .collect();
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let said = |path: &Path| {
+        std::fs::File::open(path).is_ok_and(|f| {
+            std::io::BufReader::new(f)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| line.contains("\"type\":\"user\""))
+        })
+    };
+    found
+        .into_iter()
+        .find(|(_, path)| said(path))
+        .and_then(|(_, path)| Some(path.file_stem()?.to_str()?.to_string()))
+}
+
+/// qass's own tabs, open or closed, newest first: named `qass`, in its folder.
+fn tabs_of(folder: &Path) -> Vec<qoop_store::TerminalRow> {
+    let tabs = (|| {
+        let dir = paths::runtime_dir().ok()?;
+        let store = crate::existing_store(&dir).ok()??;
+        store.named_terminals(SPACE).ok()
+    })();
+    tabs.unwrap_or_default()
+        .into_iter()
+        .filter(|t| in_folder(&t.cwd, folder))
+        .collect()
+}
+
+/// What tells an agent carried on into its conversation to pick its work up again: Claude's
+/// own hook says it at every resume, the others hear it as their first message.
+fn resume_message(program: &str) -> Option<[&'static str; 2]> {
+    const SAY: &str = "qass, carried on: start again from the skill's Start, then carry on.";
+    match program {
+        "codex" => Some(["", SAY]),
+        "gemini" => Some(["-i", SAY]),
+        "opencode" => Some(["--prompt", SAY]),
+        _ => None,
+    }
+}
+
+/// The line that carries the conversation on: a person's `[agents]` line as typed, flags and
+/// all, with the resume words after it; else the manifest's whole resume line.
+fn resume_command(
+    typed: Option<String>,
+    argv: Vec<String>,
+    program: &str,
+) -> (Option<String>, Vec<String>) {
+    let said = resume_message(program)
+        .into_iter()
+        .flatten()
+        .filter(|w| !w.is_empty())
+        .map(String::from);
+    match (typed, argv.split_first()) {
+        (Some(line), Some((first, rest))) if first == program => {
+            (Some(line), rest.iter().cloned().chain(said).collect())
+        }
+        _ => (None, argv.into_iter().chain(said).collect()),
+    }
 }
 
 /// How qass stands.
@@ -254,14 +465,43 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         terminal
     } else {
         let read = config::read();
-        let (typed, command) = launch(&read.qass_agent, &read)?;
+        let (typed, command, program) = launch(&read.qass_agent, &read)?;
+        let tabs = tabs_of(&folder);
+        let kept = |name| {
+            std::fs::read_to_string(folder.join(name))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let (last, session) = (kept(LAST_AGENT), kept(LAST_SESSION));
+        let ids: Vec<&str> = session
+            .as_deref()
+            .into_iter()
+            .chain(tabs.iter().filter_map(|t| t.agent_session.as_deref()))
+            .collect();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let resumed = carry(&program, &tabs, last.as_deref(), session.as_deref(), || {
+            claude_newest(&ids, &folder)
+        })
+        .filter(|id| still_kept(&program, id, &home))
+        .and_then(|id| qoop_runtime::daemon::resume_argv(&program, Some(&id)));
+        let carried = resumed.is_some();
+        let (typed, command) = match resumed {
+            Some(argv) => resume_command(typed, argv, &program),
+            None => (typed, command),
+        };
         // No qass runs or sleeps: none can still be using the copies older installs left
         // in each agent's own skills.
         crate::skills::remove_old_qass();
-        if program_of(typed.as_deref().unwrap_or(&read.qass_agent)) == "gemini" {
+        if program == "gemini" {
             crate::skills::trust_qass_for_gemini()?;
         }
         std::fs::create_dir_all(&folder)?;
+        std::fs::write(folder.join(LAST_AGENT), format!("{program}\n"))?;
+        if !carried {
+            // A new conversation: the id kept is the last one's, and no longer qass's.
+            let _ = std::fs::remove_file(folder.join(LAST_SESSION));
+        }
         let opts = supervise::NewOpts {
             name: Some("qass".into()),
             cwd: Some(folder),
@@ -271,7 +511,12 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         };
         let mut opened = 0;
         supervise::open_terminal(&opts, |terminal| opened = terminal)?;
-        println!("qass started in terminal {opened} on {}", read.qass_agent);
+        let how = if carried {
+            "carried on its conversation"
+        } else {
+            "started"
+        };
+        println!("qass {how} in terminal {opened} on {}", read.qass_agent);
         u64::from(opened)
     };
     // Shown where the person is looking; with no interface open, the number says where.
@@ -313,6 +558,157 @@ mod tests {
         assert_eq!(sleeping_qass(&tabs, &asleep, &dir), Some(7));
         assert_eq!(sleeping_qass(&tabs[..2], &asleep, &dir), None);
         assert_eq!(sleeping_qass(&tabs, &[(5, 2, 30)], &dir), None);
+    }
+
+    /// Each agent carries on its own conversation: Claude its newest kept one; another agent
+    /// the id its hook kept in qass's folder while qass last ran on it, else the newest qass
+    /// tab's while that tab still names it, never an older tab's.
+    #[test]
+    fn qass_carries_on_its_own_conversation() {
+        let with = |id: i64, agent: Option<&str>, session: Option<&str>| {
+            let mut t = tab(id, "/q", agent);
+            t.agent_session = session.map(String::from);
+            t
+        };
+        let none = || -> Option<String> { panic!("not claude") };
+        let older = with(4, Some("codex"), Some("s4"));
+        let closed = with(9, None, None);
+        assert_eq!(
+            carry(
+                "gemini",
+                std::slice::from_ref(&closed),
+                Some("gemini"),
+                Some("g1"),
+                none
+            ),
+            Some("g1".into())
+        );
+        assert_eq!(
+            carry(
+                "gemini",
+                std::slice::from_ref(&closed),
+                Some("codex"),
+                Some("g1"),
+                none
+            ),
+            None
+        );
+        assert_eq!(
+            carry(
+                "codex",
+                &[with(9, Some("codex"), Some("s9")), older.clone()],
+                None,
+                None,
+                none
+            ),
+            Some("s9".into())
+        );
+        assert_eq!(
+            carry("codex", &[closed.clone(), older], Some("codex"), None, none),
+            None
+        );
+        assert_eq!(carry("opencode", &[], Some("opencode"), None, none), None);
+        assert_eq!(
+            carry("claude", &[closed], None, None, || Some("c1".into())),
+            Some("c1".into())
+        );
+    }
+
+    /// Claude carries on the newest conversation it can: one qoop kept the id of (in another
+    /// project too) or the newest in qass's folder, never a file with no message in it.
+    #[test]
+    fn claude_carries_on_its_newest_conversation_with_a_message() {
+        let root = tempfile::tempdir().expect("dir");
+        let folder = root.path().join("my qass");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let slug: String = folder
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let projects = root.path().join("projects");
+        let here = projects.join(&slug);
+        let elsewhere = projects.join("-old-qass");
+        std::fs::create_dir_all(&here).expect("here");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let write = |path: PathBuf, body: &str, age: u64| {
+            std::fs::write(&path, body).expect("write");
+            let at = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(at))
+                .expect("mtime");
+        };
+        let said = "{\"type\":\"user\",\"message\":{}}\n";
+        write(here.join("a1.jsonl"), said, 300);
+        write(here.join("t2.jsonl"), "{\"type\":\"ai-title\"}\n", 10);
+        let roots = [projects];
+        assert_eq!(
+            claude_newest_in(&roots, &[], &folder).as_deref(),
+            Some("a1")
+        );
+        write(elsewhere.join("k3.jsonl"), said, 100);
+        assert_eq!(
+            claude_newest_in(&roots, &["k3"], &folder).as_deref(),
+            Some("k3")
+        );
+        assert_eq!(
+            claude_newest_in(&roots, &["gone"], &root.path().join("none")),
+            None
+        );
+    }
+
+    /// Gemini and Codex conversations are carried on only while the agent still keeps them;
+    /// opencode's are taken at its word.
+    #[test]
+    fn only_a_conversation_still_kept_is_carried_on() {
+        let home = tempfile::tempdir().expect("home");
+        let chats = home.path().join(".gemini/tmp/qass/chats");
+        std::fs::create_dir_all(&chats).expect("chats");
+        let reply = r#"{"sessionId":"g-1"}{"type":"user"}{"type":"gemini"}"#;
+        std::fs::write(chats.join("session-2026-10-11-g-1.json"), reply).expect("w");
+        // Asked, never answered: Gemini does not list it.
+        std::fs::write(
+            chats.join("session-2026-10-11-g-3.json"),
+            r#"{"sessionId":"g-3"}{"type":"user"}"#,
+        )
+        .expect("w");
+        let day = home.path().join(".codex/sessions/2026/10/11");
+        std::fs::create_dir_all(&day).expect("day");
+        std::fs::write(day.join("rollout-2026-10-11T00-00-00-c-1.jsonl"), "{}").expect("w");
+        assert!(still_kept("gemini", "g-1", home.path()));
+        assert!(!still_kept("gemini", "g-2", home.path()));
+        assert!(!still_kept("gemini", "g-3", home.path()));
+        assert!(still_kept("codex", "c-1", home.path()));
+        assert!(!still_kept("codex", "c-2", home.path()));
+        assert!(still_kept("opencode", "o-1", home.path()));
+    }
+
+    /// A person's own line keeps its flags, the resume words after it; agents other than
+    /// Claude hear what to pick up again.
+    #[test]
+    fn a_resume_keeps_the_owners_flags() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = Some("claude --dangerously-skip-permissions".to_string());
+        assert_eq!(
+            resume_command(line.clone(), words(&["claude", "--resume", "c1"]), "claude"),
+            (line, words(&["--resume", "c1"]))
+        );
+        let (typed, said) = resume_command(None, words(&["codex", "resume", "s9"]), "codex");
+        assert_eq!(typed, None);
+        assert_eq!(&said[..3], words(&["codex", "resume", "s9"]).as_slice());
+        assert!(said[3].contains("carried on"));
+        let (_, said) = resume_command(None, words(&["opencode", "--session", "o"]), "opencode");
+        assert_eq!(said[3], "--prompt");
+        // An override naming another binary is typed whole.
+        let mine = Some("claude --x".to_string());
+        assert_eq!(
+            resume_command(mine, words(&["my-claude", "--resume", "c1"]), "claude"),
+            (None, words(&["my-claude", "--resume", "c1"]))
+        );
     }
 
     #[test]

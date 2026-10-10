@@ -2855,6 +2855,9 @@ fn claude_session_title(id: &str) -> Option<String> {
     claude_transcript(id).and_then(|path| claude_session_title_at(&path))
 }
 
+/// The line restore types to carry an agent's conversation on, for `qoop qass` to type the same.
+pub use qoop_detect::resume_argv;
+
 /// Whether an agent's conversation can be carried on from its own storage. Claude writes a
 /// conversation down only once it has a message, so the id of a session opened and never
 /// used (a `/clear`, a fresh start) names nothing and `claude --resume` on it fails. Other
@@ -2866,7 +2869,7 @@ fn resumable(program: Option<&str>, session: &str) -> bool {
 /// `<projects>/<slug>/<id>.jsonl`: the id is the file name, so one stat per
 /// project directory finds it. `CLAUDE_CONFIG_DIR` first, as Claude reads it.
 /// An id that could climb out of the directory is refused up front.
-fn claude_transcript(id: &str) -> Option<PathBuf> {
+pub fn claude_transcript(id: &str) -> Option<PathBuf> {
     let mut roots = Vec::new();
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         roots.push(PathBuf::from(dir).join("projects"));
@@ -2878,7 +2881,7 @@ fn claude_transcript(id: &str) -> Option<PathBuf> {
 }
 
 /// The same, under these `projects` directories.
-fn claude_transcript_in(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
+pub fn claude_transcript_in(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
     if id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }

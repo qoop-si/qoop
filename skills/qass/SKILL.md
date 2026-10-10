@@ -331,11 +331,11 @@ When the owner asks for a new agent, or for a goal that is separate from every r
 worker's, in any mode:
 
 ```
-"<this skill's dir>/spawn.sh" <repo> <branch> [--agent claude|opencode] [--space NAME]   # prints "<n> <G>"
+"<this skill's dir>/spawn.sh" <repo> <branch> [--agent NAME] [--space NAME]   # prints "<n> <G>"
 qoop prompt <n> --generation <G> -- '<goal, done criteria, fence>'
 ```
 
-The agent he names (default claude); the space he names, made when missing (default: the
+Agent: his pick (claude, opencode, an `[agents]` name), else `[qass] agent` with its flags (claude if that is neither); the space he names, made when missing (default: the
 repo's own). The first brief to a worker you started needs no ok; it starts with "First run
 `qoop task new <goal>`, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as
 the fence allows." and still ends with the fence; a step the fence forbids comes back to you. Its task id reaches you on its event lines

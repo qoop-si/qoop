@@ -920,6 +920,9 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             "no token: pass --token or run inside a qoop terminal (QOOP_TOKEN)",
         ));
     };
+    // qass's own conversation, kept in its folder once the daemon took the report (a late
+    // hook of a closed tab is refused): the daemon forgets a closed tab's id.
+    let kept = session.clone();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -1024,7 +1027,12 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
         .await
         .map_err(|_| std::io::Error::other("the daemon did not answer within 5s"))??;
         match answer {
-            ControlResponse::AgentStateReported { .. } => Ok(()),
+            ControlResponse::AgentStateReported { .. } => {
+                if let Some(session) = &kept {
+                    qass::note_session(session);
+                }
+                Ok(())
+            }
             ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(format!(
                 "the daemon refused the report: {reason}"
             ))),

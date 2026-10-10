@@ -1,23 +1,24 @@
 #!/bin/bash
 # qass spawn: a new worker in its own worktree, ready for a brief.
 #
-#   spawn.sh <repo> <branch> [--agent claude|opencode] [--space NAME]
+#   spawn.sh <repo> <branch> [--agent NAME] [--space NAME]
 #                                   prints "<terminal> <generation>"
 #
 # The repo must be a git repository under $HOME and not $HOME itself. The worker
-# runs with the owner's own settings for that agent; what it may do is in its
-# brief. The space is made when missing, as `qoop new --space` does. The brief
+# runs the owner's own line for that agent: NAME is claude, opencode or a name
+# from his `[agents]` (config.toml), and without --agent it is `[qass] agent`,
+# so a worker starts with the flags he gave qass. What it may do is in its brief. The space is made when missing, as `qoop new --space` does. The brief
 # goes afterwards, with `qoop prompt`.
 set -euo pipefail
 
 repo="${1:?usage: spawn.sh <repo> <branch>}"
 branch="${2:?usage: spawn.sh <repo> <branch>}"
 shift 2
-agent=claude
+agent=
 where=()
 while [ $# -ge 2 ]; do
     case "$1" in
-        --agent) agent="$2" ;;
+        --agent) agent="$2"; agent_given=1 ;;
         # qass's own space is on no list the owner sees: a worker there would vanish.
         --space) [ "$2" != qass ] || { echo "spawn: the space qass is qass's own; pick another" >&2; exit 1; }
                  where=(--space "$2") ;;
@@ -26,10 +27,26 @@ while [ $# -ge 2 ]; do
     shift 2
 done
 [ $# -eq 0 ] || { echo "spawn: $1 needs a value" >&2; exit 1; }
-case "$agent" in
-    claude) cmd=(claude) ;;
-    opencode) cmd=(opencode) ;;
-    *) echo "spawn: agent is claude or opencode" >&2; exit 1 ;;
+# The owner's line for that name, from his config: an `[agents]` line as written,
+# else the name itself.
+config="$(qoop config --json)"
+[ -n "$agent" ] || agent="$(printf '%s' "$config" | jq -r '.settings["qass.agent"] // "claude"')"
+line="$(printf '%s' "$config" | jq -r --arg a "$agent" '[.agents[] | select(.name == $a) | .command][0] // $a')"
+case "$line" in *[\'\"\$\`\\]*) echo "spawn: the line for $agent holds quotes or \$; give spawn a plain one" >&2; exit 1 ;; esac
+read -ra cmd <<<"$line"
+[ "${#cmd[@]}" -gt 0 ] || { echo "spawn: the line for $agent is empty" >&2; exit 1; }
+# Not typed into a shell, so a home path is spelled out here.
+case "${cmd[0]}" in "~/"*) cmd[0]="$HOME/${cmd[0]#\~/}" ;; esac
+# Its program: the first word that is not an assignment, by name. An assignment
+# first runs through env.
+program=
+for w in "${cmd[@]}"; do case "$w" in *=*) ;; *) program="${w##*/}"; break ;; esac; done
+case "${cmd[0]}" in *=*) cmd=(env "${cmd[@]}") ;; esac
+case "$program" in
+    claude | opencode) ;;
+    # qass on another agent: its workers are Claude, whose ready screen this knows.
+    *) [ -n "${agent_given:-}" ] && { echo "spawn: $agent runs $program; a worker runs claude or opencode" >&2; exit 1; }
+       cmd=(claude); program=claude ;;
 esac
 case "$branch" in -*) echo "spawn: bad branch $branch" >&2; exit 1 ;; esac
 repo="$(cd "$repo" && pwd -P)"
@@ -49,6 +66,7 @@ case "$t" in '' | *[!0-9]*) echo "spawn: no terminal number from qoop worktree n
 # draw in pieces): for Claude its input line on a screen that does not ask, for
 # opencode its idle state. The shell before it may draw ❯ too, and its generation
 # is the shell's, so both are read again on every pass.
+want="$program"
 answered=0
 seen=0
 for _ in $(seq 180); do
@@ -56,13 +74,13 @@ for _ in $(seq 180); do
     g="$(printf '%s' "$row" | jq -r '.generation // empty' 2>/dev/null || true)"
     state="$(printf '%s' "$row" | jq -r '.state // empty' 2>/dev/null || true)"
     program="$(printf '%s' "$row" | jq -r '.program // empty' 2>/dev/null || true)"
-    if [ -n "$g" ] && [ "$program" = opencode ] && [ "$agent" = opencode ]; then
+    if [ -n "$g" ] && [ "$program" = opencode ] && [ "$want" = opencode ]; then
         if [ "$state" = idle ]; then seen=$((seen + 1)); else seen=0; fi
         if [ "$seen" -ge 2 ]; then
             echo "$t $g"
             exit 0
         fi
-    elif [ -n "$g" ] && [ "$program" = claude ] && [ "$agent" = claude ]; then
+    elif [ -n "$g" ] && [ "$program" = claude ] && [ "$want" = claude ]; then
         screen="$(qoop read "$t" 2>/dev/null || true)"
         if printf '%s' "$screen" | grep -qi "trust this folder"; then
             seen=0
@@ -88,5 +106,5 @@ for _ in $(seq 180); do
     fi
     sleep 0.5
 done
-echo "spawn: terminal $t did not reach $agent's idle screen in 90 s" >&2
+echo "spawn: terminal $t did not reach $want's idle screen in 90 s" >&2
 exit 1
