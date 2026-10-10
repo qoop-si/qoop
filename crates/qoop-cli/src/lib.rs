@@ -2778,7 +2778,8 @@ fn existing_store(dir: &std::path::Path) -> std::io::Result<Option<qoop_store::S
     [paths::state_location(dir), dir.to_path_buf()]
         .into_iter()
         .map(|d| qoop_runtime::legacy::db_path(&d))
-        .find(|db| db.exists())
+        // A missing or stray file is "no store yet", and the next place may hold the real one.
+        .find(|db| qoop_store::Store::holds_schema(db))
         .map(|db| qoop_store::Store::open_existing(&db).map_err(std::io::Error::other))
         .transpose()
 }

@@ -41,6 +41,9 @@ pub enum StoreError {
     /// rather than landing after the caller had already answered.
     #[error("abandoned by its caller before it was committed")]
     Abandoned,
+    /// A file a reader was pointed at that holds no qoop database: a reader never makes one.
+    #[error("{} holds no qoop database", .0.display())]
+    NotADatabase(std::path::PathBuf),
     /// A ledger row that is not the JSON this build writes, so something other than this
     /// build wrote it. A distinct variant rather than a string inside `Sqlite` because the
     /// caller has to be able to tell it apart from "the store is busy", and it is reported
@@ -165,10 +168,33 @@ impl Store {
     }
 
     /// The same, for a file that must already exist: a reader that finds nothing gets an
-    /// error rather than an empty database left behind in its place.
+    /// error rather than an empty database left behind in its place. A file with no qoop
+    /// schema is nothing too: a reader that built the schema into one would make a stray file
+    /// (what a bare `sqlite3 <path>` leaves) look like a real database, which every later
+    /// reader and daemon start would then prefer.
     pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+        if !Self::holds_schema(path) {
+            return Err(StoreError::NotADatabase(path.to_path_buf()));
+        }
         let flags = rusqlite::OpenFlags::default() - rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         Self::prepare(Connection::open_with_flags(path, flags)?)
+    }
+
+    /// Whether the file at `path` is a qoop database: it has the schema a daemon wrote. Read
+    /// only, so asking never makes one; a missing, empty or foreign file is not.
+    pub fn holds_schema(path: &Path) -> bool {
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|c| {
+                // A lock is a database being written, not a missing one: wait as `prepare`
+                // does rather than answer "no store" and send the reader elsewhere.
+                c.busy_timeout(std::time::Duration::from_secs(5))?;
+                c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace')",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Whether this build could open the database at `path`, found out by reading and
@@ -1966,6 +1992,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM asleep", [], |r| r.get(0))
             .expect("count");
         assert_eq!(old, 0);
+    }
+
+    /// A reader handed an empty file (what a stray `sqlite3 <path>` leaves) refuses it and
+    /// leaves it empty: building a schema there made it look like a real database.
+    #[test]
+    fn a_reader_never_turns_an_empty_file_into_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qoop.db");
+        std::fs::write(&path, "").unwrap();
+        let refused = Store::open_existing(&path).err().expect("refused");
+        assert!(
+            refused.to_string().contains("holds no qoop database"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(!dir.path().join("qoop.db-wal").exists());
+        // A header with no schema (what `sqlite3 <path> "PRAGMA journal_mode=WAL"` leaves).
+        let stray = dir.path().join("stray.db");
+        rusqlite::Connection::open(&stray)
+            .unwrap()
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        assert!(std::fs::metadata(&stray).unwrap().len() > 0);
+        assert!(!Store::holds_schema(&stray));
+        assert!(Store::open_existing(&stray).is_err());
+        let real = dir.path().join("real.db");
+        drop(Store::open(&real).unwrap());
+        assert!(Store::holds_schema(&real));
     }
 
     #[test]

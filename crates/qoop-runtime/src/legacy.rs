@@ -158,10 +158,14 @@ fn move_dir(new: &Path) -> io::Result<()> {
 /// The database file in `state`: this build's name for a new one, and the name it already
 /// has for one a 0.7.x daemon made. Never renamed: the old daemon opens it by that name, and
 /// a machine put back on the old build (a rollback) must find its tabs where it left them.
+///
+/// A file under the new name with no schema is not a database: a stray `sqlite3 <path>`
+/// leaves one behind, and taking it would hide every space the old file holds, from the next
+/// daemon too.
 pub fn db_path(state: &Path) -> PathBuf {
     let new = state.join("qoop.db");
     let old = state.join(OLD_DB);
-    if !new.exists() && old.exists() {
+    if old.exists() && !qoop_store::Store::holds_schema(&new) {
         old
     } else {
         new
@@ -435,7 +439,14 @@ mod tests {
         assert_eq!(db_path(state.path()), state.path().join("qoop.db"));
         std::fs::write(state.path().join("qoro.db"), "old").unwrap();
         assert_eq!(db_path(state.path()), state.path().join("qoro.db"));
-        std::fs::write(state.path().join("qoop.db"), "new").unwrap();
+        std::fs::write(state.path().join("qoop.db"), "").unwrap();
+        assert_eq!(
+            db_path(state.path()),
+            state.path().join("qoro.db"),
+            "a file with no schema under the new name hides nothing"
+        );
+        std::fs::remove_file(state.path().join("qoop.db")).unwrap();
+        drop(qoop_store::Store::open(&state.path().join("qoop.db")).unwrap());
         assert_eq!(db_path(state.path()), state.path().join("qoop.db"));
     }
 
