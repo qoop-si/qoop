@@ -2089,3 +2089,36 @@ fn the_daemon_says_when_a_newer_qoop_is_on_disk_and_runs_the_file_once() {
     assert_eq!(ready(&d), None);
     assert_eq!(d.starts(), 1);
 }
+
+/// A binary that cannot say its version (it hangs, or fails) is not run again for every ask: a
+/// window and a phone ask twice a minute each. It is asked again at once when the file changes.
+#[test]
+fn a_binary_that_fails_to_say_its_version_is_not_run_for_every_ask() {
+    let d = Daemon::start_installed();
+    let runs = d.dir.path().join("runs");
+    let broken = d.exe.with_file_name("broken");
+    std::fs::write(
+        &broken,
+        format!("#!/bin/sh\necho x >> '{}'\nexit 1\n", runs.display()),
+    )
+    .expect("script");
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::rename(&broken, &d.exe).expect("replace");
+    let ready = |d: &Daemon| match d.ask_as_watcher(ControlRequest::UpdateState {
+        id: format!("state-{}", unique()),
+    }) {
+        Some(ControlResponse::UpdateState { ready, .. }) => ready,
+        other => panic!("no answer: {other:?}"),
+    };
+    for _ in 0..5 {
+        assert_eq!(ready(&d), None);
+    }
+    let ran = std::fs::read_to_string(&runs)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(ran, 1, "the broken file was run {ran} times for five asks");
+    // Replaced by one that works: no wait for the retry time.
+    replace_with_version(&d.exe, NEXT);
+    assert_eq!(ready(&d).as_deref(), Some(NEXT));
+}

@@ -5940,7 +5940,14 @@ type Stamp = (Option<std::time::SystemTime>, u64);
 struct Disk {
     stamp: Option<Stamp>,
     version: Option<String>,
+    /// When the binary last failed to say its version (it hung, or exited badly): not asked
+    /// again for [`DISK_RETRY`], since every window and phone asks twice a minute and a hung
+    /// binary costs five seconds of a process each time.
+    failed: Option<std::time::Instant>,
 }
+
+/// How long a binary that did not say its version is left alone.
+const DISK_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for Restart {
     fn default() -> Self {
@@ -5973,10 +5980,13 @@ impl Restart {
             .ok()
             .map(|m| (m.modified().ok(), m.len()));
         let mut disk = self.disk.lock().await;
-        if disk.stamp != stamp || stamp.is_none() {
-            // Not remembered when it did not answer: the next ask tries again.
+        let remembered = stamp.is_some()
+            && disk.stamp == stamp
+            && disk.failed.is_none_or(|at| at.elapsed() < DISK_RETRY);
+        if !remembered {
             let said = version_on_disk(exe).await.ok();
-            disk.stamp = said.as_ref().and(stamp);
+            disk.stamp = stamp;
+            disk.failed = said.is_none().then(std::time::Instant::now);
             disk.version = said.and_then(|line| {
                 let version = line.trim().split_once(' ')?.1.to_string();
                 crate::paths::parse_version(&version).map(|_| version)

@@ -36,8 +36,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 
 /// Put the notch back on the binary now on disk, through a fresh launchd registration (a
 /// kickstart is refused for an agent whose file was replaced). What `qoop update` calls once
-/// it has swapped the binary: silent, and nothing when the notch was never installed.
-pub fn restart_if_installed() {
+/// it has swapped the binary: silent, and nothing when the notch was never installed. False
+/// when it was and could not be put back.
+pub fn restart_if_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
         // A login item from before the rename becomes one under the new label: written and
@@ -46,14 +47,16 @@ pub fn restart_if_installed() {
             && qoop_runtime::legacy::old_launchd_plist(mac::OLD_LABEL).is_some();
         if let Some(plist) = mac::plist_path().filter(|p| p.exists() || had_old) {
             if had_old && mac::write_plist(&plist).is_err() {
-                return;
+                return false;
             }
             let loaded = crate::launchd::reload(mac::LABEL, &plist).is_ok();
             if had_old && loaded {
                 qoop_runtime::legacy::retire_launchd_agent(mac::OLD_LABEL);
             }
+            return loaded;
         }
     }
+    true
 }
 
 /// FNV-1a over the app's bytes: the name of the file it is written to, so a new build

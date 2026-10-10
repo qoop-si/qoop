@@ -212,6 +212,9 @@ fn run_auto() -> std::io::Result<()> {
         println!("auto: no prebuilt binary for {os}-{arch}");
         return Ok(());
     };
+    // Resolved before an install can replace the file: on Linux the running path then reads
+    // `<path> (deleted)`, and a reload asked of that path never runs.
+    let exe = crate::own_path().ok_or_else(|| std::io::Error::other("cannot find this binary"))?;
     let latest = fetch_latest(asset);
     let version = auto_version(current, &latest, |latest| install(latest, current, true))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -222,7 +225,6 @@ fn run_auto() -> std::io::Result<()> {
             println!("this machine: {line}");
             // Whatever the install left for the notch and the bridge is done now if the
             // move went through and nobody is connected, else a later run does it.
-            let exe = std::env::current_exe()?;
             let alone = runtime.block_on(alone_on(&version));
             if reload_if_marked(&reload_mark(), alone, || reload_services(&exe)) {
                 println!("the notch and the bridge are on {version}");
@@ -604,16 +606,18 @@ fn after_swap(
     exe: &Path,
     auto: bool,
     mark: &Path,
-    reload: impl FnOnce(&Path),
+    reload: impl FnOnce(&Path) -> bool,
 ) -> std::io::Result<()> {
     refresh_integrations(exe);
     if auto {
         write_mark(mark)
-    } else {
-        reload(exe);
+    } else if reload(exe) {
         // Done by hand, so nothing is left for a later run.
         let _ = std::fs::remove_file(mark);
         Ok(())
+    } else {
+        // Said by the reload; the next unattended run tries again.
+        write_mark(mark)
     }
 }
 
@@ -638,25 +642,31 @@ fn write_mark(mark: &Path) -> std::io::Result<()> {
 /// A running notch is the old build's; launchd starts the new one in its place. The same for
 /// a phone's bridge service, which would otherwise keep the old build or, once launchd has
 /// pinned the replaced file, never start again. Asked of the new binary, which is the one
-/// the service must run from now on.
-fn reload_services(exe: &Path) {
-    crate::notch::restart_if_installed();
+/// the service must run from now on. Whether both are back on it.
+fn reload_services(exe: &Path) -> bool {
+    let notch = crate::notch::restart_if_installed();
+    if !notch {
+        eprintln!("qoop: the notch was not reloaded; run `qoop update` again or log in again");
+    }
     let reload = Command::new(exe)
         .args(["bridge", "reload"])
         .stdout(Stdio::null())
         .status();
-    if !reload.is_ok_and(|status| status.success()) {
+    let bridge = reload.is_ok_and(|status| status.success());
+    if !bridge {
         eprintln!("qoop: the bridge service was not reloaded; run `qoop bridge reload`");
     }
+    notch && bridge
 }
 
 /// Act on the mark of a reload left for later, when nobody is connected to be cut off. Said
-/// for a test with the reload handed in; the mark goes only once the reload ran.
-fn reload_if_marked(mark: &Path, alone: bool, reload: impl FnOnce()) -> bool {
-    if !alone || !mark.exists() {
+/// for a test with the reload handed in. The mark goes only when the reload worked: one that
+/// failed (launchd refused) is tried again by the next run, not forgotten with the bridge on
+/// the old binary. True when the services are on the new binary now.
+fn reload_if_marked(mark: &Path, alone: bool, reload: impl FnOnce() -> bool) -> bool {
+    if !alone || !mark.exists() || !reload() {
         return false;
     }
-    reload();
     let _ = std::fs::remove_file(mark);
     true
 }
@@ -1974,7 +1984,15 @@ mod tests {
         let exe = installed(dir.path(), "0.9.3");
         let mark = dir.path().join("rt/reload-pending");
         let reloaded = std::cell::Cell::new(0);
-        after_swap(&exe, true, &mark, |_| reloaded.set(reloaded.get() + 1)).expect("after");
+        let works = || {
+            reloaded.set(reloaded.get() + 1);
+            true
+        };
+        let refused = || {
+            reloaded.set(reloaded.get() + 1);
+            false
+        };
+        after_swap(&exe, true, &mark, |_| works()).expect("after");
         assert_eq!(
             reloaded.get(),
             0,
@@ -1983,19 +2001,26 @@ mod tests {
         assert!(mark.exists());
 
         // Somebody is connected: nothing, and the mark stays for the next run.
-        assert!(!reload_if_marked(&mark, false, || reloaded.set(reloaded.get() + 1)));
+        assert!(!reload_if_marked(&mark, false, works));
         assert_eq!((reloaded.get(), mark.exists()), (0, true));
-        // Nobody is: once, and the mark goes.
-        assert!(reload_if_marked(&mark, true, || reloaded.set(reloaded.get() + 1)));
-        assert_eq!((reloaded.get(), mark.exists()), (1, false));
+        // Nobody is, but launchd refuses: tried, and the mark stays so the next run tries again.
+        assert!(!reload_if_marked(&mark, true, refused));
+        assert_eq!((reloaded.get(), mark.exists()), (1, true));
+        // It works the next time: the mark goes.
+        assert!(reload_if_marked(&mark, true, works));
+        assert_eq!((reloaded.get(), mark.exists()), (2, false));
         // Nothing marked, nothing to do.
-        assert!(!reload_if_marked(&mark, true, || reloaded.set(reloaded.get() + 1)));
-        assert_eq!(reloaded.get(), 1);
+        assert!(!reload_if_marked(&mark, true, works));
+        assert_eq!(reloaded.get(), 2);
 
+        // By hand: reloaded at once and nothing is left over; refused, it is left for the
+        // next unattended run.
         super::write_mark(&mark).expect("mark");
-        after_swap(&exe, false, &mark, |_| reloaded.set(reloaded.get() + 1)).expect("after");
-        assert_eq!(reloaded.get(), 2, "a swap by hand left the services alone");
+        after_swap(&exe, false, &mark, |_| works()).expect("after");
+        assert_eq!(reloaded.get(), 3, "a swap by hand left the services alone");
         assert!(!mark.exists());
+        after_swap(&exe, false, &mark, |_| refused()).expect("after");
+        assert!(mark.exists(), "a refused reload by hand was forgotten");
     }
 
     /// A binary the release script did not build never updates itself, whatever starts it.

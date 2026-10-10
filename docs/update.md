@@ -110,7 +110,10 @@ that does not know the question is asked once and never again), so they are at m
 late. A click on them asks the daemon to move now, live. The windows of that daemon end with
 the move, and the one that was clicked starts the new qoop in its own place, in the same
 terminal, on the same space and tab; any other window is back at its shell and running `qoop`
-brings it back. Type-ahead in flight is lost. A daemon that cannot hand its tabs over live
+brings it back. Type-ahead in flight is lost. A click the daemon never takes up (it gave up after its first look) is asked about again 20
+seconds on: if the daemon still offers the update, the hint says the restart did not start and a
+later close of the stream is not read as a move. A `qoop --remote` window is never offered the
+restart (it cannot start the qoop of another machine in its own place). A daemon that cannot hand its tabs over live
 moves nothing and says why on the hint row: the old way, which ends idle agents and resumes
 them, is only ever `qoop update` typed by hand. The phone's Terminals tab shows the same words,
 beside the pet, for each online Mac in this state; they are read only there, since a tap would
@@ -161,7 +164,7 @@ moves when you run `qoop update`), and from 0.9.2 on the push carries the same t
 A person's own `qoop` window on that machine (an ssh session) holds the push; the Mac's own
 reconnecting link does not. A push does not reload the bridge there either: it leaves the
 mark, which that machine's own check acts on, so a remote whose daemon has no check needs
-`qoop bridge reload` there.
+`qoop bridge reload` there. A reload that fails (launchd refused) leaves the mark where it is, so the next run tries again.
 
 Trust is TLS plus the checksum beside each tarball. It catches corruption, not a compromised
 host: the opt out file is the answer for anyone who wants to decide each update by hand. A

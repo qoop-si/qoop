@@ -462,20 +462,52 @@ struct UpdateAsk {
     ticks: u32,
     /// The daemon predates the question and said so: not asked again on this connection.
     refused: bool,
-    /// A click asked the daemon to move and nothing has said it will not: when its side of
-    /// the stream then closes, that is the move, and this process starts the new qoop in
+    /// When a click asked the daemon to move and nothing has said it will not: when its side
+    /// of the stream then closes, that is the move, and this process starts the new qoop in
     /// its place.
-    clicked: bool,
+    clicked: Option<std::time::Instant>,
+    /// Whether the question that checks on that click has been asked.
+    rechecked: bool,
 }
 
+/// How long a click is given before the daemon is asked again whether it still waits to move:
+/// one that cannot (it gave up after its first look, say) never says so by itself.
+const CLICK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a click that did not come to a move leaves on the hint row.
+const NOT_MOVED: &str = "the restart did not start; `qoop update` restarts idle agents";
+
 impl UpdateAsk {
-    /// Whether this acknowledgement tick is the one to ask on.
-    fn due(&mut self) -> bool {
+    /// Whether this acknowledgement tick is the one to ask on: every half minute, and once
+    /// when a click has had [`CLICK_PATIENCE`] and nothing has come of it.
+    fn due(&mut self, now: std::time::Instant) -> bool {
         if self.refused {
             return false;
         }
+        let overdue = !self.rechecked
+            && self
+                .clicked
+                .is_some_and(|at| now.saturating_duration_since(at) >= CLICK_PATIENCE);
+        self.rechecked |= overdue;
         self.ticks += 1;
-        (self.ticks - 1).is_multiple_of(UPDATE_STATE_EVERY)
+        overdue || (self.ticks - 1).is_multiple_of(UPDATE_STATE_EVERY)
+    }
+
+    fn click(&mut self, now: std::time::Instant) {
+        self.clicked = Some(now);
+        self.rechecked = false;
+    }
+
+    /// The daemon still offers the update, long after a click asked it to move: nothing is
+    /// moving, so the stream closing later is not the move. True when that was the case.
+    fn gave_up(&mut self, now: std::time::Instant) -> bool {
+        let stuck = self
+            .clicked
+            .is_some_and(|at| now.saturating_duration_since(at) >= CLICK_PATIENCE);
+        if stuck {
+            self.clicked = None;
+        }
+        stuck
     }
 }
 
@@ -492,7 +524,7 @@ pub fn restarting() -> bool {
 /// The daemon's side of the stream closed. After a click that asked it to move, that is the
 /// move.
 fn daemon_closed(update: &UpdateAsk) {
-    if update.clicked {
+    if update.clicked.is_some() {
         RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -6198,7 +6230,7 @@ where
                     if sidebar::refresh_files() {
                         dirty = true;
                     }
-                    if state.update.due() {
+                    if state.update.due(std::time::Instant::now()) {
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::UpdateState { id: UPDATE_STATE_ID.into() },
                             &mut control_seq,
@@ -7012,7 +7044,7 @@ where
                                     }
                                     Some(Clicked::Restart) => {
                                         if let Some(version) = sidebar::ready_version() {
-                                            state.update.clicked = true;
+                                            state.update.click(std::time::Instant::now());
                                             state.hint = Some("restarting for update".into());
                                             wr.write_all(&client::encode_control_seq(
                                                 &restart_click(version),
@@ -11222,7 +11254,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         }
         // The click refused outright: nothing moves.
         ControlResponse::Failed { id, reason } if id == RESTART_CLICK_ID => {
-            state.update.clicked = false;
+            state.update.clicked = None;
             state.hint = Some(reason);
             *dirty = true;
         }
@@ -11352,7 +11384,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             id,
             waiting_on: Some(line),
         } if id == RESTART_CLICK_ID => {
-            state.update.clicked = false;
+            state.update.clicked = None;
             state.hint = Some(line);
             *dirty = true;
         }
@@ -11364,7 +11396,14 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             *dirty = true;
         }
         ControlResponse::UpdateState { ready, .. } => {
+            let offered = ready.is_some();
             if sidebar::set_ready(ready) {
+                *dirty = true;
+            }
+            // Still offered a good while after the click: it was not taken up (the daemon gave
+            // up after its first look), so the words are the person's again.
+            if offered && state.update.gave_up(std::time::Instant::now()) {
+                state.hint = Some(NOT_MOVED.into());
                 *dirty = true;
             }
         }
@@ -18389,11 +18428,16 @@ mod tests {
         assert!(!fold_refused(&mut s));
     }
 
+    /// The answers these tests apply write what the foot reads, which is one value for the
+    /// whole process: they take turns.
+    static READY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The daemon's answer to the question fills what the foot reads, the question is asked on
     /// the first tick and every fifteenth after it, and a daemon that does not know it is not
     /// asked again: any other failure is not that.
     #[test]
     fn the_answer_fills_ready_and_an_old_daemon_mutes_the_question() {
+        let _only = READY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = state();
         let (mut request, mut dirty) = (0u64, false);
         let state_of = |ready: Option<&str>| ControlResponse::UpdateState {
@@ -18410,7 +18454,8 @@ mod tests {
         assert!(dirty && sidebar::ready_version().is_none());
 
         let mut ask = UpdateAsk::default();
-        let due: Vec<bool> = (0..31).map(|_| ask.due()).collect();
+        let now = std::time::Instant::now();
+        let due: Vec<bool> = (0..31).map(|_| ask.due(now)).collect();
         assert_eq!(
             due.iter()
                 .enumerate()
@@ -18442,7 +18487,7 @@ mod tests {
         );
         assert!(s.update.refused);
         assert!(
-            (0..100).all(|_| !s.update.due()),
+            (0..100).all(|_| !s.update.due(std::time::Instant::now())),
             "asked an old daemon again"
         );
         // One too old to read the id.
@@ -18477,7 +18522,7 @@ mod tests {
         daemon_closed(&UpdateAsk::default());
         assert!(!restarting(), "a close with no click restarted");
         daemon_closed(&UpdateAsk {
-            clicked: true,
+            clicked: Some(std::time::Instant::now()),
             ..UpdateAsk::default()
         });
         assert!(restarting(), "the close after a click was not the move");
@@ -18485,7 +18530,7 @@ mod tests {
 
         let (mut request, mut dirty) = (0u64, false);
         let mut s = state();
-        s.update.clicked = true;
+        s.update.clicked = Some(std::time::Instant::now());
         // Nothing in the way, still answering: the move is on.
         apply(
             &mut s,
@@ -18496,7 +18541,7 @@ mod tests {
             &mut request,
             &mut dirty,
         );
-        assert!(s.update.clicked);
+        assert!(s.update.clicked.is_some());
         // A daemon that cannot go live says why, and nothing moves.
         apply(
             &mut s,
@@ -18507,12 +18552,12 @@ mod tests {
             &mut request,
             &mut dirty,
         );
-        assert!(!s.update.clicked);
+        assert!(s.update.clicked.is_none());
         assert_eq!(
             s.hint.as_deref(),
             Some("this qoop cannot hand its tabs over live")
         );
-        s.update.clicked = true;
+        s.update.clicked = Some(std::time::Instant::now());
         apply(
             &mut s,
             ControlResponse::Failed {
@@ -18522,9 +18567,9 @@ mod tests {
             &mut request,
             &mut dirty,
         );
-        assert!(!s.update.clicked);
+        assert!(s.update.clicked.is_none());
         // Somebody else's waiting line (the mux's, about a remote) is not the click's answer.
-        s.update.clicked = true;
+        s.update.clicked = Some(std::time::Instant::now());
         apply(
             &mut s,
             ControlResponse::RestartArmed {
@@ -18534,6 +18579,67 @@ mod tests {
             &mut request,
             &mut dirty,
         );
-        assert!(s.update.clicked);
+        assert!(s.update.clicked.is_some());
+    }
+
+    /// A click the daemon never took up (it gave up after its first look) is asked about again
+    /// once, 20 seconds on; if the daemon still offers the update then, the click is called off,
+    /// the hint says nothing started, and a later close of the stream is not read as a move.
+    #[test]
+    fn a_click_that_never_moved_is_called_off_when_the_update_is_still_offered() {
+        let _only = READY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let at = std::time::Instant::now();
+        let mut ask = UpdateAsk::default();
+        assert!(ask.due(at), "the first question is at once");
+        ask.click(at);
+        let soon = at + std::time::Duration::from_secs(10);
+        assert!(!ask.due(soon), "asked again before the click had its time");
+        let later = at + CLICK_PATIENCE;
+        assert!(ask.due(later), "the click was not checked on");
+        assert!(
+            !ask.due(later + std::time::Duration::from_secs(2)),
+            "checked on twice"
+        );
+        // Before its time an answer that still offers the update does not call it off.
+        assert!(!ask.gave_up(soon));
+        assert!(ask.clicked.is_some());
+        assert!(ask.gave_up(later));
+        assert!(ask.clicked.is_none());
+
+        // Through the answer itself.
+        let mut s = state();
+        let (mut request, mut dirty) = (0u64, false);
+        s.update.clicked = Some(
+            std::time::Instant::now()
+                .checked_sub(CLICK_PATIENCE + std::time::Duration::from_secs(1))
+                .expect("a past instant"),
+        );
+        apply(
+            &mut s,
+            ControlResponse::UpdateState {
+                id: UPDATE_STATE_ID.into(),
+                ready: Some("9.9.9".into()),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.update.clicked.is_none());
+        assert_eq!(s.hint.as_deref(), Some(NOT_MOVED));
+        RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        daemon_closed(&s.update);
+        assert!(!restarting(), "a close after a given up click restarted");
+        // An answer that no longer offers it (the move happened elsewhere) says nothing.
+        let mut t = state();
+        t.update.clicked = s.update.clicked;
+        apply(
+            &mut t,
+            ControlResponse::UpdateState {
+                id: UPDATE_STATE_ID.into(),
+                ready: None,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(t.hint.is_none());
     }
 }

@@ -474,7 +474,7 @@ fn run_client() -> std::io::Result<()> {
 
 /// This binary's path, resolved through any link before an update can rename a new file over
 /// it: on Linux the running path then reads `<path> (deleted)`.
-fn own_path() -> Option<std::path::PathBuf> {
+pub(crate) fn own_path() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
@@ -2934,6 +2934,16 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// What the update reloads the services with is this binary's path with every link resolved,
+    /// taken before it can be replaced: never `current_exe` read afterwards, which on Linux says
+    /// `<path> (deleted)`.
+    #[test]
+    fn the_path_an_update_reloads_with_is_resolved() {
+        let own = super::own_path().expect("a path");
+        assert_eq!(std::fs::canonicalize(&own).expect("resolves"), own);
+        assert!(!own.to_string_lossy().contains("(deleted)"));
+    }
+
     use super::{
         ContextJson, cli_sender_from, explain_row, is_usage, parse_context_args,
         parse_history_args, parse_history_dir_args, parse_prompt_args, prompt_refusal,

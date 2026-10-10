@@ -894,6 +894,13 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     async fn control(&mut self, request: ControlRequest) -> io::Result<()> {
         use ControlRequest as R;
         match request {
+            // `qoop --remote` has no local daemon, and its window cannot start the qoop on that
+            // machine in its own place (only a window of this machine's daemon does): so it is
+            // never offered the restart, and the remote is not asked.
+            R::UpdateState { id } if self.home != 0 => {
+                self.respond(&ControlResponse::UpdateState { id, ready: None })
+                    .await
+            }
             R::ListAgents { .. } | R::ListWorkspaces { .. } => {
                 let id = request.request_id().to_string();
                 let mut asked = false;
@@ -3216,6 +3223,64 @@ mod tests {
         .await
         .expect("arm");
         assert_eq!(restarts(&mut rx3), 1);
+    }
+
+    /// Whether the daemon could move onto a newer qoop is asked of this machine's own daemon. A
+    /// window for a remote machine alone (`qoop --remote`) cannot start the new qoop in its place,
+    /// so it is told there is nothing, and the remote is not asked.
+    #[tokio::test]
+    async fn only_a_window_with_a_local_daemon_is_offered_the_restart() {
+        let (events, _events) = mpsc::channel(1);
+        let mut mux = Mux {
+            links: vec![
+                Some(Link::new(String::new(), None)),
+                Some(Link::new("devbox".into(), None)),
+            ],
+            home: 0,
+            down: Vec::new(),
+            down_seqs: BTreeMap::new(),
+            pushed_spaces: Vec::new(),
+            last_link: 0,
+            order: Vec::new(),
+            order_file: None,
+            events,
+            only: None,
+            tried: BTreeSet::new(),
+        };
+        let (local_tx, mut local_rx) = mpsc::unbounded_channel();
+        let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
+        mux.links[0].as_mut().expect("local").conn = Some((1, local_tx));
+        mux.links[1].as_mut().expect("remote").conn = Some((1, remote_tx));
+        let ask = ControlRequest::UpdateState { id: "u".into() };
+        let asked = |rx: &mut mpsc::UnboundedReceiver<BytesMut>| {
+            let mut n = 0;
+            while let Ok(bytes) = rx.try_recv() {
+                if matches!(
+                    body_of::<ControlRequest>(&bytes),
+                    ControlRequest::UpdateState { .. }
+                ) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        // With a local daemon it goes there, and only there.
+        mux.control(ask.clone()).await.expect("ask");
+        assert_eq!((asked(&mut local_rx), asked(&mut remote_rx)), (1, 0));
+        assert!(mux.down.is_empty());
+
+        // `qoop --remote`: answered here with nothing, and nobody is asked.
+        mux.home = 1;
+        mux.control(ask).await.expect("ask");
+        assert_eq!((asked(&mut local_rx), asked(&mut remote_rx)), (0, 0));
+        let said: ControlResponse = body_of(&mux.down);
+        assert_eq!(
+            said,
+            ControlResponse::UpdateState {
+                id: "u".into(),
+                ready: None
+            }
+        );
     }
 
     /// `qoop --space`: the interface is given the one space and its tabs, and a tab asked
