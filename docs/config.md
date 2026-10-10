@@ -9,7 +9,7 @@ The interface reads it when it starts, and again within two seconds of any chang
 (`qoop settings`, `qoop config set`, an editor). `[sleep]`
 and `[daemon]` are the daemon's, read from the same file: `daemon.exit_when_asleep` each
 time it falls quiet, `sleep.idle_minutes` and `sleep.qass_idle_minutes` at its next idle check, a few
-minutes at most, and from "never" at the next agent activity (no restart either way). A daemon on another
+minutes at most, and from "never" at the next agent activity, or at once when the change was made from a phone or the web app (no restart either way). A daemon on another
 machine reads that machine's file. There is no other
 place any of these is set: an environment variable would change with whoever happened to
 start the daemon, a terminal, the notch or an ssh relay.
@@ -45,6 +45,27 @@ exit_when_asleep = true
 | `sleep.idle_minutes` | `0` | a tab idle this many minutes, and unwatched for as long, sleeps by itself, the same way `ctrl-a Z` puts it to sleep, refusals included; the rest of its space is left as it is. A space or an agent whose cup is full (kept awake) is passed by. `0` is never, and then nothing runs for it at all |
 | `sleep.qass_idle_minutes` | follows `sleep.idle_minutes` | the same for the tabs of the space named `qass`, where qass lives: `0` keeps them awake while the others sleep, a number sleeps them after that many idle minutes while the other spaces follow `sleep.idle_minutes`. qass does not wake by itself: `qoop qass`, `ctrl-a Q` or the qass page (`qoop qass page`) wakes it. The running daemon takes it up at its next idle check, as it does `sleep.idle_minutes`; from `0` or unset it starts checking at the next agent activity |
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached, so a machine with everything asleep runs nothing of qoop; the next `qoop` starts it again. `false` keeps it up |
+
+## These keys are per machine
+
+`sleep.idle_minutes`, `sleep.qass_idle_minutes` and `daemon.exit_when_asleep` belong to the machine
+whose file they are in: each machine has its own RAM and its own agents, so there is no account-wide
+copy. To change a remote's, use the phone or the web app (Settings, under that computer: "Idle tabs
+sleep" and "Leave when asleep"), `qoop settings` in a tab on that machine (the page names the machine
+it is on), or `ssh host qoop config set sleep.idle_minutes 30`. The phone and the web app change the
+first and the last key only, through that machine's running daemon: a machine with no session running
+has nothing to answer, and the app says so.
+
+When a change takes effect: `sleep.idle_minutes` within one idle check of the daemon (a minute to five
+minutes, set by the number), also when it was off before and the change came from the phone or the web
+app; `daemon.exit_when_asleep` the next time the daemon falls quiet, which is when the last interface
+detaches. A setting never puts anything to sleep by itself. Turning idle sleep on after tabs have been
+idle for hours can make the next pass sleep several at once, each one vetted as always: a tab that is
+working, waiting on you or kept awake is passed by.
+
+Two writers in one daemon take turns, so neither loses the other's change. A second process writing
+at the same moment (`qoop settings` in a tab, `qoop config set`) is last writer wins on the whole file,
+which is replaced atomically, as any editor does.
 
 `QOOP_IDLE_TIMEOUT_MINUTES` is no longer read. It used to close idle tabs for good; a daemon
 that finds it set says so once and points here, where `sleep.idle_minutes` puts idle tabs

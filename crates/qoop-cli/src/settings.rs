@@ -13,6 +13,7 @@ use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qoop_runtime::avatar::{self, Avatar};
+use qoop_runtime::paths;
 use qoop_tui::config::{self, Theme};
 use qoop_tui::notify;
 use qoop_tui::theme::{self, Role};
@@ -407,6 +408,11 @@ pub(crate) fn part_titles(pet: &Avatar) -> [(&'static str, String, Option<u8>); 
     ]
 }
 
+/// This machine's name for the page, or a plain word when it cannot be read.
+fn host() -> String {
+    paths::host_name().unwrap_or_else(|| "this machine".to_string())
+}
+
 /// Where the keyboard is.
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
@@ -423,6 +429,8 @@ struct Page {
     focus: Focus,
     pet: Avatar,
     said: Option<String>,
+    /// The machine this page runs on, whose `config.toml` it edits.
+    host: String,
 }
 
 impl Page {
@@ -492,6 +500,13 @@ impl Page {
             ) + 2;
         }
         s.put(x0, 2, &"─".repeat(rw), &ink(Role::Rule));
+        // Which machine's file this edits: a tab opened on a remote space runs there.
+        s.put(
+            x0,
+            3,
+            &format!("settings on {}", self.host),
+            &ink(Role::Faint),
+        );
         self.draw_list(&mut s, x0, 4, h - 3, rw);
         if let Some(said) = &self.said {
             s.put(x0, h - 2, said, &ink(Role::Faint));
@@ -728,6 +743,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         focus: Focus::List,
         pet: the_pet(),
         said: None,
+        host: host(),
     };
     let session = Session::start()?;
     let mut player = Player::new();
@@ -809,6 +825,7 @@ mod tests {
             focus: Focus::List,
             pet: the_pet(),
             said: None,
+            host: "devbox".to_string(),
         };
         let mut player = Player::new();
         page.key(Key::Up, &mut player);
@@ -838,10 +855,12 @@ mod tests {
             focus: Focus::List,
             pet: the_pet(),
             said: None,
+            host: "devbox".to_string(),
         };
         let frame = page.draw(NEED.0, NEED.1).frame();
         assert!(frame.contains("search"), "{frame:?}");
         assert!(frame.contains("machines"), "{frame:?}");
         assert!(frame.contains("agent finished"), "{frame:?}");
+        assert!(frame.contains("settings on devbox"), "{frame:?}");
     }
 }
