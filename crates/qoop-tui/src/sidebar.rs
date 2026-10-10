@@ -1563,9 +1563,13 @@ fn search_rows(c: &Column) -> Vec<Row> {
     let mut runs = vec![(1, 1, Role::Title)];
     let field = if query.is_empty() {
         if typing {
-            runs.push((lead_w, 1, Role::Brand));
+            // The caret takes the blank before the word, drawn at that cell's right edge: it
+            // stands where the first letter will go, and the word never moves.
+            runs.push((lead_w - 1, 1, Role::Brand));
+            format!(" /\u{2595}search {all} {}", plural(all))
+        } else {
+            format!("{lead}search {all} {}", plural(all))
         }
-        format!("{lead}{caret}search {all} {}", plural(all))
     } else {
         let count = format!("{found} of {all}");
         let count_w = crate::width::width(&count);
@@ -10240,7 +10244,8 @@ mod tests {
         for col in 1..=WIDTH {
             assert_eq!(act(Hit::Search, col, &c, false), Some(Act::Search));
         }
-        // Typing: the caret comes before the word.
+        // Typing with nothing typed yet: the caret takes the blank before the word, so the
+        // word stays on its column.
         let nav = Nav {
             typing: true,
             ..Nav::default()
@@ -10250,7 +10255,7 @@ mod tests {
         assert!(
             empty
                 .text
-                .starts_with(&format!(" [ / \u{258f}search {all} agents")),
+                .starts_with(&format!(" [ /\u{2595}search {all} agents")),
             "{:?}",
             empty.text
         );
@@ -10260,8 +10265,16 @@ mod tests {
                 brackets[0],
                 brackets[1],
                 (3, 1, Role::Title),
-                (5, 1, Role::Brand)
+                (4, 1, Role::Brand)
             ]
+        );
+        let column_of = |text: &str, word: &str| {
+            crate::width::width(&text[..text.find(word).expect("the word")])
+        };
+        assert_eq!(
+            column_of(&idle.text, "search"),
+            column_of(&empty.text, "search"),
+            "the word moved when the field took the keyboard"
         );
         // The words, the caret, and the count at the right bracket.
         let nav = Nav {
@@ -10282,6 +10295,11 @@ mod tests {
             typed.text.starts_with(" [ / co\u{258f}"),
             "{:?}",
             typed.text
+        );
+        assert_eq!(
+            column_of(&typed.text, "co"),
+            column_of(&idle.text, "search"),
+            "the first letter typed is not where the word was"
         );
         assert!(
             typed.text.ends_with(&format!("{count} ] ")),
