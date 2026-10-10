@@ -185,6 +185,8 @@ pub fn edit(path: &Path, edits: &[(&str, toml_edit::Item)]) -> Result<(), String
         STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let written = std::fs::write(&staged, doc.to_string()).and_then(|()| {
+        // On disk before the rename, so a crash cannot leave an empty config.toml behind it.
+        std::fs::File::open(&staged)?.sync_all()?;
         if let Ok(meta) = std::fs::metadata(&target) {
             let _ = std::fs::set_permissions(&staged, meta.permissions());
         }
