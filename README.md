@@ -1,14 +1,107 @@
 # qoop
 
-A portable runtime for human and coding-agent workspaces.
+qoop keeps your coding agents (Claude Code, Codex and the like) in one terminal, shows what
+each one is doing, and tells you when one needs you, on your computer or on your phone. Close
+the window and they keep working; open it again and everything is where you left it.
+
+## Get started
+
+You need a Mac or a Linux computer, and an agent you already use, such as
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) or
+[Codex](https://github.com/openai/codex). qoop runs it; it does not replace it.
+
+1. **Get your install line.** Sign in at [qoop.si/app](https://qoop.si/app). The page shows a
+   line made for you (it needs a seat: ask for one at [qoop.si](https://qoop.si)). Paste it
+   into Terminal:
+
+   ```
+   curl -fsSL https://qoop.si/i/<your link> | sh
+   ```
+
+   It puts `qoop` in `~/.local/bin`, adds a small hook to each agent it finds, and asks a few
+   questions (your pet, sounds, light or dark). Every answer can be changed later with
+   `qoop settings`.
+
+2. **Sign this computer in**, so your account knows it is yours:
+
+   ```
+   qoop login
+   ```
+
+   It prints a link and a code. Open the link, sign in, type the code, then answer `y` in
+   Terminal.
+
+3. **Open your project in qoop:**
+
+   ```
+   cd my-project
+   qoop
+   ```
+
+   You are in a shell inside qoop. Type `claude` (or `codex`) there to start an agent.
+
+   The column on the left lists your agents. A dot pattern beside each one says what it is
+   doing: breathing while it works, an empty ring when it wants an answer from you.
+
+4. **Close the window whenever you like** (`ctrl-q`). The agent keeps working. Type `qoop`
+   to come back.
+
+5. **Optional:** open [qoop.si/app](https://qoop.si/app) on your phone and sign in with the
+   same account to see and answer your agents from anywhere, and add a server with
+   `qoop remote add <name> <user@host>` so agents keep working while your laptop sleeps.
+
+While no agent is running, the row above the keys says how to start one.
+
+## Words you will see
+
+| word | what it means |
+|---|---|
+| agent | an AI coding program, such as Claude Code or Codex, running in one of qoop's tabs |
+| tab | one terminal; a tab with an agent in it is listed in the column |
+| space | a group of tabs for one project, named after it |
+| qass | qoop's own helper: it watches your agents, answers the easy questions the way you would, and passes the rest to you |
+| server | another computer you reach with ssh; its spaces show up beside your own |
+
+## Keys you will use
+
+Most keys are `ctrl-a`, then one letter.
+
+| keys | what they do |
+|---|---|
+| `ctrl-a c` | a new tab |
+| `ctrl-a tab` | go to the agent that needs you |
+| `ctrl-a space` | find anything: a tab, an agent, a space |
+| `ctrl-a Q` | open qass |
+| `ctrl-a ?` | every key, with a search |
+| `ctrl-q` | leave; everything keeps running |
+
+## Your phone
+
+Open [qoop.si/app](https://qoop.si/app) on your phone and sign in with the account your
+computer signed in with (`qoop login`). Your computers show up by themselves, with the agent
+that is waiting for you first. You can answer it, type into any terminal, open or close one,
+start an agent in a space, and put a space to sleep or wake it. Notifications need the qoop
+app on the phone (the web page cannot send them): turn them on there and the phone tells you
+when an agent blocks, finishes or fails.
+
+A phone can also be paired with one computer without an account: run `qoop pair` there,
+scan the code it shows with the qoop app, and type the six digits the phone shows into the
+computer.
+
+The phone and the computer talk end to end encrypted through a relay that sees neither the
+screens nor the keys, and a notification carries a fixed sentence and four numbers, nothing
+from a screen. `qoop login`, `qoop pair` and the phone side come with the prebuilt release;
+they are not part of this repository, so a build from source has no phone part.
+
+## How it works
 
 ```
 cd my-project
 qoop
 ```
 
-That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
-no manifest. Press ctrl-q and the shell keeps running; run `qoop` again and you are back in
+That reaches a real shell, with an index of your terminals beside it. No manifest to write.
+Press ctrl-q and the shell keeps running; run `qoop` again and you are back in
 the same one, on the terminal you left: the same space, the same tab, the same pane of a split.
 
 ```
@@ -111,7 +204,9 @@ which agent is in it and which generation of that agent. A workspace can be capt
 somewhere else, exactly, including the agent's own session. What scrolls off goes to disk as
 rows. Closing a terminal contains what it started.
 
-## Getting started
+## Build from source
+
+The prebuilt release (see Get started) is the easy way. To build it yourself:
 
 ```
 cargo build --release
@@ -138,6 +233,13 @@ How a screen is read, and how to override a misreading, is in
 [docs/manifests.md](docs/manifests.md); what each hook installs is in
 [docs/hooks.md](docs/hooks.md).
 
+On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
+skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
+`QOOP_DEST`), and it says so if that directory is not on your PATH. The releases are
+read from `https://qoop.si/releases`, which `qoop update` reads too; no token is needed.
+
+## qass
+
 The skill install also brings qass, for every agent above, an assistant that sits above every
 other agent: it is told when one stops, reads where that work stands (its task, its plan
 file, the repo's rules), answers what it can the way you would, and sends you only what
@@ -161,10 +263,7 @@ your "ok <name>") or `mode auto`, and per repository grants such as
 make it more careful, never let it act alone where it would have asked you. `qoop paths`
 lists every folder qoop writes to and how big each is.
 
-On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
-skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
-`QOOP_DEST`), and it says so if that directory is not on your PATH. The releases are
-read from `https://qoop.si/releases`, which `qoop update` reads too; no token is needed.
+## Sleep
 
 A tab you are not using can sleep: it ends, nothing of it takes CPU or memory, and waking
 it brings back the same number, name, split, directory and scrollback, the last screen
@@ -201,6 +300,8 @@ qoop --space api        the interface with that one space in it; `qoop` shows th
 qoop stop               end everything now: what was awake comes back on the next open
 ```
 
+## Settings
+
 The interface reads `~/.config/qoop/config.toml` (or `$XDG_CONFIG_HOME/qoop/config.toml`)
 when it starts, and again within two seconds of any change to it (`qoop settings`, also on
 `ctrl-a m`, settings; `qoop config set`; an editor). Every key is optional:
@@ -224,7 +325,7 @@ go; `qoop onboard` walks through the main ones on a first start. `[sleep]` and `
 the daemon's own, read by it from the same file; every key is in
 [docs/config.md](docs/config.md).
 
-### Other machines
+## Other machines
 
 A qoop on a server keeps running when you log out, like the one here does. Add it once and
 its spaces are listed beside this machine's. From the interface, the `+` beside "spaces"
@@ -264,18 +365,6 @@ background job holds it, and the interface says once what it is waiting on. Tabs
 numbers and agents come back in their own conversations. A build from main between releases
 is never sent anywhere, and a machine whose qoop is from before this needs one update by hand there (`qoop stop`,
 then the install script or `qoop update`) and follows on its own after that.
-
-### Your phone
-
-`qoop pair --hub wss://your-hub` prints a QR code; the qoop app scans it, shows the six
-digits you type back on the Mac, and from then on lists every agent on that Mac with the one
-waiting for you first. You can answer it, type into any terminal, open or close one, start an
-agent in a space, put a space to sleep or wake one of its tabs, and start the Mac's qoop again
-once everything slept, and the phone is told when an agent blocks, finishes or fails. The phone and the Mac talk end to
-end encrypted through a relay, `qoop-hub`, that sees neither the screens nor the keys, and a
-push carries a fixed sentence and four numbers, nothing from a screen. The phone side (the
-app, the hub, and the part of the release that runs `qoop pair`, `qoop devices` and `qoop
-bridge`) is not part of this repository.
 
 `qoop --help` lists the whole command surface, which is also written down in
 [docs/cli-surface.md](docs/cli-surface.md) and checked against the binary by a test.

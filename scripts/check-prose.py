@@ -17,7 +17,7 @@ EN = "\u2013"
 # rule that is enforced over the documentation and not over the code is enforced over the
 # smaller half. `skills` and `hooks` are copied into people's own agent directories, so
 # they ship as surely as the binary does.
-roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "README.md", ".github", ".qoop"]
+roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "site", "README.md", ".github", ".qoop"]
 skip = ("ref/", "target/", "node_modules/")
 
 fail = []
