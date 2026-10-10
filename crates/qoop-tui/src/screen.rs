@@ -1124,7 +1124,7 @@ pub fn paint(frame: &Frame) -> String {
         ),
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
-            None => (here(frame), None),
+            None => (calm(frame, watched), None),
         },
     };
     // `mode` is never set while a close is asked, so the two never meet.
@@ -1357,6 +1357,23 @@ fn here(frame: &Frame) -> String {
         }
         None => format!("{space} / nothing open"),
     }
+}
+
+/// What the calm row says while no agent runs here: a person who just installed qoop sees a
+/// shell and nothing that tells them what to type into it.
+pub(crate) const START_AGENT: &str = "type claude or codex here to start an agent";
+
+/// The calm row: [`here`], or [`START_AGENT`] while no agent outside qass is on the list and
+/// the keyboard is on a live tab outside qass. A sleeping or missing tab keeps [`here`], which
+/// names the way out of a blank pane, and qass's own tab is already an agent.
+fn calm(frame: &Frame, watched: &[AgentRow]) -> String {
+    let live_tab = watched
+        .iter()
+        .any(|r| r.terminal == frame.focused && r.state != "sleeping");
+    if live_tab && !watched.iter().any(|r| r.agent) {
+        return START_AGENT.to_string();
+    }
+    here(frame)
 }
 
 /// The state of the thing the status line is about to name, when something waits.
@@ -7399,5 +7416,97 @@ mod tests {
         assert!(slept.ends_with(", sleeping  ctrl-a x dismiss"), "{slept:?}");
         let live = here(&frame(1));
         assert!(live.ends_with(", working"), "{live:?}");
+    }
+
+    /// While no agent runs, the calm row says how to start one; an agent on the list, a
+    /// sleeping focus, qass's own tab and an agent only in qass's space each decide it as they
+    /// should, and the painted row carries it.
+    #[test]
+    fn the_calm_row_says_how_to_start_an_agent_until_one_runs() {
+        let shell = AgentRow {
+            agent: false,
+            ..row(1, "zsh", "idle")
+        };
+        let mut qass_spaces = spaces();
+        qass_spaces.push(WorkspaceRow {
+            id: 2,
+            name: sidebar::QASS_SPACE.to_string(),
+            ..spaces()[0].clone()
+        });
+        let in_qass = AgentRow {
+            workspace: 2,
+            ..row(3, "claude", "idle")
+        };
+        let panes = std::collections::BTreeMap::new();
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let behind = crate::run::Behind {
+            terminal: 0,
+            from: 0,
+            lines: Vec::new(),
+            total: 0,
+        };
+        let say = |rows: &[AgentRow], spaces: &[WorkspaceRow], focused| {
+            let frame = Frame {
+                armed: None,
+                drawer: None,
+                rows,
+                spaces,
+                panes: panes.clone(),
+                space: Some(1),
+                focused,
+                snapshot: None,
+                cols: 100,
+                lines: 24,
+                message: None,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Tree,
+                seen: &seen,
+                unseen: &unseen,
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &behind,
+                image_notice: None,
+                toast: None,
+                chrome: Default::default(),
+            };
+            let (_, watched) = sidebar::shown(frame.spaces, frame.rows);
+            (calm(&frame, watched), strip(&paint(&frame)))
+        };
+        let base = spaces();
+        let (said, painted) = say(std::slice::from_ref(&shell), &base, 1);
+        assert_eq!(said, START_AGENT);
+        assert!(painted.contains(START_AGENT), "{painted:?}");
+        let with_agent = [shell.clone(), row(2, "claude", "working")];
+        let (said, painted) = say(&with_agent, &base, 1);
+        assert_ne!(said, START_AGENT);
+        assert!(!painted.contains(START_AGENT), "{painted:?}");
+        let slept = [AgentRow {
+            state: "sleeping".into(),
+            ..shell.clone()
+        }];
+        assert!(say(&slept, &base, 1).0.ends_with("ctrl-a x dismiss"));
+        assert!(
+            say(std::slice::from_ref(&shell), &base, 9)
+                .0
+                .ends_with("nothing open")
+        );
+        assert_eq!(
+            say(&[shell.clone(), in_qass.clone()], &qass_spaces, 1).0,
+            START_AGENT
+        );
+        // The keyboard in qass's own tab: that is an agent already.
+        assert_ne!(say(&[shell, in_qass], &qass_spaces, 3).0, START_AGENT);
+        assert!(START_AGENT.len() < 50);
     }
 }

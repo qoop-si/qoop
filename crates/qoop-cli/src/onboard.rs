@@ -1,7 +1,7 @@
 //! `qoop onboard`: the first start, one group of settings a screen.
 //!
-//! Six steps under the word: the pet, the sounds, light or dark, the command key, the
-//! notifications, sleep. Their names sit under a line of dots that turns green as steps
+//! Seven steps under the word: the pet, the sounds, light or dark, the command key, the
+//! notifications, sleep, qass. Their names sit under a line of dots that turns green as steps
 //! pass; the current step says what it holds in one sentence and shows its choices. Left
 //! and right choose (a sound plays), up and down move between a step's rows, enter goes on,
 //! esc finishes. Each choice is written as it is made, so leaving early keeps what was set.
