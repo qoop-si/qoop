@@ -2678,11 +2678,17 @@ pub fn moves(c: &Column, strip: bool) -> Option<Motion> {
 /// Frame zero is the still column: hit testing, `QOOP_MOTION=0` and a column with
 /// nothing working all paint at zero, where every mark is its dot.
 fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
-    if c.icons && role == crate::theme::Role::Sleeping {
+    let moving = agent.state == "working" || role == crate::theme::Role::Background;
+    state_mark(role, moving, c.tick, c.icons)
+}
+
+/// A state's mark where the column is not the one drawing it (the qass screen's header): the
+/// zzz where icons are drawn and the state is asleep, else the two cell picture.
+pub(crate) fn state_mark(role: crate::theme::Role, moving: bool, tick: u64, icons: bool) -> String {
+    if icons && role == crate::theme::Role::Sleeping {
         return asleep_mark();
     }
-    let moving = agent.state == "working" || role == crate::theme::Role::Background;
-    cell_mark(role, moving, c.tick)
+    cell_mark(role, moving, tick)
 }
 
 /// An asleep tab's mark where icons are drawn: the zzz and the blank the two-cell mark

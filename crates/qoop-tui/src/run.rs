@@ -655,6 +655,8 @@ struct State {
     /// When `ctrl-a Q` last asked `qoop qass` to start or wake it, so a second press before
     /// its tab is listed does not start a second qass.
     qass_asked: Option<std::time::Instant>,
+    /// The qass screen's own memory: its zoom, and the clocks its lines age on.
+    qass_ui: crate::qass_screen::Ui,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
     /// A terminal to show once an index lists it, and until when: one `qoop focus` named
@@ -1143,6 +1145,7 @@ impl State {
             image_notice: None,
             toast: toast_text(self),
             chrome: screen::Chrome {
+                qass: self.on_qass_screen().then_some(self.qass_ui),
                 shut: &self.shut,
                 drag: None,
                 usage: &self.usage,
@@ -1274,6 +1277,19 @@ impl State {
         if self.focused == 0 {
             return None;
         }
+        // qass's box: only its inside is the terminal, counted from the inside's corner.
+        if self.on_qass_screen() {
+            let inner = self.qass_rect()?;
+            if within < inner.y
+                || within >= inner.y + inner.rows
+                || x < inner.x
+                || x >= inner.x + inner.cols
+            {
+                return None;
+            }
+            let local = (within - inner.y, x - inner.x);
+            return Some((self.focused, local, local));
+        }
         if let Some(space) = self.space
             && let Some(layout) = self.layouts.get(&space)
         {
@@ -1301,6 +1317,10 @@ impl State {
     fn scrolled_rows(&self) -> usize {
         let (_, pane_rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        let pane_rows = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .map_or(pane_rows, |inner| inner.rows as u16);
         let Some(anchor) = self.anchor else {
             return 0;
         };
@@ -1828,6 +1848,11 @@ impl State {
                     .find(|(t, _)| *t == target)
             })
             .map_or(area, |(_, rect)| rect);
+        // qass's tile is the inside of its box, the cell the hit was counted from.
+        let rect = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .unwrap_or(rect);
         let (cols, rows) = (rect.cols.max(1) as f32, rect.rows.max(1) as f32);
         let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
         let sides = [
@@ -2075,6 +2100,10 @@ impl State {
                 .map(|(_, r)| r)?,
             None => area,
         };
+        let rect = self
+            .qass_rect()
+            .filter(|_| self.on_qass_screen())
+            .unwrap_or(rect);
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         Some(screen::DragPaint {
             carried: Vec::new(),
@@ -2234,6 +2263,53 @@ impl State {
     /// Whether the space on screen is qass's.
     fn in_qass(&self) -> bool {
         self.space.is_some() && self.space == sidebar::qass_space(&self.spaces)
+    }
+
+    /// Whether qass's space is one plain tab, no split and none waiting: only then is its
+    /// terminal in a box. A split is the ordinary tiled pane, whoever it is for.
+    fn qass_single(&self) -> bool {
+        sidebar::qass_space(&self.spaces)
+            .and_then(|space| self.layouts.get(&space))
+            .is_none_or(|l| l.leaf_count() == 1 && !l.has_pending())
+    }
+
+    /// Whether the pane is qass's screen: qass's space on screen as one tab, and the keyboard
+    /// in its agent or resting on its sleeping tab. A shell opened in that space is not it.
+    fn on_qass_screen(&self) -> bool {
+        if !self.in_qass() || !self.qass_single() {
+            return false;
+        }
+        if self.focused != 0 {
+            let qass = sidebar::qass_space(&self.spaces);
+            return self
+                .rows
+                .iter()
+                .any(|r| r.terminal == self.focused && r.agent && Some(r.workspace) == qass);
+        }
+        self.dim_tab().is_some_and(|tab| {
+            self.dim_tabs()
+                .iter()
+                .any(|t| t.terminal == tab && t.agent.is_some())
+        })
+    }
+
+    /// The inside of qass's terminal box, in pane cells: what its pty is sized to, whether or
+    /// not it is on screen, so looking at qass does not reflow it. `None` when the pane is
+    /// too small to frame.
+    fn qass_rect(&self) -> Option<layout::Rect> {
+        let (cols, rows) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        crate::qass_screen::Plan::new(cols as usize, rows as usize, self.qass_ui.zoomed)
+            .map(|plan| plan.inner)
+    }
+
+    /// Whether qass's mark on its screen moves: it is working and its screen is up.
+    fn qass_working(&self) -> bool {
+        self.on_qass_screen()
+            && self
+                .rows
+                .iter()
+                .any(|r| r.terminal == self.focused && r.state == "working")
     }
 
     /// The tab after the focused one, wrapping, within the space on screen.
@@ -5434,6 +5510,9 @@ fn start_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
 
 /// The pane's size in cells, which is what a sleeping tab's screen is cut to.
 fn pane_cells(state: &State) -> (u16, u16) {
+    if let Some(inner) = state.qass_rect().filter(|_| state.on_qass_screen()) {
+        return (inner.cols as u16, inner.rows as u16);
+    }
     screen::pane_size_for(
         state.cols,
         state.lines,
@@ -5767,6 +5846,7 @@ where
         pending_focus: None,
         qass_back: None,
         qass_asked: None,
+        qass_ui: Default::default(),
         last: LastFocus::read(last_focus),
         show_when_listed: None,
         elsewhere: None,
@@ -6240,7 +6320,7 @@ where
             // repaint the same cell.
             let moving = if motion && screen::left_for(state.cols, state.collapsed, state.sidebar_width) > 0 {
                 let rows = sidebar::moves(&state.column(0, 0), state.collapsed);
-                if state.drawer_moving() { Some(sidebar::Motion::Spin) } else { rows }
+                if state.drawer_moving() || state.qass_working() { Some(sidebar::Motion::Spin) } else { rows }
             } else {
                 None
             };
@@ -6280,6 +6360,9 @@ where
                     }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                     if sidebar::refresh_files() {
+                        dirty = true;
+                    }
+                    if state.on_qass_screen() && state.qass_ui.refresh(sidebar::now_unix()) {
                         dirty = true;
                     }
                     if state.update.due(std::time::Instant::now()) {
@@ -9302,6 +9385,12 @@ fn pane_area(state: &State) -> layout::Rect {
 /// The rectangle of the focused terminal, or the whole pane when there is no
 /// tiling tree for this space.
 fn focused_rect(state: &State) -> layout::Rect {
+    if state.focused != 0
+        && state.on_qass_screen()
+        && let Some(inner) = state.qass_rect()
+    {
+        return inner;
+    }
     let area = pane_area(state);
     if state.focused == 0 {
         return area;
@@ -9888,10 +9977,16 @@ fn zoom_flip(
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<(bool, Option<BytesMut>)> {
     let space = state.space;
-    let changed = match space.and_then(|s| state.layouts.get_mut(&s)) {
+    let mut changed = match space.and_then(|s| state.layouts.get_mut(&s)) {
         Some(layout) => layout.toggle_zoom(),
         None => false,
     };
+    // One tab has nothing to zoom, except qass's screen: its header goes and the terminal
+    // box takes the whole pane.
+    if !changed && state.on_qass_screen() && state.qass_rect().is_some() {
+        state.qass_ui.zoomed = !state.qass_ui.zoomed;
+        changed = true;
+    }
     if !changed {
         return Ok((false, None));
     }
@@ -10038,6 +10133,20 @@ fn size_terminals(
         .filter(|t| !visible.contains(t) && (dragging || crate::mux::is_remote_terminal(*t)))
         .collect();
     want.retain(|t, _| !later.contains(t));
+    // qass's agent is the size of its box's inside wherever the keyboard is, so looking at
+    // it does not reflow it; the owner's agents keep the whole pane.
+    if let Some(inner) = state.qass_rect().filter(|_| state.qass_single()) {
+        let qass = sidebar::qass_space(&state.spaces);
+        for row in state
+            .rows
+            .iter()
+            .filter(|r| Some(r.workspace) == qass && r.agent)
+        {
+            if let Some(wanted) = want.get_mut(&row.terminal) {
+                *wanted = size(inner);
+            }
+        }
+    }
     if state.focused != 0 {
         want.insert(state.focused, size(focused_rect(state)));
     }
@@ -10114,6 +10223,7 @@ fn move_focus(
         state.qass_back = Some(from).filter(|t| *t != 0);
         // A start asked for has arrived.
         state.qass_asked = None;
+        state.qass_ui.refresh(sidebar::now_unix());
     }
     // A tab outside the tree on screen brings its own tree, and the one it
     // replaces is parked for the way back.
@@ -13320,6 +13430,7 @@ mod tests {
             pending_focus: None,
             qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14558,6 +14669,7 @@ mod tests {
             pending_focus: None,
             qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14697,6 +14809,7 @@ mod tests {
             pending_focus: None,
             qass_back: None,
             qass_asked: None,
+            qass_ui: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -18317,6 +18430,276 @@ mod tests {
         assert_eq!(out_of_qass(&state, &left), Some(1));
         state.space = Some(3);
         assert_eq!(out_of_qass(&state, &left), None, "only from qass's space");
+    }
+
+    /// The pane's cells and qass's box inside, for a 160x50 window.
+    fn qass_cells(state: &State) -> ((u16, u16), layout::Rect) {
+        let (cols, rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
+        let inner =
+            crate::qass_screen::Plan::new(cols as usize, rows as usize, state.qass_ui.zoomed)
+                .expect("a pane this size is framed")
+                .inner;
+        ((cols, rows), inner)
+    }
+
+    fn qass_window() -> State {
+        let mut state = qass_state();
+        state.cols = 160;
+        state.lines = 50;
+        state
+    }
+
+    /// qass's pty is the inside of its box, the owner's agents keep the whole pane, and
+    /// going to qass and back reflows nobody.
+    #[test]
+    fn qass_is_sized_to_its_box_and_nobody_else_is() {
+        let mut state = qass_window();
+        let ((cols, rows), inner) = qass_cells(&state);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(inner.cols as u16, inner.rows as u16))
+        );
+        assert_eq!(state.sized.get(&1), Some(&(cols, rows)));
+        assert_eq!(state.sized.get(&3), Some(&(cols, rows)));
+        assert!(inner.rows < rows as usize && inner.cols < cols as usize);
+
+        let before = state.sized.clone();
+        let mut seq = 0;
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.on_qass_screen());
+        assert_eq!(state.sized, before, "looking at qass resizes nothing");
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.on_qass_screen());
+        assert_eq!(state.sized, before, "and neither does coming back");
+        assert_eq!(focused_rect(&state), pane_area(&state));
+    }
+
+    /// The box is qass's agent alone: a shell opened in its space, or a split there, is the
+    /// ordinary pane.
+    #[test]
+    fn only_qass_agent_alone_is_in_the_box() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(!state.on_qass_screen(), "the owner's tab is a plain pane");
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.on_qass_screen());
+        let (_, inner) = qass_cells(&state);
+        assert_eq!(focused_rect(&state), inner);
+
+        let mut shell = agent(6, 9, "zsh", "idle");
+        shell.agent = false;
+        state.rows.push(shell);
+        state.focused = 6;
+        assert!(!state.on_qass_screen(), "a shell in qass's space");
+        assert_eq!(focused_rect(&state), pane_area(&state));
+
+        state.focused = 5;
+        let mut layout = Layout::single(5);
+        let area = pane_area(&state);
+        assert!(layout.split_placeholder(5, layout::Dir::V, area));
+        assert!(layout.bind_placeholder(6));
+        state.layouts.insert(9, layout);
+        assert!(!state.on_qass_screen(), "a split in qass's space");
+        let (_, inner) = qass_cells(&state);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let tile = state
+            .layouts
+            .get(&9)
+            .unwrap()
+            .tile_rects(pane_area(&state))
+            .into_iter()
+            .find(|(t, _)| *t == 5)
+            .map(|(_, r)| (r.cols as u16, r.rows as u16))
+            .unwrap();
+        assert_ne!(tile, (inner.cols as u16, inner.rows as u16));
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&tile),
+            "a split tile is its tile, as before"
+        );
+        // A split still waiting for its terminal is a split too.
+        state.layouts.remove(&9);
+        let mut layout = Layout::single(5);
+        assert!(layout.split_placeholder(5, layout::Dir::V, pane_area(&state)));
+        state.layouts.insert(9, layout);
+        assert!(!state.on_qass_screen(), "a split waiting for its terminal");
+        state.layouts.remove(&9);
+        state.focused = 5;
+        assert!(state.on_qass_screen());
+        // The pointer far outside the box is held on its edge, never past it.
+        assert_eq!(clamped_to_focused(&state, 1, 1), (0, 0));
+        assert_eq!(
+            clamped_to_focused(&state, state.lines, state.cols),
+            (inner.rows - 1, inner.cols - 1)
+        );
+    }
+
+    /// A click inside the box is a cell of qass's terminal; the header and the frame are not.
+    #[test]
+    fn a_click_in_the_box_lands_on_qass_terminal_and_the_frame_does_not() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, inner) = qass_cells(&state);
+        let first_col = screen::left_for(state.cols, state.collapsed, state.sidebar_width) + 1;
+        let screen_row = |y: usize| (screen::TABS + 1 + y) as u16;
+        let screen_col = |x: usize| (first_col + x) as u16;
+        // The first cell inside the box is cell (0, 0) of the terminal.
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            state.in_pane(
+                screen_row(inner.y + inner.rows - 1),
+                screen_col(inner.x + inner.cols - 1)
+            ),
+            Some((inner.rows - 1, inner.cols - 1))
+        );
+        // The border, the header and the cell after the last column are qass's frame.
+        assert_eq!(
+            state.in_pane(screen_row(inner.y - 1), screen_col(inner.x)),
+            None
+        );
+        assert_eq!(state.in_pane(screen_row(0), screen_col(inner.x)), None);
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x - 1)),
+            None
+        );
+        assert_eq!(
+            state.in_pane(screen_row(inner.y), screen_col(inner.x + inner.cols)),
+            None
+        );
+    }
+
+    /// `ctrl-a z` on qass's screen puts the header away and gives the terminal the whole
+    /// pane, and again brings it back; the pty follows both.
+    #[test]
+    fn zoom_on_qass_screen_swaps_the_header_for_room() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, boxed) = qass_cells(&state);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(boxed.cols as u16, boxed.rows as u16))
+        );
+        let (changed, out) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && out.is_some());
+        assert!(state.qass_ui.zoomed);
+        let (_, zoomed) = qass_cells(&state);
+        assert!(zoomed.rows > boxed.rows && zoomed.y < boxed.y);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(zoomed.cols as u16, zoomed.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), zoomed);
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(changed && !state.qass_ui.zoomed);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(boxed.cols as u16, boxed.rows as u16))
+        );
+        // Elsewhere there is nothing to zoom, as before.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!changed);
+        assert!(!state.qass_ui.zoomed);
+    }
+
+    /// A window too small to frame anything leaves qass's pane plain and its pty whole.
+    #[test]
+    fn a_tiny_pane_stays_plain_for_qass() {
+        let mut state = qass_window();
+        state.cols = 40;
+        state.lines = 8;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.qass_rect(), None);
+        assert_eq!(focused_rect(&state), pane_area(&state));
+        assert!(
+            state.frame().chrome.qass.is_some(),
+            "asked for, and refused by the plan"
+        );
+        let painted = screen::paint(&state.frame());
+        assert!(!painted.contains("terminal"), "{painted:?}");
+    }
+
+    /// The frame of the real state: the header and the box on qass's tab, the plain pane on
+    /// the owner's, and the sleeping tab speaks for qass too.
+    #[test]
+    fn the_frame_wears_the_header_on_qass_tab_only() {
+        let mut state = qass_window();
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let plain = strip(&screen::paint(&state.frame()));
+        assert!(
+            !plain.contains("keeping watch") && !plain.contains("T5"),
+            "{plain}"
+        );
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let painted = strip(&screen::paint(&state.frame()));
+        for want in [
+            "qass",
+            "idle",
+            "listening for changes in 2 agents",
+            "[ 0 waiting ]",
+            "terminal",
+            "T5",
+        ] {
+            assert!(painted.contains(want), "{want:?} in\n{painted}");
+        }
+        // Asleep: its tab is a line of its space, the keyboard rests on it, the header says so.
+        state.rows.retain(|r| r.terminal != 5);
+        let space = state.spaces.iter_mut().find(|w| w.name == "qass").unwrap();
+        space.asleep = true;
+        space.sleeping = vec![qoop_runtime::control::SleepingTab {
+            terminal: 5,
+            lead: None,
+            title: None,
+            agent: Some("claude".to_string()),
+            session: None,
+            cwd: "/q".to_string(),
+        }];
+        state.focused = 0;
+        assert!(state.on_qass_screen());
+        let painted = strip(&screen::paint(&state.frame()));
+        for want in [
+            "asleep",
+            "enter or",
+            "wakes it",
+            "nothing until you wake it",
+            "T5",
+        ] {
+            assert!(painted.contains(want), "{want:?} in\n{painted}");
+        }
+        let ((cols, rows), inner) = qass_cells(&state);
+        assert_eq!(pane_cells(&state), (inner.cols as u16, inner.rows as u16));
+        assert!(inner.cols < cols as usize && inner.rows < rows as usize);
     }
 
     /// `ctrl-a s/S` pass a sleeping space by, and with every other space asleep stay put.

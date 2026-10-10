@@ -145,6 +145,9 @@ pub struct Chrome<'a> {
     pub drag: Option<&'a DragPaint>,
     /// The keyboard's hold on the column: its filter and the row it stands on.
     pub nav: Option<&'a sidebar::Nav>,
+    /// The pane is qass's screen: a header over qass's terminal in a box. Set only while
+    /// the focused tab is qass's agent, by the one place that knows (`State::on_qass_screen`).
+    pub qass: Option<crate::qass_screen::Ui>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -186,6 +189,7 @@ impl Default for Chrome<'_> {
             inbox: sidebar::Inbox::default(),
             drag: None,
             nav: None,
+            qass: None,
         }
     }
 }
@@ -458,6 +462,50 @@ pub fn pane_size_for(
     )
 }
 
+/// The qass screen's plan for this frame's pane, when the pane is qass's screen and big
+/// enough to frame.
+pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
+    let ui = frame.chrome.qass?;
+    let (cols, rows) = pane_size_for(
+        frame.cols,
+        frame.lines,
+        frame.collapsed,
+        0,
+        frame.sidebar_width,
+    );
+    crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed)
+}
+
+/// qass's screen painted for this frame, with its plan, when the pane is qass's and qass has
+/// a tab to speak for.
+fn qass_screen_of(
+    frame: &Frame,
+    pet: Option<&qoop_runtime::avatar::Avatar>,
+    spotlight: bool,
+) -> Option<(crate::qass_screen::Plan, crate::qass_screen::Screen)> {
+    let plan = qass_plan(frame)?;
+    let facts = crate::qass_screen::facts(
+        frame.rows,
+        frame.spaces,
+        frame.focused,
+        frame.seen,
+        frame.unseen,
+    )?;
+    let ctx = crate::qass_screen::Ctx {
+        pet,
+        colour: crate::colorlevel::level() != crate::colorlevel::Level::Mono,
+        icons: crate::icons::on(),
+        tick: frame.tick,
+        now: frame.now_unix,
+        fade: spotlight,
+    };
+    let wake_at = frame.chrome.qass.and_then(|ui| ui.wake_at);
+    Some((
+        plan,
+        crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx),
+    ))
+}
+
 /// The columns spent before the pane starts: the left column and the rule beside it, or
 /// nothing at all when the window is too narrow to hold both.
 ///
@@ -681,7 +729,8 @@ pub(crate) fn picture_cell(frame: &Frame) -> Option<(usize, usize)> {
     }
     let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
     if frame.tiles.len() < 2 {
-        return Some((TABS + 1, left + 1));
+        let (y, x) = qass_plan(frame).map_or((0, 0), |p| (p.inner.y, p.inner.x));
+        return Some((TABS + 1 + y, left + 1 + x));
     }
     let t = frame.tiles.iter().find(|t| t.focused)?;
     Some((TABS + 1 + t.rect.y, left + 1 + t.rect.x))
@@ -708,8 +757,23 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
             snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
             cell,
         );
-        let row = row.min(pane_rows as usize - 1) + 1 + TABS;
-        let col = col.min(pane_cols as usize - 1)
+        // Inside qass's box, the cursor is offset by the header and the frame.
+        let (area, y, x) = match qass_plan(frame) {
+            Some(p) => (p.inner, p.inner.y, p.inner.x),
+            None => (
+                layout::Rect {
+                    x: 0,
+                    y: 0,
+                    cols: pane_cols as usize,
+                    rows: pane_rows as usize,
+                },
+                0,
+                0,
+            ),
+        };
+        let row = row.min(area.rows - 1) + y + 1 + TABS;
+        let col = col.min(area.cols - 1)
+            + x
             + left_for(frame.cols, frame.collapsed, frame.sidebar_width)
             + 1;
         Some((row, col))
@@ -827,6 +891,7 @@ pub fn paint(frame: &Frame) -> String {
     // The pet stands on the foot of the column. Read once per frame so the
     // reservation below and the overlay further down paint the same pet.
     let avatar = sidebar::current_avatar();
+    let qass = qass_screen_of(frame, avatar.as_ref(), spotlight);
     let column = frame.column();
     let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
         sidebar::rows_collapsed(&column, column_rows)
@@ -1024,6 +1089,31 @@ pub fn paint(frame: &Frame) -> String {
         // tile paints the legacy path, so one terminal paints pixel for pixel
         // what it always has.
         if frame.tiles.len() < 2 {
+            if let Some((plan, screen)) = &qass {
+                // qass's screen: its header and the frame around its terminal, whose rows
+                // are the box's inside, counted from its first.
+                out.push_str(&screen.row(pane_row, |local| {
+                    let (line, spans) = window_row(
+                        frame.snapshot,
+                        frame.behind,
+                        frame.scroll,
+                        frame.anchor,
+                        local,
+                    );
+                    let selected = frame
+                        .selection
+                        .and_then(|s| s.columns_on(local, plan.inner.cols));
+                    pane_row_paint(
+                        frame,
+                        line,
+                        spans,
+                        links_of(frame.snapshot),
+                        plan.inner.cols,
+                        selected,
+                    )
+                }));
+                continue;
+            }
             let (line, spans) = window_row(
                 frame.snapshot,
                 frame.behind,
@@ -1177,7 +1267,10 @@ pub fn paint(frame: &Frame) -> String {
     // covers terminal text.
     if let Some(notice) = frame.image_notice {
         let (tile_x, tile_y, tile_cols, tile_rows) = if frame.tiles.len() < 2 {
-            (0, 0, pane_cols as usize, pane_rows as usize)
+            match qass_plan(frame) {
+                Some(p) => (p.inner.x, p.inner.y, p.inner.cols, p.inner.rows),
+                None => (0, 0, pane_cols as usize, pane_rows as usize),
+            }
         } else if let Some(tile) = frame.tiles.iter().find(|t| t.focused) {
             (tile.rect.x, tile.rect.y, tile.rect.cols, tile.rect.rows)
         } else {
