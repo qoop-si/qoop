@@ -212,10 +212,10 @@ const SPACES_TITLE_ROW: usize = qoop_tui::screen::SIDEBAR_TOP + qoop_tui::sideba
 /// the row under it.
 const TAB_NAMES_ROW: usize = 1;
 
-/// How far under the column's title the list starts: the title row, then the search box.
+/// How far under the column's title the list starts: the title row, then the search chip.
 const LIST_BELOW_TITLE: usize = 1 + qoop_tui::sidebar::SEARCH_ROWS;
 
-/// The screen row the first space's rule is drawn on: under the title and the search box. The
+/// The screen row the first space's rule is drawn on: under the title and the search chip. The
 /// next space's rule follows it directly while the first space holds no agent.
 const FIRST_SPACE_ROW: usize = SPACES_TITLE_ROW + LIST_BELOW_TITLE;
 

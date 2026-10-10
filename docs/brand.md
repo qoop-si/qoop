@@ -115,3 +115,14 @@ each mark is a two by two picture in one cell and a space:
 A space is its name in its colour, starting in the column the marks start in, with a line of
 dots in the same colour down its left edge from halfway down its own row to a foot beside its
 last row.
+
+## Search chip
+
+The search under the `agents` title is one row: an ember `[` and `]` with the field between
+them. The `[` stands in the column of the inbox edge's left corner (also the column the title's
+word and the space names start in) and the `]` in the column of the edge's right corner, so the
+chip is exactly as wide as the tray above it at every column width. Idle it reads `/ search N
+agents`, the slash in the title's ink and the words faint. Typing, the query is bright with an
+ember caret, a query longer than the room shows its end, and `M of N` stands flush right just
+inside the `]`; the count goes first when the column is too narrow to read both. The brackets
+never move.

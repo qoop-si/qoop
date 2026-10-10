@@ -314,7 +314,7 @@ pub enum Hit {
     Tabs,
     /// The `spaces` title, with the order word and the `+` at its right.
     Title,
-    /// The search box under the title, all three of its rows.
+    /// The search chip under the title.
     Search,
     /// The foot of the column: the brand, `menu`, and the mark that folds the column.
     Foot,
@@ -354,7 +354,7 @@ pub enum Act {
     Terminal(u32),
     /// The `+` of the title: a space, named first.
     NewSpace,
-    /// The search box under the title: type to filter the column.
+    /// The search chip under the title: type to filter the column.
     Search,
     /// The `tree` or `priority` word of the title: the order below, and its switch.
     View,
@@ -745,12 +745,12 @@ pub enum Pick {
     Terminal(u32),
 }
 
-/// The column while the keyboard has it: what is typed in the search box, whether typing is
+/// The column while the keyboard has it: what is typed in the search chip, whether typing is
 /// going there, and the row the pick stands on. The filter lives exactly as long as this does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Nav {
     pub query: String,
-    /// Keys go to the search box rather than to the rows.
+    /// Keys go to the search chip rather than to the rows.
     pub typing: bool,
     pub pick: Option<Pick>,
     /// Where the pick stood in [`items`], so a pick that vanished (closed, filtered out)
@@ -1335,9 +1335,9 @@ fn item_row(c: &Column, item: &Item) -> Line {
 }
 
 /// How many rows the inbox takes at the top of a column with `room` rows above the foot:
-/// none when it would leave the title, the search box and a row of the tree no room (folded,
+/// none when it would leave the title, the search chip and a row of the tree no room (folded,
 /// its one row; open, its tab row, a list row and its edge), one when folded, else the tab
-/// row and as many list rows as were dragged that leave the edge, the title, the box and one
+/// row and as many list rows as were dragged that leave the edge, the title, the chip and one
 /// tree row. Never more because news came, so the tree stays where it was.
 fn inbox_height(c: &Column, room: usize) -> usize {
     let least = if c.inbox.folded {
@@ -1390,7 +1390,7 @@ fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avat
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
-/// its edge, the title, the search box and one row of the tree. Zero when the inbox has no
+/// its edge, the title, the search chip and one row of the tree. Zero when the inbox has no
 /// list rows to drag.
 pub(crate) fn inbox_room(
     c: &Column,
@@ -1539,34 +1539,33 @@ fn title_line(c: &Column) -> Line {
     }
 }
 
-/// The rows of the search box: a border, the field, a border.
-pub const SEARCH_ROWS: usize = 3;
+/// The rows of the search: one, the chip.
+pub const SEARCH_ROWS: usize = 1;
 
-/// The search box under the title: a rounded box drawn with the inbox tray's corners. Idle it
-/// reads ` /  search 6 agents`; typing, its border brightens and it shows a `/`, what is typed
-/// (its end, when it is longer than the room), the caret, and how many agents it found out of
-/// all of them, flush right.
+/// The search chip under the title: one row between ember brackets, the left one on the
+/// column of the inbox edge's left corner and of the words below it, the right one on the
+/// column of the edge's right corner, so the chip is as wide as the tray above it at any
+/// width. Idle it reads ` / search 6 agents`; typing, it shows a `/`, what is typed (its end,
+/// when it is longer than the room), the caret, and how many agents it found out of all of
+/// them, flush right inside the right bracket.
 fn search_rows(c: &Column) -> Vec<Row> {
     use crate::theme::Role;
     let (query, typing) = c
         .nav
         .map_or(("", false), |nav| (nav.query.as_str(), nav.typing));
+    // The columns between the brackets: the tray's edge has the same.
     let inner = c.width.saturating_sub(4);
-    let border = if typing { Role::Detail } else { Role::Rule };
     let (found, all) = search_counts(c);
     let caret = if typing { "\u{258f}" } else { "" };
     let lead = " / ";
     let lead_w = crate::width::width(lead);
-    // Runs in the field's own columns; the box shifts them by its left edge below.
-    let mut runs = Vec::new();
+    // Runs in the field's own columns; the left bracket shifts them below.
+    let mut runs = vec![(1, 1, Role::Title)];
     let field = if query.is_empty() {
         if typing {
-            runs.push((1, 1, Role::Title));
             runs.push((lead_w, 1, Role::Brand));
         }
-        // The caret takes the blank before the word, so the word never moves when it comes.
-        let blank = if typing { "" } else { " " };
-        format!("{lead}{caret}{blank}search {all} {}", plural(all))
+        format!("{lead}{caret}search {all} {}", plural(all))
     } else {
         let count = format!("{found} of {all}");
         let count_w = crate::width::width(&count);
@@ -1586,7 +1585,6 @@ fn search_rows(c: &Column) -> Vec<Row> {
             tail = chars.as_str();
         }
         let tail_w = crate::width::width(tail);
-        runs.push((1, 1, Role::Title));
         runs.push((lead_w, tail_w, Role::Focused));
         if typing {
             runs.push((lead_w + tail_w, 1, Role::Brand));
@@ -1599,28 +1597,15 @@ fn search_rows(c: &Column) -> Vec<Row> {
             left
         }
     };
-    let edge = |l: char, r: char| Line {
-        text: fit(&format!(" {l}{}{r} ", "\u{2500}".repeat(inner)), c.width),
-        colour: None,
-        runs: vec![(1, inner + 2, border)],
-        ..Line::default()
-    };
-    let mut boxed_runs = vec![(1, 1, border), (2 + inner, 1, border)];
-    boxed_runs.extend(runs.into_iter().map(|(at, len, role)| (2 + at, len, role)));
-    let middle = Line {
-        text: fit(
-            &format!(" \u{2502}{}\u{2502} ", fit_to(&field, inner)),
-            c.width,
-        ),
+    let mut chip_runs = vec![(1, 1, Role::Brand), (2 + inner, 1, Role::Brand)];
+    chip_runs.extend(runs.into_iter().map(|(at, len, role)| (2 + at, len, role)));
+    let chip = Line {
+        text: fit(&format!(" [{}] ", fit_to(&field, inner)), c.width),
         colour: Some(Role::Faint),
-        runs: boxed_runs,
+        runs: chip_runs,
         ..Line::default()
     };
-    vec![
-        (edge('\u{256d}', '\u{256e}'), Some(Hit::Search)),
-        (middle, Some(Hit::Search)),
-        (edge('\u{2570}', '\u{256f}'), Some(Hit::Search)),
-    ]
+    vec![(chip, Some(Hit::Search))]
 }
 
 /// `agent` or `agents` after a count.
@@ -1628,7 +1613,7 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "agent" } else { "agents" }
 }
 
-/// How many agents the search finds out of all the column lists: what the box says it is
+/// How many agents the search finds out of all the column lists: what the chip says it is
 /// looking through, and what it found.
 fn search_counts(c: &Column) -> (usize, usize) {
     let all = c.agents.iter().filter(|a| a.agent);
@@ -1848,7 +1833,7 @@ fn nothing_found(width: usize) -> Line {
     }
 }
 
-/// What is typed in the search box, without the blanks around it.
+/// What is typed in the search chip, without the blanks around it.
 fn query_of<'a>(c: &Column<'a>) -> &'a str {
     c.nav.map_or("", |nav| nav.query.trim())
 }
@@ -4802,7 +4787,7 @@ mod tests {
             );
         }
         // A tree that fits never scrolls: the first rule sits under the next row, the title
-        // and the search box.
+        // and the search chip.
         let (spaces, agents) = sample();
         assert_eq!(
             hit(&spaces, &agents, 3, 3, 17, 2 + SEARCH_ROWS),
@@ -4921,12 +4906,8 @@ mod tests {
                         None
                     } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
                         Some(Hit::Title)
-                    } else if in_tree
-                        && (text.starts_with(" \u{256d}")
-                            || text.starts_with(" \u{2570}")
-                            || text.starts_with(" \u{2502} /"))
-                    {
-                        // The search box: its border, its field, its border.
+                    } else if in_tree && text.starts_with(" [ /") {
+                        // The search chip.
                         Some(Hit::Search)
                     } else if text.ends_with('\u{ab}') {
                         // The menu row, the foot's last: the version and `menu «`.
@@ -8897,13 +8878,15 @@ mod tests {
         let rows = tree_rows(&spaces, &[a, b], 9, 18, &Seen::new(), &Shut::new());
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = unboxed(&lines);
-        assert_eq!(texts[5], rule_row(&rows, 1).text.trim_end());
-        assert_eq!(texts[6], " \u{2810}\u{2800}claude");
-        assert_eq!(texts[7], "   \u{2514} claude \u{b7} x");
-        assert!(texts[8].is_empty(), "{texts:?}");
-        assert_eq!(texts[9], rule_row(&rows, 2).text.trim_end());
-        assert_eq!(texts[10], " \u{2810}\u{2800}codex");
-        assert_eq!(texts[11], "   \u{2514} codex \u{b7} x");
+        // The rules start under the title and the search chip.
+        let top = 2 + SEARCH_ROWS;
+        assert_eq!(texts[top], rule_row(&rows, 1).text.trim_end());
+        assert_eq!(texts[top + 1], " \u{2810}\u{2800}claude");
+        assert_eq!(texts[top + 2], "   \u{2514} claude \u{b7} x");
+        assert!(texts[top + 3].is_empty(), "{texts:?}");
+        assert_eq!(texts[top + 4], rule_row(&rows, 2).text.trim_end());
+        assert_eq!(texts[top + 5], " \u{2810}\u{2800}codex");
+        assert_eq!(texts[top + 6], "   \u{2514} codex \u{b7} x");
     }
 
     /// A long worktree shortens with an ellipsis while the tab keeps every letter it
@@ -9082,7 +9065,7 @@ mod tests {
             agent_at(2, 1, "claude", "idle", 5000),
             agent(3, 1, "gemini", "blocked"),
         ];
-        // The least that holds the title, the search box, one row of list and the foot, then more.
+        // The least that holds the title, the search chip, one row of list and the foot, then more.
         let least = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len() + 6;
         for height in [least, least + 1, 12, 16, 30] {
             let rows = rows12(
@@ -10210,12 +10193,11 @@ mod tests {
         assert_eq!(resolve(&nav(Terminal(9), 0), &[]), None);
     }
 
-    /// The search box is three rows under the title that a click on any of them focuses: a
-    /// rounded border, the field, a border. Idle it reads `search N agents` in the faint ink;
-    /// typing, the border brightens and the field shows the `/`, the words, the caret and how
-    /// many agents they found out of all.
+    /// The search is one row under the title that a click on any column of it focuses: ember
+    /// brackets round the field. Idle it reads `search N agents` in the faint ink; typing, the
+    /// field shows the `/`, the words, the caret and how many agents they found out of all.
     #[test]
-    fn the_search_box_sits_under_the_title_and_shows_the_query() {
+    fn the_search_chip_sits_under_the_title_and_shows_the_query() {
         use crate::theme::Role;
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
@@ -10233,59 +10215,55 @@ mod tests {
             &shut,
         );
         let all = agents.iter().filter(|a| a.agent).count();
-        let box_of = |c: &Column| {
+        let chip_of = |c: &Column| {
             let rows = rows_folded(c, 30, None);
             let at = rows
                 .iter()
                 .position(|(_, h)| *h == Some(Hit::Title))
                 .expect("a title");
-            for row in &rows[at + 1..at + 4] {
-                assert_eq!(row.1, Some(Hit::Search));
-                assert_eq!(crate::width::width(&row.0.text), WIDTH, "{:?}", row.0);
-            }
-            assert_ne!(rows[at + 4].1, Some(Hit::Search), "the box is three rows");
-            rows[at + 1..at + 4]
-                .iter()
-                .map(|(line, _)| line.clone())
-                .collect::<Vec<_>>()
+            assert_eq!(rows[at + 1].1, Some(Hit::Search));
+            assert_ne!(rows[at + 2].1, Some(Hit::Search), "the chip is one row");
+            assert_ne!(rows[at - 1].1, Some(Hit::Search), "the chip is one row");
+            assert_eq!(crate::width::width(&rows[at + 1].0.text), WIDTH);
+            rows[at + 1].0.clone()
         };
-        let bar = "\u{2500}".repeat(WIDTH - 4);
-        let idle = box_of(&c);
-        assert_eq!(idle[0].text, format!(" \u{256d}{bar}\u{256e} "));
-        assert_eq!(idle[2].text, format!(" \u{2570}{bar}\u{256f} "));
+        let brackets = [(1, 1, Role::Brand), (WIDTH - 2, 1, Role::Brand)];
+        let idle = chip_of(&c);
         assert!(
-            idle[1]
-                .text
-                .starts_with(&format!(" \u{2502} /  search {all} agents")),
+            idle.text.starts_with(&format!(" [ / search {all} agents")),
             "{:?}",
-            idle[1].text
+            idle.text
         );
-        assert!(idle[1].text.ends_with("\u{2502} "));
-        assert_eq!(idle[0].runs, vec![(1, WIDTH - 2, Role::Rule)]);
-        assert_eq!(
-            idle[1].runs,
-            vec![(1, 1, Role::Rule), (WIDTH - 2, 1, Role::Rule)]
-        );
-        assert_eq!(idle[1].colour, Some(Role::Faint));
+        assert!(idle.text.ends_with("] "));
+        assert_eq!(idle.runs, [brackets[0], brackets[1], (3, 1, Role::Title)]);
+        assert_eq!(idle.colour, Some(Role::Faint));
         for col in 1..=WIDTH {
             assert_eq!(act(Hit::Search, col, &c, false), Some(Act::Search));
         }
-        // Typing: the border brightens, the caret takes the blank before the word.
+        // Typing: the caret comes before the word.
         let nav = Nav {
             typing: true,
             ..Nav::default()
         };
         c.nav = Some(&nav);
-        let empty = box_of(&c);
+        let empty = chip_of(&c);
         assert!(
-            empty[1]
+            empty
                 .text
-                .starts_with(&format!(" \u{2502} / \u{258f}search {all} agents")),
+                .starts_with(&format!(" [ / \u{258f}search {all} agents")),
             "{:?}",
-            empty[1].text
+            empty.text
         );
-        assert_eq!(empty[0].runs, vec![(1, WIDTH - 2, Role::Detail)]);
-        // The words, the caret, and the count at the right edge.
+        assert_eq!(
+            empty.runs,
+            [
+                brackets[0],
+                brackets[1],
+                (3, 1, Role::Title),
+                (5, 1, Role::Brand)
+            ]
+        );
+        // The words, the caret, and the count at the right bracket.
         let nav = Nav {
             query: "co".into(),
             typing: true,
@@ -10298,24 +10276,23 @@ mod tests {
             found > 0 && found < total,
             "the sample has a few that match"
         );
-        let typed = box_of(&c);
+        let typed = chip_of(&c);
         let count = format!("{found} of {total}");
         assert!(
-            typed[1].text.starts_with(" \u{2502} / co\u{258f}"),
+            typed.text.starts_with(" [ / co\u{258f}"),
             "{:?}",
-            typed[1].text
+            typed.text
         );
         assert!(
-            typed[1].text.ends_with(&format!("{count} \u{2502} ")),
+            typed.text.ends_with(&format!("{count} ] ")),
             "{:?}",
-            typed[1].text
+            typed.text
         );
-        assert_eq!(typed[0].runs, vec![(1, WIDTH - 2, Role::Detail)]);
         assert_eq!(
-            typed[1].runs,
-            vec![
-                (1, 1, Role::Detail),
-                (WIDTH - 2, 1, Role::Detail),
+            typed.runs,
+            [
+                brackets[0],
+                brackets[1],
                 (3, 1, Role::Title),
                 (5, 2, Role::Focused),
                 (7, 1, Role::Brand),
@@ -10328,15 +10305,88 @@ mod tests {
             ..Nav::default()
         };
         c.nav = Some(&long);
-        let line = &box_of(&c)[1];
+        let line = chip_of(&c);
         assert!(line.text.contains("end\u{258f}"), "{:?}", line.text);
+        assert!(line.text.ends_with("] "), "{:?}", line.text);
         assert!(line.text.contains(" of "), "{:?}", line.text);
     }
 
-    /// A column too narrow to read the words beside the count drops the count and keeps the
-    /// words and the box whole.
+    /// The chip is as wide as the inbox's tray above it, to the cell: its `[` stands in the
+    /// column of the edge's left corner, of the title's words and of the space names, and its
+    /// `]` in the column of the edge's right corner, idle or typing, short query or long, with
+    /// icons or without, at every width from the narrowest.
     #[test]
-    fn a_narrow_search_box_drops_the_count_before_the_words() {
+    fn the_search_chip_brackets_stand_on_the_trays_corners() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let col_of = |text: &str, find: &dyn Fn(char) -> bool| -> usize {
+            let at = text.chars().position(find).expect("the glyph");
+            crate::width::width(&text.chars().take(at).collect::<String>())
+        };
+        let long = "x".repeat(60);
+        let wide = "程".repeat(40);
+        for width in [SIDEBAR_MIN, 30, WIDTH, 60] {
+            for icons in [false, true] {
+                for (query, typing) in [
+                    ("", false),
+                    ("api", true),
+                    (long.as_str(), true),
+                    (wide.as_str(), true),
+                ] {
+                    let nav = Nav {
+                        query: query.into(),
+                        typing,
+                        ..Nav::default()
+                    };
+                    let mut c = opened(column(
+                        &spaces,
+                        &agents,
+                        1,
+                        1,
+                        0,
+                        View::Tree,
+                        &seen,
+                        &unseen,
+                        NOW,
+                        width,
+                        &shut,
+                    ));
+                    c.icons = icons;
+                    c.nav = (typing || !query.is_empty()).then_some(&nav);
+                    let rows = rows_folded(&c, 40, None);
+                    let at = |hit: Hit| rows.iter().position(|(_, h)| *h == Some(hit));
+                    let text = |hit: Hit| rows[at(hit).expect("a row")].0.text.clone();
+                    let tray = rows
+                        .iter()
+                        .map(|(l, _)| l.text.as_str())
+                        .find(|t| t.starts_with(" \u{2570}"))
+                        .expect("the inbox edge");
+                    let chip = text(Hit::Search);
+                    let why = format!("width {width} icons {icons} query {query:?}: {chip:?}");
+                    assert_eq!(crate::width::width(&chip), width, "{why}");
+                    let left = col_of(tray, &|ch| ch == '\u{2570}');
+                    let right = col_of(tray, &|ch| ch == '\u{256f}');
+                    assert_eq!(col_of(&chip, &|ch| ch == '['), left, "{why}");
+                    assert_eq!(chip.chars().rev().nth(1), Some(']'), "{why}");
+                    assert_eq!(
+                        col_of(&chip[..chip.len() - 1], &|ch| ch == ']'),
+                        right,
+                        "{why}"
+                    );
+                    assert_eq!(col_of(&text(Hit::Title), &|ch| ch == 'a'), left, "{why}");
+                    // A query that finds nobody leaves no space to compare with.
+                    if at(Hit::Space(1)).is_some() {
+                        assert_eq!(col_of(&text(Hit::Space(1)), &|ch| ch == 'c'), left, "{why}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A column too narrow to read the words beside the count drops the count and keeps the
+    /// words and the brackets whole.
+    #[test]
+    fn a_narrow_search_chip_drops_the_count_before_the_words() {
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let nav = Nav {
@@ -10359,13 +10409,14 @@ mod tests {
                 &shut,
             );
             c.nav = Some(&nav);
-            for (line, _) in search_rows(&c) {
-                assert_eq!(crate::width::width(&line.text), width, "{line:?}");
-            }
-            let middle = &search_rows(&c)[1].0.text;
-            assert!(middle.contains("api\u{258f}"), "width {width}: {middle:?}");
+            let rows = search_rows(&c);
+            assert_eq!(rows.len(), SEARCH_ROWS);
+            let chip = &rows[0].0.text;
+            assert_eq!(crate::width::width(chip), width, "{chip:?}");
+            assert!(chip.contains("api\u{258f}"), "width {width}: {chip:?}");
+            assert!(chip.starts_with(" [") && chip.ends_with("] "), "{chip:?}");
         }
-        // Wide letters count by their columns: the caret and the count stay in the box.
+        // Wide letters count by their columns: the caret and the count stay in the chip.
         let wide = Nav {
             query: "程".repeat(40),
             typing: true,
@@ -10385,11 +10436,12 @@ mod tests {
             &shut,
         );
         c.nav = Some(&wide);
-        let middle = &search_rows(&c)[1].0.text;
+        let chip = &search_rows(&c)[0].0.text;
         assert!(
-            middle.contains("\u{258f}") && middle.contains(" of "),
-            "{middle:?}"
+            chip.contains("\u{258f}") && chip.contains(" of ") && chip.ends_with("] "),
+            "{chip:?}"
         );
+        assert_eq!(crate::width::width(chip), WIDTH, "{chip:?}");
     }
 
     /// The count says how many agents the search finds, out of all of them, whatever the
@@ -10502,10 +10554,10 @@ mod tests {
         assert!(rows.iter().any(|(_, h)| *h == Some(Hit::Terminal(27))));
         assert!(!rows.iter().any(|(_, h)| *h == Some(Hit::Terminal(1))));
     }
-    /// With the inbox dragged as tall as it goes, the title, the search box and a row of the
+    /// With the inbox dragged as tall as it goes, the title, the search chip and a row of the
     /// tree are still on the column.
     #[test]
-    fn an_inbox_dragged_to_its_limit_leaves_the_search_box_and_a_tree_row() {
+    fn an_inbox_dragged_to_its_limit_leaves_the_search_chip_and_a_tree_row() {
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let mut c = opened(column(

@@ -34,8 +34,9 @@ bell, so you find out without looking, even when its space is folded. The name i
 you would say, not the runtime underneath it: an agent installed as a node package reads as
 itself, not as `node`.
 
-The search box under the title filters the column by space name, agent name, state and
-directory. `ctrl-a a` gives the column the keyboard: `j` `k` or the arrows move over its rows,
+The search chip under the title (one row, ember brackets, as wide as the inbox tray above it)
+filters the column by space name, agent name, state and directory. `ctrl-a a` gives the column
+the keyboard: `j` `k` or the arrows move over its rows,
 `enter` opens one, `/` types in the search, `s` sleeps the row, `S` every space, `w` wakes it,
 `n` opens a new tab, `x` closes (asking first, as its `x` does), `f` folds, and `q` or `esc`
 gives the keyboard back. Each live agent's row ends in a moon: a click puts that one tab to

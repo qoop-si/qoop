@@ -2534,7 +2534,7 @@ pub(crate) const SIDE_HINT: &[(&str, &str)] = &[
     ("q", "back"),
 ];
 
-/// The same while the search box has the typing.
+/// The same while the search chip has the typing.
 pub(crate) const SEARCH_HINT: &[(&str, &str)] =
     &[("type", "filter"), ("enter", "pick"), ("esc", "clear")];
 

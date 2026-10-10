@@ -4499,7 +4499,7 @@ fn side_ask_sleep(state: &mut State) {
     state.modes.side_ask = Some(ids);
 }
 
-/// A click on the search box: the typing goes there, with what was already typed kept when the
+/// A click on the search chip: the typing goes there, with what was already typed kept when the
 /// keyboard already had the column.
 fn focus_search(state: &mut State) {
     match state.modes.side.as_mut() {
@@ -4508,11 +4508,11 @@ fn focus_search(state: &mut State) {
     }
 }
 
-/// The most characters the search box takes.
+/// The most characters the search chip takes.
 const SIDE_QUERY_MAX: usize = 64;
 
 /// Give the keyboard to the agents column, standing on the row the person is in, with the
-/// search box taking the typing when `typing`.
+/// search chip taking the typing when `typing`.
 fn enter_side(state: &mut State, typing: bool) {
     state.modes.side = Some(sidebar::Nav {
         typing,
@@ -4602,7 +4602,7 @@ fn side_over(state: &State, row: u16, col: u16) -> bool {
 
 /// Decide what one read of stdin meant while the keyboard has the agents column.
 ///
-/// `j k` and the arrows move the pick, `enter` goes there, `/` types in the search box, and
+/// `j k` and the arrows move the pick, `enter` goes there, `/` types in the search chip, and
 /// `s w S n N f x` act on the row: sleep, wake, sleep every space, a new tab, a new space,
 /// fold, close (which asks the way a click on its `x` does). `esc` clears a search and then
 /// leaves, `q` leaves at once. The prefix and a detach leave and are passed on. The mouse
@@ -4692,7 +4692,7 @@ fn side_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> M
     }
 }
 
-/// One key while the search box has the typing.
+/// One key while the search chip has the typing.
 fn side_typing(state: &mut State, key: ModeKey) {
     let Some(nav) = state.modes.side.as_mut() else {
         return;
@@ -5537,7 +5537,7 @@ enum Clicked {
     KeepAwakeAgent(u32),
     /// The sleep mark on an agent's row: that tab alone goes to sleep.
     SleepAgent(u32),
-    /// The search box under the title: the keyboard takes the column, typing.
+    /// The search chip under the title: the keyboard takes the column, typing.
     Search,
     /// The rule's close, which only arms the question.
     Close(i64),
@@ -18220,10 +18220,10 @@ mod tests {
         assert!(s.modes.side.is_none());
     }
 
-    /// The sleep mark on an agent's row is a click of its own, and the search box under the
+    /// The sleep mark on an agent's row is a click of its own, and the search chip under the
     /// title is one too.
     #[test]
-    fn the_sleep_mark_and_the_search_box_are_clicks() {
+    fn the_sleep_mark_and_the_search_chip_are_clicks() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         let found = |s: &State, want: fn(&Clicked) -> bool| {
@@ -18240,20 +18240,27 @@ mod tests {
             Some(Clicked::Search)
         ));
     }
-    /// Every row of the search box is the same click, and no row beside it is.
+    /// The search chip is one click row, and no row beside it is.
     #[test]
-    fn the_whole_search_box_is_one_click() {
+    fn the_whole_search_chip_is_one_click() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         let rows: Vec<u16> = (1..s.lines)
             .filter(|row| matches!(s.clicked(*row, 5), Some(Clicked::Search)))
             .collect();
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(
-            rows[2] - rows[0],
+        assert_eq!(rows.len(), crate::sidebar::SEARCH_ROWS, "{rows:?}");
+        // Both brackets and the middle of the chip answer it.
+        for col in [
             2,
-            "the three rows are together: {rows:?}"
-        );
+            3,
+            crate::sidebar::WIDTH as u16 - 1,
+            crate::sidebar::WIDTH as u16,
+        ] {
+            assert!(
+                matches!(s.clicked(rows[0], col), Some(Clicked::Search)),
+                "column {col}"
+            );
+        }
     }
 
     /// The foot answers by its words: the settings mark opens the page, the hub word opens
@@ -18358,10 +18365,10 @@ mod tests {
         );
     }
 
-    /// A click on the search box types into the query that is there; with no mode open it opens
+    /// A click on the search chip types into the query that is there; with no mode open it opens
     /// the mode, typing.
     #[test]
-    fn a_click_on_the_search_box_keeps_what_was_typed() {
+    fn a_click_on_the_search_chip_keeps_what_was_typed() {
         let mut s = state();
         let mut request = 0;
         focus_search(&mut s);
