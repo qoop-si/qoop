@@ -34,6 +34,7 @@ mod places;
 mod qass;
 mod qass_page;
 mod remote;
+pub mod report;
 mod settings;
 mod skills;
 mod sound;
@@ -193,6 +194,15 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("skills") => skills::run(&args),
         Some("paths") => places::run(&args[2..]),
         Some("qass") => qass::run_qass(&args),
+        Some("report")
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("send" | "delete" | "inbox")
+            ) =>
+        {
+            phone_command(phone, &args)
+        }
+        Some("report") => report::run(&args),
         Some("update") => update::run(&args),
         Some("restart") => update::run_restart(&args),
         Some("pair" | "devices" | "bridge" | "login" | "logout") => phone_command(phone, &args),
@@ -287,6 +297,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop settings   every setting on one page, with your pet\n\
                   \x20 qoop onboard    the first start: pet, sounds, look, keys, notifications, sleep, qass\n\
                   \x20 qoop qass [page]  open qass, the assistant over your agents, or its page\n\
+                  \x20 qoop report draft|list|show|rm|send|delete  qass's notes to qoop's maker\n\
+                  \x20                 about its own way of working, checked and shown first\n\
                   \x20 qoop sound      hear the notification sounds and keep one each\n\
                   \x20 qoop notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\

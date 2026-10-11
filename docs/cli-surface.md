@@ -94,6 +94,13 @@ a claim nobody has to keep.
 | `qoop onboard` | the first start, one step a screen: pet, sounds, light or dark, the command key, notifications, sleep, the agent qass runs on; left and right choose, up and down move between rows, enter goes on, esc finishes; piped, says it needs a terminal | no |
 | `qoop qass` | open qass, the assistant over every agent: the running one is shown, one asleep in the `qass` space is woken, otherwise it starts in its own folder (`qoop paths qass-data`) on `[qass] agent` from `config.toml` (claude, codex, gemini, opencode or an `[agents]` name, typed with its flags), carrying on its own last conversation on that agent while the agent still keeps it (Claude: its newest of qass's; the others: the id their hook last reported from qass's folder, kept in `last-session`), or, with none, told to start its qass skill. It lives in the space `qass`, which the sidebar and `ctrl-a s` leave out: `ctrl-a Q`, or a click on the pet in the sidebar foot, goes there and back. Its tab shows the board above it (`qoop task board --page` in a pane of its own, the tab's first; `ctrl-a z` on it is full screen), put back by `qoop qass` and `ctrl-a Q` when the tab is without it. Closing it is `qoop close` | no |
 | `qoop qass page` | qass's page, built like `qoop settings`: its state (running, asleep, not started or not set up), the agent it runs on, what it is doing, when it last did anything, wake or start, sleep now, open its tab, and its sleep mode (`sleep.qass_idle_minutes`: never, 15, 30 or 60 minutes idle); up and down move, enter does, `w` `s` `o` are wake, sleep, open, left and right change the sleep mode, `q` or esc leaves; piped, says it needs a terminal | no |
+| `qoop report draft` | read a note from qass about its own way of working on stdin (`area`, `what`, `cost`, `often`, `fix`, one `field: value` line each), check it (printable ASCII, common English words or qoop's own, numbers only in `often`, none of the person's own names, which are read on this machine and never sent), add the qoop version and qass's agent, keep it in qass's folder under `reports` and print the exact bytes it would send and whether `[report] send` lets it go | no |
+| `qoop report list` | the kept notes, each `kept` or `sent` | no |
+| `qoop report show <n>` | one kept note, checked again, as it would be sent | no |
+| `qoop report rm <n>` | forget a kept note; a sent one is taken off the hub first with `qoop report delete` | no |
+| `qoop report send <n> [--yes]` | send one note to the hub this machine signed in to, only as `[report] send` allows: never under `never`; under `ask` with `--yes` (the person said yes to it); under `always` by itself once a first one went after a yes. A machine not signed in keeps the note; a hub from before notes is said. Part of the qoop release | yes |
+| `qoop report delete <n>` | take a sent note off the hub by the key it gave; it stays kept here | yes |
+| `qoop report inbox` | the notes people sent, for a machine of the hub's owner: the largest 50 groups (an area and a `what` alike), each with its count, its newest day and its newest note, printed as text only | yes |
 | `qoop paths [name] [--json]` | where qoop keeps each kind of file (config, data, runtime, cache, logs, qass-config, qass-data, skills) and how big it is; with a name, only that path, for a script or a `--cwd`; `--json` adds `exists` and `bytes` | no |
 | `qoop sound` | hear the notification sounds (macOS its own, Linux the freedesktop ones installed) and keep one for a finished agent and one for an agent that waits; on a terminal the arrows move and play, enter keeps, space plays again, `o` turns sound off, `q` or esc stops; piped, a number or a name plays one, an empty line keeps, `off`, `q` or EOF stops | no |
 | `qoop notch install` | on macOS 14 or newer, a LaunchAgent that runs `qoop notch run` at login: the agents of every running session in the notch, the pet with a badge for the ones that need you, working and idle counts, and a click for the list | no |
@@ -140,9 +147,10 @@ The phone and account commands (pair, devices, bridge, login and logout) are par
 release, not of this repository: a build from source says it has no phone support for them,
 and a bridge reload does nothing.
 
-Five rows say yes, and each is the point of its row: `qoop update` reaches qoop.si for the
+The rows that say yes are each the point of their row: `qoop update` reaches qoop.si for the
 releases, and `qoop pair`, `qoop bridge`, `qoop login` and `qoop logout` reach the hub, and
-only once a person has asked for a phone or an account. Nothing else touches the network: no control plane, no
+only once a person has asked for a phone or an account; `qoop report send`, `delete` and
+`inbox` reach the hub this machine signed in to, and only when asked for one note. Nothing else touches the network: no control plane, no
 background version check, and a machine that never pairs a phone never opens a
 connection to a hub. Anything else that ever needs the network is an addition to this
 table with a yes, plus a row in the gate saying what happens when it is unreachable.

@@ -476,6 +476,7 @@ version = "0.9.5"
 dependencies = [
  "bytes",
  "libc",
+ "qoop-domain",
  "qoop-history",
  "qoop-proto",
  "qoop-pty",

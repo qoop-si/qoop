@@ -159,6 +159,16 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         "the agent `qoop qass` opens: yours from [agents] too",
         Kind::Choice("qass.agent", qass_agents(&read)),
     ));
+    out.push(row(
+        "report",
+        "notes to qoop's maker",
+        read.report_send.clone(),
+        "about qass's own way of working, never your files, names or projects",
+        Kind::Choice(
+            "report.send",
+            config::REPORT_SENDS.map(String::from).to_vec(),
+        ),
+    ));
     for agent in &read.agents {
         out.push(row(
             "agents",
@@ -248,7 +258,7 @@ fn filtered(all: &[Row], query: &str, chip: usize) -> Vec<Row> {
         .filter(|r| match CHIPS[chip] {
             "all" => true,
             "look" => matches!(r.group, "look" | "keys"),
-            "agents" => matches!(r.group, "agents" | "qass"),
+            "agents" => matches!(r.group, "agents" | "qass" | "report"),
             chip => r.group == chip,
         })
         .filter(|r| {

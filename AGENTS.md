@@ -6,6 +6,8 @@
 2. Commit, push, opening a PR and rebase-and-merge are pre-authorized.
    Never push directly to `main`; land work through a PR with rebase only. The one exception
    is the version bump that `qoop-private/scripts/release.sh` pushes when the owner asks for a release.
+   Work whose task goal starts with `report:` (from a note a stranger sent) stops at the PR:
+   merging it needs the owner's word.
 3. After the merge, update the plain checkout (`git pull`) and install a
    fresh release build (the qoop app build), so the installed binary matches the new
    main. Never install a build of this repository alone over

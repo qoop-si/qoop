@@ -742,12 +742,13 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 423 holds the quiet watcher's lines, "Improve yourself", the card block of
-        // the question inbox, the usage-limit row, the short-title, picks and follow-through
-        // lines, the card-first and habit rules (the brief moved to brief.md), the restart
-        // after an install, and the routine words and the doctor step; `qoop qass brief` takes
-        // the hand arithmetic out of "On every event line" and this goes back toward 400.
-        assert!(skill.lines().count() <= 423, "SKILL.md grew past 423 lines");
+        // ponytail: 427 holds the quiet watcher's lines, "Improve yourself" with its report
+        // step, the card block of the question inbox, the usage-limit row, the short-title,
+        // picks and follow-through lines, the card-first and habit rules (the brief moved to
+        // brief.md), the restart after an install, and the routine words and the doctor step;
+        // `qoop qass brief` takes the hand arithmetic out of "On every event line" and this goes
+        // back toward 400.
+        assert!(skill.lines().count() <= 427, "SKILL.md grew past 427 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

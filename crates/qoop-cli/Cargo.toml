@@ -23,6 +23,7 @@ bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 qoop-proto = { path = "../qoop-proto" }
+qoop-domain = { path = "../qoop-domain" }
 qoop-store = { path = "../qoop-store" }
 qoop-pty = { path = "../qoop-pty" }
 

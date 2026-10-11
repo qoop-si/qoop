@@ -1,7 +1,7 @@
 //! `qoop onboard`: the first start, one group of settings a screen.
 //!
-//! Seven steps under the word: the pet, the sounds, light or dark, the command key, the
-//! notifications, sleep, qass. Their names sit under a line of dots that turns green as steps
+//! Eight steps under the word: the pet, the sounds, light or dark, the command key, the
+//! notifications, sleep, qass, and whether qass may send notes about itself to qoop's maker. Their names sit under a line of dots that turns green as steps
 //! pass; the current step says what it holds in one sentence and shows its choices. Left
 //! and right choose (a sound plays), up and down move between a step's rows, enter goes on,
 //! esc finishes. Each choice is written as it is made, so leaving early keeps what was set.
@@ -24,50 +24,70 @@ struct Step {
     what: &'static str,
     /// The settings groups the step holds; none for the pet.
     groups: &'static [&'static str],
+    /// Lines under the choices, for a step whose choice needs more than one sentence.
+    also: &'static [&'static str],
 }
 
-const STEPS: [Step; 7] = [
+const STEPS: [Step; 8] = [
     Step {
         name: "pet",
         title: "your pet",
         what: "the pet that sits beside the q in the sidebar",
         groups: &[],
+        also: &[],
     },
     Step {
         name: "sound",
         title: "sounds",
         what: "what plays when an agent finishes, then when one waits on you",
         groups: &["sound"],
+        also: &[],
     },
     Step {
         name: "look",
         title: "light or dark",
         what: "follow the terminal, or always dark, or always light",
         groups: &["look"],
+        also: &[],
     },
     Step {
         name: "keys",
         title: "the command key",
         what: "the key that starts every qoop command",
         groups: &["keys"],
+        also: &[],
     },
     Step {
         name: "notifications",
         title: "notifications",
         what: "how qoop tells you when you are not looking",
         groups: &["notifications"],
+        also: &[],
     },
     Step {
         name: "sleep",
         title: "sleep",
         what: "when idle tabs sleep to give back memory",
         groups: &["sleep"],
+        also: &[],
     },
     Step {
         name: "qass",
         title: "qass",
         what: "the assistant over your agents: the agent `qoop qass` opens it in",
         groups: &["qass"],
+        also: &[],
+    },
+    Step {
+        name: "improve",
+        title: "improve qass",
+        what: "when qass meets a problem in its own way of working, it can send qoop's maker a short note",
+        groups: &["report"],
+        also: &[
+            "never your files, names or projects: a fixed form of common words, shown to you first",
+            "always (recommended) sends by itself once you said yes to the first; ask asks each time",
+            "sent with your account so it can be limited; the note itself carries no account",
+        ],
     },
 ];
 
@@ -106,7 +126,7 @@ impl Onboard {
             s.pet(cx + 20, 0, &self.pet);
         }
         // The named dots, joined by a line that turns green behind the current step.
-        let gap = 15;
+        let gap = 12;
         let x0 = cx - (STEPS.len() - 1) * gap / 2;
         for (i, t) in STEPS.iter().enumerate() {
             let x = x0 + i * gap;
@@ -136,7 +156,10 @@ impl Onboard {
         if step.groups.is_empty() {
             self.draw_pet(&mut s, cx);
         } else {
-            self.draw_rows(&mut s, cx, w);
+            let below = self.draw_rows(&mut s, cx, w);
+            for (y, line) in (below..).zip(step.also) {
+                s.centre(cx, y, line, &ink(Role::Faint));
+            }
         }
         if let Some(said) = &self.said {
             s.centre(cx, h - 2, said, &ink(Role::Faint));
@@ -201,7 +224,8 @@ impl Onboard {
     /// Each row on one line with its value; the selected one also opens its choices under it,
     /// wrapped and centred, the current one raised. One open at a time keeps a long list
     /// (Linux has 26 sounds) inside a 30 row window.
-    fn draw_rows(&self, s: &mut Screen, cx: usize, w: usize) {
+    /// Returns the line under the last row.
+    fn draw_rows(&self, s: &mut Screen, cx: usize, w: usize) -> usize {
         let macos = cfg!(target_os = "macos");
         let mut y = 13;
         for (i, row) in self.rows().iter().enumerate() {
@@ -269,6 +293,7 @@ impl Onboard {
             }
             y += 1;
         }
+        y
     }
 
     /// One key; `false` when onboarding is over.
@@ -422,6 +447,9 @@ mod tests {
             };
             let frame = o.draw(NEED.0, NEED.1).frame();
             assert!(frame.contains(each.what), "step {step}");
+            for line in each.also {
+                assert!(frame.contains(line), "step {step}: {line}");
+            }
         }
     }
 }

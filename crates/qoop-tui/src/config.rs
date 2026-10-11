@@ -97,6 +97,10 @@ pub struct Config {
 /// The agents qass's skill installs beside, and so the ones `qoop qass` can start by name.
 pub const QASS_AGENTS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
 
+/// `[report] send`: whether qass's notes to qoop's maker go out after a yes for each, by
+/// themselves once a first went out after a yes, or never. No answer reads as `ask`.
+pub const REPORT_SENDS: [&str; 3] = ["ask", "always", "never"];
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -217,6 +221,8 @@ pub struct Read {
     pub qass_agent: String,
     /// `[qass.models]`: the model each of [`QASS_TIERS`] starts a worker on, in that order.
     pub qass_models: [String; 3],
+    /// `[report] send`, one of [`REPORT_SENDS`].
+    pub report_send: String,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
@@ -289,6 +295,17 @@ fn qass_agent_in(text: &str) -> Option<String> {
     agent_name(agent).then(|| agent.to_string())
 }
 
+/// `[report] send` as the file says it, `ask` when it says nothing usable.
+fn report_send_in(text: &str) -> String {
+    let table: Option<toml::Table> = toml::from_str(text).ok();
+    table
+        .as_ref()
+        .and_then(|t| t.get("report")?.get("send")?.as_str())
+        .filter(|v| REPORT_SENDS.contains(v))
+        .unwrap_or("ask")
+        .to_string()
+}
+
 /// Where the file is.
 pub fn path() -> PathBuf {
     qoop_runtime::paths::config_dir().join("config.toml")
@@ -308,6 +325,7 @@ pub fn agents() -> Vec<Launcher> {
 pub fn read_from(path: &Path) -> Read {
     let mut qass_agent = "claude".to_string();
     let mut qass_models = QASS_TIERS.map(|(_, family)| family.to_string());
+    let mut report_send = "ask".to_string();
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
             let (config, agents, problems) = parse_all(&text);
@@ -315,6 +333,7 @@ pub fn read_from(path: &Path) -> Read {
                 qass_agent = agent;
             }
             qass_models = qass_models_in(&text);
+            report_send = report_send_in(&text);
             (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -332,6 +351,7 @@ pub fn read_from(path: &Path) -> Read {
         agents,
         qass_agent,
         qass_models,
+        report_send,
         problems,
         path: path.to_path_buf(),
         exists,
@@ -447,6 +467,7 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
         qass: Spans,
         #[serde(default)]
         board: Spans,
+        report: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
@@ -616,6 +637,23 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 line,
                 "qass is a table: [qass] then agent = \"claude\"".into(),
             ),
+            ("report", toml::Value::Table(report)) => {
+                for (key, value) in report {
+                    let line = line_of(&nested.report, key);
+                    match (key.as_str(), value.as_str()) {
+                        ("send", Some(v)) if REPORT_SENDS.contains(&v) => {}
+                        ("send", _) => refuse(
+                            line,
+                            format!("send = {value} is not one of {}", REPORT_SENDS.join(", ")),
+                        ),
+                        _ => refuse(line, format!("there is no setting report.{key}")),
+                    }
+                }
+            }
+            ("report", _) => refuse(
+                line,
+                "report is a table: [report] then send = \"ask\"".into(),
+            ),
             ("sleep" | "daemon", _) => {}
             ("agents", toml::Value::Table(table)) => {
                 for (name, value) in table {
@@ -702,7 +740,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 16] = [
+pub const KEYS: [&str; 17] = [
     "prefix",
     "theme",
     "icons",
@@ -719,6 +757,7 @@ pub const KEYS: [&str; 16] = [
     "qass.models.mid",
     "qass.models.low",
     "board.cards",
+    "report.send",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -750,6 +789,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Ok(()) => toml_edit::value(value),
             Err(why) => return Err(format!("{key}: {why}")),
         },
+        "report.send" if REPORT_SENDS.contains(&value) => toml_edit::value(value),
+        "report.send" => return Err(format!("{key} is one of {}", REPORT_SENDS.join(", "))),
         "sleep.idle_minutes" | "sleep.qass_idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
@@ -812,6 +853,7 @@ mod tests {
             ("qass.models.mid", "claude-sonnet-5-5"),
             ("qass.models.low", "haiku"),
             ("board.cards", "quiet"),
+            ("report.send", "always"),
         ];
         assert_eq!(values.len(), KEYS.len());
         for (key, value) in values {
@@ -833,6 +875,7 @@ mod tests {
         assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));
         assert!(!read.config.lifecycle.exit_when_asleep);
         assert_eq!(read.qass_agent, "codex");
+        assert_eq!(read.report_send, "always");
         assert_eq!(read.qass_models, ["opus", "claude-sonnet-5-5", "haiku"]);
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(
@@ -1206,5 +1249,21 @@ mod tests {
         );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert_eq!(problems[0].line, Some(4), "{problems:?}");
+    }
+
+    /// No answer is `ask`; a wrong one is said and read as `ask`, never as `always`.
+    #[test]
+    fn report_send_is_ask_unless_the_file_says_otherwise() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        assert_eq!(read_from(&path).report_send, "ask");
+        std::fs::write(&path, "[report]\nsend = \"yes\"\n").expect("write");
+        let read = read_from(&path);
+        assert_eq!(read.report_send, "ask");
+        assert_eq!(read.problems.len(), 1, "{:?}", read.problems);
+        assert!(set(&path, "report.send", "sometimes").is_err());
+        set(&path, "report.send", "never").expect("set");
+        assert_eq!(read_from(&path).report_send, "never");
     }
 }
