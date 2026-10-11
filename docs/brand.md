@@ -72,7 +72,8 @@ after it (`online` in green, `offline` in orange, `local` in grey; `online` and 
 web app), `menu`, the settings cog and `«` at the right (a click on the cog opens the settings
 page; where icons are not drawn it is `set`, from 24 columns), and the q sits on the four rows
 right above it. The picked pet stands on the menu
-row at the right, five rows of half blocks with its feet on the row above the menu, and adds
+row at the right, five rows of half blocks with its feet on the row above the menu (a click on any
+cell of it is `ctrl-a Q`: qass, or back), and adds
 only a blank row above the q, so no word moves whatever the pet. Sixteen columns hold the q
 and the widest pet side by side, fewer than the narrowest the column drags to.
 

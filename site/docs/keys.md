@@ -17,7 +17,7 @@ program.
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
-| `ctrl-a Q` | the qass page: its state, its sleep mode, wake and sleep |
+| `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
 | `ctrl-a W` | close the space when it is empty |
 
 ## Panes
@@ -60,6 +60,7 @@ program.
 | drag | select, and copy when you let go |
 | drag a divider | resize the panes on either side |
 | click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
+| click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
 | click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |

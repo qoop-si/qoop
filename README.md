@@ -71,7 +71,7 @@ Most keys are `ctrl-a`, then one letter.
 | `ctrl-a c` | a new tab |
 | `ctrl-a tab` | go to the agent that needs you |
 | `ctrl-a space` | find anything: a tab, an agent, a space |
-| `ctrl-a Q` | open qass |
+| `ctrl-a Q`, or a click on the pet | open qass, or go back |
 | `ctrl-a ?` | every key, with a search |
 | `ctrl-q` | leave; everything keeps running |
 
@@ -138,8 +138,8 @@ sleep.
 The column opens thirty eight columns wide, and a drag on its edge pulls it anywhere from
 twenty four to half the window. Its foot signs it with the q in thick dots, one `●` a cell,
 its tail in ember, and your picked pet standing beside it on the
-menu row, the last row of the column. A column too narrow for both falls back to the word in
-braille.
+menu row, the last row of the column. A click on the pet is `ctrl-a Q`: qass, or back. A column
+too narrow for both falls back to the word in braille.
 
 A space's own line ends in four controls, plain words in the same columns on every line whatever the name
 is: `+` starts a terminal or an agent in the space (an agent asks for its name first),

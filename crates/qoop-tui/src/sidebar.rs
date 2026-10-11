@@ -318,6 +318,9 @@ pub enum Hit {
     Search,
     /// The foot of the column: the brand, `menu`, and the mark that folds the column.
     Foot,
+    /// A row the pet stands on, with the cells the pet is across: only the last cells of the
+    /// row before the column's edge margin answer, the q beside it answers nothing.
+    Pet(usize),
 }
 
 /// What a click on the column asks for, once the column it landed on is known.
@@ -368,6 +371,8 @@ pub enum Act {
     HubDown,
     /// Fold the whole column away to its strip, and back.
     Collapse,
+    /// The pet: qass's screen, or back from it, as `ctrl-a Q` does.
+    Qass,
     /// A tab of the inbox: its list, from the top, and the inbox open again if it was folded.
     InboxTab(InboxTab),
     /// The inbox's caret: fold it to one row, or open it again.
@@ -916,7 +921,7 @@ fn parts(
     let count = Some(inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let feet = foot_rows(
+    let mut feet = foot_rows(
         c.width,
         pet,
         count,
@@ -924,6 +929,13 @@ fn parts(
         hub_link(),
         c.icons,
     );
+    if let Some(cols) = avatar
+        .filter(|_| pet)
+        .map(pet_width)
+        .filter(|cols| *cols > 0)
+    {
+        stand_pet(&mut feet, cols);
+    }
     let foot = feet.len().min(height);
     let room = height - foot;
     let mut head = inbox_rows(c, inbox_height(c, room));
@@ -3109,6 +3121,10 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
             let start = end.saturating_sub(title_mode(c.view).len());
             (col > start && col <= end).then_some(Act::View)
         }
+        // The pet's cells are the last of the row, one cell of margin before the edge.
+        Hit::Pet(cols) => (c.width.saturating_sub(cols)..c.width)
+            .contains(&col)
+            .then_some(Act::Qass),
         Hit::Foot => {
             if collapsed {
                 return Some(Act::Collapse);
@@ -3442,6 +3458,31 @@ const COUNT_BOX_ROWS: usize = 3;
 /// The foot with the pet standing: the count box over the pet's rows and the menu row.
 pub(crate) const STAGE_FOOT_ROWS: usize = COUNT_BOX_ROWS + PET_FOOT_ROWS;
 
+/// The first and last column any row of the art lights, if any.
+fn lit_span(
+    cells: &[[qoop_runtime::avatar::Cell; qoop_runtime::avatar::ART_COLS]],
+) -> Option<(usize, usize)> {
+    let lit = |x: usize| cells.iter().any(|row| row[x] != (None, None));
+    let lo = (0..qoop_runtime::avatar::ART_COLS).find(|x| lit(*x))?;
+    let hi = (0..qoop_runtime::avatar::ART_COLS).rfind(|x| lit(*x))?;
+    Some((lo, hi))
+}
+
+/// The cells across the pet is drawn in, which is what the overlay stamps and what a click on
+/// the pet lands in: nothing for art with no lit cell.
+pub(crate) fn pet_width(avatar: &qoop_runtime::avatar::Avatar) -> usize {
+    lit_span(&qoop_runtime::avatar::art_cells(avatar)).map_or(0, |(lo, hi)| hi - lo + 1)
+}
+
+/// Mark the rows the pet stands on, the foot's five rows under the count box, as the pet's.
+/// The overlay stamps the art over exactly these rows ([`avatar_overlay_rows`]).
+fn stand_pet(feet: &mut [Row], cols: usize) {
+    let top = feet.len() - PET_FOOT_ROWS;
+    for (_, hit) in &mut feet[top..top + qoop_runtime::avatar::ART_ROWS] {
+        *hit = Some(Hit::Pet(cols));
+    }
+}
+
 /// The pet as itself: its five half-block rows (a cell is two pixels, drawn as
 /// [`qoop_runtime::avatar::paint`] says), trimmed to the columns any row lights, the
 /// same trim for every row so the picture is never skewed. Pre-escaped for the overlay to
@@ -3455,13 +3496,11 @@ pub(crate) fn avatar_overlay(
     if !colour {
         return (0, Vec::new());
     }
-    use qoop_runtime::avatar::{ART_COLS, Paint, art_cells, bg, fg, paint};
+    use qoop_runtime::avatar::{Paint, art_cells, bg, fg, paint};
     let cells = art_cells(avatar);
-    let lit = |x: usize| cells.iter().any(|row| row[x] != (None, None));
-    let Some(lo) = (0..ART_COLS).find(|x| lit(*x)) else {
+    let Some((lo, hi)) = lit_span(&cells) else {
         return (0, Vec::new());
     };
-    let hi = (0..ART_COLS).rfind(|x| lit(*x)).unwrap_or(lo);
     let fore = |n: u8| fg(crate::theme::pet(n));
     let back =
         |n: Option<u8>| n.map_or_else(|| "\x1b[49m".to_string(), |n| bg(crate::theme::pet(n)));
@@ -3552,7 +3591,8 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 ///
 /// Whatever the pet, the words sit in the same rows counted from the bottom: nothing a person
 /// reads ever moves. The menu row answers a click by the word under it (see [`foot_act`]) and
-/// folds the column elsewhere; the other rows are text and answer nothing.
+/// folds the column elsewhere. The pet's five rows are marked [`Hit::Pet`] by [`parts`], and only
+/// the pet's cells answer; the other rows are text and answer nothing.
 fn foot_rows(
     width: usize,
     pet: bool,
@@ -5971,7 +6011,18 @@ mod tests {
             )
         };
         let (a, b) = (paint(&bare), paint(&mohawk));
-        assert_eq!(a, b);
+        // Which cells are the pet's is the one thing that follows the art.
+        let unwidth = |rows: &[Row]| -> Vec<Row> {
+            rows.iter()
+                .map(|(line, hit)| {
+                    let hit = hit.map(|h| if let Hit::Pet(_) = h { Hit::Pet(0) } else { h });
+                    (line.clone(), hit)
+                })
+                .collect()
+        };
+        assert_eq!(unwidth(&a), unwidth(&b));
+        assert_eq!(a[24].1, Some(Hit::Pet(pet_width(&bare))));
+        assert_eq!(b[24].1, Some(Hit::Pet(pet_width(&mohawk))));
         for (line, _) in &a {
             assert!(!line.text.contains("Bare"), "{line:?}");
             assert!(!line.text.contains("Mohawk"), "{line:?}");
@@ -5982,6 +6033,166 @@ mod tests {
             // The feet are on the pet's last row, the one right above the menu.
             assert!(art[art.len() - 1].contains('\u{2580}'), "{art:?}");
         }
+    }
+
+    /// Every cell of the pet answers `Act::Qass`, and no other cell of the column does: the
+    /// cells are the ones the overlay is stamped on, read off its escapes, at every width and
+    /// height, so the click and the paint cannot drift apart.
+    #[test]
+    fn the_pet_cells_are_the_qass_act_and_nowhere_else() {
+        let pet = art_pet();
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut standing_at = 0;
+        for width in SIDEBAR_MIN..=SIDEBAR_MAX {
+            for height in 0..=40 {
+                let rows = rows12(
+                    &spaces,
+                    &agents,
+                    1,
+                    1,
+                    height,
+                    0,
+                    View::Tree,
+                    &seen,
+                    &unseen,
+                    NOW,
+                    width,
+                    Some(&pet),
+                );
+                let c = column(
+                    &spaces,
+                    &agents,
+                    1,
+                    1,
+                    0,
+                    View::Tree,
+                    &seen,
+                    &unseen,
+                    NOW,
+                    width,
+                    &shut,
+                );
+                let standing = pet_shown(&c, height, true);
+                // The cells the paint stamps: each `ESC [ row ; col H` starts one art row.
+                let paint = crate::screen::avatar_overlay_paint(
+                    height,
+                    width,
+                    false,
+                    true,
+                    Some(&pet),
+                    true,
+                );
+                let stamps: Vec<(usize, usize)> = paint
+                    .split("\x1b[")
+                    .filter_map(|part| {
+                        let (at, _) = part.split_once('H')?;
+                        let (row, col) = at.split_once(';')?;
+                        Some((row.parse().ok()?, col.parse().ok()?))
+                    })
+                    .collect();
+                let cols = pet_width(&pet);
+                for (i, (_, hit)) in rows.iter().enumerate() {
+                    for col in 1..=width {
+                        let screen_row = i + crate::screen::SIDEBAR_TOP;
+                        let on_pet = standing
+                            && stamps.iter().any(|(row, from)| {
+                                *row == screen_row && (*from..from + cols).contains(&col)
+                            });
+                        let got = hit.and_then(|hit| act(hit, col, &c, false));
+                        assert_eq!(
+                            got == Some(Act::Qass),
+                            on_pet,
+                            "width {width} height {height} row {i} col {col}"
+                        );
+                    }
+                }
+                if standing {
+                    standing_at += 1;
+                    assert_eq!(stamps.len(), qoop_runtime::avatar::ART_ROWS);
+                }
+            }
+        }
+        assert!(standing_at > 0, "the pet never stood");
+    }
+
+    /// The cells beside the pet keep what they did: the count box and the q are text, and the
+    /// menu row answers by its word, pet or not.
+    #[test]
+    fn the_cells_beside_the_pet_keep_their_old_acts() {
+        let pet = art_pet();
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let (width, height) = (WIDTH, 30);
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            width,
+            &shut,
+        );
+        assert!(pet_shown(&c, height, true));
+        let with = rows12(
+            &spaces,
+            &agents,
+            1,
+            1,
+            height,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            width,
+            Some(&pet),
+        );
+        let without = rows12(
+            &spaces,
+            &agents,
+            1,
+            1,
+            height,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            width,
+            None,
+        );
+        let foot = height - STAGE_FOOT_ROWS;
+        for (_, hit) in &with[foot..foot + COUNT_BOX_ROWS] {
+            assert_eq!(*hit, None, "the count box answers nothing");
+        }
+        let menu = (
+            with.last().expect("a row").1,
+            without.last().expect("a row").1,
+        );
+        assert_eq!(menu, (Some(Hit::Foot), Some(Hit::Foot)));
+        let cols = pet_width(&pet);
+        for (_, hit) in &with[height - PET_FOOT_ROWS..height - 1] {
+            assert_eq!(*hit, Some(Hit::Pet(cols)));
+            // The q and the blanks beside the pet answer nothing, the margin at the edge too.
+            for col in (1..width - cols).chain([width]) {
+                assert_eq!(act(Hit::Pet(cols), col, &c, false), None, "col {col}");
+            }
+        }
+        for col in 1..=width {
+            assert_ne!(act(Hit::Foot, col, &c, false), Some(Act::Qass), "col {col}");
+        }
+        assert_eq!(act(Hit::Foot, WIDTH - 10, &c, false), Some(Act::Menu));
+        // No pet picked: no row is the pet's.
+        assert!(
+            without
+                .iter()
+                .all(|(_, hit)| !matches!(hit, Some(Hit::Pet(_))))
+        );
     }
 
     /// The menu row is the column's last row at every height, the pet or not, down to a

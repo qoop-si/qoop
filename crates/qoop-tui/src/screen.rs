@@ -987,6 +987,7 @@ pub fn paint(frame: &Frame) -> String {
                     sidebar::Hit::Title
                     | sidebar::Hit::Search
                     | sidebar::Hit::Foot
+                    | sidebar::Hit::Pet(_)
                     | sidebar::Hit::Next(_)
                     | sidebar::Hit::Tabs,
                 )
@@ -2326,7 +2327,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("w", "new space"),
             ("W", "close empty"),
             ("R", "settings"),
-            ("Q", "qass, back"),
+            ("Q", "qass, or pet"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree or rank"),

@@ -1562,6 +1562,7 @@ impl State {
             sidebar::Act::HubDown => Some(Clicked::HubDown),
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
+            sidebar::Act::Qass => Some(Clicked::Qass),
             sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
             sidebar::Act::InboxFold => Some(Clicked::InboxFold),
             sidebar::Act::Search => Some(Clicked::Search),
@@ -5647,6 +5648,8 @@ enum Clicked {
     Fold(i64),
     View,
     Collapse,
+    /// The pet in the foot: qass, or back, as `ctrl-a Q` does.
+    Qass,
     Space(i64),
     /// The rule's `sleep`, on the space that rule is for rather than the one on screen:
     /// a person clicking a row means that row.
@@ -7277,6 +7280,17 @@ where
                                         state.view = state.view.toggle();
                                         dirty = true;
                                     }
+                                    Some(Clicked::Qass) => {
+                                        if let Some(bytes) = qass_press(
+                                            &mut state,
+                                            &mut control_seq,
+                                            &mut seqs,
+                                            &blocking_tx,
+                                        )? {
+                                            wr.write_all(&bytes).await?;
+                                        }
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Collapse) => {
                                         state.collapsed = !state.collapsed;
                                         // The keys of a column that is gone would be taken
@@ -7820,15 +7834,13 @@ where
                             // qass in its own space, or back from it. Its page stays
                             // `qoop qass page`.
                             Action::Qass => {
-                                match qass_toggle(&mut state, &mut control_seq, &mut seqs)? {
-                                    QassStep::Moved(Some(bytes)) => wr.write_all(&bytes).await?,
-                                    QassStep::Moved(None) => {}
-                                    QassStep::Start => {
-                                        let tx = blocking_tx.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let _ = tx.send(Blocked::Qass(start_qass()));
-                                        });
-                                    }
+                                if let Some(bytes) = qass_press(
+                                    &mut state,
+                                    &mut control_seq,
+                                    &mut seqs,
+                                    &blocking_tx,
+                                )? {
+                                    wr.write_all(&bytes).await?;
                                 }
                                 dirty = true;
                             }
@@ -10366,6 +10378,26 @@ fn out_of_qass(state: &State, rows: &[AgentRow]) -> Option<u32> {
 enum QassStep {
     Moved(Option<BytesMut>),
     Start,
+}
+
+/// `ctrl-a Q` and a click on the pet: [`qass_toggle`], and `qoop qass` run in the background
+/// when it found no qass to show. Answers the bytes to send to the daemon, if the keyboard moved.
+fn qass_press(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    blocking_tx: &tokio::sync::mpsc::UnboundedSender<Blocked>,
+) -> io::Result<Option<BytesMut>> {
+    Ok(match qass_toggle(state, control_seq, seqs)? {
+        QassStep::Moved(bytes) => bytes,
+        QassStep::Start => {
+            let tx = blocking_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(Blocked::Qass(start_qass()));
+            });
+            None
+        }
+    })
 }
 
 /// `ctrl-a Q`. In qass's space: back where the keyboard was before it, else the first awake
@@ -18326,6 +18358,26 @@ mod tests {
         assert_eq!(state.next_space(false), Some(3));
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         assert_eq!((state.focused, state.space), (3, Some(3)));
+    }
+
+    /// A click on the pet and `ctrl-a Q` are one function: the first press shows qass, the
+    /// second goes back to the very tab it left.
+    #[test]
+    fn pressing_the_pet_opens_qass_and_pressing_again_closes_it() {
+        let mut state = qass_state();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!state.in_qass());
+        assert!(
+            qass_press(&mut state, &mut seq, &mut seqs, &tx)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!((state.focused, state.space), (5, Some(9)));
+        assert!(state.in_qass());
+        qass_press(&mut state, &mut seq, &mut seqs, &tx).unwrap();
+        assert_eq!((state.focused, state.space), (1, Some(1)));
+        assert!(!state.in_qass());
     }
 
     /// A second space a rename called `qass` is kept off the lists with its tabs, and qass
