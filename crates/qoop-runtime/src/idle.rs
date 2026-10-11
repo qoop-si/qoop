@@ -67,6 +67,56 @@ pub enum ForegroundKind {
     Other,
 }
 
+/// Whether a foreground process is qoop's own board page, `qoop task board --page`: the pane
+/// above qass in its tab. It keeps nothing a sleep would lose (the board is in the daemon's
+/// own record), so it sleeps like a shell at its prompt; the wake types it again (`restore_rows`).
+pub fn board_page(argv: &[String]) -> bool {
+    match argv {
+        [program, rest @ ..] => {
+            std::path::Path::new(program).file_name() == Some(std::ffi::OsStr::new("qoop"))
+                && rest == ["task", "board", "--page"]
+        }
+        [] => false,
+    }
+}
+
+/// The name of the pane `qoop qass` shows the board in, above qass in its tab.
+pub const BOARD_PANE: &str = "board";
+
+/// Whether qass's terminal `qass` has the board in its tab: a pane named [`BOARD_PANE`] among
+/// `tree`, the rows of the panes of the tab it is in, whatever runs in that pane now. qass is
+/// found by its folder, never by a pane's place, and another pane is left alone. A board pane
+/// that came back as a shell gets its page from the wake that brought it back (`restore_rows`),
+/// the one place that types it, so it is never typed twice.
+pub fn has_board<'a>(
+    tree: impl IntoIterator<Item = &'a crate::control::AgentRow>,
+    qass: u32,
+) -> bool {
+    tree.into_iter()
+        .any(|r| r.terminal != qass && r.name.as_deref() == Some(BOARD_PANE))
+}
+
+/// [`board_page`], for the process in front of the terminal `master`, run by this very
+/// binary: a script that only calls itself `qoop` is no page of ours, and keeps its tab awake.
+pub fn shows_board(master: std::os::fd::RawFd) -> bool {
+    let Some(leader) = qoop_pty::sys::foreground_leader(master) else {
+        return false;
+    };
+    let ours = std::env::current_exe()
+        .ok()
+        .zip(qoop_pty::sys::program_of(leader));
+    ours.is_some_and(|(me, program)| same_file(&me, std::path::Path::new(&program)))
+        && board_page(&qoop_pty::sys::argv_of(leader))
+}
+
+/// Whether two paths name one file, links followed.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Classify a foreground program for the reap decision.
 ///
 /// `agent` is the bit carried on the identity, decided where the argv was read: the name
@@ -415,6 +465,60 @@ impl WatchCounts {
 mod tests {
     use super::*;
     use qoop_domain::AgentRuntimeState as S;
+
+    #[test]
+    fn only_qoops_own_board_page_is_the_board() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert!(board_page(&argv(&[
+            "/Users/me/.local/bin/qoop",
+            "task",
+            "board",
+            "--page"
+        ])));
+        assert!(board_page(&argv(&["qoop", "task", "board", "--page"])));
+        for not in [
+            &["qoop", "task", "board"][..],
+            &["qoop", "task", "board", "--page", "x"],
+            &["notqoop", "task", "board", "--page"],
+            &["sh", "-c", "qoop task board --page"],
+            &[],
+        ] {
+            assert!(!board_page(&argv(not)), "{not:?}");
+        }
+    }
+
+    /// The board is the pane named so beside qass, wherever it sits in the tab and whatever
+    /// runs in it: a board pane at a shell is left for the wake to type into, never typed
+    /// into here, and a pane already running the page is never typed into.
+    #[test]
+    fn qass_has_its_board_by_the_panes_name_alone() {
+        let row = |terminal: u32, name: Option<&str>, program: Option<&str>| {
+            serde_json::from_value::<crate::control::AgentRow>(serde_json::json!({
+                "terminal": terminal, "workspace": 1, "name": name, "program": program,
+                "behind": null, "state": "idle", "generation": null,
+            }))
+            .unwrap()
+        };
+        let qass = 7;
+        let me = row(7, Some("qass"), Some("claude"));
+        assert!(!has_board([], qass));
+        assert!(!has_board([&me], qass), "qass alone in its tab");
+        let notes = row(8, Some("notes"), Some("zsh"));
+        assert!(!has_board([&notes, &me], qass), "another pane is no board");
+        let named_qass = row(7, Some(BOARD_PANE), Some("claude"));
+        assert!(
+            !has_board([&named_qass], qass),
+            "qass itself is never its board"
+        );
+        for program in [Some("qoop"), Some("zsh"), None] {
+            let board = row(9, Some(BOARD_PANE), program);
+            assert!(has_board([&board, &me], qass), "{program:?}");
+            assert!(
+                has_board([&notes, &me, &board], qass),
+                "anywhere: {program:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_tick_is_a_quarter_of_the_timeout_within_a_minute_and_five() {

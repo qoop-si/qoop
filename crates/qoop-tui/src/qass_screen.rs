@@ -6,9 +6,10 @@
 //! reads the screen instead of looking at one. Nothing is made up: every word and number
 //! comes from a row, a sleeping tab or the watcher's `last-wake` file.
 //!
-//! The header band and the terminal box are separate rectangles ([`Plan`]), so a board can
-//! later take a column of the band, or sit beside the box, without touching the terminal's
-//! size. Nothing is drawn for it.
+//! The header band and the terminal box are separate rectangles ([`Plan`]). When qass's tab
+//! is a split (the board above qass, decision 12), the header spans the whole pane and the
+//! split's panes share what is under it ([`Plan::band`]); a zoom gives the zoomed pane all of
+//! it.
 
 use qoop_runtime::avatar::Avatar;
 use qoop_runtime::control::{AgentRow, WorkspaceRow};
@@ -131,6 +132,37 @@ impl Plan {
                 cols: cols - 2,
                 rows: rows - top - 2,
             },
+        })
+    }
+}
+
+impl Plan {
+    /// The plan of qass's split tab: the header over the whole pane, and under it, in `frame`
+    /// and `inner` alike, the area the split's panes are laid out in (they draw their own
+    /// edges). The box header only when each of two panes still keeps [`MIN_INSIDE`] rows,
+    /// else one line; `None` when the pane is too small for even that.
+    pub fn band(cols: usize, rows: usize) -> Option<Plan> {
+        if cols < MIN_COLS || rows < 2 * MIN_ROWS {
+            return None;
+        }
+        let header = if rows >= BOX_ROWS + 3 + 2 * MIN_INSIDE {
+            Header::Box
+        } else {
+            Header::Line
+        };
+        let top = header.rows();
+        let under = Rect {
+            x: 0,
+            y: top,
+            cols,
+            rows: rows - top,
+        };
+        Some(Plan {
+            header,
+            cols,
+            rows,
+            frame: under,
+            inner: under,
         })
     }
 }

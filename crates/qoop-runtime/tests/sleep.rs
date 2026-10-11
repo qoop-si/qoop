@@ -4,6 +4,8 @@
 //! losing work, the round trip that has to bring the same tabs back, and the paths that
 //! must not leave a space half awake.
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir, WorkspaceRow};
@@ -719,6 +721,117 @@ async fn a_retried_close_of_a_sleeping_tab_answers_as_the_first_did() {
         assert!(
             matches!(closed, ControlResponse::TerminalClosed { .. }),
             "attempt {attempt}: {closed:?}"
+        );
+    }
+}
+
+async fn named_tab(c: &mut TestClient, workspace: i64, name: &str) -> u32 {
+    match ask(
+        c,
+        ControlRequest::CreateTerminal {
+            id: format!("tab-{workspace}-{name}"),
+            cwd: None,
+            workspace: Some(workspace),
+            name: Some(name.into()),
+        },
+    )
+    .await
+    {
+        ControlResponse::TerminalCreated { terminal, .. } => terminal,
+        other => panic!("expected a created terminal, got {other:?}"),
+    }
+}
+
+/// Only qoop's own board page sleeps as a shell would: a program that calls itself `qoop`
+/// and is handed the page's very words, but is not this daemon's binary, keeps its tab awake.
+#[tokio::test]
+async fn a_program_posing_as_the_board_page_keeps_its_tab_awake() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    // A real binary that blocks on its words: `yes`, under the name `qoop`.
+    let posing = scratch.path().join("qoop");
+    std::os::unix::fs::symlink("/usr/bin/yes", &posing).expect("yes as qoop");
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("posing").await;
+    let space = new_space(&mut c, "qass").await;
+    let tab = named_tab(&mut c, space, "board").await;
+    c.input_to(
+        tab,
+        format!(
+            "exec '{}' task board --page > /dev/null\n",
+            posing.display()
+        )
+        .as_bytes(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let answer = sleep(&mut c, space).await;
+    assert!(
+        matches!(&answer, ControlResponse::Failed { reason, .. } if reason.contains("is running in it")),
+        "a program posing as the board page was put to sleep: {answer:?}"
+    );
+    assert!(d.terminals().get(tab).is_some(), "the refused tab ended");
+}
+
+/// A wake types the board page into the one row it belongs in: qass's space, the tab named
+/// `board`, with no agent. A tab of that name in another space, and another tab beside it in
+/// qass's space, come back as plain shells.
+#[tokio::test]
+async fn a_wake_types_the_board_page_only_into_qasss_board_tab() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let exe = scratch.path().join("qoop-page");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\necho \"PAGE-UP-$1-$2\"\nwhile read -r l; do :; done\n",
+    )
+    .expect("the stand-in");
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let d = TestDaemon::start_moving_onto(Path::new("/bin/sh"), Some(&exe)).await;
+    let mut c = d.attach("page").await;
+    let qass = new_space(&mut c, "qass").await;
+    let dev = new_space(&mut c, "dev").await;
+    let board = named_tab(&mut c, qass, "board").await;
+    let notes = named_tab(&mut c, qass, "notes").await;
+    let elsewhere = named_tab(&mut c, dev, "board").await;
+    for space in [qass, dev] {
+        let slept = sleep(&mut c, space).await;
+        assert!(
+            matches!(slept, ControlResponse::WorkspaceAsleep { .. }),
+            "{slept:?}"
+        );
+        let woke = wake(&mut c, space).await;
+        assert!(!changed(&woke).is_empty(), "{woke:?}");
+    }
+    let subscribed = ask(
+        &mut c,
+        ControlRequest::Subscribe {
+            id: "again".into(),
+            terminals: vec![board, notes, elsewhere],
+        },
+    )
+    .await;
+    assert!(
+        matches!(subscribed, ControlResponse::Subscribed { .. }),
+        "{subscribed:?}"
+    );
+    assert!(
+        c.wait_for_text_on(board, "PAGE-UP-task-board", PATIENCE)
+            .await,
+        "the board page never came back in qass's board tab"
+    );
+    for tab in [notes, elsewhere] {
+        c.input_to(tab, format!("echo PLAIN-{tab}-$((1+1))\n").as_bytes())
+            .await;
+        assert!(
+            c.wait_for_text_on(tab, &format!("PLAIN-{tab}-2"), PATIENCE)
+                .await
+        );
+        let screen: String = c
+            .screen(tab)
+            .map(|s| s.lines.join("\n"))
+            .unwrap_or_default();
+        assert!(
+            !screen.contains("board --page") && !screen.contains("PAGE-UP"),
+            "tab {tab} was typed the page: {screen}"
         );
     }
 }

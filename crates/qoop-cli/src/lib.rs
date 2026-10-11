@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 mod avatar;
 mod board;
+mod board_page;
 mod config;
 mod hooks;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
@@ -205,6 +206,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop hook-report --session-id S  report only the agent's conversation id\n\
                   \x20 qoop task new|goal|stage|plan|evidence|done|close|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
+                  \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\

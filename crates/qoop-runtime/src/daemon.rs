@@ -2207,10 +2207,18 @@ async fn serve_client(
     // broadcast receiver there would make a slow client's problem into everyone's.
     let event_tx = control_tx.clone();
     let mut changes = agents.subscribe();
+    let mut tasks = agents.subscribe_tasks();
     let events_task = tokio::spawn(async move {
         loop {
             let event = tokio::select! {
                 event = pump_agent_event(&mut changes) => event,
+                // Missed ones say the same as the next: read the board again.
+                changed = tasks.recv() => match changed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Some(crate::control::EventMessage::TasksChanged)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
                 // Matched here rather than in the branch pattern: a pattern that fails
                 // disables its branch until an agent event ends the select, and on a quiet
                 // session that is every later focus lost. Focuses missed while lagging are
@@ -2762,6 +2770,41 @@ fn subscribe(
     true
 }
 
+/// What a board calls each of `streams`' agents, as every reader does (`agent_name`): the
+/// agent's own titles read on the probe pool under its deadline, as the agent listing reads
+/// them; unread, the next name in the chain.
+async fn agent_names(terminals: &TerminalRegistry, streams: Vec<u32>) -> BTreeMap<i64, String> {
+    let sessions: Vec<(u32, Option<String>)> = streams
+        .into_iter()
+        .map(|t| (t, terminals.session_of(t)))
+        .collect();
+    let asked = sessions.clone();
+    let own = crate::blocking::try_probe(PROBE_DEADLINE, move || {
+        asked
+            .into_iter()
+            .filter_map(|(t, s)| Some((t, agent_title(s.as_deref())?)))
+            .collect::<BTreeMap<u32, String>>()
+    })
+    .await
+    .unwrap_or_default();
+    sessions
+        .into_iter()
+        .map(|(t, session)| {
+            let title = terminals
+                .session_title(session.as_deref())
+                .or_else(|| own.get(&t).cloned());
+            let name = crate::control::agent_name(
+                i64::from(t),
+                title,
+                None,
+                terminals.name_of(t),
+                session.as_deref(),
+            );
+            (i64::from(t), name)
+        })
+        .collect()
+}
+
 /// Conversation titles, read out of the agent's own storage: opencode's
 /// database for `ses_` ids, Claude's transcript for everything else.
 ///
@@ -3219,7 +3262,17 @@ fn idle_tabs(
             eligible.insert(*stream, false);
             continue;
         }
-        let foreground = crate::idle::classify_program(snap.program.as_deref(), snap.agent);
+        // qoop's own board page sleeps as a shell at its prompt would (see `vet_for_sleep`).
+        let foreground = match crate::idle::classify_program(snap.program.as_deref(), snap.agent) {
+            crate::idle::ForegroundKind::Other
+                if agents
+                    .master_of(*stream)
+                    .is_some_and(crate::idle::shows_board) =>
+            {
+                crate::idle::ForegroundKind::Shell
+            }
+            kind => kind,
+        };
         let verdict = crate::idle::eligible_for_reap(
             snap.state,
             foreground,
@@ -3614,6 +3667,8 @@ async fn handle_control(
             // it. Anything else is refused.
             match close_sleeping_tab(books, history_dir.as_deref(), terminal).await {
                 Ok(true) => {
+                    // Its task closed with it, which can move the item it was on.
+                    agents.tasks_changed();
                     record_close(store, &id, terminal).await;
                     return ControlResponse::TerminalClosed { id, terminal };
                 }
@@ -4090,7 +4145,10 @@ async fn handle_control(
                 id,
                 reason: format!("there is no workspace {workspace}"),
             },
-            Ok(true) => ControlResponse::Renamed { id },
+            Ok(true) => {
+                agents.tasks_changed();
+                ControlResponse::Renamed { id }
+            }
             Err(e) => ControlResponse::Failed {
                 id,
                 reason: format!("the space goal was not saved: {e}"),
@@ -4217,6 +4275,8 @@ async fn handle_control(
                     // keeping it awake, since the id may be given to a new space.
                     books.asleep.lock().unwrap().retain(|_, w| *w != target);
                     books.awake.lock().unwrap().spaces.remove(&target);
+                    // Its open items closed with it: off every board.
+                    agents.tasks_changed();
                     ControlResponse::WorkspaceClosed {
                         id,
                         workspace: target,
@@ -4714,23 +4774,33 @@ async fn handle_control(
             task,
             action,
         } => {
-            // A begin, and a goal that begins first, skip qass's own space, so they need the
-            // space's name; nothing else does.
+            // A begin, and a goal or a link that begins first, skip qass's own space, so they
+            // need the space's name; nothing else does.
             let space = match (&action, terminal.and_then(|t| terminals.workspace_of(t))) {
                 (
-                    crate::control::TaskOp::Begin | crate::control::TaskOp::Goal { .. },
+                    crate::control::TaskOp::Begin
+                    | crate::control::TaskOp::Goal { .. }
+                    | crate::control::TaskOp::Link { .. },
                     Some(space),
                 ) => space_name(store, space).await,
                 _ => None,
             };
+            // A link from a terminal keeps what its agent is called, for when it is gone.
+            let name = match (&action, terminal) {
+                (crate::control::TaskOp::Link { .. }, Some(t)) => {
+                    agent_names(terminals, vec![t]).await.remove(&i64::from(t))
+                }
+                _ => None,
+            };
             // Boxed, like the listing: this arm's future is part of every request's.
             Box::pin(crate::tasks::write(
-                id, terminal, token, task, action, space, agents, store,
+                id, terminal, token, task, action, space, name, agents, store,
             ))
             .await
         }
         ControlRequest::TaskRead {
             id,
+            board,
             task,
             terminal,
             token,
@@ -4742,8 +4812,17 @@ async fn handle_control(
                 Some(space) => space_name(store, space).await,
                 None => None,
             };
+            // What a board names a local agent, as every reader does (`agent_name`): the
+            // agent's own titles read on the probe pool under its deadline, as the agent
+            // listing reads them; unread, the next name in the chain. Only for a board or a
+            // card.
+            let names = if board || task.is_some() {
+                agent_names(terminals, terminals.streams()).await
+            } else {
+                BTreeMap::new()
+            };
             Box::pin(crate::tasks::read(
-                id, task, terminal, token, before, space, agents, store,
+                id, board, task, terminal, token, before, space, names, agents, store,
             ))
             .await
         }
@@ -5642,10 +5721,15 @@ fn open_terminal_with(
                 && !keeps
             {
                 let owed = crate::store::Owed::new();
+                let news = forgetting.clone();
                 tokio::spawn(async move {
                     let _owed = owed;
                     let closed = books.store.close_terminal(stream as i64).await;
                     books.closing.lock().unwrap().remove(&stream);
+                    // Its task closed with it, which can move the item it was on.
+                    if let Ok(true) = closed {
+                        news.tasks_changed();
+                    }
                     // History lives as long as the tab can come back, and a closed row
                     // never does. Only after the close landed: a row still open is
                     // restored with its history. The writer may still be on its last
@@ -6309,6 +6393,9 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
                 // have been had nobody been moving.
                 eprintln!("qoopd: tab {id} ended while the daemon moved; closing it");
                 let closed = into.books.store.close_terminal(id as i64).await;
+                if let Ok(true) = closed {
+                    into.agents.tasks_changed();
+                }
                 if closed.is_ok()
                     && let Some(dir) = into.history_dir.as_ref().map(|d| d.join(id.to_string()))
                 {
@@ -6563,6 +6650,37 @@ async fn restore_rows(
     dirs: &std::collections::BTreeSet<PathBuf>,
     report: &mut RestoreReport,
 ) {
+    // qoop's own board page above qass keeps nothing a sleep or a restart loses: the binary
+    // this daemon is starts it again in its pane, so every wake (`qoop wake`, the phone, an
+    // idle wake, a restart) brings the board back rather than a shell. Only the pane `qoop
+    // qass` named so, in qass's space, with no agent.
+    let board_pane = |row: &qoop_store::TerminalRow| {
+        row.agent.is_none() && row.title.as_deref() == Some(crate::idle::BOARD_PANE)
+    };
+    // The binary this daemon runs as: set for a hand over, and read from the process for a cold
+    // start, whose restore runs before anything sets it.
+    let exe = into
+        .books
+        .restart
+        .exe
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_exe().ok());
+    let board_page = match exe {
+        Some(exe) if rows.iter().any(board_pane) && qass_space(into).await == Ok(Some(space)) => {
+            Some(
+                [
+                    "exec",
+                    &exe.display().to_string(),
+                    "task",
+                    "board",
+                    "--page",
+                ]
+                .map(String::from),
+            )
+        }
+        _ => None,
+    };
     for row in rows {
         // A stop that came in meanwhile has already asked every open tab to close, and a
         // tab opened after that would be one it never asks.
@@ -6609,7 +6727,13 @@ async fn restore_rows(
         let resume = row
             .agent
             .as_deref()
-            .and_then(|agent| qoop_detect::resume_argv(agent, session));
+            .and_then(|agent| qoop_detect::resume_argv(agent, session))
+            .or_else(|| {
+                board_page
+                    .clone()
+                    .filter(|_| board_pane(&row))
+                    .map(Vec::from)
+            });
         // The id the resume names is the conversation of the agent it starts, so it is
         // held from now and handed to that agent when it appears: `agents --json`, the
         // history and a sleep all have it before the agent says anything. Held before the
@@ -6731,6 +6855,9 @@ fn vet_for_sleep(
                 }
                 (Some(name), Some(session))
             }
+            // qoop's own board page above qass keeps nothing a sleep would lose; the wake
+            // types it again in the shell that comes back (`restore_rows`).
+            K::Other if master.is_some_and(crate::idle::shows_board) => (None, None),
             K::Other => {
                 return Err(format!(
                     "{} is running in it",
@@ -6962,8 +7089,10 @@ async fn sleep_tab(
         // the registry keeps an open row nothing runs; the next start brings it back as a
         // shell. Waiting out ending panes here closes that if it is ever seen.
         for stream in &fresh {
-            if into.terminals.get(*stream).is_none() {
-                let _ = into.books.store.close_terminal(*stream as i64).await;
+            if into.terminals.get(*stream).is_none()
+                && let Ok(true) = into.books.store.close_terminal(*stream as i64).await
+            {
+                into.agents.tasks_changed();
             }
         }
         return Err(match (written, still) {

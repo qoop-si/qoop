@@ -114,6 +114,32 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
             0x03 | 0x04 => Some(Key::Stop),
             0x12 => Some(Key::CtrlR),
             b @ 0x20..=0x7e => Some(Key::Char(char::from(b))),
+            // A character past ASCII, in its UTF-8 bytes: cut off at the end, it waits too.
+            b @ 0xc2..=0xf4 => {
+                let len = match b {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    _ => 4,
+                };
+                // Only continuation bytes belong to it: at any other (an escape typed next),
+                // the lead is dropped alone and that byte read for itself.
+                let rest = &bytes[i + 1..bytes.len().min(i + len)];
+                if rest.iter().any(|c| !(0x80..=0xbf).contains(c)) {
+                    i += 1;
+                    continue;
+                }
+                if rest.len() < len - 1 {
+                    return (out, i);
+                }
+                let raw = &bytes[i..i + len];
+                i += len - 1;
+                // A C1 control (U+0080 to U+009F) is no character to type.
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .filter(|c| !c.is_control())
+                    .map(Key::Char)
+            }
             _ => None,
         };
         out.extend(key);
@@ -413,6 +439,16 @@ mod tests {
         // Cut off at the end: left for the next read.
         assert_eq!(decode(b"\x1b"), (vec![], 0));
         assert_eq!(decode(b"a\x1b[1;"), (vec![Key::Char('a')], 1));
+        // Past ASCII, whole or waiting for its rest.
+        assert_eq!(
+            only("çş€".as_bytes()),
+            [Key::Char('ç'), Key::Char('ş'), Key::Char('€')]
+        );
+        assert_eq!(decode(&"aş".as_bytes()[..2]), (vec![Key::Char('a')], 1));
+        // A C1 control is dropped; a lead byte cut short by an escape keeps the escape.
+        assert_eq!(only(b"\xc2\x9bx"), [Key::Char('x')]);
+        assert_eq!(only(b"\xc3\x1b[A"), [Key::Up]);
+        assert_eq!(decode(b"\xe2\x82\x1b"), (vec![], 2));
     }
 
     #[test]

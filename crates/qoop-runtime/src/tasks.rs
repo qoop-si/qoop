@@ -11,7 +11,8 @@ use qoop_store::{Outcome, TaskEventRow, TaskRow};
 
 use crate::agents::AgentRegistry;
 use crate::control::{
-    ControlResponse, TASK_REF_GOAL, TaskEventInfo, TaskInfo, TaskOp, TaskOutcome, TaskRef,
+    ControlResponse, ItemCardInfo, ItemEventInfo, StepInfo, TASK_REF_GOAL, TaskEventInfo, TaskInfo,
+    TaskOp, TaskOutcome, TaskRef, item_info,
 };
 use crate::store::{HandleError, StoreHandle, now};
 
@@ -40,6 +41,15 @@ fn failed(id: String, reason: impl Into<String>) -> ControlResponse {
     ControlResponse::Failed {
         id,
         reason: reason.into(),
+    }
+}
+
+/// A write that landed on `task`.
+fn written(id: String, task: i64) -> ControlResponse {
+    ControlResponse::TaskWritten {
+        id,
+        task,
+        key: None,
     }
 }
 
@@ -75,6 +85,7 @@ pub(crate) async fn write(
     task: Option<i64>,
     action: TaskOp,
     space: Option<String>,
+    name: Option<String>,
     agents: &AgentRegistry,
     store: &StoreHandle,
 ) -> ControlResponse {
@@ -83,15 +94,75 @@ pub(crate) async fn write(
         Err(reason) => return failed(id, reason),
     };
     let now = now();
-    // A goal from a terminal lands on its live task: begun first, exactly as a hook's
-    // Begin would, so a goal set before the first edit, or after a done claim and a new
+    // An item belongs to a space, not a terminal: its own branch, before any target.
+    if let TaskOp::Add {
+        workspace,
+        goal,
+        description,
+    } = action
+    {
+        return match store
+            .run(move |s| {
+                let name = s
+                    .workspaces()?
+                    .into_iter()
+                    .find(|w| w.id == workspace)
+                    .map(|w| w.name);
+                if name.as_deref() == Some(QASS_SPACE) {
+                    return Ok(None);
+                }
+                let description = description.unwrap_or_default();
+                s.add_item(workspace, &goal, &description, now).map(Some)
+            })
+            .await
+        {
+            Ok(Some((task, key))) => {
+                agents.tasks_changed();
+                ControlResponse::TaskWritten {
+                    id,
+                    task,
+                    key: Some(key),
+                }
+            }
+            Ok(None) => failed(
+                id,
+                "qass's own space has no board: add the item to the space the work is in",
+            ),
+            Err(e) => store_failed(id, e),
+        };
+    }
+    // An agent on another machine is named by its item and its remote, never by a task here.
+    if let TaskOp::LinkRemote {
+        item,
+        remote,
+        task: theirs,
+        name,
+        stage,
+    } = action
+    {
+        return match store
+            .run(move |s| s.link_remote(item, &remote, theirs, &name, &stage, now))
+            .await
+        {
+            Ok(changed) => {
+                if changed {
+                    agents.tasks_changed();
+                }
+                written(id, item)
+            }
+            Err(e) => store_failed(id, e),
+        };
+    }
+    // A goal or a link from a terminal lands on its live task: begun first, exactly as a
+    // hook's Begin would, so one set before the first edit, or after a done claim and a new
     // request, is never written onto the old task.
     let goal_here = matches!(action, TaskOp::Goal { .. }) && task.is_none();
-    if matches!(action, TaskOp::Begin) || goal_here {
+    let link_here = matches!(action, TaskOp::Link { .. }) && task.is_none();
+    if matches!(action, TaskOp::Begin) || goal_here || link_here {
         let Some(terminal) = speaker else {
             return failed(
                 id,
-                if goal_here {
+                if goal_here || link_here {
                     "no task named, and not inside a qoop terminal"
                 } else {
                     "a task is begun from inside a qoop terminal"
@@ -101,35 +172,63 @@ pub(crate) async fn write(
         // qass edits its own files; it never has a task of its own.
         // An unread name could be qass's: nothing is opened on a guess, the next edit asks again.
         if space.is_none() || space.as_deref() == Some(QASS_SPACE) {
-            return ControlResponse::TaskWritten { id, task: 0 };
+            if link_here {
+                return failed(
+                    id,
+                    if space.is_none() {
+                        "qoop could not read this terminal's space in time; nothing was linked, \
+                         try again"
+                    } else {
+                        "qass's own space keeps no task, so there is nothing to link"
+                    },
+                );
+            }
+            return written(id, 0);
         }
         let (goal, asked_at) = match agents.last_prompt(terminal) {
             Some((goal, at)) => (goal, Some(at)),
             None => (String::new(), None),
         };
-        let wanted = match action {
-            TaskOp::Goal { goal } => Some(goal),
-            _ => None,
+        let (wanted, item) = match action {
+            TaskOp::Goal { goal } => (Some(goal), None),
+            TaskOp::Link { item } => (None, Some(item)),
+            _ => (None, None),
         };
         return match store
             .run(move |s| {
                 let wanted = wanted
                     .map(|g| qoop_store::task::goal_text(&g))
                     .transpose()?;
-                let (task, opened) = s.begin_task(i64::from(terminal), &goal, asked_at, now)?;
+                // A link opens its task named after the item, refused before anything is
+                // begun when the item is not open; an edit's, after the last request.
+                let (task, opened) = match item {
+                    Some(item) => s.begin_linked(i64::from(terminal), item, asked_at, now)?,
+                    None => s.begin_task(i64::from(terminal), &goal, asked_at, now)?,
+                };
                 let changed = match &wanted {
                     Some(wanted) => s.set_task_goal(task, wanted, now)?,
                     None => false,
                 };
-                Ok((task, opened || changed))
+                let linked = match item {
+                    Some(item) => s.link_task(task, item, now)?,
+                    None => false,
+                };
+                // What the agent is called now, kept for its card once its terminal is gone.
+                if let (Some(_), Some(name)) = (item, &name) {
+                    s.name_agent(task, name)?;
+                }
+                Ok((task, opened || changed, linked))
             })
             .await
         {
-            Ok((task, shown)) => {
+            Ok((task, shown, linked)) => {
                 if shown {
                     agents.announce(terminal);
                 }
-                ControlResponse::TaskWritten { id, task }
+                if shown || linked {
+                    agents.tasks_changed();
+                }
+                written(id, task)
             }
             Err(e) => store_failed(id, e),
         };
@@ -144,10 +243,23 @@ pub(crate) async fn write(
         {
             Ok(task) => {
                 agents.announce(terminal);
-                ControlResponse::TaskWritten { id, task }
+                agents.tasks_changed();
+                written(id, task)
             }
             Err(e) => store_failed(id, e),
         };
+    }
+    if matches!(
+        action,
+        TaskOp::Describe { .. }
+            | TaskOp::Steps { .. }
+            | TaskOp::Check { .. }
+            | TaskOp::Link { .. }
+            | TaskOp::Unlink
+            | TaskOp::Start
+            | TaskOp::Reopen
+    ) {
+        return Box::pin(item_write(id, speaker, task, action, agents, store, now)).await;
     }
     if matches!(action, TaskOp::Close { .. }) && task.is_none() {
         return failed(id, "close names its task: qoop task close <id>");
@@ -186,7 +298,17 @@ pub(crate) async fn write(
     };
     let wrote = store
         .run(move |s| match action {
-            TaskOp::New { .. } | TaskOp::Begin => unreachable!("handled above"),
+            TaskOp::New { .. }
+            | TaskOp::Begin
+            | TaskOp::Add { .. }
+            | TaskOp::Describe { .. }
+            | TaskOp::Steps { .. }
+            | TaskOp::Check { .. }
+            | TaskOp::Link { .. }
+            | TaskOp::Unlink
+            | TaskOp::Start
+            | TaskOp::Reopen
+            | TaskOp::LinkRemote { .. } => unreachable!("handled above"),
             TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
             TaskOp::Goal { goal } => s.set_task_goal(task, &goal, now),
             TaskOp::Plan { text } => s.task_plan(task, &text, now).map(|()| false),
@@ -196,6 +318,11 @@ pub(crate) async fn write(
                 let outcome = match outcome {
                     TaskOutcome::Verified => Outcome::Verified,
                     TaskOutcome::Failed => Outcome::Failed,
+                    // Items only: a task ends with its agent's work, it is not taken off a board.
+                    TaskOutcome::Dropped => {
+                        s.open_item_goal(task)?;
+                        Outcome::Abandoned
+                    }
                 };
                 s.close_task(task, outcome, &reason, now).map(|_| true)
             }
@@ -207,7 +334,76 @@ pub(crate) async fn write(
             if shown && let Some(home) = home.and_then(|t| u32::try_from(t).ok()) {
                 agents.announce(home);
             }
-            ControlResponse::TaskWritten { id, task }
+            if shown {
+                agents.tasks_changed();
+            }
+            written(id, task)
+        }
+        Err(e) => store_failed(id, e),
+    }
+}
+
+/// A write on an item. By id, the item named (for an unlink, an item or a task); from a
+/// terminal, the item its open task is linked to, or for an unlink that task.
+async fn item_write(
+    id: String,
+    speaker: Option<u32>,
+    task: Option<i64>,
+    action: TaskOp,
+    agents: &AgentRegistry,
+    store: &StoreHandle,
+    now: i64,
+) -> ControlResponse {
+    if task.is_none() {
+        if matches!(action, TaskOp::Start | TaskOp::Reopen) {
+            return failed(id, "name the item, by its key or #id");
+        }
+        if speaker.is_none() {
+            return failed(id, "no task named, and not inside a qoop terminal");
+        }
+    }
+    let wrote = store
+        .run(move |s| {
+            use qoop_store::TaskError;
+            let target = match task {
+                Some(task) => task,
+                None => {
+                    let open = match speaker {
+                        Some(terminal) => s.open_task_of(i64::from(terminal))?,
+                        None => None,
+                    };
+                    let open = open.ok_or(TaskError::NotOnBoard)?;
+                    if matches!(action, TaskOp::Unlink) {
+                        open.id
+                    } else {
+                        s.linked_item(open.id)?.ok_or(TaskError::NotOnBoard)?
+                    }
+                }
+            };
+            let mut key = None;
+            let changed = match action {
+                TaskOp::Describe { text } => s.describe_item(target, &text, now)?,
+                TaskOp::Steps { steps } => s.set_steps(target, &steps, now)?,
+                TaskOp::Check { n, done } => s.check_step(target, n, done, now)?,
+                TaskOp::Link { item } => s.link_task(target, item, now)?,
+                TaskOp::Unlink => s.unlink(target, now)?,
+                // Its key as stored, for the line qass is told.
+                TaskOp::Start => {
+                    key = Some(s.start_item(target, now)?);
+                    true
+                }
+                TaskOp::Reopen => s.reopen_item(target, now)?,
+                _ => unreachable!("only board writes come here"),
+            };
+            Ok((target, changed, key))
+        })
+        .await;
+    match wrote {
+        Ok((task, changed, key)) => {
+            if changed {
+                agents.tasks_changed();
+            }
+            ControlResponse::TaskWritten { id, task, key }
         }
         Err(e) => store_failed(id, e),
     }
@@ -259,11 +455,13 @@ fn fit<T: serde::Serialize>(items: Vec<T>, budget: &mut usize) -> (Vec<T>, bool)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read(
     id: String,
+    board: bool,
     task: Option<i64>,
     terminal: Option<u32>,
     token: Option<String>,
     before: Option<i64>,
     space: Option<String>,
+    names: std::collections::BTreeMap<i64, String>,
     agents: &AgentRegistry,
     store: &StoreHandle,
 ) -> ControlResponse {
@@ -271,32 +469,67 @@ pub(crate) async fn read(
         Ok(s) => s,
         Err(reason) => return failed(id, reason),
     };
+    let now = now();
     let found = store
         .run(move |s| {
+            let items = if board { Some(s.items(now)?) } else { None };
+            let card = match task {
+                Some(task) => s.item_card(task, now)?,
+                None => None,
+            };
             let one = match (task, speaker) {
                 (Some(task), _) => Some(s.task(task)?),
                 (None, Some(terminal)) => Some(s.open_task_of(i64::from(terminal))?),
                 (None, None) => None,
             };
-            Ok(match one {
-                // One task (or none open), with its events.
+            let (tasks, events, one) = match one {
+                // One task (or none open), with its events; an item's are in its card's
+                // activity, with its agents'.
                 Some(row) => {
                     let events = match &row {
                         // One more than is kept, so a cut is known even below the byte cap.
-                        Some(t) => s.task_events(t.id, before, EVENTS_READ + 1)?,
-                        None => Vec::new(),
+                        Some(t) if card.is_none() => {
+                            s.task_events(t.id, before, EVENTS_READ + 1)?
+                        }
+                        _ => Vec::new(),
                     };
                     (row.into_iter().collect::<Vec<_>>(), events, true)
                 }
                 // Every open task.
                 None => (s.open_tasks()?, Vec::new(), false),
-            })
+            };
+            Ok((items, card, tasks, events, one))
         })
         .await;
-    let (tasks, events, one) = match found {
+    let (items, card, tasks, events, one) = match found {
         Ok(found) => found,
         Err(e) => return store_failed(id, e),
     };
+    let name = |t: i64| names.get(&t).cloned();
+    let items: Option<Vec<_>> = items.map(|v| v.into_iter().map(|r| item_info(r, name)).collect());
+    let card = card.map(|c| ItemCardInfo {
+        item: item_info(c.item, name),
+        description: c.description,
+        steps: c
+            .steps
+            .into_iter()
+            .map(|s| StepInfo {
+                n: s.n,
+                text: s.text,
+                done_at: s.done_at,
+            })
+            .collect(),
+        activity: c
+            .activity
+            .into_iter()
+            .map(|e| ItemEventInfo {
+                task: e.task,
+                at: e.at,
+                kind: e.kind,
+                body: e.body,
+            })
+            .collect(),
+    });
     if one && task.is_some() && tasks.is_empty() {
         return failed(id, format!("no task #{}", task.unwrap_or_default()));
     }
@@ -306,23 +539,46 @@ pub(crate) async fn read(
     // which are as long as they are. Then rows, then events.
     // Measured, not guessed: an id is the caller's and JSON may write a character of it as
     // six bytes.
+    // A card's description and steps are in the envelope: they are bounded, and a card
+    // without them is not one. Its activity is fitted last.
+    let mut card = card;
+    let activity = card
+        .as_mut()
+        .map(|c| std::mem::take(&mut c.activity))
+        .unwrap_or_default();
     let envelope = serde_json::to_vec(&ControlResponse::Tasks {
         id: id.clone(),
         tasks: Vec::new(),
         events: Vec::new(),
         more: true,
         space: space.clone(),
+        items: items.as_ref().map(|_| Vec::new()),
+        item: card.clone().map(Box::new),
     })
     .map_or(ANSWER_BYTES, |v| v.len() + 64);
     let mut budget = ANSWER_BYTES.saturating_sub(envelope);
     let (tasks, rows_cut) = fit(tasks.into_iter().map(info).collect(), &mut budget);
+    let (items, items_cut) = match items {
+        Some(items) => {
+            let (kept, cut) = fit(items, &mut budget);
+            (Some(kept), cut)
+        }
+        None => (None, false),
+    };
     let (events, events_cut) = fit(events.into_iter().map(event_info).collect(), &mut budget);
+    let (activity, activity_cut) = fit(activity, &mut budget);
+    let item = card.map(|mut c| {
+        c.activity = activity;
+        Box::new(c)
+    });
     ControlResponse::Tasks {
         id,
         tasks,
         events,
-        more: rows_cut || events_cut || read_cut,
+        more: rows_cut || items_cut || events_cut || activity_cut || read_cut,
         space,
+        items,
+        item,
     }
 }
 
@@ -347,6 +603,114 @@ pub(crate) fn refs(open: Vec<TaskRow>) -> std::collections::BTreeMap<u32, TaskRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A link from a terminal begins its task first; where a begin opens nothing it is refused
+    /// with the reason and leaves no task behind: qass's own space, and a space whose name was
+    /// not read in time. With the name read, it links.
+    #[tokio::test]
+    async fn a_link_where_a_begin_opens_nothing_is_refused_with_why() {
+        let agents = AgentRegistry::new().expect("registry");
+        let token = crate::agents::mint_token(1);
+        agents.register(1, TerminalId::new("1"), token.clone());
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let (item, _) = s.add_item(ws, "the item", "", 1).unwrap();
+        let store = StoreHandle::new(s);
+        let link = |space: Option<&str>| {
+            write(
+                "w".into(),
+                Some(1),
+                Some(token.as_str().to_string()),
+                None,
+                TaskOp::Link { item },
+                space.map(String::from),
+                Some("worker".to_string()),
+                &agents,
+                &store,
+            )
+        };
+        for (space, why) in [
+            (None, "could not read this terminal's space"),
+            (Some(QASS_SPACE), "qass's own space keeps no task"),
+        ] {
+            let answer = link(space).await;
+            assert!(
+                matches!(&answer, ControlResponse::Failed { reason, .. } if reason.contains(why)),
+                "{answer:?}"
+            );
+        }
+        let open = store.run(|s| s.open_tasks()).await.unwrap();
+        assert!(open.is_empty(), "nothing begun: {open:?}");
+        let answer = link(Some("work")).await;
+        let ControlResponse::TaskWritten { task, .. } = answer else {
+            panic!("not linked: {answer:?}")
+        };
+        let linked = store.run(move |s| s.linked_item(task)).await.unwrap();
+        assert_eq!(linked, Some(item));
+    }
+
+    /// A task a link opens is named after the item, not the agent's last prompt, and says it
+    /// was opened by the link. Once closed, its agent keeps the name it was linked under on
+    /// the item, though its terminal is gone, and its stage reads finished.
+    #[tokio::test]
+    async fn a_linked_task_is_the_items_and_its_agent_keeps_its_name_once_closed() {
+        let agents = AgentRegistry::new().expect("registry");
+        let token = crate::agents::mint_token(1);
+        agents.register(1, TerminalId::new("1"), token.clone());
+        agents.push_focus_event(
+            1,
+            crate::control::FocusEvent {
+                kind: "user".into(),
+                label: "check what the tests say".into(),
+                at_unix: 1,
+            },
+        );
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let (item, key) = s.add_item(ws, "login keeps the session", "", 1).unwrap();
+        let store = StoreHandle::new(s);
+        let answer = write(
+            "w".into(),
+            Some(1),
+            Some(token.as_str().to_string()),
+            None,
+            TaskOp::Link { item },
+            Some("work".into()),
+            Some("worker".into()),
+            &agents,
+            &store,
+        )
+        .await;
+        let ControlResponse::TaskWritten { task, .. } = answer else {
+            panic!("not linked: {answer:?}")
+        };
+        let (row, events) = store
+            .run(move |s| Ok((s.task(task)?, s.task_events(task, None, 10)?)))
+            .await
+            .unwrap();
+        assert_eq!(row.unwrap().goal, "login keeps the session");
+        let opened = events.iter().find(|e| e.kind == "opened").unwrap();
+        assert_eq!(
+            opened.body,
+            format!("opened by a link to {key}: login keeps the session")
+        );
+
+        let live = |t: i64| (t == 1).then(|| "its tab".to_string());
+        let read = || store.run(move |s| s.items(10));
+        let open = crate::control::item_info(read().await.unwrap().remove(0), live);
+        assert_eq!(open.agents[0].name, "its tab", "open: the live name");
+        store.run(|s| s.close_terminal(1, 5)).await.unwrap();
+        // The terminal is gone, and its number may name another tab now.
+        let closed = crate::control::item_info(read().await.unwrap().remove(0), live);
+        let agent = &closed.agents[0];
+        assert!(agent.closed);
+        assert_eq!(
+            (agent.name.as_str(), agent.stage.as_str()),
+            ("worker", crate::control::FINISHED)
+        );
+    }
 
     /// Rows and events alike stop where the next one would pass the budget, in order, and
     /// say so.

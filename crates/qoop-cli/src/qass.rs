@@ -504,7 +504,7 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         }
         let opts = supervise::NewOpts {
             name: Some("qass".into()),
-            cwd: Some(folder),
+            cwd: Some(folder.clone()),
             space: Some(SPACE.into()),
             command,
             typed,
@@ -519,14 +519,119 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         println!("qass {how} in terminal {opened} on {}", read.qass_agent);
         u64::from(opened)
     };
+    // The board on top of it; qass is there without it, so a board that cannot open is said
+    // and nothing more.
+    if let Err(why) = show_board(terminal, &folder) {
+        eprintln!("qoop: the board did not open above qass: {why}");
+    }
     // Shown where the person is looking; with no interface open, the number says where.
     let _ = run(&["focus", &terminal.to_string()]);
     Ok(())
 }
 
+/// Refuses a line for qass while it waits on the owner (its state `blocked`): the enter after
+/// it would answer the prompt qass is showing, a permission asked or a question, in the
+/// owner's place.
+pub(crate) fn hearing(state: Option<&str>) -> Result<(), String> {
+    match state {
+        Some("blocked") => Err("qass waits on you: answer it in its tab first".into()),
+        _ => Ok(()),
+    }
+}
+
+/// Type `text` into a terminal and press enter, as nobody: a send from inside a terminal
+/// would say that terminal waits on the answer, and neither the board nor `qoop qass` does.
+pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
+    let out = Command::new(std::env::current_exe()?)
+        .args(["send", &terminal.to_string(), "--enter", "--", text])
+        .env_remove("QOOP_TERMINAL")
+        .env_remove("QOOP_TOKEN")
+        .env_remove("QORO_TERMINAL")
+        .env_remove("QORO_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(std::io::Error::other(
+        said.trim().trim_start_matches("qoop: ").to_string(),
+    ))
+}
+
+/// Put the board above qass in its tab (decision 12): `qoop task board --page` in a pane of
+/// its own, the tab's first, stacked over qass through the split the interface keeps. A tab
+/// that has a board pane is left as it is, even one at a shell: the wake that brought it back
+/// typed its page (`restore_rows`), and typing it here too would put the second line into the
+/// page as a new item.
+fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir};
+    use qoop_runtime::idle::{BOARD_PANE, has_board};
+
+    let qass = u32::try_from(qass).map_err(std::io::Error::other)?;
+    let patience = std::time::Duration::from_secs(10);
+    let ControlResponse::Agents { agents, splits, .. } = crate::task::ask(
+        ControlRequest::ListAgents {
+            id: crate::request_id("qass"),
+        },
+        patience,
+    )?
+    else {
+        return Err(std::io::Error::other(
+            "unexpected answer to the agent listing",
+        ));
+    };
+    let tree = splits.into_iter().find(|t| t.leaves().contains(&qass));
+    let panes = tree.as_ref().map(|t| t.leaves()).unwrap_or_default();
+    if has_board(agents.iter().filter(|r| panes.contains(&r.terminal)), qass) {
+        return Ok(());
+    }
+    let me = std::env::current_exe()?.display().to_string();
+    let page = ["exec", &me, "task", "board", "--page"];
+    let opts = supervise::NewOpts {
+        name: Some(BOARD_PANE.into()),
+        cwd: Some(folder.to_path_buf()),
+        space: Some(SPACE.into()),
+        command: page.iter().map(|w| w.to_string()).collect(),
+        typed: None,
+    };
+    let mut board = 0;
+    supervise::open_terminal(&opts, |t| board = t)?;
+    // The board first, so the tab is still one tab and the board is on top.
+    let tree = Pane::Split {
+        dir: SplitDir::H,
+        permille: 500,
+        first: Box::new(Pane::Leaf { terminal: board }),
+        second: Box::new(tree.unwrap_or(Pane::Leaf { terminal: qass })),
+    };
+    match crate::task::ask(
+        ControlRequest::SetSplit {
+            id: crate::request_id("qass"),
+            tree,
+        },
+        patience,
+    )? {
+        ControlResponse::SplitSaved { .. } => Ok(()),
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected answer: {other:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line for qass is refused while it waits on the owner, and only then.
+    #[test]
+    fn qass_hears_nothing_while_it_waits_on_the_owner() {
+        let refused = hearing(Some("blocked")).unwrap_err();
+        assert!(refused.contains("qass waits on you"), "{refused}");
+        for state in [None, Some("idle"), Some("working"), Some("done")] {
+            assert_eq!(hearing(state), Ok(()), "{state:?}");
+        }
+    }
 
     fn tab(id: i64, cwd: &str, agent: Option<&str>) -> qoop_store::TerminalRow {
         qoop_store::TerminalRow {

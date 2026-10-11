@@ -7,7 +7,7 @@
 use std::io::Read;
 
 use qoop_runtime::control::{
-    ControlRequest, ControlResponse, TaskEventInfo, TaskInfo, TaskOp, TaskOutcome,
+    ControlRequest, ControlResponse, ItemCardInfo, TaskEventInfo, TaskInfo, TaskOp, TaskOutcome,
 };
 use qoop_runtime::paths;
 
@@ -23,7 +23,8 @@ stage <stage>` (investigating, planning, implementing, reviewing, verifying, wai
 `qoop task goal \"<what the owner wants; done when ...>\"` true to his words, add \
 `qoop task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
 finish with `qoop task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
-or stop as usual. If a `qoop task` command fails, carry on with the work.";
+or stop as usual. If a `qoop task` command fails, carry on with the work. On a board item, \
+tick each step with `qoop task check <n>`.";
 
 /// How long `rules` waits for the daemon. A hook waits on it at every session start and
 /// every request, and gives it 2 s before going quiet; a daemon answers in milliseconds.
@@ -37,21 +38,37 @@ const QASS_SPACE: &str = crate::qass::SPACE;
 
 const USAGE: &str = "usage:
   qoop task new [--replace] <goal>     open this terminal's task
-  qoop task goal [--id N] <text|->     what the owner wants and when it is done, in plain words
+  qoop task goal [--id KEY|N] <text|->  what the owner wants and when it is done, in plain words
                                        (--id: another terminal's task, for qass)
   qoop task stage <stage>              investigating|planning|implementing|reviewing|verifying|waiting-human
   qoop task plan <text|->              acceptance, plan, how it will be verified, risks
   qoop task evidence <text|->          a check that proves an acceptance point, and its result
   qoop task done [summary]             claim it is done; it is checked outside the agent
-  qoop task close <id> --verified|--failed [reason]
+  qoop task close <KEY|id> --verified|--failed|--dropped [reason]
+                                       --dropped takes an item off the board (items only)
+  qoop task add --space S <title> [--description <text|->]
+                                       put an item on a space's board; prints its key
+  qoop task describe [--id KEY|N] <text|->  the item's description
+  qoop task steps [--id KEY|N] -       the item's steps, one per line on standard input
+  qoop task check [--id KEY|N] <n> [--undo]  tick step n of the item
+  qoop task link [--id N] <KEY|#id>    put this terminal's task (or task N) on an item
+  qoop task link <KEY|#id> --remote R --task N --name NAME --stage S
+                                       an agent on remote R works on the item (qass)
+  qoop task unlink [--id KEY|N]        take the task off its item; an item: every agent
+  qoop task start <KEY|id>             ask qass to start the item
+  qoop task reopen <KEY|id>            bring a closed item back
   qoop task ls [--json]                open tasks
-  qoop task board [--dir DIR]          every space's goal and open tasks as Markdown; --dir
-                                       writes README.md and space-<id>.md there
-  qoop task show [id] [--before E] [--json]   no id: this terminal's open task
+  qoop task board [--json] [--dir DIR] the board's items, then every space's goal and open
+                                       tasks as Markdown; --json: the items; --dir writes
+                                       README.md and space-<id>.md there
+  qoop task board --page               the board as a page: lanes, cards, moves
+  qoop task show [KEY|id] [--before E] [--json]   no id: this terminal's open task; an
+                                       item comes with its card (--json: `item`)
   qoop task begin                      this terminal's open task, opened now if none (hooks)
   qoop task rules [--turn]             what an agent in qoop is told at session start
                                        (--turn: the line it is given with each request)
-  <text> may be `-` to read it from standard input";
+  <text> may be `-` to read it from standard input; without --id, describe, steps and check
+  write to the item this terminal's task is linked to";
 
 /// This terminal and its token, when run inside a qoop terminal.
 fn here() -> (Option<u32>, Option<String>) {
@@ -85,7 +102,10 @@ pub(crate) fn text(words: &[String]) -> std::io::Result<String> {
     Ok(words.join(" "))
 }
 
-fn ask(request: ControlRequest, patience: std::time::Duration) -> std::io::Result<ControlResponse> {
+pub(crate) fn ask(
+    request: ControlRequest,
+    patience: std::time::Duration,
+) -> std::io::Result<ControlResponse> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -99,14 +119,17 @@ fn ask(request: ControlRequest, patience: std::time::Duration) -> std::io::Resul
 }
 
 fn write(task: Option<i64>, action: TaskOp) -> std::io::Result<i64> {
+    written(task, action).map(|(task, _)| task)
+}
+
+/// The same, with the key of an item it added.
+pub(crate) fn written(task: Option<i64>, action: TaskOp) -> std::io::Result<(i64, Option<String>)> {
     // A task named by id is spoken for by nobody: qass closes a worker's task from its own
     // terminal, and sending that terminal along would make the daemon ask whether the task
-    // is qass's.
-    let (terminal, token) = match task {
-        Some(_) => (None, None),
-        None => here(),
-    };
-    if task.is_none() && terminal.is_none() {
+    // is qass's. Nor is an item added, or a remote agent reported: they name no task here.
+    let nobody = task.is_some() || matches!(action, TaskOp::Add { .. } | TaskOp::LinkRemote { .. });
+    let (terminal, token) = if nobody { (None, None) } else { here() };
+    if !nobody && terminal.is_none() {
         return Err(std::io::Error::other(
             "QOOP_TERMINAL and QOOP_TOKEN are not set: run this in a qoop terminal, or name the task",
         ));
@@ -119,7 +142,7 @@ fn write(task: Option<i64>, action: TaskOp) -> std::io::Result<i64> {
         action,
     };
     match ask(request, std::time::Duration::from_secs(10))? {
-        ControlResponse::TaskWritten { task, .. } => Ok(task),
+        ControlResponse::TaskWritten { task, key, .. } => Ok((task, key)),
         ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
         other => Err(std::io::Error::other(format!(
             "unexpected answer: {other:?}"
@@ -132,6 +155,7 @@ struct Found {
     events: Vec<TaskEventInfo>,
     more: bool,
     space: Option<String>,
+    item: Option<Box<ItemCardInfo>>,
 }
 
 fn read(
@@ -143,6 +167,7 @@ fn read(
     let (terminal, token) = if mine { here() } else { (None, None) };
     let request = ControlRequest::TaskRead {
         id: crate::request_id("task"),
+        board: false,
         task,
         terminal,
         token,
@@ -154,12 +179,14 @@ fn read(
             events,
             more,
             space,
+            item,
             ..
         } => Ok(Found {
             tasks,
             events,
             more,
             space,
+            item,
         }),
         ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
         other => Err(std::io::Error::other(format!(
@@ -200,6 +227,131 @@ fn line(t: &TaskInfo) -> String {
     )
 }
 
+/// An item by key (`QOOP-3`, any case) or id (`#12`, `12`). A key is looked up in the record
+/// itself, as `qoop task board` reads it; an id is the daemon's to check.
+fn item(key: &str) -> std::io::Result<i64> {
+    if let Ok(id) = key.trim_start_matches('#').parse() {
+        return Ok(id);
+    }
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    crate::existing_store(&dir)?
+        .map(|store| store.item_id(key).map_err(std::io::Error::other))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| std::io::Error::other(format!("no board item {key}")))
+}
+
+/// A leading `--id <KEY|id>`, and the words after it.
+fn named(rest: &[String]) -> std::io::Result<(Option<i64>, &[String])> {
+    match rest.split_first() {
+        Some((flag, tail)) if flag == "--id" => {
+            let (key, words) = tail.split_first().ok_or_else(|| usage(USAGE))?;
+            Ok((Some(item(key)?), words))
+        }
+        _ => Ok((None, rest)),
+    }
+}
+
+/// A space by id or by a name only one space has, as the daemon lists them.
+fn space(wanted: &str) -> std::io::Result<i64> {
+    let request = ControlRequest::ListWorkspaces {
+        id: crate::request_id("task"),
+    };
+    match ask(request, std::time::Duration::from_secs(10))? {
+        ControlResponse::Workspaces { workspaces, .. } => {
+            crate::supervise::resolve_space(&workspaces, wanted)
+        }
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected answer: {other:?}"
+        ))),
+    }
+}
+
+/// `qoop task add --space S <title> [--description <text|->]`.
+fn add(rest: &[String]) -> std::io::Result<()> {
+    let (mut wanted, mut description, mut title) = (None, None, Vec::new());
+    let mut it = rest.iter();
+    while let Some(word) = it.next() {
+        match word.as_str() {
+            "--space" => wanted = Some(it.next().ok_or_else(|| usage(USAGE))?),
+            "--description" => {
+                description = Some(text(std::slice::from_ref(
+                    it.next().ok_or_else(|| usage(USAGE))?,
+                ))?)
+            }
+            _ => title.push(word.clone()),
+        }
+    }
+    let (Some(wanted), false) = (wanted, title.is_empty()) else {
+        return Err(usage(USAGE));
+    };
+    let workspace = space(wanted)?;
+    let (id, key) = written(
+        None,
+        TaskOp::Add {
+            workspace,
+            goal: title.join(" "),
+            description,
+        },
+    )?;
+    println!("{} (#{id})", key.unwrap_or_default());
+    Ok(())
+}
+
+/// `qoop task link <KEY|#id> --remote R --task N --name NAME --stage S`: what qass reports for
+/// an agent on another machine. `rest` is the flags after the key.
+fn link_remote(key: &str, rest: &[String]) -> std::io::Result<()> {
+    let value = |flag: &str| {
+        rest.iter()
+            .position(|a| a == flag)
+            .and_then(|i| rest.get(i + 1))
+            .cloned()
+            .ok_or_else(|| usage(USAGE))
+    };
+    let task = value("--task")?
+        .trim_start_matches('#')
+        .parse()
+        .map_err(|_| usage(USAGE))?;
+    write(
+        None,
+        TaskOp::LinkRemote {
+            item: item(key)?,
+            remote: value("--remote")?,
+            task,
+            name: value("--name")?,
+            stage: value("--stage")?,
+        },
+    )
+    .map(drop)
+}
+
+/// `qoop task start <KEY>`: record the ask, then tell qass, which starts the work and links
+/// the agent. Without qass running the item still reads Doing for ten minutes. While qass
+/// waits on the owner nothing is recorded or typed: the enter would answer its prompt.
+fn start(key: &str) -> std::io::Result<()> {
+    let facts = crate::qass::look();
+    let running = facts.life == crate::qass::Life::Running;
+    if running {
+        crate::qass::hearing(facts.state.as_deref()).map_err(std::io::Error::other)?;
+    }
+    // qass is told the key as stored, which it finds on the board, not as it was typed.
+    let (_, stored) = written(Some(item(key)?), TaskOp::Start)?;
+    let key = stored.as_deref().unwrap_or(key);
+    match facts.terminal.filter(|_| running) {
+        // As nobody, the way the board tells it: no wait edge from the asking terminal.
+        Some(terminal) => {
+            crate::qass::send(terminal, &format!("start {key}"))?;
+            println!("{key} started; qass is told");
+            Ok(())
+        }
+        None => {
+            println!("{key} started; qass is not running, so nothing will pick it up: `qoop qass`");
+            Ok(())
+        }
+    }
+}
+
 fn json(value: &impl serde::Serialize) -> std::io::Result<()> {
     println!(
         "{}",
@@ -230,18 +382,8 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             Ok(())
         }
         Some("goal") => {
-            // Only a leading `--id <n>` names another task: a goal may mention the flag.
-            let (task, words) = match rest.split_first() {
-                Some((flag, tail)) if flag == "--id" => {
-                    let (n, words) = tail.split_first().ok_or_else(|| usage(USAGE))?;
-                    let n: i64 = n
-                        .trim_start_matches('#')
-                        .parse()
-                        .map_err(|_| usage(USAGE))?;
-                    (Some(n), words)
-                }
-                _ => (None, rest),
-            };
+            // Only a leading `--id <KEY|n>` names another task: a goal may mention the flag.
+            let (task, words) = named(rest)?;
             if words.is_empty() {
                 return Err(usage(USAGE));
             }
@@ -280,19 +422,17 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         )
         .map(drop),
         Some("close") => {
-            let outcome = match (has("--verified"), has("--failed")) {
-                (true, false) => TaskOutcome::Verified,
-                (false, true) => TaskOutcome::Failed,
+            let outcome = match (has("--verified"), has("--failed"), has("--dropped")) {
+                (true, false, false) => TaskOutcome::Verified,
+                (false, true, false) => TaskOutcome::Failed,
+                (false, false, true) => TaskOutcome::Dropped,
                 _ => return Err(usage(USAGE)),
             };
-            let words = without(&["--verified", "--failed"]);
+            let words = without(&["--verified", "--failed", "--dropped"]);
             let Some((id, reason)) = words.split_first() else {
                 return Err(usage(USAGE));
             };
-            let id: i64 = id
-                .trim_start_matches('#')
-                .parse()
-                .map_err(|_| usage(USAGE))?;
+            let id = item(id)?;
             write(
                 Some(id),
                 TaskOp::Close {
@@ -303,8 +443,70 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             .map(drop)
         }
         Some("board") => match raw.as_slice() {
-            [] => crate::board::run(None),
-            [flag, dir] if flag == "--dir" => crate::board::run(Some(std::path::Path::new(dir))),
+            [] => crate::board::run(None, false),
+            [flag] if flag == "--json" => crate::board::run(None, true),
+            [flag] if flag == "--page" => crate::board_page::run(),
+            [flag, dir] if flag == "--dir" => {
+                crate::board::run(Some(std::path::Path::new(dir)), false)
+            }
+            _ => Err(usage(USAGE)),
+        },
+        Some("add") => add(rest),
+        Some("describe") => {
+            let (task, words) = named(rest)?;
+            if words.is_empty() {
+                return Err(usage(USAGE));
+            }
+            write(task, TaskOp::Describe { text: text(words)? }).map(drop)
+        }
+        Some("steps") => {
+            let (task, words) = named(rest)?;
+            if words != ["-"] {
+                return Err(usage(USAGE));
+            }
+            let steps = text(words)?.lines().map(String::from).collect();
+            write(task, TaskOp::Steps { steps }).map(drop)
+        }
+        Some("check") => {
+            let (task, words) = named(rest)?;
+            let (undo, words) = match words.split_last() {
+                Some((last, words)) if last == "--undo" => (true, words),
+                _ => (false, words),
+            };
+            let [n] = words else {
+                return Err(usage(USAGE));
+            };
+            let n = n.parse().map_err(|_| usage(USAGE))?;
+            write(task, TaskOp::Check { n, done: !undo }).map(drop)
+        }
+        Some("link") => {
+            let (task, words) = named(rest)?;
+            match words {
+                [key, flag, ..] if flag == "--remote" && task.is_none() => {
+                    link_remote(key, &words[1..])
+                }
+                [key] => {
+                    let item = item(key)?;
+                    let linked = write(task, TaskOp::Link { item })?;
+                    println!("task #{linked} is on {key}");
+                    Ok(())
+                }
+                _ => Err(usage(USAGE)),
+            }
+        }
+        Some("unlink") => {
+            let (task, words) = named(rest)?;
+            if !words.is_empty() {
+                return Err(usage(USAGE));
+            }
+            write(task, TaskOp::Unlink).map(drop)
+        }
+        Some("start") => match raw.as_slice() {
+            [key] => start(key),
+            _ => Err(usage(USAGE)),
+        },
+        Some("reopen") => match raw.as_slice() {
+            [key] => write(Some(item(key)?), TaskOp::Reopen).map(drop),
             _ => Err(usage(USAGE)),
         },
         Some("ls") => {
@@ -337,14 +539,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                                 .ok_or_else(|| usage(USAGE))?,
                         )
                     }
-                    other => {
-                        task = Some(
-                            other
-                                .trim_start_matches('#')
-                                .parse()
-                                .map_err(|_| usage(USAGE))?,
-                        )
-                    }
+                    other => task = Some(item(other)?),
                 }
             }
             if task.is_none() && here().0.is_none() {
@@ -361,6 +556,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     "task": found.tasks.first(),
                     "events": found.events,
                     "more": found.more,
+                    "item": found.item,
                 }));
             }
             let Some(t) = found.tasks.first() else {
@@ -368,6 +564,27 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 return Ok(());
             };
             println!("{}", line(t));
+            if let Some(card) = &found.item {
+                println!(
+                    "  {} {}, steps {}/{}",
+                    card.item.key, card.item.state, card.item.steps_done, card.item.steps_total
+                );
+                for step in &card.steps {
+                    let mark = if step.done_at.is_some() { "x" } else { " " };
+                    println!("  [{mark}] {}. {}", step.n, step.text);
+                }
+                for line in card.description.lines() {
+                    println!("    {line}");
+                }
+                // Its events and its agents', in words.
+                for e in &card.activity {
+                    println!(
+                        "  {} {}",
+                        ago(e.at),
+                        crate::board_page::activity_words(&e.kind, &e.body)
+                    );
+                }
+            }
             for e in &found.events {
                 let mut lines = e.body.lines();
                 println!(

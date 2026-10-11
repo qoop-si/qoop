@@ -13,12 +13,14 @@
 #![forbid(unsafe_code)]
 
 pub mod history;
+pub mod item;
 pub mod task;
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use history::History;
+pub use item::{ItemAgent, ItemCard, ItemRow, ItemState, StepRow};
 use rusqlite::{Connection, OptionalExtension, params};
 pub use task::{Outcome, TaskError, TaskEventRow, TaskRow};
 
@@ -350,7 +352,43 @@ impl Store {
                  kind TEXT NOT NULL,
                  body TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS task_event_by_task ON task_event(task, id);",
+             CREATE INDEX IF NOT EXISTS task_event_by_task ON task_event(task, id);
+             -- The owner's board (`item.rs`). An item is a task row opened by `add` that
+             -- never has a terminal; this marks it and keeps its key, fixed at creation so
+             -- a rename of the space never changes it. Its steps, the agents' tasks linked
+             -- to it, and the agents on other machines qass reports, each in a table of
+             -- its own. New tables, no version bump: an older binary ignores them.
+             CREATE TABLE IF NOT EXISTS board_item (
+                 task INTEGER PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
+                 prefix TEXT NOT NULL,
+                 n INTEGER NOT NULL,
+                 description TEXT NOT NULL DEFAULT '',
+                 UNIQUE (prefix, n)
+             );
+             CREATE TABLE IF NOT EXISTS task_step (
+                 task INTEGER NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+                 n INTEGER NOT NULL,
+                 text TEXT NOT NULL,
+                 done_at INTEGER,
+                 PRIMARY KEY (task, n)
+             );
+             -- `name` is what the agent was called when it was linked, kept for when its
+             -- terminal is gone.
+             CREATE TABLE IF NOT EXISTS task_item (
+                 task INTEGER PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
+                 item INTEGER NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+                 name TEXT
+             );
+             CREATE INDEX IF NOT EXISTS task_item_by_item ON task_item(item);
+             CREATE TABLE IF NOT EXISTS task_item_remote (
+                 item INTEGER NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+                 remote TEXT NOT NULL,
+                 task INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 stage TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (remote, task)
+             );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
@@ -548,6 +586,9 @@ impl Store {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         task::abandon_open_tasks(&tx, &terminals, now)?;
+        // Its board items too: an item lives in a space, and one left open with no space
+        // would stay on every board with nowhere to run.
+        item::abandon_open_items(&tx, id, now)?;
         let n = tx.execute("DELETE FROM workspace WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(n)

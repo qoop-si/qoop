@@ -222,6 +222,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         },
         ControlRequest::TaskRead {
             id: "x29".into(),
+            board: true,
             task: None,
             terminal: Some(terminal),
             token: None,

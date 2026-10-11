@@ -467,8 +467,12 @@ pub enum ControlRequest {
     },
     /// Read tasks: one by `task` (or the open one of `terminal`, with its token) with its
     /// events newest first, older than `before` when given; with neither, every open task.
+    /// A board item named by `task` comes with its card (`Tasks::item`). `board` asks for
+    /// the board too (`Tasks::items`), which a daemon from before it never answers.
     TaskRead {
         id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        board: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,15 +516,201 @@ pub enum TaskOp {
         outcome: TaskOutcome,
         reason: String,
     },
+    /// Put an item on a space's board: a task with no terminal, answered with its key. From
+    /// anywhere, never in qass's own space.
+    Add {
+        workspace: i64,
+        goal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Describe, Steps and Check write on an item: by id, that item; from a terminal, the
+    /// item its task is linked to, refused when it is not on the board.
+    Describe {
+        text: String,
+    },
+    /// Replace the item's steps; a step whose text is unchanged keeps its tick.
+    Steps {
+        steps: Vec<String>,
+    },
+    /// Tick step `n` (from 1), or untick it.
+    Check {
+        n: i64,
+        done: bool,
+    },
+    /// Link a task to the item `item`. From a terminal, its live task, begun first as `Begin`
+    /// does, and refused where a begin opens nothing (qass's space).
+    Link {
+        item: i64,
+    },
+    /// Take a task off its item: from a terminal, its open task; by id, that task, or an
+    /// item, which loses every agent and a waiting start and so moves back to Todo.
+    Unlink,
+    /// Ask for the item named by id to be started: Doing for ten minutes, until an agent is
+    /// linked. Answered with its key as stored.
+    Start,
+    /// Bring the closed item named by id back, its steps kept.
+    Reopen,
+    /// qass reports an agent on an ssh remote working on `item`, from that machine's
+    /// events: its task there, its name and its stage.
+    LinkRemote {
+        item: i64,
+        remote: String,
+        task: i64,
+        name: String,
+        stage: String,
+    },
 }
 
-/// How a task is closed by a person or qass. The two other endings, superseded and
-/// abandoned, happen to a task; nobody asks for them.
+/// How a task is closed by a person or qass. Superseded happens to a task; nobody asks for
+/// it. Dropped is abandoned, asked for: an item taken off the board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOutcome {
     Verified,
     Failed,
+    Dropped,
+}
+
+/// A board item as the board shows it: no description and no step texts, so a whole board
+/// fits one frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemInfo {
+    pub id: i64,
+    /// `<PREFIX>-<n>`, fixed when it was added.
+    pub key: String,
+    #[serde(default)]
+    pub workspace: Option<i64>,
+    pub title: String,
+    /// `todo`, `doing` or `done`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    pub steps_done: usize,
+    pub steps_total: usize,
+    #[serde(default)]
+    pub agents: Vec<ItemAgentInfo>,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<i64>,
+}
+
+/// An agent working on an item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAgentInfo {
+    pub task: i64,
+    #[serde(default)]
+    pub terminal: Option<i64>,
+    pub name: String,
+    /// `this Mac`, or the remote's name.
+    pub machine: String,
+    /// For a remote agent, the stage qass last reported.
+    pub stage: String,
+    #[serde(default)]
+    pub claimed: bool,
+    #[serde(default)]
+    pub closed: bool,
+}
+
+/// One step of an item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepInfo {
+    pub n: i64,
+    pub text: String,
+    #[serde(default)]
+    pub done_at: Option<i64>,
+}
+
+/// An item as its card shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemCardInfo {
+    #[serde(flatten)]
+    pub item: ItemInfo,
+    pub description: String,
+    pub steps: Vec<StepInfo>,
+    /// Its own events and its agents', newest first, each with the task it is on.
+    pub activity: Vec<ItemEventInfo>,
+}
+
+/// One line of an item's activity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemEventInfo {
+    pub task: i64,
+    pub at: i64,
+    pub kind: String,
+    pub body: String,
+}
+
+/// What a machine's own agents are called on the board.
+pub const THIS_MACHINE: &str = "this Mac";
+
+/// What every reader calls a local agent, in one order: its agent title (what a person called
+/// the conversation here, else the agent's own), the conversation's stored name, the tab's
+/// name, the head of the conversation's id, its terminal. The same everywhere, so the board,
+/// its Markdown and the sidebar never name one agent two ways.
+pub fn agent_name(
+    terminal: i64,
+    title: Option<String>,
+    stored: Option<String>,
+    tab: Option<String>,
+    session: Option<&str>,
+) -> String {
+    title
+        .or(stored)
+        .or(tab)
+        .or_else(|| session.map(|s| s.chars().take(8).collect()))
+        .unwrap_or_else(|| format!("terminal {terminal}"))
+}
+
+/// What a local agent's stage reads once its task is closed.
+pub const FINISHED: &str = "finished";
+
+/// A stored item as the protocol carries it. `name` names a local agent by its terminal
+/// ([`agent_name`]), for a terminal still open; a closed one keeps the name it was linked
+/// under (its terminal may be gone, or its number handed to another tab), and its stage
+/// reads [`FINISHED`]. A remote one comes with the name and stage qass reported.
+pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>) -> ItemInfo {
+    let agents = row
+        .agents
+        .into_iter()
+        .map(|a| {
+            let live = a.terminal.filter(|_| !a.closed).and_then(&name);
+            let local = a.remote.is_none();
+            ItemAgentInfo {
+                // A closed agent never borrows the name of whatever tab holds its old number now.
+                name: live
+                    .or(a.name)
+                    .or_else(|| a.terminal.filter(|_| !a.closed).and_then(&name))
+                    .unwrap_or_else(|| match a.terminal {
+                        Some(t) => format!("terminal {t}"),
+                        None => format!("task #{}", a.task),
+                    }),
+                machine: a.remote.unwrap_or_else(|| THIS_MACHINE.to_string()),
+                task: a.task,
+                terminal: a.terminal,
+                stage: if a.closed && local {
+                    FINISHED.to_string()
+                } else {
+                    a.stage
+                },
+                claimed: a.claimed,
+                closed: a.closed,
+            }
+        })
+        .collect();
+    ItemInfo {
+        id: row.task.id,
+        key: row.key,
+        workspace: row.task.workspace,
+        title: row.task.goal,
+        state: row.state.as_str().to_string(),
+        outcome: row.task.outcome,
+        steps_done: row.steps_done,
+        steps_total: row.steps_total,
+        agents,
+        updated_at: row.updated_at,
+        closed_at: row.task.closed_at,
+    }
 }
 
 /// A task as a row in the agents listing: enough to say what the terminal is working on.
@@ -790,10 +980,12 @@ pub enum ControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<String>,
     },
-    /// A `TaskWrite` landed on `task`.
+    /// A `TaskWrite` landed on `task`; `key` is an item's, when one was added or started.
     TaskWritten {
         id: String,
         task: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// What a `TaskRead` asked for, kept under one frame: `more` says the list or the events
     /// were cut there, and older events come with `before`. `space` is the asking terminal's
@@ -807,6 +999,13 @@ pub enum ControlResponse {
         more: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<String>,
+        /// The board, when it was asked for. `None` from a daemon from before the board,
+        /// which a client shows as too old rather than as an empty board.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items: Option<Vec<ItemInfo>>,
+        /// The card of the item `task` named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<Box<ItemCardInfo>>,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -1447,6 +1646,25 @@ pub fn raw_request_id(body: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// One chain names a local agent in every reader: the agent title, the stored name, the
+    /// tab's name, the head of the conversation id, then its terminal.
+    #[test]
+    fn an_agent_is_named_by_one_chain() {
+        let some = |s: &str| Some(s.to_string());
+        let id = Some("0123456789abcdef");
+        assert_eq!(
+            agent_name(3, some("title"), some("stored"), some("tab"), id),
+            "title"
+        );
+        assert_eq!(
+            agent_name(3, None, some("stored"), some("tab"), id),
+            "stored"
+        );
+        assert_eq!(agent_name(3, None, None, some("tab"), id), "tab");
+        assert_eq!(agent_name(3, None, None, None, id), "01234567");
+        assert_eq!(agent_name(3, None, None, None, None), "terminal 3");
+    }
+
     fn leaf(terminal: u32) -> Pane {
         Pane::Leaf { terminal }
     }
@@ -2040,6 +2258,10 @@ pub enum EventMessage {
     /// decodes leniently by design), which degrades to the old behaviour of waiting
     /// for the next change rather than breaking the connection.
     Resync,
+    /// A task, a board item or a space goal changed: a board reads them again. Sent only
+    /// when a write changed something. An older client drops it, the event lane being
+    /// lenient.
+    TasksChanged,
 }
 
 #[cfg(test)]

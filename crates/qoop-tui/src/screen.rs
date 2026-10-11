@@ -145,8 +145,9 @@ pub struct Chrome<'a> {
     pub drag: Option<&'a DragPaint>,
     /// The keyboard's hold on the column: its filter and the row it stands on.
     pub nav: Option<&'a sidebar::Nav>,
-    /// The pane is qass's screen: a header over qass's terminal in a box. Set only while
-    /// the focused tab is qass's agent, by the one place that knows (`State::on_qass_screen`).
+    /// The pane is qass's screen: a header over qass's terminal in a box, or over qass's
+    /// split tab (the board above qass). Set only while one of those has the keyboard, by the
+    /// one place that knows (`State::qass_header`).
     pub qass: Option<crate::qass_screen::Ui>,
 }
 
@@ -473,6 +474,10 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
         0,
         frame.sidebar_width,
     );
+    // qass's split tab: the header over its panes, which draw their own edges.
+    if frame.tiles.len() >= 2 {
+        return crate::qass_screen::Plan::band(cols as usize, rows as usize);
+    }
     crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed)
 }
 
@@ -1134,6 +1139,13 @@ pub fn paint(frame: &Frame) -> String {
                 selected,
             ));
         } else {
+            // qass's header over its split: the rows above the panes.
+            if let Some((plan, screen)) = &qass
+                && pane_row < plan.header.rows()
+            {
+                out.push_str(&screen.row(pane_row, |_| String::new()));
+                continue;
+            }
             paint_tiled_row(frame, &edges, pane_row, pane_cols as usize, left, &mut out);
         }
     }

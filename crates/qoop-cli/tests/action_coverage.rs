@@ -451,10 +451,40 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "put an item on a space's board",
+            method: || {
+                Method::Control(ControlRequest::TaskWrite {
+                    id: "a".into(),
+                    terminal: None,
+                    token: None,
+                    task: None,
+                    action: qoop_runtime::control::TaskOp::Add {
+                        workspace: 1,
+                        goal: "g".into(),
+                        description: None,
+                    },
+                })
+            },
+        },
+        Action {
+            name: "show the board",
+            method: || {
+                Method::Control(ControlRequest::TaskRead {
+                    id: "a".into(),
+                    board: true,
+                    task: None,
+                    terminal: None,
+                    token: None,
+                    before: None,
+                })
+            },
+        },
+        Action {
             name: "show a task and what was recorded on it",
             method: || {
                 Method::Control(ControlRequest::TaskRead {
                     id: "a".into(),
+                    board: false,
                     task: Some(1),
                     terminal: None,
                     token: None,
@@ -677,6 +707,7 @@ fn every_control_method_is_reachable_from_some_action() {
         },
         ControlRequest::TaskRead {
             id: String::new(),
+            board: false,
             task: None,
             terminal: None,
             token: None,

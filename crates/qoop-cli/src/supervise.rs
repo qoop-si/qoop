@@ -303,8 +303,8 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
     events.iter().any(|event| match event {
         EventMessage::AgentChanged { terminal } => watched.contains(terminal),
         EventMessage::Resync => true,
-        // Which terminal an interface shows says nothing about any agent.
-        EventMessage::Focus { .. } => false,
+        // Which terminal an interface shows says nothing about any agent, nor does the board.
+        EventMessage::Focus { .. } | EventMessage::TasksChanged => false,
     })
 }
 
@@ -453,7 +453,7 @@ async fn follow(
             let events = link.next_events(None).await?.unwrap_or_default();
             if events
                 .iter()
-                .any(|e| !matches!(e, EventMessage::Focus { .. }))
+                .any(|e| !matches!(e, EventMessage::Focus { .. } | EventMessage::TasksChanged))
             {
                 break;
             }
@@ -1088,7 +1088,7 @@ pub(crate) fn parse_new_args(args: &[String]) -> Result<NewOpts, String> {
 
 /// A space by id, or by a name only one space has. Never made: `sleep` and `wake` act on
 /// what exists, and a name two spaces share is refused rather than guessed.
-fn resolve_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Result<i64> {
+pub(crate) fn resolve_space(spaces: &[WorkspaceRow], wanted: &str) -> std::io::Result<i64> {
     if let Some(space) = wanted
         .parse::<i64>()
         .ok()

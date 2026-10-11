@@ -1,5 +1,5 @@
-//! `qoop task board`: every space with the owner's goal for it, and the open tasks in it, as
-//! Markdown a person or qass can read.
+//! `qoop task board`: the board's items, then every space with the owner's goal for it and
+//! the open tasks in it, as Markdown a person or qass can read; `--json`, the items alone.
 //!
 //! Read from the record itself, as `qoop ls` is: no frame to fit in, no events cut, nothing
 //! held open on the daemon. Only the agents' live names come from the daemon, through an
@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::qass_page::ago;
 
-use qoop_runtime::control::{ControlRequest, ControlResponse};
+use qoop_runtime::control::{ControlRequest, ControlResponse, ItemInfo, agent_name, item_info};
 use qoop_runtime::{client, paths};
 use qoop_store::task::one_line;
 use qoop_store::{Store, TaskRow};
@@ -49,6 +49,7 @@ struct Open {
 struct Board {
     asof: String,
     now: i64,
+    items: Vec<ItemInfo>,
     spaces: Vec<Space>,
     closed: Vec<Closed>,
 }
@@ -116,37 +117,47 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
         .into_iter()
         .collect();
     let mut tasks = store.open_tasks().map_err(std::io::Error::other)?;
+    let workspaces = store.workspaces().map_err(std::io::Error::other)?;
+    let mut rows = HashMap::new();
+    for w in &workspaces {
+        for t in store.open_terminals(w.id).map_err(std::io::Error::other)? {
+            rows.insert(t.id, t);
+        }
+    }
+    // The name every reader gives an open terminal's agent (`agent_name`); a closed agent on
+    // an item keeps the name it was linked under (`item_info`), any other its number.
+    let name_of = |terminal: i64| {
+        let row = rows.get(&terminal)?;
+        let session = row.agent_session.as_deref();
+        Some(agent_name(
+            terminal,
+            live.get(&terminal).cloned(),
+            session.and_then(|s| stored.get(s).cloned()),
+            row.title.clone(),
+            session,
+        ))
+    };
+    let items = store
+        .items(now)
+        .map_err(std::io::Error::other)?
+        .into_iter()
+        .map(|row| item_info(row, name_of))
+        .collect();
     let mut spaces = Vec::new();
     let mut names = HashMap::new();
-    for w in store.workspaces().map_err(std::io::Error::other)? {
+    for w in workspaces {
         names.insert(w.id, w.name.clone());
         if w.name == QASS_SPACE {
             continue;
         }
-        let terminals = store.open_terminals(w.id).map_err(std::io::Error::other)?;
         let mine: Vec<TaskRow>;
         (mine, tasks) = tasks.into_iter().partition(|t| t.workspace == Some(w.id));
         let mut open = Vec::new();
         for task in mine {
-            let row = terminals.iter().find(|t| Some(t.id) == task.terminal);
-            // The name the sidebar shows: the agent's title, its stored one, its
-            // conversation's first characters, the tab's name, its number.
-            let name = task
-                .terminal
-                .and_then(|t| live.get(&t).cloned())
-                .or_else(|| {
-                    row.and_then(|r| r.agent_session.as_ref())
-                        .and_then(|s| stored.get(s).cloned())
-                })
-                .or_else(|| {
-                    row.and_then(|r| r.agent_session.as_ref())
-                        .map(|s| s.chars().take(8).collect())
-                })
-                .or_else(|| row.and_then(|r| r.title.clone()))
-                .unwrap_or_else(|| {
-                    task.terminal
-                        .map_or("no terminal".to_string(), |t| format!("terminal {t}"))
-                });
+            let name = task.terminal.and_then(name_of).unwrap_or_else(|| {
+                task.terminal
+                    .map_or("no terminal".to_string(), |t| format!("terminal {t}"))
+            });
             let newest = |kind: &str, n: usize| {
                 store
                     .task_events_of(task.id, kind, n)
@@ -203,6 +214,7 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
     Ok(Board {
         asof: local_now(),
         now,
+        items,
         spaces,
         closed,
     })
@@ -216,7 +228,37 @@ fn cell(text: &str) -> String {
 }
 
 fn index(b: &Board) -> String {
-    let mut out = format!("# Board\n\nAs of {}. {HEADER}\n\n", b.asof);
+    let mut out = format!("# Board\n\nAs of {}. {HEADER}\n\n## Items\n\n", b.asof);
+    if b.items.is_empty() {
+        out.push_str("None. `qoop task add --space <space> <title>` adds one.\n");
+    } else {
+        out.push_str("| Key | Title | State | Steps | Assignees |\n|---|---|---|---|---|\n");
+        for i in &b.items {
+            let who: Vec<String> = i
+                .agents
+                .iter()
+                .filter(|a| !a.closed)
+                .map(|a| format!("{} ({}, {})", a.name, a.machine, a.stage))
+                .collect();
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {}/{} | {} |",
+                i.key,
+                cell(&i.title),
+                i.outcome
+                    .as_deref()
+                    .map_or(i.state.clone(), |o| format!("{}, {o}", i.state)),
+                i.steps_done,
+                i.steps_total,
+                if who.is_empty() {
+                    "none".to_string()
+                } else {
+                    cell(&who.join(", "))
+                }
+            );
+        }
+    }
+    out.push_str("\n## Spaces\n\n");
     if b.spaces.is_empty() {
         out.push_str("No spaces.\n");
     } else {
@@ -352,14 +394,25 @@ fn write_dir(b: &Board, dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `qoop task board [--dir DIR]`.
-pub(crate) fn run(dir: Option<&Path>) -> std::io::Result<()> {
+/// `qoop task board [--json] [--dir DIR]`.
+pub(crate) fn run(dir: Option<&Path>, json: bool) -> std::io::Result<()> {
     let runtime = paths::runtime_dir().map_err(std::io::Error::other)?;
     let Some(store) = crate::existing_store(&runtime)? else {
-        println!("no spaces yet. `qoop` starts one.");
+        if json {
+            println!("[]");
+        } else {
+            println!("no spaces yet. `qoop` starts one.");
+        }
         return Ok(());
     };
     let board = read(&store, &live_titles())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&board.items).map_err(std::io::Error::other)?
+        );
+        return Ok(());
+    }
     match dir {
         Some(dir) => write_dir(&board, dir),
         None => {

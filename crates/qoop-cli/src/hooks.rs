@@ -941,8 +941,9 @@ fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io
 
 /// The Claude permissions that let an agent run `qoop task` without asking each time: the
 /// rules its hook gives it ask for several per task. Every subcommand an agent uses on its
-/// own task, and not `close`, which ends somebody's task and stays a question.
-const ALLOW: [&str; 8] = [
+/// own task and on the board item it works on, and not `close`, `add` or `start`, which end
+/// somebody's task or put new work on the board and stay a question.
+const ALLOW: [&str; 13] = [
     "Bash(qoop task new:*)",
     "Bash(qoop task stage:*)",
     "Bash(qoop task plan:*)",
@@ -951,6 +952,11 @@ const ALLOW: [&str; 8] = [
     "Bash(qoop task show:*)",
     "Bash(qoop task ls:*)",
     "Bash(qoop task rules:*)",
+    "Bash(qoop task goal:*)",
+    "Bash(qoop task link:*)",
+    "Bash(qoop task check:*)",
+    "Bash(qoop task steps:*)",
+    "Bash(qoop task describe:*)",
 ];
 
 /// Rules the person may already have that cover all of `ALLOW`.
@@ -2359,8 +2365,10 @@ mod tests {
         assert_eq!(allow(&config), serde_json::json!(ALLOW));
         assert!(marker.exists());
         assert!(
-            !ALLOW.iter().any(|r| r.contains("close")),
-            "ending a task is never pre-approved"
+            !ALLOW
+                .iter()
+                .any(|r| ["close", " add", " start"].iter().any(|w| r.contains(w))),
+            "ending a task, or adding or starting work, is never pre-approved"
         );
         assert!(!edit(&config, &target("claude"), &script, false).expect("again"));
         assert!(remove(&config, &script, false, true).expect("remove"));

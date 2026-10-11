@@ -100,6 +100,18 @@ pub enum TaskError {
     },
     #[error("{0} is empty")]
     Empty(&'static str),
+    #[error("#{0} is not a board item")]
+    NotAnItem(i64),
+    #[error("#{0} is a board item itself; an agent's task is what links to one")]
+    ItemAsAgent(i64),
+    #[error("this task is not on the board: qoop task link <KEY> puts it there")]
+    NotOnBoard,
+    #[error("no step {0}; the item has {1}")]
+    NoStep(i64, usize),
+    #[error("{len} steps, over the {max} limit; merge some")]
+    TooManySteps { len: usize, max: usize },
+    #[error("#{0}'s space was removed; add it again in a space that is there")]
+    SpaceGone(i64),
 }
 
 /// One line, no control characters: a goal is shown in lists and injected into agents.
@@ -123,7 +135,7 @@ fn invisible(c: char) -> bool {
 
 /// Lines and tabs kept, every other control character dropped: the text is shown in other
 /// terminals (qass reads it), where an escape sequence would draw instead of read.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.trim()
         .chars()
         .filter(|c| (!c.is_control() || *c == '\n' || *c == '\t') && !invisible(*c))
@@ -149,10 +161,10 @@ pub(crate) fn within(what: &'static str, text: &str, max: usize) -> Result<(), S
     Ok(())
 }
 
-const COLUMNS: &str =
+pub(crate) const COLUMNS: &str =
     "id, workspace, terminal, goal, stage, opened_at, updated_at, claimed_at, closed_at, outcome";
 
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
+pub(crate) fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
         id: r.get(0)?,
         workspace: r.get(1)?,
@@ -167,7 +179,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     })
 }
 
-fn event(tx: &Connection, task: i64, kind: &str, body: &str, now: i64) -> rusqlite::Result<()> {
+pub(crate) fn event(
+    tx: &Connection,
+    task: i64,
+    kind: &str,
+    body: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO task_event (task, at, kind, body) VALUES (?1, ?2, ?3, ?4)",
         params![task, now, kind, body],
@@ -175,7 +193,7 @@ fn event(tx: &Connection, task: i64, kind: &str, body: &str, now: i64) -> rusqli
     Ok(())
 }
 
-fn close(
+pub(crate) fn close(
     tx: &Connection,
     task: i64,
     outcome: Outcome,
@@ -217,16 +235,27 @@ pub(crate) fn abandon_open_tasks(
     Ok(())
 }
 
+/// A task row by id.
+pub(crate) fn row_of(tx: &Connection, task: i64) -> rusqlite::Result<TaskRow> {
+    tx.query_row(
+        &format!("SELECT {COLUMNS} FROM task WHERE id = ?1"),
+        params![task],
+        row,
+    )
+}
+
+/// Say a task changed now.
+pub(crate) fn touch(tx: &Connection, task: i64, now: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE task SET updated_at = ?2 WHERE id = ?1",
+        params![task, now],
+    )?;
+    Ok(())
+}
+
 /// The open task row, or why it cannot be written to.
-fn open_row(tx: &Connection, task: i64) -> Result<TaskRow, StoreError> {
-    let found = tx
-        .query_row(
-            &format!("SELECT {COLUMNS} FROM task WHERE id = ?1"),
-            params![task],
-            row,
-        )
-        .optional()?;
-    match found {
+pub(crate) fn open_row(tx: &Connection, task: i64) -> Result<TaskRow, StoreError> {
+    match row_of(tx, task).optional()? {
         None => Err(TaskError::NoTask(task).into()),
         Some(t) if t.closed_at.is_some() => Err(TaskError::Closed(task).into()),
         Some(t) => Ok(t),
@@ -269,11 +298,13 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let mut replaced = None;
         if let Some((old, old_goal)) = open {
             if !replace {
                 return Err(TaskError::AlreadyOpen(terminal, old, old_goal).into());
             }
             close(&tx, old, Outcome::Superseded, "", now)?;
+            replaced = Some(old);
         }
         tx.execute(
             "INSERT INTO task (workspace, terminal, goal, stage, opened_at, updated_at) \
@@ -282,6 +313,9 @@ impl Store {
         )?;
         let id = tx.last_insert_rowid();
         event(&tx, id, "opened", &goal, now)?;
+        if let Some(old) = replaced {
+            crate::item::carry_link(&tx, old, id, now)?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -298,6 +332,24 @@ impl Store {
         asked_at: Option<i64>,
         now: i64,
     ) -> Result<(i64, bool), StoreError> {
+        self.begin(
+            terminal,
+            goal,
+            asked_at,
+            "qoop when the agent changed files",
+            now,
+        )
+    }
+
+    /// [`Store::begin_task`], its `opened` event saying who opened it (`by`).
+    pub(crate) fn begin(
+        &self,
+        terminal: i64,
+        goal: &str,
+        asked_at: Option<i64>,
+        by: &str,
+        now: i64,
+    ) -> Result<(i64, bool), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let open: Option<(i64, Option<i64>)> = tx
             .query_row(
@@ -306,7 +358,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        match (open, asked_at) {
+        let replaced = match (open, asked_at) {
             (Some((id, Some(claimed))), Some(asked)) if asked > claimed => {
                 close(
                     &tx,
@@ -315,10 +367,11 @@ impl Store {
                     "a new request after its done claim",
                     now,
                 )?;
+                Some(id)
             }
             (Some((id, _)), _) => return Ok((id, false)),
-            (None, _) => {}
-        }
+            (None, _) => None,
+        };
         let workspace: Option<i64> = tx
             .query_row(
                 "SELECT workspace FROM terminal WHERE id = ?1 AND closed_at IS NULL",
@@ -339,13 +392,12 @@ impl Store {
             params![workspace, terminal, goal, STAGES[0], now],
         )?;
         let id = tx.last_insert_rowid();
-        event(
-            &tx,
-            id,
-            "opened",
-            &format!("opened by qoop when the agent changed files: {goal}"),
-            now,
-        )?;
+        event(&tx, id, "opened", &format!("opened by {by}: {goal}"), now)?;
+        // Here and not in `close`, which abandon shares: only a task that has a successor
+        // hands its place on the board to it.
+        if let Some(old) = replaced {
+            crate::item::carry_link(&tx, old, id, now)?;
+        }
         tx.commit()?;
         Ok((id, true))
     }
@@ -413,10 +465,7 @@ impl Store {
         within(what, &text, max)?;
         let tx = self.conn.unchecked_transaction()?;
         open_row(&tx, task)?;
-        tx.execute(
-            "UPDATE task SET updated_at = ?2 WHERE id = ?1",
-            params![task, now],
-        )?;
+        touch(&tx, task, now)?;
         event(&tx, task, kind, &text, now)?;
         tx.commit()?;
         Ok(())
@@ -457,14 +506,7 @@ impl Store {
     }
 
     pub fn task(&self, id: i64) -> Result<Option<TaskRow>, StoreError> {
-        Ok(self
-            .conn
-            .query_row(
-                &format!("SELECT {COLUMNS} FROM task WHERE id = ?1"),
-                params![id],
-                row,
-            )
-            .optional()?)
+        Ok(row_of(&self.conn, id).optional()?)
     }
 
     /// The open task of a terminal, if it has one.
@@ -479,10 +521,12 @@ impl Store {
             .optional()?)
     }
 
-    /// Every open task, oldest first.
+    /// Every open task, oldest first. Board items are not tasks anyone works in: they are
+    /// read with `items`.
     pub fn open_tasks(&self) -> Result<Vec<TaskRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM task WHERE closed_at IS NULL ORDER BY id"
+            "SELECT {COLUMNS} FROM task WHERE closed_at IS NULL \
+             AND id NOT IN (SELECT task FROM board_item) ORDER BY id"
         ))?;
         let rows = stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -490,10 +534,11 @@ impl Store {
 
     /// Tasks checked and closed (verified or failed) at or after `since`, newest first, at
     /// most `limit`. Superseded and abandoned ones ended without a check, so they are not
-    /// news.
+    /// news; a board item closed is shown as a Done item, not here.
     pub fn closed_tasks_since(&self, since: i64, limit: usize) -> Result<Vec<TaskRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM task WHERE closed_at >= ?1 AND outcome IN ('verified', 'failed') \
+             AND id NOT IN (SELECT task FROM board_item) \
              ORDER BY closed_at DESC, id DESC LIMIT ?2"
         ))?;
         let rows = stmt

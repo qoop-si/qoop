@@ -193,6 +193,9 @@ pub struct AgentRegistry {
     /// nobody, so an index showed a command that had already finished. A registry that
     /// announces its own changes cannot have a path that forgets to.
     changes: tokio::sync::broadcast::Sender<u32>,
+    /// Tasks, board items or a space goal changed: a board reads them again. Its own
+    /// channel, because it is not about any terminal's row.
+    tasks: tokio::sync::broadcast::Sender<()>,
     /// Which terminal a watched pid belongs to.
     by_pid: Mutex<HashMap<i32, u32>>,
     terminals: Mutex<BTreeMap<u32, TerminalAgent>>,
@@ -235,6 +238,17 @@ impl AgentRegistry {
     /// Watch for terminals whose agent has moved.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<u32> {
         self.changes.subscribe()
+    }
+
+    /// Watch for changes to tasks, board items and space goals.
+    pub fn subscribe_tasks(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.tasks.subscribe()
+    }
+
+    /// Say that a write changed tasks, the board or a space goal. Only on a real change: an
+    /// older phone reloads its whole agent list on any event.
+    pub fn tasks_changed(&self) {
+        let _ = self.tasks.send(());
     }
 
     /// Say that a terminal's agent is not what it was.
@@ -376,6 +390,7 @@ impl AgentRegistry {
             expectations: Mutex::new(BTreeMap::new()),
             shield_at_unix: Mutex::new(BTreeMap::new()),
             changes: tokio::sync::broadcast::channel(64).0,
+            tasks: tokio::sync::broadcast::channel(16).0,
         })
     }
 
@@ -1152,7 +1167,9 @@ impl AgentRegistry {
     /// the shield.
     pub fn push_focus_event(&self, stream: u32, event: crate::control::FocusEvent) {
         self.note_shield(stream, event.at_unix);
-        if event.kind == "user" && !event.label.is_empty() {
+        // A harness message in the prompt's place (a task notification, pasted content, a
+        // command's output) is not what the person asked: never a goal.
+        if event.kind == "user" && !event.label.is_empty() && !harness_text(&event.label) {
             self.prompts
                 .lock()
                 .unwrap()
@@ -1205,6 +1222,22 @@ impl AgentRegistry {
             .map(|log| log.iter().cloned().collect())
             .unwrap_or_default()
     }
+}
+
+/// Whether a prompt head is an agent harness's own message: it opens with a tag whose name
+/// is lower case with a dash or an underscore (`<task-notification>`, `<agent-message from=..>`,
+/// `<pasted_content id=..>`, `<command-name>`). A request that only starts with `<`, such as
+/// "`<Header>` overlaps the nav", is the person's and is kept.
+fn harness_text(label: &str) -> bool {
+    let Some(rest) = label.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_lowercase() || *c == '-' || *c == '_')
+        .collect();
+    let after = rest[name.len()..].chars().next();
+    name.contains(['-', '_']) && matches!(after, Some('>' | ' '))
 }
 
 fn identity_of(pid: Pid, generation: GenerationId) -> AgentIdentity {
@@ -2339,6 +2372,36 @@ mod tests {
         );
         assert!(r.shield_fresh(1, NOW + 10, 1800));
         assert!(!r.shield_fresh(2, NOW + 10, 1800), "never cross-terminal");
+    }
+
+    /// A prompt head starting with `<` is a harness message, never a goal: the request
+    /// before it stays the one a begin names its task after.
+    #[test]
+    fn a_harness_message_is_not_kept_as_the_prompt() {
+        let r = registry();
+        let user = |label: &str, at_unix| crate::control::FocusEvent {
+            kind: "user".into(),
+            label: label.into(),
+            at_unix,
+        };
+        r.push_focus_event(1, user("make greet shout", NOW));
+        r.push_focus_event(1, user("<task-notification> agent finished", NOW + 1));
+        r.push_focus_event(1, user("  <command-name>/clear", NOW + 2));
+        assert_eq!(r.last_prompt(1), Some(("make greet shout".into(), NOW)));
+        r.push_focus_event(
+            1,
+            user("<pasted_content id=\"3386\"> the owner said", NOW + 3),
+        );
+        r.push_focus_event(1, user("<agent-message from=\"a97\"> report", NOW + 4));
+        assert_eq!(r.last_prompt(1), Some(("make greet shout".into(), NOW)));
+        r.push_focus_event(2, user("<system-reminder>", NOW));
+        assert_eq!(r.last_prompt(2), None);
+        r.push_focus_event(3, user("<Header> overlaps the nav", NOW));
+        assert_eq!(
+            r.last_prompt(3),
+            Some(("<Header> overlaps the nav".into(), NOW)),
+            "a request that only starts with < is the person's"
+        );
     }
 
     /// An explicit close is marked once and taken once: a repeat close does not

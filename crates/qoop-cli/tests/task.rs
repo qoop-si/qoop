@@ -620,3 +620,316 @@ $Q task goal > empty.out 2>&1; echo $? > empty.rc"#,
     let (_, ls, _) = daemon.run(&["task", "ls"]);
     assert_eq!(ls.lines().count(), 1, "qass opened nothing: {ls}");
 }
+
+/// Count the board's news this daemon sends, on a connection of its own, as a phone would.
+fn watch_tasks(dir: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use qoop_runtime::client::{Connection, Incoming};
+    use qoop_runtime::control::EventMessage;
+    use tokio::io::AsyncReadExt;
+    let heard = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let socket = qoop_testkit::socket_in(dir);
+    let (counter, connected) = (heard.clone(), ready.clone());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let Ok((stream, mut inbuf)) =
+                qoop_runtime::client::connect_observer(&socket, "board-watch").await
+            else {
+                return;
+            };
+            connected.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (mut rd, _wr) = stream.into_split();
+            let mut connection = Connection::new();
+            let mut read = vec![0u8; 64 * 1024];
+            loop {
+                for incoming in connection.drain(&mut inbuf).unwrap_or_default() {
+                    if matches!(incoming, Incoming::Event(EventMessage::TasksChanged)) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                match rd.read(&mut read).await {
+                    Ok(n) if n > 0 => inbuf.extend_from_slice(&read[..n]),
+                    _ => return,
+                }
+            }
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the watcher never connected");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    heard
+}
+
+/// Wait until the count moves past `from`, and say whether it did.
+fn heard_after(heard: &std::sync::atomic::AtomicUsize, from: usize, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if heard.load(std::sync::atomic::Ordering::SeqCst) > from {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn board_items(daemon: &Daemon) -> Vec<serde_json::Value> {
+    let (ok, out, err) = daemon.run(&["task", "board", "--json"]);
+    assert!(ok, "board --json: {err}");
+    serde_json::from_str(&out).unwrap_or_else(|e| panic!("board --json: {e}: {out}"))
+}
+
+/// The board end to end: an item added from outside any terminal; a terminal links its own
+/// task to it, and its steps and ticks land on the item; the board shows it Doing with that
+/// terminal on it; it moves to Done and back, to Todo, and a drop takes it off. Every real
+/// change is announced to a watching client, and a write that changes nothing is not.
+#[test]
+fn a_board_item_is_worked_from_a_terminal_and_moved_from_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let heard = watch_tasks(dir.path());
+    let count = || heard.load(std::sync::atomic::Ordering::SeqCst);
+
+    let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "login", "works"]);
+    assert!(ok, "add: {err}");
+    let key = out
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(key.ends_with("-1"), "a key, numbered from 1: {out}");
+    assert!(
+        heard_after(&heard, 0, Duration::from_secs(5)),
+        "an add is heard"
+    );
+    let (ok, _, err) = daemon.run(&["task", "add", "--space", "nowhere", "x"]);
+    assert!(!ok && err.contains("no space"), "{err}");
+    let (ok, _, err) = daemon.run(&["task", "describe", "x"]);
+    assert!(!ok && err.contains("are not set"), "{err}");
+
+    let work = daemon.inside(
+        "1",
+        "item",
+        &format!(
+            r#"$Q task steps - > nolink.out 2>&1 <<STEPS
+read
+STEPS
+echo $? > nolink.rc
+$Q task link {key} > link.out 2>&1
+printf 'read the code\nfix it\nrun the tests\n' | $Q task steps - > steps.out 2>&1
+$Q task check 2 > check.out 2>&1
+$Q task check 9 > badcheck.out 2>&1; echo $? > badcheck.rc
+$Q task describe "the login form loses the session" > describe.out 2>&1
+$Q task stage waiting-human > stage.out 2>&1"#
+        ),
+    );
+    assert_eq!(read(&work, "nolink.rc").trim(), "1");
+    assert!(
+        read(&work, "nolink.out").contains("not on the board"),
+        "{}",
+        read(&work, "nolink.out")
+    );
+    assert!(
+        read(&work, "link.out").contains(&format!("is on {key}")),
+        "{}",
+        read(&work, "link.out")
+    );
+    for file in ["steps.out", "check.out", "describe.out", "stage.out"] {
+        assert_eq!(read(&work, file), "", "{file}: {}", read(&work, file));
+    }
+    assert!(
+        read(&work, "badcheck.out").contains("no step 9; the item has 3"),
+        "{}",
+        read(&work, "badcheck.out")
+    );
+
+    let items = board_items(&daemon);
+    assert_eq!(items.len(), 1, "{items:?}");
+    let item = &items[0];
+    assert_eq!(item["key"], key.as_str());
+    assert_eq!(item["title"], "login works");
+    assert_eq!(item["state"], "doing");
+    assert_eq!(
+        (item["steps_done"].clone(), item["steps_total"].clone()),
+        (1.into(), 3.into())
+    );
+    assert_eq!(item["agents"][0]["terminal"], 1);
+    assert_eq!(item["agents"][0]["machine"], "this Mac");
+    assert_eq!(item["agents"][0]["stage"], "waiting-human");
+    let id = item["id"].as_i64().unwrap();
+    let (_, out, _) = daemon.run(&["task", "board"]);
+    assert!(
+        out.contains(&format!("| {key} | login works | doing | 1/3 |")),
+        "items come first: {out}"
+    );
+    assert!(out.find("## Items") < out.find("## Spaces"), "{out}");
+
+    // The card, from the daemon: description, steps and the agent's work in its activity.
+    let (ok, out, err) = daemon.run(&["task", "show", &key, "--json"]);
+    assert!(ok, "show: {err}");
+    let card: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        card["item"]["description"],
+        "the login form loses the session"
+    );
+    assert_eq!(card["item"]["steps"][1]["text"], "fix it");
+    assert!(card["item"]["steps"][1]["done_at"].is_number());
+    let activity: Vec<&str> = card["item"]["activity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["body"].as_str().unwrap())
+        .collect();
+    assert!(activity.contains(&"waits on you"), "{activity:?}");
+    assert!(activity.contains(&"2. fix it"), "{activity:?}");
+    // The item is no task anyone works in.
+    let (_, ls, _) = daemon.run(&["task", "ls"]);
+    assert_eq!(ls.lines().count(), 1, "only the terminal's task: {ls}");
+
+    // A write that changes nothing is not news.
+    let before = count();
+    let (ok, _, err) = daemon.run(&["task", "reopen", &key]);
+    assert!(ok, "reopen an open item: {err}");
+    assert!(
+        !heard_after(&heard, before, Duration::from_millis(1500)),
+        "nothing changed, nothing sent"
+    );
+
+    // Done, then back: its agent is still on it, so Doing again, its steps kept.
+    let (ok, _, err) = daemon.run(&["task", "close", &key, "--verified", "checked"]);
+    assert!(ok, "close: {err}");
+    assert!(
+        heard_after(&heard, before, Duration::from_secs(5)),
+        "a close is heard"
+    );
+    assert_eq!(board_items(&daemon)[0]["state"], "done");
+    let (ok, _, err) = daemon.run(&["task", "reopen", &format!("#{id}")]);
+    assert!(ok, "reopen: {err}");
+    let items = board_items(&daemon);
+    assert_eq!(
+        (items[0]["state"].clone(), items[0]["steps_done"].clone()),
+        ("doing".into(), 1.into())
+    );
+
+    // Back to Todo: every agent off it.
+    let (ok, _, err) = daemon.run(&["task", "unlink", "--id", &key]);
+    assert!(ok, "unlink: {err}");
+    assert_eq!(board_items(&daemon)[0]["state"], "todo");
+    let (ok, out, err) = daemon.run(&["task", "start", &key]);
+    assert!(ok, "start: {err}");
+    assert!(out.contains("qass is not running"), "{out}");
+    assert_eq!(
+        board_items(&daemon)[0]["state"],
+        "doing",
+        "a start waits for an agent"
+    );
+
+    // Dropped: off the board.
+    let before = count();
+    let (ok, _, err) = daemon.run(&["task", "close", &key, "--dropped"]);
+    assert!(ok, "drop: {err}");
+    assert!(
+        heard_after(&heard, before, Duration::from_secs(5)),
+        "a drop is heard"
+    );
+    assert!(
+        board_items(&daemon).is_empty(),
+        "a dropped item is not shown"
+    );
+    let (ok, _, err) = daemon.run(&["task", "link", "--id", "1", &key]);
+    assert!(
+        !ok && err.contains("closed"),
+        "no link to a closed item: {err}"
+    );
+
+    // qass's own space has no board.
+    let (ok, _, err) = daemon.run(&["new", "--space", "qass"]);
+    assert!(ok, "{err}");
+    std::thread::sleep(Duration::from_millis(500));
+    let (ok, _, err) = daemon.run(&["task", "add", "--space", "qass", "notes"]);
+    assert!(!ok && err.contains("no board"), "{err}");
+}
+
+/// One agent, one name: the board read from the record and the card the daemon answers call a
+/// linked agent by its tab's name, and the card carries its events in its activity, in words.
+/// A start tells the key as stored, whatever its spelling. A drop is for items only, and a
+/// link from qass's space is refused out loud with nothing begun.
+#[test]
+fn a_board_agent_has_one_name_and_the_boards_refusals_say_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "named", "work"]);
+    assert!(ok, "add: {err}");
+    let key = out
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let (ok, out, err) = daemon.run(&["new", "--space", "1", "--name", "worker"]);
+    assert!(ok, "new: {err}");
+    let worker = out.trim().to_string();
+    std::thread::sleep(Duration::from_millis(500));
+    let work = daemon.inside(
+        &worker,
+        "worker",
+        &format!("$Q task link {key} > link.out 2>&1"),
+    );
+    assert!(
+        read(&work, "link.out").contains("is on"),
+        "{}",
+        read(&work, "link.out")
+    );
+    let items = board_items(&daemon);
+    assert_eq!(items[0]["agents"][0]["name"], "worker", "{items:?}");
+    let (_, markdown, _) = daemon.run(&["task", "board"]);
+    assert!(markdown.contains("worker (this Mac"), "{markdown}");
+    let (ok, out, err) = daemon.run(&["task", "show", &key, "--json"]);
+    assert!(ok, "show: {err}");
+    let card: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(card["item"]["agents"][0]["name"], "worker", "{card}");
+    assert_eq!(
+        card["events"],
+        serde_json::json!([]),
+        "an item's events are in its activity"
+    );
+
+    // A start says the key as stored, and the card says it in words.
+    let (ok, _, err) = daemon.run(&["task", "unlink", "--id", &key]);
+    assert!(ok, "unlink: {err}");
+    let (ok, out, err) = daemon.run(&["task", "start", &key.to_lowercase()]);
+    assert!(ok, "start: {err}");
+    assert!(out.starts_with(&format!("{key} started")), "{out}");
+    let (_, out, _) = daemon.run(&["task", "show", &key]);
+    assert!(out.contains("started by the owner"), "{out}");
+
+    // The worker's own task is no item: a drop is refused.
+    let (_, ls, _) = daemon.run(&["task", "ls", "--json"]);
+    let open: Vec<serde_json::Value> = serde_json::from_str(&ls).unwrap();
+    let task = open[0]["id"].as_i64().unwrap().to_string();
+    let (ok, _, err) = daemon.run(&["task", "close", &task, "--dropped"]);
+    assert!(!ok && err.contains("not a board item"), "{err}");
+
+    // qass's own space: a link there begins nothing and says so.
+    let (ok, out, err) = daemon.run(&["new", "--space", "qass"]);
+    assert!(ok, "{err}");
+    let qass = out.trim().to_string();
+    std::thread::sleep(Duration::from_millis(500));
+    let work = daemon.inside(
+        &qass,
+        "qass-link",
+        &format!("$Q task link {key} > link.out 2>&1; echo $? > link.rc"),
+    );
+    assert_eq!(read(&work, "link.rc").trim(), "1");
+    assert!(
+        read(&work, "link.out").contains("qass's own space keeps no task"),
+        "{}",
+        read(&work, "link.out")
+    );
+    let (_, ls, _) = daemon.run(&["task", "ls"]);
+    assert_eq!(ls.lines().count(), 1, "only the worker's task: {ls}");
+}
