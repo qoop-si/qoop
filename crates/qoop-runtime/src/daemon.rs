@@ -1182,7 +1182,8 @@ impl Daemon {
         // installed. A retry is seconds behind the answer it missed, so the window is about
         // forensics on a reap, not about the retry.
         let _ = store.prune_applied().await;
-        // Cards of a terminal that is gone end, and old ended ones go, once a start.
+        // Cards of a terminal that is gone are ended as its tab's end ends them, and old ended
+        // ones go, once a start.
         let _ = store.run(|s| s.tidy_asks(crate::store::now())).await;
         let agents = Arc::new(crate::agents::AgentRegistry::new()?);
         let scanner = Arc::new(ContainmentScanner::default());

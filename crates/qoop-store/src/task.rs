@@ -218,7 +218,7 @@ pub(crate) fn close(
         .optional()?
         .flatten();
     if let Some(terminal) = terminal {
-        crate::ask::close_drafts(tx, terminal, "its task ended", now)?;
+        crate::ask::close_drafts(tx, terminal, "its task ended", true, now)?;
     }
     tx.execute(
         "UPDATE task SET closed_at = ?2, updated_at = ?2, outcome = ?3, terminal = NULL \
@@ -439,7 +439,7 @@ impl Store {
         if stage != "waiting-human"
             && let Some(terminal) = t.terminal
         {
-            crate::ask::close_drafts(&tx, terminal, "no longer waits", now)?;
+            crate::ask::close_drafts(&tx, terminal, "no longer waits", false, now)?;
         }
         tx.commit()?;
         Ok(t.stage != stage || t.claimed_at.is_some())
@@ -481,7 +481,7 @@ impl Store {
             return Ok(None);
         }
         event(&tx, task, "stage", &back, now)?;
-        crate::ask::close_drafts(&tx, terminal, "answered in its tab", now)?;
+        crate::ask::close_drafts(&tx, terminal, "answered in its tab", false, now)?;
         tx.commit()?;
         Ok(Some(back))
     }
@@ -562,7 +562,7 @@ impl Store {
         )?;
         event(&tx, task, "done", &summary, now)?;
         if let Some(terminal) = t.terminal {
-            crate::ask::close_drafts(&tx, terminal, "its task is done", now)?;
+            crate::ask::close_drafts(&tx, terminal, "its task is done", false, now)?;
         }
         tx.commit()?;
         Ok(())

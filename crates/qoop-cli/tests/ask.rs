@@ -446,7 +446,7 @@ fn a_card_ends_when_the_owner_puts_it_away_or_its_worker_is_told_in_the_chat() {
 }
 
 #[test]
-fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_closes_its_card() {
+fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_leaves_its_card_to_qass() {
     let stack = Stack::start();
     let korea = stack.agent("work", "korea", Some("sess-korea"));
     let shell = stack.open("qass", "qassshell", &[]);
@@ -458,12 +458,19 @@ fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_closes_its_c
     // A number is never used twice.
     let said = add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
     assert!(said.contains("never used twice"), "{said}");
-    // Its terminal ends: the card ends with it.
+    // Its terminal ends: the card stays, untied from the tab and the agent, and his answer
+    // goes to qass.
     let (ok, _, err) = stack.run(&["close", &korea]);
     assert!(ok, "{err}");
-    assert!(stack.wait(|| stack.card_status("E2") == "closed"));
-    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
-    assert!(out.contains("agent closed"), "{out}");
+    assert!(stack.wait(|| {
+        stack
+            .run(&["ask", "ls", "--json"])
+            .1
+            .contains("its tab closed")
+    }));
+    assert_eq!(stack.card_status("E2"), "open");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
+    assert!(ok && out.contains("Passed"), "{out} {err}");
 }
 
 /// `escalate.sh` as the skill installs it, its data folder filled in.

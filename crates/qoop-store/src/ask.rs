@@ -5,15 +5,15 @@
 //! `body` this crate never looks into: the daemon and the clients own its shape.
 //!
 //! A card is tied to its agent by the agent's session id, not by the terminal alone: terminal
-//! ids are reused, so every path that ends a terminal closes its live cards in the same
-//! transaction (`close_for_terminals`, called from `task::abandon_open_tasks`).
+//! ids are reused, so every path that ends a terminal unties its live cards in the same
+//! transaction (`close_for_terminals`, called from `task::abandon_open_tasks`, and at start).
 //!
 //! Status words: `open` (waiting for him), `queued` (his answer is kept and will be typed as
 //! soon as its target takes input), `passed` (his words were typed to qass, which relays
 //! them), `answered` (his words went to the worker), `closed`. `closed_at` is when the card
 //! last changed status: when it was queued, passed, answered or closed.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Store, StoreError};
 
@@ -91,18 +91,29 @@ fn find(conn: &Connection, card: &str) -> rusqlite::Result<Option<AskRow>> {
     .optional()
 }
 
-/// Close every live card of these terminals, as its agent closed. Called inside the
-/// transaction that ends the terminals, so a reused terminal id never finds an old card.
+/// The note on a card whose tab ended while it was live.
+pub const TAB_CLOSED: &str = "its tab closed: qass gets the answer";
+
+/// End these terminals' cards. An open draft closes: its agent no longer waits; so does a
+/// passed card: his words already reached qass. An open card of qass's and a queued answer stay
+/// live with terminal and agent cleared, so a reused terminal id or agent label never matches
+/// them and his answer goes to qass. Called inside the transaction that ends the terminals, and
+/// at start for those that ended unseen.
 pub(crate) fn close_for_terminals(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     terminals: &[i64],
     now: i64,
 ) -> rusqlite::Result<()> {
     for terminal in terminals {
         tx.execute(
             "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?2 \
-             WHERE terminal = ?1 AND status IN ('open', 'queued', 'passed')",
+             WHERE terminal = ?1 AND ((card LIKE 'W%' AND status = 'open') OR status = 'passed')",
             params![terminal, now],
+        )?;
+        tx.execute(
+            "UPDATE ask SET terminal = NULL, agent = NULL, note = ?2 \
+             WHERE terminal = ?1 AND status IN ('open', 'queued')",
+            params![terminal, TAB_CLOSED],
         )?;
     }
     Ok(())
@@ -111,8 +122,8 @@ pub(crate) fn close_for_terminals(
 impl Store {
     /// Write a card. `body` is the card's JSON. An open card with the number is rewritten
     /// (qass fixing a typo), an identical one is left alone (a retry), an ended one is
-    /// refused. Every other live card of the same agent is closed as superseded, but only
-    /// when the card names an agent.
+    /// refused. Every other open card of the same agent is closed as superseded, but only
+    /// when the card names an agent: an answer he already gave is never dropped.
     pub fn add_ask(
         &self,
         card: &str,
@@ -127,6 +138,13 @@ impl Store {
             if old.status != "open" {
                 return Err(AskError::Ended(card.into(), old.status).into());
             }
+            // A card about nobody stays so: one whose tab closed is never tied to whoever has
+            // its terminal id now.
+            let (agent, terminal) = if old.agent.is_none() {
+                (None, None)
+            } else {
+                (agent, terminal)
+            };
             if old.body == body && old.agent.as_deref() == agent {
                 return Ok(Added::Same);
             }
@@ -141,7 +159,7 @@ impl Store {
         if let Some(agent) = agent {
             tx.execute(
                 "UPDATE ask SET status = 'closed', note = 'superseded', closed_at = ?2 \
-                 WHERE agent = ?1 AND status IN ('open', 'queued', 'passed')",
+                 WHERE agent = ?1 AND status = 'open'",
                 params![agent, now],
             )?;
         }
@@ -328,9 +346,21 @@ impl Store {
         )?)
     }
 
-    /// At daemon start: queued answers go back to `open`, cards of a terminal that is no
-    /// longer open end as `agent closed`, and ended cards past their keep are dropped.
+    /// At daemon start: cards of a terminal that is no longer open are ended as its tab's end
+    /// ends them (`close_for_terminals`), queued answers go back to `open`, and ended cards
+    /// past their keep are dropped.
     pub fn tidy_asks(&self, now: i64) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let gone: Vec<i64> = tx
+            .prepare(
+                "SELECT DISTINCT terminal FROM ask WHERE status IN ('open', 'queued', 'passed') \
+                 AND terminal IS NOT NULL AND terminal NOT IN \
+                 (SELECT id FROM terminal WHERE closed_at IS NULL)",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        close_for_terminals(&tx, &gone, now)?;
+        tx.commit()?;
         // An answer kept for delivery does not outlive the daemon that was to type it: it is
         // given back to him, with the reason, once the next start has checked its terminal.
         self.conn.execute(
@@ -338,12 +368,6 @@ impl Store {
              note = 'not delivered: qoop restarted', closed_at = NULL WHERE status = 'queued' \
              AND (terminal IS NULL OR terminal IN (SELECT id FROM terminal WHERE closed_at IS NULL))",
             [],
-        )?;
-        self.conn.execute(
-            "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?1 \
-             WHERE status IN ('open', 'queued', 'passed') AND terminal IS NOT NULL AND terminal NOT IN \
-             (SELECT id FROM terminal WHERE closed_at IS NULL)",
-            params![now],
         )?;
         self.conn.execute(
             "DELETE FROM ask WHERE status IN ('answered', 'closed') AND closed_at < ?1",
@@ -354,17 +378,20 @@ impl Store {
 }
 
 /// End a terminal's live drafts: its agent no longer waits on the owner (its stage moved, it
-/// took an answer, it claimed or ended its task). qass's own cards are left to qass.
+/// took an answer, it claimed or ended its task). qass's own cards are left to qass. With
+/// `keep_queued` an answer he already gave stays queued for delivery.
 pub(crate) fn close_drafts(
     tx: &Connection,
     terminal: i64,
     note: &str,
+    keep_queued: bool,
     now: i64,
 ) -> rusqlite::Result<usize> {
     tx.execute(
         "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
-         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'queued', 'passed')",
-        params![terminal, note, now],
+         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'queued', 'passed') \
+         AND NOT (?4 AND status = 'queued')",
+        params![terminal, note, now, keep_queued],
     )
 }
 
@@ -552,7 +579,7 @@ mod tests {
         // A close (the chat answered) ends a queued card, so it is never typed.
         assert!(s.close_ask("E2", "answered in chat", 32).unwrap());
         assert!(!s.deliver_ask("E2", "passed", "passed to qass", 33).unwrap());
-        // A queued card gives back with its reason; an exiting agent closes it.
+        // A queued card gives back with its reason; its agent exiting leaves it to qass.
         s.add_ask("E3", Some("T5"), Some(t), None, "{}", 40)
             .unwrap();
         s.claim_ask("E3", "queued", None, "go", "queued", 41)
@@ -566,7 +593,8 @@ mod tests {
         s.claim_ask("E3", "queued", None, "go", "queued", 42)
             .unwrap();
         s.close_terminal(t, 50).unwrap();
-        assert_eq!(s.ask("E3").unwrap().unwrap().status, "closed");
+        let e3 = s.ask("E3").unwrap().unwrap();
+        assert_eq!((e3.status.as_str(), e3.terminal), ("queued", None));
     }
 
     #[test]
@@ -594,34 +622,132 @@ mod tests {
         assert_eq!(s.ended_asks(5).unwrap().len(), 1);
     }
 
+    /// A waiting spell on terminal `t` with a draft for it, his answer queued when `queue`.
+    fn draft_on(s: &Store, t: i64, agent: &str, queue: bool, at: i64) -> String {
+        let task = s.open_task(t, "ship", true, at).unwrap();
+        s.set_task_stage(task, "waiting-human", at).unwrap();
+        let card = s
+            .add_draft(agent, t, Some("sess"), "{d}", at)
+            .unwrap()
+            .unwrap();
+        if queue {
+            s.claim_ask(&card, "queued", Some("a"), "a", "queued", at)
+                .unwrap();
+        }
+        card
+    }
+
+    fn untied(s: &Store, card: &str) -> (String, Option<i64>, Option<String>, Option<String>) {
+        let a = s.ask(card).unwrap().unwrap();
+        (a.status, a.terminal, a.agent, a.note)
+    }
+
+    /// A tab's end closes its open draft and a passed card; qass's open card and a queued answer
+    /// go on to qass, untied from the terminal and the agent; a remote card is not touched.
     #[test]
-    fn ending_a_terminal_closes_its_live_cards_and_tidy_drops_old_ones() {
-        let (s, t) = store_with_terminal();
-        s.add_ask("E1", Some("T5"), Some(t), None, "{}", 10)
+    fn a_tabs_end_closes_its_open_draft_and_hands_the_rest_to_qass() {
+        let mut s = Store::in_memory().expect("open");
+        let ws = s.create_workspace("w", 1).unwrap();
+        let (t5, t6) = (
+            s.create_terminal(5, ws, "/tmp", "/bin/sh", 2).unwrap(),
+            s.create_terminal(6, ws, "/tmp", "/bin/sh", 2).unwrap(),
+        );
+        let w5 = draft_on(&s, t5, "T5", false, 10);
+        let w6 = draft_on(&s, t6, "T6", true, 11);
+        s.add_ask("E1", Some("T6"), Some(t6), None, "{}", 12)
             .unwrap();
-        s.add_ask("E2", Some("ubox/T2"), None, None, "{}", 11)
+        s.add_ask("E2", Some("ubox/T2"), None, None, "{}", 13)
             .unwrap();
-        assert!(s.close_terminal(t, 50).unwrap());
-        let e1 = s.ask("E1").unwrap().unwrap();
+        s.add_ask("E3", None, Some(t5), None, "{}", 14).unwrap();
+        s.claim_ask("E3", "passed", None, "go", "passed to qass", 15)
+            .unwrap();
         assert_eq!(
-            (e1.status.as_str(), e1.note.as_deref()),
+            s.ask(&w6).unwrap().unwrap().status,
+            "queued",
+            "never superseded"
+        );
+        assert!(s.close_terminal(t5, 50).unwrap());
+        assert!(s.close_terminal(t6, 50).unwrap());
+        let closed = s.ask(&w5).unwrap().unwrap();
+        assert_eq!(
+            (closed.status.as_str(), closed.note.as_deref()),
             ("closed", Some("agent closed"))
         );
         assert_eq!(
-            s.ask("E2").unwrap().unwrap().status,
-            "open",
+            s.ask("E3").unwrap().unwrap().status,
+            "closed",
+            "a passed card: his words already reached qass"
+        );
+        let tab = Some(TAB_CLOSED.to_string());
+        assert_eq!(untied(&s, "E1"), ("open".into(), None, None, tab.clone()));
+        assert_eq!(untied(&s, &w6), ("queued".into(), None, None, tab));
+        assert_eq!(
+            untied(&s, "E2"),
+            ("open".into(), None, Some("ubox/T2".into()), None),
             "a remote card stays"
         );
-        // A card whose terminal is not open is closed at start, and old ended ones go.
-        s.add_ask("E3", Some("T9"), Some(9), None, "{}", 60)
-            .unwrap();
-        s.tidy_asks(70).unwrap();
-        assert_eq!(s.ask("E3").unwrap().unwrap().status, "closed");
-        s.tidy_asks(50 + KEEP_SECS + 1).unwrap();
-        assert!(s.ask("E1").unwrap().is_none());
-        assert!(
-            s.ask("E2").unwrap().is_some(),
-            "a live card is never pruned"
+        // A restart gives the queued answer back to him, as any queued answer.
+        s.tidy_asks(60).unwrap();
+        let w6 = s.ask(&w6).unwrap().unwrap();
+        assert_eq!(
+            (w6.status.as_str(), w6.terminal, w6.note.as_deref()),
+            ("open", None, Some("not delivered: qoop restarted"))
         );
+        assert_eq!(s.ask("E1").unwrap().unwrap().status, "open");
+        // A rewrite that still names the old tab never ties the card to whoever has it now.
+        let t7 = s.create_terminal(7, ws, "/tmp", "/bin/sh", 61).unwrap();
+        s.add_ask("E1", Some("T7"), Some(t7), None, "{fixed}", 62)
+            .unwrap();
+        let e1 = s.ask("E1").unwrap().unwrap();
+        assert_eq!(
+            (e1.terminal, e1.agent, e1.body.as_str()),
+            (None, None, "{fixed}")
+        );
+        // Old ended cards go; a live one is never pruned.
+        s.tidy_asks(50 + KEEP_SECS + 1).unwrap();
+        assert!(s.ask(&w5).unwrap().is_none());
+        assert!(s.ask("E1").unwrap().is_some());
+    }
+
+    /// A terminal that ended while no daemon watched is ended the same way at start.
+    #[test]
+    fn a_tab_that_ended_unseen_is_ended_the_same_way_at_start() {
+        let (s, t) = store_with_terminal();
+        let open = draft_on(&s, t, "T5", false, 10);
+        s.add_ask("E1", Some("T9"), Some(9), None, "{}", 11)
+            .unwrap();
+        s.claim_ask("E1", "queued", None, "go", "queued", 12)
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE terminal SET closed_at = 20 WHERE id = ?1",
+                params![t],
+            )
+            .unwrap();
+        s.tidy_asks(30).unwrap();
+        assert_eq!(s.ask(&open).unwrap().unwrap().status, "closed");
+        // Untied first, so its queued answer is given back to him rather than closed.
+        assert_eq!(
+            untied(&s, "E1"),
+            (
+                "open".into(),
+                None,
+                None,
+                Some("not delivered: qoop restarted".into())
+            )
+        );
+    }
+
+    /// An answer he already gave outlives its task: closing the task leaves it queued for
+    /// delivery, while an open draft closes with it.
+    #[test]
+    fn an_answer_he_gave_outlives_its_task() {
+        let (s, t) = store_with_terminal();
+        let card = draft_on(&s, t, "T5", true, 10);
+        let task = s.open_task_of(t).unwrap().unwrap().id;
+        s.close_task(task, crate::Outcome::Verified, "ok", 20)
+            .unwrap();
+        let a = s.ask(&card).unwrap().unwrap();
+        assert_eq!((a.status.as_str(), a.terminal), ("queued", Some(t)));
     }
 }

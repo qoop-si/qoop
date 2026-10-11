@@ -144,7 +144,7 @@ impl Pane {
     }
 
     /// A card whose terminal has left the agent rows (and sleeps in no tab) is read again, once:
-    /// the daemon closed it with the terminal and sends no event for that.
+    /// the daemon closed or untied it with the terminal and sends no event for that.
     pub fn note_gone(&mut self, rows: &[AgentRow], spaces: &[WorkspaceRow]) {
         // Before the first index there is nobody to compare with.
         if !self.loaded || rows.is_empty() {
