@@ -27,6 +27,27 @@ or stop as usual. If a `qoop task` command fails, carry on with the work. On a b
 tick each step with `qoop task check <n>`. In shell, write rm targets as literal paths or \
 \"${VAR:?}\".";
 
+/// Said beside a request that has no task yet: the moment a vague one should be cleared up,
+/// before any work, in one go.
+const CLARIFY: &str = "If it is unclear, ask every question at once, each with options and your \
+pick, before you start.";
+
+/// The line said beside every request: the open task and what to record on it, or, with none,
+/// how real work gets one and that an unclear request is cleared up first.
+fn turn_line(open: Option<&TaskInfo>) -> String {
+    match open {
+        Some(t) => format!(
+            "qoop: this terminal's task #{} is open (stage {}). Record each check that proves it \
+             with `qoop task evidence`, and `qoop task done` when finished.",
+            t.id, t.stage
+        ),
+        None => format!(
+            "qoop: if this request is real work, qoop opens its task when you edit a file; give it \
+             a plan with `qoop task plan -` and record checks with `qoop task evidence`. {CLARIFY}"
+        ),
+    }
+}
+
 /// How long `rules` waits for the daemon. A hook waits on it at every session start and
 /// every request, and gives it 2 s before going quiet; a daemon answers in milliseconds.
 const RULES_PATIENCE: std::time::Duration = std::time::Duration::from_millis(800);
@@ -619,19 +640,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             // start of a session were read and then not followed. A line beside each request
             // is what an agent acts on.
             if has("--turn") {
-                match open {
-                    Some(t) => println!(
-                        "qoop: this terminal's task #{} is open (stage {}). Record each check \
-                         that proves it with `qoop task evidence`, and `qoop task done` when \
-                         finished.",
-                        t.id, t.stage
-                    ),
-                    None => println!(
-                        "qoop: if this request is real work, qoop opens its task when you edit \
-                         a file; give it a plan with `qoop task plan -` and record checks with \
-                         `qoop task evidence`."
-                    ),
-                }
+                println!("{}", turn_line(open));
                 return Ok(());
             }
             println!("{RULES}");
@@ -653,6 +662,30 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_request_is_cleared_up_before_work_in_one_go() {
+        assert!(turn_line(None).ends_with(CLARIFY));
+        assert!(CLARIFY.contains("every question at once"));
+        let task = TaskInfo {
+            id: 7,
+            workspace: None,
+            terminal: Some(3),
+            goal: "x".into(),
+            stage: "implementing".into(),
+            opened_at: 0,
+            updated_at: 0,
+            claimed_at: None,
+            closed_at: None,
+            outcome: None,
+        };
+        let open = turn_line(Some(&task));
+        assert!(open.contains("task #7 is open (stage implementing)"));
+        assert!(
+            !open.contains(CLARIFY),
+            "not repeated on every turn of a task"
+        );
+    }
 
     #[test]
     fn the_rules_stay_short() {

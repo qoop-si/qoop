@@ -1,6 +1,17 @@
 # The first brief to a worker you started
 
-Read this before `spawn.sh` and the first `qoop prompt` to the worker it starts.
+Read this before `qoop task add`, `spawn.sh` and the first `qoop prompt` to the worker it starts.
+
+## Before you create
+
+Check that his request says what, where (repo or space), when it is done, its fences (what not to
+touch) and how urgent; the tier is yours to pick (below), never a question. Missing one that changes
+the work: ask ONE card (the format under "Cards" in SKILL.md; agent `-`, its handle a word of his
+request): every missing point at once, options with reasons, your pick; never a second round,
+never a question the repo, the lessons, `policy` or the screen already answers.
+Nothing missing: create, do not ask. After his answer: the item with a real description, the steps
+he named and a `done when` line; the worker started with the brief below; one line to him saying
+where it lives (its key and space).
 
 ## Tier
 
@@ -25,7 +36,7 @@ One `qoop prompt` line, in this order:
 1. "First run `qoop task link <KEY>`" (or `qoop task new <goal>` for work on no item), "then follow
    `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task`
    command alone, one per call, never chained (a chain asks permission)."
-2. The goal in the owner's words and when it is done.
+2. The goal in the owner's words and when it is done (already cleared up with him: no second round).
 3. `tier: <tier>, because <why>`.
 4. Sub-agents (claude workers only), a few clauses: where the work fans out and on which tier
    (its subagent `model`: best `opus`, mid `sonnet`, low `haiku`), and that it uses them there and

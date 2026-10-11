@@ -745,6 +745,30 @@ mod tests {
         assert!(here.render(on).contains(written.to_str().expect("utf8")));
     }
 
+    #[test]
+    fn the_brief_clears_a_request_up_before_anything_is_made() {
+        let brief = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "brief.md")
+            .expect("brief.md")
+            .1;
+        assert!(brief.contains("## Before you create"));
+        assert!(brief.contains("ONE card"), "every question in one card");
+        assert!(
+            brief.contains("`done when` line"),
+            "an item says when it is done"
+        );
+        let skill = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "SKILL.md")
+            .expect("SKILL.md")
+            .1;
+        assert!(
+            skill.contains("\"Before you create\""),
+            "the board part points at it"
+        );
+    }
+
     fn qass_dirs(home: &tempfile::TempDir) -> QassDirs {
         QassDirs {
             data: home.path().join("data/qass"),

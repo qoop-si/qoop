@@ -370,8 +370,8 @@ and never on a remote.
 
 His work is a board in qoop (TUI, phone, web): items (`QOOP-12`) in Todo, Doing, Done, each with a
 title, description, steps (`3/7`) and its agents. You run it, and it is the truth:
-- He wants something: `qoop task add --space <space> '<his words>' [--description ...]`; steps
-  (`qoop task steps --id <n> -`) only from his words or the worker's plan.
+- He wants something: brief.md's "Before you create", then `qoop task add --space <space> '<his
+  words>' [--description ...]`; steps (`qoop task steps --id <n> -`) only from his or a plan's words
 - `start <KEY>` typed to you, or an item he moved to Doing: start it now where it belongs (its
   repo's space, an ssh remote when he named one), the brief's first line "First run `qoop task
   link <KEY>`"; a remote worker you link on each event: `qoop task link <KEY> --remote <r> --task
