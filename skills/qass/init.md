@@ -1,8 +1,8 @@
 # qass: the default workflow, `/qass init`, and verifying where it runs
 
-Read this file when a worker's repo has no `.qoop/workflow.md` (use the default below as its
-workflow), when the owner types `/qass init <repo path or agent name>`, and when a finished
-task's workflow has a "Verify where it runs" section for you to run.
+Read this when a worker's repo has no `.qoop/workflow.md` (the default below is its workflow),
+when the owner types `/qass init <repo path or agent name>`, and when a finished task's workflow
+has a "Verify where it runs" section for you to run.
 
 ## The default workflow
 
@@ -52,8 +52,9 @@ an agent on a remote: ask the owner for a local path. Then:
    in it: people without qoop read it.
 6. Save both drafts in `@QASS_DATA@/init-<repo name>.md` (the checkout folder's name, only
    letters, digits, `.`, `-` and `_`) and ask the owner, the way any question reaches him (A:
-   write both, B: write the workflow only, C: change something first), with the drafts' full
-   text after the question's first lines.
+   write both, B: write the workflow only, C: change something first): first what the drafts
+   say in at most 5 lines (how it is checked, how it ships, what agents may do alone), then
+   their full text.
 7. On his yes, write `.qoop/workflow.md` (and the patch) into the repo's working tree and leave
    them uncommitted; tell him which files changed, and that worktrees from `origin/main` get the
    workflow once he commits it (until then you read it from the main checkout). The saved draft
@@ -104,5 +105,6 @@ section: nothing to run.
    missing toolchain, is a card, never a fail. Run the check, keep its output and the terminal's last lines with keys,
    tokens and personal data cut out, then `qoop close <n>` and `rm -rf <s>`.
 5. Pass: the close note names what ran and what came back. Fail: a card, `now` (main is
-   broken), with the failing output trimmed the same way; his answer may be a new worker. A
+   broken), with the failing line of the output (a card value is one line), trimmed the same way;
+   his answer may be a new worker. A
    remote worker: a card, as for its other checks.

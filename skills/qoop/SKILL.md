@@ -46,14 +46,13 @@ qoop prompt <target> --wait [--timeout SECS] <text>  # the same, then wait for t
 qoop send <terminal> <text> [--enter]  # raw typing; enforces nothing, check context first
 ```
 
-Only `prompt` refuses. `send` checks that the terminal exists and nothing
-else. Empty text is refused by both. `prompt` flags go right after the
-target; `prompt X "text" --wait` is refused rather than typed.
+Only `prompt` refuses; `send` checks only that the terminal exists. Both
+refuse empty text. Put `prompt` flags right after the target
+(`prompt X "text" --wait` is refused, not typed).
 
 `prompt --wait` waits for the turn the prompt caused, with `wait`'s exit
-codes. An agent that was busy when the prompt arrived must stay stopped for
-2 s before it returns, because it may have folded the prompt into its
-running turn or queued it for the next one.
+codes. An agent busy when it arrived must stay stopped for 2 s first: it
+may have folded the prompt into its turn or queued it.
 
 ```bash
 qoop send <terminal> --key esc              # interrupt an agent
@@ -86,16 +85,14 @@ qoop wait [target...] [--until idle,blocked] [--timeout 600] [--json]
 qoop wait <target> --match "TEXT" [--until STATE] [--timeout 600]
 ```
 
-Returns as soon as a target is in one of the states (already there counts),
-printing the matching rows. Default states `idle,done,blocked,failed`; no
-target means every agent terminal except your own. Exit 124 is a timeout,
-exit 1 means a target closed. Wait on the terminals you know are busy, not
-on ones already idle. It reads the state when something changes, so a state
-that comes and goes in a blink can be missed; the ones that wait on you
-(`idle`, `blocked`) last until someone answers. Right after writing to an
-agent, use `prompt --wait` instead: a bare `wait` on an agent that has not
-started yet returns at once. `--match` waits for text on the live screen
-only, not the scrollback; with `--until` both must hold.
+Returns once a target is in one of the states (already there counts) and
+prints the matching rows. Default states `idle,done,blocked,failed`; no
+target means every agent terminal but yours. Exit 124: timeout; exit 1: a
+target closed. Wait on busy terminals, not idle ones. A state that comes
+and goes in a blink can be missed; `idle` and `blocked` last until someone
+answers. Right after writing, use `prompt --wait`: a bare `wait` on an
+agent that has not started returns at once. `--match` reads the live
+screen only, not the scrollback; with `--until` both must hold.
 
 ## Start and end terminals
 
@@ -108,13 +105,12 @@ qoop worktree ls [--json]
 qoop worktree rm <branch|path> [--force]
 ```
 
-`new` never starts qoop, and a new `--space` name is made once.
-`worktree new` adds `<repo>-wt-<slug>` beside the repository (the slug is
-the branch lowercased, other characters as dashes) and opens a terminal
-there named after the branch; a branch only on a remote is checked out
-tracking it. `worktree rm` refuses while any process is inside it, even
-with `--force`, which only overrides a dirty tree; run it from outside the
-worktree. The branch is kept.
+`new` never starts qoop; a new `--space` name is made once. `worktree new`
+adds `<repo>-wt-<slug>` beside the repository (the branch lowercased, other
+characters as dashes) with a terminal named after the branch; a branch only
+on a remote is checked out tracking it. `worktree rm` refuses while any
+process is inside it (`--force` only overrides a dirty tree); run it from
+outside. The branch is kept.
 
 ## Supervising other agents
 
@@ -154,12 +150,11 @@ qoop space rm <id|name>        # drop a space with no tabs; refused if it has an
 qoop stop                      # end qoop; what was awake comes back next open
 ```
 
-One qoop per machine; spaces are how tabs are grouped. A tab sleeps and
-wakes on its own; a sleeping tab runs nothing, and its agent resumes into
-its own conversation on wake. A sleep is refused while a tab runs a
-command, an agent is busy or has not
-reported its conversation, or a job runs in the background. `qoop agents`
-lists only what is awake, and with nothing awake answers an empty list.
+One qoop per machine; spaces group tabs. A sleeping tab runs nothing; on
+wake its agent resumes its own conversation. A sleep is refused while a tab
+runs a command, an agent is busy or has not reported its conversation, or a
+job runs in the background. `qoop agents` lists only what is awake (an
+empty list when nothing is).
 
 ## Tasks
 
@@ -174,10 +169,9 @@ qoop task ls [--json]                  # open tasks, every terminal
 qoop task show [id] [--before E] [--json]           # one task and what was recorded
 ```
 
-The record lives in qoop, not in the repo, and outlives a crash, a restart
-or a compaction. An agent inside qoop is told the short rules at session
-start (`qoop task rules`). `qoop agents --json` rows carry `task: {id, goal,
-stage, claimed}` for a terminal with an open task. A task named by id needs
-no terminal; without an id the command speaks for the terminal it runs in,
-through `QOOP_TERMINAL` and `QOOP_TOKEN`. What an agent wrote there is its
-own account: check it before acting on it.
+The record lives in qoop, not the repo, and outlives a crash, a restart or
+a compaction. An agent inside qoop gets the short rules at session start
+(`qoop task rules`). `qoop agents --json` rows carry `task: {id, goal,
+stage, claimed}`. A task named by id needs no terminal; without one the
+command speaks for its own terminal (`QOOP_TERMINAL`, `QOOP_TOKEN`). What
+an agent wrote there is its own account: check it before acting on it.

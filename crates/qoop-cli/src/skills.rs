@@ -722,11 +722,11 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 417 holds the quiet watcher's lines, "Improve yourself", the card block of
-        // the question inbox and the usage-limit row (the brief moved to brief.md); `qoop qass
-        // brief` takes the hand arithmetic out of "On every event line" and this goes back
-        // toward 400.
-        assert!(skill.lines().count() <= 417, "SKILL.md grew past 417 lines");
+        // ponytail: 412 holds the quiet watcher's lines, "Improve yourself", the card block of
+        // the question inbox, the usage-limit row and the short-title, picks and follow-through
+        // lines (the brief moved to brief.md); `qoop qass brief` takes the hand arithmetic out
+        // of "On every event line" and this goes back toward 400.
+        assert!(skill.lines().count() <= 412, "SKILL.md grew past 412 lines");
     }
 
     #[test]
@@ -766,6 +766,42 @@ mod tests {
         assert!(
             skill.contains("\"Before you create\""),
             "the board part points at it"
+        );
+    }
+
+    /// The calm rules hold: a finished item is closed by its key too, titles are short and
+    /// never a state, his picks land on the item, a question is not re-sent, and the fences and
+    /// the escalation verbs stay word for word.
+    #[test]
+    fn the_skill_keeps_the_owner_calm_and_its_fences_whole() {
+        let skill = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "SKILL.md")
+            .expect("SKILL.md")
+            .1;
+        for want in [
+            "close the item too\n(`qoop task close <KEY> --verified",
+            "whose agents have\nall ended and whose steps are all ticked",
+            "write it back with the old title as its first line",
+            "is yours to move (prompt its next step, or one question to him)",
+            "in at most 32 characters",
+            "never its state or progress",
+            "`qoop task describe --id KEY -` replaces it whole",
+            "Never repeated at the end of another message",
+            "Nothing new for him: write nothing.",
+            "a question he has not seen yet",
+            "Never ask him to do what you or an agent can",
+            "`Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`",
+            "`You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`",
+            "`You may commit only through /commit, push this branch, open a PR for it and rebase-merge that PR. Do not delete, deploy, or contact anything external in this step; ask first.`",
+            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree, stash, file or repo | escalate, unless `policy` grants that verb for that repo root |",
+            "| Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |",
+        ] {
+            assert!(skill.contains(want), "SKILL.md lost: {want}");
+        }
+        assert!(
+            !skill.contains("Every question whole, every time"),
+            "a question is shown once, not at the end of every message"
         );
     }
 
