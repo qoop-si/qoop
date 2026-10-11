@@ -250,15 +250,26 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 ))
             })?;
             let agent = (agent != "-").then(|| agent.to_string());
-            let result = written(send(
+            let options: Vec<String> = body
+                .options
+                .iter()
+                .map(|o| format!("  {}: {}", o.key.to_uppercase(), o.label))
+                .collect();
+            let sent = send(
                 AskOp::Add {
                     card: card.clone(),
                     agent,
                     body: Box::new(body),
                 },
                 true,
-            )?)?;
+            );
+            if matches!(&sent, Err(e) if e.get_ref().is_some_and(|i| i.is::<Unavailable>())) {
+                // Not stored, so the card is shown as it was written: qass still has it.
+                println!("{card}\n{}", options.join("\n"));
+            }
+            let result = written(sent?)?;
             println!("{card} {result:?}");
+            options.iter().for_each(|o| println!("{o}"));
             Ok(())
         }
         Some("close") => {

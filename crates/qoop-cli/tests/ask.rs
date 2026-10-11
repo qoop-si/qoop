@@ -431,3 +431,137 @@ fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_closes_its_c
     let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
     assert!(out.contains("agent closed"), "{out}");
 }
+
+/// `escalate.sh` as the skill installs it, its data folder filled in.
+fn escalate(stack: &Stack) -> PathBuf {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../skills/qass/escalate.sh"
+    ))
+    .expect("the skill's escalate.sh");
+    let data = stack.path("qass-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let path = stack.path("escalate.sh");
+    std::fs::write(
+        &path,
+        src.replace("@QASS_DATA@", &data.display().to_string()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The skill's own door, run as qass runs it: from a terminal in qass's space, the card as a
+/// heredoc. A scripted stand-in for qass, never a model.
+#[test]
+fn escalate_sh_keeps_a_block_card_and_done_ends_it_while_the_old_form_still_works() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let script = escalate(&stack);
+    let sh = script.display();
+    let card = stack.path("card.txt");
+
+    // A block card is kept, and the options are echoed as before.
+    let said = stack.inside(
+        &shell,
+        &format!("'{sh}' E1 {korea} later korea - < '{}'", card.display()),
+    );
+    assert!(
+        said.contains("E1 Added") && said.contains("  A: run now"),
+        "{said}"
+    );
+    assert!(
+        said.contains("noted E1"),
+        "a later card only says it is noted: {said}"
+    );
+    assert_eq!(stack.card_status("E1"), "open");
+
+    // A now card is stored before the ring (the ring is the 3 second hold of today).
+    let said = stack.inside(
+        &shell,
+        &format!("'{sh}' E2 - now other - < '{}'", card.display()),
+    );
+    assert!(
+        said.contains("E2 Added") && said.contains("escalated E2"),
+        "{said}"
+    );
+
+    // The old positional form is untouched: options echoed, nothing stored.
+    let said = stack.inside(
+        &shell,
+        &format!("'{sh}' E3 {korea} later korea 'A: yes' 'B: no'"),
+    );
+    assert!(
+        said.contains("  A: yes") && said.contains("noted E3"),
+        "{said}"
+    );
+    assert_eq!(stack.card_status("E3"), "");
+
+    // A forgotten heredoc under the `-` ends in a refusal, never a hang; without the `-` nothing is read.
+    let said = stack.inside(
+        &shell,
+        &format!("{{ '{sh}' E4 {korea} later korea - < /dev/null; echo rc=$?; }}"),
+    );
+    assert!(
+        said.contains("card was not stored")
+            && said.contains("doing is missing")
+            && said.contains("rc=2")
+            && !said.contains("noted E4"),
+        "{said}"
+    );
+    assert_eq!(stack.card_status("E4"), "");
+    let said = stack.inside(&shell, &format!("sleep 3 | '{sh}' E5 {korea} later korea"));
+    assert!(said.contains("noted E5"), "{said}");
+
+    let said = stack.inside(
+        &shell,
+        &format!("sleep 8 | '{sh}' E6 {korea} later korea -"),
+    );
+    assert!(
+        said.contains("no card arrived"),
+        "an open empty pipe is a refusal: {said}"
+    );
+    assert_eq!(stack.card_status("E6"), "");
+
+    // A daemon that cannot keep the card (here none runs): the card is shown as written, the
+    // ring would still go, and the work is not stopped.
+    let nowhere = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(nowhere.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = qoop_testkit::sandboxed("sh")
+        .arg("-c")
+        .arg(format!(
+            "'{sh}' E7 - later korea - < '{}'; echo rc=$?",
+            card.display()
+        ))
+        .env("QOOP_RUNTIME_DIR", nowhere.path())
+        .env("XDG_CONFIG_HOME", nowhere.path().join("config"))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stack.path("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("QOOP_TERMINAL")
+        .env_remove("QOOP_TOKEN")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("  A: run now")
+            && said.contains("needs a restart of qoop")
+            && said.contains("noted E7")
+            && said.contains("rc=0"),
+        "{said} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // done ends the card; a card the inbox does not know does not stop the work.
+    let said = stack.inside(&shell, &format!("'{sh}' done E1 chat"));
+    assert!(said.contains("E1 Closed"), "{said}");
+    assert_eq!(stack.card_status("E1"), "closed");
+    let said = stack.inside(&shell, &format!("'{sh}' done E99"));
+    assert!(said.contains("noted E99"), "{said}");
+}

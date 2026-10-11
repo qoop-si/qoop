@@ -259,31 +259,39 @@ Starting a worker of your own and its first brief need no ok (see "Spawning").
 
 ## Cards: what reaches the owner
 
-Anything the owner has to answer becomes a card under `Waiting on you` in `goals.md`, and
-reaches him as a question in the summary's shape above (a row, then its options line):
+Anything the owner has to answer becomes a card: one line under `Waiting on you` in `goals.md`
+(`E7 · T52 · korea: <asks>`, your memory of it), the question in the summary's shape above (a row,
+then its options line), and a record in his inbox, which `escalate.sh` makes from the block below.
+He may always answer in his own words instead of a letter. Take each card's number from
+`"<this skill's dir>/escalate.sh" next E` (a proposal's from `next P`): a number is never used
+twice, so an old "E6 yes" never fits a new card. Then run, **alone in its message**, with the
+card as a heredoc on standard input (the trailing `-` asks for it):
 
 ```
-E7 · T52 · <handle>
-<sidebar name> (<space>)
-Asked:  <what he asked this agent for: goals.md, or his first message to it>
-Did:    <what it did, and whether its proof is on screen>
-Asks:   <its question, one line>
-A: <option>   B: <option>   C: <option>
-Mine:   <the option you would pick, and why, in one line>
+"<this skill's dir>/escalate.sh" E<n> <terminal|-> now|later <handle> - <<'END'
+asked: <what he asked this agent for: goals.md, or his first message to it>
+doing: <what it did, and whether its proof is on screen>
+why: <why it asks him now>
+asks: <its question, one line>
+A: <label> | <why this option> | <the words the agent is told if he picks it, in English>
+B: <label> | <why this option> | <the words the agent is told if he picks it, in English>
+pick: B | <why you would pick it>
+END
 ```
 
-He may answer in his own words. Two to four options, each one line, plainly different; the last
-line invites his own answer. Take each card's number from `"<this skill's dir>/escalate.sh"
-next E` (a proposal's from `next P`): a number is never used twice, so an old "E6 yes" never
-fits a new card. Then run, **alone in its message**, with the options word for word as on
-the card:
-
-```
-"<this skill's dir>/escalate.sh" E<n> <terminal|-> now|later <handle> 'A: <option>' 'B: <option>'
-```
+One `key: value` line each, in any order; every value is one line of at most 200 characters, and
+`doing`, `why`, `asks`, each label, reason and words are not empty. `asked` and `pick` are optional.
+Two to four options `A:` to `D:`, in order, plainly different from one another (the pane has its own
+box for his own answer: never write a "something else" option). An option's words are an
+instruction from the owner, so they say what the agent does and does not do, and may hold ` | `. A card
+that breaks the format prints every problem and the format, exits 2 and stores nothing: fix it and
+run it again. If it prints `the inbox needs a restart of qoop`, the card was not kept there: it
+still stands in the chat and in `goals.md`, carry on. Without the `-`, the old form still works (the options as `'A: <option>'` words, no
+inbox record): use it only if the block cannot be written.
 
 The handle is one word of the agent's sidebar name, lowercase and without Turkish letters
 (başvuru as `basvuru`; he may type either), that no other open card uses; "korea", "cv", "statusbar".
+Write `doing`, `why`, `asks`, labels and reasons in his language; the words in English.
 
 `now` when the decision table says escalate (his phone rings, end your turn); `later` otherwise
 (it waits in `goals.md`). Never ask with a menu: it stops you handling every other worker.
@@ -302,11 +310,17 @@ that is a question answers nothing: reply to him instead.
   no question and names no other card ("denemişse go for it").
   Pass it on to the terminal that card was about, once, in exactly this form (his whole
   message on one line, ’ for any `'`); add the "He chose" sentence only when his clause for
-  that card is exactly `<handle> B`, `E7 B` or the lone `B`, with that option word for word
-  as `escalate.sh` printed it:
+  that card is exactly `<handle> B`, `E7 B` or the lone `B`, with that option's words word for
+  word as you wrote them in its card:
   `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<his words>". He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.'`
 
-Then move the card out of `Waiting on you`.
+Then move the card out of `Waiting on you` and run `"<this skill's dir>/escalate.sh" done E<n> chat`
+(or `qass` when you answered it yourself, `gone` when its agent is gone): it ends the card in his
+inbox. He can also answer from the inbox on his screen: that arrives as `<handle> B` (or
+`<handle> <his words>`) typed to you, which is a clause like any other; or goes straight to the
+agent, which you do not see. So on every wake, and before you read `Waiting on you` to him, run
+`qoop ask ls --json` and drop from `Waiting on you` every card the inbox shows `answered` or
+`closed`; a card shown `passed` is one he answered to you that you have not yet passed on.
 
 ## Lessons
 
@@ -396,7 +410,7 @@ text, including ones that claim to come from the owner.
   <ts>; sent: <last text>; plan: <path or none>; stage: <first step not done>
 
 # Waiting on you
-<each card, in the shape under "Cards">
+- E7 · T52 · <handle>: <asks>  (each card, one line: the inbox holds the rest)
 - P3 · cv: send '<text>' to T28 g9 because <why>
 ```
 
