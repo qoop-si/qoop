@@ -1494,6 +1494,16 @@ impl State {
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
+        self.clicked_with(row, col, sidebar::current_avatar().as_ref())
+    }
+
+    /// [`State::clicked`] with the pet the paint stands in the foot, which a test names.
+    fn clicked_with(
+        &self,
+        row: u16,
+        col: u16,
+        avatar: Option<&qoop_runtime::avatar::Avatar>,
+    ) -> Option<Clicked> {
         // The last painted frame's clock, not a fresh one: tiers move rows,
         // and a click maps onto what the paint drew by construction. A click
         // before the first paint reads zero, where no positive stamp is stale.
@@ -1523,7 +1533,7 @@ impl State {
                 None => None,
             };
         }
-        let (hit, first) = self.column_hit(row)?;
+        let (hit, first) = self.column_hit_with(row, avatar)?;
         let column = self.column(now_unix, 0);
         if let sidebar::Hit::Terminal(terminal) = hit
             && first
@@ -1573,6 +1583,15 @@ impl State {
     /// onto. A click maps onto the last paint (`paint_now`); a drag being painted maps onto
     /// the frame it is painted in, so its rule lands on the rows drawn beside it.
     fn column_rows_at(&self, now: i64) -> Vec<(sidebar::Line, Option<sidebar::Hit>)> {
+        self.column_rows_with(now, sidebar::current_avatar().as_ref())
+    }
+
+    /// [`State::column_rows_at`] with the pet named, for a test that stands one.
+    fn column_rows_with(
+        &self,
+        now: i64,
+        avatar: Option<&qoop_runtime::avatar::Avatar>,
+    ) -> Vec<(sidebar::Line, Option<sidebar::Hit>)> {
         let column_rows = screen::column_rows(self.lines as usize);
         // Frame zero of the animation: tiers move rows, the tick never does.
         let column = self.column(now, 0);
@@ -1581,11 +1600,12 @@ impl State {
         } else {
             // The paint gives the foot the pet's rows when a pet is picked, so the
             // click maps onto the same layout it drew.
-            sidebar::rows_folded(&column, column_rows, sidebar::current_avatar().as_ref())
+            sidebar::rows_folded(&column, column_rows, avatar)
         }
     }
 
     /// The column as the last paint drew it.
+    #[cfg(test)]
     fn column_rows_now(&self) -> Vec<(sidebar::Line, Option<sidebar::Hit>)> {
         self.column_rows_at(self.paint_now)
     }
@@ -1593,9 +1613,17 @@ impl State {
     /// What the column drew on a one based screen row, and whether that row is the first
     /// of its kind: an agent's name rather than the row under it.
     fn column_hit(&self, row: u16) -> Option<(sidebar::Hit, bool)> {
+        self.column_hit_with(row, sidebar::current_avatar().as_ref())
+    }
+
+    fn column_hit_with(
+        &self,
+        row: u16,
+        avatar: Option<&qoop_runtime::avatar::Avatar>,
+    ) -> Option<(sidebar::Hit, bool)> {
         // The column, which starts at the top row and runs down to the status line.
         let within = (row as usize).checked_sub(screen::SIDEBAR_TOP)?;
-        let rows = self.column_rows_now();
+        let rows = self.column_rows_with(self.paint_now, avatar);
         let hit = rows.get(within).and_then(|(_, hit)| *hit)?;
         // An agent's name row carries its mark and the row under it does not, which holds
         // however the list is scrolled; anything else is first where the row above differs.
@@ -18378,6 +18406,45 @@ mod tests {
         qass_press(&mut state, &mut seq, &mut seqs, &tx).unwrap();
         assert_eq!((state.focused, state.space), (1, Some(1)));
         assert!(!state.in_qass());
+    }
+
+    /// A click on a pet cell is read by `clicked` as the qass press and enters qass through
+    /// the same helper as the key; a click beside the pet is not.
+    #[test]
+    fn a_click_on_the_pet_reaches_qass_through_clicked() {
+        let pet = qoop_runtime::avatar::Avatar {
+            body: qoop_runtime::avatar::BODY.into(),
+            hair: "mohawk".into(),
+            eyes: "big".into(),
+            hair_ink: 212,
+            body_ink: 33,
+        };
+        let mut state = qass_state();
+        state.lines = 50;
+        let rows = state.column_rows_with(0, Some(&pet));
+        let at = rows
+            .iter()
+            .position(|(_, hit)| matches!(hit, Some(sidebar::Hit::Pet(_))))
+            .expect("a pet row");
+        let row = (at + screen::SIDEBAR_TOP) as u16;
+        let cols = sidebar::pet_width(&pet);
+        let on = sidebar::WIDTH - 1;
+        assert!(matches!(
+            state.clicked_with(row, on as u16, Some(&pet)),
+            Some(Clicked::Qass)
+        ));
+        assert!(!matches!(
+            state.clicked_with(row, (sidebar::WIDTH - cols - 1) as u16, Some(&pet)),
+            Some(Clicked::Qass)
+        ));
+        assert!(!matches!(
+            state.clicked_with(row, on as u16, None),
+            Some(Clicked::Qass)
+        ));
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        qass_press(&mut state, &mut seq, &mut seqs, &tx).unwrap();
+        assert!(state.in_qass());
     }
 
     /// A second space a rename called `qass` is kept off the lists with its tabs, and qass
