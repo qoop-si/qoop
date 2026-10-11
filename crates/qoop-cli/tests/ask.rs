@@ -565,3 +565,31 @@ fn escalate_sh_keeps_a_block_card_and_done_ends_it_while_the_old_form_still_work
     let said = stack.inside(&shell, &format!("'{sh}' done E99"));
     assert!(said.contains("noted E99"), "{said}");
 }
+
+/// qass reconciles its notes against `qoop ask ls --json`: a card that ended among many others is
+/// still in it, though the pane and the plain listing show only the last few.
+#[test]
+fn the_json_listing_holds_every_ended_card_and_the_plain_one_the_last_five() {
+    let stack = Stack::start();
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    for n in 1..=7 {
+        let said = stack.inside(
+            &shell,
+            &format!(
+                "qoop ask add E{n} --agent - --handle h{n} --urgency later < '{}'",
+                stack.path("card.txt").display()
+            ),
+        );
+        assert!(said.contains("Added"), "{said}");
+    }
+    for n in 1..=7 {
+        let (ok, _, err) = stack.run(&["ask", "dismiss", &format!("E{n}")]);
+        assert!(ok, "{err}");
+    }
+    for n in 1..=7 {
+        assert_eq!(stack.card_status(&format!("E{n}")), "closed", "E{n}");
+    }
+    let (_, plain, _) = stack.run(&["ask", "ls"]);
+    assert_eq!(plain.matches("(ended)").count(), 5, "{plain}");
+}

@@ -41,8 +41,9 @@ const BEFORE_ENTER: Duration = Duration::from_millis(300);
 /// The most characters of his own words one answer carries.
 const TEXT_MAX: usize = 400;
 
-/// How many ended cards a read carries.
+/// How many ended cards a read carries: the last few for the pane, or all of the keep window.
 const ENDED_SHOWN: usize = 5;
+const ENDED_ALL: usize = 200;
 
 /// Who is asking, as the request said it.
 pub(crate) struct Caller {
@@ -190,11 +191,17 @@ fn info(row: AskRow) -> Option<AskInfo> {
 
 pub(crate) async fn read(
     id: String,
+    all: bool,
     _terminals: &Arc<TerminalRegistry>,
     store: &StoreHandle,
 ) -> ControlResponse {
     match store
-        .run(|s| Ok((s.live_asks()?, s.ended_asks(ENDED_SHOWN)?)))
+        .run(move |s| {
+            Ok((
+                s.live_asks()?,
+                s.ended_asks(if all { ENDED_ALL } else { ENDED_SHOWN })?,
+            ))
+        })
         .await
     {
         Ok((live, ended)) => ControlResponse::Asks {

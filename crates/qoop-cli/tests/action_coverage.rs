@@ -492,7 +492,12 @@ fn actions() -> Vec<Action> {
         },
         Action {
             name: "read the question inbox",
-            method: || Method::Control(ControlRequest::AskRead { id: "a".into() }),
+            method: || {
+                Method::Control(ControlRequest::AskRead {
+                    id: "a".into(),
+                    all: false,
+                })
+            },
         },
         Action {
             name: "show a task and what was recorded on it",
@@ -736,7 +741,10 @@ fn every_control_method_is_reachable_from_some_action() {
                 card: String::new(),
             },
         },
-        ControlRequest::AskRead { id: String::new() },
+        ControlRequest::AskRead {
+            id: String::new(),
+            all: false,
+        },
     ];
     for request in &all {
         match request {

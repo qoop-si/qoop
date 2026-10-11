@@ -496,6 +496,10 @@ pub enum ControlRequest {
     /// The cards waiting for the owner and the last few that ended, answered as `Asks`.
     AskRead {
         id: String,
+        /// Every card that ended in the last 14 days (up to 200), not the last five: what qass
+        /// reconciles its notes against.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
     },
 }
 
@@ -989,7 +993,7 @@ impl ControlRequest {
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
             | Self::AskWrite { id, .. }
-            | Self::AskRead { id }
+            | Self::AskRead { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }

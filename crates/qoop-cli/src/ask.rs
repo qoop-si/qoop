@@ -210,9 +210,11 @@ fn written(response: ControlResponse) -> std::io::Result<qoop_runtime::control::
     }
 }
 
-fn read_all() -> std::io::Result<(Vec<AskInfo>, Vec<AskInfo>)> {
+/// The inbox: the cards waiting and the ended ones, the last five or (`all`) every one kept.
+fn read_all(all: bool) -> std::io::Result<(Vec<AskInfo>, Vec<AskInfo>)> {
     let request = ControlRequest::AskRead {
         id: crate::request_id("ask"),
+        all,
     };
     match ask_daemon_once(request, Duration::from_secs(10))? {
         ControlResponse::Asks { live, ended, .. } => Ok((live, ended)),
@@ -324,7 +326,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             Ok(())
         }
         Some("ls") => {
-            let (live, ended) = read_all()?;
+            let json_out = rest.iter().any(|a| a == "--json");
+            // The JSON is what qass reconciles its notes against: every card that ended, not five.
+            let (live, ended) = read_all(json_out)?;
             if rest.iter().any(|a| a == "--json") {
                 return json(&serde_json::json!({ "live": live, "ended": ended }));
             }

@@ -242,7 +242,10 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
                 note: "echo PWNED".into(),
             },
         },
-        ControlRequest::AskRead { id: "x34".into() },
+        ControlRequest::AskRead {
+            id: "x34".into(),
+            all: false,
+        },
         ControlRequest::TaskRead {
             id: "x29".into(),
             board: true,

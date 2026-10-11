@@ -197,6 +197,7 @@ impl Pane {
         self.stale = false;
         Some(ControlRequest::AskRead {
             id: READ_ID.to_string(),
+            all: false,
         })
     }
 

@@ -4878,7 +4878,9 @@ async fn handle_control(
             ))
             .await
         }
-        ControlRequest::AskRead { id } => Box::pin(crate::asks::read(id, terminals, store)).await,
+        ControlRequest::AskRead { id, all } => {
+            Box::pin(crate::asks::read(id, all, terminals, store)).await
+        }
         ControlRequest::ListFocusEvents {
             terminal, last_n, ..
         } => {
