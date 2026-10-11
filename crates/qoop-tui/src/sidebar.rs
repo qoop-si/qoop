@@ -921,14 +921,7 @@ fn parts(
     let count = Some(inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let mut feet = foot_rows(
-        c.width,
-        pet,
-        count,
-        pending_now().get(),
-        hub_link(),
-        c.icons,
-    );
+    let mut feet = foot_rows(c.width, count, pending_now().get(), hub_link(), c.icons);
     if let Some(cols) = avatar
         .filter(|_| pet)
         .map(pet_width)
@@ -1424,28 +1417,20 @@ fn tray_line(width: usize) -> Line {
 }
 
 /// The rows above the foot in a column of `height` rows: the inbox, the title and the list.
-fn room_of(c: &Column, height: usize, avatar: Option<&qoop_runtime::avatar::Avatar>) -> usize {
-    let pet = pet_shown(c, height, avatar.is_some());
-    let feet = foot_rows(
-        c.width,
-        pet,
-        Some(0),
-        pending_now().get(),
-        hub_link(),
-        c.icons,
-    );
-    height.saturating_sub(feet.len())
+/// The foot is the same rows whatever the pet, so only the height decides.
+fn room_of(height: usize) -> usize {
+    height.saturating_sub(STAGE_FOOT_ROWS)
 }
 
 /// The most list rows a drag may give the inbox in a column of `height` rows: what leaves
 /// its edge, the title, the search chip and one row of the tree. Zero when the inbox has no
 /// list rows to drag.
 pub(crate) fn inbox_room(
-    c: &Column,
+    _c: &Column,
     height: usize,
-    avatar: Option<&qoop_runtime::avatar::Avatar>,
+    _avatar: Option<&qoop_runtime::avatar::Avatar>,
 ) -> usize {
-    room_of(c, height, avatar).saturating_sub(4 + SEARCH_ROWS)
+    room_of(height).saturating_sub(4 + SEARCH_ROWS)
 }
 
 /// The inbox's first list row after one notch of the wheel over its list, never past
@@ -1453,10 +1438,10 @@ pub(crate) fn inbox_room(
 pub(crate) fn inbox_wheeled(
     c: &Column,
     height: usize,
-    avatar: Option<&qoop_runtime::avatar::Avatar>,
+    _avatar: Option<&qoop_runtime::avatar::Avatar>,
     up: bool,
 ) -> usize {
-    let rows = inbox_height(c, room_of(c, height, avatar)).saturating_sub(1);
+    let rows = inbox_height(c, room_of(height)).saturating_sub(1);
     let last = inbox_items(c, c.inbox.tab).len().saturating_sub(rows);
     let at = c.inbox.scroll.min(last);
     if up {
@@ -3447,11 +3432,11 @@ pub(crate) const PET_COLS: usize = 8;
 /// The foot with the pet in it: the pet's five half-block rows standing on the menu row.
 /// The same for every avatar, so the words sit in the same rows whatever the pet is.
 pub(crate) const PET_FOOT_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 1;
-/// The foot, pet or no pet: the count chip's row, the q's four rows and the menu row. The pet
-/// stands at the right of its first five rows, level with the q, so the foot is no taller
-/// with the pet than without it.
-pub(crate) const STAGE_FOOT_ROWS: usize = 1 + Q_FOOT_ROWS;
-const _: () = assert!(STAGE_FOOT_ROWS == PET_FOOT_ROWS);
+/// The foot, pet or no pet: the count chip's row, then the pet's rows (the q's four rows at
+/// the left of their last four), then the menu row. The chip stands over the pet, so the foot
+/// is the same height with the pet as without it.
+pub(crate) const STAGE_FOOT_ROWS: usize = 2 + Q_FOOT_ROWS;
+const _: () = assert!(STAGE_FOOT_ROWS == 1 + PET_FOOT_ROWS);
 
 /// The first and last column any row of the art lights, if any.
 fn lit_span(
@@ -3566,13 +3551,14 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// word at the left and `menu <cog> « ` at the right.
 ///
 /// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
-/// in ember. The row above the q holds the inbox count as a chip ([`count_chip`]) under the
-/// q's left edge. The pet (`pet`) stands at the right of the foot's first five rows (stamped
-/// by the overlay), level with the q, its feet on the row above the menu. The foot is the
-/// same six rows with or without the pet, so the pet never takes a row from the list.
+/// in ember. The pet stands at the right of the five rows above the menu (stamped by the
+/// overlay), level with the q, its feet on the row above the menu, and the inbox count stands
+/// over it as a chip ([`count_chip`]), flush with its right edge. The foot is the same seven
+/// rows with or without the pet, so the pet never takes a row from the list.
 ///
 /// ```text
-///  [ 2 ]        ▀▀▀▀▀▀
+///                  [ 2 ]
+///               ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///  ●   ●        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
@@ -3586,7 +3572,6 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// the pet's cells answer; the other rows are text and answer nothing.
 fn foot_rows(
     width: usize,
-    pet: bool,
     count: Option<usize>,
     update: Pending,
     hub: HubLink,
@@ -3613,17 +3598,14 @@ fn foot_rows(
     };
     let menu_row = (menu_row, Some(Hit::Foot));
     let mut out: Vec<Row> = Vec::with_capacity(STAGE_FOOT_ROWS);
-    // The count chip on the row above the q, under the q's left edge; the pet's head is at
-    // the right of the same row. The row stays with no count, so nothing below it moves.
-    let room = if pet {
-        width.saturating_sub(1 + PET_COLS + 1)
-    } else {
-        width
-    };
+    // The count chip over the pet's rows, flush with the pet's right edge, then the row of the
+    // pet's head with the q not yet begun. Both rows stay with no count or no pet, so nothing
+    // below them moves.
     out.push((
-        count.map_or_else(|| blank(width).0, |n| count_chip(n, room, width)),
+        count.map_or_else(|| blank(width).0, |n| count_chip(n, width)),
         None,
     ));
+    out.push(blank(width));
     out.extend(Q_LOGO.iter().enumerate().map(|(row, dots)| {
         let (at, cell) = Q_TAIL;
         let runs = if row == at {
@@ -3676,35 +3658,36 @@ fn foot_lead(
     }
 }
 
-/// The inbox count as a chip on the row above the q, in the search chip's ember brackets:
-/// `[ 2 ]` from the column's second cell, the q's own left edge. The number is warm while
-/// anything waits and quiet at zero. Tighter `[2]` when `room` (the cells left of the pet)
-/// does not hold the spaced one, and nothing when not even that fits.
-fn count_chip(count: usize, room: usize, width: usize) -> Line {
+/// The inbox count as a chip over the pet, in the search chip's ember brackets: `[ 2 ]` flush
+/// right with one blank cell before the column's edge, the pet's own right edge. The number is
+/// warm while anything waits and quiet at zero. Tighter `[2]` when the column cannot hold the
+/// spaced one with a blank on each side, and nothing when not even that fits.
+fn count_chip(count: usize, width: usize) -> Line {
     use crate::theme::Role;
     let number = count.to_string();
     let n = crate::width::width(&number);
-    // A leading blank, the number, its brackets (and their inner blanks), a gap before the pet.
-    let pad = if 1 + n + 4 < room {
+    // A blank on each side, the number, its brackets (and their inner blanks).
+    let pad = if 1 + n + 4 < width {
         " "
-    } else if 1 + n + 2 < room {
+    } else if 1 + n + 2 < width {
         ""
     } else {
         return blank(width).0;
     };
+    let chip_w = n + 2 + 2 * pad.len();
+    let at = width - 1 - chip_w;
     let ink = if count > 0 {
         Role::Blocked
     } else {
         Role::Faint
     };
-    let close = 1 + 1 + pad.len() + n + pad.len();
     Line {
-        text: fit(&format!(" [{pad}{number}{pad}]"), width),
+        text: fit(&format!("{}[{pad}{number}{pad}] ", " ".repeat(at)), width),
         colour: Some(Role::Faint),
         runs: vec![
-            (1, 1, Role::Brand),
-            (2 + pad.len(), n, ink),
-            (close, 1, Role::Brand),
+            (at, 1, Role::Brand),
+            (at + 1 + pad.len(), n, ink),
+            (at + chip_w - 1, 1, Role::Brand),
         ],
         ..Line::default()
     }
@@ -5559,14 +5542,15 @@ mod tests {
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The count chip's row (blank with no count), the q alone, its tail in ember, then the
         // menu.
-        let rows = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false);
+        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false);
         assert_eq!(
             rows.len(),
             STAGE_FOOT_ROWS,
             "the chip row, the q's four rows and the menu"
         );
         assert_eq!(rows[0].0.text, " ".repeat(WIDTH));
-        let rows = &rows[1..];
+        assert_eq!(rows[1].0.text, " ".repeat(WIDTH));
+        let rows = &rows[2..];
         for (line, _) in rows {
             assert_eq!(
                 crate::width::width(&line.text),
@@ -5622,45 +5606,34 @@ mod tests {
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
-    /// The pet stands beside the q in rows the foot has anyway: the foot is the same six rows
-    /// with or without it, and the q and the menu rows are the same text, so no word moves and
-    /// the list above loses nothing to the pet.
+    /// The count chip stands over the pet, flush with its right edge (one blank cell before
+    /// the column's edge), in ember brackets, the number warm while anything waits and quiet at
+    /// zero; tighter, then gone, when the column is too narrow. The foot is seven rows whatever
+    /// the count.
     #[test]
-    fn the_pet_takes_no_row_and_moves_no_word() {
-        for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let alone = foot_rows(width, false, Some(3), Pending::None, HubLink::Up, false);
-            let stands = foot_rows(width, true, Some(3), Pending::None, HubLink::Up, false);
-            assert_eq!(alone.len(), STAGE_FOOT_ROWS, "width {width}");
-            assert_eq!(stands.len(), STAGE_FOOT_ROWS, "width {width}");
-            assert_eq!(&stands[1..], &alone[1..], "width {width}");
-            for rows in [&alone, &stands] {
-                assert!(rows[0].0.text.starts_with(" [ 3 ]"), "{:?}", rows[0].0.text);
-            }
-        }
-    }
-
-    /// The count chip sits under the q's left edge in ember brackets, its number warm while
-    /// anything waits and quiet at zero, tighter when the room beside the pet is short.
-    #[test]
-    fn the_count_chip_stands_over_the_q() {
+    fn the_count_chip_stands_over_the_pet() {
         use crate::theme::Role;
-        let chip = count_chip(2, 30, 30);
-        assert!(chip.text.starts_with(" [ 2 ] "), "{:?}", chip.text);
-        assert_eq!(
-            chip.runs,
-            [
-                (1, 1, Role::Brand),
-                (3, 1, Role::Blocked),
-                (5, 1, Role::Brand)
-            ]
-        );
-        assert_eq!(count_chip(0, 30, 30).runs[1], (3, 1, Role::Faint));
-        assert!(count_chip(123, 9, 30).text.starts_with(" [ 123 ]"));
-        assert!(count_chip(123, 7, 30).text.starts_with(" [123] "));
-        assert_eq!(count_chip(123, 6, 30).text, " ".repeat(30));
-        // The `[` is on the q's left column.
-        let foot = foot_rows(WIDTH, true, Some(2), Pending::None, HubLink::Up, false);
-        assert_eq!(foot[0].0.text.find('['), foot[1].0.text.find('\u{25cf}'));
+        for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
+            let foot = foot_rows(width, Some(2), Pending::None, HubLink::Up, false);
+            assert_eq!(foot.len(), STAGE_FOOT_ROWS);
+            assert_eq!(foot[0].0.text, format!("{}[ 2 ] ", " ".repeat(width - 6)));
+            assert_eq!(foot[1].0.text, " ".repeat(width), "the pet's head row");
+            assert_eq!(
+                foot[0].0.runs,
+                [
+                    (width - 6, 1, Role::Brand),
+                    (width - 4, 1, Role::Blocked),
+                    (width - 2, 1, Role::Brand)
+                ]
+            );
+            let none = foot_rows(width, None, Pending::None, HubLink::Up, false);
+            assert_eq!(none.len(), STAGE_FOOT_ROWS);
+            assert_eq!(&none[1..], &foot[1..]);
+        }
+        assert_eq!(count_chip(0, 30).runs[1].2, Role::Faint);
+        assert_eq!(count_chip(123, 9).text, " [ 123 ] ");
+        assert_eq!(count_chip(123, 8).text, "  [123] ");
+        assert_eq!(count_chip(123, 6).text, " ".repeat(6));
     }
 
     /// The menu row shows the version and, right after it, the hub word, while the tail keeps
@@ -5669,7 +5642,7 @@ mod tests {
     fn the_menu_row_carries_the_version_then_the_hub_word() {
         for icons in [false, true] {
             for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-                let rows = foot_rows(width, false, None, Pending::None, HubLink::Up, icons);
+                let rows = foot_rows(width, None, Pending::None, HubLink::Up, icons);
                 let (menu, hit) = rows.last().expect("the menu row");
                 assert_eq!(*hit, Some(Hit::Foot));
                 assert_eq!(crate::width::width(&menu.text), width);
@@ -5697,7 +5670,7 @@ mod tests {
             }
         }
         // No room for the version, no link and no word hanging in the air.
-        let tight = foot_rows(8, false, None, Pending::None, HubLink::Up, false);
+        let tight = foot_rows(8, None, Pending::None, HubLink::Up, false);
         let text = &tight.last().unwrap().0.text;
         assert!(
             !text.contains("online") && !text.contains(VERSION),
@@ -5713,7 +5686,7 @@ mod tests {
     fn the_hub_word_follows_the_hub_state() {
         use crate::theme::Role;
         let word = |hub| {
-            let rows = foot_rows(WIDTH, false, None, Pending::None, hub, false);
+            let rows = foot_rows(WIDTH, None, Pending::None, hub, false);
             let menu = &rows.last().unwrap().0;
             let at = crate::width::width(&format!(" {VERSION}")) + 1;
             let (word, _) = hub_word(hub);
@@ -5779,7 +5752,7 @@ mod tests {
             format!("{MENU_LABEL} \u{ab} ")
         );
         assert!(!foot_tail(WIDTH, true).contains("settings"));
-        let rows = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, true);
+        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, true);
         let text = &rows.last().unwrap().0.text;
         assert!(text.ends_with(&tail), "{text:?}");
         // With icons the cog is one cell, 1-based column WIDTH - 3.
@@ -5819,14 +5792,7 @@ mod tests {
     /// foot still folds the column.
     #[test]
     fn the_version_link_covers_only_the_version() {
-        let rows = foot_rows(
-            WIDTH,
-            false,
-            None,
-            Pending::Newer("9.9.9"),
-            HubLink::Up,
-            false,
-        );
+        let rows = foot_rows(WIDTH, None, Pending::Newer("9.9.9"), HubLink::Up, false);
         let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
         let at = version_link_in(WIDTH, false, Pending::Newer("9.9.9")).expect("shown");
         let word: String = text[at..at + VERSION.len()].iter().collect();
@@ -5880,20 +5846,18 @@ mod tests {
         let brand = crate::theme::Role::Brand;
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            for pet in [false, true] {
-                let rows = foot_rows(width, pet, None, Pending::None, HubLink::Up, false);
-                let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
-                for (i, (line, hit)) in logo.iter().enumerate() {
-                    assert_eq!(
-                        line.text.trim_end(),
-                        format!(" {}", Q_LOGO[i]),
-                        "width {width}"
-                    );
-                    assert_eq!(crate::width::width(&line.text), width);
-                    assert_eq!(line.colour, Some(crate::theme::Role::Text));
-                    assert_eq!(line.runs, embers[i], "row {i}");
-                    assert_eq!(*hit, None);
-                }
+            let rows = foot_rows(width, None, Pending::None, HubLink::Up, false);
+            let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
+            for (i, (line, hit)) in logo.iter().enumerate() {
+                assert_eq!(
+                    line.text.trim_end(),
+                    format!(" {}", Q_LOGO[i]),
+                    "width {width}"
+                );
+                assert_eq!(crate::width::width(&line.text), width);
+                assert_eq!(line.colour, Some(crate::theme::Role::Text));
+                assert_eq!(line.runs, embers[i], "row {i}");
+                assert_eq!(*hit, None);
             }
             assert!(avatar_fits(30, width, true), "width {width}");
         }
@@ -6209,7 +6173,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Pending| {
-            foot_rows(width, false, None, update, HubLink::Up, false)
+            foot_rows(width, None, update, HubLink::Up, false)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -6244,7 +6208,7 @@ mod tests {
                         (Pending::Newer("9.9.9"), false),
                         (Pending::Ready, true),
                     ] {
-                        let rows = foot_rows(width, false, None, pending, hub, icons);
+                        let rows = foot_rows(width, None, pending, hub, icons);
                         let (row, _) = rows.last().expect("the menu row");
                         let ctx = format!("{width} {hub:?} {icons} {pending:?}: {:?}", row.text);
                         assert!(crate::width::width(&row.text) <= width, "{ctx}");
@@ -6378,7 +6342,7 @@ mod tests {
         for (line, hit) in &with[foot..] {
             assert!(!matches!(hit, Some(Hit::Terminal(_))), "{line:?}");
         }
-        assert!(matches!(with[foot].1, Some(Hit::Pet(_))));
+        assert!(matches!(with[foot + 1].1, Some(Hit::Pet(_))));
         let (menu_row, hit) = &with[29];
         assert!(
             menu_row.text.ends_with(&foot_tail(WIDTH, false)),
@@ -8163,7 +8127,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -8230,7 +8194,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4 - SEARCH_ROWS);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -8386,9 +8350,9 @@ mod tests {
             let rows = rows_folded(&c, height, Some(&pet));
             assert_eq!(rows.len(), height);
             let foot = &rows[height - STAGE_FOOT_ROWS..];
-            assert!(foot[0].0.text.starts_with(" [ 1 ]"), "{:?}", foot[0].0.text);
-            assert!(foot[0].0.runs.contains(&(3, 1, Role::Blocked)));
-            for (_, hit) in &foot[..PET_FOOT_ROWS - 1] {
+            assert!(foot[0].0.text.ends_with("[ 1 ] "), "{:?}", foot[0].0.text);
+            assert!(foot[0].0.runs.contains(&(WIDTH - 4, 1, Role::Blocked)));
+            for (_, hit) in &foot[1..PET_FOOT_ROWS] {
                 assert_eq!(*hit, Some(Hit::Pet(cols)), "height {height}");
             }
             assert_eq!(foot.last().expect("the menu").1, Some(Hit::Foot));
@@ -8409,7 +8373,7 @@ mod tests {
         );
         // No pet chosen: the chip stands just the same.
         let rows = rows_folded(&c, 30, None);
-        assert!(rows[30 - STAGE_FOOT_ROWS].0.text.starts_with(" [ 1 ]"));
+        assert!(rows[30 - STAGE_FOOT_ROWS].0.text.ends_with("[ 1 ] "));
     }
 
     /// A folded space hides the agents a person is not looking at, never the one the
@@ -9186,7 +9150,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, the search chip, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len() + 6;
+        let least = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len() + 6;
         for height in [least, least + 1, 12, 16, 30] {
             let rows = rows12(
                 &spaces,
@@ -10635,7 +10599,7 @@ mod tests {
         c.nav = Some(&nav);
         let rows = rows_folded(&c, 24, None);
         assert_eq!(rows.len(), plain.len());
-        let foot = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
         let line = &rows[rows.len() - foot - 1].0;
         assert!(
             line.text.contains("j/k move  enter open  q back"),
