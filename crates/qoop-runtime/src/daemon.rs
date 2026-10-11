@@ -6410,10 +6410,15 @@ pub struct RestoreReport {
     pub terminals: usize,
     /// Tabs reopened.
     pub brought_back: usize,
-    /// Tabs whose directory was gone, started where the daemon is instead.
+    /// Tabs whose directory was not there, started somewhere else instead: where the daemon
+    /// is, or for an agent the nearest folder that exists.
     pub cwd_fallback: usize,
     /// Tabs where the agent's own resume command was typed back in.
     pub agents_resumed: usize,
+    /// Agent tabs whose folder was not there: nothing was resumed, a line says why.
+    pub agents_folder_gone: usize,
+    /// The terminals of those tabs, whose rows forget the agent once the restore is done.
+    pub folder_gone: Vec<u32>,
     /// Tabs that named an agent but had no resume command for it, so a shell.
     pub agents_shell_fallback: usize,
     /// Tabs with no agent recorded, restored as plain shells.
@@ -6426,10 +6431,11 @@ impl RestoreReport {
     /// One line for the startup log: what survived and what fell back.
     pub fn summary(&self) -> String {
         format!(
-            "restore: {}/{} panes, {} agents resumed, {} agent shells, {} plain shells, {} moved directory",
+            "restore: {}/{} panes, {} agents resumed, {} agent folders gone, {} agent shells, {} plain shells, {} moved directory",
             self.brought_back,
             self.terminals,
             self.agents_resumed,
+            self.agents_folder_gone,
             self.agents_shell_fallback,
             self.plain_shells,
             self.cwd_fallback,
@@ -6684,18 +6690,15 @@ pub async fn restore_report(into: &Restore) -> RestoreReport {
         listed.push((space.id, awake));
     }
     // A directory that is gone is not a reason to lose the tab. The shell starts where the
-    // daemon is instead, which is visible and recoverable, unlike a tab that silently did
-    // not come back. Every directory is asked about before any tab opens, at once, because
-    // this runs before the socket is served: see `existing_dirs`.
-    let dirs = existing_dirs(
-        listed
-            .iter()
-            .flat_map(|(_, rows)| rows.iter().map(|row| PathBuf::from(&row.cwd))),
-    )
-    .await;
+    // daemon is instead (or, for an agent, in the nearest folder that exists), which is
+    // visible and recoverable, unlike a tab that silently did not come back. Every directory
+    // is asked about before any tab opens, at once, because this runs before the socket is
+    // served: see `restore_dirs`.
+    let dirs = restore_dirs(listed.iter().flat_map(|(_, rows)| rows)).await;
     for (space, rows) in listed {
         restore_rows(into, space, rows, &dirs, &mut report).await;
     }
+    forget_gone_agents(into, &report.folder_gone).await;
     // History no open row owns: tabs closed before history was deleted with them, tabs
     // slept in the last run, crash leftovers. Before any new id is minted, so a new tab
     // handed a number whose row a closed space removed does not open the old history.
@@ -6711,7 +6714,7 @@ async fn restore_rows(
     into: &Restore,
     space: i64,
     rows: Vec<qoop_store::TerminalRow>,
-    dirs: &std::collections::BTreeSet<PathBuf>,
+    dirs: &Dirs,
     report: &mut RestoreReport,
 ) {
     // qoop's own board page above qass keeps nothing a sleep or a restart loses: the binary
@@ -6762,8 +6765,13 @@ async fn restore_rows(
         }
         report.terminals += 1;
         // The row keeps its directory either way.
-        let cwd = PathBuf::from(&row.cwd);
-        let cwd = dirs.contains(&cwd).then_some(cwd);
+        let saved = PathBuf::from(&row.cwd);
+        let present = dirs.present(&saved);
+        let cwd = if present {
+            Some(saved.clone())
+        } else {
+            dirs.nearest.get(&saved).cloned()
+        };
         let opened = open_terminal(
             &into.terminals,
             stream,
@@ -6788,7 +6796,7 @@ async fn restore_rows(
             .agent_session
             .as_deref()
             .filter(|session| resumable(row.agent.as_deref(), session));
-        let resume = row
+        let mut resume = row
             .agent
             .as_deref()
             .and_then(|agent| qoop_detect::resume_argv(agent, session))
@@ -6798,6 +6806,13 @@ async fn restore_rows(
                     .filter(|_| board_pane(&row))
                     .map(Vec::from)
             });
+        // An agent keeps its conversation under the folder it ran in, and asks to trust the
+        // folder it is started in: resumed anywhere else it finds nothing, and the person
+        // is asked about a folder they never chose. So an agent whose folder is not there
+        // is not resumed at all. The tab is told why, and keeps the conversation's id.
+        let folder_gone = (!present && row.agent.is_some())
+            .then(|| resume.take())
+            .flatten();
         // The id the resume names is the conversation of the agent it starts, so it is
         // held from now and handed to that agent when it appears: `agents --json`, the
         // history and a sleep all have it before the agent says anything. Held before the
@@ -6829,7 +6844,23 @@ async fn restore_rows(
         if !sent {
             into.terminals.set_session(stream, None, None);
         }
+        // Its own send: the notice must not count as a resume that was typed.
+        if let Some(argv) = &folder_gone {
+            let gone = saved.is_absolute() && dirs.gone.contains(&saved);
+            let line = folder_gone_notice(&saved, gone, argv);
+            let _ = handle
+                .commands
+                .send(ClientCommand::Input {
+                    from: ClientId::new("qoop-restore"),
+                    bytes: Bytes::from(line),
+                })
+                .await;
+            report.folder_gone.push(stream);
+        }
         match (&row.agent, sent) {
+            _ if folder_gone.is_some() => {
+                report.agents_folder_gone += 1;
+            }
             (Some(_), true) => {
                 report.agents_resumed += 1;
             }
@@ -6840,12 +6871,51 @@ async fn restore_rows(
                 report.plain_shells += 1;
             }
         }
-        // A row whose directory is gone started where the daemon is instead. Counted
+        // A row whose directory is gone started somewhere else instead. Counted
         // here, after the open succeeded, so a tab that never opened is missing from
         // both halves of the summary rather than half reported as moved.
-        if cwd.is_none() {
+        if !present {
             report.cwd_fallback += 1;
         }
+    }
+}
+
+/// The line typed into a tab whose agent was not resumed because its folder is not there.
+///
+/// `gone` is a definite answer; otherwise the folder did not answer or the saved path means
+/// nothing here. The hint is quoted to paste as it stands. Control characters are replaced
+/// in the whole text, since it is typed into a line editor, and the leading space keeps the
+/// line out of the shell's history.
+fn folder_gone_notice(saved: &Path, gone: bool, argv: &[String]) -> String {
+    let path = saved.display().to_string();
+    let hint = format!(
+        "{} && {}",
+        shell_line(&["cd".into(), path.clone()]),
+        shell_line(argv)
+    );
+    let text = if gone {
+        format!("agent folder gone: {path}. Recreate it, then: {hint}")
+    } else {
+        format!("agent folder not available: {path}. Not resumed. When it is: {hint}")
+    };
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    format!(
+        " {}\r",
+        shell_line(&["printf".into(), "%s\\n".into(), text])
+    )
+}
+
+/// Forget the agent of rows whose agent was not resumed because its folder is not there.
+///
+/// Otherwise a `cd` in the tab followed by a stop is written as the tab's folder, and the
+/// next start types the resume there. The conversation's id stays in the row (the store
+/// keeps it when the agent is cleared), and the tab's notice carries the command.
+async fn forget_gone_agents(into: &Restore, tabs: &[u32]) {
+    for tab in tabs {
+        let _ = into.books.store.set_agent(*tab as i64, None, None).await;
     }
 }
 
@@ -7351,7 +7421,7 @@ async fn wake_locked(
             ));
         }
     }
-    let dirs = existing_dirs(rows.iter().map(|row| PathBuf::from(&row.cwd))).await;
+    let dirs = restore_dirs(&rows).await;
     let mut report = RestoreReport::default();
     restore_rows(into, workspace, rows, &dirs, &mut report).await;
     // The marks come off last, and only from what came back: until then a late write about
@@ -7368,6 +7438,10 @@ async fn wake_locked(
     // Off here either way: the tabs are running, and a mark here would leave them neither
     // awake to a client nor able to wake again.
     into.books.mark(workspace, &opened, false);
+    // After the unmark, which the store's write waits for, and before the announce below.
+    if unmarked.is_ok() {
+        forget_gone_agents(into, &report.folder_gone).await;
+    }
     // Announced now, every one: the recorder skipped what they announced while marked, and
     // an agent that came up meanwhile is only now handed the conversation its resume named.
     for stream in &opened {
@@ -8373,31 +8447,128 @@ const SEARCH_CHUNK: u64 = 16_384;
 /// How long a check of a directory the user chose may take before it is abandoned.
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Which of `paths` are directories, every one probed at once under the same deadline.
+/// Whether each of `paths` is a directory, every one probed at once under the same deadline:
+/// `None` when it did not answer in time or found the pool busy. Such a path is never spawned
+/// into: an unchecked path's `chdir` would run on this thread. `asked` probes outside the
+/// pool's queue, see [`probe_dir_asked`].
+async fn probe_dirs(
+    paths: impl IntoIterator<Item = PathBuf>,
+    asked: bool,
+) -> Vec<(PathBuf, Option<bool>)> {
+    let mut probes = tokio::task::JoinSet::new();
+    for path in paths.into_iter().collect::<std::collections::BTreeSet<_>>() {
+        probes.spawn(async move {
+            let answer = if asked {
+                probe_dir_asked(&path).await
+            } else {
+                is_dir_probed(&path).await
+            };
+            (path, answer.ok())
+        });
+    }
+    let mut answers = Vec::new();
+    while let Some(Ok(probed)) = probes.join_next().await {
+        answers.push(probed);
+    }
+    answers
+}
+
+/// What restore learned about the folders its tabs were saved in.
+#[derive(Default)]
+struct Dirs {
+    /// Probed and a directory.
+    exist: std::collections::BTreeSet<PathBuf>,
+    /// Probed and not there: a definite answer, unlike a timeout.
+    gone: std::collections::BTreeSet<PathBuf>,
+    /// For an agent row whose folder is gone: the nearest ancestor that exists.
+    nearest: std::collections::BTreeMap<PathBuf, PathBuf>,
+}
+
+impl Dirs {
+    /// Whether the saved folder can be started in as it is. A relative path is read against
+    /// the daemon's own folder, which is not where the tab was.
+    fn present(&self, saved: &Path) -> bool {
+        saved.is_absolute() && self.exist.contains(saved)
+    }
+}
+
+/// Every folder the rows were saved in, probed at once, and for agent rows whose folder is
+/// gone the nearest ancestor that exists.
 ///
 /// Restore runs before the socket is served, and a client's handshake deadline
 /// (`SEQUENCE_DEADLINE`, ten seconds) covers all of it. One probe after another cost a
 /// `PROBE_DEADLINE` per tab on a dead mount, so a handful of such tabs failed the attach of
 /// a daemon that was only busy; at once, the start waits one deadline however many there
 /// are. Each distinct path is probed once, so tabs sharing a dead directory hold one probe
-/// thread between them, not one each.
+/// thread between them, not one each. The ancestors of every gone path are walked the same
+/// way, one level for all of them together, and a level that does not answer ends its chain.
 ///
-/// A path left out is gone, or did not answer in time, or found the pool busy. None of
-/// those is spawned into: an unchecked path's `chdir` would run on this thread.
-async fn existing_dirs(
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> std::collections::BTreeSet<PathBuf> {
-    let mut probes = tokio::task::JoinSet::new();
-    for path in paths.into_iter().collect::<std::collections::BTreeSet<_>>() {
-        probes.spawn(async move { matches!(is_dir_probed(&path).await, Ok(true)).then_some(path) });
+/// An agent row's path that did not answer, because the probe pool was busy, is asked once
+/// more outside the pool's queue: a busy start must not read as a missing folder, since an
+/// agent whose folder is missing is not resumed.
+async fn restore_dirs<'a>(rows: impl IntoIterator<Item = &'a qoop_store::TerminalRow>) -> Dirs {
+    let rows: Vec<_> = rows.into_iter().collect();
+    let saved = |agent_only: bool| {
+        rows.iter()
+            .filter(move |row| !agent_only || row.agent.is_some())
+            .map(|row| PathBuf::from(&row.cwd))
+    };
+    let mut dirs = Dirs::default();
+    let mut unknown = Vec::new();
+    for (path, answer) in probe_dirs(saved(false), false).await {
+        match answer {
+            Some(true) => dirs.exist.insert(path),
+            Some(false) => dirs.gone.insert(path),
+            None => {
+                unknown.push(path);
+                continue;
+            }
+        };
     }
-    let mut found = std::collections::BTreeSet::new();
-    while let Some(probed) = probes.join_next().await {
-        if let Ok(Some(path)) = probed {
-            found.insert(path);
-        }
+    let agent_paths: std::collections::BTreeSet<_> = saved(true).collect();
+    unknown.retain(|path| agent_paths.contains(path));
+    for (path, answer) in probe_dirs(unknown, true).await {
+        match answer {
+            Some(true) => dirs.exist.insert(path),
+            Some(false) => dirs.gone.insert(path),
+            None => continue,
+        };
     }
-    found
+    // Level by level: each chain holds the path it started from and the parent it asks next.
+    let mut chains: Vec<(PathBuf, PathBuf)> = agent_paths
+        .into_iter()
+        .filter(|path| path.is_absolute() && dirs.gone.contains(path))
+        .filter_map(|path| Some((path.clone(), parent_below_root(&path)?)))
+        .collect();
+    // ponytail: one level per round, so a deep gone path costs its depth in rounds; each round
+    // is one concurrent probe, and a path this deep below a missing folder is rare.
+    while !chains.is_empty() {
+        let answers: std::collections::BTreeMap<_, _> =
+            probe_dirs(chains.iter().map(|(_, parent)| parent.clone()), false)
+                .await
+                .into_iter()
+                .collect();
+        chains = chains
+            .into_iter()
+            .filter_map(|(path, parent)| match answers.get(&parent) {
+                Some(Some(true)) => {
+                    dirs.nearest.insert(path, parent);
+                    None
+                }
+                Some(Some(false)) => Some((path, parent_below_root(&parent)?)),
+                _ => None,
+            })
+            .collect();
+    }
+    dirs
+}
+
+/// The parent of `path`, unless that is the root: a tab left in `/` is no nearer its folder
+/// than one left where the daemon is.
+fn parent_below_root(path: &Path) -> Option<PathBuf> {
+    path.parent()
+        .filter(|parent| *parent != Path::new("/"))
+        .map(Path::to_path_buf)
 }
 
 /// Whether a directory a person is waiting on exists: like [`is_dir_probed`], but never
@@ -10970,7 +11141,43 @@ mod session_title_tests {
 
 #[cfg(test)]
 mod restore_report_tests {
-    use super::RestoreReport;
+    use super::{Dirs, RestoreReport, folder_gone_notice, parent_below_root};
+    use std::path::{Path, PathBuf};
+
+    /// The notice is typed into a line editor and pasted by a person: no control character
+    /// reaches the editor, and the command inside is quoted for a path with a space and a
+    /// quote in it.
+    #[test]
+    fn the_notice_pastes_whole_and_carries_no_control_characters() {
+        let argv = ["claude".to_string(), "--resume".into(), "abc".into()];
+        let line = folder_gone_notice(Path::new("/tmp/it's a\u{15}dir"), true, &argv);
+        assert!(line.starts_with(" printf "), "{line:?}");
+        assert!(line.ends_with('\r'), "{line:?}");
+        let body = &line[..line.len() - 1];
+        assert!(!body.chars().any(char::is_control), "{body:?}");
+        assert!(body.contains("agent folder gone"), "{body:?}");
+        assert!(body.contains("claude --resume abc"), "{body:?}");
+        let line = folder_gone_notice(Path::new("/tmp/a b"), false, &argv);
+        assert!(line.contains("agent folder not available"), "{line:?}");
+        // Quoted once for the pasted command, and again for the `printf` that shows it.
+        assert!(line.contains(r"cd '\''/tmp/a b'\'' && claude"), "{line:?}");
+    }
+
+    /// The walk up never ends in `/`, and a relative path is never present.
+    #[test]
+    fn the_walk_stops_below_the_root_and_a_relative_path_is_never_present() {
+        assert_eq!(
+            parent_below_root(Path::new("/a/b")),
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(parent_below_root(Path::new("/a")), None);
+        let dirs = Dirs {
+            exist: [PathBuf::from("rel"), PathBuf::from("/abs")].into(),
+            ..Dirs::default()
+        };
+        assert!(!dirs.present(Path::new("rel")));
+        assert!(dirs.present(Path::new("/abs")));
+    }
 
     /// The summary names every category, so a silent fallback has nowhere to hide.
     #[test]
@@ -10981,13 +11188,15 @@ mod restore_report_tests {
             brought_back: 4,
             cwd_fallback: 1,
             agents_resumed: 1,
+            agents_folder_gone: 1,
             agents_shell_fallback: 1,
             plain_shells: 2,
             opened: vec![1, 2, 3, 4],
+            folder_gone: vec![3],
         };
         assert_eq!(
             report.summary(),
-            "restore: 4/4 panes, 1 agents resumed, 1 agent shells, 2 plain shells, 1 moved directory"
+            "restore: 4/4 panes, 1 agents resumed, 1 agent folders gone, 1 agent shells, 2 plain shells, 1 moved directory"
         );
     }
 

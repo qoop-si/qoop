@@ -33,11 +33,15 @@ async fn new_space(c: &mut TestClient, name: &str) -> i64 {
 }
 
 async fn new_tab(c: &mut TestClient, workspace: i64, id: &str) -> u32 {
+    new_tab_in(c, workspace, id, None).await
+}
+
+async fn new_tab_in(c: &mut TestClient, workspace: i64, id: &str, cwd: Option<&Path>) -> u32 {
     match ask(
         c,
         ControlRequest::CreateTerminal {
             id: id.into(),
-            cwd: None,
+            cwd: cwd.map(|p| p.display().to_string()),
             workspace: Some(workspace),
             name: None,
         },
@@ -100,6 +104,72 @@ async fn wake_tab(c: &mut TestClient, workspace: i64, terminal: Option<u32>) -> 
         },
     )
     .await
+}
+
+/// Held for the whole of a test that installs an agent override: the table is process wide.
+static OVERRIDES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A wake is a restore, and a tab whose agent's folder is gone while it slept must not have
+/// the agent resumed anywhere else. The one ordering that fails silently is the row's agent
+/// being cleared before the sleep mark comes off: the store drops a write into a sleeping
+/// tab, so the asserts on the row are what catches it.
+#[tokio::test]
+async fn a_woken_agent_tab_whose_folder_is_gone_is_not_resumed() {
+    let _overrides = OVERRIDES.lock().await;
+    let held = tempfile::tempdir().expect("a directory");
+    let base = std::fs::canonicalize(held.path()).expect("a real path");
+    let marker = base.join("resumed");
+    let overrides = base.join("overrides");
+    std::fs::create_dir(&overrides).expect("mkdir");
+    std::fs::write(
+        overrides.join("wake-gone-xyz.toml"),
+        format!(
+            "id = \"wake-gone-xyz\"\nversion = \"test\"\n[resume]\nlatest = [\"/usr/bin/touch\", \"{}\"]\n",
+            marker.display()
+        ),
+    )
+    .expect("an override");
+    let outcome = qoop_detect::reload_overrides(&overrides);
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+    let work = base.join("work");
+    std::fs::create_dir(&work).expect("mkdir");
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("waker").await;
+    let space = new_space(&mut c, "gone").await;
+    let tab = new_tab_in(&mut c, space, "t1", Some(&work)).await;
+    let asleep = sleep(&mut c, space).await;
+    assert!(
+        matches!(
+            asleep,
+            ControlResponse::WorkspaceAsleep { terminals: 1, .. }
+        ),
+        "the space did not sleep: {asleep:?}"
+    );
+    // What a sleep of an agent tab writes down, and the folder going while it sleeps.
+    d.store()
+        .checkpoint(vec![qoop_store::Checkpoint {
+            terminal: tab as i64,
+            agent: Some("wake-gone-xyz".into()),
+            agent_session: Some("session-w".into()),
+        }])
+        .await
+        .expect("a checkpoint");
+    std::fs::remove_dir(&work).expect("remove the folder");
+
+    let woke = wake(&mut c, space).await;
+    assert!(
+        matches!(woke, ControlResponse::WorkspaceAwake { terminals: 1, .. }),
+        "the space did not wake: {woke:?}"
+    );
+    // A resume typed into the woken shell would touch the marker within moments; the
+    // restore test beside the daemon covers what the tab is told.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!marker.exists(), "the agent was resumed without its folder");
+    let rows = d.store().open_terminals(space).await.expect("rows");
+    let row = rows.iter().find(|r| r.id == tab as i64).expect("the row");
+    assert_eq!(row.agent, None, "the row still names the agent");
+    assert_eq!(row.agent_session.as_deref(), Some("session-w"));
 }
 
 #[tokio::test]
