@@ -9,7 +9,7 @@
 //! line. Read and written through the daemon, as `qoop task` is; read again each time the
 //! daemon says a task changed, and every half minute besides.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,7 +25,7 @@ use crate::qass::{self, Life};
 use crate::qass_page::{ago, wrap};
 
 /// The smallest window the page draws in: three lanes of a card each.
-const NEED: (usize, usize) = (60, 14);
+const NEED: (usize, usize) = (qoop_tui::qass_screen::BOARD_MIN_COLS, 14);
 /// A card's rows: its top edge with the space, two of title, the foot, its bottom edge.
 const CARD_H: usize = 5;
 /// Read again after this long with no news, for what changes with time alone (a start that
@@ -108,6 +108,18 @@ struct Page {
     card: Option<ItemCardInfo>,
     said: Option<String>,
     now: i64,
+    /// The card under a held mouse button: let go over qass's pane (the interface says so),
+    /// it is handed to qass.
+    held: Option<i64>,
+    /// The size the page was last drawn at, which the mouse is read against.
+    size: (usize, usize),
+    /// Where the held card was drawn when it was pressed (left, top, width): what its release
+    /// is checked against, since selecting it may scroll its lane.
+    held_at: Option<(usize, usize, usize)>,
+    /// The held card was carried off itself: its release is no click.
+    wandered: bool,
+    /// The Done cards put away are shown (dimmed), to bring one back.
+    reveal: bool,
 }
 
 fn now_unix() -> i64 {
@@ -151,9 +163,11 @@ fn lanes<'a>(
     items: &'a [ItemInfo],
     spaces: &[WorkspaceRow],
     filter: &str,
+    reveal: bool,
 ) -> [Vec<&'a ItemInfo>; 3] {
     let mut out: [Vec<&ItemInfo>; 3] = Default::default();
-    for item in items {
+    // A card the owner put away is off the board until he asks to see those.
+    for item in items.iter().filter(|i| reveal || !i.hidden) {
         let Some(lane) = LANES.iter().position(|l| *l == item.state) else {
             continue;
         };
@@ -212,6 +226,11 @@ impl Page {
             card: None,
             said: None,
             now: now_unix(),
+            held: None,
+            size: NEED,
+            held_at: None,
+            wandered: false,
+            reveal: false,
         }
     }
 
@@ -220,7 +239,37 @@ impl Page {
             self.items.as_deref().unwrap_or_default(),
             &self.spaces,
             &self.filter,
+            self.reveal,
         )
+    }
+
+    /// The Done cards put away (within Done's 24 hours: older ones are off the board anyway).
+    fn hidden(&self) -> usize {
+        self.items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|i| i.hidden)
+            .count()
+    }
+
+    /// Put a closed card away, or bring a put away one back: `x` on it, or a click on its
+    /// cross. Open cards have none.
+    fn dismissed(&self, item: &ItemInfo) -> Step {
+        if item.state != "done" {
+            return Step::Stay;
+        }
+        let undo = item.hidden;
+        let said = if undo {
+            format!("{} is back on the board", item.key)
+        } else {
+            format!(
+                "{} is off the board: hidden ({}) shows it",
+                item.key,
+                self.hidden() + 1
+            )
+        };
+        Step::Write(item.id, TaskOp::Dismiss { undo }, said)
     }
 
     /// The spaces an issue can be added to: every one but qass's.
@@ -305,11 +354,190 @@ impl Page {
         }
     }
 
+    /// The left button on the board: a press on a card selects it and holds it; let go in
+    /// the page it is just selected; let go over qass's pane (the interface says so, the page
+    /// cannot see past its edge) a Todo card is handed to qass as `L` hands it, any other
+    /// says why not. Only on the board itself, not over a dialog or while typing.
+    fn mouse(&mut self, key: Key) -> Step {
+        match key {
+            Key::Mouse {
+                down: true,
+                held: false,
+                col,
+                row,
+            } if self.mode == Mode::Board => {
+                let (col, row) = (col as usize, row as usize);
+                self.wandered = false;
+                // A Done card's cross puts it away (or back): never also a press that holds it.
+                if let Some(id) = self.cross_at(col, row) {
+                    self.held = None;
+                    let item = self
+                        .items
+                        .as_ref()
+                        .and_then(|v| v.iter().find(|i| i.id == id));
+                    return item.map_or(Step::Stay, |item| self.dismissed(item));
+                }
+                if self.on_hidden_line(col, row) {
+                    self.held = None;
+                    self.reveal = !self.reveal;
+                    self.settle();
+                    return Step::Stay;
+                }
+                let placed = self.placed(col, row);
+                self.held_at = placed.map(|(_, _, at)| at);
+                self.held = placed.map(|(lane, id, _)| {
+                    (self.lane, self.sel) = (lane, Some(id));
+                    id
+                });
+                if let Some(item) = self.selected().filter(|_| self.held.is_some()) {
+                    self.said = (item.state == "todo")
+                        .then(|| format!("drag onto qass to start {}", item.key));
+                }
+            }
+            // Carried off the card it was pressed on: what comes up later is no click.
+            Key::Mouse {
+                down: true,
+                held: true,
+                col,
+                row,
+            } => {
+                if !self.on_held(col as usize, row as usize) {
+                    self.wandered = true;
+                }
+            }
+            // Pressed and let go on the same card, never carried off it: a click, which opens it
+            // as `enter` does.
+            Key::Mouse {
+                down: false,
+                col,
+                row,
+                ..
+            } => {
+                let on = self.on_held(col as usize, row as usize);
+                let held = self.held.take();
+                self.held_at = None;
+                if self.mode == Mode::Board
+                    && !self.wandered
+                    && on
+                    && let Some(id) = held
+                {
+                    return Step::Open(id);
+                }
+            }
+            Key::Dropped(on_qass) => {
+                // Only on the board itself: a dialog or a field typed in has the keys.
+                let held = self.held.take().filter(|_| self.mode == Mode::Board);
+                let item = held.and_then(|id| self.items.as_ref()?.iter().find(|i| i.id == id));
+                if let (true, Some(item)) = (on_qass, item) {
+                    return match item.state.as_str() {
+                        "todo" => self.moved(item, true),
+                        "doing" => {
+                            self.said = Some(format!("{} is already in doing", item.key));
+                            Step::Stay
+                        }
+                        _ => {
+                            self.said = Some(format!("reopen {} first", item.key));
+                            Step::Stay
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+        Step::Stay
+    }
+
+    /// The card drawn at a cell of the page, with its lane: the lanes and cards as
+    /// [`Page::draw`] places them at the size it last drew.
+    #[cfg(test)]
+    fn card_at(&self, col: usize, row: usize) -> Option<(usize, i64)> {
+        self.placed(col, row).map(|(n, id, _)| (n, id))
+    }
+
+    /// The card under a cell, with its lane and its top left cell and width, as drawn.
+    fn placed(&self, col: usize, row: usize) -> Option<(usize, i64, (usize, usize, usize))> {
+        let (w, h) = self.size;
+        // Too small, the page shows only how big to make it: no card is under the pointer.
+        if w < NEED.0 || h < NEED.1 {
+            return None;
+        }
+        let lw = (w - 2 - 4) / 3;
+        let (top, bottom) = (2, h - 2);
+        let lanes = self.lanes();
+        let n = (0..3).find(|n| {
+            let x = 1 + n * (lw + 2) + 1;
+            col >= x && col < x + lw - 2
+        })?;
+        let (first, room) = self.shown(n, lanes[n].len(), bottom - top);
+        let at = row.checked_sub(top + 1)? / CARD_H;
+        (at < room)
+            .then(|| lanes[n].get(first + at))
+            .flatten()
+            .map(|item| {
+                let place = (1 + n * (lw + 2) + 1, top + 1 + at * CARD_H, lw - 2);
+                (n, item.id, place)
+            })
+    }
+
+    /// Whether a cell is on the card held, where it was drawn when pressed.
+    fn on_held(&self, col: usize, row: usize) -> bool {
+        self.held.is_some()
+            && self
+                .held_at
+                .is_some_and(|(x, y, w)| col >= x && col < x + w && row >= y && row < y + CARD_H)
+    }
+
+    /// Whether a cell is a Done card's cross: its top edge, one in from the right corner.
+    fn cross_at(&self, col: usize, row: usize) -> Option<i64> {
+        let (_, id, (x, y, w)) = self.placed(col, row)?;
+        let item = self.items.as_ref()?.iter().find(|i| i.id == id)?;
+        (item.state == "done" && row == y && col == x + w - 2).then_some(id)
+    }
+
+    /// Whether a cell is on the Done lane's foot, where `hidden (N)` is.
+    fn on_hidden_line(&self, col: usize, row: usize) -> bool {
+        let (w, h) = self.size;
+        if w < NEED.0 || h < NEED.1 || self.hidden() == 0 {
+            return false;
+        }
+        let lw = (w - 2 - 4) / 3;
+        let x = 1 + 2 * (lw + 2);
+        row == h - 4 && col > x && col < x + lw - 1
+    }
+
+    /// The first card a lane of `len` cards shows and how many fit in its `h` rows, scrolled
+    /// to keep the keyboard's card in sight.
+    fn shown(&self, n: usize, len: usize, h: usize) -> (usize, usize) {
+        let room = (h - 3) / CARD_H;
+        let lanes = self.lanes();
+        let at = self
+            .sel
+            .and_then(|sel| lanes[n].iter().position(|i| i.id == sel));
+        let first = match at {
+            Some(at) if n == self.lane => (at + 1).saturating_sub(room),
+            _ => 0,
+        };
+        (first.min(len), room)
+    }
+
     /// One key.
     fn key(&mut self, key: Key) -> Step {
         if key == Key::Stop {
             return Step::Leave;
         }
+        if matches!(key, Key::Mouse { .. } | Key::Dropped(_)) {
+            return self.mouse(key);
+        }
+        let step = self.typed(key);
+        // A key that takes the page off the board lets go of a card held there.
+        if self.mode != Mode::Board {
+            self.held = None;
+        }
+        step
+    }
+
+    /// A key, not the mouse.
+    fn typed(&mut self, key: Key) -> Step {
         match self.mode.clone() {
             Mode::Board => self.board_key(key),
             Mode::Card(at) => self.card_key(key, at),
@@ -395,6 +623,12 @@ impl Page {
                     return self.moved(item, c == 'L');
                 }
             }
+            Key::Char('x') => {
+                if let Some(item) = self.selected() {
+                    return self.dismissed(item);
+                }
+            }
+            Key::Char('X') => self.reveal = !self.reveal,
             Key::Char('/') => self.mode = Mode::Filter,
             Key::Char('t') => self.mode = Mode::Tell(String::new()),
             Key::Char('c') => {
@@ -532,14 +766,7 @@ impl Page {
         }
         s.put(x, y + h - 1, &format!("└{}┘", "─".repeat(w - 2)), &rule);
         // The cards: as many as fit above the lane's foot, scrolled to keep the keyboard's.
-        let room = (h - 3) / CARD_H;
-        let at = self
-            .sel
-            .and_then(|sel| lane.iter().position(|i| i.id == sel));
-        let first = match at {
-            Some(at) if n == self.lane => (at + 1).saturating_sub(room),
-            _ => 0,
-        };
+        let (first, room) = self.shown(n, lane.len(), h);
         let mut cy = y + 1;
         for item in lane.iter().skip(first).take(room) {
             let on = n == self.lane && Some(item.id) == self.sel && self.mode != Mode::Filter;
@@ -556,7 +783,11 @@ impl Page {
         let hidden = lane.len().saturating_sub(first + room);
         let foot = match n {
             0 => "+ create issue  c".to_string(),
-            2 => "closed in 24 h".to_string(),
+            2 => match (self.hidden(), self.reveal) {
+                (0, _) => "closed in 24 h".to_string(),
+                (n, false) => format!("hidden ({n})  X"),
+                (n, true) => format!("hidden ({n}) shown  X"),
+            },
             _ => String::new(),
         };
         let foot = if hidden > 0 {
@@ -579,7 +810,19 @@ impl Page {
             ink(theme::space_in(&self.spaces, id))
         });
         s.put(x, y, &format!("┌{}┐", "─".repeat(w - 2)), &edge);
-        s.put(x + 2, y, &fit(&format!(" {space} "), w - 4), &space_ink);
+        s.put(x + 2, y, &fit(&format!(" {space} "), w - 6), &space_ink);
+        // A Done card's cross puts it away; one put away (shown dimmed) brings it back.
+        if item.state == "done" {
+            if item.hidden {
+                s.put(x + w - 8, y, " show ", &ink(Role::Detail));
+            }
+            let cross = if item.hidden {
+                Role::Detail
+            } else {
+                Role::Faint
+            };
+            s.put(x + w - 2, y, "x", &ink(cross));
+        }
         for row in y + 1..y + CARD_H - 1 {
             s.put(x, row, "│", &edge);
             s.put(x + w - 1, row, "│", &edge);
@@ -915,6 +1158,7 @@ impl Page {
                 ("c", "create"),
                 ("/", "filter"),
                 ("H L", "move"),
+                ("x", "dismiss done"),
                 ("t", "tell qass"),
                 ("q", "close"),
             ],
@@ -949,6 +1193,8 @@ pub(crate) fn activity_words(kind: &str, body: &str) -> String {
         "start" if body.is_empty() => return "started by the owner".to_string(),
         "evidence" => "check",
         "done" => "claims done",
+        "hidden" => return "hidden from the board".to_string(),
+        "unhidden" => return "back on the board".to_string(),
         other => other,
     };
     if body.is_empty() {
@@ -1175,6 +1421,7 @@ pub(crate) fn run() -> std::io::Result<()> {
     let (tx, news) = mpsc::channel();
     watch(tx);
     let session = Session::start()?;
+    let _mouse = MouseOn::start()?;
     let mut polled: Option<Instant> = None;
     let mut last = String::new();
     'run: loop {
@@ -1193,6 +1440,10 @@ pub(crate) fn run() -> std::io::Result<()> {
             reload(&mut page);
         }
         let (w, h) = page::size();
+        page.size = (w, h);
+        if w < NEED.0 || h < NEED.1 {
+            page.held = None;
+        }
         let screen = page.draw(w.max(NEED.0), h.max(NEED.1));
         // Written only when it changed: a page that repaints every tick is never idle to the
         // daemon, and its tab would never sleep. Ages are left out of the comparison (drawn
@@ -1272,6 +1523,25 @@ pub(crate) fn run() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The page asks for the left button while it runs (motion while held, SGR reports), so a
+/// card can be carried onto qass; dropped, the terminal stops sending them.
+struct MouseOn;
+
+impl MouseOn {
+    fn start() -> std::io::Result<MouseOn> {
+        print!("\x1b[?1002h\x1b[?1006h");
+        std::io::stdout().flush()?;
+        Ok(MouseOn)
+    }
+}
+
+impl Drop for MouseOn {
+    fn drop(&mut self) {
+        print!("\x1b[?1006l\x1b[?1002l");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// Read the board again, and the open card with it.
 fn reload(page: &mut Page) {
     page.now = now_unix();
@@ -1311,6 +1581,7 @@ mod tests {
             agents: Vec::new(),
             updated_at: 0,
             closed_at: None,
+            hidden: false,
         }
     }
 
@@ -1334,6 +1605,184 @@ mod tests {
         ]);
         p.settle();
         p
+    }
+
+    /// A card pressed on the board is held; let go over qass (the interface says so) a Todo
+    /// card is started as `L` starts it, Doing and Done say why not; let go anywhere else, or
+    /// with nothing held, nothing happens.
+    #[test]
+    fn a_card_carried_onto_qass_is_handed_to_it() {
+        let mut p = page();
+        p.size = (90, 30);
+        let press = |col, row| Key::Mouse {
+            down: true,
+            held: false,
+            col,
+            row,
+        };
+        let release = Key::Mouse {
+            down: false,
+            held: false,
+            col: 0,
+            row: 0,
+        };
+        // Lanes of 28 columns from column 1, the first card on rows 3 to 7.
+        assert_eq!(p.card_at(5, 4), Some((0, 1)));
+        assert_eq!(p.card_at(35, 4), Some((1, 3)));
+        assert_eq!(p.card_at(5, 1), None, "the head");
+        assert_eq!(p.key(press(5, 4)), Step::Stay);
+        assert_eq!(p.said.as_deref(), Some("drag onto qass to start QOOP-1"));
+        assert_eq!(p.key(Key::Dropped(true)), Step::Start(1, "QOOP-1".into()));
+        assert_eq!(
+            p.key(Key::Dropped(true)),
+            Step::Stay,
+            "nothing held any more"
+        );
+        p.key(press(35, 4));
+        assert_eq!(p.sel, Some(3));
+        assert_eq!(p.key(Key::Dropped(true)), Step::Stay);
+        assert_eq!(p.said.as_deref(), Some("QOOP-3 is already in doing"));
+        p.key(press(64, 4));
+        p.key(Key::Dropped(true));
+        assert_eq!(p.said.as_deref(), Some("reopen QOOP-6 first"));
+        p.key(press(5, 4));
+        assert_eq!(p.key(Key::Dropped(false)), Step::Stay);
+        p.key(press(5, 4));
+        assert_eq!(p.key(release), Step::Stay);
+        assert_eq!(p.key(Key::Dropped(true)), Step::Stay, "let go in the page"); // A window too small draws no board: nothing is under the pointer.
+        p.size = (50, 30);
+        assert_eq!(p.card_at(5, 4), None);
+        p.size = (90, 10);
+        assert_eq!(p.card_at(5, 4), None);
+    }
+
+    /// A click on a card opens it as `enter` does: pressed and let go on the same card, never
+    /// carried off it; a press let go elsewhere, or carried off and back, only selects.
+    #[test]
+    fn a_click_on_a_card_opens_it_and_a_drag_does_not() {
+        let mut p = page();
+        p.size = (90, 30);
+        let at = |down, held, col, row| Key::Mouse {
+            down,
+            held,
+            col,
+            row,
+        };
+        assert_eq!(p.key(at(true, false, 5, 4)), Step::Stay);
+        assert_eq!(
+            p.key(at(false, false, 6, 5)),
+            Step::Open(1),
+            "the same card"
+        );
+        p.key(at(true, false, 35, 4));
+        assert_eq!(
+            p.key(at(false, false, 5, 4)),
+            Step::Stay,
+            "let go on another card"
+        );
+        assert_eq!(p.sel, Some(3));
+        p.key(at(true, false, 5, 4));
+        p.key(at(true, true, 35, 4));
+        p.key(at(true, true, 5, 4));
+        assert_eq!(
+            p.key(at(false, false, 5, 4)),
+            Step::Stay,
+            "carried off and back"
+        );
+        assert_eq!(
+            p.key(at(false, false, 5, 4)),
+            Step::Stay,
+            "a release with no press"
+        );
+        p.key(at(true, false, 5, 1));
+        assert_eq!(p.key(at(false, false, 5, 1)), Step::Stay, "the head");
+    }
+
+    /// A Done card has a cross at its top right that puts it away (nothing deleted: a write
+    /// the daemon keeps), as `x` does; an open card has none. Put away cards leave the lane, its
+    /// foot counts them, and a click there (or `X`) shows them, their cross bringing one back.
+    #[test]
+    fn a_done_card_is_put_away_by_its_cross_and_shown_again() {
+        let mut p = page();
+        p.size = (90, 30);
+        let press = |col, row| Key::Mouse {
+            down: true,
+            held: false,
+            col,
+            row,
+        };
+        // The Done lane starts at column 61, its card at 62, 26 wide: the cross at 86, row 3.
+        let cell = |p: &Page, col: usize, row: usize| drawn(p, 90, 30).chars().nth(row * 90 + col);
+        let line = |p: &Page, row: usize| -> String {
+            drawn(p, 90, 30).chars().skip(row * 90).take(90).collect()
+        };
+        assert_eq!(cell(&p, 86, 3), Some('x'));
+        assert_eq!(cell(&p, 26, 3), Some('─'), "no cross on Todo");
+        match p.key(press(86, 3)) {
+            Step::Write(6, TaskOp::Dismiss { undo: false }, said) => {
+                assert!(said.starts_with("QOOP-6 is off the board"), "{said}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(p.held, None, "the cross holds nothing");
+        assert_eq!(p.key(press(5, 3)), Step::Stay);
+        assert_eq!(
+            p.key(Key::Char('x')),
+            Step::Stay,
+            "an open card has no cross"
+        );
+        // The daemon says it is hidden: off the lane, counted at its foot.
+        for item in p.items.as_mut().unwrap() {
+            item.hidden = item.id == 6;
+        }
+        assert!(p.lanes()[2].is_empty());
+        let foot = line(&p, 26);
+        assert!(foot.contains("hidden (1)"), "{foot}");
+        assert_eq!(p.key(press(66, 26)), Step::Stay);
+        assert!(p.reveal && p.lanes()[2].len() == 1);
+        assert!(line(&p, 3).contains("show"));
+        assert!(matches!(
+            p.key(press(86, 3)),
+            Step::Write(6, TaskOp::Dismiss { undo: true }, _)
+        ));
+        p.key(Key::Char('X'));
+        assert!(!p.reveal);
+        // Shown, a hidden card selected, then put away by a click on the foot: the keyboard
+        // leaves it, so enter, x and H cannot act on a card nobody sees.
+        p.key(Key::Char('X'));
+        p.key(press(70, 4));
+        assert_eq!(p.sel, Some(6));
+        p.key(Key::Mouse {
+            down: false,
+            held: false,
+            col: 0,
+            row: 0,
+        });
+        p.key(press(66, 26));
+        assert!(!p.reveal);
+        assert_ne!(p.sel, Some(6));
+    }
+
+    /// A card held while the page leaves the board (a field to type in, the dialog) is let
+    /// go: a drop then starts nothing.
+    #[test]
+    fn a_drop_starts_nothing_once_the_page_left_the_board() {
+        let mut p = page();
+        p.size = (90, 30);
+        let press = Key::Mouse {
+            down: true,
+            held: false,
+            col: 5,
+            row: 4,
+        };
+        p.key(press);
+        p.key(Key::Char('/'));
+        assert_eq!(p.key(Key::Dropped(true)), Step::Stay);
+        p.key(Key::Esc);
+        p.key(press);
+        assert!(matches!(p.key(Key::Enter), Step::Open(1)));
+        p.mode = Mode::Card(0);
+        assert_eq!(p.key(Key::Dropped(true)), Step::Stay);
     }
 
     fn drawn(p: &Page, w: usize, h: usize) -> String {
@@ -1361,19 +1810,19 @@ mod tests {
         };
         let items = p.items.clone().unwrap();
         assert_eq!(
-            ids(&lanes(&items, &p.spaces, "")),
+            ids(&lanes(&items, &p.spaces, "", false)),
             [vec![1, 2], vec![3, 4, 5], vec![6]]
         );
         assert_eq!(
-            ids(&lanes(&items, &p.spaces, "app")),
+            ids(&lanes(&items, &p.spaces, "app", false)),
             [vec![], vec![4, 5], vec![]]
         );
         assert_eq!(
-            ids(&lanes(&items, &p.spaces, "qoop-6")),
+            ids(&lanes(&items, &p.spaces, "qoop-6", false)),
             [vec![], vec![], vec![6]]
         );
         assert_eq!(
-            ids(&lanes(&items, &p.spaces, " harness ")),
+            ids(&lanes(&items, &p.spaces, " harness ", false)),
             [vec![1], vec![], vec![]]
         );
     }

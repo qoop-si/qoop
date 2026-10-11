@@ -71,6 +71,17 @@ pub enum Key {
     Stop,
     CtrlR,
     Char(char),
+    /// The left button, in the cells of the page (from 0): pressed, moved while held
+    /// (`held`), or let go. Only a page that asks for the mouse gets these.
+    Mouse {
+        down: bool,
+        held: bool,
+        col: u16,
+        row: u16,
+    },
+    /// What the interface says about a press held in this page and let go outside it: over
+    /// qass's pane (`true`), or anywhere else.
+    Dropped(bool),
 }
 
 /// The keys in `bytes`, and how many bytes they used. An escape sequence is read to its
@@ -85,6 +96,26 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
                 let Some(&next) = bytes.get(i + 1) else {
                     return (out, i);
                 };
+                if next == b']' {
+                    // An OSC, to BEL or ST, read whole: never its letters as keys.
+                    let body = &bytes[i + 2..];
+                    let end = body.iter().enumerate().find_map(|(at, b)| match b {
+                        0x07 => Some((at, 1)),
+                        0x1b if body.get(at + 1) == Some(&b'\\') => Some((at, 2)),
+                        _ => None,
+                    });
+                    let Some((at, len)) = end else {
+                        return (out, i);
+                    };
+                    let key = match &body[..at] {
+                        b"7701;drop=qass" => Some(Key::Dropped(true)),
+                        b"7701;drop=none" => Some(Key::Dropped(false)),
+                        _ => None,
+                    };
+                    out.extend(key);
+                    i += 2 + at + len;
+                    continue;
+                }
                 if !matches!(next, b'[' | b'O') {
                     // Alt and a key: the key alone.
                     i += 1;
@@ -98,7 +129,13 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
                     return (out, i);
                 };
                 let last = bytes[i + 2 + end];
+                let params = &bytes[i + 2..i + 2 + end];
                 i += 2 + end;
+                if let (b'M' | b'm', Some(sgr)) = (last, params.strip_prefix(b"<")) {
+                    out.extend(mouse(sgr, last == b'M'));
+                    i += 1;
+                    continue;
+                }
                 match last {
                     b'D' => Some(Key::Left),
                     b'C' => Some(Key::Right),
@@ -146,6 +183,23 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
         i += 1;
     }
     (out, i)
+}
+
+/// An SGR mouse report's `b;x;y`, for the left button only: the wheel and the other buttons
+/// are nothing here.
+fn mouse(params: &[u8], down: bool) -> Option<Key> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut parts = text.split(';').map(|p| p.parse::<u16>().ok());
+    let (b, x, y) = (parts.next()??, parts.next()??, parts.next()??);
+    if b & 0b0100_0011 != 0 {
+        return None;
+    }
+    Some(Key::Mouse {
+        down,
+        held: b & 32 != 0,
+        col: x.saturating_sub(1),
+        row: y.saturating_sub(1),
+    })
 }
 
 /// The keys typed next: what arrives, and when it ends in a cut-off escape, what follows
@@ -403,6 +457,37 @@ pub fn show(screen: &Screen, need: (usize, usize)) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The left button's reports are read whole, the wheel and other buttons are nothing, and
+    /// the interface's drop arrives as one key, never as its letters; a report or a drop cut
+    /// anywhere waits for the rest.
+    #[test]
+    fn mouse_reports_and_the_drop_are_read_whole() {
+        let only = |bytes: &[u8]| decode(bytes).0;
+        let at = |down, held, col, row| Key::Mouse {
+            down,
+            held,
+            col,
+            row,
+        };
+        assert_eq!(
+            only(b"\x1b[<0;6;5M\x1b[<32;7;5M\x1b[<0;7;5m"),
+            [
+                at(true, false, 5, 4),
+                at(true, true, 6, 4),
+                at(false, false, 6, 4)
+            ]
+        );
+        assert_eq!(only(b"\x1b[<64;6;5M\x1b[<65;6;5M\x1b[<2;6;5M"), []);
+        assert_eq!(only(b"\x1b]7701;drop=qass\x07"), [Key::Dropped(true)]);
+        assert_eq!(only(b"\x1b]7701;drop=none\x1b\\"), [Key::Dropped(false)]);
+        assert_eq!(only(b"\x1b]0;a title\x07q"), [Key::Char('q')]);
+        for whole in [&b"\x1b]7701;drop=qass\x07"[..], &b"\x1b[<0;6;5M"[..]] {
+            for cut in 1..whole.len() {
+                assert_eq!(decode(&whole[..cut]), (Vec::new(), 0), "{cut}");
+            }
+        }
+    }
 
     #[test]
     fn keys_arrows_letters_and_cut_sequences() {

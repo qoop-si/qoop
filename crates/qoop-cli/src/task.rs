@@ -79,6 +79,8 @@ const USAGE: &str = "usage:
   qoop task unlink [--id KEY|N]        take the task off its item; an item: every agent
   qoop task start <KEY|id>             ask qass to start the item
   qoop task reopen <KEY|id>            bring a closed item back
+  qoop task dismiss <KEY|id> [--undo]  put a closed item away from the board (nothing is
+                                       deleted); --undo: back on the board
   qoop task ls [--json]                open tasks
   qoop task board [--json] [--dir DIR] the board's items, then every space's goal and open
                                        tasks as Markdown; --json: the items; --dir writes
@@ -529,6 +531,21 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         },
         Some("reopen") => match raw.as_slice() {
             [key] => write(Some(item(key)?), TaskOp::Reopen).map(drop),
+            _ => Err(usage(USAGE)),
+        },
+        Some("dismiss") => match without(&["--undo"]).as_slice() {
+            [key] => {
+                let undo = has("--undo");
+                write(Some(item(key)?), TaskOp::Dismiss { undo })?;
+                if undo {
+                    println!("{key} is back on the board");
+                } else {
+                    println!(
+                        "{key} is off the board; qoop task dismiss {key} --undo brings it back"
+                    );
+                }
+                Ok(())
+            }
             _ => Err(usage(USAGE)),
         },
         Some("ls") => {

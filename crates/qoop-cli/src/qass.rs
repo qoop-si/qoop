@@ -595,8 +595,8 @@ pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
     ))
 }
 
-/// Put the board above qass in its tab (decision 12): `qoop task board --page` in a pane of
-/// its own, the tab's first, stacked over qass through the split the interface keeps. A tab
+/// Put the board beside qass in its tab (decision 12): `qoop task board --page` in a pane of
+/// its own, the tab's first, left of qass through the split the interface keeps. A tab
 /// that has a board pane is left as it is, even one at a shell: the wake that brought it back
 /// typed its page (`restore_rows`), and typing it here too would put the second line into the
 /// page as a new item.
@@ -633,10 +633,11 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
     };
     let mut board = 0;
     supervise::open_terminal(&opts, |t| board = t)?;
-    // The board first, so the tab is still one tab and the board is on top.
+    // The board first, so the tab is still one tab and the board is on the left; the
+    // interface stacks it over qass when the pane is too narrow for the two side by side.
     let tree = Pane::Split {
-        dir: SplitDir::H,
-        permille: 500,
+        dir: SplitDir::V,
+        permille: 700,
         first: Box::new(Pane::Leaf { terminal: board }),
         second: Box::new(tree.unwrap_or(Pane::Leaf { terminal: qass })),
     };

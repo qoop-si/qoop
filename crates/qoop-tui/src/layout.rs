@@ -64,6 +64,11 @@ pub struct Layout {
     pub focus: u32,
     pub prev_focus: Option<u32>,
     pub zoomed: Option<u32>,
+    /// Columns cut from the right of the root's first pane, left blank for something drawn
+    /// there (qass's questions beside the board). Only ever set on a copy that is drawn,
+    /// never on a tree that is kept or saved; the divider and every ratio are measured
+    /// without it, so the second pane is the same with or without it.
+    pub gap: usize,
 }
 
 impl Layout {
@@ -76,6 +81,7 @@ impl Layout {
             focus: terminal,
             prev_focus: None,
             zoomed: None,
+            gap: 0,
         }
     }
 
@@ -95,6 +101,7 @@ impl Layout {
             focus: leaves.first().copied().unwrap_or(0),
             prev_focus: None,
             zoomed: None,
+            gap: 0,
         }
     }
 
@@ -138,6 +145,27 @@ impl Layout {
         }
         self.set_focus(terminal);
         true
+    }
+
+    /// The root split's direction and ratio, `None` for a single pane.
+    pub fn root_split(&self) -> Option<(Dir, f32)> {
+        match &self.root {
+            Node::Split { dir, ratio, .. } => Some((*dir, *ratio)),
+            Node::Leaf { .. } => None,
+        }
+    }
+
+    /// Lay the root split out another way: what qass's tab shows at a width its saved split
+    /// does not suit. False for a single pane.
+    pub fn set_root_split(&mut self, to: Dir, to_ratio: f32) -> bool {
+        match &mut self.root {
+            Node::Split { dir, ratio, .. } => {
+                *dir = to;
+                *ratio = to_ratio;
+                true
+            }
+            Node::Leaf { .. } => false,
+        }
     }
 
     /// Visible terminals: zoomed alone when zoom is on, else all leaves.
@@ -319,6 +347,16 @@ impl Layout {
         }
         let mut out = Vec::new();
         layout_node(&self.root, self.inner(area), &mut out);
+        // The gap comes out of the first pane only, after the split is measured.
+        if self.gap > 0
+            && let Node::Split { first, .. } = &self.root
+            && let Node::Leaf {
+                terminal: Some(first),
+            } = **first
+            && let Some((_, rect)) = out.iter_mut().find(|(t, _)| *t == first)
+        {
+            rect.cols = rect.cols.saturating_sub(self.gap);
+        }
         out
     }
 

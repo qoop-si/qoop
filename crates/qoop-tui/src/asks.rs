@@ -107,6 +107,12 @@ pub struct Pane {
     shown_left: Option<u64>,
     /// Cards already read again because their terminal left the rows.
     gone: Vec<String>,
+    /// The open cards of the last read, each with a hash of its body: what tells a new
+    /// question (newly open, reopened or rewritten, all with the same `opened_at`) from one
+    /// already there.
+    last_open: std::collections::BTreeMap<String, u64>,
+    /// The owner put the questions away; the next new question brings them back.
+    pub hidden: bool,
 }
 
 impl Pane {
@@ -136,6 +142,18 @@ impl Pane {
 
     /// Take a fresh read: the open card stays the open card when it is still there.
     pub fn take(&mut self, live: Vec<AskInfo>, ended: Vec<AskInfo>) {
+        let open: std::collections::BTreeMap<String, u64> = live
+            .iter()
+            .filter(|c| c.status == "open")
+            .map(|c| (c.card.clone(), body_hash(c)))
+            .collect();
+        if open
+            .iter()
+            .any(|(card, hash)| self.last_open.get(card) != Some(hash))
+        {
+            self.hidden = false;
+        }
+        self.last_open = open;
         let keep = self.open_card().map(|c| c.card.clone());
         self.live = live;
         self.ended = ended;
@@ -322,6 +340,18 @@ impl Pane {
     /// Whether an answer is being held, for the key line.
     pub fn holding(&self) -> bool {
         self.hold.is_some()
+    }
+
+    /// Whether an answer is held, on its way or just answered: the questions stay up through
+    /// all three, so the last answer's word is still seen.
+    pub fn busy(&self) -> bool {
+        self.hold.is_some() || self.sent.is_some() || self.notice.is_some()
+    }
+
+    /// Whether the questions show by themselves: a card waits and the owner has not put them
+    /// away since it came.
+    pub fn calling(&self) -> bool {
+        self.waiting() > 0 && !self.hidden
     }
 
     fn hold_answer(&mut self, option: Option<usize>, text: Option<String>, now: Instant) -> bool {
@@ -1188,6 +1218,16 @@ pub fn hit_at(view: &View, rect: Rect, row: usize, col: usize) -> Option<Hit> {
         .iter()
         .find(|t| t.row == r && x >= t.x0 && x < t.x1)
         .map(|t| t.hit)
+}
+
+/// A card's body as one number, from its JSON: a rewritten question hashes differently.
+fn body_hash(card: &AskInfo) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(&card.body)
+        .unwrap_or_default()
+        .hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]

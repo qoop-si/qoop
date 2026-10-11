@@ -370,6 +370,12 @@ impl Store {
                  description TEXT NOT NULL DEFAULT '',
                  UNIQUE (prefix, n)
              );
+             -- A Done item the owner put away (`dismiss`): off every board, nothing deleted.
+             -- New table, no version bump: an older binary ignores it.
+             CREATE TABLE IF NOT EXISTS board_hidden (
+                 task INTEGER PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
+                 at INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS task_step (
                  task INTEGER NOT NULL REFERENCES task(id) ON DELETE CASCADE,
                  n INTEGER NOT NULL,

@@ -747,6 +747,12 @@ pub enum TaskOp {
     Start,
     /// Bring the closed item named by id back, its steps kept.
     Reopen,
+    /// Put the closed item named by id away from the board, or (`undo`) bring it back on.
+    /// Nothing of it is deleted: it stays closed, with its outcome and history.
+    Dismiss {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        undo: bool,
+    },
     /// qass reports an agent on an ssh remote working on `item`, from that machine's
     /// events: its task there, its name and its stage.
     LinkRemote {
@@ -789,6 +795,9 @@ pub struct ItemInfo {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<i64>,
+    /// Put away by the owner (`dismiss`): closed, left out of the Done lane by every client.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// An agent working on an item.
@@ -906,6 +915,7 @@ pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>)
         agents,
         updated_at: row.updated_at,
         closed_at: row.task.closed_at,
+        hidden: row.hidden,
     }
 }
 

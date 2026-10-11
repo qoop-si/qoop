@@ -89,6 +89,8 @@ pub struct ItemRow {
     pub agents: Vec<ItemAgent>,
     /// The newest change on it or on an agent working on it.
     pub updated_at: i64,
+    /// Put away by the owner (`dismiss`): closed, off the board, nothing of it deleted.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +322,19 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         .iter()
         .map(|a| a.updated_at)
         .fold(task.updated_at, i64::max);
+    // Put away since its latest close: a mark from before a reopen and a new close (an older
+    // binary reopens without clearing it) is stale and ignored.
+    let hidden = match task.closed_at {
+        Some(closed) => tx
+            .query_row(
+                "SELECT 1 FROM board_hidden WHERE task = ?1 AND at >= ?2",
+                params![task.id, closed],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some(),
+        None => false,
+    };
     Ok(ItemRow {
         task,
         key,
@@ -328,6 +343,7 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         steps_total: steps_total as usize,
         agents,
         updated_at,
+        hidden,
     })
 }
 
@@ -748,9 +764,61 @@ impl Store {
             "UPDATE task SET closed_at = NULL, outcome = NULL, updated_at = ?2 WHERE id = ?1",
             params![item, now],
         )?;
+        // Open again, so on the board again.
+        tx.execute("DELETE FROM board_hidden WHERE task = ?1", params![item])?;
         event(&tx, item, "reopened", "", now)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Put a closed item away from the board, or (`undo`) bring it back: it stays closed, with
+    /// its outcome, steps, links and history; its activity says so. Refused for an open item.
+    /// Answers whether anything changed.
+    pub fn dismiss_item(&self, item: i64, undo: bool, now: i64) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !is_item(&tx, item)? {
+            return Err(TaskError::NotAnItem(item).into());
+        }
+        // Done (closed verified or failed) is what the Done lane shows; a dropped item is on no
+        // board to be put away from.
+        let row = row_of(&tx, item)?;
+        let Some(closed) = row
+            .closed_at
+            .filter(|_| matches!(row.outcome.as_deref(), Some("verified" | "failed")))
+        else {
+            return Err(TaskError::NotDone(item).into());
+        };
+        let marked: bool = tx
+            .query_row(
+                "SELECT 1 FROM board_hidden WHERE task = ?1 AND at >= ?2",
+                params![item, closed],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let changed = match (undo, marked) {
+            (true, true) => {
+                tx.execute("DELETE FROM board_hidden WHERE task = ?1", params![item])?;
+                true
+            }
+            (false, false) => {
+                tx.execute(
+                    "INSERT OR REPLACE INTO board_hidden (task, at) VALUES (?1, ?2)",
+                    params![item, now.max(closed)],
+                )?;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            event(&tx, item, if undo { "unhidden" } else { "hidden" }, "", now)?;
+            tx.execute(
+                "UPDATE task SET updated_at = ?2 WHERE id = ?1",
+                params![item, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// The board: every open item, then those done in the last `DONE_SECS`, without their
@@ -853,6 +921,88 @@ mod tests {
 
     fn state_of(s: &Store, item: i64, now: i64) -> ItemState {
         s.item_card(item, now).unwrap().unwrap().item.state
+    }
+
+    /// A closed item put away is off the board and nothing of it is lost: still closed and
+    /// verified, its history one line longer; brought back, it is on the board again; reopened,
+    /// never hidden; an open item cannot be put away.
+    #[test]
+    fn a_closed_item_is_dismissed_and_shown_again_and_nothing_is_lost() {
+        let (s, ws, _) = setup();
+        let (item, _) = s.add_item(ws, "ship it", "", 10).unwrap();
+        assert!(matches!(
+            task_err(s.dismiss_item(item, false, 15).unwrap_err()),
+            TaskError::NotDone(_)
+        ));
+        s.close_task(item, Outcome::Verified, "moved on the board", 20)
+            .unwrap();
+        let hidden = |now| {
+            s.items(now)
+                .unwrap()
+                .iter()
+                .find(|i| i.task.id == item)
+                .map(|i| i.hidden)
+        };
+        assert_eq!(hidden(21), Some(false));
+        assert!(s.dismiss_item(item, false, 30).unwrap());
+        assert!(!s.dismiss_item(item, false, 31).unwrap(), "already hidden");
+        assert_eq!(hidden(32), Some(true));
+        let card = s.item_card(item, 32).unwrap().unwrap();
+        assert_eq!(card.item.task.outcome.as_deref(), Some("verified"));
+        assert!(card.item.task.closed_at.is_some());
+        assert_eq!(card.activity[0].kind, "hidden");
+        assert!(s.dismiss_item(item, true, 40).unwrap());
+        assert_eq!(hidden(41), Some(false));
+        assert_eq!(
+            s.item_card(item, 41).unwrap().unwrap().activity[0].kind,
+            "unhidden"
+        );
+        s.dismiss_item(item, false, 50).unwrap();
+        assert!(s.reopen_item(item, 60).unwrap());
+        assert_eq!(hidden(61), Some(false), "open again, on the board again");
+        let marks: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM board_hidden WHERE task = ?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marks, 0, "a reopen takes the mark off");
+        // A mark an older binary left behind across a reopen and a new close is stale.
+        s.conn
+            .execute(
+                "INSERT OR REPLACE INTO board_hidden (task, at) VALUES (?1, 62)",
+                params![item],
+            )
+            .unwrap();
+        s.close_task(item, Outcome::Verified, "again", 70).unwrap();
+        assert_eq!(
+            hidden(71),
+            Some(false),
+            "the mark is from before this close"
+        );
+        // Put away in the very second it closed: hidden (the mark is at its close, not before).
+        assert!(s.dismiss_item(item, false, 70).unwrap());
+        assert_eq!(hidden(71), Some(true));
+        // Put away, reopened and closed again all in one second: the reopen took the mark off,
+        // so the new close is on the board.
+        assert!(s.reopen_item(item, 70).unwrap());
+        s.close_task(item, Outcome::Verified, "same second", 70)
+            .unwrap();
+        assert_eq!(hidden(70), Some(false));
+        // A dropped item is on no board: nothing to put away.
+        let (dropped, _) = s.add_item(ws, "never mind", "", 80).unwrap();
+        s.close_task(dropped, Outcome::Abandoned, "dropped", 81)
+            .unwrap();
+        assert!(matches!(
+            task_err(s.dismiss_item(dropped, false, 82).unwrap_err()),
+            TaskError::NotDone(_)
+        ));
+        assert!(matches!(
+            task_err(s.dismiss_item(999, false, 90).unwrap_err()),
+            TaskError::NotAnItem(_)
+        ));
     }
 
     /// A start asked for before a close is spent: the reopened item is Todo, not Doing, until

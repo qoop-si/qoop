@@ -151,6 +151,9 @@ pub struct Chrome<'a> {
     pub qass: Option<crate::qass_screen::Ui>,
     /// The question inbox, as this client keeps it, while qass's screen is up.
     pub asks: Option<&'a crate::asks::Pane>,
+    /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
+    /// over the board's tile. The tree knows where the board is, so the client says.
+    pub questions: Option<crate::qass_screen::Side>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -194,6 +197,7 @@ impl Default for Chrome<'_> {
             nav: None,
             qass: None,
             asks: None,
+            questions: None,
         }
     }
 }
@@ -477,9 +481,15 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
         0,
         frame.sidebar_width,
     );
-    // qass's split tab: the header over its panes, which draw their own edges.
+    // qass's split tab: the header over its panes, which draw their own edges, and the
+    // questions where the tree put them.
     if frame.tiles.len() >= 2 {
-        return crate::qass_screen::Plan::band(cols as usize, rows as usize, ui.inbox);
+        return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
+            crate::qass_screen::Plan {
+                side: frame.chrome.questions,
+                ..plan
+            }
+        });
     }
     crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed, ui.inbox)
 }
@@ -1167,20 +1177,14 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&screen.row(pane_row, |_| String::new()));
                 continue;
             }
-            // The question inbox beside the panes, or in their place in a narrow window.
+            // The questions beside the board, or over its tile: the panes paint first, the
+            // questions over their own cells, so qass's tile is never lost under them.
             let inbox = qass
                 .as_ref()
                 .and_then(|(plan, screen)| Some((plan.side?, screen.inbox_row(pane_row)?)));
-            if let Some((side, row)) = &inbox
-                && side.replaces
-            {
-                out.push_str(&at(pane_row + TABS + 1, left + 1));
-                out.push_str(row);
-                continue;
-            }
             paint_tiled_row(frame, &edges, pane_row, pane_cols as usize, left, &mut out);
-            if let Some((_, row)) = inbox {
-                out.push_str(&at(pane_row + TABS + 1, left + 1));
+            if let Some((side, row)) = inbox {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
                 out.push_str(&row);
             }
         }

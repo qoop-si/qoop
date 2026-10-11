@@ -131,7 +131,7 @@ impl Drop for Daemon {
 }
 
 #[test]
-fn qoop_qass_puts_the_board_above_qass_and_the_tab_still_sleeps() {
+fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path());
     let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "check", "the", "board"]);
@@ -147,10 +147,11 @@ fn qoop_qass_puts_the_board_above_qass_and_the_tab_still_sleeps() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no terminal in {out:?}"));
 
-    // One tab: the board first, on top, qass under it; the board page running in its pane.
+    // One tab: the board first, on the left, qass beside it (the interface stacks them in a
+    // narrow pane); the board page running in its pane.
     let mut board = 0;
     daemon.until(
-        "the board above qass",
+        "the board beside qass",
         &|| format!("{:?}", daemon.index()),
         || {
             let (rows, splits) = daemon.index();
@@ -163,7 +164,8 @@ fn qoop_qass_puts_the_board_above_qass_and_the_tab_still_sleeps() {
             matches!(
                 tree,
                 Pane::Split {
-                    dir: qoop_runtime::control::SplitDir::H,
+                    dir: qoop_runtime::control::SplitDir::V,
+                    permille: 700,
                     ..
                 }
             ) && leaves == [board, qass]

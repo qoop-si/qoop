@@ -112,6 +112,8 @@ pub enum TaskError {
     TooManySteps { len: usize, max: usize },
     #[error("#{0}'s space was removed; add it again in a space that is there")]
     SpaceGone(i64),
+    #[error("only a done item can be dismissed; #{0} is open or was dropped")]
+    NotDone(i64),
 }
 
 /// One line, no control characters: a goal is shown in lists and injected into agents.

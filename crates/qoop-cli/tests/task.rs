@@ -808,6 +808,26 @@ $Q task stage waiting-human > stage.out 2>&1"#
         "a close is heard"
     );
     assert_eq!(board_items(&daemon)[0]["state"], "done");
+    // Put away from the board and back: nothing deleted, the board's files say so.
+    let (ok, out, err) = daemon.run(&["task", "dismiss", &key]);
+    assert!(ok, "dismiss: {err}");
+    assert!(out.contains("is off the board"), "{out}");
+    assert_eq!(board_items(&daemon)[0]["hidden"], true);
+    assert_eq!(board_items(&daemon)[0]["outcome"], "verified");
+    let (_, out, _) = daemon.run(&["task", "board"]);
+    assert!(out.contains("done, verified, hidden"), "{out}");
+    let (ok, _, err) = daemon.run(&["task", "dismiss", &key, "--undo"]);
+    assert!(ok, "undo: {err}");
+    assert!(
+        board_items(&daemon)[0].get("hidden").is_none(),
+        "left out when false"
+    );
+    let (ok, out, err) = daemon.run(&["task", "show", &key, "--json"]);
+    assert!(ok, "show: {err}");
+    assert!(
+        out.contains("\"unhidden\"") && out.contains("\"hidden\""),
+        "{out}"
+    );
     let (ok, _, err) = daemon.run(&["task", "reopen", &format!("#{id}")]);
     assert!(ok, "reopen: {err}");
     let items = board_items(&daemon);
@@ -820,6 +840,12 @@ $Q task stage waiting-human > stage.out 2>&1"#
     let (ok, _, err) = daemon.run(&["task", "unlink", "--id", &key]);
     assert!(ok, "unlink: {err}");
     assert_eq!(board_items(&daemon)[0]["state"], "todo");
+    // An open item has nothing to put away.
+    let (ok, _, err) = daemon.run(&["task", "dismiss", &key]);
+    assert!(
+        !ok && err.contains("only a done item can be dismissed"),
+        "{err}"
+    );
     let (ok, out, err) = daemon.run(&["task", "start", &key]);
     assert!(ok, "start: {err}");
     assert!(out.contains("qass is not running"), "{out}");

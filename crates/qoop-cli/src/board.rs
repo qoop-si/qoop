@@ -240,14 +240,17 @@ fn index(b: &Board) -> String {
                 .filter(|a| !a.closed)
                 .map(|a| format!("{} ({}, {})", a.name, a.machine, a.stage))
                 .collect();
+            let state = i
+                .outcome
+                .as_deref()
+                .map_or(i.state.clone(), |o| format!("{}, {o}", i.state));
+            // Put away by the owner: off every board he sees, still done.
+            let hidden = if i.hidden { ", hidden" } else { "" };
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {}/{} | {} |",
+                "| {} | {} | {state}{hidden} | {}/{} | {} |",
                 i.key,
                 cell(&i.title),
-                i.outcome
-                    .as_deref()
-                    .map_or(i.state.clone(), |o| format!("{}, {o}", i.state)),
                 i.steps_done,
                 i.steps_total,
                 if who.is_empty() {

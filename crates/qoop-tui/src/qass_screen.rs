@@ -14,7 +14,7 @@
 use qoop_runtime::avatar::Avatar;
 use qoop_runtime::control::{AgentRow, WorkspaceRow};
 
-use crate::layout::Rect;
+use crate::layout::{Dir, Rect};
 use crate::theme::{self, Role};
 use crate::{sidebar, width};
 
@@ -43,6 +43,41 @@ pub const INBOX_MIN_ROWS: usize = 14;
 const INBOX_BOX_ROWS: usize = 14;
 const INBOX_SHARE: usize = 43;
 const INBOX_WIDTH: (usize, usize) = (48, 56);
+/// The narrowest the board page draws in (`qoop task board --page` asks for this much).
+pub const BOARD_MIN_COLS: usize = 60;
+/// The narrowest qass's terminal gets beside the board.
+const QASS_MIN_COLS: usize = 40;
+/// The board's share of qass's tab when it is shown the other way from how it was saved.
+const BOARD_RATIO_V: f32 = 0.70;
+const BOARD_RATIO_H: f32 = 0.50;
+/// The questions column between the board and qass: the edge column the board's frame keeps,
+/// then the inbox at the width it is built for.
+pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
+
+/// How qass's tab with the board is laid out in a pane `cols` wide: side by side while the
+/// board and qass both keep their minimum, else stacked; the saved ratio when the saved
+/// direction is the one shown, else that direction's own. With `questions`, the columns cut
+/// from the board for them, when the board still keeps its minimum after the cut.
+pub fn board_shape(cols: usize, saved: (Dir, f32), questions: bool) -> (Dir, f32, usize) {
+    let ratio = |dir: Dir| match (saved.0 == dir, dir) {
+        (true, _) => saved.1,
+        (false, Dir::V) => BOARD_RATIO_V,
+        (false, Dir::H) => BOARD_RATIO_H,
+    };
+    // The split's frame takes a cell on each side and its divider one more.
+    let total = cols.saturating_sub(3);
+    let board = (total as f32 * ratio(Dir::V).clamp(0.1, 0.9)).floor() as usize;
+    if board < BOARD_MIN_COLS || total - board < QASS_MIN_COLS {
+        return (Dir::H, ratio(Dir::H), 0);
+    }
+    let gap = if questions && board >= BOARD_MIN_COLS + QUESTIONS_GAP {
+        QUESTIONS_GAP
+    } else {
+        0
+    };
+    (Dir::V, ratio(Dir::V), gap)
+}
+
 /// The file the watcher touches each time it tells qass an event.
 const LAST_WAKE: &str = "last-wake";
 
@@ -208,55 +243,26 @@ impl Plan {
 impl Plan {
     /// The plan of qass's split tab: the header over the whole pane, and under it, in `frame`
     /// and `inner` alike, the area the split's panes are laid out in (they draw their own
-    /// edges). The box header only when each of two panes still keeps [`MIN_INSIDE`] rows,
-    /// else one line; `None` when the pane is too small for even that.
-    pub fn band(cols: usize, rows: usize, inbox: bool) -> Option<Plan> {
+    /// edges). The box header only when each of two stacked panes still keeps
+    /// [`MIN_INSIDE`] rows, which also leaves the questions the rows they need; else one line;
+    /// `None` when the pane is too small for even that. Where the questions go is the
+    /// tree's to say (the board's tile): `side` is left for the caller.
+    pub fn band(cols: usize, rows: usize) -> Option<Plan> {
         if cols < MIN_COLS || rows < 2 * MIN_ROWS {
             return None;
         }
-        // With the inbox open the box header also leaves it rows of its own.
-        let wants_inbox = inbox && Plan::holds_inbox(cols, rows);
-        let room = if wants_inbox {
-            (3 + 2 * MIN_INSIDE).max(INBOX_BOX_ROWS)
-        } else {
-            3 + 2 * MIN_INSIDE
-        };
+        let room = (3 + 2 * MIN_INSIDE).max(INBOX_BOX_ROWS);
         let header = if rows >= BOX_ROWS + room {
             Header::Box
         } else {
             Header::Line
         };
         let top = header.rows();
-        let under = Rect {
+        let panes = Rect {
             x: 0,
             y: top,
             cols,
             rows: rows - top,
-        };
-        let (side, panes) = if !wants_inbox {
-            (None, under)
-        } else if cols >= INBOX_BESIDE_COLS {
-            let w = (cols * INBOX_SHARE / 100).clamp(INBOX_WIDTH.0, INBOX_WIDTH.1);
-            (
-                Some(Side {
-                    rect: Rect { cols: w, ..under },
-                    replaces: false,
-                }),
-                Rect {
-                    x: w,
-                    cols: cols - w,
-                    ..under
-                },
-            )
-        } else {
-            // The panes keep their size under the inbox: nothing repaints.
-            (
-                Some(Side {
-                    rect: under,
-                    replaces: true,
-                }),
-                under,
-            )
         };
         Some(Plan {
             header,
@@ -264,7 +270,7 @@ impl Plan {
             rows,
             frame: panes,
             inner: panes,
-            side,
+            side: None,
         })
     }
 }
@@ -1307,29 +1313,48 @@ mod tests {
         assert!(tall.side.unwrap().rect.rows >= INBOX_BOX_ROWS);
     }
 
-    /// The split tab's panes sit beside the inbox when it is open, and keep their place under
-    /// it when the window is narrow.
+    /// The split tab's header is the same with the questions shown or not: under it the panes
+    /// have the whole width, and the questions are cut from the board's tile, not from here.
     #[test]
-    fn the_split_tabs_panes_leave_the_inbox_a_column_or_keep_their_place_under_it() {
-        let shut = Plan::band(122, 40, false).unwrap();
-        let open = Plan::band(122, 40, true).unwrap();
-        let side = open.side.expect("an inbox beside the panes");
-        assert!(!side.replaces && (48..=56).contains(&side.rect.cols));
-        assert_eq!(open.header, shut.header);
+    fn the_split_tabs_header_leaves_the_panes_the_whole_width() {
+        let plan = Plan::band(122, 40).unwrap();
+        assert_eq!(plan.header, Header::Box);
+        assert_eq!((plan.frame.x, plan.frame.cols), (0, 122));
+        assert_eq!(plan.frame, plan.inner);
+        assert_eq!(plan.side, None);
+        assert_eq!(Plan::band(122, 20).unwrap().header, Header::Line);
+    }
+
+    /// qass's tab with the board goes side by side once the board keeps 60 columns and qass
+    /// 40, whatever direction was saved; the saved ratio only for the direction it was saved
+    /// with; the questions column only while the board keeps 60 after it.
+    #[test]
+    fn the_board_goes_beside_qass_when_both_keep_their_minimum() {
+        let stacked = (Dir::H, 0.5);
+        assert_eq!(board_shape(161, stacked, false), (Dir::V, 0.70, 0));
+        assert_eq!(board_shape(134, stacked, false), (Dir::V, 0.70, 0));
+        assert_eq!(board_shape(133, stacked, false), (Dir::H, 0.5, 0));
+        assert_eq!(board_shape(121, (Dir::V, 0.75), false), (Dir::H, 0.5, 0));
+        assert_eq!(board_shape(200, (Dir::V, 0.6), false), (Dir::V, 0.6, 0));
         assert_eq!(
-            (open.frame.x, open.frame.cols),
-            (side.rect.cols, 122 - side.rect.cols)
+            board_shape(161, stacked, true),
+            (Dir::V, 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            (open.frame.y, open.frame.rows),
-            (shut.frame.y, shut.frame.rows)
+            board_shape(159, stacked, true),
+            (Dir::V, 0.70, QUESTIONS_GAP)
         );
-        assert_eq!(open.frame, open.inner);
-        let narrow = Plan::band(80, 40, true).unwrap();
-        assert!(narrow.side.unwrap().replaces);
-        assert_eq!(narrow.frame, Plan::band(80, 40, false).unwrap().frame);
-        // Short: the header gives up its box for a line to leave the inbox its rows.
-        assert_eq!(Plan::band(122, 20, true).unwrap().header, Header::Line);
-        assert_eq!(Plan::band(59, 40, true).unwrap().side, None);
+        assert_eq!(board_shape(158, stacked, true), (Dir::V, 0.70, 0));
+        for cols in 80..=260 {
+            let (dir, ratio, gap) = board_shape(cols, stacked, true);
+            if dir == Dir::V {
+                let total = cols - 3;
+                let board = (total as f32 * ratio).floor() as usize;
+                assert!(
+                    board - gap >= BOARD_MIN_COLS && total - board >= QASS_MIN_COLS,
+                    "{cols}"
+                );
+            }
+        }
     }
 }

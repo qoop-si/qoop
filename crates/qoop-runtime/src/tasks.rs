@@ -258,6 +258,7 @@ pub(crate) async fn write(
             | TaskOp::Unlink
             | TaskOp::Start
             | TaskOp::Reopen
+            | TaskOp::Dismiss { .. }
     ) {
         return Box::pin(item_write(id, speaker, task, action, agents, store, now)).await;
     }
@@ -308,6 +309,7 @@ pub(crate) async fn write(
             | TaskOp::Unlink
             | TaskOp::Start
             | TaskOp::Reopen
+            | TaskOp::Dismiss { .. }
             | TaskOp::LinkRemote { .. } => unreachable!("handled above"),
             TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
             TaskOp::Goal { goal } => s.set_task_goal(task, &goal, now),
@@ -355,7 +357,10 @@ async fn item_write(
     now: i64,
 ) -> ControlResponse {
     if task.is_none() {
-        if matches!(action, TaskOp::Start | TaskOp::Reopen) {
+        if matches!(
+            action,
+            TaskOp::Start | TaskOp::Reopen | TaskOp::Dismiss { .. }
+        ) {
             return failed(id, "name the item, by its key or #id");
         }
         if speaker.is_none() {
@@ -393,6 +398,7 @@ async fn item_write(
                     true
                 }
                 TaskOp::Reopen => s.reopen_item(target, now)?,
+                TaskOp::Dismiss { undo } => s.dismiss_item(target, undo, now)?,
                 _ => unreachable!("only board writes come here"),
             };
             Ok((target, changed, key))
