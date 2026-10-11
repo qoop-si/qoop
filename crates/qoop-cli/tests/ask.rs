@@ -1,7 +1,7 @@
 //! `qoop ask` against a live daemon, through the real socket, with stand-in agents named
 //! `claude` (a shell script on the PATH): who may write a card, where an answer goes (the
-//! worker itself, or qass), and that qass is never typed into while it is busy or being typed
-//! in.
+//! worker itself, or qass), and that an answer is never refused: it is kept and typed once its
+//! target is at rest (and, for qass, nobody is typing in it).
 //!
 //! The cards are written from a shell inside qass's space, as `escalate.sh` runs them, so the
 //! token is the real one the daemon gave that terminal.
@@ -333,16 +333,38 @@ fn an_answer_goes_to_the_worker_when_it_is_the_same_conversation_and_through_qas
     assert_eq!(stack.card_status("E1"), "answered");
     assert_eq!(stack.log("qass"), "", "qass was not involved");
 
-    // Route 2: an agent that reports no session is answered through qass. qass was typed into
-    // when its tab opened, so for the first 30 seconds it is not typed into again: busy.
+    // A worker that is mid-turn is never refused: the answer is kept (`queued`) and typed when
+    // the worker is next at rest.
+    let (ok, _, err) = stack.run(&["send", &korea, "BUSY", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(stack.wait(|| stack.state_of(&korea) == "working"));
+    add(&stack, &shell, "E5", &format!("T{korea}"), "korea");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E5", "--option", "a"]);
+    assert!(ok && out.contains("Answered"), "{out} {err}");
+    assert_eq!(stack.card_status("E5"), "queued");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !stack.log("korea").contains("The owner answered E5"),
+        "typed into a turn that is running: {:?}",
+        stack.log("korea")
+    );
+    let (ok, _, err) = stack.run(&["send", &korea, "FREE", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(
+        stack.wait(|| stack
+            .log("korea")
+            .contains("The owner answered E5: \"korea A\".")),
+        "{:?}",
+        stack.log("korea")
+    );
+    assert_eq!(stack.card_status("E5"), "answered");
+
+    // Route 2: an agent that reports no session is answered through qass, never refused. qass
+    // was typed into when its tab opened, so for 30 seconds the answer is kept.
     add(&stack, &shell, "E2", &format!("T{cv}"), "cv");
     let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
-    assert!(ok && out.contains("Busy"), "{out} {err}");
-    assert_eq!(
-        stack.card_status("E2"),
-        "open",
-        "a busy qass leaves the card open"
-    );
+    assert!(ok && out.contains("Passed"), "{out} {err}");
+    assert_eq!(stack.card_status("E2"), "queued", "kept, not refused");
     assert_eq!(stack.log("qass"), "");
     assert_eq!(
         stack.log("cv"),
@@ -350,30 +372,42 @@ fn an_answer_goes_to_the_worker_when_it_is_the_same_conversation_and_through_qas
         "the worker is never typed to without its session"
     );
 
-    // While qass works it is busy however long ago anyone typed.
-    std::thread::sleep(Duration::from_secs(31));
+    // While qass works the answers wait too, and a second one lines up behind the first.
     let (ok, _, err) = stack.run(&["send", &qass, "BUSY", "--enter"]);
     assert!(ok, "{err}");
     assert!(stack.wait(|| stack.state_of(&qass) == "working"));
-    let (_, out, _) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
-    assert!(out.contains("Busy"), "{out}");
+    add(&stack, &shell, "E3", "-", "h");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E3", "--text", "run", "it", "twice"]);
+    assert!(ok && out.contains("Passed"), "{out} {err}");
+    assert_eq!(stack.card_status("E3"), "queued");
     let (ok, _, err) = stack.run(&["send", &qass, "FREE", "--enter"]);
     assert!(ok, "{err}");
     assert!(stack.wait(|| stack.state_of(&qass) == "idle"));
-    // Idle again, but someone just typed into it: still busy.
-    let (_, out, _) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
-    assert!(out.contains("Busy"), "{out}");
-
-    // At rest for over 30 seconds: the handle and the letter are typed to qass.
-    std::thread::sleep(Duration::from_secs(31));
-    let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--text", "run", "it", "twice"]);
-    assert!(ok && out.contains("Passed"), "{out} {err}");
+    // Idle again, but someone just typed into it: still kept.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(stack.card_status("E2"), "queued");
     assert!(
-        stack.wait(|| stack.log("qass").contains("cv run it twice")),
+        !stack.log("qass").contains("cv A"),
         "{:?}",
         stack.log("qass")
     );
+
+    // At rest for over 30 seconds: each is typed to qass once, in the order they were answered.
+    std::thread::sleep(Duration::from_secs(31));
+    assert!(
+        stack.wait(|| stack.log("qass").contains("h run it twice")),
+        "{:?}",
+        stack.log("qass")
+    );
+    let typed = stack.log("qass");
+    let (first, second) = (
+        typed.find("cv A").unwrap(),
+        typed.find("h run it twice").unwrap(),
+    );
+    assert!(first < second, "in order: {typed:?}");
+    assert_eq!(typed.matches("cv A").count(), 1, "once each: {typed:?}");
     assert_eq!(stack.card_status("E2"), "passed");
+    assert_eq!(stack.card_status("E3"), "passed");
 
     // qass reports it handled: the card ends. A second answer is refused.
     let said = stack.inside(&shell, "qoop ask close E2 --note 'qass answered'");

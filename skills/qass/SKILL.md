@@ -91,6 +91,8 @@ for him. A finish the board shows needs no note.
 A line looks like `T52 g3 claude working->idle "title" /path`; `->sleeping` and `->closed` go
 to "Asleep or gone". It may end `task:<id>:<stage>`, plus `:claimed` once the worker said done.
 A line starting with a remote's name (`ubox/T2 ...`) is an agent there: see "Remotes".
+A line `ASK E75 answered a -> T224` (or `ASK E3 passed text -> qass`) says the owner answered a card
+from the inbox and it went out: it needs nothing, `qoop ask ls` still shows the card.
 One wake may bring several lines, most urgent first: handle each. What needs nothing now comes
 with a later wake or within 10 minutes (never said: `@QASS_DATA@/quiet.log`). Write to agents
 only with `qoop prompt`, `qoop send` or `on.sh`: only then does their next stop come at once.

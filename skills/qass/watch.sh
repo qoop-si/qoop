@@ -26,6 +26,7 @@
 #
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
+#        ASK E75 answered a -> T224   (the owner answered a card: nothing to do, see asks_said)
 # A row with an open task (`qoop task`) ends with its id and stage, and `:claimed` once the
 # agent said done: ... /home/me/src/app task:12:verifying:claimed
 #
@@ -165,6 +166,23 @@ snapshot_file() { if [ -z "$1" ]; then echo "$dir/last.json"; else echo "$dir/la
 # running from an older install reads and clears those.
 held_file() { if [ -z "$1" ]; then echo "$dir/held"; else echo "$dir/held-$1"; fi; }
 said_file() { if [ -z "$1" ]; then echo "$dir/said"; else echo "$dir/said-$1"; fi; }
+
+# One line per answer the owner gave from the inbox (phone, desk or terminal) since the last look,
+# after it went out: `ASK E75 answered a -> T224` (an option, or `text`), `ASK E3 passed a -> qass`.
+# qass never has to act on it: the card is `answered` or `passed` in `qoop ask ls`, and the
+# worker was already told. The first look only records what is there. A card answered again
+# after it came back open is a new line (its closed time is part of what is remembered).
+asks_said() {
+    local f="$dir/asks-seen" cur new
+    cur="$(qoop ask ls --json 2>/dev/null | jq -r '(.live + .ended)[]
+        | select(.status == "answered" or .status == "passed")
+        | "\(.closed_at // 0) ASK \(.card) \(.status) \(.option // "text") -> \(if .status == "passed" then "qass" else (.agent // "-") end)"' 2>/dev/null)" || return 0
+    if [ -f "$f" ]; then
+        new="$(printf '%s\n' "$cur" | grep -vxFf "$f" || true)"
+        [ -z "$new" ] || say "$(printf '%s\n' "$new" | sed -E 's/^[0-9]+ //')"
+    fi
+    printf '%s\n' "$cur" > "$f"
+}
 
 # Why a line was not said, for whoever wonders what qass did not hear.
 note() { printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$dir/quiet.log" 2>/dev/null || true; }
@@ -601,6 +619,7 @@ fi
             kill -TERM $$ 2>/dev/null
             exit 0
         fi
+        asks_said
         if [ "$quiet" = 1 ]; then
             settle_locked flush ""
             settle_locked ride_expire

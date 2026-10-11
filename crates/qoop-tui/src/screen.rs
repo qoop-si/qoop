@@ -526,7 +526,6 @@ pub(crate) fn qass_screen_of(
             rows: frame.rows,
             spaces: frame.spaces,
             now_unix: frame.now_unix,
-            now: std::time::Instant::now(),
             fade: spotlight,
             // The board is already a pane of qass's tab: no tab of the inbox's own for it.
             board_above: frame.tiles.len() >= 2,

@@ -542,11 +542,12 @@ pub enum AskResult {
     Unchanged,
     /// An open card was rewritten.
     Replaced,
-    /// His words were sent to the worker.
+    /// His answer goes to the worker: typed at once, or when it is next at rest.
     Answered,
-    /// His words were typed to qass, which relays them.
+    /// His answer goes to qass, which relays it: typed at once, or when qass is at rest.
     Passed,
-    /// qass could not be typed to just now: the card is still open.
+    /// What a daemon from before answers were queued said when qass could not be typed to:
+    /// the card stayed open. Nothing produces it now; it stays so an older daemon's word parses.
     Busy,
     Closed,
     /// The card had already ended.

@@ -6,9 +6,8 @@
 //! card is open, what is typed, the answer being held), so a test reads the pane instead of
 //! looking at one.
 //!
-//! An answer is never sent at once: it is held for [`HOLD`] with the words it would send in
-//! front of him, and `u` takes it back. Until the hold ends the card is still open at the
-//! daemon, so a quit or a detach in that time drops the answer and loses nothing.
+//! An answer goes at once, and a calm line says what went ("sent to korea: ..."). The daemon
+//! keeps it and types it as soon as its target takes input, so nothing here waits or refuses.
 
 use std::time::{Duration, Instant};
 
@@ -20,9 +19,6 @@ use crate::qass_screen::{Seg, bold, edge, ink, line, seg};
 use crate::sidebar;
 use crate::theme::{self, Role};
 use crate::width;
-
-/// How long an answer is held, with the words it sends in front of him, before it goes.
-pub const HOLD: Duration = Duration::from_secs(5);
 
 /// How long a word about what just happened stands in place of the key line.
 const NOTICE: Duration = Duration::from_secs(6);
@@ -36,30 +32,6 @@ pub const WRITE_ID: &str = "asks-write";
 
 /// The most characters of his own words one answer carries (the daemon's own limit).
 const TEXT_MAX: usize = 400;
-
-/// What a held answer will do when the hold ends.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Held {
-    Answer {
-        option: Option<String>,
-        text: Option<String>,
-        /// The words of the option as he saw them.
-        seen: Option<String>,
-    },
-    Dismiss,
-}
-
-/// An answer or a dismissal waiting out its hold.
-#[derive(Clone, Debug)]
-pub struct Hold {
-    card: String,
-    /// What he would type in the chat to say the same: `korea B`, or `korea` and his words.
-    typed: String,
-    /// What the banner says it sends.
-    words: String,
-    held: Held,
-    until: Instant,
-}
 
 /// What a key did, for the loop that owns the keyboard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,15 +68,14 @@ pub struct Pane {
     preview: Option<usize>,
     typing: bool,
     text: String,
-    hold: Option<Hold>,
+    /// Writes made and not yet sent: the loop sends them on its next tick.
+    outbox: Vec<ControlRequest>,
     /// What the daemon last said about an answer: shown in place of the key line.
     notice: Option<String>,
     /// When the notice is let go.
     notice_until: Option<Instant>,
-    /// An answer sent and not yet answered, by its request id.
-    sent: Option<(String, String)>,
-    /// The second the countdown was last painted for.
-    shown_left: Option<u64>,
+    /// Answers sent and not yet answered, by request id: the card's handle and his words.
+    sent: std::collections::BTreeMap<String, (String, String)>,
     /// Cards already read again because their terminal left the rows.
     gone: Vec<String>,
     /// The open cards of the last read, each with a hash of its body: what tells a new
@@ -170,12 +141,6 @@ impl Pane {
             self.typing = false;
             self.text.clear();
         }
-        // A hold for a card that is gone is a hold for nothing.
-        if let Some(h) = &self.hold
-            && !self.live.iter().any(|c| c.card == h.card)
-        {
-            self.hold = None;
-        }
     }
 
     /// A card whose terminal has left the agent rows (and sleeps in no tab) is read again, once:
@@ -227,11 +192,12 @@ impl Pane {
                 true
             }
             ControlResponse::AskWritten { id, result, .. } if self.is_mine(id) => {
-                let typed = self.sent.take().map(|(_, typed)| typed).unwrap_or_default();
+                let (handle, words) = self.sent.remove(id).unwrap_or_default();
                 let said = match result {
-                    AskResult::Answered => "sent".to_string(),
-                    AskResult::Passed => "passed to qass".to_string(),
-                    AskResult::Busy => format!("qass is busy, type {typed} in the chat"),
+                    AskResult::Answered => format!("sent to {handle}: {words}"),
+                    AskResult::Passed => format!("sent to qass: {words}"),
+                    // Only a daemon from before answers were queued says it.
+                    AskResult::Busy => format!("qass is busy, answer {handle} in the chat"),
                     AskResult::Closed => "put away".to_string(),
                     _ => "done".to_string(),
                 };
@@ -240,7 +206,7 @@ impl Pane {
                 true
             }
             ControlResponse::Failed { id, reason } if self.is_mine(id) => {
-                self.sent = None;
+                self.sent.remove(id);
                 self.say(reason.clone());
                 self.stale = true;
                 true
@@ -259,19 +225,15 @@ impl Pane {
     }
 
     fn is_mine(&self, id: &str) -> bool {
-        self.sent.as_ref().is_some_and(|(sent, _)| sent == id)
+        self.sent.contains_key(id)
     }
 
-    /// The moment the inbox next has something to do by itself: a hold running out or a
-    /// countdown second to repaint.
+    /// The moment the inbox next has something to do by itself: a write to send now or a
+    /// notice to let go.
     pub fn wake_at(&self) -> Option<Instant> {
-        let hold = self
-            .hold
-            .as_ref()
-            .map(|h| h.until.min(Instant::now() + Duration::from_millis(250)));
-        match (hold, self.notice_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        match (self.outbox.is_empty(), self.notice_until) {
+            (false, _) => Some(Instant::now()),
+            (true, until) => until,
         }
     }
 
@@ -281,71 +243,27 @@ impl Pane {
         self.notice_until = Some(Instant::now() + NOTICE);
     }
 
-    /// A tick: the request that sends a held answer whose time is up, and whether the
-    /// countdown changed.
-    pub fn tick(&mut self, now: Instant) -> (Option<ControlRequest>, bool) {
+    /// A tick: the writes to send, and whether the screen changed.
+    pub fn tick(&mut self, now: Instant) -> (Vec<ControlRequest>, bool) {
         let mut moved = false;
         if self.notice_until.is_some_and(|until| now >= until) {
             self.notice = None;
             self.notice_until = None;
-            self.notice_until = None;
             moved = true;
         }
-        let Some(hold) = &self.hold else {
-            return (None, moved);
-        };
-        if now < hold.until {
-            let left = left_secs(hold.until, now);
-            moved |= self.shown_left != Some(left);
-            self.shown_left = Some(left);
-            return (None, moved);
-        }
-        let hold = self.hold.take().expect("checked above");
-        self.shown_left = None;
-        self.notice = None;
-        self.notice_until = None;
-        let id = format!("{WRITE_ID}-{}", hold.card);
-        self.sent = Some((id.clone(), hold.typed.clone()));
-        let action = match hold.held {
-            Held::Answer { option, text, seen } => AskOp::Answer {
-                card: hold.card,
-                option,
-                text,
-                seen,
-            },
-            Held::Dismiss => AskOp::Dismiss { card: hold.card },
-        };
-        (
-            Some(ControlRequest::AskWrite {
-                id,
-                terminal: None,
-                token: None,
-                action,
-            }),
-            true,
-        )
+        (std::mem::take(&mut self.outbox), moved)
     }
 
-    /// The keyboard leaves the inbox: an answer still being held is taken back, because
-    /// nothing on screen would let him see it go or stop it.
+    /// The keyboard leaves the inbox.
     pub fn release(&mut self) {
         self.focus = false;
         self.typing = false;
-        if self.hold.take().is_some() {
-            self.shown_left = None;
-            self.say("taken back");
-        }
     }
 
-    /// Whether an answer is being held, for the key line.
-    pub fn holding(&self) -> bool {
-        self.hold.is_some()
-    }
-
-    /// Whether an answer is held, on its way or just answered: the questions stay up through
-    /// all three, so the last answer's word is still seen.
+    /// Whether an answer is on its way or just answered: the questions stay up through both,
+    /// so the last answer's word is still seen.
     pub fn busy(&self) -> bool {
-        self.hold.is_some() || self.sent.is_some() || self.notice.is_some()
+        !self.outbox.is_empty() || !self.sent.is_empty() || self.notice.is_some()
     }
 
     /// Whether the questions show by themselves: a card waits and the owner has not put them
@@ -354,80 +272,70 @@ impl Pane {
         self.waiting() > 0 && !self.hidden
     }
 
-    fn hold_answer(&mut self, option: Option<usize>, text: Option<String>, now: Instant) -> bool {
+    /// Write now: the one request every answer and every dismissal goes out by.
+    fn write(&mut self, action: AskOp, handle: String, words: String) {
+        let card = match &action {
+            AskOp::Answer { card, .. } | AskOp::Dismiss { card } => card.clone(),
+            _ => return,
+        };
+        let id = format!("{WRITE_ID}-{card}");
+        self.sent.insert(id.clone(), (handle, words));
+        self.outbox.push(ControlRequest::AskWrite {
+            id,
+            terminal: None,
+            token: None,
+            action,
+        });
+        self.notice = None;
+        self.notice_until = None;
+        self.typing = false;
+        self.text.clear();
+    }
+
+    fn send_answer(&mut self, option: Option<usize>, text: Option<String>) -> bool {
         let Some(card) = self.open_card() else {
             return false;
         };
         if card.status != "open" {
             return false;
         }
-        let (words, held) = match (option.and_then(|i| card.body.options.get(i)), text) {
-            (_, Some(text)) => (
-                text.clone(),
-                Held::Answer {
-                    option: None,
-                    text: Some(text),
-                    seen: None,
-                },
-            ),
-            (Some(o), None) => (
-                o.words.clone(),
-                Held::Answer {
-                    option: Some(o.key.clone()),
-                    text: None,
-                    seen: Some(o.words.clone()),
-                },
-            ),
-            (None, None) => return false,
-        };
-        let typed = match &held {
-            Held::Answer {
-                option: Some(k), ..
-            } => format!("{} {}", card.body.handle, k.to_uppercase()),
-            Held::Answer { text, .. } => {
-                format!(
-                    "{} {}",
-                    card.body.handle,
-                    text.as_deref().unwrap_or_default()
-                )
-            }
-            Held::Dismiss => String::new(),
-        };
-        self.hold = Some(Hold {
-            card: card.card.clone(),
-            typed,
+        let (words, option, text, seen) =
+            match (option.and_then(|i| card.body.options.get(i)), text) {
+                (_, Some(text)) => (text.clone(), None, Some(text), None),
+                (Some(o), None) => (
+                    o.words.clone(),
+                    Some(o.key.clone()),
+                    None,
+                    Some(o.words.clone()),
+                ),
+                (None, None) => return false,
+            };
+        let (card, handle) = (card.card.clone(), card.body.handle.clone());
+        self.write(
+            AskOp::Answer {
+                card,
+                option,
+                text,
+                seen,
+            },
+            handle,
             words,
-            held,
-            until: now + HOLD,
-        });
-        self.notice = None;
-        self.notice_until = None;
-        self.shown_left = None;
-        self.typing = false;
-        self.text.clear();
+        );
         true
     }
 
-    fn hold_dismiss(&mut self, now: Instant) -> bool {
+    fn dismiss(&mut self) -> bool {
         let Some(card) = self.open_card() else {
             return false;
         };
-        self.hold = Some(Hold {
-            card: card.card.clone(),
-            typed: String::new(),
-            words: "put away unanswered".to_string(),
-            held: Held::Dismiss,
-            until: now + HOLD,
-        });
-        self.notice = None;
-        self.notice_until = None;
-        self.shown_left = None;
+        let (card, handle) = (card.card.clone(), card.body.handle.clone());
+        self.write(AskOp::Dismiss { card }, handle, String::new());
         true
     }
 
-    /// Answer with option `at` of the open card, held first.
-    pub fn press_option(&mut self, at: usize, now: Instant) -> bool {
-        self.hold_answer(Some(at), None, now)
+    /// Answer with option `at` of the open card.
+    pub fn press_option(&mut self, at: usize) -> bool {
+        self.send_answer(Some(at), None)
     }
 
     /// Open card number `at` of the list.
@@ -493,12 +401,12 @@ impl Pane {
 
     /// A key, or the bytes of several. `prefix` is the interface's prefix byte, which with a
     /// mouse report or a detach is not the inbox's and goes back.
-    pub fn key(&mut self, bytes: &[u8], prefix: u8, now: Instant) -> Out {
+    pub fn key(&mut self, bytes: &[u8], prefix: u8) -> Out {
         if bytes.first() == Some(&prefix) || bytes.starts_with(b"\x1b[<") || bytes == b"\x11" {
             return Out::Pass(bytes.to_vec());
         }
         if self.typing {
-            return self.type_key(bytes, now);
+            return self.type_key(bytes);
         }
         let mut out = Out::Stay;
         let mut i = 0;
@@ -517,7 +425,7 @@ impl Pane {
                 (Key::Char(rest[0]), 1)
             };
             i += used;
-            match self.act(key, now) {
+            match self.act(key) {
                 Out::Stay => {}
                 other => {
                     out = other;
@@ -528,7 +436,7 @@ impl Pane {
         out
     }
 
-    fn act(&mut self, key: Key, now: Instant) -> Out {
+    fn act(&mut self, key: Key) -> Out {
         match key {
             Key::Esc => Out::Closed,
             Key::Up => {
@@ -549,7 +457,7 @@ impl Pane {
                 Out::Stay
             }
             Key::Char(c @ b'a'..=b'd') => {
-                self.press_option((c - b'a') as usize, now);
+                self.press_option((c - b'a') as usize);
                 Out::Stay
             }
             Key::Char(b't') => {
@@ -557,14 +465,7 @@ impl Pane {
                 Out::Stay
             }
             Key::Char(b'x') => {
-                self.hold_dismiss(now);
-                Out::Stay
-            }
-            Key::Char(b'u') => {
-                if self.hold.take().is_some() {
-                    self.shown_left = None;
-                    self.say("taken back");
-                }
+                self.dismiss();
                 Out::Stay
             }
             Key::Char(b'\r' | b'\n') => match self.open_card().and_then(|c| c.terminal) {
@@ -575,7 +476,7 @@ impl Pane {
         }
     }
 
-    fn type_key(&mut self, bytes: &[u8], now: Instant) -> Out {
+    fn type_key(&mut self, bytes: &[u8]) -> Out {
         if bytes == b"\x1b" {
             self.typing = false;
             return Out::Stay;
@@ -594,7 +495,7 @@ impl Pane {
                 '\r' | '\n' => {
                     let text = self.text.trim().to_string();
                     if !text.is_empty() {
-                        self.hold_answer(None, Some(text), now);
+                        self.send_answer(None, Some(text));
                     }
                     return Out::Stay;
                 }
@@ -613,11 +514,11 @@ impl Pane {
     }
 
     /// A click on something the view drew.
-    pub fn click(&mut self, hit: Hit, now: Instant) -> Out {
+    pub fn click(&mut self, hit: Hit) -> Out {
         match hit {
             Hit::Card(at) => self.select(at),
             Hit::Option(at) => {
-                self.press_option(at, now);
+                self.press_option(at);
             }
             Hit::Box => self.start_typing(),
             Hit::Board => {
@@ -672,7 +573,6 @@ pub struct Ctx<'a> {
     pub rows: &'a [AgentRow],
     pub spaces: &'a [WorkspaceRow],
     pub now_unix: i64,
-    pub now: Instant,
     /// A box is open over the screen, which fades everything behind it.
     pub fade: bool,
     /// The board is a pane of qass's tab: the inbox keeps no tab for it.
@@ -687,11 +587,6 @@ pub struct View {
     pub targets: Vec<Target>,
     /// Where typing goes, relative to the inbox: its row and column, while the box has the keys.
     pub cursor: Option<(usize, usize)>,
-}
-
-/// Whole seconds left of a hold, counted up: five at the start, one at the end.
-fn left_secs(until: Instant, now: Instant) -> u64 {
-    until.saturating_duration_since(now).as_secs_f64().ceil() as u64
 }
 
 fn age_short(secs: i64) -> String {
@@ -732,6 +627,9 @@ fn space_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
 
 /// A tag on the open card that says why it may not be what it was, from the rows alone.
 fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
+    if card.status == "queued" {
+        return Some("sent when it is free".to_string());
+    }
     if card.status == "passed" {
         let ago = card
             .closed_at
@@ -898,7 +796,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             .min(pane.live.len().saturating_sub(b.list));
         for (at, c) in pane.live.iter().enumerate().skip(first).take(b.list) {
             let old = ctx.now_unix - c.opened_at >= OLD_SECS;
-            let calm = old || c.status == "passed";
+            let calm = old || c.status != "open";
             let role = if calm { Role::Faint } else { Role::Text };
             let age = age_short(ctx.now_unix - c.opened_at);
             let name = sidebar::chip_name(&name_of(c, ctx));
@@ -981,10 +879,6 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             .unwrap_or(0)
             .min(cw / 3);
         for (i, o) in card.body.options.iter().enumerate() {
-            let held = pane.hold.as_ref().is_some_and(|h| {
-                h.card == card.card
-                    && matches!(&h.held, Held::Answer { option: Some(k), .. } if *k == o.key)
-            });
             let key_ink = if passed { Role::Faint } else { Role::Brand };
             let lab = width::fit(&o.label, label_w);
             let reason_room = cw.saturating_sub(4 + label_w + 2);
@@ -996,11 +890,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             });
             out.push(wrap(&[
                 seg(key_ink, format!("[{}] ", o.key)),
-                if held {
-                    bold(Role::Working, lab)
-                } else {
-                    seg(if passed { Role::Faint } else { Role::Text }, lab)
-                },
+                seg(if passed { Role::Faint } else { Role::Text }, lab),
                 seg(Role::Text, "  "),
                 seg(Role::Detail, cut_dots(&o.reason, reason_room)),
             ]));
@@ -1114,7 +1004,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     while out.len() < 1 + content {
         out.push(blank());
     }
-    out.push(wrap(&bottom_line(pane, ctx, cw)));
+    out.push(wrap(&bottom_line(pane, cw)));
     out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, fade));
     out.truncate(rows);
     // A target below the clipped rows is no target.
@@ -1156,29 +1046,7 @@ fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> Stri
     ])
 }
 
-fn bottom_line(pane: &Pane, ctx: &Ctx, cw: usize) -> Vec<Seg> {
-    if let Some(h) = &pane.hold {
-        let left = left_secs(h.until, ctx.now);
-        // Who it goes to, by the name the list shows.
-        let to = pane
-            .live
-            .iter()
-            .find(|c| c.card == h.card)
-            .map(|c| name_of(c, ctx))
-            .unwrap_or_default();
-        let verb = match h.held {
-            Held::Dismiss => format!("putting {to} away in {left} s"),
-            Held::Answer { .. } => format!("sending to {to} in {left} s: {}", h.words),
-        };
-        let undo = "  u undo";
-        return vec![
-            seg(
-                Role::Working,
-                cut_dots(&verb, cw.saturating_sub(undo.len())),
-            ),
-            bold(Role::Brand, undo),
-        ];
-    }
+fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
     if let Some(n) = &pane.notice {
         return vec![seg(Role::Detail, cut_dots(n, cw))];
     }
@@ -1328,7 +1196,6 @@ mod tests {
             rows,
             spaces,
             now_unix: 1_000,
-            now: Instant::now(),
             fade: false,
             board_above: false,
         }
@@ -1461,83 +1328,70 @@ mod tests {
 
     #[test]
     fn keys_move_the_open_card_and_the_previewed_option() {
-        let now = Instant::now();
         let mut p = pane(3);
         p.focus = true;
         assert_eq!(p.open_card().unwrap().card, "E1");
-        p.key(b"j", 1, now);
-        p.key(b"j", 1, now);
-        p.key(b"j", 1, now);
+        p.key(b"j", 1);
+        p.key(b"j", 1);
+        p.key(b"j", 1);
         assert_eq!(p.open_card().unwrap().card, "E3", "stops at the last");
-        p.key(b"k", 1, now);
+        p.key(b"k", 1);
         assert_eq!(p.open_card().unwrap().card, "E2");
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("sends: Do not run"), "the pick previews first");
-        p.key(b"\x1b[B", 1, now);
+        p.key(b"\x1b[B", 1);
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("sends: Skip 0042"), "{t}");
-        p.key(b"\x1b[A", 1, now);
-        p.key(b"\x1b[A", 1, now);
+        p.key(b"\x1b[A", 1);
+        p.key(b"\x1b[A", 1);
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("sends: Run 0042 on staging now"), "{t}");
     }
 
     #[test]
-    fn one_key_holds_an_answer_with_its_words_and_u_takes_it_back() {
+    fn one_key_sends_an_answer_at_once_with_the_words_he_saw() {
         let t0 = Instant::now();
-        let mut p = pane(2);
+        let mut p = pane(1);
         p.focus = true;
-        p.key(b"b", 1, t0);
-        assert!(p.holding());
-        let v = view(
-            &p,
-            &Ctx {
-                now: t0,
-                ..ctx(&[], &[])
-            },
-            50,
-            36,
-        );
-        let t = text(&v);
+        // A key goes out on the very next tick: no wait, and `u` means nothing.
+        p.key(b"u", 1);
+        assert_eq!(p.tick(t0).0.len(), 0);
+        p.key(b"b", 1);
         assert!(
-            t.contains("sending to migrations in 5 s: Do not") && t.contains("u undo"),
-            "{t}"
+            p.wake_at().is_some_and(|at| at <= Instant::now()),
+            "due now"
         );
-        // Nothing is sent while the hold runs.
-        assert_eq!(p.tick(t0 + Duration::from_secs(2)).0, None);
-        p.key(b"u", 1, t0 + Duration::from_secs(3));
-        assert!(!p.holding());
-        assert_eq!(
-            p.tick(t0 + Duration::from_secs(9)).0,
-            None,
-            "taken back: never sent"
-        );
-        // Held again, and it goes when the time is up, with the words he saw.
-        p.key(b"b", 1, t0);
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite {
-            action:
-                AskOp::Answer {
-                    card,
-                    option,
-                    text,
-                    seen,
-                },
-            terminal: None,
-            token: None,
-            ..
-        }) = sent
+        let (sent, _) = p.tick(t0);
+        let [
+            ControlRequest::AskWrite {
+                action:
+                    AskOp::Answer {
+                        card,
+                        option,
+                        text,
+                        seen,
+                    },
+                terminal: None,
+                token: None,
+                ..
+            },
+        ] = sent.as_slice()
         else {
-            panic!("an answer goes out")
+            panic!("an answer goes out: {sent:?}")
         };
         assert_eq!(
             (card.as_str(), option.as_deref(), text),
-            ("E1", Some("b"), None)
+            ("E1", Some("b"), &None)
         );
         assert_eq!(
             seen.as_deref(),
             Some("Do not run 0042 yet; stay idle and wait for the owner.")
         );
+        assert!(p.tick(t0).0.is_empty(), "sent once");
+        // Leaving the inbox takes nothing back: the answer already went.
+        p.key(b"a", 1);
+        p.release();
+        assert_eq!(p.tick(t0).0.len(), 1);
     }
 
     #[test]
@@ -1545,53 +1399,54 @@ mod tests {
         let t0 = Instant::now();
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"t", 1, t0);
+        p.key(b"t", 1);
         assert!(p.typing());
-        p.key(b"run it", 1, t0);
-        p.key(b"\x7f", 1, t0);
-        p.key(b"\x7f", 1, t0);
-        p.key(b"twice", 1, t0);
+        p.key(b"run it", 1);
+        p.key(b"\x7f", 1);
+        p.key(b"\x7f", 1);
+        p.key(b"twice", 1);
         let v = view(&p, &ctx(&[], &[]), 50, 36);
         assert!(text(&v).contains("run twice\u{2588}"), "{}", text(&v));
         assert!(v.cursor.is_some());
-        p.key(b"\r", 1, t0);
-        assert!(!p.typing() && p.holding());
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite {
-            action: AskOp::Answer { option, text, .. },
-            ..
-        }) = sent
+        p.key(b"\r", 1);
+        assert!(!p.typing());
+        let (sent, _) = p.tick(t0);
+        let [
+            ControlRequest::AskWrite {
+                action: AskOp::Answer { option, text, .. },
+                ..
+            },
+        ] = sent.as_slice()
         else {
             panic!("an answer goes out")
         };
-        assert_eq!((option, text.as_deref()), (None, Some("run twice")));
+        assert_eq!((option, text.as_deref()), (&None, Some("run twice")));
         // An empty box sends nothing, and esc stops typing.
-        p.key(b"t", 1, t0);
-        p.key(b"\r", 1, t0);
-        assert!(!p.holding());
-        p.key(b"\x1b", 1, t0);
+        p.key(b"t", 1);
+        p.key(b"\r", 1);
+        assert!(p.tick(t0).0.is_empty());
+        p.key(b"\x1b", 1);
         assert!(!p.typing());
     }
 
     #[test]
     fn the_prefix_a_mouse_report_and_the_exit_keys_are_not_typed() {
-        let t0 = Instant::now();
         let mut p = pane(1);
         p.focus = true;
-        assert_eq!(p.key(b"\x01", 1, t0), Out::Pass(b"\x01".to_vec()));
-        assert!(matches!(p.key(b"\x1b[<0;5;5M", 1, t0), Out::Pass(_)));
-        p.key(b"t", 1, t0);
+        assert_eq!(p.key(b"\x01", 1), Out::Pass(b"\x01".to_vec()));
+        assert!(matches!(p.key(b"\x1b[<0;5;5M", 1), Out::Pass(_)));
+        p.key(b"t", 1);
         assert_eq!(
-            p.key(b"\x01", 1, t0),
+            p.key(b"\x01", 1),
             Out::Pass(b"\x01".to_vec()),
             "even while typing"
         );
-        p.key(b"\x1b", 1, t0);
-        assert_eq!(p.key(b"\t", 1, t0), Out::ToChat);
-        assert_eq!(p.key(b"\x1b", 1, t0), Out::Closed);
-        assert_eq!(p.key(b"\r", 1, t0), Out::Jump(1));
+        p.key(b"\x1b", 1);
+        assert_eq!(p.key(b"\t", 1), Out::ToChat);
+        assert_eq!(p.key(b"\x1b", 1), Out::Closed);
+        assert_eq!(p.key(b"\r", 1), Out::Jump(1));
         // Letters that mean nothing are swallowed, never typed into the chat behind.
-        assert_eq!(p.key(b"z", 1, t0), Out::Stay);
+        assert_eq!(p.key(b"z", 1), Out::Stay);
     }
 
     #[test]
@@ -1602,9 +1457,9 @@ mod tests {
         c.closed_at = Some(940);
         p.take(vec![c], Vec::new());
         p.focus = true;
-        p.key(b"a", 1, t0);
-        p.key(b"t", 1, t0);
-        assert!(!p.holding() && !p.typing());
+        p.key(b"a", 1);
+        p.key(b"t", 1);
+        assert!(p.tick(t0).0.is_empty() && !p.typing());
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
             t.contains("passed to qass, 1 min ago") && t.contains("waiting for qass"),
@@ -1614,37 +1469,55 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_answers_become_notices_and_a_busy_qass_names_the_words_to_type() {
+    fn the_daemon_answers_become_one_calm_line_saying_what_went_and_to_whom() {
         let t0 = Instant::now();
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"a", 1, t0);
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite { id, .. }) = sent else {
-            panic!("sent")
+        let wrote = |p: &mut Pane| {
+            p.key(b"a", 1);
+            let (sent, _) = p.tick(t0);
+            let Some(ControlRequest::AskWrite { id, .. }) = sent.into_iter().next() else {
+                panic!("sent")
+            };
+            id
         };
+        let said = |p: &Pane| text(&view(p, &ctx(&[], &[]), 100, 36));
+        let id = wrote(&mut p);
         assert!(p.answered(&ControlResponse::AskWritten {
-            id: id.clone(),
+            id,
             card: "E1".into(),
-            result: AskResult::Busy,
+            result: AskResult::Answered,
         }));
         assert!(p.stale, "the inbox is read again");
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
-            t.contains("qass is busy, type migrations A in the chat"),
-            "{t}"
+            said(&p).contains("sent to migrations: Run 0042 on staging now"),
+            "{}",
+            said(&p)
         );
+        // A card that goes through qass says so, queued or not.
+        let id = wrote(&mut p);
+        p.answered(&ControlResponse::AskWritten {
+            id,
+            card: "E1".into(),
+            result: AskResult::Passed,
+        });
+        assert!(said(&p).contains("sent to qass: Run 0042 on staging now"));
         // A refusal is shown as the daemon worded it.
-        p.key(b"a", 1, t0);
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite { id, .. }) = sent else {
-            panic!("sent")
-        };
+        let id = wrote(&mut p);
         p.answered(&ControlResponse::Failed {
             id,
             reason: "E1 changed since you read it; look again".into(),
         });
-        assert!(text(&view(&p, &ctx(&[], &[]), 50, 36)).contains("changed since you read it"));
+        assert!(said(&p).contains("changed since you read it"));
+        assert!(p.sent.is_empty());
+        // A daemon from before answers were queued may still say busy.
+        let id = wrote(&mut p);
+        p.answered(&ControlResponse::AskWritten {
+            id,
+            card: "E1".into(),
+            result: AskResult::Busy,
+        });
+        assert!(said(&p).contains("qass is busy, answer migrations in the chat"));
         // An older daemon: the pane says so.
         let mut old = Pane::default();
         assert!(old.answered(&ControlResponse::Failed {
@@ -1655,21 +1528,39 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_read_keeps_the_open_card_and_drops_a_hold_for_a_card_that_left() {
+    fn several_answers_in_flight_each_report_their_own_words() {
         let t0 = Instant::now();
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"a", 1);
+        p.key(b"j", 1);
+        p.key(b"c", 1);
+        let (sent, _) = p.tick(t0);
+        assert_eq!(sent.len(), 2);
+        let ids: Vec<String> = sent
+            .into_iter()
+            .map(|r| match r {
+                ControlRequest::AskWrite { id, .. } => id,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        for id in ids.iter().rev() {
+            p.answered(&ControlResponse::AskWritten {
+                id: id.clone(),
+                card: "E1".into(),
+                result: AskResult::Answered,
+            });
+        }
+        assert!(p.sent.is_empty(), "both were answered");
+    }
+
+    #[test]
+    fn a_fresh_read_keeps_the_open_card_when_it_is_still_there() {
         let mut p = pane(3);
-        p.key(b"j", 1, t0);
-        p.key(b"a", 1, t0);
-        assert!(p.holding());
+        p.key(b"j", 1);
         let kept: Vec<AskInfo> = p.live.iter().filter(|c| c.card != "E1").cloned().collect();
         p.take(kept.clone(), Vec::new());
         assert_eq!(p.open_card().unwrap().card, "E2");
-        assert!(p.holding());
-        p.take(
-            kept.into_iter().filter(|c| c.card != "E2").collect(),
-            Vec::new(),
-        );
-        assert!(!p.holding(), "the card is gone");
     }
 
     #[test]
@@ -1734,13 +1625,12 @@ mod tests {
         assert_eq!(hit_at(&v, rect, 7 + tabs, 3), None);
         assert_eq!(hit_at(&v, rect, 6, 10), None, "above the box");
         let mut p = pane(3);
-        let now = Instant::now();
-        p.click(Hit::Card(2), now);
+        p.click(Hit::Card(2));
         assert_eq!(p.open_card().unwrap().card, "E3");
-        p.click(Hit::Option(0), now);
-        assert!(p.holding());
+        p.click(Hit::Option(0));
+        assert_eq!(p.tick(Instant::now()).0.len(), 1);
         let mut q = pane(1);
-        q.click(Hit::Box, now);
+        q.click(Hit::Box);
         assert!(q.typing());
     }
 
@@ -1763,8 +1653,15 @@ mod tests {
         let t0 = Instant::now();
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"a", 1, t0);
-        p.key(b"u", 1, t0);
+        p.key(b"a", 1);
+        let (sent, _) = p.tick(t0);
+        let Some(ControlRequest::AskWrite { id, .. }) = sent.into_iter().next() else {
+            panic!("sent")
+        };
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "taken back".into(),
+        });
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("taken back") && !t.contains("j k cards"), "{t}");
         assert!(p.wake_at().is_some(), "a clock to let it go");
@@ -1801,101 +1698,20 @@ mod tests {
     }
 
     #[test]
-    fn busy_names_what_was_sent_not_what_is_open_now() {
-        let t0 = Instant::now();
-        let mut p = pane(2);
-        p.focus = true;
-        p.key(b"c", 1, t0);
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite { id, .. }) = sent else {
-            panic!("sent")
-        };
-        // He moved on while it was out.
-        p.key(b"j", 1, t0);
-        p.answered(&ControlResponse::AskWritten {
-            id,
-            card: "E1".into(),
-            result: AskResult::Busy,
-        });
-        let t = text(&view(&p, &ctx(&[], &[]), 56, 36));
-        assert!(
-            t.contains("qass is busy, type migrations C in the chat"),
-            "{t}"
-        );
-        // His own words are typed after the handle, as he would type them.
-        let mut q = pane(1);
-        q.focus = true;
-        q.key(b"t", 1, t0);
-        q.key(b"run it twice", 1, t0);
-        q.key(b"\r", 1, t0);
-        let (sent, _) = q.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite { id, .. }) = sent else {
-            panic!("sent")
-        };
-        q.answered(&ControlResponse::AskWritten {
-            id,
-            card: "E1".into(),
-            result: AskResult::Busy,
-        });
-        assert!(text(&view(&q, &ctx(&[], &[]), 70, 36)).contains("type migrations run it twice"));
-    }
-
-    #[test]
-    fn a_hold_marks_its_own_card_and_names_who_it_goes_to_and_leaving_takes_it_back() {
-        let t0 = Instant::now();
-        let mut p = pane(2);
-        p.focus = true;
-        p.key(b"b", 1, t0);
-        let marked = |p: &Pane| {
-            let v = view(
-                p,
-                &Ctx {
-                    now: t0,
-                    ..ctx(&[], &[])
-                },
-                56,
-                36,
-            );
-            v.rows
-                .iter()
-                .any(|r| strip(r).contains("[b] wait") && r.contains("\x1b[1m"))
-        };
-        assert!(marked(&p), "the held option is bold on its card");
-        p.key(b"j", 1, t0);
-        assert!(!marked(&p), "and not on another card's");
-        assert!(
-            text(&view(
-                &p,
-                &Ctx {
-                    now: t0,
-                    ..ctx(&[], &[])
-                },
-                56,
-                36
-            ))
-            .contains("sending to migrations in 5 s")
-        );
-        p.release();
-        assert!(!p.holding() && !p.focus);
-        assert_eq!(p.tick(t0 + HOLD).0, None, "taken back: never sent");
-    }
-
-    #[test]
     fn words_typed_for_a_card_are_not_kept_for_the_one_that_replaced_it() {
-        let t0 = Instant::now();
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1, t0);
-        p.key(b"for the first", 1, t0);
+        p.key(b"t", 1);
+        p.key(b"for the first", 1);
         // The card he types for is gone: the box is empty and closed for the next one.
         p.take(p.live[1..].to_vec(), Vec::new());
         assert!(!p.typing() && p.typed().is_empty());
         // Typed text changes with a move to another card, and escapes are not letters.
-        p.key(b"t", 1, t0);
-        p.key(b"\x1b[D", 1, t0);
-        p.key(b"\x1b[200~", 1, t0);
+        p.key(b"t", 1);
+        p.key(b"\x1b[D", 1);
+        p.key(b"\x1b[200~", 1);
         assert_eq!(p.typed(), "");
-        p.key(b"ok", 1, t0);
+        p.key(b"ok", 1);
         assert_eq!(p.typed(), "ok");
     }
 

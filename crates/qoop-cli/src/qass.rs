@@ -712,6 +712,73 @@ mod tests {
         assert!(on.contains(&format!("@QASS_DATA@/{PROMPTED_LOG}")));
     }
 
+    /// qass sees every answer the owner gave: one `ASK` line for each, once, with the first look
+    /// only recording what was already there. Runs the watcher's own `say` and `asks_said` with a
+    /// stand-in `qoop` that prints a card listing.
+    #[test]
+    fn the_watcher_says_each_inbox_answer_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let watch = include_str!("../../../skills/qass/watch.sh");
+        let function = |name: &str| {
+            let from = watch.find(&format!("\n{name}() {{")).expect("function") + 1;
+            let len = watch[from..].find("\n}\n").expect("its end") + 3;
+            watch[from..from + len].to_string()
+        };
+        let root = tempfile::tempdir().expect("dir");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let stand_in = bin.join("qoop");
+        std::fs::write(&stand_in, "#!/bin/sh\ncat \"$LISTING\"\n").expect("script");
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let listing = root.path().join("listing.json");
+        let look = |json: &str| -> String {
+            std::fs::write(&listing, json).expect("listing");
+            let script = format!(
+                "set -euo pipefail\ndir={dir}\n{say}\n{asks}\nasks_said\n",
+                dir = root.path().display(),
+                say = function("say"),
+                asks = function("asks_said"),
+            );
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("LISTING", &listing)
+                .output()
+                .expect("bash");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let card = |c: &str, status: &str, option: &str, agent: &str, at: i64| {
+            format!(
+                r#"{{"card":"{c}","status":"{status}","option":{option},"agent":{agent},"closed_at":{at}}}"#
+            )
+        };
+        let old = card("E1", "answered", r#""b""#, r#""T5""#, 10);
+        // The first look records what is there and says nothing.
+        assert_eq!(look(&format!(r#"{{"live":[],"ended":[{old}]}}"#)), "");
+        let sent = card("E75", "answered", r#""a""#, r#""T224""#, 20);
+        let relayed = card("E3", "passed", "null", "null", 21);
+        let open = card("E9", "open", "null", r#""T6""#, 0);
+        let json = format!(r#"{{"live":[{relayed},{open}],"ended":[{sent},{old}]}}"#);
+        assert_eq!(
+            look(&json),
+            "ASK E3 passed text -> qass\nASK E75 answered a -> T224\n"
+        );
+        assert_eq!(look(&json), "", "each answer is said once");
+    }
+
     #[test]
     fn only_the_agent_in_qasss_folder_is_the_sleeping_qass() {
         let dir = std::env::temp_dir();

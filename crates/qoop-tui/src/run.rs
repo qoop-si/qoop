@@ -6889,7 +6889,7 @@ where
             if state.pending_focus.is_some() {
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
-            // A held answer's countdown, and the moment it goes. `None` with nothing held.
+            // A write to send, and the moment a notice is let go. `None` with nothing to do.
             let asks_at = state.asks.wake_at().map(tokio::time::Instant::from_std);
 
             tokio::select! {
@@ -7313,7 +7313,7 @@ where
                         // The question inbox owns the keyboard while it is given it, and
                         // hands back the prefix, the mouse and what is not its own.
                         dirty = true;
-                        let taken = asks_keys(&mut state, &bytes, keys.prefix(), std::time::Instant::now());
+                        let taken = asks_keys(&mut state, &bytes, keys.prefix());
                         if taken.resize
                             && let Some(resize) = size_terminals(&mut state, &mut seqs)?
                         {
@@ -7485,7 +7485,7 @@ where
                                     }
                                     Some(AskClick::Inbox(hit)) => {
                                         state.asks.focus = true;
-                                        state.asks.click(hit, std::time::Instant::now());
+                                        state.asks.click(hit);
                                         dirty = true;
                                         continue;
                                     }
@@ -9164,8 +9164,8 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    let (send, moved) = state.asks.tick(std::time::Instant::now());
-                    if let Some(request) = send {
+                    let (sends, moved) = state.asks.tick(std::time::Instant::now());
+                    for request in sends {
                         wr.write_all(&client::encode_control_seq(&request, &mut control_seq)?).await?;
                     }
                     if moved {
@@ -11207,12 +11207,11 @@ struct AskKeys {
     jump: Option<u32>,
 }
 
-/// Keys typed while the inbox has the keyboard. Leaving it (to the chat, away, to an agent)
-/// takes back an answer still being held.
-fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8, now: std::time::Instant) -> AskKeys {
+/// Keys typed while the inbox has the keyboard.
+fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     use crate::asks::Out;
     let mut taken = AskKeys::default();
-    match state.asks.key(bytes, prefix, now) {
+    match state.asks.key(bytes, prefix) {
         Out::Stay => {}
         Out::ToChat => {
             state.asks.release();
@@ -11287,7 +11286,6 @@ impl State {
                 rows: &self.rows,
                 spaces: &self.spaces,
                 now_unix: frame.now_unix,
-                now: std::time::Instant::now(),
                 fade: false,
                 board_above: frame.tiles.len() >= 2,
             };
@@ -20114,16 +20112,19 @@ mod tests {
     /// up; leaving them, by putting them away or by their last card going, gives the keyboard
     /// to qass's terminal and not to the board it may have come from.
     #[test]
-    fn leaving_the_questions_hides_them_over_a_held_answer_and_hands_the_keyboard_to_qass() {
+    fn leaving_the_questions_hides_them_over_a_sent_answer_and_hands_the_keyboard_to_qass() {
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         state.focused = 4;
         state.layouts.get_mut(&9).unwrap().focus_terminal(4);
         assert!(!questions_toggle(&mut state) && state.asks.focus);
-        state.asks.key(b"a", 1, std::time::Instant::now());
-        assert!(state.asks.holding() && state.asks.busy());
+        state.asks.key(b"a", 1);
+        assert!(state.asks.busy());
         assert!(questions_toggle(&mut state));
-        assert!(state.asks.busy(), "the answer was taken back, and says so");
+        assert!(
+            state.asks.busy(),
+            "the answer went, and its word is still due"
+        );
         assert!(
             state.questions().is_none(),
             "hidden wins over the word on screen"
@@ -20734,63 +20735,60 @@ mod tests {
 
     #[test]
     fn keys_in_the_inbox_close_it_leave_it_or_go_back_to_the_ordinary_path() {
-        let now = std::time::Instant::now();
         let mut state = qass_window();
         let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         asks_toggle(&mut state);
         // The prefix and the mouse are not the inbox's.
-        let taken = asks_keys(&mut state, b"\x01", 1, now);
+        let taken = asks_keys(&mut state, b"\x01", 1);
         assert_eq!(taken.feed.as_deref(), Some(&b"\x01"[..]));
         assert!(state.asks.focus);
         // A letter is the inbox's and goes nowhere else.
-        let taken = asks_keys(&mut state, b"z", 1, now);
+        let taken = asks_keys(&mut state, b"z", 1);
         assert_eq!(taken, AskKeys::default());
-        // An answer is held; tab gives the chat the keyboard and takes the answer back.
-        asks_keys(&mut state, b"a", 1, now);
-        assert!(state.asks.holding());
-        asks_keys(&mut state, b"\t", 1, now);
-        assert!(!state.asks.focus && !state.asks.holding() && state.qass_ui.inbox);
+        // An answer goes out; tab gives the chat the keyboard and the answer stays sent.
+        asks_keys(&mut state, b"a", 1);
+        assert!(state.asks.busy());
+        asks_keys(&mut state, b"\t", 1);
+        assert!(!state.asks.focus && state.asks.busy() && state.qass_ui.inbox);
         // Esc puts it away and asks for the pty to be sized again.
         state.asks.focus = true;
-        let taken = asks_keys(&mut state, b"\x1b", 1, now);
+        let taken = asks_keys(&mut state, b"\x1b", 1);
         assert!(taken.resize && !state.qass_ui.inbox && !state.asks.focus);
         // Enter on a card goes to its agent's tab.
         asks_toggle(&mut state);
-        let taken = asks_keys(&mut state, b"\r", 1, now);
+        let taken = asks_keys(&mut state, b"\r", 1);
         assert_eq!(taken.jump, Some(1));
         assert!(!state.asks.focus);
     }
 
     #[test]
     fn in_a_narrow_pane_tab_puts_the_inbox_away_because_there_is_no_chat_beside_it() {
-        let now = std::time::Instant::now();
         let mut state = qass_window();
         state.cols = 120;
         let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         asks_toggle(&mut state);
         assert!(state.qass_plan().unwrap().side.unwrap().replaces);
-        asks_keys(&mut state, b"\t", 1, now);
+        asks_keys(&mut state, b"\t", 1);
         assert!(!state.qass_ui.inbox && !state.asks.focus);
     }
 
     #[test]
     fn the_keyboard_leaves_the_inbox_with_the_screen_it_was_on() {
-        let now = std::time::Instant::now();
         let mut state = qass_window();
         let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         asks_toggle(&mut state);
-        asks_keys(&mut state, b"b", 1, now);
-        assert!(state.asks_focused() && state.asks.holding());
-        // Away from qass's screen: nothing is shown, so nothing is held for him.
+        asks_keys(&mut state, b"b", 1);
+        assert!(state.asks_focused() && state.asks.busy());
+        // Away from qass's screen: nothing is shown.
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(!state.asks_focused());
         state.asks_settle();
-        assert!(!state.asks.focus && !state.asks.holding());
+        assert!(!state.asks.focus);
         // Zoomed, the same.
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         state.asks.focus = true;

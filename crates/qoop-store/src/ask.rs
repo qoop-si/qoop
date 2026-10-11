@@ -8,9 +8,10 @@
 //! ids are reused, so every path that ends a terminal closes its live cards in the same
 //! transaction (`close_for_terminals`, called from `task::abandon_open_tasks`).
 //!
-//! Status words: `open` (waiting for him), `passed` (his words were typed to qass, which
-//! relays them), `answered` (his words went to the worker), `closed`. `closed_at` is when the
-//! card last changed status: when it was passed, answered or closed.
+//! Status words: `open` (waiting for him), `queued` (his answer is kept and will be typed as
+//! soon as its target takes input), `passed` (his words were typed to qass, which relays
+//! them), `answered` (his words went to the worker), `closed`. `closed_at` is when the card
+//! last changed status: when it was queued, passed, answered or closed.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -100,7 +101,7 @@ pub(crate) fn close_for_terminals(
     for terminal in terminals {
         tx.execute(
             "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?2 \
-             WHERE terminal = ?1 AND status IN ('open', 'passed')",
+             WHERE terminal = ?1 AND status IN ('open', 'queued', 'passed')",
             params![terminal, now],
         )?;
     }
@@ -140,7 +141,7 @@ impl Store {
         if let Some(agent) = agent {
             tx.execute(
                 "UPDATE ask SET status = 'closed', note = 'superseded', closed_at = ?2 \
-                 WHERE agent = ?1 AND status IN ('open', 'passed')",
+                 WHERE agent = ?1 AND status IN ('open', 'queued', 'passed')",
                 params![agent, now],
             )?;
         }
@@ -246,17 +247,42 @@ impl Store {
         Ok(old)
     }
 
-    /// Give a card back to `open`, after its answer could not be sent.
-    pub fn reopen_ask(&self, card: &str) -> Result<(), StoreError> {
+    /// Give a card back to `open`, after its answer could not be sent, with the reason.
+    pub fn reopen_ask(&self, card: &str, note: Option<&str>) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE ask SET status = 'open', answer = NULL, option = NULL, note = NULL, \
-             closed_at = NULL WHERE card = ?1 AND status IN ('answered', 'passed')",
-            params![card],
+            "UPDATE ask SET status = 'open', answer = NULL, option = NULL, note = ?2, \
+             closed_at = NULL WHERE card = ?1 AND status IN ('answered', 'queued', 'passed')",
+            params![card, note],
         )?;
         Ok(())
     }
 
-    /// End a live card (`open` or `passed`) with a note. False when it was already ended,
+    /// A queued answer is about to be typed: `queued` to `to` (`answered` or `passed`), once.
+    /// False when it is no longer queued (a chat answer or qass closed it): nothing is typed.
+    pub fn deliver_ask(
+        &self,
+        card: &str,
+        to: &str,
+        note: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE ask SET status = ?2, note = ?3, closed_at = ?4 \
+             WHERE card = ?1 AND status = 'queued'",
+            params![card, to, note, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The answers kept and not yet typed, oldest first.
+    pub fn queued_asks(&self) -> Result<Vec<AskRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM ask WHERE status = 'queued' ORDER BY closed_at, id"
+        ))?;
+        Ok(stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// End a live card (`open`, `queued` or `passed`) with a note. False when it was already ended,
     /// which is not an error: a late `done` for a card he already dismissed is harmless.
     pub fn close_ask(&self, card: &str, note: &str, now: i64) -> Result<bool, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -265,17 +291,18 @@ impl Store {
         }
         let n = tx.execute(
             "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
-             WHERE card = ?1 AND status IN ('open', 'passed')",
+             WHERE card = ?1 AND status IN ('open', 'queued', 'passed')",
             params![card, note, now],
         )?;
         tx.commit()?;
         Ok(n == 1)
     }
 
-    /// The cards still waiting (`open`) or being relayed (`passed`), oldest first.
+    /// The cards still waiting (`open`), kept for delivery (`queued`) or being relayed
+    /// (`passed`), oldest first.
     pub fn live_asks(&self) -> Result<Vec<AskRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {COLUMNS} FROM ask WHERE status IN ('open', 'passed') ORDER BY opened_at, id"
+            "SELECT {COLUMNS} FROM ask WHERE status IN ('open', 'queued', 'passed') ORDER BY opened_at, id"
         ))?;
         Ok(stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?)
     }
@@ -295,18 +322,26 @@ impl Store {
     pub fn has_draft(&self, terminal: i64) -> Result<bool, StoreError> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND card LIKE 'W%' \
-             AND status IN ('open', 'passed'))",
+             AND status IN ('open', 'queued', 'passed'))",
             params![terminal],
             |r| r.get(0),
         )?)
     }
 
-    /// At daemon start: cards of a terminal that is no longer open end as `agent closed`,
-    /// and ended cards past their keep are dropped.
+    /// At daemon start: queued answers go back to `open`, cards of a terminal that is no
+    /// longer open end as `agent closed`, and ended cards past their keep are dropped.
     pub fn tidy_asks(&self, now: i64) -> Result<(), StoreError> {
+        // An answer kept for delivery does not outlive the daemon that was to type it: it is
+        // given back to him, with the reason, once the next start has checked its terminal.
+        self.conn.execute(
+            "UPDATE ask SET status = 'open', answer = NULL, option = NULL, \
+             note = 'not delivered: qoop restarted', closed_at = NULL WHERE status = 'queued' \
+             AND (terminal IS NULL OR terminal IN (SELECT id FROM terminal WHERE closed_at IS NULL))",
+            [],
+        )?;
         self.conn.execute(
             "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?1 \
-             WHERE status IN ('open', 'passed') AND terminal IS NOT NULL AND terminal NOT IN \
+             WHERE status IN ('open', 'queued', 'passed') AND terminal IS NOT NULL AND terminal NOT IN \
              (SELECT id FROM terminal WHERE closed_at IS NULL)",
             params![now],
         )?;
@@ -485,12 +520,53 @@ mod tests {
             .unwrap_err();
         assert!(again.to_string().contains("already answered"), "{again}");
         assert!(s.live_asks().unwrap().is_empty());
-        s.reopen_ask("E1").unwrap();
+        s.reopen_ask("E1", None).unwrap();
         let back = s.ask("E1").unwrap().unwrap();
         assert_eq!(
             (back.status.as_str(), back.answer, back.closed_at),
             ("open", None, None)
         );
+    }
+
+    #[test]
+    fn a_queued_answer_is_live_delivered_once_and_ended_by_a_close() {
+        let (s, t) = store_with_terminal();
+        for (card, at) in [("E1", 10), ("E2", 11)] {
+            s.add_ask(card, None, None, None, "{}", at).unwrap();
+            s.claim_ask(card, "queued", None, "go", "queued", at + 10)
+                .unwrap();
+        }
+        assert_eq!(s.live_asks().unwrap().len(), 2, "queued is live");
+        let order: Vec<String> = s
+            .queued_asks()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.card)
+            .collect();
+        assert_eq!(order, ["E1", "E2"], "oldest first");
+        assert!(s.deliver_ask("E1", "passed", "passed to qass", 30).unwrap());
+        assert!(
+            !s.deliver_ask("E1", "passed", "passed to qass", 31).unwrap(),
+            "once only"
+        );
+        // A close (the chat answered) ends a queued card, so it is never typed.
+        assert!(s.close_ask("E2", "answered in chat", 32).unwrap());
+        assert!(!s.deliver_ask("E2", "passed", "passed to qass", 33).unwrap());
+        // A queued card gives back with its reason; an exiting agent closes it.
+        s.add_ask("E3", Some("T5"), Some(t), None, "{}", 40)
+            .unwrap();
+        s.claim_ask("E3", "queued", None, "go", "queued", 41)
+            .unwrap();
+        s.reopen_ask("E3", Some("not delivered: no tab")).unwrap();
+        let back = s.ask("E3").unwrap().unwrap();
+        assert_eq!(
+            (back.status.as_str(), back.note.as_deref()),
+            ("open", Some("not delivered: no tab"))
+        );
+        s.claim_ask("E3", "queued", None, "go", "queued", 42)
+            .unwrap();
+        s.close_terminal(t, 50).unwrap();
+        assert_eq!(s.ask("E3").unwrap().unwrap().status, "closed");
     }
 
     #[test]

@@ -3,17 +3,22 @@
 //! qass writes a card (`Add`) and ends one it has handled (`Close`), each with the token of a
 //! terminal in its own space. The owner answers or dismisses from a client that speaks for no
 //! terminal: any terminal's token is refused there, so a worker can neither forge a card nor
-//! answer one. An answer is claimed once (`open` to `answered` or `passed`), then sent:
+//! answer one. An answer is claimed once (`open` to `queued`) and is never refused: one
+//! flusher types it as soon as its target takes input, then the card is `answered` or `passed`:
 //!
-//! 1. straight to the worker, when it is the same conversation the card was written about, at
-//!    rest, and said which conversation that is;
+//! 1. straight to the worker, when it is the same conversation the card was written about and
+//!    said which conversation that is (at its next rest when it is working);
 //! 2. otherwise typed to qass as `<handle> <letter>` (the form qass already reads in the
-//!    chat), but only while qass is idle and nobody is typing in its terminal.
+//!    chat), once qass is idle and nobody is typing in its terminal.
 //!
-//! A send that fails gives the card back to `open`, so an answer is never lost silently.
+//! The route is read again at every send, so a conversation that changed while the answer
+//! waited is not typed into. A send that fails, or an answer that waits too long, gives the
+//! card back to `open` with the reason, so an answer is never lost silently.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use qoop_domain::ClientId;
@@ -37,6 +42,16 @@ const TYPED_QUIET_SECS: i64 = 30;
 /// The pause between the words and the Enter that sends them, the one `qoop prompt` leaves so
 /// a bracketed paste lands before the newline submits it.
 const BEFORE_ENTER: Duration = Duration::from_millis(300);
+
+/// How often the flusher looks at the answers waiting for a target to take input.
+const FLUSH_EVERY: Duration = Duration::from_secs(1);
+
+/// After words are typed to a target it is left alone this long: it still reads idle until its
+/// turn starts, and the next answer must not land in a turn that has not begun.
+const SETTLE: Duration = Duration::from_secs(3);
+
+/// How long an answer may wait for its target before it is given back.
+const GIVE_UP_SECS: i64 = 30 * 60;
 
 /// The most characters of his own words one answer carries.
 const TEXT_MAX: usize = 400;
@@ -77,6 +92,13 @@ pub fn refusal(state: &str, readiness: &str) -> Option<&'static str> {
 }
 
 impl Standing {
+    /// Will be at rest by itself: idle, done or mid-turn, and not at a trust prompt. A blocked
+    /// agent waits on the owner, so words for it go through qass.
+    fn coming_to_rest(&self) -> bool {
+        matches!(self.state.as_str(), "idle" | "done" | "working")
+            && self.readiness != "trust_required"
+    }
+
     /// At rest and open to words.
     fn at_rest(&self) -> bool {
         matches!(self.state.as_str(), "idle" | "done")
@@ -379,7 +401,15 @@ pub(crate) async fn write(
             if caller.terminal.is_some() {
                 return failed(id, "a card is answered by the owner, not from a terminal");
             }
-            match answer(&card, option, text, seen, terminals, agents, store).await {
+            match answer(
+                &card,
+                option,
+                text,
+                seen,
+                (terminals, agents, connections, store),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(reason) => return failed(id, reason),
             }
@@ -462,6 +492,14 @@ async fn close(card: &str, note: &str, store: &StoreHandle) -> Result<AskResult,
 fn clean_text(text: &str) -> Option<String> {
     Some(qoop_store::task::one_line(text)).filter(|t| !t.is_empty())
 }
+
+/// What the daemon's ask code works with: terminals, agents, connections and the store.
+type Hands<'a> = (
+    &'a Arc<TerminalRegistry>,
+    &'a Arc<AgentRegistry>,
+    &'a Arc<ConnectionRegistry>,
+    &'a StoreHandle,
+);
 
 /// What is sent to the worker for an answer: the line qass sends today.
 fn line_for_worker(card: &str, said: &str, chose: Option<(&str, &str)>) -> String {
@@ -550,36 +588,38 @@ pub(crate) enum Route {
     Worker(u32),
     /// Typed to qass, which relays it.
     Qass(u32),
-    /// qass cannot be typed to now: the card stays open.
-    Busy,
     /// qass has no tab.
     NoQass,
 }
 
-/// Route 1 when the worker is provably the conversation the card was written about and at
-/// rest: the card has a session, the live row reports the same one, and the agent is idle or
-/// done. A card without a session (an agent that reports none, or a remote one) never takes
-/// it. Otherwise route 2, while qass is at rest and nobody typed into it lately.
-pub(crate) fn route(
-    row: &AskRow,
-    worker: Option<&(u32, Standing)>,
-    qass: Option<&(u32, Standing, Option<i64>)>,
-) -> Route {
+/// Route 1 when the worker is provably the conversation the card was written about and is at
+/// rest or on its way to it: the card has a session, the live row reports the same one, and
+/// the agent is idle, done or working. A card without a session (an agent that reports none, or
+/// a remote one) never takes it. Otherwise route 2.
+pub(crate) fn route(row: &AskRow, worker: Option<&(u32, Standing)>, qass: Option<u32>) -> Route {
     if let Some((terminal, s)) = worker
         && row.session.is_some()
         && s.session == row.session
-        && s.at_rest()
+        && s.coming_to_rest()
     {
         return Route::Worker(*terminal);
     }
-    match qass {
-        None => Route::NoQass,
-        Some((terminal, s, typed_ago))
-            if s.at_rest() && typed_ago.is_none_or(|ago| ago >= TYPED_QUIET_SECS) =>
-        {
-            Route::Qass(*terminal)
-        }
-        Some(_) => Route::Busy,
+    qass.map_or(Route::NoQass, Route::Qass)
+}
+
+/// Whether the target of a route takes words now: at rest, and for qass nobody typed into it
+/// lately (a draft still reads `idle`, and typing over it would send half a sentence).
+pub(crate) fn takes_words(
+    route: Route,
+    worker: Option<&(u32, Standing)>,
+    qass: Option<&(u32, Standing, Option<i64>)>,
+) -> bool {
+    match route {
+        Route::Worker(_) => worker.is_some_and(|(_, s)| s.at_rest()),
+        Route::Qass(_) => qass.is_some_and(|(_, s, typed_ago)| {
+            s.at_rest() && typed_ago.is_none_or(|ago| ago >= TYPED_QUIET_SECS)
+        }),
+        Route::NoQass => false,
     }
 }
 
@@ -588,10 +628,9 @@ async fn answer(
     option: Option<String>,
     text: Option<String>,
     seen: Option<String>,
-    terminals: &Arc<TerminalRegistry>,
-    agents: &Arc<AgentRegistry>,
-    store: &StoreHandle,
+    hands: Hands<'_>,
 ) -> Result<AskResult, String> {
+    let (terminals, agents, connections, store) = hands;
     let wanted = card.to_string();
     let row = store
         .run(move |s| s.ask(&wanted))
@@ -631,68 +670,196 @@ async fn answer(
     // words are the answer, the option only says which he looked at.
     let key = chosen.filter(|_| text.is_none()).map(|o| o.key.clone());
 
-    let worker = row
-        .terminal
-        .and_then(|t| u32::try_from(t).ok())
-        .and_then(|t| standing(agents, terminals, t).map(|s| (t, s)));
+    let worker = worker_of(&row, agents, terminals);
     let qass = qass_terminal(terminals, agents, store).await;
-    let qass_now = qass.and_then(|t| {
-        standing(agents, terminals, t)
-            .map(|s| (t, s, agents.typed_ago(t, crate::agents::now_unix())))
-    });
-    let (to, note, target, line) = match route(&row, worker.as_ref(), qass_now.as_ref()) {
-        Route::Worker(terminal) => {
-            let said = match (&key, &text) {
-                (Some(k), _) => format!("{} {}", body.handle, k.to_uppercase()),
-                (None, Some(t)) => t.clone(),
-                (None, None) => unreachable!("checked above"),
-            };
-            let chose = chosen
-                .filter(|_| text.is_none())
-                .map(|o| (o.key.as_str(), o.words.as_str()));
-            (
-                "answered",
-                "owner, inbox",
-                terminal,
-                line_for_worker(card, &said, chose),
-            )
-        }
-        Route::Qass(terminal) => (
-            "passed",
-            "passed to qass",
-            terminal,
-            line_for_qass(&body.handle, key.as_deref(), text.as_deref()),
-        ),
-        Route::Busy => return Ok(AskResult::Busy),
+    let result = match route(&row, worker.as_ref(), qass) {
+        Route::Worker(_) => AskResult::Answered,
+        Route::Qass(_) => AskResult::Passed,
         Route::NoQass => return Err("qass has no tab to hand this to".to_string()),
     };
     let said = text.clone().or_else(|| key.clone()).unwrap_or_default();
     let (wanted, option_key) = (card.to_string(), key);
     let claimed = store
-        .run(move |s| s.claim_ask(&wanted, to, option_key.as_deref(), &said, note, now()))
+        .run(move |s| {
+            s.claim_ask(
+                &wanted,
+                "queued",
+                option_key.as_deref(),
+                &said,
+                "queued",
+                now(),
+            )
+        })
         .await
         .map_err(why)?;
-    let give_back = || {
-        let back = card.to_string();
-        async move {
-            let _ = store.run(move |s| s.reopen_ask(&back)).await;
-        }
-    };
     // Rewritten between the read and the claim: the words he read are not the ones in the
     // card now, so nothing is sent.
     if claimed.body != row.body {
-        give_back().await;
+        let back = card.to_string();
+        let _ = store.run(move |s| s.reopen_ask(&back, None)).await;
         return Err(format!("{card} changed since you read it; look again"));
     }
-    if let Err(reason) = type_into(terminals, target, &line).await {
-        give_back().await;
-        return Err(format!("{reason}; the card is open again"));
+    kick(terminals, agents, connections, store);
+    Ok(result)
+}
+
+/// The worker a card is about, as it stands: its terminal, when that still holds an agent.
+fn worker_of(
+    row: &AskRow,
+    agents: &Arc<AgentRegistry>,
+    terminals: &Arc<TerminalRegistry>,
+) -> Option<(u32, Standing)> {
+    let terminal = u32::try_from(row.terminal?).ok()?;
+    standing(agents, terminals, terminal).map(|s| (terminal, s))
+}
+
+/// What is typed for a queued answer on a route, rebuilt from the card and the stored answer.
+fn line_for(row: &AskRow, route: Route) -> Option<String> {
+    let body: AskCard = serde_json::from_str(&row.body).ok()?;
+    let option = row.option.as_deref();
+    let text = row.answer.as_deref().filter(|_| option.is_none());
+    match route {
+        Route::Worker(_) => {
+            let said = match (option, text) {
+                (Some(k), _) => format!("{} {}", body.handle, k.to_uppercase()),
+                (None, Some(t)) => t.to_string(),
+                (None, None) => return None,
+            };
+            let chose = option
+                .and_then(|k| body.options.iter().find(|o| o.key == k))
+                .map(|o| (o.key.as_str(), o.words.as_str()));
+            Some(line_for_worker(&row.card, &said, chose))
+        }
+        Route::Qass(_) => Some(line_for_qass(&body.handle, option, text)),
+        Route::NoQass => None,
     }
-    Ok(if to == "answered" {
-        AskResult::Answered
-    } else {
-        AskResult::Passed
-    })
+}
+
+/// Whether a flusher is running: one types every queued answer, so they go in order.
+static FLUSHING: AtomicBool = AtomicBool::new(false);
+
+/// Start the flusher unless one runs.
+fn kick(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    if FLUSHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (terminals, agents, connections, store) = (
+        terminals.clone(),
+        agents.clone(),
+        connections.clone(),
+        store.clone(),
+    );
+    tokio::spawn(async move {
+        loop {
+            // A panic ends this look, not the flag: the queue is looked at again below.
+            let look = tokio::spawn(flush(
+                terminals.clone(),
+                agents.clone(),
+                connections.clone(),
+                store.clone(),
+            ));
+            if look.await.is_err() {
+                tokio::time::sleep(FLUSH_EVERY).await;
+            }
+            FLUSHING.store(false, Ordering::SeqCst);
+            // An answer queued after the last look and before the flag went down.
+            let waiting = store.run(|s| s.queued_asks()).await;
+            if !waiting.is_ok_and(|rows| !rows.is_empty()) || FLUSHING.swap(true, Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Type every queued answer as its target takes input; returns when none is queued and the
+/// last target typed to has settled.
+async fn flush(
+    terminals: Arc<TerminalRegistry>,
+    agents: Arc<AgentRegistry>,
+    connections: Arc<ConnectionRegistry>,
+    store: StoreHandle,
+) {
+    let mut sent: HashMap<u32, Instant> = HashMap::new();
+    loop {
+        let Ok(rows) = store.run(|s| s.queued_asks()).await else {
+            return;
+        };
+        if rows.is_empty() && sent.values().all(|at| at.elapsed() >= SETTLE) {
+            return;
+        }
+        // The oldest answer of a target goes first: a target seen once is left to it.
+        let mut seen = HashSet::new();
+        for row in rows {
+            flush_card(
+                &row,
+                &mut seen,
+                &mut sent,
+                (&terminals, &agents, &connections, &store),
+            )
+            .await;
+        }
+        tokio::time::sleep(FLUSH_EVERY).await;
+    }
+}
+
+/// One queued answer: typed if its target takes words now, given back if it cannot be
+/// delivered, left alone otherwise.
+async fn flush_card(
+    row: &AskRow,
+    seen: &mut HashSet<u32>,
+    sent: &mut HashMap<u32, Instant>,
+    (terminals, agents, connections, store): Hands<'_>,
+) {
+    let give_back = |why: String| async move {
+        let (card, note) = (row.card.clone(), format!("not delivered: {why}"));
+        let _ = store.run(move |s| s.reopen_ask(&card, Some(&note))).await;
+        connections.asks_changed();
+    };
+    if now() - row.closed_at.unwrap_or_else(now) > GIVE_UP_SECS {
+        return give_back("it waited too long".to_string()).await;
+    }
+    let worker = worker_of(row, agents, terminals);
+    let qass = qass_terminal(terminals, agents, store).await;
+    let route = route(row, worker.as_ref(), qass);
+    let (target, to, note) = match route {
+        Route::Worker(t) => (t, "answered", "owner, inbox"),
+        Route::Qass(t) => (t, "passed", "passed to qass"),
+        Route::NoQass => return give_back("qass has no tab".to_string()).await,
+    };
+    if !seen.insert(target) || sent.get(&target).is_some_and(|at| at.elapsed() < SETTLE) {
+        return;
+    }
+    let qass_now = qass.and_then(|t| {
+        standing(agents, terminals, t)
+            .map(|s| (t, s, agents.typed_ago(t, crate::agents::now_unix())))
+    });
+    if !takes_words(route, worker.as_ref(), qass_now.as_ref()) {
+        return;
+    }
+    let Some(line) = line_for(row, route) else {
+        return give_back("its card could not be read".to_string()).await;
+    };
+    let card = row.card.clone();
+    // Flipped before it is typed, so a chat answer or a close that came first wins and a
+    // card is never typed twice.
+    match store
+        .run(move |s| s.deliver_ask(&card, to, note, now()))
+        .await
+    {
+        Ok(true) => {}
+        _ => return,
+    }
+    sent.insert(target, Instant::now());
+    connections.asks_changed();
+    if let Err(reason) = type_into(terminals, target, &line).await {
+        give_back(reason).await;
+    }
 }
 
 #[cfg(test)]
@@ -786,38 +953,32 @@ mod tests {
     }
 
     #[test]
-    fn a_card_takes_the_direct_route_only_with_a_matching_session_and_an_agent_at_rest() {
-        let qass_free = (9, at("idle", None), None);
+    fn a_card_takes_the_direct_route_only_with_a_matching_session_and_an_agent_coming_to_rest() {
         let worker = |state, session| Some((5, at(state, session)));
-        // The same conversation, at rest: straight to the worker.
-        assert_eq!(
-            route(
-                &card(Some("s1")),
-                worker("idle", Some("s1")).as_ref(),
-                Some(&qass_free)
-            ),
-            Route::Worker(5)
-        );
+        // The same conversation, at rest or mid-turn: straight to the worker, never refused.
+        for state in ["idle", "done", "working"] {
+            assert_eq!(
+                route(
+                    &card(Some("s1")),
+                    worker(state, Some("s1")).as_ref(),
+                    Some(9)
+                ),
+                Route::Worker(5),
+                "{state}"
+            );
+        }
         // No session on the card, or none reported by the agent: through qass.
         assert_eq!(
-            route(
-                &card(None),
-                worker("idle", Some("s1")).as_ref(),
-                Some(&qass_free)
-            ),
+            route(&card(None), worker("idle", Some("s1")).as_ref(), Some(9)),
             Route::Qass(9)
         );
         assert_eq!(
-            route(
-                &card(Some("s1")),
-                worker("idle", None).as_ref(),
-                Some(&qass_free)
-            ),
+            route(&card(Some("s1")), worker("idle", None).as_ref(), Some(9)),
             Route::Qass(9)
         );
         // Neither says a session (opencode, amp, goose, cursor): two blanks are not a match.
         assert_eq!(
-            route(&card(None), worker("idle", None).as_ref(), Some(&qass_free)),
+            route(&card(None), worker("idle", None).as_ref(), Some(9)),
             Route::Qass(9)
         );
         // Another conversation in the terminal (a /clear, a new session): through qass.
@@ -825,56 +986,87 @@ mod tests {
             route(
                 &card(Some("s1")),
                 worker("idle", Some("s2")).as_ref(),
-                Some(&qass_free)
+                Some(9)
             ),
             Route::Qass(9)
         );
-        // The worker is working, blocked or gone: through qass.
-        for state in ["working", "blocked", "sleeping"] {
+        // The worker waits on him or is gone: through qass.
+        for state in ["blocked", "sleeping", "failed"] {
             assert_eq!(
                 route(
                     &card(Some("s1")),
                     worker(state, Some("s1")).as_ref(),
-                    Some(&qass_free)
+                    Some(9)
                 ),
                 Route::Qass(9),
                 "{state}"
             );
         }
-        assert_eq!(
-            route(&card(Some("s1")), None, Some(&qass_free)),
-            Route::Qass(9)
-        );
+        assert_eq!(route(&card(Some("s1")), None, Some(9)), Route::Qass(9));
+        // Nobody to take it: refused, never "busy".
+        assert_eq!(route(&card(None), None, None), Route::NoQass);
     }
 
     #[test]
-    fn qass_is_typed_to_only_while_it_is_at_rest_and_nobody_is_typing() {
-        let no_worker = None;
+    fn words_are_typed_only_to_a_target_at_rest_and_qass_only_when_nobody_is_typing() {
+        let worker = |state| Some((5, at(state, Some("s1"))));
         let qass = |state, typed: Option<i64>| Some((9, at(state, None), typed));
-        assert_eq!(
-            route(&card(None), no_worker, qass("idle", None).as_ref()),
-            Route::Qass(9)
-        );
-        assert_eq!(
-            route(&card(None), no_worker, qass("done", Some(31)).as_ref()),
-            Route::Qass(9)
-        );
+        assert!(takes_words(Route::Worker(5), worker("idle").as_ref(), None));
+        assert!(!takes_words(
+            Route::Worker(5),
+            worker("working").as_ref(),
+            None
+        ));
+        assert!(takes_words(
+            Route::Qass(9),
+            None,
+            qass("idle", None).as_ref()
+        ));
+        assert!(takes_words(
+            Route::Qass(9),
+            None,
+            qass("done", Some(31)).as_ref()
+        ));
         for state in ["working", "blocked", "sleeping", "starting"] {
-            assert_eq!(
-                route(&card(None), no_worker, qass(state, None).as_ref()),
-                Route::Busy,
+            assert!(
+                !takes_words(Route::Qass(9), None, qass(state, None).as_ref()),
                 "{state}"
             );
         }
-        assert_eq!(
-            route(&card(None), no_worker, qass("idle", Some(5)).as_ref()),
-            Route::Busy
+        assert!(!takes_words(
+            Route::Qass(9),
+            None,
+            qass("idle", Some(5)).as_ref()
+        ));
+        assert!(!takes_words(
+            Route::Qass(9),
+            None,
+            qass("idle", Some(29)).as_ref()
+        ));
+        assert!(!takes_words(Route::NoQass, None, None));
+    }
+
+    #[test]
+    fn a_queued_answer_is_typed_as_the_route_says_when_it_is_sent() {
+        let body = r#"{"handle":"korea","urgency":"now","doing":"d","why":"w","asks":"a","options":[{"key":"b","label":"B","reason":"r","words":"Do not run 0042 yet."}]}"#;
+        let mut row = card(None);
+        row.body = body.into();
+        row.card = "E7".into();
+        row.option = Some("b".into());
+        row.answer = Some("b".into());
+        assert_eq!(line_for(&row, Route::Qass(9)).as_deref(), Some("korea B"));
+        assert!(
+            line_for(&row, Route::Worker(5))
+                .unwrap()
+                .contains("He chose B: Do not run 0042 yet")
         );
+        row.option = None;
+        row.answer = Some("run it twice".into());
         assert_eq!(
-            route(&card(None), no_worker, qass("idle", Some(29)).as_ref()),
-            Route::Busy
+            line_for(&row, Route::Qass(9)).as_deref(),
+            Some("korea run it twice")
         );
-        assert_eq!(route(&card(None), no_worker, None), Route::NoQass);
+        assert_eq!(line_for(&row, Route::NoQass), None);
     }
 
     #[test]
