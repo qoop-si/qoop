@@ -1374,6 +1374,7 @@ fn qoop_restart_carries_everything_onto_a_build_of_the_same_version() {
     let tree = Pane::Split {
         dir: SplitDir::V,
         permille: 500,
+        questions: 0,
         first: Box::new(Pane::Leaf { terminal: 1 }),
         second: Box::new(Pane::Leaf {
             terminal: agent_tab,
