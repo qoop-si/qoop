@@ -881,6 +881,98 @@ $Q task stage waiting-human > stage.out 2>&1"#
     assert!(!ok && err.contains("no board"), "{err}");
 }
 
+/// An agent on a board item is told, beside every request, the item and its next step, and
+/// still reads its own task's plan in `qoop task show`.
+#[test]
+fn a_linked_agent_hears_its_item_and_keeps_its_own_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "login", "works"]);
+    assert!(ok, "add: {err}");
+    let key = out
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let work = daemon.inside(
+        "1",
+        "item",
+        &format!(
+            r#"$Q task link {key} > link.out 2>&1
+printf 'read the code\nfix it\nrun the tests\n' | $Q task steps - > steps.out 2>&1
+$Q task check 1 > check.out 2>&1
+printf 'step one: read it\n' | $Q task plan - > plan.out 2>&1
+$Q task rules --turn > turn.out 2>&1
+$Q task rules > rules.out 2>&1
+$Q task show --json > show.json 2>&1"#
+        ),
+    );
+    let turn = read(&work, "turn.out");
+    assert!(
+        turn.contains(&format!("item {key} 'login works' 1/3, next 2 'fix it'")),
+        "{turn}"
+    );
+    assert!(
+        turn.contains("`qoop task check 2` once it passes"),
+        "{turn}"
+    );
+    let rules = read(&work, "rules.out");
+    assert!(rules.contains(&format!("on {key} 1/3.")), "{rules}");
+    let show: serde_json::Value = serde_json::from_str(&read(&work, "show.json")).unwrap();
+    let kinds: Vec<&str> = show["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        kinds.contains(&"plan"),
+        "its own plan is still there: {kinds:?} {show}"
+    );
+    let activity = show["item"]["activity"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert_eq!(
+        activity, 0,
+        "a terminal's own read carries no activity: {show}"
+    );
+}
+
+/// A prompt that reaches an agent waiting on the owner is his answer: the task leaves
+/// `waiting-human` for the stage before it, and no board says it still waits on him.
+#[test]
+fn an_answer_reaching_the_agent_moves_its_stage_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let work = daemon.inside(
+        "1",
+        "asker",
+        r#"$Q task new "pick a logo" > new.out 2>&1
+$Q task stage planning > a.out 2>&1
+$Q task stage waiting-human > b.out 2>&1
+$Q task show --json > before.json 2>&1
+$Q hook-report --state working --event user --label "B, the round one" > hook.out 2>&1
+$Q task show --json > after.json 2>&1"#,
+    );
+    let stage = |file: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(&read(&work, file)).unwrap();
+        v["task"]["stage"].as_str().unwrap_or_default().to_string()
+    };
+    assert_eq!(
+        stage("before.json"),
+        "waiting-human",
+        "{}",
+        read(&work, "before.json")
+    );
+    assert_eq!(
+        stage("after.json"),
+        "planning",
+        "{}",
+        read(&work, "after.json")
+    );
+}
+
 /// One agent, one name: the board read from the record and the card the daemon answers call a
 /// linked agent by its tab's name, and the card carries its events in its activity, in words.
 /// A start tells the key as stored, whatever its spelling. A drop is for items only, and a

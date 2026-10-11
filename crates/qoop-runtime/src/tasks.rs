@@ -479,7 +479,7 @@ pub(crate) async fn read(
     let found = store
         .run(move |s| {
             let items = if board { Some(s.items(now)?) } else { None };
-            let card = match task {
+            let mut card = match task {
                 Some(task) => s.item_card(task, now)?,
                 None => None,
             };
@@ -488,13 +488,25 @@ pub(crate) async fn read(
                 (None, Some(terminal)) => Some(s.open_task_of(i64::from(terminal))?),
                 (None, None) => None,
             };
+            // A terminal's own read also carries the item its open task works on: what its
+            // per-request line names. Without the activity, which that line never shows and
+            // which is the bulk of a card.
+            if let (None, Some(Some(open))) = (task, &one)
+                && let Some(item) = s.linked_item(open.id)?
+            {
+                card = s.item_card(item, now)?.map(|mut c| {
+                    c.activity.clear();
+                    c
+                });
+            }
             let (tasks, events, one) = match one {
                 // One task (or none open), with its events; an item's are in its card's
-                // activity, with its agents'.
+                // activity, with its agents'. A terminal's own task keeps its events beside
+                // its item's card.
                 Some(row) => {
                     let events = match &row {
                         // One more than is kept, so a cut is known even below the byte cap.
-                        Some(t) if card.is_none() => {
+                        Some(t) if task.is_none() || card.is_none() => {
                             s.task_events(t.id, before, EVENTS_READ + 1)?
                         }
                         _ => Vec::new(),

@@ -422,6 +422,46 @@ impl Store {
         Ok(t.stage != stage || t.claimed_at.is_some())
     }
 
+    /// The open task of `terminal`, waiting on the owner, took his answer (a prompt reached the
+    /// agent): its stage goes back to the one before `waiting-human`, else `implementing`. Only
+    /// the stage moves: a claim stays. Answers the stage it went back to, `None` when the task
+    /// was not waiting.
+    pub fn answer_waiting(&self, terminal: i64, now: i64) -> Result<Option<String>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let waiting: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL \
+                 AND stage = 'waiting-human' ORDER BY id DESC LIMIT 1",
+                params![terminal],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(task) = waiting else {
+            return Ok(None);
+        };
+        let before: Option<String> = tx
+            .query_row(
+                "SELECT body FROM task_event WHERE task = ?1 AND kind = 'stage' \
+                 AND body != 'waiting-human' ORDER BY id DESC LIMIT 1",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let back = before
+            .filter(|b| STAGES.contains(&b.as_str()))
+            .unwrap_or_else(|| "implementing".to_string());
+        let moved = tx.execute(
+            "UPDATE task SET stage = ?2, updated_at = ?3 WHERE id = ?1 AND stage = 'waiting-human'",
+            params![task, back, now],
+        )?;
+        if moved == 0 {
+            return Ok(None);
+        }
+        event(&tx, task, "stage", &back, now)?;
+        tx.commit()?;
+        Ok(Some(back))
+    }
+
     /// Rewrite an open task's goal: what the owner wants, in plain words, with its done bar.
     /// The first goal is the owner's cut prompt; this replaces it as the ask becomes clear or
     /// changes. The old text stays in the events. Answers whether the goal changed.
@@ -828,6 +868,39 @@ mod tests {
         assert_eq!(
             s.task(next).unwrap().unwrap().goal,
             format!("work in terminal {t}")
+        );
+    }
+
+    #[test]
+    fn an_answer_takes_a_task_off_waiting_on_the_owner() {
+        let (s, _, t) = store_with_terminal();
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        assert_eq!(
+            s.answer_waiting(t, 11).unwrap(),
+            None,
+            "not waiting: nothing moves"
+        );
+        s.set_task_stage(id, "planning", 12).unwrap();
+        s.set_task_stage(id, "waiting-human", 13).unwrap();
+        s.claim_task_done(id, "asks before the merge", 14).unwrap();
+        assert_eq!(
+            s.answer_waiting(t, 15).unwrap().as_deref(),
+            Some("planning")
+        );
+        let row = s.task(id).unwrap().unwrap();
+        assert_eq!(row.stage, "planning", "the stage before it");
+        assert_eq!(row.claimed_at, Some(14), "the claim stays");
+        assert_eq!(s.answer_waiting(t, 16).unwrap(), None, "said once");
+        // Waiting with no stage before it: implementing.
+        let (other, _, u) = {
+            let (s2, ws, u) = store_with_terminal();
+            (s2, ws, u)
+        };
+        let fresh = other.open_task(u, "y", false, 10).unwrap();
+        other.set_task_stage(fresh, "waiting-human", 11).unwrap();
+        assert_eq!(
+            other.answer_waiting(u, 12).unwrap().as_deref(),
+            Some("implementing")
         );
     }
 

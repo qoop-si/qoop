@@ -211,7 +211,7 @@ stated plan, not by how important the question feels.
 | Its line ends `:claimed`, or it finished with its task open | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes |
 | Its task closed verified | when `policy` grants `close-finished` for its repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |
 | Before you prompt another review round: its stage events in `qoop task show <id> --json` (`events`, kind `stage`) changed to `reviewing` as many times as the workflow's limit (default 8) | a card, never another round |
-| Its task stage is `waiting-human` | a card; read the question from its screen |
+| Its task stage is `waiting-human` | a card; read the question from its screen. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | a card for later |
 | Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when his task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md or the workflow says |

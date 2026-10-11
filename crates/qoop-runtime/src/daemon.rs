@@ -4696,6 +4696,15 @@ async fn handle_control(
                         if kind == "user" {
                             crate::asks::relayed(label.as_deref(), terminal, connections, store)
                                 .await;
+                            // A prompt reached an agent waiting on the owner: its answer. The
+                            // stage goes back, so no board still says it waits on him.
+                            let now = crate::agents::now_unix();
+                            let back = store
+                                .run(move |s| s.answer_waiting(i64::from(terminal), now))
+                                .await;
+                            if matches!(back, Ok(Some(_))) {
+                                agents.tasks_changed();
+                            }
                         }
                         agents.push_focus_event(
                             terminal,

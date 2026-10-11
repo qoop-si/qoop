@@ -33,8 +33,9 @@ its start.
 
 One `qoop prompt` line, in this order:
 
-1. "First run `qoop task link <KEY>`" (or `qoop task new <goal>` for work on no item), "then follow
-   `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task`
+1. "First run `qoop task link <KEY>`" (or `qoop task new <goal>` for work on no item) "and keep its
+   steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the
+   fence allows. Each `qoop task`
    command alone, one per call, never chained (a chain asks permission)."
 2. The goal in the owner's words and when it is done (already cleared up with him: no second round).
 3. `tier: <tier>, because <why>`.
@@ -52,5 +53,5 @@ and put its path in the brief.
 
 ```
 "<this skill's dir>/spawn.sh" ~/src/shop fix/cart-total --tier mid       # prints "57 1"
-qoop prompt 57 --generation 1 -- 'First run `qoop task link SHOP-4`, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per call, never chained (a chain asks permission). Goal: the cart total is wrong when a coupon and free shipping meet; done when a test shows the right total and the fix is in a PR. tier: mid, because it is one bug in known code. Sub-agents: one low agent to find every place the total is computed; two reviewers on your plan, best for the one that tries to break it, mid for the other; none anywhere else. Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.'
+qoop prompt 57 --generation 1 -- 'First run `qoop task link SHOP-4` and keep its steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per call, never chained (a chain asks permission). Goal: the cart total is wrong when a coupon and free shipping meet; done when a test shows the right total and the fix is in a PR. tier: mid, because it is one bug in known code. Sub-agents: one low agent to find every place the total is computed; two reviewers on your plan, best for the one that tries to break it, mid for the other; none anywhere else. Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.'
 ```
