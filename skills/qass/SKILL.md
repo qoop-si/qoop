@@ -85,6 +85,7 @@ for him. A finish the board shows needs no note.
 4. Give him the summary (its shape is under "How you talk to the owner").
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
    resume and compaction; else read it now. Notes, scratch, skill dir: your folder's AGENTS.md.
+5. `qoop doctor --new @QASS_DATA@/doctor-said`, now and when he asks: fix or escalate each line.
 
 ## On every event line
 
@@ -94,8 +95,10 @@ A line starting with a remote's name (`ubox/T2 ...`) is an agent there: see "Rem
 A line `ASK E75 answered a -> T224` (or `ASK E3 passed text -> qass`) says the owner answered a card
 from the inbox and it went out: it needs nothing, `qoop ask ls` still shows the card.
 One wake may bring several lines, most urgent first: handle each. What needs nothing now comes
-with a later wake or within 10 minutes (never said: `@QASS_DATA@/quiet.log`). Write to agents
-only with `qoop prompt`, `qoop send` or `on.sh`: only then does their next stop come at once.
+with a later wake or within 10 minutes (never said: `@QASS_DATA@/quiet.log`); a plain rest (no
+claim, no question) after 30 minutes if it still holds, a sleep never. His `routine on` (in any
+language) writes `say` to `@QASS_DATA@/routine`, `routine off` removes it. Write to agents only
+with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wait or block come at once.
 
 1. `qoop task board --dir @QASS_DATA@/board` (every wake: the files are as fresh as this run),
    then `qoop context 52 --last 1 --lines 40`. If the generation is no longer 3, drop the event.

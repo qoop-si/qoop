@@ -45,6 +45,11 @@
 #   already said, only ever go with another block.
 # - A remote whose daemon left with no agent on it, and lines that went stale, go to
 #   quiet.log instead. Held lines and marks outlive a restart of this script.
+# - Routine, silent unless the file `routine` in qass's folder holds `say` (the owner's word:
+#   `routine off`, `routine on`): a plain rest (working or starting to idle or done, no claim,
+#   not waiting-human) is held QASS_ROUTINE_HOLD seconds (1800) and said only if the agent is
+#   still there, never riding along with another block; a sleep, and a daemon leaving
+#   with no agent working or blocked on it, go to quiet.log only.
 # - With cswap installed, a Claude agent of this Mac that stopped on its usage limit comes out
 #   at once as `->limited ... resets:7:20am` (`again` when it was limited minutes before).
 set -euo pipefail
@@ -58,6 +63,7 @@ quiet="${QASS_QUIET:-1}"
 batch="${QASS_BATCH:-30}"
 qhold="${QASS_QUIET_HOLD:-600}"
 linkdown="${QASS_LINKDOWN:-60}"
+rhold="${QASS_ROUTINE_HOLD:-1800}"
 
 defs='
 def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
@@ -98,6 +104,12 @@ again="$defs"'
 
 # Whether a row array $a holds an agent: a machine that goes away with none says nothing.
 has_agents="$defs"'($a | rows | length) > 0'
+# Whether it holds one at work or waiting at a menu: with routine silent, only then is a
+# machine going away worth a word.
+has_busy="$defs"'[$a | rows[] | select(.state != "idle" and .state != "done" and .state != "sleeping")] | length > 0'
+
+# Whether routine is silent: unless the owner said `routine on` (the file holds `say`).
+routine_quiet() { [ "$(cat "$dir/routine" 2>/dev/null)" != say ]; }
 
 # Reads held entries ("<t> <gen> <class> <due> <arrival> <line>") against the row array $b and
 # prints each as "P <line to say>" or "D <line>" (went stale). A sleep or a close holds while
@@ -260,12 +272,15 @@ hold_put() { # label terminal generation class line
     f="$(held_file "$1")"
     now="$(date +%s)"
     class="$4" arr="$now"
-    if [ "$class" = short ]; then due=$((now + settle)); else due=$((now + qhold)); fi
+    case "$class" in short) due=$((now + settle)) ;; routine) due=$((now + rhold)) ;; *) due=$((now + qhold)) ;; esac
     read -r o_t o_g o_class o_due o_arr _ <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
     if [ -n "${o_t:-}" ]; then
         [ "$o_due" -ge "$due" ] || due="$o_due"
         arr="$o_arr"
+        # A routine line is the agent's newest word: it never inherits an earlier class.
+        [ "$class" != routine ] || { due=$((now + rhold)); arr="$now"; }
         case "$class.$o_class" in
+            routine.*) ;;
             short.* | *.short) class=short ;;
             long.* | *.long) class=long ;;
         esac
@@ -317,8 +332,8 @@ flush() {
         [ ! -e "$(gone_file "$label")" ] || continue
         snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
         # Short lines first, then long, then ride: the most urgent first in the block.
-        sel="$(awk -v now="$now" -v b="$batch" '$3 != "short" || $4 <= now + b {
-            print ($3 == "short" ? 0 : $3 == "long" ? 1 : 2) " " NR " " $0 }' "$f" |
+        sel="$(awk -v now="$now" -v b="$batch" '($3 == "routine" ? $4 <= now : $3 != "short" || $4 <= now + b) {
+            print ($3 == "short" ? 0 : $3 == "long" ? 1 : $3 == "routine" ? 2 : 3) " " NR " " $0 }' "$f" |
             sort -n -k1,1 -k2,2 | cut -d' ' -f3-)"
         [ -n "$sel" ] || continue
         # Taken only once checked: a failed check keeps them held for the next round.
@@ -345,7 +360,7 @@ flush() {
     while IFS= read -r l; do [ -z "$l" ] || said_put "${l#* }" "${l%% *}"; done <<< "$said"
     while IFS= read -r f; do
         [ -n "$f" ] || continue
-        awk -v now="$now" -v b="$batch" '!($3 != "short" || $4 <= now + b)' "$f" > "$f.tmp"
+        awk -v now="$now" -v b="$batch" '!($3 == "routine" ? $4 <= now : $3 != "short" || $4 <= now + b)' "$f" > "$f.tmp"
         mv "$f.tmp" "$f"
     done <<< "$picked"
 }
@@ -416,6 +431,29 @@ quiet_hold() { # label line
     fi
 }
 
+# Whether a line is routine (see the top of this file). Run after `urgent`, which parsed it.
+routine() {
+    parse_line "$1" || return 1
+    [ "$L_STATE" != sleeping ] || return 0
+    case "$L_FROM.$L_STATE" in working.idle | working.done | starting.idle | starting.done) ;; *) return 1 ;; esac
+    [ "$L_STAGE" != waiting-human ] && [ -z "$L_CLAIMED" ]
+}
+
+# A routine line: a sleep is only logged, unless a line that is not routine is held for its
+# agent (a question it left): then it goes as any held line; a rest is held for the routine hold.
+quiet_routine() { # label line
+    if [ "$L_STATE" = sleeping ]; then
+        if awk -v t="$L_T" '$1 == t && $3 != "routine" { f = 1 } END { exit !f }' \
+            "$(held_file "$1")" 2>/dev/null; then
+            quiet_hold "$1" "$2"
+        else
+            note "routine: asleep" "$2"
+        fi
+    else
+        settle_locked hold_put "$1" "$L_T" "$L_G" routine "$2"
+    fi
+}
+
 # A remote link down for QASS_LINKDOWN seconds is said once; back up, said again only then.
 link_down() { # name; under the settle lock
     [ -e "$dir/down-$1" ] && [ ! -e "$dir/down-$1.said" ] || return 0
@@ -482,8 +520,10 @@ follow() {
             else
                 # Marked first, so what was held for this machine waits for its return.
                 touch "$gone"
+                busy="$has_agents"
+                if routine_quiet; then busy="$has_busy"; fi
                 if jq -en --argjson a "$prev" --argjson self "$self" --arg at "$at" \
-                    "$has_agents" >/dev/null 2>&1; then
+                    "$busy" >/dev/null 2>&1; then
                     settle_locked flush "${at}daemon-gone"
                 else
                     note "daemon gone, no agent" "${at}daemon-gone"
@@ -512,7 +552,8 @@ follow() {
                     l="$(limit_line "$label" "$l")"
                     [ -n "$l" ] || continue
                     if urgent "$l"; then now_lines="$now_lines$l
-"; else quiet_hold "$label" "$l"; fi
+"; elif routine_quiet && routine "$l"; then quiet_routine "$label" "$l"
+                    else quiet_hold "$label" "$l"; fi
                 else
                     hold "$label" "$l" || now_lines="$now_lines$l
 "

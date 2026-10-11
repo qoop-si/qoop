@@ -86,6 +86,8 @@ printf -- '- T5 g1 0a1b2c3d "fix x" task:12; hands off until %s\n- T6 g1 y: task
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
+# The tick reads the inbox: answered at once, not by the snapshots' long wait.
+[ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 22 2>/dev/null
 EOF
 got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$skill_w/watch.sh" || true)"
@@ -135,6 +137,8 @@ cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 [ "\$1" = remote ] && exit 0
+# The tick reads the inbox: answered at once, not by the snapshots' long wait.
+[ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 14 2>/dev/null
 EOF
 got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
@@ -151,7 +155,10 @@ got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.s
 # ---- quiet: the default watcher --------------------------------------------------------------
 export QASS_QUIET=1
 q="$tmp/home/.qass"
-fresh() { rm -rf "$q"; mkdir -p "$q"; }
+# The cases below keep routine said (the owner's `routine on`), so they pin the holds; the routine
+# cases at the end start from quiet_fresh, routine silent as it is by default.
+fresh() { rm -rf "$q"; mkdir -p "$q"; echo say > "$q/routine"; }
+quiet_fresh() { rm -rf "$q"; mkdir -p "$q"; }
 # A fake qoop that prints the snapshots in $tmp/snapshots, one every $2 seconds, then keeps the
 # stream open $1 seconds; `ls` prints $tmp/ls.
 stream() { # hold-open-seconds [gap-seconds]
@@ -160,6 +167,7 @@ stream() { # hold-open-seconds [gap-seconds]
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 [ "\$1" = remote ] && { cat "$tmp/remotes" 2>/dev/null; exit 0; }
 [ "\$1" = read ] && { cat "$tmp/screen" 2>/dev/null; exit 0; }
+[ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
 while IFS= read -r l; do printf '%s\n' "\$l"; sleep ${2:-0}; done < "$tmp/snapshots"
 exec sleep $1
 EOF
@@ -572,5 +580,60 @@ echo half > "$tmp/home/.qass/next-card"
 printf -- 'E2E tests over HTTP20, then card E7\n' > "$tmp/home/.qass/goals.md"
 got="$("$skill_w/escalate.sh" next E)"
 [ "$got" = "E8" ] || { echo "a broken count, or a word read as a card: $got"; exit 1; }
+
+# ---- routine, silent by default (his answer to E81) -------------------------------------------
+export QASS_QUIET=1
+# A plain rest is not said with the other lines; still there after the routine hold, it is.
+quiet_fresh; stream 20
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+got="$(QASS_ROUTINE_HOLD=8 timed 16)"
+[ "$(echo "$got" | lines)" = 'T5 g1 claude working->idle "task" /w' ] && echo "$got" | within 8 16 \
+    || { echo "a routine rest printed: $got"; exit 1; }
+# One that went back to work before the hold is never said.
+quiet_fresh; stream 12 2
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" "[$(row 5 1 working)]" > "$tmp/snapshots"
+got="$(QASS_ROUTINE_HOLD=3 timed 14)"
+[ -z "$got" ] && grep -q 'stale.*T5 g1 claude working->idle' "$q/quiet.log" \
+    || { echo "a rest that went back to work printed: $got"; exit 1; }
+# A worker qass prompted is no exception: its plain rest is routine too.
+quiet_fresh; stream 12
+printf '%s 99 T5\n' "$(date +%s)" > "$q/prompted.log"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+got="$(QASS_SETTLE=2 QASS_ROUTINE_HOLD=60 timed 14)"
+[ -z "$got" ] || { echo "a prompted worker's routine rest printed: $got"; exit 1; }
+# It never rides along: a block said now leaves the held rest where it is.
+quiet_fresh; stream 8 1
+printf '%s\n' "[$(row 5 1 working),$(row 6 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle),$(row 6 1 working)]" "[$(row 5 1 idle),$(row 6 1 blocked)]" > "$tmp/snapshots"
+got="$(QASS_ROUTINE_HOLD=60 timed 6)"
+[ "$(echo "$got" | lines)" = 'T6 g1 claude working->blocked "task" /w' ] \
+    || { echo "a routine rest rode along: $got"; exit 1; }
+# A sleep is only logged.
+quiet_fresh; stream 12
+echo '[{"name":"a","sleeping":[5]}]' > "$tmp/ls"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 6 1 working)]" > "$tmp/snapshots"
+got="$(QASS_QUIET_HOLD=4 timed 10)"
+[ -z "$got" ] && grep -q 'routine: asleep T5' "$q/quiet.log" || { echo "a routine sleep printed: $got"; exit 1; }
+# A sleep with a line that is not routine held for its agent goes as that line would.
+quiet_fresh; stream 16 1
+printf '%s\n' "[$(row 5 1 blocked)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" "[$(row 6 1 working)]" > "$tmp/snapshots"
+got="$(QASS_QUIET_HOLD=4 timed 14)"
+echo "$got" | lines | grep -q '^T5 g1 claude .*->sleeping' || { echo "a held question's sleep printed: $got"; exit 1; }
+rm -f "$tmp/ls"
+# A daemon leaving with only idle agents is not said; with one at work, it is.
+quiet_fresh; stream 0
+printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
+printf '%s\n' '[]' > "$tmp/snapshots"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ -z "$got" ] && grep -q 'daemon gone, no agent' "$q/quiet.log" || { echo "an idle machine's exit printed: $got"; exit 1; }
+quiet_fresh
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = daemon-gone ] || { echo "a busy machine's exit printed: $got"; exit 1; }
 
 echo "qass watch: ok"
