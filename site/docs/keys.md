@@ -18,6 +18,7 @@ program.
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
 | `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
+| `ctrl-a i` | on qass's screen: the question inbox beside qass's chat. In it `j` `k` pick a question, `a` to `d` answer with an option (held for 5 seconds, `u` takes it back), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `asks you` count in qass's header does the same |
 | `ctrl-a W` | close the space when it is empty |
 
 ## Panes
@@ -61,6 +62,7 @@ program.
 | drag a divider | resize the panes on either side |
 | click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
 | click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
+| click the `asks you` count in qass's header | open or close the question inbox, the same as `ctrl-a i` |
 | click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |
