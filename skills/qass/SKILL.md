@@ -208,7 +208,7 @@ stated plan, not by how important the question feels.
 | Worker situation | You |
 |---|---|
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
-| Its line ends `:claimed`, or it finished with its task open | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes |
+| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when `policy` grants `close-finished` for its repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |
 | Before you prompt another review round: its stage events in `qoop task show <id> --json` (`events`, kind `stage`) changed to `reviewing` as many times as the workflow's limit (default 8) | a card, never another round |
 | Its task stage is `waiting-human` | a card; read the question from its screen. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |

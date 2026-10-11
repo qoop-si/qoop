@@ -395,6 +395,18 @@ got="$(timed 5)"
 got="$(timed 5)"
 [ -z "$got" ] || { echo "a restart said the remote gone again: $got"; exit 1; }
 
+# A first claim of done is said at once ("Done, checked" runs now); the same claim again waits.
+fresh; stream 0
+cl='{"terminal":8,"generation":1,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"verifying","claimed":%s}}'
+printf '%s\n' "[$(printf "$cl" working false)]" > "$q/last.json"
+printf '%s\n' "[$(printf "$cl" idle true)]" > "$tmp/snapshots"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] || { echo "a first claim printed: $got"; exit 1; }
+grep -q '^8 1 idle verifying:claimed ' "$q/said" || { echo "the claim was not kept: $(cat "$q/said")"; exit 1; }
+printf '%s\n' "[$(printf "$cl" working true)]" > "$q/last.json"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ -z "$got" ] && grep -q '^8 1 long ' "$q/held" || { echo "a repeated claim printed: $got"; exit 1; }
+
 # A Claude agent stopped on its usage limit, with cswap there to switch the account, is said at
 # once as limited, with its reset time; a second limit within the hold ends "again". Without
 # cswap, with only the stale limit line, or with the words inside the conversation, it is an idle

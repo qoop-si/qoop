@@ -198,7 +198,8 @@ fn assignee(item: &ItemInfo) -> (String, String, Role) {
         .agents
         .iter()
         .find(|a| !a.closed)
-        .or(item.agents.last())
+        // An ended agent says who finished, but not on a reopened item back in Todo.
+        .or(item.agents.last().filter(|_| item.state != "todo"))
     {
         Some(a) => {
             let (word, role) = agent_word(a);
@@ -2089,6 +2090,11 @@ mod tests {
             ("worker".into(), "waits on you".into(), Role::Blocked)
         );
         assert_eq!(assignee(&item(2, "todo", "t", 1)).1, "no agent yet");
+        // Its agent ended: in Doing it says finished; reopened back in Todo, nobody yet.
+        i.agents[0].closed = true;
+        assert_eq!(assignee(&i).1, agent_word(&i.agents[0]).0);
+        i.state = "todo".into();
+        assert_eq!(assignee(&i).1, "no agent yet");
     }
 
     #[test]

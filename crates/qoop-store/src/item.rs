@@ -236,6 +236,16 @@ fn state(
     if agents.iter().any(|a| !a.closed) {
         return Ok(ItemState::Doing);
     }
+    // Every agent on it ended, and linked after its last reopen: the work is finished and
+    // waits for qass's check, never Todo again (an unlink takes the agents off; a reopen with no
+    // agent since is Todo). Event ids, not clocks: a remote's re-sync rewrites its time.
+    if !agents.is_empty() {
+        let linked = newest(tx, t.id, "linked")?.map_or(0, |(id, _)| id);
+        let reopened = newest(tx, t.id, "reopened")?.map_or(0, |(id, _)| id);
+        if linked > reopened {
+            return Ok(ItemState::Doing);
+        }
+    }
     Ok(match waiting_start(tx, t.id)? {
         Some((_, at)) if now - at < START_SECS => ItemState::Doing,
         _ => ItemState::Todo,
@@ -1159,7 +1169,8 @@ mod tests {
         // A task closed with its terminal is not carried: nothing replaced it.
         s.close_terminal(t, 34).unwrap();
         assert_eq!(s.linked_item(third).unwrap(), Some(item), "kept as history");
-        assert_eq!(state_of(&s, item, 35), ItemState::Todo);
+        // Its only agent ended: finished, waiting for qass's check, never Todo again.
+        assert_eq!(state_of(&s, item, 35), ItemState::Doing);
 
         s.close_task(other, Outcome::Verified, "", 36).unwrap();
         let u = s.create_terminal(7, ws, "/tmp", "/bin/sh", 37).unwrap();
@@ -1172,6 +1183,38 @@ mod tests {
             task_err(s.unlink(late, 39).unwrap_err()),
             TaskError::NotOnBoard
         ));
+    }
+
+    /// An item whose agents all ended stays in Doing until it is closed; a reopen with no
+    /// agent linked since is Todo, and a re-sync of an ended remote agent changes nothing.
+    #[test]
+    fn a_finished_item_never_falls_back_to_todo() {
+        let (s, ws, t) = setup();
+        let (item, _) = s.add_item(ws, "logo", "", 10).unwrap();
+        let task = s.open_task(t, "logo", false, 11).unwrap();
+        s.link_task(task, item, 12).unwrap();
+        s.close_terminal(t, 13).unwrap();
+        assert_eq!(state_of(&s, item, 14), ItemState::Doing);
+        let card = s.item_card(item, 14).unwrap().unwrap();
+        assert!(
+            card.item.agents.iter().all(|a| a.closed),
+            "its agent reads finished"
+        );
+        s.close_task(item, Outcome::Verified, "checked", 15)
+            .unwrap();
+        assert_eq!(state_of(&s, item, 16), ItemState::Done);
+        assert!(s.reopen_item(item, 17).unwrap());
+        assert_eq!(
+            state_of(&s, item, 18),
+            ItemState::Todo,
+            "reopened, nobody on it yet"
+        );
+        s.link_remote(item, "box", 7, "T3", "verified", 19).unwrap();
+        assert_eq!(
+            state_of(&s, item, 20),
+            ItemState::Doing,
+            "a new agent since, finished"
+        );
     }
 
     /// Todo, Doing on a start for ten minutes or on a live agent, Todo again on an unlink
@@ -1219,7 +1262,8 @@ mod tests {
             s.link_remote(item, "box", 7, "T3", "verified", 1_104)
                 .unwrap()
         );
-        assert_eq!(state_of(&s, item, 1_105), ItemState::Todo);
+        // The remote agent finished: the item stays in Doing for qass's check.
+        assert_eq!(state_of(&s, item, 1_105), ItemState::Doing);
 
         // A local agent, its waiting stage read as such in the item's activity.
         let task = s.open_task(t, "the work", false, 1_200).unwrap();

@@ -32,7 +32,7 @@
 # Quiet (the default; QASS_QUIET=0 gives everything above and nothing below). Every line wakes
 # qass, and a wake re-reads its whole conversation, so only what needs it now is said now:
 # - At once, with whatever is held: ->blocked, ->failed, ->closed, a task stage that just
-#   became waiting-human, hands-off->idle, daemon-gone with agents on it, a link down for
+#   became waiting-human, a first claim of done (:claimed), hands-off->idle, daemon-gone with agents on it, a link down for
 #   QASS_LINKDOWN seconds (60). Everything else is held, one entry per agent, and printed in
 #   one block, so Monitor brings several in one wake.
 # - Short hold (QASS_SETTLE): a line about work qass started (the newest record in
@@ -174,11 +174,11 @@ note() { printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$dir/quiet.log" 2>/dev/
 parse_line() {
     local re='^(([A-Za-z0-9_-]+)/)?T([0-9]+) g([^ ]+) [^ ]+ ([a-z-]+)->([a-z]+)'
     local task=' task:[^: ]+:([a-z-]+)(:claimed)?( |$)'
-    L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-"
+    L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-" L_CLAIMED=""
     [[ "$1" =~ $re ]] || return 1
     L_LABEL="${BASH_REMATCH[2]}" L_T="${BASH_REMATCH[3]}" L_G="${BASH_REMATCH[4]}"
     L_FROM="${BASH_REMATCH[5]}" L_STATE="${BASH_REMATCH[6]}"
-    if [[ "$1" =~ $task ]]; then L_STAGE="${BASH_REMATCH[1]}"; fi
+    if [[ "$1" =~ $task ]]; then L_STAGE="${BASH_REMATCH[1]}" L_CLAIMED="${BASH_REMATCH[2]}"; fi
     return 0
 }
 
@@ -192,9 +192,12 @@ urgent() {
     parse_line "$1" || return 0
     case "$L_STATE" in blocked | failed | closed | limited) return 0 ;; esac
     [ "$L_FROM" != hands-off ] || return 0
-    if [ "$L_STAGE" = waiting-human ]; then
+    if [ "$L_STAGE" = waiting-human ] || [ -n "$L_CLAIMED" ]; then
         read -r s_t s_gen s_state s_stage _ <<< "$(said_of "$L_LABEL" "$L_T")"
-        [ "${s_stage:-}" = waiting-human ] || return 0
+        # A first waiting-human, or a first claim of done ("Done, checked" runs at once).
+        [ "$L_STAGE" != waiting-human ] || [ "${s_stage%:claimed}" = waiting-human ] || return 0
+        [ -z "$L_CLAIMED" ] || { [ "${s_gen:-}" = "$L_G" ] && [ "${s_stage:-}" != "${s_stage%:claimed}" ]; } ||
+            return 0
     fi
     return 1
 }
@@ -225,7 +228,7 @@ hold_class() {
     if [ -n "${r_at:-}" ] && [ "${r_from:-}" = "$self" ] && [ "$r_at" -ge "${s_arr:-0}" ]; then
         echo short; return
     fi
-    if [ "$L_STAGE" = waiting-human ] && [ "${s_stage:-}" = waiting-human ] &&
+    if [ "$L_STAGE" = waiting-human ] && [ "${s_stage%:claimed}" = waiting-human ] &&
         [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ]; then
         echo ride; return
     fi
@@ -261,7 +264,7 @@ said_put() { # line arrival
     parse_line "$1" || return 0
     f="$(said_file "$L_LABEL")"
     { grep -v "^$L_T " "$f" 2>/dev/null || true
-      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE $2"; } > "$f.tmp"
+      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE${L_CLAIMED} $2"; } > "$f.tmp"
     mv "$f.tmp" "$f"
 }
 

@@ -568,12 +568,16 @@ async fn a_space_removed_and_a_tab_closed_are_board_news() {
         board_changed(&mut rd, &mut inbuf, PATIENCE).await,
         "a tab closed is heard"
     );
+    // Its only agent ended with the tab: the item stays in Doing, its agent finished, for
+    // qass's check; it never falls back to Todo.
     let deadline = Instant::now() + PATIENCE;
-    while board(&mut c, true).await.expect("a board")[0].state != "todo" {
-        assert!(
-            Instant::now() < deadline,
-            "the item never went back to todo"
-        );
+    loop {
+        let item = board(&mut c, true).await.expect("a board").remove(0);
+        if item.agents.iter().all(|a| a.closed) {
+            assert_eq!(item.state, "doing", "a finished item stays in Doing");
+            break;
+        }
+        assert!(Instant::now() < deadline, "its agent never read as ended");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
