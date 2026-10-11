@@ -21,7 +21,7 @@
 #                            standard input is never read.
 #   escalate.sh done E<n> [note]  the card is handled (answered in the chat, by you, or gone)
 #   escalate.sh show E<n>    the card qass is showing him now: his next message answers it
-#   escalate.sh next E|P     the number for a proposal (P), or a card (E) written by hand: never
+#   escalate.sh next E|P     the number for a proposal (P), or a card (E) in the old form: never
 #                            one used before, even when it is long answered and gone from goals.md
 #
 # The handle is the word of the agent's sidebar name the owner types to answer.
@@ -44,7 +44,7 @@ take_number() {
     echo "$n"
 }
 
-id="${1:?usage: escalate.sh E<n> <terminal or -> now|later <handle> [options]}"
+id="${1:?usage: escalate.sh new <terminal or -> now|later <handle> - <<END (see the top of this file)}"
 if [ "$id" = show ]; then
     echo "showing ${2:-}"
     exit 0
@@ -82,9 +82,14 @@ if [ "$id" = new ]; then
     }
     # Read once (a retry sends it again), and at most 5 s: a forgotten heredoc must not hang.
     body="$dir/card.$$"
-    perl -e 'alarm 5; local $/; my $t = <STDIN>; print $t if defined $t' > "$body" 2>/dev/null || true
+    locked=""
+    trap '[ -z "$locked" ] || rmdir "$dir/card.lock" 2>/dev/null; rm -f "$body"' EXIT
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm 5; local $/; my $t = <STDIN>; print $t if defined $t' > "$body" 2>/dev/null || true
+    else
+        cat > "$body"
+    fi
     if [ ! -s "$body" ]; then
-        rm -f "$body"
         echo "no card arrived on standard input: write it as a heredoc; nothing was stored" >&2
         exit 2
     fi
@@ -92,22 +97,25 @@ if [ "$id" = new ]; then
     # minute; without it two cards can still meet on a number, which the inbox refuses (exit 4)
     # and the next number settles.
     find "$dir" -maxdepth 1 -name card.lock -mmin +1 -exec rmdir {} \; 2>/dev/null || true
-    locked=""
     i=0
     while [ $i -lt 100 ]; do
         if mkdir "$dir/card.lock" 2>/dev/null; then locked=1; break; fi
         sleep 0.1
         i=$((i + 1))
     done
+    # Only the last try is printed: a number refused on the way is not one to use.
     tries=0
     while :; do
         id="E$(take_number)"
         rc=0
-        qoop ask add "$id" --agent "$terminal_arg" --handle "$handle" --urgency "$urgency" < "$body" || rc=$?
+        out="$(qoop ask add "$id" --agent "$terminal_arg" --handle "$handle" --urgency "$urgency" < "$body" 2>&1)" || rc=$?
         [ "$rc" = 4 ] && [ $tries -lt 4 ] || break
         tries=$((tries + 1))
     done
+    echo "$out"
+    # Released before the ring, which may wait half a minute.
     [ -z "$locked" ] || rmdir "$dir/card.lock" 2>/dev/null || true
+    locked=""
     rm -f "$body"
     case "$rc" in
     0) ;;

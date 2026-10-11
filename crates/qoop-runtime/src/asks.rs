@@ -436,7 +436,7 @@ async fn add(
     }
     if !card.starts_with('E') || card.len() < 2 || !card[1..].bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
-            "{card} is not a card number: E<n> from escalate.sh next E"
+            "{card} is not a card number: E<n> from escalate.sh new"
         ));
     }
     let (agent, terminal) = match agent.as_deref().map(agent_key) {

@@ -1,7 +1,7 @@
 #!/bin/sh
 # qass's Stop hook: a question for the owner is a card first. When this turn's last message asks
 # him something (a line ending in "?", or answer words such as `dub A` that name no open card)
-# and the turn wrote no card (`escalate.sh E<n> ... -`, or `escalate.sh show`), the stop is
+# and the turn wrote no card (`escalate.sh new ... -`, or `escalate.sh show`), the stop is
 # blocked once with one sentence; `stop_hook_active` lets the next stop through, so it never
 # loops. Any failure lets the stop through: this hook must never hold qass up.
 command -v python3 >/dev/null 2>&1 || exit 0
@@ -70,7 +70,7 @@ if not asked and not handles:
     sys.exit(0)
 print(json.dumps({"decision": "block", "reason":
     "You asked the owner something in chat and wrote no card this turn. Write it as a card "
-    "(escalate.sh E<n> ... - <<'END'), then point to it in one line by its handle. If it was "
+    "(escalate.sh new ... - <<'END'), then point to it in one line by its handle. If it was "
     "not a question for him, end your message without one."}))
 PY
 )

@@ -124,7 +124,7 @@ with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wai
 The machines in `qoop remote ls` (`ubox`, ...) run their own qoop; the watch already
 follows them. For an agent there, run each command through `on.sh` with the remote's
 name, in the same form as here, and key the agent as `ubox/T2` in goals.md and commands
-(`escalate.sh new ubox/2 ...`); to the owner it is its name and "(ubox)":
+(`escalate.sh new ubox/2 now|later <handle> -`, as in Cards); to the owner it is its name and "(ubox)":
 
 ```
 "<this skill's dir>/on.sh" ubox context 2 --last 1 --lines 40
@@ -248,8 +248,8 @@ hour in all. In `mode propose` write only after the owner approves it with
 ## Propose mode
 
 Instead of writing, add `P<n> · <handle>: send '<text>' to T<n> g<G> because <why>` under
-`Waiting on you` (`n` from `escalate.sh next P`), record it with `"<this skill's dir>/escalate.sh"
-P<n> <terminal> later <handle>`, and show him one line: what you would tell which agent (by name) and why, then
+`Waiting on you` (the `P<n>` that `escalate.sh next P` prints), record it with
+`"<this skill's dir>/escalate.sh" P<n> <terminal> later <handle>`, and show him one line: what you would tell which agent (by name) and why, then
 "onay: `ok <handle>`". When he answers "ok <handle>", send exactly that proposal.
 Starting a worker of your own and its first brief need no ok (see "Spawning").
 
@@ -277,9 +277,10 @@ One `key: value` line each, any order, a value at most 200 characters. `doing`, 
 every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:` to
 `D:`, plainly different, no "something else" (the pane has his own box). The words are his
 instruction and may hold ` | `. A broken card prints every problem, exits 2 and stores nothing: fix
-it, run it again. On `the inbox needs a restart of qoop`: `qoop restart` once (Done, checked) and
-write it again; if that did not restart, the card stands in the chat and `goals.md` only. Without the `-`, the old form
-(`'A: <option>'` words, no inbox record), only when the block cannot be written. The handle: one
+it, run it again; any other refusal: `new` once more. Its number: the `E<n>` it printed last. On
+`the inbox needs a restart of qoop`: `qoop restart` once (checked), write it again (that number
+counts); not restarted, the card stands in chat and `goals.md` only. Without the `-`, the old form
+(`'A: <option>'` words, no inbox record, number from `escalate.sh next E`) when no block can be written. The handle: one
 word of the agent's sidebar name, lowercase, no Turkish letters (başvuru as `basvuru`; he may type
 either), unused by any open card ("korea"). `doing`, `why`, `asks`, labels and reasons are in his
 language, the words in English.

@@ -1,6 +1,6 @@
 //! Asks: a question qass puts to the owner, kept until it is answered.
 //!
-//! A card is written by qass once (`qoop ask add`), numbered `E<n>` by `escalate.sh next`, and
+//! A card is written by qass once (`qoop ask add`), numbered `E<n>` by `escalate.sh new`, and
 //! kept here so the pane, the phone and the desk all read one record. The card's text is a JSON
 //! `body` this crate never looks into: the daemon and the clients own its shape.
 //!
