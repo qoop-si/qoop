@@ -156,6 +156,8 @@ pub struct Chrome<'a> {
     pub questions: Option<crate::qass_screen::Side>,
     /// The handle on the divider of qass's split tab, in ember.
     pub handle: Option<crate::qass_screen::Handle>,
+    /// The handle on the questions' own edge, beside the board, in ember too.
+    pub questions_handle: Option<crate::qass_screen::Handle>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -201,6 +203,7 @@ impl Default for Chrome<'_> {
             asks: None,
             questions: None,
             handle: None,
+            questions_handle: None,
         }
     }
 }
@@ -953,6 +956,9 @@ pub fn paint(frame: &Frame) -> String {
         )
     };
     if let Some(handle) = frame.chrome.handle.filter(|_| !edges.is_empty()) {
+        put_handle(&mut edges, handle);
+    }
+    if let Some(handle) = frame.chrome.questions_handle.filter(|_| !edges.is_empty()) {
         put_handle(&mut edges, handle);
     }
     // The space of the focused tab when that tab runs no agent, and so draws no row.
@@ -2694,6 +2700,16 @@ pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
 pub(crate) const RESIZE_BOARD_HINT: &[(&str, &str)] = &[
     ("hjkl", "move 5%"),
     ("HJKL", "20%"),
+    ("s", "swap sides"),
+    ("=", "equalize"),
+    ("esc", "done"),
+];
+
+/// The same with the questions beside the board: `<` and `>` take them narrower and wider.
+pub(crate) const RESIZE_QUESTIONS_HINT: &[(&str, &str)] = &[
+    ("hjkl", "move 5%"),
+    ("HJKL", "20%"),
+    ("<>", "questions"),
     ("s", "swap sides"),
     ("=", "equalize"),
     ("esc", "done"),

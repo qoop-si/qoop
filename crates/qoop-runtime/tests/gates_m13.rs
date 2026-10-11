@@ -952,6 +952,7 @@ fn beside(
     qoop_runtime::control::Pane::Split {
         dir: qoop_runtime::control::SplitDir::V,
         permille: 500,
+        questions: 0,
         first: Box::new(first),
         second: Box::new(second),
     }

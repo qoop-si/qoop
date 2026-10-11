@@ -72,6 +72,9 @@ pub struct Layout {
     /// The gap is cut from the left (top) edge of the root's second pane instead of the right
     /// edge of its first: qass's tab with qass on the left and the board on the right.
     pub gap_second: bool,
+    /// The width the owner dragged qass's questions to, in columns, `None` for the default. Kept
+    /// and saved with the root split like its ratio; `gap` is the drawn result of it.
+    pub questions: Option<usize>,
 }
 
 impl Layout {
@@ -86,13 +89,18 @@ impl Layout {
             zoomed: None,
             gap: 0,
             gap_second: false,
+            questions: None,
         }
     }
 
     /// The tree as the daemon keeps it, or `None` while a split is on its way: a
     /// placeholder has no terminal to name, and the bind writes the tree once it has.
     pub fn to_pane(&self) -> Option<Pane> {
-        to_pane(&self.root)
+        let mut pane = to_pane(&self.root)?;
+        if let Pane::Split { questions, .. } = &mut pane {
+            *questions = self.questions.map_or(0, |w| w as u32);
+        }
+        Some(pane)
     }
 
     /// A tree the daemon kept, with the keyboard in its first pane (the tab).
@@ -107,6 +115,10 @@ impl Layout {
             zoomed: None,
             gap: 0,
             gap_second: false,
+            questions: match pane {
+                Pane::Split { questions, .. } if *questions > 0 => Some(*questions as usize),
+                _ => None,
+            },
         }
     }
 
@@ -466,6 +478,61 @@ impl Layout {
         divider_in(&self.root, self.inner(area), col, row, &mut path).then_some(path)
     }
 
+    /// The two root panes' columns before the gap is cut, side by side only.
+    pub fn root_cols(&self, area: Rect) -> Option<(usize, usize)> {
+        let Node::Split {
+            dir: Dir::V, ratio, ..
+        } = &self.root
+        else {
+            return None;
+        };
+        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
+        Some((first.cols, second.cols))
+    }
+
+    /// The questions' own edge, the board's frame edge beside them: its column and the rows it
+    /// runs over, pane-local. `None` without a gap, and while zoomed, when nothing is drawn.
+    pub fn questions_edge(&self, area: Rect) -> Option<(usize, usize, usize)> {
+        let Node::Split {
+            dir: Dir::V, ratio, ..
+        } = &self.root
+        else {
+            return None;
+        };
+        if self.gap == 0 || self.zoomed.is_some() {
+            return None;
+        }
+        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
+        let x = if self.gap_second {
+            second.x + self.gap - 1
+        } else {
+            first.x + first.cols - self.gap
+        };
+        Some((x, first.y, first.rows))
+    }
+
+    /// Whether a pane-local cell is on the questions' edge.
+    pub fn on_questions_edge(&self, area: Rect, col: usize, row: usize) -> bool {
+        self.questions_edge(area)
+            .is_some_and(|(x, y, rows)| col == x && row >= y && row < y + rows)
+    }
+
+    /// The gap (the edge column and the questions) that puts the questions' edge on `col`.
+    pub fn gap_at(&self, area: Rect, col: usize) -> Option<usize> {
+        let Node::Split {
+            dir: Dir::V, ratio, ..
+        } = &self.root
+        else {
+            return None;
+        };
+        let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
+        if self.gap_second {
+            (col + 1).checked_sub(second.x)
+        } else {
+            (first.x + first.cols).checked_sub(col)
+        }
+    }
+
     /// Put the divider of the split at `path` under a pane-local cell. Answers whether it
     /// moved.
     ///
@@ -546,6 +613,7 @@ fn to_pane(node: &Node) -> Option<Pane> {
                 Dir::H => SplitDir::H,
             },
             permille: (ratio.clamp(0.0, 1.0) * 1000.0).round() as u16,
+            questions: 0,
             first: Box::new(to_pane(first)?),
             second: Box::new(to_pane(second)?),
         }),
@@ -562,6 +630,7 @@ fn from_pane(pane: &Pane) -> Node {
             permille,
             first,
             second,
+            ..
         } => Node::Split {
             dir: match dir {
                 SplitDir::V => Dir::V,

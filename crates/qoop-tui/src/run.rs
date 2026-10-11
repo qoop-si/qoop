@@ -1057,6 +1057,13 @@ struct Closing {
 ///
 /// Together because they are one idea: a key means something else until the mode is left,
 /// and `apply` (which cannot write) sometimes has to ask the daemon on a mode's behalf.
+/// An edge of qass's tab held by the mouse: a divider of the tree, or the questions' own edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Grab {
+    Divider(layout::SplitPath),
+    Questions,
+}
+
 #[derive(Default)]
 struct Modes {
     /// Copy mode over the focused terminal. See `copy`.
@@ -1067,7 +1074,8 @@ struct Modes {
     clipboard: Option<String>,
     /// Requests made where no write is in hand, sent at the loop's next write.
     outbox: Vec<ControlRequest>,
-    /// Resize mode: `h j k l` move the nearest divider until the mode is left.
+    /// Resize mode: `h j k l` move the nearest divider (and `<` `>` the questions) until the mode
+    /// is left.
     resizing: bool,
     /// The sidebar mode: the keyboard on the agents column, with its filter and its pick.
     side: Option<sidebar::Nav>,
@@ -1075,10 +1083,10 @@ struct Modes {
     side_go: Option<Go>,
     /// The spaces `S` asked about, waiting for a `y`: any other key keeps them awake.
     side_ask: Option<Vec<i64>>,
-    /// A split divider held by the mouse: the path to its split.
-    split_drag: Option<layout::SplitPath>,
-    /// The divider last pressed and when, so a second press on it is a double click.
-    divider_click: Option<(layout::SplitPath, std::time::Instant)>,
+    /// An edge held by the mouse.
+    split_drag: Option<Grab>,
+    /// The edge last pressed and when, so a second press on it is a double click.
+    divider_click: Option<(Grab, std::time::Instant)>,
     /// A close waiting for its `y`: the terminal, and the question on the notice row.
     confirm_close: Option<(u32, String)>,
     /// Rows for a pinned view that went behind the screen have been asked for and not
@@ -1171,6 +1179,7 @@ impl State {
                 asks: self.qass_header().then_some(&self.asks),
                 questions: self.qass_split().then(|| self.questions()).flatten(),
                 handle: self.qass_split().then(|| self.handle()).flatten(),
+                questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
                 shut: &self.shut,
                 drag: None,
                 usage: &self.usage,
@@ -1190,7 +1199,9 @@ impl State {
                 } else if self.modes.resizing {
                     Some((
                         "resize",
-                        if self.on_board_tab() {
+                        if self.questions().is_some_and(|side| !side.replaces) {
+                            screen::RESIZE_QUESTIONS_HINT
+                        } else if self.on_board_tab() {
                             screen::RESIZE_BOARD_HINT
                         } else {
                             screen::RESIZE_HINT
@@ -1499,39 +1510,49 @@ impl State {
             return false;
         }
         let (x, y) = self.pane_cell(row, col);
-        let path = self
-            .space
-            .and_then(|space| self.drawn_tree(space))
-            .and_then(|layout| layout.divider_at(area, x, y));
-        // A second press on the divider of qass's tab within a double click's time puts the
-        // two panes back to their default shares, and holds nothing.
+        let shown = self.space.and_then(|space| self.drawn_tree(space));
+        let grab = shown.and_then(|layout| match layout.divider_at(area, x, y) {
+            Some(path) => Some(Grab::Divider(path)),
+            None => layout
+                .on_questions_edge(area, x, y)
+                .then_some(Grab::Questions),
+        });
+        // A second press on an edge of qass's tab within a double click's time puts what it
+        // moves back to its default, and holds nothing.
         let now = std::time::Instant::now();
         let double = self.on_board_tab()
-            && path.as_ref().is_some_and(|path| {
+            && grab.as_ref().is_some_and(|grab| {
                 self.modes.divider_click.as_ref().is_some_and(|(was, at)| {
-                    was == path && now.duration_since(*at).as_millis() <= DOUBLE_CLICK_MS as u128
+                    was == grab && now.duration_since(*at).as_millis() <= DOUBLE_CLICK_MS as u128
                 })
             });
-        self.modes.divider_click = path.clone().map(|path| (path, now)).filter(|_| !double);
-        if double && let Some(space) = self.space {
+        self.modes.divider_click = grab.clone().map(|grab| (grab, now)).filter(|_| !double);
+        if double && let (Some(space), Some(grab)) = (self.space, grab.clone()) {
             self.modes.split_drag = None;
-            self.reset_split(space);
+            self.reset_split(space, &grab);
             return true;
         }
-        self.modes.split_drag = path;
+        self.modes.split_drag = grab;
         self.modes.split_drag.is_some()
     }
 
     /// Move a held divider to the pointer. Answers whether it moved: only then does the
     /// frame repaint, and the paint sizes the focused tile once for all the frame's moves.
     fn split_motion(&mut self, col: u16, row: u16) -> bool {
-        let Some(path) = self.modes.split_drag.clone() else {
+        let Some(grab) = self.modes.split_drag.clone() else {
             return false;
         };
         let (x, y) = self.pane_cell(row, col);
         let area = pane_area(self);
-        self.space
-            .is_some_and(|space| self.change_shown(space, |layout| layout.drag(area, &path, x, y)))
+        let Some(space) = self.space else {
+            return false;
+        };
+        match grab {
+            Grab::Divider(path) => {
+                self.change_absorbing(space, |layout| layout.drag(area, &path, x, y))
+            }
+            Grab::Questions => self.questions_to(space, |layout| layout.gap_at(area, x)),
+        }
     }
 
     fn clicked(&self, row: u16, col: u16) -> Option<Clicked> {
@@ -2524,8 +2545,13 @@ impl State {
                 && area.rows >= crate::qass_screen::INBOX_MIN_ROWS
                 && tree.zoomed.is_none();
             let board_first = self.board_first(tree);
-            let (dir, ratio, gap) =
-                crate::qass_screen::board_shape(area.cols, saved, questions, board_first);
+            let (dir, ratio, gap) = crate::qass_screen::board_shape(
+                area.cols,
+                saved,
+                questions,
+                tree.questions,
+                board_first,
+            );
             shown.set_root_split(dir, ratio);
             shown.gap = gap;
             shown.gap_second = !board_first;
@@ -2540,6 +2566,58 @@ impl State {
             gap: 0,
             ..self.drawn(tree)
         }
+    }
+
+    /// [`State::change_shown`] for a change that moves the divider between qass and the questions:
+    /// with the questions beside the board they keep the board's columns and take the
+    /// difference, so the two panes next to that edge are the ones that change.
+    fn change_absorbing(&mut self, space: i64, change: impl FnOnce(&mut Layout) -> bool) -> bool {
+        let area = pane_area(self);
+        let Some(shown) = self.drawn_tree(space).filter(|tree| tree.gap > 0) else {
+            return self.change_shown(space, change);
+        };
+        let (width, second) = (shown.gap - 1, shown.gap_second);
+        // The pane the questions are cut from is the one that grows or shrinks with the divider.
+        let cols = |tree: &Layout| {
+            tree.root_cols(area)
+                .map(|(first, last)| if second { last } else { first })
+        };
+        self.change_shown(space, |tree| {
+            let before = cols(tree);
+            let done = change(tree);
+            let (Some(before), Some(after)) = (before, cols(tree)) else {
+                return false;
+            };
+            // A width under zero is under the minimum too: the shape refuses it.
+            tree.questions = Some((width + after).saturating_sub(before));
+            done
+        })
+    }
+
+    /// Set the questions' width from the gap `gap_of` reads off the tree as it is drawn, when both
+    /// them and the board keep their minimum. Answers whether it moved.
+    fn questions_to(&mut self, space: i64, gap_of: impl Fn(&Layout) -> Option<usize>) -> bool {
+        let area = pane_area(self);
+        let Some(shown) = self.drawn_tree(space).filter(|tree| tree.gap > 0) else {
+            return false;
+        };
+        let Some(gap) = gap_of(&shown) else {
+            return false;
+        };
+        let Some((first, last)) = shown.root_cols(area) else {
+            return false;
+        };
+        let board = if shown.gap_second { last } else { first };
+        let Some(width) = crate::qass_screen::questions_width(gap, board) else {
+            return false;
+        };
+        if width + 1 == shown.gap {
+            return false;
+        }
+        self.change_shown(space, |tree| {
+            tree.questions = Some(width);
+            true
+        })
     }
 
     /// The tree of `space` as it is drawn ([`State::drawn`]).
@@ -2636,8 +2714,9 @@ impl State {
         done
     }
 
-    /// Give qass's tab its default shares back, the board's side the larger.
-    fn reset_split(&mut self, space: i64) {
+    /// Give what `grab` moves its default back: the questions' width for their own edge, and for
+    /// the divider the board's side its larger share too.
+    fn reset_split(&mut self, space: i64, grab: &Grab) {
         let Some(tree) = self.layouts.get(&space).filter(|t| self.board_tree(t)) else {
             return;
         };
@@ -2647,7 +2726,13 @@ impl State {
             .unwrap_or((layout::Dir::V, 0.0));
         let ratio = crate::qass_screen::board_default(dir, self.board_first(tree));
         let area = pane_area(self);
-        if self.change_shown(space, |tree| tree.set_root_ratio(area, ratio)) {
+        let divider = matches!(grab, Grab::Divider(_));
+        // Either one moving is a reset: a width alone is one under the default ratio.
+        let moved = self.change_shown(space, |tree| {
+            let ratio_moved = divider && tree.set_root_ratio(area, ratio);
+            tree.questions.take().is_some() || ratio_moved
+        });
+        if moved {
             self.save_split(space);
         }
     }
@@ -2665,6 +2750,13 @@ impl State {
             .find(|(t, _)| *t == qass)?;
         let (dir, _) = tree.root_split()?;
         crate::qass_screen::handle_of(rect, dir, self.board_first(&tree))
+    }
+
+    /// The handle on the questions' own edge, when they are beside the board and drawn.
+    fn questions_handle(&self) -> Option<crate::qass_screen::Handle> {
+        let tree = self.drawn_tree(self.space?)?;
+        let (x, y, rows) = tree.questions_edge(self.tree_area(&tree))?;
+        crate::qass_screen::edge_handle(x, y, rows)
     }
 
     /// The area `tree`'s panes are laid out in: the pane, less qass's header over its split.
@@ -5510,6 +5602,30 @@ fn equalize(state: &mut State) {
     }
 }
 
+/// Widen or narrow the questions column by a step, stopping at the questions' minimum and at the
+/// board's. `qass`'s own width does not change: the board gives or takes the columns.
+fn questions_key(state: &mut State, wider: bool) {
+    let Some(space) = state.space else {
+        return;
+    };
+    let area = pane_area(state);
+    let step = crate::qass_screen::QUESTIONS_STEP;
+    let moved = state.questions_to(space, |tree| {
+        let (first, last) = tree.root_cols(area)?;
+        let board = if tree.gap_second { last } else { first };
+        Some(if wider {
+            (tree.gap + step).min(board.saturating_sub(crate::qass_screen::BOARD_MIN_COLS))
+        } else {
+            tree.gap
+                .saturating_sub(step)
+                .max(crate::qass_screen::QUESTIONS_MIN + 1)
+        })
+    });
+    if moved {
+        state.save_split(space);
+    }
+}
+
 /// Decide what one read of stdin meant in resize mode.
 ///
 /// `h j k l` and the arrows move the nearest divider 5%, `H J K L` 20%, `=` evens everything
@@ -5534,12 +5650,17 @@ fn resize_key(state: &mut State, bytes: &[u8]) -> ModeOutcome {
         };
         if let Some((mv, step)) = nudge {
             if let Some(space) = state.space {
-                state.change_shown(space, |layout| layout.nudge(area, mv, step));
+                state.change_absorbing(space, |layout| layout.nudge(area, mv, step));
                 state.save_split(space);
             }
         } else {
             match key {
                 ModeKey::Byte(b'=') => equalize(state),
+                // On qass's tab only, and only while the questions are beside the board: they
+                // get wider or narrower, the board's side and qass's staying as they are.
+                ModeKey::Byte(key @ (b'<' | b'>')) if state.on_board_tab() => {
+                    questions_key(state, key == b'>');
+                }
                 // On qass's tab only: the board and qass change sides. Elsewhere it is no
                 // key of this mode, as before.
                 ModeKey::Byte(b's') if state.on_board_tab() => {
@@ -16317,10 +16438,12 @@ mod tests {
         Pane::Split {
             dir: SplitDir::V,
             permille: 500,
+            questions: 0,
             first: Box::new(leaf(1)),
             second: Box::new(Pane::Split {
                 dir: SplitDir::H,
                 permille: 500,
+                questions: 0,
                 first: Box::new(leaf(2)),
                 second: Box::new(leaf(3)),
             }),
@@ -19328,6 +19451,7 @@ mod tests {
             &qoop_runtime::control::Pane::Split {
                 dir: qoop_runtime::control::SplitDir::H,
                 permille: 500,
+                questions: 0,
                 first: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 4 }),
                 second: Box::new(qoop_runtime::control::Pane::Leaf { terminal: 5 }),
             },
@@ -19717,6 +19841,265 @@ mod tests {
         assert_eq!(state.sized.get(&5).copied(), qass_size);
     }
 
+    /// The pane-local cell `(x, y)` as the screen's one based `(col, row)`.
+    fn screen_of(state: &State, x: usize, y: usize) -> (u16, u16) {
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        ((left + 1 + x) as u16, (screen::TABS + 1 + y) as u16)
+    }
+
+    /// qass's tab with a card waiting: the questions stand beside the board.
+    fn qass_with_questions() -> State {
+        let mut state = qass_wide();
+        // Room for the board to give columns: at 200 columns it already stands on its minimum.
+        state.cols = 240;
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(!state.questions().expect("the column").replaces);
+        state
+    }
+
+    /// The three columns on screen: the board's, the questions' and qass's.
+    fn widths(state: &State) -> (usize, usize, usize) {
+        let side = state.questions().expect("the column");
+        (
+            tile_of(state, 4).cols,
+            side.rect.cols,
+            tile_of(state, 5).cols,
+        )
+    }
+
+    /// A cell on the edge between the board and the questions.
+    fn board_edge(state: &State) -> (u16, u16) {
+        let tree = state.drawn_tree(9).expect("the tab");
+        let (x, y, rows) = tree.questions_edge(pane_area(state)).expect("an edge");
+        screen_of(state, x, y + rows / 2)
+    }
+
+    /// A cell on the divider between qass and the questions.
+    fn qass_edge(state: &State) -> (u16, u16) {
+        let (board, qass) = (tile_of(state, 4), tile_of(state, 5));
+        let x = if board.x < qass.x {
+            qass.x - 1
+        } else {
+            qass.x + qass.cols
+        };
+        screen_of(state, x, qass.y + qass.rows / 2)
+    }
+
+    /// Press on `at`, move the pointer `dx` columns, let go: whether the edge moved, saved the way
+    /// the loop saves it.
+    fn drag_edge(state: &mut State, edge: fn(&State) -> (u16, u16), dx: i32) -> bool {
+        let at = edge(state);
+        // Two quick drags on one edge would be a double click.
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1), "an edge is held at {at:?}");
+        let moved = state.split_motion((i32::from(at.0) + dx) as u16, at.1);
+        assert!(state.modes.split_drag.take().is_some());
+        state.save_split(9);
+        moved
+    }
+
+    /// The edge between the board and the questions drags: those two change and qass keeps its
+    /// columns and its ratio; past the questions' 24 columns or the board's 60 nothing moves.
+    #[test]
+    fn the_edge_between_the_board_and_the_questions_resizes_those_two() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        let ratio = state.drawn_tree(9).unwrap().root_split();
+        assert!(drag_edge(&mut state, board_edge, -10));
+        assert_eq!(widths(&state), (board - 10, questions + 10, qass));
+        assert_eq!(
+            state.drawn_tree(9).unwrap().root_split(),
+            ratio,
+            "the divider stays"
+        );
+        assert!(drag_edge(&mut state, board_edge, 10 + 10));
+        assert_eq!(widths(&state), (board + 10, questions - 10, qass));
+        // To the limits, whole cells, and one cell past each is refused.
+        let (board, questions, qass) = widths(&state);
+        assert!(!drag_edge(
+            &mut state,
+            board_edge,
+            (questions as i32 - 24) + 1
+        ));
+        assert!(!drag_edge(&mut state, board_edge, -(board as i32 - 60) - 1));
+        assert_eq!(widths(&state), (board, questions, qass));
+        assert!(drag_edge(&mut state, board_edge, -(board as i32 - 60)));
+        assert_eq!(widths(&state), (60, questions + board - 60, qass));
+        let questions = widths(&state).1;
+        assert!(drag_edge(&mut state, board_edge, questions as i32 - 24));
+        assert_eq!(widths(&state).1, 24, "the questions' own minimum");
+    }
+
+    /// The divider between the questions and qass drags: those two change and the board keeps its
+    /// columns; qass keeps its 40 and the questions their 24.
+    #[test]
+    fn the_divider_between_the_questions_and_qass_resizes_those_two() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        assert!(drag_edge(&mut state, qass_edge, 8));
+        assert_eq!(widths(&state), (board, questions + 8, qass - 8));
+        assert!(drag_edge(&mut state, qass_edge, -20));
+        assert_eq!(widths(&state), (board, questions - 12, qass + 12));
+        let (_, questions, qass) = widths(&state);
+        assert!(!drag_edge(&mut state, qass_edge, qass as i32 - 40 + 1));
+        assert!(!drag_edge(
+            &mut state,
+            qass_edge,
+            -(questions as i32 - 24) - 1
+        ));
+        assert_eq!(widths(&state), (board, questions, qass));
+        assert!(drag_edge(&mut state, qass_edge, qass as i32 - 40));
+        assert_eq!(widths(&state), (board, questions + qass - 40, 40));
+    }
+
+    /// The width rides on the root split with the ratio: it is written with every drag, read back
+    /// as drawn, kept while the questions are closed and kept through a swap of sides.
+    #[test]
+    fn the_questions_width_is_remembered_with_the_layout() {
+        let mut state = qass_with_questions();
+        let shut = widths(&state);
+        assert!(drag_edge(&mut state, board_edge, -12));
+        let wide = widths(&state);
+        assert_eq!(wide.1, shut.1 + 12);
+        let saved = state.split_writes.last().expect("saved").clone();
+        let qoop_runtime::control::Pane::Split { questions, .. } = &saved else {
+            panic!("a split");
+        };
+        assert_eq!(*questions as usize, wide.1);
+        // Another client, or a restart: the tree the daemon kept draws the same widths.
+        let back = Layout::from_pane(&saved);
+        assert_eq!(back.questions, Some(wide.1));
+        state.layouts.insert(9, back);
+        assert_eq!(widths(&state), wide);
+        // Closed and opened again.
+        state.asks.take(Vec::new(), Vec::new());
+        assert!(state.questions().is_none());
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert_eq!(widths(&state), wide);
+        // Sides swapped: each keeps its columns, the questions are cut from the other side.
+        assert!(state.swap_sides(9));
+        assert_eq!(widths(&state), wide);
+        assert!(tile_of(&state, 5).x < tile_of(&state, 4).x, "qass is first");
+    }
+
+    /// With qass first the questions stand on the board's left: the same two edges, mirrored.
+    #[test]
+    fn both_edges_work_with_qass_on_the_left() {
+        let mut state = qass_with_questions();
+        assert!(state.swap_sides(9));
+        let (board, questions, qass) = widths(&state);
+        assert!(drag_edge(&mut state, board_edge, 7));
+        assert_eq!(widths(&state), (board - 7, questions + 7, qass));
+        assert!(drag_edge(&mut state, qass_edge, 5));
+        assert_eq!(widths(&state), (board - 7, questions + 7 - 5, qass + 5));
+        assert!(drag_edge(&mut state, qass_edge, -5));
+        assert!(drag_edge(&mut state, board_edge, -7));
+        assert_eq!(widths(&state), (board, questions, qass));
+    }
+
+    /// A double click on the questions' edge puts their width back and nothing else; on the divider
+    /// it puts the ratio back too. A wide column under the default ratio still resets.
+    #[test]
+    fn a_double_click_resets_the_width_and_the_divider_resets_the_ratio_too() {
+        let mut state = qass_with_questions();
+        let first = widths(&state);
+        let ratio = state.drawn_tree(9).unwrap().root_split();
+        assert!(drag_edge(&mut state, board_edge, -9));
+        assert_eq!(state.drawn_tree(9).unwrap().root_split(), ratio);
+        let at = board_edge(&state);
+        // The drag above pressed this edge a moment ago.
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1), "the second press");
+        assert_eq!(state.modes.split_drag, None);
+        assert_eq!(widths(&state), first);
+        assert_eq!(state.layouts[&9].questions, None);
+        assert_eq!(
+            state.split_writes.last().map(|p| p.leaves()),
+            Some(vec![4, 5])
+        );
+        // Moved the divider: the questions' edge resets the width only.
+        assert!(drag_edge(&mut state, qass_edge, 6));
+        let moved = state.drawn_tree(9).unwrap().root_split();
+        assert_ne!(moved, ratio);
+        let at = board_edge(&state);
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1));
+        assert_eq!(state.layouts[&9].questions, None);
+        assert_eq!(
+            state.drawn_tree(9).unwrap().root_split(),
+            moved,
+            "the ratio stays"
+        );
+        // The divider resets both.
+        let at = qass_edge(&state);
+        state.modes.divider_click = None;
+        assert!(state.split_press(at.0, at.1));
+        assert!(state.modes.split_drag.take().is_some());
+        assert!(state.split_press(at.0, at.1));
+        assert_eq!(widths(&state), first);
+        // Two different edges one after the other are not a double click.
+        let (b, a) = (board_edge(&state), qass_edge(&state));
+        state.modes.divider_click = None;
+        assert!(state.split_press(b.0, b.1));
+        assert!(state.split_press(a.0, a.1));
+        assert!(state.modes.split_drag.is_some());
+    }
+
+    /// In resize mode `>` widens and `<` narrows the questions by a step, qass keeping its
+    /// columns, to the limits and no further; with the questions away they do nothing.
+    #[test]
+    fn resize_mode_widens_and_narrows_the_questions() {
+        let mut state = qass_with_questions();
+        let (board, questions, qass) = widths(&state);
+        let step = crate::qass_screen::QUESTIONS_STEP;
+        state.modes.resizing = true;
+        resize_key(&mut state, b">");
+        assert_eq!(widths(&state), (board - step, questions + step, qass));
+        assert!(state.modes.resizing, "the mode stays");
+        assert!(state.split_writes.last().is_some());
+        resize_key(&mut state, b"<");
+        assert_eq!(widths(&state), (board, questions, qass));
+        for _ in 0..40 {
+            resize_key(&mut state, b">");
+        }
+        assert_eq!(widths(&state).0, 60, "the board keeps its minimum");
+        for _ in 0..40 {
+            resize_key(&mut state, b"<");
+        }
+        assert_eq!(widths(&state).1, 24, "the questions keep theirs");
+        assert_eq!(widths(&state).2, qass);
+        assert_eq!(
+            screen::RESIZE_QUESTIONS_HINT
+                .iter()
+                .find(|(k, _)| *k == "<>"),
+            Some(&("<>", "questions"))
+        );
+        // Away: nothing to move, the mode is not left and nothing is saved.
+        state.asks.take(Vec::new(), Vec::new());
+        let kept = state.layouts[&9].questions;
+        resize_key(&mut state, b">");
+        assert!(state.modes.resizing);
+        assert_eq!(state.layouts[&9].questions, kept);
+    }
+
+    /// Zoomed there is no edge to hold, and the width is what it was after the unzoom.
+    #[test]
+    fn a_zoomed_tab_has_no_questions_edge_and_keeps_the_width() {
+        let mut state = qass_with_questions();
+        assert!(drag_edge(&mut state, board_edge, -6));
+        let wide = widths(&state);
+        let at = board_edge(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().toggle_zoom());
+        assert!(state.questions().is_none());
+        assert!(!state.split_press(at.0, at.1), "no edge while zoomed");
+        assert!(state.layouts.get_mut(&9).unwrap().toggle_zoom());
+        assert_eq!(widths(&state), wide);
+    }
+
     /// Put away with `ctrl-a i`, the questions stay away for the cards already seen; a new
     /// question, a rewritten one or one reopened brings them back. A card only passed to qass
     /// does not open them.
@@ -19918,6 +20301,37 @@ mod tests {
         frame.chrome.handle = None;
         let bare = screen::paint(&frame);
         assert_ne!(painted, bare, "the handle is the difference: {h:?}");
+    }
+
+    /// The key row of resize mode names `<>` while the questions are beside the board, and not
+    /// when they are away, where the keys do nothing.
+    #[test]
+    fn the_key_row_offers_the_questions_keys_only_while_they_are_beside() {
+        let mut state = qass_with_questions();
+        state.modes.resizing = true;
+        let shown = state.frame().chrome.mode;
+        assert_eq!(shown, Some(("resize", screen::RESIZE_QUESTIONS_HINT)));
+        state.asks.take(Vec::new(), Vec::new());
+        let shown = state.frame().chrome.mode;
+        assert_eq!(shown, Some(("resize", screen::RESIZE_BOARD_HINT)));
+    }
+
+    /// The questions' own edge has a handle where the board's frame meets them, only while they
+    /// are beside the board, and it is painted.
+    #[test]
+    fn the_questions_edge_has_a_handle_beside_the_board_only() {
+        let mut state = qass_with_questions();
+        let h = state.questions_handle().expect("a handle");
+        let tree = state.drawn_tree(9).unwrap();
+        let (x, ..) = tree.questions_edge(pane_area(&state)).unwrap();
+        assert!(h.vertical && h.x == x);
+        let mut frame = state.frame();
+        assert_eq!(frame.chrome.questions_handle, Some(h));
+        let painted = screen::paint(&frame);
+        frame.chrome.questions_handle = None;
+        assert_ne!(painted, screen::paint(&frame), "the handle is painted");
+        state.asks.take(Vec::new(), Vec::new());
+        assert_eq!(state.questions_handle(), None);
     }
 
     /// A move of the divider that would turn the page over, or squeeze the board under its

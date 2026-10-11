@@ -1311,6 +1311,10 @@ pub enum Pane {
     Split {
         dir: SplitDir,
         permille: u16,
+        /// qass's questions column, in columns: the width the owner dragged it to. Zero is not
+        /// set (the default width), and is not written, so an older reader sees the tree it knew.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        questions: u32,
         first: Box<Pane>,
         second: Box<Pane>,
     },
@@ -1345,12 +1349,14 @@ impl Pane {
             Self::Split {
                 dir,
                 permille,
+                questions,
                 first,
                 second,
             } => match (first.retain(keep), second.retain(keep)) {
                 (Some(first), Some(second)) => Some(Self::Split {
                     dir: *dir,
                     permille: *permille,
+                    questions: *questions,
                     first: Box::new(first),
                     second: Box::new(second),
                 }),
@@ -1368,11 +1374,13 @@ impl Pane {
             Self::Split {
                 dir,
                 permille,
+                questions,
                 first,
                 second,
             } => Some(Self::Split {
                 dir: *dir,
                 permille: *permille,
+                questions: *questions,
                 first: Box::new(first.map(f)?),
                 second: Box::new(second.map(f)?),
             }),
@@ -1904,6 +1912,7 @@ mod tests {
         Pane::Split {
             dir,
             permille: 500,
+            questions: 0,
             first: Box::new(first),
             second: Box::new(second),
         }
@@ -1924,6 +1933,41 @@ mod tests {
         let back: Pane = serde_json::from_str(&json).expect("decode");
         assert_eq!(back, quad());
         assert_eq!(back.leaves(), vec![1, 2, 3, 4]);
+    }
+
+    /// The width of qass's questions column rides on the root split: it is written only when set,
+    /// read as unset from a tree without it, and kept by the two functions that rebuild a tree.
+    #[test]
+    fn the_questions_width_is_kept_by_the_wire_retain_and_map() {
+        let Pane::Split {
+            dir,
+            permille,
+            first,
+            second,
+            ..
+        } = quad()
+        else {
+            unreachable!("quad is a split")
+        };
+        let wide = Pane::Split {
+            dir,
+            permille,
+            questions: 70,
+            first,
+            second,
+        };
+        let json = serde_json::to_string(&wide).expect("encode");
+        assert!(json.contains("\"questions\":70"), "{json}");
+        assert_eq!(serde_json::from_str::<Pane>(&json).expect("decode"), wide);
+        assert_eq!(wide.retain(&|_| true), Some(wide.clone()));
+        assert_eq!(wide.map(&Some), Some(wide.clone()));
+        let plain = serde_json::to_string(&quad()).expect("encode");
+        assert!(!plain.contains("questions"), "{plain}");
+        let old = r#"{"k":"split","dir":"v","permille":500,"first":{"k":"leaf","terminal":1},"second":{"k":"leaf","terminal":2}}"#;
+        assert_eq!(
+            serde_json::from_str::<Pane>(old).expect("decode"),
+            split(SplitDir::V, leaf(1), leaf(2))
+        );
     }
 
     #[test]

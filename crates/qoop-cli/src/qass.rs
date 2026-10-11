@@ -638,6 +638,7 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
     let tree = Pane::Split {
         dir: SplitDir::V,
         permille: 700,
+        questions: 0,
         first: Box::new(Pane::Leaf { terminal: board }),
         second: Box::new(tree.unwrap_or(Pane::Leaf { terminal: qass })),
     };

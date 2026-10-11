@@ -835,7 +835,8 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             .unwrap_or_default();
         let right = format!("{space}waiting {waited}");
         let name = name_of(card, ctx);
-        let left_w = cw.saturating_sub(width::width(&right) + 2);
+        // The marker takes two columns of the left side; a narrow column keeps a space before the wait.
+        let left_w = cw.saturating_sub(width::width(&right) + 4);
         let title_left = format!("\u{25be} {}", width::fit(&name, left_w.min(24)).trim_end());
         let gap = cw.saturating_sub(width::width(&title_left) + width::width(&right));
         out.push(wrap(&[
@@ -918,7 +919,8 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         }
         // The one text box.
         let box_w = cw;
-        let title = " type a different answer ";
+        // Cut to the box: the column may be dragged as narrow as the questions go.
+        let title = cut_dots(" type a different answer ", box_w.saturating_sub(4));
         let mut top = format!("\u{256d}\u{2500}{title}");
         top.push_str(&"\u{2500}".repeat(box_w.saturating_sub(width::width(&top) + 1)));
         top.push('\u{256e}');
@@ -1314,6 +1316,33 @@ mod tests {
         assert_eq!(
             (card.as_str(), option, text.as_deref()),
             ("W7", &None, Some("merge it"))
+        );
+    }
+
+    /// The column can be dragged down to 24 columns: no line of the card, the text box's top edge
+    /// included, is wider than the column.
+    #[test]
+    fn the_text_box_fits_the_narrowest_column() {
+        let p = pane(1);
+        for cols in [24, 30, 40] {
+            let v = view(&p, &ctx(&[], &[]), cols, 36);
+            for row in &v.rows {
+                let w = width::width(&strip(row));
+                assert!(w <= cols, "{w} columns in {cols}: {:?}", strip(row));
+            }
+        }
+        // The box's top edge keeps both corners, with the title cut to what fits.
+        let t = text(&view(&p, &ctx(&[], &[]), 24, 36));
+        let top = t
+            .lines()
+            .find(|l| l.contains("\u{256d}\u{2500} type"))
+            .expect("the box");
+        assert!(top.contains('\u{256e}'), "{t}");
+        // The open card's name and its wait never run together.
+        let head = t.lines().find(|l| l.contains("waiting")).expect("the head");
+        assert!(
+            !head.contains("migrawaiting") && !head.contains("migrationswaiting"),
+            "{t}"
         );
     }
 

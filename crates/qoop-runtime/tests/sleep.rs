@@ -436,6 +436,7 @@ fn split(first: u32, second: u32) -> Pane {
     Pane::Split {
         dir: SplitDir::V,
         permille: 500,
+        questions: 0,
         first: Box::new(Pane::Leaf { terminal: first }),
         second: Box::new(Pane::Leaf { terminal: second }),
     }
@@ -660,6 +661,7 @@ async fn a_sleeping_tab_stays_asleep_across_a_restart_beside_an_awake_one() {
                 tree: Pane::Split {
                     dir: SplitDir::V,
                     permille: 500,
+                    questions: 0,
                     first: Box::new(Pane::Leaf { terminal: tab }),
                     second: Box::new(Pane::Leaf { terminal: pane }),
                 },

@@ -53,6 +53,10 @@ const BOARD_RATIO_H: f32 = 0.50;
 /// The questions column between the board and qass: the edge column the board's frame keeps,
 /// then the inbox at the width it is built for.
 pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
+/// The narrowest the questions column is dragged to, so a card still reads.
+pub const QUESTIONS_MIN: usize = 24;
+/// The columns the keys widen or narrow it by.
+pub const QUESTIONS_STEP: usize = 4;
 
 /// The ratio of qass's tab (its first pane's share) the way the tab is shown when it was saved
 /// the other way: the board's own share when the board is first, what is left when qass is.
@@ -68,11 +72,13 @@ pub fn board_default(dir: Dir, board_first: bool) -> f32 {
 /// board and qass both keep their minimum, else stacked; the saved ratio (the first pane's
 /// share, whichever pane that is) when the saved direction is the one shown, else that
 /// direction's own. With `questions`, the columns cut from the board for them, when the board
-/// still keeps its minimum after the cut.
+/// still keeps its minimum after the cut: the default width, or the one the owner dragged them to
+/// (`width`), which gives way to what the board needs before it is dropped.
 pub fn board_shape(
     cols: usize,
     saved: (Dir, f32),
     questions: bool,
+    width: Option<usize>,
     board_first: bool,
 ) -> (Dir, f32, usize) {
     let ratio = |dir: Dir| match saved.0 == dir {
@@ -88,12 +94,35 @@ pub fn board_shape(
     if board < BOARD_MIN_COLS || total - board < QASS_MIN_COLS {
         return (Dir::H, ratio(Dir::H), 0);
     }
-    let gap = if questions && board >= BOARD_MIN_COLS + QUESTIONS_GAP {
-        QUESTIONS_GAP
-    } else {
-        0
+    let gap = match (questions, width) {
+        (false, _) => 0,
+        (true, None) if board >= BOARD_MIN_COLS + QUESTIONS_GAP => QUESTIONS_GAP,
+        (true, None) => 0,
+        (true, Some(width)) => {
+            let gap = (width + 1).min(board.saturating_sub(BOARD_MIN_COLS));
+            if gap > QUESTIONS_MIN { gap } else { 0 }
+        }
     };
     (Dir::V, ratio(Dir::V), gap)
+}
+
+/// The questions width (without their edge column) a drag or a key asks for, `gap` being the edge
+/// column and the questions, in a board pane `pane_cols` wide before the cut. `None` when the
+/// questions would be under their minimum or the board under its own.
+pub fn questions_width(gap: usize, pane_cols: usize) -> Option<usize> {
+    let width = gap.checked_sub(1)?;
+    (width >= QUESTIONS_MIN && pane_cols.checked_sub(gap)? >= BOARD_MIN_COLS).then_some(width)
+}
+
+/// The handle on the questions' edge, a thin line over the middle half of it.
+pub fn edge_handle(x: usize, y: usize, rows: usize) -> Option<Handle> {
+    let len = rows / 2;
+    (len >= 2).then_some(Handle {
+        x,
+        y: y + (rows - len) / 2,
+        len,
+        vertical: true,
+    })
 }
 
 /// The handle on the divider between the board and qass: a thin line over the middle half of
@@ -1406,47 +1435,62 @@ mod tests {
     #[test]
     fn the_board_goes_beside_qass_when_both_keep_their_minimum() {
         let stacked = (Dir::H, 0.5);
-        assert_eq!(board_shape(161, stacked, false, true), (Dir::V, 0.70, 0));
-        assert_eq!(board_shape(134, stacked, false, true), (Dir::V, 0.70, 0));
-        assert_eq!(board_shape(133, stacked, false, true), (Dir::H, 0.5, 0));
         assert_eq!(
-            board_shape(121, (Dir::V, 0.75), false, true),
+            board_shape(161, stacked, false, None, true),
+            (Dir::V, 0.70, 0)
+        );
+        assert_eq!(
+            board_shape(134, stacked, false, None, true),
+            (Dir::V, 0.70, 0)
+        );
+        assert_eq!(
+            board_shape(133, stacked, false, None, true),
             (Dir::H, 0.5, 0)
         );
         assert_eq!(
-            board_shape(200, (Dir::V, 0.6), false, true),
+            board_shape(121, (Dir::V, 0.75), false, None, true),
+            (Dir::H, 0.5, 0)
+        );
+        assert_eq!(
+            board_shape(200, (Dir::V, 0.6), false, None, true),
             (Dir::V, 0.6, 0)
         );
         assert_eq!(
-            board_shape(161, stacked, true, true),
+            board_shape(161, stacked, true, None, true),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            board_shape(159, stacked, true, true),
+            board_shape(159, stacked, true, None, true),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
-        assert_eq!(board_shape(158, stacked, true, true), (Dir::V, 0.70, 0));
+        assert_eq!(
+            board_shape(158, stacked, true, None, true),
+            (Dir::V, 0.70, 0)
+        );
         // Qass first: the same cuts, the first pane's share is the mirror of the board's, and
         // the saved ratio is read as qass's share, never the board's.
         assert_eq!(board_default(Dir::V, true), 0.70);
         assert_eq!(board_default(Dir::V, false), 1.0 - 0.70);
         assert_eq!(
-            board_shape(161, stacked, true, false),
+            board_shape(161, stacked, true, None, false),
             (Dir::V, 1.0 - 0.70, QUESTIONS_GAP)
         );
-        assert_eq!(board_shape(133, stacked, false, false), (Dir::H, 0.5, 0));
+        assert_eq!(
+            board_shape(133, stacked, false, None, false),
+            (Dir::H, 0.5, 0)
+        );
         // 0.3 of 158 is qass's 47 columns and the board's 111: a column of questions fits; the
         // same number read as the board's share would not even fit the board.
         assert_eq!(
-            board_shape(161, (Dir::V, 0.3), true, false).2,
+            board_shape(161, (Dir::V, 0.3), true, None, false).2,
             QUESTIONS_GAP
         );
         assert_eq!(
-            board_shape(161, (Dir::V, 0.3), false, true),
+            board_shape(161, (Dir::V, 0.3), false, None, true),
             (Dir::H, 0.5, 0)
         );
         for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, false);
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, false);
             if dir == Dir::V {
                 let total = cols - 3;
                 let qass = (total as f32 * ratio).floor() as usize;
@@ -1457,7 +1501,7 @@ mod tests {
             }
         }
         for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, true);
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, true);
             if dir == Dir::V {
                 let total = cols - 3;
                 let board = (total as f32 * ratio).floor() as usize;
@@ -1467,5 +1511,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A dragged questions width is kept, gives way to the board's minimum, and is dropped under
+    /// the questions' own; a drag or a key is refused when it would break either minimum.
+    #[test]
+    fn a_dragged_questions_width_gives_way_to_the_board_before_it_is_dropped() {
+        let wide = (Dir::V, 0.70);
+        assert_eq!(board_shape(200, wide, true, Some(30), true).2, 31);
+        assert_eq!(board_shape(200, wide, true, Some(70), true).2, 71);
+        // Only 77 columns are left over the board's 60 at 200 columns, and 49 at 160.
+        assert_eq!(board_shape(200, wide, true, Some(90), true).2, 77);
+        assert_eq!(board_shape(160, wide, true, Some(90), true).2, 49);
+        // Less than the questions' minimum is left: they leave the board's side.
+        assert_eq!(board_shape(200, (Dir::V, 0.45), true, Some(70), true).2, 28);
+        assert_eq!(board_shape(200, (Dir::V, 0.4), true, Some(70), true).2, 0);
+        // Qass first: the board is the second pane.
+        assert_eq!(board_shape(200, (Dir::V, 0.3), true, Some(70), false).2, 71);
+        // Without a width, or without questions, nothing moves.
+        assert_eq!(board_shape(200, wide, true, None, true).2, QUESTIONS_GAP);
+        assert_eq!(board_shape(200, wide, false, Some(70), true).2, 0);
+    }
+
+    #[test]
+    fn the_questions_keep_their_minimum_and_so_does_the_board() {
+        assert_eq!(questions_width(25, 100), Some(24));
+        assert_eq!(questions_width(24, 100), None);
+        assert_eq!(questions_width(40, 100), Some(39));
+        assert_eq!(questions_width(41, 100), None);
+        assert_eq!(questions_width(0, 100), None);
+        assert_eq!(
+            edge_handle(5, 2, 20),
+            Some(Handle {
+                x: 5,
+                y: 7,
+                len: 10,
+                vertical: true
+            })
+        );
+        assert_eq!(edge_handle(5, 2, 3), None);
     }
 }

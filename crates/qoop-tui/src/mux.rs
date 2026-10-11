@@ -2380,6 +2380,7 @@ mod tests {
         let beside = |a, b| Pane::Split {
             dir: qoop_runtime::control::SplitDir::V,
             permille: 500,
+            questions: 0,
             first: Box::new(Pane::Leaf { terminal: a }),
             second: Box::new(Pane::Leaf { terminal: b }),
         };
