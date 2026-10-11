@@ -718,6 +718,11 @@ mod tests {
             ),
             Route::Qass(9)
         );
+        // Neither says a session (opencode, amp, goose, cursor): two blanks are not a match.
+        assert_eq!(
+            route(&card(None), worker("idle", None).as_ref(), Some(&qass_free)),
+            Route::Qass(9)
+        );
         // Another conversation in the terminal (a /clear, a new session): through qass.
         assert_eq!(
             route(
