@@ -154,6 +154,8 @@ pub struct Chrome<'a> {
     /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
     /// over the board's tile. The tree knows where the board is, so the client says.
     pub questions: Option<crate::qass_screen::Side>,
+    /// The handle on the divider of qass's split tab, in ember.
+    pub handle: Option<crate::qass_screen::Handle>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -198,6 +200,7 @@ impl Default for Chrome<'_> {
             qass: None,
             asks: None,
             questions: None,
+            handle: None,
         }
     }
 }
@@ -942,7 +945,7 @@ pub fn paint(frame: &Frame) -> String {
         Vec::new()
     };
     // The lines around split panes, worked out once for the whole frame.
-    let edges = if frame.tiles.len() < 2 {
+    let mut edges = if frame.tiles.len() < 2 {
         Vec::new()
     } else {
         pane_edges(
@@ -952,6 +955,9 @@ pub fn paint(frame: &Frame) -> String {
             pane_rows as usize,
         )
     };
+    if let Some(handle) = frame.chrome.handle.filter(|_| !edges.is_empty()) {
+        put_handle(&mut edges, handle);
+    }
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
         .rows
@@ -2687,6 +2693,15 @@ pub(crate) const RESIZE_HINT: &[(&str, &str)] = &[
     ("esc", "done"),
 ];
 
+/// Resize mode's keys on qass's tab, where `s` puts the board and qass on each other's side.
+pub(crate) const RESIZE_BOARD_HINT: &[(&str, &str)] = &[
+    ("hjkl", "move 5%"),
+    ("HJKL", "20%"),
+    ("s", "swap sides"),
+    ("=", "equalize"),
+    ("esc", "done"),
+];
+
 /// The agents column's keys while the keyboard has it, for the notice row.
 pub(crate) const SIDE_HINT: &[(&str, &str)] = &[
     ("j/k", "move"),
@@ -3135,6 +3150,28 @@ fn pane_edges(
         }
     }
     grid
+}
+
+/// The handle's cells in the edge grid, in the same ember as the focused pane's corners; a cell
+/// that already holds a name or a corner is left as it is.
+fn put_handle(grid: &mut [Vec<Option<(char, EdgeInk)>>], handle: crate::qass_screen::Handle) {
+    let glyph = if handle.vertical {
+        '\u{2502}'
+    } else {
+        '\u{2500}'
+    };
+    for at in 0..handle.len {
+        let (x, y) = if handle.vertical {
+            (handle.x, handle.y + at)
+        } else {
+            (handle.x + at, handle.y)
+        };
+        if let Some(cell) = grid.get_mut(y).and_then(|row| row.get_mut(x))
+            && cell.is_none()
+        {
+            *cell = Some((glyph, EdgeInk::Lit));
+        }
+    }
 }
 
 /// The escape for one kind of edge cell: the focused pane's corners in ember, its name bold
@@ -7660,5 +7697,40 @@ mod tests {
         // The keyboard in qass's own tab: that is an agent already.
         assert_ne!(say(&[shell, in_qass], &qass_spaces, 3).0, START_AGENT);
         assert!(START_AGENT.len() < 50);
+    }
+    /// The handle's cells are ember edge cells over the divider only: a cell that holds a name or
+    /// a corner keeps it, and nothing outside the line is touched.
+    #[test]
+    fn the_handle_fills_only_free_cells_of_its_line() {
+        use crate::qass_screen::Handle;
+        let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; 10]; 10];
+        grid[4][3] = Some(('x', EdgeInk::Title));
+        put_handle(
+            &mut grid,
+            Handle {
+                x: 3,
+                y: 2,
+                len: 5,
+                vertical: true,
+            },
+        );
+        let column: Vec<_> = (0..10).map(|y| grid[y][3]).collect();
+        assert_eq!(column[2], Some(('\u{2502}', EdgeInk::Lit)));
+        assert_eq!(column[3], Some(('\u{2502}', EdgeInk::Lit)));
+        assert_eq!(column[4], Some(('x', EdgeInk::Title)), "a name is kept");
+        assert_eq!(column[6], Some(('\u{2502}', EdgeInk::Lit)));
+        assert_eq!((column[1], column[7]), (None, None), "only its own cells");
+        assert!(grid.iter().flatten().filter(|c| c.is_some()).count() == 5);
+        // A row of it, off the edge of the grid: clipped, no panic.
+        put_handle(
+            &mut grid,
+            Handle {
+                x: 8,
+                y: 9,
+                len: 6,
+                vertical: false,
+            },
+        );
+        assert_eq!(grid[9][9], Some(('\u{2500}', EdgeInk::Lit)));
     }
 }

@@ -69,6 +69,9 @@ pub struct Layout {
     /// never on a tree that is kept or saved; the divider and every ratio are measured
     /// without it, so the second pane is the same with or without it.
     pub gap: usize,
+    /// The gap is cut from the left (top) edge of the root's second pane instead of the right
+    /// edge of its first: qass's tab with qass on the left and the board on the right.
+    pub gap_second: bool,
 }
 
 impl Layout {
@@ -82,6 +85,7 @@ impl Layout {
             prev_focus: None,
             zoomed: None,
             gap: 0,
+            gap_second: false,
         }
     }
 
@@ -102,6 +106,7 @@ impl Layout {
             prev_focus: None,
             zoomed: None,
             gap: 0,
+            gap_second: false,
         }
     }
 
@@ -166,6 +171,40 @@ impl Layout {
             }
             Node::Leaf { .. } => false,
         }
+    }
+
+    /// Set the root split's ratio, refusing what `set_ratio` refuses.
+    pub fn set_root_ratio(&mut self, area: Rect, ratio: f32) -> bool {
+        let area = self.inner(area);
+        self.set_ratio(area, &[], ratio)
+    }
+
+    /// Put the root's two panes on each other's side, so that each keeps the columns (rows) it
+    /// has in `area`: the ratio is set from whole cells, the way a drag sets it, so a pane never
+    /// loses a cell to rounding and swapping twice is the identity. False unless the root is a
+    /// split of two panes.
+    pub fn swap_root(&mut self, area: Rect) -> bool {
+        let inner = self.inner(area);
+        let Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } = &mut self.root
+        else {
+            return false;
+        };
+        let Some((_, far)) = halves(*dir, *ratio, inner) else {
+            return false;
+        };
+        let (far, total) = match *dir {
+            Dir::V => (far.cols, inner.cols - 1),
+            Dir::H => (far.rows, inner.rows - 1),
+        };
+        std::mem::swap(first, second);
+        // Half a cell past the edge, so the floor in `halves` lands on the cell itself.
+        *ratio = (far as f32 + 0.5) / total as f32;
+        true
     }
 
     /// Visible terminals: zoomed alone when zoom is on, else all leaves.
@@ -347,15 +386,20 @@ impl Layout {
         }
         let mut out = Vec::new();
         layout_node(&self.root, self.inner(area), &mut out);
-        // The gap comes out of the first pane only, after the split is measured.
+        // The gap comes out of one pane only, after the split is measured: the first pane's
+        // right edge, or the second pane's left edge.
         if self.gap > 0
-            && let Node::Split { first, .. } = &self.root
+            && let Node::Split { first, second, .. } = &self.root
             && let Node::Leaf {
-                terminal: Some(first),
-            } = **first
-            && let Some((_, rect)) = out.iter_mut().find(|(t, _)| *t == first)
+                terminal: Some(cut),
+            } = **(if self.gap_second { second } else { first })
+            && let Some((_, rect)) = out.iter_mut().find(|(t, _)| *t == cut)
         {
-            rect.cols = rect.cols.saturating_sub(self.gap);
+            let cut = self.gap.min(rect.cols);
+            rect.cols -= cut;
+            if self.gap_second {
+                rect.x += cut;
+            }
         }
         out
     }
@@ -1214,6 +1258,59 @@ mod tests {
     fn rect_of(layout: &Layout, terminal: u32) -> Rect {
         layout
             .tile_rects(area(80, 24))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .expect("a tile")
+            .1
+    }
+
+    /// Swapping the root's panes keeps every pane's size to the cell, twice is the identity,
+    /// and the gap follows the board: cut from the second pane's left edge when it is second.
+    #[test]
+    fn swapping_the_root_keeps_every_size_and_twice_is_the_identity() {
+        for width in [97, 120, 161, 200] {
+            let a = area(width, 24);
+            for ratio in [0.3_f32, 0.5, 0.7, 0.713] {
+                let mut layout = Layout::single(1);
+                assert!(layout.split_placeholder(1, Dir::V, a));
+                assert!(layout.bind_placeholder(2));
+                assert!(layout.set_root_split(Dir::V, ratio));
+                let before = layout.tile_rects(a);
+                assert!(layout.swap_root(a));
+                assert_eq!(layout.leaves(), [2, 1]);
+                let after = layout.tile_rects(a);
+                for (t, r) in &before {
+                    let now = after.iter().find(|(u, _)| u == t).unwrap().1;
+                    assert_eq!(now.cols, r.cols, "{width} {ratio}: {t} keeps its columns");
+                    assert_eq!(now.rows, r.rows);
+                }
+                // Side by side still, on the other sides.
+                assert!(after[0].1.x < after[1].1.x);
+                assert!(layout.swap_root(a));
+                assert_eq!(layout.leaves(), [1, 2]);
+                assert_eq!(layout.tile_rects(a), before, "{width} {ratio}");
+            }
+        }
+        // A tree with no split has nothing to swap.
+        assert!(!Layout::single(1).swap_root(area(80, 24)));
+        // The gap is cut from the first pane's right edge, or the second's left edge.
+        let a = area(120, 24);
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, Dir::V, a));
+        assert!(layout.bind_placeholder(2));
+        let (one, two) = (rect_of_in(&layout, 1, a), rect_of_in(&layout, 2, a));
+        layout.gap = 10;
+        assert_eq!(rect_of_in(&layout, 1, a).cols, one.cols - 10);
+        assert_eq!(rect_of_in(&layout, 2, a), two, "the other pane is the same");
+        layout.gap_second = true;
+        assert_eq!(rect_of_in(&layout, 1, a), one);
+        let cut = rect_of_in(&layout, 2, a);
+        assert_eq!((cut.x, cut.cols), (two.x + 10, two.cols - 10));
+    }
+
+    fn rect_of_in(layout: &Layout, terminal: u32, a: Rect) -> Rect {
+        layout
+            .tile_rects(a)
             .into_iter()
             .find(|(t, _)| *t == terminal)
             .expect("a tile")

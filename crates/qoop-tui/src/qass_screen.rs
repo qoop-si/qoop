@@ -54,19 +54,37 @@ const BOARD_RATIO_H: f32 = 0.50;
 /// then the inbox at the width it is built for.
 pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
 
+/// The ratio of qass's tab (its first pane's share) the way the tab is shown when it was saved
+/// the other way: the board's own share when the board is first, what is left when qass is.
+pub fn board_default(dir: Dir, board_first: bool) -> f32 {
+    let board = match dir {
+        Dir::V => BOARD_RATIO_V,
+        Dir::H => BOARD_RATIO_H,
+    };
+    if board_first { board } else { 1.0 - board }
+}
+
 /// How qass's tab with the board is laid out in a pane `cols` wide: side by side while the
-/// board and qass both keep their minimum, else stacked; the saved ratio when the saved
-/// direction is the one shown, else that direction's own. With `questions`, the columns cut
-/// from the board for them, when the board still keeps its minimum after the cut.
-pub fn board_shape(cols: usize, saved: (Dir, f32), questions: bool) -> (Dir, f32, usize) {
-    let ratio = |dir: Dir| match (saved.0 == dir, dir) {
-        (true, _) => saved.1,
-        (false, Dir::V) => BOARD_RATIO_V,
-        (false, Dir::H) => BOARD_RATIO_H,
+/// board and qass both keep their minimum, else stacked; the saved ratio (the first pane's
+/// share, whichever pane that is) when the saved direction is the one shown, else that
+/// direction's own. With `questions`, the columns cut from the board for them, when the board
+/// still keeps its minimum after the cut.
+pub fn board_shape(
+    cols: usize,
+    saved: (Dir, f32),
+    questions: bool,
+    board_first: bool,
+) -> (Dir, f32, usize) {
+    let ratio = |dir: Dir| match saved.0 == dir {
+        true => saved.1,
+        false => board_default(dir, board_first),
     };
     // The split's frame takes a cell on each side and its divider one more.
     let total = cols.saturating_sub(3);
-    let board = (total as f32 * ratio(Dir::V).clamp(0.1, 0.9)).floor() as usize;
+    // The first pane's cells are measured the way the split measures them, so the board's and
+    // qass's are exact whichever of them is first.
+    let first = (total as f32 * ratio(Dir::V).clamp(0.1, 0.9)).floor() as usize;
+    let board = if board_first { first } else { total - first };
     if board < BOARD_MIN_COLS || total - board < QASS_MIN_COLS {
         return (Dir::H, ratio(Dir::H), 0);
     }
@@ -76,6 +94,58 @@ pub fn board_shape(cols: usize, saved: (Dir, f32), questions: bool) -> (Dir, f32
         0
     };
     (Dir::V, ratio(Dir::V), gap)
+}
+
+/// The handle on the divider between the board and qass: a thin line over the middle half of
+/// it, in pane-local cells. `vertical` is a column of `len` rows from (`x`, `y`), else a row of
+/// `len` columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handle {
+    pub x: usize,
+    pub y: usize,
+    pub len: usize,
+    pub vertical: bool,
+}
+
+/// Where the handle stands, from qass's tile: the divider is the cell on the board's side of
+/// it (the column or row just before the tile when the board is first, just after when qass
+/// is). `None` when the tile is too short for a line of two cells.
+pub fn handle_of(qass: Rect, dir: Dir, board_first: bool) -> Option<Handle> {
+    let (along, across) = match dir {
+        Dir::V => (qass.rows, qass.cols),
+        Dir::H => (qass.cols, qass.rows),
+    };
+    let len = along / 2;
+    if len < 2 || across == 0 {
+        return None;
+    }
+    let start = (along - len) / 2;
+    Some(match (dir, board_first) {
+        (Dir::V, true) => Handle {
+            x: qass.x.checked_sub(1)?,
+            y: qass.y + start,
+            len,
+            vertical: true,
+        },
+        (Dir::V, false) => Handle {
+            x: qass.x + qass.cols,
+            y: qass.y + start,
+            len,
+            vertical: true,
+        },
+        (Dir::H, true) => Handle {
+            x: qass.x + start,
+            y: qass.y.checked_sub(1)?,
+            len,
+            vertical: false,
+        },
+        (Dir::H, false) => Handle {
+            x: qass.x + start,
+            y: qass.y + qass.rows,
+            len,
+            vertical: false,
+        },
+    })
 }
 
 /// The file the watcher touches each time it tells qass an event.
@@ -1331,22 +1401,58 @@ mod tests {
     #[test]
     fn the_board_goes_beside_qass_when_both_keep_their_minimum() {
         let stacked = (Dir::H, 0.5);
-        assert_eq!(board_shape(161, stacked, false), (Dir::V, 0.70, 0));
-        assert_eq!(board_shape(134, stacked, false), (Dir::V, 0.70, 0));
-        assert_eq!(board_shape(133, stacked, false), (Dir::H, 0.5, 0));
-        assert_eq!(board_shape(121, (Dir::V, 0.75), false), (Dir::H, 0.5, 0));
-        assert_eq!(board_shape(200, (Dir::V, 0.6), false), (Dir::V, 0.6, 0));
+        assert_eq!(board_shape(161, stacked, false, true), (Dir::V, 0.70, 0));
+        assert_eq!(board_shape(134, stacked, false, true), (Dir::V, 0.70, 0));
+        assert_eq!(board_shape(133, stacked, false, true), (Dir::H, 0.5, 0));
         assert_eq!(
-            board_shape(161, stacked, true),
+            board_shape(121, (Dir::V, 0.75), false, true),
+            (Dir::H, 0.5, 0)
+        );
+        assert_eq!(
+            board_shape(200, (Dir::V, 0.6), false, true),
+            (Dir::V, 0.6, 0)
+        );
+        assert_eq!(
+            board_shape(161, stacked, true, true),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            board_shape(159, stacked, true),
+            board_shape(159, stacked, true, true),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
-        assert_eq!(board_shape(158, stacked, true), (Dir::V, 0.70, 0));
+        assert_eq!(board_shape(158, stacked, true, true), (Dir::V, 0.70, 0));
+        // Qass first: the same cuts, the first pane's share is the mirror of the board's, and
+        // the saved ratio is read as qass's share, never the board's.
+        assert_eq!(board_default(Dir::V, true), 0.70);
+        assert_eq!(board_default(Dir::V, false), 1.0 - 0.70);
+        assert_eq!(
+            board_shape(161, stacked, true, false),
+            (Dir::V, 1.0 - 0.70, QUESTIONS_GAP)
+        );
+        assert_eq!(board_shape(133, stacked, false, false), (Dir::H, 0.5, 0));
+        // 0.3 of 158 is qass's 47 columns and the board's 111: a column of questions fits; the
+        // same number read as the board's share would not even fit the board.
+        assert_eq!(
+            board_shape(161, (Dir::V, 0.3), true, false).2,
+            QUESTIONS_GAP
+        );
+        assert_eq!(
+            board_shape(161, (Dir::V, 0.3), false, true),
+            (Dir::H, 0.5, 0)
+        );
         for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true);
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, false);
+            if dir == Dir::V {
+                let total = cols - 3;
+                let qass = (total as f32 * ratio).floor() as usize;
+                assert!(
+                    total - qass - gap >= BOARD_MIN_COLS && qass >= QASS_MIN_COLS,
+                    "{cols}"
+                );
+            }
+        }
+        for cols in 80..=260 {
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, true);
             if dir == Dir::V {
                 let total = cols - 3;
                 let board = (total as f32 * ratio).floor() as usize;

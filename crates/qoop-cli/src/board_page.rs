@@ -120,6 +120,9 @@ struct Page {
     wandered: bool,
     /// The Done cards put away are shown (dimmed), to bring one back.
     reveal: bool,
+    /// Each lane's first card in view: the wheel moves it, the keyboard and a click bring the
+    /// selected card back into view.
+    top: [usize; 3],
 }
 
 fn now_unix() -> i64 {
@@ -232,6 +235,7 @@ impl Page {
             held_at: None,
             wandered: false,
             reveal: false,
+            top: [0; 3],
         }
     }
 
@@ -295,10 +299,17 @@ impl Page {
             .sel
             .and_then(|sel| lanes.iter().position(|l| l.iter().any(|i| i.id == sel)))
         {
+            // Only a card that went to another lane is brought into view: settle also runs on
+            // every poll, which must not undo the wheel.
+            let moved = lane != self.lane;
             self.lane = lane;
+            if moved {
+                self.follow();
+            }
             return;
         }
         self.sel = lanes[self.lane].first().map(|i| i.id);
+        self.follow();
     }
 
     /// Move the keyboard `by` cards in its lane.
@@ -311,6 +322,7 @@ impl Page {
             .unwrap_or(0);
         let to = (at as isize + by).clamp(0, lane.len().saturating_sub(1) as isize) as usize;
         self.sel = lane.get(to).map(|i| i.id);
+        self.follow();
     }
 
     /// Move the keyboard to the lane `by` over, onto the card at the same height.
@@ -324,6 +336,62 @@ impl Page {
         let lane = &lanes[to];
         let sel = lane.get(at.min(lane.len().saturating_sub(1))).map(|i| i.id);
         (self.lane, self.sel) = (to, sel);
+        self.follow();
+    }
+
+    /// How many cards fit in a lane's rows at the size last drawn; none while the page is too
+    /// small to draw lanes at all.
+    fn room(&self) -> usize {
+        let (w, h) = self.size;
+        if w < NEED.0 || h < NEED.1 {
+            return 0;
+        }
+        (h - 4 - 3) / CARD_H
+    }
+
+    /// Scroll the keyboard's lane the least that brings the selected card into view.
+    fn follow(&mut self) {
+        let room = self.room();
+        let lanes = self.lanes();
+        let Some(at) = self
+            .sel
+            .and_then(|sel| lanes[self.lane].iter().position(|i| i.id == sel))
+        else {
+            return;
+        };
+        let top = &mut self.top[self.lane];
+        if at < *top {
+            *top = at;
+        } else if room > 0 && at >= *top + room {
+            *top = at + 1 - room;
+        }
+    }
+
+    /// The lane under a page column, as drawn.
+    fn lane_at(&self, col: usize) -> Option<usize> {
+        let lw = (self.size.0 - 2 - 4) / 3;
+        (0..3).find(|n| {
+            let x = 1 + n * (lw + 2) + 1;
+            col >= x && col < x + lw - 2
+        })
+    }
+
+    /// One notch of the wheel over a lane: that lane moves by a card, never past its last.
+    fn wheel(&mut self, up: bool, col: usize, row: usize) {
+        let (w, h) = self.size;
+        if self.mode != Mode::Board || w < NEED.0 || h < NEED.1 || row < 2 || row >= h - 2 {
+            return;
+        }
+        let Some(n) = self.lane_at(col) else {
+            return;
+        };
+        let last = self.lanes()[n].len().saturating_sub(self.room());
+        let top = self.top[n].min(last);
+        self.top[n] = if up {
+            top.saturating_sub(1)
+        } else {
+            (top + 1).min(last)
+        };
     }
 
     /// What `H` or `L` on `item` asks for, and the line said after it.
@@ -388,6 +456,7 @@ impl Page {
                 self.held_at = placed.map(|(_, _, at)| at);
                 self.held = placed.map(|(lane, id, _)| {
                     (self.lane, self.sel) = (lane, Some(id));
+                    self.follow();
                     id
                 });
                 if let Some(item) = self.selected().filter(|_| self.held.is_some()) {
@@ -465,10 +534,7 @@ impl Page {
         let lw = (w - 2 - 4) / 3;
         let (top, bottom) = (2, h - 2);
         let lanes = self.lanes();
-        let n = (0..3).find(|n| {
-            let x = 1 + n * (lw + 2) + 1;
-            col >= x && col < x + lw - 2
-        })?;
+        let n = self.lane_at(col)?;
         let (first, room) = self.shown(n, lanes[n].len(), bottom - top);
         let at = row.checked_sub(top + 1)? / CARD_H;
         (at < room)
@@ -506,25 +572,21 @@ impl Page {
         row == h - 4 && col > x && col < x + lw - 1
     }
 
-    /// The first card a lane of `len` cards shows and how many fit in its `h` rows, scrolled
-    /// to keep the keyboard's card in sight.
+    /// The first card a lane of `len` cards shows and how many fit in its `h` rows: the lane's
+    /// own scroll, never past its last card.
     fn shown(&self, n: usize, len: usize, h: usize) -> (usize, usize) {
         let room = (h - 3) / CARD_H;
-        let lanes = self.lanes();
-        let at = self
-            .sel
-            .and_then(|sel| lanes[n].iter().position(|i| i.id == sel));
-        let first = match at {
-            Some(at) if n == self.lane => (at + 1).saturating_sub(room),
-            _ => 0,
-        };
-        (first.min(len), room)
+        (self.top[n].min(len.saturating_sub(room)), room)
     }
 
     /// One key.
     fn key(&mut self, key: Key) -> Step {
         if key == Key::Stop {
             return Step::Leave;
+        }
+        if let Key::Wheel { up, col, row } = key {
+            self.wheel(up, col as usize, row as usize);
+            return Step::Stay;
         }
         if matches!(key, Key::Mouse { .. } | Key::Dropped(_)) {
             return self.mouse(key);
@@ -552,6 +614,7 @@ impl Page {
                     other => edit(&mut self.filter, other),
                 }
                 self.settle();
+                self.follow();
                 Step::Stay
             }
             Mode::Create { mut title, space } => {
@@ -781,7 +844,7 @@ impl Page {
                 (y + 1 + lane.len().min(room) * CARD_H).min(y + 1 + (room.max(1) - 1) * CARD_H);
             self.new_card(s, title, *space, x + 1, cy, w - 2);
         }
-        let hidden = lane.len().saturating_sub(first + room);
+        let below = lane.len().saturating_sub(first + room);
         let foot = match n {
             0 => "+ create issue  c".to_string(),
             2 => match (self.hidden(), self.reveal) {
@@ -791,11 +854,13 @@ impl Page {
             },
             _ => String::new(),
         };
-        let foot = if hidden > 0 {
-            format!("{hidden} more below  {foot}")
-        } else {
-            foot
-        };
+        // How many cards are out of view each way, ahead of the lane's own hint.
+        let marks = [(first, "above"), (below, "below")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, word)| format!("{n} {word}  "))
+            .collect::<String>();
+        let foot = format!("{marks}{foot}");
         s.put(x + 2, y + h - 2, &fit(&foot, w - 4), &ink(Role::Faint));
     }
 
@@ -1798,6 +1863,116 @@ mod tests {
             }
         }
         text
+    }
+
+    /// A lane of 13 cards in a window that fits 6: the keyboard on the last one has it drawn
+    /// (`j` follows), the wheel moves the lane under the pointer by a card and stops at both
+    /// ends, another lane scrolls on its own, and neither a poll nor a key elsewhere undoes it.
+    #[test]
+    fn a_lane_scrolls_with_the_wheel_and_the_keyboard_follows_its_card() {
+        let mut p = page();
+        p.items = Some(
+            (1..=13)
+                .map(|n| item(n, "doing", &format!("card number {n}"), 1))
+                .chain((20..=29).map(|n| item(n, "done", &format!("closed {n}"), 1)))
+                .collect(),
+        );
+        p.lane = 1;
+        p.settle();
+        p.size = (120, 4 + 3 + 6 * CARD_H);
+        let (w, h) = p.size;
+        let shown = |p: &Page| drawn(p, w, h);
+        assert!(shown(&p).contains("QOOP-1 "), "the first card is in view");
+        assert!(!shown(&p).contains("QOOP-13"));
+        assert!(shown(&p).contains("7 below"));
+        for _ in 0..12 {
+            p.key(Key::Char('j'));
+        }
+        assert!(shown(&p).contains("QOOP-13"), "the last card is drawn");
+        assert!(shown(&p).contains("7 above"));
+        // A wheel over DOING (the middle lane) scrolls it; at the top it stops.
+        let (col, row) = (60, 8);
+        for _ in 0..20 {
+            p.key(Key::Wheel { up: true, col, row });
+        }
+        assert_eq!(p.top[1], 0);
+        assert!(shown(&p).contains("QOOP-1 "));
+        p.key(Key::Wheel {
+            up: false,
+            col,
+            row,
+        });
+        assert_eq!(p.top[1], 1);
+        for _ in 0..20 {
+            p.key(Key::Wheel {
+                up: false,
+                col,
+                row,
+            });
+        }
+        assert_eq!(p.top[1], 7, "never past the last card");
+        // A poll leaves the wheel where it is.
+        p.top[1] = 3;
+        p.settle();
+        assert_eq!(p.top[1], 3);
+        // DONE scrolls on its own while the keyboard stays in DOING.
+        p.key(Key::Wheel {
+            up: false,
+            col: 100,
+            row,
+        });
+        assert_eq!((p.top[2], p.top[1]), (1, 3));
+        // The keyboard on a card out of view brings it back.
+        p.key(Key::Char('k'));
+        assert!(
+            p.top[1]
+                <= p.lanes()[1]
+                    .iter()
+                    .position(|i| Some(i.id) == p.sel)
+                    .unwrap()
+        );
+        // The wheel over no lane, or while typing, does nothing.
+        let before = p.top;
+        p.key(Key::Wheel {
+            up: false,
+            col: 0,
+            row,
+        });
+        p.mode = Mode::Filter;
+        p.key(Key::Wheel {
+            up: false,
+            col,
+            row,
+        });
+        assert_eq!(p.top, before);
+        assert!(p.filter.is_empty());
+    }
+
+    /// A click on a card still finds it after the lane scrolled.
+    #[test]
+    fn a_card_is_found_where_it_is_drawn_after_a_scroll() {
+        let mut p = page();
+        p.items = Some(
+            (1..=13)
+                .map(|n| item(n, "doing", &format!("card number {n}"), 1))
+                .collect(),
+        );
+        p.size = (120, 4 + 3 + 6 * CARD_H);
+        p.key(Key::Wheel {
+            up: false,
+            col: 60,
+            row: 8,
+        });
+        p.key(Key::Wheel {
+            up: false,
+            col: 60,
+            row: 8,
+        });
+        assert_eq!(
+            p.card_at(60, 4),
+            Some((1, 3)),
+            "the third card is now first"
+        );
     }
 
     #[test]

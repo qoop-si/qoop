@@ -79,6 +79,13 @@ pub enum Key {
         col: u16,
         row: u16,
     },
+    /// One notch of the wheel over a cell of the page, up or down. Only a page that asks for
+    /// the mouse gets these.
+    Wheel {
+        up: bool,
+        col: u16,
+        row: u16,
+    },
     /// What the interface says about a press held in this page and let go outside it: over
     /// qass's pane (`true`), or anywhere else.
     Dropped(bool),
@@ -185,20 +192,28 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
     (out, i)
 }
 
-/// An SGR mouse report's `b;x;y`, for the left button only: the wheel and the other buttons
-/// are nothing here.
+/// An SGR mouse report's `b;x;y`, for the left button and the plain wheel only: the other
+/// buttons and a wheel with a modifier are nothing here.
 fn mouse(params: &[u8], down: bool) -> Option<Key> {
     let text = std::str::from_utf8(params).ok()?;
     let mut parts = text.split(';').map(|p| p.parse::<u16>().ok());
     let (b, x, y) = (parts.next()??, parts.next()??, parts.next()??);
+    let (col, row) = (x.saturating_sub(1), y.saturating_sub(1));
+    if matches!(b, 64 | 65) {
+        return down.then_some(Key::Wheel {
+            up: b == 64,
+            col,
+            row,
+        });
+    }
     if b & 0b0100_0011 != 0 {
         return None;
     }
     Some(Key::Mouse {
         down,
         held: b & 32 != 0,
-        col: x.saturating_sub(1),
-        row: y.saturating_sub(1),
+        col,
+        row,
     })
 }
 
@@ -478,11 +493,30 @@ mod tests {
                 at(false, false, 6, 4)
             ]
         );
-        assert_eq!(only(b"\x1b[<64;6;5M\x1b[<65;6;5M\x1b[<2;6;5M"), []);
+        // The plain wheel is a key; a wheel with a modifier and the other buttons are nothing.
+        assert_eq!(
+            only(b"\x1b[<64;6;5M\x1b[<65;6;5M\x1b[<2;6;5M\x1b[<68;6;5M\x1b[<80;6;5M"),
+            [
+                Key::Wheel {
+                    up: true,
+                    col: 5,
+                    row: 4
+                },
+                Key::Wheel {
+                    up: false,
+                    col: 5,
+                    row: 4
+                },
+            ]
+        );
         assert_eq!(only(b"\x1b]7701;drop=qass\x07"), [Key::Dropped(true)]);
         assert_eq!(only(b"\x1b]7701;drop=none\x1b\\"), [Key::Dropped(false)]);
         assert_eq!(only(b"\x1b]0;a title\x07q"), [Key::Char('q')]);
-        for whole in [&b"\x1b]7701;drop=qass\x07"[..], &b"\x1b[<0;6;5M"[..]] {
+        for whole in [
+            &b"\x1b]7701;drop=qass\x07"[..],
+            &b"\x1b[<0;6;5M"[..],
+            &b"\x1b[<65;6;5M"[..],
+        ] {
             for cut in 1..whole.len() {
                 assert_eq!(decode(&whole[..cut]), (Vec::new(), 0), "{cut}");
             }
