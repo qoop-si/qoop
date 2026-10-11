@@ -1408,6 +1408,46 @@ mod tests {
         }
     }
 
+    /// The daemon's draft for an agent that waits on him has no options: the card shows its
+    /// question and the box for his own words, a key moves nothing, and his words go out.
+    #[test]
+    fn a_draft_with_no_options_takes_his_own_words() {
+        let t0 = Instant::now();
+        let mut draft = card(7, "dub52", "open");
+        draft.card = "W7".to_string();
+        draft.body.asks = "Merge PR #513 now or deploy first?".to_string();
+        draft.body.options.clear();
+        draft.body.pick = None;
+        let mut p = Pane::default();
+        p.take(vec![draft], Vec::new());
+        p.focus = true;
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        for want in ["Merge PR #513 now or deploy first?", "t to type"] {
+            assert!(t.contains(want), "{want:?} in\n{t}");
+        }
+        assert!(!t.contains("[a]"), "{t}");
+        p.key(b"j", 1, t0);
+        p.key(b"a", 1, t0);
+        assert!(!p.holding(), "no option to hold");
+        p.key(b"t", 1, t0);
+        p.key(b"merge it", 1, t0);
+        p.key(b"\r", 1, t0);
+        let (sent, _) = p.tick(t0 + HOLD);
+        let Some(ControlRequest::AskWrite {
+            action: AskOp::Answer {
+                card, option, text, ..
+            },
+            ..
+        }) = sent
+        else {
+            panic!("his words go out")
+        };
+        assert_eq!(
+            (card.as_str(), option, text.as_deref()),
+            ("W7", None, Some("merge it"))
+        );
+    }
+
     #[test]
     fn an_empty_inbox_says_so_and_a_missing_one_says_why() {
         let mut p = Pane::default();

@@ -101,6 +101,16 @@ const QASS: &[(&str, &str, bool)] = &[
     ),
     ("on.sh", include_str!("../../../skills/qass/on.sh"), true),
     (
+        "cardcheck.sh",
+        include_str!("../../../skills/qass/cardcheck.sh"),
+        true,
+    ),
+    (
+        "habit.sh",
+        include_str!("../../../skills/qass/habit.sh"),
+        true,
+    ),
+    (
         "brief.md",
         include_str!("../../../skills/qass/brief.md"),
         false,
@@ -722,11 +732,12 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 412 holds the quiet watcher's lines, "Improve yourself", the card block of
-        // the question inbox, the usage-limit row and the short-title, picks and follow-through
-        // lines (the brief moved to brief.md); `qoop qass brief` takes the hand arithmetic out
-        // of "On every event line" and this goes back toward 400.
-        assert!(skill.lines().count() <= 412, "SKILL.md grew past 412 lines");
+        // ponytail: 420 holds the quiet watcher's lines, "Improve yourself", the card block of
+        // the question inbox, the usage-limit row, the short-title, picks and follow-through
+        // lines, and the card-first and habit rules (the brief moved to brief.md); `qoop qass
+        // brief` takes the hand arithmetic out of "On every event line" and this goes back
+        // toward 400.
+        assert!(skill.lines().count() <= 420, "SKILL.md grew past 420 lines");
     }
 
     #[test]
@@ -787,9 +798,14 @@ mod tests {
             "in at most 32 characters",
             "never its state or progress",
             "`qoop task describe --id KEY -` replaces it whole",
-            "Never repeated at the end of another message",
+            "never\n  the question again at the end of another message",
+            "A question for him is a card first",
+            "becomes a card before any chat line about it",
+            "| Finished with a question for him in its last words | a card now |",
+            "habit.sh\" may <verb>:<repo>`",
+            "A `W<n>` card for that agent is the daemon's draft",
             "Nothing new for him: write nothing.",
-            "a question he has not seen yet",
+            "the handle words of a card waiting on him",
             "Never ask him to do what you or an agent can",
             "`Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`",
@@ -802,6 +818,140 @@ mod tests {
         assert!(
             !skill.contains("Every question whole, every time"),
             "a question is shown once, not at the end of every message"
+        );
+    }
+
+    /// A habit is only reversible work in a repo, counted from his answers: three of qass's
+    /// own pick in a row let qass settle that kind, one other answer resets it, the owner can
+    /// turn one off; a commit, a merge, a deploy or anything outside the verbs is refused.
+    #[test]
+    fn a_habit_counts_only_reversible_work_and_three_same_answers() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("habit.sh");
+        let body = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "habit.sh")
+            .expect("habit.sh")
+            .1;
+        std::fs::write(&script, body).expect("write");
+        let habit = |args: &[&str]| -> (bool, String) {
+            let out = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .args(args)
+                .env("QASS_HABITS", dir.path().join("habits"))
+                .output()
+                .expect("run");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        for _ in 0..2 {
+            assert!(habit(&["answered", "edit:qoop", "same"]).0);
+        }
+        assert!(!habit(&["may", "edit:qoop"]).0, "two are not a habit");
+        habit(&["answered", "edit:qoop", "same"]);
+        assert!(habit(&["may", "edit:qoop"]).0, "three are");
+        assert!(!habit(&["may", "test:qoop"]).0, "one kind, one repo");
+        habit(&["off", "edit:qoop"]);
+        assert!(!habit(&["may", "edit:qoop"]).0, "turned off");
+        habit(&["on", "edit:qoop"]);
+        assert!(habit(&["may", "edit:qoop"]).0);
+        habit(&["answered", "edit:qoop", "other"]);
+        assert!(
+            !habit(&["may", "edit:qoop"]).0,
+            "one other answer resets it"
+        );
+        for refused in [
+            "commit:qoop",
+            "merge:qoop",
+            "deploy:app",
+            "rm:qoop",
+            "edit:",
+            "edit",
+        ] {
+            assert!(!habit(&["answered", refused, "same"]).0, "{refused}");
+        }
+        assert!(habit(&["ls"]).1.contains("edit:qoop: 0 of 3"));
+        assert!(habit(&["clear"]).0);
+        assert!(habit(&["ls"]).1.contains("no habits yet"));
+    }
+
+    /// qass cannot end a turn that asks the owner something in chat without a card: blocked
+    /// once, let through when it wrote a card, when its answer words name an open card, when
+    /// it asked nothing, and on the second stop.
+    #[test]
+    fn qass_stops_only_after_a_question_became_a_card() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("cardcheck.sh");
+        let body = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "cardcheck.sh")
+            .expect("cardcheck.sh")
+            .1;
+        std::fs::write(&script, body).expect("write");
+        // `qoop ask ls --json` answers one open card, `dub`.
+        let fake = dir.path().join("qoop");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho '{\"live\":[{\"body\":{\"handle\":\"dub\"}}],\"ended\":[]}'\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let stop = |said: &str, command: &str, active: bool| -> String {
+            let transcript = dir.path().join("t.jsonl");
+            let user = serde_json::json!({"message": {"role": "user", "content": "özet"}});
+            let tool = serde_json::json!({"message": {"role": "assistant", "content": [
+                {"type": "tool_use", "input": {"command": command}}]}});
+            let result = serde_json::json!({"message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "ok"}]}});
+            let text = serde_json::json!({"message": {"role": "assistant", "content": [
+                {"type": "text", "text": said}]}});
+            std::fs::write(&transcript, format!("{user}\n{tool}\n{result}\n{text}\n"))
+                .expect("write");
+            let payload = serde_json::json!({"transcript_path": transcript,
+                "stop_hook_active": active});
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("run");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("payload");
+            let out = child.wait_with_output().expect("wait");
+            assert!(out.status.success(), "a hook must exit 0");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let block = "\"decision\": \"block\"";
+        assert!(stop("Phone board: PR #29 birleşsin mi?", "qoop agents", false).contains(block));
+        assert!(
+            stop("`hub A` yaz · deploy", "qoop agents", false).contains(block),
+            "no card hub"
+        );
+        assert!(stop("`dub A` yaz · 1 soru seni bekliyor", "qoop agents", false).is_empty());
+        let card = "\"$d/escalate.sh\" E74 T5 now dub - <<'END'";
+        assert!(stop("Seni bekleyen soru var: `dub A`", card, false).is_empty());
+        assert!(stop("Merge işi bitti, kapattım.", "qoop agents", false).is_empty());
+        assert!(
+            stop(
+                "dub · Merge PR #513 now or deploy first?",
+                "qoop agents",
+                false
+            )
+            .is_empty(),
+            "a question line that names a live card points at it"
+        );
+        assert!(
+            stop("PR birleşsin mi?", "qoop agents", true).is_empty(),
+            "the second stop"
         );
     }
 

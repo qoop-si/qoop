@@ -54,7 +54,9 @@
 #     or no `notification_type` from an older build)
 #     -> blocked + `--event blocked`, no label (it carries no tool); every other
 #     notification type reports nothing
-#   Stop, SessionEnd -> idle + `--event done`, no label
+#   Stop -> idle + `--event done`, labelled with the turn's last question (the last line of its
+#   last message that ends in "?"), which the daemon files as a draft card when the agent waits
+#   on the owner; SessionEnd -> idle + `--event done`, no label
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 
@@ -102,6 +104,50 @@ def first_fileish(tool_input):
 def one_line(text, limit=120):
     single = " ".join(str(text).split())
     return single[:limit]
+
+
+def last_question(payload):
+    """The last line ending in "?" of the turn's last message, read from the end of the
+    transcript; "" when there is none or it cannot be read."""
+    path = payload.get("transcript_path")
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        message = entry.get("message") if isinstance(entry, dict) else None
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        # His last prompt ends the turn read back: a question before it was already answered.
+        if message.get("role") == "user":
+            results = isinstance(content, list) and any(
+                isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
+            if not results:
+                return ""
+            continue
+        if message.get("role") != "assistant":
+            continue
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
+        if not texts:
+            continue
+        for text_line in reversed("\n".join(texts).splitlines()):
+            # Its markdown off: a question set in bold still ends in "?".
+            # (A backtick is chr(96): one written out would end the shell's command substitution.)
+            bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
+            if bare.endswith("?"):
+                return one_line(bare)
+        return ""
+    return ""
 
 
 def worktree_mark(cwd):
@@ -213,7 +259,9 @@ elif name == "Notification":
                     "quota_auto_resume_stale"):
         raise SystemExit(0)
     state, flags, event, label = "blocked", "--visible-blocker", "blocked", ""
-elif name in ("Stop", "SessionEnd"):
+elif name == "Stop":
+    state, flags, event, label = "idle", "--visible-idle", "done", last_question(payload)
+elif name == "SessionEnd":
     state, flags, event, label = "idle", "--visible-idle", "done", ""
 elif name == "StopFailure":
     state, flags, event, label = "failed", "", "", ""

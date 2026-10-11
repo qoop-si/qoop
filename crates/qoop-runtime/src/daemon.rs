@@ -4738,7 +4738,27 @@ async fn handle_control(
                                 .await;
                             if matches!(back, Ok(Some(_))) {
                                 agents.tasks_changed();
+                                // Its draft card closed with the wait.
+                                connections.asks_changed();
                             }
+                        }
+                        // The agent ended its turn waiting on the owner: his inbox shows it,
+                        // with the question the hook read from the turn's last words.
+                        if kind == "done" {
+                            let name = agent_names(terminals, vec![terminal])
+                                .await
+                                .remove(&i64::from(terminal));
+                            crate::asks::draft_waiting(
+                                terminal,
+                                name,
+                                // Masked and cut like any label: a token in the question never
+                                // reaches the card or the phone.
+                                label.as_deref().map(crate::control::truncate_focus_label),
+                                terminals.session_of(terminal),
+                                connections,
+                                store,
+                            )
+                            .await;
                         }
                         agents.push_focus_event(
                             terminal,
@@ -4861,10 +4881,22 @@ async fn handle_control(
                 _ => None,
             };
             // Boxed, like the listing: this arm's future is part of every request's.
-            Box::pin(crate::tasks::write(
+            // A stage, a claim or a close ends an agent's wait: its draft card closed in the same
+            // write, and every inbox reads again.
+            let ends_wait = matches!(
+                action,
+                crate::control::TaskOp::Stage { .. }
+                    | crate::control::TaskOp::Done { .. }
+                    | crate::control::TaskOp::Close { .. }
+            );
+            let wrote = Box::pin(crate::tasks::write(
                 id, terminal, token, task, action, space, name, agents, store,
             ))
-            .await
+            .await;
+            if ends_wait {
+                connections.asks_changed();
+            }
+            wrote
         }
         ControlRequest::TaskRead {
             id,

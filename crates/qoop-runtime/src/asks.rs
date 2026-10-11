@@ -213,6 +213,85 @@ pub(crate) async fn read(
     }
 }
 
+/// Why a draft card asks him: the daemon saw the agent stop on its own `waiting-human` stage.
+const DRAFT_WHY: &str = "it stopped and waits for your answer";
+
+/// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
+/// digits, then its task id, so no two drafts share one ("dub52").
+fn draft_handle(name: &str, task: i64) -> String {
+    let word: String = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("agent")
+        .to_ascii_lowercase()
+        .chars()
+        .take(20)
+        .collect();
+    format!("{word}{task}")
+}
+
+/// One line of at most [`crate::control::ASK_FIELD_MAX`] characters, as a card value must be.
+fn card_value(text: &str) -> String {
+    qoop_store::task::one_line(text)
+        .chars()
+        .take(crate::control::ASK_FIELD_MAX)
+        .collect()
+}
+
+/// The agent in `terminal` ended its turn waiting on the owner (its task in `waiting-human`):
+/// a draft card, so his inbox shows it even when qass wrote nothing. Only on a Mac with qass's
+/// space (the inbox lives there), never over a live card, once a waiting spell. No options:
+/// he answers in his own words, which the worker route types to the agent. Never in the way of
+/// the report that called it: a failure is dropped.
+pub(crate) async fn draft_waiting(
+    terminal: u32,
+    name: Option<String>,
+    question: Option<String>,
+    session: Option<String>,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let made = store
+        .run(move |s| {
+            let Some(task) = s.open_task_of(i64::from(terminal))? else {
+                return Ok(None);
+            };
+            if task.stage != "waiting-human"
+                || !s.workspaces()?.iter().any(|w| w.name == QASS_SPACE)
+            {
+                return Ok(None);
+            }
+            let name = name.unwrap_or_else(|| format!("terminal {terminal}"));
+            let asks = question
+                .filter(|q| !q.trim().is_empty())
+                .unwrap_or_else(|| format!("{name} waits on you: {}", task.goal));
+            let card = AskCard {
+                handle: draft_handle(&name, task.id),
+                urgency: "now".to_string(),
+                asked: None,
+                doing: card_value(&task.goal),
+                why: DRAFT_WHY.to_string(),
+                asks: card_value(&asks),
+                options: Vec::new(),
+                pick: None,
+            };
+            let Ok(body) = serde_json::to_string(&card) else {
+                return Ok(None);
+            };
+            s.add_draft(
+                &format!("T{terminal}"),
+                i64::from(terminal),
+                session.as_deref(),
+                &body,
+                now(),
+            )
+        })
+        .await;
+    if matches!(made, Ok(Some(_))) {
+        connections.asks_changed();
+    }
+}
+
 /// A card closed because the worker it was about was told its answer in the chat.
 pub(crate) async fn relayed(
     label: Option<&str>,
@@ -236,13 +315,16 @@ pub(crate) async fn relayed(
     }
 }
 
-/// `E7` from a prompt head that starts `The owner answered E7`, matched whole so it never
-/// reads E70 as E7.
+/// `E7` (qass's card) or `W12` (the daemon's draft) from a prompt head that starts `The owner
+/// answered E7`, matched whole so it never reads E70 as E7.
 fn card_in_prompt(head: &str) -> Option<String> {
-    let rest = head.strip_prefix("The owner answered E")?;
+    let rest = head.strip_prefix("The owner answered ")?;
+    let kind = rest.chars().next().filter(|c| matches!(c, 'E' | 'W'))?;
+    let rest = &rest[1..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let after = rest[digits.len()..].chars().next();
-    (!digits.is_empty() && after.is_none_or(|c| !c.is_alphanumeric())).then(|| format!("E{digits}"))
+    (!digits.is_empty() && after.is_none_or(|c| !c.is_alphanumeric()))
+        .then(|| format!("{kind}{digits}"))
 }
 
 pub(crate) async fn write(
@@ -650,6 +732,14 @@ mod tests {
         assert_eq!(card_in_prompt("The owner answered E7x"), None);
         assert_eq!(card_in_prompt("The owner answered E"), None);
         assert_eq!(card_in_prompt("run the tests for E7"), None);
+        assert_eq!(
+            card_in_prompt("The owner answered W12: \"merge it\"").as_deref(),
+            Some("W12")
+        );
+        assert_eq!(card_in_prompt("The owner answered X12"), None);
+        assert_eq!(draft_handle("Dub-local PR 513", 52), "dub52");
+        assert_eq!(draft_handle("ödeme", 3), "deme3");
+        assert_eq!(draft_handle("***", 4), "agent4");
     }
 
     #[test]

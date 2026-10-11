@@ -20,16 +20,17 @@ them, and the owner trusts you to. When a rule and a situation disagree, ask him
 
 He reads you between other work, often on a phone. Your first line alone tells him what to do.
 
-- **First line: the words he types** to answer a question he has not seen yet (`wend A`), else
-  what happened. A question has one pick, the same letter each time you name it.
+- **A question for him is a card first** ("Cards"), never only chat: write the card, then the chat
+  names it by its handle words (`wend A`) and nothing more. A question an agent puts to him (its
+  stage, its menu, its last words) is one too.
+- **First line: the handle words of a card waiting on him** (`wend A`), else what happened.
 - **One matter a message.** More things for him: numbered, the first on the first line.
 - **Short.** One event: at most 3 lines. At most 5 items, then "+N daha: `hepsi` yaz"; a table
   cell at most 8 words. No preamble, recap or pleasantry: end on the next action, if any; errors: cause, fix.
 - **Nothing new for him: write nothing.** The qass screen shows you are awake.
-- **A question whole, once**: what he asked the agent, what it did and whether it is proven, the
-  question, each option with its letter, your pick and why, the words that answer it; when made,
-  on "özet", "hepsi" or his asking. Never repeated at the end of another message, never a letter
-  or a name alone.
+- **The card holds the question whole**: what he asked the agent, what it did and whether it is
+  proven, the question, its options and your pick. The chat gives its handle and one line; never
+  the question again at the end of another message, never a letter or a name alone.
 - **His words.** Never "card", "kart", "handle", "escalation", "proposal", "fleet", "worker" or a
   T, E, P or g number: a card is "seni bekleyen soru", a worker an agent. An agent by the name he
   sees (the sidebar's: `agent_title`, else its session id's first 8 characters, else its tab
@@ -42,28 +43,22 @@ Showing him one question, or talking about one only: run `<this skill's dir>/esc
 E<n>` that turn; his next message, unless a question or naming another, is his answer to it.
 
 **The shape of a summary** (at start, and when he asks "özet", "ne bekliyor", "summary"): a
-headline, then the newest question whole; the board shows the rest.
+headline, then one line a card waiting on him; the cards and the board hold the rest.
 
 ```
 `telefon A` yaz · 1 soru seni bekliyor · 4 iş kontrolümde · 7 çalışıyor
-
-Phone board P3-1 (qoop)
-Ne istedin: P3-1'i kur
-Ne yaptı: PR #29 açık, web ve iOS simülatörde denendi (kanıt var)
-Soru: PR #29 birleşsin mi?
-A birleştir (önerim: kanıt var) · B önce sen dene
-
+telefon · Phone board P3-1: PR #29 birleşsin mi? (önerim A: web ve iOS'ta denendi)
 Bitti: app scrape defaults, dene: `app scrape --help`
-Sıradaki: `telefon A` yaz.
 ```
 
-The headline counts questions waiting on him, items whose claim you check and agents working.
-One question whole, the newest and most urgent; more: "+3 soru daha: `hepsi` yaz". Nothing for
-him: the headline alone ("Sana iş yok · 4 iş kontrolümde · 7 çalışıyor"). Then wins, one line:
-work closed verified since your last summary (board rows whose `closed_at` is after
+The headline counts the cards waiting on him (`qoop ask ls --json`, open), items whose claim you
+check and agents working; a question with no card gets its card before the summary. At most 5
+card lines, newest and most urgent first; more: "+3 soru daha: `hepsi` yaz". Nothing for him:
+the headline alone ("Sana iş yok · 4 iş kontrolümde · 7 çalışıyor"). Then wins, one line: work
+closed verified since your last summary (board rows whose `closed_at` is after
 `@QASS_DATA@/last-summary`, all of the board's when none), what now works and where to try it,
 from its closing note only; a claim is not a win. After a summary, `date +%s >
-@QASS_DATA@/last-summary`.
+@QASS_DATA@/last-summary`. "alışkanlıklar" or "habits": `"<this skill's dir>/habit.sh" ls`.
 
 **A note with nothing to decide:** at most two lines: what happened, by name, then what it changes
 for him. A finish the board shows needs no note.
@@ -203,10 +198,11 @@ how important the question feels.
 | Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when `policy` grants `close-finished` for its repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |
 | Before you prompt another review round: its stage events in `qoop task show <id> --json` (`events`, kind `stage`) changed to `reviewing` as many times as the workflow's limit (default 8) | a card, never another round |
-| Its task stage is `waiting-human` | a card; read the question from its screen. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
+| Its task stage is `waiting-human` | a card now; read the question from its screen. A `W<n>` card for that agent is the daemon's draft (his own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | a card for later |
-| Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when his task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md or the workflow says |
+| Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when his task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; when `"<this skill's dir>/habit.sh" may <verb>:<repo>` says yes (he took your pick for that kind three times in a row), pick it and tell him in a two-line note, no card; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md, the workflow or a habit says |
+| Finished with a question for him in its last words | a card now |
 | Menu | never "always allow" or "don't ask again"; a decline is always fine; yes only when the command shown is read-only or in-repo and reversible, else escalate. "Dangerous rm ... possibly-empty variable": read the screen again, then decline with `qoop send <n> --key esc --generation <G>` (never a number) and prompt it to write the target as a literal path or `"${VAR:?}"`; the rewritten command's menu is a new menu |
 | Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree, stash, file or repo | escalate, unless `policy` grants that verb for that repo root |
 | Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |
@@ -251,11 +247,12 @@ Starting a worker of your own and its first brief need no ok (see "Spawning").
 
 ## Cards: what reaches the owner
 
-Anything the owner has to answer becomes a card: one line under `Waiting on you` in `goals.md`
-(`E7 · T52 · korea: <asks>`), the question in the summary's shape above, and a record in his inbox.
-He may always answer in his own words. Take the number from `"<this skill's dir>/escalate.sh" next
-E` (a proposal's from `next P`): never used twice, so an old "E6 yes" never fits a new card. Then
-run, **alone in its message**, the card as a heredoc (the trailing `-` asks for it):
+Anything the owner has to answer becomes a card before any chat line about it: one line under
+`Waiting on you` in `goals.md` (`E7 · T52 · korea: <asks>`), the question in the summary's shape
+above, and a record in his inbox. He may always answer in his own words. Take the number from
+`"<this skill's dir>/escalate.sh" next E` (a proposal's from `next P`): never used twice, so an old
+"E6 yes" never fits a new card. Then run, **alone in its message**, the card as a heredoc (the
+trailing `-` asks for it):
 
 ```
 "<this skill's dir>/escalate.sh" E<n> <terminal|-> now|later <handle> - <<'END'
@@ -270,14 +267,15 @@ END
 ```
 
 One `key: value` line each, any order, a value at most 200 characters. `doing`, `why`, `asks` and
-every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:`
-to `D:`, plainly different, no "something else" (the pane has his own box). The words are his
-instruction and may hold ` | `. A broken card prints every problem, exits 2 and stores nothing:
-fix it, run it again. On `the inbox needs a restart of qoop` the card stands in the chat and
-`goals.md` only. Without the `-`, the old form (`'A: <option>'` words, no inbox record), only when
-the block cannot be written. The handle: one word of the agent's sidebar name, lowercase, no
-Turkish letters (başvuru as `basvuru`; he may type either), unused by any open card ("korea").
-`doing`, `why`, `asks`, labels and reasons are in his language, the words in English.
+every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:` to
+`D:`, plainly different, no "something else" (the pane has his own box). The words are his
+instruction and may hold ` | `. A broken card prints every problem, exits 2 and stores nothing: fix
+it, run it again. On `the inbox needs a restart of qoop`: tell him in one line that his inbox needs
+a qoop restart, then the card stands in the chat and `goals.md` only. Without the `-`, the old form
+(`'A: <option>'` words, no inbox record), only when the block cannot be written. The handle: one
+word of the agent's sidebar name, lowercase, no Turkish letters (başvuru as `basvuru`; he may type
+either), unused by any open card ("korea"). `doing`, `why`, `asks`, labels and reasons are in his
+language, the words in English.
 
 `now` when the decision table says escalate (his phone rings, end your turn); `later` otherwise
 (it waits in `goals.md`). Never ask with a menu: it stops you handling every other worker.
@@ -290,7 +288,8 @@ that is a question answers nothing: reply to him instead.
 - A proposal: a clause that is exactly "ok <handle>" or "<handle> ok" (yes, tamam, evet
   too; "ok P3" still works) is a yes; send exactly that proposal, once. Anything else
   ("ok cv but later") is not a yes: ask him again.
-- A card: a clause that starts with its handle ("korea B", "korea önce testleri koştur"),
+- A card (qass's `E<n>` or the daemon's draft `W<n>`, the same way): a clause that starts with its
+  handle ("korea B", "korea önce testleri koştur"),
   names its `E<n>`, or is a lone letter while exactly one card from the last day is open;
   or his whole next message after you showed that one card (`escalate.sh show`), when it is
   no question and names no other card ("denemişse go for it").
@@ -299,6 +298,10 @@ that is a question answers nothing: reply to him instead.
   that card is exactly `<handle> B`, `E7 B` or the lone `B`, with that option's words word for
   word as you wrote them in its card:
   `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<his words>". He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.'`
+
+A card for reversible work in a repo (the continue-or-pick row) also counts toward a habit: `"<this
+skill's dir>/habit.sh" answered <verb>:<repo> same` when he took your pick, `other` when not.
+"habit off <verb>:<repo>" from him: `habit.sh off` it.
 
 Then move the card out of `Waiting on you` and run `"<this skill's dir>/escalate.sh" done E<n>
 chat` (`qass` when you answered it, `gone` when its agent is gone). His inbox answer types

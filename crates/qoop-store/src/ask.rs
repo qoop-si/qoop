@@ -163,6 +163,59 @@ impl Store {
         Ok(Added::New)
     }
 
+    /// A draft the daemon files for an agent that waits on the owner: card `W<n>`, `n` the
+    /// next row id, so a number is never reused or refused. None when a live card already names
+    /// the terminal: qass's card, or an earlier draft, stands.
+    pub fn add_draft(
+        &self,
+        agent: &str,
+        terminal: i64,
+        session: Option<&str>,
+        body: &str,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let live: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND status IN ('open', 'passed'))",
+            params![terminal],
+            |r| r.get(0),
+        )?;
+        if live {
+            return Ok(None);
+        }
+        let Some(task): Option<i64> = tx
+            .query_row(
+                "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL",
+                params![terminal],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        // One draft a waiting spell: a card opened since it last began waiting (answered,
+        // dismissed or closed) stands for this spell, so a stage nobody moved never re-asks.
+        let asked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE task = ?1 AND opened_at >= COALESCE( \
+             (SELECT MAX(at) FROM task_event WHERE task = ?1 AND kind = 'stage' \
+              AND body = 'waiting-human'), 0))",
+            params![task],
+            |r| r.get(0),
+        )?;
+        if asked {
+            return Ok(None);
+        }
+        let n: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM ask", [], |r| r.get(0))?;
+        let card = format!("W{n}");
+        tx.execute(
+            "INSERT INTO ask (card, agent, terminal, session, task, status, body, opened_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+            params![card, agent, terminal, session, task, body, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(card))
+    }
+
     /// One card by its number.
     pub fn ask(&self, card: &str) -> Result<Option<AskRow>, StoreError> {
         Ok(find(&self.conn, card)?)
@@ -238,6 +291,16 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Whether a terminal has a live draft (`W<n>`), the daemon's card for its agent.
+    pub fn has_draft(&self, terminal: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND card LIKE 'W%' \
+             AND status IN ('open', 'passed'))",
+            params![terminal],
+            |r| r.get(0),
+        )?)
+    }
+
     /// At daemon start: cards of a terminal that is no longer open end as `agent closed`,
     /// and ended cards past their keep are dropped.
     pub fn tidy_asks(&self, now: i64) -> Result<(), StoreError> {
@@ -255,6 +318,21 @@ impl Store {
     }
 }
 
+/// End a terminal's live drafts: its agent no longer waits on the owner (its stage moved, it
+/// took an answer, it claimed or ended its task). qass's own cards are left to qass.
+pub(crate) fn close_drafts(
+    tx: &Connection,
+    terminal: i64,
+    note: &str,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
+         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'passed')",
+        params![terminal, note, now],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +342,77 @@ mod tests {
         let ws = s.create_workspace("w", 1).unwrap();
         let t = s.create_terminal(5, ws, "/tmp", "/bin/sh", 2).unwrap();
         (s, t)
+    }
+
+    /// A draft is made for an agent waiting on him: never over a live card, once a waiting
+    /// spell, a new number for a new spell; it closes when the agent stops waiting (its stage
+    /// moved, it took an answer, it claimed or ended its task), and qass's own card stays.
+    #[test]
+    fn a_draft_is_filed_once_a_wait_and_closes_when_the_wait_ends() {
+        let (s, t) = store_with_terminal();
+        assert_eq!(
+            s.add_draft("T5", t, None, "{d}", 9).unwrap(),
+            None,
+            "no task, no draft"
+        );
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        let first = s.add_draft("T5", t, Some("sess"), "{d}", 12).unwrap();
+        let card = first.clone().expect("a draft");
+        assert!(card.starts_with('W'));
+        assert!(s.has_draft(t).unwrap());
+        assert_eq!(
+            s.add_draft("T5", t, None, "{d}", 13).unwrap(),
+            None,
+            "a live card stands"
+        );
+        // His answer in its tab ends the wait and the draft; the same spell never asks again.
+        s.answer_waiting(t, 14).unwrap();
+        assert_eq!(
+            s.ask(&card).unwrap().unwrap().note.as_deref(),
+            Some("answered in its tab")
+        );
+        s.set_task_stage(task, "waiting-human", 15).unwrap();
+        let second = s
+            .add_draft("T5", t, None, "{d}", 15)
+            .unwrap()
+            .expect("a new spell");
+        assert_ne!(second, card);
+        s.claim_ask(&second, "answered", None, "go", "owner, inbox", 16)
+            .unwrap();
+        assert_eq!(
+            s.add_draft("T5", t, None, "{d}", 17).unwrap(),
+            None,
+            "answered this spell"
+        );
+        // Each way out of a wait closes a live draft.
+        for (n, end) in ["stage", "done", "close"].into_iter().enumerate() {
+            let at = 20 + 10 * n as i64;
+            let task = match end {
+                "close" => s.open_task(t, "ship", true, at).unwrap(),
+                _ => task,
+            };
+            s.set_task_stage(task, "waiting-human", at).unwrap();
+            let card = s
+                .add_draft("T5", t, None, "{d}", at + 1)
+                .unwrap()
+                .expect(end);
+            match end {
+                "stage" => drop(s.set_task_stage(task, "implementing", at + 2).unwrap()),
+                "done" => s.claim_task_done(task, "shipped", at + 2).unwrap(),
+                _ => drop(
+                    s.close_task(task, crate::Outcome::Verified, "ok", at + 2)
+                        .unwrap(),
+                ),
+            }
+            assert_eq!(s.ask(&card).unwrap().unwrap().status, "closed", "{end}");
+        }
+        // qass's card is never closed as a draft.
+        s.add_ask("E9", Some("T5"), Some(t), None, "{e}", 60)
+            .unwrap();
+        let task = s.open_task(t, "more", true, 61).unwrap();
+        s.set_task_stage(task, "implementing", 62).unwrap();
+        assert_eq!(s.ask("E9").unwrap().unwrap().status, "open");
     }
 
     #[test]

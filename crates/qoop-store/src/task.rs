@@ -209,6 +209,17 @@ pub(crate) fn close(
     reason: &str,
     now: i64,
 ) -> rusqlite::Result<()> {
+    let terminal: Option<i64> = tx
+        .query_row(
+            "SELECT terminal FROM task WHERE id = ?1",
+            params![task],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(terminal) = terminal {
+        crate::ask::close_drafts(tx, terminal, "its task ended", now)?;
+    }
     tx.execute(
         "UPDATE task SET closed_at = ?2, updated_at = ?2, outcome = ?3, terminal = NULL \
          WHERE id = ?1",
@@ -425,6 +436,11 @@ impl Store {
             params![task, stage, now],
         )?;
         event(&tx, task, "stage", stage, now)?;
+        if stage != "waiting-human"
+            && let Some(terminal) = t.terminal
+        {
+            crate::ask::close_drafts(&tx, terminal, "no longer waits", now)?;
+        }
         tx.commit()?;
         Ok(t.stage != stage || t.claimed_at.is_some())
     }
@@ -465,6 +481,7 @@ impl Store {
             return Ok(None);
         }
         event(&tx, task, "stage", &back, now)?;
+        crate::ask::close_drafts(&tx, terminal, "answered in its tab", now)?;
         tx.commit()?;
         Ok(Some(back))
     }
@@ -538,12 +555,15 @@ impl Store {
         let summary = printable(summary);
         within("the summary", &summary, SUMMARY_MAX)?;
         let tx = self.conn.unchecked_transaction()?;
-        open_row(&tx, task)?;
+        let t = open_row(&tx, task)?;
         tx.execute(
             "UPDATE task SET claimed_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![task, now],
         )?;
         event(&tx, task, "done", &summary, now)?;
+        if let Some(terminal) = t.terminal {
+            crate::ask::close_drafts(&tx, terminal, "its task is done", now)?;
+        }
         tx.commit()?;
         Ok(())
     }
