@@ -987,18 +987,12 @@ pub(crate) fn wheeled(
     }
 }
 
-/// Whether the pet stands in the foot, with the inbox count box above it: it fits the
-/// column, and the whole list still fits above it. The pet is decoration and the list is
-/// not: when the agents need the rows, the pet gives them up rather than push anyone off the
-/// column.
+/// Whether the pet stands in the foot: it can be drawn and it fits the column. It never gives
+/// way to a long list: it stands in rows the foot keeps anyway, and the list above scrolls.
 /// The column and the painter ask this one question, so the art never lands on a row the
 /// list was given.
 pub fn pet_shown(c: &Column, height: usize, present: bool) -> bool {
-    if !pet_drawn(present) || !avatar_fits(height, c.width, present) {
-        return false;
-    }
-    let room = height - STAGE_FOOT_ROWS;
-    inbox_height(c, room) + 2 + SEARCH_ROWS + content(c).len() <= room
+    pet_drawn(present) && avatar_fits(height, c.width, present)
 }
 
 /// Whether a picked pet can be drawn at all: it is half blocks in its own inks, so without
@@ -3442,10 +3436,10 @@ pub(crate) fn current_avatar() -> Option<qoop_runtime::avatar::Avatar> {
 }
 
 /// Whether the pet itself fits in the foot: open column, wide enough for the thick q and the
-/// widest pet beside it ([`Q_PET_WIDTH`]), tall enough that the foot with its count box
-/// still leaves six rows of list.
+/// widest pet beside it ([`Q_PET_WIDTH`]), and tall enough for the whole foot. The pet costs
+/// the list no row: it stands in rows the foot has anyway, beside the q and the count chip.
 pub(crate) fn avatar_fits(height: usize, width: usize, present: bool) -> bool {
-    present && width >= Q_PET_WIDTH && height >= STAGE_FOOT_ROWS + 6
+    present && width >= Q_PET_WIDTH && height >= STAGE_FOOT_ROWS
 }
 
 /// The widest pet once trimmed to the columns it lights, in cells.
@@ -3453,10 +3447,11 @@ pub(crate) const PET_COLS: usize = 8;
 /// The foot with the pet in it: the pet's five half-block rows standing on the menu row.
 /// The same for every avatar, so the words sit in the same rows whatever the pet is.
 pub(crate) const PET_FOOT_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 1;
-/// The rows of the box that shows the inbox count: a border, the number, a border.
-const COUNT_BOX_ROWS: usize = 3;
-/// The foot with the pet standing: the count box over the pet's rows and the menu row.
-pub(crate) const STAGE_FOOT_ROWS: usize = COUNT_BOX_ROWS + PET_FOOT_ROWS;
+/// The foot, pet or no pet: the count chip's row, the q's four rows and the menu row. The pet
+/// stands at the right of its first five rows, level with the q, so the foot is no taller
+/// with the pet than without it.
+pub(crate) const STAGE_FOOT_ROWS: usize = 1 + Q_FOOT_ROWS;
+const _: () = assert!(STAGE_FOOT_ROWS == PET_FOOT_ROWS);
 
 /// The first and last column any row of the art lights, if any.
 fn lit_span(
@@ -3571,17 +3566,13 @@ const Q_PET_WIDTH: usize = 1 + Q_COLS + 1 + PET_COLS + 1;
 /// word at the left and `menu <cog> « ` at the right.
 ///
 /// The logo is the q alone ([`Q_LOGO`]) on the four rows above the menu, cream with its tail
-/// in ember. While the pet stands (`pet`) one blank row goes on top and the pet stands at the
-/// right of the foot's first five rows (stamped by the overlay), its feet on the row above
-/// the menu. The small box with the inbox `count` alone sits over the pet's rows; with no pet
-/// it sits at the right of the logo's first three rows instead, so the count never goes
-/// because the pet did. It goes only where even that does not fit the width.
+/// in ember. The row above the q holds the inbox count as a chip ([`count_chip`]) under the
+/// q's left edge. The pet (`pet`) stands at the right of the foot's first five rows (stamped
+/// by the overlay), level with the q, its feet on the row above the menu. The foot is the
+/// same six rows with or without the pet, so the pet never takes a row from the list.
 ///
 /// ```text
-///                  ╭───╮
-///                  │ 2 │
-///                  ╰───╯
-///               ▀▀▀▀▀▀
+///  [ 2 ]        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
 ///  ●   ●        ▀▀▀▀▀▀
 ///  ● ● ●        ▀▀▀▀▀▀
@@ -3622,17 +3613,17 @@ fn foot_rows(
     };
     let menu_row = (menu_row, Some(Hit::Foot));
     let mut out: Vec<Row> = Vec::with_capacity(STAGE_FOOT_ROWS);
-    let boxed = count.map(count_box);
-    // Flush right with the pet's right edge: one blank cell of margin before the column's edge.
-    let box_at = |piece: &BoxRow| width.saturating_sub(crate::width::width(&piece.0) + 1);
-    if pet {
-        for piece in boxed.iter().flatten() {
-            let at = box_at(piece);
-            let lead = " ".repeat(at);
-            out.push((box_line(piece, at, &lead, width, Role::Faint, &[]), None));
-        }
-        out.extend((0..PET_FOOT_ROWS - Q_FOOT_ROWS).map(|_| blank(width)));
-    }
+    // The count chip on the row above the q, under the q's left edge; the pet's head is at
+    // the right of the same row. The row stays with no count, so nothing below it moves.
+    let room = if pet {
+        width.saturating_sub(1 + PET_COLS + 1)
+    } else {
+        width
+    };
+    out.push((
+        count.map_or_else(|| blank(width).0, |n| count_chip(n, room, width)),
+        None,
+    ));
     out.extend(Q_LOGO.iter().enumerate().map(|(row, dots)| {
         let (at, cell) = Q_TAIL;
         let runs = if row == at {
@@ -3640,25 +3631,11 @@ fn foot_rows(
         } else {
             Vec::new()
         };
-        let text = format!(" {dots}");
-        // With no pet, the box stands beside the logo's first rows when the width has the room.
-        let beside = boxed
-            .as_ref()
-            .filter(|_| !pet)
-            .and_then(|box_rows| box_rows.get(row))
-            .filter(|piece| 1 + Q_COLS + 1 + crate::width::width(&piece.0) < width);
-        let line = match beside {
-            Some(piece) => {
-                let at = box_at(piece);
-                let lead = format!("{text:<at$}");
-                box_line(piece, at, &lead, width, Role::Text, &runs)
-            }
-            None => Line {
-                text: fit(&text, width),
-                colour: Some(Role::Text),
-                runs,
-                ..Line::default()
-            },
+        let line = Line {
+            text: fit(&format!(" {dots}"), width),
+            colour: Some(Role::Text),
+            runs,
+            ..Line::default()
         };
         (line, None)
     }));
@@ -3699,62 +3676,36 @@ fn foot_lead(
     }
 }
 
-/// One row of the count box: its text and the runs in it, from the box's own left edge.
-type BoxRow = (String, Vec<(usize, usize, crate::theme::Role)>);
-
-/// The box with the inbox count alone, as three rows. The number is warm while anything
-/// waits and quiet at zero.
-fn count_box(count: usize) -> Vec<BoxRow> {
+/// The inbox count as a chip on the row above the q, in the search chip's ember brackets:
+/// `[ 2 ]` from the column's second cell, the q's own left edge. The number is warm while
+/// anything waits and quiet at zero. Tighter `[2]` when `room` (the cells left of the pet)
+/// does not hold the spaced one, and nothing when not even that fits.
+fn count_chip(count: usize, room: usize, width: usize) -> Line {
     use crate::theme::Role;
-    let inner = format!(" {count} ");
-    let across = crate::width::width(&inner);
-    let edge = |l: char, r: char| format!("{l}{}{r}", "\u{2500}".repeat(across));
-    let number = if count > 0 {
+    let number = count.to_string();
+    let n = crate::width::width(&number);
+    // A leading blank, the number, its brackets (and their inner blanks), a gap before the pet.
+    let pad = if 1 + n + 4 < room {
+        " "
+    } else if 1 + n + 2 < room {
+        ""
+    } else {
+        return blank(width).0;
+    };
+    let ink = if count > 0 {
         Role::Blocked
     } else {
         Role::Faint
     };
-    vec![
-        (
-            edge('\u{256d}', '\u{256e}'),
-            vec![(0, across + 2, Role::Rule)],
-        ),
-        (
-            format!("\u{2502}{inner}\u{2502}"),
-            vec![
-                (0, 1, Role::Rule),
-                (1, across, number),
-                (1 + across, 1, Role::Rule),
-            ],
-        ),
-        (
-            edge('\u{2570}', '\u{256f}'),
-            vec![(0, across + 2, Role::Rule)],
-        ),
-    ]
-}
-
-/// A foot row holding a box piece at column `at` after `lead`: the row's own runs, then the
-/// piece's moved to where it stands.
-fn box_line(
-    piece: &BoxRow,
-    at: usize,
-    lead: &str,
-    width: usize,
-    colour: crate::theme::Role,
-    runs: &[(usize, usize, crate::theme::Role)],
-) -> Line {
-    let mut runs = runs.to_vec();
-    runs.extend(
-        piece
-            .1
-            .iter()
-            .map(|(from, len, role)| (at + from, *len, *role)),
-    );
+    let close = 1 + 1 + pad.len() + n + pad.len();
     Line {
-        text: fit(&format!("{lead}{}", piece.0), width),
-        colour: Some(colour),
-        runs,
+        text: fit(&format!(" [{pad}{number}{pad}]"), width),
+        colour: Some(Role::Faint),
+        runs: vec![
+            (1, 1, Role::Brand),
+            (2 + pad.len(), n, ink),
+            (close, 1, Role::Brand),
+        ],
         ..Line::default()
     }
 }
@@ -5606,10 +5557,17 @@ mod tests {
 
     #[test]
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
-        // The q alone, its tail in ember, then the menu.
+        // The count chip's row (blank with no count), the q alone, its tail in ember, then the
+        // menu.
         let rows = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false);
-        assert_eq!(rows.len(), Q_FOOT_ROWS, "the q's four rows and the menu");
-        for (line, _) in &rows {
+        assert_eq!(
+            rows.len(),
+            STAGE_FOOT_ROWS,
+            "the chip row, the q's four rows and the menu"
+        );
+        assert_eq!(rows[0].0.text, " ".repeat(WIDTH));
+        let rows = &rows[1..];
+        for (line, _) in rows {
             assert_eq!(
                 crate::width::width(&line.text),
                 WIDTH,
@@ -5664,23 +5622,45 @@ mod tests {
         assert_eq!(act(Hit::Foot, 2, &c, true), Some(Act::Collapse));
     }
 
-    /// A standing pet only adds rows above the words (the count box and a blank one), so the
-    /// words sit in the same rows counted from the bottom whether the pet stands or gives its
-    /// rows to the list.
+    /// The pet stands beside the q in rows the foot has anyway: the foot is the same six rows
+    /// with or without it, and the q and the menu rows are the same text, so no word moves and
+    /// the list above loses nothing to the pet.
     #[test]
-    fn the_pet_adds_rows_above_the_words_and_moves_none_of_them() {
+    fn the_pet_takes_no_row_and_moves_no_word() {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let gave_way = foot_rows(width, false, None, Pending::None, HubLink::Up, false);
-            let stands = foot_rows(width, true, Some(0), Pending::None, HubLink::Up, false);
-            assert_eq!(stands.len(), STAGE_FOOT_ROWS);
-            let added = STAGE_FOOT_ROWS - gave_way.len();
-            let blank_at = COUNT_BOX_ROWS;
-            for (line, hit) in &stands[blank_at..added] {
-                assert_eq!(line.text, " ".repeat(width), "{line:?}");
-                assert_eq!(*hit, None);
+            let alone = foot_rows(width, false, Some(3), Pending::None, HubLink::Up, false);
+            let stands = foot_rows(width, true, Some(3), Pending::None, HubLink::Up, false);
+            assert_eq!(alone.len(), STAGE_FOOT_ROWS, "width {width}");
+            assert_eq!(stands.len(), STAGE_FOOT_ROWS, "width {width}");
+            assert_eq!(&stands[1..], &alone[1..], "width {width}");
+            for rows in [&alone, &stands] {
+                assert!(rows[0].0.text.starts_with(" [ 3 ]"), "{:?}", rows[0].0.text);
             }
-            assert_eq!(&stands[added..], &gave_way[..], "width {width}");
         }
+    }
+
+    /// The count chip sits under the q's left edge in ember brackets, its number warm while
+    /// anything waits and quiet at zero, tighter when the room beside the pet is short.
+    #[test]
+    fn the_count_chip_stands_over_the_q() {
+        use crate::theme::Role;
+        let chip = count_chip(2, 30, 30);
+        assert!(chip.text.starts_with(" [ 2 ] "), "{:?}", chip.text);
+        assert_eq!(
+            chip.runs,
+            [
+                (1, 1, Role::Brand),
+                (3, 1, Role::Blocked),
+                (5, 1, Role::Brand)
+            ]
+        );
+        assert_eq!(count_chip(0, 30, 30).runs[1], (3, 1, Role::Faint));
+        assert!(count_chip(123, 9, 30).text.starts_with(" [ 123 ]"));
+        assert!(count_chip(123, 7, 30).text.starts_with(" [123] "));
+        assert_eq!(count_chip(123, 6, 30).text, " ".repeat(30));
+        // The `[` is on the q's left column.
+        let foot = foot_rows(WIDTH, true, Some(2), Pending::None, HubLink::Up, false);
+        assert_eq!(foot[0].0.text.find('['), foot[1].0.text.find('\u{25cf}'));
     }
 
     /// The menu row shows the version and, right after it, the hub word, while the tail keeps
@@ -6116,7 +6096,7 @@ mod tests {
         assert!(standing_at > 0, "the pet never stood");
     }
 
-    /// The cells beside the pet keep what they did: the count box and the q are text, and the
+    /// The cells beside the pet keep what they did: the count chip and the q are text, and the
     /// menu row answers by its word, pet or not.
     #[test]
     fn the_cells_beside_the_pet_keep_their_old_acts() {
@@ -6166,10 +6146,6 @@ mod tests {
             width,
             None,
         );
-        let foot = height - STAGE_FOOT_ROWS;
-        for (_, hit) in &with[foot..foot + COUNT_BOX_ROWS] {
-            assert_eq!(*hit, None, "the count box answers nothing");
-        }
         let menu = (
             with.last().expect("a row").1,
             without.last().expect("a row").1,
@@ -6178,7 +6154,8 @@ mod tests {
         let cols = pet_width(&pet);
         for (_, hit) in &with[height - PET_FOOT_ROWS..height - 1] {
             assert_eq!(*hit, Some(Hit::Pet(cols)));
-            // The q and the blanks beside the pet answer nothing, the margin at the edge too.
+            // The count chip, the q and the blanks beside the pet answer nothing, the margin at
+            // the edge too.
             for col in (1..width - cols).chain([width]) {
                 assert_eq!(act(Hit::Pet(cols), col, &c, false), None, "col {col}");
             }
@@ -6342,14 +6319,13 @@ mod tests {
     #[test]
     fn art_fits_an_open_column_of_decent_size_only() {
         assert!(avatar_fits(30, 30, true));
-        assert!(avatar_fits(STAGE_FOOT_ROWS + 6, Q_PET_WIDTH, true));
+        assert!(avatar_fits(STAGE_FOOT_ROWS, Q_PET_WIDTH, true));
         assert!(!avatar_fits(30, 30, false));
         assert!(!avatar_fits(30, Q_PET_WIDTH - 1, true));
-        assert!(!avatar_fits(STAGE_FOOT_ROWS + 5, 30, true));
+        assert!(!avatar_fits(STAGE_FOOT_ROWS - 1, 30, true));
     }
 
-    /// Thirty working agents in one space: more than a thirty row column holds, so the
-    /// rows above the foot are list rows unless a pet takes them.
+    /// Thirty working agents in one space: more than a thirty row column holds.
     fn crowd() -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
         (
             vec![space(1, "app")],
@@ -6359,15 +6335,21 @@ mod tests {
         )
     }
 
-    /// With a pet and a list short enough to stand above it, the foot takes its nine rows
-    /// (the count box, a blank one, the logo and the tail beside where the pet stamps, then
-    /// the menu) and
-    /// the column keeps its exact height. A list that needs those rows keeps them: the
-    /// pet gives way, and no agent is pushed off the column for a picture.
+    /// A row of the list proper: an agent's, or the thin (now blank) line between two
+    /// agents. A crowded list never reserves padding, so a blank row here can only be
+    /// that gap, never wasted space.
+    fn carries_agents((line, hit): &Row) -> bool {
+        matches!(hit, Some(Hit::Terminal(_))) || line.text.chars().all(|c| c == ' ')
+    }
+
+    /// A crowd that needs every row and a pet together: the pet keeps its place and the list
+    /// gets exactly the rows it gets without a pet, every one of them an agent's. The foot
+    /// carries no agent, and its last row is the menu.
     #[test]
-    fn a_pet_takes_its_rows_only_when_the_list_still_fits() {
+    fn a_crowd_and_a_pet_share_the_column_without_a_fight() {
         let pet = art_pet();
-        let at = |(spaces, agents): (Vec<WorkspaceRow>, Vec<AgentRow>)| {
+        let (spaces, agents) = crowd();
+        let at = |avatar: Option<&qoop_runtime::avatar::Avatar>| {
             rows12(
                 &spaces,
                 &agents,
@@ -6380,65 +6362,29 @@ mod tests {
                 &Unseen::new(),
                 NOW,
                 WIDTH,
-                Some(&pet),
+                avatar,
             )
         };
-        let rows = at(sample());
-        assert_eq!(rows.len(), 30);
-        // The rows of the foot never carry an agent: the pet's reservation, not
-        // the list's, whatever the overlay stamps over their trailing columns.
-        for (line, hit) in &rows[30 - STAGE_FOOT_ROWS..30] {
+        let (with, without) = (at(Some(&pet)), at(None));
+        assert_eq!(with.len(), 30);
+        let foot = 30 - STAGE_FOOT_ROWS;
+        let list_start = with
+            .iter()
+            .position(|(_, hit)| matches!(hit, Some(Hit::Terminal(_))))
+            .expect("an agent row");
+        assert!(with[list_start..foot].iter().all(carries_agents));
+        let text = |rows: &[Row]| rows.iter().map(|(l, _)| l.text.clone()).collect::<Vec<_>>();
+        assert_eq!(text(&with[..foot]), text(&without[..foot]));
+        for (line, hit) in &with[foot..] {
             assert!(!matches!(hit, Some(Hit::Terminal(_))), "{line:?}");
         }
-        let (menu_row, hit) = &rows[29];
+        assert!(matches!(with[foot].1, Some(Hit::Pet(_))));
+        let (menu_row, hit) = &with[29];
         assert!(
             menu_row.text.ends_with(&foot_tail(WIDTH, false)),
             "{menu_row:?}"
         );
         assert_eq!(*hit, Some(Hit::Foot));
-        // A crowd needs every row: the pet gives way, and the rows it would have reserved
-        // over the foot the column keeps without it carry agents instead.
-        let crowded = at(crowd());
-        assert_eq!(crowded.len(), 30);
-        let kept = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
-        for row in &crowded[30 - STAGE_FOOT_ROWS..30 - kept] {
-            assert!(carries_agents(row), "{row:?}");
-        }
-    }
-
-    /// A row of the list proper: an agent's, or the thin (now blank) line between two
-    /// agents. A crowded list never reserves padding, so a blank row here can only be
-    /// that gap, never wasted space.
-    fn carries_agents((line, hit): &Row) -> bool {
-        matches!(hit, Some(Hit::Terminal(_))) || line.text.chars().all(|c| c == ' ')
-    }
-
-    /// The reservation eats list rows, not padding: without a pet those rows
-    /// carry agents.
-    #[test]
-    fn without_a_pet_those_rows_carry_agents() {
-        let (spaces, agents) = crowd();
-        let plain = rows12(
-            &spaces,
-            &agents,
-            1,
-            1,
-            30,
-            0,
-            View::Tree,
-            &Seen::new(),
-            &Unseen::new(),
-            NOW,
-            WIDTH,
-            None,
-        );
-        let freed = 30 - STAGE_FOOT_ROWS
-            ..30 - foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
-        assert!(
-            plain[freed.clone()].iter().all(carries_agents),
-            "thirty agents must reach the rows a pet would have reserved: {:?}",
-            &plain[freed]
-        );
     }
 
     /// Overlay rows are the foot's first five, top first, so the pet stands on the menu.
@@ -8409,124 +8355,19 @@ mod tests {
         assert!(pet_shown(&c, 40, true));
     }
 
-    /// The box over the pet shows the inbox count and nothing else, in the rows right above
-    /// the pet's, flush with the pet's right edge; warm while something waits.
+    /// The pet never gives way to a long list: from the foot's own height up it stands at
+    /// the right of the foot's first five rows, the count chip on the row above the q, and the
+    /// list above scrolls in what is left. Under the foot's height the pet goes, and the foot
+    /// keeps its last rows, the menu row always.
     #[test]
-    fn the_count_box_stands_over_the_pet_and_shows_only_the_count() {
+    fn the_pet_and_the_count_chip_stay_with_a_long_list() {
         use crate::theme::Role;
         let spaces = vec![space(1, "app")];
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
-        let box_of = |agents: &[AgentRow]| {
-            let c = opened(column(
-                &spaces,
-                agents,
-                1,
-                99,
-                0,
-                View::Tree,
-                &seen,
-                &unseen,
-                NOW,
-                WIDTH,
-                &shut,
-            ));
-            assert!(pet_shown(&c, 40, true));
-            rows_folded(&c, 40, Some(&art_pet()))
-        };
-        let rows = box_of(&[agent(1, 1, "claude", "working")]);
-        let top = 40 - STAGE_FOOT_ROWS;
-        let text = |at: usize| rows[at].0.text.trim_end().to_string();
-        let across = 3;
-        let pad = " ".repeat(WIDTH - across - 3);
-        assert_eq!(
-            text(top),
-            format!("{pad}\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}")
-        );
-        assert_eq!(text(top + 1), format!("{pad}\u{2502} 0 \u{2502}"));
-        assert_eq!(
-            text(top + 2),
-            format!("{pad}\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}")
-        );
-        assert!(rows[top + 1].0.runs.contains(&(WIDTH - 5, 3, Role::Faint)));
-        // The box ends on the row the pet's rows start on.
-        assert_eq!(top + COUNT_BOX_ROWS, 40 - PET_FOOT_ROWS);
-        assert!(rows[top..top + 3].iter().all(|(_, hit)| hit.is_none()));
-        // Three agents waiting is a three, in the warm ink.
-        let waiting: Vec<AgentRow> = (1..=3).map(|t| agent(t, 1, "claude", "blocked")).collect();
-        let rows = box_of(&waiting);
-        assert_eq!(
-            rows[top + 1].0.text.trim_end(),
-            format!("{pad}\u{2502} 3 \u{2502}")
-        );
-        assert!(
-            rows[top + 1]
-                .0
-                .runs
-                .contains(&(WIDTH - 5, 3, Role::Blocked))
-        );
-    }
-
-    /// The count box does not go because the pet did: with the pet hidden (a list that needs
-    /// the rows, a short window, no pet chosen) the same box stands at the right of the
-    /// logo's first rows, above the menu row, and the foot keeps its five rows.
-    #[test]
-    fn the_count_box_stays_when_the_pet_is_hidden() {
-        use crate::theme::Role;
-        let spaces = vec![space(1, "app")];
-        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
-        let kept = foot_rows(WIDTH, false, None, Pending::None, HubLink::Up, false).len();
-        let check = |agents: &[AgentRow], height: usize, pet: Option<&_>, number: &str| {
-            let c = opened(column(
-                &spaces,
-                agents,
-                1,
-                99,
-                0,
-                View::Tree,
-                &seen,
-                &unseen,
-                NOW,
-                WIDTH,
-                &shut,
-            ));
-            let rows = rows_folded(&c, height, pet);
-            assert_eq!(rows.len(), height);
-            let foot = &rows[height - kept..];
-            let text = |at: usize| foot[at].0.text.trim_end().to_string();
-            let first = format!(
-                "{:<w$}\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}",
-                " \u{25cf} \u{25cf} \u{25cf}",
-                w = WIDTH - 6
-            );
-            assert_eq!(text(0), first);
-            assert!(
-                text(1).ends_with(&format!("\u{2502} {number} \u{2502}")),
-                "{:?}",
-                text(1)
-            );
-            assert!(text(2).ends_with("\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}"));
-            assert!(
-                text(3).trim_end() == "     \u{25cf}",
-                "the tail row has no box"
-            );
-            assert!(foot[..3].iter().all(|(_, hit)| hit.is_none()));
-            // The logo is still its own colour and the box its own.
-            assert!(foot[1].0.runs.contains(&(
-                WIDTH - 5,
-                3,
-                if number == "0" {
-                    Role::Faint
-                } else {
-                    Role::Blocked
-                }
-            )));
-            assert!(
-                foot[3].0.runs.contains(&(5, 1, Role::Brand)),
-                "the ember tail"
-            );
-        };
-        let long: Vec<AgentRow> = (1..=20).map(|t| agent(t, 1, "claude", "working")).collect();
-        // The list needs the rows: the pet gives way.
+        let pet = art_pet();
+        let cols = pet_width(&pet);
+        let mut long: Vec<AgentRow> = (1..=40).map(|t| agent(t, 1, "claude", "working")).collect();
+        long[0].state = "blocked".into();
         let c = opened(column(
             &spaces,
             &long,
@@ -8540,20 +8381,35 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        assert!(!pet_shown(&c, 40, true));
-        check(&long, 40, Some(&art_pet()), "0");
-        // No pet chosen, and a window too short for one.
-        let few = vec![agent(1, 1, "claude", "blocked")];
-        check(&few, 40, None, "1");
-        assert!(!avatar_fits(12, WIDTH, true));
-        check(&few, 14, Some(&art_pet()), "1");
-        // Where even the logo's rows leave no room beside it, there is no box.
-        let narrow = foot_rows(12, false, Some(0), Pending::None, HubLink::Up, false);
+        for height in [50, 30, STAGE_FOOT_ROWS + 4, STAGE_FOOT_ROWS] {
+            assert!(pet_shown(&c, height, true), "height {height}");
+            let rows = rows_folded(&c, height, Some(&pet));
+            assert_eq!(rows.len(), height);
+            let foot = &rows[height - STAGE_FOOT_ROWS..];
+            assert!(foot[0].0.text.starts_with(" [ 1 ]"), "{:?}", foot[0].0.text);
+            assert!(foot[0].0.runs.contains(&(3, 1, Role::Blocked)));
+            for (_, hit) in &foot[..PET_FOOT_ROWS - 1] {
+                assert_eq!(*hit, Some(Hit::Pet(cols)), "height {height}");
+            }
+            assert_eq!(foot.last().expect("the menu").1, Some(Hit::Foot));
+            assert!(
+                content(&c).len() > height,
+                "the list is longer than the column"
+            );
+        }
+        // Under the foot's height the pet goes; the menu row is still the last one.
+        let short = STAGE_FOOT_ROWS - 1;
+        assert!(!pet_shown(&c, short, true));
+        let rows = rows_folded(&c, short, Some(&pet));
+        assert_eq!(rows.len(), short);
+        assert_eq!(rows.last().expect("the menu").1, Some(Hit::Foot));
         assert!(
-            narrow
-                .iter()
-                .all(|(line, _)| !line.text.contains('\u{256d}'))
+            rows.iter()
+                .all(|(_, hit)| !matches!(hit, Some(Hit::Pet(_))))
         );
+        // No pet chosen: the chip stands just the same.
+        let rows = rows_folded(&c, 30, None);
+        assert!(rows[30 - STAGE_FOOT_ROWS].0.text.starts_with(" [ 1 ]"));
     }
 
     /// A folded space hides the agents a person is not looking at, never the one the

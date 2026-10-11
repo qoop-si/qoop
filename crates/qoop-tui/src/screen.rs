@@ -3603,7 +3603,10 @@ mod tests {
         let pet = sky_pet();
         assert!(avatar_overlay_paint(38, sidebar::WIDTH, true, true, Some(&pet), true).is_empty());
         assert!(avatar_overlay_paint(38, 10, false, true, Some(&pet), true).is_empty());
-        assert!(avatar_overlay_paint(8, sidebar::WIDTH, false, true, Some(&pet), true).is_empty());
+        let short = sidebar::STAGE_FOOT_ROWS - 1;
+        assert!(
+            avatar_overlay_paint(short, sidebar::WIDTH, false, true, Some(&pet), true).is_empty()
+        );
         assert!(
             avatar_overlay_paint(38, sidebar::WIDTH, false, false, Some(&pet), true).is_empty()
         );

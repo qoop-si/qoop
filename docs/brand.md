@@ -71,11 +71,13 @@ tail is exact. The last row of the column is the menu row: the version at the le
 after it (`online` in green, `offline` in orange, `local` in grey; `online` and `local` open the
 web app), `menu`, the settings cog and `«` at the right (a click on the cog opens the settings
 page; where icons are not drawn it is `set`, from 24 columns), and the q sits on the four rows
-right above it. The picked pet stands on the menu
-row at the right, five rows of half blocks with its feet on the row above the menu (a click on any
-cell of it is `ctrl-a Q`: qass, or back), and adds
-only a blank row above the q, so no word moves whatever the pet. Sixteen columns hold the q
-and the widest pet side by side, fewer than the narrowest the column drags to.
+right above it. The row above the q holds the inbox count as a chip, `[ 2 ]` in the search
+chip's ember brackets under the q's left edge, warm while anything waits. The picked pet stands
+at the right, five rows of half blocks level with the q and the chip, its feet on the row above
+the menu (a click on any cell of it is `ctrl-a Q`: qass, or back). The foot is the same six rows
+with or without the pet, so the pet never takes a row from the agent list, which scrolls above
+it; only a column shorter than the foot itself drops the pet. Sixteen columns hold the q and the
+widest pet side by side, fewer than the narrowest the column drags to.
 
 A column too narrow for that falls back to the word in braille (`⣖⡆⣖⡆⣖⡆⣖⡆`, four rings),
 cream letters on the lower three dot rows of its row, and the two tails as one ember dot (`⠁`)
