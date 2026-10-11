@@ -1422,8 +1422,14 @@ fn qoop_restart_carries_everything_onto_a_build_of_the_same_version() {
     d.wait_for_screen(1, &format!("DONE-{command}"));
     d.send(1, "echo AFTER-$((6*7))");
     d.wait_for_screen(1, "AFTER-42");
+    // The history is read a window after another from a total read first: a line the tab
+    // prints in between shifts the windows past the oldest rows, so the tab goes quiet first,
+    // and the writer has its half second to put what scrolled up on disk.
+    std::thread::sleep(Duration::from_secs(2));
     assert!(
-        history_of(&d, 1).iter().any(|row| row == "SCROLLED-1"),
+        history_of(&d, 1)
+            .iter()
+            .any(|row| row.trim() == "SCROLLED-1"),
         "the scrollback from before the restart is gone"
     );
     let splits = match d.ask(ControlRequest::ListAgents {
