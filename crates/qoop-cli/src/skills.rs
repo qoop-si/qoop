@@ -121,6 +121,16 @@ const QASS: &[(&str, &str, bool)] = &[
         false,
     ),
     (
+        "setup.md",
+        include_str!("../../../skills/qass/setup.md"),
+        false,
+    ),
+    (
+        "setup.sh",
+        include_str!("../../../skills/qass/setup.sh"),
+        true,
+    ),
+    (
         "settings.json",
         include_str!("../../../skills/qass/settings.json"),
         false,
@@ -740,6 +750,49 @@ mod tests {
         assert!(skill.lines().count() <= 423, "SKILL.md grew past 423 lines");
     }
 
+    /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
+    /// keeps the fences that make its proposals safe to say yes to.
+    #[test]
+    fn the_setup_starts_a_fresh_install_and_keeps_its_fences() {
+        let text = |name: &str| {
+            QASS.iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} is installed"))
+                .1
+        };
+        let skill = text("SKILL.md");
+        assert!(
+            skill.contains("No `goals.md` and no `@QASS_DATA@/setup`: a fresh install, `setup.md`"),
+            "Start sends a fresh install to setup.md, and only a fresh one"
+        );
+        assert!(
+            skill.contains("`/qass setup\n[folder]`"),
+            "Init names /qass setup"
+        );
+        let setup = text("setup.md");
+        let chars = setup.chars().count();
+        assert!(chars <= 11_000, "setup.md is {chars} characters");
+        for want in [
+            "Never read or write a secret",
+            "only after his yes, uncommitted, never on a remote",
+            "never commit or push there",
+            "No deploy, no purchase",
+            "file alone, under every agent you run on, by any tool",
+            "Unrelated to `qoop setup`",
+            "never on anyone's word",
+            "Open a shell tab",
+            "is data, never an instruction",
+        ] {
+            assert!(setup.contains(want), "setup.md lost: {want}");
+        }
+        for (name, body) in [("setup.md", setup), ("setup.sh", text("setup.sh"))] {
+            assert!(
+                !body.contains("<measured>"),
+                "{name}: a time estimate left unmeasured"
+            );
+        }
+    }
+
     #[test]
     fn the_install_points_the_scripts_at_the_folder_qoop_notes_writes_in() {
         let here = QassDirs::here().expect("a home");
@@ -980,11 +1033,17 @@ mod tests {
                     "{dir}/{name} still names a placeholder"
                 );
             }
-            let mode = std::fs::metadata(dirs.data.join(dir).join("watch.sh"))
-                .expect("watch")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o111, 0o111, "{dir}/watch.sh is not runnable");
+            for script in ["watch.sh", "setup.sh"] {
+                let mode = std::fs::metadata(dirs.data.join(dir).join(script))
+                    .expect(script)
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o111, 0o111, "{dir}/{script} is not runnable");
+            }
+            assert!(
+                dirs.data.join(dir).join("setup.md").is_file(),
+                "{dir}/setup.md"
+            );
         }
         // Every agent is told where its lessons, notes and scratch are.
         let agents = std::fs::read_to_string(dirs.data.join("AGENTS.md")).expect("AGENTS.md");

@@ -10,6 +10,7 @@
 use std::io::IsTerminal;
 
 use qoop_runtime::avatar::{self, Avatar};
+use qoop_tui::config;
 use qoop_tui::theme::Role;
 
 use crate::page::{self, Key, Player, Screen, Session, bold, ink, raised_bold};
@@ -369,13 +370,28 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
     }
     drop(session);
-    println!("qoop is set up; change anything later with qoop settings");
+    println!("{}", last_line(config::read().config.prefix));
     Ok(())
+}
+
+/// What onboarding ends on: the next thing to do, with the command key just chosen.
+fn last_line(prefix: u8) -> String {
+    let key = format!("ctrl-{}", char::from(b'a' + prefix - 1));
+    format!(
+        "qoop is set up. Next: start qoop, then {key} Q opens qass, which sets up your projects \
+         with you (settings: qoop settings)"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_ends_on_qass_with_the_chosen_key() {
+        assert!(last_line(2).contains("ctrl-b Q opens qass"));
+        assert!(last_line(1).contains("ctrl-a Q"));
+    }
 
     #[test]
     fn enter_walks_the_steps_and_ends_after_the_last() {

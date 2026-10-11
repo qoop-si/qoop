@@ -16,4 +16,6 @@ the files below, not here.
 - State: `@QASS_DATA@/goals.md`, as the skill says.
 - Board: `@QASS_DATA@/board/`, every space's goal and open tasks, written by `qoop task board`
   on every wake. Read it, never edit it; it is safe to delete.
+- Setup: `@QASS_DATA@/setup`, what the person picked in `/qass setup` (`setup.md`), written only
+  by `setup.sh`.
 - Scratchpad: `@QASS_DATA@/scratch/`, for anything temporary. Nothing else here is scratch.
