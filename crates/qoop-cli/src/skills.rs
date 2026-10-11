@@ -732,12 +732,12 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 420 holds the quiet watcher's lines, "Improve yourself", the card block of
+        // ponytail: 423 holds the quiet watcher's lines, "Improve yourself", the card block of
         // the question inbox, the usage-limit row, the short-title, picks and follow-through
-        // lines, and the card-first and habit rules (the brief moved to brief.md); `qoop qass
-        // brief` takes the hand arithmetic out of "On every event line" and this goes back
-        // toward 400.
-        assert!(skill.lines().count() <= 420, "SKILL.md grew past 420 lines");
+        // lines, the card-first and habit rules (the brief moved to brief.md), the restart
+        // after an install, and the routine words and the doctor step; `qoop qass brief` takes
+        // the hand arithmetic out of "On every event line" and this goes back toward 400.
+        assert!(skill.lines().count() <= 423, "SKILL.md grew past 423 lines");
     }
 
     #[test]
