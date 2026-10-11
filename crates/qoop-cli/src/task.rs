@@ -768,6 +768,7 @@ mod tests {
                 agents: Vec::new(),
                 updated_at: 0,
                 closed_at: None,
+                hidden: Default::default(),
             },
             description: String::new(),
             steps: steps
