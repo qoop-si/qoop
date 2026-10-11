@@ -644,6 +644,8 @@ pub struct Ctx<'a> {
     pub now: Instant,
     /// A box is open over the screen, which fades everything behind it.
     pub fade: bool,
+    /// The board is a pane of qass's tab: the inbox keeps no tab for it.
+    pub board_above: bool,
 }
 
 /// The inbox painted: one string per row, each exactly as wide as asked, and where a click
@@ -828,14 +830,16 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         tabs.push(bold(Role::Blocked, n.to_string()));
     }
     let board_x = width::width("questions") + if n > 0 { 2 + n.to_string().len() } else { 0 } + 2;
-    tabs.push(seg(Role::Text, "  "));
-    tabs.push(seg(Role::Faint, "board"));
-    targets.push(Target {
-        row: out.len(),
-        x0: 2 + board_x,
-        x1: 2 + board_x + 5,
-        hit: Hit::Board,
-    });
+    if !ctx.board_above {
+        tabs.push(seg(Role::Text, "  "));
+        tabs.push(seg(Role::Faint, "board"));
+        targets.push(Target {
+            row: out.len(),
+            x0: 2 + board_x,
+            x1: 2 + board_x + 5,
+            hit: Hit::Board,
+        });
+    }
     out.push(wrap(&tabs));
     out.push(hr());
 
@@ -1285,6 +1289,7 @@ mod tests {
             now_unix: 1_000,
             now: Instant::now(),
             fade: false,
+            board_above: false,
         }
     }
 

@@ -1141,7 +1141,7 @@ impl State {
             toast: toast_text(self),
             chrome: screen::Chrome {
                 qass: self.qass_header().then_some(self.qass_ui),
-                asks: self.on_qass_screen().then_some(&self.asks),
+                asks: self.qass_header().then_some(&self.asks),
                 shut: &self.shut,
                 drag: None,
                 usage: &self.usage,
@@ -2339,19 +2339,26 @@ impl State {
         }
         let (cols, rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
-        crate::qass_screen::Plan::band(cols as usize, rows as usize).map_or(0, |p| p.header.rows())
+        crate::qass_screen::Plan::band(cols as usize, rows as usize, self.qass_ui.inbox)
+            .map_or(0, |p| p.header.rows())
     }
 
     /// The area `tree`'s panes are laid out in: the pane, less qass's header over its split.
     fn tree_area(&self, tree: &Layout) -> layout::Rect {
         let (cols, rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
-        let band = self.band_over(tree);
+        // Under qass's header, and beside the question inbox when it is open there.
+        if self.band_over(tree) > 0
+            && let Some(plan) =
+                crate::qass_screen::Plan::band(cols as usize, rows as usize, self.qass_ui.inbox)
+        {
+            return plan.frame;
+        }
         layout::Rect {
             x: 0,
-            y: band,
+            y: 0,
             cols: cols as usize,
-            rows: rows as usize - band,
+            rows: rows as usize,
         }
     }
 
@@ -2382,6 +2389,13 @@ impl State {
     fn qass_plan(&self) -> Option<crate::qass_screen::Plan> {
         let (cols, rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        if self.qass_split() {
+            return crate::qass_screen::Plan::band(
+                cols as usize,
+                rows as usize,
+                self.qass_ui.inbox,
+            );
+        }
         crate::qass_screen::Plan::new(
             cols as usize,
             rows as usize,
@@ -2403,7 +2417,7 @@ impl State {
     fn asks_focused(&self) -> bool {
         self.asks.focus
             && self.qass_ui.inbox
-            && self.on_qass_screen()
+            && self.qass_header()
             && self.qass_plan().is_some_and(|p| p.side.is_some())
     }
 
@@ -10682,7 +10696,7 @@ impl State {
     /// Where a one based screen position is among qass's screen and its inbox, when it is
     /// on either. Asked of the same painter that drew them, so a click lands on what was shown.
     fn ask_click(&self, row: u16, col: u16) -> Option<AskClick> {
-        if !self.on_qass_screen() {
+        if !self.qass_header() {
             return None;
         }
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
@@ -10708,6 +10722,7 @@ impl State {
                 now_unix: frame.now_unix,
                 now: std::time::Instant::now(),
                 fade: false,
+                board_above: frame.tiles.len() >= 2,
             };
             let view = crate::asks::view(&self.asks, &ctx, side.rect.cols, side.rect.rows);
             return Some(
@@ -10725,7 +10740,7 @@ impl State {
 /// and the keyboard in the chat, give it the keyboard; with the keyboard in it, put it away.
 /// True when the layout changed, so qass's terminal must be sized again.
 fn asks_toggle(state: &mut State) -> bool {
-    if !state.on_qass_screen() {
+    if !state.qass_header() {
         state.message = Some("the question inbox opens on qass's screen: ctrl-a Q".to_string());
         return false;
     }
@@ -19002,7 +19017,7 @@ mod tests {
             0,
             state.sidebar_width,
         );
-        let band = crate::qass_screen::Plan::band(cols as usize, rows as usize)
+        let band = crate::qass_screen::Plan::band(cols as usize, rows as usize, false)
             .unwrap()
             .header
             .rows();
@@ -19580,6 +19595,94 @@ mod tests {
         zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
         state.asks_settle();
         assert!(!state.asks.focus);
+    }
+
+    /// In qass's split tab (the board above qass) the inbox stands beside both panes: they
+    /// keep every row and give up the columns, their ptys follow, and the board needs no tab
+    /// of the inbox's own.
+    #[test]
+    fn the_inbox_stands_beside_the_board_and_qass_in_the_split_tab() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.qass_split() && !state.on_qass_screen());
+        let shut = state.layouts[&9].tile_rects(pane_area(&state));
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(asks_toggle(&mut state), "the layout changed");
+        assert!(state.asks_focused());
+        let plan = state.qass_plan().unwrap();
+        let side = plan.side.expect("beside at this width");
+        assert!(!side.replaces);
+        let open = state.layouts[&9].tile_rects(pane_area(&state));
+        assert_eq!(pane_area(&state).x, side.rect.cols);
+        for ((t, was), (u, now)) in shut.iter().zip(&open) {
+            assert_eq!(t, u);
+            assert_eq!(now.rows, was.rows, "no rows lost");
+            assert!(
+                now.x >= side.rect.cols && now.cols < was.cols,
+                "{was:?} then {now:?}"
+            );
+        }
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+        let (board, qass) = (open[0].1, open[1].1);
+        assert_eq!(
+            state.sized.get(&4),
+            Some(&(board.cols as u16, board.rows as u16))
+        );
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(qass.cols as u16, qass.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), qass);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(
+            painted.contains("questions") && painted.contains("Question 1?"),
+            "{painted}"
+        );
+        assert!(
+            !painted.contains("questions  1  board"),
+            "the board is a pane here, not a tab"
+        );
+        // The chip and the inbox answer clicks in the split too.
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let chip = screen.chip().expect("the chip on the header");
+        let at = |r: usize, c: usize| ((screen::TABS + 1 + r) as u16, (left + 1 + c) as u16);
+        let (row, col) = at(chip.row, chip.x0 + 2);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        let (row, col) = at(side.rect.y + 3, side.rect.x + 5);
+        assert!(
+            matches!(state.ask_click(row, col), Some(AskClick::Inbox(_))),
+            "{:?}",
+            state.ask_click(row, col)
+        );
+        let (row, col) = at(qass.y + 1, qass.x + 3);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Chat));
+        // Put away: the panes get their columns back.
+        assert!(asks_toggle(&mut state));
+        assert_eq!(state.layouts[&9].tile_rects(pane_area(&state)), shut);
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+    }
+
+    #[test]
+    fn in_a_narrow_window_the_inbox_takes_the_split_tabs_place_and_the_ptys_keep_their_size() {
+        let mut state = qass_split_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(asks_toggle(&mut state));
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+        assert_eq!(state.sized, before);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("Question 1?"), "{painted}");
     }
 
     /// A window too small to frame anything leaves qass's pane plain and its pty whole.

@@ -479,7 +479,7 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
     );
     // qass's split tab: the header over its panes, which draw their own edges.
     if frame.tiles.len() >= 2 {
-        return crate::qass_screen::Plan::band(cols as usize, rows as usize);
+        return crate::qass_screen::Plan::band(cols as usize, rows as usize, ui.inbox);
     }
     crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed, ui.inbox)
 }
@@ -517,6 +517,8 @@ pub(crate) fn qass_screen_of(
             now_unix: frame.now_unix,
             now: std::time::Instant::now(),
             fade: spotlight,
+            // The board is already a pane of qass's tab: no tab of the inbox's own for it.
+            board_above: frame.tiles.len() >= 2,
         };
         let view = crate::asks::view(asks, &seen, side.rect.cols, side.rect.rows);
         screen = screen.with_inbox(view.rows);
@@ -1165,7 +1167,22 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&screen.row(pane_row, |_| String::new()));
                 continue;
             }
+            // The question inbox beside the panes, or in their place in a narrow window.
+            let inbox = qass
+                .as_ref()
+                .and_then(|(plan, screen)| Some((plan.side?, screen.inbox_row(pane_row)?)));
+            if let Some((side, row)) = &inbox
+                && side.replaces
+            {
+                out.push_str(&at(pane_row + TABS + 1, left + 1));
+                out.push_str(row);
+                continue;
+            }
             paint_tiled_row(frame, &edges, pane_row, pane_cols as usize, left, &mut out);
+            if let Some((_, row)) = inbox {
+                out.push_str(&at(pane_row + TABS + 1, left + 1));
+                out.push_str(&row);
+            }
         }
     }
 

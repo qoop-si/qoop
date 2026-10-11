@@ -210,11 +210,18 @@ impl Plan {
     /// and `inner` alike, the area the split's panes are laid out in (they draw their own
     /// edges). The box header only when each of two panes still keeps [`MIN_INSIDE`] rows,
     /// else one line; `None` when the pane is too small for even that.
-    pub fn band(cols: usize, rows: usize) -> Option<Plan> {
+    pub fn band(cols: usize, rows: usize, inbox: bool) -> Option<Plan> {
         if cols < MIN_COLS || rows < 2 * MIN_ROWS {
             return None;
         }
-        let header = if rows >= BOX_ROWS + 3 + 2 * MIN_INSIDE {
+        // With the inbox open the box header also leaves it rows of its own.
+        let wants_inbox = inbox && Plan::holds_inbox(cols, rows);
+        let room = if wants_inbox {
+            (3 + 2 * MIN_INSIDE).max(INBOX_BOX_ROWS)
+        } else {
+            3 + 2 * MIN_INSIDE
+        };
+        let header = if rows >= BOX_ROWS + room {
             Header::Box
         } else {
             Header::Line
@@ -226,12 +233,38 @@ impl Plan {
             cols,
             rows: rows - top,
         };
+        let (side, panes) = if !wants_inbox {
+            (None, under)
+        } else if cols >= INBOX_BESIDE_COLS {
+            let w = (cols * INBOX_SHARE / 100).clamp(INBOX_WIDTH.0, INBOX_WIDTH.1);
+            (
+                Some(Side {
+                    rect: Rect { cols: w, ..under },
+                    replaces: false,
+                }),
+                Rect {
+                    x: w,
+                    cols: cols - w,
+                    ..under
+                },
+            )
+        } else {
+            // The panes keep their size under the inbox: nothing repaints.
+            (
+                Some(Side {
+                    rect: under,
+                    replaces: true,
+                }),
+                under,
+            )
+        };
         Some(Plan {
             header,
             cols,
             rows,
-            frame: under,
-            inner: under,
+            frame: panes,
+            inner: panes,
+            side,
         })
     }
 }
@@ -646,6 +679,13 @@ impl Screen {
     pub fn with_inbox(mut self, rows: Vec<String>) -> Screen {
         self.inbox = rows;
         self
+    }
+
+    /// One row of the inbox in a split tab, whose panes paint themselves: the row of the pane
+    /// `pane_row` falls on, while the inbox is open.
+    pub fn inbox_row(&self, pane_row: usize) -> Option<String> {
+        let side = self.plan.side?;
+        self.inbox.get(pane_row.checked_sub(side.rect.y)?).cloned()
     }
 
     /// The chip that opens the inbox, when the header shows it whole.
@@ -1265,5 +1305,31 @@ mod tests {
         let tall = Plan::new(122, 21, false, true).unwrap();
         assert_eq!(tall.header, Header::Box);
         assert!(tall.side.unwrap().rect.rows >= INBOX_BOX_ROWS);
+    }
+
+    /// The split tab's panes sit beside the inbox when it is open, and keep their place under
+    /// it when the window is narrow.
+    #[test]
+    fn the_split_tabs_panes_leave_the_inbox_a_column_or_keep_their_place_under_it() {
+        let shut = Plan::band(122, 40, false).unwrap();
+        let open = Plan::band(122, 40, true).unwrap();
+        let side = open.side.expect("an inbox beside the panes");
+        assert!(!side.replaces && (48..=56).contains(&side.rect.cols));
+        assert_eq!(open.header, shut.header);
+        assert_eq!(
+            (open.frame.x, open.frame.cols),
+            (side.rect.cols, 122 - side.rect.cols)
+        );
+        assert_eq!(
+            (open.frame.y, open.frame.rows),
+            (shut.frame.y, shut.frame.rows)
+        );
+        assert_eq!(open.frame, open.inner);
+        let narrow = Plan::band(80, 40, true).unwrap();
+        assert!(narrow.side.unwrap().replaces);
+        assert_eq!(narrow.frame, Plan::band(80, 40, false).unwrap().frame);
+        // Short: the header gives up its box for a line to leave the inbox its rows.
+        assert_eq!(Plan::band(122, 20, true).unwrap().header, Header::Line);
+        assert_eq!(Plan::band(59, 40, true).unwrap().side, None);
     }
 }
