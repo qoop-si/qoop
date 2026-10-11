@@ -1,0 +1,6 @@
+# The daemon says things through `say!`, which drops a line it cannot write: `eprintln!`
+# panics on a full disk, and a panic in the daemon ends every tab (src/say.rs).
+disallowed-macros = [
+    { path = "std::eprintln", reason = "use say!, which never panics on a failed write" },
+    { path = "std::eprint", reason = "use say!, which never panics on a failed write" },
+]

@@ -91,7 +91,7 @@ async fn wait_for(deadline: tokio::time::Instant, owed: impl Fn() -> usize) {
     }
     let left = owed();
     if left > 0 {
-        eprintln!("qoopd: exiting with {left} writes to disk unfinished");
+        crate::say!("qoopd: exiting with {left} writes to disk unfinished");
     }
 }
 

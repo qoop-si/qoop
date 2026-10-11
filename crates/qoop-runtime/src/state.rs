@@ -33,7 +33,7 @@ fn migrate_db(from: &Path, to: &Path, db: &str) -> io::Result<()> {
     let new = to.join(db);
     if new.exists() {
         if holds_tabs(&new)? {
-            eprintln!(
+            crate::say!(
                 "qoopd: a database is in both {} and {}; using the second, the first is \
                  left as it is",
                 from.display(),
@@ -83,7 +83,7 @@ fn migrate_db(from: &Path, to: &Path, db: &str) -> io::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         remove_if_there(&from.join(format!("{db}{suffix}")))?;
     }
-    eprintln!("qoopd: moved the database and history to {}", to.display());
+    crate::say!("qoopd: moved the database and history to {}", to.display());
     Ok(())
 }
 
@@ -124,7 +124,7 @@ fn move_dir(from: &Path, to: &Path) -> io::Result<()> {
         return Ok(());
     }
     if to.exists() {
-        eprintln!(
+        crate::say!(
             "qoopd: {} is already there, so {} was left where it is",
             to.display(),
             from.display()

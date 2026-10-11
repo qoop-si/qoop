@@ -1,6 +1,8 @@
 //! The qoop daemon runtime.
 
 #![cfg(unix)]
+// `say!`, never `eprintln!`, which panics on a full disk (`say`, `clippy.toml`).
+#![deny(clippy::disallowed_macros)]
 
 pub mod agents;
 pub mod asks;
@@ -16,6 +18,7 @@ pub mod legacy;
 pub mod lock;
 pub mod paths;
 pub mod release;
+pub mod say;
 pub mod spill;
 pub mod state;
 pub mod store;

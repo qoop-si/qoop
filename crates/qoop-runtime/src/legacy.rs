@@ -78,7 +78,7 @@ fn skips_migration(exe: Option<&Path>, sandboxed: bool) -> bool {
 /// files open in a running process open, and only when the new name is free.
 pub fn move_home() {
     if !migrating() {
-        eprintln!(
+        crate::say!(
             "qoop: a build under a target directory without {SANDBOX_ENV} does not move the \
              qoro directories of this home"
         );
@@ -129,7 +129,7 @@ fn move_dir(new: &Path) -> io::Result<()> {
         // said once.
         (Ok(now), Ok(was)) => {
             if real_dir(&now) && real_dir(&was) && !new.join(BOTH_NOTE).exists() {
-                eprintln!(
+                crate::say!(
                     "qoop: {} and {} both exist; {} is used and {} is left as it is. Move what \
                      you need from the old one by hand.",
                     old.display(),

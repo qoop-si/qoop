@@ -341,13 +341,14 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // The tabs the daemon before this one handed over, read before anything is closed:
     // their descriptors are the ones inherited that stay open.
     let mut orphans = Vec::new();
+    let mut refused = None;
     let handed = handoff::requested(args).and_then(|(file, nonce)| {
         // Named before the read, which deletes the file: if it is refused, the shells it
         // names lose their terminals as the descriptors close, and are waited for.
         let named = handoff::children_in(&file);
         handoff::read(&file, &nonce)
             .map_err(|e| {
-                eprintln!("qoopd: the handover was refused: {e}");
+                refused = Some(e);
                 orphans = named;
             })
             .ok()
@@ -359,6 +360,10 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
             .unwrap_or_default(),
     );
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    log_to_file(&dir);
+    if let Some(e) = refused {
+        qoop_runtime::say!("qoopd: the handover was refused: {e}");
+    }
     // Held across the whole sequence: stale-socket check, unlink, bind, listen, initialise.
     // Two daemons started at once therefore serialise here rather than both concluding the
     // socket is stale and unlinking each other's.
@@ -378,7 +383,9 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                 None => {
                     // Said, because a daemon that waits here for long is a different
                     // thing from one that is not running, and nothing else tells them apart.
-                    eprintln!("qoopd: waiting for the startup lock, another daemon holds it");
+                    qoop_runtime::say!(
+                        "qoopd: waiting for the startup lock, another daemon holds it"
+                    );
                     lock::StartupLock::acquire(&path)?
                 }
             }
@@ -415,7 +422,7 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                     d.leaving_when_idle().restarting_into(exe)
                 }
                 Err(e) => {
-                    eprintln!("qoopd: where this binary is could not be read: {e}");
+                    qoop_runtime::say!("qoopd: where this binary is could not be read: {e}");
                     d.leaving_when_idle()
                 }
             },
@@ -431,10 +438,10 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                         "another daemon is serving this socket; {carried_tabs} tabs carried \
                          here are left to it and restart from their rows"
                     );
-                    eprintln!("qoopd: {why}");
+                    qoop_runtime::say!("qoopd: {why}");
                     return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, why));
                 }
-                eprintln!("qoopd: another daemon is already serving this socket");
+                qoop_runtime::say!("qoopd: another daemon is already serving this socket");
                 return Ok(());
             }
             Err(e) => {
@@ -442,13 +449,34 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                 return Err(e);
             }
         };
-        eprintln!("qoopd: listening on {}", daemon.socket().display());
+        qoop_runtime::say::serving();
+        qoop_runtime::say!("qoopd: listening on {}", daemon.socket().display());
         if !orphans.is_empty() {
             tokio::spawn(qoop_runtime::daemon::reap_children(orphans));
         }
         drop(lock);
         daemon.serve().await
     })
+}
+
+/// Where a daemon started on demand speaks: its starters give it `/dev/null` for stderr, so
+/// what it said (a tab lost on a move, a refused handover, a panic) went nowhere. It writes to
+/// `qoopd.log` in the logs directory instead, or in its session directory `session` when
+/// `QOOP_RUNTIME_DIR` names one, so an isolated stack never writes into the person's log
+/// (`qoop_runtime::say`).
+fn log_to_file(session: &std::path::Path) {
+    let explicit = qoop_runtime::legacy::var_os(paths::RUNTIME_DIR_ENV).is_some();
+    let dir = if explicit {
+        Some(session.to_path_buf())
+    } else {
+        paths::logs_dir()
+    };
+    if dir.is_some_and(|d| qoop_runtime::say::to_file(d.join("qoopd.log"))) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        qoop_runtime::say!("[{at}] qoopd {} starting", env!("CARGO_PKG_VERSION"));
+    }
 }
 
 /// Start the daemon if there is not one, then attach.

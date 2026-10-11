@@ -68,10 +68,24 @@ impl Machine {
         c
     }
 
+    /// Where the logs directory is in this machine's home (`paths::logs_dir`).
+    fn logs(&self) -> PathBuf {
+        let home = self.root.path().join("home");
+        if cfg!(target_os = "macos") {
+            home.join("Library/Logs/qoop")
+        } else {
+            home.join(".local/state/qoop/log")
+        }
+    }
+
     /// Started, and answering a handshake: a connect alone succeeds as soon as the socket
     /// is bound, which is before the move has run.
     fn start(&self, old: bool) -> Daemon {
-        let child = self.qoop(old).arg("daemon").spawn().expect("spawn");
+        self.start_as(self.qoop(old))
+    }
+
+    fn start_as(&self, mut command: Command) -> Daemon {
+        let child = command.arg("daemon").spawn().expect("spawn");
         let daemon = Daemon(child);
         let socket = self.session().join("qoopd.sock");
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -184,5 +198,61 @@ fn an_existing_install_has_its_state_moved_out_of_the_runtime_directory() {
     assert!(
         !m.session().join("qoop.db").exists(),
         "a listing left a database in the runtime directory"
+    );
+}
+
+fn read(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Started on demand, a daemon has `/dev/null` for stderr: what it says goes to its log, which
+/// only the person can read. An isolated stack (its runtime directory named) keeps its log
+/// beside its socket and never writes into the person's.
+#[test]
+fn a_daemon_started_with_nowhere_to_write_keeps_a_log() {
+    let m = Machine::new();
+    let person = m.start(false);
+    let log = m.logs().join("qoopd.log");
+    let text = read(&log);
+    assert!(
+        text.contains("qoopd") && text.contains("starting") && text.contains("listening on"),
+        "{text:?}"
+    );
+    let mode = std::fs::metadata(&log).expect("log").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the log is readable by others");
+    m.stop(false);
+    drop(person);
+
+    let said = read(&log).len();
+    let isolated = m.start(true);
+    assert!(
+        read(&m.session().join("qoopd.log")).contains("listening on"),
+        "no log beside the socket"
+    );
+    m.stop(true);
+    drop(isolated);
+    assert_eq!(
+        read(&log).len(),
+        said,
+        "an isolated stack wrote into the person's log"
+    );
+}
+
+/// A daemon whose stderr goes somewhere (a terminal, a test's pipe) keeps it.
+#[test]
+fn a_daemon_whose_stderr_is_taken_keeps_it() {
+    let m = Machine::new();
+    let mut piped = m.qoop(false);
+    piped.stderr(Stdio::piped());
+    let mut daemon = m.start_as(piped);
+    let mut stderr = daemon.0.stderr.take().expect("stderr");
+    m.stop(false);
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut text).expect("read stderr");
+    drop(daemon);
+    assert!(text.contains("listening on"), "{text:?}");
+    assert!(
+        !m.logs().join("qoopd.log").exists(),
+        "a daemon with a stderr of its own wrote a log"
     );
 }

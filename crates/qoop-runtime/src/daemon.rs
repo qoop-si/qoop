@@ -1164,7 +1164,7 @@ impl Daemon {
         // a few seconds after its socket goes, and the bind is what proves it has gone.
         if state != dir {
             crate::state::migrate(dir, state)?;
-            eprintln!("qoopd: state in {}", state.display());
+            crate::say!("qoopd: state in {}", state.display());
         }
         // In a verified private directory: the runtime one, or `paths::state_dir`, which
         // is checked the same way.
@@ -1209,7 +1209,7 @@ impl Daemon {
                 awake.spaces = spaces;
                 awake.panes = panes.into_iter().map(|t| t as u32).collect();
             }
-            Err(e) => eprintln!("qoopd: what is kept awake could not be read: {e}"),
+            Err(e) => crate::say!("qoopd: what is kept awake could not be read: {e}"),
         }
         // Which tabs are asleep, read before anything is restored: they stay down, and
         // their rows must keep their place from the first teardown on.
@@ -1222,7 +1222,7 @@ impl Daemon {
             // lost, and a wake brings each back. Restoring them all instead would bring back
             // a sleeping tab under its mark, where no agent write lands.
             Err(e) => {
-                eprintln!("qoopd: which tabs are asleep could not be read: {e}");
+                crate::say!("qoopd: which tabs are asleep could not be read: {e}");
                 for space in store.workspaces().await.unwrap_or_default() {
                     let rows = store.open_terminals(space.id).await.unwrap_or_default();
                     books.mark(
@@ -1262,7 +1262,7 @@ impl Daemon {
         if let Some(handoff) = handoff {
             let carried = handoff.terminals.len();
             let adopted = adopt_terminals(&into, handoff).await;
-            eprintln!("qoopd: took over {adopted} of {carried} running tabs");
+            crate::say!("qoopd: took over {adopted} of {carried} running tabs");
         }
         let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
@@ -1414,7 +1414,7 @@ impl Daemon {
                 // already attached and has stopped reading.
                 while outbound.load(Ordering::Relaxed) > MAX_OUTBOUND_BYTES {
                     match watched.evict_worst(now) {
-                        Some(evicted) => eprintln!(
+                        Some(evicted) => crate::say!(
                             "qoopd: disconnecting {} to stay within the outbound budget",
                             evicted.as_str()
                         ),
@@ -1423,7 +1423,7 @@ impl Daemon {
                 }
 
                 for client in watched.wedged(now, NO_ACK_DEADLINE) {
-                    eprintln!(
+                    crate::say!(
                         "qoopd: disconnecting {} after {NO_ACK_DEADLINE:?} with no acknowledgement",
                         client.as_str()
                     );
@@ -1458,7 +1458,7 @@ impl Daemon {
         // macOS literal-zero-idle claim intact. On, it parks while nothing is awake and
         // otherwise wakes on an adaptive tick to put to sleep a space idle past the time.
         if crate::legacy::var_os(crate::idle::IDLE_TIMEOUT_ENV).is_some() {
-            eprintln!(
+            crate::say!(
                 "qoopd: {} is no longer read: idle spaces sleep after `[sleep] idle_minutes` in \
                  config.toml",
                 crate::idle::IDLE_TIMEOUT_ENV
@@ -1469,9 +1469,9 @@ impl Daemon {
         // timeouts change without a restart.
         let timeouts = IdleTimeouts::read();
         if timeouts.shortest() == 0 {
-            eprintln!("qoopd: idle sleep: off");
+            crate::say!("qoopd: idle sleep: off");
         } else {
-            eprintln!(
+            crate::say!(
                 "qoopd: idle sleep: after {}m, qass after {}m",
                 timeouts.general / 60,
                 timeouts.qass / 60
@@ -1501,7 +1501,7 @@ impl Daemon {
             if qoop_pty::procwatch::is_subscription() {
                 let fd = watched_agents.raw_fd();
                 let Ok(afd) = AsyncFd::with_interest(WatchFd(fd), Interest::READABLE) else {
-                    eprintln!("qoopd: cannot watch for process changes");
+                    crate::say!("qoopd: cannot watch for process changes");
                     return;
                 };
                 loop {
@@ -1552,13 +1552,17 @@ impl Daemon {
         }
 
         let mut next_client = 0u64;
+        let mut failing = None;
         loop {
             // One failed accept is one connection, not the daemon: `?` here ended `serve`
             // and took every terminal with it on the first EMFILE. A peer that gave up
             // mid-accept is skipped; anything else waits a beat so a persistent error
             // cannot spin.
             let stream = match self.listener.accept().await {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => {
+                    failing = None;
+                    stream
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -1568,7 +1572,9 @@ impl Daemon {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("qoopd: accept failed: {e}");
+                    if news(&mut failing, &e) {
+                        crate::say!("qoopd: accept failed: {e}");
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -1588,7 +1594,7 @@ impl Daemon {
             if self.connections.len() >= MAX_CONNECTIONS
                 && let Some(evicted) = self.connections.evict_worst(std::time::Instant::now())
             {
-                eprintln!(
+                crate::say!(
                     "qoopd: evicted {} to admit {}",
                     evicted.as_str(),
                     client.as_str()
@@ -1656,7 +1662,7 @@ impl Daemon {
                 )
                 .await;
                 if let Err(e) = result {
-                    eprintln!("qoopd: client ended: {e}");
+                    crate::say!("qoopd: client ended: {e}");
                 }
                 // What it held as news is news no more: every index looks again.
                 for terminal in registry.remove(&registered) {
@@ -1701,7 +1707,7 @@ pub fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
 /// daemon is to serve. Anything else is closed and the socket is bound as usual.
 fn inherited_listener(fd: std::os::fd::RawFd, socket: &Path) -> Option<UnixListener> {
     if !fd_is_open(fd) {
-        eprintln!("qoopd: the socket passed on is not open; binding a new one");
+        crate::say!("qoopd: the socket passed on is not open; binding a new one");
         return None;
     }
     // SAFETY: the daemon before this one passed this descriptor on as its listener, and
@@ -1713,7 +1719,7 @@ fn inherited_listener(fd: std::os::fd::RawFd, socket: &Path) -> Option<UnixListe
         .and_then(|addr| addr.as_pathname().map(|path| path == socket))
         .unwrap_or(false);
     if !ours {
-        eprintln!("qoopd: the socket passed on is not this daemon's; binding a new one");
+        crate::say!("qoopd: the socket passed on is not this daemon's; binding a new one");
         return None;
     }
     // Close-on-exec again: the shells this daemon starts must not hold the socket open.
@@ -1943,7 +1949,7 @@ impl RenderQueue {
         if trace_latency()
             && let Some(at) = self.put_at.lock().unwrap().take()
         {
-            eprintln!("trace: queue to writer {:?}", at.elapsed());
+            crate::say!("trace: queue to writer {:?}", at.elapsed());
         }
         taken
     }
@@ -2173,7 +2179,7 @@ async fn serve_client(
             .and_then(serde_json::Value::as_str)
             .filter(|key| !key.is_empty() && key.len() <= 64);
         for ended in connections.mark_welcomed(&client, observer, replaces) {
-            eprintln!(
+            crate::say!(
                 "qoopd: {} replaces {}, the same link reconnected",
                 client.as_str(),
                 ended.as_str()
@@ -3104,6 +3110,34 @@ async fn park<T: Clone>(
     }
 }
 
+/// Whether `e` is worth a line: not when it repeats the error said last. A failing `accept`
+/// is retried ten times a second, and on EMFILE that was every retry, into the daemon's log.
+fn news(last: &mut Option<String>, e: &io::Error) -> bool {
+    let text = e.to_string();
+    if last.as_deref() == Some(text.as_str()) {
+        return false;
+    }
+    *last = Some(text);
+    true
+}
+
+#[cfg(test)]
+mod news_tests {
+    use super::news;
+    use std::io;
+
+    #[test]
+    fn an_error_is_said_once_until_it_changes_or_ends() {
+        let mut last = None;
+        let emfile = || io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(news(&mut last, &emfile()));
+        assert!(!news(&mut last, &emfile()), "the same error again");
+        assert!(news(&mut last, &io::Error::from_raw_os_error(libc::ENOMEM)));
+        last = None; // an accept went through
+        assert!(news(&mut last, &emfile()), "back after a success");
+    }
+}
+
 #[cfg(test)]
 mod park_tests {
     use super::{Park, park};
@@ -3231,13 +3265,13 @@ async fn idle_sleep_pass(
             continue;
         }
         match sleep_space(into, space, Some(tab)).await {
-            Ok((ended, _)) => eprintln!(
+            Ok((ended, _)) => crate::say!(
                 "qoopd: idle sleep: tab {tab} of space {space} asleep, {} panes ended",
                 ended.len()
             ),
             // Said once per pass and tried again on the next: a refusal here is a tab that
             // is not what it looked like from its screen alone.
-            Err(why) => eprintln!("qoopd: idle sleep: {why}"),
+            Err(why) => crate::say!("qoopd: idle sleep: {why}"),
         }
     }
 }
@@ -5024,7 +5058,7 @@ async fn handle_control(
                 // what this one is waiting on.
                 restart.waiting.send_replace(None);
                 waiting.mark_unchanged();
-                eprintln!("qoopd: {wanted} is on disk; moving onto it once nothing is working");
+                crate::say!("qoopd: {wanted} is on disk; moving onto it once nothing is working");
                 tokio::spawn(restart_when_safe(restore(), exe));
                 // The first look's answer, so the asker hears what is in the way. A look
                 // that found nothing ends this daemon, and with it this connection.
@@ -6461,7 +6495,7 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
             Err(refused) if refused.ended => {
                 // The shell ended while the daemon moved: the tab is closed, as it would
                 // have been had nobody been moving.
-                eprintln!("qoopd: tab {id} ended while the daemon moved; closing it");
+                crate::say!("qoopd: tab {id} ended while the daemon moved; closing it");
                 let closed = into.books.store.close_terminal(id as i64).await;
                 if let Ok(true) = closed {
                     into.agents.tasks_changed();
@@ -6473,10 +6507,10 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
                 }
             }
             Err(refused) => {
-                eprintln!("qoopd: tab {id} could not be taken over: {}", refused.why);
+                crate::say!("qoopd: tab {id} could not be taken over: {}", refused.why);
                 if refused.ours {
                     let seen = fallback_teardown(&into.scanner, tty_dev, child as u32, start).await;
-                    eprintln!("qoopd: tab {id}: stopped {seen} tracked processes");
+                    crate::say!("qoopd: tab {id}: stopped {seen} tracked processes");
                 } else {
                     // Closed without a terminal, its shell is hung up: waited for, so it
                     // does not stay as a zombie of this process.
@@ -7187,7 +7221,7 @@ async fn sleep_tab(
         .collect();
     if fresh.is_empty() {
         if let Err(why) = end_tabs(into, &live).await {
-            eprintln!("qoopd: sleep of tab {tab}: {why}");
+            crate::say!("qoopd: sleep of tab {tab}: {why}");
         }
         return Ok(live);
     }
@@ -7238,7 +7272,7 @@ async fn sleep_tab(
     // Asleep from here, marks and all, whether or not every pane has ended yet: one still
     // running is ended by the next sleep of this tab, or waited out by its wake.
     if let Err(why) = end_tabs(into, &live).await {
-        eprintln!("qoopd: sleep of tab {tab}: {why}");
+        crate::say!("qoopd: sleep of tab {tab}: {why}");
     }
     Ok(live)
 }
@@ -7267,7 +7301,7 @@ async fn end_tabs(into: &Restore, streams: &[u32]) -> Result<(), String> {
     }
     for stream in streams {
         if !into.books.writer_done(*stream, SHUTDOWN_PATIENCE).await {
-            eprintln!("qoopd: the history of tab {stream} was still being written at its sleep");
+            crate::say!("qoopd: the history of tab {stream} was still being written at its sleep");
         }
     }
     Ok(())
@@ -7579,7 +7613,7 @@ async fn leave(watch: &Leaving) -> bool {
         .stopping
         .store(true, std::sync::atomic::Ordering::SeqCst);
     crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
-    eprintln!("qoopd: nothing is awake and nobody is attached; leaving");
+    crate::say!("qoopd: nothing is awake and nobody is attached; leaving");
     // The lock goes with the process, and with it the next daemon may bind.
     std::process::exit(0);
 }
@@ -7679,7 +7713,7 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
             let why = "automatic updates are turned off here (no-auto-update)";
             into.books.restart.waiting.send_replace(Some(why.into()));
             if call_off(&into.books.restart, asked) {
-                eprintln!("qoopd: the move onto the new version is called off: {why}");
+                crate::say!("qoopd: the move onto the new version is called off: {why}");
                 return;
             }
         }
@@ -7707,7 +7741,7 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                         .restart
                         .waiting
                         .send_replace(Some(WINDOW_OPEN.into()));
-                    eprintln!("qoopd: the move onto the new version waits: {WINDOW_OPEN}");
+                    crate::say!("qoopd: the move onto the new version waits: {WINDOW_OPEN}");
                     drop(handed);
                 }
                 Ok(Moving {
@@ -7717,7 +7751,7 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                     // Only returns when the exec did not happen: the file is gone, the
                     // descriptors closed, and every paused tab carries on as it was.
                     let e = handed.exec(&exe);
-                    eprintln!(
+                    crate::say!(
                         "qoopd: {} could not be started: {e}; staying on this version",
                         exe.display()
                     );
@@ -7740,11 +7774,11 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                     if let Some(asked) = replaced
                         && call_off(&into.books.restart, asked)
                     {
-                        eprintln!("qoopd: the move onto the new version is called off: {why}");
+                        crate::say!("qoopd: the move onto the new version is called off: {why}");
                         return;
                     }
                     if before.as_ref() != Some(&why) {
-                        eprintln!("qoopd: the move onto the new version waits: {why}");
+                        crate::say!("qoopd: the move onto the new version waits: {why}");
                     }
                 }
             }
@@ -7944,7 +7978,9 @@ async fn restart_look(
                         .restart
                         .no_handoff
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    eprintln!("qoopd: {failed} hand overs failed in a row, the last because {why}");
+                    crate::say!(
+                        "qoopd: {failed} hand overs failed in a row, the last because {why}"
+                    );
                 }
                 books
                     .restart
@@ -7957,7 +7993,7 @@ async fn restart_look(
                     .no_handoff
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    eprintln!("qoopd: {why}");
+                    crate::say!("qoopd: {why}");
                     drop(held);
                     return Box::pin(restart_look(into, exe, replaced)).await;
                 }
@@ -7969,7 +8005,7 @@ async fn restart_look(
     // open, as at a stop.
     if let Err(e) = end_tabs(into, &into.terminals.streams()).await {
         // Its pty is closed by the exec, which hangs its shell up.
-        eprintln!("qoopd: {e}; moving anyway");
+        crate::say!("qoopd: {e}; moving anyway");
     }
     crate::store::settle_owed(tokio::time::Instant::now() + SHUTDOWN_PATIENCE).await;
     Ok(Moving {
@@ -8018,7 +8054,7 @@ impl HandedOver {
                 self.nonce.clone(),
             ],
         );
-        eprintln!("qoopd: moving onto {}", exe.display());
+        crate::say!("qoopd: moving onto {}", exe.display());
         // Inheritable only now: a child started in between would carry every tab's master.
         let fds = self
             .kept
@@ -8099,13 +8135,13 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
     if let Some(stream) = left.first().filter(|_| restart.keeps_tabs()) {
         return Err(format!("tab {stream} cannot be handed over live"));
     }
-    eprintln!("qoopd: taking the startup lock to hand the tabs over");
+    crate::say!("qoopd: taking the startup lock to hand the tabs over");
     let startup =
         take_startup_lock(&dir, tokio::time::Instant::now() + STARTUP_LOCK_PATIENCE).await?;
     // From here tabs are parked, so one deadline for everything that follows.
     let deadline = tokio::time::Instant::now() + HANDOVER_PATIENCE;
     if !left.is_empty() {
-        eprintln!("qoopd: tabs {left:?} cannot be handed over and are ended by the move");
+        crate::say!("qoopd: tabs {left:?} cannot be handed over and are ended by the move");
         let table = fresh_process_table().await?;
         let checkpoints = vet_tabs(into, &left, &table)?;
         into.books
@@ -8195,7 +8231,7 @@ async fn hand_over(into: &Restore, exe: &Path, streams: &[u32]) -> Result<Handed
     if !checkpoints.is_empty()
         && let Err(e) = into.books.store.checkpoint(checkpoints).await
     {
-        eprintln!("qoopd: the agents could not be written down before the move: {e}");
+        crate::say!("qoopd: the agents could not be written down before the move: {e}");
     }
     // The socket and the state lock, as further descriptors of the same open files.
     let mut pass_on =
@@ -8311,7 +8347,7 @@ async fn lock_spaces(
 /// takes the startup lock and binds over the socket left behind.
 fn exec_daemon(exe: &Path) -> ! {
     let e = exec_into(exe, &[]);
-    eprintln!(
+    crate::say!(
         "qoopd: {} could not be started: {e}; leaving, and the next start brings the tabs back",
         exe.display()
     );
@@ -8321,7 +8357,7 @@ fn exec_daemon(exe: &Path) -> ! {
 /// `exe daemon <args>` in place of this process. Returns the error when it did not happen.
 fn exec_into(exe: &Path, args: &[String]) -> io::Error {
     let mut command = daemon_command(exe, args);
-    eprintln!("qoopd: moving onto {}", exe.display());
+    crate::say!("qoopd: moving onto {}", exe.display());
     run_exec(&mut command)
 }
 
@@ -8857,7 +8893,7 @@ fn spawn_history_writer(
         {
             Ok(Ok(h)) => h,
             _ => {
-                eprintln!("qoopd: history for {} is unavailable", dir.display());
+                crate::say!("qoopd: history for {} is unavailable", dir.display());
                 return;
             }
         };
@@ -8907,7 +8943,7 @@ fn spawn_history_writer(
             if gap.rows > 0 {
                 // Recorded, never silent. The rows are gone; saying how many and when is
                 // the difference between lossy and wrong.
-                eprintln!(
+                crate::say!(
                     "qoopd: history for {} lost {} rows between {} and {}",
                     dir.display(),
                     gap.rows,
@@ -8956,7 +8992,7 @@ fn spawn_history_writer(
             rows.extend(more);
             if later.rows > 0 {
                 // The same record as above: a loss inside the window is still a loss.
-                eprintln!(
+                crate::say!(
                     "qoopd: history for {} lost {} rows between {} and {}",
                     dir.display(),
                     later.rows,
@@ -8979,7 +9015,7 @@ fn spawn_history_writer(
                     // rather than being dragged along by it.
                     rows_behind.store(history.len(), std::sync::atomic::Ordering::Relaxed);
                     if truncated > 0 {
-                        eprintln!(
+                        crate::say!(
                             "qoopd: history for {} truncated {truncated} bytes of an \
                              oversized row",
                             dir.display()
@@ -8992,7 +9028,7 @@ fn spawn_history_writer(
                     // directory, and losing them there is the point, not a failure.
                     let gone = finished && !dir.exists();
                     if !gone {
-                        eprintln!("qoopd: history write failed: {e}");
+                        crate::say!("qoopd: history write failed: {e}");
                     }
                 }
                 Err(_) => return,
@@ -9222,7 +9258,7 @@ fn spawn_terminal(
         match classify_task_end(outcome) {
             TaskEnd::Clean => {}
             TaskEnd::Ended { error } => {
-                eprintln!("qoopd: terminal ended: {error}");
+                crate::say!("qoopd: terminal ended: {error}");
             }
             TaskEnd::Panicked => {
                 agents.announce(stream);
@@ -9232,7 +9268,7 @@ fn spawn_terminal(
                 let seen =
                     fallback_teardown(&fallback_scanner, tty_dev, fallback_pid, fallback_start)
                         .await;
-                eprintln!(
+                crate::say!(
                     "qoopd: terminal {stream} task panicked; contained ({seen} tracked processes)"
                 );
             }
@@ -9339,7 +9375,7 @@ async fn fallback_teardown(
     // rather than silent. Capture fails only when the kernel will not describe
     // our own just-spawned child, which is how rarely this fires.
     if child.is_some() && child_start.is_none() {
-        eprintln!(
+        crate::say!(
             "qoopd: fallback teardown for pid {child_pid} has no start time; direct signal skipped"
         );
     }
@@ -9381,7 +9417,7 @@ async fn fallback_teardown(
         .groups_to_signal(round, &qoop_pty::sys::still_alive, &qoop_pty::sys::in_group)
         .is_empty()
     {
-        eprintln!("qoopd: fallback teardown for pid {child_pid} left processes behind");
+        crate::say!("qoopd: fallback teardown for pid {child_pid} left processes behind");
     }
     seen
 }
@@ -9740,7 +9776,7 @@ async fn terminal_task(
     // What the daemon this one moved from had not typed into the child yet.
     for chunk in qoop_pty::chunk_paste(&seed.pending) {
         if writes.push(chunk, WritePriority::UserInput).is_err() {
-            eprintln!(
+            crate::say!(
                 "qoopd: tab {stream}: input carried over the move did not fit and was dropped"
             );
             break;
@@ -10286,7 +10322,7 @@ async fn terminal_task(
                             let began = *detect_since.get_or_insert(now);
                             detect_at = Some((now + DETECT_SETTLE).min(began + DETECT_CEILING));
                             if trace && let Some(at) = pending_input.take() {
-                                eprintln!("trace: input to snapshot {:?}", at.elapsed());
+                                crate::say!("trace: input to snapshot {:?}", at.elapsed());
                             }
                         }
                     }
@@ -10446,7 +10482,7 @@ async fn terminal_task(
                         // offset, which is what stops the tail from being silently lost.
                         Ok(Ok(n)) => {
                         if trace && let Some(at) = pending_input {
-                            eprintln!("trace: input to pty write {:?}", at.elapsed());
+                            crate::say!("trace: input to pty write {:?}", at.elapsed());
                         }
                         writes.advance(n)
                     }
@@ -10462,7 +10498,7 @@ async fn terminal_task(
     }
     .await;
     if let Err(e) = &outcome {
-        eprintln!("qoopd: terminal for pid {child_pid} failed: {e}");
+        crate::say!("qoopd: terminal for pid {child_pid} failed: {e}");
     }
     // Output held back for the next frame is the child's last screen when the loop ends
     // here, and the ended update repeats whatever was published last.
@@ -10683,7 +10719,7 @@ async fn tear_down(
     .unwrap_or_default();
     containment.absorb(session);
     if opaque > 0 {
-        eprintln!(
+        crate::say!(
             "qoopd: teardown for pid {child_pid}: {opaque} processes in its session could not \
              be inspected and may still hold this terminal"
         );
@@ -10711,7 +10747,7 @@ async fn tear_down(
             Step::Failed { reason } => {
                 // Reported, never silently ignored. An orphaned tree is a real outcome and
                 // the operator has to be able to see it.
-                eprintln!("qoopd: teardown for pid {child_pid} failed: {reason}");
+                crate::say!("qoopd: teardown for pid {child_pid} failed: {reason}");
                 break;
             }
             Step::SignalGroups { signal, groups } => {
@@ -10745,7 +10781,7 @@ async fn tear_down(
         let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
     }
     if dropped > 0 {
-        eprintln!(
+        crate::say!(
             "qoopd: teardown for pid {child_pid} kept the last {} bytes and dropped {dropped}",
             tail.len()
         );

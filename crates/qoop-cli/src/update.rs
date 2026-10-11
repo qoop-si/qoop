@@ -1028,17 +1028,9 @@ async fn auto_once(exe: &Path, opt_out: &Path, log: Option<&Path>, limit: Durati
 }
 
 /// The log opened for appending, after it was moved aside if it has grown past
-/// [`LOG_LIMIT`]: it holds the last hundred KB or two and no more.
+/// [`LOG_LIMIT`]: it holds the last hundred KB or two and no more. Readable by the person only.
 fn open_log(log: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(log.parent()?).ok()?;
-    if std::fs::metadata(log).is_ok_and(|m| m.len() > LOG_LIMIT) {
-        let _ = std::fs::rename(log, log.with_extension("log.old"));
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .ok()
+    qoop_runtime::say::open_log(log, LOG_LIMIT)
 }
 
 /// Where a run's output goes: the log, or nowhere.
