@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ask;
 pub mod history;
 pub mod item;
 pub mod task;
@@ -19,6 +20,7 @@ pub mod task;
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub use ask::{Added, AskError, AskRow};
 pub use history::History;
 pub use item::{ItemAgent, ItemCard, ItemRow, ItemState, StepRow};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -34,6 +36,9 @@ pub enum StoreError {
     /// answer to give.
     #[error("{0}")]
     Task(#[from] task::TaskError),
+    /// An ask write refused for what it asked: the message is the answer to give.
+    #[error("{0}")]
+    Ask(#[from] ask::AskError),
     #[error(
         "this database was written by a newer qoop (schema {found}, this build understands \
          {understood}); use that build or move the file aside"
@@ -388,6 +393,25 @@ impl Store {
                  stage TEXT NOT NULL,
                  updated_at INTEGER NOT NULL,
                  PRIMARY KEY (remote, task)
+             );
+             -- The questions qass put to the owner (`ask.rs`). `terminal` is not a foreign key,
+             -- for the reason `task.terminal` is not: ids are reused, so every path that ends a
+             -- terminal closes its live cards. New table, no version bump: an older binary
+             -- ignores it.
+             CREATE TABLE IF NOT EXISTS ask (
+                 id INTEGER PRIMARY KEY,
+                 card TEXT NOT NULL UNIQUE,
+                 agent TEXT,
+                 terminal INTEGER,
+                 session TEXT,
+                 task INTEGER REFERENCES task(id) ON DELETE SET NULL,
+                 status TEXT NOT NULL,
+                 note TEXT,
+                 body TEXT NOT NULL,
+                 answer TEXT,
+                 option TEXT,
+                 opened_at INTEGER NOT NULL,
+                 closed_at INTEGER
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

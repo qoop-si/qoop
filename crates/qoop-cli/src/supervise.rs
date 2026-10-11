@@ -303,8 +303,9 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
     events.iter().any(|event| match event {
         EventMessage::AgentChanged { terminal } => watched.contains(terminal),
         EventMessage::Resync => true,
-        // Which terminal an interface shows says nothing about any agent, nor does the board.
-        EventMessage::Focus { .. } | EventMessage::TasksChanged => false,
+        // Which terminal an interface shows says nothing about any agent, nor does the board
+        // or the question inbox.
+        EventMessage::Focus { .. } | EventMessage::TasksChanged | EventMessage::AsksChanged => false,
     })
 }
 
@@ -453,7 +454,14 @@ async fn follow(
             let events = link.next_events(None).await?.unwrap_or_default();
             if events
                 .iter()
-                .any(|e| !matches!(e, EventMessage::Focus { .. } | EventMessage::TasksChanged))
+                .any(|e| {
+                    !matches!(
+                        e,
+                        EventMessage::Focus { .. }
+                            | EventMessage::TasksChanged
+                            | EventMessage::AsksChanged
+                    )
+                })
             {
                 break;
             }

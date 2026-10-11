@@ -232,6 +232,10 @@ pub struct AgentRegistry {
     /// fresher than the idle timeout. Bounded by live-terminal count,
     /// cleared on forget.
     shield_at_unix: Mutex<BTreeMap<u32, i64>>,
+    /// When a person last typed into each terminal, as unix seconds. What the inbox reads
+    /// to leave a composer alone: a half written message still reads `idle`, so only this
+    /// stamp says someone is in it. Not the restore replay, not the inbox's own sends.
+    typed_at_unix: Mutex<BTreeMap<u32, i64>>,
 }
 
 impl AgentRegistry {
@@ -389,6 +393,7 @@ impl AgentRegistry {
             closed: Mutex::new(BTreeSet::new()),
             expectations: Mutex::new(BTreeMap::new()),
             shield_at_unix: Mutex::new(BTreeMap::new()),
+            typed_at_unix: Mutex::new(BTreeMap::new()),
             changes: tokio::sync::broadcast::channel(64).0,
             tasks: tokio::sync::broadcast::channel(16).0,
         })
@@ -548,6 +553,21 @@ impl AgentRegistry {
         if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
             agent.last_io_unix = Some(now_unix);
         }
+    }
+
+    /// Record that a person typed into this terminal. The focus reports an interface sends
+    /// when its window changes are not typing.
+    pub fn note_typed(&self, stream: u32, bytes: &[u8], now_unix: i64) {
+        if bytes == b"\x1b[I" || bytes == b"\x1b[O" {
+            return;
+        }
+        self.typed_at_unix.lock().unwrap().insert(stream, now_unix);
+    }
+
+    /// Seconds since a person last typed into this terminal, `None` when nobody has.
+    pub fn typed_ago(&self, stream: u32, now_unix: i64) -> Option<i64> {
+        let at = *self.typed_at_unix.lock().unwrap().get(&stream)?;
+        Some((now_unix - at).max(0))
     }
 
     /// When this terminal was last live, the later of the two clocks, or
@@ -728,6 +748,7 @@ impl AgentRegistry {
         self.remove_live(stream);
         self.closed.lock().unwrap().remove(&stream);
         self.shield_at_unix.lock().unwrap().remove(&stream);
+        self.typed_at_unix.lock().unwrap().remove(&stream);
         self.drop_expectations_touching(stream);
         // A terminal that is gone is a change like any other. Closing one answers as soon
         // as the request is accepted, but the terminal itself lives until its teardown

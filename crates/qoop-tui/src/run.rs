@@ -8340,6 +8340,7 @@ where
                                 // client did, and re-reading the index converges it.
                                 refresh = true;
                             }
+                            Incoming::Event(EventMessage::AsksChanged) => {}
                             // `qoop focus`, from a notch or a launcher: the same switch a
                             // click on the row makes. A terminal this interface does not
                             // list yet waits for the index that names it.

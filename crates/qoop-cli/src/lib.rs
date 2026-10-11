@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod ask;
 mod avatar;
 mod board;
 mod board_page;
@@ -70,7 +71,18 @@ pub fn main_with(phone: Option<Phone>) {
     // Exit 2 when the command was called wrong, 1 when it failed.
     if let Err(e) = run(phone) {
         eprintln!("qoop: {}", worded(&e));
-        std::process::exit(if is_usage(&e) { 2 } else { 1 });
+        std::process::exit(if is_usage(&e) {
+            2
+        } else if e
+            .get_ref()
+            .is_some_and(|inner| inner.is::<ask::Unavailable>())
+        {
+            // The inbox cannot take a card (an older daemon, or none): `escalate.sh` says so
+            // and still rings.
+            3
+        } else {
+            1
+        });
     }
 }
 
@@ -165,6 +177,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
         Some("task") => task::run(&args),
+        Some("ask") => ask::run(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
@@ -207,6 +220,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop task new|goal|stage|plan|evidence|done|close|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
+                  \x20 qoop ask add|close|ls  the owner's question inbox, as qass fills it;\n\
+                  \x20                 `qoop ask` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
@@ -1175,8 +1190,10 @@ where
                 if let client::Incoming::Control(response) = incoming
                     && (response.request_id() == id
                         || matches!(&response, ControlResponse::Failed { id, reason }
-                            if id.is_empty()
-                                && qoop_runtime::control::too_old_for(reason, Some("RestartWhenSafe"))))
+                        if id.is_empty()
+                            && ["RestartWhenSafe", "AskWrite", "AskRead"].iter().any(|variant| {
+                                qoop_runtime::control::too_old_for(reason, Some(variant))
+                            })))
                 {
                     return Ok(response);
                 }
@@ -3186,6 +3203,44 @@ mod tests {
         );
         let shell = row(3, None, Some("sh"));
         assert_eq!(prompt_refusal(&shell), None);
+    }
+
+    /// The inbox sends text under the rules `qoop prompt` has, ported into the daemon: the
+    /// same states are refused, and only a working agent is refused by the inbox alone.
+    #[test]
+    fn the_inbox_refuses_what_qoop_prompt_refuses() {
+        let cases = [
+            ("idle", "ready"),
+            ("done", "ready"),
+            ("starting", "booting"),
+            ("failed", "ready"),
+            ("uncertain", "ready"),
+            ("blocked", "ready"),
+            ("blocked", "trust_required"),
+            ("idle", "trust_required"),
+            ("sleeping", "ready"),
+        ];
+        for (state, readiness) in cases {
+            let mut r = row(1, None, Some("claude"));
+            r.state = state.into();
+            r.readiness = readiness.into();
+            assert_eq!(
+                qoop_runtime::asks::refusal(state, readiness).is_some(),
+                prompt_refusal(&r).is_some(),
+                "{state} {readiness}"
+            );
+        }
+        let mut working = row(1, None, Some("claude"));
+        working.state = "working".into();
+        assert_eq!(
+            prompt_refusal(&working),
+            None,
+            "qoop prompt sends to a working agent"
+        );
+        assert_eq!(
+            qoop_runtime::asks::refusal("working", "ready"),
+            Some("working")
+        );
     }
 
     #[test]

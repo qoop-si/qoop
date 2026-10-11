@@ -482,6 +482,198 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before: Option<i64>,
     },
+    /// Write to the owner's question inbox. `Add` and `Close` come from qass, with the token
+    /// of a terminal in qass's own space; `Answer` and `Dismiss` are the owner's, from a
+    /// client that speaks for no terminal, and are refused to any terminal's token.
+    AskWrite {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        action: AskOp,
+    },
+    /// The cards waiting for the owner and the last few that ended, answered as `Asks`.
+    AskRead {
+        id: String,
+    },
+}
+
+/// What an `AskWrite` does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AskOp {
+    /// Put a card in the inbox. `agent` is `T52`, `ubox/T2` or none, as `qoop ask add`
+    /// normalized it.
+    Add {
+        card: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        body: Box<AskCard>,
+    },
+    /// The owner's answer: an option's key, his own words, or both.
+    Answer {
+        card: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// The words of `option` as the owner saw them. Refused when the card was rewritten
+        /// since: he must never send words he did not read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen: Option<String>,
+    },
+    /// End a card: it was answered in the chat, qass answered it, or its agent is done.
+    Close { card: String, note: String },
+    /// The owner puts a card away unanswered.
+    Dismiss { card: String },
+}
+
+/// What an `AskWrite` came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskResult {
+    Added,
+    /// The same card again: nothing changed.
+    Unchanged,
+    /// An open card was rewritten.
+    Replaced,
+    /// His words were sent to the worker.
+    Answered,
+    /// His words were typed to qass, which relays them.
+    Passed,
+    /// qass could not be typed to just now: the card is still open.
+    Busy,
+    Closed,
+    /// The card had already ended.
+    Ended,
+}
+
+/// The longest one value of a card may be, in characters.
+pub const ASK_FIELD_MAX: usize = 200;
+
+/// One option of a card: what a tap sends and why it is offered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOption {
+    /// `a` to `d`, in order.
+    pub key: String,
+    pub label: String,
+    pub reason: String,
+    /// What the worker is told when this option is picked.
+    pub words: String,
+}
+
+/// The option qass would take, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskPick {
+    pub key: String,
+    pub reason: String,
+}
+
+/// A question card as qass writes it (`skills/qass/SKILL.md`). Identity (its number, the
+/// agent, the urgency) is not in here: it is the arguments of `escalate.sh`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskCard {
+    /// The word of the agent's sidebar name the owner types to answer: lowercase.
+    pub handle: String,
+    /// `now` rings his phone, `later` waits.
+    pub urgency: String,
+    /// What he asked the agent for. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<String>,
+    pub doing: String,
+    pub why: String,
+    pub asks: String,
+    /// Two to four, keyed `a` to `d` in order.
+    pub options: Vec<AskOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<AskPick>,
+}
+
+impl AskCard {
+    /// Every rule of the format that is not grammar: what is required, how long a value may
+    /// be, which keys. All the problems at once, so the writer fixes them in one go.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        check_value(&mut out, "doing", &self.doing);
+        check_value(&mut out, "why", &self.why);
+        check_value(&mut out, "asks", &self.asks);
+        if let Some(asked) = &self.asked {
+            check_value(&mut out, "asked", asked);
+        }
+        for o in &self.options {
+            let key = &o.key;
+            check_value(&mut out, &format!("option {key} label"), &o.label);
+            check_value(&mut out, &format!("option {key} reason"), &o.reason);
+            check_value(&mut out, &format!("option {key} words"), &o.words);
+        }
+        if let Some(p) = &self.pick {
+            check_value(&mut out, "pick reason", &p.reason);
+        }
+        let handle_ok = !self.handle.is_empty()
+            && self.handle.chars().count() <= 40
+            && self
+                .handle
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !handle_ok {
+            out.push("the handle is one lowercase word (a to z, 0 to 9, -), at most 40".into());
+        }
+        if !matches!(self.urgency.as_str(), "now" | "later") {
+            out.push("the urgency is now or later".into());
+        }
+        let keys: Vec<&str> = self.options.iter().map(|o| o.key.as_str()).collect();
+        if !(2..=4).contains(&keys.len()) || keys != ["a", "b", "c", "d"][..keys.len()] {
+            out.push("two to four options, keyed A to D in order".into());
+        }
+        if let Some(p) = &self.pick
+            && !keys.contains(&p.key.as_str())
+        {
+            out.push(format!("pick names {}, which is not an option", p.key));
+        }
+        out
+    }
+}
+
+/// One value of a card: not empty, one line, within `ASK_FIELD_MAX`.
+fn check_value(out: &mut Vec<String>, what: &str, text: &str) {
+    if text.chars().any(char::is_control) {
+        out.push(format!("{what} holds a control character or a newline"));
+    }
+    if text.trim().is_empty() {
+        out.push(format!("{what} is empty"));
+    }
+    let len = text.chars().count();
+    if len > ASK_FIELD_MAX {
+        out.push(format!(
+            "{what} is {len} characters, over the {ASK_FIELD_MAX} limit; shorten it"
+        ));
+    }
+}
+
+/// A card as the inbox shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskInfo {
+    pub card: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The local terminal it is about, when it is about one.
+    #[serde(default)]
+    pub terminal: Option<u32>,
+    /// `open`, `passed`, `answered` or `closed`.
+    pub status: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub opened_at: i64,
+    #[serde(default)]
+    pub closed_at: Option<i64>,
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub option: Option<String>,
+    #[serde(default)]
+    pub task: Option<i64>,
+    pub body: AskCard,
 }
 
 /// What a `TaskWrite` does.
@@ -796,6 +988,8 @@ impl ControlRequest {
             | Self::SleepSettings { id, .. }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
+            | Self::AskWrite { id, .. }
+            | Self::AskRead { id }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -1006,6 +1200,18 @@ pub enum ControlResponse {
         /// The card of the item `task` named.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item: Option<Box<ItemCardInfo>>,
+    },
+    /// An `AskWrite` landed on `card`.
+    AskWritten {
+        id: String,
+        card: String,
+        result: AskResult,
+    },
+    /// The inbox: cards waiting (oldest first) and the last few that ended (newest first).
+    Asks {
+        id: String,
+        live: Vec<AskInfo>,
+        ended: Vec<AskInfo>,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -1524,6 +1730,8 @@ impl ControlResponse {
             | Self::SleepSettings { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }
+            | Self::AskWritten { id, .. }
+            | Self::Asks { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }
@@ -2262,6 +2470,9 @@ pub enum EventMessage {
     /// when a write changed something. An older client drops it, the event lane being
     /// lenient.
     TasksChanged,
+    /// The question inbox changed: a card came, was answered or ended. Says where to look,
+    /// like `AgentChanged`; `AskRead` says what is there. An older client ignores it.
+    AsksChanged,
 }
 
 #[cfg(test)]

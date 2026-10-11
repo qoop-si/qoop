@@ -220,6 +220,29 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
                 replace: true,
             },
         },
+        // Typing happens only for a stored card the owner answers, and nothing is stored here:
+        // the answer names no card, and a card from a stranger's token is refused.
+        ControlRequest::AskWrite {
+            id: "x32".into(),
+            terminal: None,
+            token: None,
+            action: qoop_runtime::control::AskOp::Answer {
+                card: "E1".into(),
+                option: Some("a".into()),
+                text: Some("echo PWNED".into()),
+                seen: None,
+            },
+        },
+        ControlRequest::AskWrite {
+            id: "x33".into(),
+            terminal: Some(terminal),
+            token: Some("not-its-token".into()),
+            action: qoop_runtime::control::AskOp::Close {
+                card: "E1".into(),
+                note: "echo PWNED".into(),
+            },
+        },
+        ControlRequest::AskRead { id: "x34".into() },
         ControlRequest::TaskRead {
             id: "x29".into(),
             board: true,
@@ -267,6 +290,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
+            | ControlRequest::AskWrite { .. }
+            | ControlRequest::AskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

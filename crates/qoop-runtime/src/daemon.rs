@@ -237,6 +237,9 @@ pub struct ConnectionRegistry {
     /// `qoop focus`, fanned out to every connection's event task. Bounded and lossy on
     /// purpose: a focus nobody drained in time is a click the person has moved past.
     focus: tokio::sync::broadcast::Sender<u32>,
+    /// The question inbox changed, fanned out like `focus` and as lossy: a client that missed
+    /// one re-reads on the next, and always on a resync.
+    asks: tokio::sync::broadcast::Sender<()>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
     /// on, rather than a timer.
     changed: tokio::sync::Notify,
@@ -250,6 +253,7 @@ impl Default for ConnectionRegistry {
         Self {
             inner: std::sync::Mutex::default(),
             focus: tokio::sync::broadcast::channel(16).0,
+            asks: tokio::sync::broadcast::channel(16).0,
             changed: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -412,6 +416,11 @@ impl ConnectionRegistry {
                 c.interface.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Tell every connection the question inbox changed.
+    pub fn asks_changed(&self) {
+        let _ = self.asks.send(());
     }
 
     /// Ask every attached interface to show `terminal`, and say which processes those are.
@@ -1173,6 +1182,8 @@ impl Daemon {
         // installed. A retry is seconds behind the answer it missed, so the window is about
         // forensics on a reap, not about the retry.
         let _ = store.prune_applied().await;
+        // Cards of a terminal that is gone end, and old ended ones go, once a start.
+        let _ = store.run(|s| s.tidy_asks(crate::store::now())).await;
         let agents = Arc::new(crate::agents::AgentRegistry::new()?);
         let scanner = Arc::new(ContainmentScanner::default());
         // One pass before the first terminal exists, so a terminal created immediately has
@@ -2147,6 +2158,7 @@ async fn serve_client(
     // a focus sent the moment the interface is in must neither miss it nor leave its pid
     // out of the answer.
     let mut focus = connections.focus.subscribe();
+    let mut asks = connections.asks.subscribe();
     if hello.client_id == qoop_proto::INTERFACE_ID
         && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
     {
@@ -2226,6 +2238,13 @@ async fn serve_client(
                 shown = focus.recv() => match shown {
                     Ok(terminal) => Some(crate::control::EventMessage::Focus { terminal }),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                // A lagging receiver missed some changes: one is as good as all of them.
+                changed = asks.recv() => match changed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Some(crate::control::EventMessage::AsksChanged)
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
             };
@@ -4672,6 +4691,12 @@ async fn handle_control(
                     if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
                         let at_unix = crate::agents::now_unix();
                         let before = agents.activity(terminal);
+                        // A worker told "The owner answered E7" in the chat has the answer:
+                        // the card is handled, whoever relayed it.
+                        if kind == "user" {
+                            crate::asks::relayed(label.as_deref(), terminal, connections, store)
+                                .await;
+                        }
                         agents.push_focus_event(
                             terminal,
                             crate::control::FocusEvent {
@@ -4826,6 +4851,34 @@ async fn handle_control(
             ))
             .await
         }
+        ControlRequest::AskWrite {
+            id,
+            terminal,
+            token,
+            action,
+        } => {
+            // qass's own space is the one that may write a card: its name is read in time or
+            // the write is refused.
+            let space = match terminal.and_then(|t| terminals.workspace_of(t)) {
+                Some(space) => space_name(store, space).await,
+                None => None,
+            };
+            Box::pin(crate::asks::write(
+                id,
+                crate::asks::Caller {
+                    terminal,
+                    token,
+                    space,
+                },
+                action,
+                terminals,
+                agents,
+                connections,
+                store,
+            ))
+            .await
+        }
+        ControlRequest::AskRead { id } => Box::pin(crate::asks::read(id, terminals, store)).await,
         ControlRequest::ListFocusEvents {
             terminal, last_n, ..
         } => {
@@ -9617,6 +9670,9 @@ async fn terminal_task(
                             // of a tab that has been quiet for hours.
                             if crate::idle::is_live_input(from.as_str()) {
                                 agents.note_io(stream, crate::agents::now_unix());
+                                if from.as_str() != crate::asks::SENDER {
+                                    agents.note_typed(stream, &bytes, crate::agents::now_unix());
+                                }
                             }
                             // A large paste with no line terminator, to a child in canonical
                             // mode, is discarded by the line discipline past its limit while

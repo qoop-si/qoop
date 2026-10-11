@@ -26,7 +26,7 @@ const ANSWER_BYTES: usize = 60_000;
 const EVENTS_READ: usize = 200;
 
 /// Whether `token` is this terminal's, the same check a hook report passes.
-fn admitted(agents: &AgentRegistry, terminal: u32, token: &str) -> bool {
+pub(crate) fn admitted(agents: &AgentRegistry, terminal: u32, token: &str) -> bool {
     let id = TerminalId::new(terminal.to_string());
     let token = CapabilityToken::new(token.to_string());
     let Some(generation) = agents.agent(terminal).map(|a| a.belief.generation) else {

@@ -480,6 +480,21 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "answer, put away or hand over a card of the question inbox",
+            method: || {
+                Method::Control(ControlRequest::AskWrite {
+                    id: "a".into(),
+                    terminal: None,
+                    token: None,
+                    action: qoop_runtime::control::AskOp::Dismiss { card: "E1".into() },
+                })
+            },
+        },
+        Action {
+            name: "read the question inbox",
+            method: || Method::Control(ControlRequest::AskRead { id: "a".into() }),
+        },
+        Action {
             name: "show a task and what was recorded on it",
             method: || {
                 Method::Control(ControlRequest::TaskRead {
@@ -713,6 +728,15 @@ fn every_control_method_is_reachable_from_some_action() {
             token: None,
             before: None,
         },
+        ControlRequest::AskWrite {
+            id: String::new(),
+            terminal: None,
+            token: None,
+            action: qoop_runtime::control::AskOp::Dismiss {
+                card: String::new(),
+            },
+        },
+        ControlRequest::AskRead { id: String::new() },
     ];
     for request in &all {
         match request {
@@ -751,6 +775,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
+            | ControlRequest::AskWrite { .. }
+            | ControlRequest::AskRead { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

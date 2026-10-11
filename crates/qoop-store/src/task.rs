@@ -220,6 +220,7 @@ pub(crate) fn abandon_open_tasks(
     terminals: &[i64],
     now: i64,
 ) -> rusqlite::Result<()> {
+    crate::ask::close_for_terminals(tx, terminals, now)?;
     for &terminal in terminals {
         let open: Option<i64> = tx
             .query_row(

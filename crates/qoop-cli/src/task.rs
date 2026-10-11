@@ -71,7 +71,7 @@ const USAGE: &str = "usage:
   write to the item this terminal's task is linked to";
 
 /// This terminal and its token, when run inside a qoop terminal.
-fn here() -> (Option<u32>, Option<String>) {
+pub(crate) fn here() -> (Option<u32>, Option<String>) {
     let terminal = qoop_runtime::legacy::var("QOOP_TERMINAL")
         .ok()
         .and_then(|t| t.parse().ok());
@@ -352,7 +352,7 @@ fn start(key: &str) -> std::io::Result<()> {
     }
 }
 
-fn json(value: &impl serde::Serialize) -> std::io::Result<()> {
+pub(crate) fn json(value: &impl serde::Serialize) -> std::io::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(value).map_err(std::io::Error::other)?
