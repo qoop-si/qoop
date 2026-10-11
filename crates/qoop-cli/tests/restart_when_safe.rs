@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse, WorkspaceRow};
+use qoop_runtime::control::{
+    AgentRow, ControlRequest, ControlResponse, Pane, SplitDir, WorkspaceRow,
+};
 
 /// The cap every condition below waits under. It only decides how long a real failure
 /// takes to report, and covers the daemon's own minute between looks with no event.
@@ -167,6 +169,7 @@ impl Daemon {
             version: version.into(),
             keep_tabs: false,
             quiet: false,
+            same_version: false,
         })
     }
 
@@ -1317,12 +1320,289 @@ fn arming_for_the_version_already_running_moves_nothing() {
             other => panic!("{version} was not answered as already there: {other:?}"),
         }
     }
+    // `same_version` lets a build of this very version through, and nothing older.
+    for version in ["0.0.1", "not-a-version"] {
+        match d.ask(ControlRequest::RestartWhenSafe {
+            id: format!("arm-{}", unique()),
+            version: version.into(),
+            keep_tabs: true,
+            quiet: false,
+            same_version: true,
+        }) {
+            Some(ControlResponse::RestartArmed {
+                waiting_on: None, ..
+            }) => {}
+            other => panic!("{version} was not answered as already there: {other:?}"),
+        }
+    }
     std::thread::sleep(Duration::from_secs(3));
     let log = std::fs::read_to_string(&d.log).unwrap_or_default();
     assert!(d.running(), "the daemon went: {log}");
     assert_eq!(d.starts(), 1, "the daemon moved: {log}");
     assert!(!log.contains("is on disk"), "it armed: {log}");
     d.wait_for_row(1, "stayed", |_| true);
+}
+
+/// `qoop restart` after an install between two releases: the binary on disk says the version
+/// that runs, and the daemon still becomes it at once, with a running command, a working agent,
+/// the history, a split and the board all carried, and says so.
+#[test]
+fn qoop_restart_carries_everything_onto_a_build_of_the_same_version() {
+    let mut d = Daemon::start_installed();
+    let go = d.dir.path().join("go");
+    d.install_agent(&go);
+    d.send(1, "seq 1 80 | sed 's/^/SCROLLED-/'");
+    d.wait_for_screen(1, "SCROLLED-80");
+    d.send(
+        1,
+        "echo SHELL=$$; sh -c 'echo PID=$$; sleep 8; echo DONE-$$'",
+    );
+    d.wait_for_screen(1, "PID=");
+    let screen = text(&d.run(&["read", "1"]).stdout);
+    let shell = number_after(&screen, "SHELL=").expect("the shell's pid");
+    let command = number_after(&screen, "PID=").expect("the command's pid");
+    let agent_tab = d.new_tab();
+    d.send(agent_tab, "droid");
+    d.wait_for_row(agent_tab, "was working", |row| {
+        row.program.as_deref() == Some("droid") && row.state == "working"
+    });
+    let generation = d
+        .agents()
+        .into_iter()
+        .find(|row| row.terminal == agent_tab)
+        .and_then(|row| row.generation);
+    let tree = Pane::Split {
+        dir: SplitDir::V,
+        permille: 500,
+        first: Box::new(Pane::Leaf { terminal: 1 }),
+        second: Box::new(Pane::Leaf {
+            terminal: agent_tab,
+        }),
+    };
+    assert!(matches!(
+        d.ask(ControlRequest::SetSplit {
+            id: format!("split-{}", unique()),
+            tree: tree.clone(),
+        }),
+        Some(ControlResponse::SplitSaved { .. })
+    ));
+    let added = d.run(&["task", "add", "--space", "1", "survives the restart"]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+    let daemon = d.child.id();
+
+    let restarted = d.run(&["restart"]);
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert!(
+        restarted.status.success(),
+        "{}\n{log}",
+        text(&restarted.stderr)
+    );
+    let said = text(&restarted.stdout);
+    assert!(
+        said.contains("2 tabs carried") && said.contains("nothing ended"),
+        "{said}"
+    );
+    assert_eq!(d.starts(), 2, "the daemon never moved: {log}");
+    assert!(d.running(), "the daemon exited instead of moving: {log}");
+    assert!(log.contains("took over 2 of 2"), "{log}");
+
+    assert_eq!(
+        parent_of(shell),
+        Some(daemon),
+        "the shell was replaced: {log}"
+    );
+    let after = d
+        .agents()
+        .into_iter()
+        .find(|row| row.terminal == agent_tab)
+        .expect("the agent's row");
+    assert_eq!(after.state, "working", "{after:?}");
+    assert_eq!(after.generation, generation, "the agent was started again");
+    d.wait_for_screen(1, &format!("DONE-{command}"));
+    d.send(1, "echo AFTER-$((6*7))");
+    d.wait_for_screen(1, "AFTER-42");
+    assert!(
+        history_of(&d, 1).iter().any(|row| row == "SCROLLED-1"),
+        "the scrollback from before the restart is gone"
+    );
+    let splits = match d.ask(ControlRequest::ListAgents {
+        id: format!("agents-{}", unique()),
+    }) {
+        Some(ControlResponse::Agents { splits, .. }) => splits,
+        other => panic!("no agents: {other:?}"),
+    };
+    assert_eq!(splits, vec![tree], "the split did not survive");
+    let board = text(&d.run(&["task", "board"]).stdout);
+    assert!(board.contains("survives the restart"), "{board}");
+    std::fs::write(&go, "").expect("go");
+    d.wait_for_row(agent_tab, "was admitted as idle", |row| row.state == "idle");
+}
+
+/// A binary on disk that cannot take tabs over: `qoop restart` ends nothing, says so and what a
+/// stop would interrupt, and leaves nothing armed to move later onto whatever is installed next.
+#[test]
+fn qoop_restart_without_a_handover_ends_nothing_and_leaves_no_arm() {
+    let mut d = Daemon::start_installed();
+    replace_without_handoff(&d.exe, VERSION);
+    d.send(1, "echo SHELL=$$; sleep 30");
+    d.wait_for_row(1, "ran sleep", running_sleep);
+    let screen = text(&d.run(&["read", "1"]).stdout);
+    let shell = number_after(&screen, "SHELL=").expect("the shell's pid");
+
+    let restarted = d.run(&["restart"]);
+    let said = text(&restarted.stderr);
+    assert!(!restarted.status.success(), "{said}");
+    assert!(said.contains("did not restart"), "{said}");
+    assert!(said.contains("cannot take the tabs over live"), "{said}");
+    assert!(
+        said.contains("tab 1") && said.contains("qoop stop"),
+        "{said}"
+    );
+    assert_eq!(parent_of(shell), Some(d.child.id()), "the shell was ended");
+
+    // A build that can take tabs over lands next, and the tab keeps changing: the restart
+    // asked for above must not happen now, unasked.
+    // Ending the command and making a tab are what wake an armed daemon's next look.
+    replace_with_version(&d.exe, VERSION);
+    d.interrupt(1);
+    d.wait_for_row(1, "ended its command", |row| !running_sleep(row));
+    d.new_tab();
+    // Past twice the daemon's least spacing between two looks (`LOOK_SPACING`, 2 s), so a
+    // look that would move has had its chance.
+    std::thread::sleep(Duration::from_secs(6));
+    let log = std::fs::read_to_string(&d.log).unwrap_or_default();
+    assert!(d.running(), "{log}");
+    assert_eq!(d.starts(), 1, "the restart happened later, unasked: {log}");
+}
+
+/// The first time `qoop restart` meets a daemon from before it: that daemon cannot move onto
+/// a build of its own version, so nothing is asked of it, and the person is told what a stop
+/// would interrupt instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn qoop_restart_against_an_older_daemon_asks_nothing_and_says_what_a_stop_ends() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let socket = qoop_testkit::socket_in(dir.path());
+    let mut up = socket.parent().expect("a parent");
+    std::fs::create_dir_all(up).expect("the socket's directory");
+    while up != dir.path() {
+        std::fs::set_permissions(up, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        up = up.parent().expect("inside the tempdir");
+    }
+    let asked = std::sync::Arc::new(AtomicUsize::new(0));
+    tokio::spawn(daemon_before_restart(socket, asked.clone()));
+    let runtime = dir.path().to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
+            .arg("restart")
+            .env("QOOP_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", runtime.join("config"))
+            .env_remove("QOOP_SESSION")
+            .env_remove("QORO_SESSION")
+            .output()
+            .expect("run qoop")
+    })
+    .await
+    .expect("join");
+    let said = text(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("from before `qoop restart`"), "{said}");
+    assert!(said.contains("tab 1 claude: working"), "{said}");
+    assert!(!said.contains("tab 2"), "an idle shell was listed: {said}");
+    assert!(said.contains("qoop stop"), "{said}");
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "the old daemon was asked to move"
+    );
+}
+
+/// A daemon from before `qoop restart`: its welcome lists no capability, it has a working agent
+/// in tab 1 and an idle shell in tab 2, and it counts every ask to move.
+async fn daemon_before_restart(
+    socket: PathBuf,
+    asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use bytes::BytesMut;
+    use qoop_proto::{Channel, Frame, HandshakeOutcome, ServerCapabilities};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let asked = asked.clone();
+        tokio::spawn(async move {
+            let mut inbuf = BytesMut::new();
+            let mut read = [0u8; 8192];
+            let mut shaken = false;
+            loop {
+                match stream.read(&mut read).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => inbuf.extend_from_slice(&read[..n]),
+                }
+                while let Ok(Some(frame)) = Frame::decode(&mut inbuf) {
+                    let (channel, body) = if !shaken {
+                        let Ok(hello) = serde_json::from_slice(&frame.body) else {
+                            return;
+                        };
+                        let HandshakeOutcome::Welcome(welcome) =
+                            qoop_proto::negotiate(&hello, &ServerCapabilities::first_generation())
+                        else {
+                            return;
+                        };
+                        shaken = true;
+                        (Channel::Handshake, serde_json::to_vec(&welcome))
+                    } else if frame.channel == Channel::Control {
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&frame.body).unwrap_or_default();
+                        let id = request["id"].as_str().unwrap_or_default().to_string();
+                        let answer = match request["op"].as_str().unwrap_or_default() {
+                            "ListAgents" => {
+                                let row =
+                                    |terminal: u32, program: &str, agent: bool, state: &str| {
+                                        serde_json::from_value::<AgentRow>(serde_json::json!({
+                                            "terminal": terminal,
+                                            "workspace": 1,
+                                            "program": program,
+                                            "behind": null,
+                                            "state": state,
+                                            "agent": agent,
+                                        }))
+                                        .expect("a row")
+                                    };
+                                ControlResponse::Agents {
+                                    id,
+                                    agents: vec![
+                                        row(1, "claude", true, "working"),
+                                        row(2, "zsh", false, "unknown"),
+                                    ],
+                                    splits: Vec::new(),
+                                }
+                            }
+                            op => {
+                                if op == "RestartWhenSafe" {
+                                    asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                ControlResponse::RestartArmed {
+                                    id,
+                                    waiting_on: None,
+                                }
+                            }
+                        };
+                        (Channel::Control, serde_json::to_vec(&answer))
+                    } else {
+                        continue;
+                    };
+                    let mut out = BytesMut::new();
+                    Frame::new(channel, 0, bytes::Bytes::from(body.expect("json")))
+                        .encode(&mut out)
+                        .expect("encode");
+                    if stream.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// A relay whose daemon went (stopped here, or moved onto a new binary) ends at once, even
@@ -1637,6 +1917,7 @@ impl Daemon {
             version: NEXT.into(),
             keep_tabs,
             quiet,
+            same_version: false,
         })
     }
 
@@ -1677,6 +1958,7 @@ impl Daemon {
                             version: NEXT.into(),
                             keep_tabs,
                             quiet,
+                            same_version: false,
                         },
                         Duration::from_secs(30),
                     )
@@ -1975,6 +2257,7 @@ fn a_quiet_ask_for_the_version_already_running_says_whether_a_person_is_connecte
         version: VERSION.into(),
         keep_tabs: true,
         quiet: true,
+        same_version: false,
     }) {
         Some(ControlResponse::RestartArmed { waiting_on, .. }) => waiting_on,
         other => panic!("not armed: {other:?}"),

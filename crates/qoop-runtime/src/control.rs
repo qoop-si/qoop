@@ -422,6 +422,10 @@ pub enum ControlRequest {
     /// only with no client connected, since a live move cuts every client's connection. Asked
     /// again while it waits, a later ask can only weaken them. A daemon from before them
     /// ignores both, which is why a sender checks the version it runs first.
+    ///
+    /// `same_version`: a build that says the version this daemon runs is one to move onto too,
+    /// which is what `qoop restart` asks after an install between two releases. A daemon from
+    /// before it answers that it is already there and moves nothing.
     RestartWhenSafe {
         id: String,
         version: String,
@@ -429,6 +433,8 @@ pub enum ControlRequest {
         keep_tabs: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         quiet: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        same_version: bool,
     },
     /// Whether a newer qoop than this daemon runs is on disk: the version it could move onto,
     /// answered as `UpdateState`. Read only, and what the foot of the interface and the
@@ -1711,6 +1717,16 @@ pub fn readiness_of(
 /// move nobody asked for by hand is ever sent to it.
 pub const KEEPS_PROMISES_FROM: &str = "0.9.2";
 
+/// What a daemon that moves onto a build of its own version (`RestartWhenSafe`'s
+/// `same_version`) says among the welcome's capabilities. One without it stays where it is.
+pub const SAME_VERSION_RESTART: &str = "restart-same-version";
+
+/// The welcome's key for the tabs a daemon took over running when it became its binary.
+pub const ADOPTED: &str = "adopted";
+
+/// The welcome's key for a mark of the daemon's process image, new at every exec.
+pub const BOOT: &str = "boot";
+
 /// Whether a daemon running `version` keeps those promises.
 pub fn keeps_promises(version: &str) -> bool {
     crate::paths::parse_version(version)
@@ -2143,12 +2159,13 @@ mod tests {
             ControlRequest::RestartWhenSafe {
                 keep_tabs: false,
                 quiet: false,
+                same_version: false,
                 ..
             }
         ));
         let plain = serde_json::to_string(&old).expect("encode");
         assert!(
-            !plain.contains("keep_tabs") && !plain.contains("quiet"),
+            !plain.contains("keep_tabs") && !plain.contains("quiet") && !plain.contains("same"),
             "{plain}"
         );
         let kept = ControlRequest::RestartWhenSafe {
@@ -2156,9 +2173,11 @@ mod tests {
             version: "1.0.0".into(),
             keep_tabs: true,
             quiet: true,
+            same_version: true,
         };
         let wire = serde_json::to_string(&kept).expect("encode");
         assert!(wire.contains(r#""keep_tabs":true"#) && wire.contains(r#""quiet":true"#));
+        assert!(wire.contains(r#""same_version":true"#), "{wire}");
         assert_eq!(
             serde_json::from_str::<ControlRequest>(&wire).expect("decode"),
             kept

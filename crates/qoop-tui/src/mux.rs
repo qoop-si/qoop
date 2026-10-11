@@ -166,6 +166,7 @@ fn restart_when_safe(version: String) -> ControlRequest {
         // a person there is never closed. Its own link to this Mac is not one.
         keep_tabs: true,
         quiet: true,
+        same_version: false,
     }
 }
 
@@ -2983,6 +2984,7 @@ mod tests {
                 version: "9.0.0".into(),
                 keep_tabs: true,
                 quiet: true,
+                same_version: false,
             }),
             "{asked:?}"
         );

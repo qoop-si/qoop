@@ -253,6 +253,16 @@ A daemon that was started before this existed has nothing to hand over with, so 
 move onto a build that has it is this fallback, here and on every remote; every move after
 that is live.
 
+`qoop restart` is the same live move asked for by hand, onto whatever qoop is on disk, a build
+of the version that already runs included (an install between two releases, which `qoop update`
+and the foot do not move onto). It never takes the fallback: when the move cannot be live it
+moves nothing, says why and which working agents and running commands a `qoop stop` would
+interrupt, and leaves nothing waiting to move later. A tab the new binary then fails to take
+over is brought back the old way, and `qoop restart` names it and exits 1. A hook report cut by
+the move (the daemon closes the connections it had accepted when it becomes the new binary) is
+sent once more to the daemon that serves the same socket a moment later, so an agent's state is
+not lost in the gap.
+
 The same check that holds a move also holds `qoop sleep` and the sleep an idle space falls
 into: a single command that prints nothing while it leads its own foreground group (`vim`,
 `less`, an `ssh` in front) now counts as running, so a space with one of those open stays

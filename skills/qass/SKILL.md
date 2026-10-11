@@ -188,6 +188,9 @@ all ended and whose steps are all ticked, close the item too
 (`qoop task close <KEY> --verified '<the same>'`). One missing: prompt exactly that step when it
 is reversible or `policy` grants its verb there, else a card. A remote worker's repo: ask the
 owner. Never report a check that did not run (CI where the workflow says there is none).
+An install leaves the daemon on its old build: then `qoop restart` once (every tab and agent keeps
+running; open qoop windows close, tell him in one line), never `qoop stop` plus a start. Not
+restarted: a card with what it says a stop would end; "not moved yet": once more, never a loop.
 
 ## Decision table
 
@@ -272,8 +275,8 @@ One `key: value` line each, any order, a value at most 200 characters. `doing`, 
 every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:` to
 `D:`, plainly different, no "something else" (the pane has his own box). The words are his
 instruction and may hold ` | `. A broken card prints every problem, exits 2 and stores nothing: fix
-it, run it again. On `the inbox needs a restart of qoop`: tell him in one line that his inbox needs
-a qoop restart, then the card stands in the chat and `goals.md` only. Without the `-`, the old form
+it, run it again. On `the inbox needs a restart of qoop`: `qoop restart` once (Done, checked) and
+write it again; if that did not restart, the card stands in the chat and `goals.md` only. Without the `-`, the old form
 (`'A: <option>'` words, no inbox record), only when the block cannot be written. The handle: one
 word of the agent's sidebar name, lowercase, no Turkish letters (başvuru as `basvuru`; he may type
 either), unused by any open card ("korea"). `doing`, `why`, `asks`, labels and reasons are in his

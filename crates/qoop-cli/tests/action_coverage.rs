@@ -403,6 +403,7 @@ fn actions() -> Vec<Action> {
                     version: "0.0.0".into(),
                     keep_tabs: false,
                     quiet: false,
+                    same_version: false,
                 })
             },
         },
@@ -709,6 +710,7 @@ fn every_control_method_is_reachable_from_some_action() {
             version: String::new(),
             keep_tabs: false,
             quiet: false,
+            same_version: false,
         },
         ControlRequest::UpdateState { id: String::new() },
         ControlRequest::SleepSettings {

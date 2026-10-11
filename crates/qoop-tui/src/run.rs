@@ -572,6 +572,7 @@ fn restart_click(version: String) -> ControlRequest {
         version,
         keep_tabs: true,
         quiet: false,
+        same_version: false,
     }
 }
 
@@ -22594,6 +22595,7 @@ mod tests {
                 version: "9.9.9".into(),
                 keep_tabs: true,
                 quiet: false,
+                same_version: false,
             }
         );
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);

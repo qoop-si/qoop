@@ -42,6 +42,7 @@ async fn a_tab_that_cannot_be_handed_over_holds_a_move_that_ends_no_tab() {
                 version: "99.0.0".into(),
                 keep_tabs: true,
                 quiet: false,
+                same_version: false,
             },
             PATIENCE,
         )

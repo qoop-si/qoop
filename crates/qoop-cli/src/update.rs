@@ -302,18 +302,282 @@ async fn bring_along(version: &str) -> bool {
 /// so it never holds a quiet move back; the welcome carries the version it runs, which
 /// `client::connect` throws away), and that version.
 async fn hello(socket: &Path) -> std::io::Result<(tokio::net::UnixStream, BytesMut, String)> {
+    welcome(socket, "qoop-update")
+        .await
+        .map(|(stream, inbuf, welcome)| (stream, inbuf, welcome.server_version))
+}
+
+/// The same, with the whole welcome: what the daemon can do and which tabs it took over.
+async fn welcome(
+    socket: &Path,
+    name: &str,
+) -> std::io::Result<(tokio::net::UnixStream, BytesMut, qoop_proto::ServerWelcome)> {
     let timed_out =
         |what: &str| std::io::Error::new(std::io::ErrorKind::TimedOut, what.to_string());
     let stream = tokio::time::timeout(ASK_TO_MOVE, tokio::net::UnixStream::connect(socket))
         .await
         .map_err(|_| timed_out("the daemon did not accept the connection"))??;
-    let (stream, inbuf, welcome) = tokio::time::timeout(
-        ASK_TO_MOVE,
-        client::handshake_observer(stream, "qoop-update"),
-    )
-    .await
-    .map_err(|_| timed_out("the daemon did not answer the handshake"))??;
-    Ok((stream, inbuf, welcome.server_version))
+    let (stream, inbuf, welcome) =
+        tokio::time::timeout(ASK_TO_MOVE, client::handshake_observer(stream, name))
+            .await
+            .map_err(|_| timed_out("the daemon did not answer the handshake"))??;
+    Ok((stream, inbuf, welcome))
+}
+
+/// How long a daemon that took the ask to restart is given to close the connection, which is
+/// its exec: past its own first look, which a slow handover can outlast.
+const STILL_MOVING: Duration = Duration::from_secs(15);
+
+/// `qoop restart`: this machine's daemon becomes the qoop on disk now, a build of the same
+/// version included, with every tab and agent still running in it (the handover). It ends no
+/// tab it can avoid: when the move cannot be live it says why and what a stop would interrupt,
+/// and moves nothing; a tab the new binary then cannot take over is brought back and named. No
+/// network and no remote, unlike `qoop update`.
+pub fn run_restart(args: &[String]) -> std::io::Result<()> {
+    match args.get(2).map(String::as_str) {
+        None => {}
+        Some("--help" | "-h") => {
+            println!(
+                "usage: qoop restart   move the daemon onto the qoop on disk now, every tab and agent still running"
+            );
+            return Ok(());
+        }
+        Some(other) => {
+            return Err(crate::usage(format!(
+                "unknown argument {other}; usage: qoop restart"
+            )));
+        }
+    }
+    let socket = paths::socket_path(&paths::runtime_dir().map_err(std::io::Error::other)?);
+    if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        println!("qoop is not running; the next qoop starts the one on disk");
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(restart_here(&socket))
+}
+
+async fn restart_here(socket: &Path) -> std::io::Result<()> {
+    let before = rows(socket).await?;
+    let (pid, boot) = ask_to_move(socket, &before).await?;
+    let moved = moved_onto(socket, pid, boot).await?;
+    let adopted: Vec<u32> = moved
+        .extra
+        .get(qoop_runtime::control::ADOPTED)
+        .and_then(|ids| serde_json::from_value(ids.clone()).ok())
+        .unwrap_or_default();
+    let tabs = carried_live(&before, &adopted, &rows(socket).await?);
+    let version = plain(&moved.server_version);
+    let meanwhile = if tabs.closed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; tabs {} closed by themselves meanwhile",
+            tab_list(&tabs.closed)
+        )
+    };
+    if !tabs.restored.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "qoop moved onto {version}, but tabs {} were not carried live: they were ended \
+             and brought back, agents resumed in their conversations{meanwhile}",
+            tab_list(&tabs.restored)
+        )));
+    }
+    println!(
+        "qoop restarted live onto {version}: {} tabs carried in the same process, nothing ended{meanwhile}",
+        tabs.live.len()
+    );
+    Ok(())
+}
+
+/// Ask the daemon to move now, and wait for the exec that cuts the connection. Answers the
+/// daemon's pid and the mark of its process image, which the move keeps and changes.
+async fn ask_to_move(
+    socket: &Path,
+    before: &[qoop_runtime::control::AgentRow],
+) -> std::io::Result<(Option<u32>, Option<serde_json::Value>)> {
+    use tokio::io::AsyncReadExt;
+    let (mut stream, inbuf, welcomed) = welcome(socket, "qoop-restart").await?;
+    if !welcomed
+        .capabilities
+        .iter()
+        .any(|c| c == qoop_runtime::control::SAME_VERSION_RESTART)
+    {
+        return Err(not_restarted(
+            "the running daemon is from before `qoop restart` and cannot move onto a build of its own version",
+            before,
+        ));
+    }
+    let pid = qoop_runtime::daemon::peer_pid(&stream);
+    let boot = welcomed.extra.get(qoop_runtime::control::BOOT).cloned();
+    let request = ControlRequest::RestartWhenSafe {
+        id: crate::request_id("restart"),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        keep_tabs: true,
+        quiet: false,
+        same_version: true,
+    };
+    match crate::ask_over(&mut stream, inbuf, &request, ASK_TO_MOVE).await {
+        Err(e) if crate::cut_by_daemon(&e) => Ok((pid, boot)),
+        // No look finished within the daemon's own patience: the exec closing the
+        // connection is the move.
+        Ok(ControlResponse::RestartArmed {
+            waiting_on: None, ..
+        }) => {
+            let mut sink = [0u8; 4096];
+            tokio::time::timeout(STILL_MOVING, async {
+                while stream.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+            })
+            .await
+            .map(|()| (pid, boot))
+            .map_err(|_| {
+                std::io::Error::other(
+                    "the daemon took the restart but has not moved yet: it may still be \
+                     handing the tabs over; nothing was ended, run `qoop restart` again in a \
+                     minute, and its log says why",
+                )
+            })
+        }
+        Ok(ControlResponse::RestartArmed {
+            waiting_on: Some(why),
+            ..
+        })
+        | Ok(ControlResponse::Failed { reason: why, .. }) => Err(not_restarted(&why, before)),
+        Ok(_) => Err(std::io::Error::other(
+            "the daemon gave an answer this qoop does not understand",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// The welcome of the daemon that came back after the cut, when it is the one that moved: an
+/// exec keeps the pid and starts a new process image, so the same pid under a new mark is the
+/// move. Another pid is a daemon that ended and was started again, and the same mark one whose
+/// connection was cut without moving. Never starts a daemon.
+async fn moved_onto(
+    socket: &Path,
+    pid: Option<u32>,
+    boot: Option<serde_json::Value>,
+) -> std::io::Result<qoop_proto::ServerWelcome> {
+    let deadline = std::time::Instant::now() + COME_BACK;
+    loop {
+        match welcome(socket, "qoop-restart").await {
+            Ok((stream, _, welcomed)) if qoop_runtime::daemon::peer_pid(&stream) == pid => {
+                if welcomed.extra.get(qoop_runtime::control::BOOT).cloned() == boot {
+                    return Err(std::io::Error::other(
+                        "the daemon closed the connection but did not move; nothing was ended",
+                    ));
+                }
+                return Ok(welcomed);
+            }
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "the daemon ended instead of moving, and another one serves now",
+                ));
+            }
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "the daemon did not come back after its move: {e}"
+                )));
+            }
+        }
+    }
+}
+
+/// The awake tabs from before a move, as it left them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Carried {
+    /// Taken over running by the daemon that became the new binary.
+    live: Vec<u32>,
+    /// Gone, with no row after: closed by themselves.
+    closed: Vec<u32>,
+    /// A row after, but not taken over: ended and brought back.
+    restored: Vec<u32>,
+}
+
+fn carried_live(
+    before: &[qoop_runtime::control::AgentRow],
+    adopted: &[u32],
+    after: &[qoop_runtime::control::AgentRow],
+) -> Carried {
+    let mut tabs = Carried::default();
+    for row in before.iter().filter(|row| row.slept_at_unix.is_none()) {
+        if adopted.contains(&row.terminal) {
+            tabs.live.push(row.terminal);
+        } else if after.iter().any(|a| a.terminal == row.terminal) {
+            tabs.restored.push(row.terminal);
+        } else {
+            tabs.closed.push(row.terminal);
+        }
+    }
+    tabs
+}
+
+fn tab_list(tabs: &[u32]) -> String {
+    tabs.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every tab this machine's daemon has, as `ListAgents` answers.
+async fn rows(socket: &Path) -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
+    let request = ControlRequest::ListAgents {
+        id: crate::request_id("restart"),
+    };
+    match crate::ask_daemon(socket, "qoop-restart", &request).await? {
+        ControlResponse::Agents { agents, .. } => Ok(agents),
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        _ => Err(std::io::Error::other(
+            "unexpected answer to the agent listing",
+        )),
+    }
+}
+
+/// Why nothing moved, said loudly: what a `qoop stop` would interrupt instead, and how.
+fn not_restarted(why: &str, rows: &[qoop_runtime::control::AgentRow]) -> std::io::Error {
+    let busy: Vec<String> = rows
+        .iter()
+        .filter(|row| row.slept_at_unix.is_none())
+        .filter(|row| {
+            if row.agent {
+                matches!(row.state.as_str(), "working" | "blocked" | "starting")
+            } else {
+                row.program
+                    .as_deref()
+                    .is_some_and(|p| !qoop_runtime::idle::is_shell_program(p))
+            }
+        })
+        .map(|row| {
+            let name = row
+                .name
+                .as_deref()
+                .or(row.program.as_deref())
+                .unwrap_or("shell");
+            format!(
+                "\n  tab {} {}: {}",
+                row.terminal,
+                plain(name),
+                plain(&row.state)
+            )
+        })
+        .collect();
+    // A script a shell runs shows as that shell, so a stop may end more than is named here.
+    let interrupted = if busy.is_empty() {
+        "\nno agent is working now; a command still running in a tab would end too".to_string()
+    } else {
+        format!("\na `qoop stop` would interrupt:{}", busy.concat())
+    };
+    std::io::Error::other(format!(
+        "qoop did not restart: {}; every tab is still running{interrupted}\n\
+         `qoop stop`, then `qoop`, restarts the old way: tabs end and agents are resumed",
+        plain(why)
+    ))
 }
 
 /// What came of the ask to this machine's own daemon, or that there is none to ask. `auto`
@@ -479,6 +743,7 @@ where
         version: version.to_string(),
         keep_tabs: auto,
         quiet: auto,
+        same_version: false,
     };
     match crate::ask_over(stream, inbuf, &request, ASK_TO_MOVE).await {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -689,6 +954,7 @@ async fn alone_on(version: &str) -> bool {
                 version: version.to_string(),
                 keep_tabs: true,
                 quiet: true,
+                same_version: false,
             };
             matches!(
                 crate::ask_over(stream, inbuf, &request, ASK_TO_MOVE).await,
@@ -1084,6 +1350,41 @@ mod tests {
         keeps_promises, move_daemon, note, put_on_with, release_built, reload_if_marked,
         remote_line_with, retry_busy, run,
     };
+
+    fn tab(terminal: u32, asleep: bool) -> qoop_runtime::control::AgentRow {
+        serde_json::from_value(serde_json::json!({
+            "terminal": terminal,
+            "workspace": 1,
+            "program": null,
+            "behind": null,
+            "state": "idle",
+            "slept_at_unix": asleep.then_some(1),
+        }))
+        .expect("a row")
+    }
+
+    /// A restart reports every awake tab as carried, closed by itself, or ended and brought
+    /// back, and leaves a sleeping tab out.
+    #[test]
+    fn a_restart_tells_carried_tabs_from_closed_and_restored_ones() {
+        let before = [tab(1, false), tab(2, false), tab(3, false), tab(4, true)];
+        let after = [tab(1, false), tab(3, false), tab(4, true)];
+        assert_eq!(
+            super::carried_live(&before, &[1], &after),
+            super::Carried {
+                live: vec![1],
+                closed: vec![2],
+                restored: vec![3],
+            }
+        );
+        assert_eq!(
+            super::carried_live(&before, &[1, 2, 3], &after),
+            super::Carried {
+                live: vec![1, 2, 3],
+                ..Default::default()
+            }
+        );
+    }
 
     const MAC_ARM: &str = "qoop-aarch64-apple-darwin.tar.gz";
 

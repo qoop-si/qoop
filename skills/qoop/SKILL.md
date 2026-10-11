@@ -147,6 +147,7 @@ qoop sleep <space>             # every tab of a space that can sleep
 qoop wake --tab <terminal>     # bring one tab back; `wake <space>` all of it
 qoop wake                      # the tab that slept last
 qoop space rm <id|name>        # drop a space with no tabs; refused if it has any
+qoop restart                   # daemon onto the qoop on disk, every tab still running
 qoop stop                      # end qoop; what was awake comes back next open
 ```
 

@@ -200,6 +200,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             version: "0.0.0".into(),
             keep_tabs: false,
             quiet: false,
+            same_version: false,
         },
         // Reads whether a newer qoop is on disk: nothing typed.
         ControlRequest::UpdateState { id: "x30".into() },

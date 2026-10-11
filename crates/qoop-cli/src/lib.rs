@@ -189,6 +189,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("paths") => places::run(&args[2..]),
         Some("qass") => qass::run_qass(&args),
         Some("update") => update::run(&args),
+        Some("restart") => update::run_restart(&args),
         Some("pair" | "devices" | "bridge" | "login" | "logout") => phone_command(phone, &args),
         Some("ls") => run_list_spaces(&args),
         Some("stop") => run_stop(&args),
@@ -283,6 +284,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
                  \x20 qoop stop       end the daemon and every tab; `qoop` brings them back\n\
+                 \x20 qoop restart    move the daemon onto the qoop on disk now, every tab and agent still running\n\
                  \x20 qoop pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
                  \x20 qoop login [--hub URL]  link this machine to your account: it then shows\n\
                  \x20                 on qoop.si/app and on your phone\n\
@@ -1039,12 +1041,9 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     rt.block_on(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // One bound over the whole exchange, connect and handshake included, not only
-        // the answer: a daemon that accepts and never greets would otherwise hold the
-        // agent's turn until the agent's own hook timeout, minutes for most of them.
-        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-            let socket = paths::socket_path(&dir);
+        let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+        let socket = paths::socket_path(&dir);
+        let attempt = || async {
             let (stream, mut inbuf) = client::connect(&socket, "qoop-hook").await?;
             let (mut rd, mut wr) = stream.into_split();
             let mut seq = 0u32;
@@ -1055,7 +1054,8 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             loop {
                 let n = rd.read(&mut read).await?;
                 if n == 0 {
-                    return Err::<ControlResponse, std::io::Error>(std::io::Error::other(
+                    return Err::<ControlResponse, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
                         "the daemon closed the connection before answering",
                     ));
                 }
@@ -1068,9 +1068,16 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|_| std::io::Error::other("the daemon did not answer within 5s"))??;
+        };
+        // One bound over each whole exchange, connect and handshake included, not only
+        // the answer: a daemon that accepts and never greets would otherwise hold the
+        // agent's turn until the agent's own hook timeout, minutes for most of them.
+        let bounded = || async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), attempt())
+                .await
+                .map_err(|_| std::io::Error::other("the daemon did not answer within 5s"))?
+        };
+        let answer = once_more_if_cut(bounded).await?;
         match answer {
             ControlResponse::AgentStateReported { .. } => {
                 if let Some(session) = &kept {
@@ -1087,6 +1094,37 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             ))),
         }
     })
+}
+
+/// One exchange, made again once when the daemon cut it: moving onto a new binary closes every
+/// connection it had accepted, and the next one serves the same socket once it is up. The
+/// report goes again, with a bound of its own, rather than being lost; sent twice at worst,
+/// when the first was taken and only its answer lost.
+async fn once_more_if_cut<T, F, Fut>(attempt: F) -> std::io::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    match attempt().await {
+        Err(e) if cut_by_daemon(&e) => {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            attempt().await
+        }
+        answer => answer,
+    }
+}
+
+/// Whether the daemon cut the connection under a request: what it does to every connection it
+/// had accepted when it moves onto a new binary, whose socket stays open across the move. A
+/// hook report cut this way is sent once more; a refusal, no daemon at all, or a daemon that
+/// never answers is not.
+pub(crate) fn cut_by_daemon(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 /// `qoop reload-manifests`: re-read agent-detection overrides without restarting.
@@ -3693,6 +3731,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_cut_exchange_is_made_once_more_and_a_refusal_is_not() {
+        use std::io::{Error, ErrorKind};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let tries = AtomicU32::new(0);
+        let answer = super::once_more_if_cut(|| async {
+            match tries.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(Error::from(ErrorKind::UnexpectedEof)),
+                _ => Ok("taken"),
+            }
+        })
+        .await;
+        assert_eq!(answer.expect("the second try"), "taken");
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+        tries.store(0, Ordering::SeqCst);
+        let refused = super::once_more_if_cut(|| async {
+            tries.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(Error::other("refused"))
+        })
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "a refusal was sent again");
+        for (kind, again) in [
+            (ErrorKind::ConnectionReset, true),
+            (ErrorKind::BrokenPipe, true),
+            (ErrorKind::ConnectionRefused, false),
+            (ErrorKind::NotFound, false),
+        ] {
+            assert_eq!(super::cut_by_daemon(&Error::from(kind)), again, "{kind:?}");
+        }
+    }
+
     #[test]
     fn a_usage_mistake_is_told_apart_from_a_failure() {
         assert!(is_usage(&usage("usage: qoop wait <target>")));
@@ -3712,6 +3782,7 @@ mod tests {
             version: "9.9.9".into(),
             keep_tabs: false,
             quiet: false,
+            same_version: false,
         };
         let daemon = async move {
             let mut read = [0u8; 4096];

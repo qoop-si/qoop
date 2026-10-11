@@ -1262,7 +1262,11 @@ impl Daemon {
         if let Some(handoff) = handoff {
             let carried = handoff.terminals.len();
             let adopted = adopt_terminals(&into, handoff).await;
-            crate::say!("qoopd: took over {adopted} of {carried} running tabs");
+            crate::say!(
+                "qoopd: took over {} of {carried} running tabs",
+                adopted.len()
+            );
+            let _ = ADOPTED.set(adopted);
         }
         let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
@@ -1735,9 +1739,20 @@ pub fn peer_is_ours(uid: u32) -> bool {
     uid == paths::current_uid()
 }
 
+/// The tabs this process took over running when it became this binary, said in every welcome
+/// so `qoop restart` can tell a tab carried live from one ended and brought back. Set once:
+/// only the exec that starts a daemon hands it tabs.
+static ADOPTED: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// A mark of this process image, new at every exec, said in every welcome beside `ADOPTED`:
+/// the same pid with another mark is a daemon that became its binary again, and the same mark
+/// is one that never moved.
+static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The peer's pid, which is how `qoop focus` names the interfaces it moved: a launcher
-/// raises the window the process runs in. `None` when the kernel will not say.
-fn peer_pid(stream: &UnixStream) -> Option<u32> {
+/// raises the window the process runs in, and how `qoop restart` tells the daemon that moved
+/// (an exec keeps the pid) from one started in its place. `None` when the kernel will not say.
+pub fn peer_pid(stream: &impl AsRawFd) -> Option<u32> {
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "macos")]
     {
@@ -2150,7 +2165,23 @@ async fn serve_client(
         }
     };
 
-    let outcome = negotiate(&hello, &ServerCapabilities::first_generation());
+    let mut outcome = negotiate(&hello, &ServerCapabilities::first_generation());
+    if let qoop_proto::HandshakeOutcome::Welcome(w) = &mut outcome {
+        w.capabilities
+            .push(crate::control::SAME_VERSION_RESTART.into());
+        if let Some(ids) = ADOPTED.get() {
+            w.extra
+                .insert(crate::control::ADOPTED.into(), serde_json::json!(ids));
+        }
+        let boot = BOOT.get_or_init(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}-{}", std::process::id(), now.as_nanos())
+        });
+        w.extra
+            .insert(crate::control::BOOT.into(), serde_json::json!(boot));
+    }
     let body = match &outcome {
         qoop_proto::HandshakeOutcome::Welcome(w) => serde_json::to_vec(w),
         qoop_proto::HandshakeOutcome::Refuse(r) => serde_json::to_vec(r),
@@ -4983,8 +5014,15 @@ async fn handle_control(
         //
         // A quiet ask also learns whether a client is connected: how an update that finishes
         // with a reload of the bridge and the notch finds out nobody would be cut off.
-        ControlRequest::RestartWhenSafe { version, quiet, .. }
-            if !crate::paths::is_newer_version(&version, env!("CARGO_PKG_VERSION")) =>
+        //
+        // `same_version` lifts this for a build of the version that runs here, and only for it.
+        ControlRequest::RestartWhenSafe {
+            version,
+            quiet,
+            same_version,
+            ..
+        } if !crate::paths::is_newer_version(&version, env!("CARGO_PKG_VERSION"))
+            && !(same_version && version == env!("CARGO_PKG_VERSION")) =>
         {
             ControlResponse::RestartArmed {
                 id,
@@ -5027,6 +5065,7 @@ async fn handle_control(
             version,
             keep_tabs,
             quiet,
+            same_version,
             ..
         } => {
             let restart = &books.restart;
@@ -5069,12 +5108,18 @@ async fn handle_control(
                 };
                 restart.keep_tabs.store(keep, SeqCst);
                 restart.quiet.store(quiet, SeqCst);
+                // Only a build of this very version: a newer one is guarded by its version
+                // on disk, and its arm (a timer's waiting on a window) is not this ask's to end.
+                let once = same_version && version == env!("CARGO_PKG_VERSION");
+                restart.once.store(once, SeqCst);
                 let reset = restart.no_handoff.swap(false, SeqCst);
                 let failed = restart.failures.swap(0, SeqCst) > 0;
                 let start = !restart.armed.swap(true, SeqCst);
+                // A `qoop restart` that finds an arm running looks at once too: it is
+                // answered by a look of its own, and called off by it when nothing can move.
                 (
                     start,
-                    !start && (reset || failed || (keep, quiet) != (was_keep, was_quiet)),
+                    !start && (once || reset || failed || (keep, quiet) != (was_keep, was_quiet)),
                 )
             };
             if wake {
@@ -6243,6 +6288,10 @@ pub struct Restart {
     /// timer's ask set, never the other way round).
     keep_tabs: std::sync::atomic::AtomicBool,
     quiet: std::sync::atomic::AtomicBool,
+    /// Whether the last ask was `qoop restart`'s (`same_version`): the move happens at the look
+    /// that can make it or is called off, and never waits to happen later, unasked, onto
+    /// whatever build is installed by then. Set under the `wanted` lock.
+    once: std::sync::atomic::AtomicBool,
     /// Rung when an ask changes what the armed task would do, so it looks at once and not at
     /// the next event or minute.
     wake: tokio::sync::Notify,
@@ -6285,6 +6334,7 @@ impl Default for Restart {
             wanted: std::sync::Mutex::default(),
             keep_tabs: std::sync::atomic::AtomicBool::new(false),
             quiet: std::sync::atomic::AtomicBool::new(false),
+            once: std::sync::atomic::AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
             connections: std::sync::OnceLock::new(),
             disk: tokio::sync::Mutex::default(),
@@ -6356,6 +6406,10 @@ const WINDOW_OPEN: &str = "a qoop window is open here, the restart is offered in
 /// Short enough for the hint row of a narrow window: it is what a click on `restart for update`
 /// answers.
 const NOT_LIVE: &str = "this qoop cannot restart live; `qoop update` restarts idle agents";
+
+/// The same, said to `qoop restart`, which moves onto a build of the same version that
+/// `qoop update` would not move onto.
+const NOT_LIVE_NOW: &str = "the qoop on disk cannot take the tabs over live";
 
 impl Bookkeeping {
     pub fn new(
@@ -6509,12 +6563,12 @@ impl RestoreReport {
     }
 }
 
-/// Take over the terminals the daemon before this one left running, and say how many. A
+/// Take over the terminals the daemon before this one left running, and say which. A
 /// terminal that cannot be taken over is closed on this side, its processes stopped the way
 /// a terminal's are when its task fails, and it keeps its row: the restore that follows
 /// opens it again as a shell, resuming its agent, in its place.
-async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> usize {
-    let mut adopted = 0;
+async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> Vec<u32> {
+    let mut adopted = Vec::new();
     for carried in handoff.terminals {
         let (id, tty_dev, child, start) = (
             carried.id,
@@ -6523,7 +6577,7 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> us
             carried.child_start,
         );
         match adopt_one(into, carried) {
-            Ok(()) => adopted += 1,
+            Ok(()) => adopted.push(id),
             Err(refused) if refused.ended => {
                 // The shell ended while the daemon moved: the tab is closed, as it would
                 // have been had nobody been moving.
@@ -7740,6 +7794,8 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
     let mut changes = into.agents.subscribe();
     loop {
         let looked = tokio::time::Instant::now();
+        // The ask this look answers: one that comes in during the look is answered by the next.
+        let looking_for = into.books.restart.wanted.lock().unwrap().0;
         if into.books.restart.opted_out() {
             let asked = into.books.restart.wanted.lock().unwrap().0;
             let why = "automatic updates are turned off here (no-auto-update)";
@@ -7807,6 +7863,18 @@ async fn restart_when_safe(into: Restore, exe: PathBuf) {
                         && call_off(&into.books.restart, asked)
                     {
                         crate::say!("qoopd: the move onto the new version is called off: {why}");
+                        return;
+                    }
+                    // `qoop restart` moves now or not at all: what is in the way is said, and
+                    // nothing is left armed to move later, unasked.
+                    if into
+                        .books
+                        .restart
+                        .once
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        && call_off(&into.books.restart, looking_for)
+                    {
+                        crate::say!("qoopd: the restart is called off: {why}");
                         return;
                     }
                     if before.as_ref() != Some(&why) {
@@ -7904,7 +7972,8 @@ async fn restart_look(
     // would be ended, whatever the reason it cannot go live (this covers the latch set
     // after failed hand overs too, which looks again through here).
     if books.restart.keeps_tabs() && !live {
-        return Err(NOT_LIVE.into());
+        let once = books.restart.once.load(std::sync::atomic::Ordering::SeqCst);
+        return Err(if once { NOT_LIVE_NOW } else { NOT_LIVE }.into());
     }
     // Handed over, a tab is not asked to be idle: it keeps running through the move.
     let checkpoints = if live {
