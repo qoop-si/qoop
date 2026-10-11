@@ -44,6 +44,8 @@
 #   already said, only ever go with another block.
 # - A remote whose daemon left with no agent on it, and lines that went stale, go to
 #   quiet.log instead. Held lines and marks outlive a restart of this script.
+# - With cswap installed, a Claude agent of this Mac that stopped on its usage limit comes out
+#   at once as `->limited ... resets:7:20am` (`again` when it was limited minutes before).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -171,7 +173,7 @@ note() { printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$dir/quiet.log" 2>/dev/
 # line that is not about an agent (daemon-gone, link-down).
 parse_line() {
     local re='^(([A-Za-z0-9_-]+)/)?T([0-9]+) g([^ ]+) [^ ]+ ([a-z-]+)->([a-z]+)'
-    local task=' task:[^: ]+:([a-z-]+)(:claimed)?$'
+    local task=' task:[^: ]+:([a-z-]+)(:claimed)?( |$)'
     L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-"
     [[ "$1" =~ $re ]] || return 1
     L_LABEL="${BASH_REMATCH[2]}" L_T="${BASH_REMATCH[3]}" L_G="${BASH_REMATCH[4]}"
@@ -188,7 +190,7 @@ urgent() {
     local s_t s_gen s_state s_stage _
     case "$1" in *daemon-gone | */link-down | */link-up) return 0 ;; esac
     parse_line "$1" || return 0
-    case "$L_STATE" in blocked | failed | closed) return 0 ;; esac
+    case "$L_STATE" in blocked | failed | closed | limited) return 0 ;; esac
     [ "$L_FROM" != hands-off ] || return 0
     if [ "$L_STAGE" = waiting-human ]; then
         read -r s_t s_gen s_state s_stage _ <<< "$(said_of "$L_LABEL" "$L_T")"
@@ -341,6 +343,43 @@ ride_expire() {
     done
 }
 
+# A Claude agent of this Mac that stopped on its usage limit (its screen shows the limit and the
+# live "continuing automatically" countdown), named when cswap is there to switch the account:
+# the line comes out as ->limited with the reset time on its screen, and
+# ends " again" when the same agent was limited within QASS_QUIET_HOLD seconds. Anything else,
+# or a screen it cannot read, leaves the line as it was.
+limit_line() { # label line -> the line to say
+    local screen when again
+    if [ -n "$1" ] || ! parse_line "$2" || ! command -v cswap >/dev/null 2>&1; then
+        printf '%s\n' "$2"; return 0
+    fi
+    case "$L_FROM.$L_STATE" in working.idle | *.failed) ;; *) printf '%s\n' "$2"; return 0 ;; esac
+    [[ "$2" =~ ^T[0-9]+\ g[^\ ]+\ claude\  ]] || { printf '%s\n' "$2"; return 0; }
+    screen="$(perl -e 'alarm 3; exec @ARGV' qoop read "$L_T" </dev/null 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 15 || true)"
+    # The live countdown too: the limit line stays in the scrollback after the agent went on.
+    printf '%s\n' "$screen" | grep -qE '^[[:space:]]*(⚠[[:space:]]*)?Usage limit reached( again)? · ' &&
+        printf '%s\n' "$screen" | grep -qi 'continuing automatically at' ||
+        { printf '%s\n' "$2"; return 0; }
+    when="$(printf '%s\n' "$screen" | grep -oE '(resets|automatically at) [0-9]{1,2}(:[0-9]{2})? ?([aApP][mM])?' |
+        head -n 1 | sed -E 's/^(resets|automatically at) //' | tr -d ' ' || true)"
+    again="$(settle_locked limit_note "$L_T")"
+    # The same stop seen twice (its idle, then its failure): said once.
+    [ "$again" != same ] || { note "limit already said" "$2"; return 0; }
+    printf '%s resets:%s%s\n' "${2/->$L_STATE /->limited }" "${when:-?}" "${again:+ again}"
+}
+
+# Notes a limit of terminal $1: prints "same" when it had one under 10 s ago (one stop seen
+# twice, its idle and its failure), "again" when within QASS_QUIET_HOLD seconds.
+limit_note() {
+    local f="$dir/limited" now t at
+    now="$(date +%s)"
+    read -r t at <<< "$(grep "^$1 " "$f" 2>/dev/null | tail -1 || true)"
+    [ -z "${at:-}" ] || [ $((now - at)) -ge 10 ] || { echo same; return 0; }
+    { grep -v "^$1 " "$f" 2>/dev/null || true; echo "$1 $now"; } > "$f.tmp"
+    mv "$f.tmp" "$f"
+    [ -z "${at:-}" ] || [ $((now - at)) -ge "$qhold" ] || echo again
+}
+
 # One line of a machine's diff, quiet: said now (with what is held), or held.
 quiet_hold() { # label line
     local class
@@ -449,6 +488,8 @@ follow() {
             while IFS= read -r l; do
                 [ -n "$l" ] || continue
                 if [ "$quiet" = 1 ]; then
+                    l="$(limit_line "$label" "$l")"
+                    [ -n "$l" ] || continue
                     if urgent "$l"; then now_lines="$now_lines$l
 "; else quiet_hold "$label" "$l"; fi
                 else

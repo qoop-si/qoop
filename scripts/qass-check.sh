@@ -159,6 +159,7 @@ stream() { # hold-open-seconds [gap-seconds]
 #!/bin/sh
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 [ "\$1" = remote ] && { cat "$tmp/remotes" 2>/dev/null; exit 0; }
+[ "\$1" = read ] && { cat "$tmp/screen" 2>/dev/null; exit 0; }
 while IFS= read -r l; do printf '%s\n' "\$l"; sleep ${2:-0}; done < "$tmp/snapshots"
 exec sleep $1
 EOF
@@ -393,6 +394,74 @@ got="$(timed 5)"
 [ "$(echo "$got" | lines)" = ubox/daemon-gone ] || { echo "remote gone printed: $got"; exit 1; }
 got="$(timed 5)"
 [ -z "$got" ] || { echo "a restart said the remote gone again: $got"; exit 1; }
+
+# A Claude agent stopped on its usage limit, with cswap there to switch the account, is said at
+# once as limited, with its reset time; a second limit within the hold ends "again". Without
+# cswap, with only the stale limit line, or with the words inside the conversation, it is an idle
+# like any other (held here); a remote agent is never read.
+limit_screen() {
+    printf '%s\n' "⏺ Done with the first part." "$@" "────" "❯ " "────" "  ⏵⏵ bypass permissions on" > "$tmp/screen"
+}
+printf '#!/bin/sh\nexit 2\n' > "$tmp/bin/cswap"; chmod +x "$tmp/bin/cswap"
+fresh; stream 0
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" "    Continuing automatically at 7:20am"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a limit printed: $got"; exit 1; }
+# The same stop seen again within seconds (its failure after its idle) is said once.
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ -z "$got" ] && grep -q 'limit already said T5' "$q/quiet.log" || { echo "one stop twice printed: $got"; exit 1; }
+# A second limit two minutes later ends "again"; one past the hold does not.
+echo "5 $(( $(date +%s) - 120 ))" > "$q/limited"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am again' ] || { echo "a second limit printed: $got"; exit 1; }
+echo "5 $(( $(date +%s) - 700 ))" > "$q/limited"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a limit past the hold printed: $got"; exit 1; }
+# A turn that ends failed on the limit (StopFailure) is named the same way.
+fresh
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"; printf '%s\n' "[$(row 5 1 failed)]" > "$tmp/snapshots"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a failed limit printed: $got"; exit 1; }
+# Another agent program is not named (cswap switches Claude accounts only).
+fresh
+printf '%s\n' "[$(row 5 1 working | sed 's/"claude"/"codex"/')]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle | sed 's/"claude"/"codex"/')]" > "$tmp/snapshots"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ -z "$got" ] && grep -q '^5 1 long ' "$q/held" || { echo "a codex limit was named: $got"; exit 1; }
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+for case in stale talk nocswap; do
+    fresh
+    printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+    p="$tmp/bin:$PATH"
+    case "$case" in
+        stale) limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" ;;
+        talk) limit_screen "  It said Usage limit reached · continuing automatically at 7:20am." ;;
+        nocswap) limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" "    Continuing automatically at 7:20am"
+                 mv "$tmp/bin/cswap" "$tmp/cswap.off"; p="$tmp/bin:/usr/bin:/bin" ;;
+    esac
+    got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$p" "$skill_w/watch.sh" 2>/dev/null)"
+    [ -z "$got" ] && grep -q '^5 1 long ' "$q/held" || { echo "a $case limit was named: $got"; exit 1; }
+done
+mv "$tmp/cswap.off" "$tmp/bin/cswap"
+fresh; stream 30
+echo "ubox  fake-host" > "$tmp/remotes"
+limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" "    Continuing automatically at 7:20am"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"; printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
+printf '%s\n' "[$(row 2 3 working)]" > "$q/last-ubox.json"
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in *watch*) echo '[$(row 2 3 idle)]'; exec sleep 30 ;; esac
+echo '[]'
+EOF
+chmod +x "$tmp/bin/ssh"
+got="$(timed 4)"
+[ "$(echo "$got" | lines)" = 'ubox/T2 g3 claude working->idle "task" /w' ] || { echo "a remote limit printed: $got"; exit 1; }
+rm -f "$tmp/bin/ssh" "$tmp/remotes" "$tmp/bin/cswap" "$tmp/screen"
 
 # A remote link: a drop under QASS_LINKDOWN says nothing; a longer one says link-down once, and
 # link-up when it is back; a restart while down does not say it again.

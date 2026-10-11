@@ -220,6 +220,7 @@ stated plan, not by how important the question feels.
 | Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |
 | Design, UI or marketing pick, copy, naming, pricing, or a requirement with several plausible readings | a card for later; now if the worker sits idle on it |
 | Failed, or the same question twice | escalate |
+| `->limited` (its usage limit, this Mac, only with `cswap` installed) | `cswap auto --once >/dev/null 2>&1; echo $?` once per wake, even when you may not write to them (never `cswap switch`, its config or accounts). 0 or 2, or 1 while `pgrep -f "[c]swap auto"` finds its loop: prompt each limited agent you may write to, 5 s apart: `The usage limit that stopped you is cleared; resume the task you were on.` plus the fence. A line ending `again`, exit 3, or exit 1 with no loop: tell the owner once, with its reset time, and how many you could not prompt |
 
 ## Writing to a worker
 
