@@ -24,7 +24,8 @@ stage <stage>` (investigating, planning, implementing, reviewing, verifying, wai
 `qoop task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
 finish with `qoop task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
 or stop as usual. If a `qoop task` command fails, carry on with the work. On a board item, \
-tick each step with `qoop task check <n>`.";
+tick each step with `qoop task check <n>`. In shell, write rm targets as literal paths or \
+\"${VAR:?}\".";
 
 /// How long `rules` waits for the daemon. A hook waits on it at every session start and
 /// every request, and gives it 2 s before going quiet; a daemon answers in milliseconds.
@@ -655,7 +656,12 @@ mod tests {
 
     #[test]
     fn the_rules_stay_short() {
-        assert!(RULES.len() <= 900, "{} chars in every session", RULES.len());
+        // ponytail: 940, the last sentence spares every agent Claude Code's "dangerous rm" menu.
+        assert!(RULES.len() <= 940, "{} chars in every session", RULES.len());
+        assert!(
+            RULES.contains("${VAR:?}"),
+            "deletion targets that cannot be empty"
+        );
         assert!(
             !RULES.contains("--replace"),
             "no invitation to replace a task"

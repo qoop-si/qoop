@@ -215,7 +215,7 @@ stated plan, not by how important the question feels.
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | a card for later |
 | Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when his task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md or the workflow says |
-| Menu | never "always allow" or "don't ask again"; a decline is always fine; yes only when the command shown is read-only or in-repo and reversible, else escalate |
+| Menu | never "always allow" or "don't ask again"; a decline is always fine; yes only when the command shown is read-only or in-repo and reversible, else escalate. "Dangerous rm ... possibly-empty variable": read the screen again, then decline with `qoop send <n> --key esc --generation <G>` (never a number) and prompt it to write the target as a literal path or `"${VAR:?}"`; the rewritten command's menu is a new menu |
 | Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree, stash, file or repo | escalate, unless `policy` grants that verb for that repo root |
 | Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |
 | Design, UI or marketing pick, copy, naming, pricing, or a requirement with several plausible readings | a card for later; now if the worker sits idle on it |
