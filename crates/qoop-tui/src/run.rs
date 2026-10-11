@@ -657,6 +657,8 @@ struct State {
     qass_asked: Option<std::time::Instant>,
     /// The qass screen's own memory: its zoom, and the clocks its lines age on.
     qass_ui: crate::qass_screen::Ui,
+    /// The question inbox beside qass's terminal: its cards, what is typed, the answer held.
+    asks: crate::asks::Pane,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
     /// A terminal to show once an index lists it, and until when: one `qoop focus` named
@@ -1139,6 +1141,7 @@ impl State {
             toast: toast_text(self),
             chrome: screen::Chrome {
                 qass: self.qass_header().then_some(self.qass_ui),
+                asks: self.on_qass_screen().then_some(&self.asks),
                 shut: &self.shut,
                 drag: None,
                 usage: &self.usage,
@@ -2371,10 +2374,37 @@ impl State {
     /// not it is on screen, so looking at qass does not reflow it. `None` when the pane is
     /// too small to frame.
     fn qass_rect(&self) -> Option<layout::Rect> {
+        self.qass_plan().map(|plan| plan.inner)
+    }
+
+    /// qass's screen laid out in the pane: its header, the inbox when it is open, and the
+    /// terminal's box.
+    fn qass_plan(&self) -> Option<crate::qass_screen::Plan> {
         let (cols, rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
-        crate::qass_screen::Plan::new(cols as usize, rows as usize, self.qass_ui.zoomed)
-            .map(|plan| plan.inner)
+        crate::qass_screen::Plan::new(
+            cols as usize,
+            rows as usize,
+            self.qass_ui.zoomed,
+            self.qass_ui.inbox,
+        )
+    }
+
+    /// The keyboard is in the inbox only while the inbox is shown: leaving qass's screen, the
+    /// zoom or a window too small for it takes the keyboard back, and an answer still being
+    /// held with it.
+    fn asks_settle(&mut self) {
+        if self.asks.focus && !self.asks_focused() {
+            self.asks.release();
+        }
+    }
+
+    /// Whether the keyboard is in the question inbox: open, shown and given the keys.
+    fn asks_focused(&self) -> bool {
+        self.asks.focus
+            && self.qass_ui.inbox
+            && self.on_qass_screen()
+            && self.qass_plan().is_some_and(|p| p.side.is_some())
     }
 
     /// Whether qass's mark on its screen moves: it is working and its screen is up.
@@ -5924,6 +5954,8 @@ where
         qass_back: None,
         qass_asked: None,
         qass_ui: Default::default(),
+        // Read once as soon as the loop runs.
+        asks: crate::asks::Pane::new(),
         last: LastFocus::read(last_focus),
         show_when_listed: None,
         elsewhere: None,
@@ -6429,6 +6461,13 @@ where
                 tokio::time::Instant::from_std(toast.until)
             });
 
+            // The keyboard is in the inbox only while the inbox is shown: leaving qass's
+            // screen, the zoom or a window too small for it takes the keyboard back, and an
+            // answer still being held with it.
+            state.asks_settle();
+            // A held answer's countdown, and the moment it goes. `None` with nothing held.
+            let asks_at = state.asks.wake_at().map(tokio::time::Instant::from_std);
+
             tokio::select! {
                 biased;
                 _ = ack_tick.tick() => {
@@ -6842,6 +6881,27 @@ where
                                 feed = Some(rest);
                             }
                         }
+                    } else if state.asks_focused()
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // The question inbox owns the keyboard while it is given it, and
+                        // hands back the prefix, the mouse and what is not its own.
+                        dirty = true;
+                        let taken = asks_keys(&mut state, &bytes, keys.prefix(), std::time::Instant::now());
+                        if taken.resize
+                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                        {
+                            wr.write_all(&resize).await?;
+                        }
+                        if let Some(terminal) = taken.jump
+                            && let Some(bytes) =
+                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                        {
+                            wr.write_all(&bytes).await?;
+                        }
+                        feed = taken.feed;
                     } else {
                         feed = Some(bytes);
                     }
@@ -6974,6 +7034,36 @@ where
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
+                                }
+                                // The question inbox and the chip that opens it answer their own
+                                // clicks; a click in qass's terminal takes the keyboard back.
+                                match state.ask_click(row, col) {
+                                    Some(AskClick::Toggle) => {
+                                        if asks_toggle(&mut state)
+                                            && let Some(resize) =
+                                                size_terminals(&mut state, &mut seqs)?
+                                        {
+                                            wr.write_all(&resize).await?;
+                                        }
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::Inbox(hit)) => {
+                                        state.asks.focus = true;
+                                        state.asks.click(hit, std::time::Instant::now());
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::InboxBlank) => {
+                                        state.asks.focus = true;
+                                        dirty = true;
+                                        continue;
+                                    }
+                                    Some(AskClick::Chat) if state.asks.focus => {
+                                        state.asks.release();
+                                        dirty = true;
+                                    }
+                                    Some(AskClick::Chat) | None => {}
                                 }
                                 // The divider first: a press there arms a drag
                                 // and consumes the press whole, so it never
@@ -7907,6 +7997,14 @@ where
                             }
                             // qass in its own space, or back from it. Its page stays
                             // `qoop qass page`.
+                            Action::Asks => {
+                                if asks_toggle(&mut state)
+                                    && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                {
+                                    wr.write_all(&resize).await?;
+                                }
+                                dirty = true;
+                            }
                             Action::Qass => {
                                 if let Some(bytes) = qass_press(
                                     &mut state,
@@ -8334,13 +8432,17 @@ where
                             }
                             Incoming::Event(EventMessage::AgentChanged { .. })
                             | Incoming::Event(EventMessage::Resync) => {
+                                // A resync may have missed a card too.
+                                if matches!(message, Incoming::Event(EventMessage::Resync)) {
+                                    state.asks.stale = true;
+                                }
                                 // What changed is not in the message on purpose, so the
                                 // answer comes from the one place that has it. A resync
                                 // is the same refresh: the daemon missed nothing, this
                                 // client did, and re-reading the index converges it.
                                 refresh = true;
                             }
-                            Incoming::Event(EventMessage::AsksChanged) => {}
+                            Incoming::Event(EventMessage::AsksChanged) => state.asks.stale = true,
                             // `qoop focus`, from a notch or a launcher: the same switch a
                             // click on the row makes. A terminal this interface does not
                             // list yet waits for the index that names it.
@@ -8363,6 +8465,9 @@ where
                             // The board's news: nothing the index draws.
                             Incoming::Event(EventMessage::TasksChanged) => {}
                             Incoming::Control(response) => {
+                                if state.asks.answered(&response) {
+                                    dirty = true;
+                                }
                                 // Only the answers that change what terminals exist ask for
                                 // a new index. Asking after every answer includes asking
                                 // after the index itself, which is a request per response
@@ -8512,6 +8617,11 @@ where
                             &mut control_seq,
                         )?).await?;
                     }
+                    // The inbox, when something said it moved: a card, or the terminal of one.
+                    state.asks.note_gone(&state.rows, &state.spaces);
+                    if let Some(read) = state.asks.read_request() {
+                        wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
+                    }
                 }
                 // A held escape that nothing completed: it was a key. Released into the
                 // filter, and the stdin arm is woken to type it through the ordinary path.
@@ -8533,6 +8643,20 @@ where
                     }
                 } => {
                     fire_notes(&mut state, &mut out)?;
+                }
+                _ = async {
+                    match asks_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let (send, moved) = state.asks.tick(std::time::Instant::now());
+                    if let Some(request) = send {
+                        wr.write_all(&client::encode_control_seq(&request, &mut control_seq)?).await?;
+                    }
+                    if moved {
+                        dirty = true;
+                    }
                 }
                 // A close that has not finished in [`CLOSE_PATIENCE`] is not going to.
                 // Said once, with what is left, rather than left as a row that never
@@ -10496,6 +10620,140 @@ fn qass_press(
         });
     }
     Ok(moved)
+}
+
+/// What the question inbox did with some keys, for the loop that owns the keyboard.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AskKeys {
+    /// What is not the inbox's, for the ordinary path.
+    feed: Option<Vec<u8>>,
+    /// The layout changed: qass's terminal must be sized again.
+    resize: bool,
+    /// Go to this agent's tab.
+    jump: Option<u32>,
+}
+
+/// Keys typed while the inbox has the keyboard. Leaving it (to the chat, away, to an agent)
+/// takes back an answer still being held.
+fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8, now: std::time::Instant) -> AskKeys {
+    use crate::asks::Out;
+    let mut taken = AskKeys::default();
+    match state.asks.key(bytes, prefix, now) {
+        Out::Stay => {}
+        Out::ToChat => {
+            state.asks.release();
+            // Where the inbox stands in the chat's place there is no chat to go back to.
+            if state
+                .qass_plan()
+                .and_then(|p| p.side)
+                .is_some_and(|side| side.replaces)
+            {
+                state.qass_ui.inbox = false;
+            }
+        }
+        Out::Closed => {
+            state.qass_ui.inbox = false;
+            state.asks.release();
+            taken.resize = true;
+        }
+        Out::Jump(terminal) => {
+            state.asks.release();
+            taken.jump = Some(terminal);
+        }
+        Out::Pass(rest) => taken.feed = Some(rest),
+    }
+    taken
+}
+
+/// What a click in the pane means for the question inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskClick {
+    /// The `[ N asks you ]` chip on qass's header.
+    Toggle,
+    /// Something the inbox drew.
+    Inbox(crate::asks::Hit),
+    /// The inbox, where it drew nothing to press.
+    InboxBlank,
+    /// qass's own terminal: the keyboard goes back to the chat, and the click goes on.
+    Chat,
+}
+
+impl State {
+    /// Where a one based screen position is among qass's screen and its inbox, when it is
+    /// on either. Asked of the same painter that drew them, so a click lands on what was shown.
+    fn ask_click(&self, row: u16, col: u16) -> Option<AskClick> {
+        if !self.on_qass_screen() {
+            return None;
+        }
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let pane_row = (row as usize).checked_sub(screen::TABS + 1)?;
+        let pane_col = (col as usize).checked_sub(left + 1)?;
+        let frame = self.frame();
+        let (plan, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false)?;
+        if let Some(chip) = screen.chip()
+            && chip.row == pane_row
+            && (chip.x0..chip.x1).contains(&pane_col)
+        {
+            return Some(AskClick::Toggle);
+        }
+        let side = plan.side?;
+        let inside = |r: layout::Rect| {
+            pane_row >= r.y && pane_row < r.y + r.rows && pane_col >= r.x && pane_col < r.x + r.cols
+        };
+        if inside(side.rect) {
+            let ctx = crate::asks::Ctx {
+                rows: &self.rows,
+                spaces: &self.spaces,
+                now_unix: frame.now_unix,
+                now: std::time::Instant::now(),
+                fade: false,
+            };
+            let view = crate::asks::view(&self.asks, &ctx, side.rect.cols, side.rect.rows);
+            return Some(
+                match crate::asks::hit_at(&view, side.rect, pane_row, pane_col) {
+                    Some(hit) => AskClick::Inbox(hit),
+                    None => AskClick::InboxBlank,
+                },
+            );
+        }
+        (!side.replaces && inside(plan.frame)).then_some(AskClick::Chat)
+    }
+}
+
+/// `ctrl-a i`, or a click on the chip: open the inbox and give it the keyboard; with it open
+/// and the keyboard in the chat, give it the keyboard; with the keyboard in it, put it away.
+/// True when the layout changed, so qass's terminal must be sized again.
+fn asks_toggle(state: &mut State) -> bool {
+    if !state.on_qass_screen() {
+        state.message = Some("the question inbox opens on qass's screen: ctrl-a Q".to_string());
+        return false;
+    }
+    let (cols, rows) = screen::pane_size_for(
+        state.cols,
+        state.lines,
+        state.collapsed,
+        0,
+        state.sidebar_width,
+    );
+    if !crate::qass_screen::Plan::holds_inbox(cols as usize, rows as usize) {
+        state.message = Some("the pane is too narrow for the question inbox".to_string());
+        return false;
+    }
+    if !state.qass_ui.inbox || state.qass_ui.zoomed {
+        state.qass_ui.zoomed = false;
+        state.qass_ui.inbox = true;
+        state.asks.focus = true;
+        state.asks.stale = true;
+        return true;
+    }
+    if state.asks.focus {
+        state.qass_ui.inbox = false;
+        state.asks.release();
+        return true;
+    }
+    state.asks.focus = true;
+    false
 }
 
 /// `ctrl-a Q`. In qass's space: back where the keyboard was before it, else the first awake
@@ -13577,6 +13835,7 @@ mod tests {
             qass_back: None,
             qass_asked: None,
             qass_ui: Default::default(),
+            asks: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14816,6 +15075,7 @@ mod tests {
             qass_back: None,
             qass_asked: None,
             qass_ui: Default::default(),
+            asks: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -14956,6 +15216,7 @@ mod tests {
             qass_back: None,
             qass_asked: None,
             qass_ui: Default::default(),
+            asks: Default::default(),
             last: LastFocus::default(),
             show_when_listed: None,
             elsewhere: None,
@@ -18699,10 +18960,14 @@ mod tests {
             0,
             state.sidebar_width,
         );
-        let inner =
-            crate::qass_screen::Plan::new(cols as usize, rows as usize, state.qass_ui.zoomed)
-                .expect("a pane this size is framed")
-                .inner;
+        let inner = crate::qass_screen::Plan::new(
+            cols as usize,
+            rows as usize,
+            state.qass_ui.zoomed,
+            state.qass_ui.inbox,
+        )
+        .expect("a pane this size is framed")
+        .inner;
         ((cols, rows), inner)
     }
 
@@ -18950,6 +19215,371 @@ mod tests {
         let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(!changed);
         assert!(!state.qass_ui.zoomed);
+    }
+
+    /// A painted frame as the text a person reads: the cursor moves and the colours gone.
+    fn plain(painted: &str) -> String {
+        let mut out = String::new();
+        let mut chars = painted.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
+        use qoop_runtime::control::{AskCard, AskInfo, AskOption};
+        AskInfo {
+            card: format!("E{n}"),
+            agent: Some(format!("T{n}")),
+            terminal: Some(n),
+            status: "open".to_string(),
+            note: None,
+            opened_at: sidebar::now_unix() - 360,
+            closed_at: None,
+            answer: None,
+            option: None,
+            task: None,
+            body: AskCard {
+                handle: handle.to_string(),
+                urgency: "later".to_string(),
+                asked: None,
+                doing: "wrote migration 0042".to_string(),
+                why: "the PR waits for it".to_string(),
+                asks: format!("Question {n}?"),
+                options: ["a", "b"]
+                    .iter()
+                    .map(|k| AskOption {
+                        key: k.to_string(),
+                        label: format!("pick {k}"),
+                        reason: format!("because {k}"),
+                        words: format!("Do {k}."),
+                    })
+                    .collect(),
+                pick: None,
+            },
+        }
+    }
+
+    /// `ctrl-a i` opens the inbox beside qass's chat and sizes the chat to what is left, again
+    /// puts it away and gives the chat its columns back; the chat stays fully on screen.
+    #[test]
+    fn the_inbox_narrows_qass_chat_beside_it_and_gives_the_columns_back() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let (_, shut) = qass_cells(&state);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(shut.cols as u16, shut.rows as u16))
+        );
+
+        assert!(asks_toggle(&mut state), "the layout changed");
+        assert!(state.qass_ui.inbox && state.asks.focus && state.asks_focused());
+        let plan = state.qass_plan().unwrap();
+        let side = plan.side.expect("beside at this width");
+        assert!(!side.replaces);
+        let (_, open) = qass_cells(&state);
+        assert_eq!((open.rows, open.y), (shut.rows, shut.y), "no rows lost");
+        assert_eq!(open.cols + side.rect.cols, shut.cols);
+        assert_eq!(
+            open.x,
+            side.rect.cols + 1,
+            "the chat starts after the inbox"
+        );
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(open.cols as u16, open.rows as u16))
+        );
+        assert_eq!(focused_rect(&state), open);
+        // The chat is whole on screen: its box is painted beside the inbox, not under it.
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(
+            painted.contains("questions") && painted.contains("\u{2500} terminal "),
+            "{painted}"
+        );
+
+        // The keyboard in the inbox puts it away; the pty gets its columns back.
+        assert!(asks_toggle(&mut state));
+        assert!(!state.qass_ui.inbox && !state.asks.focus);
+        assert!(size_terminals(&mut state, &mut seqs).unwrap().is_some());
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(shut.cols as u16, shut.rows as u16))
+        );
+        // Open and with the keyboard in the chat, it takes the keyboard and changes no size.
+        assert!(asks_toggle(&mut state));
+        size_terminals(&mut state, &mut seqs).unwrap();
+        state.asks.focus = false;
+        assert!(!asks_toggle(&mut state) && state.asks.focus);
+        assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
+    }
+
+    #[test]
+    fn in_a_narrow_pane_the_inbox_takes_the_chats_place_and_the_pty_keeps_its_size() {
+        let mut state = qass_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let before = state.sized.clone();
+        assert!(asks_toggle(&mut state));
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        assert_eq!(
+            size_terminals(&mut state, &mut seqs).unwrap(),
+            None,
+            "nothing repaints"
+        );
+        assert_eq!(state.sized, before);
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(
+            painted.contains("questions") && !painted.contains("\u{2500} terminal "),
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn a_pane_too_narrow_or_too_short_says_so_and_changes_nothing() {
+        for (cols, lines) in [(90u16, 50u16), (160, 15)] {
+            let mut state = qass_window();
+            state.cols = cols;
+            state.lines = lines;
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            assert!(!asks_toggle(&mut state), "{cols}x{lines}");
+            assert!(!state.qass_ui.inbox);
+            assert!(
+                state
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("too narrow")),
+                "{:?}",
+                state.message
+            );
+        }
+        // Away from qass's screen it says where it is.
+        let mut state = qass_window();
+        assert!(!asks_toggle(&mut state));
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("ctrl-a Q"))
+        );
+    }
+
+    /// The zoom puts the header and the inbox away together, and `ctrl-a i` brings the inbox
+    /// back unzoomed.
+    #[test]
+    fn zoom_puts_the_inbox_away_and_ctrl_a_i_unzooms_it() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        asks_toggle(&mut state);
+        zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(state.qass_ui.zoomed && state.qass_plan().unwrap().side.is_none());
+        assert!(!state.asks_focused(), "no keys for what is not shown");
+        assert!(asks_toggle(&mut state));
+        assert!(!state.qass_ui.zoomed && state.asks_focused());
+    }
+
+    /// A click lands on what was painted: the chip toggles, a card selects, an option is held,
+    /// the box types, a blank cell of the inbox takes the keyboard, the chat takes it back.
+    #[test]
+    fn clicks_in_the_inbox_and_on_the_chip_land_on_what_was_painted() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state
+            .asks
+            .take(vec![ask_card(1, "korea"), ask_card(2, "cv")], Vec::new());
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let at = |pane_row: usize, pane_col: usize| {
+            (
+                (screen::TABS + 1 + pane_row) as u16,
+                (left + 1 + pane_col) as u16,
+            )
+        };
+        // The chip, closed.
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let chip = screen.chip().expect("the chip is on the header");
+        let (row, col) = at(chip.row, chip.x0 + 2);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        assert!(asks_toggle(&mut state));
+        state.asks.focus = false;
+        // Open: find the rows the way the click does.
+        let plan = state.qass_plan().unwrap();
+        let side = plan.side.unwrap().rect;
+        let frame = state.frame();
+        let (_, screen) =
+            screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
+        let painted: Vec<String> = (0..plan.rows)
+            .map(|r| screen.row(r, |_| " ".repeat(plan.inner.cols)))
+            .collect();
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let find = |needle: &str| {
+            painted
+                .iter()
+                .position(|r| {
+                    strip(r)
+                        .chars()
+                        .take(side.cols)
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} not painted"))
+        };
+        let (row, col) = at(find("2 cv"), side.x + 8);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Card(1)))
+        );
+        let (row, col) = at(find("[b] pick b"), side.x + 8);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Option(1)))
+        );
+        let (row, col) = at(find("t to type"), side.x + 8);
+        assert_eq!(
+            state.ask_click(row, col),
+            Some(AskClick::Inbox(crate::asks::Hit::Box))
+        );
+        // A cell of the inbox with nothing to press, and the chat.
+        let (row, col) = at(find("questions"), side.x + side.cols - 3);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::InboxBlank));
+        let (row, col) = at(plan.inner.y + 1, plan.inner.x + 5);
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Chat));
+        // Nothing on the owner's own tabs.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.ask_click(row, col), None);
+    }
+
+    /// The chip counts the cards waiting once the inbox is readable, the blocked agents before.
+    #[test]
+    fn the_header_chip_counts_the_cards_when_it_can() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        let chip_of = |state: &State| {
+            let painted = screen::paint(&state.frame());
+            let at = painted.find("asks you").expect("the chip");
+            let head: String = painted[..at]
+                .chars()
+                .rev()
+                .take(12)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            head
+        };
+        let before = chip_of(&state);
+        state.asks.take(
+            vec![ask_card(1, "a"), ask_card(2, "b"), ask_card(3, "c")],
+            Vec::new(),
+        );
+        assert!(
+            chip_of(&state).contains("3"),
+            "{:?} then {:?}",
+            before,
+            chip_of(&state)
+        );
+        state.asks.take(Vec::new(), Vec::new());
+        assert!(chip_of(&state).contains('0'));
+    }
+
+    #[test]
+    fn keys_in_the_inbox_close_it_leave_it_or_go_back_to_the_ordinary_path() {
+        let now = std::time::Instant::now();
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        asks_toggle(&mut state);
+        // The prefix and the mouse are not the inbox's.
+        let taken = asks_keys(&mut state, b"\x01", 1, now);
+        assert_eq!(taken.feed.as_deref(), Some(&b"\x01"[..]));
+        assert!(state.asks.focus);
+        // A letter is the inbox's and goes nowhere else.
+        let taken = asks_keys(&mut state, b"z", 1, now);
+        assert_eq!(taken, AskKeys::default());
+        // An answer is held; tab gives the chat the keyboard and takes the answer back.
+        asks_keys(&mut state, b"a", 1, now);
+        assert!(state.asks.holding());
+        asks_keys(&mut state, b"\t", 1, now);
+        assert!(!state.asks.focus && !state.asks.holding() && state.qass_ui.inbox);
+        // Esc puts it away and asks for the pty to be sized again.
+        state.asks.focus = true;
+        let taken = asks_keys(&mut state, b"\x1b", 1, now);
+        assert!(taken.resize && !state.qass_ui.inbox && !state.asks.focus);
+        // Enter on a card goes to its agent's tab.
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"\r", 1, now);
+        assert_eq!(taken.jump, Some(1));
+        assert!(!state.asks.focus);
+    }
+
+    #[test]
+    fn in_a_narrow_pane_tab_puts_the_inbox_away_because_there_is_no_chat_beside_it() {
+        let now = std::time::Instant::now();
+        let mut state = qass_window();
+        state.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        asks_toggle(&mut state);
+        assert!(state.qass_plan().unwrap().side.unwrap().replaces);
+        asks_keys(&mut state, b"\t", 1, now);
+        assert!(!state.qass_ui.inbox && !state.asks.focus);
+    }
+
+    #[test]
+    fn the_keyboard_leaves_the_inbox_with_the_screen_it_was_on() {
+        let now = std::time::Instant::now();
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        asks_toggle(&mut state);
+        asks_keys(&mut state, b"b", 1, now);
+        assert!(state.asks_focused() && state.asks.holding());
+        // Away from qass's screen: nothing is shown, so nothing is held for him.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!state.asks_focused());
+        state.asks_settle();
+        assert!(!state.asks.focus && !state.asks.holding());
+        // Zoomed, the same.
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.focus = true;
+        zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks_settle();
+        assert!(!state.asks.focus);
     }
 
     /// A window too small to frame anything leaves qass's pane plain and its pty whole.

@@ -32,14 +32,27 @@ const TEXT_MIN: usize = 44;
 /// Blank columns before the pet or the text, and between the pet and the text.
 const LEAD: usize = 2;
 const GAP: usize = 2;
+/// The narrowest pane that holds the inbox at all, and the one that holds it beside qass's
+/// terminal rather than in its place.
+pub const INBOX_MIN_COLS: usize = 60;
+pub const INBOX_BESIDE_COLS: usize = 100;
+/// The shortest pane that holds the inbox.
+pub const INBOX_MIN_ROWS: usize = 14;
+/// The inbox beside the terminal takes about this share of the pane, kept between two widths.
+/// The rows the inbox keeps under the header box, so a card shows its options and its text box.
+const INBOX_BOX_ROWS: usize = 14;
+const INBOX_SHARE: usize = 43;
+const INBOX_WIDTH: (usize, usize) = (48, 56);
 /// The file the watcher touches each time it tells qass an event.
 const LAST_WAKE: &str = "last-wake";
 
 /// What this client remembers about the screen: the zoom, and the two clocks its lines age on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Ui {
-    /// The header is put away and the terminal box takes the whole pane.
+    /// The header is put away and the terminal box takes the whole pane. The inbox goes with it.
     pub zoomed: bool,
+    /// The question inbox is open beside qass's terminal (or in its place, in a narrow pane).
+    pub inbox: bool,
     /// When the watcher last told qass something, unix seconds, as the file's age says.
     pub wake_at: Option<i64>,
     /// The quarter minute the ages were last drawn in, so a line that says `2 min ago` is
@@ -90,6 +103,14 @@ impl Header {
     }
 }
 
+/// The inbox's rectangle in the pane, and whether it takes the terminal's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Side {
+    pub rect: Rect,
+    /// A narrow pane: the inbox stands where the terminal box would, which keeps its size.
+    pub replaces: bool,
+}
+
 /// Where everything goes in a pane of `cols x rows` cells, pane-local.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
@@ -100,23 +121,32 @@ pub struct Plan {
     pub frame: Rect,
     /// qass's terminal inside it: the size its pty is given.
     pub inner: Rect,
+    /// The question inbox, when it is open and the pane is big enough for it.
+    pub side: Option<Side>,
 }
 
 impl Plan {
     /// `None` when the pane is too small to frame anything: it stays plain then.
-    pub fn new(cols: usize, rows: usize, zoomed: bool) -> Option<Plan> {
+    pub fn new(cols: usize, rows: usize, zoomed: bool, inbox: bool) -> Option<Plan> {
         if cols < MIN_COLS || rows < MIN_ROWS {
             return None;
         }
+        // The inbox needs rows of its own: under them the header gives up its box for a line.
+        let wants_inbox = inbox && !zoomed && Plan::holds_inbox(cols, rows);
+        let box_rows = if wants_inbox {
+            BOX_ROWS + INBOX_BOX_ROWS
+        } else {
+            BOX_ROWS + 2 + MIN_INSIDE
+        };
         let header = if zoomed {
             Header::None
-        } else if rows >= BOX_ROWS + 2 + MIN_INSIDE {
+        } else if rows >= box_rows {
             Header::Box
         } else {
             Header::Line
         };
         let top = header.rows();
-        Some(Plan {
+        let mut plan = Plan {
             header,
             cols,
             rows,
@@ -132,7 +162,46 @@ impl Plan {
                 cols: cols - 2,
                 rows: rows - top - 2,
             },
-        })
+            side: None,
+        };
+        if inbox && !zoomed && cols >= INBOX_MIN_COLS && rows >= INBOX_MIN_ROWS {
+            let below = Rect {
+                x: 0,
+                y: top,
+                cols,
+                rows: rows - top,
+            };
+            if cols >= INBOX_BESIDE_COLS {
+                let w = (cols * INBOX_SHARE / 100).clamp(INBOX_WIDTH.0, INBOX_WIDTH.1);
+                plan.side = Some(Side {
+                    rect: Rect { cols: w, ..below },
+                    replaces: false,
+                });
+                plan.frame = Rect {
+                    x: w,
+                    cols: cols - w,
+                    ..below
+                };
+                plan.inner = Rect {
+                    x: w + 1,
+                    y: top + 1,
+                    cols: cols - w - 2,
+                    rows: rows - top - 2,
+                };
+            } else {
+                // The pty keeps the size it has: nothing repaints when the inbox comes and goes.
+                plan.side = Some(Side {
+                    rect: below,
+                    replaces: true,
+                });
+            }
+        }
+        Some(plan)
+    }
+
+    /// Whether a pane of this size can hold the inbox at all.
+    pub fn holds_inbox(cols: usize, rows: usize) -> bool {
+        cols >= INBOX_MIN_COLS && rows >= INBOX_MIN_ROWS
     }
 }
 
@@ -201,6 +270,7 @@ pub fn facts(
     focused: u32,
     seen: &sidebar::Seen,
     unseen: &sidebar::Unseen,
+    cards: Option<usize>,
 ) -> Option<Facts> {
     let qass = sidebar::qass_space(spaces)?;
     // The agent the keyboard is in, else the first one: a second agent opened in qass's space
@@ -240,7 +310,8 @@ pub fn facts(
             .filter(|r| sidebar::needs_person(r, focused, seen, unseen))
             .count(),
         working: mine().filter(|r| r.state == "working").count(),
-        asks: mine().filter(|r| r.state == "blocked").count(),
+        // The cards waiting in his inbox once it can be read; the blocked agents before.
+        asks: cards.unwrap_or_else(|| mine().filter(|r| r.state == "blocked").count()),
     })
 }
 
@@ -356,13 +427,13 @@ pub fn pet_for(pet: &Avatar, asleep: bool) -> Avatar {
 }
 
 /// A piece of a line: its words and the ink they wear.
-struct Seg {
-    role: Role,
-    bold: bool,
-    text: String,
+pub(crate) struct Seg {
+    pub(crate) role: Role,
+    pub(crate) bold: bool,
+    pub(crate) text: String,
 }
 
-fn seg(role: Role, text: impl Into<String>) -> Seg {
+pub(crate) fn seg(role: Role, text: impl Into<String>) -> Seg {
     Seg {
         role,
         bold: false,
@@ -370,7 +441,7 @@ fn seg(role: Role, text: impl Into<String>) -> Seg {
     }
 }
 
-fn bold(role: Role, text: impl Into<String>) -> Seg {
+pub(crate) fn bold(role: Role, text: impl Into<String>) -> Seg {
     Seg {
         role,
         bold: true,
@@ -379,7 +450,7 @@ fn bold(role: Role, text: impl Into<String>) -> Seg {
 }
 
 /// `text` cut to at most `cols` columns, on a character.
-fn cut(text: &str, cols: usize) -> String {
+pub(crate) fn cut(text: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars().filter(|c| width::drawn(*c)) {
@@ -394,12 +465,12 @@ fn cut(text: &str, cols: usize) -> String {
 }
 
 /// The ink of `role`, faded to one grey while a box is open over the screen.
-fn ink(role: Role, fade: bool) -> String {
+pub(crate) fn ink(role: Role, fade: bool) -> String {
     theme::fg(if fade { Role::Unobserved } else { role })
 }
 
 /// `segs` painted into exactly `cols` columns.
-fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
+pub(crate) fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
     let mut out = String::new();
     let mut used = 0;
     for s in segs {
@@ -457,7 +528,7 @@ fn fit_chips(f: &Facts, room: usize, first_gap: usize) -> Vec<Seg> {
 
 /// A box edge: ember corners, the rule between them, a title after the first corner and a
 /// tag before the last, each dropped when the edge is too short to hold it.
-fn edge(
+pub(crate) fn edge(
     cols: usize,
     (left, right): (char, char),
     title: Option<&str>,
@@ -513,6 +584,18 @@ pub struct Screen {
     top: String,
     bottom: String,
     side: String,
+    /// The inbox's rows, each as wide as its rectangle, while it is open.
+    inbox: Vec<String>,
+    /// Where the `[ N asks you ]` chip is, pane-local: its row and its columns.
+    chip: Option<Chip>,
+}
+
+/// The `[ N asks you ]` chip's cells in the pane: a click on it opens and closes the inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chip {
+    pub row: usize,
+    pub x0: usize,
+    pub x1: usize,
 }
 
 impl Screen {
@@ -525,24 +608,49 @@ impl Screen {
             seg(Role::Text, "  "),
             seg(say.role, format!("{mark}{}", say.word)),
         ];
-        let header = match plan.header {
-            Header::None => Vec::new(),
-            Header::Line => vec![one_line(state, f, plan.cols, ctx.fade)],
-            Header::Box => box_rows(plan.cols, state, f, &say, wake_at, ctx),
+        let (header, chip) = match plan.header {
+            Header::None => (Vec::new(), None),
+            Header::Line => {
+                let (line, x) = one_line(state, f, plan.cols, ctx.fade);
+                (vec![line], x.map(|(x0, x1)| Chip { row: 0, x0, x1 }))
+            }
+            Header::Box => {
+                let (rows, x) = box_rows(plan.cols, state, f, &say, wake_at, ctx);
+                (rows, x.map(|(x0, x1)| Chip { row: 5, x0, x1 }))
+            }
         };
         Screen {
             plan,
             header,
+            inbox: Vec::new(),
+            chip,
             top: edge(
-                plan.cols,
+                plan.frame.cols,
                 ('\u{256d}', '\u{256e}'),
                 Some("terminal"),
                 Some(&format!("T{}", f.terminal)),
                 ctx.fade,
             ),
-            bottom: edge(plan.cols, ('\u{2570}', '\u{256f}'), None, None, ctx.fade),
+            bottom: edge(
+                plan.frame.cols,
+                ('\u{2570}', '\u{256f}'),
+                None,
+                None,
+                ctx.fade,
+            ),
             side: format!("{}\u{2502}{}", ink(Role::Rule, ctx.fade), theme::RESET),
         }
+    }
+
+    /// The inbox's painted rows, one per row of its rectangle.
+    pub fn with_inbox(mut self, rows: Vec<String>) -> Screen {
+        self.inbox = rows;
+        self
+    }
+
+    /// The chip that opens the inbox, when the header shows it whole.
+    pub fn chip(&self) -> Option<Chip> {
+        self.chip
     }
 
     /// One row of the pane, exactly `plan.cols` columns. `terminal` paints qass's own row
@@ -556,28 +664,55 @@ impl Screen {
         if pane_row < p.frame.y || pane_row >= p.frame.y + p.frame.rows {
             return blank();
         }
+        let inbox = |at: usize| self.inbox.get(at).cloned().unwrap_or_else(blank);
+        // A narrow pane: the inbox is where the terminal box would be.
+        if let Some(side) = p.side.filter(|s| s.replaces) {
+            return inbox(pane_row - side.rect.y);
+        }
+        let left = p
+            .side
+            .map(|s| inbox(pane_row - s.rect.y))
+            .unwrap_or_default();
         if pane_row == p.frame.y {
-            return self.top.clone();
+            return format!("{left}{}", self.top);
         }
         if pane_row + 1 == p.frame.y + p.frame.rows {
-            return self.bottom.clone();
+            return format!("{left}{}", self.bottom);
         }
-        format!("{0}{1}{0}", self.side, terminal(pane_row - p.inner.y))
+        format!("{left}{0}{1}{0}", self.side, terminal(pane_row - p.inner.y))
     }
 }
 
 /// The header as one line: the state, then the counters that fit.
-fn one_line(mut state: Vec<Seg>, f: &Facts, cols: usize, fade: bool) -> String {
+fn one_line(
+    mut state: Vec<Seg>,
+    f: &Facts,
+    cols: usize,
+    fade: bool,
+) -> (String, Option<(usize, usize)>) {
     state.insert(0, seg(Role::Text, " "));
     let used: usize = state.iter().map(|s| width::width(&s.text)).sum();
     // The counters after two blank cells, as many as fit whole.
     let room = cols.saturating_sub(used + 2);
     let chips = fit_chips(f, room, 2);
+    let span = last_chip(f, &chips).map(|(from, to)| (used + 2 + from, used + 2 + to));
     if !chips.is_empty() {
         state.push(seg(Role::Text, "  "));
         state.extend(chips);
     }
-    line(&state, cols, fade)
+    (line(&state, cols, fade), span)
+}
+
+/// Where the last counter, `[ N asks you ]`, stands in the run `fit_chips` made: its first and
+/// one past its last column, when all three counters fit whole (four pieces each, and a gap
+/// between every two).
+fn last_chip(f: &Facts, run: &[Seg]) -> Option<(usize, usize)> {
+    if run.len() != 3 * 4 + 2 {
+        return None;
+    }
+    let total: usize = run.iter().map(|s| width::width(&s.text)).sum();
+    let own: usize = chips(f).last()?.iter().map(|s| width::width(&s.text)).sum();
+    Some((total - own, total))
 }
 
 /// The framed header: the pet on the left, the five lines on the right.
@@ -588,7 +723,7 @@ fn box_rows(
     say: &Say,
     wake_at: Option<i64>,
     ctx: Ctx,
-) -> Vec<String> {
+) -> (Vec<String>, Option<(usize, usize)>) {
     let inside = cols - 2;
     let art = ctx
         .pet
@@ -599,6 +734,8 @@ fn box_rows(
     let lead = if pet_w > 0 { LEAD + pet_w + GAP } else { LEAD };
     let text_w = inside.saturating_sub(lead + 1);
     let chip_line = fit_chips(f, text_w, 1);
+    // The border, then the pet's columns, then the counters.
+    let span = last_chip(f, &chip_line).map(|(from, to)| (1 + lead + from, 1 + lead + to));
     let label = |what: &str, text: &str| {
         vec![
             seg(Role::Faint, format!("{what:<6}")),
@@ -638,7 +775,7 @@ fn box_rows(
         ));
     }
     out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, ctx.fade));
-    out
+    (out, span)
 }
 
 #[cfg(test)]
@@ -699,7 +836,7 @@ mod tests {
     #[test]
     fn the_plan_gives_the_terminal_the_inside_of_its_box() {
         // A tall pane: a 7 row header box, then the terminal box and its two borders.
-        let p = Plan::new(160, 46, false).unwrap();
+        let p = Plan::new(160, 46, false, false).unwrap();
         assert_eq!(p.header, Header::Box);
         assert_eq!((p.frame.y, p.frame.rows, p.frame.cols), (7, 39, 160));
         assert_eq!(
@@ -712,25 +849,25 @@ mod tests {
             }
         );
         // The shortest pane that still has a header box leaves six rows inside it.
-        let p = Plan::new(80, 15, false).unwrap();
+        let p = Plan::new(80, 15, false, false).unwrap();
         assert_eq!((p.header, p.inner.rows), (Header::Box, 6));
         // One row less and the header is one line.
-        let p = Plan::new(80, 14, false).unwrap();
+        let p = Plan::new(80, 14, false, false).unwrap();
         assert_eq!(
             (p.header, p.frame.y, p.inner.y, p.inner.rows),
             (Header::Line, 1, 2, 11)
         );
-        let p = Plan::new(24, 6, false).unwrap();
+        let p = Plan::new(24, 6, false, false).unwrap();
         assert_eq!(
             (p.header, p.inner.rows, p.inner.cols),
             (Header::Line, 3, 22)
         );
         // Zoomed: no header, the box is the pane.
-        let p = Plan::new(160, 46, true).unwrap();
+        let p = Plan::new(160, 46, true, false).unwrap();
         assert_eq!((p.header, p.frame.y, p.inner.rows), (Header::None, 0, 44));
         // Too small for any frame: the pane stays plain.
-        assert_eq!(Plan::new(23, 46, false), None);
-        assert_eq!(Plan::new(160, 5, false), None);
+        assert_eq!(Plan::new(23, 46, false, false), None);
+        assert_eq!(Plan::new(160, 5, false, false), None);
     }
 
     #[test]
@@ -738,7 +875,7 @@ mod tests {
         for cols in MIN_COLS..130 {
             for rows in MIN_ROWS..60 {
                 for zoomed in [false, true] {
-                    let p = Plan::new(cols, rows, zoomed).unwrap();
+                    let p = Plan::new(cols, rows, zoomed, false).unwrap();
                     assert!(p.inner.cols >= 22 && p.inner.rows >= 3, "{cols}x{rows}");
                     assert_eq!(p.frame.y + p.frame.rows, rows);
                     assert_eq!(p.inner.y + p.inner.rows + 1, rows);
@@ -783,7 +920,7 @@ mod tests {
 
     #[test]
     fn the_header_is_painted_from_the_facts() {
-        let plan = Plan::new(100, 40, false).unwrap();
+        let plan = Plan::new(100, 40, false, false).unwrap();
         let mut f = facts_of("working");
         f.activity = Some("Bash cargo test".to_string());
         let screen = Screen::new(plan, &f, Some(1_000 + 5), ctx(None));
@@ -817,7 +954,7 @@ mod tests {
 
     #[test]
     fn the_terminal_rows_are_asked_for_in_the_boxs_own_numbering() {
-        let plan = Plan::new(60, 30, false).unwrap();
+        let plan = Plan::new(60, 30, false, false).unwrap();
         let screen = Screen::new(plan, &facts_of("idle"), None, ctx(None));
         let asked = std::cell::RefCell::new(Vec::new());
         for r in 0..plan.rows {
@@ -834,7 +971,7 @@ mod tests {
 
     #[test]
     fn a_short_pane_gets_one_line_with_the_counters_that_fit() {
-        let plan = Plan::new(60, 10, false).unwrap();
+        let plan = Plan::new(60, 10, false, false).unwrap();
         assert_eq!(plan.header, Header::Line);
         let screen = Screen::new(plan, &facts_of("idle"), None, ctx(None));
         let first = strip(&screen.row(0, |_| String::new()));
@@ -843,7 +980,7 @@ mod tests {
             first.contains("qass") && first.contains("idle") && first.contains("[ 3 waiting ]"),
             "{first:?}"
         );
-        let narrow = Plan::new(30, 10, false).unwrap();
+        let narrow = Plan::new(30, 10, false, false).unwrap();
         let first = strip(
             &Screen::new(narrow, &facts_of("idle"), None, ctx(None)).row(0, |_| String::new()),
         );
@@ -854,7 +991,7 @@ mod tests {
     #[test]
     fn the_pet_shows_when_there_is_room_and_squints_asleep() {
         let pet = pet();
-        let plan = Plan::new(100, 40, false).unwrap();
+        let plan = Plan::new(100, 40, false, false).unwrap();
         let with = Screen::new(plan, &facts_of("working"), None, ctx(Some(&pet)));
         let without = Screen::new(plan, &facts_of("working"), None, ctx(None));
         assert_ne!(with.header, without.header, "the pet is drawn");
@@ -880,7 +1017,7 @@ mod tests {
             assert!(awake.header[1 + i].contains(&big[i]), "row {i} awake");
         }
         // Too narrow for the pet beside the text: text alone, and still as wide as the pane.
-        let narrow = Plan::new(50, 40, false).unwrap();
+        let narrow = Plan::new(50, 40, false, false).unwrap();
         let screen = Screen::new(narrow, &facts_of("working"), None, ctx(Some(&pet)));
         let bare = Screen::new(narrow, &facts_of("working"), None, ctx(None));
         assert_eq!(screen.header, bare.header);
@@ -950,7 +1087,7 @@ mod tests {
             qass,
         ];
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
-        let f = facts(&rows, &spaces, 5, &seen, &unseen).unwrap();
+        let f = facts(&rows, &spaces, 5, &seen, &unseen, None).unwrap();
         assert_eq!((f.terminal, f.state.as_str()), (5, "working"));
         assert_eq!(f.activity.as_deref(), Some("Read a.rs"));
         assert_eq!(f.active_at, Some(42));
@@ -960,11 +1097,11 @@ mod tests {
         let mut done = rows.clone();
         done.push(row(7, 1, "done"));
         sidebar::qass_last(&mut spaces.clone(), &mut done);
-        let f = facts(&done, &spaces, 5, &seen, &unseen).unwrap();
+        let f = facts(&done, &spaces, 5, &seen, &unseen, None).unwrap();
         assert_eq!((f.agents, f.waiting), (6, 3));
         // No qass tab, no screen.
         let owner_only: Vec<AgentRow> = rows[..5].to_vec();
-        assert_eq!(facts(&owner_only, &spaces, 0, &seen, &unseen), None);
+        assert_eq!(facts(&owner_only, &spaces, 0, &seen, &unseen, None), None);
     }
 
     #[test]
@@ -985,6 +1122,7 @@ mod tests {
             0,
             &sidebar::Seen::new(),
             &sidebar::Unseen::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -992,5 +1130,140 @@ mod tests {
             (5, "sleeping", None)
         );
         assert!(f.asleep());
+    }
+
+    /// The inbox beside qass's terminal takes a share of the pane and leaves the terminal the
+    /// rest; in a narrow pane it takes the terminal's place and the pty keeps its size.
+    #[test]
+    fn the_inbox_is_beside_the_terminal_when_wide_and_in_its_place_when_narrow() {
+        let closed = Plan::new(122, 40, false, false).unwrap();
+        let open = Plan::new(122, 40, false, true).unwrap();
+        let side = open.side.expect("an inbox at 122 columns");
+        assert!(
+            !side.replaces && (48..=56).contains(&side.rect.cols),
+            "{side:?}"
+        );
+        assert_eq!((side.rect.x, side.rect.y, side.rect.rows), (0, 7, 33));
+        assert_eq!(open.frame.x, side.rect.cols);
+        assert_eq!(open.frame.cols + side.rect.cols, 122);
+        // The terminal loses columns and no rows, and still has a real inside.
+        assert_eq!(open.inner.rows, closed.inner.rows);
+        assert_eq!(open.inner.x, side.rect.cols + 1);
+        assert_eq!(open.inner.cols, open.frame.cols - 2);
+        assert_eq!(closed.side, None);
+        // A wide window keeps the share inside its two widths.
+        for cols in 100..220 {
+            let p = Plan::new(cols, 40, false, true).unwrap();
+            let w = p.side.unwrap().rect.cols;
+            assert!((48..=56).contains(&w) && p.inner.cols >= 22, "{cols}: {w}");
+        }
+        // Narrow: in the terminal's place, the pty exactly as it was.
+        let narrow = Plan::new(80, 40, false, true).unwrap();
+        let shut = Plan::new(80, 40, false, false).unwrap();
+        assert!(narrow.side.unwrap().replaces);
+        assert_eq!((narrow.frame, narrow.inner), (shut.frame, shut.inner));
+        assert_eq!(narrow.side.unwrap().rect, narrow.frame);
+        // Too narrow or too short: no inbox at all. Zoom puts it away with the header.
+        assert_eq!(Plan::new(59, 40, false, true).unwrap().side, None);
+        assert_eq!(Plan::new(100, 13, false, true).unwrap().side, None);
+        assert_eq!(Plan::new(122, 40, true, true).unwrap().side, None);
+        assert!(
+            Plan::holds_inbox(60, 14) && !Plan::holds_inbox(59, 14) && !Plan::holds_inbox(60, 13)
+        );
+    }
+
+    #[test]
+    fn a_row_with_the_inbox_is_the_inbox_then_the_terminal_box_and_as_wide_as_the_pane() {
+        for (cols, rows) in [(122, 40), (100, 34), (80, 40)] {
+            let plan = Plan::new(cols, rows, false, true).unwrap();
+            let side = plan.side.unwrap();
+            let inbox: Vec<String> = (0..side.rect.rows)
+                .map(|i| format!("{:<w$}", format!("I{i}"), w = side.rect.cols))
+                .collect();
+            let screen = Screen::new(plan, &facts_of("idle"), None, ctx(None)).with_inbox(inbox);
+            for r in 0..plan.rows {
+                let row = strip(&screen.row(r, |_| "T".repeat(plan.inner.cols)));
+                assert_eq!(width::width(&row), cols, "{cols}x{rows} row {r}: {row:?}");
+                if r >= plan.frame.y {
+                    assert!(row.starts_with('I'), "{cols}x{rows} row {r}: {row:?}");
+                }
+            }
+            if !side.replaces {
+                // Beside: the terminal's frame follows the inbox and its first row is the edge.
+                let top = strip(&screen.row(plan.frame.y, |_| String::new()));
+                assert!(
+                    top[top.find('\u{256d}').unwrap()..].contains("terminal"),
+                    "{top}"
+                );
+                let mid = strip(&screen.row(plan.frame.y + 2, |_| "T".repeat(plan.inner.cols)));
+                assert!(
+                    mid.contains(&format!("\u{2502}{}\u{2502}", "T".repeat(plan.inner.cols))),
+                    "{mid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_chip_is_found_where_it_is_painted() {
+        for (cols, rows, pet) in [
+            (100, 40, false),
+            (100, 40, true),
+            (60, 10, false),
+            (122, 40, true),
+        ] {
+            let plan = Plan::new(cols, rows, false, false).unwrap();
+            let pet_art = pet.then(self::tests::pet);
+            let screen = Screen::new(plan, &facts_of("idle"), None, ctx(pet_art.as_ref()));
+            let Some(chip) = screen.chip() else {
+                panic!("a chip at {cols}x{rows}");
+            };
+            let row = strip(&screen.row(chip.row, |_| String::new()));
+            let cells: Vec<char> = row.chars().collect();
+            let under: String = cells[chip.x0..chip.x1].iter().collect();
+            assert_eq!(under, "[ 1 asks you ]", "{cols}x{rows} pet={pet}: {row:?}");
+        }
+        // Too narrow to hold all three counters: no chip to press.
+        let narrow = Plan::new(30, 10, false, false).unwrap();
+        assert_eq!(
+            Screen::new(narrow, &facts_of("idle"), None, ctx(None)).chip(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_chip_counts_the_cards_once_they_can_be_read() {
+        let spaces = vec![space(1, "app"), space(9, "qass")];
+        let rows = vec![row(1, 1, "blocked"), row(5, 9, "idle")];
+        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let blocked = facts(&rows, &spaces, 5, &seen, &unseen, None).unwrap();
+        assert_eq!(
+            blocked.asks, 1,
+            "a blocked agent before the inbox is readable"
+        );
+        let cards = facts(&rows, &spaces, 5, &seen, &unseen, Some(3)).unwrap();
+        assert_eq!(cards.asks, 3);
+        assert_eq!(
+            facts(&rows, &spaces, 5, &seen, &unseen, Some(0))
+                .unwrap()
+                .asks,
+            0
+        );
+    }
+
+    /// With the inbox open the header gives up its box for a line when the pane is too short
+    /// for both, so the inbox always has room for a card's options and its text box.
+    #[test]
+    fn the_inbox_keeps_its_rows_by_shrinking_the_header_when_the_pane_is_short() {
+        for rows in 15..21 {
+            let open = Plan::new(122, rows, false, true).unwrap();
+            let shut = Plan::new(122, rows, false, false).unwrap();
+            assert_eq!(shut.header, Header::Box, "{rows}");
+            assert_eq!(open.header, Header::Line, "{rows}");
+            assert!(open.side.unwrap().rect.rows >= INBOX_MIN_ROWS - 1, "{rows}");
+        }
+        let tall = Plan::new(122, 21, false, true).unwrap();
+        assert_eq!(tall.header, Header::Box);
+        assert!(tall.side.unwrap().rect.rows >= INBOX_BOX_ROWS);
     }
 }

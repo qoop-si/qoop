@@ -9,8 +9,8 @@
 //! transaction (`close_for_terminals`, called from `task::abandon_open_tasks`).
 //!
 //! Status words: `open` (waiting for him), `passed` (his words were typed to qass, which
-//! relays them), `answered` (his words went to the worker), `closed`. `closed_at` is when a
-//! card left `open` or `passed`, whichever way.
+//! relays them), `answered` (his words went to the worker), `closed`. `closed_at` is when the
+//! card last changed status: when it was passed, answered or closed.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -184,12 +184,10 @@ impl Store {
         if old.status != "open" {
             return Err(AskError::NotOpen(card.into(), old.status).into());
         }
-        // `passed` stays live until qass reports it handled, so it keeps no `closed_at`.
-        let closed = (to != "passed").then_some(now);
         tx.execute(
             "UPDATE ask SET status = ?2, answer = ?3, option = ?4, note = ?5, closed_at = ?6 \
              WHERE id = ?1",
-            params![old.id, to, answer, option, note, closed],
+            params![old.id, to, answer, option, note, now],
         )?;
         tx.commit()?;
         Ok(old)
@@ -353,7 +351,11 @@ mod tests {
             .unwrap();
         s.claim_ask("E1", "passed", None, "go", "passed to qass", 20)
             .unwrap();
-        assert_eq!(s.live_asks().unwrap()[0].status, "passed");
+        let passed = s.live_asks().unwrap().remove(0);
+        assert_eq!(
+            (passed.status.as_str(), passed.closed_at),
+            ("passed", Some(20))
+        );
         assert!(s.ended_asks(5).unwrap().is_empty());
         assert!(s.close_ask("E1", "qass answered", 30).unwrap());
         assert!(

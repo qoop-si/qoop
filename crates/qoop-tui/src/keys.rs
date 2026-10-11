@@ -143,6 +143,8 @@ pub enum Action {
     /// Uppercase, like the other pages and boxes on the capitals; the lowercase letter stays
     /// free.
     Qass,
+    /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
+    Asks,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
@@ -418,6 +420,7 @@ impl Keys {
                     b'?' => Action::Keybinds,
                     b'R' => Action::SpaceSettings,
                     b'Q' => Action::Qass,
+                    b'i' => Action::Asks,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.
@@ -711,6 +714,7 @@ mod tests {
         assert_eq!(keys.feed(b"\x01r"), vec![Action::Rename]);
         assert_eq!(keys.feed(b"\x01R"), vec![Action::SpaceSettings]);
         assert_eq!(keys.feed(b"\x01Q"), vec![Action::Qass]);
+        assert_eq!(keys.feed(b"\x01i"), vec![Action::Asks]);
     }
 
     #[test]

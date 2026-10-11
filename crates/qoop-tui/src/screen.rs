@@ -149,6 +149,8 @@ pub struct Chrome<'a> {
     /// split tab (the board above qass). Set only while one of those has the keyboard, by the
     /// one place that knows (`State::qass_header`).
     pub qass: Option<crate::qass_screen::Ui>,
+    /// The question inbox, as this client keeps it, while qass's screen is up.
+    pub asks: Option<&'a crate::asks::Pane>,
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -191,6 +193,7 @@ impl Default for Chrome<'_> {
             drag: None,
             nav: None,
             qass: None,
+            asks: None,
         }
     }
 }
@@ -478,12 +481,12 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
     if frame.tiles.len() >= 2 {
         return crate::qass_screen::Plan::band(cols as usize, rows as usize);
     }
-    crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed)
+    crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed, ui.inbox)
 }
 
 /// qass's screen painted for this frame, with its plan, when the pane is qass's and qass has
 /// a tab to speak for.
-fn qass_screen_of(
+pub(crate) fn qass_screen_of(
     frame: &Frame,
     pet: Option<&qoop_runtime::avatar::Avatar>,
     spotlight: bool,
@@ -495,6 +498,7 @@ fn qass_screen_of(
         frame.focused,
         frame.seen,
         frame.unseen,
+        frame.chrome.asks.and_then(|asks| asks.count()),
     )?;
     let ctx = crate::qass_screen::Ctx {
         pet,
@@ -505,10 +509,19 @@ fn qass_screen_of(
         fade: spotlight,
     };
     let wake_at = frame.chrome.qass.and_then(|ui| ui.wake_at);
-    Some((
-        plan,
-        crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx),
-    ))
+    let mut screen = crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx);
+    if let (Some(side), Some(asks)) = (plan.side, frame.chrome.asks) {
+        let seen = crate::asks::Ctx {
+            rows: frame.rows,
+            spaces: frame.spaces,
+            now_unix: frame.now_unix,
+            now: std::time::Instant::now(),
+            fade: spotlight,
+        };
+        let view = crate::asks::view(asks, &seen, side.rect.cols, side.rect.rows);
+        screen = screen.with_inbox(view.rows);
+    }
+    Some((plan, screen))
 }
 
 /// The columns spent before the pane starts: the left column and the rule beside it, or
@@ -756,6 +769,12 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
         0,
         frame.sidebar_width,
     );
+    // The keyboard is in the inbox: its own caret is drawn, and the chat's is not.
+    if frame.chrome.asks.is_some_and(|asks| asks.focus)
+        && qass_plan(frame).is_some_and(|p| p.side.is_some())
+    {
+        return None;
+    }
     if frame.tiles.len() < 2 {
         let (row, cell) = snapshot.cursor;
         let col = cursor_column(
@@ -2329,6 +2348,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x", "close tab"),
+            ("i", "qass inbox"),
         ],
     ),
     (
@@ -5369,7 +5389,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 40;
+    const COMMANDS: usize = 41;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5428,6 +5448,7 @@ mod tests {
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
             Action::Qass => (const { place(38) }, Some("ctrl-a Q")),
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
+            Action::Asks => (const { place(40) }, Some("ctrl-a i")),
         }
     }
 
@@ -5492,6 +5513,7 @@ mod tests {
             Action::Sleep,
             Action::UpNext,
             Action::Agents,
+            Action::Asks,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
