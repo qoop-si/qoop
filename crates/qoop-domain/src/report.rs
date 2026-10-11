@@ -399,6 +399,16 @@ fn often_ok(often: &str) -> bool {
         )
 }
 
+/// A `what` as notes are grouped by it, on the hub and when a machine looks for a note it kept
+/// already: lower case, one space between words, no stop at the end.
+pub fn group_key(what: &str) -> String {
+    what.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', '!', '?', ';', ','])
+        .to_ascii_lowercase()
+}
+
 /// A word the free text may use: common English or qoop's own.
 pub fn common_word(word: &str) -> bool {
     glossary(word) || common(word)
@@ -601,6 +611,15 @@ mod tests {
         assert!(problems(&n).iter().any(|p| p.contains("over 200")));
         n.cost = String::new();
         assert!(problems(&n).iter().any(|p| p == "cost: empty"));
+    }
+
+    #[test]
+    fn notes_alike_share_a_group_key() {
+        assert_eq!(
+            group_key("The  watcher slept."),
+            group_key("the watcher slept")
+        );
+        assert_ne!(group_key("the watcher slept"), group_key("a tab woke"));
     }
 
     #[test]

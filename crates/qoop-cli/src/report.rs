@@ -140,6 +140,12 @@ fn draft() -> std::io::Result<()> {
     refuse(&problems)?;
     let dir = folder()?;
     std::fs::create_dir_all(&dir)?;
+    // One problem is one note: the hub would only count it twice.
+    if let Some(kept) = alike(&dir, &note.what) {
+        return Err(std::io::Error::other(format!(
+            "this problem is already note {kept} (`qoop report show {kept}`)"
+        )));
+    }
     let n = next_number(&dir);
     let path = dir.join(format!("{n}.txt"));
     std::fs::write(&path, note.text())?;
@@ -177,7 +183,11 @@ fn list() -> std::io::Result<()> {
     let mut numbers = numbers(&dir);
     numbers.sort_unstable();
     if numbers.is_empty() {
-        println!("no notes kept");
+        println!(
+            "no notes kept. When a problem in qass's own way of working is qoop's, qass drafts \
+             one here and shows it to you first; `qoop settings` (notes to qoop's maker) says \
+             whether it may send them."
+        );
     }
     for n in numbers {
         let what = std::fs::read_to_string(dir.join(format!("{n}.txt")))
@@ -232,6 +242,17 @@ fn numbers(dir: &Path) -> Vec<u32> {
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.strip_suffix(".txt")?.parse().ok())
         .collect()
+}
+
+/// The kept or sent note that names the same problem as `what`, if any.
+fn alike(dir: &Path, what: &str) -> Option<u32> {
+    let key = report::group_key(what);
+    numbers(dir).into_iter().find(|n| {
+        std::fs::read_to_string(dir.join(format!("{n}.txt")))
+            .ok()
+            .and_then(|t| Note::parse(&t).ok())
+            .is_some_and(|note| report::group_key(&note.what) == key)
+    })
 }
 
 fn next_number(dir: &Path) -> u32 {
@@ -427,5 +448,17 @@ mod tests {
         assert!(!any_sent(dir.path()));
         std::fs::write(dir.path().join("7.sent"), "key\n").expect("write");
         assert!(any_sent(dir.path()));
+    }
+
+    #[test]
+    fn a_problem_kept_already_is_found_by_its_what() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("3.txt"),
+            "area: watcher\nwhat: The watcher slept.\ncost: a wake\noften: 1 time in 1 day\n",
+        )
+        .expect("write");
+        assert_eq!(alike(dir.path(), "the  watcher slept"), Some(3));
+        assert_eq!(alike(dir.path(), "a tab woke"), None);
     }
 }

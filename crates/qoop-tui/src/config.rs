@@ -467,6 +467,7 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
         qass: Spans,
         #[serde(default)]
         board: Spans,
+        #[serde(default)]
         report: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
