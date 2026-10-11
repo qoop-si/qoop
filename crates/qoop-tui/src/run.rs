@@ -3050,7 +3050,11 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ),
     ("resize panes", "e", "h j k l move the nearest divider"),
     ("equalize panes", "=", "every pane the same share"),
-    ("toggle view", "g", "spaces as a tree or agents by urgency"),
+    (
+        "tree or urgency",
+        "g",
+        "spaces as a tree or agents by urgency",
+    ),
     ("keybinds", "?", "every key, and what it does"),
     ("settings", "", "every setting on one page, with your pet"),
     // After "settings": a letter jumps to the first row it starts, and `s` has
@@ -3557,7 +3561,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             equalize(state);
             MenuSend::Nothing
         }
-        "toggle view" => {
+        "tree or urgency" => {
             state.view = state.view.toggle();
             MenuSend::Nothing
         }
@@ -16988,7 +16992,7 @@ mod tests {
                 "copy mode",
                 "resize panes",
                 "equalize panes",
-                "toggle view",
+                "tree or urgency",
                 "keybinds",
                 "settings",
                 "sleep space",
@@ -17065,7 +17069,7 @@ mod tests {
         // View flips locally and sends nothing.
         let view = MENU
             .iter()
-            .position(|(n, _, _)| *n == "toggle view")
+            .position(|(n, _, _)| *n == "tree or urgency")
             .unwrap();
         let before = state.view;
         assert!(matches!(

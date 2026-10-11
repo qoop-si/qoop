@@ -19,8 +19,11 @@ use qoop_tui::theme::{self, Role};
 
 use crate::page::{self, Key, Player, Screen, Session, bold, ink, raised, raised_bold};
 
-/// The smallest window the page is drawn in.
+/// The window the whole page fits in, pet column included.
 pub const NEED: (usize, usize) = (100, 30);
+/// The smallest window the page is drawn in: below `NEED` the pet column folds away and the
+/// settings take the width (a tab beside the sidebar is often 91 x 34).
+pub const MIN: (usize, usize) = (64, 16);
 /// Where the pet column ends and the settings begin.
 const DIV: usize = 40;
 const CHIPS: [&str; 6] = ["all", "sound", "look", "agents", "machines", "phones"];
@@ -445,6 +448,54 @@ struct Page {
     said: Option<String>,
     /// The machine this page runs on, whose `config.toml` it edits.
     host: String,
+    /// Whether the last frame had room for the pet column (`wide`); set before each draw.
+    wide: bool,
+}
+
+/// Whether a `w` x `h` frame has room for the pet column beside the settings.
+pub(crate) fn wide(w: usize, h: usize) -> bool {
+    w >= NEED.0 && h >= NEED.1
+}
+
+/// `text` in lines of at most `width` characters (the unit `Screen` draws), broken at spaces, a
+/// word longer than a line cut where the line ends.
+fn fit_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        let used = line.chars().count();
+        if used > 0 && used + 1 + word.len() <= width {
+            line.push(' ');
+            line.extend(word);
+            continue;
+        }
+        if used > 0 {
+            lines.push(std::mem::take(&mut line));
+        }
+        while word.len() > width {
+            lines.push(word.drain(..width).collect());
+        }
+        line = word.into_iter().collect();
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// `text` cut to `width` characters, ending in "…" when it was longer.
+fn cut(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 impl Page {
@@ -452,9 +503,26 @@ impl Page {
         filtered(&self.all, &self.query, self.chip)
     }
 
+    /// Fit the page to a `w` x `h` frame before drawing it: below `NEED` the pet column is not
+    /// drawn, so a pet in focus hands it to the list.
+    fn fit(&mut self, w: usize, h: usize) {
+        self.wide = wide(w, h);
+        if !self.wide && matches!(self.focus, Focus::Pet(_)) {
+            self.focus = Focus::List;
+        }
+    }
+
     fn draw(&self, w: usize, h: usize) -> Screen {
         let mut s = Screen::new(w, h);
-        // The pet column.
+        if self.wide {
+            self.draw_pet(&mut s, h);
+        }
+        self.draw_settings(&mut s, w, h);
+        s
+    }
+
+    /// The pet column, the q over it, and the rule that ends it.
+    fn draw_pet(&self, s: &mut Screen, h: usize) {
         s.word(3, 1);
         s.pet2(4, 5, &self.pet);
         s.put(4, 17, &self.pet.name(), &bold(Role::Focused));
@@ -484,8 +552,12 @@ impl Page {
         for y in 1..h - 2 {
             s.put(DIV, y, "│", &ink(Role::Rule));
         }
+    }
+
+    /// The search and its chips, the machine, the rows, and the keys.
+    fn draw_settings(&self, s: &mut Screen, w: usize, h: usize) {
         // The search line and its chips.
-        let x0 = DIV + 3;
+        let x0 = if self.wide { DIV + 3 } else { 2 };
         let rw = w - x0 - 2;
         let chips_w: usize = CHIPS.iter().map(|c| c.len() + 2).sum::<usize>() - 2;
         let mut cx = x0 + rw - chips_w;
@@ -521,7 +593,7 @@ impl Page {
             &format!("settings on {}", self.host),
             &ink(Role::Faint),
         );
-        self.draw_list(&mut s, x0, 4, h - 3, rw);
+        self.draw_list(s, x0, 4, h - 3, rw);
         if let Some(said) = &self.said {
             s.put(x0, h - 2, said, &ink(Role::Faint));
         }
@@ -532,7 +604,6 @@ impl Page {
             ("←→", "change"),
             ("esc", "back"),
         ]);
-        s
     }
 
     /// The rows from `y` to `bottom`, grouped, the selected one opened and kept in view.
@@ -552,9 +623,13 @@ impl Page {
         enum Line<'a> {
             Head(&'static str),
             Row(&'a Row, usize),
+            /// A line of the selected row's help, when it is longer than its place beside the value.
+            Help(String),
             Pick(Vec<(String, bool)>),
             Gap,
         }
+        // The help's place beside the label (2 + 18) and the value (9) and the gap after them.
+        let help_room = w.saturating_sub(31);
         let mut lines: Vec<Line> = Vec::new();
         let mut group = "";
         for (i, row) in rows.iter().enumerate() {
@@ -566,7 +641,13 @@ impl Page {
                 lines.push(Line::Head(row.group));
             }
             lines.push(Line::Row(row, i));
-            if i == self.sel && self.focus == Focus::List && row.kind != Kind::Info {
+            let selected = i == self.sel && self.focus == Focus::List;
+            if selected && row.help.chars().count() > help_room {
+                for help in fit_lines(&row.help, w.saturating_sub(4)) {
+                    lines.push(Line::Help(help));
+                }
+            }
+            if selected && row.kind != Kind::Info {
                 // The picker wraps to the width, four columns in.
                 let (list, at) = options(row, macos);
                 let mut line = Vec::new();
@@ -587,11 +668,18 @@ impl Page {
             .iter()
             .position(|l| matches!(l, Line::Row(_, i) if *i == self.sel))
             .unwrap_or(0);
+        // The selected row and what opens under it (its help, its picker) stay in view; a block
+        // taller than the room shows its top.
+        let end = lines[at + 1..]
+            .iter()
+            .position(|l| !matches!(l, Line::Help(_) | Line::Pick(_)))
+            .map_or(lines.len(), |k| at + 1 + k);
         let room = bottom - y;
         let start = if lines.len() <= room {
             0
         } else {
-            at.saturating_sub(room / 2).min(lines.len() - room)
+            let centred = at.saturating_sub(room / 2).min(lines.len() - room);
+            centred.max(end.saturating_sub(room)).min(at)
         };
         for (k, line) in lines.iter().skip(start).take(room).enumerate() {
             let yy = y + k;
@@ -616,7 +704,12 @@ impl Page {
                         Role::Focused
                     };
                     let label: String = row.label.chars().take(18).collect();
-                    let help: String = row.help.chars().take(w.saturating_sub(31)).collect();
+                    // The selected row's long help is on the lines under it; any other is cut.
+                    let help = if on && row.help.chars().count() > help_room {
+                        String::new()
+                    } else {
+                        cut(&row.help, help_room)
+                    };
                     s.seg(
                         x,
                         yy,
@@ -627,6 +720,9 @@ impl Page {
                             (&help, paint(Role::Faint, false)),
                         ],
                     );
+                }
+                Line::Help(text) => {
+                    s.put(x + 4, yy, text, &ink(Role::Faint));
                 }
                 Line::Pick(items) => {
                     let mut xx = x + 4;
@@ -678,10 +774,13 @@ impl Page {
                 self.sel = 0;
                 self.focus = Focus::List;
             }
+            // The pet is changed only where it is drawn.
+            (Key::CtrlR, _) if !self.wide => {}
             (Key::CtrlR, _) => {
                 random_pet(&mut self.pet);
                 self.save_pet();
             }
+            (Key::Up, Focus::List) if self.sel == 0 && !self.wide => {}
             (Key::Up, Focus::List) if self.sel == 0 => self.focus = Focus::Pet(2),
             (Key::Up, Focus::List) => self.sel -= 1,
             (Key::Down, Focus::List) if self.sel + 1 < count => self.sel += 1,
@@ -758,12 +857,16 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         pet: the_pet(),
         said: None,
         host: host(),
+        wide: true,
     };
     let session = Session::start()?;
     let mut player = Player::new();
     'run: loop {
+        // Never drawn under MIN: the frame below it only says how big it must be.
         let (w, h) = page::size();
-        page::show(&page.draw(w.max(NEED.0), h.max(NEED.1)), NEED)?;
+        let (w, h) = (w.max(MIN.0), h.max(MIN.1));
+        page.fit(w, h);
+        page::show(&page.draw(w, h), MIN)?;
         for key in page::next_keys(&session.typed) {
             if !page.key(key, &mut player) {
                 break 'run;
@@ -840,6 +943,7 @@ mod tests {
             pet: the_pet(),
             said: None,
             host: "devbox".to_string(),
+            wide: true,
         };
         let mut player = Player::new();
         page.key(Key::Up, &mut player);
@@ -859,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn the_page_fits_the_smallest_window() {
+    fn the_whole_page_fits_the_window_it_needs() {
         let page = Page {
             lists: Vec::new(),
             all: rows(&[]),
@@ -870,12 +974,162 @@ mod tests {
             pet: the_pet(),
             said: None,
             host: "devbox".to_string(),
+            wide: true,
         };
         let frame = page.draw(NEED.0, NEED.1).frame();
         assert!(frame.contains("search"), "{frame:?}");
         assert!(frame.contains("machines"), "{frame:?}");
         assert!(frame.contains("agent finished"), "{frame:?}");
         assert!(frame.contains("settings on devbox"), "{frame:?}");
+    }
+
+    /// A page of fixed rows (no config read), the second with help longer than any line.
+    fn small_page(sel: usize) -> Page {
+        let long = "this help is longer than any line of the page can hold, so it goes under the value when its row is selected and ends in a dot dot dot otherwise, with averyveryverylongwordthatmustbecut";
+        let mut all = vec![
+            row("sound", "sound", Kind::Toggle("notify.sound")),
+            Row {
+                help: long.to_string(),
+                ..row("look", "theme", Kind::Info)
+            },
+        ];
+        for i in 0..12 {
+            all.push(row(
+                "keys",
+                &format!("key {i}"),
+                Kind::Choice("prefix", (0..9).map(|n| format!("ctrl-{n}")).collect()),
+            ));
+        }
+        Page {
+            lists: Vec::new(),
+            all,
+            query: String::new(),
+            chip: 0,
+            sel,
+            focus: Focus::List,
+            pet: the_pet(),
+            said: None,
+            host: "devbox".to_string(),
+            wide: true,
+        }
+    }
+
+    /// The frame as plain text, one line per row.
+    fn text(page: &mut Page, w: usize, h: usize) -> Vec<String> {
+        page.fit(w, h);
+        let frame = page.draw(w, h).frame();
+        let mut out = String::new();
+        let mut in_esc = false;
+        for ch in frame.chars() {
+            match (in_esc, ch) {
+                (false, '\x1b') => in_esc = true,
+                (false, ch) => out.push(ch),
+                (true, 'H') => {
+                    in_esc = false;
+                    out.push('\n');
+                }
+                (true, 'm' | 'J' | 'K') => in_esc = false,
+                (true, _) => {}
+            }
+        }
+        out.lines().map(str::to_string).collect()
+    }
+
+    /// From 130 x 38 down to 64 x 16 every size draws the settings; the pet only where it fits,
+    /// the selected row's long help whole under it, any other long help cut with "…".
+    #[test]
+    fn the_page_fits_every_size_from_the_smallest() {
+        for (w, h) in [
+            (130, 38),
+            (100, 30),
+            (100, 29),
+            (99, 30),
+            (91, 34),
+            (70, 20),
+            (64, 16),
+        ] {
+            let mut page = small_page(1);
+            let lines = text(&mut page, w, h);
+            let all = lines.join("\n");
+            assert_eq!(
+                all.contains("ctrl-r a random pet"),
+                wide(w, h),
+                "{w}x{h}: {all}"
+            );
+            assert!(all.contains("settings on devbox"), "{w}x{h}");
+            assert!(all.contains("theme"), "{w}x{h}");
+            for word in ["longer", "selected", "otherwise,", "averyvery", "mustbecut"] {
+                assert!(all.contains(word), "{w}x{h}: {word} missing in {all}");
+            }
+            // Selected elsewhere, the same help is cut.
+            let mut other = small_page(0);
+            let cut = text(&mut other, w, h).join("\n");
+            assert!(
+                cut.contains("this help is") && cut.contains('…') && !cut.contains("mustbecut"),
+                "{w}x{h}: {cut}"
+            );
+        }
+        assert!(
+            page::too_small(63, 16, MIN)
+                && page::too_small(64, 15, MIN)
+                && !page::too_small(64, 16, MIN)
+        );
+    }
+
+    /// At the smallest size the selected row's help and picker stay in view under it: the last
+    /// row's, and a middle row's whose wrapped help pushes the picker past a centred window.
+    #[test]
+    fn the_selected_row_and_its_picker_stay_in_view() {
+        let mut page = small_page(13);
+        let all = text(&mut page, 64, 16).join("\n");
+        assert!(all.contains("key 11") && all.contains("ctrl-8"), "{all}");
+        let mut page = small_page(5);
+        page.all[5].help = "a long help for a row in the middle of the list, long enough to take four lines under it at this width, so the row, its help and its two picker lines are taller than half the room and a centred window would cut the picker off".to_string();
+        let all = text(&mut page, 64, 16).join("\n");
+        assert!(all.contains("key 3") && all.contains("ctrl-8"), "{all}");
+    }
+
+    /// Narrowed, the pet's focus goes to the list and the pet keys do nothing; up stays put.
+    #[test]
+    fn a_narrow_page_keeps_the_pet_out_of_reach() {
+        let mut page = small_page(0);
+        page.focus = Focus::Pet(1);
+        page.fit(70, 20);
+        assert!(page.focus == Focus::List);
+        let mut player = Player::new();
+        let before = page.pet.name();
+        page.key(Key::Up, &mut player);
+        assert!(page.focus == Focus::List && page.sel == 0);
+        page.key(Key::CtrlR, &mut player);
+        assert_eq!(page.pet.name(), before);
+        page.fit(130, 38);
+        page.key(Key::Up, &mut player);
+        assert!(page.focus == Focus::Pet(2));
+    }
+
+    /// A search longer than its room shows its end and never writes over a chip.
+    #[test]
+    fn a_long_search_leaves_every_chip_whole() {
+        for (w, h) in [(100, 30), (64, 16)] {
+            let mut page = small_page(0);
+            page.query = "a search typed far longer than the room before the chips".to_string();
+            let line = text(&mut page, w, h)
+                .into_iter()
+                .find(|l| l.contains("/ "))
+                .unwrap_or_default();
+            for chip in CHIPS {
+                assert!(line.contains(chip), "{w}x{h}: {chip} lost in {line:?}");
+            }
+            assert!(line.contains("chips"), "{w}x{h}: {line:?}");
+        }
+    }
+
+    #[test]
+    fn long_text_is_fitted_to_its_lines() {
+        assert_eq!(fit_lines("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(fit_lines("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(cut("abcdef", 4), "abc…");
+        assert_eq!(cut("abc", 4), "abc");
     }
 
     #[test]

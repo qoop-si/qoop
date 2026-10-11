@@ -448,11 +448,16 @@ pub fn size() -> (usize, usize) {
     (usize::from(w), usize::from(h))
 }
 
+/// Whether a `w` x `h` terminal is too small for a page that needs `need`.
+pub fn too_small(w: usize, h: usize, need: (usize, usize)) -> bool {
+    w < need.0 || h < need.1
+}
+
 /// Paint `screen`, or, when the terminal is smaller than `need`, say how big it must be.
 pub fn show(screen: &Screen, need: (usize, usize)) -> std::io::Result<()> {
     let (w, h) = size();
     let mut out = std::io::stdout();
-    if w < need.0 || h < need.1 {
+    if too_small(w, h, need) {
         out.write_all(
             format!(
                 "\x1b[H\x1b[2J{}make the window at least {} x {} (it is {w} x {h}), esc leaves{}",
