@@ -42,7 +42,9 @@ One `qoop prompt` line, in this order:
    nowhere else. For example: three reviewers in parallel at the plan
    (best for the one that tries to break it, mid for the others); a low agent to scan many files;
    one mid agent per independent lane.
-5. The fence sentence (`SKILL.md`, "Writing to a worker").
+5. The fence sentence (`SKILL.md`, "Writing to a worker"), then: "Run your own browser and
+   simulator tests headless and read the screenshots yourself; open a window only when the owner
+   asks to see something, and close what you open."
 
 A step the fence forbids comes back to you. A file his message names (a screenshot) you may Read,
 and put its path in the brief.

@@ -156,6 +156,14 @@ runs a command, an agent is busy or has not reported its conversation, or a
 job runs in the background. `qoop agents` lists only what is awake (an
 empty list when nothing is).
 
+## Testing what you build
+
+Run your own browser and simulator tests headless and read the screenshots yourself (headless
+Chrome or Playwright `headless: true`; `xcrun simctl boot` and `xcrun simctl io <udid>
+screenshot`, never `open -a Simulator`; Android `-no-window` and `adb exec-out screencap`). Open
+a window only when the owner asks to see something, and close every browser, simulator and
+emulator you started.
+
 ## Tasks
 
 ```bash

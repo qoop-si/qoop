@@ -26,7 +26,9 @@ step's check passes. Add `qoop task evidence \"<check: result>\"` for each accep
 with `qoop task done \"<summary>\"` once every step is ticked, before your tab closes; it is a claim \
 checked outside you, so keep working or stop as usual. If a `qoop task` command fails, carry on. Write rm targets \
 as literal paths or \"${VAR:?}\". Keep a debrief to 12 short lines, the result first and the \
-owner's one next action last; open a plan or report with a 5-line summary.";
+owner's one next action last; open a plan or report with a 5-line summary. Run your own \
+browser and simulator tests headless and read the screenshots; open a window only when \
+the owner asks to see something, and close what you open.";
 
 /// Said beside a request that has no task yet: the moment a vague one should be cleared up,
 /// before any work, in one go.
@@ -878,10 +880,10 @@ mod tests {
 
     #[test]
     fn the_rules_stay_short() {
-        // ponytail: 1100 holds when to tick, move and finish, the "dangerous rm" sentence and the
-        // debrief one, each a sentence of its own.
+        // ponytail: 1260 holds when to tick, move and finish, the "dangerous rm" sentence, the
+        // debrief one and the owner's headless-testing one (+160), each a sentence of its own.
         assert!(
-            RULES.len() <= 1100,
+            RULES.len() <= 1260,
             "{} chars in every session",
             RULES.len()
         );
@@ -896,6 +898,10 @@ mod tests {
         assert!(
             RULES.contains("debrief to 12 short lines") && RULES.contains("5-line summary"),
             "what an agent writes for the owner stays short"
+        );
+        assert!(
+            RULES.contains("tests headless") && RULES.contains("close what you open"),
+            "no test window on the owner's desktop"
         );
     }
 }
