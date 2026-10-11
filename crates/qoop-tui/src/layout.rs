@@ -75,6 +75,12 @@ pub struct Layout {
     /// The width the owner dragged qass's questions to, in columns, `None` for the default. Kept
     /// and saved with the root split like its ratio; `gap` is the drawn result of it.
     pub questions: Option<usize>,
+    /// A root pane folded to a strip one cell wide on its own side (the first on the left, the
+    /// second on the right), the other taking the rest, whatever the root's direction: qass's
+    /// tab with the board or qass folded. Only ever set on a drawn copy, like `gap`; the root
+    /// and its ratio are left as saved. With a gap, it is cut from the open pane on the edge
+    /// facing the folded one.
+    pub fold: Option<u32>,
 }
 
 impl Layout {
@@ -90,6 +96,7 @@ impl Layout {
             gap: 0,
             gap_second: false,
             questions: None,
+            fold: None,
         }
     }
 
@@ -119,6 +126,7 @@ impl Layout {
                 Pane::Split { questions, .. } if *questions > 0 => Some(*questions as usize),
                 _ => None,
             },
+            fold: None,
         }
     }
 
@@ -396,6 +404,9 @@ impl Layout {
         {
             return vec![(z, area)];
         }
+        if let Some(folded) = self.folded(area) {
+            return folded;
+        }
         let mut out = Vec::new();
         layout_node(&self.root, self.inner(area), &mut out);
         // The gap comes out of one pane only, after the split is measured: the first pane's
@@ -414,6 +425,45 @@ impl Layout {
             }
         }
         out
+    }
+
+    /// The tiles while a root pane is folded ([`Layout::fold`]): the folded pane one cell wide
+    /// against its own edge, the divider, the open pane the rest less the gap on the edge that
+    /// faces the folded one. `None` without a fold on a root of two panes.
+    fn folded(&self, area: Rect) -> Option<Vec<(u32, Rect)>> {
+        let fold = self.fold?;
+        let Node::Split { first, second, .. } = &self.root else {
+            return None;
+        };
+        let (Node::Leaf { terminal: Some(a) }, Node::Leaf { terminal: Some(b) }) =
+            (&**first, &**second)
+        else {
+            return None;
+        };
+        let inner = self.inner(area);
+        if inner.cols < 3 + self.gap || (fold != *a && fold != *b) {
+            return None;
+        }
+        let open_cols = inner.cols - 2 - self.gap;
+        let strip = |x: usize| Rect {
+            x,
+            cols: 1,
+            ..inner
+        };
+        Some(if fold == *a {
+            let open = Rect {
+                x: inner.x + 2 + self.gap,
+                cols: open_cols,
+                ..inner
+            };
+            vec![(*a, strip(inner.x)), (*b, open)]
+        } else {
+            let open = Rect {
+                cols: open_cols,
+                ..inner
+            };
+            vec![(*a, open), (*b, strip(inner.x + inner.cols - 1))]
+        })
     }
 
     /// The part of `area` the panes share once a frame is drawn around them: one cell in
@@ -499,7 +549,8 @@ impl Layout {
         else {
             return None;
         };
-        if self.gap == 0 || self.zoomed.is_some() {
+        if self.gap <= crate::qass_screen::STRIP_GAP || self.zoomed.is_some() || self.fold.is_some()
+        {
             return None;
         }
         let (first, second) = halves(Dir::V, *ratio, self.inner(area))?;
@@ -1331,6 +1382,52 @@ mod tests {
             .find(|(t, _)| *t == terminal)
             .expect("a tile")
             .1
+    }
+
+    /// A folded pane is one cell against its own edge whatever the root's direction and ratio,
+    /// the other pane the rest past the divider; a gap comes out of the open pane on the edge
+    /// facing the folded one; the root is left as saved.
+    #[test]
+    fn a_folded_pane_is_one_cell_on_its_side_and_the_gap_faces_it() {
+        for width in [61, 121, 161] {
+            let a = area(width, 30);
+            for dir in [Dir::V, Dir::H] {
+                let mut layout = Layout::single(1);
+                assert!(layout.split_placeholder(1, Dir::V, area(200, 30)));
+                assert!(layout.bind_placeholder(2));
+                layout.set_root_split(dir, 0.7);
+                let saved = layout.root_split();
+                let inner = layout.inner(a);
+                for gap in [0, 2, 49] {
+                    layout.gap = gap;
+                    layout.fold = Some(1);
+                    let tiles = layout.tile_rects(a);
+                    let (first, second) = (tiles[0].1, tiles[1].1);
+                    assert_eq!((tiles[0].0, tiles[1].0), (1, 2));
+                    assert_eq!((first.x, first.cols, first.rows), (inner.x, 1, inner.rows));
+                    assert_eq!(second.x, inner.x + 2 + gap, "{width} {dir:?} {gap}");
+                    assert_eq!(second.x + second.cols, inner.x + inner.cols);
+                    layout.fold = Some(2);
+                    let tiles = layout.tile_rects(a);
+                    let (first, second) = (tiles[0].1, tiles[1].1);
+                    assert_eq!((second.x, second.cols), (inner.x + inner.cols - 1, 1));
+                    assert_eq!(first.x, inner.x);
+                    assert_eq!(
+                        first.x + first.cols + gap + 1,
+                        second.x,
+                        "gap, divider, strip"
+                    );
+                    assert_eq!(layout.root_split(), saved, "the root is never touched");
+                }
+            }
+        }
+        // Zoomed, the fold is not looked at.
+        let mut layout = Layout::single(1);
+        assert!(layout.split_placeholder(1, Dir::V, area(120, 30)));
+        assert!(layout.bind_placeholder(2));
+        layout.fold = Some(1);
+        layout.zoomed = Some(1);
+        assert_eq!(layout.tile_rects(area(120, 30)), vec![(1, area(120, 30))]);
     }
 
     /// Swapping the root's panes keeps every pane's size to the cell, twice is the identity,

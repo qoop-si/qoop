@@ -524,6 +524,8 @@ impl Pane {
             Hit::Board => {
                 self.say("the board is not here yet");
             }
+            // The client folds the column: nothing of the pane's own changes.
+            Hit::Fold => {}
         }
         Out::Stay
     }
@@ -556,6 +558,8 @@ pub enum Hit {
     Box,
     /// The second tab.
     Board,
+    /// The title on qass's split tab: folds the questions back to their strip.
+    Fold,
 }
 
 /// A cell range on one row of the inbox that a click answers.
@@ -753,7 +757,18 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
 
     // The tabs.
     let n = pane.waiting();
-    let mut tabs = vec![bold(Role::Text, "questions")];
+    // On qass's split tab the title folds the column, with the caret a space's fold wears.
+    let mut tabs = Vec::new();
+    if ctx.board_above {
+        tabs.push(bold(Role::Brand, "\u{25be} "));
+        targets.push(Target {
+            row: out.len(),
+            x0: 2,
+            x1: 2 + 2 + width::width("questions"),
+            hit: Hit::Fold,
+        });
+    }
+    tabs.push(bold(Role::Text, "questions"));
     if n > 0 {
         tabs.push(seg(Role::Text, "  "));
         tabs.push(bold(Role::Blocked, n.to_string()));

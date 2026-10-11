@@ -145,6 +145,9 @@ pub enum Action {
     Qass,
     /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
     Asks,
+    /// ctrl-a T, on qass's tab with the board: fold the pane with the keyboard to its strip,
+    /// or open the one folded.
+    Fold,
     /// ctrl-a b, fold the left column away and back.
     Collapse,
     /// ctrl-a U, say whether a newer release is waiting and how it gets installed.
@@ -421,6 +424,7 @@ impl Keys {
                     b'R' => Action::SpaceSettings,
                     b'Q' => Action::Qass,
                     b'i' => Action::Asks,
+                    b'T' => Action::Fold,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
                     // biggest key.

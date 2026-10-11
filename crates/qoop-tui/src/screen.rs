@@ -154,10 +154,36 @@ pub struct Chrome<'a> {
     /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
     /// over the board's tile. The tree knows where the board is, so the client says.
     pub questions: Option<crate::qass_screen::Side>,
+    /// The questions folded to their strip on qass's split tab, while they are not open.
+    pub questions_strip: Option<crate::layout::Rect>,
     /// The handle on the divider of qass's split tab, in ember.
     pub handle: Option<crate::qass_screen::Handle>,
     /// The handle on the questions' own edge, beside the board, in ember too.
     pub questions_handle: Option<crate::qass_screen::Handle>,
+    /// qass's split tab: whose titles fold their pane, and the pane folded.
+    pub fold: Option<FoldPaint>,
+}
+
+/// qass's tab with the board, for its titles and strips: the two panes a click on the title
+/// folds, the one folded to its strip, and whether qass's top edge carries its folder (the
+/// tab bar's path, which the header took the place of).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldPaint {
+    pub board: u32,
+    pub qass: u32,
+    pub folded: Option<u32>,
+    pub path: bool,
+}
+
+/// A pane's name on its top edge: on qass's tab with the board, behind the caret that folds
+/// it (the one a space's fold wears in the column). The click reads the same words.
+pub(crate) fn pane_title(agent: &AgentRow, caret: bool) -> String {
+    let name = crate::sidebar::label(agent);
+    if caret {
+        format!("\u{25be} {name}")
+    } else {
+        name
+    }
 }
 
 /// What a carried row looks like while the button is held: the rows it leaves dimmed, a
@@ -202,8 +228,10 @@ impl Default for Chrome<'_> {
             qass: None,
             asks: None,
             questions: None,
+            questions_strip: None,
             handle: None,
             questions_handle: None,
+            fold: None,
         }
     }
 }
@@ -264,6 +292,8 @@ pub enum KeyContext {
     Sidebar,
     /// `ctrl-a` is down and the next key is a command: every command there is.
     Prefix,
+    /// qass's tab with the board: its titles fold their panes, and the keys that fold.
+    Qass,
 }
 
 /// One entry of the key row: the key, what it does, and how soon it goes when the row
@@ -297,6 +327,15 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("b", Some("hide column"), 5),
             ("d", Some("detach"), 0),
         ],
+        KeyContext::Qass => &[
+            ("click title", Some("fold or open"), 1),
+            ("ctrl-a:", None, 0),
+            ("T", Some("fold pane"), 2),
+            ("i", Some("questions"), 2),
+            ("space", Some("find"), 3),
+            ("?", Some("keys"), 4),
+            ("d", Some("detach"), 0),
+        ],
         KeyContext::Prefix => &[
             ("n", Some("next"), 1),
             ("p", Some("prev"), 3),
@@ -321,6 +360,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("g", Some("view"), 6),
             ("m", Some("menu"), 4),
             ("M", Some("last answer"), 6),
+            ("T", Some("fold"), 6),
             ("?", Some("keys"), 2),
             ("U", Some("update"), 7),
             ("d", Some("detach"), 0),
@@ -524,6 +564,9 @@ pub(crate) fn qass_screen_of(
     };
     let wake_at = frame.chrome.qass.and_then(|ui| ui.wake_at);
     let mut screen = crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx);
+    if let Some(strip) = frame.chrome.questions_strip {
+        screen = screen.with_strip(strip, facts.asks, spotlight);
+    }
     if let (Some(side), Some(asks)) = (plan.side, frame.chrome.asks) {
         let seen = crate::asks::Ctx {
             rows: frame.rows,
@@ -895,6 +938,21 @@ pub fn paint(frame: &Frame) -> String {
     let spotlight = frame.spotlight();
     let faded = theme::fg(theme::Role::Unobserved);
 
+    // The pet stands on the foot of the column. Read once per frame so the
+    // reservation below and the overlay further down paint the same pet.
+    let avatar = sidebar::current_avatar();
+    let qass = qass_screen_of(frame, avatar.as_ref(), spotlight);
+    // qass's full header stands in the tab bar's rows: its screen goes without the tabs.
+    let above: Vec<&str> = qass
+        .as_ref()
+        .map(|(_, screen)| (0..TABS).map_while(|i| screen.above(i)).collect())
+        .unwrap_or_default();
+    for (at_row, header) in above.iter().enumerate() {
+        out.push_str(&at(at_row + 1, left + 1));
+        out.push_str(header);
+        out.push_str(theme::RESET);
+    }
+
     // The tab bar, over the pane and only over the pane. It starts where the pane starts,
     // past the column and its rule. Split panes are sub-terminals, never top tabs.
     let tabs = bar_tabs(frame.rows, &frame.panes, frame.space, frame.spaces);
@@ -903,6 +961,7 @@ pub fn paint(frame: &Frame) -> String {
     for (at_row, pieces) in tabs::painted(&tabs, focused_tab, pane_cols as usize)
         .into_iter()
         .enumerate()
+        .filter(|_| above.is_empty())
     {
         out.push_str(&at(at_row + 1, left + 1));
         for (piece, style) in pieces {
@@ -927,10 +986,6 @@ pub fn paint(frame: &Frame) -> String {
     // The column runs the whole height, from the top row to the status line; its content
     // starts one row under the top, beneath the rule's bend.
     let column_rows = column_rows(frame.lines as usize);
-    // The pet stands on the foot of the column. Read once per frame so the
-    // reservation below and the overlay further down paint the same pet.
-    let avatar = sidebar::current_avatar();
-    let qass = qass_screen_of(frame, avatar.as_ref(), spotlight);
     let column = frame.column();
     let panel: Vec<(sidebar::Line, Option<sidebar::Hit>)> = if wide_enough && frame.collapsed {
         sidebar::rows_collapsed(&column, column_rows)
@@ -955,12 +1010,29 @@ pub fn paint(frame: &Frame) -> String {
             pane_rows as usize,
         )
     };
+    if let Some(fold) = frame.chrome.fold.filter(|_| !edges.is_empty()) {
+        put_fold_titles(&mut edges, &frame.tiles, frame.rows, fold);
+    }
     if let Some(handle) = frame.chrome.handle.filter(|_| !edges.is_empty()) {
         put_handle(&mut edges, handle);
     }
     if let Some(handle) = frame.chrome.questions_handle.filter(|_| !edges.is_empty()) {
         put_handle(&mut edges, handle);
     }
+    // A pane folded to its strip: the strip's cells over the tile, row by row.
+    let folded_strip = frame.chrome.fold.and_then(|fold| {
+        let tile = frame
+            .tiles
+            .iter()
+            .find(|t| Some(t.terminal) == fold.folded)?;
+        let (name, role) = if tile.terminal == fold.qass {
+            ("qass", theme::Role::Brand)
+        } else {
+            ("board", theme::Role::Text)
+        };
+        let rows = crate::qass_screen::strip_rows(tile.rect.rows, None, name, role, spotlight);
+        Some((tile.rect, rows))
+    });
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
         .rows
@@ -1195,6 +1267,17 @@ pub fn paint(frame: &Frame) -> String {
             if let Some((side, row)) = inbox {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
                 out.push_str(&row);
+            }
+            if let Some((rect, rows)) = &folded_strip
+                && let Some(cell) = pane_row.checked_sub(rect.y).and_then(|at| rows.get(at))
+            {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
+                out.push_str(cell);
+            }
+            // Or folded to their strip, in the cell the tree left for it.
+            if let Some((x, cell)) = qass.as_ref().and_then(|(_, s)| s.strip_row(pane_row)) {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + x));
+                out.push_str(cell);
             }
         }
     }
@@ -2378,7 +2461,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x", "close tab"),
-            ("i", "qass inbox"),
+            ("i/T", "inbox, fold"),
         ],
     ),
     (
@@ -3163,6 +3246,61 @@ fn pane_edges(
         }
     }
     grid
+}
+
+/// qass's tab with the board: the titles of the board and qass rewritten behind the caret that
+/// folds them, and qass's folder on the right of its top edge, two cells in from its corner.
+fn put_fold_titles(
+    grid: &mut [Vec<Option<(char, EdgeInk)>>],
+    tiles: &[Tile],
+    agents: &[AgentRow],
+    fold: FoldPaint,
+) {
+    for tile in tiles
+        .iter()
+        .filter(|t| t.terminal == fold.board || t.terminal == fold.qass)
+    {
+        let r = tile.rect;
+        let (Some(top), Some(agent)) = (
+            r.y.checked_sub(1),
+            agents.iter().find(|a| a.terminal == tile.terminal),
+        ) else {
+            continue;
+        };
+        let room = r.cols.saturating_sub(2);
+        if room < 3 {
+            continue;
+        }
+        let title = pane_title(agent, true);
+        let title = width::fit(&title, width::width(&title).min(room - 2));
+        let ink = if tile.focused {
+            EdgeInk::TitleLit
+        } else {
+            EdgeInk::Title
+        };
+        let mut x = r.x + 1;
+        for c in format!(" {} ", title.trim_end()).chars() {
+            let at_ink = if c == '\u{25be}' { EdgeInk::Lit } else { ink };
+            if let Some(cell) = grid[top].get_mut(x) {
+                *cell = Some((c, at_ink));
+            }
+            x += 1;
+        }
+        let path = (fold.path && tile.terminal == fold.qass)
+            .then(|| crate::tabs::folder(agent))
+            .filter(|p| !p.is_empty());
+        if let Some(path) = path {
+            let tag = format!(" {path} ");
+            let w = width::width(&tag);
+            if x + 2 + w + 2 <= r.x + r.cols {
+                for (at, c) in (r.x + r.cols - 1 - w..).zip(tag.chars()) {
+                    if let Some(cell) = grid[top].get_mut(at) {
+                        *cell = Some((c, EdgeInk::Title));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The handle's cells in the edge grid, in the same ember as the focused pane's corners; a cell
@@ -5460,7 +5598,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 41;
+    const COMMANDS: usize = 42;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5519,7 +5657,8 @@ mod tests {
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
             Action::Qass => (const { place(38) }, Some("ctrl-a Q")),
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
-            Action::Asks => (const { place(40) }, Some("ctrl-a i")),
+            Action::Asks => (const { place(40) }, Some("ctrl-a i/T")),
+            Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
         }
     }
 
@@ -5585,6 +5724,7 @@ mod tests {
             Action::UpNext,
             Action::Agents,
             Action::Asks,
+            Action::Fold,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();

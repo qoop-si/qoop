@@ -273,7 +273,7 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
 }
 
 /// The folder a tab runs in, for the row under its label.
-fn folder(row: &AgentRow) -> String {
+pub(crate) fn folder(row: &AgentRow) -> String {
     path_of(row.cwd.as_deref(), std::env::var("HOME").ok().as_deref())
 }
 

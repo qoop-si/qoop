@@ -1,8 +1,9 @@
 //! The qass screen: what the pane shows while the keyboard is in qass's own tab.
 //!
-//! A framed `qass` header (the pet as qass's face, how qass stands, what it did last and
-//! what it does now, three counters) over a framed `terminal` box that holds qass's real
-//! terminal. Everything here is a pure function of the rows the daemon sent, so a test
+//! A `qass` header (the pet as qass's face in the middle, in ember brackets; how qass stands,
+//! what it does now and what it did last on its left; the three counters on its right) over a
+//! framed `terminal` box that holds qass's real terminal. The header's first rows stand where
+//! the tab strip would: qass's screen goes without the tabs. Everything here is a pure function of the rows the daemon sent, so a test
 //! reads the screen instead of looking at one. Nothing is made up: every word and number
 //! comes from a row, a sleeping tab or the watcher's `last-wake` file.
 //!
@@ -22,16 +23,18 @@ use crate::{sidebar, width};
 /// stays plain.
 const MIN_COLS: usize = 24;
 const MIN_ROWS: usize = 6;
-/// The header box: a border, the pet's five rows, a border.
-const BOX_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 2;
+/// The header: the pet's five rows in their brackets, then a rule. Its first rows are painted in
+/// the tab strip's rows ([`crate::tabs::ROWS`]), which qass's screen does without, so the pane
+/// gives it only the rest ([`Header::rows`]).
+const HEAD_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 1;
 /// The fewest rows qass's terminal keeps inside its box while the header is a box.
 const MIN_INSIDE: usize = 6;
-/// The columns the text needs beside the pet, before the pet is worth showing: the widest
-/// line is the three counters.
-const TEXT_MIN: usize = 44;
-/// Blank columns before the pet or the text, and between the pet and the text.
-const LEAD: usize = 2;
-const GAP: usize = 2;
+/// The columns qass's own line needs left of the pet (`qass` and its state) before the pet is
+/// worth showing: under it the header goes without the pet.
+const LEFT_MIN: usize = 16;
+/// Blank cells between a bracket and the pet, and between a bracket and the lines beside it.
+const PAD: usize = 1;
+const GAP: usize = 3;
 /// The narrowest pane that holds the inbox at all, and the one that holds it beside qass's
 /// terminal rather than in its place.
 pub const INBOX_MIN_COLS: usize = 60;
@@ -57,6 +60,9 @@ pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
 pub const QUESTIONS_MIN: usize = 24;
 /// The columns the keys widen or narrow it by.
 pub const QUESTIONS_STEP: usize = 4;
+/// The questions folded to their strip: the edge column the board's frame keeps, then one cell
+/// with the count and the name down it. Always there, so the questions never vanish.
+pub const STRIP_GAP: usize = 2;
 
 /// The ratio of qass's tab (its first pane's share) the way the tab is shown when it was saved
 /// the other way: the board's own share when the board is first, what is left when qass is.
@@ -71,9 +77,10 @@ pub fn board_default(dir: Dir, board_first: bool) -> f32 {
 /// How qass's tab with the board is laid out in a pane `cols` wide: side by side while the
 /// board and qass both keep their minimum, else stacked; the saved ratio (the first pane's
 /// share, whichever pane that is) when the saved direction is the one shown, else that
-/// direction's own. With `questions`, the columns cut from the board for them, when the board
-/// still keeps its minimum after the cut: the default width, or the one the owner dragged them to
-/// (`width`), which gives way to what the board needs before it is dropped.
+/// direction's own. The columns cut from the board for the questions: their strip
+/// ([`STRIP_GAP`]) always; with `questions` the open column while the board keeps its minimum
+/// after it: the default width, or the one the owner dragged them to (`width`), which gives way
+/// to what the board needs before the column falls back to the strip.
 pub fn board_shape(
     cols: usize,
     saved: (Dir, f32),
@@ -91,16 +98,17 @@ pub fn board_shape(
     // qass's are exact whichever of them is first.
     let first = (total as f32 * ratio(Dir::V).clamp(0.1, 0.9)).floor() as usize;
     let board = if board_first { first } else { total - first };
-    if board < BOARD_MIN_COLS || total - board < QASS_MIN_COLS {
-        return (Dir::H, ratio(Dir::H), 0);
+    // The questions' strip is charged before the board's minimum, so it is never dropped.
+    if board < BOARD_MIN_COLS + STRIP_GAP || total - board < QASS_MIN_COLS {
+        return (Dir::H, ratio(Dir::H), STRIP_GAP);
     }
     let gap = match (questions, width) {
-        (false, _) => 0,
+        (false, _) => STRIP_GAP,
         (true, None) if board >= BOARD_MIN_COLS + QUESTIONS_GAP => QUESTIONS_GAP,
-        (true, None) => 0,
+        (true, None) => STRIP_GAP,
         (true, Some(width)) => {
             let gap = (width + 1).min(board.saturating_sub(BOARD_MIN_COLS));
-            if gap > QUESTIONS_MIN { gap } else { 0 }
+            if gap > QUESTIONS_MIN { gap } else { STRIP_GAP }
         }
     };
     (Dir::V, ratio(Dir::V), gap)
@@ -177,6 +185,30 @@ pub fn handle_of(qass: Rect, dir: Dir, board_first: bool) -> Option<Handle> {
     })
 }
 
+/// A pane of qass's split tab folded to its strip (never closed): the title or `ctrl-a T`
+/// folds it, its strip or the keyboard going in opens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fold {
+    Board,
+    Qass,
+}
+
+/// The questions' gap on qass's tab with a pane folded, the open pane `open_cols` wide: the
+/// open column while that pane keeps its own minimum (the board's or qass's) after it, else
+/// the strip, and the questions lay over the open pane when wanted.
+pub fn fold_gap(open_cols: usize, board_open: bool, questions: bool) -> usize {
+    let min = if board_open {
+        BOARD_MIN_COLS
+    } else {
+        QASS_MIN_COLS
+    };
+    if questions && open_cols >= min + QUESTIONS_GAP {
+        QUESTIONS_GAP
+    } else {
+        STRIP_GAP
+    }
+}
+
 /// The file the watcher touches each time it tells qass an event.
 const LAST_WAKE: &str = "last-wake";
 
@@ -187,6 +219,8 @@ pub struct Ui {
     pub zoomed: bool,
     /// The question inbox is open beside qass's terminal (or in its place, in a narrow pane).
     pub inbox: bool,
+    /// The board or qass's terminal folded to its strip on qass's split tab: one at a time.
+    pub fold: Option<Fold>,
     /// When the watcher last told qass something, unix seconds, as the file's age says.
     pub wake_at: Option<i64>,
     /// The quarter minute the ages were last drawn in, so a line that says `2 min ago` is
@@ -232,7 +266,7 @@ impl Header {
         match self {
             Header::None => 0,
             Header::Line => 1,
-            Header::Box => BOX_ROWS,
+            Header::Box => HEAD_ROWS - crate::tabs::ROWS,
         }
     }
 }
@@ -268,9 +302,9 @@ impl Plan {
         // The inbox needs rows of its own: under them the header gives up its box for a line.
         let wants_inbox = inbox && !zoomed && Plan::holds_inbox(cols, rows);
         let box_rows = if wants_inbox {
-            BOX_ROWS + INBOX_BOX_ROWS
+            Header::Box.rows() + INBOX_BOX_ROWS
         } else {
-            BOX_ROWS + 2 + MIN_INSIDE
+            Header::Box.rows() + 2 + MIN_INSIDE
         };
         let header = if zoomed {
             Header::None
@@ -351,7 +385,7 @@ impl Plan {
             return None;
         }
         let room = (3 + 2 * MIN_INSIDE).max(INBOX_BOX_ROWS);
-        let header = if rows >= BOX_ROWS + room {
+        let header = if rows >= Header::Box.rows() + room {
             Header::Box
         } else {
             Header::Line
@@ -729,6 +763,8 @@ pub struct Screen {
     side: String,
     /// The inbox's rows, each as wide as its rectangle, while it is open.
     inbox: Vec<String>,
+    /// The questions folded to their strip on qass's split tab: its rectangle and its cells.
+    strip: Option<(Rect, Vec<String>)>,
     /// Where the `[ N asks you ]` chip is, pane-local: its row and its columns.
     chip: Option<Chip>,
 }
@@ -736,6 +772,8 @@ pub struct Screen {
 /// The `[ N asks you ]` chip's cells in the pane: a click on it opens and closes the inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chip {
+    /// A header row: with the full header counted from the screen's first row (its first rows
+    /// stand in the tab strip's), with the one line header a pane row.
     pub row: usize,
     pub x0: usize,
     pub x1: usize,
@@ -758,14 +796,15 @@ impl Screen {
                 (vec![line], x.map(|(x0, x1)| Chip { row: 0, x0, x1 }))
             }
             Header::Box => {
-                let (rows, x) = box_rows(plan.cols, state, f, &say, wake_at, ctx);
-                (rows, x.map(|(x0, x1)| Chip { row: 5, x0, x1 }))
+                let (rows, x) = bracket_rows(plan.cols, state, f, &say, wake_at, ctx);
+                (rows, x.map(|(x0, x1)| Chip { row: 1, x0, x1 }))
             }
         };
         Screen {
             plan,
             header,
             inbox: Vec::new(),
+            strip: None,
             chip,
             top: edge(
                 plan.frame.cols,
@@ -791,6 +830,24 @@ impl Screen {
         self
     }
 
+    /// The questions' strip in `rect`, with the header's count on it: the same number as the
+    /// `[ N asks you ]` chip, since both read these facts.
+    pub fn with_strip(mut self, rect: Rect, asks: usize, fade: bool) -> Screen {
+        let count = Some((asks, if asks > 0 { Role::Blocked } else { Role::Faint }));
+        self.strip = Some((
+            rect,
+            strip_rows(rect.rows, count, "questions", Role::Faint, fade),
+        ));
+        self
+    }
+
+    /// The strip's cell on pane row `pane_row`, and the pane column it stands in.
+    pub fn strip_row(&self, pane_row: usize) -> Option<(usize, &str)> {
+        let (rect, rows) = self.strip.as_ref()?;
+        let cell = rows.get(pane_row.checked_sub(rect.y)?)?;
+        Some((rect.x, cell))
+    }
+
     /// One row of the inbox in a split tab, whose panes paint themselves: the row of the pane
     /// `pane_row` falls on, while the inbox is open.
     pub fn inbox_row(&self, pane_row: usize) -> Option<String> {
@@ -803,11 +860,30 @@ impl Screen {
         self.chip
     }
 
+    /// How many of the header's rows stand in the tab strip's rows: those of the full header,
+    /// none of the one line header's.
+    fn above_rows(&self) -> usize {
+        match self.plan.header {
+            Header::Box => crate::tabs::ROWS,
+            Header::Line | Header::None => 0,
+        }
+    }
+
+    /// Header row `i` of those painted in the tab strip's rows, when the full header is up:
+    /// the screen paints it there instead of the tabs.
+    pub fn above(&self, i: usize) -> Option<&str> {
+        (i < self.above_rows())
+            .then(|| self.header.get(i).map(String::as_str))
+            .flatten()
+    }
+
     /// One row of the pane, exactly `plan.cols` columns. `terminal` paints qass's own row
     /// `n` (counted inside the box) in exactly `plan.inner.cols` columns.
     pub fn row(&self, pane_row: usize, terminal: impl FnOnce(usize) -> String) -> String {
         let p = &self.plan;
-        if let Some(header) = self.header.get(pane_row) {
+        if pane_row < p.header.rows()
+            && let Some(header) = self.header.get(pane_row + self.above_rows())
+        {
             return header.clone();
         }
         let blank = || " ".repeat(p.cols);
@@ -831,6 +907,37 @@ impl Screen {
         }
         format!("{left}{0}{1}{0}", self.side, terminal(pane_row - p.inner.y))
     }
+}
+
+/// A pane folded to a strip one cell wide, `rows` tall: the ember `▸` that opens it, the count
+/// when it has one (bold, in its role), a blank, then the name one letter a row, cut at the
+/// bottom. A terminal cannot turn a word sideways, so the letters stack.
+pub fn strip_rows(
+    rows: usize,
+    count: Option<(usize, Role)>,
+    name: &str,
+    role: Role,
+    fade: bool,
+) -> Vec<String> {
+    let cell = |text: String, role: Role, strong: bool| {
+        let bold = if strong && !fade { "\x1b[1m" } else { "" };
+        format!("{}{bold}{text}{}", ink(role, fade), theme::RESET)
+    };
+    let mut out = vec![cell("\u{25b8}".into(), Role::Brand, true)];
+    if let Some((n, role)) = count {
+        // One cell: a count past nine reads as its plus.
+        let digit = if n > 9 {
+            "+".to_string()
+        } else {
+            n.to_string()
+        };
+        out.push(cell(digit, role, true));
+    }
+    out.push(" ".into());
+    out.extend(name.chars().map(|c| cell(c.to_string(), role, false)));
+    out.resize(rows, " ".into());
+    out.truncate(rows);
+    out
 }
 
 /// The header as one line: the state, then the counters that fit.
@@ -865,8 +972,12 @@ fn last_chip(f: &Facts, run: &[Seg]) -> Option<(usize, usize)> {
     Some((total - own, total))
 }
 
-/// The framed header: the pet on the left, the five lines on the right.
-fn box_rows(
+/// The header: the pet in the middle inside tall ember brackets, qass's own lines on its left
+/// (right-aligned to the brackets), the counters and the sub line on its right, a rule under.
+/// The pet stands centred while the counters fit whole on its right, else as far left as they
+/// need; with no room for it (or no colour, or a fade) the lines meet at the centre instead.
+/// The counters' cells come back for the chip, in header columns.
+fn bracket_rows(
     cols: usize,
     state: Vec<Seg>,
     f: &Facts,
@@ -874,57 +985,98 @@ fn box_rows(
     wake_at: Option<i64>,
     ctx: Ctx,
 ) -> (Vec<String>, Option<(usize, usize)>) {
-    let inside = cols - 2;
-    let art = ctx
-        .pet
-        .filter(|_| ctx.colour && !ctx.fade)
-        .map(|pet| sidebar::avatar_overlay(&pet_for(pet, f.asleep()), true))
-        .filter(|(w, rows)| *w > 0 && !rows.is_empty() && inside >= LEAD + w + GAP + TEXT_MIN);
-    let (pet_w, rows) = art.unwrap_or((0, Vec::new()));
-    let lead = if pet_w > 0 { LEAD + pet_w + GAP } else { LEAD };
-    let text_w = inside.saturating_sub(lead + 1);
-    let chip_line = fit_chips(f, text_w, 1);
-    // The border, then the pet's columns, then the counters.
-    let span = last_chip(f, &chip_line).map(|(from, to)| (1 + lead + from, 1 + lead + to));
+    let w = |segs: &[Seg]| segs.iter().map(|s| width::width(&s.text)).sum::<usize>();
     let label = |what: &str, text: &str| {
         vec![
             seg(Role::Faint, format!("{what:<6}")),
             seg(Role::Detail, text.to_string()),
         ]
     };
-    let texts = [
+    let left = [
         state,
-        vec![seg(Role::Faint, say.sub.clone())],
-        label("last", &last_line(f.active_at, wake_at, ctx.now)),
         label(say.line.0, &say.line.1),
-        chip_line,
+        label("last", &last_line(f.active_at, wake_at, ctx.now)),
     ];
-    let rule = ink(Role::Rule, ctx.fade);
-    let mut out = vec![edge(
-        cols,
-        ('\u{256d}', '\u{256e}'),
-        Some("qass"),
-        None,
-        ctx.fade,
-    )];
-    for (i, segs) in texts.iter().enumerate() {
-        let pet = match rows.get(i) {
-            Some(art) => format!(
-                "{}{}{art}{}",
-                " ".repeat(LEAD),
-                theme::RESET,
-                " ".repeat(GAP)
-            ),
-            None => " ".repeat(lead),
-        };
-        out.push(format!(
-            "{rule}\u{2502}{}{pet}{}{rule} \u{2502}{}",
-            theme::RESET,
-            line(segs, text_w, ctx.fade),
-            theme::RESET,
+    let chips_w = w(&fit_chips(f, usize::MAX, 1));
+    let art = ctx
+        .pet
+        .filter(|_| ctx.colour && !ctx.fade)
+        .map(|pet| sidebar::avatar_overlay(&pet_for(pet, f.asleep()), true))
+        .filter(|(pw, rows)| *pw > 0 && !rows.is_empty());
+    // Where the middle stands: the pet's first column (its brackets two cells out), or with no
+    // pet the first of a four cell gap the lines keep apart.
+    let fit = |mid_w: usize| {
+        let centred = cols.saturating_sub(mid_w) / 2;
+        let most = cols.saturating_sub(1 + GAP + chips_w + mid_w + GAP);
+        let at = centred.min(most);
+        (at >= 1 + LEFT_MIN + GAP).then_some(at)
+    };
+    let pet = art.and_then(|(pw, rows)| {
+        let mid_w = PAD + 1 + pw + 1 + PAD;
+        fit(mid_w).map(|at| (at, pw, rows))
+    });
+    let (mid_x, mid_w) = match &pet {
+        Some((at, pw, _)) => (*at, PAD + 1 + pw + 1 + PAD),
+        None => {
+            let gap = 2;
+            (fit(gap).unwrap_or(cols.saturating_sub(gap) / 2), gap)
+        }
+    };
+    let left_end = mid_x.saturating_sub(GAP);
+    let right_x = (mid_x + mid_w + GAP).min(cols);
+    let right_w = cols.saturating_sub(right_x + 1);
+    let chips = fit_chips(f, right_w, 1);
+    let span = last_chip(f, &chips).map(|(from, to)| (right_x + from, right_x + to));
+    let right = [chips, vec![seg(Role::Faint, say.sub.clone())]];
+    let brand = ink(Role::Brand, ctx.fade);
+    let mut out = Vec::with_capacity(HEAD_ROWS);
+    for r in 0..HEAD_ROWS - 1 {
+        // Left of the middle: a line right-aligned against it, cut at the pane's edge.
+        let text = r.checked_sub(1).and_then(|i| left.get(i));
+        let room = left_end.saturating_sub(1);
+        let shown = text.map_or(0, |segs| w(segs).min(room));
+        let mut row = " ".repeat(left_end.saturating_sub(shown));
+        if let Some(segs) = text {
+            row.push_str(&line(segs, shown, ctx.fade));
+        }
+        row.push_str(&" ".repeat(mid_x - left_end));
+        // The middle: the brackets and the pet, or the gap.
+        match &pet {
+            Some((_, pw, art)) => {
+                let (top, bottom) = match r {
+                    0 => ('\u{250c}', '\u{2510}'),
+                    4 => ('\u{2514}', '\u{2518}'),
+                    _ => ('\u{2502}', '\u{2502}'),
+                };
+                row.push_str(&format!("{brand}{top}{}{}", theme::RESET, " ".repeat(PAD)));
+                match art.get(r) {
+                    Some(cells) => row.push_str(&format!("{cells}{}", theme::RESET)),
+                    None => row.push_str(&" ".repeat(*pw)),
+                }
+                row.push_str(&format!(
+                    "{}{brand}{bottom}{}",
+                    " ".repeat(PAD),
+                    theme::RESET
+                ));
+            }
+            None => row.push_str(&" ".repeat(mid_w)),
+        }
+        // Right of the middle: the counters, then the sub line.
+        row.push_str(&" ".repeat(right_x.saturating_sub(mid_x + mid_w)));
+        let text = r.checked_sub(1).and_then(|i| right.get(i));
+        row.push_str(&line(
+            text.map_or(&[][..], |s| &s[..]),
+            cols - right_x,
+            ctx.fade,
         ));
+        out.push(row);
     }
-    out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, ctx.fade));
+    out.push(format!(
+        "{}{}{}",
+        ink(Role::Rule, ctx.fade),
+        "\u{2500}".repeat(cols),
+        theme::RESET
+    ));
     (out, span)
 }
 
@@ -985,27 +1137,28 @@ mod tests {
 
     #[test]
     fn the_plan_gives_the_terminal_the_inside_of_its_box() {
-        // A tall pane: a 7 row header box, then the terminal box and its two borders.
+        // A tall pane: the full header takes 4 pane rows (its first 2 stand in the tab bar's),
+        // then the terminal box and its two borders.
         let p = Plan::new(160, 46, false, false).unwrap();
         assert_eq!(p.header, Header::Box);
-        assert_eq!((p.frame.y, p.frame.rows, p.frame.cols), (7, 39, 160));
+        assert_eq!((p.frame.y, p.frame.rows, p.frame.cols), (4, 42, 160));
         assert_eq!(
             p.inner,
             Rect {
                 x: 1,
-                y: 8,
+                y: 5,
                 cols: 158,
-                rows: 37
+                rows: 40
             }
         );
-        // The shortest pane that still has a header box leaves six rows inside it.
-        let p = Plan::new(80, 15, false, false).unwrap();
+        // The shortest pane that still has the full header leaves six rows inside it.
+        let p = Plan::new(80, 12, false, false).unwrap();
         assert_eq!((p.header, p.inner.rows), (Header::Box, 6));
         // One row less and the header is one line.
-        let p = Plan::new(80, 14, false, false).unwrap();
+        let p = Plan::new(80, 11, false, false).unwrap();
         assert_eq!(
             (p.header, p.frame.y, p.inner.y, p.inner.rows),
-            (Header::Line, 1, 2, 11)
+            (Header::Line, 1, 2, 8)
         );
         let p = Plan::new(24, 6, false, false).unwrap();
         assert_eq!(
@@ -1074,14 +1227,28 @@ mod tests {
         let mut f = facts_of("working");
         f.activity = Some("Bash cargo test".to_string());
         let screen = Screen::new(plan, &f, Some(1_000 + 5), ctx(None));
+        let above: Vec<String> = (0..crate::tabs::ROWS)
+            .map(|i| {
+                strip(
+                    screen
+                        .above(i)
+                        .expect("the full header stands in the bar's rows"),
+                )
+            })
+            .collect();
         let rows: Vec<String> = (0..plan.rows)
             .map(|r| strip(&screen.row(r, |_| " ".repeat(plan.inner.cols))))
             .collect();
         assert!(
-            rows.iter().all(|r| width::width(r) == 100),
+            rows.iter().chain(&above).all(|r| width::width(r) == 100),
             "every row is as wide as the pane"
         );
-        let text = rows.join("\n");
+        let text = above
+            .iter()
+            .chain(&rows)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         for want in [
             "qass",
             "working",
@@ -1094,12 +1261,16 @@ mod tests {
         ] {
             assert!(text.contains(want), "{want:?} in\n{text}");
         }
-        assert!(rows[0].starts_with('\u{256d}') && rows[BOX_ROWS - 1].starts_with('\u{2570}'));
-        assert!(rows[BOX_ROWS].starts_with('\u{256d}') && rows[39].starts_with('\u{2570}'));
-        // The terminal sits between the box's sides, one column in.
+        // No box around the header: a rule under it, then the terminal's box.
+        let rule = plan.header.rows() - 1;
         assert!(
-            rows[BOX_ROWS + 1].starts_with('\u{2502}') && rows[BOX_ROWS + 1].ends_with('\u{2502}')
+            rows[rule].chars().all(|c| c == '\u{2500}'),
+            "{:?}",
+            rows[rule]
         );
+        assert!(rows[rule + 1].starts_with('\u{256d}') && rows[39].starts_with('\u{2570}'));
+        // The terminal sits between the box's sides, one column in.
+        assert!(rows[rule + 2].starts_with('\u{2502}') && rows[rule + 2].ends_with('\u{2502}'));
     }
 
     #[test]
@@ -1163,8 +1334,8 @@ mod tests {
         let (squint, big) = (art("squint"), art("big"));
         assert_ne!(squint, big, "the eye styles differ in the art");
         for i in 0..squint.len() {
-            assert!(asleep.header[1 + i].contains(&squint[i]), "row {i} asleep");
-            assert!(awake.header[1 + i].contains(&big[i]), "row {i} awake");
+            assert!(asleep.header[i].contains(&squint[i]), "row {i} asleep");
+            assert!(awake.header[i].contains(&big[i]), "row {i} awake");
         }
         // Too narrow for the pet beside the text: text alone, and still as wide as the pane.
         let narrow = Plan::new(50, 40, false, false).unwrap();
@@ -1176,6 +1347,63 @@ mod tests {
         faded.fade = true;
         let screen = Screen::new(plan, &facts_of("working"), None, faded);
         assert!(!screen.header[1].contains("\x1b[48;5;"));
+    }
+
+    /// The full header: the pet in the middle inside ember brackets, centred while the counters
+    /// fit whole on its right, moved left only as far as they need (a 120 column window gives
+    /// an 81 column pane), with qass's own line still on its left. The one line header has no
+    /// rows in the tab bar's.
+    #[test]
+    fn the_pet_stands_in_the_middle_and_moves_over_only_for_the_counters() {
+        let pet = pet();
+        let (pw, _) = sidebar::avatar_overlay(&pet, true);
+        for (cols, centred) in [(161, true), (81, false)] {
+            let plan = Plan::new(cols, 40, false, false).unwrap();
+            let screen = Screen::new(plan, &facts_of("working"), None, ctx(Some(&pet)));
+            let top: Vec<char> = strip(&screen.header[0]).chars().collect();
+            let lb = top
+                .iter()
+                .position(|c| *c == '\u{250c}')
+                .expect("left bracket");
+            let rb = top
+                .iter()
+                .position(|c| *c == '\u{2510}')
+                .expect("right bracket");
+            assert_eq!(rb - lb, pw + 3, "{cols}: the pet and a cell either side");
+            let middle = (lb + rb) / 2;
+            if centred {
+                assert!(middle.abs_diff(cols / 2) <= 1, "{cols}: {middle}");
+            } else {
+                assert!(middle + 5 < cols / 2, "{cols}: moved left, {middle}");
+            }
+            let first = strip(&screen.header[1]);
+            let (left, right) = first.split_at(first.char_indices().nth(lb).unwrap().0);
+            assert!(
+                left.contains("qass") && left.contains("working"),
+                "{first:?}"
+            );
+            assert!(
+                right.contains("[ 3 waiting ] [ 1 working ] [ 1 asks you ]"),
+                "{first:?}"
+            );
+            assert!(screen.chip().is_some(), "{cols}");
+            assert!(
+                strip(&screen.header[HEAD_ROWS - 1])
+                    .chars()
+                    .all(|c| c == '\u{2500}')
+            );
+        }
+        // No pet (no colour here): no brackets, the counters still whole on the right.
+        let plan = Plan::new(161, 40, false, false).unwrap();
+        let bare = Screen::new(plan, &facts_of("working"), None, ctx(None));
+        assert!(!bare.header.iter().any(|r| r.contains('\u{250c}')));
+        assert!(strip(&bare.header[1]).contains("[ 1 asks you ]"));
+        // The one line header stays in the pane: nothing for the tab bar's rows.
+        let short = Plan::new(60, 10, false, false).unwrap();
+        assert_eq!(
+            Screen::new(short, &facts_of("idle"), None, ctx(None)).above(0),
+            None
+        );
     }
 
     fn row(terminal: u32, workspace: i64, state: &str) -> AgentRow {
@@ -1299,7 +1527,7 @@ mod tests {
             !side.replaces && (48..=56).contains(&side.rect.cols),
             "{side:?}"
         );
-        assert_eq!((side.rect.x, side.rect.y, side.rect.rows), (0, 7, 33));
+        assert_eq!((side.rect.x, side.rect.y, side.rect.rows), (0, 4, 36));
         assert_eq!(open.frame.x, side.rect.cols);
         assert_eq!(open.frame.cols + side.rect.cols, 122);
         // The terminal loses columns and no rows, and still has a real inside.
@@ -1374,7 +1602,10 @@ mod tests {
             let Some(chip) = screen.chip() else {
                 panic!("a chip at {cols}x{rows}");
             };
-            let row = strip(&screen.row(chip.row, |_| String::new()));
+            let row = match plan.header {
+                Header::Box => strip(&screen.header[chip.row]),
+                _ => strip(&screen.row(chip.row, |_| String::new())),
+            };
             let cells: Vec<char> = row.chars().collect();
             let under: String = cells[chip.x0..chip.x1].iter().collect();
             assert_eq!(under, "[ 1 asks you ]", "{cols}x{rows} pet={pet}: {row:?}");
@@ -1405,14 +1636,14 @@ mod tests {
     /// for both, so the inbox always has room for a card's options and its text box.
     #[test]
     fn the_inbox_keeps_its_rows_by_shrinking_the_header_when_the_pane_is_short() {
-        for rows in 15..21 {
+        for rows in 14..18 {
             let open = Plan::new(122, rows, false, true).unwrap();
             let shut = Plan::new(122, rows, false, false).unwrap();
             assert_eq!(shut.header, Header::Box, "{rows}");
             assert_eq!(open.header, Header::Line, "{rows}");
             assert!(open.side.unwrap().rect.rows >= INBOX_MIN_ROWS - 1, "{rows}");
         }
-        let tall = Plan::new(122, 21, false, true).unwrap();
+        let tall = Plan::new(122, 18, false, true).unwrap();
         assert_eq!(tall.header, Header::Box);
         assert!(tall.side.unwrap().rect.rows >= INBOX_BOX_ROWS);
     }
@@ -1426,7 +1657,8 @@ mod tests {
         assert_eq!((plan.frame.x, plan.frame.cols), (0, 122));
         assert_eq!(plan.frame, plan.inner);
         assert_eq!(plan.side, None);
-        assert_eq!(Plan::band(122, 20).unwrap().header, Header::Line);
+        assert_eq!(Plan::band(122, 19).unwrap().header, Header::Box);
+        assert_eq!(Plan::band(122, 18).unwrap().header, Header::Line);
     }
 
     /// qass's tab with the board goes side by side once the board keeps 60 columns and qass
@@ -1437,23 +1669,23 @@ mod tests {
         let stacked = (Dir::H, 0.5);
         assert_eq!(
             board_shape(161, stacked, false, None, true),
-            (Dir::V, 0.70, 0)
+            (Dir::V, 0.70, STRIP_GAP)
         );
         assert_eq!(
             board_shape(134, stacked, false, None, true),
-            (Dir::V, 0.70, 0)
+            (Dir::V, 0.70, STRIP_GAP)
         );
         assert_eq!(
             board_shape(133, stacked, false, None, true),
-            (Dir::H, 0.5, 0)
+            (Dir::H, 0.5, STRIP_GAP)
         );
         assert_eq!(
             board_shape(121, (Dir::V, 0.75), false, None, true),
-            (Dir::H, 0.5, 0)
+            (Dir::H, 0.5, STRIP_GAP)
         );
         assert_eq!(
             board_shape(200, (Dir::V, 0.6), false, None, true),
-            (Dir::V, 0.6, 0)
+            (Dir::V, 0.6, STRIP_GAP)
         );
         assert_eq!(
             board_shape(161, stacked, true, None, true),
@@ -1465,7 +1697,7 @@ mod tests {
         );
         assert_eq!(
             board_shape(158, stacked, true, None, true),
-            (Dir::V, 0.70, 0)
+            (Dir::V, 0.70, STRIP_GAP)
         );
         // Qass first: the same cuts, the first pane's share is the mirror of the board's, and
         // the saved ratio is read as qass's share, never the board's.
@@ -1477,7 +1709,7 @@ mod tests {
         );
         assert_eq!(
             board_shape(133, stacked, false, None, false),
-            (Dir::H, 0.5, 0)
+            (Dir::H, 0.5, STRIP_GAP)
         );
         // 0.3 of 158 is qass's 47 columns and the board's 111: a column of questions fits; the
         // same number read as the board's share would not even fit the board.
@@ -1487,7 +1719,7 @@ mod tests {
         );
         assert_eq!(
             board_shape(161, (Dir::V, 0.3), false, None, true),
-            (Dir::H, 0.5, 0)
+            (Dir::H, 0.5, STRIP_GAP)
         );
         for cols in 80..=260 {
             let (dir, ratio, gap) = board_shape(cols, stacked, true, None, false);
@@ -1511,6 +1743,16 @@ mod tests {
                 );
             }
         }
+        // The strip is charged before the board's minimum: a board one strip short of it goes
+        // stacked (still with its strip), never side by side without one.
+        assert_eq!(
+            board_shape(105, (Dir::V, 0.6), false, None, true),
+            (Dir::H, 0.5, STRIP_GAP)
+        );
+        assert_eq!(
+            board_shape(107, (Dir::V, 0.6), false, None, true),
+            (Dir::V, 0.6, STRIP_GAP)
+        );
     }
 
     /// A dragged questions width is kept, gives way to the board's minimum, and is dropped under
@@ -1525,12 +1767,15 @@ mod tests {
         assert_eq!(board_shape(160, wide, true, Some(90), true).2, 49);
         // Less than the questions' minimum is left: they leave the board's side.
         assert_eq!(board_shape(200, (Dir::V, 0.45), true, Some(70), true).2, 28);
-        assert_eq!(board_shape(200, (Dir::V, 0.4), true, Some(70), true).2, 0);
+        assert_eq!(
+            board_shape(200, (Dir::V, 0.4), true, Some(70), true).2,
+            STRIP_GAP
+        );
         // Qass first: the board is the second pane.
         assert_eq!(board_shape(200, (Dir::V, 0.3), true, Some(70), false).2, 71);
         // Without a width, or without questions, nothing moves.
         assert_eq!(board_shape(200, wide, true, None, true).2, QUESTIONS_GAP);
-        assert_eq!(board_shape(200, wide, false, Some(70), true).2, 0);
+        assert_eq!(board_shape(200, wide, false, Some(70), true).2, STRIP_GAP);
     }
 
     #[test]
