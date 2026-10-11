@@ -1293,25 +1293,27 @@ mod tests {
             assert!(t.contains(want), "{want:?} in\n{t}");
         }
         assert!(!t.contains("[a]"), "{t}");
-        p.key(b"j", 1, t0);
-        p.key(b"a", 1, t0);
-        assert!(!p.holding(), "no option to hold");
-        p.key(b"t", 1, t0);
-        p.key(b"merge it", 1, t0);
-        p.key(b"\r", 1, t0);
-        let (sent, _) = p.tick(t0 + HOLD);
-        let Some(ControlRequest::AskWrite {
-            action: AskOp::Answer {
-                card, option, text, ..
+        p.key(b"j", 1);
+        p.key(b"a", 1);
+        assert!(p.tick(t0).0.is_empty(), "no option to send");
+        p.key(b"t", 1);
+        p.key(b"merge it", 1);
+        p.key(b"\r", 1);
+        let (sent, _) = p.tick(t0);
+        let [
+            ControlRequest::AskWrite {
+                action: AskOp::Answer {
+                    card, option, text, ..
+                },
+                ..
             },
-            ..
-        }) = sent
+        ] = sent.as_slice()
         else {
             panic!("his words go out")
         };
         assert_eq!(
             (card.as_str(), option, text.as_deref()),
-            ("W7", None, Some("merge it"))
+            ("W7", &None, Some("merge it"))
         );
     }
 

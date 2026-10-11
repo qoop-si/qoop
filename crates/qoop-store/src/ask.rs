@@ -177,7 +177,7 @@ impl Store {
     ) -> Result<Option<String>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let live: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND status IN ('open', 'passed'))",
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND status IN ('open', 'queued', 'passed'))",
             params![terminal],
             |r| r.get(0),
         )?;
@@ -363,7 +363,7 @@ pub(crate) fn close_drafts(
 ) -> rusqlite::Result<usize> {
     tx.execute(
         "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
-         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'passed')",
+         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'queued', 'passed')",
         params![terminal, note, now],
     )
 }
