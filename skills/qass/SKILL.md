@@ -278,7 +278,7 @@ every label, reason and words are required; `asked` and `pick` optional. Two to 
 `D:`, plainly different, no "something else" (the pane has his own box). The words are his
 instruction and may hold ` | `. A broken card prints every problem, exits 2 and stores nothing: fix
 it, run it again; any other refusal: `new` once more. Its number: the `E<n>` it printed last. On
-`the inbox needs a restart of qoop`: `qoop restart` once (checked), write it again (that number
+`the inbox needs a restart of qoop`: `qoop restart` once (checked), write it again (its new number
 counts); not restarted, the card stands in chat and `goals.md` only. Without the `-`, the old form
 (`'A: <option>'` words, no inbox record, number from `escalate.sh next E`) when no block can be written. The handle: one
 word of the agent's sidebar name, lowercase, no Turkish letters (başvuru as `basvuru`; he may type
