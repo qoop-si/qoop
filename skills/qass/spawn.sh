@@ -1,7 +1,7 @@
 #!/bin/bash
 # qass spawn: a new worker in its own worktree, ready for a brief.
 #
-#   spawn.sh <repo> <branch> [--agent NAME] [--space NAME]
+#   spawn.sh <repo> <branch> [--agent NAME] [--space NAME] [--tier best|mid|low]
 #                                   prints "<terminal> <generation>"
 #
 # The repo must be a git repository under $HOME and not $HOME itself. The worker
@@ -9,16 +9,25 @@
 # from his `[agents]` (config.toml), and without --agent it is `[qass] agent`,
 # so a worker starts with the flags he gave qass. What it may do is in its brief. The space is made when missing, as `qoop new --space` does. The brief
 # goes afterwards, with `qoop prompt`.
+#
+# A claude worker always starts on a model of `[qass.models]` (config.toml; opus, sonnet, haiku
+# by default, the newest of each family) through ANTHROPIC_MODEL: the tier's, or with no --tier
+# a model the owner's line already names (`--model`), else mid's. A Fable model is never used:
+# the config falls back and the line's own one is dropped. Every other flag of his line stays.
+# opencode keeps its own model. A woken worker comes back on claude's default (a restore types
+# a bare `claude --resume`).
 set -euo pipefail
 
 repo="${1:?usage: spawn.sh <repo> <branch>}"
 branch="${2:?usage: spawn.sh <repo> <branch>}"
 shift 2
 agent=
+tier=
 where=()
 while [ $# -ge 2 ]; do
     case "$1" in
         --agent) agent="$2"; agent_given=1 ;;
+        --tier) case "$2" in best | mid | low) tier="$2" ;; *) echo "spawn: --tier is best, mid or low" >&2; exit 1 ;; esac ;;
         # qass's own space is on no list the owner sees: a worker there would vanish.
         --space) [ "$2" != qass ] || { echo "spawn: the space qass is qass's own; pick another" >&2; exit 1; }
                  where=(--space "$2") ;;
@@ -48,6 +57,39 @@ case "$program" in
     *) [ -n "${agent_given:-}" ] && { echo "spawn: $agent runs $program; a worker runs claude or opencode" >&2; exit 1; }
        cmd=(claude); program=claude ;;
 esac
+if [ "$program" = claude ]; then
+    # The model the owner's line already names, and the line without it.
+    own= rest=()
+    for ((i = 0; i < ${#cmd[@]}; i++)); do
+        case "${cmd[i]}" in
+            # A value only when one follows: `--model --verbose` keeps --verbose.
+            --model) case "${cmd[i + 1]:-}" in '' | -*) ;; *) own="${cmd[i + 1]}"; i=$((i + 1)) ;; esac ;;
+            --model=*) own="${cmd[i]#--model=}" ;;
+            # His own ANTHROPIC_MODEL= would win over the tier's (the last one counts): it is
+            # his line's model, like --model.
+            ANTHROPIC_MODEL=*) own="${cmd[i]#ANTHROPIC_MODEL=}" ;;
+            *) rest+=("${cmd[i]}") ;;
+        esac
+    done
+    case "$(printf '%s' "$own" | tr 'A-Z' 'a-z')" in *fable*) echo "spawn: the line's model $own is Fable, never used" >&2; own= ;; esac
+    if [ -n "$tier" ] || [ -z "$own" ]; then
+        use="${tier:-mid}"
+        model="$(printf '%s' "$config" | jq -r --arg k "qass.models.$use" '.settings[$k] // empty')"
+        printf '%s' "$config" | jq -r '.problems[]? | select(test("qass.models"))' >&2 || true
+        [ -n "$model" ] || { echo "spawn: no model for tier $use" >&2; exit 1; }
+        echo "spawn: claude on $model (tier $use)" >&2
+        # Claude Code's own variable rather than a flag: a wrapper or stand-in that takes no
+        # flags still starts, and nothing of his line changes but a model it named.
+        case "${rest[0]}" in
+            env) cmd=(env "ANTHROPIC_MODEL=$model" "${rest[@]:1}") ;;
+            *) cmd=(env "ANTHROPIC_MODEL=$model" "${rest[@]}") ;;
+        esac
+    else
+        cmd=("${rest[@]}" --model "$own")
+    fi
+elif [ -n "$tier" ]; then
+    echo "spawn: $program keeps its own model; tiers choose claude models" >&2
+fi
 case "$branch" in -*) echo "spawn: bad branch $branch" >&2; exit 1 ;; esac
 repo="$(cd "$repo" && pwd -P)"
 home="$(cd "$HOME" && pwd -P)"

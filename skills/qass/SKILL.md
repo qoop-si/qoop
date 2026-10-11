@@ -350,19 +350,15 @@ When the owner asks for a new agent, or for a goal that is separate from every r
 worker's, in any mode:
 
 ```
-"<this skill's dir>/spawn.sh" <repo> <branch> [--agent NAME] [--space NAME]   # prints "<n> <G>"
-qoop prompt <n> --generation <G> -- '<goal, done criteria, fence>'
+"<this skill's dir>/spawn.sh" <repo> <branch> [--agent NAME] [--space NAME] [--tier best|mid|low]
+qoop prompt <n> --generation <G> -- '<the brief>'      # spawn.sh prints "<n> <G>"
 ```
 
 Agent: his pick (claude, opencode, an `[agents]` name), else `[qass] agent` with its flags
 (claude if that is neither); the space he names, made when missing (default: the repo's own).
-The first brief to a worker you started needs no ok; it starts with "First run `qoop task link
-<KEY>`" (or `qoop task new <goal>` for work on no item), "then follow `qoop task rules` and the
-repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per
-call, never chained (a chain asks permission)." and still ends with the fence; a step the fence
-forbids comes back to you. Its task id reaches you on its event lines (`task:<id>`). A file his
-message names (a screenshot) you may Read, and put its path in the brief. Record it in `goals.md`.
-At most 4 of yours alive. Review or research that only reads: a subagent.
+Its tier and its first brief (no ok needed): follow `<this skill's dir>/brief.md`. Its task id
+reaches you on its event lines (`task:<id>`). Record it in `goals.md`. At most 4 of yours alive.
+Your own review or research that only reads: a subagent of yours; a worker's: its brief.
 
 ## Init
 

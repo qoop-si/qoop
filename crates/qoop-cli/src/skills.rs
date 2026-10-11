@@ -101,6 +101,11 @@ const QASS: &[(&str, &str, bool)] = &[
     ),
     ("on.sh", include_str!("../../../skills/qass/on.sh"), true),
     (
+        "brief.md",
+        include_str!("../../../skills/qass/brief.md"),
+        false,
+    ),
+    (
         "init.md",
         include_str!("../../../skills/qass/init.md"),
         false,
@@ -717,10 +722,11 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 421 holds the quiet watcher's lines, "Improve yourself", the card block of
-        // the question inbox and the usage-limit row; `qoop qass brief` takes the hand arithmetic
-        // out of "On every event line" and this goes back toward 400.
-        assert!(skill.lines().count() <= 421, "SKILL.md grew past 421 lines");
+        // ponytail: 417 holds the quiet watcher's lines, "Improve yourself", the card block of
+        // the question inbox and the usage-limit row (the brief moved to brief.md); `qoop qass
+        // brief` takes the hand arithmetic out of "On every event line" and this goes back
+        // toward 400.
+        assert!(skill.lines().count() <= 417, "SKILL.md grew past 417 lines");
     }
 
     #[test]

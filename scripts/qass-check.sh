@@ -499,6 +499,51 @@ got="$(QASS_LINKDOWN=5 timed 13)"
 rm -f "$tmp/bin/ssh" "$tmp/remotes"
 export QASS_QUIET=0
 
+# spawn.sh starts a claude worker on a tier's model through ANTHROPIC_MODEL, keeps every flag of
+# the owner's line, keeps a model his line names when no tier is asked, never a Fable one, and
+# leaves opencode on its own model.
+mkdir -p "$tmp/home/repo"; git -C "$tmp/home/repo" init -q
+tiers() { # agent-line [problem]
+    jq -n --arg line "$1" --arg problem "${2:-}" '{settings: {"qass.agent": "w",
+        "qass.models.best": "opus", "qass.models.mid": "sonnet", "qass.models.low": "haiku"},
+        agents: [{name: "w", command: $line}], problems: ([$problem] | map(select(. != "")))}'
+}
+cat > "$tmp/bin/qoop" <<EOF
+#!/bin/sh
+case "\$1" in
+    config) cat "$tmp/config.json" ;;
+    worktree) shift; while [ "\$1" != -- ]; do shift; done; shift; echo "\$*" > "$tmp/started"
+              echo "worktree=/x branch=b"; echo terminal=7 ;;
+    agents) case "\$(cat "$tmp/started")" in opencode*) p=opencode ;; *) p=claude ;; esac
+            echo "[{\"terminal\":7,\"generation\":1,\"state\":\"idle\",\"program\":\"\$p\"}]" ;;
+    read) echo '❯ ' ;;
+esac
+EOF
+chmod +x "$tmp/bin/qoop"
+spawned() { # line [spawn args...] -> what the worker's terminal started; stderr in $tmp/said
+    tiers "$1" "${problem:-}" > "$tmp/config.json"; shift
+    HOME="$tmp/home" PATH="$tmp/bin:$PATH" "$skill_w/spawn.sh" "$tmp/home/repo" "b$RANDOM" "$@" \
+        > "$tmp/printed" 2> "$tmp/said" || { echo "spawn failed: $(cat "$tmp/said")"; exit 1; }
+    cat "$tmp/started"
+}
+d='claude --dangerously-skip-permissions'
+[ "$(spawned "$d" --tier low)" = "env ANTHROPIC_MODEL=haiku $d" ] || { echo "low tier: $(cat "$tmp/started")"; exit 1; }
+grep -q 'claude on haiku (tier low)' "$tmp/said" && [ "$(cat "$tmp/printed")" = "7 1" ] || { echo "tier not said: $(cat "$tmp/said")"; exit 1; }
+[ "$(spawned "$d")" = "env ANTHROPIC_MODEL=sonnet $d" ] || { echo "no tier: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "$d --model opus")" = "$d --model opus" ] || { echo "his model: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "$d --model=claude-fable-5-1")" = "env ANTHROPIC_MODEL=sonnet $d" ] || { echo "his Fable: $(cat "$tmp/started")"; exit 1; }
+grep -q 'Fable, never used' "$tmp/said" || { echo "Fable not said: $(cat "$tmp/said")"; exit 1; }
+[ "$(spawned "$d --model haiku" --tier best)" = "env ANTHROPIC_MODEL=opus $d" ] || { echo "tier over his: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "X=1 $d" --tier mid)" = "env ANTHROPIC_MODEL=sonnet X=1 $d" ] || { echo "env line: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "ANTHROPIC_MODEL=claude-fable-5-1 $d")" = "env ANTHROPIC_MODEL=sonnet $d" ] || { echo "his Fable variable: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "ANTHROPIC_MODEL=opus $d" --tier low)" = "env ANTHROPIC_MODEL=haiku $d" ] || { echo "tier over his variable: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned "$d --model --verbose" --tier low)" = "env ANTHROPIC_MODEL=haiku $d --verbose" ] || { echo "a bare --model: $(cat "$tmp/started")"; exit 1; }
+[ "$(spawned opencode --agent w --tier low)" = "opencode" ] && grep -q 'keeps its own model' "$tmp/said" \
+    || { echo "opencode: $(cat "$tmp/started") $(cat "$tmp/said")"; exit 1; }
+problem="qass.models.best: the Fable family is not used; best is opus" spawned "$d" --tier best > /dev/null
+grep -q 'the Fable family is not used' "$tmp/said" || { echo "the config's fallback was not said: $(cat "$tmp/said")"; exit 1; }
+rm -rf "$tmp/home/repo" "$tmp/started" "$tmp/config.json" "$tmp/said" "$tmp/printed"
+
 # Card and proposal numbers come from one count that starts above every number goals.md shows,
 # and never hand the same number out twice.
 rm -f "$tmp/home/.qass/next-card"

@@ -160,18 +160,24 @@ pub fn edit(path: &Path, edits: &[(&str, toml_edit::Item)]) -> Result<(), String
     };
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|_| not_toml(path))?;
     for (key, item) in edits {
-        match key.split_once('.') {
-            Some((table, leaf)) => {
-                if !doc.contains_key(table) {
-                    doc.insert(table, toml_edit::Item::Table(toml_edit::Table::new()));
-                }
-                let Some(table) = doc[table].as_table_like_mut() else {
-                    return Err(format!("{table} is not a table in {}", path.display()));
-                };
-                put(table, leaf, item);
+        // Every part but the last is a table, made when missing: `qass.models.best` is the key
+        // `best` of `[qass.models]`.
+        let (tables, leaf) = key.rsplit_once('.').unwrap_or(("", key));
+        let mut at: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+        let parts: Vec<&str> = tables.split('.').filter(|t| !t.is_empty()).collect();
+        for (n, table) in parts.iter().copied().enumerate() {
+            if at.get(table).is_none() {
+                let mut fresh = toml_edit::Table::new();
+                // A table that only holds a deeper one gets no header of its own.
+                fresh.set_implicit(n + 1 < parts.len());
+                at.insert(table, toml_edit::Item::Table(fresh));
             }
-            None => put(doc.as_table_mut(), key, item),
+            at = match at.get_mut(table).and_then(|t| t.as_table_like_mut()) {
+                Some(next) => next,
+                None => return Err(format!("{table} is not a table in {}", path.display())),
+            };
         }
+        put(at, leaf, item);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

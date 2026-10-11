@@ -59,6 +59,9 @@ fn show(json: bool) -> std::io::Result<()> {
                 "sleep.qass_idle_minutes": c.lifecycle.qass_idle_minutes.unwrap_or(c.lifecycle.idle_minutes),
                 "daemon.exit_when_asleep": c.lifecycle.exit_when_asleep,
                 "qass.agent": read.qass_agent,
+                "qass.models.best": read.qass_models[0],
+                "qass.models.mid": read.qass_models[1],
+                "qass.models.low": read.qass_models[2],
             },
             "agents": read.agents.iter().map(|a| serde_json::json!({ "name": a.name, "command": a.command })).collect::<Vec<_>>(),
             "choices": {

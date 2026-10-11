@@ -210,6 +210,8 @@ pub struct Read {
     pub agents: Vec<Launcher>,
     /// `[qass] agent`: what `qoop qass` starts, one of [`QASS_AGENTS`] or an `[agents]` name.
     pub qass_agent: String,
+    /// `[qass.models]`: the model each of [`QASS_TIERS`] starts a worker on, in that order.
+    pub qass_models: [String; 3],
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
@@ -241,6 +243,40 @@ fn agent_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The tiers qass starts a worker on, and the family each one is when the file names none:
+/// Claude Code's aliases, which always mean the newest model of that family.
+pub const QASS_TIERS: [(&str, &str); 3] = [("best", "opus"), ("mid", "sonnet"), ("low", "haiku")];
+
+/// Whether a model may be a tier's: a plain name, and never of the Fable family.
+fn tier_model(name: &str) -> Result<(), String> {
+    if name.to_ascii_lowercase().contains("fable") {
+        return Err("the Fable family is not used".to_string());
+    }
+    // A letter or digit first, so it never reads as a flag; `[` `]` for a suffix like `opus[1m]`.
+    let plain = name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '[' | ']'));
+    plain
+        .then_some(())
+        .ok_or_else(|| format!("{name} is not a model name"))
+}
+
+/// `[qass.models]` as the file says it, a tier it names wrongly left at its default family.
+fn qass_models_in(text: &str) -> [String; 3] {
+    let table: Option<toml::Table> = toml::from_str(text).ok();
+    let models = table
+        .as_ref()
+        .and_then(|t| t.get("qass")?.get("models")?.as_table());
+    QASS_TIERS.map(|(tier, family)| {
+        models
+            .and_then(|m| m.get(tier)?.as_str())
+            .filter(|name| tier_model(name).is_ok())
+            .unwrap_or(family)
+            .to_string()
+    })
+}
+
 /// `[qass] agent` as the file says it, when it is a name an agent may have.
 fn qass_agent_in(text: &str) -> Option<String> {
     let table: toml::Table = toml::from_str(text).ok()?;
@@ -266,12 +302,14 @@ pub fn agents() -> Vec<Launcher> {
 /// Read a file by its path, so a test never touches a home directory.
 pub fn read_from(path: &Path) -> Read {
     let mut qass_agent = "claude".to_string();
+    let mut qass_models = QASS_TIERS.map(|(_, family)| family.to_string());
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
             let (config, agents, problems) = parse_all(&text);
             if let Some(agent) = qass_agent_in(&text) {
                 qass_agent = agent;
             }
+            qass_models = qass_models_in(&text);
             (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -288,6 +326,7 @@ pub fn read_from(path: &Path) -> Read {
         config,
         agents,
         qass_agent,
+        qass_models,
         problems,
         path: path.to_path_buf(),
         exists,
@@ -508,6 +547,31 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             ("qass", toml::Value::Table(qass)) => {
                 for (key, value) in qass {
                     let line = line_of(&nested.qass, key);
+                    if let ("models", toml::Value::Table(models)) = (key.as_str(), value) {
+                        for (tier, model) in models {
+                            let Some(&(_, family)) = QASS_TIERS.iter().find(|(t, _)| t == tier)
+                            else {
+                                refuse(
+                                    line,
+                                    format!(
+                                        "there is no tier qass.models.{tier}; the tiers are best, mid, low"
+                                    ),
+                                );
+                                continue;
+                            };
+                            if let Err(why) = model
+                                .as_str()
+                                .ok_or("not text".to_string())
+                                .and_then(tier_model)
+                            {
+                                refuse(
+                                    line,
+                                    format!("qass.models.{tier}: {why}; {tier} is {family}"),
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     match (key.as_str(), value.as_str()) {
                         ("agent", Some(name)) if agent_name(name) => {}
                         ("agent", _) => refuse(
@@ -611,7 +675,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 12] = [
+pub const KEYS: [&str; 15] = [
     "prefix",
     "theme",
     "icons",
@@ -624,6 +688,9 @@ pub const KEYS: [&str; 12] = [
     "sleep.qass_idle_minutes",
     "daemon.exit_when_asleep",
     "qass.agent",
+    "qass.models.best",
+    "qass.models.mid",
+    "qass.models.low",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -649,6 +716,10 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
                 QASS_AGENTS.join(", ")
             ));
         }
+        "qass.models.best" | "qass.models.mid" | "qass.models.low" => match tier_model(value) {
+            Ok(()) => toml_edit::value(value),
+            Err(why) => return Err(format!("{key}: {why}")),
+        },
         "sleep.idle_minutes" | "sleep.qass_idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
@@ -707,6 +778,9 @@ mod tests {
             ("sleep.qass_idle_minutes", "0"),
             ("daemon.exit_when_asleep", "false"),
             ("qass.agent", "codex"),
+            ("qass.models.best", "opus"),
+            ("qass.models.mid", "claude-sonnet-5-5"),
+            ("qass.models.low", "haiku"),
         ];
         assert_eq!(values.len(), KEYS.len());
         for (key, value) in values {
@@ -726,6 +800,7 @@ mod tests {
         assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));
         assert!(!read.config.lifecycle.exit_when_asleep);
         assert_eq!(read.qass_agent, "codex");
+        assert_eq!(read.qass_models, ["opus", "claude-sonnet-5-5", "haiku"]);
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(
             text.contains("# mine") && text.contains("unknown = 1") && text.contains("kept = true")
@@ -735,6 +810,40 @@ mod tests {
         let said = set(&path, "theme", "dark").expect_err("refused");
         assert!(said.contains("is not TOML; fix it first"), "{said}");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "[sleep\n");
+    }
+
+    #[test]
+    fn the_model_tiers_default_to_the_newest_families_and_never_fable() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        assert_eq!(read_from(&path).qass_models, ["opus", "sonnet", "haiku"]);
+        set(&path, "qass.models.low", "claude-haiku-4-5").expect("set");
+        let read = read_from(&path);
+        assert_eq!(read.qass_models, ["opus", "sonnet", "claude-haiku-4-5"]);
+        assert!(read.problems.is_empty(), "{:?}", read.problems);
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[qass.models]"), "{text}");
+        for bad in ["fable", "Claude-Fable-5-1", "--dangerous", "two words", ""] {
+            assert!(set(&path, "qass.models.best", bad).is_err(), "{bad}");
+        }
+        std::fs::write(
+            &path,
+            "[qass.models]\nbest = \"claude-fable-5-1\"\nhuge = \"opus\"\n",
+        )
+        .expect("write");
+        let read = read_from(&path);
+        // A Fable model falls back to its tier's family and the file is told so.
+        assert_eq!(read.qass_models, ["opus", "sonnet", "haiku"]);
+        let said: Vec<_> = read.problems.iter().map(|p| p.what.as_str()).collect();
+        assert!(
+            said.iter()
+                .any(|w| w.contains("Fable") && w.contains("best is opus")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|w| w.contains("qass.models.huge")),
+            "{said:?}"
+        );
     }
 
     #[test]

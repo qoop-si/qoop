@@ -1,0 +1,45 @@
+# The first brief to a worker you started
+
+Read this before `spawn.sh` and the first `qoop prompt` to the worker it starts.
+
+## Tier
+
+Pick one for the work, and say which and why in one clause of the brief:
+
+- `best`: hard planning, review, risky or ambiguous work.
+- `mid`: normal implementation; most tasks.
+- `low`: mechanical, bulk or read-heavy work: scans, listings, simple edits, summaries.
+
+Pass it as `spawn.sh ... --tier <tier>`; it starts a claude worker on that tier's model from
+`[qass.models]` in config.toml (the newest Opus, Sonnet and Haiku by default; never a Fable model).
+The owner changes it with one word (`best`, `mid`, `low`): spawn again or tell him it takes a new
+worker. spawn.sh says on stderr which model it used (an alias; the worker's banner, `qoop read`,
+shows the exact id): tell him once. An opencode worker keeps its own model. A woken worker comes
+back on claude's own default (a restore types a bare `claude --resume`): its tier holds only from
+its start.
+
+## The brief
+
+One `qoop prompt` line, in this order:
+
+1. "First run `qoop task link <KEY>`" (or `qoop task new <goal>` for work on no item), "then follow
+   `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task`
+   command alone, one per call, never chained (a chain asks permission)."
+2. The goal in the owner's words and when it is done.
+3. `tier: <tier>, because <why>`.
+4. Sub-agents (claude workers only), a few clauses: where the work fans out and on which tier
+   (its subagent `model`: best `opus`, mid `sonnet`, low `haiku`), and that it uses them there and
+   nowhere else. For example: three reviewers in parallel at the plan
+   (best for the one that tries to break it, mid for the others); a low agent to scan many files;
+   one mid agent per independent lane.
+5. The fence sentence (`SKILL.md`, "Writing to a worker").
+
+A step the fence forbids comes back to you. A file his message names (a screenshot) you may Read,
+and put its path in the brief.
+
+## Example
+
+```
+"<this skill's dir>/spawn.sh" ~/src/shop fix/cart-total --tier mid       # prints "57 1"
+qoop prompt 57 --generation 1 -- 'First run `qoop task link SHOP-4`, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per call, never chained (a chain asks permission). Goal: the cart total is wrong when a coupon and free shipping meet; done when a test shows the right total and the fix is in a PR. tier: mid, because it is one bug in known code. Sub-agents: one low agent to find every place the total is computed; two reviewers on your plan, best for the one that tries to break it, mid for the other; none anywhere else. Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.'
+```
