@@ -607,6 +607,81 @@ fn escalate_sh_keeps_a_block_card_and_done_ends_it_while_the_old_form_still_work
     assert!(said.contains("noted E99"), "{said}");
 }
 
+/// `escalate.sh new` takes the number and keeps the card in one call: cards in a row get their
+/// own numbers, a lost counter still lands above every number the inbox keeps, a number given to
+/// another question is refused (exit 4) and `new` goes on to the next, and a typo fix is taken.
+#[test]
+fn escalate_new_numbers_each_card_once_and_never_writes_over_another_question() {
+    let stack = Stack::start();
+    let shell = stack.open("qass", "qassshell", &[]);
+    let script = escalate(&stack);
+    let sh = script.display();
+    let card = stack.path("card.txt");
+    let card = card.display();
+    let data = stack.path("qass-data");
+    let new =
+        |handle: &str| stack.inside(&shell, &format!("'{sh}' new - later {handle} - < '{card}'"));
+
+    let numbers: Vec<String> = (0..3)
+        .map(|_| {
+            let said = new("h");
+            assert!(said.contains("noted E"), "{said}");
+            said.lines()
+                .find_map(|l| l.strip_suffix(" Added"))
+                .unwrap_or_else(|| panic!("{said}"))
+                .to_string()
+        })
+        .collect();
+    assert_eq!(numbers, ["E1", "E2", "E3"]);
+
+    // The counter lost: the number still lands above every card the inbox keeps.
+    std::fs::remove_file(data.join("next-card")).unwrap();
+    assert!(new("h").contains("E4 Added"));
+
+    // A number typed by hand over E4, about another question: refused, its own exit code.
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "{{ qoop ask add E4 --agent - --handle other --urgency later < '{card}'; echo rc=$?; }}"
+        ),
+    );
+    assert!(said.contains("taken") && said.contains("rc=4"), "{said}");
+    // The same question again (a retry or a typo fix) is taken.
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "{{ qoop ask add E4 --agent - --handle h --urgency later < '{card}'; echo rc=$?; }}"
+        ),
+    );
+    assert!(said.contains("rc=0"), "{said}");
+
+    // A counter behind and an inbox it cannot read: `new` meets E4, is refused, and takes E5.
+    let blind = stack.path("blind");
+    std::fs::create_dir_all(&blind).unwrap();
+    std::fs::write(
+        blind.join("qoop"),
+        format!(
+            "#!/bin/sh\n[ \"$1 $2\" = \"ask ls\" ] && exit 1\nexec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_qoop")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(blind.join("qoop"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(data.join("next-card"), "4").unwrap();
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "PATH='{}':$PATH '{sh}' new - later z - < '{card}'",
+            blind.display()
+        ),
+    );
+    assert!(
+        said.contains("E5 Added") && said.contains("noted E5"),
+        "{said}"
+    );
+    assert_eq!(stack.card_status("E4"), "open");
+}
+
 /// qass reconciles its notes against `qoop ask ls --json`: a card that ended among many others is
 /// still in it, though the pane and the plain listing show only the last few.
 #[test]

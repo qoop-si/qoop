@@ -52,6 +52,19 @@ impl std::fmt::Display for Unavailable {
 
 impl std::error::Error for Unavailable {}
 
+/// The card number is not free (used before, or another question has it): exit 4, so
+/// `escalate.sh new` takes the next one.
+#[derive(Debug)]
+pub(crate) struct NotFree(pub String);
+
+impl std::fmt::Display for NotFree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotFree {}
+
 /// A card from its text, or every problem found. Pure: the grammar and the limits, nothing
 /// of the daemon.
 pub(crate) fn parse(text: &str, handle: &str, urgency: &str) -> Result<AskCard, Vec<String>> {
@@ -269,7 +282,14 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 // Not stored, so the card is shown as it was written: qass still has it.
                 println!("{card}\n{}", options.join("\n"));
             }
-            let result = written(sent?)?;
+            let result = match sent? {
+                ControlResponse::Failed { reason, .. }
+                    if reason.contains(qoop_store::ask::NOT_FREE) =>
+                {
+                    return Err(std::io::Error::other(NotFree(reason)));
+                }
+                answer => written(answer)?,
+            };
             println!("{card} {result:?}");
             options.iter().for_each(|o| println!("{o}"));
             Ok(())

@@ -81,6 +81,9 @@ pub fn main_with(phone: Option<Phone>) {
             // The inbox cannot take a card (an older daemon, or none): `escalate.sh` says so
             // and still rings.
             3
+        } else if e.get_ref().is_some_and(|inner| inner.is::<ask::NotFree>()) {
+            // The card number is not free: `escalate.sh new` takes the next.
+            4
         } else {
             1
         });

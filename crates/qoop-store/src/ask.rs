@@ -48,13 +48,18 @@ pub enum Added {
     Replaced,
 }
 
+/// Said in every refusal of a card number that is not free, so a caller can retry with the next.
+pub const NOT_FREE: &str = "a number is never used twice";
+
 /// What a write to an ask may be refused for.
 #[derive(Debug, thiserror::Error)]
 pub enum AskError {
-    #[error(
-        "{0} is already {1}: a number is never used twice, take a new one with escalate.sh next E"
-    )]
+    #[error("{0} is already {1}: {NOT_FREE}, take a new one with escalate.sh new")]
     Ended(String, String),
+    #[error(
+        "{0} is taken by another question (its handle is {1}): {NOT_FREE}, take a new one with escalate.sh new"
+    )]
+    Taken(String, String),
     #[error("no card {0}")]
     NoCard(String),
     #[error("{0} is already {1}")]
@@ -80,6 +85,12 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AskRow> {
         opened_at: r.get(11)?,
         closed_at: r.get(12)?,
     })
+}
+
+/// The `handle` a card's JSON names: the store never reads more of it.
+fn handle_of(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("handle")?.as_str().map(str::to_string)
 }
 
 fn find(conn: &Connection, card: &str) -> rusqlite::Result<Option<AskRow>> {
@@ -121,9 +132,10 @@ pub(crate) fn close_for_terminals(
 
 impl Store {
     /// Write a card. `body` is the card's JSON. An open card with the number is rewritten
-    /// (qass fixing a typo), an identical one is left alone (a retry), an ended one is
-    /// refused. Every other open card of the same agent is closed as superseded, but only
-    /// when the card names an agent: an answer he already gave is never dropped.
+    /// (qass fixing a typo), an identical one is left alone (a retry), an ended one or one
+    /// about another handle (two questions given one number) is refused. Every other open card
+    /// of the same agent is closed as superseded, but only when the card names an agent: an
+    /// answer he already gave is never dropped.
     pub fn add_ask(
         &self,
         card: &str,
@@ -147,6 +159,10 @@ impl Store {
             };
             if old.body == body && old.agent.as_deref() == agent {
                 return Ok(Added::Same);
+            }
+            let (was, now_is) = (handle_of(&old.body), handle_of(body));
+            if was != now_is {
+                return Err(AskError::Taken(card.into(), was.unwrap_or_default()).into());
             }
             tx.execute(
                 "UPDATE ask SET agent = ?2, terminal = ?3, session = COALESCE(session, ?4), body = ?5 \
@@ -511,7 +527,37 @@ mod tests {
         let err = s
             .add_ask("E7", Some("T5"), Some(t), None, "{b}", 21)
             .unwrap_err();
-        assert!(err.to_string().contains("never used twice"), "{err}");
+        assert!(err.to_string().contains(NOT_FREE), "{err}");
+    }
+
+    /// Two questions given one number: a rewrite naming another handle is refused, a typo fix
+    /// under the same handle is taken.
+    #[test]
+    fn an_open_card_is_never_rewritten_as_another_question() {
+        let (s, t) = store_with_terminal();
+        let card = |handle: &str, asks: &str| format!(r#"{{"handle":"{handle}","asks":"{asks}"}}"#);
+        s.add_ask("E8", Some("T5"), Some(t), None, &card("korea", "ship?"), 10)
+            .unwrap();
+        let err = s
+            .add_ask("E8", None, None, None, &card("cv", "merge?"), 11)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("taken") && err.to_string().contains(NOT_FREE),
+            "{err}"
+        );
+        assert_eq!(
+            s.add_ask(
+                "E8",
+                Some("T5"),
+                Some(t),
+                None,
+                &card("korea", "ship it?"),
+                12
+            )
+            .unwrap(),
+            Added::Replaced
+        );
+        assert!(s.ask("E8").unwrap().unwrap().body.contains("ship it?"));
     }
 
     #[test]

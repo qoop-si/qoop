@@ -124,7 +124,7 @@ with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wai
 The machines in `qoop remote ls` (`ubox`, ...) run their own qoop; the watch already
 follows them. For an agent there, run each command through `on.sh` with the remote's
 name, in the same form as here, and key the agent as `ubox/T2` in goals.md and commands
-(`escalate.sh E12 ubox/2 ...`); to the owner it is its name and "(ubox)":
+(`escalate.sh new ubox/2 ...`); to the owner it is its name and "(ubox)":
 
 ```
 "<this skill's dir>/on.sh" ubox context 2 --last 1 --lines 40
@@ -248,8 +248,8 @@ hour in all. In `mode propose` write only after the owner approves it with
 ## Propose mode
 
 Instead of writing, add `P<n> · <handle>: send '<text>' to T<n> g<G> because <why>` under
-`Waiting on you`, record it with `"<this skill's dir>/escalate.sh" P<n> <terminal> later
-<handle>`, and show him one line: what you would tell which agent (by name) and why, then
+`Waiting on you` (`n` from `escalate.sh next P`), record it with `"<this skill's dir>/escalate.sh"
+P<n> <terminal> later <handle>`, and show him one line: what you would tell which agent (by name) and why, then
 "onay: `ok <handle>`". When he answers "ok <handle>", send exactly that proposal.
 Starting a worker of your own and its first brief need no ok (see "Spawning").
 
@@ -257,13 +257,12 @@ Starting a worker of your own and its first brief need no ok (see "Spawning").
 
 Anything the owner has to answer becomes a card before any chat line about it: one line under
 `Waiting on you` in `goals.md` (`E7 · T52 · korea: <asks>`), the question in the summary's shape
-above, and a record in his inbox. He may always answer in his own words. Take the number from
-`"<this skill's dir>/escalate.sh" next E` (a proposal's from `next P`): never used twice, so an old
-"E6 yes" never fits a new card. Then run, **alone in its message**, the card as a heredoc (the
-trailing `-` asks for it):
+above, and a record in his inbox. He may always answer in his own words. Run, **alone in its
+message**, the card as a heredoc (the trailing `-` asks for it); `new` takes the next free number
+and prints it (`E12 Added`): use that number in goals.md and the chat, never one of your own.
 
 ```
-"<this skill's dir>/escalate.sh" E<n> <terminal|-> now|later <handle> - <<'END'
+"<this skill's dir>/escalate.sh" new <terminal|-> now|later <handle> - <<'END'
 asked: <what he asked this agent for: goals.md, or its first message from him>
 doing: <what it did, and whether its proof is on screen>
 why: <why it asks him now>
