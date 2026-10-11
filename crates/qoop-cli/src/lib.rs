@@ -21,6 +21,7 @@ mod avatar;
 mod board;
 mod board_page;
 mod config;
+mod doctor;
 mod hooks;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
 #[cfg(target_os = "macos")]
@@ -178,6 +179,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("hook-report") => run_hook_report(&args),
         Some("task") => task::run(&args),
         Some("ask") => ask::run(&args),
+        Some("doctor") => doctor::run(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
         Some("avatar") => avatar::run(&args),
@@ -223,6 +225,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
                   \x20 qoop ask add|close|ls  the owner's question inbox, as qass fills it;\n\
                   \x20                 `qoop ask` for more\n\
+                  \x20 qoop doctor  whether the board, the inbox and the agents agree;\n\
+                  \x20                 read-only, `qoop doctor --help` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
