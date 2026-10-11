@@ -16,23 +16,21 @@ use crate::usage;
 /// What every agent opened in qoop is told at the start of a session, by its own hook.
 /// Short on purpose: it is in every session's context.
 pub(crate) const RULES: &str = "You are running inside qoop, which keeps a task record per \
-terminal. It may open one by itself when you edit a file; `qoop task show` says whether there is \
-one, and `qoop task new \"<outcome>\"` opens it. For real work (changing files, a multi-step investigation), give it a plan \
-with `qoop task plan -` (acceptance, steps, how you will verify it), move it with `qoop task \
-stage <stage>` (investigating, planning, implementing, reviewing, verifying, waiting-human), keep \
-`qoop task goal \"<what the owner wants; done when ...>\"` true to his words, add \
-`qoop task evidence \"<check: result>\"` for each check that proves an acceptance point, and \
-finish with `qoop task done \"<summary>\"`. Done is a claim checked outside you, so keep working \
-or stop as usual. If a `qoop task` command fails, carry on with the work. Tick a step \
-(`qoop task check <n>`) once its check passes, move the stage at each phase change (off \
-waiting-human once answered), give each acceptance point its evidence, link owner-named work \
-(`qoop task link <KEY>`), and say done only with every step ticked, before your tab closes. In shell, write rm targets as literal paths or \
-\"${VAR:?}\".";
+terminal: `qoop task show` shows yours. For real work (changing files, a multi-step \
+investigation), open it with `qoop task new \"<outcome>\"` (an edit opens one too), or `qoop task \
+link <KEY>` for the owner's board item. Write its plan with `qoop task plan -`: acceptance, steps, \
+how you verify. Keep `qoop task goal \"<what the owner wants; done when ...>\"` true to his words. \
+Move `qoop task stage <stage>` at each phase change: investigating, planning, implementing, \
+reviewing, verifying, waiting-human (leave it once answered). Tick `qoop task check <n>` when a \
+step's check passes. Add `qoop task evidence \"<check: result>\"` for each acceptance point. Finish \
+with `qoop task done \"<summary>\"` once every step is ticked, before your tab closes; it is a claim \
+checked outside you, so keep working or stop as usual. If a `qoop task` command fails, carry on. Write rm targets \
+as literal paths or \"${VAR:?}\". Keep a debrief to 12 short lines, the result first and the \
+owner's one next action last; open a plan or report with a 5-line summary.";
 
 /// Said beside a request that has no task yet: the moment a vague one should be cleared up,
 /// before any work, in one go.
-const CLARIFY: &str = "If it is unclear, ask every question at once, each with options and your \
-pick, before you start.";
+const CLARIFY: &str = "Unclear? First ask every question at once, with options and your pick.";
 
 /// The line said beside every request: the open task, the board item it works on with its next
 /// step, or, with none, how real work gets a task and that an unclear request is cleared up
@@ -40,15 +38,14 @@ pick, before you start.";
 fn turn_line(open: Option<&TaskInfo>, item: Option<&ItemCardInfo>) -> String {
     let Some(t) = open else {
         return format!(
-            "qoop: if this request is real work, qoop opens its task when you edit a file; give it \
-             a plan with `qoop task plan -` and record checks with `qoop task evidence`. {CLARIFY}"
+            "qoop: real work gets a task on its first edit; plan it (`qoop task plan -`), \
+             prove it (`qoop task evidence`). {CLARIFY}"
         );
     };
     let Some(card) = item else {
         return format!(
-            "qoop: this terminal's task #{} is open (stage {}). Record each check that proves it \
-             with `qoop task evidence`, and `qoop task done` when finished (owner's item? `qoop \
-             task link <KEY>`).",
+            "qoop: this terminal's task #{} is open (stage {}). Prove each check with `qoop task \
+             evidence`, finish with `qoop task done`; the owner's item: `qoop task link <KEY>`.",
             t.id, t.stage
         );
     };
@@ -106,15 +103,17 @@ const QASS_SPACE: &str = crate::qass::SPACE;
 const USAGE: &str = "usage:
   qoop task new [--replace] <goal>     open this terminal's task
   qoop task goal [--id KEY|N] <text|->  what the owner wants and when it is done, in plain words
-                                       (--id: another terminal's task, for qass)
+                                       (--id: another terminal's task, for qass; on an item,
+                                       its short title, cut at 32 characters)
   qoop task stage <stage>              investigating|planning|implementing|reviewing|verifying|waiting-human
   qoop task plan <text|->              acceptance, plan, how it will be verified, risks
   qoop task evidence <text|->          a check that proves an acceptance point, and its result
   qoop task done [summary]             claim it is done; it is checked outside the agent
   qoop task close <KEY|id> --verified|--failed|--dropped [reason]
                                        --dropped takes an item off the board (items only)
-  qoop task add --space S <title> [--description <text|->]
-                                       put an item on a space's board; prints its key
+  qoop task add --space S <short title> [--description <text|->]
+                                       put an item on a space's board; prints its key (a title
+                                       over 32 characters is cut, the whole kept in the description)
   qoop task describe [--id KEY|N] <text|->  the item's description
   qoop task steps [--id KEY|N] -       the item's steps, one per line on standard input
   qoop task check [--id KEY|N] <n> [--undo]  tick step n of the item
@@ -365,7 +364,17 @@ fn add(rest: &[String]) -> std::io::Result<()> {
         },
     )?;
     println!("{} (#{id})", key.unwrap_or_default());
+    said_cut(&title.join(" "), "its description and history");
     Ok(())
+}
+
+/// One line when a title was cut to fit a card, so the writer knows what the board shows.
+fn said_cut(title: &str, kept: &str) {
+    let full = qoop_store::task::one_line(title);
+    let short = qoop_store::item::short_title(&full);
+    if short != full {
+        println!("title cut to '{short}'; the whole text is in {kept}");
+    }
 }
 
 /// `qoop task link <KEY|#id> --remote R --task N --name NAME --stage S`: what qass reports for
@@ -456,13 +465,20 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             if words.is_empty() {
                 return Err(usage(USAGE));
             }
-            match write(task, TaskOp::Goal { goal: text(words)? })? {
+            let goal = text(words)?;
+            match write(task, TaskOp::Goal { goal: goal.clone() })? {
                 0 => Err(std::io::Error::other(
                     "not recorded: this terminal's space keeps no task (qass's own, or one qoop \
                      cannot name yet)",
                 )),
                 id => {
                     println!("task #{id}");
+                    // A key names an item, whose goal is its title.
+                    if rest.first().is_some_and(|a| a == "--id")
+                        && rest.get(1).is_some_and(|k| k.contains('-'))
+                    {
+                        said_cut(&goal, "its history");
+                    }
                     Ok(())
                 }
             }
@@ -767,6 +783,7 @@ mod tests {
                 steps_total: steps.len(),
                 agents: Vec::new(),
                 updated_at: 0,
+                since: 0,
                 closed_at: None,
                 hidden: Default::default(),
             },
@@ -787,6 +804,10 @@ mod tests {
     #[test]
     fn a_new_request_is_cleared_up_before_work_in_one_go() {
         assert!(turn_line(None, None).ends_with(CLARIFY));
+        assert!(
+            turn_line(None, None).chars().count() <= 180,
+            "short beside every request"
+        );
         assert!(CLARIFY.contains("every question at once"));
         let open = turn_line(Some(&open_task()), None);
         assert!(open.contains("task #7 is open (stage implementing)"));
@@ -857,11 +878,10 @@ mod tests {
 
     #[test]
     fn the_rules_stay_short() {
-        // ponytail: 1160: the board sentence says when to tick, move and finish (+220 over the
-        // sentence it replaced), and the last one spares every agent Claude Code's "dangerous rm"
-        // menu.
+        // ponytail: 1100 holds when to tick, move and finish, the "dangerous rm" sentence and the
+        // debrief one, each a sentence of its own.
         assert!(
-            RULES.len() <= 1160,
+            RULES.len() <= 1100,
             "{} chars in every session",
             RULES.len()
         );
@@ -872,6 +892,10 @@ mod tests {
         assert!(
             !RULES.contains("--replace"),
             "no invitation to replace a task"
+        );
+        assert!(
+            RULES.contains("debrief to 12 short lines") && RULES.contains("5-line summary"),
+            "what an agent writes for the owner stays short"
         );
     }
 }

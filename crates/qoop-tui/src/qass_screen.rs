@@ -377,8 +377,6 @@ pub fn facts(
     rows: &[AgentRow],
     spaces: &[WorkspaceRow],
     focused: u32,
-    seen: &sidebar::Seen,
-    unseen: &sidebar::Unseen,
     cards: Option<usize>,
 ) -> Option<Facts> {
     let qass = sidebar::qass_space(spaces)?;
@@ -415,8 +413,15 @@ pub fn facts(
         activity,
         active_at,
         agents: mine().count(),
+        // What waits on him, the way a card says "waits on you": blocked or failed, or its
+        // task waiting on him. A finish nobody read is the sidebar's to show, not a wait.
         waiting: mine()
-            .filter(|r| sidebar::needs_person(r, focused, seen, unseen))
+            .filter(|r| {
+                matches!(r.state.as_str(), "blocked" | "failed")
+                    || r.task
+                        .as_ref()
+                        .is_some_and(|t| t.stage == "waiting-human" && !t.claimed)
+            })
             .count(),
         working: mine().filter(|r| r.state == "working").count(),
         // The cards waiting in his inbox once it can be read; the blocked agents before.
@@ -1202,22 +1207,36 @@ mod tests {
             row(6, 1, "sleeping"),
             qass,
         ];
-        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
-        let f = facts(&rows, &spaces, 5, &seen, &unseen, None).unwrap();
+        let f = facts(&rows, &spaces, 5, None).unwrap();
         assert_eq!((f.terminal, f.state.as_str()), (5, "working"));
         assert_eq!(f.activity.as_deref(), Some("Read a.rs"));
         assert_eq!(f.active_at, Some(42));
         // blocked and failed want him; qass's own working tab is in no count.
         assert_eq!((f.agents, f.waiting, f.working, f.asks), (5, 2, 1, 1));
-        // An unread finish is waiting too.
+        // An unread finish is not a wait; a task waiting on him is, once per agent.
         let mut done = rows.clone();
         done.push(row(7, 1, "done"));
         sidebar::qass_last(&mut spaces.clone(), &mut done);
-        let f = facts(&done, &spaces, 5, &seen, &unseen, None).unwrap();
-        assert_eq!((f.agents, f.waiting), (6, 3));
+        let f = facts(&done, &spaces, 5, None).unwrap();
+        assert_eq!(
+            (f.agents, f.waiting),
+            (6, 2),
+            "a finish nobody read is no wait"
+        );
+        let mut asks = row(8, 1, "idle");
+        asks.task = Some(qoop_runtime::control::TaskRef {
+            id: 3,
+            goal: "ship".to_string(),
+            stage: "waiting-human".to_string(),
+            claimed: false,
+        });
+        done.push(asks);
+        sidebar::qass_last(&mut spaces.clone(), &mut done);
+        let f = facts(&done, &spaces, 5, None).unwrap();
+        assert_eq!((f.agents, f.waiting), (7, 3));
         // No qass tab, no screen.
         let owner_only: Vec<AgentRow> = rows[..5].to_vec();
-        assert_eq!(facts(&owner_only, &spaces, 0, &seen, &unseen, None), None);
+        assert_eq!(facts(&owner_only, &spaces, 0, None), None);
     }
 
     #[test]
@@ -1232,15 +1251,7 @@ mod tests {
             cwd: "/q".to_string(),
         }];
         let rows = vec![row(1, 1, "idle")];
-        let f = facts(
-            &rows,
-            &spaces,
-            0,
-            &sidebar::Seen::new(),
-            &sidebar::Unseen::new(),
-            None,
-        )
-        .unwrap();
+        let f = facts(&rows, &spaces, 0, None).unwrap();
         assert_eq!(
             (f.terminal, f.state.as_str(), f.active_at),
             (5, "sleeping", None)
@@ -1351,20 +1362,14 @@ mod tests {
     fn the_chip_counts_the_cards_once_they_can_be_read() {
         let spaces = vec![space(1, "app"), space(9, "qass")];
         let rows = vec![row(1, 1, "blocked"), row(5, 9, "idle")];
-        let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
-        let blocked = facts(&rows, &spaces, 5, &seen, &unseen, None).unwrap();
+        let blocked = facts(&rows, &spaces, 5, None).unwrap();
         assert_eq!(
             blocked.asks, 1,
             "a blocked agent before the inbox is readable"
         );
-        let cards = facts(&rows, &spaces, 5, &seen, &unseen, Some(3)).unwrap();
+        let cards = facts(&rows, &spaces, 5, Some(3)).unwrap();
         assert_eq!(cards.asks, 3);
-        assert_eq!(
-            facts(&rows, &spaces, 5, &seen, &unseen, Some(0))
-                .unwrap()
-                .asks,
-            0
-        );
+        assert_eq!(facts(&rows, &spaces, 5, Some(0)).unwrap().asks, 0);
     }
 
     /// With the inbox open the header gives up its box for a line when the pane is too short

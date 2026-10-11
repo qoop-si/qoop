@@ -793,6 +793,9 @@ pub struct ItemInfo {
     #[serde(default)]
     pub agents: Vec<ItemAgentInfo>,
     pub updated_at: i64,
+    /// When it came into its lane (Done: when it closed), for "how long"; 0 from an older daemon.
+    #[serde(default)]
+    pub since: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<i64>,
     /// Put away by the owner (`dismiss`): closed, left out of the Done lane by every client.
@@ -815,6 +818,9 @@ pub struct ItemAgentInfo {
     pub claimed: bool,
     #[serde(default)]
     pub closed: bool,
+    /// When it began on the item, for how long it has worked; 0 from an older daemon.
+    #[serde(default)]
+    pub since: i64,
 }
 
 /// One step of an item.
@@ -900,6 +906,7 @@ pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>)
                 },
                 claimed: a.claimed,
                 closed: a.closed,
+                since: a.since,
             }
         })
         .collect();
@@ -914,6 +921,7 @@ pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>)
         steps_total: row.steps_total,
         agents,
         updated_at: row.updated_at,
+        since: row.since,
         closed_at: row.task.closed_at,
         hidden: row.hidden,
     }

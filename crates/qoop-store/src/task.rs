@@ -24,7 +24,8 @@ pub const STAGES: [&str; 6] = [
 ];
 
 /// Budgets, in characters. Past one the write is refused with the limit named, never cut:
-/// a cut plan reads as a whole one.
+/// a cut plan reads as a whole one. A board item's title is the one exception: it is cut to
+/// `item::TITLE_MAX` at a word, its whole text kept (`item::short_title`).
 pub const GOAL_MAX: usize = 300;
 pub const PLAN_MAX: usize = 2_500;
 pub const EVIDENCE_MAX: usize = 1_000;
@@ -90,6 +91,12 @@ pub enum TaskError {
     NoTask(i64),
     #[error("task #{0} is closed")]
     Closed(i64),
+    /// A close of an agent's task that already ended, while the item it worked on is open:
+    /// the item is what is left to close, the same way.
+    #[error(
+        "task #{0} is closed; its item {1} is open: qoop task close {1} {2} '<what you checked>'"
+    )]
+    ClosedOnItem(i64, String, &'static str),
     #[error("unknown stage {0:?}; one of: {stages}", stages = STAGES.join(", "))]
     UnknownStage(String),
     #[error("{what} is {len} characters, over the {max} limit; shorten it")]
@@ -466,18 +473,29 @@ impl Store {
     /// The first goal is the owner's cut prompt; this replaces it as the ask becomes clear or
     /// changes. The old text stays in the events. Answers whether the goal changed.
     pub fn set_task_goal(&self, task: i64, goal: &str, now: i64) -> Result<bool, StoreError> {
-        let goal = goal_text(goal)?;
+        let full = goal_text(goal)?;
         let tx = self.conn.unchecked_transaction()?;
         let t = open_row(&tx, task)?;
+        // An item's goal is its title: cut to fit a card, the whole text kept in the event.
+        let item: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM board_item WHERE task = ?1)",
+            params![task],
+            |r| r.get(0),
+        )?;
+        let goal = if item {
+            crate::item::short_title(&full)
+        } else {
+            full.clone()
+        };
         // The same words again change nothing: no event, and the task does not look touched.
-        if t.goal == goal {
+        if t.goal == goal && full == goal {
             return Ok(false);
         }
         tx.execute(
             "UPDATE task SET goal = ?2, updated_at = ?3 WHERE id = ?1",
             params![task, goal, now],
         )?;
-        event(&tx, task, "goal", &goal, now)?;
+        event(&tx, task, "goal", &full, now)?;
         tx.commit()?;
         Ok(true)
     }

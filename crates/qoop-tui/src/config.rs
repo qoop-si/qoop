@@ -17,6 +17,8 @@
 //! exit_when_asleep = true
 //! [qass]
 //! agent = "claude"    # claude | codex | gemini | opencode, or a name from [agents]
+//! [board]
+//! cards = "full"      # full | quiet: a word on a card only when someone must act
 //! [agents]            # a name for a new agent, and the line typed to start it
 //! claudec = "claude --dangerously-skip-permissions"
 //! lm = "opencode"
@@ -88,6 +90,8 @@ pub struct Config {
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
     pub lifecycle: qoop_runtime::config::Lifecycle,
+    /// The board's quiet cards: one line, a word only on a card someone must act on.
+    pub quiet_cards: bool,
 }
 
 /// The agents qass's skill installs beside, and so the ones `qoop qass` can start by name.
@@ -105,6 +109,7 @@ impl Default for Config {
             alert_sound: "Funk",
             notch: true,
             lifecycle: qoop_runtime::config::Lifecycle::default(),
+            quiet_cards: false,
         }
     }
 }
@@ -440,6 +445,8 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
         agents: Spans,
         #[serde(default)]
         qass: Spans,
+        #[serde(default)]
+        board: Spans,
     }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
@@ -544,6 +551,26 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 }
             }
             ("notch", _) => refuse(line, "notch is a table: [notch] then enabled = true".into()),
+            ("board", toml::Value::Table(board)) => {
+                for (key, value) in board {
+                    let line = line_of(&nested.board, key);
+                    match (key.as_str(), value.as_str()) {
+                        ("cards", Some("full")) => config.quiet_cards = false,
+                        ("cards", Some("quiet")) => config.quiet_cards = true,
+                        ("cards", _) => {
+                            refuse(
+                                line,
+                                format!("cards = {value} is not \"full\" or \"quiet\""),
+                            );
+                        }
+                        _ => refuse(line, format!("there is no setting board.{key}")),
+                    }
+                }
+            }
+            ("board", _) => refuse(
+                line,
+                "board is a table: [board] then cards = \"full\"".into(),
+            ),
             ("qass", toml::Value::Table(qass)) => {
                 for (key, value) in qass {
                     let line = line_of(&nested.qass, key);
@@ -675,7 +702,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 15] = [
+pub const KEYS: [&str; 16] = [
     "prefix",
     "theme",
     "icons",
@@ -691,6 +718,7 @@ pub const KEYS: [&str; 15] = [
     "qass.models.best",
     "qass.models.mid",
     "qass.models.low",
+    "board.cards",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -705,6 +733,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "theme" => return Err("theme is auto, dark or light".to_string()),
         "icons" if matches!(value, "auto" | "on" | "off") => toml_edit::value(value),
         "icons" => return Err("icons is auto, on or off".to_string()),
+        "board.cards" if matches!(value, "full" | "quiet") => toml_edit::value(value),
+        "board.cards" => return Err("board.cards is full or quiet".to_string()),
         "notify.done_sound" | "notify.alert_sound" => match sound_named(value) {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
@@ -781,6 +811,7 @@ mod tests {
             ("qass.models.best", "opus"),
             ("qass.models.mid", "claude-sonnet-5-5"),
             ("qass.models.low", "haiku"),
+            ("board.cards", "quiet"),
         ];
         assert_eq!(values.len(), KEYS.len());
         for (key, value) in values {
@@ -795,6 +826,8 @@ mod tests {
             ["there is no setting unknown", "there is no setting extra"]
         );
         assert_eq!(read.config.prefix, 0x02);
+        assert!(read.config.quiet_cards);
+        assert!(set(&path, "board.cards", "loud").is_err());
         assert_eq!(read.config.theme, Theme::Light);
         assert_eq!(read.config.lifecycle.idle_minutes, 30);
         assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));

@@ -50,6 +50,8 @@ struct Board {
     asof: String,
     now: i64,
     items: Vec<ItemInfo>,
+    /// A closed item's closing note, by its id: what the closer checked.
+    notes: HashMap<i64, String>,
     spaces: Vec<Space>,
     closed: Vec<Closed>,
 }
@@ -109,6 +111,17 @@ fn live_titles() -> HashMap<i64, String> {
     })
 }
 
+/// What the closer of a task or item wrote, qass's note of what it checked for a verified close.
+fn closing_note(store: &Store, task: i64) -> std::io::Result<String> {
+    Ok(store
+        .task_events_of(task, "closed", 1)
+        .map_err(std::io::Error::other)?
+        .into_iter()
+        .next()
+        .map(|e| e.body)
+        .unwrap_or_default())
+}
+
 fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
     let now = now();
     let stored: HashMap<String, String> = store
@@ -137,7 +150,7 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
             session,
         ))
     };
-    let items = store
+    let items: Vec<ItemInfo> = store
         .items(now)
         .map_err(std::io::Error::other)?
         .into_iter()
@@ -198,23 +211,22 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
         if space.as_deref() == Some(QASS_SPACE) {
             continue;
         }
-        let note = store
-            .task_events_of(task.id, "closed", 1)
-            .map_err(std::io::Error::other)?
-            .into_iter()
-            .next()
-            .map(|e| e.body)
-            .unwrap_or_default();
+        let note = closing_note(store, task.id)?;
         closed.push(Closed {
             task,
             space: space.unwrap_or_else(|| "a closed space".to_string()),
             note,
         });
     }
+    let mut notes = HashMap::new();
+    for i in items.iter().filter(|i| i.state == "done") {
+        notes.insert(i.id, closing_note(store, i.id)?);
+    }
     Ok(Board {
         asof: local_now(),
         now,
         items,
+        notes,
         spaces,
         closed,
     })
@@ -234,12 +246,16 @@ fn index(b: &Board) -> String {
     } else {
         out.push_str("| Key | Title | State | Steps | Assignees |\n|---|---|---|---|---|\n");
         for i in &b.items {
-            let who: Vec<String> = i
-                .agents
-                .iter()
-                .filter(|a| !a.closed)
-                .map(|a| format!("{} ({}, {})", a.name, a.machine, a.stage))
-                .collect();
+            // A closed item's agents are named only: a stage there is stale.
+            let who: Vec<String> = if i.state == "done" {
+                i.agents.iter().map(|a| a.name.clone()).collect()
+            } else {
+                i.agents
+                    .iter()
+                    .filter(|a| !a.closed)
+                    .map(|a| format!("{} ({}, {})", a.name, a.machine, a.stage))
+                    .collect()
+            };
             let state = i
                 .outcome
                 .as_deref()
@@ -284,11 +300,41 @@ fn index(b: &Board) -> String {
         }
     }
     out.push_str("\n## Closed in the last 24 h\n\n");
-    if b.closed.is_empty() {
+    // Closed items first, newest first; an agent task of a listed item is that same job.
+    let mut items: Vec<&ItemInfo> = b
+        .items
+        .iter()
+        .filter(|i| i.state == "done" && !i.hidden)
+        .filter(|i| i.closed_at.is_some_and(|at| at >= b.now - CLOSED_SECS))
+        .collect();
+    items.sort_by_key(|i| std::cmp::Reverse(i.closed_at));
+    items.truncate(CLOSED_MAX);
+    let listed: Vec<i64> = items
+        .iter()
+        .flat_map(|i| i.agents.iter().map(|a| a.task))
+        .collect();
+    let tasks: Vec<&Closed> = b
+        .closed
+        .iter()
+        .filter(|c| !listed.contains(&c.task.id))
+        .collect();
+    if items.is_empty() && tasks.is_empty() {
         out.push_str("None.\n");
     }
     // The exact close time rides along unseen, for a reader comparing it with its own clock.
-    for c in &b.closed {
+    for i in &items {
+        let _ = writeln!(
+            out,
+            "- {} ({}): {}. Closed {}: {} <!-- closed_at {} -->",
+            i.outcome.as_deref().unwrap_or("closed"),
+            i.key,
+            cell(&i.title),
+            ago(i.closed_at, b.now),
+            one_line(b.notes.get(&i.id).map_or("", String::as_str)),
+            i.closed_at.unwrap_or_default()
+        );
+    }
+    for c in tasks {
         let t = &c.task;
         let _ = writeln!(
             out,
@@ -467,6 +513,48 @@ mod tests {
         let mut b = read(&store, &HashMap::new()).unwrap();
         b.asof = "2026-10-10 21:40".into();
         (dir, b)
+    }
+
+    /// A closed item is listed among the closed with its close time, and the agent task that
+    /// did it is not listed again; its row names its agent with no stage.
+    #[test]
+    fn closed_items_are_listed_once_and_say_no_stage() {
+        let mut store = Store::in_memory().expect("store");
+        let ws = store.create_workspace("web", 1).unwrap();
+        let t = store.create_terminal(5, ws, "/w", "/bin/sh", 2).unwrap();
+        let (item, key) = store.add_item(ws, "checkout", "", 2).unwrap();
+        let task = store.open_task(t, "fix checkout", false, 3).unwrap();
+        store.link_task(task, item, 4).unwrap();
+        store.set_task_stage(task, "waiting-human", 5).unwrap();
+        let second = store.create_terminal(8, ws, "/w", "/bin/sh", 2).unwrap();
+        let did = store.open_task(second, "wire checkout", false, 3).unwrap();
+        store.link_task(did, item, 4).unwrap();
+        store
+            .close_task(did, qoop_store::Outcome::Verified, "PR merged", now())
+            .unwrap();
+        store
+            .close_task(item, qoop_store::Outcome::Verified, "checked", now())
+            .unwrap();
+        let other = store.create_terminal(6, ws, "/w", "/bin/sh", 2).unwrap();
+        let alone = store.open_task(other, "side job", false, 3).unwrap();
+        store
+            .close_task(alone, qoop_store::Outcome::Verified, "ran", now())
+            .unwrap();
+        let b = read(&store, &HashMap::new()).unwrap();
+        let readme = index(&b);
+        assert!(
+            readme.contains(&format!(
+                "- verified ({key}): checkout. Closed just now: verified: checked"
+            )),
+            "{readme}"
+        );
+        assert!(readme.contains("side job"), "{readme}");
+        assert!(
+            !readme.contains("wire checkout"),
+            "one job, one line: {readme}"
+        );
+        assert!(!readme.contains("waiting-human"), "{readme}");
+        assert!(!readme.contains("None."), "{readme}");
     }
 
     /// The folder holds the owner's goal and each open task's goal, stage, plan, newest

@@ -22,12 +22,50 @@ use crate::{Store, StoreError};
 pub const DESCRIPTION_MAX: usize = 2_500;
 pub const STEPS_MAX: usize = 30;
 pub const STEP_MAX: usize = 200;
+/// The longest title a card shows on one line. A longer one is cut at a word, never refused:
+/// the owner typed it, and its whole text is kept in its event (and the description).
+pub const TITLE_MAX: usize = 32;
 /// How long a start waits for an agent to be linked before the item reads as Todo again.
 pub const START_SECS: i64 = 600;
 /// How long a Done item stays on the board.
 pub const DONE_SECS: i64 = 86_400;
 /// The most of a remote agent's name or machine kept, and of its stage.
 const NAME_MAX: usize = 100;
+
+/// A title as a card shows it: at most [`TITLE_MAX`] characters, cut at the last space past
+/// the middle when there is one, else at the limit; no trailing space or punctuation, and no
+/// bracket left open when what is before it still says enough.
+pub fn short_title(title: &str) -> String {
+    if title.chars().count() <= TITLE_MAX {
+        return title.to_string();
+    }
+    let head: String = title.chars().take(TITLE_MAX + 1).collect();
+    let cut = head
+        .char_indices()
+        .rev()
+        .find(|&(at, c)| c == ' ' && head[..at].chars().count() > TITLE_MAX / 2)
+        .map(|(at, _)| at)
+        .map_or_else(
+            || head.chars().take(TITLE_MAX).collect(),
+            |at| head[..at].to_string(),
+        );
+    let trim = |t: &str| {
+        t.trim_end_matches(|c: char| c.is_whitespace() || ",;:.-(/&+".contains(c))
+            .to_string()
+    };
+    let mut kept = trim(&cut);
+    if kept.matches('(').count() > kept.matches(')').count()
+        && let Some(open) = kept.rfind('(')
+        && trim(&kept[..open]).chars().count() > TITLE_MAX / 2
+    {
+        kept = trim(&kept[..open]);
+    }
+    if kept.is_empty() {
+        head.chars().take(TITLE_MAX).collect()
+    } else {
+        kept
+    }
+}
 const STAGE_MAX: usize = 40;
 /// The body of the `unlinked` event that takes every agent off an item at once.
 const EVERY_AGENT: &str = "every agent";
@@ -76,6 +114,8 @@ pub struct ItemAgent {
     pub claimed: bool,
     pub closed: bool,
     pub updated_at: i64,
+    /// When it began on the item: a local task's opening, a remote agent's first report.
+    pub since: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +129,8 @@ pub struct ItemRow {
     pub agents: Vec<ItemAgent>,
     /// The newest change on it or on an agent working on it.
     pub updated_at: i64,
+    /// When it came into its lane (see [`lane_since`]).
+    pub since: i64,
     /// Put away by the owner (`dismiss`): closed, off the board, nothing of it deleted.
     pub hidden: bool,
 }
@@ -255,8 +297,8 @@ fn state(
 fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
     let mut stmt = tx.prepare(
         "SELECT t.id, t.terminal, t.stage, t.claimed_at IS NOT NULL, t.closed_at IS NOT NULL, \
-         t.updated_at, l.name FROM task_item l JOIN task t ON t.id = l.task WHERE l.item = ?1 \
-         ORDER BY t.id",
+         t.updated_at, l.name, t.opened_at FROM task_item l JOIN task t ON t.id = l.task \
+         WHERE l.item = ?1 ORDER BY t.id",
     )?;
     let mut all = stmt
         .query_map(params![item], |r| {
@@ -269,6 +311,7 @@ fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
                 claimed: r.get(3)?,
                 closed: r.get(4)?,
                 updated_at: r.get(5)?,
+                since: r.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -288,6 +331,8 @@ fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
             stage,
             claimed: false,
             updated_at: r.get(4)?,
+            // A remote agent's start is not reported, and its newest report is no start: none.
+            since: 0,
         })
     })?;
     for agent in remote {
@@ -332,6 +377,7 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         .iter()
         .map(|a| a.updated_at)
         .fold(task.updated_at, i64::max);
+    let since = lane_since(tx, &task, state)?;
     // Put away since its latest close: a mark from before a reopen and a new close (an older
     // binary reopens without clearing it) is stale and ignored.
     let hidden = match task.closed_at {
@@ -353,8 +399,45 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         steps_total: steps_total as usize,
         agents,
         updated_at,
+        since,
         hidden,
     })
+}
+
+/// When an item came into its lane: Done when it closed; Doing at the first link or start
+/// since it was last reopened or unlinked; Todo at its newest opening, reopening or unlink.
+// ponytail: up to three event queries per item on each board read; a stored `entered_at` on
+// the item if boards grow past a few hundred items.
+fn lane_since(tx: &Connection, task: &TaskRow, state: ItemState) -> rusqlite::Result<i64> {
+    if let Some(closed) = task.closed_at {
+        return Ok(closed);
+    }
+    // The newest reopen or unlink: a Doing run starts after it, or at it when no link came since.
+    let mut back = (0, None);
+    for kind in ["reopened", "unlinked"] {
+        if let Some((id, at)) = newest(tx, task.id, kind)?
+            && id > back.0
+        {
+            back = (id, Some(at));
+        }
+    }
+    let at: Option<i64> = if state == ItemState::Doing {
+        tx.query_row(
+            "SELECT MIN(at) FROM task_event WHERE task = ?1 AND id > ?2 \
+             AND kind IN ('linked', 'start')",
+            params![task.id, back.0],
+            |r| r.get::<_, Option<i64>>(0),
+        )?
+        .or(back.1)
+    } else {
+        tx.query_row(
+            "SELECT MAX(at) FROM task_event WHERE task = ?1 \
+             AND kind IN ('opened', 'reopened', 'unlinked')",
+            params![task.id],
+            |r| r.get(0),
+        )?
+    };
+    Ok(at.unwrap_or(task.opened_at))
 }
 
 fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEventRow> {
@@ -421,9 +504,25 @@ impl Store {
         description: &str,
         now: i64,
     ) -> Result<(i64, String), StoreError> {
-        let title = goal_text(title)?;
+        let full = goal_text(title)?;
         let description = printable(description);
         within("the description", &description, DESCRIPTION_MAX)?;
+        let title = short_title(&full);
+        // A cut title keeps its whole text in the opened event, and at the top of the
+        // description once, when it fits there: a later edit must not fail on its length.
+        let with_full = if description.is_empty() {
+            full.clone()
+        } else {
+            format!("{full}\n\n{description}")
+        };
+        let description = if title == full
+            || description.contains(&full)
+            || with_full.chars().count() > DESCRIPTION_MAX
+        {
+            description
+        } else {
+            with_full
+        };
         let tx = self.conn.unchecked_transaction()?;
         let name: Option<String> = tx
             .query_row(
@@ -451,7 +550,7 @@ impl Store {
             "INSERT INTO board_item (task, prefix, n, description) VALUES (?1, ?2, ?3, ?4)",
             params![id, prefix, n, description],
         )?;
-        event(&tx, id, "opened", &title, now)?;
+        event(&tx, id, "opened", &full, now)?;
         if !description.is_empty() {
             event(&tx, id, "description", &description, now)?;
         }
@@ -507,6 +606,20 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// The key of the open item a task is linked to, if any.
+    pub fn open_item_key(&self, task: i64) -> Result<Option<String>, StoreError> {
+        let item: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT l.item FROM task_item l JOIN task t ON t.id = l.item \
+                 WHERE l.task = ?1 AND t.closed_at IS NULL",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(item.map(|i| key_of(&self.conn, i)).transpose()?)
     }
 
     /// The item a task is linked to, if any.
@@ -1070,6 +1183,105 @@ mod tests {
             s.add_item(ws, "x", &"d".repeat(DESCRIPTION_MAX + 1), 16)
                 .is_err()
         );
+    }
+
+    /// An item says when it came into its lane: Todo at its opening, Doing at its first link
+    /// since then, Done when it closed; its agent says when it began.
+    #[test]
+    fn an_item_says_since_when_it_is_in_its_lane() {
+        let (mut s, ws, t) = setup();
+        let other = s.create_terminal(9, ws, "/tmp", "/bin/sh", 2).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let since = |at| s.item_card(item, at).unwrap().unwrap().item.since;
+        assert_eq!(since(11), 10);
+        let task = s.open_task(t, "ship it", false, 20).unwrap();
+        s.link_task(task, item, 30).unwrap();
+        s.set_task_stage(task, "implementing", 40).unwrap();
+        assert_eq!(since(41), 30);
+        let card = s.item_card(item, 41).unwrap().unwrap();
+        assert_eq!(card.item.agents[0].since, 20);
+        // Another agent taken off it: the run goes on from that change, never from its creation.
+        let second = s.open_task(other, "help", false, 42).unwrap();
+        s.link_task(second, item, 43).unwrap();
+        s.unlink(second, 44).unwrap();
+        assert_eq!(since(45), 44);
+        s.close_task(item, Outcome::Verified, "checked", 50)
+            .unwrap();
+        assert_eq!(since(51), 50);
+    }
+
+    /// An ended agent's task points at the open item it worked on, and at nothing once that
+    /// item is closed too.
+    #[test]
+    fn an_ended_task_names_the_open_item_left_to_close() {
+        let (s, ws, t) = setup();
+        let (item, key) = s.add_item(ws, "ship", "", 10).unwrap();
+        let task = s.open_task(t, "ship it", false, 11).unwrap();
+        assert_eq!(s.open_item_key(task).unwrap(), None);
+        s.link_task(task, item, 12).unwrap();
+        s.close_task(task, Outcome::Verified, "done", 13).unwrap();
+        assert_eq!(s.open_item_key(task).unwrap(), Some(key));
+        s.close_task(item, Outcome::Verified, "checked", 14)
+            .unwrap();
+        assert_eq!(s.open_item_key(task).unwrap(), None);
+    }
+
+    /// A long title fits a card: cut at a word (or at the limit when there is none), its whole
+    /// text kept at the top of the description, never twice; a rename is cut the same way and
+    /// its event keeps the whole text; an agent's own goal is not an item's and stays whole.
+    #[test]
+    fn titles_are_cut_to_fit_a_card_and_nothing_is_lost() {
+        let (s, ws, t) = setup();
+        let long =
+            "Fix app #614: config only_main_content honored as scrape default (PR #615 live)";
+        let (item, _) = s.add_item(ws, long, "", 10).unwrap();
+        let card = s.item_card(item, 11).unwrap().unwrap();
+        assert_eq!(card.item.task.goal, "Fix app #614: config");
+        assert_eq!(card.description, long);
+        let opened = s.task_events(item, None, 10).unwrap();
+        assert!(opened.iter().any(|e| e.kind == "opened" && e.body == long));
+
+        let (item, _) = s.add_item(ws, long, "his notes", 10).unwrap();
+        let card = s.item_card(item, 11).unwrap().unwrap();
+        assert_eq!(card.description, format!("{long}\n\nhis notes"));
+        let (item, _) = s.add_item(ws, long, &format!("asked: {long}"), 10).unwrap();
+        let card = s.item_card(item, 11).unwrap().unwrap();
+        assert_eq!(card.description, format!("asked: {long}"), "never twice");
+        let full = "d".repeat(DESCRIPTION_MAX - 10);
+        let (item, _) = s.add_item(ws, long, &full, 10).unwrap();
+        let card = s.item_card(item, 11).unwrap().unwrap();
+        assert_eq!(card.description, full, "no room: the event keeps it");
+        assert!(s.describe_item(item, &card.description, 12).is_ok());
+
+        assert_eq!(short_title(&"x".repeat(80)), "x".repeat(TITLE_MAX));
+        assert_eq!(short_title("short one"), "short one");
+        // Characters, never bytes: a Turkish letter on the cut is kept whole.
+        let tr = format!("{} ğüşiöç çalışıyor", "ı".repeat(20));
+        assert_eq!(short_title(&tr), format!("{} ğüşiöç", "ı".repeat(20)));
+        assert_eq!(
+            short_title("Restore after a daemon restart: an agent"),
+            "Restore after a daemon restart"
+        );
+        assert_eq!(
+            short_title("Phone board: build P3-1 (Jira mobile, column tabs)"),
+            "Phone board: build P3-1"
+        );
+        assert!(
+            s.add_item(ws, &"y".repeat(crate::task::GOAL_MAX + 1), "", 10)
+                .is_err()
+        );
+
+        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        assert!(s.set_task_goal(item, long, 12).unwrap());
+        let card = s.item_card(item, 13).unwrap().unwrap();
+        assert_eq!(card.item.task.goal, "Fix app #614: config");
+        let events = s.task_events(item, None, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "goal" && e.body == long));
+
+        let own = s.open_task(t, "agent goal", false, 14).unwrap();
+        assert!(s.set_task_goal(own, long, 15).unwrap());
+        assert_eq!(s.task_events(own, None, 1).unwrap()[0].body, long);
+        assert_eq!(s.open_task_of(t).unwrap().unwrap().goal, long);
     }
 
     /// Setting the list replaces it; an unchanged text keeps its tick wherever it moved;

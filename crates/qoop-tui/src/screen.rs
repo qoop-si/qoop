@@ -509,8 +509,6 @@ pub(crate) fn qass_screen_of(
         frame.rows,
         frame.spaces,
         frame.focused,
-        frame.seen,
-        frame.unseen,
         frame.chrome.asks.and_then(|asks| asks.count()),
     )?;
     let ctx = crate::qass_screen::Ctx {

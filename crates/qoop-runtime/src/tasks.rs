@@ -326,7 +326,23 @@ pub(crate) async fn write(
                         Outcome::Abandoned
                     }
                 };
-                s.close_task(task, outcome, &reason, now).map(|_| true)
+                // An agent's task that ended with its tab: name the item still to close.
+                let flag = if outcome == Outcome::Failed {
+                    "--failed"
+                } else {
+                    "--verified"
+                };
+                match s.close_task(task, outcome, &reason, now) {
+                    Err(qoop_store::StoreError::Task(qoop_store::TaskError::Closed(t))) => {
+                        match s.open_item_key(t)? {
+                            Some(key) => {
+                                Err(qoop_store::TaskError::ClosedOnItem(t, key, flag).into())
+                            }
+                            None => Err(qoop_store::TaskError::Closed(t).into()),
+                        }
+                    }
+                    other => other.map(|_| true),
+                }
             }
         })
         .await;

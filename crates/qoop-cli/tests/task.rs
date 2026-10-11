@@ -274,7 +274,7 @@ $Q task rules --turn > turn-open.out 2>&1"#,
         !read(&work, "after.out").contains("--replace"),
         "no invitation to replace"
     );
-    assert!(read(&work, "turn-none.out").starts_with("qoop: if this request is real work"));
+    assert!(read(&work, "turn-none.out").starts_with("qoop: real work gets a task"));
     assert!(
         read(&work, "turn-open.out")
             .starts_with("qoop: this terminal's task #1 is open (stage investigating)."),
@@ -879,6 +879,46 @@ $Q task stage waiting-human > stage.out 2>&1"#
     std::thread::sleep(Duration::from_millis(500));
     let (ok, _, err) = daemon.run(&["task", "add", "--space", "qass", "notes"]);
     assert!(!ok && err.contains("no board"), "{err}");
+}
+
+/// Closing an agent's task that already ended, while its item is open, names the item to close,
+/// the same way, so a finished card is not left in Doing.
+#[test]
+fn closing_an_ended_task_names_its_open_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "ship"]);
+    assert!(ok, "add: {err}");
+    let key = out
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let work = daemon.inside(
+        "1",
+        "ended",
+        &format!(r#"$Q task new 'ship it' > new.out 2>&1; $Q task link {key} > link.out 2>&1"#),
+    );
+    let id = read(&work, "new.out")
+        .trim()
+        .trim_start_matches("task #")
+        .to_string();
+    let (ok, _, err) = daemon.run(&["task", "close", &id, "--verified", "ran"]);
+    assert!(ok, "first close: {err}");
+    let (ok, _, err) = daemon.run(&["task", "close", &id, "--failed", "again"]);
+    assert!(
+        !ok && err.contains(&format!(
+            "its item {key} is open: qoop task close {key} --failed"
+        )),
+        "{err}"
+    );
+    let (ok, _, err) = daemon.run(&["task", "close", &key, "--verified", "checked"]);
+    assert!(ok, "the item closes: {err}");
+    let (ok, _, err) = daemon.run(&["task", "close", &id, "--verified", "again"]);
+    assert!(
+        !ok && err.contains("is closed") && !err.contains("its item"),
+        "{err}"
+    );
 }
 
 /// An agent on a board item is told, beside every request, the item and its next step, and
