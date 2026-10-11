@@ -109,6 +109,17 @@ Notes:
   (an older build). Every other kind, `idle_prompt` a minute after the agent
   finished included, reports nothing; `Stop` already said idle. An installed
   hook picks this up on the next `qoop hooks install`.
+- a question dialog (`elicitation_dialog` or `elicitation_url_dialog`) is the
+  one `blocked` report that carries a label: its type. When it is still the
+  agent's newest event 120 seconds later (qass often answers first), the daemon
+  drafts a `W<n>` inbox card for it, "a question on its screen", with no
+  options, whether or not the agent has an open task; never for a permission
+  menu, a quota notice or qass's own tab. His words for it go through qass,
+  since a blocked agent takes none, typed as the draft's handle (the agent's
+  name word, then its task number, or `-t` and its terminal without a task)
+  and his words. The draft closes when the agent reports a tool or a prompt,
+  or its task moves. A hook installed before this sends no type, and its
+  dialogs get no draft.
 - focus events (claude, codex, gemini, opencode): the scripts add `--event
   user|tool|blocked|done` with a one-line `--label` beside the unchanged
   state word. The daemon keeps the last 50 per terminal in memory for the

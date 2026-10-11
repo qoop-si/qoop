@@ -1497,6 +1497,15 @@ mod tests {
                 r#"{{"hook_event_name":"Notification","notification_type":"{kind}"}}"#
             ));
             assert!(said.contains("--state blocked"), "{kind} reported {said:?}");
+            // A question dialog names its type, which the daemon drafts a card for; the
+            // others carry no label.
+            let dialog = kind.starts_with("elicitation_");
+            assert_eq!(
+                said.contains(&format!("--label {kind}")),
+                dialog,
+                "{kind} reported {said:?}"
+            );
+            assert_eq!(said.contains("--label"), dialog, "{kind} reported {said:?}");
         }
         let said = report(r#"{"hook_event_name":"Notification"}"#);
         assert!(

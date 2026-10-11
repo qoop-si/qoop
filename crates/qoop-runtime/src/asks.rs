@@ -238,9 +238,39 @@ pub(crate) async fn read(
 /// Why a draft card asks him: the daemon saw the agent stop on its own `waiting-human` stage.
 const DRAFT_WHY: &str = "it stopped and waits for your answer";
 
+/// Why a dialog draft asks him: a question dialog stayed up on the agent's screen.
+const DIALOG_WHY: &str = "a question waits on its screen; qass answers it with your words";
+
+/// How long a question dialog stays up before it gets a draft: qass wakes on the block at once
+/// and often answers it first.
+const DIALOG_DRAFT_SECS: u64 = 120;
+
+/// Sets [`DIALOG_DRAFT_SECS`] instead, for a test that cannot wait two minutes.
+const DIALOG_DRAFT_ENV: &str = "QOOP_DIALOG_DRAFT_SECS";
+
+/// How long a question dialog stays up before it gets a draft, read once.
+pub(crate) fn dialog_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        Duration::from_secs(
+            crate::legacy::var(DIALOG_DRAFT_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(DIALOG_DRAFT_SECS),
+        )
+    })
+}
+
+/// Whether a `blocked` label is a question dialog: the hook passes the notification type of
+/// those two, and of nothing else it reports as blocked.
+pub(crate) fn is_dialog(label: &str) -> bool {
+    matches!(label, "elicitation_dialog" | "elicitation_url_dialog")
+}
+
 /// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
-/// digits, then its task id, so no two drafts share one ("dub52").
-fn draft_handle(name: &str, task: i64) -> String {
+/// digits, then `tail`: its task id, so no two drafts share one ("dub52"), or for an agent
+/// with no task `-t` and its terminal, which no task's handle can be ("dub-t3").
+fn draft_handle(name: &str, tail: impl std::fmt::Display) -> String {
     let word: String = name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .find(|w| !w.is_empty())
@@ -249,7 +279,7 @@ fn draft_handle(name: &str, task: i64) -> String {
         .chars()
         .take(20)
         .collect();
-    format!("{word}{task}")
+    format!("{word}{tail}")
 }
 
 /// One line of at most [`crate::control::ASK_FIELD_MAX`] characters, as a card value must be.
@@ -310,6 +340,79 @@ pub(crate) async fn draft_waiting(
         })
         .await;
     if matches!(made, Ok(Some(_))) {
+        connections.asks_changed();
+    }
+}
+
+/// The agent in `terminal` still shows the question dialog its blocked report of `since`
+/// opened: a draft card, "a question on its screen", task or not. Never for qass's own tab,
+/// only on a Mac with qass's space, and once a spell. No options: his words go to qass, since
+/// a blocked agent takes none, and qass answers the dialog. A failure is dropped.
+pub(crate) async fn draft_dialog(
+    terminal: u32,
+    since: i64,
+    name: Option<String>,
+    (terminals, agents, connections, store): Hands<'_>,
+) {
+    // Still blocked: an answer given at the desk can leave a long tool running with no event.
+    if !standing(agents, terminals, terminal).is_some_and(|s| s.state == "blocked")
+        || qass_terminal(terminals, agents, store).await == Some(terminal)
+    {
+        return;
+    }
+    let session = terminals.session_of(terminal);
+    let made = store
+        .run(move |s| {
+            if !s.workspaces()?.iter().any(|w| w.name == QASS_SPACE) {
+                return Ok(None);
+            }
+            let task = s.open_task_of(i64::from(terminal))?;
+            let name = name.unwrap_or_else(|| format!("terminal {terminal}"));
+            let handle = match &task {
+                Some(task) => draft_handle(&name, task.id),
+                None => draft_handle(&name, format!("-t{terminal}")),
+            };
+            let card = AskCard {
+                handle,
+                urgency: "now".to_string(),
+                asked: None,
+                doing: card_value(task.as_ref().map_or("no open task", |t| t.goal.as_str())),
+                why: DIALOG_WHY.to_string(),
+                asks: card_value(&format!(
+                    "{name} (T{terminal}) has a question on its screen"
+                )),
+                options: Vec::new(),
+                pick: None,
+            };
+            let Ok(body) = serde_json::to_string(&card) else {
+                return Ok(None);
+            };
+            s.add_dialog_draft(
+                &format!("T{terminal}"),
+                i64::from(terminal),
+                session.as_deref(),
+                &body,
+                since,
+                now(),
+            )
+        })
+        .await;
+    if matches!(made, Ok(Some(_))) {
+        connections.asks_changed();
+    }
+}
+
+/// The agent in `terminal` reported a tool or a prompt: the dialog it showed is gone, and so is
+/// its draft.
+pub(crate) async fn dialog_ended(
+    terminal: u32,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let closed = store
+        .run(move |s| s.close_dialog_drafts(i64::from(terminal), now()))
+        .await;
+    if matches!(closed, Ok(true)) {
         connections.asks_changed();
     }
 }
@@ -595,9 +698,12 @@ pub(crate) enum Route {
 /// Route 1 when the worker is provably the conversation the card was written about and is at
 /// rest or on its way to it: the card has a session, the live row reports the same one, and
 /// the agent is idle, done or working. A card without a session (an agent that reports none, or
-/// a remote one) never takes it. Otherwise route 2.
+/// a remote one) never takes it, nor does a dialog's draft. Otherwise route 2.
 pub(crate) fn route(row: &AskRow, worker: Option<&(u32, Standing)>, qass: Option<u32>) -> Route {
-    if let Some((terminal, s)) = worker
+    // A dialog's draft (a `W` card with no task): only qass answers a dialog, and once it is
+    // gone his words would be a prompt about nothing.
+    let dialog = row.card.starts_with('W') && row.task.is_none();
+    if let Some((terminal, s)) = worker.filter(|_| !dialog)
         && row.session.is_some()
         && s.session == row.session
         && s.coming_to_rest()
@@ -907,6 +1013,7 @@ mod tests {
         assert_eq!(draft_handle("Dub-local PR 513", 52), "dub52");
         assert_eq!(draft_handle("ödeme", 3), "deme3");
         assert_eq!(draft_handle("***", 4), "agent4");
+        assert_eq!(draft_handle("Dub-local PR 513", "-t3"), "dub-t3");
     }
 
     #[test]
@@ -950,6 +1057,24 @@ mod tests {
             readiness: "ready".into(),
             session: session.map(String::from),
         }
+    }
+
+    /// A dialog's draft goes to qass even when its agent is back at rest in the same
+    /// conversation: the dialog is gone, and his words would be a prompt about nothing.
+    #[test]
+    fn a_dialog_draft_always_goes_to_qass() {
+        let dialog = AskRow {
+            card: "W7".into(),
+            task: None,
+            ..card(Some("s1"))
+        };
+        let waiting = AskRow {
+            task: Some(3),
+            ..dialog.clone()
+        };
+        let worker = Some((5, at("idle", Some("s1"))));
+        assert_eq!(route(&dialog, worker.as_ref(), Some(9)), Route::Qass(9));
+        assert_eq!(route(&waiting, worker.as_ref(), Some(9)), Route::Worker(5));
     }
 
     #[test]

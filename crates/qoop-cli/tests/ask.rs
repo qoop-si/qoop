@@ -12,7 +12,9 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// A stand-in agent: reports idle (with a session when `STUB_SESSION` is set), logs every
-/// line it is sent, and flips its state on `BUSY` and `FREE`.
+/// line it is sent, and flips its state on `BUSY` and `FREE`. `ASK` shows a question dialog
+/// as the claude hook reports one, `MENU` a permission menu, `TOOL` a tool, and `TASK` opens
+/// a task.
 const STUB: &str = r#"#!/bin/sh
 if [ -n "$STUB_SESSION" ]; then qoop hook-report --state idle --session-id "$STUB_SESSION"; else qoop hook-report --state idle; fi
 while IFS= read -r line; do
@@ -21,6 +23,10 @@ while IFS= read -r line; do
     BUSY) qoop hook-report --state working ;;
     FREE) qoop hook-report --state idle ;;
     RELAY*) qoop hook-report --state idle --event user --label "The owner answered ${line#RELAY }: in the chat" ;;
+    TASK) qoop task new "ship the login fix" ;;
+    ASK) qoop hook-report --state blocked --visible-blocker --event blocked --label elicitation_dialog ;;
+    MENU) qoop hook-report --state blocked --visible-blocker --event blocked --label "Bash rm -rf build" ;;
+    TOOL) qoop hook-report --state working --visible-working --event tool --label "Read src/main.rs" ;;
   esac
 done
 "#;
@@ -55,6 +61,8 @@ impl Stack {
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("SHELL", "/bin/sh")
+            // A question dialog gets its draft after 2 seconds, not 120.
+            .env("QOOP_DIALOG_DRAFT_SECS", "2")
             .env(
                 "PATH",
                 format!(
@@ -205,6 +213,27 @@ impl Stack {
             .find(|c| c["card"] == card)
             .map(|c| c["status"].as_str().unwrap_or("").to_string())
             .unwrap_or_default()
+    }
+
+    /// The daemon's drafts about `terminal`, oldest first.
+    fn drafts(&self, terminal: &str) -> Vec<serde_json::Value> {
+        let (_, out, _) = self.run(&["ask", "ls", "--json"]);
+        let all: serde_json::Value = serde_json::from_str(&out).expect("json");
+        let mut drafts: Vec<serde_json::Value> = ["live", "ended"]
+            .iter()
+            .flat_map(|k| all[k].as_array().cloned().unwrap_or_default())
+            .filter(|c| {
+                c["terminal"].as_u64().map(|t| t.to_string()).as_deref() == Some(terminal)
+                    && c["card"].as_str().is_some_and(|n| n.starts_with('W'))
+            })
+            .collect();
+        drafts.sort_by_key(|c| c["card"].as_str().unwrap_or("")[1..].parse::<i64>().ok());
+        drafts
+    }
+
+    fn send(&self, terminal: &str, line: &str) {
+        let (ok, _, err) = self.run(&["send", terminal, line, "--enter"]);
+        assert!(ok, "send failed: {err}");
     }
 }
 
@@ -708,4 +737,114 @@ fn the_json_listing_holds_every_ended_card_and_the_plain_one_the_last_five() {
     }
     let (_, plain, _) = stack.run(&["ask", "ls"]);
     assert_eq!(plain.matches("(ended)").count(), 5, "{plain}");
+}
+
+/// A question dialog still up after the wait drafts one card, "a question on its screen",
+/// with no options; the next tool closes it. One answered before the wait gets none, a second
+/// dialog on the same task gets a second card, and neither a permission menu nor qass's own
+/// tab gets one.
+#[test]
+fn a_question_dialog_still_up_after_the_wait_drafts_one_card_and_a_tool_closes_it() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", None);
+    let qass = stack.agent("qass", "qass", None);
+    stack.send(&korea, "TASK");
+    stack.send(&korea, "ASK");
+    assert!(
+        stack.wait(|| stack.drafts(&korea).len() == 1),
+        "no draft: {:?}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    let first = stack.drafts(&korea).remove(0);
+    assert_eq!(first["status"], "open");
+    assert!(
+        first["body"]["asks"]
+            .as_str()
+            .is_some_and(|a| a.ends_with("has a question on its screen")),
+        "{first}"
+    );
+    assert_eq!(first["body"]["doing"], "ship the login fix");
+    assert_eq!(first["body"]["options"], serde_json::json!([]));
+    let handle = first["body"]["handle"].as_str().unwrap().to_string();
+    assert!(
+        handle.starts_with("korea") && handle[5..].bytes().all(|b| b.is_ascii_digit()),
+        "{handle}"
+    );
+    // Still up: still one card.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(stack.drafts(&korea).len(), 1);
+
+    // The next tool closes it.
+    stack.send(&korea, "TOOL");
+    let card = first["card"].as_str().unwrap();
+    assert!(stack.wait(|| stack.card_status(card) == "closed"));
+    assert_eq!(stack.drafts(&korea)[0]["note"], "the dialog ended");
+
+    // A dialog answered before the wait gets none.
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(&korea, "ASK");
+    stack.send(&korea, "TOOL");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.drafts(&korea).len(), 1, "answered in time");
+
+    // A second dialog on the same task is a spell of its own.
+    stack.send(&korea, "ASK");
+    assert!(stack.wait(|| stack.drafts(&korea).len() == 2));
+    let second = stack.drafts(&korea).remove(1);
+    assert_eq!(second["status"], "open");
+    assert_ne!(second["card"], first["card"]);
+    assert_eq!(second["body"]["handle"], handle.as_str());
+
+    // A permission menu and qass's own dialog get none.
+    stack.send(&korea, "TOOL");
+    assert!(stack.wait(|| stack.drafts(&korea)[1]["status"] == "closed"));
+    // A second on, so the spell is not the one the last card was opened in.
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(&korea, "MENU");
+    stack.send(&qass, "ASK");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.drafts(&korea).len(), 2, "a menu");
+    assert!(stack.drafts(&qass).is_empty(), "qass's own tab");
+}
+
+/// An agent with no task gets a draft too, its handle the agent's name and its terminal. A
+/// blocked agent takes no words, even in the same conversation: his answer is typed to qass,
+/// starting with that handle.
+#[test]
+fn a_dialog_draft_without_a_task_is_answered_through_qass_by_its_handle() {
+    let stack = Stack::start();
+    let cv = stack.agent("work", "cv", Some("sess-cv"));
+    let _qass = stack.agent("qass", "qass", None);
+    stack.send(&cv, "ASK");
+    assert!(
+        stack.wait(|| stack.drafts(&cv).len() == 1),
+        "no draft: {:?}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    let draft = stack.drafts(&cv).remove(0);
+    let handle = format!("cv-t{cv}");
+    assert_eq!(draft["body"]["handle"], handle.as_str());
+    assert_eq!(draft["body"]["doing"], "no open task");
+    let card = draft["card"].as_str().unwrap();
+    let (ok, out, err) = stack.run(&["ask", "answer", card, "--text", "pick", "the", "second"]);
+    assert!(ok && out.contains("Passed"), "{out} {err}");
+    // qass was typed into when its tab opened: the answer waits out the quiet.
+    std::thread::sleep(Duration::from_secs(31));
+    assert!(
+        stack.wait(|| stack.log("qass").contains("pick the second")),
+        "{:?}",
+        stack.log("qass")
+    );
+    assert!(
+        stack
+            .log("qass")
+            .starts_with(&format!("{handle} pick the second")),
+        "{:?}",
+        stack.log("qass")
+    );
+    assert!(
+        !stack.log("cv").contains("The owner answered"),
+        "{:?}",
+        stack.log("cv")
+    );
 }

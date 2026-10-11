@@ -1220,7 +1220,10 @@ impl AgentRegistry {
             match event.kind.as_str() {
                 "done" => return None,
                 "user" => return Some("thinking".to_string()),
-                "tool" | "blocked" if !event.label.is_empty() => {
+                // A dialog's label is the daemon's, not a word for the sidebar.
+                "tool" | "blocked"
+                    if !event.label.is_empty() && !crate::asks::is_dialog(&event.label) =>
+                {
                     return Some(event.label.clone());
                 }
                 _ => {}
@@ -2134,6 +2137,9 @@ mod tests {
         push("blocked", "Bash cargo publish");
         // Claude follows a labelled permission request with a label-less notification.
         push("blocked", "");
+        assert_eq!(r.activity(1).as_deref(), Some("Bash cargo publish"));
+        // A question dialog's type is the daemon's mark, never the sidebar's word.
+        push("blocked", "elicitation_dialog");
         assert_eq!(r.activity(1).as_deref(), Some("Bash cargo publish"));
         push("done", "");
         assert_eq!(r.activity(1), None, "a finished turn has no activity");

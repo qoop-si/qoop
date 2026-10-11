@@ -4757,6 +4757,54 @@ async fn handle_control(
                     if let Some(kind) = event.filter(|k| crate::control::parse_focus_event(k)) {
                         let at_unix = crate::agents::now_unix();
                         let before = agents.activity(terminal);
+                        // A tool, a prompt or the turn's end: no question dialog is up, so no
+                        // draft for one stands. Asked of the store each time, so a draft that
+                        // outlived a restart ends too.
+                        // ponytail: one small UPDATE a tool event; an in-memory mark per
+                        // terminal if the ask table ever grows past thousands of rows.
+                        // A tool's report never waits on it; the turn's end does, so the close
+                        // lands before the waiting draft below looks for a live card.
+                        if kind == "tool" {
+                            let (connections, store) = (connections.clone(), store.clone());
+                            tokio::spawn(async move {
+                                crate::asks::dialog_ended(terminal, &connections, &store).await;
+                            });
+                        } else if kind == "user" || kind == "done" {
+                            crate::asks::dialog_ended(terminal, connections, store).await;
+                        }
+                        // A question dialog still up after the wait gets a draft card; qass
+                        // often answers it first. Its spell is this event: a later one, or
+                        // an answer, leaves it the newest no more.
+                        if kind == "blocked" && label.as_deref().is_some_and(crate::asks::is_dialog)
+                        {
+                            let (terminals, agents, connections, store) = (
+                                terminals.clone(),
+                                agents.clone(),
+                                connections.clone(),
+                                store.clone(),
+                            );
+                            tokio::spawn(async move {
+                                tokio::time::sleep(crate::asks::dialog_wait()).await;
+                                let still = agents.focus_events(terminal).last().is_some_and(|e| {
+                                    e.kind == "blocked"
+                                        && e.at_unix == at_unix
+                                        && crate::asks::is_dialog(&e.label)
+                                });
+                                if !still {
+                                    return;
+                                }
+                                let name = agent_names(&terminals, vec![terminal])
+                                    .await
+                                    .remove(&i64::from(terminal));
+                                crate::asks::draft_dialog(
+                                    terminal,
+                                    at_unix,
+                                    name,
+                                    (&terminals, &agents, &connections, &store),
+                                )
+                                .await;
+                            });
+                        }
                         // A worker told "The owner answered E7" in the chat has the answer:
                         // the card is handled, whoever relayed it.
                         if kind == "user" {
@@ -5002,7 +5050,13 @@ async fn handle_control(
                 };
             }
             let last_n = last_n.min(crate::control::MAX_FOCUS_EVENTS);
-            let all = agents.focus_events(terminal);
+            let mut all = agents.focus_events(terminal);
+            // A dialog's label is the daemon's own mark: the focus view shows it as before.
+            for event in &mut all {
+                if crate::asks::is_dialog(&event.label) {
+                    event.label.clear();
+                }
+            }
             let from = all.len().saturating_sub(last_n);
             ControlResponse::FocusEvents {
                 id,

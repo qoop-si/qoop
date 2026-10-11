@@ -251,6 +251,54 @@ impl Store {
         Ok(Some(card))
     }
 
+    /// A draft for a question dialog still up on an agent's screen, the spell that began at
+    /// `since`: card `W<n>` like [`Store::add_draft`], with or without an open task. None when
+    /// a live card names the terminal, or a card for it was opened since the spell began.
+    ///
+    /// Its `task` is left empty, task or not: that is what marks a dialog draft, so a tool or a
+    /// prompt closes only these ([`Store::close_dialog_drafts`]). The note cannot mark it, since
+    /// an answer rewrites the note.
+    pub fn add_dialog_draft(
+        &self,
+        agent: &str,
+        terminal: i64,
+        session: Option<&str>,
+        body: &str,
+        since: i64,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let asked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 \
+             AND (status IN ('open', 'queued', 'passed') OR opened_at > ?2))",
+            params![terminal, since],
+            |r| r.get(0),
+        )?;
+        if asked {
+            return Ok(None);
+        }
+        let n: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM ask", [], |r| r.get(0))?;
+        let card = format!("W{n}");
+        tx.execute(
+            "INSERT INTO ask (card, agent, terminal, session, status, body, opened_at) \
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)",
+            params![card, agent, terminal, session, body, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(card))
+    }
+
+    /// End a terminal's live dialog draft: its agent reported a tool or a prompt, so the
+    /// dialog is gone. A waiting draft and qass's cards stay. Answers whether one ended.
+    pub fn close_dialog_drafts(&self, terminal: i64, now: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE ask SET status = 'closed', note = 'the dialog ended', closed_at = ?2 \
+             WHERE terminal = ?1 AND card LIKE 'W%' AND task IS NULL \
+             AND status IN ('open', 'passed')",
+            params![terminal, now],
+        )? > 0)
+    }
+
     /// One card by its number.
     pub fn ask(&self, card: &str) -> Result<Option<AskRow>, StoreError> {
         Ok(find(&self.conn, card)?)
@@ -491,6 +539,61 @@ mod tests {
         let task = s.open_task(t, "more", true, 61).unwrap();
         s.set_task_stage(task, "implementing", 62).unwrap();
         assert_eq!(s.ask("E9").unwrap().unwrap().status, "open");
+    }
+
+    /// A dialog draft needs no task, never stands over a live card, is filed once a spell (from
+    /// the spell's start), and a tool or a prompt closes it even once he answered, while a
+    /// waiting draft stays. A task's stage moving closes it too.
+    #[test]
+    fn a_dialog_draft_is_filed_once_a_spell_and_only_it_closes_on_a_tool() {
+        let (s, t) = store_with_terminal();
+        let first = s
+            .add_dialog_draft("T5", t, Some("sess"), "{d}", 10, 130)
+            .unwrap()
+            .expect("no task needed");
+        assert_eq!(s.ask(&first).unwrap().unwrap().task, None);
+        assert_eq!(
+            s.add_dialog_draft("T5", t, None, "{d}", 10, 131).unwrap(),
+            None,
+            "a live card stands"
+        );
+        // His words went to qass: the note changed, and the tool still closes it.
+        s.claim_ask(&first, "passed", None, "yes", "owner, inbox", 132)
+            .unwrap();
+        assert!(s.close_dialog_drafts(t, 133).unwrap());
+        let row = s.ask(&first).unwrap().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.note.as_deref()),
+            ("closed", Some("the dialog ended"))
+        );
+        assert_eq!(
+            s.add_dialog_draft("T5", t, None, "{d}", 10, 140).unwrap(),
+            None,
+            "this spell had its draft"
+        );
+        let second = s
+            .add_dialog_draft("T5", t, None, "{d}", 135, 255)
+            .unwrap()
+            .expect("a new spell");
+        assert_ne!(second, first);
+        // A waiting draft is not a dialog's: a tool leaves it.
+        s.close_ask(&second, "dismissed", 256).unwrap();
+        let task = s.open_task(t, "ship", false, 260).unwrap();
+        s.set_task_stage(task, "waiting-human", 261).unwrap();
+        let waiting = s
+            .add_draft("T5", t, None, "{d}", 262)
+            .unwrap()
+            .expect("a waiting draft");
+        assert!(!s.close_dialog_drafts(t, 263).unwrap());
+        assert_eq!(s.ask(&waiting).unwrap().unwrap().status, "open");
+        // With a task open, its stage moving closes a dialog draft.
+        s.set_task_stage(task, "implementing", 264).unwrap();
+        let third = s
+            .add_dialog_draft("T5", t, None, "{d}", 270, 390)
+            .unwrap()
+            .expect("a new spell");
+        s.set_task_stage(task, "reviewing", 391).unwrap();
+        assert_eq!(s.ask(&third).unwrap().unwrap().status, "closed");
     }
 
     #[test]

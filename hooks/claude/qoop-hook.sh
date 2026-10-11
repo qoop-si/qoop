@@ -52,8 +52,9 @@
 #   Notification (`permission_prompt`, `elicitation_dialog`,
 #     `elicitation_url_dialog`, `agent_needs_input`, `quota_auto_resume_stale`,
 #     or no `notification_type` from an older build)
-#     -> blocked + `--event blocked`, no label (it carries no tool); every other
-#     notification type reports nothing
+#     -> blocked + `--event blocked`, labelled with the type for the two question
+#     dialogs (the daemon drafts an inbox card for one still up after 120 s), no label
+#     for the rest (they carry no tool); every other notification type reports nothing
 #   Stop -> idle + `--event done`, labelled with the turn's last question (the last line of its
 #   last message that ends in "?"), which the daemon files as a draft card when the agent waits
 #   on the owner; SessionEnd -> idle + `--event done`, no label
@@ -258,7 +259,9 @@ elif name == "Notification":
                     "elicitation_url_dialog", "agent_needs_input",
                     "quota_auto_resume_stale"):
         raise SystemExit(0)
-    state, flags, event, label = "blocked", "--visible-blocker", "blocked", ""
+    # A question dialog says which: the daemon drafts an inbox card for one still up later.
+    label = kind if kind in ("elicitation_dialog", "elicitation_url_dialog") else ""
+    state, flags, event = "blocked", "--visible-blocker", "blocked"
 elif name == "Stop":
     state, flags, event, label = "idle", "--visible-idle", "done", last_question(payload)
 elif name == "SessionEnd":
