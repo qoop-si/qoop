@@ -1367,6 +1367,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     supervise::check_generation(terminal, generation)?;
     if !keys.is_empty() {
         supervise::send_keys(terminal, &keys)?;
+        crate::qass::note_prompted(terminal);
         println!("sent to terminal {terminal}");
         return Ok(());
     }
@@ -1427,6 +1428,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         )?)
         .await?;
         wr.flush().await?;
+        crate::qass::note_prompted(terminal);
         println!("sent to terminal {terminal}");
         Ok(())
     })
@@ -1847,6 +1849,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         )?)
         .await?;
         wr.flush().await?;
+        crate::qass::note_prompted(terminal);
         println!("prompted terminal {terminal}");
         if !wait {
             return Ok(());

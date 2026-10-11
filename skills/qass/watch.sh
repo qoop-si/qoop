@@ -28,6 +28,22 @@
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
 # A row with an open task (`qoop task`) ends with its id and stage, and `:claimed` once the
 # agent said done: ... /home/me/src/app task:12:verifying:claimed
+#
+# Quiet (the default; QASS_QUIET=0 gives everything above and nothing below). Every line wakes
+# qass, and a wake re-reads its whole conversation, so only what needs it now is said now:
+# - At once, with whatever is held: ->blocked, ->failed, ->closed, a task stage that just
+#   became waiting-human, hands-off->idle, daemon-gone with agents on it, a link down for
+#   QASS_LINKDOWN seconds (60). Everything else is held, one entry per agent, and printed in
+#   one block, so Monitor brings several in one wake.
+# - Short hold (QASS_SETTLE): a line about work qass started (the newest record in
+#   prompted.log for that terminal comes from qass's own terminal, written by `qoop prompt`,
+#   `qoop send` and on.sh), new, restarted and starting lines, remote agents.
+# - Long hold (QASS_QUIET_HOLD, 600 s from its first line): everything else, an agent woken
+#   by its own background work or driven by the owner. It rides along with any earlier block.
+# - Ride: a repeat of an agent already said waiting on the owner, and a sleep after an idle
+#   already said, only ever go with another block.
+# - A remote whose daemon left with no agent on it, and lines that went stale, go to
+#   quiet.log instead. Held lines and marks outlive a restart of this script.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -35,6 +51,10 @@ dir="@QASS_DATA@"   # filled in by `qoop skills install`
 mkdir -p "$dir"
 self="${QOOP_TERMINAL:-${QORO_TERMINAL:-0}}"
 settle="${QASS_SETTLE:-20}"
+quiet="${QASS_QUIET:-1}"
+batch="${QASS_BATCH:-30}"
+qhold="${QASS_QUIET_HOLD:-600}"
+linkdown="${QASS_LINKDOWN:-60}"
 
 defs='
 def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
@@ -72,6 +92,24 @@ settled="$defs"'
 # $b is a row array and $due terminal numbers; prints those that still wait.
 again="$defs"'
 ($b | rows) as $new | $due[] | $new[.] // empty | select(.state | waits) | line(.; "hands-off")'
+
+# Whether a row array $a holds an agent: a machine that goes away with none says nothing.
+has_agents="$defs"'($a | rows | length) > 0'
+
+# Reads held entries ("<t> <gen> <class> <due> <arrival> <line>") against the row array $b and
+# prints each as "P <line to say>" or "D <line>" (went stale). A sleep or a close holds while
+# the agent is still away; any other line is said as the row is now, while it still waits.
+recheck="$defs"'
+($b | rows) as $new
+| capture("^(?<t>[0-9]+) (?<g>[^ ]+) [^ ]+ [0-9]+ (?<arr>[0-9]+) (?<line>.*)$") as $h
+| ($h.line | capture("^(?:[A-Za-z0-9_-]+/)?T[0-9]+ g[^ ]+ [^ ]+ (?<from>[a-z-]+)->(?<state>[a-z]+)")) as $m
+| $new[$h.t] as $r
+| "P \($h.arr) " as $say
+| if $m.state == "sleeping" or $m.state == "closed" then
+    (if $r == null then $say + $h.line else "D " + $h.line end)
+  elif $r == null or (($r.state | waits) | not) then "D " + $h.line
+  elif ($r.generation | tostring) == $h.g then $say + line($r; $m.from)
+  else $say + line($r; "restarted") end'
 
 # A machine's lines held until they settle: "<terminal> <generation> <from> <state> <due>".
 settle_file() { if [ -z "$1" ]; then echo "$dir/settle"; else echo "$dir/settle-$1"; fi; }
@@ -120,6 +158,223 @@ say() {
 
 # A machine's own files: "" is this Mac, any other label a remote.
 snapshot_file() { if [ -z "$1" ]; then echo "$dir/last.json"; else echo "$dir/last-$1.json"; fi; }
+# Quiet: its held lines, "<t> <gen> <short|long|ride> <due> <arrival> <line>", and its said
+# lines, "<t> <gen> <state> <stage> <arrival>". Not the settle files: an older watcher still
+# running from an older install reads and clears those.
+held_file() { if [ -z "$1" ]; then echo "$dir/held"; else echo "$dir/held-$1"; fi; }
+said_file() { if [ -z "$1" ]; then echo "$dir/said"; else echo "$dir/said-$1"; fi; }
+
+# Why a line was not said, for whoever wonders what qass did not hear.
+note() { printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$dir/quiet.log" 2>/dev/null || true; }
+
+# A line's parts, in L_LABEL L_T L_G L_FROM L_STATE L_STAGE ("-" with no task). Fails for a
+# line that is not about an agent (daemon-gone, link-down).
+parse_line() {
+    local re='^(([A-Za-z0-9_-]+)/)?T([0-9]+) g([^ ]+) [^ ]+ ([a-z-]+)->([a-z]+)'
+    local task=' task:[^: ]+:([a-z-]+)(:claimed)?$'
+    L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-"
+    [[ "$1" =~ $re ]] || return 1
+    L_LABEL="${BASH_REMATCH[2]}" L_T="${BASH_REMATCH[3]}" L_G="${BASH_REMATCH[4]}"
+    L_FROM="${BASH_REMATCH[5]}" L_STATE="${BASH_REMATCH[6]}"
+    if [[ "$1" =~ $task ]]; then L_STAGE="${BASH_REMATCH[1]}"; fi
+    return 0
+}
+
+# The said line of terminal $2 on machine $1, as "<t> <gen> <state> <stage> <arrival>".
+said_of() { grep "^$2 " "$(said_file "$1")" 2>/dev/null | tail -1 || true; }
+
+# Whether a line is said at once (see the top of this file). Run parse_line first.
+urgent() {
+    local s_t s_gen s_state s_stage _
+    case "$1" in *daemon-gone | */link-down | */link-up) return 0 ;; esac
+    parse_line "$1" || return 0
+    case "$L_STATE" in blocked | failed | closed) return 0 ;; esac
+    [ "$L_FROM" != hands-off ] || return 0
+    if [ "$L_STAGE" = waiting-human ]; then
+        read -r s_t s_gen s_state s_stage _ <<< "$(said_of "$L_LABEL" "$L_T")"
+        [ "${s_stage:-}" = waiting-human ] || return 0
+    fi
+    return 1
+}
+
+# The newest prompted.log record for terminal $1 of this Mac, as "<unix> <sender>": who wrote
+# to it last through `qoop prompt` or `qoop send`. "unreadable" when the log cannot be read.
+record_of() {
+    local log="$dir/prompted.log"
+    [ -e "$log" ] || return 0
+    [ -r "$log" ] || { echo unreadable; return 0; }
+    tail -n 2000 "$log" | awk -v t="T$1" '$3 == t { last = $1 " " $2 } END { if (last != "") print last }'
+}
+
+# The hold for the agent line just parsed, on machine $1: short, long or ride. A long one says
+# why in quiet.log, so a write qass made that left no record shows up there.
+hold_class() {
+    local s_t s_gen s_state s_stage s_arr r_at r_from
+    case "$L_FROM" in new | restarted | starting) echo short; return ;; esac
+    [ -z "$1" ] || { echo short; return; }
+    read -r s_t s_gen s_state s_stage s_arr <<< "$(said_of "" "$L_T")"
+    if [ "$L_STATE" = sleeping ] && [ "${s_gen:-}" = "$L_G" ] &&
+        { [ "${s_state:-}" = idle ] || [ "${s_state:-}" = done ]; } &&
+        ! grep -q "^$L_T " "$(held_file "")" 2>/dev/null; then
+        echo ride; return
+    fi
+    read -r r_at r_from <<< "$(record_of "$L_T")"
+    if [ "${r_at:-}" = unreadable ]; then echo short; return; fi
+    if [ -n "${r_at:-}" ] && [ "${r_from:-}" = "$self" ] && [ "$r_at" -ge "${s_arr:-0}" ]; then
+        echo short; return
+    fi
+    if [ "$L_STAGE" = waiting-human ] && [ "${s_stage:-}" = waiting-human ] &&
+        [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ]; then
+        echo ride; return
+    fi
+    echo long
+}
+
+# Holds a line, one entry per agent: a newer line takes the text, the earlier due time and the
+# first arrival stand, a short or long hold outranks a ride. Runs under the settle lock.
+hold_put() { # label terminal generation class line
+    local f now due class o_t o_g o_class o_due o_arr _ arr
+    f="$(held_file "$1")"
+    now="$(date +%s)"
+    class="$4" arr="$now"
+    if [ "$class" = short ]; then due=$((now + settle)); else due=$((now + qhold)); fi
+    read -r o_t o_g o_class o_due o_arr _ <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
+    if [ -n "${o_t:-}" ]; then
+        [ "$o_due" -ge "$due" ] || due="$o_due"
+        arr="$o_arr"
+        case "$class.$o_class" in
+            short.* | *.short) class=short ;;
+            long.* | *.long) class=long ;;
+        esac
+    fi
+    { grep -v "^$2 " "$f" 2>/dev/null || true
+      echo "$2 $3 $class $due $arr $5"; } > "$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
+# Notes each said line as its agent's last, with when it first came: a record from qass newer
+# than that makes the agent's next line short. A closed agent is forgotten.
+said_put() { # line arrival
+    local f
+    parse_line "$1" || return 0
+    f="$(said_file "$L_LABEL")"
+    { grep -v "^$L_T " "$f" 2>/dev/null || true
+      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE $2"; } > "$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
+# Says lines in one block, so Monitor brings them as one wake: $1 (lines said at once, maybe
+# none) first, then every held line that goes with them, each checked against the latest
+# snapshot. With no $1 it says nothing until a held line is due. Runs under the settle lock;
+# the held entries go only after the block is out, so a kill in between says twice, not never.
+flush() {
+    local now f label snap sel out l go="" block="" said="" picked=""
+    now="$(date +%s)"
+    [ -z "$1" ] || go=1
+    while IFS= read -r l; do
+        [ -n "$l" ] && parse_line "$l" || continue
+        # A line said at once is newer than whatever was held for its agent.
+        f="$(held_file "$L_LABEL")"
+        if grep -q "^$L_T " "$f" 2>/dev/null; then
+            { grep -v "^$L_T " "$f" || true; } > "$f.tmp"
+            mv "$f.tmp" "$f"
+        fi
+    done <<< "$1"
+    for f in "$dir"/held "$dir"/held-*; do
+        [ -s "$f" ] || continue
+        case "$f" in *.tmp) continue ;; esac
+        [ -n "$go" ] || ! awk -v now="$now" '$3 != "ride" && $4 <= now { d = 1 } END { exit !d }' "$f" || go=1
+    done
+    [ -n "$go" ] || return 0
+    for f in "$dir"/held "$dir"/held-*; do
+        [ -s "$f" ] || continue
+        case "$f" in *.tmp) continue ;; esac
+        label="${f#"$dir"/held}"; label="${label#-}"
+        # With that machine's daemon away its rows are stale: keep its lines for later.
+        [ ! -e "$(gone_file "$label")" ] || continue
+        snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
+        # Short lines first, then long, then ride: the most urgent first in the block.
+        sel="$(awk -v now="$now" -v b="$batch" '$3 != "short" || $4 <= now + b {
+            print ($3 == "short" ? 0 : $3 == "long" ? 1 : 2) " " NR " " $0 }' "$f" |
+            sort -n -k1,1 -k2,2 | cut -d' ' -f3-)"
+        [ -n "$sel" ] || continue
+        # Taken only once checked: a failed check keeps them held for the next round.
+        out="$(printf '%s\n' "$sel" | jq -rR --argjson b "$snap" --argjson self "$self" \
+            --arg at "$(at_of "$label")" "$recheck" 2>/dev/null)" || continue
+        picked="$picked$f
+"
+        while IFS= read -r l; do
+            case "$l" in
+                "P "*) l="${l#P }"; block="$block${l#* }
+"; said="$said${l%% *} ${l#* }
+" ;;
+                "D "*) note stale "${l#D }" ;;
+            esac
+        done <<< "$out"
+    done
+    block="$(printf '%s' "$1${1:+
+}$block")"
+    if [ -n "$block" ]; then
+        printf '%s\n' "$block"
+        touch "$dir/last-wake"
+    fi
+    while IFS= read -r l; do [ -z "$l" ] || said_put "$l" "$now"; done <<< "$1"
+    while IFS= read -r l; do [ -z "$l" ] || said_put "${l#* }" "${l%% *}"; done <<< "$said"
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        awk -v now="$now" -v b="$batch" '!($3 != "short" || $4 <= now + b)' "$f" > "$f.tmp"
+        mv "$f.tmp" "$f"
+    done <<< "$picked"
+}
+
+# A ride line nothing carried for QASS_QUIET_HOLD seconds: a repeat or a sleep, not worth a
+# wake of its own. Runs under the settle lock.
+ride_expire() {
+    local f now
+    now="$(date +%s)"
+    for f in "$dir"/held "$dir"/held-*; do
+        [ -s "$f" ] || continue
+        case "$f" in *.tmp) continue ;; esac
+        awk -v now="$now" '$3 == "ride" && $4 <= now' "$f" | while IFS= read -r l; do note "ride expired" "${l#* * * * * }"; done
+        awk -v now="$now" '!($3 == "ride" && $4 <= now)' "$f" > "$f.tmp"
+        mv "$f.tmp" "$f"
+    done
+}
+
+# One line of a machine's diff, quiet: said now (with what is held), or held.
+quiet_hold() { # label line
+    local class
+    parse_line "$2" || return 0
+    class="$(hold_class "$1")"
+    case "$class" in
+        long) if [ -z "$(record_of "$L_T" 2>/dev/null)" ]; then note "long: no record" "$2"; else note "long: written by another" "$2"; fi ;;
+    esac
+    if [ "$class" = short ] && [ "$settle" -le 0 ]; then
+        settle_locked flush "$2"
+    else
+        settle_locked hold_put "$1" "$L_T" "$L_G" "$class" "$2"
+    fi
+}
+
+# A remote link down for QASS_LINKDOWN seconds is said once; back up, said again only then.
+link_down() { # name; under the settle lock
+    [ -e "$dir/down-$1" ] && [ ! -e "$dir/down-$1.said" ] || return 0
+    touch "$dir/down-$1.said"
+    flush "$1/link-down"
+}
+link_up() { # name; under the settle lock
+    local was=""
+    [ ! -e "$dir/down-$1.said" ] || was=1
+    rm -f "$dir/down-$1" "$dir/down-$1.said"
+    [ -z "$was" ] || flush "$1/link-up"
+}
+# When a link went down, as written in its mark; an empty mark (an older watcher's) starts now.
+down_since() {
+    local t
+    t="$(cat "$1" 2>/dev/null || true)"
+    case "$t" in '' | *[!0-9]*) t="$(date +%s)"; [ ! -e "$1" ] || echo "$t" > "$1" ;; esac
+    echo "$t"
+}
 gone_file() { if [ -z "$1" ]; then echo "$dir/gone"; else echo "$dir/gone-$1"; fi; }
 at_of() { if [ -z "$1" ]; then echo ""; else echo "$1/"; fi; }
 
@@ -145,15 +400,37 @@ follow() {
     [ -n "$prev" ] || prev='[]'
     while IFS= read -r snap; do
         case "$snap" in \[*) ;; *) continue ;; esac
+        # Quiet saves the snapshot before its lines are held: a stop in between would lose
+        # them, so a stop waits for the end of this snapshot's step (step_end).
+        [ "$quiet" != 1 ] || { stop=""; trap 'stop=1' TERM INT HUP; }
         if [ -n "$label" ] && [ -e "$dir/down-$label" ]; then
-            echo "${at}link-up"
-            rm -f "$dir/down-$label"
+            if [ "$quiet" = 1 ]; then
+                settle_locked link_up "$label"
+            else
+                echo "${at}link-up"
+                rm -f "$dir/down-$label"
+            fi
         fi
         if [ "$snap" = "[]" ]; then
             # The daemon went away. Say it once; whatever comes back is a new start,
-            # not a wave of closes and opens.
-            [ -e "$gone" ] || echo "${at}daemon-gone"
+            # not a wave of closes and opens. Quiet: only when agents went with it (a remote
+            # stops its daemon once no tab is left), and the mark outlives a restart.
+            if [ -e "$gone" ]; then
+                :
+            elif [ "$quiet" != 1 ]; then
+                echo "${at}daemon-gone"
+            else
+                # Marked first, so what was held for this machine waits for its return.
+                touch "$gone"
+                if jq -en --argjson a "$prev" --argjson self "$self" --arg at "$at" \
+                    "$has_agents" >/dev/null 2>&1; then
+                    settle_locked flush "${at}daemon-gone"
+                else
+                    note "daemon gone, no agent" "${at}daemon-gone"
+                fi
+            fi
             touch "$gone"
+            step_end
             continue
         fi
         if [ ! -e "$gone" ]; then
@@ -164,21 +441,41 @@ follow() {
                 sleeping="$(sleeping_on "$label")"
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
-                --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || continue
+                --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || { step_end; continue; }
+            # Quiet checks held lines against the saved snapshot: save this one first, so a
+            # line held from it is checked against the rows it came from.
+            [ "$quiet" != 1 ] || { printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"; }
             now_lines=""
             while IFS= read -r l; do
                 [ -n "$l" ] || continue
-                hold "$label" "$l" || now_lines="$now_lines$l
+                if [ "$quiet" = 1 ]; then
+                    if urgent "$l"; then now_lines="$now_lines$l
+"; else quiet_hold "$label" "$l"; fi
+                else
+                    hold "$label" "$l" || now_lines="$now_lines$l
 "
+                fi
             done <<< "$out"
             if [ -n "$now_lines" ]; then
-                say "${now_lines%?}"
+                if [ "$quiet" = 1 ]; then
+                    settle_locked flush "${now_lines%?}"
+                else
+                    say "${now_lines%?}"
+                fi
             fi
         fi
         rm -f "$gone"
         prev="$snap"
         printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"
+        step_end
     done
+}
+
+# The end of one snapshot's quiet step: a stop asked for during it goes ahead now.
+step_end() {
+    [ "$quiet" = 1 ] || return 0
+    trap 'exit 143' TERM INT HUP
+    [ -z "${stop:-}" ] || exit 143
 }
 
 # A remote's stream, kept up: when the link drops it says so once and tries again, every
@@ -187,7 +484,9 @@ follow() {
 # meanwhile is still said.
 follow_remote() {
     local name="$1" wait=5 down="$dir/down-$1" since
-    rm -f "$down" "$(gone_file "$name")"   # marks of an earlier run say nothing of this one
+    # Marks of an earlier run say nothing of this one; quiet keeps them, so a restart says
+    # neither the gone daemon nor the dropped link again.
+    [ "$quiet" = 1 ] || rm -f "$down" "$(gone_file "$name")"
     while kill -0 $$ 2>/dev/null; do
         since="$(date +%s)"
         # exec: the stream's ssh is this loop's own child, so it goes when the loop goes.
@@ -197,8 +496,8 @@ follow_remote() {
         [ $(( $(date +%s) - since )) -lt 60 ] || wait=5
         # A remote with no daemon ends its stream too; that was said as daemon-gone.
         if [ ! -e "$down" ] && [ ! -e "$(gone_file "$name")" ]; then
-            echo "$name/link-down"
-            touch "$down"
+            # Quiet: marked with the time, said by the tick once it lasts (link_down).
+            if [ "$quiet" = 1 ]; then date +%s > "$down"; else echo "$name/link-down"; touch "$down"; fi
         fi
         sleep "$wait"
         wait=$((wait * 2 > 300 ? 300 : wait * 2))
@@ -222,7 +521,25 @@ due() {
         done
 }
 
-rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null; rmdir "$dir/settle.lock" 2>/dev/null || true
+rmdir "$dir/settle.lock" 2>/dev/null || true
+if [ "$quiet" = 1 ]; then
+    # Held lines and marks carry over; the logs are cut, the said lines of a week ago go.
+    if [ -f "$dir/quiet.log" ]; then
+        tail -n 2000 "$dir/quiet.log" > "$dir/quiet.log.tmp" && mv "$dir/quiet.log.tmp" "$dir/quiet.log"
+    fi
+    # ponytail: cut only past 1 MB, months of writes, so an append racing the cut is rare.
+    if [ -f "$dir/prompted.log" ] && [ "$(wc -c < "$dir/prompted.log")" -gt 1048576 ]; then
+        tail -n 2000 "$dir/prompted.log" > "$dir/prompted.log.tmp" && mv "$dir/prompted.log.tmp" "$dir/prompted.log"
+    fi
+    week=$(( $(date +%s) - 604800 ))
+    for f in "$dir"/said "$dir"/said-*; do
+        [ -f "$f" ] || continue
+        case "$f" in *.tmp) continue ;; esac
+        awk -v w="$week" '$5 >= w' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    done
+else
+    rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null
+fi
 
 # Every 10 s, apart from the streams: the hands-off marks that have passed, against each
 # machine's last snapshot. A `read -t` would do it in the loops, but /bin/bash on macOS
@@ -240,8 +557,19 @@ rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null; rmdir "$dir/settle.lock" 2>/dev
             kill -TERM $$ 2>/dev/null
             exit 0
         fi
+        if [ "$quiet" = 1 ]; then
+            settle_locked flush ""
+            settle_locked ride_expire
+            for f in "$dir"/down-*; do
+                [ -e "$f" ] || continue
+                case "$f" in *.said) continue ;; esac
+                [ ! -e "$f.said" ] || continue
+                [ $(( $(date +%s) - $(down_since "$f") )) -ge "$linkdown" ] || continue
+                settle_locked link_down "${f#"$dir"/down-}"
+            done
+        fi
         for f in "$dir"/settle "$dir"/settle-*; do
-            [ -f "$f" ] || continue
+            [ "$quiet" != 1 ] && [ -f "$f" ] || continue
             label="${f#"$dir"/settle}"; label="${label#-}"
             [ ! -e "$(gone_file "$label")" ] || continue
             settle_locked take_due "$f" | while read -r t g from state _; do
@@ -262,7 +590,7 @@ rm -f "$dir"/settle "$dir"/settle-* 2>/dev/null; rmdir "$dir/settle.lock" 2>/dev
             out="$(jq -rn --argjson b "$snap" --argjson due "[\"$t\"]" --argjson self "$self" \
                 --arg at "$(at_of "$label")" "$again" 2>/dev/null)" || continue
             if [ -n "$out" ]; then
-                say "$out"
+                if [ "$quiet" = 1 ]; then settle_locked flush "$out"; else say "$out"; fi
             fi
         done
     done
@@ -280,5 +608,5 @@ trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || t
 # Killed rather than ended (Monitor stopping it), go through the same way out.
 trap 'exit 143' TERM INT HUP
 
-rm -f "$(gone_file "")"   # a mark left by an earlier run says nothing about this one
+[ "$quiet" = 1 ] || rm -f "$(gone_file "")"   # a mark left by an earlier run says nothing about this one
 follow "" < <(qoop agents --watch --json)

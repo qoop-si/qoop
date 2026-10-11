@@ -28,6 +28,14 @@ for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
     cmd="$cmd '$a'"
 done
+# A write to an agent there is noted where qass counts its writes, as `qoop prompt` notes one
+# here. Before the exec below, so it counts the attempt; a note that fails stops nothing.
+case "$1" in prompt | send)
+    from="${QOOP_TERMINAL:-${QORO_TERMINAL:-}}"
+    if [ -d "@QASS_DATA@" ] && [ -n "$from" ]; then
+        { printf '%s %s %s/T%s\n' "$(date +%s)" "$from" "$name" "${2:-}" >> "@QASS_DATA@/prompted.log"; } 2>/dev/null || true
+    fi ;;
+esac
 # Short and private: a socket path past 104 bytes is refused on macOS.
 sock="/tmp/qoop-$(id -u)-ssh"
 mkdir -p "$sock"

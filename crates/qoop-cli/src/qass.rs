@@ -17,6 +17,42 @@ use crate::supervise;
 /// The space qass lives in.
 pub(crate) const SPACE: &str = "qass";
 
+/// Where `qoop prompt` and `qoop send` note who wrote to a terminal, in qass's folder: its
+/// watcher says at once that an agent qass wrote to stopped, and lets the rest wait.
+pub(crate) const PROMPTED_LOG: &str = "prompted.log";
+
+/// Notes that the terminal this call runs in just wrote to `target`. Only into a qass folder
+/// that already exists, and never failing the write it records: a person without qass gets
+/// no file, and a prompt never fails for want of its note.
+pub(crate) fn note_prompted(target: u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let from = qoop_runtime::legacy::var("QOOP_TERMINAL").ok();
+    let _ = note_prompted_in(paths::qass_data_dir(), from.as_deref(), target, now);
+}
+
+fn note_prompted_in(
+    folder: Option<PathBuf>,
+    from: Option<&str>,
+    target: u32,
+    now: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let (Some(folder), Some(from)) = (folder, from.and_then(|v| v.parse::<u32>().ok())) else {
+        return Ok(());
+    };
+    if !folder.is_dir() {
+        return Ok(());
+    }
+    // One short write in append mode: notes from two callers never run into each other.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(folder.join(PROMPTED_LOG))?
+        .write_all(format!("{now} {from} T{target}\n").as_bytes())
+}
+
 /// What starts the qass skill as each agent's first message, as each was seen to take it:
 /// Claude a slash command, Codex a `$skill` mention, Gemini and opencode a request to use
 /// it (both pick a skill by name from the prompt; neither has a skill command).
@@ -645,6 +681,34 @@ mod tests {
             created_at: 0,
             closed_at: None,
         }
+    }
+
+    #[test]
+    fn a_write_is_noted_for_the_watcher_only_in_a_qass_folder_that_exists() {
+        let home = tempfile::tempdir().expect("a directory");
+        let folder = home.path().join("qass");
+        let at = || Some(folder.clone());
+        note_prompted_in(at(), Some("128"), 52, 100).expect("no folder is no error");
+        assert!(!folder.exists(), "a person without qass gets no folder");
+        std::fs::create_dir(&folder).expect("folder");
+        note_prompted_in(at(), Some("128"), 52, 100).expect("noted");
+        note_prompted_in(at(), None, 52, 100).expect("outside a terminal, nothing");
+        note_prompted_in(at(), Some("x"), 52, 100).expect("a broken number, nothing");
+        note_prompted_in(None, Some("7"), 52, 100).expect("no home, nothing");
+        note_prompted_in(at(), Some("7"), 52, 101).expect("noted");
+        let log = std::fs::read_to_string(folder.join(PROMPTED_LOG)).expect("log");
+        assert_eq!(log, "100 128 T52\n101 7 T52\n");
+    }
+
+    #[test]
+    fn the_watcher_reads_the_log_qoop_writes() {
+        // Both scripts name it under @QASS_DATA@, which the install fills in from the same
+        // `qass_data_dir()` this module writes under (`skills.rs`, `QassDirs::here`).
+        let watch = include_str!("../../../skills/qass/watch.sh");
+        assert!(watch.contains("dir=\"@QASS_DATA@\""));
+        assert!(watch.contains(&format!("\"$dir/{PROMPTED_LOG}\"")));
+        let on = include_str!("../../../skills/qass/on.sh");
+        assert!(on.contains(&format!("@QASS_DATA@/{PROMPTED_LOG}")));
     }
 
     #[test]

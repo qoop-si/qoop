@@ -298,11 +298,22 @@ fn write_changed(path: &Path, body: &str, program: bool) -> std::io::Result<bool
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, body)?;
-    if program {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    // Written beside and renamed over: bash reads a running script as it goes, so qass's
+    // watcher, running from the old file while this installs, keeps the old bytes whole. The
+    // old file's mode carries over; a symlink there becomes a plain file, as installs are.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let fresh = path.with_file_name(format!(".{name}.new"));
+    let mode = match program {
+        true => Some(std::fs::Permissions::from_mode(0o755)),
+        false => std::fs::metadata(path).ok().map(|m| m.permissions()),
+    };
+    let written = std::fs::write(&fresh, body)
+        .and_then(|()| mode.map_or(Ok(()), |m| std::fs::set_permissions(&fresh, m)))
+        .and_then(|()| std::fs::rename(&fresh, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&fresh);
     }
-    Ok(true)
+    written.map(|()| true)
 }
 
 /// Lay out qass's folder: its skill where every agent reads it, its instructions, its scratch.
@@ -589,6 +600,38 @@ mod tests {
         tempfile::tempdir().expect("a directory")
     }
 
+    #[test]
+    fn a_script_running_from_the_old_file_keeps_reading_the_old_bytes() {
+        use std::io::Read;
+        let home = home_dir();
+        let path = home.path().join("watch.sh");
+        std::fs::write(&path, "old body\n").expect("old");
+        // What bash holds while it runs the script.
+        let mut running = std::fs::File::open(&path).expect("open");
+        assert!(write_changed(&path, "a new, longer body\n", true).expect("written"));
+        let mut seen = String::new();
+        running.read_to_string(&mut seen).expect("read");
+        assert_eq!(seen, "old body\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("new"),
+            "a new, longer body\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let left: Vec<_> = std::fs::read_dir(home.path()).expect("dir").collect();
+        assert_eq!(left.len(), 1, "no temp file left beside it");
+        let notes = home.path().join("SKILL.md");
+        std::fs::write(&notes, "old").expect("old");
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        assert!(write_changed(&notes, "new", false).expect("written"));
+        let mode = std::fs::metadata(&notes)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "a file keeps the mode it had");
+    }
+
     fn target(agent: &str) -> Target {
         targets()
             .into_iter()
@@ -674,7 +717,25 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        assert!(skill.lines().count() <= 400, "SKILL.md grew past 400 lines");
+        // ponytail: 412 holds the quiet watcher's lines and "Improve yourself"; `qoop qass brief`
+        // takes the hand arithmetic out of "On every event line" and this goes back to 400.
+        assert!(skill.lines().count() <= 412, "SKILL.md grew past 412 lines");
+    }
+
+    #[test]
+    fn the_install_points_the_scripts_at_the_folder_qoop_notes_writes_in() {
+        let here = QassDirs::here().expect("a home");
+        assert_eq!(
+            Some(here.data.clone()),
+            qoop_runtime::paths::qass_data_dir()
+        );
+        let on = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "on.sh")
+            .expect("on.sh")
+            .1;
+        let written = here.data.join(crate::qass::PROMPTED_LOG);
+        assert!(here.render(on).contains(written.to_str().expect("utf8")));
     }
 
     fn qass_dirs(home: &tempfile::TempDir) -> QassDirs {
