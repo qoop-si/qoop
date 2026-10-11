@@ -814,6 +814,21 @@ mod tests {
         // Its folder loads the lessons, so a restored or woken qass still has them.
         let folder = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
         assert!(folder.contains(&dirs.owner.display().to_string()));
+        // His policy, and the settings that keep it his, are out of qass's file tools (a rule
+        // with `//` is an absolute path, Claude Code's own syntax; `Edit` covers every tool
+        // that writes a file, and a deny wins over `dontAsk`).
+        let settings: serde_json::Value = serde_json::from_str(&folder).expect("settings json");
+        let deny: Vec<&str> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("a deny list")
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        for path in [dirs.owner.join("policy"), dirs.folder_settings()] {
+            let rule = format!("Edit(/{})", path.display());
+            assert!(rule.starts_with("Edit(//"), "{rule} is not absolute");
+            assert!(deny.contains(&rule.as_str()), "{rule} not in {deny:?}");
+        }
         assert!(
             !install_qass(home.path(), &dirs).expect("reinstall"),
             "the second install changed something"

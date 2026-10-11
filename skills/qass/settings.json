@@ -1,7 +1,8 @@
 {
   "permissions": {
     "defaultMode": "dontAsk",
-    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"]
+    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"],
+    "deny": ["Edit(/@QASS_CONFIG@/policy)", "Edit(/@QASS_DATA@/.claude/settings.json)"]
   },
   "hooks": {
     "SessionStart": [
