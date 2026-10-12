@@ -634,11 +634,11 @@ fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
 
 /// The most rows the question takes, and each other card text (a reason, what was asked): a text
 /// that needs more ends in `\u{2026}`.
-const ASK_ROWS: usize = 5;
-const SIDE_ROWS: usize = 2;
+const ASK_ROWS: usize = 8;
+const SIDE_ROWS: usize = 8;
 
 /// The rows each card text needs at its width, as many as `ASK_ROWS` and `SIDE_ROWS` allow.
-/// `reasons` is the rows the option reasons take beyond their first.
+/// `reasons` is the rows each option reason takes.
 struct Lens {
     ask: usize,
     asked: usize,
@@ -646,15 +646,15 @@ struct Lens {
     why: usize,
     pick: usize,
     sends: usize,
-    reasons: usize,
+    reasons: Vec<usize>,
 }
 
 /// How the pane is divided between the parts, given its height.
 struct Budget {
     /// Rows of the question.
     ask: usize,
-    /// The side texts wrap onto `SIDE_ROWS` rows; off, each is one cut row.
-    side: bool,
+    /// The most rows each side text takes: it falls to 1, a cut row, as the pane gets short.
+    side: usize,
     list: usize,
     asked: bool,
     why: bool,
@@ -676,7 +676,7 @@ fn budget(
 ) -> Budget {
     let mut b = Budget {
         ask: lens.ask,
-        side: true,
+        side: SIDE_ROWS,
         list: cards.clamp(1, 5),
         asked: has_asked,
         why: true,
@@ -689,7 +689,7 @@ fn budget(
     };
     let need = |b: &Budget| {
         // tabs, rule, list, rule, hints, and the detail below.
-        let more = |on: bool, n: usize| usize::from(b.side && on) * (n - 1);
+        let more = |on: bool, n: usize| usize::from(on) * (n.min(b.side) - 1);
         let detail = 2
             + b.ask
             + more(b.asked, lens.asked)
@@ -697,7 +697,11 @@ fn budget(
             + more(b.why, lens.why)
             + more(b.pick, lens.pick)
             + more(b.sends, lens.sends)
-            + usize::from(b.side) * lens.reasons
+            + lens
+                .reasons
+                .iter()
+                .map(|&n| n.min(b.side) - 1)
+                .sum::<usize>()
             + usize::from(b.asked)
             + usize::from(b.doing)
             + usize::from(b.why)
@@ -716,8 +720,8 @@ fn budget(
             if b.handled < 2 {
                 b.handled = 0;
             }
-        } else if b.side {
-            b.side = false;
+        } else if b.side > 1 {
+            b.side -= 1;
         } else if b.list > 3 {
             b.list -= 1;
         } else if b.gap_top {
@@ -846,8 +850,8 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 .body
                 .options
                 .iter()
-                .map(|o| side_rows(&o.reason, reason_room) - 1)
-                .sum(),
+                .map(|o| side_rows(&o.reason, reason_room))
+                .collect(),
         };
         let b = budget(
             inner_rows,
@@ -857,7 +861,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             card.body.pick.is_some(),
             &lens,
         );
-        let side = if b.side { SIDE_ROWS } else { 1 };
+        let side = b.side;
         // The list: a window of it that holds the open card.
         let first = sel
             .saturating_sub(b.list.saturating_sub(1))
@@ -1973,5 +1977,29 @@ mod tests {
             .unwrap();
         assert_eq!(hit_at(&v, rect, first, 10), Some(Hit::Option(0)));
         assert_eq!(hit_at(&v, rect, first + 1, 10), Some(Hit::Option(0)));
+    }
+
+    #[test]
+    fn a_card_with_long_values_shows_all_its_text_and_gives_rows_back_one_at_a_time() {
+        let mut c = card(1, "web", "open");
+        c.body.asked =
+            Some("drop users.legacy_id and move the audit trail to the new events table before the freeze".into());
+        c.body.doing = "wrote migration 0042, dry run on the copy is clean, and the rollback script is ready but not yet tested on staging data".into();
+        c.body.why = "the PR cannot open before 0042 has run once on staging, and the freeze window starts on Friday morning for everyone".into();
+        c.body.options[0].reason = "no rollback exists and staging is a copy of last week, so a bad run costs a day of restoring it".into();
+        c.body.options[1].reason = "you may want to read the SQL first, since it also rewrites the audit trail rows in place".into();
+        let mut p = Pane::default();
+        p.take(vec![c], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 60, 50));
+        assert!(!t.contains('\u{2026}'), "{t}");
+        // Shorter and shorter: the rows given back are fewer than all at once, the text
+        // loses its tail on a row at a time and the pane keeps its exact size.
+        let mut cut = Vec::new();
+        for rows in (14..=50).rev() {
+            let v = view(&p, &ctx(&[], &[]), 60, rows);
+            assert_eq!(v.rows.len(), rows);
+            cut.push(text(&v).matches('\u{2026}').count());
+        }
+        assert!(cut.windows(2).all(|w| w[0] <= w[1] + 3), "{cut:?}");
     }
 }
