@@ -300,7 +300,10 @@ status() {
 
     picked="$(grep '^pick ' "$state" 2>/dev/null | sed 's/^pick //' || true)"
     if [ -z "$picked" ]; then
-        s2=no d2="$(found | grep -c . || true) found in $(searched): none picked"
+        # A new computer often has none of the usual folders: say so, not "found in :".
+        where="$(searched)"
+        [ -n "$where" ] && where="in $where" || where="(no ~/code, ~/src or such folder here)"
+        s2=no d2="$(found | grep -c . || true) found $where: none picked"
     else
         s2=yes missing=
         old="$IFS"; IFS="$nl"; set -f

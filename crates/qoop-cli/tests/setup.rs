@@ -248,6 +248,18 @@ fn projects_are_the_main_checkouts_newest_first_with_their_stack() {
 }
 
 #[test]
+fn a_home_with_no_project_folder_says_so() {
+    let home = Home::new();
+    let _ = std::fs::remove_dir_all(home.at("home/code"));
+    let out = home.status();
+    assert!(
+        home.item(2)
+            .contains("0 found (no ~/code, ~/src or such folder here): none picked"),
+        "{out}"
+    );
+}
+
+#[test]
 fn a_fresh_home_has_every_box_open_and_status_writes_nothing() {
     let home = Home::new();
     home.repos();

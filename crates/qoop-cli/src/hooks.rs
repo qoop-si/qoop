@@ -489,6 +489,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to install into"));
     };
+    let mut any = false;
     for target in wanted(args)? {
         // Asked for every agent, only the ones on this machine: an agent named on the
         // command line is installed whether or not it is here yet.
@@ -496,6 +497,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
             println!("  {:<10} not present, skipped", target.agent);
             continue;
         }
+        any = true;
         // Dropped hooks have no configuration to edit: the file itself goes
         // into the agent's plugin directory. The file is qoop's own and the
         // person never edits it, so missing or different means install.
@@ -575,7 +577,17 @@ fn install(args: &[String]) -> std::io::Result<()> {
             );
         }
     }
-    println!("\nan agent already running does not read its configuration again: start it afresh.");
+    if any {
+        println!(
+            "\nan agent already running does not read its configuration again: start it afresh."
+        );
+    } else {
+        // A new computer often has qoop before its agent: nothing installs them later by itself.
+        println!(
+            "\nno agent on this machine yet: once one is installed, run `qoop hooks install` and \
+             `qoop skills install`"
+        );
+    }
     Ok(())
 }
 

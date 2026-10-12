@@ -24,13 +24,20 @@ when run from a Rosetta shell.
 
 ## Uninstall
 
+Run these on the machine itself, in this order: the commands need `qoop` until the last line.
+
 ```
+qoop notch uninstall      on a Mac: the notch and its login item
 qoop hooks uninstall
 qoop skills uninstall
-qoop stop                 for each running session (qoop ls lists them)
+qoop logout               unlinks this machine; with no phone paired here, it also removes the
+                          bridge service (with one, `qoop devices rm <name>` for each first)
+qoop stop
+rm -rf "$(qoop paths config)" "$(qoop paths data)" "$(qoop paths cache)" "$(qoop paths logs)"
+rm -rf ~/.cache/qoop      on a Mac: the ssh sockets of the links to remotes
+rm -f ~/.local/bin/qoro   the old name, on a machine that had qoop before the rename
 rm "$(command -v qoop)"
-rm -rf ~/.config/qoop
 ```
 
-Session data (history, the index of what was open) lives under `$XDG_RUNTIME_DIR/qoop`, or
-the system temporary directory when that is unset; remove it too for a clean slate.
+The data directory holds the spaces, the tabs and their history; `qoop paths` lists every
+directory and what it holds. A remote you added keeps its own qoop: run the same there.
