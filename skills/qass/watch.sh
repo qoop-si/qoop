@@ -64,6 +64,7 @@ quiet="${QASS_QUIET:-1}"
 batch="${QASS_BATCH:-30}"
 qhold="${QASS_QUIET_HOLD:-600}"
 linkdown="${QASS_LINKDOWN:-60}"
+vcheck="${QASS_REMOTE_VERSION_EVERY:-60}"
 rhold="${QASS_ROUTINE_HOLD:-1800}"
 # A Monitor is killed at 30 minutes and its one notice of that can be lost (2026-10-12: it came
 # in the second an event did, and nothing watched for an hour). So this ends first, by itself.
@@ -595,19 +596,54 @@ step_end() {
     esac
 }
 
+# A remote's qoop version, as its installed binary says it; empty when the link is down.
+remote_version() { "$here/on.sh" "$1" --version 2>/dev/null | head -n 1 || true; }
+
+# One remote's stream until it ends, or until that remote's qoop changes version: a remote that
+# updates keeps a running `agents --watch` on its old binary, which may not say what the new one
+# does (a stage-only change, 0.9.5 to 0.10.0), so the stream ends and is opened again on the new.
+stream_remote() {
+    # `s` is not local: bash 3.2 runs a trap after the function has unwound.
+    local name="$1" was="" now n=0
+    "$here/on.sh" --master "$name" agents --watch --json 2>/dev/null &
+    s=$!
+    trap 'kill "$s" 2>/dev/null; exit 143' TERM
+    while kill -0 "$s" 2>/dev/null; do
+        # In the background, so a TERM lands at once rather than after the sleep.
+        sleep 1 &
+        wait $! || true
+        n=$((n + 1))
+        [ "$vcheck" -gt 0 ] && [ $((n % vcheck)) -eq 0 ] || continue
+        now="$(remote_version "$name")"
+        # The first answer is the version the stream started on; none yet (a blip) asks again.
+        [ -n "$was" ] || { was="$now"; continue; }
+        if [ -n "$now" ] && [ "$now" != "$was" ]; then
+            touch "$dir/reopen-$name"
+            break
+        fi
+    done
+    kill "$s" 2>/dev/null || true
+}
+
 # A remote's stream, kept up: when the link drops it says so once and tries again, every
 # 5 s at first and at most every 5 minutes. A drop is not the remote's daemon going away:
 # when the link is back its first snapshot is compared with the last one, so what changed
 # meanwhile is still said.
 follow_remote() {
     local name="$1" wait=5 down="$dir/down-$1" since
+    rm -f "$dir/reopen-$name"
     # Marks of an earlier run say nothing of this one; quiet keeps them, so a restart says
     # neither the gone daemon nor the dropped link again.
     [ "$quiet" = 1 ] || rm -f "$down" "$(gone_file "$name")"
     while kill -0 $$ 2>/dev/null; do
         since="$(date +%s)"
-        # exec: the stream's ssh is this loop's own child, so it goes when the loop goes.
-        follow "$name" < <(exec "$here/on.sh" --master "$name" agents --watch --json 2>/dev/null)
+        # The stream's ssh goes with the reader that ends, and that reader with this loop.
+        follow "$name" < <(stream_remote "$name")
+        # Ended for a new qoop there, not a drop: open it again now, with nothing to say.
+        if [ -e "$dir/reopen-$name" ]; then
+            rm -f "$dir/reopen-$name"
+            continue
+        fi
         # Only a link that held a minute starts the wait over: one that drops at once
         # backs off, so a flapping link cannot wake qass again and again.
         [ $(( $(date +%s) - since )) -lt 60 ] || wait=5

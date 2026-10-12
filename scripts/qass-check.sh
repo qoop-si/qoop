@@ -532,7 +532,35 @@ touch "$q/down-ubox" "$q/down-ubox.said"
 fake_ssh 999
 got="$(QASS_LINKDOWN=5 timed 13)"
 [ -z "$got" ] || { echo "a restart while down printed: $got"; exit 1; }
-rm -f "$tmp/bin/ssh" "$tmp/remotes"
+
+# A remote that updates qoop: the stream on its old binary ends and opens again on the new one,
+# with no link-down said (a drop is said at once without quiet); the same version keeps one stream.
+fresh; stream 40
+echo "ubox  fake-host" > "$tmp/remotes"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
+printf '%s\n' "[$(row 2 3 idle)]" > "$q/last-ubox.json"
+echo "qoop 0.9.5" > "$tmp/ver"
+: > "$tmp/watch-starts"
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in
+*--version*) cat "$tmp/ver" ;;
+*watch*) echo start >> "$tmp/watch-starts"; echo '[$(row 2 3 idle)]'; exec sleep 40 ;;
+*) echo '[]' ;;
+esac
+EOF
+chmod +x "$tmp/bin/ssh"
+got="$(QASS_QUIET=0 QASS_REMOTE_VERSION_EVERY=1 timed 5)"
+[ "$(wc -l < "$tmp/watch-starts" | tr -d ' ')" = 1 ] || { echo "the same version opened the stream again"; exit 1; }
+[ -z "$got" ] || { echo "an unchanged remote printed: $got"; exit 1; }
+: > "$tmp/watch-starts"
+( sleep 2; echo "qoop 0.10.0" > "$tmp/ver" ) &
+got="$(QASS_QUIET=0 QASS_REMOTE_VERSION_EVERY=1 timed 6)"
+wait
+[ "$(wc -l < "$tmp/watch-starts" | tr -d ' ')" = 2 ] || { echo "a new version kept the old stream: $(wc -l < "$tmp/watch-starts") starts"; exit 1; }
+[ -z "$got" ] || { echo "a version change printed: $got"; exit 1; }
+rm -f "$tmp/bin/ssh" "$tmp/remotes" "$tmp/ver" "$tmp/watch-starts"
 export QASS_QUIET=0
 
 # spawn.sh starts a claude worker on a tier's model through ANTHROPIC_MODEL, keeps every flag of
