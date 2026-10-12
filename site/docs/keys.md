@@ -18,7 +18,7 @@ program.
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
 | `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
-| `ctrl-a i` | on qass's screen: the question inbox beside qass's chat. In it `j` `k` pick a question, `a` to `d` answer with an option (held for 5 seconds, `u` takes it back), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `asks you` count in qass's header does the same |
+| `ctrl-a i` | on qass's screen: the question inbox beside qass's chat. A new question opens nothing by itself: it lights the questions tab on the rail and the lamp under the pet; `ctrl-a i` (or a click on that tab) brings it up, and the last answer puts it away. In it `j` `k` pick a question, `a` to `d` answer with an option (sent at once), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `asks you` count in qass's header does the same |
 | `ctrl-a W` | close the space when it is empty |
 
 ## Panes

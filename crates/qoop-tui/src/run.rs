@@ -3012,20 +3012,40 @@ impl State {
         )
     }
 
-    /// The keyboard is in the inbox only while the inbox is shown: leaving qass's screen, the
-    /// zoom or a window too small for it takes the keyboard back, and an answer still being
-    /// held with it. On qass's split tab it goes to qass's terminal, not to the board.
-    fn asks_settle(&mut self) {
-        // A fold whose tab with the board is gone goes with it, so the board never comes back
-        // folded. A zoom keeps it (the tab is still there).
-        if self.qass_ui.fold.is_some()
-            && self
-                .space
-                .and_then(|space| self.layouts.get(&space))
-                .and_then(|tree| self.board_leaves(tree))
-                .is_none()
+    /// qass's page as home, and the keyboard in the inbox only while the inbox is shown.
+    /// Every entry to qass's space folds the board onto the rail and starts with the questions
+    /// down; the questions brought up by hand go once the last card is answered and its word
+    /// seen; the keyboard never stays in a folded pane. Leaving qass's screen, the zoom or a
+    /// window too small for the inbox takes the keyboard back from it, and an answer still
+    /// being held with it; on qass's split tab it goes to qass's terminal, not to the board.
+    /// True when the panes must be sized again.
+    fn asks_settle(&mut self) -> bool {
+        let mut resize = false;
+        // Every way in (the sidebar, the space keys, ctrl-a Q, the first render) passes here.
+        // Nothing is written while the screen stays on qass's space, so a fold chosen on the
+        // page holds until he leaves it.
+        if self.space != self.qass_ui.seen {
+            self.qass_ui.seen = self.space;
+            if self.space.is_some() && self.space == sidebar::qass_space(&self.spaces) {
+                let board = Some(crate::qass_screen::Fold::Board);
+                resize = self.qass_ui.fold != board || self.asks.raised;
+                self.qass_ui.fold = board;
+                self.asks.raised = false;
+            }
+        }
+        if self.asks.raised && self.asks.waiting() == 0 && !self.asks.busy() {
+            self.asks.raised = false;
+        }
+        // The keyboard, there or on its way, goes to the open pane: a folded one cannot take
+        // it. A move meant for the folded pane opens it first, so this never fights him.
+        let leaves = self
+            .space
+            .and_then(|space| self.layouts.get(&space))
+            .and_then(|tree| self.fold_leaf(tree).zip(self.board_leaves(tree)));
+        if let Some(((folded, _), (board, qass))) = leaves
+            && self.pending_focus.unwrap_or(self.focused) == folded
         {
-            self.qass_ui.fold = None;
+            self.pending_focus = Some(if folded == board { qass } else { board });
         }
         if self.asks.focus && !self.asks_focused() {
             self.asks.release();
@@ -3033,6 +3053,7 @@ impl State {
                 self.qass_next();
             }
         }
+        resize
     }
 
     /// The keyboard to qass's terminal of the tab on screen, next: what leaving the questions
@@ -3059,11 +3080,12 @@ impl State {
             && self.qass_plan().is_some_and(|p| p.side.is_some())
     }
 
-    /// Whether the questions want to be on screen: a card waits and the owner has not put
-    /// them away since it came, an answer is held, on its way or just answered, or he asked
-    /// for them (`ctrl-a i`, also with nothing waiting: the handled ones).
+    /// Whether the questions want to be on screen: he brought them up (`ctrl-a i`, the rail's
+    /// tab or the count) while cards waited, until the last is answered and its word seen; or
+    /// he asked for them with nothing waiting (the handled ones). A card never brings them: it
+    /// lights the rail's tab and the lamp.
     fn questions_wanted(&self) -> bool {
-        self.qass_ui.inbox || (!self.asks.hidden && (self.asks.busy() || self.asks.calling()))
+        self.qass_ui.inbox || (self.asks.raised && (self.asks.waiting() > 0 || self.asks.busy()))
     }
 
     /// Where the questions are drawn on qass's split tab, in pane cells: the column cut from
@@ -3106,8 +3128,8 @@ impl State {
                 replaces: false,
             });
         }
-        // No room beside it (a stacked tab, or a board too narrow): over that tile, by hand or
-        // when a card comes, the same rule as beside.
+        // No room beside it (a stacked tab, or a board too narrow): over that tile, by the same
+        // rule as beside.
         (self.questions_wanted() && crate::qass_screen::Plan::holds_inbox(board.cols, board.rows))
             .then_some(crate::qass_screen::Side {
                 rect: board,
@@ -7333,7 +7355,11 @@ where
             // The keyboard is in the inbox only while the inbox is shown: leaving qass's
             // screen, the zoom or a window too small for it takes the keyboard back, and an
             // answer still being held with it.
-            state.asks_settle();
+            if state.asks_settle()
+                && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+            {
+                wr.write_all(&resize).await?;
+            }
             if state.pending_focus.is_some() {
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
@@ -9485,8 +9511,8 @@ where
                             Incoming::Control(response) => {
                                 if state.asks.answered(&response) {
                                     dirty = true;
-                                    // A question that came or went moves the questions in or
-                                    // out beside the board: the board is sized again, qass not.
+                                    // The last card going takes questions he brought up out
+                                    // beside the board: the board is sized again, qass not.
                                     if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
                                         wr.write_all(&resize).await?;
                                     }
@@ -11782,12 +11808,13 @@ fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
                 .is_some_and(|side| side.replaces)
             {
                 state.qass_ui.inbox = false;
+                state.asks.raised = false;
             }
         }
         Out::Closed => {
             state.qass_ui.inbox = false;
+            state.asks.raised = false;
             if state.qass_split() {
-                state.asks.hidden = true;
                 state.qass_next();
             }
             state.asks.release();
@@ -11922,10 +11949,10 @@ fn asks_toggle(state: &mut State) -> bool {
     false
 }
 
-/// [`asks_toggle`] on qass's split tab, where the questions show by themselves while a card
-/// waits: shown, the keyboard goes in; with the keyboard in, they are put away until the next
-/// new question and the keyboard goes to qass's terminal; not shown, they are brought up,
-/// also with nothing waiting (what qass handled).
+/// [`asks_toggle`] on qass's split tab, where a card only lights the rail's tab: shown, the
+/// keyboard goes in; with the keyboard in, they are put away and the keyboard goes to qass's
+/// terminal; not shown, they are brought up: while cards wait until the last is answered,
+/// with nothing waiting the handled ones until put away.
 fn questions_toggle(state: &mut State) -> bool {
     // The questions take the keyboard and may cover the board: a card held there is let go.
     state.cancel_board_drag();
@@ -11936,9 +11963,14 @@ fn questions_toggle(state: &mut State) -> bool {
         }
         return questions_fold(state);
     }
-    state.qass_ui.inbox = true;
+    if state.asks.waiting() > 0 {
+        state.asks.raised = true;
+    } else {
+        state.qass_ui.inbox = true;
+    }
     if state.questions().is_none() {
         state.qass_ui.inbox = false;
+        state.asks.raised = false;
         state.message = Some("the pane is too narrow for the questions".to_string());
         return false;
     }
@@ -11947,15 +11979,15 @@ fn questions_toggle(state: &mut State) -> bool {
     true
 }
 
-/// The questions put away to their strip until the next card comes, the keyboard back to
-/// qass's terminal: what `ctrl-a i` does with them open and in hand, and their title's click.
+/// The questions put away to the rail's tab, the keyboard back to qass's terminal: what
+/// `ctrl-a i` does with them open and in hand, and their title's click.
 fn questions_fold(state: &mut State) -> bool {
     if state.questions().is_none() {
         return false;
     }
     state.asks.release();
     state.qass_ui.inbox = false;
-    state.asks.hidden = true;
+    state.asks.raised = false;
     state.qass_next();
     true
 }
@@ -12016,7 +12048,6 @@ fn fold_pane(state: &mut State, fold: crate::qass_screen::Fold) -> bool {
     ) {
         state.qass_ui.fold = Some(crate::qass_screen::Fold::Both);
         state.qass_ui.inbox = true;
-        state.asks.hidden = false;
         state.asks.focus = true;
         state.asks.stale = true;
         return true;
@@ -20541,13 +20572,21 @@ mod tests {
         assert_eq!(state.board_wheel(row, col, true), None);
     }
 
-    /// With the board folded the questions are weighed against qass: beside it from qass's
-    /// side when qass keeps its minimum after them, over qass's tile when not.
+    /// With the board folded a card opens nothing: it lights the questions' tab. Brought up,
+    /// the questions are weighed against qass: beside it from qass's side when qass keeps its
+    /// minimum after them, over qass's tile when not.
     #[test]
-    fn a_card_with_the_board_folded_opens_the_questions_from_qass_side() {
+    fn a_card_with_the_board_folded_brought_up_opens_the_questions_from_qass_side() {
         let mut state = qass_wide();
         assert!(title_fold(&mut state, 4));
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions))
+        );
+        assert!(questions_toggle(&mut state), "ctrl-a i brings them up");
         let side = state.questions().expect("the column");
         let (strip, qass) = (tile_of(&state, 4), tile_of(&state, 5));
         assert!(!side.replaces);
@@ -20592,14 +20631,74 @@ mod tests {
         );
     }
 
-    /// A fold whose tab with the board is gone is let go, so the board never comes back folded.
+    /// Every entry to qass's space starts with the board folded onto the rail and the
+    /// keyboard in qass; a fold chosen on the page holds while the screen stays there, also
+    /// through a settle without the board's tab (a board page restarting).
     #[test]
-    fn a_stale_fold_goes_with_its_tab() {
-        let mut state = qass_wide();
-        assert!(title_fold(&mut state, 4));
+    fn entering_qass_space_folds_the_board_and_a_fold_chosen_there_holds() {
+        let mut state = qass_split_window();
+        state.cols = 200;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        state.asks_settle();
+        assert_eq!(state.qass_ui.seen, state.space);
+        assert_ne!(state.space, Some(9));
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert_eq!(state.qass_ui.fold, None, "sized for the split first");
+        assert!(state.asks_settle(), "the entry asks for a resize");
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+        assert_eq!(state.focused, 5);
+        size_terminals(&mut state, &mut seqs).unwrap();
+        let qass = tile_of(&state, 5);
+        assert_eq!(
+            state.sized.get(&5),
+            Some(&(qass.cols as u16, qass.rows as u16))
+        );
+        assert!(qass.cols > 100, "qass takes the room: {qass:?}");
+        // Opened by hand, it stays open on the page, through a settle that misses the board.
+        assert!(state.strip_press(4));
+        assert_eq!(state.qass_ui.fold, None);
+        let board_row = state.rows.iter().position(|r| r.terminal == 4).unwrap();
+        let row = state.rows.remove(board_row);
+        assert!(!state.asks_settle());
+        state.rows.insert(board_row, row);
+        assert!(!state.asks_settle());
+        assert_eq!(state.qass_ui.fold, None);
+        // Leaving and coming back folds it again.
         state.space = Some(1);
         state.asks_settle();
-        assert_eq!(state.qass_ui.fold, None);
+        state.space = Some(9);
+        assert!(state.asks_settle());
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+    }
+
+    /// The keyboard on its way to the folded board (an entry through `pending_focus`) goes to
+    /// qass instead; questions brought up and left open are down again on the next entry.
+    #[test]
+    fn an_entry_never_leaves_the_keyboard_in_the_folded_board_nor_the_questions_up() {
+        let mut state = qass_wide();
+        state.asks_settle();
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Board));
+        state.pending_focus = Some(4);
+        state.asks_settle();
+        assert_eq!(state.pending_focus, Some(5));
+        state.focused = 4;
+        state.pending_focus = None;
+        state.asks_settle();
+        assert_eq!(state.pending_focus, Some(5));
+        state.pending_focus = None;
+        state.focused = 5;
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(questions_toggle(&mut state));
+        assert!(state.questions().is_some());
+        state.space = Some(1);
+        state.asks_settle();
+        state.space = Some(9);
+        state.asks_settle();
+        assert!(!state.asks.raised);
+        assert!(
+            state.questions().is_none(),
+            "the entry starts with them down"
+        );
     }
 
     /// The tiles of qass's tab as drawn now.
@@ -20607,12 +20706,12 @@ mod tests {
         state.drawn(&state.layouts[&9]).tile_rects(pane_area(state))
     }
 
-    /// A card waiting opens the questions between the board and qass by themselves, cut from
-    /// the board: qass's tile and pty keep their size, the board's is resized; the last card
-    /// gone folds them back to their strip and gives the board its columns back. Folded, the
-    /// strip stands in the cell after the board's edge, with the header's count on it.
+    /// A card waiting opens nothing: it lights the questions' tab. Brought up (`ctrl-a i`),
+    /// they stand between the board and qass, cut from the board: qass's tile and pty keep
+    /// their size, the board's is resized; the last card gone folds them back to their tab and
+    /// gives the board its columns back.
     #[test]
-    fn a_question_opens_the_column_between_the_board_and_qass_and_qass_keeps_its_size() {
+    fn a_question_brought_up_opens_the_column_between_the_board_and_qass_and_qass_keeps_its_size() {
         let mut state = qass_wide();
         let mut seqs = std::collections::BTreeMap::new();
         state.asks.take(Vec::new(), Vec::new());
@@ -20629,6 +20728,10 @@ mod tests {
         let row = |r: usize| written_on(&painted, screen::TABS + 1 + rail.y + r);
         assert!(row(0).contains("\u{25b8} questions"), "{:?}", row(0));
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        size_terminals(&mut state, &mut seqs).unwrap();
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert_eq!(qass_tiles(&state), shut);
+        assert!(questions_toggle(&mut state));
         size_terminals(&mut state, &mut seqs).unwrap();
         let open = qass_tiles(&state);
         assert_eq!(open[1], shut[1], "qass's tile is the same");
@@ -20681,6 +20784,8 @@ mod tests {
         // Room for the board to give columns: at 200 columns it already stands on its minimum.
         state.cols = 240;
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        // Brought up by hand: a card alone opens nothing.
+        state.asks.raised = true;
         assert!(!state.questions().expect("the column").replaces);
         state
     }
@@ -20958,7 +21063,7 @@ mod tests {
         // Before the store is read: both fall back to the same count.
         assert_eq!(state.asks.count(), None);
         assert_eq!(tab_count(&state), header_count(&state));
-        // Three cards, put away: the tab says 3, so does the header.
+        // Three cards: they light the tab and open nothing; the tab says 3, so does the header.
         state.asks.take(
             vec![
                 ask_card(1, "korea"),
@@ -20967,7 +21072,6 @@ mod tests {
             ],
             Vec::new(),
         );
-        state.asks.hidden = true;
         assert!(state.questions().is_none());
         assert_eq!(tab_count(&state), "3");
         assert_eq!(header_count(&state), "3");
@@ -20986,47 +21090,80 @@ mod tests {
         assert!(asks_toggle(&mut state) && state.questions().is_some());
     }
 
-    /// Put away with `ctrl-a i`, the questions stay away for the cards already seen; a new
-    /// question, a rewritten one or one reopened brings them back. A card only passed to qass
-    /// does not open them.
+    /// Brought up with `ctrl-a i`, put away with it again: no card brings them back by itself,
+    /// a new one, a rewritten one or one reopened alike; the rail's tab says they wait.
+    /// Brought up, the last answer and its word gone, they go, and a later card stays on the
+    /// rail.
     #[test]
-    fn a_new_rewritten_or_reopened_question_brings_the_put_away_column_back() {
+    fn no_card_brings_the_put_away_column_back_and_the_last_answer_puts_it_away() {
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
-        assert!(state.questions().is_some());
-        assert!(
-            !questions_toggle(&mut state) && state.asks.focus,
-            "the keyboard goes in"
-        );
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(questions_toggle(&mut state), "brought up");
+        assert!(state.asks.focus && state.questions().is_some());
         assert!(questions_toggle(&mut state), "put away");
         assert!(!state.asks.focus && state.questions().is_none());
         assert_eq!(
             state.pending_focus, None,
             "the keyboard was in qass already"
         );
-        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
-        assert!(state.questions().is_none(), "the same card");
         let mut rewritten = ask_card(1, "korea");
         rewritten.body.asks = "Question 1, again?".into();
         state.asks.take(vec![rewritten.clone()], Vec::new());
-        assert!(state.questions().is_some(), "rewritten, same opened_at");
-        assert!(!questions_toggle(&mut state));
-        assert!(questions_toggle(&mut state));
-        let mut passed = rewritten.clone();
-        passed.status = "passed".into();
-        state.asks.take(vec![passed], Vec::new());
-        assert!(state.questions().is_none(), "passed is qass's, not his");
-        state.asks.take(vec![rewritten], Vec::new());
-        assert!(state.questions().is_some(), "open again");
+        assert!(state.questions().is_none(), "rewritten: still on the rail");
         state
             .asks
             .take(vec![ask_card(1, "korea"), ask_card(2, "japan")], Vec::new());
-        assert!(state.questions().is_some());
+        assert!(state.questions().is_none(), "a new one: still on the rail");
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions))
+        );
+        // Brought up, the cards answered elsewhere: they go, and the next card opens nothing.
+        assert!(questions_toggle(&mut state));
+        state.asks.take(Vec::new(), Vec::new());
+        state.asks_settle();
+        assert!(!state.asks.raised && state.questions().is_none());
+        state.asks.take(vec![ask_card(3, "peru")], Vec::new());
+        assert!(
+            state.questions().is_none(),
+            "a later card stays on the rail"
+        );
+    }
+
+    /// Put away and brought up again, the last answer's word is still seen before they go;
+    /// a `ctrl-a i` refused for want of room leaves nothing raised to pop up later.
+    #[test]
+    fn brought_up_again_the_last_answer_word_is_seen_and_a_refusal_raises_nothing() {
+        let mut state = qass_wide();
+        // The entry settled first: it starts with the questions down.
+        state.asks_settle();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(questions_toggle(&mut state), "up");
+        assert!(questions_toggle(&mut state), "put away");
+        assert!(questions_toggle(&mut state), "up again");
+        state.asks.key(b"a", 1);
+        assert!(state.asks.busy());
+        state.asks.take(Vec::new(), Vec::new());
+        state.asks_settle();
+        assert!(state.questions().is_some(), "the word is still due");
+        // Zoomed: no room, refused.
+        let mut state = qass_wide();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        assert!(!questions_toggle(&mut state));
+        assert!(!state.asks.raised);
+        state.layouts.get_mut(&9).unwrap().zoomed = None;
+        assert!(
+            state.questions().is_none(),
+            "nothing pops up once there is room"
+        );
     }
 
     /// `ctrl-a i` with nothing waiting brings the questions up all the same (what qass
     /// handled); in a pane too narrow for the column they come over the board's tile, with
-    /// qass's tile still drawn, and a card brings them there by itself, as it does beside.
+    /// qass's tile still drawn, brought up there as beside; a card alone opens nothing.
     #[test]
     fn ctrl_a_i_brings_the_questions_up_and_a_narrow_pane_shows_them_over_the_board() {
         let mut state = qass_wide();
@@ -21039,9 +21176,11 @@ mod tests {
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         let tiles = qass_tiles(&state);
         assert!(tiles[0].1.y == tiles[1].1.y, "side by side");
-        let side = state.questions().expect("over the board, by themselves");
-        assert!(side.replaces && side.rect == tiles[0].1);
+        assert!(state.questions().is_none(), "a card opens nothing");
         assert!(!state.asks.focus, "a card does not take the keyboard");
+        assert!(questions_toggle(&mut state));
+        let side = state.questions().expect("over the board, brought up");
+        assert!(side.replaces && side.rect == tiles[0].1);
         assert!(
             state
                 .rail_paint()
@@ -21095,6 +21234,7 @@ mod tests {
     fn swapping_sides_keeps_the_columns_and_the_questions_and_the_handle_follow() {
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.asks.raised = true;
         let before = qass_tiles(&state);
         let (board0, qass0) = (before[0].1, before[1].1);
         let h0 = state.handle().expect("a handle");
@@ -21243,6 +21383,7 @@ mod tests {
         // With the questions open the board cannot go under what keeps the column.
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.asks.raised = true;
         assert!(state.questions().is_some());
         state.modes.resizing = true;
         let was = state.layouts[&9].root_split();
@@ -21414,15 +21555,18 @@ mod tests {
     }
 
     /// Put away by the owner, the questions stay away while an answer is held or its word is
-    /// up; leaving them, by putting them away or by their last card going, gives the keyboard
-    /// to qass's terminal and not to the board it may have come from.
+    /// up; leaving them, by putting them away or by their last card answered, gives the
+    /// keyboard to qass's terminal and not to the board it may have come from.
     #[test]
     fn leaving_the_questions_hides_them_over_a_sent_answer_and_hands_the_keyboard_to_qass() {
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         state.focused = 4;
         state.layouts.get_mut(&9).unwrap().focus_terminal(4);
-        assert!(!questions_toggle(&mut state) && state.asks.focus);
+        assert!(
+            questions_toggle(&mut state) && state.asks.focus,
+            "brought up, in"
+        );
         state.asks.key(b"a", 1);
         assert!(state.asks.busy());
         assert!(questions_toggle(&mut state));
@@ -21432,7 +21576,7 @@ mod tests {
         );
         assert!(
             state.questions().is_none(),
-            "hidden wins over the word on screen"
+            "put away wins over the word on screen"
         );
         assert_eq!(state.pending_focus, Some(5));
         // The last card going while the keyboard is in them does the same.
@@ -21845,17 +21989,19 @@ mod tests {
             type Change = Box<dyn Fn(&mut State)>;
             let variants: Vec<(&str, Change)> = vec![
                 (
-                    "a card beside the board",
-                    Box::new(|s| s.asks.take(vec![ask_card(1, "korea")], Vec::new())),
+                    "a card brought up beside the board",
+                    Box::new(|s| {
+                        s.asks.take(vec![ask_card(1, "korea")], Vec::new());
+                        s.asks.raised = true;
+                    }),
                 ),
                 (
-                    "three waiting, put away",
+                    "three waiting on the rail",
                     Box::new(|s| {
                         s.asks.take(
                             vec![ask_card(1, "a"), ask_card(2, "b"), ask_card(3, "c")],
                             Vec::new(),
                         );
-                        s.asks.hidden = true;
                     }),
                 ),
                 (
@@ -21992,10 +22138,11 @@ mod tests {
                 let area = pane_area(&state);
                 assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
             }
-            // Questions folded: the rail shows. A card beside the board: it does not.
+            // Questions folded: the rail shows. A card brought up beside the board: it does not.
             let shut = tile_of(&state, 5);
             assert!(state.rail_paint().is_some());
             state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            state.asks.raised = true;
             assert!(state.rail_paint().is_none() && state.questions().is_some());
             let open = tile_of(&state, 5);
             // Qass on the left moves right by the rail's columns; its size is the same.
@@ -22057,6 +22204,7 @@ mod tests {
         assert!(!stacked.split_press(col, row));
         // The questions open over the board's tile: the tab keeps its place, the preview goes.
         stacked.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        stacked.asks.raised = true;
         assert!(stacked.questions().is_some_and(|q| q.replaces));
         let painted = plain(&screen::paint(&stacked.frame()));
         assert!(!painted.contains("ctrl-a i opens"), "{painted}");
@@ -22537,11 +22685,11 @@ mod tests {
         );
         size_terminals(&mut state, &mut seqs).unwrap();
         let before = state.sized.clone();
-        // A card brings them over the board by itself now (the owner: they open when a
-        // question comes); `ctrl-a i` gives them the keyboard.
+        // A card opens nothing (R2, 2026-10-13: it lights the rail's tab); `ctrl-a i` brings
+        // them over the board, the keyboard in them.
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
-        assert!(state.questions().is_some(), "by themselves");
-        assert!(!asks_toggle(&mut state));
+        assert!(state.questions().is_none(), "a card opens nothing");
+        assert!(asks_toggle(&mut state));
         assert!(state.asks_focused());
         let side = state.qass_plan().unwrap().side.expect("over the board");
         assert!(side.replaces && side.rect == shut[0].1);
@@ -22580,9 +22728,10 @@ mod tests {
         size_terminals(&mut state, &mut seqs).unwrap();
         let before = state.sized.clone();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
-        // A card brings them over the split by itself; `ctrl-a i` then gives them the keyboard.
+        // A card opens nothing; `ctrl-a i` brings them over the split, the keyboard in them.
+        assert!(state.questions().is_none());
+        assert!(asks_toggle(&mut state) && state.asks_focused());
         assert!(state.qass_plan().unwrap().side.unwrap().replaces);
-        assert!(!asks_toggle(&mut state) && state.asks_focused());
         assert_eq!(size_terminals(&mut state, &mut seqs).unwrap(), None);
         assert_eq!(state.sized, before);
         let painted = plain(&screen::paint(&state.frame()));

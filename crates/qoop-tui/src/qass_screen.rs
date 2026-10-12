@@ -242,6 +242,9 @@ pub struct Ui {
     pub fold: Option<Fold>,
     /// The width the owner dragged the rail's tabs to, for this session; `None` for the default.
     pub rail: Option<usize>,
+    /// The space on screen when qass's page was last settled: entering qass's space from any
+    /// other folds the board onto the rail.
+    pub seen: Option<i64>,
     /// When the watcher last told qass something, unix seconds, as the file's age says.
     pub wake_at: Option<i64>,
     /// The quarter minute the ages were last drawn in, so a line that says `2 min ago` is

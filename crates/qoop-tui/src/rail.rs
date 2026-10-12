@@ -268,10 +268,15 @@ pub fn rows(
             if p.count > 1 {
                 body.push(plain(format!("+{} more", p.count - 1), Role::Faint, false));
             }
-            if w >= 14 {
-                body.push(" ".repeat(w));
-                body.push(plain("ctrl-a i opens".to_string(), Role::Faint, false));
-            }
+            // A card opens nothing by itself: the key to bring it up is said at every width
+            // that shows words.
+            body.push(" ".repeat(w));
+            let hint = if w >= 14 {
+                "ctrl-a i opens"
+            } else {
+                "ctrl-a i"
+            };
+            body.push(plain(hint.to_string(), Role::Faint, false));
         } else {
             let dots = vec!["\u{25cf}"; p.count.min(w.div_ceil(2))].join(" ");
             body.push(plain(dots, Role::Blocked, true));
@@ -444,11 +449,18 @@ mod tests {
         assert!(plain_rows.iter().any(|r| r.starts_with("3 waiting")));
         assert!(plain_rows.iter().any(|r| r.starts_with("+2 more")));
         assert!(plain_rows[19].starts_with("\u{2500}"));
-        // At 12 and 13 cells nothing runs past the edge: the hint waits for 14.
+        assert!(plain_rows.iter().any(|r| r.starts_with("ctrl-a i opens")));
+        // At 12 and 13 cells nothing runs past the edge, and the key is still said: a card
+        // opens nothing by itself (at 120 columns the rail is 12 wide).
         for w in [12, 13] {
-            for row in rows(20, w, &tabs, Some(&preview), false) {
-                assert_eq!(width::width(&plain(&row)), w + 1, "{w}: {row:?}");
+            let out = rows(20, w, &tabs, Some(&preview), false);
+            for row in &out {
+                assert_eq!(width::width(&plain(row)), w + 1, "{w}: {row:?}");
             }
+            assert!(
+                out.iter().any(|r| plain(r).starts_with("ctrl-a i ")),
+                "{w}: {out:?}"
+            );
         }
         // Under twelve cells the preview is dots.
         let narrow = rows(10, 8, &tabs, Some(&preview), false);
