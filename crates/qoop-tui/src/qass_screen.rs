@@ -1,6 +1,6 @@
 //! The qass screen: what the pane shows while the keyboard is in qass's own tab.
 //!
-//! A `qass` header (the pet as qass's face in the middle, in ember brackets; how qass stands,
+//! A `qass` header (the pet as qass's face in the middle over a state lamp; how qass stands,
 //! what it does now and what it did last on its left; the three counters on its right) over a
 //! framed `terminal` box that holds qass's real terminal. The header's first rows stand where
 //! the tab strip would: qass's screen goes without the tabs. Everything here is a pure function of the rows the daemon sent, so a test
@@ -23,7 +23,7 @@ use crate::{sidebar, width};
 /// stays plain.
 const MIN_COLS: usize = 24;
 const MIN_ROWS: usize = 6;
-/// The header: the pet's five rows in their brackets, then a rule. Its first rows are painted in
+/// The header: the pet's five rows, then a rule with the state lamp under the pet. Its first rows are painted in
 /// the tab strip's rows ([`crate::tabs::ROWS`]), which qass's screen does without, so the pane
 /// gives it only the rest ([`Header::rows`]).
 const HEAD_ROWS: usize = qoop_runtime::avatar::ART_ROWS + 1;
@@ -32,7 +32,7 @@ const MIN_INSIDE: usize = 6;
 /// The columns qass's own line needs left of the pet (`qass` and its state) before the pet is
 /// worth showing: under it the header goes without the pet.
 const LEFT_MIN: usize = 16;
-/// Blank cells between a bracket and the pet, and between a bracket and the lines beside it.
+/// Blank cells either side of the pet (the lamp's overhang), and between the pet's block and the lines beside it.
 const PAD: usize = 1;
 const GAP: usize = 3;
 /// The narrowest pane that holds the inbox at all, and the one that holds it beside qass's
@@ -805,7 +805,7 @@ impl Screen {
                 (vec![line], x.map(|(x0, x1)| Chip { row: 0, x0, x1 }))
             }
             Header::Box => {
-                let (rows, x) = bracket_rows(plan.cols, state, f, &say, wake_at, ctx);
+                let (rows, x) = header_rows(plan.cols, state, f, &say, wake_at, ctx);
                 (rows, x.map(|(x0, x1)| Chip { row: 1, x0, x1 }))
             }
         };
@@ -931,12 +931,12 @@ fn last_chip(f: &Facts, run: &[Seg]) -> Option<(usize, usize)> {
     Some((total - own, total))
 }
 
-/// The header: the pet in the middle inside tall ember brackets, qass's own lines on its left
-/// (right-aligned to the brackets), the counters and the sub line on its right, a rule under.
+/// The header: the pet in the middle over its lamp, qass's own lines on its left
+/// (right-aligned to the pet's block), the counters and the sub line on its right, a rule under.
 /// The pet stands centred while the counters fit whole on its right, else as far left as they
 /// need; with no room for it (or no colour, or a fade) the lines meet at the centre instead.
 /// The counters' cells come back for the chip, in header columns.
-fn bracket_rows(
+fn header_rows(
     cols: usize,
     state: Vec<Seg>,
     f: &Facts,
@@ -962,7 +962,7 @@ fn bracket_rows(
         .filter(|_| ctx.colour && !ctx.fade)
         .map(|pet| sidebar::avatar_overlay(&pet_for(pet, f.asleep()), true))
         .filter(|(pw, rows)| *pw > 0 && !rows.is_empty());
-    // Where the middle stands: the pet's first column (its brackets two cells out), or with no
+    // Where the middle stands: the pet's block (the pet two cells in), or with no
     // pet the first of a four cell gap the lines keep apart.
     let fit = |mid_w: usize| {
         let centred = cols.saturating_sub(mid_w) / 2;
@@ -987,7 +987,6 @@ fn bracket_rows(
     let chips = fit_chips(f, right_w, 1);
     let span = last_chip(f, &chips).map(|(from, to)| (right_x + from, right_x + to));
     let right = [chips, vec![seg(Role::Faint, say.sub.clone())]];
-    let brand = ink(Role::Brand, ctx.fade);
     let mut out = Vec::with_capacity(HEAD_ROWS);
     for r in 0..HEAD_ROWS - 1 {
         // Left of the middle: a line right-aligned against it, cut at the pane's edge.
@@ -999,24 +998,15 @@ fn bracket_rows(
             row.push_str(&line(segs, shown, ctx.fade));
         }
         row.push_str(&" ".repeat(mid_x - left_end));
-        // The middle: the brackets and the pet, or the gap.
+        // The middle: the pet with a cell of air either side, or the gap.
         match &pet {
             Some((_, pw, art)) => {
-                let (top, bottom) = match r {
-                    0 => ('\u{250c}', '\u{2510}'),
-                    4 => ('\u{2514}', '\u{2518}'),
-                    _ => ('\u{2502}', '\u{2502}'),
-                };
-                row.push_str(&format!("{brand}{top}{}{}", theme::RESET, " ".repeat(PAD)));
+                row.push_str(&" ".repeat(PAD + 1));
                 match art.get(r) {
                     Some(cells) => row.push_str(&format!("{cells}{}", theme::RESET)),
                     None => row.push_str(&" ".repeat(*pw)),
                 }
-                row.push_str(&format!(
-                    "{}{brand}{bottom}{}",
-                    " ".repeat(PAD),
-                    theme::RESET
-                ));
+                row.push_str(&" ".repeat(PAD + 1));
             }
             None => row.push_str(&" ".repeat(mid_w)),
         }
@@ -1030,13 +1020,43 @@ fn bracket_rows(
         ));
         out.push(row);
     }
-    out.push(format!(
-        "{}{}{}",
-        ink(Role::Rule, ctx.fade),
-        "\u{2500}".repeat(cols),
-        theme::RESET
-    ));
+    let lamp = pet.as_ref().map(|(at, pw, _)| (at + 1, pw + 2));
+    out.push(rule_row(cols, lamp, lamp_role(f, say), ctx.fade));
     (out, span)
+}
+
+/// The lamp's ink: ember while something waits for the owner (an agent that wants him or an
+/// ask), else qass's own state (blue working, grey idle).
+fn lamp_role(f: &Facts, say: &Say) -> Role {
+    if f.waiting + f.asks > 0 {
+        Role::Blocked
+    } else {
+        say.role
+    }
+}
+
+/// The rule under the header, with the state lamp (a short heavy stretch, `lamp` = its first
+/// column and width) under the pet.
+fn rule_row(cols: usize, lamp: Option<(usize, usize)>, role: Role, fade: bool) -> String {
+    let rule = |n: usize| {
+        format!(
+            "{}{}{}",
+            ink(Role::Rule, fade),
+            "\u{2500}".repeat(n),
+            theme::RESET
+        )
+    };
+    let Some((x, w)) = lamp.filter(|(x, _)| *x < cols) else {
+        return rule(cols);
+    };
+    let w = w.min(cols - x);
+    let lit = format!(
+        "{}\x1b[1m{}{}",
+        ink(role, fade),
+        "\u{2501}".repeat(w),
+        theme::RESET
+    );
+    format!("{}{lit}{}", rule(x), rule(cols - x - w))
 }
 
 #[cfg(test)]
@@ -1308,7 +1328,7 @@ mod tests {
         assert!(!screen.header[1].contains("\x1b[48;5;"));
     }
 
-    /// The full header: the pet in the middle inside ember brackets, centred while the counters
+    /// The full header: the pet in the middle over its lamp, centred while the counters
     /// fit whole on its right, moved left only as far as they need (a 120 column window gives
     /// an 81 column pane), with qass's own line still on its left. The one line header has no
     /// rows in the tab bar's.
@@ -1319,16 +1339,16 @@ mod tests {
         for (cols, centred) in [(161, true), (81, false)] {
             let plan = Plan::new(cols, 40, false, false).unwrap();
             let screen = Screen::new(plan, &facts_of("working"), None, ctx(Some(&pet)));
-            let top: Vec<char> = strip(&screen.header[0]).chars().collect();
-            let lb = top
+            let rule: Vec<char> = strip(&screen.header[HEAD_ROWS - 1]).chars().collect();
+            let lb = rule
                 .iter()
-                .position(|c| *c == '\u{250c}')
-                .expect("left bracket");
-            let rb = top
+                .position(|c| *c == '\u{2501}')
+                .expect("lamp start");
+            let rb = rule
                 .iter()
-                .position(|c| *c == '\u{2510}')
-                .expect("right bracket");
-            assert_eq!(rb - lb, pw + 3, "{cols}: the pet and a cell either side");
+                .rposition(|c| *c == '\u{2501}')
+                .expect("lamp end");
+            assert_eq!(rb - lb, pw + 1, "{cols}: the pet and a cell either side");
             let middle = (lb + rb) / 2;
             if centred {
                 assert!(middle.abs_diff(cols / 2) <= 1, "{cols}: {middle}");
@@ -1346,16 +1366,11 @@ mod tests {
                 "{first:?}"
             );
             assert!(screen.chip().is_some(), "{cols}");
-            assert!(
-                strip(&screen.header[HEAD_ROWS - 1])
-                    .chars()
-                    .all(|c| c == '\u{2500}')
-            );
         }
-        // No pet (no colour here): no brackets, the counters still whole on the right.
+        // No pet (no colour here): no lamp, the counters still whole on the right.
         let plan = Plan::new(161, 40, false, false).unwrap();
         let bare = Screen::new(plan, &facts_of("working"), None, ctx(None));
-        assert!(!bare.header.iter().any(|r| r.contains('\u{250c}')));
+        assert!(!bare.header.iter().any(|r| r.contains('\u{2501}')));
         assert!(strip(&bare.header[1]).contains("[ 1 asks you ]"));
         // The one line header stays in the pane: nothing for the tab bar's rows.
         let short = Plan::new(60, 10, false, false).unwrap();
@@ -1363,6 +1378,34 @@ mod tests {
             Screen::new(short, &facts_of("idle"), None, ctx(None)).above(0),
             None
         );
+    }
+
+    /// The lamp under the pet: ember while something waits for the owner, else qass's own
+    /// state (blue working, grey idle), heavy, and as wide as the pet and a cell either side.
+    #[test]
+    fn the_lamp_under_the_pet_takes_its_colour_from_the_state() {
+        let pet = pet();
+        let plan = Plan::new(161, 40, false, false).unwrap();
+        for (state, waiting, asks, role) in [
+            ("idle", 0, 0, Role::Idle),
+            ("working", 0, 2, Role::Blocked),
+            ("working", 0, 0, Role::Working),
+            ("idle", 1, 0, Role::Blocked),
+            ("idle", 0, 2, Role::Blocked),
+        ] {
+            let facts = Facts {
+                waiting,
+                asks,
+                ..facts_of(state)
+            };
+            let screen = Screen::new(plan, &facts, None, ctx(Some(&pet)));
+            let rule = &screen.header[HEAD_ROWS - 1];
+            let lit = format!("{}\x1b[1m", theme::fg(role));
+            assert!(
+                rule.contains(&format!("{lit}\u{2501}")),
+                "{state} {waiting} {asks}: {rule:?}"
+            );
+        }
     }
 
     fn row(terminal: u32, workspace: i64, state: &str) -> AgentRow {
