@@ -2612,12 +2612,24 @@ impl State {
                 let open = shown.inner(area).cols.saturating_sub(reserve);
                 shown.fold = Some(fold);
                 shown.gap = crate::qass_screen::fold_gap(open, fold != board, questions);
+            } else if self.all_folded(tree)
+                && questions
+                && crate::qass_screen::Plan::holds_inbox(
+                    shown.inner(area).cols.saturating_sub(reserve),
+                    area.rows,
+                )
+            {
+                // Both folded: the questions take the tab.
+                shown.fold_all = true;
+                shown.gap = 0;
             }
             // The rail shows while a pane is folded: the board or qass, or the questions (folded
             // unless beside the board; over its tile they keep their tab, so a card never
             // moves a pane).
             shown.rail = 0;
-            if (shown.fold.is_some() || shown.gap == 0) && self.band_over(tree) > 0 {
+            if (shown.fold.is_some() || shown.fold_all || shown.gap == 0)
+                && self.band_over(tree) > 0
+            {
                 shown.rail = reserve;
             }
         }
@@ -2641,6 +2653,11 @@ impl State {
     /// A press on a pane folded to its strip opens it and gives it the keyboard; true when the
     /// press was that, so it reaches nothing else.
     fn strip_press(&mut self, terminal: u32) -> bool {
+        if self.open_from_both(terminal) {
+            self.asks.release();
+            self.pending_focus = Some(terminal).filter(|t| *t != self.focused);
+            return true;
+        }
         if self.folded() != Some(terminal) {
             return false;
         }
@@ -2678,7 +2695,32 @@ impl State {
         match self.qass_ui.fold? {
             crate::qass_screen::Fold::Board => Some((board, board)),
             crate::qass_screen::Fold::Qass => Some((qass, board)),
+            crate::qass_screen::Fold::Both => None,
         }
+    }
+
+    /// Whether both the board and qass are folded away on `tree`, the questions holding the tab.
+    fn all_folded(&self, tree: &Layout) -> bool {
+        tree.zoomed.is_none()
+            && self.qass_ui.fold == Some(crate::qass_screen::Fold::Both)
+            && self.board_tree(tree)
+    }
+
+    /// With both folded, `terminal` (the board or qass) opens and the other stays folded; true
+    /// when it was that.
+    fn open_from_both(&mut self, terminal: u32) -> bool {
+        if self.qass_ui.fold != Some(crate::qass_screen::Fold::Both) {
+            return false;
+        }
+        let Some((board, qass)) = fold_leaves(self) else {
+            return false;
+        };
+        self.qass_ui.fold = match terminal {
+            t if t == board => Some(crate::qass_screen::Fold::Qass),
+            t if t == qass => Some(crate::qass_screen::Fold::Board),
+            _ => return false,
+        };
+        true
     }
 
     /// `tree` with the root it is shown with, to change and keep: what a change on a copy
@@ -2687,6 +2729,7 @@ impl State {
         Layout {
             gap: 0,
             fold: None,
+            fold_all: false,
             rail: 0,
             ..self.drawn(tree)
         }
@@ -2764,7 +2807,7 @@ impl State {
         };
         let (saved, shown_tree) = (before.root_split(), self.drawn(&before));
         // Folded, the tab shows no divider to change: nothing is changed or saved.
-        if shown_tree.fold.is_some() {
+        if shown_tree.fold.is_some() || shown_tree.fold_all {
             return false;
         }
         let shown = shown_tree.root_split();
@@ -2880,7 +2923,7 @@ impl State {
     fn handle(&self) -> Option<crate::qass_screen::Handle> {
         let tree = self.drawn_tree(self.space?)?;
         let (_, qass) = self.board_leaves(&tree)?;
-        if tree.zoomed.is_some() || tree.fold.is_some() {
+        if tree.zoomed.is_some() || tree.fold.is_some() || tree.fold_all {
             return None;
         }
         let (_, rect) = tree
@@ -3032,6 +3075,17 @@ impl State {
         if tree.zoomed.is_some() || tree.leaf_count() < 2 || self.band_over(&tree) == 0 {
             return None;
         }
+        if tree.fold_all {
+            let area = self.tree_area(&tree);
+            return Some(crate::qass_screen::Side {
+                rect: layout::Rect {
+                    x: area.x + tree.rail,
+                    cols: area.cols.saturating_sub(tree.rail),
+                    ..area
+                },
+                replaces: true,
+            });
+        }
         let (board, before) = self.cut(&tree)?;
         if tree.gap > 0 {
             let edge = 1;
@@ -3096,9 +3150,9 @@ impl State {
         let (board, qass) = self.board_leaves(&tree)?;
         let area = self.tree_area(&tree);
         let panes = [
-            (tree.fold == Some(board)).then_some(crate::rail::Pane::Board),
-            (tree.gap == 0).then_some(crate::rail::Pane::Questions),
-            (tree.fold == Some(qass)).then_some(crate::rail::Pane::Qass),
+            (tree.fold == Some(board) || tree.fold_all).then_some(crate::rail::Pane::Board),
+            (tree.gap == 0 && !tree.fold_all).then_some(crate::rail::Pane::Questions),
+            (tree.fold == Some(qass) || tree.fold_all).then_some(crate::rail::Pane::Qass),
         ];
         panes
             .iter()
@@ -11382,7 +11436,8 @@ fn size_terminals(
         let tiles = drawn.tile_rects(state.tree_area(tree));
         // A pane folded to its strip keeps its size, as a zoom's hidden panes do.
         for leaf in tree.leaves() {
-            if drawn.fold == Some(leaf) || !tiles.iter().any(|(t, _)| *t == leaf) {
+            if drawn.fold == Some(leaf) || drawn.fold_all || !tiles.iter().any(|(t, _)| *t == leaf)
+            {
                 want.remove(&leaf);
                 zoomed_away.insert(leaf);
             }
@@ -11390,7 +11445,7 @@ fn size_terminals(
         want.extend(
             tiles
                 .into_iter()
-                .filter(|(t, _)| drawn.fold != Some(*t))
+                .filter(|(t, _)| drawn.fold != Some(*t) && !drawn.fold_all)
                 .map(|(t, r)| (t, size(r))),
         );
     }
@@ -11481,6 +11536,8 @@ fn move_focus(
         .and_then(|tree| state.fold_leaf(tree));
     if folded.is_some_and(|(leaf, _)| leaf == to) {
         state.qass_ui.fold = None;
+    } else if state.open_from_both(to) {
+        state.asks.release();
     }
     // A card held on the board is let go once the keyboard leaves the board: the press it
     // came from belongs to a pane that is no longer in front, and the page is told so.
@@ -11941,11 +11998,30 @@ fn fold_pane(state: &mut State, fold: crate::qass_screen::Fold) -> bool {
         return false;
     };
     state.cancel_board_drag();
-    state.qass_ui.fold = Some(fold);
+    // The other pane already folded: both are, and the questions take the tab with the keyboard.
     let (gone, other) = match fold {
         crate::qass_screen::Fold::Board => (board, qass),
         crate::qass_screen::Fold::Qass => (qass, board),
+        crate::qass_screen::Fold::Both => return false,
     };
+    if matches!(
+        (state.qass_ui.fold, fold),
+        (
+            Some(crate::qass_screen::Fold::Board),
+            crate::qass_screen::Fold::Qass
+        ) | (
+            Some(crate::qass_screen::Fold::Qass),
+            crate::qass_screen::Fold::Board
+        )
+    ) {
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Both);
+        state.qass_ui.inbox = true;
+        state.asks.hidden = false;
+        state.asks.focus = true;
+        state.asks.stale = true;
+        return true;
+    }
+    state.qass_ui.fold = Some(fold);
     if state.focused == gone {
         state.pending_focus = Some(other);
     }
@@ -20383,13 +20459,48 @@ mod tests {
         assert!(title_fold(&mut state, 5));
         focus(&mut state, 5, &mut seq, &mut seqs).unwrap();
         assert_eq!(state.qass_ui.fold, None);
-        // The second fold replaces the first: one at a time.
+        // The second fold joins the first: both are away and the questions hold the tab.
         assert!(title_fold(&mut state, 4) && title_fold(&mut state, 5));
-        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Qass));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Both));
         // A tab with no board keeps today's click and drag on a title.
         let alone = qass_window();
         assert_eq!(alone.title_release(5, false), TitleAct::Focus);
         assert_eq!(alone.title_release(5, true), TitleAct::Carry);
+    }
+
+    /// With the board and qass both folded the questions fill the tab: both tiles are no columns
+    /// wide, the questions take the rest less the rail with the keyboard, no divider is left, and
+    /// a tab on the rail opens its pane again while the other stays away.
+    #[test]
+    fn both_panes_folded_leave_the_questions_the_whole_tab() {
+        let mut state = qass_wide();
+        assert!(title_fold(&mut state, 4) && title_fold(&mut state, 5));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Both));
+        let tiles = qass_tiles(&state);
+        assert!(tiles.iter().all(|(_, r)| r.cols == 0), "{tiles:?}");
+        let tree = state.drawn_tree(9).unwrap();
+        let area = state.tree_area(&tree);
+        let side = state.questions().expect("the questions");
+        assert!(side.replaces);
+        assert_eq!(side.rect.x, area.x + tree.rail);
+        assert_eq!(side.rect.x + side.rect.cols, area.x + area.cols);
+        assert_eq!(side.rect.rows, area.rows);
+        assert!(state.asks_focused(), "the keyboard is in the questions");
+        assert!(state.handle().is_none() && !state.split_press(1, 1));
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.panes,
+            [
+                Some(crate::rail::Pane::Board),
+                None,
+                Some(crate::rail::Pane::Qass)
+            ]
+        );
+        assert!(!state.committed(&state.layouts[&9]).fold_all);
+        // The board's tab opens the board: qass stays away.
+        assert!(state.strip_press(4));
+        assert_eq!(state.qass_ui.fold, Some(crate::qass_screen::Fold::Qass));
+        assert!(!state.drawn_tree(9).unwrap().fold_all);
     }
 
     /// Folded panes paint as strips: the board's letters down its cell and the titles of the

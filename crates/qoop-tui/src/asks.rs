@@ -653,8 +653,29 @@ fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
     (row.state == "working").then(|| "working again".to_string())
 }
 
+/// The most rows the question takes, and each other card text (a reason, what was asked): a text
+/// that needs more ends in `\u{2026}`.
+const ASK_ROWS: usize = 5;
+const SIDE_ROWS: usize = 2;
+
+/// The rows each card text needs at its width, as many as `ASK_ROWS` and `SIDE_ROWS` allow.
+/// `reasons` is the rows the option reasons take beyond their first.
+struct Lens {
+    ask: usize,
+    asked: usize,
+    doing: usize,
+    why: usize,
+    pick: usize,
+    sends: usize,
+    reasons: usize,
+}
+
 /// How the pane is divided between the parts, given its height.
 struct Budget {
+    /// Rows of the question.
+    ask: usize,
+    /// The side texts wrap onto `SIDE_ROWS` rows; off, each is one cut row.
+    side: bool,
     list: usize,
     asked: bool,
     why: bool,
@@ -672,8 +693,11 @@ fn budget(
     options: usize,
     has_asked: bool,
     has_pick: bool,
+    lens: &Lens,
 ) -> Budget {
     let mut b = Budget {
+        ask: lens.ask,
+        side: true,
         list: cards.clamp(1, 5),
         asked: has_asked,
         why: true,
@@ -686,8 +710,15 @@ fn budget(
     };
     let need = |b: &Budget| {
         // tabs, rule, list, rule, hints, and the detail below.
+        let more = |on: bool, n: usize| usize::from(b.side && on) * (n - 1);
         let detail = 2
-            + 1
+            + b.ask
+            + more(b.asked, lens.asked)
+            + more(b.doing, lens.doing)
+            + more(b.why, lens.why)
+            + more(b.pick, lens.pick)
+            + more(b.sends, lens.sends)
+            + usize::from(b.side) * lens.reasons
             + usize::from(b.asked)
             + usize::from(b.doing)
             + usize::from(b.why)
@@ -706,6 +737,8 @@ fn budget(
             if b.handled < 2 {
                 b.handled = 0;
             }
+        } else if b.side {
+            b.side = false;
         } else if b.list > 3 {
             b.list -= 1;
         } else if b.gap_top {
@@ -720,6 +753,8 @@ fn budget(
             b.pick = false;
         } else if b.list > 1 {
             b.list -= 1;
+        } else if b.ask > 1 {
+            b.ask = 1;
         } else if b.sends {
             b.sends = false;
         } else if b.doing {
@@ -798,13 +833,52 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
 
     if let Some(card) = pane.open_card() {
         let sel = pane.selected.min(pane.live.len() - 1);
+        let shown = pane.preview_at(card);
+        let label_w = card
+            .body
+            .options
+            .iter()
+            .map(|o| width::width(&o.label))
+            .max()
+            .unwrap_or(0)
+            .min(cw / 3);
+        let reason_room = cw.saturating_sub(4 + label_w + 2);
+        let side_rows = |text: &str, room: usize| wrap_dots(text, room, SIDE_ROWS).len();
+        let lens = Lens {
+            ask: wrap_dots(&card.body.asks, cw, ASK_ROWS).len(),
+            asked: card
+                .body
+                .asked
+                .as_deref()
+                .map_or(1, |t| side_rows(t, cw.saturating_sub(8))),
+            doing: side_rows(&card.body.doing, cw.saturating_sub(8)),
+            why: side_rows(&card.body.why, cw.saturating_sub(8)),
+            pick: card
+                .body
+                .pick
+                .as_ref()
+                .map_or(1, |p| side_rows(&p.reason, cw.saturating_sub(14))),
+            sends: card
+                .body
+                .options
+                .get(shown)
+                .map_or(1, |o| side_rows(&o.words, cw.saturating_sub(11))),
+            reasons: card
+                .body
+                .options
+                .iter()
+                .map(|o| side_rows(&o.reason, reason_room) - 1)
+                .sum(),
+        };
         let b = budget(
             inner_rows,
             pane.live.len(),
             card.body.options.len(),
             card.body.asked.is_some(),
             card.body.pick.is_some(),
+            &lens,
         );
+        let side = if b.side { SIDE_ROWS } else { 1 };
         // The list: a window of it that holds the open card.
         let first = sel
             .saturating_sub(b.list.saturating_sub(1))
@@ -863,71 +937,71 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             Some(tag) => wrap(&[seg(Role::Blocked, tag)]),
             None => blank(),
         });
+        // A text on rows after its lead (a label, a key), the later rows indented under the text.
+        let rows_after = |lead: Vec<Seg>, indent: usize, text: &str| -> Vec<String> {
+            let rows = wrap_dots(text, cw.saturating_sub(indent), side);
+            let mut lead = Some(lead);
+            rows.into_iter()
+                .map(|t| {
+                    let mut segs = lead
+                        .take()
+                        .unwrap_or_else(|| vec![seg(Role::Text, " ".repeat(indent))]);
+                    segs.push(seg(Role::Detail, t));
+                    wrap(&segs)
+                })
+                .collect()
+        };
         let label = |what: &str, text: &str| {
-            wrap(&[
-                seg(Role::Faint, format!("{what:<8}")),
-                seg(Role::Detail, cut_dots(text, cw.saturating_sub(8))),
-            ])
+            rows_after(vec![seg(Role::Faint, format!("{what:<8}"))], 8, text)
         };
         if b.asked
             && let Some(asked) = &card.body.asked
         {
-            out.push(label("asked", asked));
+            out.extend(label("asked", asked));
         }
         if b.doing {
-            out.push(label("doing", &card.body.doing));
+            out.extend(label("doing", &card.body.doing));
         }
         if b.why {
-            out.push(label("why now", &card.body.why));
+            out.extend(label("why now", &card.body.why));
         }
         if b.gap_top {
             out.push(blank());
         }
-        out.push(wrap(&[bold(Role::Text, cut_dots(&card.body.asks, cw))]));
+        for row in wrap_dots(&card.body.asks, cw, b.ask) {
+            out.push(wrap(&[bold(Role::Text, row)]));
+        }
         let passed = card.status != "open";
-        let shown = pane.preview_at(card);
-        let label_w = card
-            .body
-            .options
-            .iter()
-            .map(|o| width::width(&o.label))
-            .max()
-            .unwrap_or(0)
-            .min(cw / 3);
         for (i, o) in card.body.options.iter().enumerate() {
             let key_ink = if passed { Role::Faint } else { Role::Brand };
-            let lab = width::fit(&o.label, label_w);
-            let reason_room = cw.saturating_sub(4 + label_w + 2);
-            targets.push(Target {
-                row: out.len(),
-                x0: 2,
-                x1: 2 + cw,
-                hit: Hit::Option(i),
-            });
-            out.push(wrap(&[
+            let lab = width::fit(&cut_dots(&o.label, label_w), label_w);
+            let lead = vec![
                 seg(key_ink, format!("[{}] ", o.key)),
                 seg(if passed { Role::Faint } else { Role::Text }, lab),
                 seg(Role::Text, "  "),
-                seg(Role::Detail, cut_dots(&o.reason, reason_room)),
-            ]));
+            ];
+            for row in rows_after(lead, 4 + label_w + 2, &o.reason) {
+                targets.push(Target {
+                    row: out.len(),
+                    x0: 2,
+                    x1: 2 + cw,
+                    hit: Hit::Option(i),
+                });
+                out.push(row);
+            }
             if b.sends && i == shown {
-                out.push(wrap(&[
-                    seg(Role::Text, "    "),
-                    seg(Role::Faint, "sends: "),
-                    seg(Role::Detail, cut_dots(&o.words, cw.saturating_sub(11))),
-                ]));
+                let lead = vec![seg(Role::Text, "    "), seg(Role::Faint, "sends: ")];
+                out.extend(rows_after(lead, 11, &o.words));
             }
         }
         if b.pick
             && let Some(p) = &card.body.pick
         {
-            out.push(wrap(&[
+            let lead = vec![
                 seg(Role::Brand, format!("qass picks {}", p.key)),
-                seg(
-                    Role::Detail,
-                    format!(": {}", cut_dots(&p.reason, cw.saturating_sub(14))),
-                ),
-            ]));
+                seg(Role::Detail, ": "),
+            ];
+            out.extend(rows_after(lead, 14, &p.reason));
         }
         if b.gap_box {
             out.push(blank());
@@ -1029,7 +1103,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     View {
         rows: out,
         targets,
-        cursor: cursor.filter(|(r, _)| *r < rows),
+        cursor: cursor.filter(|(r, _)| *r <= content),
     }
 }
 
@@ -1075,6 +1149,54 @@ fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
         "ctrl-a i focuses this"
     };
     vec![seg(Role::Faint, cut_dots(keys, cw))]
+}
+
+/// `text` wrapped on words into rows of `cols` columns, at most `max` of them; a word longer than a
+/// row breaks on a character, and when text remains the last row ends in `\u{2026}`. With one row
+/// it is [`cut_dots`].
+fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
+    if max <= 1 || width::width(text) <= cols {
+        return vec![cut_dots(text, cols)];
+    }
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let chars: Vec<char> = word.chars().filter(|c| width::drawn(*c)).collect();
+        let w: usize = chars.iter().map(|c| width::columns(*c)).sum();
+        if w == 0 {
+            continue;
+        }
+        if used > 0 && used + 1 + w <= cols {
+            if let Some(r) = rows.last_mut() {
+                r.push(' ');
+            }
+            used += 1;
+        } else if used > 0 {
+            rows.push(String::new());
+            used = 0;
+        }
+        for c in chars {
+            let cw = width::columns(c);
+            if cw > cols {
+                continue;
+            }
+            if used + cw > cols {
+                rows.push(String::new());
+                used = 0;
+            }
+            if let Some(r) = rows.last_mut() {
+                r.push(c);
+            }
+            used += cw;
+        }
+    }
+    if rows.len() > max {
+        rows.truncate(max);
+        if let Some(last) = rows.last_mut() {
+            *last = cut_dots(&format!("{last}\u{2026}"), cols);
+        }
+    }
+    rows
 }
 
 /// `text` cut to `cols` columns with a closing `\u{2026}` when it did not fit.
@@ -1776,5 +1898,111 @@ mod tests {
         p.note_gone(&[row(1)], &[]);
         p.note_gone(&[row(9)], &[]);
         assert!(p.stale, "it came back and left again");
+    }
+
+    fn words(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("word{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn long_pane() -> Pane {
+        let mut c = card(1, "migrations", "open");
+        c.body.asks = words(24);
+        c.body.doing = words(12);
+        c.body.options[0].reason = words(10);
+        c.body.options[1].label = "a label far longer than a third of the column".into();
+        c.body.options[1].reason = format!("{} {}", "x".repeat(70), "\u{4e2d}".repeat(30));
+        let mut p = Pane::default();
+        p.take(vec![c], Vec::new());
+        p
+    }
+
+    #[test]
+    fn wrap_dots_wraps_on_words_and_ends_in_dots_only_when_text_is_left() {
+        assert_eq!(wrap_dots("ab cd ef", 5, 3), ["ab cd", "ef"]);
+        assert_eq!(wrap_dots("ab cd", 5, 3), ["ab cd"]);
+        assert_eq!(wrap_dots("abcdefgh ij", 4, 5), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_dots("ab cd ef gh ij", 5, 2), ["ab cd", "ef g\u{2026}"]);
+        assert_eq!(wrap_dots("ab cd ef gh", 5, 1), [cut_dots("ab cd ef gh", 5)]);
+        assert_eq!(
+            wrap_dots("\u{4e2d}\u{4e2d}\u{4e2d}", 4, 3),
+            ["\u{4e2d}\u{4e2d}", "\u{4e2d}"]
+        );
+        assert_eq!(
+            wrap_dots("\u{4e2d}x", 1, 3),
+            ["x"],
+            "a wide char that never fits is dropped"
+        );
+        assert_eq!(wrap_dots("", 5, 3), [""]);
+    }
+
+    #[test]
+    fn a_long_question_and_its_reasons_are_read_whole_when_the_pane_has_the_rows() {
+        let p = long_pane();
+        let t = text(&view(&p, &ctx(&[], &[]), 56, 44));
+        for n in 1..=24 {
+            assert!(t.contains(&format!("word{n:02}")), "question word {n}\n{t}");
+        }
+        assert!(!t.contains("word24\u{2026}"), "{t}");
+        for n in 1..=10 {
+            assert!(t.contains(&format!("word{n:02}")), "reason word {n}");
+        }
+    }
+
+    #[test]
+    fn a_short_pane_cuts_the_question_to_one_row_as_before() {
+        let p = long_pane();
+        let t = text(&view(&p, &ctx(&[], &[]), 56, 14));
+        assert!(t.contains("word01"), "{t}");
+        assert!(!t.contains("word24"), "{t}");
+        let question_rows = t
+            .lines()
+            .filter(|l| l.starts_with("\u{2502} word01"))
+            .count();
+        assert_eq!(question_rows, 1, "one question row\n{t}");
+    }
+
+    #[test]
+    fn long_cards_fit_every_size_and_keep_the_caret_off_the_key_line() {
+        for typing in [false, true] {
+            let mut p = long_pane();
+            p.focus = true;
+            p.typing = typing;
+            p.text = words(30);
+            for cols in 25..=80 {
+                for rows in 11..=60 {
+                    let v = view(&p, &ctx(&[], &[]), cols, rows);
+                    assert_eq!(v.rows.len(), rows, "{cols}x{rows}");
+                    for (i, r) in v.rows.iter().enumerate() {
+                        assert_eq!(width::width(&strip(r)), cols, "{cols}x{rows} row {i}");
+                    }
+                    assert!(v.targets.iter().all(|t| t.row < rows - 2 && t.x1 <= cols));
+                    if let Some((r, _)) = v.cursor {
+                        assert!(r <= rows - 3, "caret on row {r} of {rows} at {cols}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_later_row_of_a_wrapped_reason_hits_its_option() {
+        let p = long_pane();
+        let v = view(&p, &ctx(&[], &[]), 56, 44);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 56,
+            rows: 44,
+        };
+        let first = v
+            .rows
+            .iter()
+            .position(|r| strip(r).contains("[a] "))
+            .unwrap();
+        assert_eq!(hit_at(&v, rect, first, 10), Some(Hit::Option(0)));
+        assert_eq!(hit_at(&v, rect, first + 1, 10), Some(Hit::Option(0)));
     }
 }

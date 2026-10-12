@@ -81,6 +81,9 @@ pub struct Layout {
     /// set on a drawn copy, like `gap`; the root and its ratio are left as saved. With a gap, it
     /// is cut from the open pane on the edge facing the folded one.
     pub fold: Option<u32>,
+    /// Both root panes folded away: each a tile no columns wide, the questions taking the tab.
+    /// Only ever set on a drawn copy, like `fold`.
+    pub fold_all: bool,
     /// Columns taken from the board (both panes when they are stacked) for qass's rail: the tabs
     /// of the folded panes, the edge line and one blank column. Only ever set on a drawn copy,
     /// like `gap`, and cut after the split is measured, so the divider and every ratio are the
@@ -102,6 +105,7 @@ impl Layout {
             gap_second: false,
             questions: None,
             fold: None,
+            fold_all: false,
             rail: 0,
         }
     }
@@ -133,6 +137,7 @@ impl Layout {
                 _ => None,
             },
             fold: None,
+            fold_all: false,
             rail: 0,
         }
     }
@@ -481,7 +486,9 @@ impl Layout {
     /// against its own edge, the open pane the rest less the rail and the gap on the edge that
     /// faces the folded one. `None` without a fold on a root of two panes.
     fn folded(&self, area: Rect) -> Option<Vec<(u32, Rect)>> {
-        let fold = self.fold?;
+        if self.fold.is_none() && !self.fold_all {
+            return None;
+        }
         let Node::Split { first, second, .. } = &self.root else {
             return None;
         };
@@ -491,6 +498,29 @@ impl Layout {
             return None;
         };
         let inner = self.inner(area);
+        if self.fold_all {
+            return (inner.cols >= 3 + self.rail).then(|| {
+                vec![
+                    (
+                        *a,
+                        Rect {
+                            x: inner.x + self.rail,
+                            cols: 0,
+                            ..inner
+                        },
+                    ),
+                    (
+                        *b,
+                        Rect {
+                            x: inner.x + inner.cols,
+                            cols: 0,
+                            ..inner
+                        },
+                    ),
+                ]
+            });
+        }
+        let fold = self.fold?;
         if inner.cols < 3 + self.rail + self.gap || (fold != *a && fold != *b) {
             return None;
         }

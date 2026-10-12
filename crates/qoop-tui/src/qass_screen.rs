@@ -56,6 +56,14 @@ const BOARD_RATIO_H: f32 = 0.50;
 /// The questions column between the board and qass: the edge column the board's frame keeps,
 /// then the inbox at the width it is built for.
 pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
+/// The most the questions column grows to when the board has room to spare, so a card reads whole.
+const QUESTIONS_WIDE: usize = 60;
+
+/// The edge column and the questions at their default, given the `room` over the board's minimum
+/// (at least `QUESTIONS_GAP`): the default width, and half of the room beyond it up to `QUESTIONS_WIDE`.
+fn default_gap(room: usize) -> usize {
+    (QUESTIONS_GAP + (room - QUESTIONS_GAP) / 2).min(QUESTIONS_WIDE + 1)
+}
 /// The narrowest the questions column is dragged to, so a card still reads.
 pub const QUESTIONS_MIN: usize = 24;
 /// The columns the keys widen or narrow it by.
@@ -113,7 +121,7 @@ pub fn board_shape(
     let room = board - BOARD_MIN_COLS;
     let gap = match (questions, width) {
         (false, _) => 0,
-        (true, None) if room >= QUESTIONS_GAP => QUESTIONS_GAP,
+        (true, None) if room >= QUESTIONS_GAP => default_gap(room),
         (true, None) => 0,
         (true, Some(width)) => {
             let gap = (width + 1).min(room);
@@ -200,6 +208,8 @@ pub fn handle_of(qass: Rect, dir: Dir, board_first: bool) -> Option<Handle> {
 pub enum Fold {
     Board,
     Qass,
+    /// Both at once: the questions take the whole tab.
+    Both,
 }
 
 /// The questions' gap on qass's tab with a pane folded, the open pane `open_cols` wide (less the
@@ -212,7 +222,7 @@ pub fn fold_gap(open_cols: usize, board_open: bool, questions: bool) -> usize {
         QASS_MIN_COLS
     };
     if questions && open_cols >= min + QUESTIONS_GAP {
-        QUESTIONS_GAP
+        default_gap(open_cols - min)
     } else {
         0
     }
@@ -1115,6 +1125,37 @@ mod tests {
     }
 
     #[test]
+    fn the_questions_column_grows_with_the_room_and_never_loses_its_place() {
+        let stacked = (Dir::V, 0.70);
+        assert_eq!(
+            board_shape(161, stacked, true, None, true, 0).2,
+            QUESTIONS_GAP
+        );
+        // 180 columns: the board has 63 over its minimum, the column takes half of the 14 beyond its default.
+        assert_eq!(
+            board_shape(180, stacked, true, None, true, 0).2,
+            QUESTIONS_GAP + 7
+        );
+        assert_eq!(
+            board_shape(200, stacked, true, None, true, 0).2,
+            QUESTIONS_WIDE + 1
+        );
+        assert_eq!(
+            board_shape(400, stacked, true, None, true, 0).2,
+            QUESTIONS_WIDE + 1
+        );
+        for cols in 80..=400 {
+            let (dir, _, gap) = board_shape(cols, stacked, true, None, true, 0);
+            assert!(
+                dir != Dir::V || gap == 0 || (QUESTIONS_GAP..=QUESTIONS_WIDE + 1).contains(&gap)
+            );
+        }
+        assert_eq!(fold_gap(60 + QUESTIONS_GAP, true, true), QUESTIONS_GAP);
+        assert_eq!(fold_gap(60 + QUESTIONS_GAP - 1, true, true), 0);
+        assert_eq!(fold_gap(60 + 100, true, true), QUESTIONS_WIDE + 1);
+    }
+
+    #[test]
     fn the_plan_gives_the_terminal_the_inside_of_its_box() {
         // A tall pane: the full header takes 4 pane rows (its first 2 stand in the tab bar's),
         // then the terminal box and its two borders.
@@ -1707,7 +1748,8 @@ mod tests {
         assert_eq!(board_default(Dir::V, false), 1.0 - 0.70);
         assert_eq!(
             board_shape(161, stacked, true, None, false, 0),
-            (Dir::V, 1.0 - 0.70, QUESTIONS_GAP)
+            // The board has 51 over its minimum here: one column beyond the default is taken.
+            (Dir::V, 1.0 - 0.70, QUESTIONS_GAP + 1)
         );
         assert_eq!(
             board_shape(133, stacked, false, None, false, 0),
@@ -1717,7 +1759,7 @@ mod tests {
         // same number read as the board's share would not even fit the board.
         assert_eq!(
             board_shape(161, (Dir::V, 0.3), true, None, false, 0).2,
-            QUESTIONS_GAP
+            QUESTIONS_GAP + 1
         );
         assert_eq!(
             board_shape(161, (Dir::V, 0.3), false, None, true, 0),
@@ -1796,7 +1838,10 @@ mod tests {
             71
         );
         // Without a width, or without questions, nothing moves.
-        assert_eq!(board_shape(200, wide, true, None, true, 0).2, QUESTIONS_GAP);
+        assert_eq!(
+            board_shape(200, wide, true, None, true, 0).2,
+            QUESTIONS_WIDE + 1
+        );
         assert_eq!(board_shape(200, wide, false, Some(70), true, 0).2, 0);
     }
 
