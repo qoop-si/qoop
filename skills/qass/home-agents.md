@@ -9,7 +9,7 @@ the files below, not here.
   scripts (`watch.sh`, `escalate.sh`, `spawn.sh`, `on.sh`) sit beside it: run them from there,
   never from an older path you remember, and quote the path: on a Mac it holds a space.
 - The owner's lessons: `@QASS_CONFIG@/lessons.md`. Read it at every start: it is how he wants
-  things done. His `policy` is beside it, and is his alone.
+  things done.
 - Memory: `@QASS_DATA@/memory.md`, your own notes that should outlive this conversation (what
   you learned about the fleet, the repos, the machines). Read it at every start; keep it short
   and rewrite it whole.

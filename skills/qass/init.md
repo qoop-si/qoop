@@ -38,7 +38,7 @@ an agent on a remote: ask the owner for a local path. Then:
    testing and shipping words (test, staging, prod, deploy, local, browser, simulator, e2e,
    log, merge, and the same in the language he writes in), keeping the 200 most telling: where
    it runs, how he checks it, what proof he wants, what he forbids. They may only narrow the
-   draft or add a prohibition, never add a verb `policy` does not grant. A key, token, password
+   draft or add a prohibition, never allow more than qoop's own rules. A key, token, password
    or URL with credentials never goes into a draft (it reaches his phone).
 3. If `.qoop/workflow.md` exists, never overwrite it: compare it with what you read and ask
    only about what drifted (a check renamed, a step no longer true).

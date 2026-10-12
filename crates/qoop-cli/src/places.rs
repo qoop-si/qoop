@@ -48,7 +48,7 @@ fn places() -> Vec<Place> {
         },
         Place {
             name: "qass-config",
-            what: "qass: your policy and the lessons it keeps",
+            what: "qass: the lessons it keeps from you",
             path: Some(paths::qass_config_dir()),
         },
         Place {

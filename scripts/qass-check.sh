@@ -18,7 +18,7 @@ render() { # home -> the skill's dir
     local to="$tmp/skill-$(basename "$1")"
     mkdir -p "$to"
     for f in "$root"/skills/qass/*; do
-        sed -e "s|@QASS_DATA@|$1/.qass|g" -e "s|@QASS_CONFIG@|$1/.qass|g" "$f" > "$to/$(basename "$f")"
+        sed -e "s|@QASS_DATA@|$1/.qass|g" -e "s|@QASS_CONFIG@|$1/.qass|g" -e "s|@QOOP_CONFIG@|$1|g" "$f" > "$to/$(basename "$f")"
     done
     chmod +x "$to"/*.sh
     echo "$to"
@@ -581,20 +581,24 @@ grep -q 'the Fable family is not used' "$tmp/said" || { echo "the config's fallb
 rm -rf "$tmp/home/repo" "$tmp/started" "$tmp/config.json" "$tmp/said" "$tmp/printed"
 
 # Card and proposal numbers come from one count that starts above every number goals.md shows,
-# and never hand the same number out twice.
+# and never hand the same number out twice. A qoop that answers nothing stands in for the inbox,
+# so the numbers do not depend on the inbox of the machine the check runs on.
+mkdir -p "$tmp/nobox"
+printf '#!/bin/sh\nexit 1\n' > "$tmp/nobox/qoop"
+chmod +x "$tmp/nobox/qoop"
 rm -f "$tmp/home/.qass/next-card"
 printf -- '# Waiting on you\nE53 · T5 · cv\n- P90 · wend: send x\n' > "$tmp/home/.qass/goals.md"
-got="$("$skill_w/escalate.sh" next E) $("$skill_w/escalate.sh" next P) $("$skill_w/escalate.sh" next E)"
+got="$(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next E) $(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next P) $(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next E)"
 [ "$got" = "E91 P92 E93" ] || { echo "numbers: $got"; exit 1; }
 printf -- '# Waiting on you\n' > "$tmp/home/.qass/goals.md"
-got="$("$skill_w/escalate.sh" next E)"
+got="$(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next E)"
 [ "$got" = "E94" ] || { echo "a removed card freed its number: $got"; exit 1; }
 rm -f "$tmp/home/.qass/next-card" "$tmp/home/.qass/goals.md"
-got="$("$skill_w/escalate.sh" next E)"
+got="$(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next E)"
 [ "$got" = "E1" ] || { echo "a first count: $got"; exit 1; }
 echo half > "$tmp/home/.qass/next-card"
 printf -- 'E2E tests over HTTP20, then card E7\n' > "$tmp/home/.qass/goals.md"
-got="$("$skill_w/escalate.sh" next E)"
+got="$(PATH="$tmp/nobox:$PATH" "$skill_w/escalate.sh" next E)"
 [ "$got" = "E8" ] || { echo "a broken count, or a word read as a card: $got"; exit 1; }
 
 # ---- routine, silent by default (his answer to E81) -------------------------------------------

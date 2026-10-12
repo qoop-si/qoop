@@ -256,10 +256,13 @@ default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
 `claudes = "claude --model sonnet"`), or shows or wakes the one you have. Close it with the
 `x` on its row.
 Its rules live in the skill itself: what it answers alone, what it asks you, and what it
-never does. Your file
-`$(qoop paths qass-config)/policy` holds `mode propose` (it writes to an agent only after
-your "ok <name>") or `mode auto`, and per repository grants such as
-`grant /path/to/repo commit`. When you correct it, it keeps the rule in
+never does. `qass writes` in `qoop settings` (`[qass] mode` in config.toml) is `propose` (it
+writes to an agent only after your "ok <name>") or `auto`. In a repository whose GitHub
+`origin` belongs to the login `gh` is signed in as, every agent is told the standing way
+(`qoop task rules`): commit through /commit, push, open a PR, rebase-and-merge its own PR,
+install and clean up; elsewhere it asks first, and delete, release, production, money and
+anything external always ask. A repository's `AGENTS.md` may ask for more, never allow
+more. When you correct it, it keeps the rule in
 `$(qoop paths qass-config)/lessons.md` (2,000 characters at most, loaded at every start); a lesson can only
 make it more careful, never let it act alone where it would have asked you. `qoop paths`
 lists every folder qoop writes to and how big each is.

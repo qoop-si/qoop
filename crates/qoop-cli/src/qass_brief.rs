@@ -77,9 +77,11 @@ struct Facts {
     limit: u32,
     /// The agent's open card: its number, handle and status.
     card: Option<(String, String, String)>,
-    mode: &'static str,
-    /// The verbs granted for the agent's repository; `None` when that repository is unknown.
-    granted: Option<Vec<String>>,
+    /// `[qass] mode` from config.toml: `propose` or `auto`.
+    mode: String,
+    /// `owner/name` when the agent works in the owner's own repository
+    /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
+    own: Option<String>,
     now: i64,
     /// Seconds east of UTC, for a clock time he reads.
     offset: i64,
@@ -136,48 +138,6 @@ fn review_limit(text: &str) -> Option<u32> {
         let (n, rest) = rest.split_once(' ')?;
         rest.starts_with("review rounds").then(|| n.parse().ok())?
     })
-}
-
-/// The `mode` and, for `root` (canonical), the verbs granted there. The mode is `auto` only
-/// when its line says exactly that (any case, a `#` comment after it aside), else `propose`,
-/// with no file too. A grant's path is all between `grant` and its last word, so a path may
-/// hold spaces.
-fn policy(text: &str, root: Option<&Path>) -> (&'static str, Option<Vec<String>>) {
-    let mut mode = "propose";
-    let mut verbs = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some(m) = line.strip_prefix("mode ") {
-            let said = m.split('#').next().unwrap_or("").trim();
-            mode = if said.eq_ignore_ascii_case("auto") {
-                "auto"
-            } else {
-                "propose"
-            };
-        } else if let Some(rest) = line.strip_prefix("grant ")
-            && let Some((path, verb)) = rest.trim().rsplit_once(' ')
-            && let Some(root) = root
-        {
-            let path = Path::new(path.trim());
-            let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            if path == root && !verbs.iter().any(|v| v == verb) {
-                verbs.push(verb.to_string());
-            }
-        }
-    }
-    (mode, root.map(|_| verbs))
-}
-
-/// Which of the skill's three prompt endings the grants allow.
-fn ending(granted: &[String]) -> &'static str {
-    let has = |v: &str| granted.iter().any(|g| g == v);
-    match (
-        has("commit") && has("push-branch") && has("open-pr"),
-        has("merge-own-pr"),
-    ) {
-        (true, true) => "merge",
-        (true, false) => "pr",
-        _ => "none",
-    }
 }
 
 pub(crate) fn clock(at: i64, offset: i64) -> String {
@@ -343,17 +303,15 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         None => "card: none open".into(),
     });
 
-    let mode = f.mode;
-    let end = f.granted.as_deref().map_or("none", ending);
-    lines.push(match &f.granted {
-        Some(v) if v.is_empty() => {
-            format!("policy: mode {mode}; nothing granted here; ending none")
-        }
-        Some(v) => format!(
-            "policy: mode {mode}; granted here: {}; ending {end}",
-            v.join(" ")
+    let mode = f.mode.as_str();
+    // Which of the skill's three prompt endings: merge in the owner's own repository, else the
+    // strict one; the middle one (`pr`) where that repository's files ask before merging.
+    let end = if f.own.is_some() { "merge" } else { "none" };
+    lines.push(match f.own.as_deref() {
+        Some(r) => format!(
+            "repo: own {r}; mode {mode}; ending merge (pr if a repo file asks before merging)"
         ),
-        None => format!("policy: mode {mode}; repo unknown: no grant applies; ending none"),
+        None => format!("repo: not own; mode {mode}; ending none"),
     });
 
     let blocked = f.state == "blocked";
@@ -393,7 +351,7 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "review_limit": f.limit,
         "card": f.card.as_ref().map(|c| &c.0),
         "mode": mode,
-        "granted": f.granted,
+        "own_repo": f.own,
         "ending": end,
         "blocked": blocked,
         "allowed": allowed,
@@ -476,7 +434,7 @@ fn remote_line(target: &str) -> Option<(&str, String)> {
     Some((
         remote,
         format!(
-            "{target}: an agent on {remote}; read it with `on.sh {remote}` as today (no grant reaches a remote)"
+            "{target}: an agent on {remote}; read it with `on.sh {remote}` as today (the strict ending only)"
         ),
     ))
 }
@@ -570,9 +528,8 @@ fn gather(n: u32) -> std::io::Result<Facts> {
     let text = |key: &str| row[key].as_str().filter(|s| !s.is_empty());
     let name = head_name(row, n);
     // The repository the agent works in, by its main checkout; none when its folder is gone.
-    let root = text("cwd")
-        .map(Path::new)
-        .filter(|p| p.is_dir())
+    let cwd = text("cwd").map(Path::new).filter(|p| p.is_dir());
+    let root = cwd
         .and_then(|p| crate::worktree::repo_of(p).ok())
         .and_then(|r| r.root.canonicalize().ok());
     let workflow = |p: &Path| std::fs::read_to_string(p).ok();
@@ -586,9 +543,6 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         })
         .and_then(|t| review_limit(&t))
         .unwrap_or(ROUNDS);
-    let policy_text =
-        std::fs::read_to_string(paths::qass_config_dir().join("policy")).unwrap_or_default();
-    let (mode, granted) = policy(&policy_text, root.as_deref());
     let tab = format!("T{n}");
     let card = json(&["ask", "ls", "--json"]).and_then(|v| {
         v["live"].as_array()?.iter().find_map(|c| {
@@ -621,8 +575,8 @@ fn gather(n: u32) -> std::io::Result<Facts> {
             .map(|id| task_of(id, now).ok_or(id)),
         limit,
         card,
-        mode,
-        granted,
+        mode: qoop_tui::config::read().qass_mode,
+        own: cwd.and_then(crate::worktree::own_repo),
         now,
         offset: utc_offset(),
     })
@@ -678,7 +632,7 @@ mod tests {
             typed_here: Some(Vec::new()),
             typed_to_qass: Some(Vec::new()),
             limit: ROUNDS,
-            mode: "auto",
+            mode: "auto".into(),
             now: NOW,
             ..Facts::default()
         }
@@ -887,38 +841,33 @@ mod tests {
         assert_eq!(review_limit("at most 3 reviewers"), None);
     }
 
-    /// A grant counts for the agent's repository, its path spaced or not canonical alike;
-    /// the verbs give the ending, and `mode propose` allows proposing only.
+    /// The owner's own repository gets the merge ending, any other the strict one; `propose`
+    /// allows proposing only.
     #[test]
-    fn a_grant_with_spaces_in_its_path_counts() {
-        let dir = tempfile::tempdir().expect("dir");
-        let repo = dir.path().join("my repo");
-        std::fs::create_dir_all(&repo).expect("repo");
-        let root = repo.canonicalize().expect("canonical");
-        let text = format!(
-            "mode auto\ngrant {p} commit\ngrant {p} push-branch\ngrant {p} open-pr\ngrant /elsewhere merge-own-pr\n",
-            p = repo.display()
-        );
-        let (mode, granted) = policy(&text, Some(&root));
-        assert_eq!(mode, "auto");
-        assert_eq!(
-            granted.clone().expect("known"),
-            ["commit", "push-branch", "open-pr"]
-        );
+    fn the_repo_line_gives_the_ending() {
         let mut f = facts();
-        f.mode = mode;
-        f.granted = granted;
+        f.own = Some("pat/x".into());
         let out = brief(&f);
         assert!(
-            out.contains("granted here: commit push-branch open-pr; ending pr"),
+            out.contains(
+                "\nrepo: own pat/x; mode auto; ending merge (pr if a repo file asks before merging)\n"
+            ),
             "{out}"
         );
-        assert!(out.ends_with("Allowed now: write (ending pr)"), "{out}");
-        f.mode = "propose";
+        assert!(out.ends_with("Allowed now: write (ending merge)"), "{out}");
+        assert_eq!(compose(&f).1["own_repo"], "pat/x");
+        assert_eq!(compose(&f).1["ending"], "merge");
+        f.mode = "propose".into();
         assert!(brief(&f).ends_with("Allowed now: propose (mode propose)"));
-        // The agent's folder is gone: no repository, no grant.
-        f.granted = policy(&text, None).1;
-        assert!(brief(&f).contains("repo unknown: no grant applies; ending none"));
+        f.own = None;
+        f.mode = "auto".into();
+        let out = brief(&f);
+        assert!(
+            out.contains("\nrepo: not own; mode auto; ending none\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("Allowed now: write (ending none)"), "{out}");
+        assert!(!out.contains("policy"), "{out}");
     }
 
     /// A remote agent is read there, as today.
@@ -961,21 +910,6 @@ mod tests {
             out.contains("screen: blocked on a menu (rule permission_prompt)"),
             "{out}"
         );
-    }
-
-    /// Propose is the default: no policy, any other word, any case of it; auto only when the
-    /// line says exactly auto, a comment after it aside.
-    #[test]
-    fn the_mode_is_auto_only_when_it_says_so() {
-        for (text, mode) in [
-            ("", "propose"),
-            ("mode Propose\n", "propose"),
-            ("mode automatic\n", "propose"),
-            ("mode auto # the owner, 2026-10-12\n", "auto"),
-            ("mode AUTO\n", "auto"),
-        ] {
-            assert_eq!(policy(text, None).0, mode, "{text:?}");
-        }
     }
 
     /// With qass's terminal unknown its writes cannot be counted: no write now.

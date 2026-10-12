@@ -318,7 +318,11 @@ turn(payload, "UserPromptSubmit", "Stop")
 if name in ("SessionStart", "UserPromptSubmit"):
     ask = ["qoop", "task", "rules"] + (["--turn"] if name == "UserPromptSubmit" else [])
     try:
-        got = subprocess.run(ask, capture_output=True, timeout=2, text=True)
+        # Run where the agent works (the payload cwd), as the other calls do: the repo
+        # block follows it.
+        here = str(payload.get("cwd") or "")
+        here = here if os.path.isdir(here) else None
+        got = subprocess.run(ask, capture_output=True, timeout=2, text=True, cwd=here)
         rules = got.stdout.strip()
         if got.returncode == 0 and rules:
             sys.stdout.write(rules + "\n")

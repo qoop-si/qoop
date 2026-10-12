@@ -260,7 +260,7 @@ fn a_fresh_home_has_every_box_open_and_status_writes_nothing() {
     );
     // api-1, api and build; not github.com, `*` or the odd name.
     assert!(home.item(3).contains("3 found, 3 not decided"), "{out}");
-    assert!(out.contains("[ ] 4 "), "{out}");
+    assert!(home.item(4).contains("after your projects"), "{out}");
     assert!(home.item(5).contains("not in this build"), "{out}");
     assert!(out.contains("[ ] 6 "), "{out}");
     assert!(out.ends_with("Next: type 1 (under a minute).\n"), "{out}");
@@ -415,43 +415,38 @@ fn a_remote_counts_by_user_and_hostname_or_by_the_host_after_an_at() {
     assert!(!home.setup(&["skip-host", "bad name"]).0);
 }
 
+/// Item 4 asks nothing: it shows, for each picked project, whether qoop counts it the
+/// person's own repo (its GitHub origin's owner is the login `gh` keeps, any case).
 #[test]
-fn limits_tick_from_a_valid_policy_line_only() {
+fn what_i_may_do_shows_own_repo_for_each_picked_project() {
     let home = Home::new();
     let (api, web, _) = home.repos();
-    assert!(home.setup(&["pick", s(&api)]).0);
-    let policy = "c/qoop/qass/policy";
-    home.write(policy, "mode nonsense\n");
-    assert!(home.item(4).starts_with("[ ]"));
-    assert!(home.item(4).contains("line 1: not understood"));
-    home.write(policy, &format!("grant {} deploy\n", s(&api)));
-    assert!(home.item(4).starts_with("[ ]"), "a bad verb");
-    home.write(policy, &format!("grant {} commit\n", s(&web)));
     let line = home.item(4);
     assert!(
-        line.starts_with("[ ]") && line.contains("not a picked project"),
+        line.starts_with("[-]") && line.contains("after your projects"),
         "{line}"
     );
-    home.write(policy, "mode propose\nmode auto\n");
+    home.git(
+        &api,
+        &["remote", "add", "origin", "git@github.com:Me/api.git"],
+    );
+    home.git(
+        &web,
+        &["remote", "add", "origin", "https://github.com/acme/web"],
+    );
+    assert!(home.setup(&["pick", s(&api)]).0 && home.setup(&["pick", s(&web)]).0);
+    // No `gh` on the path: nothing is anyone's own.
+    let line = home.item(4);
+    assert!(line.contains("own repo: api no, web no"), "{line}");
+    home.write("bin/gh", "#!/bin/sh\necho me\n");
+    std::fs::set_permissions(home.at("bin/gh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
     let line = home.item(4);
     assert!(
-        line.starts_with("[ ]") && line.contains("more than one mode line"),
+        line.starts_with("[x]") && line.contains("own repo: api yes, web no"),
         "{line}"
     );
-    home.write(policy, &format!("# mine\n\ngrant {} commit\n", s(&api)));
-    assert!(home.item(4).starts_with("[x]"), "{}", home.status());
-    home.write(policy, "grant . commit\n");
-    let line = home.item(4);
-    assert!(
-        line.starts_with("[ ]") && line.contains("not an absolute path"),
-        "{line}"
-    );
-    home.write(policy, "mode propose\nwhatever\n");
-    let line = home.item(4);
-    assert!(
-        line.starts_with("[x]") && line.contains("line 2: not understood"),
-        "{line}"
-    );
+    assert!(!home.status().contains("policy"));
 }
 
 #[test]
@@ -526,7 +521,7 @@ fn a_skipped_box_is_never_shown_done_and_setup_ends_when_none_is_open() {
         "the phone was not measured: no minutes"
     );
     assert!(home.setup(&["unskip", "4"]).0);
-    assert!(home.status().ends_with("Next: type 4 (about a minute).\n"));
+    assert!(home.item(4).starts_with("[x] 4 "), "nothing to answer");
     for (skip, unskip) in [("4", "6"), ("5", "6")] {
         assert!(home.setup(&["skip", skip]).0 && home.setup(&["unskip", unskip]).0);
     }

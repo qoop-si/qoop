@@ -2,7 +2,7 @@
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"],
-    "deny": ["Edit(/@QASS_CONFIG@/policy)", "Edit(/@QASS_DATA@/.claude/settings.json)"]
+    "deny": ["Bash(qoop config set qass.mode:*)", "Edit(/@QOOP_CONFIG@/config.toml)", "Write(/@QOOP_CONFIG@/config.toml)", "Edit(/@QASS_DATA@/.claude/settings.json)"]
   },
   "hooks": {
     "Stop": [

@@ -201,8 +201,8 @@ pub fn logs_dir() -> Option<PathBuf> {
     )
 }
 
-/// qass, the assistant over the other agents: the files its owner writes (its `policy`,
-/// the `lessons` it keeps from him), beside the rest of his qoop settings.
+/// qass, the assistant over the other agents: the file it keeps from its owner (the
+/// `lessons`), beside the rest of his qoop settings.
 pub fn qass_config_dir() -> PathBuf {
     config_dir().join("qass")
 }

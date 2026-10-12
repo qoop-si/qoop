@@ -1594,6 +1594,56 @@ mod tests {
         }
     }
 
+    /// `qoop task rules` runs where the agent works, the payload's `cwd`, as the other calls
+    /// do, so its repo block is that repository's; not where the hook happened to start.
+    #[test]
+    fn the_rules_run_in_the_payloads_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let repo = dir.path().join("work repo");
+        let elsewhere = dir.path().join("elsewhere");
+        for d in [&repo, &elsewhere] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let repo = repo.canonicalize().expect("real path");
+        let fake = dir.path().join("qoop");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1 $2\" = \"task rules\" ] && echo \"rules in $(pwd -P)\"\nexit 0\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let payload = serde_json::json!({"hook_event_name": "SessionStart", "cwd": repo});
+        for (agent, arg) in [("claude", ""), ("codex", "working"), ("gemini", "working")] {
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .arg(arg)
+                .current_dir(&elsewhere)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("payload");
+            let out = child.wait_with_output().expect("wait");
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                said.contains(&format!("rules in {}", repo.display())),
+                "{agent}: {said:?}"
+            );
+        }
+    }
+
     /// A turn's end carries its last paragraph as one line, markdown off, read from the
     /// transcript, so the daemon can tell whether it asks the owner and put it in his inbox; a
     /// long one keeps both ends within the label's 120 characters.

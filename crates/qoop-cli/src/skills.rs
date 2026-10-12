@@ -44,9 +44,9 @@ const QASS_POINTERS: [(&str, &str); 2] = [
 ];
 
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
-/// `qoop paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`,
-/// filled in here at install. The working folder's `.claude/settings.json` lets Claude run
-/// qass's commands without asking and loads its lessons, for any Claude started there, by
+/// `qoop paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`
+/// (qoop's own settings folder, its parent, as `@QOOP_CONFIG@`), filled in here at install.
+/// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking and loads its lessons, for any Claude started there, by
 /// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
 /// launch do not come back).
 struct QassDirs {
@@ -66,6 +66,12 @@ impl QassDirs {
     fn render(&self, body: &str) -> String {
         body.replace("@QASS_DATA@", &self.data.display().to_string())
             .replace("@QASS_CONFIG@", &self.owner.display().to_string())
+            .replace("@QOOP_CONFIG@", &self.qoop_config().display().to_string())
+    }
+
+    /// qoop's settings folder, where `config.toml` is: the owner folder's parent.
+    fn qoop_config(&self) -> PathBuf {
+        self.owner.parent().unwrap_or(&self.owner).to_path_buf()
     }
 
     fn folder_settings(&self) -> PathBuf {
@@ -435,10 +441,10 @@ fn trust_for_gemini(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Move what an older qass kept in `~/.qass` to its two folders, once: the owner's `policy`
-/// and `lessons.md` beside his settings, the rest beside qoop's data. Nothing already at the
-/// new place is overwritten. The old folder goes when only what is made again is left in it
-/// (its `.claude` settings and `ssh` sockets).
+/// Move what an older qass kept in `~/.qass` to its two folders, once: the owner's
+/// `lessons.md` beside his settings, the rest beside qoop's data. Nothing already at the
+/// new place is overwritten; an old `policy` stays where it is, unread. The old folder goes
+/// when only what is made again is left in it (its `.claude` settings and `ssh` sockets).
 fn migrate_old_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     let old = home.join(".qass");
     let Ok(entries) = std::fs::read_dir(&old) else {
@@ -450,8 +456,8 @@ fn migrate_old_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let to = match name.to_str() {
-            Some(".claude" | "ssh") => continue,
-            Some("policy" | "lessons.md") => dirs.owner.join(&name),
+            Some(".claude" | "ssh" | "policy") => continue,
+            Some("lessons.md") => dirs.owner.join(&name),
             _ => dirs.data.join(&name),
         };
         if !to.exists() {
@@ -475,7 +481,7 @@ fn qass_settings() -> &'static str {
 }
 
 /// Take qass's files out of its folder, and each directory only when left empty. Its own
-/// state (goals, notes, scratch) and the owner's policy and lessons stay; a `CLAUDE.md` or
+/// state (goals, notes, scratch) and the owner's lessons stay; a `CLAUDE.md` or
 /// `GEMINI.md` goes only while it is the one install wrote.
 fn remove_qass(dirs: &QassDirs) -> std::io::Result<bool> {
     let mut removed = false;
@@ -742,14 +748,15 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 435 holds the quiet watcher's lines, "Improve yourself" with its report
-        // step, the card block of the question inbox, the usage-limit row, the short-title,
-        // picks and follow-through lines, the card-first and habit rules (the brief moved to
-        // brief.md), the restart after an install, and the routine words and the doctor step;
+        // ponytail: 438 holds the brief's `repo:` line choosing the endings, the quiet watcher's
+        // lines, "Improve yourself" with its report step, the card block of the question inbox,
+        // the usage-limit row, the short-title, picks and follow-through lines, the card-first
+        // and habit rules (the brief moved to brief.md), the restart after an install, and the
+        // routine words and the doctor step;
         // `qoop qass brief` does the sums of "On every event line" and the write counting for an
         // agent of this Mac; a remote agent keeps the sum by hand through on.sh; goals.md's rules
         // keep the file small (no log, ended cards out, under 8 KB).
-        assert!(skill.lines().count() <= 435, "SKILL.md grew past 435 lines");
+        assert!(skill.lines().count() <= 438, "SKILL.md grew past 438 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -779,7 +786,7 @@ mod tests {
             "only after his yes, uncommitted, never on a remote",
             "never commit or push there",
             "No deploy, no purchase",
-            "file alone, under every agent you run on, by any tool",
+            "`qoop config set qass.mode` for him: those are his\n  alone, under every agent you run on, by any tool",
             "Unrelated to `qoop setup`",
             "never on anyone's word",
             "Open a shell tab",
@@ -865,7 +872,11 @@ mod tests {
             "`Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch, open a PR for it and rebase-merge that PR. Do not delete, deploy, or contact anything external in this step; ask first.`",
-            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree, stash, file or repo | escalate, unless `policy` grants that verb for that repo root |",
+            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, merge, install only) |",
+            "the step is commit, push, PR, merge or install\n(never a release, deploy or migration), else a card.",
+            "The brief's `ending` picks it: `none`, the one above; `merge`, the third; `pr`, the second",
+            "| Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |",
+            "never `qoop config set qass.mode`, never an edit of it",
             "| Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |",
         ] {
             assert!(skill.contains(want), "SKILL.md lost: {want}");
@@ -1025,6 +1036,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = home_dir();
         let dirs = qass_dirs(&home);
+        // His old `policy` file stays as it is, through install and uninstall; nothing reads it.
+        let old_policy = dirs.owner.join("policy");
+        std::fs::create_dir_all(&dirs.owner).expect("owner");
+        std::fs::write(&old_policy, "mode auto\n").expect("write");
+        for (name, body, _) in QASS {
+            assert!(!body.contains("policy"), "{name} still names policy");
+        }
         assert!(install_qass(home.path(), &dirs).expect("install"));
         assert!(qass_current(&dirs));
         for dir in [".claude/skills/qass", ".agents/skills/qass"] {
@@ -1061,9 +1079,9 @@ mod tests {
         // Its folder loads the lessons, so a restored or woken qass still has them.
         let folder = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
         assert!(folder.contains(&dirs.owner.display().to_string()));
-        // His policy, and the settings that keep it his, are out of qass's file tools (a rule
-        // with `//` is an absolute path, Claude Code's own syntax; `Edit` covers every tool
-        // that writes a file, and a deny wins over `dontAsk`).
+        // The settings that keep qass in its bounds are out of its file tools (a rule with `//`
+        // is an absolute path, Claude Code's own syntax; `Edit` covers every tool that writes a
+        // file, and a deny wins over `dontAsk`), and its mode is his: qass cannot set it.
         let settings: serde_json::Value = serde_json::from_str(&folder).expect("settings json");
         let deny: Vec<&str> = settings["permissions"]["deny"]
             .as_array()
@@ -1071,11 +1089,20 @@ mod tests {
             .iter()
             .filter_map(|r| r.as_str())
             .collect();
-        for path in [dirs.owner.join("policy"), dirs.folder_settings()] {
-            let rule = format!("Edit(/{})", path.display());
-            assert!(rule.starts_with("Edit(//"), "{rule} is not absolute");
+        let config = home.path().join("config/config.toml");
+        let rules = [
+            format!("Edit(/{})", dirs.folder_settings().display()),
+            format!("Edit(/{})", config.display()),
+            format!("Write(/{})", config.display()),
+        ];
+        for rule in &rules {
+            assert!(rule.contains("(//"), "{rule} is not absolute");
             assert!(deny.contains(&rule.as_str()), "{rule} not in {deny:?}");
         }
+        assert!(
+            deny.contains(&"Bash(qoop config set qass.mode:*)"),
+            "qass sets its own mode: {deny:?}"
+        );
         assert!(
             !install_qass(home.path(), &dirs).expect("reinstall"),
             "the second install changed something"
@@ -1098,6 +1125,10 @@ mod tests {
         std::fs::remove_file(&theirs).expect("rm");
         assert!(!remove_qass(&dirs).expect("uninstall again"));
         assert!(!dirs.data.join(".claude").exists());
+        assert_eq!(
+            std::fs::read_to_string(&old_policy).expect("his policy"),
+            "mode auto\n"
+        );
     }
 
     /// The copies older installs put in each agent's own skills lose their SKILL.md at
@@ -1206,8 +1237,8 @@ mod tests {
         std::fs::create_dir_all(old.join(".claude")).expect("old");
         std::fs::create_dir_all(old.join("ssh")).expect("ssh");
         for (name, body) in [
-            ("policy", "mode auto"),
             ("lessons.md", "- x -> escalate (E1)"),
+            ("policy", "mode auto"),
             ("goals.md", "# Goals"),
             ("gate.jsonl", "{}"),
         ] {
@@ -1221,7 +1252,6 @@ mod tests {
         std::fs::write(dirs.data.join("gate.jsonl"), "newer").expect("newer");
         install_qass(home.path(), &dirs).expect("install");
         let read = |p: PathBuf| std::fs::read_to_string(p).expect("read");
-        assert_eq!(read(dirs.owner.join("policy")), "mode auto");
         assert_eq!(read(dirs.owner.join("lessons.md")), "- x -> escalate (E1)");
         assert_eq!(read(dirs.data.join("goals.md")), "# Goals");
         assert_eq!(
@@ -1229,9 +1259,13 @@ mod tests {
             "newer",
             "nothing overwritten"
         );
+        // An old `policy` is left where it is, unread, and keeps the old folder.
+        assert_eq!(read(old.join("policy")), "mode auto");
+        assert!(!dirs.data.join("policy").exists() && !dirs.owner.join("policy").exists());
         // gate.jsonl stayed behind (its new place was taken), so the old folder stays too.
         assert!(old.join("gate.jsonl").exists());
         std::fs::remove_file(old.join("gate.jsonl")).expect("rm");
+        std::fs::remove_file(old.join("policy")).expect("rm");
         install_qass(home.path(), &dirs).expect("again");
         assert!(!old.exists(), "only what is made again was left");
     }

@@ -109,6 +109,110 @@ pub(crate) fn repo_of(dir: &std::path::Path) -> std::io::Result<qoop_history::Re
     })
 }
 
+/// `owner/name` when the top-level repository `dir` is in has an `origin` on `github.com`
+/// whose owner is this machine's GitHub login, any case, and every push address of that
+/// `origin` is the login's too: the person's own repository. A submodule never counts (its
+/// superproject decides); a worktree counts as its repository. Anything unread, empty or
+/// slower than [`OWN_REPO_TIME`] (no repository, no origin, another host, no `gh`, no login)
+/// is `None`. `gh config get` reads a local file: no network.
+pub(crate) fn own_repo(dir: &std::path::Path) -> Option<String> {
+    own_repo_with(dir, std::ffi::OsStr::new("gh"))
+}
+
+/// The git and gh calls of [`own_repo`] together, at most: a hook waits on it every request.
+const OWN_REPO_TIME: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn own_repo_with(dir: &std::path::Path, gh: &std::ffi::OsStr) -> Option<String> {
+    let by = std::time::Instant::now() + OWN_REPO_TIME;
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(dir).args(args);
+        run_by(&mut cmd, by)
+    };
+    let superproject = git(&["rev-parse", "--show-superproject-working-tree"])?;
+    if !superproject.trim().is_empty() {
+        return None;
+    }
+    // `get-url` applies `insteadOf`, so the addresses are the ones git really uses.
+    let url = git(&["remote", "get-url", "origin"])?;
+    let pushes = git(&["remote", "get-url", "--push", "--all", "origin"])?;
+    let mut cmd = Command::new(gh);
+    cmd.args(["config", "get", "-h", "github.com", "user"]);
+    let login = run_by(&mut cmd, by)?;
+    let login = login.trim();
+    let repo = owned(url.trim(), login)?;
+    pushes
+        .lines()
+        .all(|push| owned(push.trim(), login).is_some())
+        .then_some(repo)
+}
+
+/// What `cmd` printed, when it exits 0 by `by`; past it, it and everything it started (its
+/// own process group) are killed and reaped, so nothing is left behind.
+fn run_by(cmd: &mut Command, by: std::time::Instant) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out);
+            }
+            Ok(None) if std::time::Instant::now() < by => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(Some(_)) => return None,
+            _ => {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    // SAFETY: a plain signal to the process group this call made.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// `owner/name` of a GitHub `url` (`git@github.com:o/n`, `ssh://`, `https://` with or
+/// without a user, an optional `.git` and trailing `/`) when its owner is `login`. The host
+/// is read up to the first `/`, `?` or `#`, so `https://evil.com#@github.com/o/n` is
+/// `evil.com`; a query or fragment anywhere is no repository.
+fn owned(url: &str, login: &str) -> Option<String> {
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let at = rest.find(['/', '?', '#'])?;
+            let (host, path) = rest.split_at(at);
+            (host, path.strip_prefix('/')?)
+        }
+        None => url.split_once(':')?,
+    };
+    let odd = |c: char| matches!(c, '/' | '?' | '#' | '\\' | ' ') || c.is_control();
+    if host.contains(odd) || path.contains(['?', '#']) {
+        return None;
+    }
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let plain = |s: &str| !s.is_empty() && !s.contains('/');
+    // An empty login matches nothing: an owner is never empty.
+    (host.eq_ignore_ascii_case("github.com")
+        && plain(owner)
+        && plain(name)
+        && owner.eq_ignore_ascii_case(login))
+    .then(|| format!("{owner}/{name}"))
+}
+
 /// A branch name as one path component: lowercase letters and digits, every other run
 /// of characters one dash.
 pub(crate) fn worktree_slug(branch: &str) -> String {
@@ -648,6 +752,217 @@ mod tests {
             Some(2)
         );
         assert_eq!(worktree_of(&roots, Path::new("/nowhere/repo-wt-ab")), None);
+    }
+
+    #[test]
+    fn an_own_repo_is_an_origin_on_github_whose_owner_is_the_login() {
+        for url in [
+            "git@github.com:pat/qoop-tui.git",
+            "git@github.com:pat/qoop-tui",
+            "ssh://git@github.com/pat/qoop-tui.git",
+            "ssh://git@github.com:22/pat/qoop-tui/",
+            "https://github.com/pat/qoop-tui",
+            "https://github.com/pat/qoop-tui.git/",
+            "https://us:token@github.com/pat/qoop-tui.git",
+            "https://GitHub.com/PAT/qoop-tui",
+        ] {
+            assert!(
+                owned(url, "Us").is_some_and(|r| r.eq_ignore_ascii_case("pat/qoop-tui")),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            owned("git@github.com:pat/qoop.si.git", "us").as_deref(),
+            Some("pat/qoop.si")
+        );
+        for (url, login) in [
+            ("git@github.com:bigco/app.git", "us"),
+            ("git@github.example.com:pat/x.git", "us"),
+            ("https://github.com.evil.io/pat/x", "us"),
+            ("https://gitlab.com/pat/x", "us"),
+            ("git@github.com:pat/x.git", ""),
+            ("git@github.com:pat/x/y.git", "us"),
+            ("git@github.com:pat/.git", "us"),
+            ("/src/pat/x", "us"),
+            ("./a/b:pat/x", "us"),
+            ("https://evil.com#@github.com/pat/x", "us"),
+            ("https://evil.com?@github.com/pat/x", "us"),
+            ("https://evil.com#/@github.com/pat/x", "us"),
+            ("https://evil.com\\@github.com/pat/x", "us"),
+            ("https://evil.com @github.com/pat/x", "us"),
+            ("https://evil.com\t@github.com/pat/x", "us"),
+            ("https://github.com/pat/x?y=1", "us"),
+            ("https://github.com/pat/x#frag", "us"),
+            ("", "us"),
+        ] {
+            assert_eq!(owned(url, login), None, "{url} as {login:?}");
+        }
+    }
+
+    /// Real repositories: an own one and its worktree count; a submodule pointing at the
+    /// owner inside a stranger's repository does not, nor anything with `gh` missing.
+    #[test]
+    fn only_a_top_level_repo_or_its_worktree_is_own() {
+        let dir = tempfile::tempdir().expect("dir");
+        let at = |p: &str| dir.path().join(p);
+        let run = |d: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "protocol.file.allow=always"])
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let gh = at("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho Us\n").expect("gh");
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        for (name, origin) in [
+            ("own", "git@github.com:pat/own.git"),
+            ("org", "https://github.com/bigco/app"),
+        ] {
+            std::fs::create_dir_all(at(name)).expect("repo");
+            run(&at(name), &["init", "-q"]);
+            run(&at(name), &["commit", "-q", "--allow-empty", "-m", "x"]);
+            run(&at(name), &["remote", "add", "origin", origin]);
+        }
+        let wt = at("own-wt");
+        run(
+            &at("own"),
+            &["worktree", "add", "-q", wt.to_str().expect("utf8")],
+        );
+        run(
+            &at("org"),
+            &[
+                "submodule",
+                "add",
+                "-q",
+                at("own").to_str().expect("utf8"),
+                "sub",
+            ],
+        );
+        let sub = at("org/sub");
+        run(
+            &sub,
+            &["remote", "set-url", "origin", "git@github.com:pat/own.git"],
+        );
+        let own = |d: &Path| own_repo_with(d, gh.as_os_str());
+        assert_eq!(own(&at("own")).as_deref(), Some("pat/own"));
+        assert_eq!(own(&wt).as_deref(), Some("pat/own"), "a worktree counts");
+        assert_eq!(own(&at("org")), None, "an org's repo");
+        assert_eq!(own(&sub), None, "a submodule never counts");
+        // Every push address must be the login's too.
+        run(
+            &at("own"),
+            &[
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:pat/own.git",
+            ],
+        );
+        run(
+            &at("own"),
+            &[
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "https://github.com/PAT/mirror",
+            ],
+        );
+        assert_eq!(own(&at("own")).as_deref(), Some("pat/own"), "own pushes");
+        run(
+            &at("own"),
+            &[
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:acme/x.git",
+            ],
+        );
+        assert_eq!(own(&at("own")), None, "one push address elsewhere");
+        assert_eq!(own(&wt), None, "the worktree shares it");
+        run(
+            &at("own"),
+            &["remote", "set-url", "--delete", "--push", "origin", "acme"],
+        );
+        assert_eq!(own(&at("own")).as_deref(), Some("pat/own"));
+        assert_eq!(own(dir.path()), None, "no repository");
+        let missing = at("no-gh");
+        assert_eq!(own_repo_with(&at("own"), missing.as_os_str()), None);
+        std::fs::write(&gh, "#!/bin/sh\necho\n").expect("gh");
+        assert_eq!(own(&at("own")), None, "no login");
+        std::fs::write(&gh, "#!/bin/sh\necho us\nexit 1\n").expect("gh");
+        assert_eq!(own(&at("own")), None, "gh failed");
+    }
+
+    /// A `gh` that hangs is not own within the deadline, and it and what it started are gone.
+    #[test]
+    fn a_slow_gh_is_not_own_and_leaves_nothing_running() {
+        let dir = tempfile::tempdir().expect("dir");
+        let repo = dir.path().join("own");
+        std::fs::create_dir_all(&repo).expect("repo");
+        for args in [
+            &["init", "-q"][..],
+            &["remote", "add", "origin", "git@github.com:pat/own.git"],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        let pids = dir.path().join("pids");
+        let gh = dir.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $$ $! > '{}'\nwait\necho us\n",
+                pids.display()
+            ),
+        )
+        .expect("gh");
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        // The gh stub sleeps 30 s: back long before it means the deadline held. Loose on purpose,
+        // a loaded machine runs the git calls slowly too.
+        let start = std::time::Instant::now();
+        assert_eq!(own_repo_with(&repo, gh.as_os_str()), None);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        // The kill on its own, with time for the stub to note its pids: nothing it started stays.
+        let _ = std::fs::remove_file(&pids);
+        let by = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        assert_eq!(run_by(&mut Command::new(&gh), by), None);
+        let pids = std::fs::read_to_string(&pids).expect("gh started");
+        let alive = |pid: i32| {
+            // SAFETY: signal 0 only asks whether the process exists.
+            unsafe { libc::kill(pid, 0) == 0 }
+        };
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for pid in pids
+            .split_whitespace()
+            .map(|p| p.parse::<i32>().expect("pid"))
+        {
+            while alive(pid) && std::time::Instant::now() < gone_by {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!alive(pid), "process {pid} left running");
+        }
     }
 
     #[test]

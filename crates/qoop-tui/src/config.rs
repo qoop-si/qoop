@@ -17,6 +17,7 @@
 //! exit_when_asleep = true
 //! [qass]
 //! agent = "claude"    # claude | codex | gemini | opencode, or a name from [agents]
+//! mode = "propose"    # propose | auto: qass writes to an agent after your ok, or by itself
 //! [board]
 //! cards = "full"      # full | quiet: a word on a card only when someone must act
 //! [agents]            # a name for a new agent, and the line typed to start it
@@ -100,6 +101,10 @@ pub const QASS_AGENTS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
 /// `[report] send`: whether qass's notes to qoop's maker go out after a yes for each, by
 /// themselves once a first went out after a yes, or never. No answer reads as `ask`.
 pub const REPORT_SENDS: [&str; 3] = ["ask", "always", "never"];
+
+/// `[qass] mode`: qass proposes each write and waits for the person's ok, or writes by itself
+/// within its rules. No answer reads as `propose`. Only the person sets it; qass is denied it.
+pub const QASS_MODES: [&str; 2] = ["propose", "auto"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -223,6 +228,8 @@ pub struct Read {
     pub qass_models: [String; 3],
     /// `[report] send`, one of [`REPORT_SENDS`].
     pub report_send: String,
+    /// `[qass] mode`, one of [`QASS_MODES`].
+    pub qass_mode: String,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
@@ -306,6 +313,17 @@ fn report_send_in(text: &str) -> String {
         .to_string()
 }
 
+/// `[qass] mode` as the file says it, `propose` when it says nothing usable.
+fn qass_mode_in(text: &str) -> String {
+    let table: Option<toml::Table> = toml::from_str(text).ok();
+    table
+        .as_ref()
+        .and_then(|t| t.get("qass")?.get("mode")?.as_str())
+        .filter(|v| QASS_MODES.contains(v))
+        .unwrap_or("propose")
+        .to_string()
+}
+
 /// Where the file is.
 pub fn path() -> PathBuf {
     qoop_runtime::paths::config_dir().join("config.toml")
@@ -326,6 +344,7 @@ pub fn read_from(path: &Path) -> Read {
     let mut qass_agent = "claude".to_string();
     let mut qass_models = QASS_TIERS.map(|(_, family)| family.to_string());
     let mut report_send = "ask".to_string();
+    let mut qass_mode = "propose".to_string();
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
             let (config, agents, problems) = parse_all(&text);
@@ -334,6 +353,7 @@ pub fn read_from(path: &Path) -> Read {
             }
             qass_models = qass_models_in(&text);
             report_send = report_send_in(&text);
+            qass_mode = qass_mode_in(&text);
             (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -352,6 +372,7 @@ pub fn read_from(path: &Path) -> Read {
         qass_agent,
         qass_models,
         report_send,
+        qass_mode,
         problems,
         path: path.to_path_buf(),
         exists,
@@ -630,6 +651,11 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                                 QASS_AGENTS.join(", ")
                             ),
                         ),
+                        ("mode", Some(v)) if QASS_MODES.contains(&v) => {}
+                        ("mode", _) => refuse(
+                            line,
+                            format!("mode = {value} is not one of {}", QASS_MODES.join(", ")),
+                        ),
                         _ => refuse(line, format!("there is no setting qass.{key}")),
                     }
                 }
@@ -741,7 +767,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "prefix",
     "theme",
     "icons",
@@ -757,6 +783,7 @@ pub const KEYS: [&str; 17] = [
     "qass.models.best",
     "qass.models.mid",
     "qass.models.low",
+    "qass.mode",
     "board.cards",
     "report.send",
 ];
@@ -791,6 +818,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Err(why) => return Err(format!("{key}: {why}")),
         },
         "report.send" if REPORT_SENDS.contains(&value) => toml_edit::value(value),
+        "qass.mode" if QASS_MODES.contains(&value) => toml_edit::value(value),
+        "qass.mode" => return Err(format!("{key} is one of {}", QASS_MODES.join(", "))),
         "report.send" => return Err(format!("{key} is one of {}", REPORT_SENDS.join(", "))),
         "sleep.idle_minutes" | "sleep.qass_idle_minutes" => match value.parse::<i64>() {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
@@ -855,6 +884,7 @@ mod tests {
             ("qass.models.low", "haiku"),
             ("board.cards", "quiet"),
             ("report.send", "always"),
+            ("qass.mode", "auto"),
         ];
         assert_eq!(values.len(), KEYS.len());
         for (key, value) in values {
@@ -877,6 +907,7 @@ mod tests {
         assert!(!read.config.lifecycle.exit_when_asleep);
         assert_eq!(read.qass_agent, "codex");
         assert_eq!(read.report_send, "always");
+        assert_eq!(read.qass_mode, "auto");
         assert_eq!(read.qass_models, ["opus", "claude-sonnet-5-5", "haiku"]);
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(
@@ -1266,5 +1297,24 @@ mod tests {
         assert!(set(&path, "report.send", "sometimes").is_err());
         set(&path, "report.send", "never").expect("set");
         assert_eq!(read_from(&path).report_send, "never");
+    }
+
+    /// No answer is `propose`; a wrong one is said and read as `propose`, never as `auto`.
+    #[test]
+    fn qass_mode_is_propose_unless_the_file_says_auto() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        assert_eq!(read_from(&path).qass_mode, "propose");
+        std::fs::write(&path, "[qass]\nmode = \"Auto\"\n").expect("write");
+        let read = read_from(&path);
+        assert_eq!(read.qass_mode, "propose");
+        assert_eq!(read.problems.len(), 1, "{:?}", read.problems);
+        assert_eq!(read.problems[0].line, Some(2), "{:?}", read.problems);
+        assert!(set(&path, "qass.mode", "automatic").is_err());
+        set(&path, "qass.mode", "auto").expect("set");
+        let read = read_from(&path);
+        assert_eq!(read.qass_mode, "auto");
+        assert!(read.problems.is_empty(), "{:?}", read.problems);
     }
 }

@@ -160,6 +160,13 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         Kind::Choice("qass.agent", qass_agents(&read)),
     ));
     out.push(row(
+        "qass",
+        "qass writes",
+        read.qass_mode.clone(),
+        "propose: after your ok for each; auto: by itself, within its rules",
+        Kind::Choice("qass.mode", config::QASS_MODES.map(String::from).to_vec()),
+    ));
+    out.push(row(
         "report",
         "notes to qoop's maker",
         read.report_send.clone(),

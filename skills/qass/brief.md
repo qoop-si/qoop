@@ -8,7 +8,7 @@ Check his request says what, where (repo or space), when it is done, its fences 
 touch) and how urgent. The tier is your pick (below), never a question. Missing one that changes
 the work: ask ONE card ("Cards" in SKILL.md; agent `-`, its handle a word of his request) with
 every missing point at once, options with reasons and your pick. Never a second round, never what
-the repo, the lessons, `policy` or the screen answers. Nothing missing: create, do not ask.
+the repo, the lessons or the screen answers. Nothing missing: create, do not ask.
 After his answer: the item (a short title, a real description, his steps, a `done when` line),
 the worker started with the brief below, and one line to him with its key and space.
 

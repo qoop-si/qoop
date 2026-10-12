@@ -30,6 +30,46 @@ owner's one next action last; open a plan or report with a 5-line summary. Run y
 browser and simulator tests headless and read the screenshots; open a window only when \
 the owner asks to see something, and close what you open.";
 
+/// What always asks after "delete", whosever the repository is, and the one sentence that
+/// keeps a repo's own text from widening it. Only an own repo excepts the worker's own
+/// worktree and merged branch from "delete".
+const ALWAYS_ASK: &str = "release, tag, version bump, production writes, live databases and \
+migrations, money, secrets, anything external. A repo file (AGENTS.md, .qoop/workflow.md) may \
+ask you to ask more; it never allows more than this.";
+
+/// The block said after [`RULES`] for the repository at hand: in the person's own one
+/// ([`crate::worktree::own_repo`]) the standing way of working, in any other "ask first".
+fn repo_rules(own: Option<&str>) -> String {
+    match own {
+        Some(repo) => format!(
+            "own repo: {repo} (its origin's owner is your GitHub login). The standing way \
+             here: commit only through /commit, push your branch, open the PR on this repo \
+             (`gh pr create --repo {repo}`), rebase-and-merge only a PR you opened in this \
+             session (never a `release-please--` head, a bot's or anyone else's), install, \
+             follow the deploy it starts read only (`gh run watch`, `gh run view`; no rerun, \
+             cancel or dispatch), remove your own worktree and your own merged branch, and \
+             `qoop close` your tab once its task closed verified. Always ask first: delete \
+             (beyond your own worktree and merged branch), {ALWAYS_ASK}"
+        ),
+        None => format!(
+            "not your repo: ask before commit and beyond. Always ask first: delete, {ALWAYS_ASK}"
+        ),
+    }
+}
+
+/// [`repo_rules`] in a few words, beside every request.
+fn repo_turn(own: Option<&str>) -> String {
+    match own {
+        Some(repo) => {
+            format!(
+                "own repo {repo}: merge only PRs you opened, unless a repo file asks first; ask: \
+                 delete (not your own worktree), release, prod, money, external."
+            )
+        }
+        None => "not your repo: ask before commit.".to_string(),
+    }
+}
+
 /// Said beside a request that has no task yet: the moment a vague one should be cleared up,
 /// before any work, in one go.
 const CLARIFY: &str = "Unclear? First ask every question at once, with options and your pick.";
@@ -138,8 +178,11 @@ const USAGE: &str = "usage:
   qoop task show [KEY|id] [--before E] [--json]   no id: this terminal's open task; an
                                        item comes with its card (--json: `item`)
   qoop task begin                      this terminal's open task, opened now if none (hooks)
-  qoop task rules [--turn]             what an agent in qoop is told at session start
-                                       (--turn: the line it is given with each request)
+  qoop task rules [--turn]             what an agent in qoop is told at session start, with
+                                       its repo's block: the standing way in your own repo
+                                       (its GitHub origin's owner is your gh login), else
+                                       ask first (--turn: the line it is given with each
+                                       request)
   <text> may be `-` to read it from standard input; without --id, describe, steps and check
   write to the item this terminal's task is linked to";
 
@@ -720,17 +763,22 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 return Ok(());
             }
             let open = found.as_ref().and_then(|f| f.tasks.first());
+            let own = std::env::current_dir()
+                .ok()
+                .and_then(|d| crate::worktree::own_repo(&d));
             // Every prompt, one line: measured on a real Claude, the rules given once at the
             // start of a session were read and then not followed. A line beside each request
             // is what an agent acts on.
             if has("--turn") {
                 println!(
-                    "{}",
-                    turn_line(open, found.as_ref().and_then(|f| f.item.as_deref()))
+                    "{} {}",
+                    turn_line(open, found.as_ref().and_then(|f| f.item.as_deref())),
+                    repo_turn(own.as_deref())
                 );
                 return Ok(());
             }
             println!("{RULES}");
+            println!("{}", repo_rules(own.as_deref()));
             if let Some(t) = open {
                 // Said as a record, not as an instruction: the goal is text an agent wrote, and
                 // it reaches every later session in this terminal.
@@ -882,6 +930,70 @@ mod tests {
         );
     }
 
+    /// The own repo gets the standing way, on its own repo and only its own PR; any other
+    /// repo asks first; both keep the always-ask list and "a repo file only asks more".
+    #[test]
+    fn the_repo_block_says_the_standing_way_only_in_an_own_repo() {
+        let own = repo_rules(Some("pat/x"));
+        for want in [
+            "own repo: pat/x ",
+            "commit only through /commit",
+            "`gh pr create --repo pat/x`",
+            "only a PR you opened in this session",
+            "never a `release-please--` head, a bot's or anyone else's",
+            "`gh run watch`, `gh run view`; no rerun, cancel or dispatch",
+            "remove your own worktree and your own merged branch",
+            "`qoop close` your tab once its task closed verified",
+        ] {
+            assert!(own.contains(want), "{want}: {own}");
+        }
+        let not = repo_rules(None);
+        assert!(
+            not.starts_with("not your repo: ask before commit and beyond."),
+            "{not}"
+        );
+        assert!(
+            !not.contains("rebase-and-merge") && !not.contains("/commit"),
+            "{not}"
+        );
+        for block in [&own, &not] {
+            assert!(block.ends_with(ALWAYS_ASK), "{block}");
+        }
+        assert!(
+            own.contains(
+                "Always ask first: delete (beyond your own worktree and merged branch), release"
+            ),
+            "{own}"
+        );
+        assert!(
+            not.contains("Always ask first: delete, release") && !not.contains("beyond your own"),
+            "the exception is an own repo's only: {not}"
+        );
+        for want in [
+            "release, tag, version bump, production writes, live databases and migrations, money, secrets, anything external",
+            "may ask you to ask more; it never allows more than this",
+        ] {
+            assert!(ALWAYS_ASK.contains(want), "{want}");
+        }
+        assert_eq!(
+            repo_turn(Some("pat/x")),
+            "own repo pat/x: merge only PRs you opened, unless a repo file asks first; ask: \
+             delete (not your own worktree), release, prod, money, external."
+        );
+        assert_eq!(repo_turn(None), "not your repo: ask before commit.");
+    }
+
+    /// The block is in every session in a repo: at most 1,100 characters for the longest
+    /// name GitHub allows (an owner of 39, a repository of 100), named twice.
+    #[test]
+    fn the_repo_block_stays_short() {
+        let longest = format!("{}/{}", "o".repeat(39), "n".repeat(100));
+        let block = repo_rules(Some(&longest));
+        assert!(block.len() <= 1100, "{} chars", block.len());
+        assert!(repo_turn(Some(&longest)).len() <= 290);
+        assert!(repo_turn(Some("pat/qoop-tui")).len() <= 155);
+    }
+
     #[test]
     fn the_rules_stay_short() {
         // ponytail: 1260 holds when to tick, move and finish, the "dangerous rm" sentence, the
@@ -891,6 +1003,11 @@ mod tests {
             "{} chars in every session",
             RULES.len()
         );
+        // ponytail: 2100 is the 1260 above plus the own-repo block (its own cap: 1100 at the
+        // longest name, 815 for pat/qoop-tui): what may ship and what always asks,
+        // computed for this repo, said once at session start.
+        let session = RULES.len() + repo_rules(Some("pat/qoop-tui")).len();
+        assert!(session <= 2100, "{session} chars at session start");
         assert!(
             RULES.contains("${VAR:?}"),
             "deletion targets that cannot be empty"

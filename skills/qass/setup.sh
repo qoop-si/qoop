@@ -17,12 +17,12 @@
 #   setup.sh job <KEY>             the first small job qass started for him, by its board key
 #
 # Writes only @QASS_DATA@/setup and the files `write` makes; only `undo` deletes, only those (and
-# opens a tab in ssh-space). Never runs ssh, gh or the network
-# itself, and reads nothing under ~/.ssh but its config. Unrelated to `qoop setup` (Setup files).
+# opens a tab in ssh-space). Never runs ssh or the network itself (`qoop task rules` reads gh's
+# local login for item 4), and reads nothing under ~/.ssh but its config. Unrelated to
+# `qoop setup` (Setup files).
 set -eu
 
 state="@QASS_DATA@/setup"
-policy="@QASS_CONFIG@/policy"
 roots="code coding projects src dev Developer work repos"
 nl='
 '
@@ -154,41 +154,14 @@ servers() {
     done
 }
 
-# The policy lines: "ok <n>" for the usable ones, and each line it cannot use, as "line N: why".
-# A grant counts only for a picked project, compared as real paths (/tmp is /private/tmp).
-policy_check() {
-    [ -f "$policy" ] || { echo "ok 0"; return 0; }
-    ok=0 modes=0 n=0
-    while IFS= read -r line || [ -n "$line" ]; do
-        n=$((n + 1))
-        set -f
-        # shellcheck disable=SC2086
-        set -- $line
-        set +f
-        case "${1:-#}" in
-        \#*) ;;
-        mode)
-            if [ $# -eq 2 ] && { [ "$2" = propose ] || [ "$2" = auto ]; }; then
-                ok=$((ok + 1)) modes=$((modes + 1))
-            else
-                echo "line $n: not understood"
-            fi
-            ;;
-        grant)
-            case "$#:${3:-}" in
-            3:commit | 3:push-branch | 3:open-pr | 3:merge-own-pr | 3:close-finished)
-                case "$2" in /*) ;; *) echo "line $n: not an absolute path"; continue ;; esac
-                r="$(cd "$2" 2>/dev/null && pwd -P || echo "$2")"
-                if has "pick $r"; then ok=$((ok + 1)); else echo "line $n: not a picked project"; fi
-                ;;
-            *) echo "line $n: not understood" ;;
-            esac
-            ;;
-        *) echo "line $n: not understood" ;;
-        esac
-    done < "$policy"
-    if [ "$modes" -gt 1 ]; then echo "more than one mode line"; ok=0; fi
-    echo "ok $ok"
+# "yes" when qoop counts the project the person's own repo (its origin's owner is gh's login),
+# else "no". An empty token keeps `qoop task rules` off the daemon: the plain rules, here.
+own_of() {
+    if (cd "$1" && QOOP_TOKEN='' qoop task rules 2>/dev/null) | grep -q '^own repo: '; then
+        echo yes
+    else
+        echo no
+    fi
 }
 
 # Signed in: hub.json (what `qoop login` writes) is one valid JSON object holding a non-empty
@@ -361,12 +334,15 @@ status() {
         s3=no d3="$total found, $open not decided"
     fi
 
-    pc="$(policy_check)"
-    if [ "$(echo "$pc" | sed -n 's/^ok //p')" -gt 0 ] 2>/dev/null; then s4=yes; else s4=no; fi
-    bad="$(echo "$pc" | grep -v '^ok ' | head -3 | tr '\n' ';' | sed 's/;$/ /; s/;/; /g; s/ $//')"
-    if [ -n "$bad" ]; then d4="policy: $bad"
-    elif [ "$s4" = yes ]; then d4="written"
-    else d4="you write it; I show you the lines"
+    # Nothing to answer: what qoop's rules allow in each picked project, as qoop computes it.
+    if [ -z "$picked" ]; then
+        s4=none d4="after your projects"
+    else
+        s4=yes d4="own repo:"
+        old="$IFS"; IFS="$nl"; set -f
+        for p in $picked; do d4="$d4 ${p##*/} $(own_of "$p"),"; done
+        IFS="$old"; set +f
+        d4="${d4%,}"
     fi
 
     cfgdir="$(qoop paths config 2>/dev/null || true)"
@@ -409,7 +385,7 @@ status() {
     # Measured in the isolated run of plans/2026-10-11-qass-setup/; what was not timed gets none.
     case $next in
     1) took=" (under a minute)" ;; 2) took=" (about 2 to 3 minutes a project)" ;;
-    3) took=" (about a minute)" ;; 4) took=" (about a minute)" ;; 6) took=" (about 2 minutes)" ;;
+    3) took=" (about a minute)" ;; 6) took=" (about 2 minutes)" ;;
     *) took= ;;
     esac
     echo "Next: type $next$took."
