@@ -1035,6 +1035,78 @@ mod tests {
         );
     }
 
+    /// A resumed qass keeps the skill text it loaded at its start: once the installed `SKILL.md`
+    /// is not the one it was last told to read, its stop is blocked once to read it again, a
+    /// line goes to `skill.log`, and the same skill never asks twice. A question without a card
+    /// still comes first.
+    #[test]
+    fn qass_reads_its_skill_again_once_it_changed() {
+        let home = home_dir();
+        let dirs = qass_dirs(&home);
+        let skill = home.path().join("skill");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::create_dir_all(&dirs.data).expect("data dir");
+        let script = skill.join("cardcheck.sh");
+        let body = QASS
+            .iter()
+            .find(|(n, _, _)| *n == "cardcheck.sh")
+            .expect("cardcheck.sh")
+            .1;
+        std::fs::write(&script, dirs.render(body)).expect("write");
+        std::fs::write(skill.join("SKILL.md"), "# qass v1\n").expect("write");
+        let stop = |said: &str, active: bool| -> String {
+            let transcript = home.path().join("t.jsonl");
+            let user = serde_json::json!({"message": {"role": "user", "content": "wake"}});
+            let text = serde_json::json!({"message": {"role": "assistant", "content": [
+                {"type": "text", "text": said}]}});
+            std::fs::write(&transcript, format!("{user}\n{text}\n")).expect("write");
+            let payload = serde_json::json!({"transcript_path": transcript,
+                "stop_hook_active": active});
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("run");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("payload");
+            let out = child.wait_with_output().expect("wait");
+            assert!(out.status.success(), "a hook must exit 0");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let log = || std::fs::read_to_string(dirs.data.join("skill.log")).unwrap_or_default();
+        let read = format!("Read {} whole", skill.join("SKILL.md").display());
+
+        assert!(
+            stop("Merged, closed.", false).contains(&read),
+            "never told yet"
+        );
+        assert_eq!(log().lines().count(), 1);
+        assert!(stop("Merged, closed.", true).is_empty(), "the second stop");
+        assert!(stop("Merged, closed.", false).is_empty(), "the same skill");
+
+        std::fs::write(skill.join("SKILL.md"), "# qass v2\n").expect("write");
+        let card = stop("PR #5 birleşsin mi?", false);
+        assert!(card.contains("wrote no card") && !card.contains(&read));
+        assert_eq!(
+            log().lines().count(),
+            1,
+            "a card block leaves the skill for later"
+        );
+        assert!(
+            stop("Merged, closed.", false).contains(&read),
+            "a new install"
+        );
+        assert_eq!(log().lines().count(), 2);
+        assert!(stop("Merged, closed.", false).is_empty());
+    }
+
     fn qass_dirs(home: &tempfile::TempDir) -> QassDirs {
         QassDirs {
             data: home.path().join("data/qass"),
