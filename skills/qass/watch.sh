@@ -22,7 +22,8 @@
 #
 # Started as `QOOP_SLEEP_SAFE=1 watch.sh`: that mark on the command line lets qoop put the
 # tab to sleep while this runs, and this ends by itself once the agent that started it is
-# gone (asleep or closed), within the 10 s tick.
+# gone (asleep or closed), within the 10 s tick, and after QASS_WATCH_FOR seconds (1740, under
+# the Monitor's 30 minute cap), then with the line `watch-ends`: start it again.
 #
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
@@ -64,6 +65,10 @@ batch="${QASS_BATCH:-30}"
 qhold="${QASS_QUIET_HOLD:-600}"
 linkdown="${QASS_LINKDOWN:-60}"
 rhold="${QASS_ROUTINE_HOLD:-1800}"
+# A Monitor is killed at 30 minutes and its one notice of that can be lost (2026-10-12: it came
+# in the second an event did, and nothing watched for an hour). So this ends first, by itself.
+watch_for="${QASS_WATCH_FOR:-1740}"
+started="$(date +%s)"
 
 defs='
 def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
@@ -85,6 +90,10 @@ diff="$defs"'
      elif $o.generation != $r.generation then
        (if ($r.state | waits) then line($r; "restarted") else empty end)
      elif $o.state != $r.state and ($r.state | waits) then line($r; $o.state)
+     # Still at rest, its task only now waiting on the owner (the daemon moves a question
+     # left unanswered there): news as well.
+     elif ($r.state | waits) and ($r.task.stage? // "") == "waiting-human"
+          and ($o.task.stage? // "") != "waiting-human" then line($r; $o.state)
      else empty end),
   ($old | to_entries[] | select($new[.key] == null) | .value
    | . as $r | ($sleeping | index($r.terminal)) as $asleep
@@ -500,7 +509,7 @@ follow() {
         case "$snap" in \[*) ;; *) continue ;; esac
         # Quiet saves the snapshot before its lines are held: a stop in between would lose
         # them, so a stop waits for the end of this snapshot's step (step_end).
-        [ "$quiet" != 1 ] || { stop=""; trap 'stop=1' TERM INT HUP; }
+        [ "$quiet" != 1 ] || { stop=""; trap 'stop=1' TERM INT HUP; trap 'stop=${stop:-ends}' USR1; }
         if [ -n "$label" ] && [ -e "$dir/down-$label" ]; then
             if [ "$quiet" = 1 ]; then
                 settle_locked link_up "$label"
@@ -578,7 +587,12 @@ follow() {
 step_end() {
     [ "$quiet" = 1 ] || return 0
     trap 'exit 143' TERM INT HUP
-    [ -z "${stop:-}" ] || exit 143
+    trap 'printf "watch-ends\n"; exit 0' USR1
+    case "${stop:-}" in
+        '') ;;
+        ends) printf 'watch-ends\n'; exit 0 ;;
+        *) exit 143 ;;
+    esac
 }
 
 # A remote's stream, kept up: when the link drops it says so once and tries again, every
@@ -660,6 +674,10 @@ fi
             kill -TERM $$ 2>/dev/null
             exit 0
         fi
+        if [ $(( $(date +%s) - started )) -ge "$watch_for" ]; then
+            kill -USR1 $$ 2>/dev/null
+            exit 0
+        fi
         asks_said
         if [ "$quiet" = 1 ]; then
             settle_locked flush ""
@@ -711,6 +729,8 @@ trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || t
       kill $kids 2>/dev/null || true' EXIT
 # Killed rather than ended (Monitor stopping it), go through the same way out.
 trap 'exit 143' TERM INT HUP
+# Its own time is up: said, so qass starts it again (Start, step 3).
+trap 'printf "watch-ends\n"; exit 0' USR1
 
 [ "$quiet" = 1 ] || rm -f "$(gone_file "")"   # a mark left by an earlier run says nothing about this one
 follow "" < <(qoop agents --watch --json)

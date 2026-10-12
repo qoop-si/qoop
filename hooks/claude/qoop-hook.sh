@@ -55,9 +55,9 @@
 #     -> blocked + `--event blocked`, labelled with the type for the two question
 #     dialogs (the daemon drafts an inbox card for one still up after 120 s), no label
 #     for the rest (they carry no tool); every other notification type reports nothing
-#   Stop -> idle + `--event done`, labelled with the turn's last question (the last line of its
-#   last message that ends in "?"), which the daemon files as a draft card when the agent waits
-#   on the owner; SessionEnd -> idle + `--event done`, no label
+#   Stop -> idle + `--event done`, labelled with the last paragraph of its last message; the
+#   daemon keeps it only when it asks the owner something, and files it as a draft card when
+#   the agent waits on him; SessionEnd -> idle + `--event done`, no label
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 
@@ -107,9 +107,9 @@ def one_line(text, limit=120):
     return single[:limit]
 
 
-def last_question(payload):
-    """The last line ending in "?" of the turn's last message, read from the end of the
-    transcript; "" when there is none or it cannot be read."""
+def last_paragraph(payload):
+    """The last paragraph of the turn's last message as one line, read from the end of the
+    transcript; "" when the turn has none or it cannot be read."""
     path = payload.get("transcript_path")
     if not isinstance(path, str) or not path:
         return ""
@@ -141,14 +141,28 @@ def last_question(payload):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
         if not texts:
             continue
+        # Its last paragraph, whatever it says: the daemon decides whether it asks him (a
+        # "?", or an offer such as "istersen ..."). Each line's markdown off.
+        # (A backtick is chr(96): one written out would end the shell's command substitution.)
+        paragraph = []
         for text_line in reversed("\n".join(texts).splitlines()):
-            # Its markdown off: a question set in bold still ends in "?".
-            # (A backtick is chr(96): one written out would end the shell's command substitution.)
             bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
-            if bare.endswith("?"):
-                return one_line(bare)
-        return ""
+            if bare:
+                paragraph.insert(0, bare)
+            elif paragraph:
+                break
+        return ends_kept(" ".join(paragraph))
     return ""
+
+
+def ends_kept(text, limit=120):
+    """One line of at most `limit` characters that keeps both ends of a longer text: an offer
+    is often near its start ("istersen ...") and a question near its end."""
+    single = " ".join(str(text).split())
+    if len(single) <= limit:
+        return single
+    half = (limit - 5) // 2
+    return single[:half] + " ... " + single[-half:]
 
 
 def worktree_mark(cwd):
@@ -263,7 +277,7 @@ elif name == "Notification":
     label = kind if kind in ("elicitation_dialog", "elicitation_url_dialog") else ""
     state, flags, event = "blocked", "--visible-blocker", "blocked"
 elif name == "Stop":
-    state, flags, event, label = "idle", "--visible-idle", "done", last_question(payload)
+    state, flags, event, label = "idle", "--visible-idle", "done", last_paragraph(payload)
 elif name == "SessionEnd":
     state, flags, event, label = "idle", "--visible-idle", "done", ""
 elif name == "StopFailure":

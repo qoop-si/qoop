@@ -300,6 +300,22 @@ echo "5 1 idle implementing $(( $(date +%s) - 100 ))" > "$q/said"
 printf '%s\n' "[$(printf "$wh" working)]" > "$q/last.json"
 got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
 [ "$got" = 'T5 g1 claude working->idle "x" /w task:12:waiting-human' ] || { echo "new waiting-human printed: $got"; exit 1; }
+# Still idle, its task only now waiting on him (the daemon moved a question left unanswered):
+# said at once too, on a remote as here.
+fresh; stream 10
+echo "ubox  fake-host" > "$tmp/remotes"
+printf '%s\n' "[$(printf "$wh" idle | sed 's/waiting-human/investigating/')]" > "$q/last-ubox.json"
+printf '%s\n' "[]" > "$tmp/snapshots"; printf '%s\n' "[]" > "$q/last.json"
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in *watch*) echo '[$(printf "$wh" idle)]'; exec sleep 3 ;; esac
+echo '[]'
+EOF
+chmod +x "$tmp/bin/ssh"
+got="$(timed 5)"
+[ "$(echo "$got" | lines)" = 'ubox/T5 g1 claude idle->idle "x" /w task:12:waiting-human' ] ||
+    { echo "a stage turned waiting-human printed: $got"; exit 1; }
+rm -f "$tmp/bin/ssh" "$tmp/remotes"
 
 # A sleep after an idle already said goes only with another block; a held sleep is said at its
 # time although the agent has left the rows.
@@ -635,5 +651,14 @@ quiet_fresh
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
 got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
 [ "$got" = daemon-gone ] || { echo "a busy machine's exit printed: $got"; exit 1; }
+
+# Its own time up (QASS_WATCH_FOR), it ends by itself with `watch-ends`, at the first tick past
+# it, before the Monitor's cap: a stream still open does not keep it.
+quiet_fresh; stream 30
+printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
+got="$(QASS_WATCH_FOR=2 timed 25)"
+[ "$(echo "$got" | lines)" = watch-ends ] && echo "$got" | within 9 13 ||
+    { echo "its own end printed: $got"; exit 1; }
 
 echo "qass watch: ok"

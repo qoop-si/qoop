@@ -452,16 +452,15 @@ async fn follow(
         }) {
             continue;
         }
+        // A row carries its agent's task, so a board change can change a row while its state
+        // holds (a stage the daemon moved after the turn ended): looked at too, and said only
+        // when the listing reads differently.
         loop {
             let events = link.next_events(None).await?.unwrap_or_default();
-            if events.iter().any(|e| {
-                !matches!(
-                    e,
-                    EventMessage::Focus { .. }
-                        | EventMessage::TasksChanged
-                        | EventMessage::AsksChanged
-                )
-            }) {
+            if events
+                .iter()
+                .any(|e| !matches!(e, EventMessage::Focus { .. } | EventMessage::AsksChanged))
+            {
                 break;
             }
         }

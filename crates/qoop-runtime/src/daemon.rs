@@ -4811,17 +4811,32 @@ async fn handle_control(
                             crate::asks::relayed(label.as_deref(), terminal, connections, store)
                                 .await;
                             // A prompt reached an agent waiting on the owner: its answer. The
-                            // stage goes back, so no board still says it waits on him.
+                            // stage goes back, so no board still says it waits on him. A notice
+                            // the harness typed (its own background work done) is no answer.
                             let now = crate::agents::now_unix();
-                            let back = store
-                                .run(move |s| s.answer_waiting(i64::from(terminal), now))
-                                .await;
+                            let back = if label.as_deref().is_some_and(crate::asks::not_his) {
+                                Ok(None)
+                            } else {
+                                store
+                                    .run(move |s| s.answer_waiting(i64::from(terminal), now))
+                                    .await
+                            };
                             if matches!(back, Ok(Some(_))) {
                                 agents.tasks_changed();
                                 // Its draft card closed with the wait.
                                 connections.asks_changed();
                             }
                         }
+                        // A turn's end carries its last line; it is the turn's question only when
+                        // it asks him something. Masked and cut like any label: a token in the
+                        // question never reaches the card or the phone.
+                        let label = if kind == "done" {
+                            label
+                                .filter(|l| crate::asks::asks_owner(l))
+                                .map(|l| crate::control::truncate_focus_label(&l))
+                        } else {
+                            label
+                        };
                         // The agent ended its turn waiting on the owner: his inbox shows it,
                         // with the question the hook read from the turn's last words.
                         if kind == "done" {
@@ -4830,15 +4845,36 @@ async fn handle_control(
                                 .remove(&i64::from(terminal));
                             crate::asks::draft_waiting(
                                 terminal,
-                                name,
-                                // Masked and cut like any label: a token in the question never
-                                // reaches the card or the phone.
-                                label.as_deref().map(crate::control::truncate_focus_label),
+                                name.clone(),
+                                label.clone(),
                                 terminals.session_of(terminal),
                                 connections,
                                 store,
                             )
                             .await;
+                            // It asked him and set no stage: still unanswered after the wait
+                            // (no prompt, tool or turn since), it waits on him as if it had,
+                            // so the card above and every reader of the stage see it. He
+                            // answering at the tab first makes no card.
+                            if let Some(question) = label.clone() {
+                                let (terminals, agents, connections, store) = (
+                                    terminals.clone(),
+                                    agents.clone(),
+                                    connections.clone(),
+                                    store.clone(),
+                                );
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(crate::asks::dialog_wait()).await;
+                                    crate::asks::wait_on_question(
+                                        terminal,
+                                        at_unix,
+                                        name,
+                                        question,
+                                        (&terminals, &agents, &connections, &store),
+                                    )
+                                    .await;
+                                });
+                            }
                         }
                         agents.push_focus_event(
                             terminal,

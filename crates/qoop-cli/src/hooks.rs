@@ -1594,10 +1594,11 @@ mod tests {
         }
     }
 
-    /// A turn's end carries its last question, read from the transcript (bold or not), so the
-    /// daemon can put it in the owner's inbox; a turn that asks nothing carries no label.
+    /// A turn's end carries its last paragraph as one line, markdown off, read from the
+    /// transcript, so the daemon can tell whether it asks the owner and put it in his inbox; a
+    /// long one keeps both ends within the label's 120 characters.
     #[test]
-    fn the_claude_hook_reports_the_turns_last_question_at_its_end() {
+    fn the_claude_hook_reports_the_turns_last_paragraph_at_its_end() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("a directory");
         let log = dir.path().join("reports");
@@ -1638,13 +1639,28 @@ mod tests {
         };
         let said = stop("Built and tested.\n**Merge PR #513 now or deploy first?**\nSay which.");
         assert!(
-            said.contains("--event|done|--label|Merge PR #513 now or deploy first?|"),
+            said.contains(
+                "--event|done|--label|Built and tested. Merge PR #513 now or deploy first? Say which.|"
+            ),
             "{said}"
         );
-        let said = stop("All done, PR #12 is open.");
+        let said = stop("Fixed the 404.\n\nIstersen bunu ayri bir is olarak guncellerim.");
         assert!(
-            said.contains("--event|done|") && !said.contains("--label"),
-            "{said}"
+            said.contains("--label|Istersen bunu ayri bir is olarak guncellerim.|"),
+            "only the last paragraph: {said}"
+        );
+        let long = format!("Istersen {} hazirlayayim mi?", "x ".repeat(100));
+        let said = stop(&long);
+        let label = said
+            .split("--label|")
+            .nth(1)
+            .and_then(|l| l.split('|').next())
+            .unwrap_or_default();
+        assert!(
+            label.chars().count() <= 120
+                && label.starts_with("Istersen ")
+                && label.ends_with("mi?"),
+            "{label}"
         );
         // A question he already answered is not the turn's: his prompt ends the read back.
         let _ = std::fs::remove_file(&log);

@@ -78,7 +78,7 @@ for him. A finish the board shows needs no note.
    description is full, rename anyway (the old title stays in its history).
 3. If you have a Monitor tool (Claude Code: ToolSearch `select:Monitor`), start
    `Monitor(command: "QOOP_SLEEP_SAFE=1 \"<this skill's dir>/watch.sh\"", timeout_ms: 1800000,
-   description: "qass fleet")`, and when it expires start it again at once. Without one
+   description: "qass fleet")`, and on its line `watch-ends` or its expiry start it again at once. Without one
    (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
    owner, first run `qoop agents --json`, compare it with `goals.md`, and handle every
    agent that stopped since your last look as an event line below.
@@ -211,7 +211,7 @@ how important the question feels.
 | Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when `policy` grants `close-finished` for its repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |
 | Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
-| Its task stage is `waiting-human` | a card now; read the question from its screen. A `W<n>` card for that agent is the daemon's draft (his own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
+| Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking him and he did not answer in 2 minutes) | a card now; read the question from its screen. Never close its task, or prompt it except with his words for it, while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (his own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | a card for later |
 | Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when his task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; when `"<this skill's dir>/habit.sh" may <verb>:<repo>` says yes (he took your pick for that kind three times in a row), pick it and tell him in a two-line note, no card; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md, the workflow or a habit says |

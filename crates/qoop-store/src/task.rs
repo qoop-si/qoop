@@ -445,6 +445,42 @@ impl Store {
         Ok(t.stage != stage || t.claimed_at.is_some())
     }
 
+    /// The open task of `terminal` ended a turn asking the owner and he has not answered: its
+    /// stage becomes `waiting-human`, as if the agent had set it. Unlike a stage the agent
+    /// writes, a claim stays: the question does not undo work it said was done. Answers the
+    /// task id, `None` when there is no open task or it already waits.
+    pub fn wait_on_owner(&self, terminal: i64, now: i64) -> Result<Option<i64>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let task: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT id, stage FROM task WHERE terminal = ?1 AND closed_at IS NULL \
+                 AND stage != 'waiting-human' ORDER BY id DESC LIMIT 1",
+                params![terminal],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((task, stage)) = task else {
+            return Ok(None);
+        };
+        // The stage it leaves, on record when it began there with no stage written (a new
+        // task): his answer takes it back there ([`Store::answer_waiting`]).
+        let recorded: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_event WHERE task = ?1 AND kind = 'stage')",
+            params![task],
+            |r| r.get(0),
+        )?;
+        if !recorded {
+            event(&tx, task, "stage", &stage, now)?;
+        }
+        tx.execute(
+            "UPDATE task SET stage = 'waiting-human', updated_at = ?2 WHERE id = ?1",
+            params![task, now],
+        )?;
+        event(&tx, task, "stage", "waiting-human", now)?;
+        tx.commit()?;
+        Ok(Some(task))
+    }
+
     /// The open task of `terminal`, waiting on the owner, took his answer (a prompt reached the
     /// agent): its stage goes back to the one before `waiting-human`, else `implementing`. Only
     /// the stage moves: a claim stays. Answers the stage it went back to, `None` when the task
@@ -940,6 +976,32 @@ mod tests {
             other.answer_waiting(u, 12).unwrap().as_deref(),
             Some("implementing")
         );
+    }
+
+    /// A question left unanswered puts the task on waiting with its claim kept, once, and his
+    /// answer takes it back to the stage it had.
+    #[test]
+    fn an_unanswered_question_waits_on_the_owner_and_keeps_the_claim() {
+        let (s, _, t) = store_with_terminal();
+        assert_eq!(s.wait_on_owner(t, 9).unwrap(), None, "no task, nothing");
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        s.set_task_stage(id, "verifying", 11).unwrap();
+        s.claim_task_done(id, "merged", 12).unwrap();
+        assert_eq!(s.wait_on_owner(t, 13).unwrap(), Some(id));
+        let row = s.task(id).unwrap().unwrap();
+        assert_eq!(row.stage, "waiting-human");
+        assert_eq!(row.claimed_at, Some(12), "the claim stays");
+        assert_eq!(s.wait_on_owner(t, 14).unwrap(), None, "already waits");
+        assert_eq!(
+            s.answer_waiting(t, 15).unwrap().as_deref(),
+            Some("verifying")
+        );
+        // A new task, no stage written: back to the one it opened in.
+        let (other, _, u) = store_with_terminal();
+        let fresh = other.open_task(u, "y", false, 10).unwrap();
+        let opened = other.task(fresh).unwrap().unwrap().stage;
+        assert_eq!(other.wait_on_owner(u, 11).unwrap(), Some(fresh));
+        assert_eq!(other.answer_waiting(u, 12).unwrap(), Some(opened));
     }
 
     #[test]

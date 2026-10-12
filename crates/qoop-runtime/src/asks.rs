@@ -267,6 +267,61 @@ pub(crate) fn is_dialog(label: &str) -> bool {
     matches!(label, "elicitation_dialog" | "elicitation_url_dialog")
 }
 
+/// Words that offer the owner an action and wait for his go, in the forms agents end a turn
+/// with: "istersen ... yaparım", "'tamam' dersen ...", "shall I". Cut boilerplate stays out
+/// ("let me know if", "if you want"): those close nearly every report. Lowercase, ASCII
+/// spellings too, since agents often write Turkish without its letters.
+const OFFERS: &[&str] = &[
+    "istersen",
+    "i̇stersen",
+    "dersen",
+    "ister misin",
+    "shall i ",
+    "want me to ",
+    "would you like",
+];
+
+/// Whether the last paragraph of an agent's turn asks the owner something: a sentence in it
+/// ends in "?", it offers him an action (see [`OFFERS`]), or it closes on the Turkish question
+/// word without its mark ("hazırlayayım mı"). The one rule the daemon reads a turn's end by;
+/// the hook only sends the paragraph.
+pub(crate) fn asks_owner(line: &str) -> bool {
+    let line = line
+        .trim()
+        .trim_end_matches(['.', '!', ' ', '*', '_', '`', '"', ')']);
+    if line.ends_with('?') {
+        return true;
+    }
+    // A question near its end: a "?" ending a word (not one in a link, `?q=`, or a ternary,
+    // ` ? `), with at most one sentence after it ("Merge now or deploy first? Say which.").
+    // Two or more after it is a write up that asked itself ("Why? Because ... Fixed.").
+    if let Some(at) = line.rfind("? ").or_else(|| line.rfind("?*"))
+        && line[..at].ends_with(|c: char| !c.is_whitespace())
+        && line[at + 1..]
+            .split_terminator(['.', '!', '?'])
+            .filter(|s| !s.trim().trim_matches(['*', '_', '`', ')']).is_empty())
+            .count()
+            <= 1
+    {
+        return true;
+    }
+    let lower = format!(" {} ", line.to_lowercase());
+    if OFFERS.iter().any(|w| lower.contains(&format!(" {w}"))) {
+        return true;
+    }
+    matches!(
+        line.rsplit(char::is_whitespace).next(),
+        Some("mı" | "mi" | "mu" | "mü")
+    )
+}
+
+/// Whether a prompt is one nobody typed: the harness's notice that the agent's own background
+/// work ended, or another agent's message. Neither answers a question the agent left him.
+pub(crate) fn not_his(prompt: &str) -> bool {
+    let prompt = prompt.trim_start();
+    prompt.starts_with("<task-notification") || prompt.starts_with("<agent-message")
+}
+
 /// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
 /// digits, then `tail`: its task id, so no two drafts share one ("dub52"), or for an agent
 /// with no task `-t` and its terminal, which no task's handle can be ("dub-t3").
@@ -400,6 +455,44 @@ pub(crate) async fn draft_dialog(
     if matches!(made, Ok(Some(_))) {
         connections.asks_changed();
     }
+}
+
+/// The agent in `terminal` ended its turn of `since` asking the owner, and the wait is over:
+/// when that end is still its newest event (no prompt, tool or turn came after) and it is not
+/// qass, its open task waits on him and his inbox gets the draft. No task, no card: an edit
+/// opens one. A failure is dropped.
+pub(crate) async fn wait_on_question(
+    terminal: u32,
+    since: i64,
+    name: Option<String>,
+    question: String,
+    (terminals, agents, connections, store): Hands<'_>,
+) {
+    // Its label too: two turn ends can share a second.
+    let still = agents
+        .focus_events(terminal)
+        .last()
+        .is_some_and(|e| e.kind == "done" && e.at_unix == since && e.label == question);
+    if !still || qass_terminal(terminals, agents, store).await == Some(terminal) {
+        return;
+    }
+    let now = now();
+    let waits = store
+        .run(move |s| s.wait_on_owner(i64::from(terminal), now))
+        .await;
+    if !matches!(waits, Ok(Some(_))) {
+        return;
+    }
+    agents.tasks_changed();
+    draft_waiting(
+        terminal,
+        name,
+        Some(question),
+        terminals.session_of(terminal),
+        connections,
+        store,
+    )
+    .await;
 }
 
 /// The agent in `terminal` reported a tool or a prompt: the dialog it showed is gone, and so is
@@ -971,6 +1064,40 @@ async fn flush_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three turn ends the devbox agent left him on 2026-10-12, two with no "?", ask him;
+    /// a report, a cut courtesy and a word that only starts like an offer do not.
+    #[test]
+    fn a_turn_end_asks_him_by_its_mark_or_its_offer() {
+        for asks in [
+            "Worktree acip PR olarak hazirlayayim mi?",
+            "Logo PR'i icin \"commit et, PR ac, merge et\" dersen /commit ile commit atip push'layacagim.",
+            "İstersen bunu ayrı bir iş olarak güncellerim.",
+            "Istersen bunu ayri bir is olarak guncellerim.",
+            "Worktree açıp PR olarak hazırlayayım mı",
+            "Shall I merge it now.",
+            "Do you want me to deploy it as well.",
+            "**Merge PR #513 now or deploy first?**",
+            "Built and tested. Merge PR #513 now or deploy first? Say which.",
+            "Makineyi yeniden başlatayım mı (`sudo reboot`)? Açılınca kontrol ederim.",
+            "Merge it now (\"yes\" or \"no\")?\"",
+        ] {
+            assert!(asks_owner(asks), "{asks}");
+        }
+        for not in [
+            "",
+            "Merged and deployed, staging returns 200.",
+            "Migration onaylandı, prod'a gitti.",
+            "Let me know if you need anything else.",
+            "If you want more detail, the log is in logs/run.txt.",
+            "Bu dosyada midye yok.",
+            "The report is at https://x.dev/r?id=4 now.",
+            "Why did it fail? Because the cache was stale. Fixed in PR #3.",
+            "let x = ok ? a : b; it is set.",
+        ] {
+            assert!(!asks_owner(not), "{not}");
+        }
+    }
 
     #[test]
     fn his_words_are_one_clean_line() {

@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 /// A stand-in agent: reports idle (with a session when `STUB_SESSION` is set), logs every
 /// line it is sent, and flips its state on `BUSY` and `FREE`. `ASK` shows a question dialog
-/// as the claude hook reports one, `MENU` a permission menu, `TOOL` a tool, and `TASK` opens
-/// a task.
+/// as the claude hook reports one, `MENU` a permission menu, `TOOL` a tool, `TASK` opens
+/// a task, `WAIT` sets its stage to `waiting-human`, `DONE <words>` ends a turn on those last
+/// words and `SAID <words>` is his prompt.
 const STUB: &str = r#"#!/bin/sh
 if [ -n "$STUB_SESSION" ]; then qoop hook-report --state idle --session-id "$STUB_SESSION"; else qoop hook-report --state idle; fi
 while IFS= read -r line; do
@@ -27,6 +28,9 @@ while IFS= read -r line; do
     ASK) qoop hook-report --state blocked --visible-blocker --event blocked --label elicitation_dialog ;;
     MENU) qoop hook-report --state blocked --visible-blocker --event blocked --label "Bash rm -rf build" ;;
     TOOL) qoop hook-report --state working --visible-working --event tool --label "Read src/main.rs" ;;
+    DONE*) qoop hook-report --state idle --visible-idle --event done --label "${line#DONE }" ;;
+    SAID*) qoop hook-report --state working --event user --label "${line#SAID }" ;;
+    WAIT) qoop task stage waiting-human ;;
   esac
 done
 "#;
@@ -846,5 +850,110 @@ fn a_dialog_draft_without_a_task_is_answered_through_qass_by_its_handle() {
         !stack.log("cv").contains("The owner answered"),
         "{:?}",
         stack.log("cv")
+    );
+}
+
+/// The stage of the open task of `terminal`, as `qoop agents --json` lists it.
+fn stage(stack: &Stack, terminal: &str) -> String {
+    let (_, out, _) = stack.run(&["agents", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap_or_default();
+    rows.iter()
+        .find(|r| r["terminal"].as_u64().map(|t| t.to_string()).as_deref() == Some(terminal))
+        .and_then(|r| r["task"]["stage"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A turn that ends asking him in plain words, with no stage set, is still unanswered after
+/// the wait: its task waits on him and his inbox gets one draft with those words, and his
+/// prompt takes both back. A question he answers within the wait, a turn that asks nothing
+/// and qass's own turn get none.
+#[test]
+fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
+    let stack = Stack::start();
+    let link = stack.agent("work", "link", None);
+    let qass = stack.agent("qass", "qass", None);
+    stack.send(&link, "TASK");
+    assert!(stack.wait(|| !stage(&stack, &link).is_empty()));
+    let began = stage(&stack, &link);
+    // What a remote's watch prints, read over ssh by the Mac's watcher.
+    let mut watch = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
+    watch
+        .args(["agents", "--watch", "--json"])
+        .env("QOOP_RUNTIME_DIR", stack.dir.path())
+        .env("XDG_CONFIG_HOME", stack.dir.path().join("config"))
+        .stdout(Stdio::piped());
+    for var in ["QOOP_TERMINAL", "QOOP_TOKEN", "QORO_TERMINAL", "QORO_TOKEN"] {
+        watch.env_remove(var);
+    }
+    let mut watch = watch.spawn().expect("watch");
+    stack.send(
+        &link,
+        "DONE Logo fixed. Istersen bunu ayri bir is olarak guncellerim.",
+    );
+    assert!(
+        stack.wait(|| stack.drafts(&link).len() == 1),
+        "no draft: {:?}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    let draft = stack.drafts(&link).remove(0);
+    assert_eq!(draft["status"], "open");
+    assert_eq!(
+        draft["body"]["asks"],
+        "Logo fixed. Istersen bunu ayri bir is olarak guncellerim."
+    );
+    assert_eq!(stage(&stack, &link), "waiting-human");
+    // The watch said it although the state held: the row carries the task.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = watch.kill();
+    let printed = watch.wait_with_output().expect("watch output").stdout;
+    let last = String::from_utf8_lossy(&printed)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_string();
+    assert!(last.contains("\"stage\":\"waiting-human\""), "{last}");
+
+    // The harness's notice of its own background work is no answer: both stay.
+    let card = draft["card"].as_str().unwrap().to_string();
+    stack.send(
+        &link,
+        "SAID <task-notification>build done</task-notification>",
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(stack.card_status(&card), "open");
+    assert_eq!(stage(&stack, &link), "waiting-human");
+
+    // His prompt in the tab answers it: the stage goes back and the draft closes.
+    stack.send(&link, "SAID evet yap");
+    assert!(stack.wait(|| stack.card_status(&card) == "closed"));
+    assert_eq!(stage(&stack, &link), began);
+
+    // Answered within the wait: nothing.
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(&link, "DONE Merge PR #12 now?");
+    stack.send(&link, "SAID merge");
+    // A turn that asks nothing: nothing.
+    stack.send(&link, "DONE Merged and deployed.");
+    // qass's own turn: nothing.
+    stack.send(&qass, "TASK");
+    stack.send(&qass, "DONE Dub A mi B mi?");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        stack.drafts(&link).len(),
+        1,
+        "answered in time, or no question"
+    );
+    assert_eq!(stage(&stack, &link), began);
+    assert!(stack.drafts(&qass).is_empty(), "qass's own tab");
+
+    // Waiting by its own word, its last line no question: the card says what it waits on,
+    // never that line.
+    stack.send(&link, "WAIT");
+    stack.send(&link, "DONE Merged and deployed.");
+    assert!(stack.wait(|| stack.drafts(&link).len() == 2));
+    assert_eq!(
+        stack.drafts(&link)[1]["body"]["asks"],
+        "link waits on you: ship the login fix"
     );
 }
