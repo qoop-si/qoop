@@ -7,9 +7,9 @@ Gate G9.1 reads this file: with the control-plane host blackholed, every subcomm
 produces the same result as when it is reachable. Some rows are listed but not run by it:
 `qoop`, `qoop attach`, `qoop daemon` and `qoop bridge` do not return, nor does `qoop agents --watch` on macOS
 with no daemon, which waits for one; `qoop relay` starts a daemon and then prints
-whatever that daemon says to a client rather than a result of its own, and the `qoop notch`
-rows start a window or change what the person's login starts, which a comparison run twice
-must not do to the machine it runs on. They are still
+whatever that daemon says to a client rather than a result of its own, the `qoop notch`
+rows start a window or change what the person's login starts, and `qoop uninstall` removes qoop
+itself, which a comparison run twice must not do to the machine it runs on. They are still
 required to be here, and the gate asserts that this table and `qoop --help` name the same
 set, which is what stopped `relay` from staying undocumented after milestone 6 added it.
 
@@ -123,6 +123,7 @@ a claim nobody has to keep.
 | `qoop devices rm <name>` | unpair a phone, by its name or its key fingerprint; the running bridge closes its open streams at once | no |
 | `qoop bridge` | the phones' end of this machine, in the foreground: one outbound connection to the hub, piping each paired phone to this machine's qoop while it runs; `qoop bridge reload` puts the installed bridge service back on the binary now on disk (nothing when there is none), after a replaced binary | yes |
 | `qoop update [--check]` | ask qoop.si for the newest release for this machine (macOS or Linux, arm64 or x86_64) and replace this one with it, then ask this machine's daemon and each saved remote's to move onto it (a working agent or a running command is never ended: a daemon that can hand its tabs over keeps them running and waits for nothing, any other moves once nothing there is working, then ends idle tabs and restores them, agents resumed in their conversations); `--check` only notes what is newest; a release build's daemon also runs it as `--auto` every six hours unless `no-auto-update` is in the config directory ([docs/update.md](update.md#updating-on-its-own)) | yes |
+| `qoop uninstall [--yes]` | take qoop off this machine: the steps of the Uninstall docs page in order (the notch on a Mac, `hooks uninstall`, `skills uninstall`, `logout`, `stop`, the config, data, cache and logs directories, `~/.cache/qoop` on a Mac, `~/.local/bin/qoro`, the `qoop` on PATH that is running). It lists them and asks first, `--yes` skips the question. Refused, with nothing touched, inside a qoop tab, when the running binary is not the `qoop` on PATH, when a directory is the root, the home or too shallow, and in a build without the phone part on a machine that has an account key. It stops at the first step that fails, and when a bridge service is left (a phone is still paired) it says to `qoop devices rm` first | no |
 | `qoop --handoff-formats` | the handover layout this build takes over from, which a daemon about to move onto it asks first; a build from before it fails the question | no |
 | `qoop --hello` | what a remote bootstrap asks for: version, codec generation, platform | no |
 | `qoop --help` | this surface | no |

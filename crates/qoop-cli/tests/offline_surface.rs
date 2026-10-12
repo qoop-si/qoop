@@ -57,11 +57,11 @@ fn runnable_from_the_document() -> Vec<Vec<String>> {
         // daemons alive per run against runtime directories the test had already deleted.
         // Both are still required to be in the table, which the agreement assertion below
         // covers.
-        // `notch` runs a window, or changes what the person's login starts: nothing a check
-        // that runs every row twice may do to the machine it is on.
+        // `notch` runs a window, or changes what the person's login starts, and `uninstall`
+        // removes qoop: nothing a check that runs every row twice may do to the machine it is on.
         if matches!(
             args.first().map(String::as_str),
-            Some("daemon" | "relay" | "bridge" | "notch")
+            Some("daemon" | "relay" | "bridge" | "notch" | "uninstall")
         ) {
             continue;
         }

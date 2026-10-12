@@ -65,7 +65,7 @@ fn places() -> Vec<Place> {
 }
 
 /// Bytes under a path, links not followed; 0 for one that is not there.
-fn size(path: &Path) -> u64 {
+pub(crate) fn size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };
@@ -77,7 +77,7 @@ fn size(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 30 => format!("{:.1}G", b as f64 / (1u64 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.1}M", b as f64 / (1u64 << 20) as f64),

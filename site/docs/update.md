@@ -24,14 +24,22 @@ when run from a Rosetta shell.
 
 ## Uninstall
 
-Run these on the machine itself, in this order: the commands need `qoop` until the last line.
+```
+qoop uninstall            lists what it takes and asks first
+qoop uninstall --yes      the same without the question
+```
+
+Run it in a plain terminal on the machine itself, not inside a qoop tab (it stops the daemon
+that hosts the tab). It does these steps, in this order, and stops at the first one that fails;
+each is safe to run again:
 
 ```
 qoop notch uninstall      on a Mac: the notch and its login item
 qoop hooks uninstall
 qoop skills uninstall
-qoop logout               unlinks this machine; with no phone paired here, it also removes the
-                          bridge service (with one, `qoop devices rm <name>` for each first)
+qoop logout               unlinks this machine, even when the hub cannot be reached; with no
+                          phone paired here, it also removes the bridge service (with one,
+                          `qoop devices rm <name>` for each first: the command stops and says so)
 qoop stop
 rm -rf "$(qoop paths config)" "$(qoop paths data)" "$(qoop paths cache)" "$(qoop paths logs)"
 rm -rf ~/.cache/qoop      on a Mac: the ssh sockets of the links to remotes

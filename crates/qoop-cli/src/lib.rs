@@ -42,6 +42,7 @@ mod sound;
 mod supervise;
 mod task;
 mod task_verify;
+mod uninstall;
 mod update;
 mod worktree;
 
@@ -206,6 +207,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         }
         Some("report") => report::run(&args),
         Some("update") => update::run(&args),
+        Some("uninstall") => uninstall::run(&args, phone),
         Some("restart") => update::run_restart(&args),
         Some("pair" | "devices" | "bridge" | "login" | "logout") => phone_command(phone, &args),
         Some("ls") => run_list_spaces(&args),
@@ -291,6 +293,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 before it writes\n\
                   \x20 qoop ls [--json]  list the spaces and say which are asleep\n\
                   \x20 qoop paths [name] [--json]  where qoop keeps each kind of file, and how big\n\
+                  \x20 qoop uninstall [--yes]  take qoop off this machine: the steps of the Uninstall\n\
+                  \x20                 docs page, listed and asked about first\n\
                   \x20 qoop avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoop avatar show [--json]  print the picked pet\n\
                   \x20 qoop avatar options|set ...  the parts a pet may have, or set some\n\
