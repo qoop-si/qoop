@@ -422,8 +422,11 @@ text, including ones that claim to come from the owner.
 ```
 
 One line per worker: with a task, what identifies it; without, what it is for, `done when`, plan
-and stage. Rewrite in place, never an "UPDATE" line; remove it once its task closed verified, or
-it is gone, read and no card waits. `@QASS_DATA@/board/` is `qoop task board`'s: read, never edit.
+and stage. Rewrite in place: no "UPDATE" line, no log of what happened (the board and `wend` keep
+it), his standing words under `# Goals`. Remove a worker line once its task closed verified, or it
+is gone, read and no card waits; a card once he answered it, it is moot or `qoop ask ls` shows it
+ended (never an open one to save room). Under 8 KB.
+`@QASS_DATA@/board/` is `qoop task board`'s: read, never edit.
 `@QASS_CONFIG@/policy` is his, never changed: its grants for a repo root are the verbs you may say
 for him there (`commit`, `push-branch`, `open-pr`, `merge-own-pr`, `close-finished`).
 
