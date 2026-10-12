@@ -11077,6 +11077,36 @@ fn activate(state: &mut State, space: i64, to: u32) {
     }
 }
 
+/// The first render adopted a terminal before any space was named, and the space then picked
+/// (the first, qass's last) has no tab to bring the keyboard home to: the screen follows the
+/// terminal into its own space. Without this, only qass awake showed its terminal alone under
+/// an empty tab bar, the board and the questions missing until a switch away and back. Only
+/// while no tree exists yet: after that, an empty space is one the person went to on purpose.
+fn follow_adopted(state: &mut State) {
+    let Some(space) = state.space else {
+        return;
+    };
+    if state.focused == 0
+        || state.pending_focus.is_some()
+        || !state.layouts.is_empty()
+        || !state.tabs().is_empty()
+    {
+        return;
+    }
+    let home = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == state.focused)
+        .map(|r| r.workspace)
+        .filter(|w| *w != space);
+    if let Some(home) = home {
+        state.space = Some(home);
+        if ensure_layout(state) {
+            state.adopted_resize = true;
+        }
+    }
+}
+
 /// Make sure the space on screen has a tiling tree, seeding a single pane
 /// from the focused terminal (or the first tab) when it has none.
 ///
@@ -12324,6 +12354,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 if state.focused != 0 && ensure_layout(state) {
                     state.adopted_resize = true;
                 }
+                follow_adopted(state);
             }
             // A space folds the moment it falls asleep, or first shows up asleep, and opens
             // when it wakes: only the edge moves the fold, so a sleeping space a person
@@ -12821,6 +12852,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .collect();
             state.rows = agents;
             sidebar::qass_last(&mut state.spaces, &mut state.rows);
+            follow_adopted(state);
             name_sessions(state, request);
             // A space being closed waits for this: the daemon counts store rows and the
             // index reads the live registry, so the index showing a space empty is the
@@ -18176,6 +18208,56 @@ mod tests {
             "the stray keyboard is sent home: {:?}",
             state.pending_focus
         );
+    }
+
+    /// Only qass awake: the first render adopts its terminal before any space is named, the
+    /// first space (`default`) has no tab, and the screen must follow the terminal into qass's
+    /// own tab, with the board beside it, whichever of the space list and the index comes first.
+    #[test]
+    fn the_first_open_with_only_qass_awake_shows_its_tab_with_the_board() {
+        use qoop_runtime::control::{Pane, SplitDir};
+        let mut board = agent(4, 9, "qoop", "idle");
+        board.agent = false;
+        board.name = Some(qoop_runtime::idle::BOARD_PANE.into());
+        let rows = vec![board, agent(5, 9, "claude", "idle")];
+        let tree = Pane::Split {
+            dir: SplitDir::V,
+            permille: 700,
+            questions: 0,
+            first: Box::new(Pane::Leaf { terminal: 4 }),
+            second: Box::new(Pane::Leaf { terminal: 5 }),
+        };
+        let spaces = || ControlResponse::Workspaces {
+            id: "ws".to_string(),
+            workspaces: vec![space(1, "default"), space(9, "qass")],
+        };
+        let index = || ControlResponse::Agents {
+            id: "index".to_string(),
+            agents: rows.clone(),
+            splits: vec![tree.clone()],
+        };
+        for spaces_first in [true, false] {
+            let mut state = bare_state();
+            state.adopted = true;
+            state.focused = 5;
+            assert_eq!(state.space, None);
+            let mut dirty = false;
+            let order = if spaces_first {
+                [spaces(), index()]
+            } else {
+                [index(), spaces()]
+            };
+            for response in order {
+                apply(&mut state, response, &mut 0, &mut dirty);
+            }
+            assert_eq!(state.space, Some(9), "spaces_first {spaces_first}");
+            assert_eq!(
+                state.layouts.get(&9).map(|l| l.leaves()),
+                Some(vec![4, 5]),
+                "the board is in qass's tab, spaces_first {spaces_first}"
+            );
+            assert_eq!(state.focused, 5);
+        }
     }
 
     /// An index arriving while the focus list is open marks a refetch: a tool
