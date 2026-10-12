@@ -22,6 +22,7 @@ pub mod notify;
 pub mod palette;
 pub mod present;
 pub mod qass_screen;
+pub mod rail;
 pub mod run;
 pub mod screen;
 pub mod selection;

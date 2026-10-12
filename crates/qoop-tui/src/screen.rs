@@ -154,8 +154,8 @@ pub struct Chrome<'a> {
     /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
     /// over the board's tile. The tree knows where the board is, so the client says.
     pub questions: Option<crate::qass_screen::Side>,
-    /// The questions folded to their strip on qass's split tab, while they are not open.
-    pub questions_strip: Option<crate::layout::Rect>,
+    /// qass's rail while a pane is folded: the tabs, one per folded pane.
+    pub rail: Option<RailPaint>,
     /// The handle on the divider of qass's split tab, in ember.
     pub handle: Option<crate::qass_screen::Handle>,
     /// The handle on the questions' own edge, beside the board, in ember too.
@@ -164,7 +164,25 @@ pub struct Chrome<'a> {
     pub fold: Option<FoldPaint>,
 }
 
-/// qass's tab with the board, for its titles and strips: the two panes a click on the title
+/// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
+/// screen order; the rail runs `rows` rows down from `y`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RailPaint {
+    pub x: usize,
+    pub y: usize,
+    pub rows: usize,
+    pub w: usize,
+    pub panes: [Option<crate::rail::Pane>; 3],
+}
+
+impl RailPaint {
+    /// The folded panes in screen order.
+    pub fn tabs(&self) -> Vec<crate::rail::Pane> {
+        self.panes.iter().flatten().copied().collect()
+    }
+}
+
+/// qass's tab with the board, for its titles and the rail: the two panes a click on the title
 /// folds, the one folded to its strip, and whether qass's top edge carries its folder (the
 /// tab bar's path, which the header took the place of).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,7 +246,7 @@ impl Default for Chrome<'_> {
             qass: None,
             asks: None,
             questions: None,
-            questions_strip: None,
+            rail: None,
             handle: None,
             questions_handle: None,
             fold: None,
@@ -564,9 +582,6 @@ pub(crate) fn qass_screen_of(
     };
     let wake_at = frame.chrome.qass.and_then(|ui| ui.wake_at);
     let mut screen = crate::qass_screen::Screen::new(plan, &facts, wake_at, ctx);
-    if let Some(strip) = frame.chrome.questions_strip {
-        screen = screen.with_strip(strip, facts.asks, spotlight);
-    }
     if let (Some(side), Some(asks)) = (plan.side, frame.chrome.asks) {
         let seen = crate::asks::Ctx {
             rows: frame.rows,
@@ -1019,20 +1034,11 @@ pub fn paint(frame: &Frame) -> String {
     if let Some(handle) = frame.chrome.questions_handle.filter(|_| !edges.is_empty()) {
         put_handle(&mut edges, handle);
     }
-    // A pane folded to its strip: the strip's cells over the tile, row by row.
-    let folded_strip = frame.chrome.fold.and_then(|fold| {
-        let tile = frame
-            .tiles
-            .iter()
-            .find(|t| Some(t.terminal) == fold.folded)?;
-        let (name, role) = if tile.terminal == fold.qass {
-            ("qass", theme::Role::Brand)
-        } else {
-            ("board", theme::Role::Text)
-        };
-        let rows = crate::qass_screen::strip_rows(tile.rect.rows, None, name, role, spotlight);
-        Some((tile.rect, rows))
-    });
+    // qass's rail: its rows, painted over the cells the tree left for it.
+    let rail_rows = frame
+        .chrome
+        .rail
+        .map(|rail| rail_rows_of(frame, &rail, spotlight));
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
         .rows
@@ -1268,16 +1274,11 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
                 out.push_str(&row);
             }
-            if let Some((rect, rows)) = &folded_strip
-                && let Some(cell) = pane_row.checked_sub(rect.y).and_then(|at| rows.get(at))
+            if let (Some(rail), Some(rows)) = (frame.chrome.rail, &rail_rows)
+                && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
             {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
-                out.push_str(cell);
-            }
-            // Or folded to their strip, in the cell the tree left for it.
-            if let Some((x, cell)) = qass.as_ref().and_then(|(_, s)| s.strip_row(pane_row)) {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + x));
-                out.push_str(cell);
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.x));
+                out.push_str(row);
             }
         }
     }
@@ -3165,6 +3166,66 @@ fn covers(frame: &Frame, x: usize, pane_row: usize) -> bool {
             && x >= t.rect.x
             && x < t.rect.x + t.rect.cols
     })
+}
+
+/// The rail's painted rows, one per pane row it covers: the tabs built from the same facts the
+/// header's chip says, and under them what waits.
+fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
+    use crate::rail::{Pane, Preview, Tab};
+    let facts = crate::qass_screen::facts(
+        frame.rows,
+        frame.spaces,
+        frame.focused,
+        frame.chrome.asks.and_then(|asks| asks.count()),
+    );
+    let asks = facts.as_ref().map_or(0, |f| f.asks);
+    let said = facts.as_ref().map(crate::qass_screen::say);
+    let panes = rail.tabs();
+    let tabs: Vec<Tab> = panes
+        .iter()
+        .map(|pane| match pane {
+            Pane::Board => Tab {
+                pane: *pane,
+                count: None,
+                state: None,
+                dot: theme::Role::Detail,
+            },
+            Pane::Questions => Tab {
+                pane: *pane,
+                count: Some(asks),
+                state: Some(if asks > 0 {
+                    format!("{asks} asks")
+                } else {
+                    "none".to_string()
+                }),
+                dot: if asks > 0 {
+                    theme::Role::Blocked
+                } else {
+                    theme::Role::Faint
+                },
+            },
+            Pane::Qass => Tab {
+                pane: *pane,
+                count: None,
+                state: said.as_ref().map(|s| s.word.clone()),
+                dot: said.as_ref().map_or(theme::Role::Idle, |s| s.role),
+            },
+        })
+        .collect();
+    let card = frame
+        .chrome
+        .asks
+        .and_then(|pane| pane.live.iter().find(|c| c.status == "open"));
+    let preview = card
+        .filter(|_| {
+            asks > 0 && panes.contains(&Pane::Questions) && frame.chrome.questions.is_none()
+        })
+        .map(|c| Preview {
+            count: asks,
+            title: c.body.asks.clone(),
+            agent: c.body.handle.clone(),
+        });
+    crate::rail::rows(rail.rows, rail.w, &tabs, preview.as_ref(), fade)
 }
 
 /// How a cell of the marks around split panes is painted.

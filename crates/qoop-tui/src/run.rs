@@ -1058,11 +1058,14 @@ struct Closing {
 ///
 /// Together because they are one idea: a key means something else until the mode is left,
 /// and `apply` (which cannot write) sometimes has to ask the daemon on a mode's behalf.
-/// An edge of qass's tab held by the mouse: a divider of the tree, or the questions' own edge.
+/// An edge of qass's tab held by the mouse: a divider of the tree, the questions' own edge, or the
+/// rail's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Grab {
     Divider(layout::SplitPath),
     Questions,
+    /// The edge line of qass's rail: its width, kept for the session and never saved.
+    Rail,
 }
 
 #[derive(Default)]
@@ -1179,7 +1182,7 @@ impl State {
                 qass: self.qass_header().then_some(self.qass_ui),
                 asks: self.qass_header().then_some(&self.asks),
                 questions: self.qass_split().then(|| self.questions()).flatten(),
-                questions_strip: self.qass_split().then(|| self.questions_strip()).flatten(),
+                rail: self.qass_split().then(|| self.rail_paint()).flatten(),
                 handle: self.qass_split().then(|| self.handle()).flatten(),
                 questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
@@ -1507,23 +1510,40 @@ impl State {
         let area = pane_area(self);
         // Inside the pane only: `pane_cell` pulls a pointer past the edge back in, which is
         // right for a drag already held and wrong for a press on the status rows below.
-        // A pane folded to its strip: nothing to drag, the divider is not where its ratio says.
         if (col as usize) < first_col
             || (col as usize) >= first_col + area.cols
             || (row as usize) <= screen::TABS + area.y
             || (row as usize) > screen::TABS + area.y + area.rows
-            || self.folded().is_some()
         {
             return false;
         }
         let (x, y) = self.pane_cell(row, col);
+        // The rail's edge first, also with a pane folded (that is when there is one): it is
+        // a line of its own, and a stacked tab's divider runs under it.
+        let rail = self.on_rail_edge(x, y);
+        // The rail's body is not a stacked tab's divider, which runs under it.
+        if !rail
+            && self
+                .rail_paint()
+                .is_some_and(|r| x < r.x + r.w + crate::rail::EDGE)
+        {
+            return false;
+        }
+        // A pane folded away: no divider to drag, it is not where its ratio says.
+        if !rail && self.folded().is_some() {
+            return false;
+        }
         let shown = self.space.and_then(|space| self.drawn_tree(space));
-        let grab = shown.and_then(|layout| match layout.divider_at(area, x, y) {
-            Some(path) => Some(Grab::Divider(path)),
-            None => layout
-                .on_questions_edge(area, x, y)
-                .then_some(Grab::Questions),
-        });
+        let grab = if rail {
+            Some(Grab::Rail)
+        } else {
+            shown.and_then(|layout| match layout.divider_at(area, x, y) {
+                Some(path) => Some(Grab::Divider(path)),
+                None => layout
+                    .on_questions_edge(area, x, y)
+                    .then_some(Grab::Questions),
+            })
+        };
         // A second press on an edge of qass's tab within a double click's time puts what it
         // moves back to its default, and holds nothing.
         let now = std::time::Instant::now();
@@ -1556,9 +1576,15 @@ impl State {
         };
         match grab {
             Grab::Divider(path) => {
-                self.change_absorbing(space, |layout| layout.drag(area, &path, x, y))
+                // The kept tree knows nothing of the rail: the pointer is measured where the
+                // divider is drawn, with the whole split moved right by it when qass is first.
+                let shift = self.drawn_tree(space).map_or(0, |drawn| drawn.rail_shift());
+                self.change_absorbing(space, |layout| {
+                    layout.drag(area, &path, x.saturating_sub(shift), y)
+                })
             }
             Grab::Questions => self.questions_to(space, |layout| layout.gap_at(area, x)),
+            Grab::Rail => self.rail_to(x),
         }
     }
 
@@ -2566,22 +2592,33 @@ impl State {
                 && area.rows >= crate::qass_screen::INBOX_MIN_ROWS
                 && tree.zoomed.is_none();
             let board_first = self.board_first(tree);
+            // The rail's columns are charged whether it shows or not, so a card arriving never
+            // turns the tab over.
+            let reserve = self.rail_reserve(area);
             let (dir, ratio, gap) = crate::qass_screen::board_shape(
                 area.cols,
                 saved,
                 questions,
                 tree.questions,
                 board_first,
+                reserve,
             );
             shown.set_root_split(dir, ratio);
             shown.gap = gap;
             shown.gap_second = !board_first;
-            // A pane folded to its strip: the other takes the width, the questions' gap is
+            // A pane folded to its tab: the other takes the width, the questions' gap is
             // weighed against the open pane.
             if let Some((fold, board)) = self.fold_leaf(tree) {
-                let open = shown.inner(area).cols.saturating_sub(2);
+                let open = shown.inner(area).cols.saturating_sub(reserve);
                 shown.fold = Some(fold);
                 shown.gap = crate::qass_screen::fold_gap(open, fold != board, questions);
+            }
+            // The rail shows while a pane is folded: the board or qass, or the questions (folded
+            // unless beside the board; over its tile they keep their tab, so a card never
+            // moves a pane).
+            shown.rail = 0;
+            if (shown.fold.is_some() || shown.gap == 0) && self.band_over(tree) > 0 {
+                shown.rail = reserve;
             }
         }
         shown
@@ -2650,6 +2687,7 @@ impl State {
         Layout {
             gap: 0,
             fold: None,
+            rail: 0,
             ..self.drawn(tree)
         }
     }
@@ -2661,7 +2699,7 @@ impl State {
         let area = pane_area(self);
         let Some(shown) = self
             .drawn_tree(space)
-            .filter(|tree| tree.gap > crate::qass_screen::STRIP_GAP && tree.fold.is_none())
+            .filter(|tree| tree.gap > 0 && tree.fold.is_none())
         else {
             return self.change_shown(space, change);
         };
@@ -2689,7 +2727,7 @@ impl State {
         let area = pane_area(self);
         let Some(shown) = self
             .drawn_tree(space)
-            .filter(|tree| tree.gap > crate::qass_screen::STRIP_GAP && tree.fold.is_none())
+            .filter(|tree| tree.gap > 0 && tree.fold.is_none())
         else {
             return false;
         };
@@ -2746,8 +2784,7 @@ impl State {
         let now = self.drawn(&tree);
         let refused = self.board_tree(&tree)
             && (now.root_split().map(|r| r.0) != shown.map(|r| r.0)
-                || (shown_tree.gap > crate::qass_screen::STRIP_GAP
-                    && now.gap <= crate::qass_screen::STRIP_GAP));
+                || (shown_tree.gap > 0 && now.gap == 0));
         if done && !refused {
             self.layouts.insert(space, tree);
         }
@@ -2814,6 +2851,11 @@ impl State {
     /// Give what `grab` moves its default back: the questions' width for their own edge, and for
     /// the divider the board's side its larger share too.
     fn reset_split(&mut self, space: i64, grab: &Grab) {
+        // The rail's width has a default of its own; nothing else moves and nothing is saved.
+        if *grab == Grab::Rail {
+            self.qass_ui.rail = None;
+            return;
+        }
         let Some(tree) = self.layouts.get(&space).filter(|t| self.board_tree(t)) else {
             return;
         };
@@ -2991,7 +3033,7 @@ impl State {
             return None;
         }
         let (board, before) = self.cut(&tree)?;
-        if tree.gap > crate::qass_screen::STRIP_GAP {
+        if tree.gap > 0 {
             let edge = 1;
             // Beside the tile the gap was cut from, on the side away from it: after it, or
             // before it when the gap stands before.
@@ -3039,30 +3081,101 @@ impl State {
         Some((rect, before))
     }
 
-    /// The questions folded to their strip on qass's split tab, in pane cells: the cell past
-    /// the cut tile's frame edge, down its rows, while the questions are not open.
-    fn questions_strip(&self) -> Option<layout::Rect> {
+    /// qass's rail, in pane cells, while a pane is folded: where its tabs stand and which panes
+    /// they are, in screen order. The questions' tab is there while they are not beside the board.
+    fn rail_paint(&self) -> Option<screen::RailPaint> {
         let tree = self.drawn_tree(self.space?)?;
-        if tree.zoomed.is_some()
+        if !self.qass_split()
+            || tree.rail == 0
+            || tree.zoomed.is_some()
             || tree.leaf_count() < 2
             || self.band_over(&tree) == 0
-            || tree.gap != crate::qass_screen::STRIP_GAP
-            || self.questions().is_some()
         {
             return None;
         }
-        let (tile, before) = self.cut(&tree)?;
-        let x = if before {
-            tile.x.checked_sub(tree.gap)?
-        } else {
-            tile.x + tile.cols + 1
+        let (board, qass) = self.board_leaves(&tree)?;
+        let area = self.tree_area(&tree);
+        let panes = [
+            (tree.fold == Some(board)).then_some(crate::rail::Pane::Board),
+            (tree.gap == 0).then_some(crate::rail::Pane::Questions),
+            (tree.fold == Some(qass)).then_some(crate::rail::Pane::Qass),
+        ];
+        panes
+            .iter()
+            .any(Option::is_some)
+            .then_some(screen::RailPaint {
+                x: area.x + 1,
+                y: area.y,
+                rows: area.rows,
+                w: tree.rail - crate::rail::EDGE,
+                panes,
+            })
+    }
+
+    /// The columns the rail takes off the first pane while it shows: its tabs, the edge line and
+    /// the blank column. The dragged width, else the one the pane's columns give, kept so qass's
+    /// split still has both panes at their minimum.
+    fn rail_reserve(&self, area: layout::Rect) -> usize {
+        let room = crate::qass_screen::rail_room(area.cols);
+        let tabs = self
+            .qass_ui
+            .rail
+            .unwrap_or_else(|| crate::rail::default_width(area.cols));
+        crate::rail::clamp(tabs, room) + crate::rail::EDGE
+    }
+
+    /// The pane whose tab is at a one based screen position, when it is on the rail.
+    fn rail_tab_at(&self, row: u16, col: u16) -> Option<crate::rail::Pane> {
+        let rail = self.rail_paint()?;
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let x = (col as usize).checked_sub(left + 1)?;
+        let y = (row as usize).checked_sub(screen::TABS + 1)?;
+        if x < rail.x || x >= rail.x + rail.w {
+            return None;
+        }
+        let tabs = rail.tabs();
+        let at = crate::rail::tab_at(tabs.len(), y.checked_sub(rail.y)?)?;
+        tabs.get(at).copied()
+    }
+
+    /// The terminal a board or qass tab opens.
+    fn rail_leaf(&self, pane: crate::rail::Pane) -> Option<u32> {
+        let (board, qass) = self.board_leaves(self.layouts.get(&self.space?)?)?;
+        match pane {
+            crate::rail::Pane::Board => Some(board),
+            crate::rail::Pane::Qass => Some(qass),
+            crate::rail::Pane::Questions => None,
+        }
+    }
+
+    /// Whether a pane cell is on the rail's edge line, the one that drags its width.
+    fn on_rail_edge(&self, x: usize, y: usize) -> bool {
+        self.rail_paint()
+            .is_some_and(|r| x == r.x + r.w && y >= r.y && y < r.y + r.rows)
+    }
+
+    /// Set the tabs' width from the pane cell the edge was dragged to. True when it moved.
+    fn rail_to(&mut self, x: usize) -> bool {
+        let Some(rail) = self.rail_paint() else {
+            return false;
         };
-        Some(layout::Rect {
-            x,
-            y: tile.y,
-            cols: 1,
-            rows: tile.rows,
-        })
+        let area = pane_area(self);
+        let width = x.saturating_sub(rail.x);
+        // The board keeps its minimum after the rail, or the tab would turn over.
+        let mut room = crate::qass_screen::rail_room(area.cols);
+        if let Some(tree) = self.drawn_tree(self.space.unwrap_or_default())
+            && let Some((first, last)) = tree.root_cols(area)
+        {
+            let board = if tree.gap_second { last } else { first };
+            room = room
+                .min(board.saturating_sub(crate::qass_screen::BOARD_MIN_COLS + crate::rail::EDGE));
+        }
+        let width = crate::rail::clamp(width, room);
+        if width == rail.w {
+            return false;
+        }
+        self.qass_ui.rail = Some(width);
+        true
     }
 
     /// Whether qass's mark on its screen moves: it is working and its screen is up.
@@ -7804,6 +7917,19 @@ where
                                 let clicked = state.clicked(row, col);
                                 let asked_about = put_question_down(&mut state, clicked);
 
+                                // A tab on the rail opens its pane (the questions' tab was
+                                // answered above), and the press never reaches anything else.
+                                if !shift
+                                    && let Some(terminal) = state.rail_tab_at(row, col).and_then(|pane| state.rail_leaf(pane))
+                                    && state.strip_press(terminal)
+                                {
+                                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                    dirty = true;
+                                    continue;
+                                }
                                 // A pane's name on the top edge of the panes is its handle: held,
                                 // it carries the pane like a row of the column (to the tab bar
                                 // for a tab of its own); let go where it went down, it is a click
@@ -7828,18 +7954,6 @@ where
                                     if state.selection.take().is_some() {
                                         dirty = true;
                                     }
-                                    continue;
-                                }
-                                // A pane folded to its strip opens on a press, which never
-                                // reaches the program behind the strip.
-                                if let Some((terminal, ..)) = state.tile_at_screen(row, col)
-                                    && state.strip_press(terminal)
-                                {
-                                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
-                                        wr.write_all(&resize).await?;
-                                    }
-                                    drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
-                                    dirty = true;
                                     continue;
                                 }
                                 // A tiled pane first. A click on an unfocused tile only
@@ -8493,8 +8607,9 @@ where
                                     dirty = true;
                                     continue;
                                 }
-                                if state.modes.split_drag.take().is_some() {
-                                    if let Some(space) = state.space {
+                                if let Some(grab) = state.modes.split_drag.take() {
+                                    // The rail's width is this session's: nothing is written.
+                                    if let Some(space) = state.space.filter(|_| grab != Grab::Rail) {
                                         state.save_split(space);
                                     }
                                     dirty = true;
@@ -11653,12 +11768,8 @@ impl State {
             return Some(AskClick::Toggle);
         }
         let pane_row = (row as usize).checked_sub(screen::TABS + 1)?;
-        // The questions folded to their strip: a click opens them, as the chip does.
-        if let Some(strip) = frame.chrome.questions_strip
-            && pane_row >= strip.y
-            && pane_row < strip.y + strip.rows
-            && pane_col == strip.x
-        {
+        // The questions' tab on the rail: a click opens them, as the chip does.
+        if self.rail_tab_at(row, col) == Some(crate::rail::Pane::Questions) {
             return Some(AskClick::Toggle);
         }
         let side = plan.side?;
@@ -20119,7 +20230,7 @@ mod tests {
         state
     }
 
-    /// The board folded (`ctrl-a T` in it) is a strip one cell wide: its pty keeps its size
+    /// The board folded (`ctrl-a T` in it) is no columns wide, its tab on the rail: its pty keeps its size
     /// while qass's grows into the room; opened again (`ctrl-a T`, the keyboard staying in
     /// qass), both are back as they were. Nothing of the fold is saved.
     #[test]
@@ -20143,7 +20254,7 @@ mod tests {
         }
         size_terminals(&mut state, &mut seqs).unwrap();
         let folded = qass_tiles(&state);
-        assert_eq!(folded[0].1.cols, 1, "{folded:?}");
+        assert_eq!(folded[0].1.cols, 0, "{folded:?}");
         assert!(folded[1].1.cols > open[1].1.cols, "qass grows");
         assert_eq!(
             state.sized.get(&4),
@@ -20222,30 +20333,18 @@ mod tests {
         assert_eq!(state.title_at_screen(title_row, last), Some(5));
         assert_eq!(state.title_at_screen(title_row, last + 2), None);
         assert!(title_fold(&mut state, 4));
-        let strip = tile_of(&state, 4);
-        assert_eq!(strip.cols, 1);
-        let painted = screen::paint(&state.frame());
-        let at = |r: usize| {
-            format!(
-                "\x1b[{};{}H",
-                screen::TABS + 1 + strip.y + r,
-                left + 1 + strip.x
-            )
-        };
-        let cell = |r: usize| {
-            let from = painted.rfind(&at(r)).expect("written there") + at(r).len();
-            plain(&painted[from..]).chars().next().unwrap()
-        };
+        assert_eq!(tile_of(&state, 4).cols, 0);
+        let rail = state.rail_paint().expect("the rail");
         assert_eq!(
-            (cell(0), cell(2), cell(3), cell(6)),
-            ('\u{25b8}', 'b', 'o', 'd'),
-            "the strip: its caret, then the name down it"
+            rail.tabs(),
+            vec![crate::rail::Pane::Board, crate::rail::Pane::Questions]
         );
-        // The wheel over the strip reaches no page.
-        let (row, col) = (
-            (screen::TABS + 1 + strip.y + 3) as u16,
-            (left + 1 + strip.x) as u16,
-        );
+        let painted = screen::paint(&state.frame());
+        let line = |r: usize| written_on(&painted, screen::TABS + 1 + rail.y + r);
+        assert!(line(0).contains("\u{25b8} board"), "{:?}", line(0));
+        assert!(line(1).contains("\u{25b8} questions 0"), "{:?}", line(1));
+        // The wheel over the rail reaches no page.
+        let (row, col) = screen_of(&state, rail.x, rail.y);
         assert_eq!(state.board_wheel(row, col, true), None);
     }
 
@@ -20260,14 +20359,19 @@ mod tests {
         let (strip, qass) = (tile_of(&state, 4), tile_of(&state, 5));
         assert!(!side.replaces);
         assert!(
-            side.rect.x > strip.x && side.rect.x + side.rect.cols < qass.x,
+            side.rect.x >= strip.x && side.rect.x + side.rect.cols < qass.x,
             "{side:?}"
         );
         // A narrow window: over qass's tile.
         state.cols = 120;
         let side = state.questions().expect("over qass");
         assert!(side.replaces && side.rect == tile_of(&state, 5));
-        assert_eq!(state.questions_strip(), None);
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions)),
+            "over qass's tile they keep their tab"
+        );
     }
 
     /// Stacked, the lower pane's title stands on the divider and is a click on it all the same;
@@ -20323,24 +20427,14 @@ mod tests {
         let shut = qass_tiles(&state);
         let qass_size = state.sized.get(&5).copied();
         assert!(state.questions().is_none());
-        let strip = state.questions_strip().expect("folded to their strip");
-        assert_eq!(
-            (strip.x, strip.y, strip.cols, strip.rows),
-            (
-                shut[0].1.x + shut[0].1.cols + 1,
-                shut[0].1.y,
-                1,
-                shut[0].1.rows
-            )
-        );
+        let rail = state.rail_paint().expect("folded: their tab on the rail");
+        assert_eq!(rail.tabs(), vec![crate::rail::Pane::Questions]);
+        let rail_cols = state.drawn(&state.layouts[&9]).rail;
+        assert_eq!(rail.w + crate::rail::EDGE, rail_cols);
+        assert_eq!((rail.x, rail.y), (1, tile_of(&state, 4).y - 1));
         let painted = screen::paint(&state.frame());
-        let row = |r: usize| written_on(&painted, screen::TABS + 1 + strip.y + r);
-        assert!(
-            row(0).contains('\u{25b8}') && row(1).contains('0'),
-            "{:?}",
-            row(1)
-        );
-        assert!(row(3).contains('q') && row(4).contains('u'), "{:?}", row(3));
+        let row = |r: usize| written_on(&painted, screen::TABS + 1 + rail.y + r);
+        assert!(row(0).contains("\u{25b8} questions"), "{:?}", row(0));
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         size_terminals(&mut state, &mut seqs).unwrap();
         let open = qass_tiles(&state);
@@ -20352,10 +20446,14 @@ mod tests {
         );
         let board = open[0].1;
         assert_eq!(
-            board.cols,
-            shut[0].1.cols - (crate::qass_screen::QUESTIONS_GAP - crate::qass_screen::STRIP_GAP)
+            board.cols + crate::qass_screen::QUESTIONS_GAP,
+            shut[0].1.cols + rail_cols,
+            "the rail's columns and the column's come off the board"
         );
-        assert_eq!(state.questions_strip(), None, "open: no strip");
+        assert!(
+            state.rail_paint().is_none(),
+            "open: nothing folded, no rail"
+        );
         assert!(board.cols >= crate::qass_screen::BOARD_MIN_COLS);
         assert_eq!(
             state.sized.get(&4),
@@ -20373,7 +20471,7 @@ mod tests {
         // Answered elsewhere: no card waits, the column folds and the board has it back.
         state.asks.take(Vec::new(), Vec::new());
         size_terminals(&mut state, &mut seqs).unwrap();
-        assert!(state.questions().is_none() && state.questions_strip() == Some(strip));
+        assert!(state.questions().is_none() && state.rail_paint() == Some(rail));
         assert_eq!(qass_tiles(&state), shut);
         assert_eq!(state.sized.get(&5).copied(), qass_size);
     }
@@ -20637,18 +20735,23 @@ mod tests {
         assert_eq!(widths(&state), wide);
     }
 
-    /// The folded questions' strip opens them on a click, as the chip does, and carries the same
+    /// The questions' tab on the rail opens them on a click, as the chip does, and carries the same
     /// count as the header's `[ N asks you ]`: before the ask store is read and after.
     #[test]
-    fn the_questions_strip_opens_them_and_counts_what_the_header_counts() {
+    fn the_questions_tab_opens_them_and_counts_what_the_header_counts() {
         let mut state = qass_wide();
-        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
-        // The strip's count cell is the last thing written on its second row.
-        let count_on_strip = |state: &State| {
-            let strip = state.questions_strip().expect("folded");
+        // The tab's text, wide enough (the 14 cell rail) for the word and its count.
+        let tab_count = |state: &State| {
+            let rail = state.rail_paint().expect("folded");
             let painted = screen::paint(&state.frame());
-            let row = written_on(&painted, screen::TABS + 2 + strip.y);
-            row.chars().last().unwrap().to_string()
+            let row = plain(&written_on(&painted, screen::TABS + 1 + rail.y));
+            row.split_whitespace()
+                .find_map(|w| {
+                    w.parse::<String>()
+                        .ok()
+                        .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+                })
+                .expect("a count on the tab")
         };
         let header_count = |state: &State| {
             let frame = state.frame();
@@ -20661,8 +20764,8 @@ mod tests {
         };
         // Before the store is read: both fall back to the same count.
         assert_eq!(state.asks.count(), None);
-        assert_eq!(count_on_strip(&state), header_count(&state));
-        // Three cards, put away: the strip says 3, so does the header.
+        assert_eq!(tab_count(&state), header_count(&state));
+        // Three cards, put away: the tab says 3, so does the header.
         state.asks.take(
             vec![
                 ask_card(1, "korea"),
@@ -20673,7 +20776,7 @@ mod tests {
         );
         state.asks.hidden = true;
         assert!(state.questions().is_none());
-        assert_eq!(count_on_strip(&state), "3");
+        assert_eq!(tab_count(&state), "3");
         assert_eq!(header_count(&state), "3");
         let frame = state.frame();
         let (_, screen) =
@@ -20681,12 +20784,11 @@ mod tests {
         let painted = screen::paint(&frame);
         let chip = screen.chip().unwrap();
         assert!(written_on(&painted, 1 + chip.row).contains("[ 3 asks you ]"));
-        // A click anywhere on the strip opens them.
-        let strip = state.questions_strip().unwrap();
-        let (row, col) = (
-            (screen::TABS + 1 + strip.y + 5) as u16,
-            (left + 1 + strip.x) as u16,
-        );
+        // Its words show under the tab (the ember block itself is the rail's own test).
+        assert!(painted.contains("3 waiting"), "{painted:?}");
+        // A click on the tab opens them.
+        let rail = state.rail_paint().unwrap();
+        let (col, row) = screen_of(&state, rail.x + 2, rail.y);
         assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
         assert!(asks_toggle(&mut state) && state.questions().is_some());
     }
@@ -20747,7 +20849,12 @@ mod tests {
         let side = state.questions().expect("over the board, by themselves");
         assert!(side.replaces && side.rect == tiles[0].1);
         assert!(!state.asks.focus, "a card does not take the keyboard");
-        assert_eq!(state.questions_strip(), None, "open: no strip");
+        assert!(
+            state
+                .rail_paint()
+                .is_some_and(|r| r.tabs().contains(&crate::rail::Pane::Questions)),
+            "over the board's tile they keep their tab, so nothing moves"
+        );
         let painted = screen::paint(&state.frame());
         assert!(painted.contains("Question 1?"), "{painted:?}");
         // Zoomed, nothing of them.
@@ -21485,6 +21592,333 @@ mod tests {
         out
     }
 
+    /// The cells a painted frame leaves in the screen's columns `0..cols` and rows `0..rows`: cursor
+    /// placements and the characters after them, colours gone, wide characters on their first cell.
+    fn cells_of(painted: &str, cols: usize, rows: usize) -> Vec<Vec<char>> {
+        let mut grid = vec![vec![' '; cols]; rows];
+        let (mut r, mut c) = (0usize, 0usize);
+        let mut chars = painted.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                let mut seq = String::new();
+                for ch in chars.by_ref() {
+                    seq.push(ch);
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                if let Some(at) = seq.strip_prefix('[').and_then(|s| s.strip_suffix('H')) {
+                    let mut it = at.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
+                    r = it.next().unwrap_or(1).saturating_sub(1);
+                    c = it.next().unwrap_or(1).saturating_sub(1);
+                }
+                continue;
+            }
+            if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                *cell = ch;
+            }
+            c += crate::width::columns(ch).max(1);
+        }
+        grid
+    }
+
+    /// The left sidebar is the owner's, and stays exactly as it is: whatever the panes do (the
+    /// questions folded or beside the board, the board or qass folded, the rail dragged to its
+    /// narrowest and widest, a stacked or a swapped tab, a zoom, 200 or 120 columns), the cells of
+    /// its columns are the same, row for row.
+    #[test]
+    fn the_left_sidebar_paints_the_same_whatever_the_panes_do() {
+        for cols in [200u16, 120] {
+            let mut state = qass_wide();
+            state.cols = cols;
+            let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+            let rows = state.lines as usize - screen::STATUS;
+            let sidebar = |state: &State| {
+                let grid = cells_of(
+                    &screen::paint(&state.frame()),
+                    state.cols as usize,
+                    state.lines as usize,
+                );
+                grid.into_iter()
+                    .take(rows)
+                    .map(|row| row[..left].iter().collect::<String>())
+                    .collect::<Vec<_>>()
+            };
+            let base = sidebar(&state);
+            assert!(
+                base.iter().any(|row| row.trim().len() > 3),
+                "the sidebar has something in it"
+            );
+            type Change = Box<dyn Fn(&mut State)>;
+            let variants: Vec<(&str, Change)> = vec![
+                (
+                    "a card beside the board",
+                    Box::new(|s| s.asks.take(vec![ask_card(1, "korea")], Vec::new())),
+                ),
+                (
+                    "three waiting, put away",
+                    Box::new(|s| {
+                        s.asks.take(
+                            vec![ask_card(1, "a"), ask_card(2, "b"), ask_card(3, "c")],
+                            Vec::new(),
+                        );
+                        s.asks.hidden = true;
+                    }),
+                ),
+                (
+                    "the board folded",
+                    Box::new(|s| s.qass_ui.fold = Some(crate::qass_screen::Fold::Board)),
+                ),
+                (
+                    "qass folded",
+                    Box::new(|s| s.qass_ui.fold = Some(crate::qass_screen::Fold::Qass)),
+                ),
+                (
+                    "the rail at its narrowest",
+                    Box::new(|s| s.qass_ui.rail = Some(crate::rail::MIN)),
+                ),
+                (
+                    "the rail at its widest",
+                    Box::new(|s| s.qass_ui.rail = Some(crate::rail::MAX)),
+                ),
+                (
+                    "the sides swapped",
+                    Box::new(|s| {
+                        let area = pane_area(s);
+                        s.layouts.get_mut(&9).unwrap().swap_root(area);
+                    }),
+                ),
+                (
+                    "zoomed",
+                    Box::new(|s| s.layouts.get_mut(&9).unwrap().zoomed = Some(5)),
+                ),
+            ];
+            for (what, apply) in variants {
+                let mut state = qass_wide();
+                state.cols = cols;
+                apply(&mut state);
+                assert_eq!(
+                    sidebar(&state),
+                    base,
+                    "{what} at {cols} columns moved the sidebar"
+                );
+            }
+        }
+    }
+
+    /// A tab on the rail is a click that opens its pane: the board's and qass's tabs fold away
+    /// and come back, the questions' tab is the chip's click; a press anywhere else on the rail's
+    /// rows (under the tabs) opens nothing.
+    #[test]
+    fn a_press_on_a_tab_opens_its_pane() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Board);
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.tabs(),
+            vec![crate::rail::Pane::Board, crate::rail::Pane::Questions]
+        );
+        let at = |dx: usize, dy: usize| {
+            let (col, row) = screen_of(&state, rail.x + dx, rail.y + dy);
+            (row, col)
+        };
+        let (row, col) = at(1, 0);
+        assert_eq!(state.rail_tab_at(row, col), Some(crate::rail::Pane::Board));
+        assert_eq!(state.rail_leaf(crate::rail::Pane::Board), Some(4));
+        let (row, col) = at(1, 1);
+        assert_eq!(
+            state.rail_tab_at(row, col),
+            Some(crate::rail::Pane::Questions)
+        );
+        assert_eq!(state.ask_click(row, col), Some(AskClick::Toggle));
+        let (row, col) = at(1, 5);
+        assert_eq!(state.rail_tab_at(row, col), None, "under the tabs");
+        // The edge column and the sidebar are not tabs.
+        let (row, col) = at(rail.w, 0);
+        assert_eq!(state.rail_tab_at(row, col), None);
+        assert!(state.strip_press(4), "the board's tab opens it");
+        assert_eq!(state.qass_ui.fold, None);
+        // Qass's tab, folded the other way round.
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        let rail = state.rail_paint().expect("the rail");
+        assert_eq!(
+            rail.tabs(),
+            vec![crate::rail::Pane::Questions, crate::rail::Pane::Qass]
+        );
+        assert_eq!(state.rail_leaf(crate::rail::Pane::Qass), Some(5));
+    }
+
+    /// The rail's edge drags its width between the narrowest and the widest, keeps the board at
+    /// its minimum, never moves qass's tile (the board gives the columns), saves nothing, and a
+    /// double press puts the width back.
+    #[test]
+    fn the_rail_edge_drags_its_width_and_qass_keeps_its_tile() {
+        let mut state = qass_wide();
+        let qass = tile_of(&state, 5);
+        let rail = state.rail_paint().expect("the rail");
+        let default = rail.w;
+        assert_eq!(default, crate::rail::default_width(pane_area(&state).cols));
+        assert!(state.on_rail_edge(rail.x + rail.w, rail.y + 3));
+        assert!(!state.on_rail_edge(rail.x + rail.w + 1, rail.y + 3));
+        let (col, row) = screen_of(&state, rail.x + rail.w, rail.y + 3);
+        assert!(state.split_press(col, row), "the press holds the edge");
+        assert_eq!(state.modes.split_drag, Some(Grab::Rail));
+        // Wider: the tabs and the board's tile change, qass's does not.
+        let (col, row) = screen_of(&state, rail.x + 24, rail.y + 3);
+        assert!(state.split_motion(col, row));
+        assert_eq!(state.rail_paint().unwrap().w, 24);
+        assert_eq!(tile_of(&state, 5), qass, "qass keeps its tile");
+        assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        // Past the widest and past the narrowest.
+        let (col, row) = screen_of(&state, rail.x + 90, rail.y + 3);
+        state.split_motion(col, row);
+        assert_eq!(state.rail_paint().unwrap().w, crate::rail::MAX);
+        let (col, row) = screen_of(&state, 0, rail.y + 3);
+        state.split_motion(col, row);
+        assert_eq!(state.rail_paint().unwrap().w, crate::rail::MIN);
+        assert_eq!(tile_of(&state, 5), qass);
+        assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        // A double press on the edge resets only the width.
+        state.modes.split_drag = None;
+        let rail = state.rail_paint().unwrap();
+        let (col, row) = screen_of(&state, rail.x + rail.w, rail.y + 3);
+        state.modes.divider_click = Some((Grab::Rail, std::time::Instant::now()));
+        assert!(state.split_press(col, row));
+        assert_eq!(state.modes.split_drag, None, "a double press holds nothing");
+        assert_eq!(state.qass_ui.rail, None);
+        assert_eq!(state.rail_paint().unwrap().w, default);
+    }
+
+    /// Qass keeps its columns and its pty size when the rail comes and goes, with the board on
+    /// either side: the rail is the board's.
+    #[test]
+    fn qass_keeps_its_tile_when_the_rail_comes_and_goes_on_either_side() {
+        for swapped in [false, true] {
+            let mut state = qass_wide();
+            if swapped {
+                let area = pane_area(&state);
+                assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+            }
+            // Questions folded: the rail shows. A card beside the board: it does not.
+            let shut = tile_of(&state, 5);
+            assert!(state.rail_paint().is_some());
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            assert!(state.rail_paint().is_none() && state.questions().is_some());
+            let open = tile_of(&state, 5);
+            // Qass on the left moves right by the rail's columns; its size is the same.
+            assert_eq!(
+                (open.cols, open.rows),
+                (shut.cols, shut.rows),
+                "swapped: {swapped}"
+            );
+            assert_eq!(open.x == shut.x, !swapped, "swapped: {swapped}");
+            state.asks.take(Vec::new(), Vec::new());
+            state.qass_ui.fold = Some(crate::qass_screen::Fold::Board);
+            assert!(state.rail_paint().is_some());
+        }
+    }
+
+    /// A swapped tab with the rail showing: the handle stands on the divider that is drawn, a
+    /// press there holds it, and the rail's body is never taken for a divider.
+    #[test]
+    fn the_divider_of_a_swapped_tab_is_where_it_is_drawn_with_the_rail_showing() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+        let rail = state.rail_paint().expect("the rail");
+        let qass = tile_of(&state, 5);
+        let handle = state.handle().expect("a handle");
+        assert_eq!(handle.x, qass.x + qass.cols, "on qass's right edge, drawn");
+        let (col, row) = screen_of(&state, handle.x, handle.y + 1);
+        assert!(state.split_press(col, row));
+        assert!(matches!(state.modes.split_drag, Some(Grab::Divider(_))));
+        state.modes.split_drag = None;
+        // A press inside qass's tile, one rail's width left of the divider, holds nothing.
+        let (col, row) = screen_of(&state, handle.x - rail.w - crate::rail::EDGE, handle.y + 1);
+        assert!(!state.split_press(col, row));
+    }
+
+    /// A swapped tab with the rail showing: dragging the divider puts it under the pointer, and
+    /// the rail's body is not a divider on a stacked tab either; with the questions open over
+    /// the board's tile the rail's preview is not repeated.
+    #[test]
+    fn the_divider_follows_the_pointer_with_the_rail_showing_and_stacked_presses_pass_the_rail() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        assert!(state.layouts.get_mut(&9).unwrap().swap_root(area));
+        let handle = state.handle().expect("a handle");
+        let (col, row) = screen_of(&state, handle.x, handle.y + 1);
+        assert!(state.split_press(col, row));
+        let (col, row) = screen_of(&state, handle.x + 6, handle.y + 1);
+        assert!(state.split_motion(col, row));
+        let qass = tile_of(&state, 5);
+        assert_eq!(qass.x + qass.cols, handle.x + 6, "under the pointer");
+        // Stacked (120 columns): a press on the rail body at the divider row is not a divider.
+        let mut stacked = qass_split_window();
+        stacked.cols = 120;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut stacked, &mut seq, &mut seqs).unwrap();
+        let rail = stacked.rail_paint().expect("the rail, stacked");
+        let qass = tile_of(&stacked, 5);
+        let (col, row) = screen_of(&stacked, rail.x + 2, qass.y - 1);
+        assert!(!stacked.split_press(col, row));
+        // The questions open over the board's tile: the tab keeps its place, the preview goes.
+        stacked.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        assert!(stacked.questions().is_some_and(|q| q.replaces));
+        let painted = plain(&screen::paint(&stacked.frame()));
+        assert!(!painted.contains("ctrl-a i opens"), "{painted}");
+    }
+
+    /// Dragging the rail wider never turns the tab over, however narrow the board was dragged.
+    #[test]
+    fn a_wide_rail_never_turns_the_tab_over() {
+        let mut state = qass_wide();
+        let area = pane_area(&state);
+        let _ = area;
+        state
+            .layouts
+            .get_mut(&9)
+            .unwrap()
+            .set_root_split(layout::Dir::V, 0.5);
+        let dir = state.drawn(&state.layouts[&9]).root_split().unwrap().0;
+        let qass = tile_of(&state, 5);
+        let rail = state.rail_paint().unwrap();
+        for x in [rail.x + 20, rail.x + 28, rail.x + 90] {
+            state.modes.split_drag = Some(Grab::Rail);
+            let (col, row) = screen_of(&state, x, rail.y + 3);
+            state.split_motion(col, row);
+            assert_eq!(state.drawn(&state.layouts[&9]).root_split().unwrap().0, dir);
+            assert_eq!(tile_of(&state, 5), qass);
+            assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        }
+    }
+
+    /// What a drawn copy carries (the rail among it) never reaches a tree that is kept, and
+    /// the focused pane's corner beside the rail survives the rail's paint.
+    #[test]
+    fn the_rail_stays_off_kept_trees_and_off_the_focused_corner() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        assert!(state.drawn(&state.layouts[&9]).rail > 0);
+        assert_eq!(state.committed(&state.layouts[&9]).rail, 0);
+        assert_eq!(state.layouts[&9].rail, 0);
+        state.qass_ui.fold = None;
+        state.focused = 4;
+        state.layouts.get_mut(&9).unwrap().focus_terminal(4);
+        let board = tile_of(&state, 4);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let corner = grid[screen::TABS + board.y - 1][left + board.x - 1];
+        assert_eq!(
+            corner, '\u{256d}',
+            "the focused pane's corner, beside the rail"
+        );
+    }
+
     /// qass's full header stands in the tab bar's rows on qass's screen: no tab is painted
     /// there and a click there opens none, while the `[ N asks you ]` chip in those rows still
     /// opens the questions. On any other tab, or zoomed, the bar is the bar.
@@ -21898,15 +22332,15 @@ mod tests {
         assert!(state.qass_split() && !state.on_qass_screen());
         let shut = qass_tiles(&state);
         assert!(shut[1].1.y > shut[0].1.y, "stacked");
-        // Stacked, the questions' strip stands at the board's right edge, down its rows.
-        let strip = state.questions_strip().expect("the strip, stacked too");
-        assert_eq!(
-            (strip.x, strip.y, strip.rows),
-            (
-                shut[0].1.x + shut[0].1.cols + 1,
-                shut[0].1.y,
-                shut[0].1.rows
-            )
+        // Stacked, the rail is cut from both panes' left edge and carries the questions' tab.
+        let rail = state.rail_paint().expect("the rail, stacked too");
+        assert_eq!(rail.tabs(), vec![crate::rail::Pane::Questions]);
+        let full = pane_area(&state);
+        let inner = state.drawn(&state.layouts[&9]).inner(full);
+        assert!(
+            shut.iter()
+                .all(|(_, r)| r.x == inner.x + rail.w + crate::rail::EDGE),
+            "both panes lose the rail's columns: {shut:?}"
         );
         size_terminals(&mut state, &mut seqs).unwrap();
         let before = state.sized.clone();

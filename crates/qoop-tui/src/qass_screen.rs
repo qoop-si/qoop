@@ -49,7 +49,7 @@ const INBOX_WIDTH: (usize, usize) = (48, 56);
 /// The narrowest the board page draws in (`qoop task board --page` asks for this much).
 pub const BOARD_MIN_COLS: usize = 60;
 /// The narrowest qass's terminal gets beside the board.
-const QASS_MIN_COLS: usize = 40;
+pub const QASS_MIN_COLS: usize = 40;
 /// The board's share of qass's tab when it is shown the other way from how it was saved.
 const BOARD_RATIO_V: f32 = 0.70;
 const BOARD_RATIO_H: f32 = 0.50;
@@ -60,9 +60,12 @@ pub const QUESTIONS_GAP: usize = 1 + INBOX_WIDTH.0;
 pub const QUESTIONS_MIN: usize = 24;
 /// The columns the keys widen or narrow it by.
 pub const QUESTIONS_STEP: usize = 4;
-/// The questions folded to their strip: the edge column the board's frame keeps, then one cell
-/// with the count and the name down it. Always there, so the questions never vanish.
-pub const STRIP_GAP: usize = 2;
+
+/// The most columns the rail's tabs may have in a pane `cols` wide: what is left once the board keeps
+/// its minimum (the rail comes off the board; a pane too narrow for both side by side is stacked).
+pub fn rail_room(cols: usize) -> usize {
+    cols.saturating_sub(BOARD_MIN_COLS + 3 + crate::rail::EDGE)
+}
 
 /// The ratio of qass's tab (its first pane's share) the way the tab is shown when it was saved
 /// the other way: the board's own share when the board is first, what is left when qass is.
@@ -77,16 +80,19 @@ pub fn board_default(dir: Dir, board_first: bool) -> f32 {
 /// How qass's tab with the board is laid out in a pane `cols` wide: side by side while the
 /// board and qass both keep their minimum, else stacked; the saved ratio (the first pane's
 /// share, whichever pane that is) when the saved direction is the one shown, else that
-/// direction's own. The columns cut from the board for the questions: their strip
-/// ([`STRIP_GAP`]) always; with `questions` the open column while the board keeps its minimum
-/// after it: the default width, or the one the owner dragged them to (`width`), which gives way
-/// to what the board needs before the column falls back to the strip.
+/// direction's own. `rail` is the columns the rail may take off the first pane (the board when
+/// it is first), always charged here, shown or not, so a card arriving never turns the tab over.
+/// The columns cut from the board for the questions: none while they are folded (their tab is on
+/// the rail); with `questions` the open column while the board keeps its minimum after it: the
+/// default width, or the one the owner dragged them to (`width`), which gives way to what the
+/// board needs before the column falls back to the rail.
 pub fn board_shape(
     cols: usize,
     saved: (Dir, f32),
     questions: bool,
     width: Option<usize>,
     board_first: bool,
+    rail: usize,
 ) -> (Dir, f32, usize) {
     let ratio = |dir: Dir| match saved.0 == dir {
         true => saved.1,
@@ -98,17 +104,20 @@ pub fn board_shape(
     // qass's are exact whichever of them is first.
     let first = (total as f32 * ratio(Dir::V).clamp(0.1, 0.9)).floor() as usize;
     let board = if board_first { first } else { total - first };
-    // The questions' strip is charged before the board's minimum, so it is never dropped.
-    if board < BOARD_MIN_COLS + STRIP_GAP || total - board < QASS_MIN_COLS {
-        return (Dir::H, ratio(Dir::H), STRIP_GAP);
+    // The rail comes off the board, on whichever side it is.
+    if board < BOARD_MIN_COLS + rail || total - board < QASS_MIN_COLS {
+        return (Dir::H, ratio(Dir::H), 0);
     }
+    // Beside the board the questions leave no rail (it shows only while a pane is folded, and
+    // `fold_gap` weighs that case), so the board's room for them is what is over its minimum.
+    let room = board - BOARD_MIN_COLS;
     let gap = match (questions, width) {
-        (false, _) => STRIP_GAP,
-        (true, None) if board >= BOARD_MIN_COLS + QUESTIONS_GAP => QUESTIONS_GAP,
-        (true, None) => STRIP_GAP,
+        (false, _) => 0,
+        (true, None) if room >= QUESTIONS_GAP => QUESTIONS_GAP,
+        (true, None) => 0,
         (true, Some(width)) => {
-            let gap = (width + 1).min(board.saturating_sub(BOARD_MIN_COLS));
-            if gap > QUESTIONS_MIN { gap } else { STRIP_GAP }
+            let gap = (width + 1).min(room);
+            if gap > QUESTIONS_MIN { gap } else { 0 }
         }
     };
     (Dir::V, ratio(Dir::V), gap)
@@ -185,17 +194,17 @@ pub fn handle_of(qass: Rect, dir: Dir, board_first: bool) -> Option<Handle> {
     })
 }
 
-/// A pane of qass's split tab folded to its strip (never closed): the title or `ctrl-a T`
-/// folds it, its strip or the keyboard going in opens it.
+/// A pane of qass's split tab folded to its tab on the rail (never closed): the title or `ctrl-a T`
+/// folds it, its tab or the keyboard going in opens it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fold {
     Board,
     Qass,
 }
 
-/// The questions' gap on qass's tab with a pane folded, the open pane `open_cols` wide: the
-/// open column while that pane keeps its own minimum (the board's or qass's) after it, else
-/// the strip, and the questions lay over the open pane when wanted.
+/// The questions' gap on qass's tab with a pane folded, the open pane `open_cols` wide (less the
+/// rail): the open column while that pane keeps its own minimum (the board's or qass's) after it,
+/// else none, and the questions lay over the open pane when wanted.
 pub fn fold_gap(open_cols: usize, board_open: bool, questions: bool) -> usize {
     let min = if board_open {
         BOARD_MIN_COLS
@@ -205,7 +214,7 @@ pub fn fold_gap(open_cols: usize, board_open: bool, questions: bool) -> usize {
     if questions && open_cols >= min + QUESTIONS_GAP {
         QUESTIONS_GAP
     } else {
-        STRIP_GAP
+        0
     }
 }
 
@@ -219,8 +228,10 @@ pub struct Ui {
     pub zoomed: bool,
     /// The question inbox is open beside qass's terminal (or in its place, in a narrow pane).
     pub inbox: bool,
-    /// The board or qass's terminal folded to its strip on qass's split tab: one at a time.
+    /// The board or qass's terminal folded to its tab on the rail on qass's split tab: one at a time.
     pub fold: Option<Fold>,
+    /// The width the owner dragged the rail's tabs to, for this session; `None` for the default.
+    pub rail: Option<usize>,
     /// When the watcher last told qass something, unix seconds, as the file's age says.
     pub wake_at: Option<i64>,
     /// The quarter minute the ages were last drawn in, so a line that says `2 min ago` is
@@ -763,8 +774,6 @@ pub struct Screen {
     side: String,
     /// The inbox's rows, each as wide as its rectangle, while it is open.
     inbox: Vec<String>,
-    /// The questions folded to their strip on qass's split tab: its rectangle and its cells.
-    strip: Option<(Rect, Vec<String>)>,
     /// Where the `[ N asks you ]` chip is, pane-local: its row and its columns.
     chip: Option<Chip>,
 }
@@ -804,7 +813,6 @@ impl Screen {
             plan,
             header,
             inbox: Vec::new(),
-            strip: None,
             chip,
             top: edge(
                 plan.frame.cols,
@@ -828,24 +836,6 @@ impl Screen {
     pub fn with_inbox(mut self, rows: Vec<String>) -> Screen {
         self.inbox = rows;
         self
-    }
-
-    /// The questions' strip in `rect`, with the header's count on it: the same number as the
-    /// `[ N asks you ]` chip, since both read these facts.
-    pub fn with_strip(mut self, rect: Rect, asks: usize, fade: bool) -> Screen {
-        let count = Some((asks, if asks > 0 { Role::Blocked } else { Role::Faint }));
-        self.strip = Some((
-            rect,
-            strip_rows(rect.rows, count, "questions", Role::Faint, fade),
-        ));
-        self
-    }
-
-    /// The strip's cell on pane row `pane_row`, and the pane column it stands in.
-    pub fn strip_row(&self, pane_row: usize) -> Option<(usize, &str)> {
-        let (rect, rows) = self.strip.as_ref()?;
-        let cell = rows.get(pane_row.checked_sub(rect.y)?)?;
-        Some((rect.x, cell))
     }
 
     /// One row of the inbox in a split tab, whose panes paint themselves: the row of the pane
@@ -907,37 +897,6 @@ impl Screen {
         }
         format!("{left}{0}{1}{0}", self.side, terminal(pane_row - p.inner.y))
     }
-}
-
-/// A pane folded to a strip one cell wide, `rows` tall: the ember `▸` that opens it, the count
-/// when it has one (bold, in its role), a blank, then the name one letter a row, cut at the
-/// bottom. A terminal cannot turn a word sideways, so the letters stack.
-pub fn strip_rows(
-    rows: usize,
-    count: Option<(usize, Role)>,
-    name: &str,
-    role: Role,
-    fade: bool,
-) -> Vec<String> {
-    let cell = |text: String, role: Role, strong: bool| {
-        let bold = if strong && !fade { "\x1b[1m" } else { "" };
-        format!("{}{bold}{text}{}", ink(role, fade), theme::RESET)
-    };
-    let mut out = vec![cell("\u{25b8}".into(), Role::Brand, true)];
-    if let Some((n, role)) = count {
-        // One cell: a count past nine reads as its plus.
-        let digit = if n > 9 {
-            "+".to_string()
-        } else {
-            n.to_string()
-        };
-        out.push(cell(digit, role, true));
-    }
-    out.push(" ".into());
-    out.extend(name.chars().map(|c| cell(c.to_string(), role, false)));
-    out.resize(rows, " ".into());
-    out.truncate(rows);
-    out
 }
 
 /// The header as one line: the state, then the counters that fit.
@@ -1668,61 +1627,61 @@ mod tests {
     fn the_board_goes_beside_qass_when_both_keep_their_minimum() {
         let stacked = (Dir::H, 0.5);
         assert_eq!(
-            board_shape(161, stacked, false, None, true),
-            (Dir::V, 0.70, STRIP_GAP)
+            board_shape(161, stacked, false, None, true, 0),
+            (Dir::V, 0.70, 0)
         );
         assert_eq!(
-            board_shape(134, stacked, false, None, true),
-            (Dir::V, 0.70, STRIP_GAP)
+            board_shape(134, stacked, false, None, true, 0),
+            (Dir::V, 0.70, 0)
         );
         assert_eq!(
-            board_shape(133, stacked, false, None, true),
-            (Dir::H, 0.5, STRIP_GAP)
+            board_shape(133, stacked, false, None, true, 0),
+            (Dir::H, 0.5, 0)
         );
         assert_eq!(
-            board_shape(121, (Dir::V, 0.75), false, None, true),
-            (Dir::H, 0.5, STRIP_GAP)
+            board_shape(121, (Dir::V, 0.75), false, None, true, 0),
+            (Dir::H, 0.5, 0)
         );
         assert_eq!(
-            board_shape(200, (Dir::V, 0.6), false, None, true),
-            (Dir::V, 0.6, STRIP_GAP)
+            board_shape(200, (Dir::V, 0.6), false, None, true, 0),
+            (Dir::V, 0.6, 0)
         );
         assert_eq!(
-            board_shape(161, stacked, true, None, true),
+            board_shape(161, stacked, true, None, true, 0),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            board_shape(159, stacked, true, None, true),
+            board_shape(159, stacked, true, None, true, 0),
             (Dir::V, 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            board_shape(158, stacked, true, None, true),
-            (Dir::V, 0.70, STRIP_GAP)
+            board_shape(158, stacked, true, None, true, 0),
+            (Dir::V, 0.70, 0)
         );
         // Qass first: the same cuts, the first pane's share is the mirror of the board's, and
         // the saved ratio is read as qass's share, never the board's.
         assert_eq!(board_default(Dir::V, true), 0.70);
         assert_eq!(board_default(Dir::V, false), 1.0 - 0.70);
         assert_eq!(
-            board_shape(161, stacked, true, None, false),
+            board_shape(161, stacked, true, None, false, 0),
             (Dir::V, 1.0 - 0.70, QUESTIONS_GAP)
         );
         assert_eq!(
-            board_shape(133, stacked, false, None, false),
-            (Dir::H, 0.5, STRIP_GAP)
+            board_shape(133, stacked, false, None, false, 0),
+            (Dir::H, 0.5, 0)
         );
         // 0.3 of 158 is qass's 47 columns and the board's 111: a column of questions fits; the
         // same number read as the board's share would not even fit the board.
         assert_eq!(
-            board_shape(161, (Dir::V, 0.3), true, None, false).2,
+            board_shape(161, (Dir::V, 0.3), true, None, false, 0).2,
             QUESTIONS_GAP
         );
         assert_eq!(
-            board_shape(161, (Dir::V, 0.3), false, None, true),
-            (Dir::H, 0.5, STRIP_GAP)
+            board_shape(161, (Dir::V, 0.3), false, None, true, 0),
+            (Dir::H, 0.5, 0)
         );
         for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, false);
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, false, 0);
             if dir == Dir::V {
                 let total = cols - 3;
                 let qass = (total as f32 * ratio).floor() as usize;
@@ -1733,7 +1692,7 @@ mod tests {
             }
         }
         for cols in 80..=260 {
-            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, true);
+            let (dir, ratio, gap) = board_shape(cols, stacked, true, None, true, 0);
             if dir == Dir::V {
                 let total = cols - 3;
                 let board = (total as f32 * ratio).floor() as usize;
@@ -1743,15 +1702,29 @@ mod tests {
                 );
             }
         }
-        // The strip is charged before the board's minimum: a board one strip short of it goes
-        // stacked (still with its strip), never side by side without one.
+        // The rail's columns are charged before the board's minimum, shown or not: a board that
+        // keeps its minimum only without them goes stacked, never side by side without room.
         assert_eq!(
-            board_shape(105, (Dir::V, 0.6), false, None, true),
-            (Dir::H, 0.5, STRIP_GAP)
+            board_shape(102, (Dir::V, 0.6), false, None, true, 0),
+            (Dir::H, 0.5, 0)
         );
         assert_eq!(
-            board_shape(107, (Dir::V, 0.6), false, None, true),
-            (Dir::V, 0.6, STRIP_GAP)
+            board_shape(103, (Dir::V, 0.6), false, None, true, 0),
+            (Dir::V, 0.6, 0)
+        );
+        assert_eq!(
+            board_shape(103, (Dir::V, 0.6), false, None, true, 16),
+            (Dir::H, 0.5, 0),
+            "the board is first: the rail comes off it"
+        );
+        assert_eq!(
+            board_shape(103, (Dir::V, 0.4), false, None, false, 16),
+            (Dir::H, 0.5, 0),
+            "swapped: it comes off the board too"
+        );
+        assert_eq!(
+            board_shape(103, (Dir::V, 0.4), false, None, false, 0).0,
+            Dir::V
         );
     }
 
@@ -1760,22 +1733,28 @@ mod tests {
     #[test]
     fn a_dragged_questions_width_gives_way_to_the_board_before_it_is_dropped() {
         let wide = (Dir::V, 0.70);
-        assert_eq!(board_shape(200, wide, true, Some(30), true).2, 31);
-        assert_eq!(board_shape(200, wide, true, Some(70), true).2, 71);
+        assert_eq!(board_shape(200, wide, true, Some(30), true, 0).2, 31);
+        assert_eq!(board_shape(200, wide, true, Some(70), true, 0).2, 71);
         // Only 77 columns are left over the board's 60 at 200 columns, and 49 at 160.
-        assert_eq!(board_shape(200, wide, true, Some(90), true).2, 77);
-        assert_eq!(board_shape(160, wide, true, Some(90), true).2, 49);
+        assert_eq!(board_shape(200, wide, true, Some(90), true, 0).2, 77);
+        assert_eq!(board_shape(160, wide, true, Some(90), true, 0).2, 49);
         // Less than the questions' minimum is left: they leave the board's side.
-        assert_eq!(board_shape(200, (Dir::V, 0.45), true, Some(70), true).2, 28);
         assert_eq!(
-            board_shape(200, (Dir::V, 0.4), true, Some(70), true).2,
-            STRIP_GAP
+            board_shape(200, (Dir::V, 0.45), true, Some(70), true, 0).2,
+            28
+        );
+        assert_eq!(
+            board_shape(200, (Dir::V, 0.4), true, Some(70), true, 0).2,
+            0
         );
         // Qass first: the board is the second pane.
-        assert_eq!(board_shape(200, (Dir::V, 0.3), true, Some(70), false).2, 71);
+        assert_eq!(
+            board_shape(200, (Dir::V, 0.3), true, Some(70), false, 0).2,
+            71
+        );
         // Without a width, or without questions, nothing moves.
-        assert_eq!(board_shape(200, wide, true, None, true).2, QUESTIONS_GAP);
-        assert_eq!(board_shape(200, wide, false, Some(70), true).2, STRIP_GAP);
+        assert_eq!(board_shape(200, wide, true, None, true, 0).2, QUESTIONS_GAP);
+        assert_eq!(board_shape(200, wide, false, Some(70), true, 0).2, 0);
     }
 
     #[test]
