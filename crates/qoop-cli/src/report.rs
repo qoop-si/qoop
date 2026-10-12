@@ -55,7 +55,14 @@ pub fn load(n: u32) -> std::io::Result<(PathBuf, Note)> {
     let mut note = Note::parse(&text).map_err(std::io::Error::other)?;
     // The code's own fields, never what the file says: qass's tools can write the file.
     stamp(&mut note);
-    refuse(&check(&note).0)?;
+    let (problems, daemon) = check(&note);
+    refuse(&problems)?;
+    if !daemon {
+        return Err(std::io::Error::other(
+            "qoop's daemon is not running, so the note cannot be checked against tab and remote \
+             names; start qoop and send it again",
+        ));
+    }
     Ok((path, note))
 }
 
@@ -215,7 +222,6 @@ fn remove(n: u32) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("note {n}: {e}")))
 }
 
-/// Every rule the note breaks, its own-name ones included.
 /// Every rule the note breaks, its own-name ones included, and whether the daemon answered
 /// for the space, tab and remote names.
 fn check(note: &Note) -> (Vec<String>, bool) {
@@ -373,9 +379,10 @@ fn qoop_names() -> (Vec<String>, Vec<String>, Vec<String>, bool) {
             .unwrap_or_default()
     };
     let (mut out, mut folders, mut cwds) = (Vec::new(), Vec::new(), Vec::new());
-    let spaces = json(&["ls", "--json"]);
-    let daemon = !spaces.is_empty();
-    for space in spaces {
+    // `ls` reads the store without a daemon; only a daemon knows the tabs.
+    let daemon = paths::runtime_dir()
+        .is_ok_and(|dir| std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_ok());
+    for space in json(&["ls", "--json"]) {
         out.extend(space["name"].as_str().map(str::to_string));
     }
     for tab in json(&["agents", "--json"]) {

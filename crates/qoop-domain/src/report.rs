@@ -249,18 +249,23 @@ pub fn own_name_problems(note: &Note, names: &[String]) -> Vec<String> {
         .collect();
     let mut out = Vec::new();
     for (key, _) in TEXT {
-        // `web one` is the host `web1`: the two number words a note may hold, as digits.
         let words: Vec<String> = parts(note.get(key))
-            .map(|(_, w)| match w.to_ascii_lowercase().as_str() {
-                "one" => "1".to_string(),
-                "two" => "2".to_string(),
-                w => w.to_string(),
-            })
+            .map(|(_, w)| w.to_ascii_lowercase())
             .collect();
+        // `web one` is the host `web1`: the two number words a note may hold, also as digits.
+        let digits = |w: &String| match w.as_str() {
+            "one" => "1".to_string(),
+            "two" => "2".to_string(),
+            w => w.to_string(),
+        };
         for start in 0..words.len() {
             for len in 1..=3.min(words.len() - start) {
-                let joined = words[start..start + len].concat();
-                if (len == 1 || joined.len() >= 4) && own.contains(&joined) {
+                let run = &words[start..start + len];
+                let joined = run.concat();
+                let as_digits: String = run.iter().map(digits).collect();
+                if (len == 1 || joined.len() >= 4)
+                    && (own.contains(&joined) || own.contains(&as_digits))
+                {
                     out.push(format!(
                         "{key}: `{}` names something of yours",
                         words[start..start + len].join(" ")
@@ -273,11 +278,12 @@ pub fn own_name_problems(note: &Note, names: &[String]) -> Vec<String> {
     out
 }
 
-/// A banned word in any of its forms: `ports`, `dashes`, `sevens`, `twentieth`, `ninth`.
+/// A banned word in any of its forms: `ports`, `port's`, `sevens`, `nineties`, `twentieth`.
 fn banned(word: &str) -> bool {
-    const ORDINALS: [&str; 7] = [
-        "third", "fifth", "eighth", "ninth", "twelfth", "dozen", "nought",
+    const ORDINALS: [&str; 10] = [
+        "third", "fifth", "eighth", "ninth", "twelfth", "dozen", "nought", "naught", "aught", "nil",
     ];
+    let word = word.trim_end_matches("'s").trim_end_matches('\'');
     let forms = [
         Some(word.to_string()),
         word.strip_suffix('s').map(str::to_string),
@@ -286,12 +292,13 @@ fn banned(word: &str) -> bool {
         word.strip_suffix("ths").map(str::to_string),
         word.strip_suffix("ieth").map(|w| format!("{w}y")),
         word.strip_suffix("ieths").map(|w| format!("{w}y")),
+        word.strip_suffix("ies").map(|w| format!("{w}y")),
         word.strip_suffix("ed").map(str::to_string),
     ];
     forms
         .into_iter()
         .flatten()
-        .any(|f| BANNED.contains(&f.as_str()) || ORDINALS.contains(&f.as_str()) || f == "nil")
+        .any(|f| BANNED.contains(&f.as_str()) || ORDINALS.contains(&f.as_str()))
 }
 
 /// `I` and its contractions, the one word written with a capital inside a sentence.
@@ -562,6 +569,8 @@ mod tests {
             "it stopped on the twentieth try, then the ninth",
             "the dashes and slashes of the name were lost",
             "a dozen tabs woke",
+            "the nine's port's slept",
+            "it slept in the nineties",
         ] {
             assert!(!problems(&ok(what)).is_empty(), "{what}");
         }
@@ -645,6 +654,8 @@ mod tests {
         assert!(p("the space slept, then the menu came back for us").len() == 1);
         assert!(p("the main space slept").is_empty());
         assert!(!p("the web one remote slept").is_empty());
+        let one = vec!["one".to_string()];
+        assert!(!own_name_problems(&ok("the tab one slept"), &one).is_empty());
     }
 }
 
