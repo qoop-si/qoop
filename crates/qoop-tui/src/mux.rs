@@ -285,6 +285,30 @@ impl Link {
         }
     }
 
+    /// The rows the link's machine listed that are worth drawing.
+    ///
+    /// A remote's own default space (its lowest id, which its daemon never closes) is left
+    /// out while it holds nothing and nobody gave it anything (no name, colour, goal or
+    /// keep-awake), as long as the machine has another space: it is a row nobody made and
+    /// nobody can remove. A machine with only its default keeps it, that is where the first
+    /// tab starts. The lowest id, not
+    /// `closable == false`: an older daemon omits `closable`, which would hide a person's own
+    /// empty spaces. This machine's own rows are all kept.
+    fn shown_spaces(&self) -> impl Iterator<Item = &WorkspaceRow> {
+        let default = (!self.name.is_empty() && self.spaces.len() > 1)
+            .then(|| self.spaces.iter().map(|row| row.id).min())
+            .flatten();
+        self.spaces.iter().filter(move |row| {
+            Some(row.id) != default
+                || row.terminals > 0
+                || row.asleep
+                || row.keep_awake
+                || row.ink.is_some()
+                || row.name != "default"
+                || row.goal.is_some()
+        })
+    }
+
     /// The space rows this link contributes to the merged list.
     ///
     /// A remote's rows say how its machine is reached, so the column can say it beside the
@@ -299,8 +323,7 @@ impl Link {
         // it, for a remote space that has no tab. Asking for one wakes the machine.
         if self.listed && *self.parked.borrow() {
             return self
-                .spaces
-                .iter()
+                .shown_spaces()
                 .map(|row| WorkspaceRow {
                     asleep: true,
                     link: state(LinkState::Parked),
@@ -310,8 +333,7 @@ impl Link {
         }
         if self.listed && self.conn.is_some() {
             return self
-                .spaces
-                .iter()
+                .shown_spaces()
                 .map(|row| WorkspaceRow {
                     link: state(LinkState::Up),
                     ..row.clone()
@@ -320,8 +342,7 @@ impl Link {
         }
         if self.listed {
             return self
-                .spaces
-                .iter()
+                .shown_spaces()
                 .map(|row| WorkspaceRow {
                     name: format!("{} ({})", row.name, self.reason),
                     terminals: 0,
@@ -2937,6 +2958,69 @@ mod tests {
         home.spaces = vec![row];
         home.conn = Some((1, mpsc::unbounded_channel().0));
         assert_eq!(links(&home), [None]);
+    }
+
+    /// A remote's own default space, the lowest id, is not drawn while it is empty and the
+    /// machine has another space. It stays when it is used, when it is the only space, and
+    /// for this machine's own link; an older daemon's rows (none `closable`) lose only the
+    /// lowest id, never a person's own empty space.
+    #[test]
+    fn a_remote_hides_its_empty_default_but_nothing_a_person_made() {
+        let row = |n: i64, terminals: usize| WorkspaceRow {
+            keep_awake: false,
+            id: n << WORKSPACE_SHIFT,
+            name: if n == 1 {
+                "default".into()
+            } else {
+                format!("s{n}")
+            },
+            terminals,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: false,
+            ink: None,
+            link: None,
+            goal: None,
+        };
+        let ids = |name: &str, spaces: Vec<WorkspaceRow>| -> Vec<i64> {
+            let mut link = Link::new(name.into(), None);
+            link.listed = true;
+            link.conn = Some((1, mpsc::unbounded_channel().0));
+            link.spaces = spaces;
+            link.listed_spaces(1)
+                .iter()
+                .map(|r| r.id >> WORKSPACE_SHIFT)
+                .collect()
+        };
+        let empty_default_and_two = || vec![row(1, 0), row(2, 0), row(3, 2)];
+        assert_eq!(ids("devbox", empty_default_and_two()), [2, 3]);
+        assert_eq!(ids("", empty_default_and_two()), [1, 2, 3], "this machine");
+        assert_eq!(ids("devbox", vec![row(1, 0)]), [1], "alone");
+        assert_eq!(ids("devbox", vec![row(1, 1), row(2, 1)]), [1, 2], "used");
+        let mut used = empty_default_and_two();
+        used[0].asleep = true;
+        assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "asleep");
+        used[0].asleep = false;
+        used[0].goal = Some("g".into());
+        assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "goal");
+        used[0].goal = None;
+        used[0].keep_awake = true;
+        assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "kept awake");
+        used[0].keep_awake = false;
+        used[0].ink = Some(2);
+        assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "coloured");
+        used[0].ink = None;
+        used[0].name = "main".into();
+        assert_eq!(ids("devbox", used), [1, 2, 3], "renamed");
+        // Not in id order on the wire: the default is still the lowest id.
+        assert_eq!(ids("devbox", vec![row(3, 2), row(1, 0)]), [3]);
+        // A link let go, or one that is down, draws the same rows.
+        let mut link = Link::new("devbox".into(), None);
+        link.listed = true;
+        link.spaces = empty_default_and_two();
+        assert_eq!(link.listed_spaces(1).len(), 2, "down");
+        link.parked.send_replace(true);
+        assert_eq!(link.listed_spaces(1).len(), 2, "parked");
     }
 
     /// The ask to move to a newer qoop: kept while its link is down and sent when it is up
