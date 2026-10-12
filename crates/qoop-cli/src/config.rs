@@ -62,7 +62,6 @@ fn show(json: bool) -> std::io::Result<()> {
                 "qass.models.best": read.qass_models[0],
                 "qass.models.mid": read.qass_models[1],
                 "qass.models.low": read.qass_models[2],
-                "qass.mode": read.qass_mode,
                 "report.send": read.report_send,
             },
             "agents": read.agents.iter().map(|a| serde_json::json!({ "name": a.name, "command": a.command })).collect::<Vec<_>>(),
@@ -73,7 +72,6 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.done_sound": config::sounds_here(),
                 "notify.alert_sound": config::sounds_here(),
                 "qass.agent": crate::settings::qass_agents(&read),
-                "qass.mode": config::QASS_MODES,
                 "report.send": config::REPORT_SENDS,
             },
             "problems": read.problems.iter().map(|p| p.short()).collect::<Vec<_>>(),
@@ -106,7 +104,6 @@ fn show(json: bool) -> std::io::Result<()> {
     );
     println!("daemon.exit_when_asleep = {}", c.lifecycle.exit_when_asleep);
     println!("qass.agent = \"{}\"", read.qass_agent);
-    println!("qass.mode = \"{}\"", read.qass_mode);
     println!("report.send = \"{}\"", read.report_send);
     for a in &read.agents {
         println!("agents.{} = {:?}", a.name, a.command);

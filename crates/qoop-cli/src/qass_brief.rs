@@ -77,8 +77,6 @@ struct Facts {
     limit: u32,
     /// The agent's open card: its number, handle and status.
     card: Option<(String, String, String)>,
-    /// `[qass] mode` from config.toml: `propose` or `auto`.
-    mode: String,
     /// `owner/name` when the agent works in the owner's own repository
     /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
     own: Option<String>,
@@ -303,15 +301,12 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         None => "card: none open".into(),
     });
 
-    let mode = f.mode.as_str();
     // Which of the skill's three prompt endings: merge in the owner's own repository, else the
     // strict one; the middle one (`pr`) where that repository's files ask before merging.
     let end = if f.own.is_some() { "merge" } else { "none" };
     lines.push(match f.own.as_deref() {
-        Some(r) => format!(
-            "repo: own {r}; mode {mode}; ending merge (pr if a repo file asks before merging)"
-        ),
-        None => format!("repo: not own; mode {mode}; ending none"),
+        Some(r) => format!("repo: own {r}; ending merge (pr if a repo file asks before merging)"),
+        None => "repo: not own; ending none".into(),
     });
 
     let blocked = f.state == "blocked";
@@ -325,11 +320,7 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     });
 
     let write_ok = !not_now.iter().any(|n| n.starts_with("write"));
-    let allowed = match (write_ok, mode) {
-        (false, _) => None,
-        (true, "propose") => Some("propose (mode propose)".to_string()),
-        (true, _) => Some(format!("write (ending {end})")),
-    };
+    let allowed = write_ok.then(|| format!("write (ending {end})"));
     let mut last = format!("Allowed now: {}", allowed.as_deref().unwrap_or("nothing"));
     if !not_now.is_empty() {
         last += &format!(". Not now: {}", not_now.join(", "));
@@ -350,7 +341,6 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "review_rounds": task.map(|t| t.rounds),
         "review_limit": f.limit,
         "card": f.card.as_ref().map(|c| &c.0),
-        "mode": mode,
         "own_repo": f.own,
         "ending": end,
         "blocked": blocked,
@@ -575,7 +565,6 @@ fn gather(n: u32) -> std::io::Result<Facts> {
             .map(|id| task_of(id, now).ok_or(id)),
         limit,
         card,
-        mode: qoop_tui::config::read().qass_mode,
         own: cwd.and_then(crate::worktree::own_repo),
         now,
         offset: utc_offset(),
@@ -632,7 +621,6 @@ mod tests {
             typed_here: Some(Vec::new()),
             typed_to_qass: Some(Vec::new()),
             limit: ROUNDS,
-            mode: "auto".into(),
             now: NOW,
             ..Facts::default()
         }
@@ -841,8 +829,8 @@ mod tests {
         assert_eq!(review_limit("at most 3 reviewers"), None);
     }
 
-    /// The owner's own repository gets the merge ending, any other the strict one; `propose`
-    /// allows proposing only.
+    /// The owner's own repository gets the merge ending, any other the strict one; writing is
+    /// allowed with nothing set: qass has no mode, and the brief never names one.
     #[test]
     fn the_repo_line_gives_the_ending() {
         let mut f = facts();
@@ -850,24 +838,22 @@ mod tests {
         let out = brief(&f);
         assert!(
             out.contains(
-                "\nrepo: own pat/x; mode auto; ending merge (pr if a repo file asks before merging)\n"
+                "\nrepo: own pat/x; ending merge (pr if a repo file asks before merging)\n"
             ),
             "{out}"
         );
         assert!(out.ends_with("Allowed now: write (ending merge)"), "{out}");
-        assert_eq!(compose(&f).1["own_repo"], "pat/x");
-        assert_eq!(compose(&f).1["ending"], "merge");
-        f.mode = "propose".into();
-        assert!(brief(&f).ends_with("Allowed now: propose (mode propose)"));
+        let json = compose(&f).1;
+        assert_eq!(json["own_repo"], "pat/x");
+        assert_eq!(json["ending"], "merge");
+        assert!(json.get("mode").is_none(), "{json}");
         f.own = None;
-        f.mode = "auto".into();
         let out = brief(&f);
-        assert!(
-            out.contains("\nrepo: not own; mode auto; ending none\n"),
-            "{out}"
-        );
+        assert!(out.contains("\nrepo: not own; ending none\n"), "{out}");
         assert!(out.ends_with("Allowed now: write (ending none)"), "{out}");
-        assert!(!out.contains("policy"), "{out}");
+        for bad in ["policy", "mode", "propose"] {
+            assert!(!out.contains(bad), "{bad}: {out}");
+        }
     }
 
     /// A remote agent is read there, as today.
