@@ -113,6 +113,9 @@ const USAGE: &str = "usage:
   qoop task done [summary]             claim it is done; it is checked outside the agent
   qoop task close <KEY|id> --verified|--failed|--dropped [reason]
                                        --dropped takes an item off the board (items only)
+  qoop task verify <KEY|id> [--repo <path>] [--json]
+                                       the closing facts of a finished task (an item: every
+                                       linked task's) and what is missing; never closes
   qoop task add --space S <short title> [--description <text|->]
                                        put an item on a space's board; prints its key (a title
                                        over 32 characters is cut, the whole kept in the description)
@@ -529,6 +532,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             )
             .map(drop)
         }
+        Some("verify") => crate::task_verify::run(rest),
         Some("board") => match raw.as_slice() {
             [] => crate::board::run(None, false),
             [flag] if flag == "--json" => crate::board::run(None, true),

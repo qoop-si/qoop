@@ -13,17 +13,17 @@ use crate::supervise::{self, NewOpts};
 
 /// One entry of `git worktree list --porcelain -z`.
 #[derive(Debug, PartialEq)]
-struct Worktree {
+pub(crate) struct Worktree {
     path: PathBuf,
     /// The short branch name; `None` when detached or bare.
-    branch: Option<String>,
+    pub(crate) branch: Option<String>,
     head: Option<String>,
     bare: bool,
 }
 
 /// Parse `git worktree list --porcelain -z`: NUL-terminated fields, an empty field
 /// between entries. NUL rather than newlines because a path can hold a newline.
-fn parse_worktrees(raw: &str) -> Vec<Worktree> {
+pub(crate) fn parse_worktrees(raw: &str) -> Vec<Worktree> {
     let mut out = Vec::new();
     let mut current: Option<Worktree> = None;
     for field in raw.split('\0') {
@@ -51,7 +51,7 @@ fn parse_worktrees(raw: &str) -> Vec<Worktree> {
 }
 
 /// Run git with argv only (never a shell), and return its stdout or its own complaint.
-fn git(dir: &std::path::Path, args: &[&std::ffi::OsStr]) -> std::io::Result<String> {
+pub(crate) fn git(dir: &std::path::Path, args: &[&std::ffi::OsStr]) -> std::io::Result<String> {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
@@ -111,7 +111,7 @@ pub(crate) fn repo_of(dir: &std::path::Path) -> std::io::Result<qoop_history::Re
 
 /// A branch name as one path component: lowercase letters and digits, every other run
 /// of characters one dash.
-fn worktree_slug(branch: &str) -> String {
+pub(crate) fn worktree_slug(branch: &str) -> String {
     let mut slug = String::new();
     for c in branch.chars() {
         if c.is_ascii_alphanumeric() {

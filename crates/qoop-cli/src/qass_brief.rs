@@ -44,13 +44,16 @@ fn parse_log(text: &str) -> Vec<Record> {
 
 /// An agent's open task, as its record says.
 #[derive(Clone, Debug, Default)]
-struct Task {
-    id: i64,
-    stage: String,
-    since: i64,
-    claimed: bool,
-    rounds: u32,
-    evidence: Option<String>,
+pub(crate) struct Task {
+    pub(crate) id: i64,
+    pub(crate) stage: String,
+    pub(crate) since: i64,
+    /// When it was opened.
+    pub(crate) opened: i64,
+    pub(crate) claimed: bool,
+    pub(crate) rounds: u32,
+    /// Every evidence body, newest first.
+    pub(crate) evidence: Vec<String>,
 }
 
 /// Everything a brief is made of, read before it is composed.
@@ -177,7 +180,7 @@ fn ending(granted: &[String]) -> &'static str {
     }
 }
 
-fn clock(at: i64, offset: i64) -> String {
+pub(crate) fn clock(at: i64, offset: i64) -> String {
     let secs = (at + offset).rem_euclid(86_400);
     format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
 }
@@ -189,7 +192,7 @@ fn minutes(since: Option<i64>, now: i64) -> String {
 }
 
 /// The first line, at most `chars` characters with the `...` that says it was cut.
-fn cut(text: &str, chars: usize) -> String {
+pub(crate) fn cut(text: &str, chars: usize) -> String {
     let line = text.lines().next().unwrap_or("").trim();
     if line.chars().count() <= chars {
         return line.to_string();
@@ -200,7 +203,7 @@ fn cut(text: &str, chars: usize) -> String {
 
 /// At most `max` words: lines before the last are dropped from the end, and `+N more` says
 /// how many went. The last line (what is allowed now) always stays.
-fn cap(mut lines: Vec<String>, max: usize) -> Vec<String> {
+pub(crate) fn cap(mut lines: Vec<String>, max: usize) -> Vec<String> {
     let words = |l: &[String]| {
         l.iter()
             .map(|s| s.split_whitespace().count())
@@ -323,7 +326,7 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
             if t.claimed { ", claimed" } else { "" },
             t.rounds,
             f.limit,
-            t.evidence.as_deref().map_or("none".into(), |e| cut(e, 80))
+            t.evidence.first().map_or("none".into(), |e| cut(e, 80))
         ));
         if t.rounds >= f.limit {
             not_now.push(format!(
@@ -408,9 +411,9 @@ fn typed(row: &serde_json::Value, dirs: Option<&BaseDirs>) -> Option<Vec<Message
         .map(|w| w.messages)
 }
 
-/// The task's facts: its stage events, all pages of them, give its rounds and its newest
-/// evidence.
-fn task_of(id: i64, now: i64) -> Option<Task> {
+/// The task's facts: its stage events, all pages of them, give its rounds, and every
+/// evidence event is read.
+pub(crate) fn task_of(id: i64, now: i64) -> Option<Task> {
     let id_s = id.to_string();
     let mut events: Vec<serde_json::Value> = Vec::new();
     let mut before: Option<String> = None;
@@ -442,12 +445,13 @@ fn task_of(id: i64, now: i64) -> Option<Task> {
             .and_then(|e| e["at"].as_i64())
             .or_else(|| task["opened_at"].as_i64())
             .unwrap_or(now),
+        opened: task["opened_at"].as_i64().unwrap_or(now),
         claimed: task["claimed_at"].is_i64(),
         rounds: rounds(stages.into_iter().rev()),
         evidence: of("evidence")
-            .next()
-            .and_then(|e| e["body"].as_str())
-            .map(String::from),
+            .filter_map(|e| e["body"].as_str())
+            .map(String::from)
+            .collect(),
     })
 }
 
@@ -855,9 +859,10 @@ mod tests {
             id: 12,
             stage: "reviewing".into(),
             since: NOW - 600,
+            opened: NOW - 900,
             claimed: true,
             rounds: 2,
-            evidence: Some(format!("cargo test: ok {}\nsecond line", "x".repeat(120))),
+            evidence: vec![format!("cargo test: ok {}\nsecond line", "x".repeat(120))],
         }));
         let out = brief(&f);
         assert!(

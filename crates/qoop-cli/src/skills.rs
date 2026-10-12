@@ -742,14 +742,14 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 436 holds the quiet watcher's lines, "Improve yourself" with its report
+        // ponytail: 435 holds the quiet watcher's lines, "Improve yourself" with its report
         // step, the card block of the question inbox, the usage-limit row, the short-title,
         // picks and follow-through lines, the card-first and habit rules (the brief moved to
         // brief.md), the restart after an install, and the routine words and the doctor step;
         // `qoop qass brief` does the sums of "On every event line" and the write counting for an
         // agent of this Mac; a remote agent keeps the sum by hand through on.sh; goals.md's rules
         // keep the file small (no log, ended cards out, under 8 KB).
-        assert!(skill.lines().count() <= 436, "SKILL.md grew past 436 lines");
+        assert!(skill.lines().count() <= 435, "SKILL.md grew past 435 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

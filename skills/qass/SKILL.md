@@ -185,14 +185,13 @@ Look these up in order before you write to a worker; a gap means "no known next 
 ## Done, checked
 
 When a worker's line ends `:claimed`, or it finished with its task still open and unclaimed,
-check each closing step of its workflow, never its words, in the repo's main checkout (the
-parent of `git -C <its cwd> rev-parse --path-format=absolute --git-common-dir`, worked out while
-its `cwd` still exists): the PR its evidence names merged (`gh pr view <n> --json
-state,mergedAt,mergeCommit`), its worktree gone (`git -C <repo> worktree list`), a build or
-install newer than the merge where the workflow says it lands (`stat -f %m` against `mergedAt`),
-the real run with its output in the evidence; then run its "Verify where it runs" section
-yourself (`init.md`). All there: close its task while open (`qoop task close <id> --verified '<what
-you checked; what now works, where to try it>'`). Then, when it is on an item whose agents have
+run `qoop task verify <id> --repo <its cwd: its -wt- folder, even when gone>` (an item:
+`<KEY>`, every linked task still open). It checks the closing facts, never its words, and its
+last line says what is missing. A PR its evidence names only as context (an older one) blocks
+the pass: tell the worker to name only its own. `Missing: none`: read the real run with its
+output in the evidence, then run its "Verify where it runs" section yourself (`init.md`). All
+there: close its task while open (`qoop task close <id> --verified '<what you checked; what now
+works, where to try it>'`). Then, when it is on an item whose agents have
 all ended and whose steps are all ticked, close the item too
 (`qoop task close <KEY> --verified '<the same>'`). One missing: prompt exactly that step when it
 is reversible or `policy` grants its verb there, else a card. A remote worker's repo: ask the

@@ -24,7 +24,7 @@ mod ts;
 pub use dir::{Repo, Typed, TypedIn, typed_in};
 pub use locate::{BaseDirs, Located, detect_product, valid_id};
 pub use model::{Message, Product, Role};
-pub use ts::date_utc;
+pub use ts::{date_utc, rfc3339_to_millis};
 
 /// One transcript window: the last messages, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

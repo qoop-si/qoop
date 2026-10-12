@@ -41,6 +41,7 @@ mod skills;
 mod sound;
 mod supervise;
 mod task;
+mod task_verify;
 mod update;
 mod worktree;
 
@@ -234,7 +235,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop setup ...  capture, inspect, trust and run a Setup\n\
                    \x20 qoop hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoop hook-report --session-id S  report only the agent's conversation id\n\
-                  \x20 qoop task new|goal|stage|plan|evidence|done|close|ls|show|board|rules  the work this\n\
+                  \x20 qoop task new|goal|stage|plan|evidence|done|close|verify|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
                   \x20 qoop ask add|close|ls  the owner's question inbox, as qass fills it;\n\
