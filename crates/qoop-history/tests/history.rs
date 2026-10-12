@@ -364,3 +364,209 @@ fn a_long_history_still_locates_old_sessions() {
     let codex = history("codex", Some("abc-1"), &d, 10, None).unwrap();
     assert_eq!(codex.messages[0].text, "fix it");
 }
+
+/// A Claude transcript of the given lines, read back as the person's messages.
+fn claude_typed(lines: &[serde_json::Value]) -> Vec<(String, Option<i64>)> {
+    let dir = tempfile::tempdir().unwrap();
+    let slug = dir.path().join("projects").join("-Users-x");
+    std::fs::create_dir_all(&slug).unwrap();
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(slug.join("sid-q.jsonl"), body).unwrap();
+    history(
+        "claude",
+        Some("sid-q"),
+        &dirs(dir.path()),
+        100,
+        Some(Role::User),
+    )
+    .unwrap()
+    .messages
+    .into_iter()
+    .map(|m| (m.text, m.ts))
+    .collect()
+}
+
+/// The three shapes Claude Code writes its queue in, as found in real transcripts.
+fn queue_op(op: &str, at: &str, content: Option<&str>) -> serde_json::Value {
+    let mut v = serde_json::json!({"type":"queue-operation","operation":op,
+        "timestamp":at,"sessionId":"sid-q"});
+    if let Some(c) = content {
+        v["content"] = c.into();
+    }
+    if op == "remove" {
+        v["reason"] = "absorbed_mid_turn".into();
+    }
+    v
+}
+
+fn queued_command(at: &str, kind: &str, prompt: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"parentUuid":"p","isSidechain":false,"type":"attachment","uuid":"u",
+        "timestamp":at,"attachment":{"type":"queued_command","prompt":prompt,
+        "source_uuid":"s","commandMode":"prompt","origin":{"kind":kind},"timestamp":at,
+        "humanTurn":true},
+        "rendered":[{"content":"<system-reminder>\nThe user sent a new message while you were working:\n</system-reminder>"}]})
+}
+
+fn user_line(at: &str, content: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"type":"user","timestamp":at,"origin":{"kind":"human"},
+        "message":{"role":"user","content":content}})
+}
+
+const T1: &str = "2026-10-04T00:55:09.976Z";
+const T1_MS: i64 = 1_791_075_309_976;
+
+/// What he typed mid-turn and Claude folded into the turn is his message, at its time;
+/// the same mechanism carrying a notification or another session's message is not his.
+#[test]
+fn a_message_typed_while_the_agent_worked_is_his() {
+    let typed = claude_typed(&[
+        queue_op("enqueue", T1, Some("cv a digeri qass icinde go")),
+        queue_op(
+            "remove",
+            "2026-10-04T00:55:13.719Z",
+            Some("cv a digeri qass icinde go"),
+        ),
+        queued_command(T1, "human", "cv a digeri qass icinde go".into()),
+        queued_command(
+            "2026-10-04T00:56:00.000Z",
+            "task-notification",
+            "<task-notification>\n<task-id>b1</task-id>".into(),
+        ),
+        queued_command(
+            "2026-10-04T00:57:00.000Z",
+            "peer",
+            "Another Claude session sent a message".into(),
+        ),
+        queued_command(
+            "2026-10-04T00:58:00.000Z",
+            "human",
+            serde_json::json!([{"type":"text","text":"with a picture"},
+                {"type":"image","source":{"type":"base64","data":"AA"}}]),
+        ),
+    ]);
+    assert_eq!(
+        typed,
+        [
+            ("cv a digeri qass icinde go".to_string(), Some(T1_MS)),
+            ("with a picture".to_string(), Some(1_791_075_480_000)),
+        ]
+    );
+}
+
+/// A queued message no dequeue or remove took yet counts as typed when queued; one taken
+/// counts once, by the line it became; a queued notification is nobody's.
+#[test]
+fn a_message_still_queued_counts_when_it_was_queued() {
+    let typed = claude_typed(&[
+        // An empty queue dequeued: nothing to take.
+        queue_op("dequeue", "2026-10-04T00:55:05.016Z", None),
+        queue_op(
+            "enqueue",
+            "2026-10-04T00:55:06.000Z",
+            Some("<task-notification>x"),
+        ),
+        queue_op("enqueue", T1, Some("run it again")),
+        // First in, first out: the notification, then the message.
+        queue_op("dequeue", "2026-10-04T00:55:10.000Z", None),
+        queue_op("dequeue", "2026-10-04T00:55:11.000Z", None),
+        user_line("2026-10-04T00:55:11.001Z", "run it again".into()),
+        queue_op(
+            "enqueue",
+            "2026-10-04T00:55:12.000Z",
+            Some("<task-notification>y"),
+        ),
+        queue_op("enqueue", "2026-10-04T00:56:00.000Z", Some("still waiting")),
+    ]);
+    assert_eq!(
+        typed,
+        [
+            // Taken as a turn: the time it was queued, not the time it was taken.
+            ("run it again".to_string(), Some(T1_MS)),
+            ("still waiting".to_string(), Some(1_791_075_360_000)),
+        ]
+    );
+    // One still queued sits where it was queued, before what came after it.
+    let typed = claude_typed(&[
+        queue_op("enqueue", T1, Some("still waiting")),
+        user_line("2026-10-04T00:56:00.000Z", "a later turn".into()),
+    ]);
+    assert_eq!(
+        typed,
+        [
+            ("still waiting".to_string(), Some(T1_MS)),
+            ("a later turn".to_string(), Some(1_791_075_360_000)),
+        ]
+    );
+}
+
+/// The summary a compacted session starts with and the marker of an interrupt ride on user
+/// lines, and nobody typed them.
+#[test]
+fn a_compaction_summary_and_an_interrupt_are_not_his() {
+    let mut summary = user_line(
+        T1,
+        "This session is being continued from a previous conversation that ran out of context."
+            .into(),
+    );
+    summary["isCompactSummary"] = true.into();
+    summary["isVisibleInTranscriptOnly"] = true.into();
+    let typed = claude_typed(&[
+        summary,
+        user_line(
+            "2026-10-04T00:55:10.000Z",
+            serde_json::json!([{"type":"text","text":"[Request interrupted by user]"}]),
+        ),
+        user_line(
+            "2026-10-04T00:55:11.000Z",
+            "[Request interrupted by user for tool use]".into(),
+        ),
+        user_line("2026-10-04T00:55:12.000Z", "go on".into()),
+    ]);
+    assert_eq!(typed, [("go on".to_string(), Some(1_791_075_312_000))]);
+}
+
+/// Every queued text put back in the input box at once (`popAll`) was never sent.
+#[test]
+fn a_queue_popped_back_into_the_box_is_not_sent() {
+    let typed = claude_typed(&[
+        queue_op(
+            "enqueue",
+            T1,
+            Some("ayrica o alt tarafta da path olabilir ya"),
+        ),
+        queue_op(
+            "popAll",
+            "2026-10-04T00:55:12.000Z",
+            Some("ayrica o alt tarafta da path olabilir ya"),
+        ),
+    ]);
+    assert_eq!(typed, []);
+}
+
+/// A user line from another origin (a peer session's message, a coordinator) is not the
+/// person at this tab.
+#[test]
+fn a_line_from_another_origin_is_not_his() {
+    let mut peer = user_line(T1, "Another Claude session sent a message: go".into());
+    peer["origin"] = serde_json::json!({"kind":"peer"});
+    let mut coordinator = user_line(T1, "Fix all of these".into());
+    coordinator["origin"] = serde_json::json!({"kind":"coordinator"});
+    let typed = claude_typed(&[
+        peer,
+        coordinator,
+        user_line("2026-10-04T00:55:12.000Z", "go on".into()),
+    ]);
+    assert_eq!(typed, [("go on".to_string(), Some(1_791_075_312_000))]);
+}
+
+/// A message folded into the running turn keeps the time it was queued, not the time it was
+/// folded: a write qass made 20 s ago stays a write of 20 s ago.
+#[test]
+fn a_message_folded_into_the_turn_keeps_its_queued_time() {
+    let typed = claude_typed(&[
+        queue_op("enqueue", T1, Some("run the tests")),
+        queue_op("remove", "2026-10-04T00:55:24.000Z", Some("run the tests")),
+        queued_command("2026-10-04T00:55:24.000Z", "human", "run the tests".into()),
+    ]);
+    assert_eq!(typed, [("run the tests".to_string(), Some(T1_MS))]);
+}

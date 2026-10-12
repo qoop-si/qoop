@@ -29,7 +29,7 @@ const FILE: &str = "SKILL.md";
 /// folder's own skills, Claude in `.claude/skills`, Codex, Gemini and opencode in
 /// `.agents/skills`: the same files in each, which find one another by their own directory.
 /// Its rules are in its SKILL.md; nothing beside them holds it back.
-const QASS_SKILL_DIRS: [&str; 2] = [".claude/skills/qass", ".agents/skills/qass"];
+pub(crate) const QASS_SKILL_DIRS: [&str; 2] = [".claude/skills/qass", ".agents/skills/qass"];
 
 /// The folder's own instructions, which every agent reads at its start: who qass is, and where
 /// its skill, the owner's lessons, its notes and its scratch are. Written only where the folder
@@ -742,13 +742,13 @@ mod tests {
             .expect("SKILL.md is installed")
             .1;
         assert!(skill.contains("init.md"), "SKILL.md points at init.md");
-        // ponytail: 427 holds the quiet watcher's lines, "Improve yourself" with its report
+        // ponytail: 433 holds the quiet watcher's lines, "Improve yourself" with its report
         // step, the card block of the question inbox, the usage-limit row, the short-title,
         // picks and follow-through lines, the card-first and habit rules (the brief moved to
         // brief.md), the restart after an install, and the routine words and the doctor step;
-        // `qoop qass brief` takes the hand arithmetic out of "On every event line" and this goes
-        // back toward 400.
-        assert!(skill.lines().count() <= 427, "SKILL.md grew past 427 lines");
+        // `qoop qass brief` does the sums of "On every event line" and the write counting for an
+        // agent of this Mac; a remote agent keeps the sum by hand through on.sh.
+        assert!(skill.lines().count() <= 433, "SKILL.md grew past 433 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

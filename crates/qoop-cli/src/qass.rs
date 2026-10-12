@@ -74,7 +74,7 @@ fn program_of(line: &str) -> &str {
 }
 
 /// Another qoop command's JSON, from this same binary.
-fn json(args: &[&str]) -> Option<serde_json::Value> {
+pub(crate) fn json(args: &[&str]) -> Option<serde_json::Value> {
     let me = std::env::current_exe().ok()?;
     let out = Command::new(me).args(args).output().ok()?;
     serde_json::from_slice(&out.stdout).ok()
@@ -113,7 +113,7 @@ fn running(folder: &Path) -> Option<u64> {
 }
 
 /// Whether a stored tab was started in `folder`, qass's own.
-fn in_folder(cwd: &str, folder: &Path) -> bool {
+pub(crate) fn in_folder(cwd: &str, folder: &Path) -> bool {
     Path::new(cwd)
         .canonicalize()
         .ok()
@@ -484,11 +484,11 @@ pub(crate) fn look() -> Facts {
 }
 
 pub fn run_qass(args: &[String]) -> std::io::Result<()> {
-    if args.get(2).map(String::as_str) == Some("page") && args.len() == 3 {
-        return crate::qass_page::run();
-    }
-    if args.len() > 2 {
-        return Err(crate::usage("usage: qoop qass [page]"));
+    match args.get(2).map(String::as_str) {
+        Some("page") if args.len() == 3 => return crate::qass_page::run(),
+        Some("brief") if args.len() > 3 => return crate::qass_brief::run(args),
+        Some(_) => return Err(crate::usage("usage: qoop qass [page | brief <n> [--json]]")),
+        None => {}
     }
     let folder = paths::qass_data_dir()
         .ok_or_else(|| std::io::Error::other("no HOME to keep qass's folder under"))?;

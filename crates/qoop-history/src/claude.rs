@@ -7,23 +7,134 @@ use serde_json::Value;
 use crate::model::{Message, Role};
 use crate::ts::rfc3339_to_millis;
 
+/// Text on a user line that nobody typed: the summary a compacted session starts with, and
+/// the marker an interrupt leaves.
+const NOT_TYPED: [&str; 2] = [
+    "This session is being continued",
+    "[Request interrupted by user",
+];
+
 /// Parse pre-split lines (see `read::read_tail_lines`) into messages.
 /// Corrupt lines are skipped and counted; only a total failure to read is an
 /// error, and that already happened upstream.
+///
+/// What the person typed while the agent was busy is read too: Claude Code queues it
+/// (`queue-operation` `enqueue`), then either takes it as a turn of its own (`dequeue`, and a
+/// `user` line follows) or folds it into the running turn (`remove`, and an `attachment` of
+/// type `queued_command` follows). One still queued counts as typed when it was queued, and
+/// one taken as a turn or folded into one keeps the time it was queued: its `user` line is stamped when the agent
+/// took it, which can be long after it was typed. A `popAll` puts every queued text back in
+/// the input box, unsent. A user line from another origin (a peer session, a coordinator)
+/// is nobody typing here.
 pub fn parse_lines(lines: &[String]) -> (Vec<Message>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0;
+    // Queued texts not taken yet, first in first out, with where they stand in `out`.
+    let mut queued: std::collections::VecDeque<(usize, Message)> = Default::default();
+    // Texts a dequeue took, with the time they were queued, for the user line they become.
+    let mut taken: Vec<Message> = Vec::new();
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<Value>(line) {
-            Ok(v) => {
-                if let Some(m) = route(&v) {
-                    out.push(m);
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            skipped += 1;
+            continue;
+        };
+        let ts = || {
+            v.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_millis)
+        };
+        match v.get("type").and_then(Value::as_str).unwrap_or("") {
+            "queue-operation" => {
+                let content = v.get("content").and_then(Value::as_str).unwrap_or("");
+                match v.get("operation").and_then(Value::as_str) {
+                    Some("enqueue") => queued.push_back((
+                        out.len(),
+                        Message {
+                            role: Role::User,
+                            text: content.to_string(),
+                            ts: ts(),
+                        },
+                    )),
+                    Some("dequeue") => taken.extend(
+                        queued
+                            .pop_front()
+                            .map(|(_, m)| m)
+                            .filter(|m| !m.text.starts_with('<')),
+                    ),
+                    Some("popAll") => queued.clear(),
+                    Some("remove") => {
+                        if let Some(at) = queued.iter().position(|(_, m)| m.text == content) {
+                            taken.extend(
+                                queued
+                                    .remove(at)
+                                    .map(|(_, m)| m)
+                                    .filter(|m| !m.text.starts_with('<')),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Err(_) => skipped += 1,
+            "attachment" => {
+                let a = v.get("attachment").unwrap_or(&Value::Null);
+                let human = a.get("type").and_then(Value::as_str) == Some("queued_command")
+                    && a.get("origin")
+                        .and_then(|o| o.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("human");
+                let text = a.get("prompt").map(flatten).unwrap_or_default();
+                if human && !text.is_empty() {
+                    // Folded into the turn after it was queued: the time it was queued.
+                    let queued_at = taken
+                        .iter()
+                        .position(|q| q.text == text)
+                        .and_then(|at| taken.remove(at).ts);
+                    let ts = queued_at.or_else(|| {
+                        a.get("timestamp")
+                            .and_then(Value::as_str)
+                            .and_then(rfc3339_to_millis)
+                            .or_else(ts)
+                    });
+                    out.push(Message {
+                        role: Role::User,
+                        text,
+                        ts,
+                    });
+                }
+            }
+            _ => {
+                let summary = v.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+                let other = v
+                    .get("origin")
+                    .and_then(|o| o.get("kind"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|k| k != "human");
+                match route(&v) {
+                    Some(m)
+                        if m.role == Role::User
+                            && (summary
+                                || other
+                                || NOT_TYPED.iter().any(|p| m.text.starts_with(p))) => {}
+                    Some(mut m) => {
+                        if m.role == Role::User
+                            && let Some(at) = taken.iter().position(|q| q.text == m.text)
+                        {
+                            m.ts = taken.remove(at).ts.or(m.ts);
+                        }
+                        out.push(m)
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    // Still queued: typed when queued. Notifications queue too, and are nobody's message.
+    for (at, m) in queued.into_iter().rev() {
+        if !m.text.is_empty() && !m.text.starts_with('<') {
+            out.insert(at, m);
         }
     }
     (out, skipped)

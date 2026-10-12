@@ -102,19 +102,24 @@ with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wai
 
 1. `qoop task board --dir @QASS_DATA@/board` (every wake: the files are as fresh as this run),
    then `qoop context 52 --last 1 --lines 40`. If the generation is no longer 3, drop the event.
-2. Overrides, first:
-   - **Owner-engaged:** `qoop history 52 --role user --last 5 --json` (`ts` in milliseconds) and
-     `date +%s`; do the arithmetic, never estimate it. Take the newest message not starting with
-     `<`. Not one you sent (noted on its `goals.md` line) and under 120 seconds old: he is at
-     that tab, hands off, and write `hands off until <ts/1000 + 120>` on its line; on each later
-     wake run `date +%s` and handle a worker whose `until` passed and that is still idle. Same
-     when the transcript is missing or stale. An older owner prompt is the task he gave; the
-     question is yours. Ignore the worker's input box: Claude Code prefills it.
+2. Overrides, first. `qoop qass brief 52` works out the facts; never estimate them.
+   - **Owner-engaged:** its `owner here` line says `engaged: hands off until <hh:mm> (<unix>)`:
+     he is at that tab, hands off; write `hands off until <unix>` on its line (the watcher says
+     it again once that passes). `unknown: treat as engaged`, or `nothing he typed in this tab`
+     on an agent doing a task he gave it there (a stale transcript): hands off, no mark, look
+     again next wake. His words: the newest of `qoop history 52 --role user --last 5` not
+     starting with `<`, not one you sent (yours have a `prompted.log` record just before them).
+     An older owner prompt is the task he gave; the question is yours. Ignore the worker's
+     input box: Claude Code prefills it. Remote (`ubox/T2`): `on.sh ubox history 2 --role user
+     --last 5 --json` (`ts` in ms) and `date +%s`, the arithmetic by hand: his newest, not
+     yours, under 120 s old, or a transcript missing or stale: hands off, and write `hands off
+     until <ts/1000 + 120>` on its line.
    - **Standing orders:** if that owner message is a go signal ("go", "continue", or the same
      in his language) or starts a skill that runs to the end on its own, do not nudge.
      Escalate only a question or a failure; a plain finish is silent.
 3. Classify: finished, asks a question, blocked on a menu, failed.
-4. Before you write anything to the worker, know where it stands (below).
+4. Before you write anything to the worker, know where it stands (below); the brief's last line
+   says what is allowed now (write, which ending, propose) and what not, with why.
 5. Decide with the table. Apply his standards; never predict a yes or no he did not give.
 6. Act, or write it down, or escalate (below). Then stay quiet until the next
    event. No polling, no progress messages.
@@ -131,6 +136,7 @@ name, in the same form as here, and key the agent as `ubox/T2` in goals.md and c
 "<this skill's dir>/on.sh" ubox prompt 2 --generation 3 -- '<one line>'
 ```
 
+`qoop qass brief` reads this Mac's policy, log and transcripts: never run it through `on.sh`.
 Plans and `wend` are on this Mac only: a remote worker's stage comes from its task (`on.sh ubox
 task show <id>`) or its messages. No grant reaches a remote: a commit, push or PR there is his.
 `ubox/link-down`: down for a minute (retried; `ubox/link-up` when back); `ubox/daemon-gone`:
@@ -205,7 +211,7 @@ how important the question feels.
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
 | Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when `policy` grants `close-finished` for its repo, `qoop close <n>` (a tab on this Mac only); else leave the tab |
-| Before you prompt another review round: its stage events in `qoop task show <id> --json` (`events`, kind `stage`) changed to `reviewing` as many times as the workflow's limit (default 8) | a card, never another round |
+| Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
 | Its task stage is `waiting-human` | a card now; read the question from its screen. A `W<n>` card for that agent is the daemon's draft (his own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | a card for later |
@@ -241,8 +247,8 @@ and with `merge-own-pr` too:
 Write apostrophes as ’, since `'` is the quote. Do not use `--wait`: the next
 state arrives as an event. After writing, confirm with one `qoop context`.
 
-At most 3 writes to one worker since the owner last spoke to you, and 10 an
-hour in all. In `mode propose` write only after the owner approves it with
+At most 3 writes to one worker since the owner last spoke to you, and 10 an hour in all: the
+brief's `writes` line counts them. In `mode propose` write only after the owner approves it with
 "ok <handle>".
 
 ## Propose mode
