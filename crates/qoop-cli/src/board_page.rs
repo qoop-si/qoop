@@ -9,6 +9,7 @@
 //! line. Read and written through the daemon, as `qoop task` is; read again each time the
 //! daemon says a task changed, and every half minute besides.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,10 +20,11 @@ use qoop_runtime::control::{
 };
 use qoop_runtime::{client, paths};
 use qoop_tui::theme::{self, Role};
+use qoop_tui::width::{self, columns};
 
 use crate::page::{self, Key, Screen, Session, bold, ink, raised, raised_bold};
 use crate::qass::{self, Life};
-use crate::qass_page::{ago, wrap};
+use crate::qass_page::ago;
 
 /// The smallest window the page draws in: three lanes of a card each.
 const NEED: (usize, usize) = (qoop_tui::qass_screen::BOARD_MIN_COLS, 14);
@@ -38,6 +40,12 @@ const SWITCH_W: usize = 19;
 /// Read again after this long with no news, for what changes with time alone (a start that
 /// expired, "3 min ago").
 const POLL: Duration = Duration::from_secs(30);
+/// An activity entry shows this many rows until it is opened.
+const ENTRY_ROWS: usize = 3;
+/// What an entry cut to those rows ends with.
+const MORE: &str = " … more";
+/// The most activity events the store sends; a full card may have more behind it.
+const ACTIVITY_SENT: usize = 200;
 /// The lanes, in order, as the daemon names the states.
 const LANES: [&str; 3] = ["todo", "doing", "done"];
 
@@ -84,6 +92,141 @@ enum Step {
     Tell(String),
     /// Keep the card view picked: quiet or full.
     Cards(bool),
+}
+
+/// An activity entry that stays itself when newer ones arrive: the event, and which of its
+/// identical twins it is, counted from the oldest.
+type EntryKey = (i64, i64, String, String, usize);
+
+/// What a dialog row is part of, to hold the view in place over a reload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Block {
+    Plain,
+    Title,
+    Description,
+    Step(i64),
+    Entry(usize),
+}
+
+/// One row of the dialog's body: pieces at an offset from the column's left, and the stop
+/// of the keyboard it belongs to (a step, then an activity entry).
+struct Row {
+    parts: Vec<(usize, String, Role, bool)>,
+    stop: Option<usize>,
+    block: Block,
+}
+
+impl Row {
+    fn new(block: Block, stop: Option<usize>) -> Row {
+        Row {
+            parts: Vec::new(),
+            stop,
+            block,
+        }
+    }
+
+    fn with(mut self, x: usize, text: &str, role: Role, strong: bool) -> Row {
+        self.parts.push((x, text.to_string(), role, strong));
+        self
+    }
+}
+
+/// `text` wrapped to `w` cells, a row each.
+fn text_rows(text: &str, w: usize, x: usize, role: Role, strong: bool, block: Block) -> Vec<Row> {
+    wrap_cells(text, w, None)
+        .iter()
+        .map(|line| Row::new(block, None).with(x, line, role, strong))
+        .collect()
+}
+
+/// Where the view was in the body before a reload.
+struct Anchor {
+    block: Block,
+    entry: Option<EntryKey>,
+    offset: usize,
+}
+
+/// The dialog's columns and body, from its box.
+struct Pane {
+    lx: usize,
+    lw: usize,
+    split: usize,
+    dx: usize,
+    dw: usize,
+    top: usize,
+    last: usize,
+}
+
+impl Pane {
+    fn of((x, y): (usize, usize), (w, h): (usize, usize)) -> Pane {
+        let lx = x + 3;
+        let split = x + w * 62 / 100;
+        let dx = split + 3;
+        Pane {
+            lx,
+            lw: split.saturating_sub(lx + 2).max(1),
+            split,
+            dx,
+            dw: (x + w).saturating_sub(dx + 2).max(1),
+            top: y + 3,
+            last: y + h - 2,
+        }
+    }
+
+    /// The rows of the body in view.
+    fn view(&self) -> usize {
+        self.last + 1 - self.top
+    }
+}
+
+/// The activity entries' keys, in the card's order.
+fn entry_keys(card: &ItemCardInfo) -> Vec<EntryKey> {
+    let mut seen: HashMap<(i64, i64, &str, &str), usize> = HashMap::new();
+    let mut keys: Vec<EntryKey> = card
+        .activity
+        .iter()
+        .rev()
+        .map(|e| {
+            let n = seen.entry((e.task, e.at, &e.kind, &e.body)).or_insert(0);
+            *n += 1;
+            (e.task, e.at, e.kind.clone(), e.body.clone(), *n - 1)
+        })
+        .collect();
+    keys.reverse();
+    keys
+}
+
+/// Rows of a column painted from `scroll` into `view` rows from `top`, at `x` and `w` wide;
+/// the row of `lit` wears the raised bar.
+fn paint(
+    s: &mut Screen,
+    rows: &[Row],
+    (scroll, top, view): (usize, usize, usize),
+    (x, w): (usize, usize),
+    lit: Option<usize>,
+) {
+    for r in 0..view {
+        let Some(row) = rows.get(scroll + r) else {
+            break;
+        };
+        let y = top + r;
+        let on = lit.is_some() && row.stop == lit;
+        if on {
+            s.put(x - 1, y, &" ".repeat(w + 1), &raised(Role::Detail));
+            if r == 0 || rows[scroll + r - 1].stop != row.stop {
+                s.put(x - 2, y, "▸", &ink(Role::Brand));
+            }
+        }
+        for (at, text, role, strong) in &row.parts {
+            let esc = match (on, strong) {
+                (true, true) => raised_bold(*role),
+                (true, false) => raised(*role),
+                (false, true) => bold(*role),
+                (false, false) => ink(*role),
+            };
+            s.put(x + at, y, &clip(text, w.saturating_sub(*at)), &esc);
+        }
+    }
 }
 
 /// What the keyboard is in.
@@ -135,6 +278,13 @@ struct Page {
     /// Each lane's first card in view: the wheel moves it, the keyboard and a click bring the
     /// selected card back into view.
     top: [usize; 3],
+    /// The dialog's first body row in view.
+    scroll: usize,
+    /// Every activity entry is shown whole (`E`); `flipped` ones are the other way round.
+    all: bool,
+    flipped: HashSet<EntryKey>,
+    /// The daemon had more activity than it sent.
+    older: bool,
 }
 
 fn now_unix() -> i64 {
@@ -155,17 +305,73 @@ fn span(then: i64, now: i64) -> String {
     }
 }
 
-/// `text` cut to `w` characters, the cut said with an ellipsis.
+/// `text` cut to `w` cells, the cut said with an ellipsis.
 fn fit(text: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
     }
-    if text.chars().count() <= w {
+    if width::width(text) <= w {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(w.saturating_sub(1)).collect();
+    let mut out = clip(text, w.saturating_sub(1));
     out.push('…');
     out
+}
+
+/// `text` cut to `w` cells.
+fn clip(text: &str, w: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        used += columns(c);
+        if used > w {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `text` in rows of at most `w` cells, broken at spaces; a word longer than a row is broken
+/// where it fills one. Stops after `limit` rows. Control characters and bidi marks are not
+/// drawn; a zero-width mark stays with its letter.
+fn wrap_cells(text: &str, w: usize, limit: Option<usize>) -> Vec<String> {
+    let w = w.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let word: Vec<char> = word.chars().filter(|c| width::drawn(*c)).collect();
+        let cells: usize = word.iter().map(|c| columns(*c)).sum();
+        if cells == 0 {
+            continue;
+        }
+        if let Some(row) = rows.last_mut().filter(|_| used + 1 + cells <= w) {
+            row.push(' ');
+            row.extend(word);
+            used += 1 + cells;
+            continue;
+        }
+        if limit.is_some_and(|l| rows.len() >= l) {
+            break;
+        }
+        rows.push(String::new());
+        used = 0;
+        for c in word {
+            let cw = columns(c);
+            if used > 0 && used + cw > w {
+                if limit.is_some_and(|l| rows.len() >= l) {
+                    return rows;
+                }
+                rows.push(String::new());
+                used = 0;
+            }
+            if let Some(row) = rows.last_mut() {
+                row.push(c);
+            }
+            used += cw;
+        }
+    }
+    rows
 }
 
 /// A space's name by id, or its number when the list does not have it.
@@ -269,6 +475,10 @@ impl Page {
             reveal: false,
             quiet: false,
             top: [0; 3],
+            scroll: 0,
+            all: false,
+            flipped: HashSet::new(),
+            older: false,
         }
     }
 
@@ -442,6 +652,16 @@ impl Page {
 
     /// One notch of the wheel over a lane: that lane moves by a card, never past its last.
     fn wheel(&mut self, up: bool, col: usize, row: usize) {
+        if matches!(self.mode, Mode::Card(_)) {
+            let max = self.max_scroll();
+            let scroll = self.scroll.min(max);
+            self.scroll = if up {
+                scroll.saturating_sub(3)
+            } else {
+                (scroll + 3).min(max)
+            };
+            return;
+        }
         let (w, h) = self.size;
         if self.mode != Mode::Board || w < NEED.0 || h < NEED.1 || row < 2 || row >= h - 2 {
             return;
@@ -493,6 +713,14 @@ impl Page {
     /// says why not. Only on the board itself, not over a dialog or while typing.
     fn mouse(&mut self, key: Key) -> Step {
         match key {
+            Key::Mouse {
+                down: true,
+                held: false,
+                col,
+                row,
+            } if matches!(self.mode, Mode::Card(_)) => {
+                return self.click(col as usize, row as usize);
+            }
             Key::Mouse {
                 down: true,
                 held: false,
@@ -790,28 +1018,43 @@ impl Page {
             return Step::Stay;
         };
         let steps = card.steps.len();
+        let item = card.item.clone();
+        let step = card.steps.get(at).cloned();
+        self.scroll = self.scroll.min(self.max_scroll());
+        let page = self.pane().view().saturating_sub(1).max(1);
         match key {
             Key::Esc | Key::Char('q') => {
                 self.mode = Mode::Board;
                 self.card = None;
             }
-            Key::Up | Key::Char('k') => self.mode = Mode::Card(at.saturating_sub(1)),
-            Key::Down | Key::Char('j') => {
-                self.mode = Mode::Card((at + 1).min(steps.saturating_sub(1)))
+            Key::Up | Key::Char('k') => self.go(at, false),
+            Key::Down | Key::Char('j') => self.go(at, true),
+            Key::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            Key::PageDown => self.scroll = (self.scroll + page).min(self.max_scroll()),
+            Key::Home => self.scroll = 0,
+            Key::End => self.scroll = self.max_scroll(),
+            Key::Enter => {
+                if let Some(entry) = at.checked_sub(steps) {
+                    self.toggle(entry);
+                }
+            }
+            Key::Char('E') => {
+                self.all = !self.all;
+                self.flipped.clear();
             }
             Key::Char('x') | Key::Char(' ') => {
-                if let Some(step) = card.steps.get(at) {
+                if let Some(step) = step {
                     let done = step.done_at.is_none();
                     let said = format!(
                         "{} step {} {}",
-                        card.item.key,
+                        item.key,
                         step.n,
                         if done { "ticked" } else { "unticked" }
                     );
-                    return Step::Write(card.item.id, TaskOp::Check { n: step.n, done }, said);
+                    return Step::Write(item.id, TaskOp::Check { n: step.n, done }, said);
                 }
             }
-            Key::Char(c @ ('H' | 'L')) => return self.moved(&card.item.clone(), c == 'L'),
+            Key::Char(c @ ('H' | 'L')) => return self.moved(&item, c == 'L'),
             Key::Char('t') => self.mode = Mode::Tell(String::new()),
             _ => {}
         }
@@ -880,7 +1123,8 @@ impl Page {
         if let Mode::Card(at) = self.mode
             && let Some(card) = &self.card
         {
-            self.dialog(&mut s, card, at, (1, top), (3 * lw + 4, bottom - top));
+            let (corner, size) = Self::dialog_box((w, h));
+            self.dialog(&mut s, card, at, corner, size);
         }
         self.foot(&mut s);
         s
@@ -1136,7 +1380,8 @@ impl Page {
     }
 
     /// The issue: Description, Checklist and Activity on the left, Details on the right, in
-    /// the box at `(x, y)` of `(w, h)`.
+    /// the box at `(x, y)` of `(w, h)`. Both columns are rows wrapped to their width and
+    /// scrolled together: nothing in them is cut.
     fn dialog(
         &self,
         s: &mut Screen,
@@ -1154,22 +1399,20 @@ impl Page {
         s.put(x, y, &format!("┌{}┐", "─".repeat(w - 2)), &edge);
         s.put(x, y + h - 1, &format!("└{}┘", "─".repeat(w - 2)), &edge);
         let item = &card.item;
+        let pane = Pane::of((x, y), (w, h));
         let space = space_name(&self.spaces, item.workspace);
         let space_ink = item.workspace.map_or(ink(Role::Faint), |id| {
             ink(theme::space_in(&self.spaces, id))
         });
-        let lx = x + 3;
-        let split = x + w * 62 / 100;
-        let lw = split - lx - 2;
-        let last = y + h - 2;
+        let key = format!(" / {}", item.key);
+        let space = fit(
+            &space,
+            (x + w - 16).saturating_sub(pane.lx + width::width(&key)),
+        );
         s.seg(
-            lx,
+            pane.lx,
             y + 1,
-            &[
-                (&space, space_ink.clone()),
-                (" / ", ink(Role::Faint)),
-                (&item.key, ink(Role::Faint)),
-            ],
+            &[(&space, space_ink), (&key, ink(Role::Faint))],
         );
         s.seg(
             x + w - 15,
@@ -1180,160 +1423,418 @@ impl Page {
                 (" close ]", ink(Role::Detail)),
             ],
         );
-        let mut ly = y + 3;
-        let line = |s: &mut Screen, ly: &mut usize, text: &str, esc: &str| {
-            if *ly <= last {
-                s.put(lx, *ly, &fit(text, lw), esc);
-            }
-            *ly += 1;
-        };
-        for t in wrap(&item.title, lw) {
-            line(s, &mut ly, &t, &bold(Role::Focused));
+        let (left, right) = (self.rows(card, pane.lw), self.details_rows(card, pane.dw));
+        let view = pane.view();
+        let total = left.len().max(right.len());
+        let scroll = self.scroll.min(total.saturating_sub(view));
+        for row in pane.top..=pane.last {
+            s.put(pane.split, row, "│", &ink(Role::Rule));
         }
-        ly += 1;
-        line(s, &mut ly, "Description", &bold(Role::Faint));
+        if scroll > 0 {
+            s.put(pane.split, pane.top, "▲", &ink(Role::Brand));
+        }
+        if scroll + view < total {
+            s.put(pane.split, pane.last, "▼", &ink(Role::Brand));
+        }
+        paint(
+            s,
+            &left,
+            (scroll, pane.top, view),
+            (pane.lx, pane.lw),
+            Some(at),
+        );
+        // Details stay in view while they fit; a taller column scrolls to its own end.
+        let beside = scroll.min(right.len().saturating_sub(view));
+        paint(
+            s,
+            &right,
+            (beside, pane.top, view),
+            (pane.dx, pane.dw),
+            None,
+        );
+    }
+
+    /// The dialog's box, as [`Page::draw`] places it over the lanes.
+    fn dialog_box(size: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+        let (w, h) = (size.0.max(NEED.0), size.1.max(NEED.1));
+        ((1, 2), (3 * ((w - 2 - 4) / 3) + 4, h - 4))
+    }
+
+    fn pane(&self) -> Pane {
+        let (at, size) = Self::dialog_box(self.size);
+        Pane::of(at, size)
+    }
+
+    /// The left column: title, description, checklist and activity, wrapped to `lw`.
+    fn rows(&self, card: &ItemCardInfo, lw: usize) -> Vec<Row> {
+        let item = &card.item;
+        let plain =
+            |text: &str, role, strong| Row::new(Block::Plain, None).with(0, text, role, strong);
+        let blank = || Row::new(Block::Plain, None);
+        let mut out = text_rows(&item.title, lw, 0, Role::Focused, true, Block::Title);
+        out.push(blank());
+        out.push(plain("Description", Role::Faint, true));
         if card.description.trim().is_empty() {
-            line(s, &mut ly, "none yet", &ink(Role::Faint));
+            out.push(Row::new(Block::Description, None).with(0, "none yet", Role::Faint, false));
         }
         for para in card.description.lines() {
-            for t in wrap(para, lw) {
-                line(s, &mut ly, &t, &ink(Role::Text));
-            }
+            out.extend(text_rows(
+                para,
+                lw,
+                0,
+                Role::Text,
+                false,
+                Block::Description,
+            ));
         }
-        ly += 1;
-        if ly <= last {
-            s.seg(
-                lx,
-                ly,
-                &[
-                    ("Checklist", bold(Role::Faint)),
-                    (
-                        &format!("  {}/{}", item.steps_done, item.steps_total),
-                        ink(Role::Faint),
-                    ),
-                ],
-            );
-        }
-        ly += 1;
+        out.push(blank());
+        out.push(
+            Row::new(Block::Plain, None)
+                .with(0, "Checklist", Role::Faint, true)
+                .with(
+                    9,
+                    &format!("  {}/{}", item.steps_done, item.steps_total),
+                    Role::Faint,
+                    false,
+                ),
+        );
         if card.steps.is_empty() {
-            line(s, &mut ly, "no steps yet", &ink(Role::Faint));
+            out.push(plain("no steps yet", Role::Faint, false));
         }
         let going = card.steps.iter().position(|st| st.done_at.is_none());
         for (n, step) in card.steps.iter().enumerate() {
-            if ly > last {
-                break;
-            }
-            let on = n == at;
-            if on {
-                s.put(lx - 1, ly, &" ".repeat(lw + 1), &raised(Role::Detail));
-                s.put(lx - 2, ly, "▸", &ink(Role::Brand));
-            }
-            let paint = |role: Role| if on { raised_bold(role) } else { ink(role) };
-            let mark = if step.done_at.is_some() {
-                "[x] "
-            } else {
-                "[ ] "
-            };
-            let mut sx = s.put(lx, ly, mark, &paint(Role::Detail));
+            let done = step.done_at.is_some();
             let room = lw.saturating_sub(4 + if going == Some(n) { 13 } else { 0 });
-            let role = if step.done_at.is_some() {
-                Role::Faint
-            } else {
-                Role::Text
-            };
-            sx = s.put(sx, ly, &fit(&step.text, room), &paint(role));
-            if going == Some(n) {
-                s.put(sx + 2, ly, "in progress", &paint(Role::Working));
+            let mut lines = wrap_cells(&step.text, room, None);
+            lines.resize(lines.len().max(1), String::new());
+            for (i, line) in lines.iter().enumerate() {
+                let mut row = Row::new(Block::Step(step.n), Some(n));
+                if i == 0 {
+                    let mark = if done { "[x] " } else { "[ ] " };
+                    row = row.with(0, mark, Role::Detail, false);
+                }
+                let role = if done { Role::Faint } else { Role::Text };
+                row = row.with(4, line, role, false);
+                if i == 0 && going == Some(n) {
+                    row = row.with(
+                        4 + width::width(line) + 2,
+                        "in progress",
+                        Role::Working,
+                        false,
+                    );
+                }
+                out.push(row);
             }
-            ly += 1;
         }
-        ly += 1;
-        line(s, &mut ly, "Activity", &bold(Role::Faint));
-        for e in &card.activity {
-            if ly > last {
-                break;
-            }
-            let when = fit(&ago(Some(e.at), self.now), 11);
-            s.put(lx, ly, &when, &ink(Role::Faint));
+        out.push(blank());
+        out.push(plain("Activity", Role::Faint, true));
+        let keys = if self.flipped.is_empty() {
+            Vec::new()
+        } else {
+            entry_keys(card)
+        };
+        let tw = lw.saturating_sub(12);
+        for (i, e) in card.activity.iter().enumerate() {
+            let whole = self.all != keys.get(i).is_some_and(|k| self.flipped.contains(k));
             let what = activity_words(&e.kind, &e.body);
-            s.put(lx + 12, ly, &fit(&what, lw - 12), &ink(Role::Text));
-            ly += 1;
+            // One row past the collapsed height is enough to know the entry was cut.
+            let mut lines = wrap_cells(&what, tw, (!whole).then_some(ENTRY_ROWS + 1));
+            let cut = lines.len() > ENTRY_ROWS && !whole;
+            if cut {
+                lines.truncate(ENTRY_ROWS);
+            }
+            lines.resize(lines.len().max(1), String::new());
+            let last = lines.len() - 1;
+            for (n, line) in lines.iter().enumerate() {
+                let mut row = Row::new(Block::Entry(i), Some(card.steps.len() + i));
+                if n == 0 {
+                    row = row.with(0, &fit(&ago(Some(e.at), self.now), 11), Role::Faint, false);
+                }
+                if cut && n == last {
+                    let line = clip(line, tw.saturating_sub(MORE.chars().count()));
+                    let end = 12 + width::width(&line);
+                    row =
+                        row.with(12, &line, Role::Text, false)
+                            .with(end, MORE, Role::Detail, false);
+                } else {
+                    row = row.with(12, line, Role::Text, false);
+                }
+                out.push(row);
+            }
         }
-        // Details.
-        for row in y + 3..=last {
-            s.put(split, row, "│", &ink(Role::Rule));
+        if self.older || card.activity.len() >= ACTIVITY_SENT {
+            out.push(blank());
+            let note = format!(
+                "older activity is not shown here: qoop task show {}",
+                item.key
+            );
+            out.extend(text_rows(&note, lw, 0, Role::Faint, false, Block::Plain));
         }
-        let dx = split + 3;
-        let dw = x + w - 2 - dx;
-        s.put(dx, y + 3, "Details", &bold(Role::Faint));
+        out
+    }
+
+    /// The right column: the facts of the issue, values wrapped to `dw`.
+    fn details_rows(&self, card: &ItemCardInfo, dw: usize) -> Vec<Row> {
+        let item = &card.item;
+        let vw = dw.saturating_sub(11);
+        let mut out = vec![
+            Row::new(Block::Plain, None).with(0, "Details", Role::Faint, true),
+            Row::new(Block::Plain, None),
+        ];
+        let kv = |out: &mut Vec<Row>, label: &str, value: &str, role: Role| {
+            let mut lines = wrap_cells(value, vw, None);
+            lines.resize(lines.len().max(1), String::new());
+            for (i, line) in lines.iter().enumerate() {
+                let mut row = Row::new(Block::Plain, None);
+                if i == 0 && !label.is_empty() {
+                    row = row.with(0, label, Role::Faint, false);
+                }
+                out.push(row.with(11, line, role, false));
+            }
+        };
         let state_role = match item.state.as_str() {
             "doing" => Role::Working,
             "done" => Role::Done,
             _ => Role::Text,
         };
-        let mut dy = y + 5;
-        let row = |s: &mut Screen, dy: &mut usize, label: &str, value: &str, esc: String| {
-            if *dy <= last {
-                s.put(dx, *dy, label, &ink(Role::Faint));
-                s.put(dx + 11, *dy, &fit(value, dw.saturating_sub(11)), &esc);
-            }
-            *dy += 1;
-        };
         let state = match &item.outcome {
             Some(o) if item.state == "done" => format!("DONE, {o}"),
             _ => item.state.to_uppercase(),
         };
-        row(s, &mut dy, "Status", &state, ink(state_role));
-        dy += 1;
+        kv(&mut out, "Status", &state, state_role);
+        out.push(Row::new(Block::Plain, None));
         if item.agents.is_empty() {
-            row(s, &mut dy, "Assignees", "none yet", ink(Role::Faint));
+            kv(&mut out, "Assignees", "none yet", Role::Faint);
         }
         for (n, a) in item.agents.iter().enumerate() {
-            let label = if n == 0 { "Assignees" } else { "" };
-            row(s, &mut dy, label, &a.name, ink(Role::Text));
+            kv(
+                &mut out,
+                if n == 0 { "Assignees" } else { "" },
+                &a.name,
+                Role::Text,
+            );
             let (word, role) = agent_word(a);
             let place = match a.terminal {
                 Some(t) => format!("{}  T{t}", a.machine),
                 None => a.machine.clone(),
             };
-            if dy <= last {
-                let px = s.put(dx + 11, dy, &fit(&place, dw / 2), &ink(Role::Faint));
-                s.put(
-                    px + 2,
-                    dy,
-                    &fit(&word, dw.saturating_sub(px + 2 - dx)),
-                    &ink(role),
+            if width::width(&place) + 2 + width::width(&word) <= vw {
+                let end = 11 + width::width(&place) + 2;
+                out.push(
+                    Row::new(Block::Plain, None)
+                        .with(11, &place, Role::Faint, false)
+                        .with(end, &word, role, false),
                 );
+            } else {
+                kv(&mut out, "", &place, Role::Faint);
+                kv(&mut out, "", &word, role);
             }
-            dy += 1;
         }
-        dy += 1;
-        row(s, &mut dy, "Space", &space, space_ink);
-        row(s, &mut dy, "Key", &item.key, ink(Role::Text));
-        row(
-            s,
-            &mut dy,
+        out.push(Row::new(Block::Plain, None));
+        let space = space_name(&self.spaces, item.workspace);
+        let space_role = item
+            .workspace
+            .map_or(Role::Faint, |id| theme::space_in(&self.spaces, id));
+        kv(&mut out, "Space", &space, space_role);
+        kv(&mut out, "Key", &item.key, Role::Text);
+        kv(
+            &mut out,
             "Updated",
             &ago(Some(item.updated_at), self.now),
-            ink(Role::Text),
+            Role::Text,
         );
         let run_by = match self.qass.0 {
             Some(t) => format!("qass  T{t}"),
             None => "qass".to_string(),
         };
-        row(s, &mut dy, "Run by", &run_by, ink(Role::Text));
-        dy += 1;
-        if dy <= last {
-            s.seg(
-                dx,
-                dy,
-                &[
-                    ("[ ", ink(Role::Brand)),
-                    ("H L", bold(Role::Text)),
-                    (" change status ]", ink(Role::Detail)),
-                ],
-            );
+        kv(&mut out, "Run by", &run_by, Role::Text);
+        out.push(Row::new(Block::Plain, None));
+        let legend = if dw >= 21 {
+            "change status ]"
+        } else {
+            "move ]"
+        };
+        out.push(
+            Row::new(Block::Plain, None)
+                .with(0, "[ ", Role::Brand, false)
+                .with(2, "H L", Role::Text, true)
+                .with(5, &format!(" {legend}"), Role::Detail, false),
+        );
+        out
+    }
+
+    /// The most the body scrolls: its rows less the window.
+    fn max_scroll(&self) -> usize {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        let pane = self.pane();
+        let rows = self.rows(card, pane.lw).len();
+        rows.max(self.details_rows(card, pane.dw).len())
+            .saturating_sub(pane.view())
+    }
+
+    /// An activity entry opened if it is shut, shut if it is open.
+    fn toggle(&mut self, entry: usize) {
+        let Some(key) = self
+            .card
+            .as_ref()
+            .and_then(|c| entry_keys(c).get(entry).cloned())
+        else {
+            return;
+        };
+        if !self.flipped.remove(&key) {
+            self.flipped.insert(key);
         }
+    }
+
+    /// The issue opened: at its top, every entry as it comes.
+    fn open_card(&mut self, card: ItemCardInfo, older: bool) {
+        self.card = Some(card);
+        self.older = older;
+        self.mode = Mode::Card(0);
+        self.scroll = 0;
+        self.all = false;
+        self.flipped.clear();
+    }
+
+    /// The open issue read again: the stop, the opened entries and the place in the body
+    /// stay where they were, whatever arrived above them.
+    fn keep_card(&mut self, card: ItemCardInfo, older: bool) {
+        let anchor = self.anchor();
+        let was = match (&self.mode, &self.card) {
+            (Mode::Card(at), Some(old)) => at
+                .checked_sub(old.steps.len())
+                .and_then(|i| entry_keys(old).get(i).cloned()),
+            _ => None,
+        };
+        let keys = entry_keys(&card);
+        if let Mode::Card(at) = self.mode {
+            let found = was.and_then(|k| keys.iter().position(|n| *n == k));
+            let at = found.map_or(at, |i| card.steps.len() + i);
+            let stops = card.steps.len() + card.activity.len();
+            self.mode = Mode::Card(at.min(stops.saturating_sub(1)));
+        }
+        self.flipped.retain(|k| keys.contains(k));
+        self.card = Some(card);
+        self.older = older;
+        if let Some(a) = anchor {
+            let block = match &a.entry {
+                Some(k) => keys.iter().position(|n| n == k).map(Block::Entry),
+                None => Some(a.block),
+            };
+            let pane = self.pane();
+            let first = self
+                .card
+                .as_ref()
+                .zip(block)
+                .and_then(|(c, b)| self.rows(c, pane.lw).iter().position(|r| r.block == b));
+            self.scroll = first.map_or(usize::MAX, |f| f + a.offset);
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The block of the first row in view and how far into it the view starts.
+    fn anchor(&self) -> Option<Anchor> {
+        let card = self.card.as_ref()?;
+        let rows = self.rows(card, self.pane().lw);
+        let row = rows.get(self.scroll)?;
+        if row.block == Block::Plain {
+            return None;
+        }
+        let first = rows.iter().position(|r| r.block == row.block)?;
+        let entry = match row.block {
+            Block::Entry(i) => entry_keys(card).get(i).cloned(),
+            _ => None,
+        };
+        Some(Anchor {
+            block: row.block,
+            entry,
+            offset: self.scroll - first,
+        })
+    }
+
+    /// `j` or `k` in the dialog: to the next stop, or, in one taller than the window, down
+    /// or up through it first. At either end of the body it scrolls a row, so the title and
+    /// the last line can be reached.
+    fn go(&mut self, at: usize, down: bool) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let stops = card.steps.len() + card.activity.len();
+        let pane = self.pane();
+        let view = pane.view();
+        let rows = self.rows(card, pane.lw);
+        let max = rows
+            .len()
+            .max(self.details_rows(card, pane.dw).len())
+            .saturating_sub(view);
+        let scroll = self.scroll.min(max);
+        let range = |stop: usize| {
+            let first = rows.iter().position(|r| r.stop == Some(stop))?;
+            let last = rows.iter().rposition(|r| r.stop == Some(stop))?;
+            Some((first, last))
+        };
+        // Where the view goes to show a stop: its top, or just enough to show its bottom.
+        let show = |(first, last): (usize, usize)| {
+            if first < scroll || last + 1 - first > view {
+                first
+            } else if last >= scroll + view {
+                last + 1 - view
+            } else {
+                scroll
+            }
+        };
+        let edge = if down { at + 1 >= stops } else { at == 0 };
+        let here = range(at);
+        let (to, shown) = match here {
+            Some((first, last)) if last >= scroll && first < scroll + view => {
+                let tall = last + 1 - first > view;
+                if tall && down && last >= scroll + view {
+                    (at, scroll + 1)
+                } else if tall && !down && first < scroll {
+                    (at, scroll - 1)
+                } else if down && at + 1 < stops {
+                    (at + 1, range(at + 1).map_or(scroll, show))
+                } else if !down && at > 0 {
+                    (at - 1, range(at - 1).map_or(scroll, show))
+                } else if down {
+                    (at, scroll + 1)
+                } else {
+                    (at, scroll.saturating_sub(1))
+                }
+            }
+            Some(r) if !edge => (at, show(r)),
+            _ if down => (at, scroll + 1),
+            _ => (at, scroll.saturating_sub(1)),
+        };
+        self.mode = Mode::Card(to);
+        self.scroll = shown.min(max);
+    }
+
+    /// A press in the dialog: on a step or an entry the keyboard goes there, and an entry
+    /// opens or shuts.
+    fn click(&mut self, col: usize, row: usize) -> Step {
+        let pane = self.pane();
+        let Some(card) = &self.card else {
+            return Step::Stay;
+        };
+        if row < pane.top || row > pane.last || col + 2 < pane.lx || col >= pane.split {
+            return Step::Stay;
+        }
+        let steps = card.steps.len();
+        let scroll = self.scroll.min(self.max_scroll());
+        let stop = self
+            .rows(card, pane.lw)
+            .get(scroll + row - pane.top)
+            .and_then(|r| r.stop);
+        if let Some(stop) = stop {
+            self.mode = Mode::Card(stop);
+            if let Some(entry) = stop.checked_sub(steps) {
+                self.toggle(entry);
+            }
+        }
+        Step::Stay
     }
 
     /// The two rows under the lanes: qass and what the page last said, then the keys.
@@ -1377,7 +1878,9 @@ impl Page {
             ],
             Mode::Card(_) => &[
                 ("j k", "step"),
-                ("x", "tick step"),
+                ("enter", "more"),
+                ("E", "all"),
+                ("x", "tick"),
                 ("H L", "move"),
                 ("t", "tell qass"),
                 ("esc", "close"),
@@ -1466,7 +1969,8 @@ fn read_board() -> Result<Option<Vec<ItemInfo>>, String> {
 }
 
 /// One item's card.
-fn read_card(item: i64) -> Result<ItemCardInfo, String> {
+/// The issue, and whether the daemon had more activity than it sent.
+fn read_card(item: i64) -> Result<(ItemCardInfo, bool), String> {
     let request = ControlRequest::TaskRead {
         id: crate::request_id("board-page"),
         board: false,
@@ -1477,8 +1981,10 @@ fn read_card(item: i64) -> Result<ItemCardInfo, String> {
     };
     match crate::task::ask(request, Duration::from_secs(10)) {
         Ok(ControlResponse::Tasks {
-            item: Some(card), ..
-        }) => Ok(*card),
+            item: Some(card),
+            more,
+            ..
+        }) => Ok((*card, more)),
         Ok(ControlResponse::Tasks { .. }) => Err(format!("#{item} is not on the board")),
         Ok(ControlResponse::Failed { reason, .. }) => Err(reason),
         Ok(other) => Err(format!("unexpected answer: {other:?}")),
@@ -1685,10 +2191,7 @@ pub(crate) fn run() -> std::io::Result<()> {
                     });
                 }
                 Step::Open(item) => match read_card(item) {
-                    Ok(card) => {
-                        page.card = Some(card);
-                        page.mode = Mode::Card(0);
-                    }
+                    Ok((card, older)) => page.open_card(card, older),
                     Err(why) => page.said = Some(why),
                 },
                 Step::Write(item, op, said) => {
@@ -1774,12 +2277,9 @@ fn reload(page: &mut Page) {
         Err(why) => page.said = Some(why),
     }
     // The open card, while its dialog is up.
-    if let (Mode::Card(at), Some(card)) = (page.mode.clone(), &page.card) {
-        match read_card(card.item.id) {
-            Ok(card) => {
-                page.mode = Mode::Card(at.min(card.steps.len().saturating_sub(1)));
-                page.card = Some(card);
-            }
+    if let (Mode::Card(_), Some(id)) = (&page.mode, page.card.as_ref().map(|c| c.item.id)) {
+        match read_card(id) {
+            Ok((card, older)) => page.keep_card(card, older),
             Err(why) => page.said = Some(why),
         }
     }
@@ -2560,5 +3060,326 @@ mod tests {
         let mut old = page();
         old.items = None;
         assert!(drawn(&old, 80, 20).contains("older than the board"));
+    }
+
+    /// Numbered words, so a wrapped or cut text can be checked word by word.
+    fn words(prefix: &str, n: usize) -> String {
+        (0..n)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn event(kind: &str, body: &str, at: i64) -> qoop_runtime::control::ItemEventInfo {
+        qoop_runtime::control::ItemEventInfo {
+            task: 1,
+            at,
+            kind: kind.into(),
+            body: body.into(),
+        }
+    }
+
+    fn open_with(
+        size: (usize, usize),
+        steps: Vec<StepInfo>,
+        activity: Vec<qoop_runtime::control::ItemEventInfo>,
+    ) -> Page {
+        let mut p = page();
+        p.size = size;
+        p.card = Some(ItemCardInfo {
+            item: item(1, "doing", "t", 1),
+            description: String::new(),
+            steps,
+            activity,
+        });
+        p.mode = Mode::Card(0);
+        p
+    }
+
+    /// Walk the whole body a page at a time: every word must be drawn at some point.
+    fn all_seen(p: &mut Page, words: &[String]) -> bool {
+        let mut left: Vec<&String> = words.iter().collect();
+        p.key(Key::Home);
+        for _ in 0..400 {
+            let text = drawn(p, p.size.0, p.size.1);
+            left.retain(|w| !text.contains(w.as_str()));
+            if left.is_empty() {
+                return true;
+            }
+            let before = p.scroll;
+            p.key(Key::PageDown);
+            if p.scroll == before {
+                break;
+            }
+        }
+        left.is_empty()
+    }
+
+    #[test]
+    fn a_long_evidence_line_is_cut_to_three_rows_and_opens_whole() {
+        let body = words("w", 100);
+        let mut p = open_with((120, 40), Vec::new(), vec![event("evidence", &body, 5)]);
+        let text = drawn(&p, 120, 40);
+        assert!(text.contains("… more"), "{text}");
+        assert!(text.contains("w000") && !text.contains("w099"), "{text}");
+        // Enter opens it in place, enter again shuts it.
+        p.key(Key::Enter);
+        let text = drawn(&p, 120, 40);
+        assert!(text.contains("w099") && !text.contains("… more"), "{text}");
+        p.key(Key::Enter);
+        assert!(drawn(&p, 120, 40).contains("… more"));
+        // `E` opens every entry, and shuts them again.
+        p.key(Key::Char('E'));
+        assert!(drawn(&p, 120, 40).contains("w099"));
+        p.key(Key::Char('E'));
+        assert!(!drawn(&p, 120, 40).contains("w099"));
+    }
+
+    #[test]
+    fn every_word_of_an_open_entry_is_reachable_in_the_smallest_window() {
+        let list: Vec<String> = (0..100).map(|i| format!("w{i:03}")).collect();
+        let mut p = open_with(
+            NEED,
+            Vec::new(),
+            vec![event("evidence", &list.join(" "), 5)],
+        );
+        p.key(Key::Enter);
+        assert!(all_seen(&mut p, &list));
+    }
+
+    #[test]
+    fn the_title_description_steps_and_details_are_whole() {
+        let title = words("t", 50);
+        let mut p = page();
+        p.size = (120, 40);
+        let mut it = item(1, "doing", &title, 1);
+        it.agents.push(ItemAgentInfo {
+            task: 9,
+            terminal: Some(4),
+            name: words("n", 12),
+            machine: "this Mac".into(),
+            stage: "working".into(),
+            claimed: false,
+            closed: false,
+            since: 0,
+        });
+        p.card = Some(ItemCardInfo {
+            item: it,
+            description: words("d", 400),
+            steps: vec![StepInfo {
+                n: 1,
+                text: words("s", 30),
+                done_at: None,
+            }],
+            activity: Vec::new(),
+        });
+        p.mode = Mode::Card(0);
+        let mut list: Vec<String> = Vec::new();
+        for (prefix, n) in [("t", 50), ("d", 400), ("s", 30), ("n", 12)] {
+            list.extend((0..n).map(|i| format!("{prefix}{i:03}")));
+        }
+        assert!(all_seen(&mut p, &list));
+    }
+
+    #[test]
+    fn the_body_scrolls_by_key_page_wheel_and_says_so() {
+        let activity: Vec<_> = (0..60)
+            .map(|i| event("evidence", &format!("entry{i:03}"), 100 - i))
+            .collect();
+        let mut p = open_with(NEED, Vec::new(), activity);
+        let text = drawn(&p, NEED.0, NEED.1);
+        assert!(
+            text.contains("Description") && !text.contains("entry059"),
+            "{text}"
+        );
+        assert!(text.contains('▼') && !text.contains('▲'), "{text}");
+        p.key(Key::End);
+        let text = drawn(&p, NEED.0, NEED.1);
+        assert!(text.contains("entry059") && text.contains('▲') && !text.contains('▼'));
+        p.key(Key::PageUp);
+        assert!(!drawn(&p, NEED.0, NEED.1).contains("entry059"));
+        p.key(Key::Home);
+        assert_eq!(p.scroll, 0);
+        p.key(Key::Wheel {
+            up: false,
+            col: 5,
+            row: 6,
+        });
+        assert_eq!(p.scroll, 3);
+        p.key(Key::Wheel {
+            up: true,
+            col: 5,
+            row: 6,
+        });
+        assert_eq!(p.scroll, 0);
+        // `j` walks the entries and the view follows to the last one.
+        for _ in 0..70 {
+            p.key(Key::Char('j'));
+        }
+        assert!(drawn(&p, NEED.0, NEED.1).contains("entry059"));
+        for _ in 0..200 {
+            p.key(Key::Char('k'));
+        }
+        assert_eq!(p.scroll, 0);
+    }
+
+    #[test]
+    fn a_short_body_does_not_scroll_and_a_tiny_window_does_not_panic() {
+        let mut p = open_with((200, 50), Vec::new(), vec![event("goal", "short", 1)]);
+        for key in [
+            Key::PageDown,
+            Key::End,
+            Key::Char('j'),
+            Key::Char('k'),
+            Key::Enter,
+        ] {
+            p.key(key);
+        }
+        assert_eq!(p.scroll, 0);
+        p.size = (4, 3);
+        for key in [
+            Key::PageDown,
+            Key::End,
+            Key::Char('j'),
+            Key::Char('k'),
+            Key::Enter,
+            Key::Char('E'),
+            Key::Wheel {
+                up: false,
+                col: 1,
+                row: 1,
+            },
+            Key::Mouse {
+                down: true,
+                held: false,
+                col: 3,
+                row: 2,
+            },
+        ] {
+            p.key(key);
+        }
+        p.size = (0, 0);
+        p.key(Key::PageDown);
+        let _ = drawn(&p, NEED.0, NEED.1);
+    }
+
+    #[test]
+    fn a_click_on_an_entry_opens_it_and_a_click_on_the_details_does_not() {
+        let body = words("w", 100);
+        let mut p = open_with(
+            (120, 40),
+            Vec::new(),
+            vec![event("evidence", &body, 5), event("goal", "other", 4)],
+        );
+        let pane = p.pane();
+        let press = |col: usize, row: usize| Key::Mouse {
+            down: true,
+            held: false,
+            col: col as u16,
+            row: row as u16,
+        };
+        // The Details column shares the rows and toggles nothing.
+        p.key(press(pane.dx + 2, pane.top + 1));
+        assert!(!drawn(&p, 120, 40).contains("w099"));
+        let rows = p.rows(p.card.as_ref().unwrap(), pane.lw);
+        let first = rows.iter().position(|r| r.stop == Some(0)).unwrap();
+        p.key(press(pane.lx + 14, pane.top + first));
+        assert!(drawn(&p, 120, 40).contains("w099"));
+        assert_eq!(p.mode, Mode::Card(0));
+        let rows = p.rows(p.card.as_ref().unwrap(), pane.lw);
+        let second = rows.iter().position(|r| r.stop == Some(1)).unwrap();
+        p.key(press(pane.lx + 14, pane.top + second));
+        assert_eq!(p.mode, Mode::Card(1));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_stop_the_opened_entry_and_the_place_in_the_body() {
+        let old: Vec<_> = (0..40)
+            .map(|i| {
+                event(
+                    "evidence",
+                    &format!("entry{i:03} {}", words("x", 30)),
+                    1000 - i,
+                )
+            })
+            .collect();
+        let mut p = open_with(NEED, Vec::new(), old.clone());
+        for _ in 0..13 {
+            p.key(Key::Char('j'));
+        }
+        p.key(Key::Enter);
+        assert_eq!(p.mode, Mode::Card(12));
+        let seen = |p: &Page| drawn(p, NEED.0, NEED.1).contains("entry012");
+        assert!(seen(&p));
+        // Two newer events arrive.
+        let mut next = vec![
+            event("evidence", "fresh", 2000),
+            event("evidence", "fresh2", 1999),
+        ];
+        next.extend(old);
+        let card = ItemCardInfo {
+            activity: next,
+            ..p.card.clone().unwrap()
+        };
+        p.keep_card(card, false);
+        assert_eq!(p.mode, Mode::Card(14), "the stop followed its entry");
+        assert!(seen(&p), "the view stayed on it");
+        assert_eq!(p.flipped.len(), 1);
+        let open = |p: &Page| {
+            let rows = p.rows(p.card.as_ref().unwrap(), p.pane().lw);
+            rows.iter().filter(|r| r.stop == Some(14)).count()
+        };
+        assert!(open(&p) > ENTRY_ROWS, "still open");
+        // The entry gone: the stop clamps and nothing panics.
+        let card = ItemCardInfo {
+            activity: vec![event("goal", "only", 1)],
+            ..p.card.clone().unwrap()
+        };
+        p.keep_card(card, true);
+        assert_eq!(p.mode, Mode::Card(0));
+        assert_eq!(
+            p.scroll,
+            p.max_scroll(),
+            "the view it was on is gone: the end"
+        );
+        assert!(drawn(&p, NEED.0, NEED.1).contains("older activity is not shown"));
+    }
+
+    #[test]
+    fn identical_events_are_told_apart_from_the_oldest() {
+        let card = ItemCardInfo {
+            item: item(1, "doing", "t", 1),
+            description: String::new(),
+            steps: Vec::new(),
+            activity: vec![
+                event("done", "x", 5),
+                event("done", "x", 5),
+                event("done", "x", 5),
+            ],
+        };
+        let keys = entry_keys(&card);
+        assert_eq!([keys[0].4, keys[1].4, keys[2].4], [2, 1, 0]);
+        let mut longer = card.clone();
+        longer.activity.insert(0, event("done", "x", 5));
+        assert_eq!(entry_keys(&longer)[1..], keys[..]);
+    }
+
+    #[test]
+    fn text_wraps_on_cells_and_keeps_every_letter() {
+        let wide = wrap_cells("中文中文中文 ab", 5, None);
+        assert!(wide.iter().all(|r| width::width(r) <= 5), "{wide:?}");
+        assert_eq!(wide.concat().replace(' ', ""), "中文中文中文ab");
+        let turkish = wrap_cells("ğüşiöçİı ğüşiöçİı ğüşiöçİı", 9, None);
+        assert_eq!(turkish, ["ğüşiöçİı", "ğüşiöçİı", "ğüşiöçİı"]);
+        // A decomposed letter is one cell and stays whole.
+        let nfd = wrap_cells("Tu\u{0308}rkc\u{0327}e", 4, None);
+        assert!(nfd.iter().all(|r| width::width(r) <= 4), "{nfd:?}");
+        assert_eq!(nfd.concat(), "Tu\u{0308}rkc\u{0327}e");
+        // A word longer than a row breaks where the row is full; a tab is a space.
+        assert_eq!(wrap_cells("abcdefgh", 3, None), ["abc", "def", "gh"]);
+        assert_eq!(wrap_cells("a\tb\x1b[31m", 9, None), ["a b[31m"]);
+        assert_eq!(wrap_cells("a b c d e f", 1, Some(2)), ["a", "b"]);
+        assert!(wrap_cells("", 5, None).is_empty());
+        assert_eq!(fit("中文中文", 5), "中文…");
     }
 }

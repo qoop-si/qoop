@@ -62,6 +62,10 @@ pub enum Key {
     Up,
     Down,
     Enter,
+    PageUp,
+    PageDown,
+    Home,
+    End,
     Tab,
     BackTab,
     Backspace,
@@ -149,6 +153,15 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
                     b'A' => Some(Key::Up),
                     b'B' => Some(Key::Down),
                     b'Z' => Some(Key::BackTab),
+                    b'H' => Some(Key::Home),
+                    b'F' => Some(Key::End),
+                    b'~' => match params {
+                        b"1" | b"7" => Some(Key::Home),
+                        b"4" | b"8" => Some(Key::End),
+                        b"5" => Some(Key::PageUp),
+                        b"6" => Some(Key::PageDown),
+                        _ => None,
+                    },
                     _ => None,
                 }
             }
@@ -299,7 +312,12 @@ pub fn raw(ink: u8) -> String {
 struct Cell {
     ch: char,
     esc: String,
+    /// Zero-width marks (a combining accent) that follow `ch` in the same cell.
+    extra: String,
 }
+
+/// The second cell of a wide character: painted as nothing.
+const SPACER: char = '\0';
 
 /// A frame of cells, painted in one write. Writing past an edge is clipped.
 pub struct Screen {
@@ -313,6 +331,7 @@ impl Screen {
         let blank = Cell {
             ch: ' ',
             esc: theme::RESET.to_string(),
+            extra: String::new(),
         };
         Screen {
             w,
@@ -321,19 +340,58 @@ impl Screen {
         }
     }
 
-    /// `text` from column `x` on row `y`, in `esc`; where the next column is.
+    /// `text` from column `x` on row `y`, in `esc`; where the next column is. A wide
+    /// character takes two columns (its second is a spacer), a zero-width mark joins the cell
+    /// before it, and a wide character that does not fit the last column is a space.
     pub fn put(&mut self, x: usize, y: usize, text: &str, esc: &str) -> usize {
         let mut x = x;
-        for ch in text.chars() {
-            if y < self.h && x < self.w {
-                self.cells[y][x] = Cell {
-                    ch,
-                    esc: esc.to_string(),
-                };
+        for ch in text.chars().filter(|c| qoop_tui::width::drawn(*c)) {
+            let cols = qoop_tui::width::columns(ch);
+            if cols == 0 {
+                if let Some(cell) = x.checked_sub(1).and_then(|p| self.cell(p, y)) {
+                    cell.extra.push(ch);
+                }
+                continue;
             }
-            x += 1;
+            let wide = cols > 1;
+            let ch = if wide && x + 1 >= self.w { ' ' } else { ch };
+            self.set(x, y, ch, esc);
+            if wide && ch != ' ' {
+                self.set(x + 1, y, SPACER, esc);
+            }
+            x += cols.min(2);
         }
         x
+    }
+
+    fn cell(&mut self, x: usize, y: usize) -> Option<&mut Cell> {
+        self.cells.get_mut(y)?.get_mut(x)
+    }
+
+    /// One cell written; the other half of a wide character it breaks is blanked.
+    fn set(&mut self, x: usize, y: usize, ch: char, esc: &str) {
+        let Some(old) = self.cell(x, y).map(|c| c.ch) else {
+            return;
+        };
+        if old == SPACER && x > 0 {
+            self.set_blank(x - 1, y);
+        } else if qoop_tui::width::columns(old) > 1 {
+            self.set_blank(x + 1, y);
+        }
+        if let Some(cell) = self.cell(x, y) {
+            *cell = Cell {
+                ch,
+                esc: esc.to_string(),
+                extra: String::new(),
+            };
+        }
+    }
+
+    fn set_blank(&mut self, x: usize, y: usize) {
+        if let Some(cell) = self.cell(x, y) {
+            cell.ch = ' ';
+            cell.extra.clear();
+        }
     }
 
     /// Pieces of text one after another; where the next column is.
@@ -434,7 +492,10 @@ impl Screen {
                     out.push_str(&cell.esc);
                     last = &cell.esc;
                 }
-                out.push(cell.ch);
+                if cell.ch != SPACER {
+                    out.push(cell.ch);
+                    out.push_str(&cell.extra);
+                }
             }
         }
         out.push_str(theme::RESET);
@@ -620,5 +681,50 @@ mod tests {
             assert_eq!(s.cells[0][at].ch, '●');
             assert_eq!(s.cells[2][at + 4].ch, '●');
         }
+    }
+
+    #[test]
+    fn a_wide_character_takes_two_cells_and_a_mark_joins_its_letter() {
+        let mut s = Screen::new(6, 1);
+        assert_eq!(s.put(0, 0, "中a", "E"), 3);
+        assert_eq!(
+            (s.cells[0][0].ch, s.cells[0][1].ch, s.cells[0][2].ch),
+            ('中', SPACER, 'a')
+        );
+        // Written over its second half, the character is blanked whole.
+        s.put(1, 0, "x", "E");
+        assert_eq!((s.cells[0][0].ch, s.cells[0][1].ch), (' ', 'x'));
+        s.put(0, 0, "中", "E");
+        s.put(0, 0, "y", "E");
+        assert_eq!((s.cells[0][0].ch, s.cells[0][1].ch), ('y', ' '));
+        // One that does not fit the last column is a space, a mark rides the cell before it.
+        s.put(5, 0, "中", "E");
+        assert_eq!(s.cells[0][5].ch, ' ');
+        s.put(3, 0, "u\u{0308}", "E");
+        assert_eq!(s.cells[0][3].extra, "\u{0308}");
+        assert!(s.frame().contains("u\u{0308}"));
+        assert!(!s.frame().contains(SPACER));
+    }
+
+    #[test]
+    fn paging_keys_are_read_in_both_encodings() {
+        let only = |bytes: &[u8]| decode(bytes).0;
+        assert_eq!(
+            only(b"\x1b[5~\x1b[6~\x1b[H\x1b[F\x1bOH\x1bOF\x1b[1~\x1b[4~\x1b[7~\x1b[8~"),
+            [
+                Key::PageUp,
+                Key::PageDown,
+                Key::Home,
+                Key::End,
+                Key::Home,
+                Key::End,
+                Key::Home,
+                Key::End,
+                Key::Home,
+                Key::End
+            ]
+        );
+        // Bracketed paste markers stay nothing.
+        assert!(only(b"\x1b[200~").is_empty());
     }
 }
