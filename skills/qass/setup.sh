@@ -154,7 +154,8 @@ servers() {
     done
 }
 
-# "yes" when qoop counts the project the person's own repo (its origin's owner is gh's login),
+# "yes" when qoop counts the project the person's own repo (its origin's owner is gh's login or
+# a `qoop.owner` in the global git config),
 # else "no". An empty token keeps `qoop task rules` off the daemon: the plain rules, here.
 own_of() {
     if (cd "$1" && QOOP_TOKEN='' qoop task rules 2>/dev/null) | grep -q '^own repo: '; then

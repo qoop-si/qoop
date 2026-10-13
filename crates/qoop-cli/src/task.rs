@@ -42,7 +42,7 @@ ask you to ask more; it never allows more than this.";
 fn repo_rules(own: Option<&str>) -> String {
     match own {
         Some(repo) => format!(
-            "own repo: {repo} (its origin's owner is your GitHub login). The standing way \
+            "own repo: {repo} (its origin's owner is yours). The standing way \
              here: commit only through /commit, push your branch, open the PR on this repo \
              (`gh pr create --repo {repo}`), rebase-and-merge only a PR you opened in this \
              session (never a `release-please--` head, a bot's or anyone else's), install, \
@@ -180,7 +180,8 @@ const USAGE: &str = "usage:
   qoop task begin                      this terminal's open task, opened now if none (hooks)
   qoop task rules [--turn]             what an agent in qoop is told at session start, with
                                        its repo's block: the standing way in your own repo
-                                       (its GitHub origin's owner is your gh login), else
+                                       (its GitHub origin's owner is your gh login or a
+                                       `qoop.owner` in the global git config), else
                                        ask first (--turn: the line it is given with each
                                        request)
   <text> may be `-` to read it from standard input; without --id, describe, steps and check

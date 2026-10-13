@@ -110,23 +110,39 @@ pub(crate) fn repo_of(dir: &std::path::Path) -> std::io::Result<qoop_history::Re
 }
 
 /// `owner/name` when the top-level repository `dir` is in has an `origin` on `github.com`
-/// whose owner is this machine's GitHub login, any case, and every push address of that
-/// `origin` is the login's too: the person's own repository. A submodule never counts (its
-/// superproject decides); a worktree counts as its repository. Anything unread, empty or
-/// slower than [`OWN_REPO_TIME`] (no repository, no origin, another host, no `gh`, no login)
-/// is `None`. `gh config get` reads a local file: no network.
+/// whose owner is the person's, any case, and every push address of that `origin` is the
+/// person's too: the person's own repository. The person's owners are this machine's GitHub
+/// login and every `qoop.owner` in the global git config (an org or a second account), read
+/// with its `includeIf`s so a folder can name its own: scope those with an absolute
+/// `gitdir:`, since a relative one or `onbranch:` follows what a repository says about
+/// itself. A repository's local config is never read, so no repository can name itself, and
+/// an inherited `GIT_CONFIG_GLOBAL` is dropped, so no launch points the lookup elsewhere. A
+/// submodule never counts (its superproject decides); a worktree counts as its repository.
+/// Anything unread, empty or slower than [`OWN_REPO_TIME`] (no repository, no origin,
+/// another host, no `gh`, no login) is `None`. `gh config get` reads a local file: no network.
 pub(crate) fn own_repo(dir: &std::path::Path) -> Option<String> {
-    own_repo_with(dir, std::ffi::OsStr::new("gh"))
+    own_repo_with(dir, std::ffi::OsStr::new("gh"), None, OWN_REPO_TIME)
 }
 
 /// The git and gh calls of [`own_repo`] together, at most: a hook waits on it every request.
 const OWN_REPO_TIME: std::time::Duration = std::time::Duration::from_millis(300);
 
-fn own_repo_with(dir: &std::path::Path, gh: &std::ffi::OsStr) -> Option<String> {
-    let by = std::time::Instant::now() + OWN_REPO_TIME;
+/// `global` stands in for the global git config file and `budget` for [`OWN_REPO_TIME`]
+/// (tests); `None` is the real file.
+fn own_repo_with(
+    dir: &std::path::Path,
+    gh: &std::ffi::OsStr,
+    global: Option<&std::path::Path>,
+    budget: std::time::Duration,
+) -> Option<String> {
+    let by = std::time::Instant::now() + budget;
     let git = |args: &[&str]| {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(dir).args(args);
+        match global {
+            Some(file) => cmd.env("GIT_CONFIG_GLOBAL", file),
+            None => cmd.env_remove("GIT_CONFIG_GLOBAL"),
+        };
         run_by(&mut cmd, by)
     };
     let superproject = git(&["rev-parse", "--show-superproject-working-tree"])?;
@@ -140,10 +156,36 @@ fn own_repo_with(dir: &std::path::Path, gh: &std::ffi::OsStr) -> Option<String> 
     cmd.args(["config", "get", "-h", "github.com", "user"]);
     let login = run_by(&mut cmd, by)?;
     let login = login.trim();
-    let repo = owned(url.trim(), login)?;
-    pushes
-        .lines()
-        .all(|push| owned(push.trim(), login).is_some())
+    if login.is_empty() {
+        return None;
+    }
+    let addresses: Vec<&str> = std::iter::once(url.as_str())
+        .chain(pushes.lines())
+        .collect();
+    // The named owners are read only when the login does not own every address, so the
+    // login's own repositories cost nothing more. Unset (exit 1), unread or past the
+    // deadline names no one: the repository is then not own, the safe side.
+    let login_owns_all = addresses.iter().all(|a| owned(a.trim(), login).is_some());
+    let named = match login_owns_all {
+        true => String::new(),
+        false => git(&[
+            "config",
+            "--global",
+            "--includes",
+            "--get-all",
+            "qoop.owner",
+        ])
+        .unwrap_or_default(),
+    };
+    let owners: Vec<&str> = std::iter::once(login)
+        .chain(named.lines().map(str::trim))
+        .filter(|o| !o.is_empty())
+        .collect();
+    let owned_by_one = |url: &str| owners.iter().find_map(|o| owned(url.trim(), o));
+    let repo = owned_by_one(&url)?;
+    addresses
+        .iter()
+        .all(|a| owned_by_one(a).is_some())
         .then_some(repo)
 }
 
@@ -799,6 +841,10 @@ mod tests {
         }
     }
 
+    /// A deadline a loaded test machine never misses by accident; the deadline itself is
+    /// tested with a hanging `gh` below.
+    const ROOMY: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Real repositories: an own one and its worktree count; a submodule pointing at the
     /// owner inside a stranger's repository does not, nor anything with `gh` missing.
     #[test]
@@ -851,7 +897,9 @@ mod tests {
             &sub,
             &["remote", "set-url", "origin", "git@github.com:pat/own.git"],
         );
-        let own = |d: &Path| own_repo_with(d, gh.as_os_str());
+        let no_global = at("gitconfig");
+        std::fs::write(&no_global, "").expect("global");
+        let own = |d: &Path| own_repo_with(d, gh.as_os_str(), Some(&no_global), ROOMY);
         assert_eq!(own(&at("own")).as_deref(), Some("pat/own"));
         assert_eq!(own(&wt).as_deref(), Some("pat/own"), "a worktree counts");
         assert_eq!(own(&at("org")), None, "an org's repo");
@@ -900,11 +948,101 @@ mod tests {
         assert_eq!(own(&at("own")).as_deref(), Some("pat/own"));
         assert_eq!(own(dir.path()), None, "no repository");
         let missing = at("no-gh");
-        assert_eq!(own_repo_with(&at("own"), missing.as_os_str()), None);
+        assert_eq!(
+            own_repo_with(&at("own"), missing.as_os_str(), Some(&no_global), ROOMY),
+            None
+        );
         std::fs::write(&gh, "#!/bin/sh\necho\n").expect("gh");
         assert_eq!(own(&at("own")), None, "no login");
         std::fs::write(&gh, "#!/bin/sh\necho us\nexit 1\n").expect("gh");
         assert_eq!(own(&at("own")), None, "gh failed");
+    }
+
+    /// An owner the person names in the global config (here through an `includeIf` for one
+    /// folder) counts like the login; the same org elsewhere does not, and a repository
+    /// cannot name itself in its own config.
+    #[test]
+    fn a_named_owner_counts_only_from_the_global_config() {
+        let dir = tempfile::tempdir().expect("dir");
+        // includeIf compares real paths: macOS temp dirs sit behind a /var symlink.
+        let root = std::fs::canonicalize(dir.path()).expect("real path");
+        let at = |p: &str| root.join(p);
+        let git = |d: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(args)
+                .status()
+                .expect("git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let gh = at("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho us\n").expect("gh");
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        for name in ["named/qoop", "elsewhere/qoop"] {
+            std::fs::create_dir_all(at(name)).expect("repo");
+            git(&at(name), &["init", "-q"]);
+            git(
+                &at(name),
+                &["remote", "add", "origin", "git@github.com:qoop-si/qoop.git"],
+            );
+        }
+        std::fs::write(at("named.gitconfig"), "[qoop]\n\towner = qoop-si\n").expect("named");
+        let global = at("gitconfig");
+        std::fs::write(
+            &global,
+            format!(
+                "[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+                at("named").display(),
+                at("named.gitconfig").display()
+            ),
+        )
+        .expect("global");
+        let own = |d: &Path| own_repo_with(d, gh.as_os_str(), Some(&global), ROOMY);
+        assert_eq!(own(&at("named/qoop")).as_deref(), Some("qoop-si/qoop"));
+        assert_eq!(
+            own(&at("elsewhere/qoop")),
+            None,
+            "the org outside the folder"
+        );
+        git(&at("elsewhere/qoop"), &["config", "qoop.owner", "qoop-si"]);
+        assert_eq!(
+            own(&at("elsewhere/qoop")),
+            None,
+            "a repository naming itself"
+        );
+        // Every push address must be one of the person's: one elsewhere among them is enough.
+        let push = |d: &str, url: &str| {
+            git(
+                &at(d),
+                &["remote", "set-url", "--add", "--push", "origin", url],
+            );
+        };
+        push("named/qoop", "git@github.com:qoop-si/qoop.git");
+        assert_eq!(own(&at("named/qoop")).as_deref(), Some("qoop-si/qoop"));
+        push("named/qoop", "git@github.com:acme/x.git");
+        assert_eq!(own(&at("named/qoop")), None, "one push address elsewhere");
+        // The login's origin with a push to a named owner is own: the names are read then too.
+        std::fs::create_dir_all(at("named/mixed")).expect("repo");
+        git(&at("named/mixed"), &["init", "-q"]);
+        git(
+            &at("named/mixed"),
+            &["remote", "add", "origin", "git@github.com:pat/own.git"],
+        );
+        push("named/mixed", "git@github.com:qoop-si/mirror.git");
+        assert_eq!(own(&at("named/mixed")).as_deref(), Some("pat/own"));
+        // No login is never own, even where a named owner alone would do.
+        std::fs::create_dir_all(at("named/org")).expect("repo");
+        git(&at("named/org"), &["init", "-q"]);
+        git(
+            &at("named/org"),
+            &["remote", "add", "origin", "git@github.com:qoop-si/org.git"],
+        );
+        assert_eq!(own(&at("named/org")).as_deref(), Some("qoop-si/org"));
+        std::fs::write(&gh, "#!/bin/sh\necho\n").expect("gh");
+        assert_eq!(own(&at("named/org")), None, "no login");
     }
 
     /// A `gh` that hangs is not own within the deadline, and it and what it started are gone.
@@ -941,7 +1079,10 @@ mod tests {
         // The gh stub sleeps 30 s: back long before it means the deadline held. Loose on purpose,
         // a loaded machine runs the git calls slowly too.
         let start = std::time::Instant::now();
-        assert_eq!(own_repo_with(&repo, gh.as_os_str()), None);
+        assert_eq!(
+            own_repo_with(&repo, gh.as_os_str(), None, OWN_REPO_TIME),
+            None
+        );
         let took = start.elapsed();
         assert!(took < std::time::Duration::from_secs(5), "{took:?}");
         // The kill on its own, with time for the stub to note its pids: nothing it started stays.
