@@ -1158,6 +1158,69 @@ fn space_of_tab(spaces: &[WorkspaceRow], tab: u32) -> Option<i64> {
         .map(|s| s.id)
 }
 
+/// How many tabs `panes` are: each pane counts as the tab it sleeps in, so the panes of a
+/// split are one tab, and a pane not listed asleep counts on its own.
+fn tabs_of(spaces: &[WorkspaceRow], panes: &[u32]) -> usize {
+    let tab = |pane: u32| {
+        spaces
+            .iter()
+            .flat_map(|s| &s.sleeping)
+            .find(|t| t.terminal == pane)
+            .and_then(|t| t.lead)
+            .unwrap_or(pane)
+    };
+    panes
+        .iter()
+        .map(|p| tab(*p))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// What `qoop wake` says once the daemon answered, judged by the space list read before it
+/// and, when no tab came back, the one read after. No tab back from a space (or a tab) with
+/// nothing listed asleep had nothing to wake; from one listed asleep before and no longer
+/// after, another wake brought it back first; from one still asleep, or when the second list
+/// could not be read (`after` is `None`), the wake failed (a stop during it, a pane that
+/// could not open). `what` is the space as it was named, else its id.
+#[allow(clippy::too_many_arguments)]
+fn wake_said(
+    before: &[WorkspaceRow],
+    after: Option<&[WorkspaceRow]>,
+    workspace: i64,
+    tab: Option<u32>,
+    what: &str,
+    terminals: usize,
+    resumed: usize,
+    changed: Option<&[u32]>,
+) -> Result<String, String> {
+    if terminals > 0 {
+        // Counted by the sleeping tabs listed before the wake: a split is one tab.
+        let tabs = changed.map_or(terminals, |panes| tabs_of(before, panes));
+        return Ok(format!(
+            "space {what}: {} awake again, {} resumed",
+            super::count(tabs, "tab"),
+            super::count(resumed, "agent")
+        ));
+    }
+    let asleep = |spaces: &[WorkspaceRow]| {
+        spaces
+            .iter()
+            .filter(|s| s.id == workspace)
+            .flat_map(|s| &s.sleeping)
+            .any(|t| tab.is_none_or(|tab| t.terminal == tab))
+    };
+    if !asleep(before) {
+        Ok(format!("nothing in space {what} was asleep"))
+    } else if after.is_some_and(|after| !asleep(after)) {
+        Ok(match tab {
+            Some(tab) => format!("tab {tab} is awake"),
+            None => format!("space {what} is awake"),
+        })
+    } else {
+        Err(format!("space {what}: no tab came back"))
+    }
+}
+
 /// An older daemon answers a request that named a tab without saying which terminals it
 /// changed, because it acted on the whole space whatever was asked.
 fn older_daemon(done: &str) -> std::io::Error {
@@ -1233,7 +1296,22 @@ pub(crate) fn run_sleep(args: &[String]) -> std::io::Result<()> {
                         Some(tab) => format!("tab {tab}"),
                         None => format!("space {}", target.space.as_deref().unwrap_or_default()),
                     };
-                    println!("{what} is asleep: {terminals} tabs ended");
+                    // A tab that stays awake keeps the space from being asleep.
+                    let state = if stayed.is_empty() {
+                        "asleep"
+                    } else {
+                        "partly asleep"
+                    };
+                    // The sleep is done: a list that fails now costs the count its splits,
+                    // never the answer and the reasons under it.
+                    let tabs = match &changed {
+                        Some(panes) => link
+                            .spaces()
+                            .await
+                            .map_or(terminals, |s| tabs_of(&s, panes)),
+                        None => terminals,
+                    };
+                    println!("{what} is {state}: {} ended", super::count(tabs, "tab"));
                     // The reason names each pane of the tab and why.
                     for s in &stayed {
                         println!("stays awake: {}", s.reason);
@@ -1286,13 +1364,35 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
                 workspace,
                 terminals,
                 resumed,
+                changed,
                 ..
             } => {
                 if target.json {
                     println!("{}", serde_json::json!({ "space": workspace, "asleep": false, "tabs": terminals, "resumed": resumed }));
-                } else {
-                    println!("space {workspace}: {terminals} tabs awake again, {resumed} agents resumed");
+                    return Ok(());
                 }
+                let what = target
+                    .space
+                    .clone()
+                    .unwrap_or_else(|| workspace.to_string());
+                // Nothing back: the list read again tells a wake that another one beat to it
+                // from one that failed.
+                let after = if terminals == 0 {
+                    link.spaces().await.ok()
+                } else {
+                    None
+                };
+                let said = wake_said(
+                    &spaces,
+                    after.as_deref(),
+                    workspace,
+                    target.tab,
+                    &what,
+                    terminals,
+                    resumed,
+                    changed.as_deref(),
+                );
+                println!("{}", said.map_err(std::io::Error::other)?);
                 Ok(())
             }
             // Nothing named and nothing asleep, but tabs up: a daemon this wake started
@@ -1309,7 +1409,10 @@ pub(crate) fn run_wake(args: &[String]) -> std::io::Result<()> {
                         if target.json {
                             println!("{}", serde_json::json!({ "asleep": false, "tabs": terminals.len() }));
                         } else {
-                            println!("nothing was asleep; {} tabs are awake", terminals.len());
+                            println!(
+                                "nothing was asleep; {} awake",
+                                super::count(terminals.len(), "tab")
+                            );
                         }
                         Ok(())
                     }
@@ -2194,6 +2297,73 @@ mod tests {
             pick_space(&named, "2024").unwrap(),
             Some(3),
             "a number that is no id is tried as a name"
+        );
+    }
+
+    /// No tab back from a wake is "nothing was asleep" only when the list before it showed
+    /// nothing asleep there. From a space with something asleep it is a failure, unless the
+    /// list after shows another wake brought it back first (two wakes at once). A split that
+    /// comes back is one tab.
+    #[test]
+    fn a_wake_that_brings_nothing_back_says_nothing_was_asleep_only_when_so() {
+        let pane = |terminal, lead| qoop_runtime::control::SleepingTab {
+            terminal,
+            lead: Some(lead),
+            title: None,
+            agent: None,
+            session: None,
+            cwd: "/".into(),
+        };
+        let space = |id, sleeping| WorkspaceRow {
+            keep_awake: false,
+            id,
+            name: "docs".into(),
+            terminals: 2,
+            asleep: false,
+            sleeping,
+            closable: true,
+            ink: None,
+            link: None,
+            goal: None,
+        };
+        let before = vec![space(1, vec![pane(6, 6), pane(7, 6)]), space(2, Vec::new())];
+        let still = before.clone();
+        let woken = vec![space(1, Vec::new()), space(2, Vec::new())];
+        let failed = |s: &str| -> Result<String, String> { Err(s.to_string()) };
+        let said = |s: &str| -> Result<String, String> { Ok(s.to_string()) };
+        let nothing = |after: Option<&[WorkspaceRow]>, workspace, tab, what: &str| {
+            wake_said(&before, after, workspace, tab, what, 0, 0, Some(&[]))
+        };
+        // Listed asleep before, and still after or with no second list: it failed.
+        assert_eq!(
+            nothing(Some(&still), 1, None, "docs"),
+            failed("space docs: no tab came back")
+        );
+        assert_eq!(
+            nothing(None, 1, Some(7), "1"),
+            failed("space 1: no tab came back")
+        );
+        // Asleep before, awake after: another wake was first.
+        assert_eq!(
+            nothing(Some(&woken), 1, None, "docs"),
+            said("space docs is awake")
+        );
+        assert_eq!(
+            nothing(Some(&woken), 1, Some(7), "1"),
+            said("tab 7 is awake")
+        );
+        // Nothing listed asleep there.
+        assert_eq!(
+            nothing(Some(&still), 2, None, "2"),
+            said("nothing in space 2 was asleep")
+        );
+        assert_eq!(
+            nothing(None, 1, Some(9), "1"),
+            said("nothing in space 1 was asleep")
+        );
+        assert_eq!(
+            wake_said(&before, None, 1, None, "docs", 2, 1, Some(&[6, 7])),
+            said("space docs: 1 tab awake again, 1 agent resumed")
         );
     }
 

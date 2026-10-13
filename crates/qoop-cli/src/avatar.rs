@@ -34,12 +34,25 @@ const CURATED: [(&str, u8, &str); BATCH] = [
 
 /// `qoop avatar ...`
 pub fn run(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoop avatar [pick|show [--json]|options --json|set [--hair H] [--hair-ink N] [--eyes E]]";
+    let help = "usage: qoop avatar [pick|show [--json]|options [--json]|set [--hair H] [--hair-ink N] [--eyes E]]";
     match args.get(2).map(String::as_str) {
         Some("pick") => pick(),
         Some("show") if args.get(3).map(String::as_str) == Some("--json") => show_json(),
         Some("show") => show(),
-        Some("options") if args.get(3).map(String::as_str) == Some("--json") => options_json(),
+        Some("options") if args[3..] == ["--json"] => options_json(),
+        Some("options") if args.len() == 3 => {
+            options();
+            Ok(())
+        }
+        // Anything else after it is refused, a flag after `--json` too: the first that is not
+        // `--json`, or the second `--json`.
+        Some("options") => Err(std::io::Error::other(format!(
+            "unknown flag {}; {help}",
+            args[3..]
+                .iter()
+                .find(|a| *a != "--json")
+                .unwrap_or_else(|| &args[4])
+        ))),
         Some("set") => {
             set(&args[3..]).map_err(|why| std::io::Error::other(format!("{why}; {help}")))
         }
@@ -49,6 +62,18 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             "unknown command {other}; {help}"
         ))),
     }
+}
+
+/// Every part a pet may have, as the flags of `qoop avatar set` take them.
+fn options() {
+    let inks: Vec<String> = HAIR_INKS
+        .iter()
+        .zip(HAIR_INK_TITLES)
+        .map(|(ink, title)| format!("{ink} ({title})"))
+        .collect();
+    println!("--hair      {}", HAIR_STYLES.join(" "));
+    println!("--hair-ink  {}", inks.join(" "));
+    println!("--eyes      {}", EYE_STYLES.join(" "));
 }
 
 /// Every part a pet may have, for a picker that is not this terminal one: each hair and
@@ -103,9 +128,7 @@ fn set(args: &[String]) -> Result<(), String> {
         }
     }
     if !pet.valid() {
-        return Err(
-            "that is not a part the picker offers (qoop avatar options --json)".to_string(),
-        );
+        return Err("that is not a part the picker offers (qoop avatar options)".to_string());
     }
     avatar::save(&pet).map_err(|e| e.to_string())?;
     println!("{}", pet.name());
@@ -401,6 +424,28 @@ fn render(pet: &Avatar, _colour: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `options` takes `--json` or nothing: any other flag is refused, not ignored, also
+    /// after `--json`.
+    #[test]
+    fn options_refuses_a_flag_it_does_not_know() {
+        for extra in [
+            &["--nope"][..],
+            &["--json", "--nope"],
+            &["--nope", "--json"],
+        ] {
+            let args: Vec<String> = ["qoop", "avatar", "options"]
+                .iter()
+                .chain(extra)
+                .map(|a| a.to_string())
+                .collect();
+            let refused = run(&args).unwrap_err().to_string();
+            assert!(
+                refused.contains("unknown flag --nope"),
+                "{extra:?}: {refused}"
+            );
+        }
+    }
 
     /// The curated batch is six valid avatars with six different names.
     #[test]

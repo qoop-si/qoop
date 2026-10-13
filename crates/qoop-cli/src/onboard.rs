@@ -16,7 +16,10 @@ use qoop_tui::theme::Role;
 use crate::page::{self, Key, Player, Screen, Session, bold, ink, raised_bold};
 use crate::settings::{self, Kind, Row};
 
-const NEED: (usize, usize) = (100, 30);
+/// The smallest window, the default terminal's: below `ROOMY` rows the step moves up a row
+/// and the pet step shows the pet at half size.
+const NEED: (usize, usize) = (80, 24);
+const ROOMY: usize = 30;
 
 struct Step {
     name: &'static str,
@@ -81,12 +84,14 @@ const STEPS: [Step; 8] = [
     Step {
         name: "improve",
         title: "improve qass",
-        what: "when qass meets a problem in its own way of working, it can send qoop's maker a short note",
+        what: "when qass's own way of working fails, it can send qoop's maker a short note",
         groups: &["report"],
         also: &[
-            "never your files, names or projects: a fixed form of common words, shown to you first",
-            "always (recommended) sends by itself once you said yes to the first; ask asks each time",
-            "sent with your account so it can be limited; the note itself carries no account",
+            "Notes never carry your files, names or projects:",
+            "a fixed form of common words, shown to you first.",
+            "We recommend always: it sends by itself after your first yes.",
+            "ask: asks each time. never: sends nothing.",
+            "Sent with your account so it can be limited; the note carries no account.",
         ],
     },
 ];
@@ -117,16 +122,20 @@ impl Onboard {
         }
     }
 
-    fn draw(&self, w: usize, h: usize) -> Screen {
+    /// The step at `w` x `h`, its rows (the step's settings) as given.
+    fn draw(&self, w: usize, h: usize, rows: &[Row]) -> Screen {
         let mut s = Screen::new(w, h);
         let cx = w / 2;
         let step = &STEPS[self.step];
+        let tight = h < ROOMY;
+        let top = if tight { 9 } else { 10 };
         s.word(cx - 13, 1);
         if !step.groups.is_empty() {
             s.pet(cx + 20, 0, &self.pet);
         }
-        // The named dots, joined by a line that turns green behind the current step.
-        let gap = 12;
+        // The named dots, joined by a line that turns green behind the current step; closer
+        // on a narrow window.
+        let gap = ((w - 10) / (STEPS.len() - 1)).min(12);
         let x0 = cx - (STEPS.len() - 1) * gap / 2;
         for (i, t) in STEPS.iter().enumerate() {
             let x = x0 + i * gap;
@@ -151,12 +160,12 @@ impl Onboard {
             };
             s.put(x.saturating_sub(t.name.len() / 2), 7, t.name, &name_ink);
         }
-        s.centre(cx, 10, step.title, &bold(Role::Focused));
-        s.centre(cx, 11, step.what, &ink(Role::Detail));
+        s.centre(cx, top, step.title, &bold(Role::Focused));
+        s.centre(cx, top + 1, step.what, &ink(Role::Detail));
         if step.groups.is_empty() {
-            self.draw_pet(&mut s, cx);
+            self.draw_pet(&mut s, cx, tight);
         } else {
-            let below = self.draw_rows(&mut s, cx, w);
+            let below = self.draw_rows(&mut s, cx, w, top + 3, rows);
             for (y, line) in (below..).zip(step.also) {
                 s.centre(cx, y, line, &ink(Role::Faint));
             }
@@ -195,11 +204,17 @@ impl Onboard {
         s
     }
 
-    fn draw_pet(&self, s: &mut Screen, cx: usize) {
+    fn draw_pet(&self, s: &mut Screen, cx: usize, tight: bool) {
         // The grid's first row is empty for every pet: start one up.
-        s.pet2(cx - 16, 12, &self.pet);
+        let parts = if tight {
+            s.pet(cx - 8, 11, &self.pet);
+            17
+        } else {
+            s.pet2(cx - 16, 12, &self.pet);
+            24
+        };
         for (i, (part, value, hue)) in settings::part_titles(&self.pet).iter().enumerate() {
-            let y = 24 + i;
+            let y = parts + i;
             if i == self.row {
                 s.put(cx - 14, y, "▸", &ink(Role::Brand));
             }
@@ -222,13 +237,12 @@ impl Onboard {
     }
 
     /// Each row on one line with its value; the selected one also opens its choices under it,
-    /// wrapped and centred, the current one raised. One open at a time keeps a long list
-    /// (Linux has 26 sounds) inside a 30 row window.
+    /// wrapped and centred, the current one raised. One open at a time, and of a long list
+    /// (Linux has 26 sounds) only the lines around the current one, keep a step inside 80 x 24.
     /// Returns the line under the last row.
-    fn draw_rows(&self, s: &mut Screen, cx: usize, w: usize) -> usize {
+    fn draw_rows(&self, s: &mut Screen, cx: usize, w: usize, mut y: usize, rows: &[Row]) -> usize {
         let macos = cfg!(target_os = "macos");
-        let mut y = 13;
-        for (i, row) in self.rows().iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let on = i == self.row;
             if !on {
                 s.centre_seg(
@@ -254,21 +268,16 @@ impl Onboard {
                 },
             );
             y += 1;
+            // The choices have the lines left above the keys, which keep a blank line over
+            // them: after the rows under this one, the help an idle row has, and the step's
+            // own lines with the blank before them.
+            let also = STEPS[self.step].also.len();
+            let under = 2 * (rows.len() - i - 1)
+                + usize::from(matches!(row.kind, Kind::Idle))
+                + if also > 0 { also + 1 } else { 0 };
+            let room = (s.h - 4).saturating_sub(y + under);
             let (list, at) = settings::options(row, macos);
-            let mut lines: Vec<Vec<(String, bool)>> = vec![Vec::new()];
-            let mut used = 0;
-            for (k, o) in list.iter().enumerate() {
-                let cell = o.len() + 3;
-                if used + cell > w - 20 {
-                    lines.push(Vec::new());
-                    used = 0;
-                }
-                if let Some(l) = lines.last_mut() {
-                    l.push((o.clone(), k == at));
-                }
-                used += cell;
-            }
-            for line in lines {
+            for line in pick_lines(&list, at, w - 20, room) {
                 let parts: Vec<(String, String)> = line
                     .into_iter()
                     .map(|(o, current)| {
@@ -359,6 +368,47 @@ impl Onboard {
     }
 }
 
+/// The fewest lines of choices an open row shows, whatever room it has.
+const PICK_LINES: usize = 3;
+
+/// `list` in lines of at most `width` columns, each choice marked when it is the current
+/// one (`at`); of more lines than `room` (or `PICK_LINES`), only those around the current
+/// one, with a "…" at the start or the end where some are left out.
+fn pick_lines(list: &[String], at: usize, width: usize, room: usize) -> Vec<Vec<(String, bool)>> {
+    let room = room.max(PICK_LINES);
+    let mut lines: Vec<Vec<(String, bool)>> = vec![Vec::new()];
+    let mut used = 0;
+    let mut current = 0;
+    for (k, o) in list.iter().enumerate() {
+        let cell = o.len() + 3;
+        if used > 0 && used + cell > width {
+            lines.push(Vec::new());
+            used = 0;
+        }
+        if k == at {
+            current = lines.len() - 1;
+        }
+        if let Some(l) = lines.last_mut() {
+            l.push((o.clone(), k == at));
+        }
+        used += cell;
+    }
+    let total = lines.len();
+    let start = current
+        .saturating_sub(room / 2)
+        .min(total.saturating_sub(room));
+    let mut shown: Vec<_> = lines.into_iter().skip(start).take(room).collect();
+    // Faint as any choice that is not the current one.
+    let more = || ("…".to_string(), false);
+    if start > 0 {
+        shown[0].insert(0, more());
+    }
+    if start + room < total {
+        shown[room - 1].push(more());
+    }
+    shown
+}
+
 /// `qoop onboard`
 pub fn run(args: &[String]) -> std::io::Result<()> {
     if args.len() > 2 {
@@ -387,7 +437,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     let mut player = Player::new();
     'run: loop {
         let (w, h) = page::size();
-        page::show(&onboard.draw(w.max(NEED.0), h.max(NEED.1)), NEED)?;
+        page::show(
+            &onboard.draw(w.max(NEED.0), h.max(NEED.1), &onboard.rows()),
+            NEED,
+        )?;
         for key in page::next_keys(&session.typed) {
             if !onboard.key(key, &mut player) {
                 break 'run;
@@ -436,19 +489,106 @@ mod tests {
         assert_eq!(o.step, STEPS.len() - 2);
     }
 
+    /// The frame without its escapes, a row a line.
+    fn plain(frame: &str) -> String {
+        let mut out = String::new();
+        let mut in_esc = false;
+        for ch in frame.chars() {
+            match (in_esc, ch) {
+                (false, '\x1b') => in_esc = true,
+                (false, ch) => out.push(ch),
+                (true, 'H') => {
+                    in_esc = false;
+                    out.push('\n');
+                }
+                (true, 'm') => in_esc = false,
+                (true, _) => {}
+            }
+        }
+        out
+    }
+
     #[test]
     fn every_step_fits_the_smallest_window() {
-        for (step, each) in STEPS.iter().enumerate() {
-            let o = Onboard {
-                step,
-                row: 0,
-                pet: settings::the_pet(),
-                said: None,
-            };
-            let frame = o.draw(NEED.0, NEED.1).frame();
-            assert!(frame.contains(each.what), "step {step}");
-            for line in each.also {
-                assert!(frame.contains(line), "step {step}: {line}");
+        for (w, h) in [NEED, (100, ROOMY)] {
+            for (step, each) in STEPS.iter().enumerate() {
+                let o = Onboard {
+                    step,
+                    row: 0,
+                    pet: settings::the_pet(),
+                    said: None,
+                };
+                let frame = plain(&o.draw(w, h, &o.rows()).frame());
+                assert!(frame.contains(each.what), "{w}x{h} step {step}");
+                for line in each.also {
+                    assert!(frame.contains(line), "{w}x{h} step {step}: {line}");
+                }
+                // Every step's name stands apart from its neighbours.
+                for t in STEPS {
+                    assert!(
+                        frame.contains(&format!(" {} ", t.name)),
+                        "{w}x{h}: {}",
+                        t.name
+                    );
+                }
+                assert!(frame.contains("esc"), "{w}x{h} step {step}: the keys");
+            }
+        }
+    }
+
+    /// Linux's 26 sounds, open on either sound row and at any of them, end above the keys at
+    /// 80 x 24, 80 x 30 and 120 x 40, the current one on screen: as many lines of them as fit,
+    /// all of them at 120 x 40, and a "…" where some are left out.
+    #[test]
+    fn a_long_list_of_sounds_ends_above_the_keys() {
+        let sounds: Vec<String> = config::FREEDESKTOP_SOUNDS.map(String::from).to_vec();
+        let step = STEPS.iter().position(|s| s.name == "sound").unwrap();
+        for (w, h) in [NEED, (80, ROOMY), (120, 40)] {
+            for row in 0..3 {
+                for now in &sounds {
+                    let rows: Vec<Row> = settings::rows(&[])
+                        .into_iter()
+                        .filter(|r| r.group == "sound")
+                        .map(|r| match r.kind {
+                            Kind::Sound(key, _) => Row {
+                                value: now.clone(),
+                                kind: Kind::Choice(key, sounds.clone()),
+                                ..r
+                            },
+                            _ => r,
+                        })
+                        .collect();
+                    let o = Onboard {
+                        step,
+                        row,
+                        pet: settings::the_pet(),
+                        said: None,
+                    };
+                    let frame = plain(&o.draw(w, h, &rows).frame());
+                    let at = format!("{w}x{h} row {row} at {now}:\n{frame}");
+                    // A line a row, after the empty one before the first row's place.
+                    let lines: Vec<&str> = frame.lines().skip(1).collect();
+                    let keys = lines[h - 3].trim();
+                    assert!(
+                        keys.starts_with("←→ choose") && keys.ends_with("esc finish"),
+                        "{at}"
+                    );
+                    assert!(lines[h - 4].trim().is_empty(), "{at}");
+                    assert!(frame.contains(&format!(" {now} ")), "{at}");
+                    if row == 0 {
+                        continue;
+                    }
+                    let shown = sounds
+                        .iter()
+                        .filter(|s| frame.contains(&format!(" {s} ")))
+                        .count();
+                    assert_eq!(frame.contains(" … "), shown < sounds.len(), "{at}");
+                    match (w, h) {
+                        (120, 40) => assert_eq!(shown, sounds.len(), "{at}"),
+                        (80, 24) => assert!(shown < sounds.len(), "{at}"),
+                        _ => {}
+                    }
+                }
             }
         }
     }

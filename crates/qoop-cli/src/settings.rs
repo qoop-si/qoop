@@ -6,7 +6,7 @@
 //! chip, up and down walk the rows (up from the first row reaches the pet's parts), left and
 //! right change the value and write it at once, esc clears the search or leaves.
 //!
-//! Machines, phones, hooks and skills are shown as their own commands print them: this
+//! Computers, phones, hooks and skills are shown as their own commands print them: this
 //! page reads them, the commands still change them.
 
 use std::io::IsTerminal;
@@ -26,7 +26,7 @@ pub const NEED: (usize, usize) = (100, 30);
 pub const MIN: (usize, usize) = (64, 16);
 /// Where the pet column ends and the settings begin.
 const DIV: usize = 40;
-const CHIPS: [&str; 6] = ["all", "sound", "look", "agents", "machines", "phones"];
+const CHIPS: [&str; 6] = ["all", "sound", "look", "agents", "computers", "phones"];
 const IDLE: [u64; 4] = [0, 15, 30, 60];
 
 /// How a row changes.
@@ -163,7 +163,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         "report",
         "notes to qoop's maker",
         read.report_send.clone(),
-        "about qass's own way of working, never your files, names or projects",
+        "notes never carry your files, names or projects; they are about qass's own way of working",
         Kind::Choice(
             "report.send",
             config::REPORT_SENDS.map(String::from).to_vec(),
@@ -230,7 +230,7 @@ pub(crate) fn listed(group: &'static str, args: &[&str], by_two_spaces: bool) ->
             Row {
                 group,
                 label: label.trim().to_string(),
-                value: if group == "machines" && !label.is_empty() {
+                value: if group == "computers" && !label.is_empty() {
                     "ssh".to_string()
                 } else {
                     String::new()
@@ -430,7 +430,7 @@ fn host() -> String {
     } else {
         String::new()
     };
-    short_host(&full).unwrap_or_else(|| "this machine".to_string())
+    short_host(&full).unwrap_or_else(|| "this computer".to_string())
 }
 
 /// A host name up to the first dot (`devbox.local` is `devbox`), `None` when there is none.
@@ -460,6 +460,21 @@ struct Page {
     host: String,
     /// Whether the last frame had room for the pet column (`wide`); set before each draw.
     wide: bool,
+    /// How wide the value column is: see [`value_width`].
+    value_w: usize,
+}
+
+/// The value column's width: every option of every row fits (cut at 20), so browsing one
+/// never moves the help beside it. Read once when the page opens, since the options of a
+/// sound row look for each sound's file.
+fn value_width(all: &[Row]) -> usize {
+    let macos = cfg!(target_os = "macos");
+    let widest = all
+        .iter()
+        .flat_map(|r| options(r, macos).0.into_iter().chain([r.value.clone()]))
+        .map(|v| qoop_tui::width::width(&v))
+        .max();
+    widest.unwrap_or(0).min(20)
 }
 
 /// Whether a `w` x `h` frame has room for the pet column beside the settings.
@@ -495,17 +510,30 @@ fn fit_lines(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// `text` cut to `width` characters, ending in "…" when it was longer.
-fn cut(text: &str, width: usize) -> String {
+/// `text` cut to `width` cells, ending in "…" when it was longer.
+pub(crate) fn cut(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if text.chars().count() <= width {
+    if qoop_tui::width::width(text) <= width {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    let mut used = 0;
+    let mut out: String = text
+        .chars()
+        .take_while(|c| {
+            used += qoop_tui::width::columns(*c);
+            used < width
+        })
+        .collect();
     out.push('…');
     out
+}
+
+/// `text` cut to `width` cells and padded to them, so the column after it stays in place
+/// whatever script the text is in.
+pub(crate) fn column(text: &str, width: usize) -> String {
+    qoop_tui::width::text(&cut(text, width), width)
 }
 
 impl Page {
@@ -638,8 +666,16 @@ impl Page {
             Pick(Vec<(String, bool)>),
             Gap,
         }
-        // The help's place beside the label (2 + 18) and the value (9) and the gap after them.
-        let help_room = w.saturating_sub(31);
+        // The label and the value columns are as wide as their longest entry, a long one cut,
+        // each with a gap after it; the help has the rest.
+        let label_w = self
+            .all
+            .iter()
+            .map(|r| qoop_tui::width::width(&r.label))
+            .max();
+        let label_w = label_w.unwrap_or(0).min(24);
+        let value_w = self.value_w;
+        let help_room = w.saturating_sub(6 + label_w + value_w);
         let mut lines: Vec<Line> = Vec::new();
         let mut group = "";
         for (i, row) in rows.iter().enumerate() {
@@ -652,7 +688,7 @@ impl Page {
             }
             lines.push(Line::Row(row, i));
             let selected = i == self.sel && self.focus == Focus::List;
-            if selected && row.help.chars().count() > help_room {
+            if selected && qoop_tui::width::width(&row.help) > help_room {
                 for help in fit_lines(&row.help, w.saturating_sub(4)) {
                     lines.push(Line::Help(help));
                 }
@@ -708,14 +744,13 @@ impl Page {
                         (false, true) => bold(role),
                         (false, false) => ink(role),
                     };
-                    let value_role = if row.group == "machines" {
+                    let value_role = if row.group == "computers" {
                         Role::Working
                     } else {
                         Role::Focused
                     };
-                    let label: String = row.label.chars().take(18).collect();
                     // The selected row's long help is on the lines under it; any other is cut.
-                    let help = if on && row.help.chars().count() > help_room {
+                    let help = if on && qoop_tui::width::width(&row.help) > help_room {
                         String::new()
                     } else {
                         cut(&row.help, help_room)
@@ -725,8 +760,14 @@ impl Page {
                         yy,
                         &[
                             (if on { "▸ " } else { "  " }, paint(Role::Brand, false)),
-                            (&format!("{label:<18}"), paint(Role::Text, on)),
-                            (&format!("{:<9}", row.value), paint(value_role, true)),
+                            (
+                                &format!("{} ", column(&row.label, label_w)),
+                                paint(Role::Text, on),
+                            ),
+                            (
+                                &format!("{} ", column(&row.value, value_w)),
+                                paint(value_role, true),
+                            ),
                             (&help, paint(Role::Faint, false)),
                         ],
                     );
@@ -852,13 +893,15 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         // No one to look at a page: the settings as text, as `qoop config` prints them.
         return crate::config::run(&["qoop".to_string(), "config".to_string()]);
     }
-    let mut lists = listed("machines", &["remote", "ls"], false);
+    let mut lists = listed("computers", &["remote", "ls"], false);
     lists.extend(listed("phones", &["devices", "ls"], true));
     lists.extend(listed("hooks", &["hooks"], false));
     lists.extend(listed("skills", &["skills"], false));
     apply_theme();
+    let all = rows(&lists);
     let mut page = Page {
-        all: rows(&lists),
+        value_w: value_width(&all),
+        all,
         lists,
         query: String::new(),
         chip: 0,
@@ -908,7 +951,7 @@ mod tests {
             row("sound", "sound", Kind::Toggle("notify.sound")),
             row("look", "theme", Kind::Info),
             row("keys", "prefix", Kind::Info),
-            row("machines", "ubox", Kind::Info),
+            row("computers", "ubox", Kind::Info),
         ];
         let labels = |rows: Vec<Row>| rows.into_iter().map(|r| r.label).collect::<Vec<_>>();
         assert_eq!(labels(filtered(&all, "", 0)).len(), 4);
@@ -954,6 +997,7 @@ mod tests {
             said: None,
             host: "devbox".to_string(),
             wide: true,
+            value_w: 0,
         };
         let mut player = Player::new();
         page.key(Key::Up, &mut player);
@@ -985,10 +1029,11 @@ mod tests {
             said: None,
             host: "devbox".to_string(),
             wide: true,
+            value_w: value_width(&rows(&[])),
         };
         let frame = page.draw(NEED.0, NEED.1).frame();
         assert!(frame.contains("search"), "{frame:?}");
-        assert!(frame.contains("machines"), "{frame:?}");
+        assert!(frame.contains("computers"), "{frame:?}");
         assert!(frame.contains("agent finished"), "{frame:?}");
         assert!(frame.contains("settings on devbox"), "{frame:?}");
     }
@@ -1011,6 +1056,7 @@ mod tests {
             ));
         }
         Page {
+            value_w: value_width(&all),
             lists: Vec::new(),
             all,
             query: String::new(),
@@ -1117,6 +1163,62 @@ mod tests {
         assert!(page.focus == Focus::Pet(2));
     }
 
+    /// A label or a value as long as the longest is whole, with a gap before the next column.
+    #[test]
+    fn a_long_label_or_value_never_runs_into_the_next() {
+        let mut page = small_page(0);
+        page.all.push(Row {
+            value: "ask".to_string(),
+            ..row("report", "notes to qoop's maker", Kind::Info)
+        });
+        page.all.push(Row {
+            value: "Submarine".to_string(),
+            ..row("report", "agent waits", Kind::Info)
+        });
+        page.value_w = value_width(&page.all);
+        let lines = text(&mut page, 100, 40);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("notes to qoop's maker ask")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Submarine some help")),
+            "{lines:?}"
+        );
+    }
+
+    /// The value column fits every option a row can take, so browsing one never moves the
+    /// help beside it and never cuts the value.
+    #[test]
+    fn browsing_a_value_leaves_the_help_where_it_is() {
+        let mut page = small_page(0);
+        let sounds = ["Glass", "a-long-sound-name"].map(String::from).to_vec();
+        page.all.push(Row {
+            value: "Glass".to_string(),
+            ..row(
+                "sound",
+                "agent finished",
+                Kind::Choice("notify.done_sound", sounds),
+            )
+        });
+        page.value_w = value_width(&page.all);
+        let line = |page: &mut Page| {
+            let lines = text(page, 100, 40);
+            let line = lines.iter().find(|l| l.contains("agent finished")).cloned();
+            line.unwrap_or_default()
+        };
+        let before = line(&mut page).find("some help");
+        assert!(before.is_some());
+        if let Some(r) = page.all.last_mut() {
+            r.value = "a-long-sound-name".to_string();
+        }
+        let after = line(&mut page);
+        assert_eq!(after.find("some help"), before, "{after}");
+        assert!(after.contains("a-long-sound-name some help"), "{after}");
+    }
+
     /// A search longer than its room shows its end and never writes over a chip.
     #[test]
     fn a_long_search_leaves_every_chip_whole() {
@@ -1140,6 +1242,22 @@ mod tests {
         assert_eq!(fit_lines("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(cut("abcdef", 4), "abc…");
         assert_eq!(cut("abc", 4), "abc");
+    }
+
+    /// A column is as wide on screen for a name in any script: `qoop ls` and this page keep
+    /// what follows a Chinese name where it is for a Latin one.
+    #[test]
+    fn a_column_counts_cells_not_characters() {
+        let width = qoop_tui::width::width;
+        assert_eq!(cut("中文中文", 5), "中文…");
+        for name in [
+            "docs",
+            "中文中文中文中文中文中文",
+            "a中文中文中文中文中文中文",
+            "ü",
+        ] {
+            assert_eq!(width(&column(name, 20)), 20, "{name}");
+        }
     }
 
     #[test]

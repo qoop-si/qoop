@@ -1,4 +1,4 @@
-//! `qoop doctor`: whether the board, the question inbox and the agents tell one truth.
+//! `qoop doctor`: whether the board, qass's questions and the agents tell one truth.
 //!
 //! Read-only on the store: three reads through the daemon (the agents, the board, the live
 //! cards), checked against the invariants in `plans/2026-10-12-sync-architecture.md`. One line
@@ -66,7 +66,7 @@ pub(crate) fn check(seen: &Seen) -> (Vec<Finding>, Vec<String>) {
     let asks = match &seen.asks {
         Ok(asks) => Some(asks),
         Err(e) => {
-            skipped.push(format!("cannot check the inbox: {e}"));
+            skipped.push(format!("cannot check the questions: {e}"));
             None
         }
     };
@@ -161,7 +161,7 @@ fn waiting_without_card(rows: &[AgentRow], asks: &[AskInfo], qass: Option<i64>) 
             .then(|| Finding {
                 id: format!("I4:T{}:{}", r.terminal, task.id),
                 line: format!(
-                    "I4 T{} {}: waits on you (task {}) with no card in the inbox; qass writes one",
+                    "I4 T{} {}: waits on you (task {}) with no question card; qass writes one",
                     r.terminal,
                     name(r),
                     task.id
@@ -339,13 +339,13 @@ fn keep(ids: &[String], file: &std::path::Path) {
 const HELP: &str = "\
 usage: qoop doctor [--json] [--new <file>]
 
-Whether the board, the question inbox and the agents tell one truth. Read-only: it reads the
+Whether the board, qass's questions and the agents tell one truth. Read-only: it reads the
 agents, the board and the live cards through the daemon and prints one line per thing that does
 not hold, and nothing when all hold. It never acts.
 
   I1  an item closed in the last day still has an open task that is claimed, or whose tab is
       gone or asleep
-  I4  an agent at rest waits on you (its task in waiting-human) and the inbox has no card for it
+  I4  an agent at rest waits on you (its task in waiting-human) and has no question card
   I6  a live card has nobody to take its answer: its tab closed, or no tab and no qass
 
   --json        the findings as JSON: [{\"id\", \"line\"}], skipped checks under \"skipped\"
@@ -594,7 +594,11 @@ mod tests {
                 .any(|s| s.contains("cannot check the agents"))
         );
         assert!(skipped.iter().any(|s| s.contains("cannot check the board")));
-        assert!(skipped.iter().any(|s| s.contains("cannot check the inbox")));
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("cannot check the questions"))
+        );
     }
 
     #[test]

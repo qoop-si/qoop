@@ -18,8 +18,11 @@ program.
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
 | `ctrl-a Q` | qass in its own space, or back to where you were; a click on the pet in the column's foot does the same |
-| `ctrl-a i` | on qass's screen: the question inbox beside qass's chat. A new question opens nothing by itself: it lights the questions tab on the rail and the lamp under the pet; `ctrl-a i` (or a click on that tab) brings it up, and the last answer puts it away. In it `j` `k` pick a question, `a` to `d` answer with an option (sent at once), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `asks you` count in qass's header does the same |
+| `ctrl-a i` | questions: on qass's screen, qass's questions beside its chat. A new question opens nothing by itself: it lights the questions tab on the rail and the lamp under the pet; `ctrl-a i` (or a click on that tab) brings it up, and the last answer puts it away. In it `j` `k` pick a question, `a` to `d` answer with an option (sent at once), `t` types your own words, `x` puts it away, `enter` goes to that agent's tab, `tab` gives the chat the keyboard, `esc` closes it. A click on the `asks you` count in qass's header does the same |
+| `ctrl-a T` | fold: on qass's screen, fold the pane the keyboard is in to its strip, or open the folded one |
 | `ctrl-a W` | close the space when it is empty |
+| `ctrl-a Z` | sleep, wake: put the tab the keyboard is in to sleep, or wake the sleeping tab it rests on |
+| `ctrl-a f` | fold: the focused space's agents fold under its rule, or open again |
 
 ## Panes
 
@@ -39,7 +42,10 @@ program.
 |---|---|
 | `ctrl-a space` | find anything: a space, an agent, a tab, an action |
 | `ctrl-a [` | copy mode: move, select, search the whole history (see [Copy mode](#copy-mode)) |
-| `ctrl-a g` | agents panel grouped by space, or ranked by urgency |
+| `ctrl-a g` | tree or priority: agents grouped by space, or ranked by priority |
+| `ctrl-a a` | agents column: the keyboard on it, to move over its rows, open, sleep, search |
+| `ctrl-a tab` | needs you: the agent that needs you next |
+| `ctrl-a M` | last answer: the focused agent's last answer, read from its transcript, as a page |
 | `ctrl-a F` | an agent's focus view: your last prompt, its last turns, one row per tool call |
 | `ctrl-a b` | fold the left column away |
 
@@ -62,7 +68,7 @@ program.
 | drag a divider | resize the panes on either side |
 | click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
 | click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
-| click the `asks you` count in qass's header | open or close the question inbox, the same as `ctrl-a i` |
+| click the `asks you` count in qass's header | open or close the questions, the same as `ctrl-a i` |
 | click a space's `⋯` | the space's settings: its name and colour |
 | drag the column's edge | widen or narrow the left column, up to half the window |
 | shift-drag | select over a program that took the mouse |

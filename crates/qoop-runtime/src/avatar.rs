@@ -35,7 +35,7 @@ pub const HAIR_TITLES: [&str; 8] = [
 pub const HAIR_INKS: [u8; 8] = [212, 214, 226, 155, 208, 35, 135, 39];
 /// Display names for the inks, same order as above.
 pub const HAIR_INK_TITLES: [&str; 8] = [
-    "Pink", "Gold", "Yellow", "Lime", "Blocked", "Done", "Violet", "Sky",
+    "Pink", "Gold", "Yellow", "Lime", "Orange", "Green", "Violet", "Sky",
 ];
 /// The eyes the setup screen offers, in picker order.
 pub const EYE_STYLES: [&str; 5] = ["small", "big", "bigsmall", "squint", "squintw"];

@@ -227,13 +227,13 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop attach     attach to one terminal, with no interface around it\n\
                  \x20 qoop daemon     run the daemon in the foreground\n\
                  \x20 qoop reset      restore a terminal left in raw mode by a killed client\n\
-                 \x20 qoop relay      pipe stdin and stdout to this machine's daemon\n\
+                 \x20 qoop relay      pipe stdin and stdout to this computer's daemon\n\
                  \x20 qoop ensure-awake  wake the space that slept last, or open a first tab\n\
-                 \x20 qoop --remote <name|ssh-target>  the interface for another machine's qoop\n\
+                 \x20 qoop --remote <name|ssh-target>  the interface for another computer's qoop\n\
                  \x20 qoop --space <id|name>  the interface with that one space in it, made\n\
                  \x20                 when the name is new; `qoop` still shows them all\n\
                  \x20 qoop remote add <name> <ssh-target>  show that\n\
-                 \x20                 machine's spaces in `qoop`, beside this one's\n\
+                 \x20                 computer's spaces in `qoop`, beside this one's\n\
                  \x20 qoop remote rm <name>  stop showing them\n\
                  \x20 qoop remote ls  the remotes added\n\
                  \x20 qoop setup ...  capture, inspect, trust and run a Setup\n\
@@ -243,9 +243,9 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop task new|goal|stage|plan|evidence|done|close|verify|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
-                  \x20 qoop ask add|close|ls  the owner's question inbox, as qass fills it;\n\
+                  \x20 qoop ask add|close|ls  the owner's questions, as qass fills them;\n\
                   \x20                 `qoop ask` for more\n\
-                  \x20 qoop doctor  whether the board, the inbox and the agents agree;\n\
+                  \x20 qoop doctor  whether the board, the questions and the agents agree;\n\
                   \x20                 read-only, `qoop doctor --help` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
@@ -296,7 +296,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 before it writes\n\
                   \x20 qoop ls [--json]  list the spaces and say which are asleep\n\
                   \x20 qoop paths [name] [--json]  where qoop keeps each kind of file, and how big\n\
-                  \x20 qoop uninstall [--yes]  take qoop off this machine: the steps of the Uninstall\n\
+                  \x20 qoop uninstall [--yes]  take qoop off this computer: the steps of the Uninstall\n\
                   \x20                 docs page, listed and asked about first\n\
                   \x20 qoop avatar pick  choose a terminal pet from a batch\n\
                   \x20 qoop avatar show [--json]  print the picked pet\n\
@@ -317,16 +317,16 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop stop       end the daemon and every tab; `qoop` brings them back\n\
                  \x20 qoop restart    move the daemon onto the qoop on disk now, every tab and agent still running\n\
                  \x20 qoop pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\
-                 \x20 qoop login [--hub URL]  link this machine to your account: it then shows\n\
+                 \x20 qoop login [--hub URL]  link this computer to your account: it then shows\n\
                  \x20                 on qoop.si/app and on your phone\n\
-                 \x20 qoop logout [--hub URL]  unlink this machine from its account\n\
-                 \x20 qoop devices ls  the phones paired with this machine\n\
+                 \x20 qoop logout [--hub URL]  unlink this computer from its account\n\
+                 \x20 qoop devices ls  the phones paired with this computer\n\
                  \x20 qoop devices rm <name>  unpair one; its open streams close at once\n\
                  \x20 qoop bridge     run the phones' end in the foreground (the service\n\
                  \x20                 that pairing installs runs exactly this)\n\
                  \x20 qoop bridge reload  put that service back on the installed binary\n\
                  \x20 qoop update [--check]  fetch the newest release, install it, and move every\n\
-                 \x20                 machine onto it, keeping running tabs running where it can\n\
+                 \x20                 computer onto it, keeping running tabs running where it can\n\
                  \x20 qoop --version\n\
                  \n\
                  detach with ctrl-q. the shell keeps running.\n\
@@ -468,8 +468,9 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                     // A failure and not a quiet exit: the tabs carried here are lost with
                     // this process, and a unit that restarts on failure should look again.
                     let why = format!(
-                        "another daemon is serving this socket; {carried_tabs} tabs carried \
-                         here are left to it and restart from their rows"
+                        "another daemon is serving this socket; what was carried here ({}) is left \
+                         to it and restarts from the rows",
+                        count(carried_tabs, "tab")
                     );
                     qoop_runtime::say!("qoopd: {why}");
                     return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, why));
@@ -3061,23 +3062,40 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     if rows.is_empty() {
         println!("no spaces yet. `qoop` starts one.");
     }
+    // Never a control character: a name or a goal with an escape in it would reach this
+    // terminal as a command (retitle it, write the clipboard).
+    let drawn =
+        |s: String| -> String { s.chars().filter(|c| qoop_tui::width::drawn(*c)).collect() };
     for (id, name, state, tabs, sleeping, goal) in rows {
-        let tabs = match tabs {
-            1 => "1 tab".to_string(),
-            n => format!("{n} tabs"),
-        };
+        let (name, goal) = (drawn(name), goal.map(drawn));
+        let tabs = count(tabs, "tab");
         let sleeping = if sleeping.is_empty() {
             String::new()
         } else {
             let numbers: Vec<String> = sleeping.iter().map(|t| t.to_string()).collect();
             format!("  asleep: {}", numbers.join(" "))
         };
-        println!("{id:>3}  {name:<20} {state:<14} {tabs}{sleeping}");
+        // A long name is cut, so the columns after it stay in place, and said whole under its
+        // row, so two that begin alike stay apart and either can be typed to `qoop sleep`.
+        let shown = crate::settings::column(&name, 20);
+        println!("{id:>3}  {shown} {state:<14} {tabs}{sleeping}");
+        if qoop_tui::width::width(&name) > 20 {
+            println!("     name: {name}");
+        }
         if let Some(goal) = goal {
             println!("     goal: {goal}");
         }
     }
     Ok(())
+}
+
+/// `1 tab`, `2 tabs`: a count and its word, the word plural for any count but one.
+pub(crate) fn count(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 /// `qoop stop`: end the daemon, and with it everything it was running.
@@ -3160,6 +3178,13 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_tab_is_said_without_an_s() {
+        assert_eq!(super::count(1, "tab"), "1 tab");
+        assert_eq!(super::count(0, "tab"), "0 tabs");
+        assert_eq!(super::count(3, "agent"), "3 agents");
+    }
+
     /// An older daemon's "`qoop stop`, then `qoop`" never reaches a person or an agent as
     /// advice; every other refusal is said as it is.
     #[test]

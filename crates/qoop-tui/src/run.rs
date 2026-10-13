@@ -3494,11 +3494,11 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("resize panes", "e", "h j k l move the nearest divider"),
     ("equalize panes", "=", "every pane the same share"),
     (
-        "tree or urgency",
+        "tree or priority",
         "g",
-        "spaces as a tree or agents by urgency",
+        "spaces as a tree or agents by priority",
     ),
-    ("keybinds", "?", "every key, and what it does"),
+    ("keys", "?", "every key, and what it does"),
     ("settings", "", "every setting on one page, with your pet"),
     // After "settings": a letter jumps to the first row it starts, and `s` has
     // meant settings for longer than these two rows have existed.
@@ -3509,7 +3509,11 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "",
         "re-read the agent detection overrides",
     ),
-    ("connect a machine", "", "another machine's qoop, over ssh"),
+    (
+        "connect a computer",
+        "",
+        "another computer's qoop, over ssh",
+    ),
     ("detach", "d", "leave, and keep everything running"),
 ];
 
@@ -3555,7 +3559,7 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             .collect(),
         MenuKind::Plus => vec![
             ("new space".to_string(), crate::keys::named("ctrl-a w")),
-            ("connect a machine (ssh)".to_string(), String::new()),
+            ("connect a computer (ssh)".to_string(), String::new()),
         ],
         MenuKind::New { .. } => vec![
             ("agent".to_string(), String::new()),
@@ -3886,7 +3890,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         }
     }
     match MENU[item].0 {
-        "connect a machine" => {
+        "connect a computer" => {
             state.prompt = ask(Naming::Remote);
             MenuSend::Nothing
         }
@@ -4004,11 +4008,11 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             equalize(state);
             MenuSend::Nothing
         }
-        "tree or urgency" => {
+        "tree or priority" => {
             state.view = state.view.toggle();
             MenuSend::Nothing
         }
-        "keybinds" => {
+        "keys" => {
             state.reading = Some(Reading::Keybinds);
             state.keys_query = None;
             MenuSend::Nothing
@@ -4197,7 +4201,7 @@ impl Naming {
             Naming::SpaceSettings(_) => "space settings",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::RenameSession(_) => "rename this session",
-            Naming::Remote => "ssh address of the machine",
+            Naming::Remote => "ssh address of the computer",
         }
     }
 
@@ -9119,7 +9123,7 @@ where
                                     }
                                     Some(row) if crate::mux::is_remote_terminal(row.terminal) => {
                                         state.message = Some(
-                                            "that agent keeps its answers on another machine".to_string(),
+                                            "that agent keeps its answers on another computer".to_string(),
                                         );
                                     }
                                     Some(row) if !row.agent => {
@@ -10860,7 +10864,7 @@ fn drop_hint(state: &State, source: Source, drop: Option<RowDrop>) -> String {
         return "a sleeping tab stays where it is, wake it first".to_string();
     }
     if drop.is_none() && state.over_other_machine(terminal) {
-        return "a tab stays on its machine".to_string();
+        return "a tab stays on its computer".to_string();
     }
     if handle && let Some(swap) = drop.as_ref().and_then(|d| state.board_carry(terminal, d)) {
         return if swap {
@@ -11915,7 +11919,7 @@ impl State {
 /// True when the layout changed, so qass's terminal must be sized again.
 fn asks_toggle(state: &mut State) -> bool {
     if !state.qass_header() {
-        state.message = Some("the question inbox opens on qass's screen: ctrl-a Q".to_string());
+        state.message = Some("the questions are on qass's screen: ctrl-a Q".to_string());
         return false;
     }
     if state.qass_split() {
@@ -11929,7 +11933,7 @@ fn asks_toggle(state: &mut State) -> bool {
         state.sidebar_width,
     );
     if !crate::qass_screen::Plan::holds_inbox(cols as usize, rows as usize) {
-        state.message = Some("the pane is too narrow for the question inbox".to_string());
+        state.message = Some("the pane is too narrow for the questions".to_string());
         return false;
     }
     if !state.qass_ui.inbox || state.qass_ui.zoomed {
@@ -17694,13 +17698,13 @@ mod tests {
                 "copy mode",
                 "resize panes",
                 "equalize panes",
-                "tree or urgency",
-                "keybinds",
+                "tree or priority",
+                "keys",
                 "settings",
                 "sleep space",
                 "wake space",
                 "reload manifests",
-                "connect a machine",
+                "connect a computer",
                 "detach",
             ]
         );
@@ -17771,7 +17775,7 @@ mod tests {
         // View flips locally and sends nothing.
         let view = MENU
             .iter()
-            .position(|(n, _, _)| *n == "tree or urgency")
+            .position(|(n, _, _)| *n == "tree or priority")
             .unwrap();
         let before = state.view;
         assert!(matches!(

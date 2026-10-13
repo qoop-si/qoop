@@ -333,7 +333,7 @@ the daemon's own, read by it from the same file; every key is in
 
 A qoop on a server keeps running when you log out, like the one here does. Add it once and
 its spaces are listed beside this machine's. From the interface, the `+` beside "spaces"
-offers `connect a machine`: type its ssh address and the screen moves to it. From a
+offers `connect a computer`: type its ssh address and the screen moves to it. From a
 shell:
 
 ```

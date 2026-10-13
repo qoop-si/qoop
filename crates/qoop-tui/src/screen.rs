@@ -2302,7 +2302,7 @@ fn swatches(pick: Option<u8>, pad: &str, inner: usize) -> String {
     line
 }
 
-/// `machine  <name> · connected`: where a remote space lives and how it is reached, in the
+/// `computer  <name> · connected`: where a remote space lives and how it is reached, in the
 /// same inks as the rule's machine chip.
 fn machine_line(
     machine: &str,
@@ -2317,7 +2317,7 @@ fn machine_line(
         LinkState::Parked => "parked",
         LinkState::Down => "offline",
     };
-    let lead = "machine  ";
+    let lead = "computer  ";
     let tail = format!(" \u{b7} {word}");
     let room = span.saturating_sub(lead.len() + width::width(&tail));
     let name = width::text(machine, width::width(machine).min(room));
@@ -2463,7 +2463,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("c", "new tab"),
             ("r", "rename tab"),
             ("x", "close tab"),
-            ("i/T", "inbox, fold"),
+            ("i/T", "questions, fold"),
         ],
     ),
     (
@@ -2477,7 +2477,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("Q", "qass, or pet"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
-            ("g", "tree or rank"),
+            ("g", "tree/priority"),
             ("a", "agents column"),
         ],
     ),
@@ -2518,7 +2518,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("M", "last answer"),
             ("F", "focus view"),
             ("b", "fold column"),
-            ("d", "detach, ctrl-q"),
+            ("d", "detach, ^q"),
             ("U", "update"),
             ("l", "repaint"),
             ("?", "this list"),
@@ -4409,9 +4409,9 @@ mod tests {
     }
 
     /// The settings box shows the name, the six swatches with the pick in brackets, and on
-    /// a remote space the machine and how it is reached; the buttons sit under all of it.
+    /// a remote space the computer and how it is reached; the buttons sit under all of it.
     #[test]
-    fn the_settings_box_shows_the_colours_and_the_machine() {
+    fn the_settings_box_shows_the_colours_and_the_computer() {
         use qoop_runtime::control::LinkState;
         let painted = painted_prompt(&settings(Some(2), Some(LinkState::Up)), 100, 24);
         assert!(painted.contains("space settings"), "{painted:?}");
@@ -4425,13 +4425,13 @@ mod tests {
             "{painted:?}"
         );
         assert!(painted.contains(" auto "), "{painted:?}");
-        assert!(painted.contains("machine  "), "{painted:?}");
+        assert!(painted.contains("computer  "), "{painted:?}");
         assert!(painted.contains("devbox"), "{painted:?}");
         assert!(painted.contains("connected"), "{painted:?}");
         assert!(painted.contains(" \u{21b5} save "), "{painted:?}");
         let here = painted_prompt(&settings(None, None), 100, 24);
         assert!(here.contains("[auto]"), "{here:?}");
-        assert!(!here.contains("machine  "), "{here:?}");
+        assert!(!here.contains("computer  "), "{here:?}");
         // The buttons move down past the extra rows, and a click finds them there.
         let asked = settings(None, Some(LinkState::Down));
         let (row, col) = prompt_button(100, 24, &asked, b'\r').expect("a save button");

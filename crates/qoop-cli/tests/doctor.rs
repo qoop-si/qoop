@@ -75,7 +75,7 @@ fn with_no_daemon_every_check_is_named_as_skipped() {
     let out = doctor(dir.path(), &[]);
     let said = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(3), "{out:?}");
-    for what in ["the agents", "the board", "the inbox"] {
+    for what in ["the agents", "the board", "the questions"] {
         assert!(said.contains(&format!("cannot check {what}")), "{said}");
     }
 }
@@ -138,7 +138,7 @@ fn an_agent_waiting_with_no_card_is_found_and_said_once() {
     drop(daemon);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(said.starts_with("I4 T1"), "{said}");
-    assert!(said.contains("no card"), "{said}");
+    assert!(said.contains("no question card"), "{said}");
     assert_eq!(
         String::from_utf8_lossy(&first.stdout),
         said,

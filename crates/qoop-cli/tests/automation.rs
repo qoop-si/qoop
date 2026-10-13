@@ -348,6 +348,42 @@ fn space_rm_removes_an_empty_space_and_refuses_one_with_a_tab() {
     assert_eq!(daemon.run(&["space", "rm"]).status.code(), Some(2));
 }
 
+/// A name too long for its column is cut there and said whole on a line under its row, so
+/// two that begin alike stay apart. An escape in a name or a goal is never printed: it would
+/// reach the terminal as a command.
+#[test]
+fn qoop_ls_says_a_cut_name_whole_under_its_row() {
+    let daemon = Daemon::start();
+    let names = [
+        "mobile app with a long name one",
+        "mobile app with a long name two",
+    ];
+    for name in names {
+        new_terminal(&daemon, &["--space", name]);
+    }
+    let sneaky = "title \x1b]0;owned\x07 of a long space name";
+    new_terminal(&daemon, &["--space", sneaky]);
+    let goal = daemon.run(&["space", "goal", sneaky, "copy \x1b]52;c;aGk=\x07 this"]);
+    assert!(goal.status.success(), "{}", text(&goal.stderr));
+    let listed = text(&daemon.run(&["ls"]).stdout);
+    for name in names {
+        assert!(
+            listed.contains(&format!("\n     name: {name}\n")),
+            "{listed}"
+        );
+    }
+    assert!(
+        listed.contains("\n     name: title ]0;owned of a long space name\n"),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains("\n     goal: copy ]52;c;aGk= this\n"),
+        "{listed:?}"
+    );
+    assert!(!listed.contains(['\x1b', '\x07']), "{listed:?}");
+    assert_eq!(listed.matches("name: ").count(), 3, "{listed}");
+}
+
 #[test]
 fn parallel_callers_naming_one_new_space_make_it_once() {
     let daemon = Daemon::start();

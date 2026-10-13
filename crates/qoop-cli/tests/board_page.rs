@@ -197,6 +197,8 @@ fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
         ok
     });
     assert!(!said.contains("running in it"), "{said}");
+    // Two panes, one tab.
+    assert!(said.contains("is asleep: 1 tab ended"), "{said}");
     let (rows, _) = daemon.index();
     for t in [board, qass] {
         assert!(
@@ -206,6 +208,19 @@ fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
             "{t} is still awake after: {said}; {rows:?}"
         );
     }
+
+    // It wakes as one tab; a second wake of its space finds nothing asleep and says so.
+    let (ok, out, err) = daemon.run(&["wake", "--tab", &board.to_string()]);
+    assert!(ok && out.contains(": 1 tab awake again"), "{out} {err}");
+    let space = out
+        .strip_prefix("space ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_else(|| panic!("no space in {out:?}"));
+    let (ok, out, err) = daemon.run(&["wake", space]);
+    assert!(
+        ok && out.contains(&format!("nothing in space {space} was asleep")),
+        "{out} {err}"
+    );
 }
 
 /// `qoop task start` asks qass the way the board does, as nobody and with one line: while qass

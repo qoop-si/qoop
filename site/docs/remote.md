@@ -3,7 +3,7 @@
 A qoop on a server keeps running when you log out, like the one here does. Add it once and
 its spaces are listed beside this machine's, as spaces: there is no separate machine list.
 
-From the interface, the `+` beside "spaces" offers `connect a machine`: type its ssh address,
+From the interface, the `+` beside "spaces" offers `connect a computer`: type its ssh address,
 pick one of the sessions already running there or name a new one, and the screen moves to it.
 From a shell:
 

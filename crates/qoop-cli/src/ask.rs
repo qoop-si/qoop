@@ -202,12 +202,12 @@ fn send(action: AskOp, unavailable_is_exit_3: bool) -> std::io::Result<ControlRe
     match answer {
         Ok(ControlResponse::Failed { reason, .. }) if older(&reason) && unavailable_is_exit_3 => {
             Err(std::io::Error::other(Unavailable(
-                "the inbox needs a restart of qoop".to_string(),
+                "the questions need a restart of qoop".to_string(),
             )))
         }
         Ok(response) => Ok(response),
         Err(e) if unavailable_is_exit_3 => Err(std::io::Error::other(Unavailable(format!(
-            "the inbox could not be reached: {e}"
+            "the questions could not be reached: {e}"
         )))),
         Err(e) => Err(e),
     }

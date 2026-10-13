@@ -386,8 +386,8 @@ async fn restart_here(socket: &Path) -> std::io::Result<()> {
         )));
     }
     println!(
-        "qoop restarted live onto {version}: {} tabs carried in the same process, nothing ended{meanwhile}",
-        tabs.live.len()
+        "qoop restarted live onto {version}: {} carried in the same process, nothing ended{meanwhile}",
+        crate::count(tabs.live.len(), "tab")
     );
     Ok(())
 }
