@@ -855,7 +855,12 @@ pub(crate) fn rows_folded_with(
     let (head, feet, body) = parts(c, height, avatar);
     // The keys of the column, on the last row of the list while the keyboard has it.
     let keys = c.nav.filter(|_| body > NAV_MIN_BODY);
-    let mut list = window(content(c), list_rows(c, body), c, c.width);
+    let content = content(c);
+    let (len, rows) = (content.len(), list_rows(c, body));
+    let at = first_row(&content, rows, c);
+    let mut list = window(content, rows, c, c.width);
+    // The tree's own thumb, as the inbox draws one: rows past the foot are not lost.
+    thumb(&mut list, len, at, c.width, crate::theme::Role::Focused);
     if let Some((at, role)) = rule.filter(|(at, _)| *at >= head.len() && !list.is_empty()) {
         list.pop();
         let at = (at - head.len()).min(list.len());
@@ -1489,28 +1494,34 @@ fn inbox_rows(c: &Column, height: usize) -> Vec<Row> {
     while out.len() < height {
         out.push((blank(c.width).0, Some(Hit::Next(None))));
     }
-    // A thumb on a track in the last column, only when the list is longer than its rows.
-    if items.len() > rows {
-        // Shorter than the track, so the track always shows there is more; and at the far
-        // end when the list is scrolled to its end.
-        let size = (rows * rows / items.len()).clamp(1, rows.saturating_sub(1).max(1));
-        let last = items.len() - rows;
-        let from = (at * (rows - size)).div_ceil(last).min(rows - size);
-        let thumb = c.inbox.tab.role();
-        for (i, (line, _)) in out.iter_mut().skip(1).enumerate() {
-            let on = (from..from + size).contains(&i);
-            let mut cells: Vec<char> = line.text.chars().collect();
-            let last = c.width.saturating_sub(1);
-            if crate::width::width(&line.text) == c.width && cells.last() == Some(&' ') {
-                cells.pop();
-                line.text = cells.into_iter().collect();
-                line.text.push(if on { '\u{2503}' } else { '\u{2502}' });
-                line.runs
-                    .push((last, 1, if on { thumb } else { Role::Rule }));
-            }
+    thumb(&mut out[1..], items.len(), at, c.width, c.inbox.tab.role());
+    out
+}
+
+/// A thumb on a track in the last column of `rows`, a window onto a list `len` rows long
+/// that starts at row `at`, only when the list is longer than its rows: the one sign that
+/// more of it is out of sight. A row whose last cell is not blank keeps it.
+fn thumb(rows: &mut [Row], len: usize, at: usize, width: usize, ink: crate::theme::Role) {
+    let shown = rows.len();
+    if len <= shown || shown == 0 {
+        return;
+    }
+    // Shorter than the track, so the track always shows there is more; and at the far end
+    // when the list is scrolled to its end.
+    let size = (shown * shown / len).clamp(1, shown.saturating_sub(1).max(1));
+    let from = (at * (shown - size))
+        .div_ceil(len - shown)
+        .min(shown - size);
+    let last = width.saturating_sub(1);
+    for (i, (line, _)) in rows.iter_mut().enumerate() {
+        let on = (from..from + size).contains(&i);
+        if crate::width::width(&line.text) == width && line.text.ends_with(' ') {
+            line.text.pop();
+            line.text.push(if on { '\u{2503}' } else { '\u{2502}' });
+            line.runs
+                .push((last, 1, if on { ink } else { crate::theme::Role::Rule }));
         }
     }
-    out
 }
 
 /// A line drawn from pieces, each in its own colour, cut to the column.
@@ -3310,7 +3321,7 @@ fn cwd_basename(cwd: Option<&str>) -> Option<String> {
 /// The middle shortened to `room` columns, tail-cut with an ellipsis, or the
 /// whole middle when it already fits. A room under two columns still yields the
 /// ellipsis, which the caller's own fit then cuts to the row.
-fn shorten_middle(middle: &str, room: usize) -> String {
+pub(crate) fn shorten_middle(middle: &str, room: usize) -> String {
     if crate::width::width(middle) <= room {
         return middle.to_string();
     }
@@ -3854,24 +3865,14 @@ fn notice_from_disk() -> Option<String> {
 
 /// What to call the program in the terminal.
 ///
-/// A name a person chose outlives the program: a tab called `release` stays `release`
-/// while it runs a shell, then cargo, then an agent. The tab bar already spells it this
-/// way, and the panel spells it the same, so the two halves of the screen name the same
-/// terminal the same way. Without a chosen name the program's last path segment answers,
+/// As the tab bar calls it ([`crate::tabs::called`]), so the two halves of the screen name
+/// the same terminal the same way: a chosen name, else the program's last path segment,
 /// because a column this narrow renders `/opt/homebrew/bin/claude` as `/opt/homebre`,
 /// which identifies nothing. A wrapper is announced as a wrapper: a person shown
 /// `docker` would conclude their agent is called docker.
 pub(crate) fn label(agent: &AgentRow) -> String {
-    if let Some(name) = agent.name.as_deref().filter(|n| !n.is_empty()) {
-        return name.to_string();
-    }
-    match (&agent.program, &agent.behind) {
-        (Some(program), _) => program
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(program)
-            .to_string(),
+    match (crate::tabs::called(agent), &agent.behind) {
+        (Some(called), _) => called.to_string(),
         (None, Some(wrapper)) => format!("behind {wrapper}"),
         (None, None) => UNNAMED.to_string(),
     }
@@ -4381,13 +4382,23 @@ mod tests {
     /// A row inside a box with its sides blanked, so what it holds reads at the columns
     /// it is drawn at: ` │ ● claude    │` is `   ● claude`. Any other row as it is.
     fn unbox(text: &str) -> String {
-        let text = without_close(text);
+        let text = unthumbed(text);
+        let text = without_close(&text);
         match text
             .strip_prefix(" \u{2502} ")
             .and_then(|t| t.strip_suffix('\u{2502}'))
         {
             Some(inside) => format!("   {}", inside.trim_end()),
             None => text.to_string(),
+        }
+    }
+
+    /// A row without the tree's scroll track on its last column, which is not the row's own:
+    /// the cell the track took is blank again. A boxed row keeps its right edge.
+    fn unthumbed(text: &str) -> String {
+        match text.strip_suffix(['\u{2503}', '\u{2502}']) {
+            Some(row) if !text.starts_with(" \u{2502} ") => format!("{row} "),
+            _ => text.to_string(),
         }
     }
 
@@ -4876,6 +4887,20 @@ mod tests {
                 .collect()
         };
         assert!(!drawn(&c).contains(&Hit::Terminal(30)), "the list fits?");
+        // The rows past the foot are not silently gone: a thumb on the last column, which
+        // moves down with the list.
+        let thumb = |c: &Column| -> Vec<usize> {
+            rows_folded(c, 15, None)
+                .iter()
+                .enumerate()
+                .filter(|(_, (line, _))| {
+                    line.text.ends_with('\u{2503}') && crate::width::width(&line.text) == WIDTH
+                })
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let top = thumb(&c);
+        assert!(!top.is_empty(), "no thumb on a list longer than its rows");
         // Turned down far enough, the last agent shows and the wheel stops there.
         let mut last = None;
         for _ in 0..100 {
@@ -4891,6 +4916,7 @@ mod tests {
             "the focused row pinned it"
         );
         assert_eq!(rows_folded(&c, 15, None).len(), 15);
+        assert!(thumb(&c).first() > top.first(), "{:?} {top:?}", thumb(&c));
         // And back up, to the first space's rule under the title.
         for _ in 0..100 {
             c.scroll = Some(wheeled(&c, 15, None, true, 3));
@@ -7941,11 +7967,16 @@ mod tests {
                 &shut,
             );
             c.usage = Some(&usage);
-            rows_folded(&c, 15, None)
+            // Tall enough for the whole tree: no scroll track in the last column.
+            rows_folded(&c, 20, None)
         };
         let wide = at(30);
         let row = tree_row(&wide, 1);
-        assert!(row.text.ends_with(" 4% 212M z c x "), "{:?}", row.text);
+        assert!(
+            unthumbed(&row.text).ends_with(" 4% 212M z c x "),
+            "{:?}",
+            row.text
+        );
         assert!(
             row.runs
                 .iter()
@@ -8996,7 +9027,7 @@ mod tests {
         let mut row = agent(1, 1, program, "idle");
         row.cwd = cwd.map(str::to_string);
         second_of(
-            &tree_rows(&spaces, &[row], 9, 13, &Seen::new(), &Shut::new()),
+            &tree_rows(&spaces, &[row], 9, 20, &Seen::new(), &Shut::new()),
             1,
         )
         .clone()

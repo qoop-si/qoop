@@ -2328,12 +2328,14 @@ async fn route<W: AsyncWrite + Unpin>(
 }
 
 /// The interface over the local daemon at `socket` (when given) and `remotes`, showing
-/// only the local space `only` when one is named.
+/// only the local space `only` when one is named. `focus` is the terminal a window that
+/// came back after its daemon moved showed before (see `run::FOCUS_ENV`).
 pub async fn run(
     socket: Option<&Path>,
     remotes: Vec<Remote>,
     notice: Option<String>,
     only: Option<i64>,
+    focus: Option<u32>,
 ) -> io::Result<()> {
     let local = match socket {
         Some(socket) => Some(client::connect(socket, qoop_proto::INTERFACE_ID).await?),
@@ -2348,6 +2350,7 @@ pub async fn run(
         BytesMut::new(),
         notice,
         socket.map(crate::run::last_focus_path),
+        focus,
     )
     .await
 }

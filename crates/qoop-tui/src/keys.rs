@@ -217,6 +217,17 @@ pub enum Action {
     CopyMode,
 }
 
+impl Action {
+    /// Whether a person moved on to something: a command, or a click. Typing for the pane and
+    /// the rest of a mouse gesture (a drag, a release, the wheel) are not.
+    pub fn moves_on(&self) -> bool {
+        !matches!(
+            self,
+            Action::Input(_) | Action::Drag { .. } | Action::Release { .. } | Action::Wheel { .. }
+        )
+    }
+}
+
 /// The decoder. Cheap to hold, and one per attached client.
 #[derive(Debug)]
 pub struct Keys {
@@ -486,6 +497,30 @@ mod tests {
 
     fn input(bytes: &[u8]) -> Action {
         Action::Input(bytes.to_vec())
+    }
+
+    #[test]
+    fn a_command_or_a_click_moves_on_and_typing_or_the_wheel_does_not() {
+        let mut keys = Keys::default();
+        assert!(keys.feed(b"\x01c").iter().all(Action::moves_on));
+        assert!(
+            Action::Click {
+                row: 1,
+                col: 5,
+                shift: false
+            }
+            .moves_on()
+        );
+        assert!(!input(b"ls").moves_on());
+        assert!(
+            !Action::Wheel {
+                row: 1,
+                col: 1,
+                up: true,
+                shift: false
+            }
+            .moves_on()
+        );
     }
 
     #[test]

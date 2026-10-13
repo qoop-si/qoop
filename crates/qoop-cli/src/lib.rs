@@ -515,6 +515,7 @@ fn log_to_file(session: &std::path::Path) {
 
 /// Start the daemon if there is not one, then attach.
 fn run_client() -> std::io::Result<()> {
+    let focus = own_focus();
     let exe = own_path();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
@@ -562,8 +563,14 @@ fn run_client() -> std::io::Result<()> {
             (Vec::new(), Some(notice))
         }
     };
-    let ran = rt.block_on(qoop_tui::mux::run(Some(&socket), remotes, notice, None));
-    restart_in_place(exe, ran)
+    let ran = rt.block_on(qoop_tui::mux::run(
+        Some(&socket),
+        remotes,
+        notice,
+        None,
+        focus,
+    ));
+    restart_in_place(exe, &socket, ran)
 }
 
 /// This binary's path, resolved through any link before an update can rename a new file over
@@ -573,31 +580,83 @@ pub(crate) fn own_path() -> Option<std::path::PathBuf> {
     Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
 
-/// After an interface that ended because its daemon moved onto a newer qoop at the person's
-/// click: this process becomes the qoop on disk with the arguments it had, so the same
-/// terminal, space and tab are back at once (the last place is kept on disk). The terminal
-/// was restored when the interface ended. Quitting never gets here: only the daemon closing
-/// its side after that click does.
+/// After an interface that ended because its daemon moved: this process becomes the qoop on
+/// disk with the arguments it had, so the same terminal, space and tab are back at once (the
+/// last place is kept on disk). The terminal was restored when the interface ended. Quitting
+/// never gets here: only the daemon closing its side does (see [`moved`]).
 fn restart_in_place(
     exe: Option<std::path::PathBuf>,
+    socket: &std::path::Path,
     ran: std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if ran.is_err() || !qoop_tui::run::restarting() {
+    if !moved(&ran, socket, CAME_BACK) {
         return ran;
     }
-    let Some(exe) = exe else { return ran };
+    let Some(exe) = exe else { return Ok(()) };
     use std::os::unix::process::CommandExt;
-    let failed = Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+    let mut again = Command::new(&exe);
+    again.args(std::env::args_os().skip(1));
+    if let Some(terminal) = qoop_tui::run::closed_on() {
+        again.env(qoop_tui::run::FOCUS_ENV, terminal.to_string());
+    }
+    // Keys typed while the window was replaced were meant for a box it no longer shows (a
+    // `Y` for the close box): dropped, never typed into the pane the new window opens on.
+    // SAFETY: tcflush on standard input only discards what is queued there.
+    unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+    let failed = again.exec();
     Err(std::io::Error::other(format!(
-        "qoop moved to the new version but {} could not be started: {failed}",
+        "the daemon moved but {} could not be started again: {failed}",
         exe.display()
     )))
+}
+
+/// The terminal this window showed before it became the qoop on disk ([`restart_in_place`]),
+/// taken out of the environment so that nothing this window starts carries it.
+fn own_focus() -> Option<u32> {
+    let own = std::env::var_os(qoop_tui::run::FOCUS_ENV)?;
+    // SAFETY: first thing in the interface, before the runtime or anything else starts a
+    // thread.
+    unsafe { std::env::remove_var(qoop_tui::run::FOCUS_ENV) };
+    own.to_str()?.parse().ok().filter(|t| *t != 0)
+}
+
+/// How long a daemon that closed an interface with no click is looked for on its socket.
+/// Past the moment an exec has the listener again, which is at once; under the few seconds
+/// after which a person reads a window that hangs as qoop being stuck.
+const CAME_BACK: Duration = Duration::from_secs(3);
+
+/// Whether an interface that ended with `ran` ended because its daemon moved. After a click
+/// on `restart for update`, the interface knows. With no click, a daemon answering on
+/// `socket` within `within` is the one that moved all the same: `qoop restart` and `qoop
+/// update` move it from another terminal (the qass skill restarts after every install), and
+/// a daemon that let a stalled window go is still there. Nothing answering is the daemon
+/// gone, and the interface's own error says so.
+fn moved(ran: &std::io::Result<()>, socket: &std::path::Path, within: Duration) -> bool {
+    match ran {
+        Ok(()) => qoop_tui::run::restarting(),
+        Err(e) => qoop_tui::run::DaemonClosed::ended(e) && answers(socket, within),
+    }
+}
+
+/// Whether a daemon listens on `socket` within `within`, the way [`ensure_daemon`] asks.
+fn answers(socket: &std::path::Path, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `qoop --space <id|name>`: the interface with one space in it and nothing else. The
 /// space is made when the name is new, and woken, or given a tab, when there is nothing in
 /// it to show. Remotes are left out: their spaces would be filtered away anyway.
 fn run_space(args: &[String]) -> std::io::Result<()> {
+    let focus = own_focus();
     let exe = own_path();
     let [_, _, wanted] = args else {
         return Err(usage("usage: qoop --space <id|name>"));
@@ -612,8 +671,9 @@ fn run_space(args: &[String]) -> std::io::Result<()> {
         Vec::new(),
         None,
         Some(space),
+        focus,
     ));
-    restart_in_place(exe, ran)
+    restart_in_place(exe, &socket, ran)
 }
 
 /// `qoop --remote <name|target>`: the interface for another machine's qoop alone.
@@ -648,7 +708,7 @@ fn run_remote(args: &[String]) -> std::io::Result<()> {
     }
     remote::wake(&remote);
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(qoop_tui::mux::run(None, vec![remote], None, None))
+    rt.block_on(qoop_tui::mux::run(None, vec![remote], None, None, None))
 }
 
 /// Attach to one terminal, with no interface around it.
@@ -3210,6 +3270,48 @@ mod tests {
         let own = super::own_path().expect("a path");
         assert_eq!(std::fs::canonicalize(&own).expect("resolves"), own);
         assert!(!own.to_string_lossy().contains("(deleted)"));
+    }
+
+    /// An interface whose daemon closed it with no click comes back when a daemon answers on
+    /// the socket (`qoop restart` from another terminal), and says the daemon stopped when
+    /// none does. Any other ending is left as it is.
+    #[test]
+    fn a_closed_interface_comes_back_only_when_a_daemon_answers() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let socket = dir.path().join("qoop.sock");
+        let closed = || Err(std::io::Error::other(qoop_tui::run::DaemonClosed));
+        let within = std::time::Duration::from_millis(300);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
+        assert!(super::moved(&closed(), &socket, within));
+        assert!(!super::moved(&Ok(()), &socket, within), "a quit came back");
+        assert!(
+            !super::moved(&Err(std::io::Error::other("other")), &socket, within),
+            "another failure came back"
+        );
+        // Gone, its socket file left behind, as a daemon killed leaves it.
+        drop(listener);
+        let at = std::time::Instant::now();
+        assert!(!super::moved(&closed(), &socket, within));
+        assert!(
+            at.elapsed() >= within,
+            "gave up before the daemon could be back"
+        );
+        assert!(!super::moved(
+            &closed(),
+            &dir.path().join("none.sock"),
+            within
+        ));
+        // One that answers a moment later is waited for.
+        let late = dir.path().join("late.sock");
+        let bind = std::thread::spawn({
+            let late = late.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::os::unix::net::UnixListener::bind(late).expect("binds")
+            }
+        });
+        assert!(super::moved(&closed(), &late, within));
+        drop(bind.join());
     }
 
     use super::{

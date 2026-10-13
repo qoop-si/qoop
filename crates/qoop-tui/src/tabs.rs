@@ -153,26 +153,17 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
     // on it. Never wider than the bar.
     let margin = cols.min(1);
     let budget = cols.saturating_sub(margin + crate::width::width(NEW));
-    let mut used = 0;
-    let mut out = Vec::with_capacity(terminals.len() + 2);
-    out.push(Segment {
-        rows: [
-            vec![(" ".repeat(margin), Ink::Quiet)],
-            vec![(" ".repeat(margin), Ink::Quiet)],
-        ],
-        wide: margin,
-        close: None,
-        hit: None,
-    });
-    let first = scrolled(terminals, focused, budget);
-    for (at, row) in terminals.iter().enumerate().skip(first) {
-        let seg = tab(row, at + 1, row.terminal == focused);
-        // The gap only counts once another tab follows it.
-        if used + seg.wide - GAP.len() > budget {
-            break;
-        }
-        used += seg.wide;
-        out.push(seg);
+    let (first, end, counted) = drawn(terminals, focused, budget);
+    let [lead, trail] = if counted {
+        counts(terminals.len(), (first, end))
+    } else {
+        [None, None]
+    };
+    let mut out = Vec::with_capacity(terminals.len() + 4);
+    out.push(quiet(" ".repeat(margin)));
+    out.extend(lead.map(quiet));
+    for (at, row) in terminals.iter().enumerate().take(end).skip(first) {
+        out.push(tab(row, at + 1, row.terminal == focused));
     }
     // The last tab drawn needs no gap: the new tab button brings its own space.
     if let Some(last) = out.last_mut().filter(|seg| seg.hit.is_some()) {
@@ -181,6 +172,7 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
         }
         last.wide -= GAP.len();
     }
+    out.extend(trail.map(quiet));
     // Cut to the columns there are: on a bar narrower than the button, a whole button
     // autowraps its last cell into the pane below.
     let wide = (cols - margin).min(crate::width::width(NEW));
@@ -194,6 +186,90 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
         hit: Some(Hit::New),
     });
     out
+}
+
+/// A piece of the bar that is only words: `text` on the top row, blank under it, and a click
+/// on it does nothing.
+fn quiet(text: String) -> Segment {
+    let wide = crate::width::width(&text);
+    Segment {
+        rows: [
+            vec![(text, Ink::Quiet)],
+            vec![(" ".repeat(wide), Ink::Quiet)],
+        ],
+        wide,
+        close: None,
+        hit: None,
+    }
+}
+
+/// The tabs the bar draws in `budget` columns, as `first..end`, and whether the ones cut
+/// are counted.
+///
+/// A cut end says how many tabs it hides, `+3`, because a bar that drops tabs without a word
+/// reads as a space with fewer terminals in it. The counts take their columns from the tabs,
+/// and give them back when the focused tab would no longer fit beside them: which tab has the
+/// keyboard is the one thing the bar never stops saying.
+fn drawn(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize, bool) {
+    let plain = fitting(terminals, focused, budget);
+    if plain == (0, terminals.len()) {
+        return (plain.0, plain.1, false);
+    }
+    let marks = |run| {
+        counts(terminals.len(), run)
+            .iter()
+            .flatten()
+            .map(|text| crate::width::width(text))
+            .sum::<usize>()
+    };
+    // Fewer tabs cut more, and a count can grow a digit: refitted until the counts of the
+    // run fit in the columns kept for them. Ends, because the columns kept only grow and
+    // two counts never take more than a few.
+    let mut kept = marks(plain);
+    let counted = loop {
+        let run = fitting(terminals, focused, budget.saturating_sub(kept));
+        if marks(run) <= kept {
+            break run;
+        }
+        kept = marks(run);
+    };
+    let holds = |(first, end): (usize, usize)| {
+        terminals[first..end]
+            .iter()
+            .any(|row| row.terminal == focused)
+    };
+    if counted.1 > counted.0 && holds(counted) == holds(plain) {
+        (counted.0, counted.1, true)
+    } else {
+        (plain.0, plain.1, false)
+    }
+}
+
+/// What a run of tabs `first..end` out of `len` says at its cut ends: `+2` before it, `+3`
+/// after it.
+fn counts(len: usize, (first, end): (usize, usize)) -> [Option<String>; 2] {
+    [
+        (first > 0).then(|| format!("+{first} ")),
+        (end < len).then(|| format!(" +{} ", len - end)),
+    ]
+}
+
+/// The run of tabs that fits in `budget` columns, as `first..end`: from where [`scrolled`]
+/// starts it, as many as fit.
+fn fitting(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize) {
+    let first = scrolled(terminals, focused, budget);
+    let mut used = 0;
+    let mut end = first;
+    for (at, row) in terminals.iter().enumerate().skip(first) {
+        let wide = tab(row, at + 1, false).wide;
+        // The gap only counts once another tab follows it.
+        if used + wide - GAP.len() > budget {
+            break;
+        }
+        used += wide;
+        end = at + 1;
+    }
+    (first, end)
 }
 
 /// The first tab the bar draws.
@@ -231,12 +307,13 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
 /// ```
 ///
 /// Only the inks and the close differ between a focused tab and the same tab unfocused,
-/// never a width.
+/// never a width. The label sets the width and the folder is cut to it: a folder wider than
+/// its name made every tab twenty one columns, and three of eight fitted at 120 columns.
 fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
     let name = format!(" {}", label(row, position));
-    let path = format!(" {}", folder(row));
     // Two blank columns at least between the name and the close, one after the folder.
-    let inner = (crate::width::width(&name) + 3).max(crate::width::width(&path) + 1);
+    let inner = crate::width::width(&name) + 3;
+    let path = format!(" {}", folder(row, inner - 2));
     let pad =
         |text: &str, to: usize| format!("{text}{}", " ".repeat(to - crate::width::width(text)));
     let (name_ink, mark_ink) = if focused {
@@ -272,17 +349,22 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
     }
 }
 
-/// The folder a tab runs in, for the row under its label.
-pub(crate) fn folder(row: &AgentRow) -> String {
-    path_of(row.cwd.as_deref(), std::env::var("HOME").ok().as_deref())
+/// The folder a tab runs in, in at most `max` columns.
+pub(crate) fn folder(row: &AgentRow, max: usize) -> String {
+    path_of(
+        row.cwd.as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        max,
+    )
 }
 
-/// The most columns a tab's path takes before its start gives way to an ellipsis.
-const MAX_PATH: usize = 20;
+/// The most columns a folder takes on a pane's edge before its start gives way to an
+/// ellipsis.
+pub(crate) const MAX_PATH: usize = 20;
 
-/// A folder as a path with the home folder as `~`, and past [`MAX_PATH`] columns its end:
-/// the end is what tells two worktrees of one repository apart.
-fn path_of(cwd: Option<&str>, home: Option<&str>) -> String {
+/// A folder as a path with the home folder as `~`, and past `max` columns its end: the end
+/// is what tells two worktrees of one repository apart.
+fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
     let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
         return String::new();
     };
@@ -298,14 +380,17 @@ fn path_of(cwd: Option<&str>, home: Option<&str>) -> String {
         Some(home) if cwd.starts_with(&format!("{home}/")) => format!("~{}", &cwd[home.len()..]),
         _ => cwd.to_string(),
     };
-    if crate::width::width(&path) <= MAX_PATH {
+    if crate::width::width(&path) <= max {
         return path;
+    }
+    if max == 0 {
+        return String::new();
     }
     let mut end = String::new();
     let mut used = 0;
     for c in path.chars().rev() {
         let wide = crate::width::width(c.encode_utf8(&mut [0; 4]));
-        if used + wide > MAX_PATH - 1 {
+        if used + wide > max - 1 {
             break;
         }
         used += wide;
@@ -314,11 +399,11 @@ fn path_of(cwd: Option<&str>, home: Option<&str>) -> String {
     format!("\u{2026}{end}")
 }
 
-/// What a tab is called: its place on this bar, and the program in it when there is one.
+/// What a tab is called: its place on this bar, and its name ([`called`]) when it has one.
 ///
-/// A number is always there because the program is not distinguishing. A space with three
-/// shells in it draws three tabs reading `sh`, and a person clicking between them cannot
-/// tell which one they are on or which one they were on.
+/// A number is always there because what a tab is called need not tell it apart. A space
+/// with three shells in it draws three tabs reading `sh`, and a person clicking between them
+/// cannot tell which one they are on or which one they were on.
 ///
 /// Its place, and not the terminal's own number, because the number on a tab is the number
 /// a person presses. Terminal numbers are handed out across the whole daemon, so a second
@@ -329,23 +414,36 @@ fn path_of(cwd: Option<&str>, home: Option<&str>) -> String {
 ///
 /// No state mark: the agents panel beside the bar already says what each one is doing.
 fn label(row: &AgentRow, position: usize) -> String {
-    // A name a person chose outlives the program: a tab called `release` stays `release`
-    // while it runs a shell, then cargo, then an agent, and a bar of chosen names is a bar
-    // somebody can read without looking at what happens to be running in each one.
-    if let Some(name) = &row.name {
-        return clip(&format!("{position} {name}"));
-    }
-    match &row.program {
-        Some(program) => {
-            let name = program
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(program);
-            clip(&format!("{position} {name}"))
-        }
+    match called(row) {
+        Some(name) => clip(&format!("{position} {name}")),
         None => clip(&format!("{position}")),
     }
+}
+
+/// What a tab is called wherever it is named: the bar, the find palette, the next line and
+/// the close box, so one tab reads the same in all of them.
+///
+/// A name a person chose outlives the program: a tab called `release` stays `release` while
+/// it runs a shell, then cargo, then an agent, and a bar of chosen names is a bar somebody
+/// can read without looking at what happens to be running in each one. Without one, the
+/// program's last path segment.
+pub(crate) fn called(row: &AgentRow) -> Option<&str> {
+    row.name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .or_else(|| program(row))
+}
+
+/// The program a tab runs, as its last path segment: `/opt/homebrew/bin/claude` is `claude`.
+pub(crate) fn program(row: &AgentRow) -> Option<&str> {
+    let program = row.program.as_deref()?;
+    Some(
+        program
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(program),
+    )
 }
 
 /// Cut a label to at most [`MAX_LABEL`] columns.
@@ -558,8 +656,9 @@ mod tests {
         assert_eq!(hit(&rows, 3, 60, corner, 1), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 0), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 1), Some(Hit::Terminal(3)));
+        // Cut to the name above it, keeping its end.
         let folder = under
-            .find("/srv/app-feat-x")
+            .find("\u{2026}app-feat-x")
             .expect("no path under the tab");
         assert_eq!(crate::width::width(&under[..folder]), name, "{under:?}");
         // No other tab carries a close.
@@ -585,21 +684,50 @@ mod tests {
         assert!(!line.text.contains("tue"));
     }
 
+    /// Tabs with no room are counted at the end they were cut from, and a tab is as wide as
+    /// its name: the folder under it is cut to fit rather than widening it.
+    #[test]
+    fn cut_tabs_are_counted_and_a_folder_does_not_widen_its_tab() {
+        let many: Vec<AgentRow> = (1..=8)
+            .map(|n| AgentRow {
+                cwd: Some("/nowhere/work/qoop-private".to_string()),
+                ..agent(n, "bash")
+            })
+            .collect();
+        let col = |text: &str, of: &str| crate::width::width(&text[..text.find(of).unwrap()]);
+        let [top, under] = rows_of(&many, 1, 80);
+        assert_eq!(col(&top, "2 bash") - col(&top, "1 bash"), 14, "{top:?}");
+        assert!(under.contains("\u{2570} \u{2026}private "), "{under:?}");
+        assert!(top.contains("5 bash") && !top.contains("6 bash"), "{top:?}");
+        assert!(top.contains(" +3 "), "{top:?}");
+        assert_eq!(hit(&many, 1, 80, col(&top, "+3"), 0), None);
+        // Scrolled to the last tab, the ones before it are counted at the start.
+        let [top, _] = rows_of(&many, 8, 80);
+        assert!(top.starts_with(" +3 \u{256d} 4 bash"), "{top:?}");
+        assert!(top.contains("8 bash"), "{top:?}");
+        // All on the bar: nothing to count.
+        let [top, _] = rows_of(&many[..3], 1, 80);
+        assert!(!top.contains("+3") && !top.contains(" +0"), "{top:?}");
+    }
+
     /// The path under a tab: home as `~`, and a long one keeps its end.
     #[test]
     fn the_path_under_a_tab_is_home_relative_and_keeps_its_end() {
         let home = Some("/Users/me");
-        assert_eq!(path_of(Some("/Users/me"), home), "~");
-        assert_eq!(path_of(Some("/Users/me/"), home), "~");
+        assert_eq!(path_of(Some("/Users/me"), home, MAX_PATH), "~");
+        assert_eq!(path_of(Some("/Users/me/"), home, MAX_PATH), "~");
         assert_eq!(
-            path_of(Some("/Users/me/coding/wend"), home),
+            path_of(Some("/Users/me/coding/wend"), home, MAX_PATH),
             "~/coding/wend"
         );
-        assert_eq!(path_of(Some("/Users/meg/a"), home), "/Users/meg/a");
-        assert_eq!(path_of(Some("/"), home), "/");
-        assert_eq!(path_of(None, home), "");
-        assert_eq!(path_of(Some("  "), home), "");
-        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home);
+        assert_eq!(
+            path_of(Some("/Users/meg/a"), home, MAX_PATH),
+            "/Users/meg/a"
+        );
+        assert_eq!(path_of(Some("/"), home, MAX_PATH), "/");
+        assert_eq!(path_of(None, home, MAX_PATH), "");
+        assert_eq!(path_of(Some("  "), home, MAX_PATH), "");
+        let long = path_of(Some("/Users/me/coding/qoop-wt-events-log"), home, MAX_PATH);
         assert_eq!(long, "\u{2026}/qoop-wt-events-log");
         assert_eq!(crate::width::width(&long), MAX_PATH);
     }
@@ -628,9 +756,18 @@ mod tests {
                     Some((crate::width::width(&text[..byte]), r.terminal))
                 })
                 .collect();
+            // Past the last tab: the count of the ones cut, or the new button, each starting
+            // with the blank before its `+`.
+            let last = starts.last().map_or(0, |(start, _)| *start);
             let plus = text
-                .find(" + ")
-                .map(|byte| crate::width::width(&text[..byte]));
+                .chars()
+                .scan(0, |col, c| {
+                    let at = *col;
+                    *col += crate::width::width(c.encode_utf8(&mut [0; 4]));
+                    Some((at, c))
+                })
+                .find(|(at, c)| *c == '+' && *at > last)
+                .map(|(at, _)| at - 1);
             for col in 0..cols {
                 let want = starts
                     .iter()

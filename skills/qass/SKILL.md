@@ -198,7 +198,7 @@ is reversible, or the brief says own repo and the step is commit, push, PR, merg
 (never a release, deploy or migration), else a card. A remote worker's repo: ask the owner.
 Never report a check that did not run (CI where the workflow says there is none).
 An install leaves the daemon on its old build: then `qoop restart` once (every tab and agent keeps
-running; open qoop windows close, tell him in one line), never `qoop stop` plus a start. Not
+running; open qoop windows come back on their own), never `qoop stop` plus a start. Not
 restarted: a card with what it says a stop would end; "not moved yet": once more, never a loop.
 
 ## Decision table

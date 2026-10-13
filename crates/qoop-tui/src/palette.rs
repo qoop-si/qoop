@@ -45,6 +45,9 @@ pub struct Entry {
     pub space_len: usize,
     /// What `sub` is saying, when it is a state, so it can be painted as one.
     pub state: Option<String>,
+    /// What runs in a tab's terminal, matched as `text` is but not drawn: a tab named `logs`
+    /// is still found by `bash`, and an agent qass named by `claude`.
+    pub program: Option<String>,
 }
 
 /// Which kind of row the palette shows, cycled with tab: everything, or one kind.
@@ -228,6 +231,7 @@ impl Palette {
                     space: Some(space.id),
                     space_len: crate::width::width(&space.name),
                     state: None,
+                    program: tab.agent.clone(),
                 });
             }
         }
@@ -240,6 +244,7 @@ impl Palette {
                 space: Some(space.id),
                 space_len: crate::width::width(&space.name),
                 state: None,
+                program: None,
             });
         }
         // The things the interface can do, each with the key that does it without the
@@ -273,6 +278,7 @@ impl Palette {
                 space: None,
                 space_len: 0,
                 state: None,
+                program: None,
             });
         }
         // One row per known agent, but only while filtering or when agents are what is
@@ -292,6 +298,7 @@ impl Palette {
                         space: None,
                         space_len: 0,
                         state: None,
+                        program: None,
                     });
                 }
             }
@@ -311,6 +318,7 @@ impl Palette {
                         space: None,
                         space_len: 0,
                         state: None,
+                        program: None,
                     });
                 }
             }
@@ -322,6 +330,9 @@ impl Palette {
                 query.is_empty()
                     || e.text.to_lowercase().contains(&query)
                     || e.sub.to_lowercase().contains(&query)
+                    || e.program
+                        .as_ref()
+                        .is_some_and(|p| p.to_lowercase().contains(&query))
                     || e.section.contains(&query)
             })
             .collect()
@@ -357,18 +368,15 @@ fn terminal_entry(agent: &AgentRow, spaces: &[WorkspaceRow], section: &'static s
         space: Some(agent.workspace),
         space_len: crate::width::width(&space),
         state: Some(agent.state.clone()),
+        program: crate::tabs::program(agent).map(str::to_string),
     }
 }
 
-/// What a tab is called, the same way the tab bar calls it.
-fn label(agent: &AgentRow) -> String {
-    match (&agent.program, &agent.behind) {
-        (Some(program), _) => program
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(program)
-            .to_string(),
+/// What a tab is called, the same way the tab bar calls it: its name, else its program, else
+/// the wrapper standing in the way, else its number. The status line names a tab this way too.
+pub(crate) fn label(agent: &AgentRow) -> String {
+    match (crate::tabs::called(agent), &agent.behind) {
+        (Some(called), _) => called.to_string(),
         (None, Some(wrapper)) => format!("behind {wrapper}"),
         (None, None) => format!("term {}", agent.terminal),
     }
@@ -599,6 +607,56 @@ mod tests {
         // The blocked codex in app is gone, the failed claude in webshop stays.
         assert!(!entries.iter().any(|e| e.item == Item::Terminal(1)));
         assert!(entries.iter().any(|e| e.item == Item::Terminal(2)));
+    }
+
+    /// A tab is found by the name it wears on the bar, and its row says that name. It is
+    /// still found by what runs in it, asleep too: a shell named `logs` by `sh`, an agent
+    /// qass named by `claude`.
+    #[test]
+    fn a_named_tab_is_found_by_its_name_and_by_its_program() {
+        let (mut rows, mut spaces) = sample();
+        rows[3].name = Some("logs".to_string());
+        rows[2].name = Some("mobile-release".to_string());
+        spaces[1].sleeping = vec![qoop_runtime::control::SleepingTab {
+            lead: None,
+            terminal: 9,
+            session: Some("hub-tail".into()),
+            title: None,
+            agent: Some("codex".into()),
+            cwd: "/tmp".into(),
+        }];
+        let found = |query: &str| -> Vec<Entry> {
+            let mut palette = Palette::open();
+            for c in query.chars() {
+                palette.push(c);
+            }
+            palette
+                .items(
+                    &rows,
+                    &spaces,
+                    0,
+                    &crate::sidebar::Seen::new(),
+                    &crate::sidebar::Unseen::new(),
+                )
+                .into_iter()
+                .filter(|e| matches!(e.item, Item::Terminal(_)))
+                .collect()
+        };
+        let logs = found("logs");
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert_eq!(logs[0].item, Item::Terminal(4));
+        assert_eq!(logs[0].text, "app logs");
+        let has = |query: &str, terminal: u32| {
+            found(query)
+                .iter()
+                .any(|e| e.item == Item::Terminal(terminal))
+        };
+        assert!(has("sh", 4), "the shell named logs is not found by sh");
+        assert!(has("claude", 3), "the named agent is not found by claude");
+        assert!(
+            has("codex", 9),
+            "the sleeping named agent is not found by codex"
+        );
     }
 
     #[test]

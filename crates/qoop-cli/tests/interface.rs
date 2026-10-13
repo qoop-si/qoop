@@ -1913,6 +1913,86 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
     );
 }
 
+/// A refusal on the status line has been read once the next command runs, or the next
+/// click: it does not stay under the box that opened, where it reads as the box's own answer.
+#[test]
+fn a_refusal_on_the_status_line_goes_when_the_next_command_runs() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    let refused = |ui: &mut Interface| {
+        ui.painted.clear();
+        ui.command(b'W');
+        assert!(
+            ui.wait_for("close them first", Duration::from_secs(10))
+                .is_some(),
+            "no refusal to close a space with a terminal in it:\n{}",
+            ui.screen
+        );
+    };
+    // Waited for together: a box seen half painted still has the status line under it to
+    // come.
+    let alone = |ui: &mut Interface, opened: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = |screen: String| screen.contains(opened) && !screen.contains("close them first");
+        while Instant::now() < deadline && !done(ui.screen.to_string()) {
+            let _ = ui.wait_for("this needle never appears", Duration::from_millis(80));
+        }
+        let screen = ui.screen.to_string();
+        assert!(screen.contains(opened), "no {opened:?} box:\n{screen}");
+        assert!(
+            !screen.contains("close them first"),
+            "the refusal stayed under the box:\n{screen}"
+        );
+    };
+    refused(&mut ui);
+    ui.command(b'c');
+    alone(&mut ui, "name the new");
+    ui.type_in(b"\r");
+    assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
+    // And a click: the `+` on the tab bar opens what to make.
+    refused(&mut ui);
+    let bar = ui.tab_bar().expect("a tab bar");
+    let (plus, _) = bar
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '+')
+        .last()
+        .unwrap_or_else(|| panic!("no new tab button: {bar:?}"));
+    ui.click(
+        (plus + 1 + qoop_tui::screen::left(ui.cols)) as u16,
+        TAB_NAMES_ROW as u16,
+    );
+    alone(&mut ui, "new in default");
+}
+
+/// `ctrl-a N` reaches the tab the bar numbers N, a sleeping one too: it wakes, as a click on
+/// it does. Asleep the tab reads `shell` on the bar, awake the program in it.
+#[test]
+fn a_tab_number_wakes_the_sleeping_tab_it_reaches() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.create_terminal("");
+    assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
+    ui.command(b'Z');
+    assert!(
+        ui.wait_for_tabs(|bar| bar.contains("2 shell"), Duration::from_secs(15)),
+        "the second tab did not sleep: {:?}\n{}",
+        ui.tab_bar(),
+        ui.daemon_log()
+    );
+    ui.command(b'2');
+    assert!(
+        ui.wait_for_tabs(|bar| !bar.contains("2 shell"), Duration::from_secs(15)),
+        "ctrl-a 2 did not wake the sleeping tab: {:?}",
+        ui.tab_bar()
+    );
+    assert!(
+        ui.wait_for_tab(2, Duration::from_secs(10)),
+        "the woken tab did not take the keyboard: {:?}",
+        ui.tab_bar()
+    );
+}
+
 /// G12.15: a shell that exits on its own takes its tab with it, and the keyboard goes to
 /// what is left.
 ///

@@ -556,13 +556,58 @@ pub fn restarting() -> bool {
     RESTARTING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// The daemon's side of the stream closed. After a click that asked it to move, that is the
-/// move.
-fn daemon_closed(update: &UpdateAsk) {
+/// The terminal a window showed when its daemon closed the stream; 0 for none.
+static CLOSED_ON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The terminal this window showed when its daemon closed the stream, for the window that
+/// comes back in its place to show again: handed to it in [`FOCUS_ENV`] (see `qoop-cli`).
+/// Never a remote terminal, whose number is this window's and not the daemon's.
+pub fn closed_on() -> Option<u32> {
+    Some(CLOSED_ON.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|t| *t != 0 && !crate::mux::is_remote_terminal(*t))
+}
+
+/// Where a window that comes back after its daemon moved finds the terminal it showed. Its
+/// own, because the last-focus file is shared by every window on the daemon: read from the
+/// file, every window that came back after `qoop restart` showed the terminal the last of
+/// them focused, and the keys typed next went to another project.
+pub const FOCUS_ENV: &str = "QOOP_INTERFACE_FOCUS";
+
+/// The daemon's side of the stream closed while `focused` was on screen. After a click that
+/// asked it to move, that is the move. Otherwise it is [`DaemonClosed`], for the caller that
+/// knows the socket to tell apart. Either way the window may come back, and `focused` is
+/// where.
+fn daemon_closed(update: &UpdateAsk, focused: u32) -> io::Result<()> {
+    CLOSED_ON.store(focused, std::sync::atomic::Ordering::SeqCst);
     if update.clicked.is_some() {
         RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Ok(());
+    }
+    Err(io::Error::other(DaemonClosed))
+}
+
+/// What the interface ends with when its daemon closed the stream with no click asking it to
+/// move. A daemon that answers on its socket again moved all the same (`qoop restart` or
+/// `qoop update` from another terminal) or let this window go, and the window comes back
+/// (see `qoop-cli`). One that does not is gone, and this says so once the screen is left: an
+/// interface that vanished without a word reads as qoop crashing for no reason.
+#[derive(Debug)]
+pub struct DaemonClosed;
+
+impl DaemonClosed {
+    /// Whether the interface ended with this.
+    pub fn ended(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<DaemonClosed>())
     }
 }
+
+impl std::fmt::Display for DaemonClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the daemon stopped; run qoop to start it again")
+    }
+}
+
+impl std::error::Error for DaemonClosed {}
 
 /// What a click on `restart for update` asks: the live move only, with the windows left
 /// to this click. A daemon that cannot hand its tabs over live says why and moves nothing.
@@ -822,6 +867,12 @@ struct State {
     /// The default is the constant; a drag changes this, arrivals never do.
     /// The collapsed strip keeps its own four columns regardless.
     sidebar_width: usize,
+    /// How wide the person wants the open column: the default, or where a drag left it.
+    ///
+    /// Kept apart from [`State::sidebar_width`], which a narrow window holds to half its
+    /// width: made small and then large again, the window gets the wanted width back rather
+    /// than keeping the one the small window allowed.
+    sidebar_wanted: usize,
     /// A divider drag in progress: the panel width when the press landed.
     ///
     /// `None` while the mouse does anything else. The width at the press is
@@ -1261,6 +1312,15 @@ impl State {
             .collect()
     }
 
+    /// The terminal `ctrl-a N` reaches: the `n`th tab on the bar, counted from one, because
+    /// that is the number a person reads off it. The bar numbers the sleeping tabs after the
+    /// awake ones, so they count here too. A number past the end is no tab.
+    fn tab_at(&self, n: usize) -> Option<u32> {
+        screen::bar_tabs(&self.rows, &self.panes(), self.space, &self.spaces)
+            .get(n.checked_sub(1)?)
+            .map(|r| r.terminal)
+    }
+
     /// Every terminal that is a pane inside somebody's tab, with that tab: the first leaf
     /// of its tree. See `is_pane`.
     fn panes(&self) -> std::collections::BTreeMap<u32, u32> {
@@ -1464,7 +1524,14 @@ impl State {
             return false;
         }
         self.sidebar_width = new;
+        self.sidebar_wanted = new;
         true
+    }
+
+    /// The open column at the wanted width, held to at most half of a window this wide, so the
+    /// pane and the edge to drag never vanish.
+    fn fit_column(&mut self) {
+        self.sidebar_width = self.sidebar_wanted.min(sidebar::sidebar_max(self.cols));
     }
 
     /// End an armed drag, anywhere. Answers whether the width moved since
@@ -4909,7 +4976,7 @@ fn close_question(state: &State, terminal: u32) -> Option<String> {
         // a stray prefix and x followed by the answer meant for it must not end it.
         format!(
             "close {} ({})? Y closes it, any other key keeps it",
-            row.program.as_deref().unwrap_or("this agent"),
+            crate::tabs::called(row).unwrap_or("this agent"),
             row.state
         )
     })
@@ -5476,8 +5543,8 @@ fn confirm_key(state: &mut State, bytes: &[u8], request: &mut u64) -> ModeOutcom
             .rows
             .iter()
             .find(|r| r.terminal == terminal)
-            .and_then(|r| r.program.clone())
-            .unwrap_or_else(|| format!("terminal {terminal}"));
+            .and_then(crate::tabs::called)
+            .map_or_else(|| format!("terminal {terminal}"), str::to_string);
         state.message = Some(format!("kept {name}"));
     } else {
         *request += 1;
@@ -6713,7 +6780,14 @@ pub async fn run(socket: &Path) -> io::Result<()> {
 /// hook is still read from its screen.
 pub async fn run_with_notice(socket: &Path, notice: Option<String>) -> io::Result<()> {
     let (stream, leftover) = client::connect(socket, qoop_proto::INTERFACE_ID).await?;
-    run_stream(stream, leftover, notice, Some(last_focus_path(socket))).await
+    run_stream(
+        stream,
+        leftover,
+        notice,
+        Some(last_focus_path(socket)),
+        None,
+    )
+    .await
 }
 
 /// Where an interface on this socket keeps the terminal it showed last: beside the
@@ -6732,23 +6806,26 @@ pub fn last_focus_path(socket: &Path) -> std::path::PathBuf {
 #[derive(Default)]
 struct LastFocus {
     file: Option<std::path::PathBuf>,
-    /// Read from the file, waiting for the first index to name it.
+    /// Read from the file, or this window's own, waiting for the first index to name it.
     resume: Option<u32>,
     /// What the file holds now, so an unchanged focus writes nothing.
     written: u32,
 }
 
 impl LastFocus {
-    fn read(file: Option<std::path::PathBuf>) -> LastFocus {
-        let resume = file
+    /// What `file` holds, unless this window is one coming back after its daemon moved and
+    /// has the terminal it showed (`own`, see [`FOCUS_ENV`]): that one is where it lands, as
+    /// every other window coming back lands on its own.
+    fn read(file: Option<std::path::PathBuf>, own: Option<u32>) -> LastFocus {
+        let held = file
             .as_deref()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .and_then(|text| text.trim().parse::<u32>().ok())
             .filter(|t| *t != 0);
         LastFocus {
             file,
-            resume,
-            written: resume.unwrap_or(0),
+            resume: own.or(held),
+            written: held.unwrap_or(0),
         }
     }
 
@@ -6778,6 +6855,7 @@ pub async fn run_stream<S>(
     leftover: BytesMut,
     notice: Option<String>,
     last_focus: Option<std::path::PathBuf>,
+    own_focus: Option<u32>,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -6791,7 +6869,7 @@ where
         previous_hook(info);
     }));
 
-    let outcome = drive(stream, leftover, notice, last_focus).await;
+    let outcome = drive(stream, leftover, notice, last_focus, own_focus).await;
 
     drop(guard);
     outcome
@@ -6802,6 +6880,7 @@ async fn drive<S>(
     leftover: BytesMut,
     notice: Option<String>,
     last_focus: Option<std::path::PathBuf>,
+    own_focus: Option<u32>,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -6851,7 +6930,7 @@ where
         qass_ui: Default::default(),
         // Read once as soon as the loop runs.
         asks: crate::asks::Pane::new(),
-        last: LastFocus::read(last_focus),
+        last: LastFocus::read(last_focus, own_focus),
         show_when_listed: None,
         elsewhere: None,
         waking: None,
@@ -6898,6 +6977,7 @@ where
         // The default, held to half the window the way a resize holds it, so a window
         // under twice the default never opens with the column past the half-window rule.
         sidebar_width: sidebar::opening_width(cols),
+        sidebar_wanted: sidebar::WIDTH,
         sidebar_drag: None,
         row_press: None,
         drop_after_move: None,
@@ -7409,11 +7489,7 @@ where
                     // Every row moved under a held drag; it ends rather than land on
                     // whatever is under the pointer now.
                     drop_carry(&mut state);
-                    // A column pulled to half a wide window stays at most half of a
-                    // narrower one, so the pane and the edge to drag never vanish.
-                    state.sidebar_width = state
-                        .sidebar_width
-                        .min(sidebar::sidebar_max(cols));
+                    state.fit_column();
                     // The window moved: refresh what is shown before
                     // sizing, or the child reflows against the width the pane no longer
                     // has.
@@ -7822,6 +7898,12 @@ where
                         // the palette's outcome handling run from here.
                         if state.palette.is_some() {
                             continue;
+                        }
+                        // The next command or click is the person moving on: what the last
+                        // one said (a refusal, a notice) has been read, and stays only if
+                        // this one says it again.
+                        if action.moves_on() && state.message.take().is_some() {
+                            dirty = true;
                         }
                         match action {
                             Action::Input(bytes) => {
@@ -8910,12 +8992,16 @@ where
                                     dirty = true;
                                 }
                             }
+                            // A sleeping tab wakes, as a click on it does.
+                            Action::Tab(n)
+                                if let Some(picked) = state.tab_at(n)
+                                    && let Some(space) = state.sleeping_space_of(picked) =>
+                            {
+                                wake(&mut state, space, picked, &mut request);
+                                dirty = true;
+                            }
                             Action::Tab(n) => {
-                                // Counted from one, because that is the position on the bar
-                                // a person is reading off. A number past the end does
-                                // nothing: there is no tab there to go to.
-                                if let Some(picked) =
-                                    state.tabs().get(n - 1).map(|r| r.terminal)
+                                if let Some(picked) = state.tab_at(n)
                                     && let Some(bytes) = focus(
                                         &mut state, picked, &mut control_seq, &mut seqs,
                                     )?
@@ -9384,8 +9470,7 @@ where
                 n = rd.read(&mut read) => {
                     let n = n?;
                     if n == 0 {
-                        daemon_closed(&state.update);
-                        return Ok(());
+                        return daemon_closed(&state.update, state.focused);
                     }
                     inbuf.extend_from_slice(&read[..n]);
                     let mut refresh = false;
@@ -12554,8 +12639,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             resumed,
             ..
         } => {
+            let agents = if resumed == 1 { "agent" } else { "agents" };
             state.message = Some(format!(
-                "{terminals} tabs of {} back, {resumed} agents resumed",
+                "{terminals} {} of {} back, {resumed} {agents} resumed",
+                plural(terminals),
                 space_name(state, workspace)
             ));
             // The tab asked for goes on screen once the index lists it again.
@@ -12811,11 +12898,21 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 state.focused = 0;
                 state.forget_screen();
                 // The tree already picked the neighbour; fall back to the tab list
-                // only when the tree names nothing alive.
+                // only when the tree names nothing alive. A focus already on its way to a
+                // live terminal stays: the place a window comes back to, read off this same
+                // index, which a `--space` window lands on after the daemon's first render
+                // (of a terminal in another space) was adopted.
                 state.pending_focus = state
-                    .space
-                    .and_then(|space| state.layouts.get(&space))
-                    .and_then(|layout| layout.visible().into_iter().find(|t| live.contains(t)))
+                    .pending_focus
+                    .filter(|t| live.contains(t))
+                    .or_else(|| {
+                        state
+                            .space
+                            .and_then(|space| state.layouts.get(&space))
+                            .and_then(|layout| {
+                                layout.visible().into_iter().find(|t| live.contains(t))
+                            })
+                    })
                     .or_else(|| {
                         agents
                             .iter()
@@ -14195,6 +14292,26 @@ mod tests {
         assert_eq!(s.sidebar_width, 24);
     }
 
+    /// A window made small and then large again gives the column back its wanted width: the
+    /// small window's clamp is not a choice the person made, and a drag is.
+    #[test]
+    fn a_column_squeezed_by_a_small_window_comes_back_with_the_window() {
+        let mut s = state();
+        s.palette = None;
+        let resize = |s: &mut State, cols: u16| {
+            s.cols = cols;
+            s.fit_column();
+            s.sidebar_width
+        };
+        assert_eq!(resize(&mut s, 120), sidebar::WIDTH);
+        assert_eq!(resize(&mut s, 60), 30);
+        assert_eq!(resize(&mut s, 120), sidebar::WIDTH);
+        assert!(s.divider_press(sidebar::WIDTH as u16 + 1, 5));
+        assert!(s.divider_motion(51, false));
+        assert_eq!(resize(&mut s, 60), 30);
+        assert_eq!(resize(&mut s, 120), 50);
+    }
+
     /// Release ends the drag anywhere and answers whether the pull moved
     /// the panel: only then is a refetch owed. Without an arm there is
     /// nothing to finish.
@@ -15198,6 +15315,7 @@ mod tests {
             tick: 0,
             paint_now: 0,
             sidebar_width: sidebar::WIDTH,
+            sidebar_wanted: sidebar::WIDTH,
             sidebar_drag: None,
             row_press: None,
             drop_after_move: None,
@@ -16440,6 +16558,7 @@ mod tests {
             tick: 0,
             paint_now: 0,
             sidebar_width: sidebar::WIDTH,
+            sidebar_wanted: sidebar::WIDTH,
             sidebar_drag: None,
             row_press: None,
             drop_after_move: None,
@@ -16583,6 +16702,7 @@ mod tests {
             tick: 0,
             paint_now: 0,
             sidebar_width: sidebar::WIDTH,
+            sidebar_wanted: sidebar::WIDTH,
             sidebar_drag: None,
             row_press: None,
             drop_after_move: None,
@@ -18143,7 +18263,7 @@ mod tests {
         let mut state = bare_state();
         state.focused = 0;
         state.adopted = false;
-        state.last = LastFocus::read(Some(file.clone()));
+        state.last = LastFocus::read(Some(file.clone()), None);
         let mut dirty = false;
         let mut request = 0u64;
         apply(&mut state, index(rows()), &mut request, &mut dirty);
@@ -18155,7 +18275,7 @@ mod tests {
         let mut state = bare_state();
         state.focused = 0;
         state.adopted = false;
-        state.last = LastFocus::read(Some(file.clone()));
+        state.last = LastFocus::read(Some(file.clone()), None);
         apply(&mut state, index(rows()), &mut request, &mut dirty);
         assert_eq!(state.focused, 1, "gone: the first tab, as before");
         assert_eq!(state.pending_focus, None);
@@ -18164,6 +18284,72 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "4\n");
         state.last.keep(crate::mux::REMOTE_TERMINAL | 3);
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "4\n");
+    }
+
+    /// Two windows come back after a move with one focus file between them, holding what the
+    /// last of them focused. The window handed its own terminal lands on it, in its space; the
+    /// other reads the file. The file still says what it holds: the first move after that
+    /// writes it.
+    #[test]
+    fn a_window_coming_back_lands_on_its_own_terminal_and_not_the_shared_one() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = dir.path().join("interface-focus");
+        let index = || ControlResponse::Agents {
+            id: "index".to_string(),
+            splits: Vec::new(),
+            agents: vec![
+                agent(1, 1, "zsh", "idle"),
+                agent(5, 1, "zsh", "idle"),
+                agent(9, 2, "zsh", "idle"),
+            ],
+        };
+        std::fs::write(&file, "9\n").expect("write");
+        let (mut request, mut dirty) = (0u64, false);
+        let window = |own| {
+            let mut state = bare_state();
+            state.focused = 0;
+            state.adopted = false;
+            state.last = LastFocus::read(Some(file.clone()), own);
+            state
+        };
+        let mut own = window(Some(5));
+        apply(&mut own, index(), &mut request, &mut dirty);
+        assert_eq!(own.space, Some(1), "its own space");
+        assert_eq!(own.pending_focus, Some(5), "its own terminal");
+        let mut other = window(None);
+        apply(&mut other, index(), &mut request, &mut dirty);
+        assert_eq!(other.space, Some(2));
+        assert_eq!(other.pending_focus, Some(9), "the file's terminal");
+        own.last.keep(5);
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "5\n");
+    }
+
+    /// A `--space` window comes back to its own tab even though the daemon's first render,
+    /// adopted before any index, was of a terminal in another space: the index that drops
+    /// that terminal keeps the window's own place rather than the space's first tab.
+    #[test]
+    fn a_space_window_comes_back_to_its_own_tab_past_another_spaces_render() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.adopted = true;
+        state.last = LastFocus::read(None, Some(4));
+        let (mut request, mut dirty) = (0u64, false);
+        apply(
+            &mut state,
+            ControlResponse::Agents {
+                id: "index".to_string(),
+                splits: Vec::new(),
+                agents: vec![agent(3, 2, "zsh", "idle"), agent(4, 2, "zsh", "idle")],
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(state.space, Some(2));
+        assert_eq!(
+            state.pending_focus,
+            Some(4),
+            "the space's first tab, not its own"
+        );
     }
 
     /// `qoop focus` for a terminal not listed yet: waited for, shown once an index names
@@ -19144,6 +19330,19 @@ mod tests {
         assert_eq!(seqs[&1], 3, "the focused one sized back to its tile");
     }
 
+    /// The question names the tab as its bar does: the name chosen for it, then the program.
+    #[test]
+    fn the_close_question_names_a_named_tab() {
+        let mut state = tiled_state();
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.name = Some("release".to_string());
+        }
+        assert_eq!(
+            close_question(&state, 2).as_deref(),
+            Some("close release (working)? Y closes it, any other key keeps it")
+        );
+    }
+
     #[test]
     fn closing_a_busy_agent_asks_first_and_only_a_capital_y_closes() {
         let mut state = tiled_state();
@@ -19777,6 +19976,22 @@ mod tests {
         assert!(state.modes.outbox.is_empty(), "{:?}", state.modes.outbox);
     }
 
+    /// `ctrl-a N` reaches the tab the bar numbers N, and the bar numbers the sleeping tabs
+    /// after the awake ones.
+    #[test]
+    fn a_tab_number_counts_the_sleeping_tabs_the_bar_numbers() {
+        let mut state = state();
+        state.spaces[1] = WorkspaceRow {
+            asleep: false,
+            ..asleep(2, "webshop", &[7, 8])
+        };
+        assert_eq!(state.tab_at(1), Some(2));
+        assert_eq!(state.tab_at(2), Some(7));
+        assert_eq!(state.tab_at(3), Some(8));
+        assert_eq!(state.tab_at(4), None);
+        assert_eq!(state.tab_at(0), None);
+    }
+
     /// The screen of a sleeping tab is asked for once when the keyboard rests on it, drawn
     /// dim in its pane when it arrives, and let go of when no sleeping tab is on screen.
     #[test]
@@ -19929,6 +20144,10 @@ mod tests {
         );
         assert_eq!(state.waking, None);
         assert_eq!(state.show_when_listed.map(|(t, _, _)| t), Some(8));
+        assert_eq!(
+            state.message.as_deref(),
+            Some("1 tab of app back, 1 agent resumed")
+        );
 
         apply(
             &mut state,
@@ -23379,13 +23598,31 @@ mod tests {
             }
         );
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
-        daemon_closed(&UpdateAsk::default());
+        let gone = daemon_closed(&UpdateAsk::default(), 7).expect_err("a close said nothing");
+        assert!(DaemonClosed::ended(&gone), "{gone}");
+        assert_eq!(
+            gone.to_string(),
+            "the daemon stopped; run qoop to start it again"
+        );
+        assert!(!DaemonClosed::ended(&io::Error::other("another failure")));
         assert!(!restarting(), "a close with no click restarted");
-        daemon_closed(&UpdateAsk {
-            clicked: Some(std::time::Instant::now()),
-            ..UpdateAsk::default()
-        });
+        assert!(
+            daemon_closed(
+                &UpdateAsk {
+                    clicked: Some(std::time::Instant::now()),
+                    ..UpdateAsk::default()
+                },
+                7
+            )
+            .is_ok(),
+            "the move was said as the daemon stopping"
+        );
         assert!(restarting(), "the close after a click was not the move");
+        assert_eq!(
+            closed_on(),
+            Some(7),
+            "the window coming back is not told where it was"
+        );
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let (mut request, mut dirty) = (0u64, false);
@@ -23486,7 +23723,7 @@ mod tests {
         assert!(s.update.clicked.is_none());
         assert_eq!(s.hint.as_deref(), Some(NOT_MOVED));
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
-        daemon_closed(&s.update);
+        assert!(daemon_closed(&s.update, 7).is_err_and(|e| DaemonClosed::ended(&e)));
         assert!(!restarting(), "a close after a given up click restarted");
         // An answer that no longer offers it (the move happened elsewhere) says nothing.
         let mut t = state();
