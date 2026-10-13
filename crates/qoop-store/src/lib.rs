@@ -334,7 +334,8 @@ impl Store {
              );
              -- The work an agent said it is doing (`task.rs`). `terminal` is not a foreign
              -- key: terminal ids are reused, so every path that ends a terminal closes its
-             -- open task instead, and a closed task keeps its history with `terminal` NULL.
+             -- open task instead (one claimed done stays open, untied, for its check), and a
+             -- closed task keeps its history with `terminal` NULL.
              -- New tables, no version bump: an older binary ignores them.
              CREATE TABLE IF NOT EXISTS task (
                  id INTEGER PRIMARY KEY,
@@ -616,6 +617,7 @@ impl Store {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         task::abandon_open_tasks(&tx, &terminals, now)?;
+        task::abandon_space_tasks(&tx, id, now)?;
         // Its board items too: an item lives in a space, and one left open with no space
         // would stay on every board with nowhere to run.
         item::abandon_open_items(&tx, id, now)?;

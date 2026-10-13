@@ -1,8 +1,8 @@
 #!/bin/sh
 # qass's Stop hook. First, a question for the owner is a card. When this turn's last message
 # asks him something (a line ending in "?", or answer words such as `dub A` that name no open
-# card) and the turn wrote no card (`escalate.sh new ... -`, or `escalate.sh show`), the stop is
-# blocked once with one sentence; `stop_hook_active` lets the next stop through, so it never
+# card, nor one ended in the last ten minutes) and the turn wrote no card (`escalate.sh new
+# ... -`, or `escalate.sh show`), the stop is blocked once with one sentence; `stop_hook_active` lets the next stop through, so it never
 # loops. Second, when that lets the stop through: the skill installed beside this script is not
 # the one qass was last told to read (`@QASS_DATA@/skill.log`, its last line), so the stop is
 # blocked once to have it read again, and a line is added. A resumed conversation keeps the skill
@@ -88,11 +88,18 @@ tick = chr(96)
 asked = [l for l in last.splitlines() if l.strip().strip("*_#> -" + tick).strip().endswith("?")]
 handles = set(re.findall(tick + r"([a-z0-9][a-z0-9-]*) [A-Da-d]" + tick, last))
 if handles or asked:
+    # The cards he can see, and those ended in the last ten minutes (an answer just passed on
+    # names its card). No listing: answer words cannot be told from a pointer, so only a line
+    # that asks still needs a card.
     try:
-        got = subprocess.run(["qoop", "ask", "ls", "--json"], capture_output=True, text=True, timeout=3)
-        cards = json.loads(got.stdout).get("live", [])
+        got = subprocess.run(["qoop", "ask", "ls", "--json"], capture_output=True, text=True, timeout=5)
+        listing = json.loads(got.stdout)
+        recent = time.time() - 600
+        cards = listing.get("live", []) + [
+            c for c in listing.get("ended", []) if (c.get("closed_at") or 0) >= recent]
     except Exception:
-        cards = []
+        print("cardcheck: qoop ask ls --json failed; answer words go unchecked", file=sys.stderr)
+        cards, handles = [], set()
     names = {c.get("body", {}).get("handle") for c in cards} | {c.get("card") for c in cards}
     names.discard(None)
     handles -= names

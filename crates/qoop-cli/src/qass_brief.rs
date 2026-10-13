@@ -20,6 +20,13 @@ const PER_HOUR: usize = 10;
 /// Review rounds when the workflow names no limit.
 const ROUNDS: u32 = 8;
 const WORDS: usize = 200;
+/// The words that start qass under each agent program: the program's, never his.
+const LAUNCH: [&str; 3] = ["/qass", "$qass", "Use the qass skill."];
+
+/// Whether a message is the line that started qass, with or without words after it.
+fn launch(text: &str) -> bool {
+    LAUNCH.iter().any(|l| text.starts_with(l))
+}
 
 /// One `prompted.log` record: `<unix> <from terminal> T<n>` (`<remote>/T<n>` from on.sh).
 #[derive(Clone, Debug, PartialEq)]
@@ -75,8 +82,8 @@ struct Facts {
     /// The open task on its row: its facts, or its id when they could not be read.
     task: Option<Result<Task, i64>>,
     limit: u32,
-    /// The agent's open card: its number, handle and status.
-    card: Option<(String, String, String)>,
+    /// The agent's open card: its number, handle, status and when it was opened.
+    card: Option<(String, String, String, Option<i64>)>,
     /// `owner/name` when the agent works in the owner's own repository
     /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
     own: Option<String>,
@@ -85,11 +92,13 @@ struct Facts {
     offset: i64,
 }
 
-/// The newest message the owner typed, in seconds: not a notification, and not one that
-/// follows a write `by_other` says came just before it. `Err` when a message has no time.
+/// The newest message the owner typed, in seconds: not a notification, not the line that
+/// started qass, and not one that follows a write `by_other` says came just before it. `Err`
+/// when a message has no time.
 fn owner_typed(messages: &[Message], by_other: impl Fn(i64) -> bool) -> Result<Option<i64>, ()> {
     for m in messages.iter().rev() {
-        if m.text.trim_start().starts_with('<') {
+        let text = m.text.trim();
+        if text.starts_with('<') || launch(text) {
             continue;
         }
         let at = m.ts.ok_or(())? / 1000;
@@ -192,13 +201,14 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     )];
     let mut not_now = Vec::new();
 
-    // Owner here: his newest message in that tab, one that follows qass's write being qass's.
-    let from_qass = |r: &Record| Some(r.from) == f.qass && r.to == tab;
+    // Owner here: his newest message in that tab. One that follows a write to that tab is the
+    // writer's, qass's or another agent's that drives this one.
+    let to_tab = |r: &Record| r.to == tab;
     let here = f
         .typed_here
         .as_deref()
         .ok_or(())
-        .and_then(|m| owner_typed(m, |at| written_before(&f.log, at, from_qass)));
+        .and_then(|m| owner_typed(m, |at| written_before(&f.log, at, to_tab)));
     let (engaged, typed_at) = match here {
         Err(()) => {
             lines.push("owner here: unknown: treat as engaged".into());
@@ -248,10 +258,17 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         .flatten();
     let since = spoke.unwrap_or(f.now - 3600);
     let to_agent = mine.iter().filter(|r| r.to == tab && r.at >= since).count();
-    let hour = mine.iter().filter(|r| r.at >= f.now - 3600).count();
+    // His word gives room: the hour's count starts again when he speaks.
+    let hour_from = since.max(f.now - 3600);
+    let hour = mine.iter().filter(|r| r.at >= hour_from).count();
     let since_words = match spoke {
         Some(_) => "since he spoke to you",
         None => "in the last hour (when he last spoke to you is unknown)",
+    };
+    let hour_words = if hour_from > f.now - 3600 {
+        "since he spoke to you"
+    } else {
+        "in the last hour"
     };
     let qass_known = if f.qass.is_some() {
         ""
@@ -259,13 +276,13 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         " (qass's terminal unknown)"
     };
     lines.push(format!(
-        "writes: {to_agent} of {PER_AGENT} to {tab} {since_words}; {hour} of {PER_HOUR} in the last hour{qass_known}"
+        "writes: {to_agent} of {PER_AGENT} to {tab} {since_words}; {hour} of {PER_HOUR} {hour_words}{qass_known}"
     ));
     if to_agent >= PER_AGENT {
         not_now.push(format!("write ({to_agent} of {PER_AGENT} {since_words})"));
     }
     if hour >= PER_HOUR {
-        not_now.push(format!("write ({hour} of {PER_HOUR} in the last hour)"));
+        not_now.push(format!("write ({hour} of {PER_HOUR} {hour_words})"));
     }
     if f.qass.is_none() {
         not_now.push("write (qass's terminal unknown)".to_string());
@@ -297,7 +314,16 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     }
 
     lines.push(match &f.card {
-        Some((card, handle, status)) => format!("card: {card} {handle} {status}"),
+        // He answered in the tab after the card: it may be settled there.
+        Some((card, handle, status, opened)) => {
+            match typed_at.filter(|at| opened.is_some_and(|o| *at > o)) {
+                Some(at) => format!(
+                    "card: {card} {handle} {status}; he typed here after it ({})",
+                    clock(at, f.offset)
+                ),
+                None => format!("card: {card} {handle} {status}"),
+            }
+        }
         None => "card: none open".into(),
     });
 
@@ -539,7 +565,12 @@ fn gather(n: u32) -> std::io::Result<Facts> {
             let mine = c["terminal"].as_u64() == Some(u64::from(n)) || c["agent"] == tab.as_str();
             mine.then(|| {
                 let s = |k: &serde_json::Value| k.as_str().unwrap_or("").to_string();
-                (s(&c["card"]), s(&c["body"]["handle"]), s(&c["status"]))
+                (
+                    s(&c["card"]),
+                    s(&c["body"]["handle"]),
+                    s(&c["status"]),
+                    c["opened_at"].as_i64(),
+                )
             })
         })
     });
@@ -655,29 +686,24 @@ mod tests {
         assert!(brief(&f).contains("typed 5 min ago"), "{}", brief(&f));
         f.log = parse_log(&format!("{} 128 T52\n", NOW - 32));
         assert!(!out.contains("SECRETWORD"), "no transcript text: {out}");
-        // Another terminal's record, or one 6 s before, does not make it qass's.
-        for log in [
-            format!("{} 205 T52", NOW - 32),
-            format!("{} 128 T52", NOW - 36),
-        ] {
-            f.log = parse_log(&log);
-            let out = brief(&f);
-            let until = clock(NOW - 30 + ENGAGED, 0);
-            assert!(
-                out.contains(&format!(
-                    "typed 30 s ago, engaged: hands off until {until} ({})",
-                    NOW - 30 + ENGAGED
-                )),
-                "{out}"
-            );
-            assert!(
-                out.contains(&format!(
-                    "Not now: write (owner typed here 30 s ago, until {until})"
-                )),
-                "{out}"
-            );
-            assert!(out.contains("Allowed now: nothing"), "{out}");
-        }
+        // A record 6 s before does not make it qass's.
+        f.log = parse_log(&format!("{} 128 T52", NOW - 36));
+        let out = brief(&f);
+        let until = clock(NOW - 30 + ENGAGED, 0);
+        assert!(
+            out.contains(&format!(
+                "typed 30 s ago, engaged: hands off until {until} ({})",
+                NOW - 30 + ENGAGED
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "Not now: write (owner typed here 30 s ago, until {until})"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("Allowed now: nothing"), "{out}");
     }
 
     /// Notifications after his message, more than any window of five, do not hide it.
@@ -771,7 +797,9 @@ mod tests {
         f.log = parse_log(&log);
         let out = brief(&f);
         assert!(
-            out.contains("writes: 3 of 3 to T52 since he spoke to you; 4 of 10 in the last hour"),
+            out.contains(
+                "writes: 3 of 3 to T52 since he spoke to you; 4 of 10 since he spoke to you"
+            ),
             "{out}"
         );
         assert!(
@@ -886,7 +914,7 @@ mod tests {
         assert_eq!(cut[cut.len() - 2], "+11 more");
         let mut f = facts();
         f.name = "a very long sidebar name ".repeat(20);
-        f.card = Some(("E82".into(), "stash".into(), "open".into()));
+        f.card = Some(("E82".into(), "stash".into(), "open".into(), Some(NOW - 60)));
         f.state = "blocked".into();
         f.rule = Some("permission_prompt".into());
         let out = brief(&f);
@@ -964,5 +992,71 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// A message right after another agent wrote to that tab is that agent's (a lead driving
+    /// its child), never his.
+    #[test]
+    fn a_message_right_after_another_agents_write_is_not_his() {
+        let mut f = facts();
+        f.typed_here = transcript(&[said(NOW - 30, "Run the tests")]);
+        f.log = parse_log(&format!("{} 205 T52\n", NOW - 32));
+        let out = brief(&f);
+        assert!(
+            out.contains("owner here: nothing he typed in this tab"),
+            "{out}"
+        );
+    }
+
+    /// His word gives room: writes from before he spoke do not count toward the hour.
+    #[test]
+    fn the_hour_counts_again_from_his_last_word() {
+        let mut f = facts();
+        f.typed_to_qass = transcript(&[said(NOW - 300, "open an agent for the scroll bug")]);
+        let log: String = (0..10)
+            .map(|i| format!("{} 128 T{}\n", NOW - 3000 + i * 180, 60 + i))
+            .collect();
+        f.log = parse_log(&log);
+        let out = brief(&f);
+        assert!(out.contains("0 of 10 since he spoke to you"), "{out}");
+        assert!(out.ends_with("Allowed now: write (ending none)"), "{out}");
+        // With him silent for longer than the hour, the hour stands.
+        f.typed_to_qass = transcript(&[said(NOW - 4000, "go")]);
+        let out = brief(&f);
+        assert!(out.contains("10 of 10 in the last hour"), "{out}");
+        assert!(out.contains("Allowed now: nothing"), "{out}");
+    }
+
+    /// The line that started qass is the program's, not his word.
+    #[test]
+    fn the_launch_line_is_not_his_word() {
+        let mut f = facts();
+        for launch in LAUNCH {
+            f.typed_to_qass = transcript(&[said(NOW - 100, launch)]);
+            f.log = parse_log(&format!("{} 128 T52\n", NOW - 60));
+            let out = brief(&f);
+            assert!(
+                out.contains("(when he last spoke to you is unknown)"),
+                "{launch}: {out}"
+            );
+        }
+    }
+
+    /// His message in the tab after the card was written is said beside the card.
+    #[test]
+    fn the_card_says_he_typed_in_the_tab_after_it() {
+        let mut f = facts();
+        f.typed_here = transcript(&[said(NOW - 300, "only iOS, send it")]);
+        f.card = Some(("E128".into(), "ios".into(), "open".into(), Some(NOW - 600)));
+        let out = brief(&f);
+        assert!(
+            out.contains(&format!(
+                "card: E128 ios open; he typed here after it ({})",
+                clock(NOW - 300, 0)
+            )),
+            "{out}"
+        );
+        f.card = Some(("E128".into(), "ios".into(), "open".into(), Some(NOW - 200)));
+        assert!(brief(&f).contains("card: E128 ios open\n"), "{}", brief(&f));
     }
 }

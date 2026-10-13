@@ -579,7 +579,8 @@ pub(crate) fn hearing(state: Option<&str>) -> Result<(), String> {
 /// would say that terminal waits on the answer, and neither the board nor `qoop qass` does.
 pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
     let out = Command::new(std::env::current_exe()?)
-        .args(["send", &terminal.to_string(), "--enter", "--", text])
+        // A prompt, so a long line (the board's text) reaches qass as one paste.
+        .args(["prompt", &terminal.to_string(), "--", text])
         .env_remove("QOOP_TERMINAL")
         .env_remove("QOOP_TOKEN")
         .env_remove("QORO_TERMINAL")

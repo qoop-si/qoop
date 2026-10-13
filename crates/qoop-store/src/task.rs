@@ -5,8 +5,9 @@
 //! loses nothing and every reader (qass, the phone, the notch) sees the same record.
 //!
 //! A task belongs to a terminal, one open at a time. Terminal ids are reused, so a task
-//! never outlives its terminal open: every path that ends a terminal abandons its task in
-//! the same transaction (`abandon_open_tasks`). Done from the agent is a claim, recorded and
+//! never outlives its terminal tied to it: every path that ends a terminal abandons its task
+//! in the same transaction (`abandon_open_tasks`), or unties it when its agent claimed it
+//! done, so the claim can still be checked. Done from the agent is a claim, recorded and
 //! cleared by the next stage write; only a close ends a task, and the outcome says how.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -218,7 +219,7 @@ pub(crate) fn close(
         .optional()?
         .flatten();
     if let Some(terminal) = terminal {
-        crate::ask::close_drafts(tx, terminal, "its task ended", true, now)?;
+        crate::ask::close_cards(tx, terminal, "its task ended", true, now)?;
     }
     tx.execute(
         "UPDATE task SET closed_at = ?2, updated_at = ?2, outcome = ?3, terminal = NULL \
@@ -233,8 +234,10 @@ pub(crate) fn close(
     event(tx, task, "closed", &body, now)
 }
 
-/// Close every open task of these terminals as abandoned. Called inside the transaction that
-/// ends the terminals, so a reused terminal id never finds an old task open.
+/// Close every open task of these terminals as abandoned, except one its agent claimed done:
+/// that work is finished and waits for its check, so it stays open and claimed, untied from
+/// the terminal, for qass or the owner to close verified or failed. Called inside the
+/// transaction that ends the terminals, so a reused terminal id never finds an old task open.
 pub(crate) fn abandon_open_tasks(
     tx: &Transaction<'_>,
     terminals: &[i64],
@@ -242,16 +245,47 @@ pub(crate) fn abandon_open_tasks(
 ) -> rusqlite::Result<()> {
     crate::ask::close_for_terminals(tx, terminals, now)?;
     for &terminal in terminals {
-        let open: Option<i64> = tx
+        let open: Option<(i64, Option<i64>)> = tx
             .query_row(
-                "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL",
+                "SELECT id, claimed_at FROM task WHERE terminal = ?1 AND closed_at IS NULL",
                 params![terminal],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(task) = open {
-            close(tx, task, Outcome::Abandoned, "its terminal closed", now)?;
+        match open {
+            Some((task, Some(_))) => {
+                tx.execute(
+                    "UPDATE task SET terminal = NULL, updated_at = ?2 WHERE id = ?1",
+                    params![task, now],
+                )?;
+                event(
+                    tx,
+                    task,
+                    "terminal",
+                    "its terminal closed; the claim waits for its check",
+                    now,
+                )?;
+            }
+            Some((task, None)) => close(tx, task, Outcome::Abandoned, "its terminal closed", now)?,
+            None => {}
         }
+    }
+    Ok(())
+}
+
+/// Close a space's open tasks as abandoned when the space goes: a claimed one left untied by
+/// its closed tab would otherwise stay open on no board.
+pub(crate) fn abandon_space_tasks(
+    tx: &Transaction<'_>,
+    space: i64,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let open: Vec<i64> = tx
+        .prepare("SELECT id FROM task WHERE workspace = ?1 AND closed_at IS NULL")?
+        .query_map(params![space], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for task in open {
+        close(tx, task, Outcome::Abandoned, "its space was removed", now)?;
     }
     Ok(())
 }
@@ -436,10 +470,12 @@ impl Store {
             params![task, stage, now],
         )?;
         event(&tx, task, "stage", stage, now)?;
+        // A stage written again is no move: a card waits on.
         if stage != "waiting-human"
+            && stage != t.stage
             && let Some(terminal) = t.terminal
         {
-            crate::ask::close_drafts(&tx, terminal, "no longer waits", false, now)?;
+            crate::ask::close_cards(&tx, terminal, "no longer waits", false, now)?;
         }
         tx.commit()?;
         Ok(t.stage != stage || t.claimed_at.is_some())
@@ -517,7 +553,7 @@ impl Store {
             return Ok(None);
         }
         event(&tx, task, "stage", &back, now)?;
-        crate::ask::close_drafts(&tx, terminal, "answered in its tab", false, now)?;
+        crate::ask::close_cards(&tx, terminal, "answered in its tab", false, now)?;
         tx.commit()?;
         Ok(Some(back))
     }
@@ -598,7 +634,7 @@ impl Store {
         )?;
         event(&tx, task, "done", &summary, now)?;
         if let Some(terminal) = t.terminal {
-            crate::ask::close_drafts(&tx, terminal, "its task is done", false, now)?;
+            crate::ask::close_cards(&tx, terminal, "its task is done", false, now)?;
         }
         tx.commit()?;
         Ok(())
@@ -821,6 +857,37 @@ mod tests {
             task_err(s.set_task_stage(id, "done", 14).unwrap_err()),
             TaskError::UnknownStage(_)
         ));
+    }
+
+    /// Work its agent claimed done is finished: its tab closing leaves the task open and
+    /// claimed, untied from the terminal, so it can still be checked and closed verified.
+    #[test]
+    fn a_claimed_task_outlives_its_terminal_for_its_check() {
+        let (mut s, _, t) = store_with_terminal();
+        let a = s.open_task(t, "ship 2.5.1", false, 10).unwrap();
+        s.claim_task_done(a, "submitted to App Review", 11).unwrap();
+        s.close_terminal(t, 12).unwrap();
+        let row = s.task(a).unwrap().unwrap();
+        assert_eq!(row.closed_at, None, "still open for its check");
+        assert!(row.claimed_at.is_some());
+        assert_eq!(row.terminal, None);
+        s.close_task(a, Outcome::Verified, "in review, checked", 13)
+            .unwrap();
+        assert_eq!(
+            s.task(a).unwrap().unwrap().outcome.as_deref(),
+            Some("verified")
+        );
+        // A space deleted takes a claimed task with it: no board would show it again.
+        let ws = s.create_workspace("gone", 20).unwrap();
+        let u = s.create_terminal(6, ws, "/tmp", "/bin/sh", 21).unwrap();
+        let b = s.open_task(u, "ship 2.5.2", false, 22).unwrap();
+        s.claim_task_done(b, "done", 23).unwrap();
+        s.close_terminal(u, 24).unwrap();
+        s.delete_workspace(ws).unwrap();
+        assert_eq!(
+            s.task(b).unwrap().unwrap().outcome.as_deref(),
+            Some("abandoned")
+        );
     }
 
     #[test]

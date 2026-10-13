@@ -694,3 +694,29 @@ got="$(QASS_WATCH_FOR=2 timed 25)"
     { echo "its own end printed: $got"; exit 1; }
 
 echo "qass watch: ok"
+
+# cardcheck.sh, the Stop hook: a pointer to a card is no question, also when the listing fails
+# or the card just ended; a question with no card is still stopped.
+card_home="$tmp/card-home"
+skill_c="$(render "$card_home")"
+mkdir -p "$card_home/.qass"
+echo "0 $(shasum -a 256 "$skill_c/SKILL.md" | cut -c1-12)" > "$card_home/.qass/skill.log"
+stop() { # last message, listing (or "fail") -> the hook's output
+    printf '%s\n' '{"message":{"role":"user","content":"wake"}}' \
+        "$(jq -cn --arg t "$1" '{message:{role:"assistant",content:[{type:"text",text:$t}]}}')" \
+        > "$tmp/turn.jsonl"
+    printf '%s' "$2" > "$tmp/listing"
+    printf '#!/bin/sh\n[ "$(cat "%s")" = fail ] && exit 1\ncat "%s"\n' "$tmp/listing" "$tmp/listing" \
+        > "$tmp/bin/qoop"
+    chmod +x "$tmp/bin/qoop"
+    jq -cn --arg p "$tmp/turn.jsonl" '{transcript_path:$p}' |
+        PATH="$tmp/bin:$PATH" "$skill_c/cardcheck.sh"
+}
+got="$(stop 'Waiting on you: `dubpr A`' fail)"
+[ -z "$got" ] || { echo "a failed listing stopped a pointer: $got"; exit 1; }
+ended="{\"live\":[],\"ended\":[{\"card\":\"E131\",\"closed_at\":$(date +%s),\"body\":{\"handle\":\"fallback\"}}]}"
+got="$(stop '`fallback B` is passed on.' "$ended")"
+[ -z "$got" ] || { echo "a card just ended read as a question: $got"; exit 1; }
+got="$(stop 'Shall I run it now?' '{"live":[],"ended":[]}')"
+echo "$got" | grep -q '"decision": "block"' || { echo "a question with no card went through: $got"; exit 1; }
+echo "qass cardcheck: ok"

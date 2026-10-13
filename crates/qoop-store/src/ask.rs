@@ -102,14 +102,14 @@ fn find(conn: &Connection, card: &str) -> rusqlite::Result<Option<AskRow>> {
     .optional()
 }
 
-/// The note on a card whose tab ended while it was live.
+/// The note on an answer of his still queued for a tab that ended.
 pub const TAB_CLOSED: &str = "its tab closed: qass gets the answer";
 
-/// End these terminals' cards. An open draft closes: its agent no longer waits; so does a
-/// passed card: his words already reached qass. An open card of qass's and a queued answer stay
-/// live with terminal and agent cleared, so a reused terminal id or agent label never matches
-/// them and his answer goes to qass. Called inside the transaction that ends the terminals, and
-/// at start for those that ended unseen.
+/// End these terminals' cards. An open card closes, a draft or qass's: the agent it asks about
+/// is gone, and a question left in his inbox for it is stale; so does a passed card: his words
+/// already reached qass. A queued answer stays live with terminal and agent cleared, so a
+/// reused terminal id or agent label never matches it and his answer goes to qass. Called
+/// inside the transaction that ends the terminals, and at start for those that ended unseen.
 pub(crate) fn close_for_terminals(
     tx: &Connection,
     terminals: &[i64],
@@ -118,7 +118,7 @@ pub(crate) fn close_for_terminals(
     for terminal in terminals {
         tx.execute(
             "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?2 \
-             WHERE terminal = ?1 AND ((card LIKE 'W%' AND status = 'open') OR status = 'passed')",
+             WHERE terminal = ?1 AND status IN ('open', 'passed')",
             params![terminal, now],
         )?;
         tx.execute(
@@ -299,6 +299,17 @@ impl Store {
         )? > 0)
     }
 
+    /// A prompt reached the agent in `terminal` (his answer typed in its tab, or new work):
+    /// it moved past the question, so its open cards end, written before now. An answer he
+    /// gave that waits to be typed or passed on stays. Answers how many ended.
+    pub fn prompt_taken(&self, terminal: i64, now: i64) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE ask SET status = 'closed', note = 'it took a prompt in its tab', \
+             closed_at = ?2 WHERE terminal = ?1 AND status = 'open' AND opened_at < ?2",
+            params![terminal, now],
+        )?)
+    }
+
     /// One card by its number.
     pub fn ask(&self, card: &str) -> Result<Option<AskRow>, StoreError> {
         Ok(find(&self.conn, card)?)
@@ -441,10 +452,12 @@ impl Store {
     }
 }
 
-/// End a terminal's live drafts: its agent no longer waits on the owner (its stage moved, it
-/// took an answer, it claimed or ended its task). qass's own cards are left to qass. With
-/// `keep_queued` an answer he already gave stays queued for delivery.
-pub(crate) fn close_drafts(
+/// End a terminal's live cards: its agent no longer waits on the owner (its stage moved, it
+/// took a prompt, it claimed or ended its task), so a question about it left open is stale.
+/// Drafts end whatever their state; qass's own cards only while open and written before now,
+/// so one written in the same second as the move stands. With `keep_queued` an answer he
+/// already gave stays queued for delivery.
+pub(crate) fn close_cards(
     tx: &Connection,
     terminal: i64,
     note: &str,
@@ -453,8 +466,9 @@ pub(crate) fn close_drafts(
 ) -> rusqlite::Result<usize> {
     tx.execute(
         "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
-         WHERE terminal = ?1 AND card LIKE 'W%' AND status IN ('open', 'queued', 'passed') \
-         AND NOT (?4 AND status = 'queued')",
+         WHERE terminal = ?1 AND ((card LIKE 'W%' AND status IN ('open', 'queued', 'passed') \
+         AND NOT (?4 AND status = 'queued')) \
+         OR (card NOT LIKE 'W%' AND status = 'open' AND opened_at < ?3))",
         params![terminal, note, now, keep_queued],
     )
 }
@@ -472,7 +486,7 @@ mod tests {
 
     /// A draft is made for an agent waiting on him: never over a live card, once a waiting
     /// spell, a new number for a new spell; it closes when the agent stops waiting (its stage
-    /// moved, it took an answer, it claimed or ended its task), and qass's own card stays.
+    /// moved, it took an answer, it claimed or ended its task), and qass's own card with it.
     #[test]
     fn a_draft_is_filed_once_a_wait_and_closes_when_the_wait_ends() {
         let (s, t) = store_with_terminal();
@@ -533,12 +547,16 @@ mod tests {
             }
             assert_eq!(s.ask(&card).unwrap().unwrap().status, "closed", "{end}");
         }
-        // qass's card is never closed as a draft.
+        // qass's card about it ends the same way: its question is stale once it moved on.
         s.add_ask("E9", Some("T5"), Some(t), None, "{e}", 60)
             .unwrap();
         let task = s.open_task(t, "more", true, 61).unwrap();
         s.set_task_stage(task, "implementing", 62).unwrap();
-        assert_eq!(s.ask("E9").unwrap().unwrap().status, "open");
+        let e9 = s.ask("E9").unwrap().unwrap();
+        assert_eq!(
+            (e9.status.as_str(), e9.note.as_deref()),
+            ("closed", Some("no longer waits"))
+        );
     }
 
     /// A dialog draft needs no task, never stands over a live card, is filed once a spell (from
@@ -827,8 +845,13 @@ mod tests {
             "closed",
             "a passed card: his words already reached qass"
         );
+        // qass's open card about a closed tab is stale: it closes, as a draft does.
+        let e1 = s.ask("E1").unwrap().unwrap();
+        assert_eq!(
+            (e1.status.as_str(), e1.note.as_deref()),
+            ("closed", Some("agent closed"))
+        );
         let tab = Some(TAB_CLOSED.to_string());
-        assert_eq!(untied(&s, "E1"), ("open".into(), None, None, tab.clone()));
         assert_eq!(untied(&s, &w6), ("queued".into(), None, None, tab));
         assert_eq!(
             untied(&s, "E2"),
@@ -842,20 +865,53 @@ mod tests {
             (w6.status.as_str(), w6.terminal, w6.note.as_deref()),
             ("open", None, Some("not delivered: qoop restarted"))
         );
-        assert_eq!(s.ask("E1").unwrap().unwrap().status, "open");
-        // A rewrite that still names the old tab never ties the card to whoever has it now.
-        let t7 = s.create_terminal(7, ws, "/tmp", "/bin/sh", 61).unwrap();
-        s.add_ask("E1", Some("T7"), Some(t7), None, "{fixed}", 62)
-            .unwrap();
-        let e1 = s.ask("E1").unwrap().unwrap();
-        assert_eq!(
-            (e1.terminal, e1.agent, e1.body.as_str()),
-            (None, None, "{fixed}")
-        );
         // Old ended cards go; a live one is never pruned.
         s.tidy_asks(50 + KEEP_SECS + 1).unwrap();
         assert!(s.ask(&w5).unwrap().is_none());
-        assert!(s.ask("E1").unwrap().is_some());
+        assert!(s.ask("E2").unwrap().is_some());
+    }
+
+    /// The agent a card asks about moves on (it takes a prompt, its task changes stage, it
+    /// claims done): every question about it still open ends, qass's too; one written in the
+    /// same second as the move, a remote one and his queued answer stand.
+    #[test]
+    fn a_card_ends_when_its_agent_moves_on() {
+        let (s, t) = store_with_terminal();
+        s.add_ask("E1", Some("T5"), Some(t), None, "{}", 10)
+            .unwrap();
+        assert_eq!(s.prompt_taken(t, 20).unwrap(), 1);
+        let e1 = s.ask("E1").unwrap().unwrap();
+        assert_eq!(
+            (e1.status.as_str(), e1.note.as_deref()),
+            ("closed", Some("it took a prompt in its tab"))
+        );
+        s.add_ask("E2", Some("T5"), Some(t), None, "{}", 30)
+            .unwrap();
+        assert_eq!(s.prompt_taken(t, 30).unwrap(), 0, "written this second");
+        let task = s.open_task(t, "ship it", false, 31).unwrap();
+        let stage = s.task(task).unwrap().unwrap().stage;
+        s.set_task_stage(task, &stage, 36).unwrap();
+        assert_eq!(
+            s.ask("E2").unwrap().unwrap().status,
+            "open",
+            "a stage written again"
+        );
+        s.set_task_stage(task, "reviewing", 40).unwrap();
+        assert_eq!(s.ask("E2").unwrap().unwrap().status, "closed");
+        s.add_ask("E3", Some("T5"), Some(t), None, "{}", 50)
+            .unwrap();
+        s.set_task_stage(task, "waiting-human", 60).unwrap();
+        assert_eq!(
+            s.ask("E3").unwrap().unwrap().status,
+            "open",
+            "the wait is the question"
+        );
+        s.claim_task_done(task, "done", 70).unwrap();
+        assert_eq!(s.ask("E3").unwrap().unwrap().status, "closed");
+        // His answer waiting to be typed survives a prompt; only open cards end.
+        let w = draft_on(&s, t, "T5", true, 80);
+        assert_eq!(s.prompt_taken(t, 90).unwrap(), 0);
+        assert_eq!(s.ask(&w).unwrap().unwrap().status, "queued");
     }
 
     /// A terminal that ended while no daemon watched is ended the same way at start.

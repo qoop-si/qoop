@@ -171,3 +171,36 @@ fn read_refuses_an_unknown_terminal() {
         "the refusal names the terminal: {stderr:?}"
     );
 }
+
+/// A long prompt reaches a program that asked for bracketed paste as one paste: the markers
+/// around the whole text, though the daemon writes it to the terminal in 1024-byte pieces.
+/// Typed instead, an agent read it as two pastes and kept only the second.
+#[test]
+fn a_long_prompt_arrives_as_one_paste() {
+    let daemon = Daemon::start();
+    let (ok, _, stderr) = daemon.run(&[
+        "send",
+        "1",
+        "stty -icanon -echo; printf '\\033[?2004h'; echo READY_PASTE; cat -v",
+        "--enter",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(daemon.wait_for_screen("1", "READY_PASTE"));
+    std::thread::sleep(Duration::from_millis(300));
+    // Past one 1024-byte piece, and short enough that its head stays on the screen.
+    let text = format!("HEADMARK {} TAILMARK", "word ".repeat(220));
+    let (ok, _, stderr) = daemon.run(&["prompt", "1", &text]);
+    assert!(ok, "{stderr}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut screen = String::new();
+    while Instant::now() < deadline {
+        screen = daemon.read("1").unwrap_or_default().replace('\n', "");
+        if screen.contains("TAILMARK^[[201~") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(screen.contains("^[[200~HEADMARK"), "{screen}");
+    assert!(screen.contains("TAILMARK^[[201~"), "{screen}");
+    assert_eq!(screen.matches("^[[200~").count(), 1, "{screen}");
+}

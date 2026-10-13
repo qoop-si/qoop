@@ -265,6 +265,28 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 ))
             })?;
             let agent = (agent != "-").then(|| agent.to_string());
+            // A new card ends that agent's other open one: read them first, so the add can say
+            // which question went (it was silent, and a question was lost). A failed read
+            // only loses the notice.
+            // Stored as the daemon keys it: `52` is `T52`, `ubox/2` is `ubox/T2`.
+            let key = agent
+                .as_deref()
+                .and_then(qoop_runtime::asks::agent_key)
+                .map(|(k, _)| k);
+            let replaced: Vec<String> = match &key {
+                Some(a) => read_all(false)
+                    .map(|(live, _)| live)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| {
+                        c.agent.as_deref() == Some(a.as_str())
+                            && c.status == "open"
+                            && &c.card != card
+                    })
+                    .map(|c| format!("replaced {} {}: {}", c.card, c.body.handle, c.body.asks))
+                    .collect(),
+                None => Vec::new(),
+            };
             let options: Vec<String> = body
                 .options
                 .iter()
@@ -292,6 +314,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             };
             println!("{card} {result:?}");
             options.iter().for_each(|o| println!("{o}"));
+            if result == qoop_runtime::control::AskResult::Added {
+                replaced.iter().for_each(|r| println!("{r}"));
+            }
             Ok(())
         }
         Some("close") => {

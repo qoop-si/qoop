@@ -479,31 +479,53 @@ fn a_card_ends_when_the_owner_puts_it_away_or_its_worker_is_told_in_the_chat() {
 }
 
 #[test]
-fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_leaves_its_card_to_qass() {
+fn a_newer_card_for_an_agent_replaces_the_old_and_a_closed_terminal_ends_it() {
     let stack = Stack::start();
     let korea = stack.agent("work", "korea", Some("sess-korea"));
     let shell = stack.open("qass", "qassshell", &[]);
     let _qass = stack.agent("qass", "qass", None);
     add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
-    add(&stack, &shell, "E2", &format!("T{korea}"), "korea");
+    // escalate.sh passes the bare number.
+    let said = add(&stack, &shell, "E2", &korea, "korea");
+    assert!(
+        said.contains("replaced E1 korea: Run 0042 on staging now?"),
+        "the add says which question it ended: {said}"
+    );
     assert_eq!(stack.card_status("E1"), "closed", "superseded");
     assert_eq!(stack.card_status("E2"), "open");
     // A number is never used twice.
     let said = add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
     assert!(said.contains("never used twice"), "{said}");
-    // Its terminal ends: the card stays, untied from the tab and the agent, and his answer
-    // goes to qass.
+    // Its terminal ends: a question about an agent that is gone is stale, so the card ends.
     let (ok, _, err) = stack.run(&["close", &korea]);
     assert!(ok, "{err}");
-    assert!(stack.wait(|| {
+    assert!(stack.wait(|| stack.card_status("E2") == "closed"));
+}
+
+/// An agent that takes a prompt in its tab (his answer there, or new work) has moved past the
+/// question: qass's open card about it ends by itself.
+#[test]
+fn a_card_ends_when_its_agent_takes_a_prompt_in_its_tab() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
+    assert_eq!(stack.card_status("E1"), "open");
+    // A card is ended only by a prompt after the second it was written in.
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(&korea, "SAID only iOS, send it");
+    assert!(
+        stack.wait(|| stack.card_status("E1") == "closed"),
+        "{}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    assert!(
         stack
             .run(&["ask", "ls", "--json"])
             .1
-            .contains("its tab closed")
-    }));
-    assert_eq!(stack.card_status("E2"), "open");
-    let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
-    assert!(ok && out.contains("Passed"), "{out} {err}");
+            .contains("it took a prompt in its tab")
+    );
 }
 
 /// `escalate.sh` as the skill installs it, its data folder filled in.
@@ -956,4 +978,83 @@ fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
         stack.drafts(&link)[1]["body"]["asks"],
         "link waits on you: ship the login fix"
     );
+}
+
+/// A listing larger than one frame (64 KB) still arrives: 60 cards with long fields are over
+/// 90 KB of JSON, and the daemon used to drop the connection instead of answering.
+#[test]
+fn a_json_listing_larger_than_one_frame_arrives_whole() {
+    let stack = Stack::start();
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    let long = "x".repeat(190);
+    let card = format!(
+        "asked: {long}\ndoing: {long}\nwhy: {long}\nasks: {long}?\n\
+         A: run now | {long} | {long}\nB: wait | {long} | {long}\npick: B | {long}\n"
+    );
+    std::fs::write(stack.path("long.txt"), card).unwrap();
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "for n in $(seq 1 60); do qoop ask add E$n --agent - --handle h$n --urgency later < '{}' || echo FAILED; done",
+            stack.path("long.txt").display()
+        ),
+    );
+    assert!(!said.contains("FAILED"), "{said}");
+    let (ok, out, err) = stack.run(&["ask", "ls", "--json"]);
+    assert!(ok, "{err}");
+    assert!(out.len() > 65_536, "only {} bytes", out.len());
+    let all: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(all["live"].as_array().map(Vec::len), Some(60));
+}
+
+/// Another qoop terminal never types into qass's tab (the one in qass's folder): typed there,
+/// a worker's note read as the owner's words, and one landed in his half-written message.
+/// From no terminal (his own shell, `qoop task start`) it is typed as before.
+#[test]
+fn another_terminal_never_types_into_qasss_tab() {
+    let stack = Stack::start();
+    let worker = stack.open("work", "worker", &[]);
+    // qass's folder as the terminals see it: under the daemon's own home.
+    stack.inside(
+        &worker,
+        "d=\"$HOME/Library/Application Support/qoop/qass\"; [ \"$(uname)\" = Darwin ] || d=\"$HOME/.local/share/qoop/qass\"; [ -z \"$XDG_DATA_HOME\" ] || d=\"$XDG_DATA_HOME/qoop/qass\"; mkdir -p \"$d\" && cd \"$d\" && qoop new --space qass --name qtab",
+    );
+    let (_, list, _) = stack.run(&["agents"]);
+    let qtab = list
+        .lines()
+        .find(|l| l.contains("qtab"))
+        .and_then(|l| l.strip_prefix("term="))
+        .and_then(|l| l.split(' ').next())
+        .unwrap_or_else(|| panic!("no qtab: {list}"))
+        .to_string();
+    let said = stack.inside(
+        &worker,
+        &format!("{{ qoop prompt {qtab} WORKER_NOTE_1; echo rc=$?; }}"),
+    );
+    assert!(
+        said.contains("nothing was typed into qass") && said.contains("rc=1"),
+        "{said}"
+    );
+    let said = stack.inside(
+        &worker,
+        &format!("{{ qoop send {qtab} --key enter; echo rc=$?; }}"),
+    );
+    assert!(
+        said.contains("nothing was typed into qass") && said.contains("rc=1"),
+        "{said}"
+    );
+    let said = stack.inside(
+        &worker,
+        &format!("{{ env -u QOOP_TOKEN qoop prompt {qtab} WORKER_NOTE_2; echo rc=$?; }}"),
+    );
+    assert!(
+        said.contains("nothing was typed into qass") && said.contains("rc=1"),
+        "one variable dropped: {said}"
+    );
+    let (ok, _, err) = stack.run(&["prompt", &qtab, "echo OWNER_LINE_3"]);
+    assert!(ok, "{err}");
+    assert!(stack.wait(|| stack.run(&["read", &qtab]).1.contains("OWNER_LINE_3")));
+    let screen = stack.run(&["read", &qtab]).1;
+    assert!(!screen.contains("WORKER_NOTE"), "{screen}");
 }

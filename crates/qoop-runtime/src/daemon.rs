@@ -2502,14 +2502,7 @@ async fn serve_client(
                                     }
                                     Err(reason) => ControlResponse::Failed { id, reason },
                                 };
-                                let Ok(body) = serde_json::to_vec(&response) else {
-                                    return;
-                                };
-                                let mut out = BytesMut::new();
-                                if Frame::new(Channel::Control, 0, Bytes::from(body))
-                                    .encode(&mut out)
-                                    .is_ok()
-                                {
+                                if let Ok(out) = control_bytes(&response) {
                                     let _ = tx.send(out).await;
                                 }
                             });
@@ -2554,14 +2547,7 @@ async fn serve_client(
                                         None,
                                     )
                                     .await;
-                                    let Ok(body) = serde_json::to_vec(&response) else {
-                                        return;
-                                    };
-                                    let mut out = BytesMut::new();
-                                    if Frame::new(Channel::Control, 0, Bytes::from(body))
-                                        .encode(&mut out)
-                                        .is_ok()
-                                    {
+                                    if let Ok(out) = control_bytes(&response) {
                                         let _ = tx.send(out).await;
                                     }
                                 });
@@ -2597,11 +2583,7 @@ async fn serve_client(
                             reason: unparsable(&e.to_string()),
                         },
                     };
-                    let body = serde_json::to_vec(&response).map_err(to_io)?;
-                    let mut out = BytesMut::new();
-                    Frame::new(Channel::Control, 0, Bytes::from(body))
-                        .encode(&mut out)
-                        .map_err(to_io)?;
+                    let out = control_bytes(&response)?;
                     if control_tx.send(out).await.is_err() {
                         break;
                     }
@@ -4814,18 +4796,22 @@ async fn handle_control(
                             // A prompt reached an agent waiting on the owner: its answer. The
                             // stage goes back, so no board still says it waits on him. A notice
                             // the harness typed (its own background work done) is no answer.
+                            // It also moved past its question, his answer in its tab or new
+                            // work: a card still open about it is stale.
                             let now = crate::agents::now_unix();
-                            let back = if label.as_deref().is_some_and(crate::asks::not_his) {
-                                Ok(None)
-                            } else {
-                                store
+                            if !label.as_deref().is_some_and(crate::asks::not_his) {
+                                let back = store
                                     .run(move |s| s.answer_waiting(i64::from(terminal), now))
-                                    .await
-                            };
-                            if matches!(back, Ok(Some(_))) {
-                                agents.tasks_changed();
-                                // Its draft card closed with the wait.
-                                connections.asks_changed();
+                                    .await;
+                                if matches!(back, Ok(Some(_))) {
+                                    agents.tasks_changed();
+                                }
+                                let ended = store
+                                    .run(move |s| s.prompt_taken(i64::from(terminal), now))
+                                    .await;
+                                if matches!(back, Ok(Some(_))) || matches!(ended, Ok(n) if n > 0) {
+                                    connections.asks_changed();
+                                }
                             }
                         }
                         // A turn's end carries its last line; it is the turn's question only when
@@ -5458,6 +5444,18 @@ fn replayed_response(
             terminal,
         }
     }
+}
+
+/// A control reply as bytes on the wire: chunked like a request when it is larger than one
+/// frame (every ended card with its whole body passes 64 KB), and all its frames in one buffer
+/// so another reply on the same connection never lands between them.
+fn control_bytes(response: &ControlResponse) -> io::Result<BytesMut> {
+    let body = serde_json::to_vec(response).map_err(to_io)?;
+    let mut out = BytesMut::new();
+    for frame in qoop_proto::chunk(Channel::Control, 0, 0, None, Bytes::from(body)) {
+        frame.encode(&mut out).map_err(to_io)?;
+    }
+    Ok(out)
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {

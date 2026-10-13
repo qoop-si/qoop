@@ -161,7 +161,7 @@ fn why(error: HandleError) -> String {
 
 /// `T52` as terminal 52, `ubox/T2` and the like as a remote's (no terminal here), and the
 /// spelling without the `T` too. `None` for what is neither.
-fn agent_key(agent: &str) -> Option<(String, Option<u32>)> {
+pub fn agent_key(agent: &str) -> Option<(String, Option<u32>)> {
     let number = |s: &str| {
         let digits = s.strip_prefix('T').unwrap_or(s);
         (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))

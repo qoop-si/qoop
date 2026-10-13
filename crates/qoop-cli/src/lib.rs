@@ -1471,6 +1471,33 @@ async fn control_roundtrip(
     Ok((answer, stashed))
 }
 
+/// Text or keys from another qoop terminal into qass's tab are refused: typed there they read
+/// as the owner's own words, and one was typed into his half-written message and sent with it.
+/// qass reads agents through their events, task and screen. Either variable set counts as a
+/// terminal, so dropping one does not pass for the owner.
+// ponytail: an agent that unsets both still types as him; the full fix is the daemon taking
+// typed input into qass's terminal only from the interface, the phone and its own inbox.
+fn into_qass_refusal(target: u32, cwd: impl FnOnce() -> Option<String>) -> Option<String> {
+    let var = |k: &str| qoop_runtime::legacy::var(k).ok().filter(|v| !v.is_empty());
+    let from = var("QOOP_TERMINAL");
+    if from.is_none() && var("QOOP_TOKEN").is_none() {
+        return None;
+    }
+    let is_qass = || {
+        paths::qass_data_dir()
+            .zip(cwd())
+            .is_some_and(|(f, cwd)| crate::qass::in_folder(&cwd, &f))
+    };
+    if from.as_deref() == Some(target.to_string().as_str()) || !is_qass() {
+        return None;
+    }
+    Some(
+        "qass reads you through your task and your screen: say it there (`qoop task evidence`, \
+         `qoop task stage waiting-human`) or in your reply; nothing was typed into qass"
+            .to_string(),
+    )
+}
+
 /// `qoop send`: type into another terminal's session.
 ///
 /// This travels on the terminal channel's addressed input, the same lane every
@@ -1514,6 +1541,16 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         )));
     }
     supervise::check_generation(terminal, generation)?;
+    if let Some(reason) = into_qass_refusal(terminal, || {
+        crate::qass::json(&["agents", "--json"])?
+            .as_array()?
+            .iter()
+            .find(|r| r["terminal"].as_u64() == Some(u64::from(terminal)))?["cwd"]
+            .as_str()
+            .map(String::from)
+    }) {
+        return Err(std::io::Error::other(reason));
+    }
     if !keys.is_empty() {
         supervise::send_keys(terminal, &keys)?;
         crate::qass::note_prompted(terminal);
@@ -1966,6 +2003,9 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         if let Some(reason) = prompt_refusal(row) {
             return Err(std::io::Error::other(reason));
         }
+        if let Some(reason) = into_qass_refusal(row.terminal, || row.cwd.clone()) {
+            return Err(std::io::Error::other(reason));
+        }
         if let Some(reason) =
             generation.and_then(|g| supervise::generation_refusal(&rows, row.terminal, g))
         {
@@ -1973,15 +2013,15 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         }
         let terminal = row.terminal;
         let mut term_seq = 0u32;
-        // Both frames carry the sender: either one records the wait edge,
-        // and the daemon dedupes by waiter.
+        // The Enter carries the sender, which records the wait edge.
         let (from_terminal, from_token) = cli_sender();
+        // A paste, not typing: the daemon writes input in 1024-byte pieces, and an agent read
+        // a long typed prompt as two pastes and kept only the second. Inside the markers it
+        // asked for, the whole text is one paste however it is cut.
         wr.write_all(&client::encode_command_to(
             terminal,
-            &ClientWire::Input {
+            &ClientWire::Paste {
                 bytes: text.into_bytes(),
-                from_terminal,
-                from_token: from_token.clone(),
             },
             &mut term_seq,
         )?)
