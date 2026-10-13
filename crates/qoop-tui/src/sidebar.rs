@@ -2486,28 +2486,51 @@ fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) ->
 /// quietly, waiting as what it wants in the blocked colour, failed in the failed colour.
 /// An idle agent with work running in the background says how much of it. A waiting agent whose newest word is `thinking` has said nothing about what it wants
 /// (a label-less prompt), so it says nothing rather than `wants: thinking`.
+/// An agent running sub-agents leads with how many, in its turn or after it, so the count
+/// survives any cut; what it wants or what failed is said alone, in its own colour.
 fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
     use crate::theme::Role;
-    // Its turn is over and it reads idle, but its footer says something still runs: said
-    // quietly, so a person does not take a busy agent for a free one.
-    if agent.state == "idle" && agent.background > 0 {
-        let n = agent.background;
-        let s = if n == 1 { "" } else { "s" };
-        return Some((format!("{n} background task{s}"), Role::Faint));
-    }
     let raw = agent
         .activity
         .as_deref()
         .map(str::trim)
-        .filter(|a| !a.is_empty())?;
-    match agent.state.as_str() {
-        "blocked" if raw != "thinking" => {
-            Some((format!("wants: {}", humanize(raw)), Role::Blocked))
+        .filter(|a| !a.is_empty());
+    match (agent.state.as_str(), raw) {
+        ("blocked", Some(raw)) if raw != "thinking" => {
+            return Some((format!("wants: {}", humanize(raw)), Role::Blocked));
         }
-        "failed" => Some((humanize(raw), Role::Failed)),
-        "working" | "starting" => Some((humanize(raw), Role::Faint)),
-        _ => None,
+        ("failed", Some(raw)) => return Some((humanize(raw), Role::Failed)),
+        _ => {}
     }
+    let doing = match raw {
+        Some(raw) if matches!(agent.state.as_str(), "working" | "starting") => Some(humanize(raw)),
+        // Its turn is over and it reads idle, but its footer says something still runs: said
+        // quietly, so a person does not take a busy agent for a free one.
+        _ if agent.state == "idle" => {
+            let n = agent.background.saturating_sub(agent.subagents) as usize;
+            (n > 0).then(|| format!("{n} background task{}", if n == 1 { "" } else { "s" }))
+        }
+        _ => None,
+    };
+    let n = agent.subagents as usize;
+    if n == 0 {
+        return doing.map(|doing| (doing, Role::Faint));
+    }
+    let count = format!("{n} sub {}", plural(n));
+    // Starting one more is what the count already says: only what it was asked stays.
+    let doing = doing
+        .map(|doing| match doing.strip_prefix("subagent") {
+            Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim().to_string(),
+            _ => doing,
+        })
+        .filter(|doing| !doing.is_empty());
+    Some((
+        match doing {
+            Some(doing) => format!("{count} \u{b7} {doing}"),
+            None => count,
+        },
+        Role::Faint,
+    ))
 }
 
 /// A shell command without the set-up in front of it: `cd /x/y && cargo test` and
@@ -4259,6 +4282,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -4288,6 +4312,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -5030,6 +5055,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -5290,6 +5316,7 @@ mod tests {
         let agents = vec![AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal: 5,
@@ -5329,6 +5356,7 @@ mod tests {
         let agents = vec![AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal: 5,
@@ -7538,6 +7566,68 @@ mod tests {
         assert!(item_row(&column, &item(3)).text.contains("bg:3"));
         assert!(!item_row(&column, &item(0)).text.contains("bg:"));
     }
+    /// An agent running sub-agents leads its second row with how many, in its turn and after
+    /// it, so a cut never takes the count; starting one more is the count's own news. What it
+    /// wants or what failed is said alone, in its own colour.
+    #[test]
+    fn an_agent_running_sub_agents_says_how_many() {
+        use crate::theme::Role;
+        let with = |state: &str, activity: Option<&str>, subagents: u32, background: u32| {
+            let mut a = agent(1, 1, "claude", state);
+            a.activity = activity.map(String::from);
+            a.subagents = subagents;
+            a.background = background;
+            said(&a)
+        };
+        let faint = |text: &str| Some((text.to_string(), Role::Faint));
+        assert_eq!(
+            with("working", Some("Edit src/a.rs"), 8, 8),
+            faint("8 sub agents \u{b7} editing a.rs")
+        );
+        assert_eq!(
+            with("working", Some("Agent Explore the code"), 1, 1),
+            faint("1 sub agent \u{b7} Explore the code")
+        );
+        assert_eq!(with("working", Some("Task"), 3, 3), faint("3 sub agents"));
+        assert_eq!(with("working", None, 2, 2), faint("2 sub agents"));
+        // After its turn: the shells beside them are what the background holds besides.
+        assert_eq!(
+            with("idle", None, 2, 3),
+            faint("2 sub agents \u{b7} 1 background task")
+        );
+        assert_eq!(with("idle", None, 2, 2), faint("2 sub agents"));
+        // A row with fewer in the background than sub-agents (another daemon's) is no shells.
+        assert_eq!(with("idle", None, 2, 1), faint("2 sub agents"));
+        assert_eq!(
+            with("blocked", Some("Bash rm -rf build"), 4, 4),
+            Some(("wants: rm -rf build".to_string(), Role::Blocked))
+        );
+        // Without sub-agents nothing changes.
+        assert_eq!(with("idle", None, 0, 2), faint("2 background tasks"));
+        assert_eq!(
+            with("working", Some("Agent Explore"), 0, 0),
+            faint("subagent Explore")
+        );
+
+        // Drawn: the count leads the row, and a narrow column cuts what follows it.
+        let spaces = vec![space(1, "app")];
+        let mut busy = agent(1, 1, "claude", "working");
+        busy.activity = Some("Edit crates/qoop-tui/src/sidebar.rs".into());
+        busy.subagents = 12;
+        busy.background = 12;
+        let rows = tree_rows(&spaces, &[busy], 9, 30, &Seen::new(), &Shut::new());
+        let second = rows
+            .iter()
+            .filter(|(_, h)| *h == Some(Hit::Terminal(1)))
+            .nth(1)
+            .map(|(l, _)| unbox(&l.text))
+            .expect("a second row");
+        assert!(
+            second.starts_with("   \u{2514} 12 sub agents \u{b7} editing"),
+            "{second:?}"
+        );
+    }
+
     /// Idle with background work is its own state, derived from the count: the mark and the
     /// ink are the background's in the tree and in the strip, and one finished unread is not news
     /// while its job runs: not in the done list or the queue, no sage. The word stays idle.

@@ -4538,6 +4538,7 @@ async fn handle_control(
                     )
                     .to_string();
                     let keep_awake = books.awake.lock().unwrap().panes.contains(&terminal);
+                    let (background, subagents) = agents.background_of(terminal);
                     crate::control::AgentRow {
                         news: news.contains(&terminal),
                         keep_awake,
@@ -4574,8 +4575,8 @@ async fn handle_control(
                         slept_at_unix: None,
                         activity,
                         pgid,
-                        background: u32::try_from(agents.background_of(terminal))
-                            .unwrap_or(u32::MAX),
+                        background: u32::try_from(background).unwrap_or(u32::MAX),
+                        subagents: u32::try_from(subagents).unwrap_or(u32::MAX),
                         task: task_refs.remove(&terminal),
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
@@ -4969,6 +4970,33 @@ async fn handle_control(
             terminals
                 .save_session(terminal, session, program.as_deref(), store)
                 .await;
+            ControlResponse::AgentStateReported { id, terminal }
+        }
+        ControlRequest::ReportSubagents {
+            terminal,
+            token,
+            change,
+            ..
+        } => {
+            // Admitted like a session report, then counted; the belief is untouched, so
+            // only the row's count moves.
+            let terminal_id = TerminalId::new(terminal.to_string());
+            let token = qoop_domain::CapabilityToken::new(token);
+            let admitted = agents
+                .agent(terminal)
+                .map(|a| a.belief.generation)
+                .is_some_and(|generation| {
+                    agents
+                        .admit(terminal, &terminal_id, Some(&token), generation)
+                        .is_ok()
+                });
+            if !admitted {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the report for terminal {terminal} was refused"),
+                };
+            }
+            agents.note_subagents(terminal, change);
             ControlResponse::AgentStateReported { id, terminal }
         }
         ControlRequest::TaskWrite {
@@ -10610,9 +10638,16 @@ async fn terminal_task(
                         let screen = engine.visible_text();
                         // Counted from the live screen here, where it is read whether or
                         // not anyone watches: the published copy goes stale unwatched.
+                        // Each program lists its sub-agents its own way: Claude in a panel
+                        // under its footer, opencode as a count in it.
+                        let subagents = if program == "opencode" {
+                            crate::idle::running_opencode_subagents(&screen)
+                        } else {
+                            crate::idle::running_background_agents(&screen)
+                        };
                         agents.note_background(
                             stream,
-                            crate::idle::running_background_agents(&screen),
+                            subagents,
                             crate::idle::running_background_tasks(&screen),
                         );
                         let osc = qoop_detect::OscContext {

@@ -672,6 +672,7 @@ pub fn bar_tabs(
         tabs.push(AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal: tab.terminal,
@@ -3815,6 +3816,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -6249,6 +6251,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -6883,6 +6886,7 @@ mod tests {
             .map(|(i, state)| AgentRow {
                 keep_awake: false,
                 background: 0,
+                subagents: 0,
                 task: None,
                 news: false,
                 terminal: i as u32 + 1,

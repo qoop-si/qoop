@@ -360,3 +360,119 @@ fn a_starting_report_after_the_composer_is_drawn_settles_to_idle() {
         line(&daemon)
     );
 }
+
+#[test]
+fn a_sub_agent_report_reaches_the_daemon_and_mixing_it_with_a_state_is_a_usage_error() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--subagent-start",
+            "a1",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok, "a forgery must not report");
+    assert!(err.contains("refused"), "the refusal names itself: {err:?}");
+    let (ok, err) = daemon.report(
+        &[
+            "--state",
+            "working",
+            "--subagents",
+            "a1",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok);
+    assert!(err.contains("stand alone"), "{err:?}");
+}
+
+/// What an agent's hooks say of its sub-agents reaches its row as a count, and its state is
+/// left alone.
+#[test]
+fn sub_agents_a_hook_names_are_counted_on_the_agents_row() {
+    let daemon = Daemon::start();
+    let dir = daemon.dir.path();
+    let reported = dir.join("reported");
+    let rule = "\u{2500}".repeat(40);
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nprintf '{rule}\\n{prompt} Try \"fix it\"\\n{rule}\\n  ? for shortcuts\\n'\n\
+             sleep 1\nfor f in '--subagent-start a1' '--subagent-start a2' '--subagent-start a3' \
+             '--subagent-end a1'; do '{qoop}' hook-report $f; done\ntouch '{reported}'\nsleep 60\n",
+            prompt = "\u{276f}",
+            qoop = env!("CARGO_BIN_EXE_qoop"),
+            reported = reported.display(),
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let number = daemon
+        .qoop(&["new", "--", agent.to_str().unwrap()])
+        .trim()
+        .to_string();
+    let line = |daemon: &Daemon| {
+        daemon
+            .qoop(&["agents"])
+            .lines()
+            .find(|l| l.starts_with(&format!("term={number} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !reported.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(reported.exists(), "the stand in never reported");
+    while Instant::now() < deadline && !line(&daemon).contains("subagents=2") {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let row = line(&daemon);
+    assert!(row.contains(" background=2 subagents=2"), "{row}");
+    assert!(
+        row.contains("state=idle"),
+        "the state is the screen's: {row}"
+    );
+}
+
+/// opencode has no hook here: the count in its footer is read off its screen into its row.
+#[test]
+fn opencodes_footer_count_reaches_its_row() {
+    let daemon = Daemon::start();
+    let dir = daemon.dir.path();
+    let agent = dir.join("opencode");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\nprintf '  Build \\302\\267 a model\\n   esc interrupt     \\342\\206\\223 3 subagents  ctrl+p commands'\nsleep 60\n",
+    )
+    .expect("write");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let number = daemon
+        .qoop(&["new", "--", agent.to_str().unwrap()])
+        .trim()
+        .to_string();
+    let line = |daemon: &Daemon| {
+        daemon
+            .qoop(&["agents"])
+            .lines()
+            .find(|l| l.starts_with(&format!("term={number} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !line(&daemon).contains("subagents=3") {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let row = line(&daemon);
+    assert!(row.contains("program=opencode"), "{row}");
+    assert!(row.contains(" background=3 subagents=3"), "{row}");
+}

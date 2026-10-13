@@ -92,6 +92,13 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             token: "forged".into(),
             session: "abc-123".into(),
         },
+        // A sub-agent's id: counted beside the agent, never bytes for the child.
+        ControlRequest::ReportSubagents {
+            id: "x12c".into(),
+            terminal,
+            token: "forged".into(),
+            change: qoop_runtime::control::SubagentChange::Started("echo PWNED".into()),
+        },
         ControlRequest::RenameTerminal {
             id: "x13".into(),
             terminal,
@@ -283,6 +290,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
+            | ControlRequest::ReportSubagents { .. }
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }

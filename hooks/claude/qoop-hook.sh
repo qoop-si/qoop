@@ -18,6 +18,8 @@
 #         "command": "/path/to/qoop-hook.sh" }] }],
 #       "PermissionRequest": [{ "matcher": "", "hooks": [{ "type": "command",
 #         "command": "/path/to/qoop-hook.sh" }] }],
+#       "SubagentStart": [{ "matcher": "", "hooks": [{ "type": "command",
+#         "command": "/path/to/qoop-hook.sh" }] }],
 #       "SubagentStop": [{ "matcher": "", "hooks": [{ "type": "command",
 #         "command": "/path/to/qoop-hook.sh" }] }],
 #       "Stop": [{ "matcher": "", "hooks": [{ "type": "command",
@@ -42,8 +44,10 @@
 #
 # Event map:
 #   SessionStart -> starting (working when `source` is `compact`), no event
-#   anything a subagent fired (the payload carries `agent_id`, SubagentStop
-#     always does) -> nothing: it describes the subagent, not this terminal
+#   SubagentStart, SubagentStop -> `--subagent-start` / `--subagent-end` with
+#     its `agent_id`: counted beside the tab, never its state
+#   anything else a subagent fired (the payload carries `agent_id`) -> nothing:
+#     it describes the subagent, not this terminal
 #   UserPromptSubmit -> working + `--event user` (prompt head, best-effort)
 #   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
 #     the first file-ish `tool_input` field, a command's description before
@@ -60,6 +64,8 @@
 #   the agent waits on him; SessionEnd -> idle + `--event done`, no label
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
+#   Stop, StopFailure with a `background_tasks` list -> also `--subagents` with
+#     the ids of its running subagents: any other it was counting has ended
 
 set -eu
 
@@ -234,10 +240,24 @@ if name == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write", "Multi
         subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=2)
     except Exception:
         pass
+
+
+def subagents(*flag):
+    # The agent's sub-agents, counted beside the tab: never a state.
+    try:
+        subprocess.run(["qoop", "hook-report", *flag], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+agent = str(payload.get("agent_id") or "")
+flag = {"SubagentStart": "--subagent-start", "SubagentStop": "--subagent-end"}.get(name)
+if agent and flag:
+    subagents(flag, agent)
 # A subagent's tool calls and its end are not this terminal's turn. Reported, a
 # background agent finishing after the turn ended put the tab back to working,
 # and the screen's idle composer took it away again a moment later.
-if payload.get("agent_id"):
+if agent:
     raise SystemExit(0)
 if name == "SessionStart":
     # A session opening, resuming or clearing is not a turn: `starting`, so an
@@ -306,6 +326,16 @@ try:
     subprocess.run(args, timeout=5, capture_output=True)
 except Exception:
     pass
+# The turn is over: a subagent missing from its own list of what still runs has ended, even
+# when its end never came. After the report, so the state is never late for it.
+tasks = payload.get("background_tasks")
+if name in ("Stop", "StopFailure") and isinstance(tasks, list):
+    running = [
+        str(t.get("id")) for t in tasks
+        if isinstance(t, dict) and t.get("type") == "subagent"
+        and t.get("status") == "running" and t.get("id")
+    ]
+    subagents("--subagents", ",".join(running))
 # Mark or compare the turn after the report, so the state never waits on its git calls.
 turn(payload, "UserPromptSubmit", "Stop")
 

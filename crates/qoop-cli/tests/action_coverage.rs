@@ -293,6 +293,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "report the agent's sub-agents without claiming a state",
+            method: || {
+                Method::Control(ControlRequest::ReportSubagents {
+                    id: "a".into(),
+                    terminal: 1,
+                    token: "t".into(),
+                    change: qoop_runtime::control::SubagentChange::Started("s".into()),
+                })
+            },
+        },
+        Action {
             name: "read what has scrolled past",
             method: || {
                 Method::Control(ControlRequest::Scrollback {
@@ -615,6 +626,12 @@ fn every_control_method_is_reachable_from_some_action() {
             token: String::new(),
             session: String::new(),
         },
+        ControlRequest::ReportSubagents {
+            id: String::new(),
+            terminal: 0,
+            token: String::new(),
+            change: qoop_runtime::control::SubagentChange::Running(Vec::new()),
+        },
         ControlRequest::ReloadAgentManifests { id: String::new() },
         ControlRequest::Shutdown { id: String::new() },
         ControlRequest::Scrollback {
@@ -774,6 +791,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::RequestOwnership { .. }
             | ControlRequest::ReportAgentState { .. }
             | ControlRequest::ReportAgentSession { .. }
+            | ControlRequest::ReportSubagents { .. }
             | ControlRequest::ListFocusEvents { .. }
             | ControlRequest::ConnectRemote { .. }
             | ControlRequest::InstallRemote { .. }

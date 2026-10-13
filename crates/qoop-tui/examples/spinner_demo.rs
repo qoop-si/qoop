@@ -31,6 +31,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
     AgentRow {
         keep_awake: false,
         background: 0,
+        subagents: 0,
         task: None,
         news: false,
         terminal,

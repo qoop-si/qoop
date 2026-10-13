@@ -81,6 +81,9 @@ pub struct TerminalAgent {
     /// by the same loop and with the same reset as `background_agents`. Read by the index, not
     /// by the sleep check: those are processes, and `sleep_blockers` judges them.
     pub background_tasks: usize,
+    /// The sub-agents the agent's hooks said started and have not said ended, by the agent's
+    /// own id for each. With the same reset as `background_agents`.
+    pub subagents: std::collections::BTreeSet<String>,
     /// The rule the screen last matched in this generation, if any.
     ///
     /// What `qoop agents explain` reports. Recorded on every evaluation,
@@ -120,6 +123,9 @@ pub struct AgentCarry {
     pub setup_gate: bool,
     pub background_agents: usize,
     pub background_tasks: usize,
+    /// Absent from a daemon that predates it.
+    #[serde(default)]
+    pub subagents: std::collections::BTreeSet<String>,
     pub screen_rule: Option<String>,
     pub screen_manifest: Option<String>,
 }
@@ -300,23 +306,68 @@ impl AgentRegistry {
         let Some(agent) = terminals.get_mut(&stream) else {
             return;
         };
-        let before = agent.background_agents + agent.background_tasks;
+        let before = (agent.background_tasks, subagents(agent));
         agent.background_agents = agents;
         agent.background_tasks = tasks;
+        let after = (agent.background_tasks, subagents(agent));
         drop(terminals);
-        if before != agents + tasks {
+        if before != after {
             self.announce(stream);
         }
     }
 
-    /// What the screen last showed running in the background, all kinds together.
-    pub fn background_of(&self, stream: u32) -> usize {
+    /// Apply what a hook said about the agent's sub-agents. Changes no state; a changed
+    /// count is announced and a repeat is not.
+    pub fn note_subagents(&self, stream: u32, change: crate::control::SubagentChange) {
+        use crate::control::SubagentChange;
+        let mut terminals = self.terminals.lock().unwrap();
+        let Some(agent) = terminals.get_mut(&stream) else {
+            return;
+        };
+        // A late hook of a process that is gone, or one a shell ran: nothing of an agent's.
+        if !matches!(agent.identity, AgentIdentity::Known { agent: true, .. }) {
+            return;
+        }
+        let before = subagents(agent);
+        // The agent waits on its start hook before the sub-agent runs, so a start lands
+        // before its end. ponytail: an end that never comes (a sub-agent killed with an
+        // interrupted turn) is held until the agent's next full list (Claude's `Stop`) or a
+        // new generation; tombstones for ended ids if that shows up in practice.
+        match change {
+            SubagentChange::Started(id) => {
+                agent.subagents.insert(id);
+            }
+            SubagentChange::Ended(id) => {
+                agent.subagents.remove(&id);
+            }
+            SubagentChange::Running(ids) => agent.subagents.retain(|id| ids.contains(id)),
+        }
+        let after = subagents(agent);
+        drop(terminals);
+        if before != after {
+            self.announce(stream);
+        }
+    }
+
+    /// What runs in the background, all kinds together (the footer's shells and monitors, and
+    /// the sub-agents), and how many of those are sub-agents: read under one lock, so the two
+    /// agree.
+    pub fn background_of(&self, stream: u32) -> (usize, usize) {
         self.terminals
             .lock()
             .unwrap()
             .get(&stream)
-            .map_or(0, |a| a.background_agents + a.background_tasks)
+            .map_or((0, 0), |a| {
+                (a.background_tasks + subagents(a), subagents(a))
+            })
     }
+}
+
+/// How many sub-agents an agent runs: what its hooks said started and has not ended, or the
+/// background agents its screen lists, whichever is more. The screen alone is what an agent
+/// without hooks has, and it lists only background ones.
+fn subagents(agent: &TerminalAgent) -> usize {
+    agent.subagents.len().max(agent.background_agents)
 }
 
 fn fresh_belief(generation: GenerationId) -> AgentBelief {
@@ -360,6 +411,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     agent.screen_rule = None;
     agent.background_agents = 0;
     agent.background_tasks = 0;
+    agent.subagents.clear();
     agent.screen_manifest = None;
     let idle = qoop_domain::AgentObservation {
         agent_id: qoop_domain::AgentId::new(stream.to_string()),
@@ -464,6 +516,7 @@ impl AgentRegistry {
                 setup_gate: false,
                 background_agents: 0,
                 background_tasks: 0,
+                subagents: Default::default(),
                 screen_rule: None,
                 screen_manifest: None,
                 leader: None,
@@ -489,6 +542,7 @@ impl AgentRegistry {
             setup_gate: agent.setup_gate,
             background_agents: agent.background_agents,
             background_tasks: agent.background_tasks,
+            subagents: agent.subagents.clone(),
             screen_rule: agent.screen_rule.clone(),
             screen_manifest: agent.screen_manifest.clone(),
         })
@@ -512,6 +566,7 @@ impl AgentRegistry {
         agent.setup_gate = carry.setup_gate;
         agent.background_agents = carry.background_agents;
         agent.background_tasks = carry.background_tasks;
+        agent.subagents = carry.subagents;
         agent.screen_rule = carry.screen_rule;
         agent.screen_manifest = carry.screen_manifest;
         agent.born = None;
@@ -907,6 +962,7 @@ impl AgentRegistry {
             agent.screen_rule = None;
             agent.background_agents = 0;
             agent.background_tasks = 0;
+            agent.subagents.clear();
             agent.screen_manifest = None;
             agent.identity = AgentIdentity::Known {
                 program,
@@ -933,6 +989,7 @@ impl AgentRegistry {
         agent.screen_rule = None;
         agent.background_agents = 0;
         agent.background_tasks = 0;
+        agent.subagents.clear();
         agent.screen_manifest = None;
         agent.identity = match leader {
             None => AgentIdentity::None,
@@ -996,6 +1053,7 @@ impl AgentRegistry {
             agent.screen_rule = None;
             agent.background_agents = 0;
             agent.background_tasks = 0;
+            agent.subagents.clear();
             agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
@@ -1584,7 +1642,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing moved");
         r.note_background(1, 1, 2);
         rx.try_recv().expect("the index is told about the work");
-        assert_eq!(r.background_of(1), 3);
+        assert_eq!(r.background_of(1), (3, 1));
         r.note_background(1, 1, 2);
         assert!(rx.try_recv().is_err(), "a repeat is not news");
         assert_eq!(state(), before, "the state is left alone");
@@ -1594,7 +1652,71 @@ mod tests {
         r.note_background(1, 0, 1);
         let me = Pid(std::process::id() as i32);
         r.note_foreground(1, Some(me), NOW).expect("a change");
-        assert_eq!(r.background_of(1), 0, "counted inside a process now gone");
+        assert_eq!(
+            r.background_of(1),
+            (0, 0),
+            "counted inside a process now gone"
+        );
+    }
+
+    /// Sub-agents a hook names are counted by id beside the agent, with what its screen lists
+    /// as the floor: a start and its end cancel, the agent's own full list replaces the set,
+    /// a shell's late hook counts nothing, and a new generation voids them. The state is
+    /// never touched, and only a moved count is news.
+    #[test]
+    fn sub_agents_a_hook_names_are_counted_beside_the_agent() {
+        use crate::control::SubagentChange::{Ended, Running, Started};
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let mut rx = r.subscribe();
+        let state = || r.agent(1).expect("agent").belief.state;
+        let before = state();
+
+        // Not an agent yet: a late hook of a process that is gone counts nothing.
+        r.note_subagents(1, Started("old".into()));
+        assert_eq!(r.background_of(1), (0, 0));
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
+            program: "claude".into(),
+            generation: GenerationId::FIRST,
+            agent: true,
+        };
+
+        r.note_subagents(1, Started("a".into()));
+        rx.try_recv().expect("the index is told");
+        r.note_subagents(1, Started("b".into()));
+        r.note_subagents(1, Started("b".into()));
+        assert_eq!(r.background_of(1).1, 2, "an id counts once");
+        r.note_subagents(1, Ended("a".into()));
+        r.note_subagents(1, Ended("never-started".into()));
+        assert_eq!(r.background_of(1).1, 1);
+        while rx.try_recv().is_ok() {}
+        r.note_subagents(1, Ended("never-started".into()));
+        assert!(rx.try_recv().is_err(), "a repeat is not news");
+        assert_eq!(state(), before, "the state is left alone");
+
+        // The screen lists more than the hooks said: the screen is the floor. Background
+        // work is the sub-agents and the shells together.
+        r.note_background(1, 3, 2);
+        assert_eq!(r.background_of(1), (5, 3));
+        r.note_background(1, 0, 2);
+        assert_eq!(r.background_of(1), (3, 1));
+
+        // The agent's own list at the end of its turn ends what is missing from it, and never
+        // brings back one whose end landed first.
+        r.note_subagents(1, Started("c".into()));
+        r.note_subagents(1, Running(vec!["b".into(), "gone".into()]));
+        assert_eq!(r.background_of(1).1, 1);
+        r.note_subagents(1, Running(Vec::new()));
+        assert_eq!(r.background_of(1).1, 0);
+
+        r.note_subagents(1, Started("e".into()));
+        let me = Pid(std::process::id() as i32);
+        r.note_foreground(1, Some(me), NOW).expect("a change");
+        assert_eq!(
+            r.background_of(1),
+            (0, 0),
+            "counted inside a process now gone"
+        );
     }
 
     #[test]

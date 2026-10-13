@@ -345,6 +345,16 @@ pub enum ControlRequest {
         /// is nothing to record, and silence must not clear what is there.
         session: String,
     },
+    /// A hook or plugin inside the terminal says a sub-agent started or ended, or which ones
+    /// run now. Never a state report and never journalled: the agent's own state is left
+    /// alone, and the row only counts them. Admitted through the same token check as
+    /// `ReportAgentSession`.
+    ReportSubagents {
+        id: String,
+        terminal: TerminalStream,
+        token: String,
+        change: SubagentChange,
+    },
     /// The focus events a terminal's hooks have reported.
     ///
     /// Answered from the daemon's memory, never from disk: events are
@@ -1008,6 +1018,7 @@ impl ControlRequest {
             | Self::RequestOwnership { id, .. }
             | Self::ReportAgentState { id, .. }
             | Self::ReportAgentSession { id, .. }
+            | Self::ReportSubagents { id, .. }
             | Self::ListFocusEvents { id, .. }
             | Self::HostColors { id, .. }
             | Self::SaveUpload { id, .. }
@@ -1669,6 +1680,12 @@ pub struct AgentRow {
     /// and zero from a daemon that predates it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub background: u32,
+    /// How many sub-agents the agent runs now, in its turn or in the background: what its
+    /// hooks said started and has not ended, or what its screen lists, whichever is more.
+    /// Also counted in `background`, so `background - subagents` is its shells and monitors.
+    /// Written only when above zero, and zero from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subagents: u32,
     /// The task the agent in this terminal opened and has not had closed (`qoop task`).
     /// Absent when there is none, and from a daemon that predates tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1803,6 +1820,18 @@ pub const MAX_FOCUS_LABEL_CHARS: usize = 120;
 /// nothing to show", never a failure: older hooks predate the field.
 pub fn parse_focus_event(kind: &str) -> bool {
     matches!(kind, "user" | "tool" | "blocked" | "done")
+}
+
+/// What a hook says about an agent's sub-agents, each named by the agent's own id for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentChange {
+    Started(String),
+    Ended(String),
+    /// Every sub-agent that runs now, from the agent's own list: one held and missing from it
+    /// has ended. Never adds one: a start comes as `Started`, and a list read before an end
+    /// that lands first would bring that one back.
+    Running(Vec<String>),
 }
 
 /// Cut a focus label to [`MAX_FOCUS_LABEL_CHARS`] characters.
@@ -2209,6 +2238,7 @@ mod tests {
             news: false,
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             terminal: 3,
             workspace: 1,

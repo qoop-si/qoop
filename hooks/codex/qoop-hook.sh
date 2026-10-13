@@ -15,7 +15,11 @@
 #       "PermissionRequest": [{ "hooks": [{ "type": "command",
 #         "command": "qoop-hook.sh blocked" }] }],
 #       "Stop": [{ "hooks": [{ "type": "command",
-#         "command": "qoop-hook.sh idle" }] }]
+#         "command": "qoop-hook.sh idle" }] }],
+#       "SubagentStart": [{ "hooks": [{ "type": "command",
+#         "command": "qoop-hook.sh subagent" }] }],
+#       "SubagentStop": [{ "hooks": [{ "type": "command",
+#         "command": "qoop-hook.sh subagent" }] }]
 #   } }
 #
 # plus an optional `PostToolUse` entry reporting `working`.
@@ -34,6 +38,11 @@
 # `UserPromptSubmit` adds a `user` event with no label, so the prompt itself
 # never leaves this machine's hook. The state words are unchanged: the
 # argument still decides the state.
+#
+# `SubagentStart` and `SubagentStop` (argument `subagent`, never a state) say a
+# sub-agent thread started or ended, by its `agent_id`: counted beside the tab.
+# Codex has no list of what still runs, so an end that never comes is held until
+# the agent exits.
 #
 # Without python3, or with a payload that does not parse, the report goes
 # out with the state alone, same as before.
@@ -55,6 +64,7 @@ case "$state" in
   blocked) flags="--visible-blocker" ;;
   idle) flags="--visible-idle" ;;
   starting | done | failed | unknown) flags="" ;;
+  subagent) flags="" ;;
   *) exit 0 ;;
 esac
 
@@ -151,6 +161,16 @@ def first_fileish(tool_input):
 name = payload.get("hook_event_name") or ""
 state = os.environ["QOOP_HOOK_STATE"]
 flags = os.environ.get("QOOP_HOOK_FLAGS") or ""
+# A sub-agent starting or ending, by its thread id: counted beside the tab, never its state.
+if state == "subagent":
+    agent = str(payload.get("agent_id") or "")
+    flag = {"SubagentStart": "--subagent-start", "SubagentStop": "--subagent-end"}.get(name)
+    if agent and flag:
+        try:
+            subprocess.run(["qoop", "hook-report", flag, agent], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+    raise SystemExit(0)
 # A session starting is not a turn. Said here and not only by the argument,
 # because an entry installed earlier still passes `working` for it.
 if name == "SessionStart":
@@ -213,6 +233,8 @@ if name in ("SessionStart", "UserPromptSubmit"):
 ' 2>/dev/null && exit 0
 fi
 
+# Without python a sub-agent event has nothing to say: it is never a state.
+[ "$state" = subagent ] && exit 0
 # shellcheck disable=SC2086
 qoop hook-report --state "$state" $flags >/dev/null 2>&1 || true
 exit 0

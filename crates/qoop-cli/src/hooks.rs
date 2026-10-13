@@ -101,6 +101,7 @@ fn targets() -> Vec<Target> {
                     Event("PostToolUse", None),
                     Event("Notification", None),
                     Event("PermissionRequest", None),
+                    Event("SubagentStart", None),
                     Event("SubagentStop", None),
                     Event("Stop", None),
                     Event("StopFailure", None),
@@ -127,6 +128,9 @@ fn targets() -> Vec<Target> {
                     Event("PostToolUse", Some("working")),
                     Event("PermissionRequest", Some("blocked")),
                     Event("Stop", Some("idle")),
+                    // `subagent` is no state: the script counts the sub-agent beside the tab.
+                    Event("SubagentStart", Some("subagent")),
+                    Event("SubagentStop", Some("subagent")),
                 ],
                 matcher: None,
             },
@@ -143,6 +147,7 @@ fn targets() -> Vec<Target> {
                     Event("SessionStart", Some("starting")),
                     Event("BeforeAgent", Some("working")),
                     Event("BeforeTool", Some("working")),
+                    Event("AfterTool", Some("subagent")),
                     Event("AfterAgent", Some("idle")),
                     Event("SessionEnd", Some("idle")),
                 ],
@@ -1792,7 +1797,6 @@ mod tests {
             std::fs::read_to_string(&log).unwrap_or_default()
         };
         for payload in [
-            r#"{"hook_event_name":"SubagentStop","agent_id":"def456","agent_type":"Explore"}"#,
             r#"{"hook_event_name":"PreToolUse","agent_id":"def456","tool_name":"Bash"}"#,
             r#"{"hook_event_name":"PostToolUse","agent_id":"def456","tool_name":"Read"}"#,
         ] {
@@ -2595,6 +2599,161 @@ mod tests {
             serde_json::json!(["Bash(qoop task show:*)"]),
             "theirs stays"
         );
+    }
+
+    /// A sub-agent starting and ending is counted beside the tab, by the agent's own id for
+    /// it, and never claims a state: Claude and Codex name it in their own events, Gemini runs
+    /// one as an `invoke_agent` call. The end of a turn says what still runs where the agent
+    /// knows it: Claude's own list, none for Gemini.
+    #[test]
+    fn every_hook_counts_sub_agents_and_claims_no_state_for_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let log = dir.path().join("calls");
+        let fake = dir.path().join("qoop");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let calls = |agent: &str, arg: &str, payload: &str| -> Vec<String> {
+            let _ = std::fs::remove_file(&log);
+            let script = dir.path().join(format!("{agent}.sh"));
+            std::fs::write(&script, target(agent).body).expect("write");
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .arg(arg)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("hook-report"))
+                .map(String::from)
+                .collect()
+        };
+        let only = |said: Vec<String>, want: &str| assert_eq!(said, vec![want.to_string()]);
+
+        only(
+            calls(
+                "claude",
+                "",
+                r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}"#,
+            ),
+            "hook-report --subagent-start a1",
+        );
+        only(
+            calls(
+                "claude",
+                "",
+                r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[]}"#,
+            ),
+            "hook-report --subagent-end a1",
+        );
+        // Claude's turn ends with its own list: running sub-agents only, shells left out.
+        let said = calls(
+            "claude",
+            "",
+            r#"{"hook_event_name":"Stop","background_tasks":[
+                {"id":"a2","type":"subagent","status":"running"},
+                {"id":"a3","type":"subagent","status":"completed"},
+                {"id":"b1","type":"shell","status":"running"},
+                {"id":"a4","type":"subagent","status":"running"}]}"#,
+        );
+        assert!(said[0].starts_with("hook-report --state idle"), "{said:?}");
+        assert_eq!(said[1], "hook-report --subagents a2,a4", "{said:?}");
+        let said = calls("claude", "", r#"{"hook_event_name":"Stop"}"#);
+        assert_eq!(
+            said.len(),
+            1,
+            "a build without the list keeps the count: {said:?}"
+        );
+        // Odd payloads say nothing wrong and still exit 0.
+        let said = calls(
+            "claude",
+            "",
+            r#"{"hook_event_name":"Stop","background_tasks":"none"}"#,
+        );
+        assert_eq!(said.len(), 1, "{said:?}");
+        let said = calls(
+            "claude",
+            "",
+            r#"{"hook_event_name":"Stop","background_tasks":[7,{"id":3,"type":"subagent","status":"running"}]}"#,
+        );
+        assert_eq!(said[1], "hook-report --subagents 3", "{said:?}");
+
+        only(
+            calls(
+                "codex",
+                "subagent",
+                r#"{"hook_event_name":"SubagentStart","agent_id":"019a-c1","agent_type":"default"}"#,
+            ),
+            "hook-report --subagent-start 019a-c1",
+        );
+        only(
+            calls(
+                "codex",
+                "subagent",
+                r#"{"hook_event_name":"SubagentStop","agent_id":"019a-c1"}"#,
+            ),
+            "hook-report --subagent-end 019a-c1",
+        );
+
+        let call = r#""tool_name":"invoke_agent","tool_input":{"agent_name":"codebase_investigator","prompt":"map it"}"#;
+        let said = calls(
+            "gemini",
+            "working",
+            &format!(r#"{{"hook_event_name":"BeforeTool",{call}}}"#),
+        );
+        let started = said[0]
+            .strip_prefix("hook-report --subagent-start ")
+            .expect("a start");
+        assert!(
+            said[1].starts_with("hook-report --state working"),
+            "{said:?}"
+        );
+        only(
+            calls(
+                "gemini",
+                "subagent",
+                &format!(r#"{{"hook_event_name":"AfterTool",{call}}}"#),
+            ),
+            &format!("hook-report --subagent-end {started}"),
+        );
+        assert!(
+            calls(
+                "gemini",
+                "subagent",
+                r#"{"hook_event_name":"AfterTool","tool_name":"read_file"}"#,
+            )
+            .is_empty(),
+            "any other tool ending says nothing"
+        );
+        let said = calls(
+            "gemini",
+            "working",
+            r#"{"hook_event_name":"BeforeTool","tool_name":"invoke_agent","tool_input":"just text"}"#,
+        );
+        assert!(
+            said[0].starts_with("hook-report --subagent-start "),
+            "{said:?}"
+        );
+        let said = calls("gemini", "idle", r#"{"hook_event_name":"AfterAgent"}"#);
+        assert_eq!(said[1], "hook-report --subagents ", "{said:?}");
     }
 
     /// An edit attempt, by the agent or one of its subagents, opens the terminal's task

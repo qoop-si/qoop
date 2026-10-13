@@ -294,6 +294,27 @@ pub fn running_background_agents(screen: &[String]) -> usize {
     .count()
 }
 
+/// How many sub-agents opencode says it is running in this tab: its prompt footer, the last
+/// row with anything on it, holds a `↓ 3 subagents` segment while any child session runs, in
+/// its turn or in the background. Only a segment of that row that ends the count's way is
+/// read, so the same words in an answer above the footer say nothing.
+/// Measured on opencode 2.0.27. Pure, so the measured screens are its tests.
+pub fn running_opencode_subagents(screen: &[String]) -> usize {
+    let Some(footer) = screen.iter().rev().find(|row| !row.trim().is_empty()) else {
+        return 0;
+    };
+    footer
+        .split("  ")
+        .filter_map(|segment| {
+            let mut words = segment.split_whitespace().rev();
+            let (kind, count) = (words.next()?, words.next()?);
+            matches!(kind, "subagent" | "subagents")
+                .then(|| count.parse::<usize>().ok())
+                .flatten()
+        })
+        .sum()
+}
+
 /// How many background shells and monitors Claude Code says it is running in this tab.
 ///
 /// The footer under the prompt box counts them while any exist (`⏵⏵ bypass permissions on ·
@@ -855,6 +876,32 @@ mod tests {
             "  ◯ rs-reader    Find the 20 largest .rs files under /Users/u...  1m 5s · ↑ 50 tokens",
         ]);
         assert_eq!(running_background_agents(&s), 2);
+    }
+
+    #[test]
+    fn opencodes_footer_says_how_many_subagents_run() {
+        // Measured: opencode 2.0.27 with three children running, in a 140 column tmux.
+        let s = screen(&[
+            "     ⠙ General Subagent \u{2014} sleep then pong 1",
+            "  ┃  Build · Muse Spark 1.3 Free OpenCode",
+            "  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            "   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                         ↓ 3 subagents  ctrl+p commands    /…/scratchpad/oc-measure:main",
+            "",
+        ]);
+        assert_eq!(running_opencode_subagents(&s), 3);
+        let one = screen(&["  ↓ 1 subagent  ctrl+p commands"]);
+        assert_eq!(running_opencode_subagents(&one), 1);
+        // Nothing running: the footer has no count.
+        let idle = screen(&["  /…/oc-measure:main  shift+tab agents  ctrl+p commands"]);
+        assert_eq!(running_opencode_subagents(&idle), 0);
+        // The words in an answer above the footer, or mid-sentence in it, are no count.
+        let quoted = screen(&[
+            "  started 3 subagents  for you",
+            "  /…/oc-measure:main  shift+tab agents  ctrl+p commands",
+        ]);
+        assert_eq!(running_opencode_subagents(&quoted), 0);
+        let prose = screen(&["  it said 3 subagents were done  ctrl+p commands"]);
+        assert_eq!(running_opencode_subagents(&prose), 0);
     }
 
     #[test]

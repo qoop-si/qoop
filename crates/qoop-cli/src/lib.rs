@@ -239,6 +239,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop setup ...  capture, inspect, trust and run a Setup\n\
                    \x20 qoop hook-report --state <state> [--event user|tool|blocked|done] [--label ...] [--session-id S]  report this terminal's agent state\n\
                   \x20 qoop hook-report --session-id S  report only the agent's conversation id\n\
+                  \x20 qoop hook-report --subagent-start ID|--subagent-end ID|--subagents ID,...  report its sub-agents\n\
                   \x20 qoop task new|goal|stage|plan|evidence|done|close|verify|ls|show|board|rules  the work this\n\
                   \x20                 terminal's agent is doing, kept by qoop; `qoop task` for more\n\
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
@@ -900,6 +901,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let mut session: Option<String> = None;
     let mut event: Option<String> = None;
     let mut label: Option<String> = None;
+    let mut subagent: Option<qoop_runtime::control::SubagentChange> = None;
     let mut rest = args.iter().skip(2);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -980,9 +982,29 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     }
                 }
             }
+            // What the agent's own sub-agents did, by its id for each: counted beside the
+            // agent, never a state. `--subagents` is its own list of what still runs, comma separated.
+            flag @ ("--subagent-start" | "--subagent-end" | "--subagents") => {
+                use qoop_runtime::control::SubagentChange;
+                let Some(value) = rest.next() else {
+                    return Err(usage(format!("usage: qoop hook-report {flag} <id>")));
+                };
+                subagent = Some(match flag {
+                    "--subagent-start" => SubagentChange::Started(value.clone()),
+                    "--subagent-end" => SubagentChange::Ended(value.clone()),
+                    _ => SubagentChange::Running(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(String::from)
+                            .collect(),
+                    ),
+                });
+            }
             other => {
                 return Err(usage(format!(
-                    "unknown flag {other}; usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T]"
+                    "unknown flag {other}; usage: qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown> [--event user|tool|blocked|done] [--label ...] [--terminal N] [--token T] [--session-id S] or qoop hook-report --session-id S [--terminal N] [--token T] or qoop hook-report --subagent-start ID|--subagent-end ID|--subagents ID,..."
                 )));
             }
         }
@@ -1008,8 +1030,22 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     // its conversation but has no lifecycle event to map. State and session
     // travel separately because saying which conversation this is says
     // nothing about what the agent is doing.
-    let request = match state {
-        None => {
+    let request = match (state, subagent) {
+        (state, Some(change)) => {
+            if state.is_some() || event.is_some() || label.is_some() || session.is_some() {
+                return Err(usage(
+                    "usage: --subagent-start/--subagent-end/--subagents stand alone",
+                ));
+            }
+            let id = id.unwrap_or_else(|| format!("hook-subagents-{terminal}-{nanos}"));
+            ControlRequest::ReportSubagents {
+                id,
+                terminal,
+                token,
+                change,
+            }
+        }
+        (None, None) => {
             if event.is_some() || label.is_some() {
                 return Err(usage(
                     "usage: --event/--label need --state; or qoop hook-report --session-id S [--terminal N] [--token T]",
@@ -1028,7 +1064,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 session,
             }
         }
-        Some(state) => {
+        (Some(state), None) => {
             if qoop_runtime::control::parse_reported_state(&state).is_none() {
                 return Err(std::io::Error::other(format!(
                     "unknown agent state {state:?}"
@@ -2751,8 +2787,12 @@ fn agent_line(row: &qoop_runtime::control::AgentRow) -> String {
         0 => String::new(),
         n => format!(" background={n}"),
     };
+    let subagents = match row.subagents {
+        0 => String::new(),
+        n => format!(" subagents={n}"),
+    };
     format!(
-        "term={} state={} program={} name={} workspace={} generation={}{background}",
+        "term={} state={} program={} name={} workspace={} generation={}{background}{subagents}",
         row.terminal, row.state, program, name, row.workspace, generation
     )
 }
@@ -3122,6 +3162,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,

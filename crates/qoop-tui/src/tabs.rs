@@ -382,6 +382,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
@@ -411,6 +412,7 @@ mod tests {
         AgentRow {
             keep_awake: false,
             background: 0,
+            subagents: 0,
             task: None,
             news: false,
             terminal,
