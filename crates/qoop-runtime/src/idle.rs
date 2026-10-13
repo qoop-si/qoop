@@ -211,6 +211,16 @@ pub fn group_holds_task(master: std::os::fd::RawFd) -> bool {
     false
 }
 
+/// The server opencode 2 starts under a client run with `--standalone` (`opencode serve
+/// --stdio`): it talks to its client over a pipe, is off the terminal, and ends with the client
+/// (measured: killing the client ends it), so a sleep that ends the client loses nothing.
+pub fn is_stdio_server(argv: &[String]) -> bool {
+    let opencode = argv
+        .first()
+        .is_some_and(|a| a.rsplit('/').next() == Some("opencode"));
+    opencode && argv.get(1).is_some_and(|a| a == "serve") && argv.iter().any(|a| a == "--stdio")
+}
+
 /// What in a terminal's process tree would outlive, or be lost to, putting it to sleep.
 ///
 /// Walked from the terminal's leader by parent. Two kinds block, named by program:
@@ -829,6 +839,39 @@ mod tests {
             sleep_blockers(&t, 10, Some(20), 5, &|_| false),
             vec!["zsh".to_string()]
         );
+    }
+
+    #[test]
+    fn opencodes_own_stdio_server_does_not_block_a_sleep() {
+        // `opencode --standalone`: the client holds the terminal, its server child is off it.
+        let t = [
+            row(10, 1, 10, Some(5), "zsh"),
+            row(20, 10, 20, Some(5), "opencode"),
+            row(30, 20, 30, None, "opencode"),
+        ];
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let safe = |pid: i32| {
+            pid == 30 && is_stdio_server(&argv(&["opencode", "serve", "--stdio", "--port", "0"]))
+        };
+        assert!(sleep_blockers(&t, 10, Some(20), 5, &safe).is_empty());
+        assert_eq!(
+            sleep_blockers(&t, 10, Some(20), 5, &|_| false),
+            vec!["opencode".to_string()],
+            "without the rule the server blocks"
+        );
+        assert!(!is_stdio_server(&argv(&["opencode", "serve", "--service"])));
+        assert!(
+            !is_stdio_server(&argv(&["/usr/bin/foo", "serve", "--stdio"])),
+            "another program's stdio server still blocks"
+        );
+        assert!(is_stdio_server(&argv(&[
+            "/Users/a/.opencode/bin/opencode",
+            "serve",
+            "--stdio",
+            "--port",
+            "0"
+        ])));
+        assert!(!is_stdio_server(&argv(&["opencode", "--standalone"])));
     }
 
     #[test]

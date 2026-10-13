@@ -7244,9 +7244,9 @@ fn vet_for_sleep(
         .and_then(qoop_pty::sys::foreground_pgrp)
         .map(|group| group.0);
     let sleep_safe = |pid: i32| {
-        qoop_pty::sys::argv_of(qoop_pty::Pid(pid))
-            .iter()
-            .any(|arg| {
+        let argv = qoop_pty::sys::argv_of(qoop_pty::Pid(pid));
+        crate::idle::is_stdio_server(&argv)
+            || argv.iter().any(|arg| {
                 arg.split_whitespace().any(|w| {
                     matches!(
                         w.trim_matches('\''),

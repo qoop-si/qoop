@@ -104,8 +104,10 @@ region = "bottom_non_empty_lines(8)"
 visible_idle = true
 line_regex = '^[^\w]*(Ask anything|Run a command)… "'
 
-# From `packages/opencode/src/cli/cmd/tui.ts`: `--session <id>` continues that session,
-# `--continue` the last one.
+# `--session <id>` continues that session, `--continue` the last one (`opencode --help`, 2.0.27).
+# `--standalone` runs the tab's own server: opencode 2 otherwise talks to one shared background
+# service whose environment is the first tab's, and the qoop hook, loaded there, would report
+# every tab as that one terminal. opencode 2 is the minimum; 1.x has no such flag.
 [resume]
-session = ["opencode", "--session", "{session}"]
-latest = ["opencode", "--continue"]
+session = ["opencode", "--standalone", "--session", "{session}"]
+latest = ["opencode", "--standalone", "--continue"]

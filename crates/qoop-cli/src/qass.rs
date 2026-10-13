@@ -55,15 +55,26 @@ fn note_prompted_in(
 
 /// What starts the qass skill as each agent's first message, as each was seen to take it:
 /// Claude a slash command, Codex a `$skill` mention, Gemini and opencode a request to use
-/// it (both pick a skill by name from the prompt; neither has a skill command).
-fn first_message(program: &str) -> Option<[&'static str; 2]> {
+/// it (both pick a skill by name from the prompt; neither has a skill command). opencode runs
+/// its own server (`--standalone`), so the qoop hook loads in qass's tab and not in the shared
+/// background service, whose environment is the first tab's.
+fn first_message(program: &str) -> Option<&'static [&'static str]> {
     match program {
-        "claude" => Some(["", "/qass"]),
-        "codex" => Some(["", "$qass"]),
-        "gemini" => Some(["-i", "Use the qass skill."]),
-        "opencode" => Some(["--prompt", "Use the qass skill."]),
+        "claude" => Some(&["", "/qass"]),
+        "codex" => Some(&["", "$qass"]),
+        "gemini" => Some(&["-i", "Use the qass skill."]),
+        "opencode" => Some(&["--standalone", "--prompt", "Use the qass skill."]),
         _ => None,
     }
+}
+
+/// `words` without a flag the person's own line already carries (`opencode --standalone`).
+fn not_typed(line: Option<&str>, words: impl Iterator<Item = String>) -> Vec<String> {
+    words
+        .filter(|w| {
+            !(w.starts_with("--") && line.is_some_and(|l| l.split_whitespace().any(|x| x == w)))
+        })
+        .collect()
 }
 
 /// The program a launcher line runs: its first word that is not an assignment, by name.
@@ -173,17 +184,13 @@ fn launch_line(
             config::QASS_AGENTS.join(", ")
         ));
     };
-    let words = line
-        .is_none()
-        .then(|| agent.to_string())
-        .into_iter()
-        .chain(
-            first
-                .iter()
-                .filter(|w| !w.is_empty())
-                .map(|w| w.to_string()),
-        )
-        .collect();
+    let words = line.is_none().then(|| agent.to_string()).into_iter().chain(
+        first
+            .iter()
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string()),
+    );
+    let words = not_typed(line.as_deref(), words);
     Ok((line, words, program))
 }
 
@@ -403,7 +410,8 @@ fn resume_command(
         .map(String::from);
     match (typed, argv.split_first()) {
         (Some(line), Some((first, rest))) if first == program => {
-            (Some(line), rest.iter().cloned().chain(said).collect())
+            let words = not_typed(Some(&line), rest.iter().cloned().chain(said));
+            (Some(line), words)
         }
         _ => (None, argv.into_iter().chain(said).collect()),
     }
@@ -942,6 +950,13 @@ mod tests {
         assert!(said[3].contains("carried on"));
         let (_, said) = resume_command(None, words(&["opencode", "--session", "o"]), "opencode");
         assert_eq!(said[3], "--prompt");
+        let own = Some("opencode --standalone".to_string());
+        let (_, said) = resume_command(
+            own,
+            words(&["opencode", "--standalone", "--session", "o"]),
+            "opencode",
+        );
+        assert_eq!(said[..2], ["--session", "o"], "no second --standalone");
         // An override naming another binary is typed whole.
         let mine = Some("claude --x".to_string());
         assert_eq!(
@@ -966,9 +981,23 @@ mod tests {
         assert_eq!(words("gemini"), ["gemini", "-i", "Use the qass skill."]);
         assert_eq!(
             words("opencode"),
-            ["opencode", "--prompt", "Use the qass skill."]
+            [
+                "opencode",
+                "--standalone",
+                "--prompt",
+                "Use the qass skill."
+            ]
         );
         assert!(launch_line("aider", &[]).is_err());
+        // A line that already says `--standalone` is not told twice.
+        let own = config::Launcher {
+            name: "opencode".into(),
+            command: "opencode --standalone".into(),
+        };
+        assert_eq!(
+            launch_line("opencode", &[own]).expect("own").1,
+            ["--prompt", "Use the qass skill."]
+        );
         let mine = config::Launcher {
             name: "claudes".into(),
             command: "claude --model sonnet".into(),

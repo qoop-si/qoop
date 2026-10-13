@@ -1,4 +1,4 @@
-// qoop hook for OpenCode (plugin).
+// qoop hook for OpenCode 2 (plugin).
 //
 // Install: `qoop hooks install opencode`, or copy this file into
 // `~/.config/opencode/plugin/`, with `qoop` on PATH. Do not also list it in
@@ -7,17 +7,25 @@
 // the environment. Outside a qoop terminal every report is a silent no-op and
 // the screen reading keeps working with no hooks installed.
 //
-// Event reference: https://opencode.ai/docs/plugins/ and the event types in
-// @opencode-ai/sdk. What is read here:
-//   session.status    {sessionID, status: {type: idle | busy | retry}}
-//   session.idle      {sessionID}
-//   session.error     {sessionID?, error?}
-//   permission.asked  {id, sessionID, permission, patterns}  (permission.updated
-//                     in older plugin types, with type, pattern and title)
-//   permission.replied {requestID} (permissionID in older types)
-//   question.asked {id}, question.replied, question.rejected
-//   session.created / session.updated {info: {id, parentID?}}
-// plus the `chat.message` and `tool.execute.before` hooks for focus events.
+// OpenCode 2 loads a plugin only when the module's default export is a
+// definition with an `id` and a `setup` function; the OpenCode 1 shape (a named
+// export returning `event` and `chat.message` hooks) is refused at load, so no
+// report ever left it. See https://opencode.ai/v2/docs/build/plugins/migrate-v1.
+//
+// Events read, from `ctx.event.subscribe` (each carries `data.sessionID`):
+//   session.execution.started     the turn begins
+//   session.execution.succeeded   the turn ends
+//   session.execution.failed      the turn ends in an error
+//   session.execution.interrupted the person stopped it
+//   session.tool.called           a tool starts (the label)
+//   session.created               {parentID?}: a subagent's session has a parent
+//   permission.asked / permission.replied
+//   question.asked / question.replied / question.rejected
+//
+// Only the server a qoop tab starts for itself (`opencode --standalone` runs
+// `serve --stdio`) may report. The shared background service (`serve --service`)
+// keeps the environment of the first tab that started it, so a plugin loaded
+// there would put every tab's state and conversation id on that one terminal.
 //
 // The session id travels as `--session-id`, which is what lets a tab come back
 // to this conversation after a restart. A subagent's session (one with a
@@ -85,12 +93,6 @@ function report(state, { sessionID, event, label } = {}) {
   );
 }
 
-function noteSession(info) {
-  if (info && typeof info.id === "string" && info.parentID) {
-    children.add(info.id);
-  }
-}
-
 function permissionLabel(p) {
   if (typeof p?.title === "string" && p.title) return p.title;
   const patterns = Array.isArray(p?.patterns)
@@ -103,84 +105,103 @@ function requestID(p) {
   return p?.requestID ?? p?.permissionID ?? p?.id;
 }
 
-function toolLabel(tool, args) {
+function toolLabel(p) {
   const detail =
-    args?.command ?? args?.filePath ?? args?.pattern ?? args?.url ?? "";
-  return [tool, typeof detail === "string" ? detail : ""]
+    p?.input?.command ??
+    p?.input?.filePath ??
+    p?.input?.pattern ??
+    p?.input?.url ??
+    "";
+  return [p?.tool ?? p?.name, typeof detail === "string" ? detail : ""]
     .filter(Boolean)
     .join(" ");
 }
 
-export const QoopPlugin = async () => ({
-  event: async ({ event }) => {
-    const p = event?.properties ?? {};
-    switch (event?.type) {
-      case "session.created":
-      case "session.updated":
-        noteSession(p.info);
-        break;
-      case "session.status": {
-        const type = p.status?.type;
-        if (type === "busy" || type === "retry") {
-          report("working", { sessionID: p.sessionID });
-        } else if (type === "idle" && !children.has(p.sessionID)) {
-          // The turn is over: nothing it asked can still be waiting, even when an
-          // answer came without a reply event that named its request.
-          pending.clear();
-          report("idle", { sessionID: p.sessionID });
-        }
-        break;
-      }
-      case "session.idle":
-        if (!children.has(p.sessionID)) {
-          // The turn is over: nothing it asked can still be waiting.
-          pending.clear();
-          report("idle", { sessionID: p.sessionID, event: "done" });
-        }
-        break;
-      case "session.error":
-        // An interrupt the person asked for is not a failure.
-        if (
-          !children.has(p.sessionID) &&
-          p.error?.name !== "MessageAbortedError"
-        ) {
-          report("failed", { sessionID: p.sessionID });
-        }
-        break;
-      case "permission.asked":
-      case "permission.updated":
-        if (requestID(p)) pending.add(requestID(p));
-        report("blocked", {
-          sessionID: p.sessionID,
-          event: "blocked",
-          label: permissionLabel(p),
-        });
-        break;
-      case "question.asked":
-        if (requestID(p)) pending.add(requestID(p));
-        report("blocked", {
-          sessionID: p.sessionID,
-          event: "blocked",
-          label: "question",
-        });
-        break;
-      case "permission.replied":
-      case "question.replied":
-      case "question.rejected":
-        pending.delete(requestID(p));
-        report("working", { sessionID: p.sessionID });
-        break;
+// One event of the stream: `{type, data}`.
+export function handle({ type, data }) {
+  const p = data ?? {};
+  switch (type) {
+    case "session.created": {
+      const parent = p.parentID ?? p.info?.parentID;
+      const id = p.sessionID ?? p.info?.id;
+      if (parent && typeof id === "string") children.add(id);
+      break;
     }
+    case "session.execution.started":
+      // A subagent's turn is no prompt of the person's, and the tab is working anyway.
+      if (!children.has(p.sessionID)) {
+        report("working", { sessionID: p.sessionID, event: "user" });
+      }
+      break;
+    case "session.tool.called":
+      if (!children.has(p.sessionID)) {
+        report("working", {
+          sessionID: p.sessionID,
+          event: "tool",
+          label: toolLabel(p),
+        });
+      }
+      break;
+    case "session.execution.succeeded":
+    case "session.execution.interrupted":
+      if (!children.has(p.sessionID)) {
+        // The turn is over: nothing it asked can still be waiting.
+        pending.clear();
+        report("idle", {
+          sessionID: p.sessionID,
+          event: type.endsWith("succeeded") ? "done" : undefined,
+        });
+      }
+      break;
+    case "session.execution.failed":
+      if (!children.has(p.sessionID)) {
+        pending.clear();
+        report("failed", { sessionID: p.sessionID });
+      }
+      break;
+    case "permission.asked":
+      if (requestID(p)) pending.add(requestID(p));
+      report("blocked", {
+        sessionID: p.sessionID,
+        event: "blocked",
+        label: permissionLabel(p),
+      });
+      break;
+    case "question.asked":
+      if (requestID(p)) pending.add(requestID(p));
+      report("blocked", {
+        sessionID: p.sessionID,
+        event: "blocked",
+        label: "question",
+      });
+      break;
+    case "permission.replied":
+    case "question.replied":
+    case "question.rejected":
+      pending.delete(requestID(p));
+      report("working", { sessionID: p.sessionID });
+      break;
+  }
+}
+
+export default {
+  id: "qoop",
+  setup(ctx) {
+    if (!process.argv.includes("--stdio")) return;
+    const stop = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: stop.signal })) {
+          try {
+            handle(event);
+          } catch {
+            // One odd event must not end the reports of every later one.
+          }
+        }
+      } catch {
+        // The stream ended with the server: nothing left to report.
+      }
+    })();
+    return () => stop.abort();
   },
-  // A prompt sent is the turn starting. The prompt text is never a label.
-  "chat.message": async (input) => {
-    report("working", { sessionID: input?.sessionID, event: "user" });
-  },
-  "tool.execute.before": async (input, output) => {
-    report("working", {
-      sessionID: input?.sessionID,
-      event: "tool",
-      label: toolLabel(input?.tool, output?.args),
-    });
-  },
-});
+};

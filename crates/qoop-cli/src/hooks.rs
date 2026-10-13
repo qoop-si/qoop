@@ -1247,6 +1247,31 @@ mod tests {
         );
     }
 
+    /// The file an older qoop dropped (opencode 1's plugin shape, which opencode 2 refuses to
+    /// load) is replaced by this build's, and a plugin beside it is left alone.
+    #[test]
+    fn an_older_dropped_plugin_is_replaced() {
+        let home = tempfile::tempdir().expect("a home");
+        let opencode = target("opencode");
+        let dir = home.path().join(opencode.config);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join(opencode.file),
+            "export const Old = async () => ({});",
+        )
+        .expect("old");
+        std::fs::write(dir.join("mine.js"), "// mine").expect("mine");
+        assert!(install_dropped(home.path(), &opencode).expect("install"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(opencode.file)).expect("read"),
+            opencode.body
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mine.js")).expect("mine"),
+            "// mine"
+        );
+    }
+
     /// Installing adds beside what is there, and never over it.
     ///
     /// The whole reason this is a gate: a person's own hooks are theirs, and an installer

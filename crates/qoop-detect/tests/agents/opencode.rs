@@ -216,3 +216,26 @@ fn a_quoted_placeholder_above_a_live_panel_does_not_hide_it() {
         Blocked,
     );
 }
+
+/// opencode 2 shares one background service whose environment is the first tab's; a tab that
+/// comes back must run its own server, or its hook reports would land on that first terminal.
+#[test]
+fn a_restored_tab_runs_its_own_server() {
+    assert_eq!(
+        qoop_detect::resume_argv("opencode", Some("ses_x")),
+        Some(vec![
+            "opencode".to_string(),
+            "--standalone".to_string(),
+            "--session".to_string(),
+            "ses_x".to_string()
+        ])
+    );
+    assert_eq!(
+        qoop_detect::resume_argv("opencode", None),
+        Some(vec![
+            "opencode".to_string(),
+            "--standalone".to_string(),
+            "--continue".to_string()
+        ])
+    );
+}

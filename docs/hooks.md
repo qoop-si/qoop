@@ -74,7 +74,7 @@ configuration entry it needs in its own header.
 | gemini   | yes          | https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md | `hooks/gemini/qoop-hook.sh` |
 | cursor   | partial      | https://cursor.com/docs/hooks                                          | `hooks/cursor/qoop-hook.sh`      |
 | aider    | no           | https://aider.chat/docs/usage/lint-test.html, https://github.com/Aider-AI/aider/issues/2557 | none (screen only) |
-| opencode | yes          | opencode plugin events (`session.status`, `permission.asked`, ...)     | `hooks/opencode/qoop-plugin.js`  |
+| opencode | yes          | opencode 2 plugin events (`session.execution.*`, `permission.asked`, ...)| `hooks/opencode/qoop-plugin.js`  |
 | amp      | yes          | https://ampcode.com/manual/plugin-api                                  | `hooks/amp/qoop-plugin.js`       |
 | goose    | yes          | https://goose-docs.ai/docs/guides/context-engineering/hooks/           | `hooks/goose/qoop-hook.sh`       |
 | copilot  | session only | https://docs.github.com/en/copilot/reference/hooks-reference           | `hooks/session/qoop-session-hook.sh` |
@@ -96,12 +96,16 @@ Notes:
 - aider has no lifecycle hook system, only `--lint-cmd`/`--test-cmd`. A generic
   command-hook feature is an open request (issue #2557). Aider stays on screen
   detection until that ships.
-- opencode: `session.status` `busy` and `retry` report working, `idle` and
-  `session.idle` idle, `permission.asked` (`permission.updated` in older
-  plugin types) and `question.asked` blocked, their replies working again,
-  and `session.error` failed. A subagent session (one with a parent) never
-  sends its id and never reports idle, because it is not the conversation a
-  person resumes. Reports go out one at a time, in event order.
+- opencode (version 2 or later; its plugin shape is `export default { id, setup }`, and the
+  version 1 shape is refused at load): `session.execution.started` reports working,
+  `succeeded` and `interrupted` idle, `failed` failed, `session.tool.called` a tool event,
+  `permission.asked` and `question.asked` blocked, their replies working again. A
+  subagent session (one with a parent) never sends its id and never reports idle, because
+  it is not the conversation a person resumes. Reports go out one at a time, in event
+  order. Only the server a qoop tab starts for itself reports (`opencode --standalone`,
+  which qoop uses for qass and for restores): the shared background service keeps the
+  environment of the first tab that started it, so a plugin loaded there stays silent. A
+  tab started by hand on the shared service has the screen reading and no hook.
 - claude's `Notification` is blocked only for the kinds that wait on the
   person: `permission_prompt`, `elicitation_dialog`,
   `elicitation_url_dialog`, `agent_needs_input` and `quota_auto_resume_stale`
@@ -151,7 +155,7 @@ Notes:
    `--session-id`, read out of that agent's hook payload on stdin (claude's
    `session_id`, codex's `session_id`, gemini's `session_id` or
    `GEMINI_SESSION_ID`, cursor's `session_id`/`conversation_id`, goose's
-   `session_id`) or out of the plugin event (`properties.sessionID` for
+   `session_id`) or out of the plugin event (`data.sessionID` for
    opencode, `thread.id` for amp). A payload with no id reports with no flag,
    same as before.
 3. The daemon admits the report through the existing token and generation
@@ -204,8 +208,8 @@ shape in each case:
   `.gemini/settings.json` (project), with the state as the script's argument.
 - cursor: entries in `.cursor/hooks.json` (project) or `~/.cursor/hooks.json`
   (user) with `"version": 1`, state as the script's argument.
-- opencode: `qoop hooks install opencode`, or copy `hooks/opencode/qoop-plugin.js` into
-  `~/.config/opencode/plugin/`; do not also list it in `opencode.json`, which loads it twice.
+- opencode: `qoop hooks install opencode` (run it again after an update: an older file is
+  replaced), or copy `hooks/opencode/qoop-plugin.js` into `~/.config/opencode/plugin/`; do not also list it in `opencode.json`, which loads it twice.
 - amp: load `hooks/amp/qoop-plugin.js` as a plugin.
 - copilot: flat entries (`{ "command": ... }`, no wrapper) under `"hooks"`
   in `~/.copilot/settings.json` (`$COPILOT_HOME/settings.json` when set; a
