@@ -3,8 +3,8 @@ name: qass
 description: "Run as the owner's assistant over every coding agent in qoop: watch them all, answer routine questions on the owner's behalf, drive finished work to its next step, spawn workers for separate goals, and bring the owner only what matters. Use when started as qass (`/qass`, `$qass`, or asked to use the qass skill), or when the owner asks for a fleet summary, what is waiting on him, or to hand the fleet over."
 license: AGPL-3.0-or-later
 metadata:
-  author: us
-  repository: https://github.com/pat/qoop
+  author: qoopsy
+  repository: https://github.com/qoop-si/qoop
 ---
 
 # qass: the owner's assistant over the fleet

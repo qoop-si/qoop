@@ -70,7 +70,7 @@ The releases are read from `https://qoop.si/releases`, anonymously: `<base>/late
 `assets[]` with `name` and `url`), and each asset is fetched by its `url` as it stands.
 `scripts/install.sh` reads the same, needs no python (Linux boxes often have none), and falls
 back to `sha256sum` where `shasum` is missing. `QOOP_RELEASE_BASE` points both at a mirror, at
-GitHub's own API (`https://api.github.com/repos/pat/qoop/releases`) or at a local directory
+GitHub's own API (`https://api.github.com/repos/qoop-si/qoop/releases`) or at a local directory
 (`file:///path` holding a `latest` file in the API's shape), which is how the platform pick
 is tested with no network. Only the GitHub API gets a token: `GH_TOKEN` or `GITHUB_TOKEN`
 from the environment, else whatever `gh auth token` prints, handed to curl on stdin as a

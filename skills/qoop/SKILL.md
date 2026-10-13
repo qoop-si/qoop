@@ -3,8 +3,8 @@ name: qoop
 description: "Work with the coding agents running in qoop terminals: see who is there, understand one before writing to it, send it text, wait for it to finish, read its screen and transcript, and start new agents in terminals or git worktrees. Use when the user mentions qoop, tabs, terminals, worktrees, or another agent's session."
 license: AGPL-3.0-or-later
 metadata:
-  author: us
-  repository: https://github.com/pat/qoop
+  author: qoopsy
+  repository: https://github.com/qoop-si/qoop
 allowed-tools: Bash(qoop:*) Read
 ---
 
