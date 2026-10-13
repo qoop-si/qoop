@@ -9100,7 +9100,6 @@ fn spawn_history_writer(
         {
             let _ = commands.try_send(ClientCommand::Refresh);
         }
-        drop(commands);
         let mut unflushed = false;
         // The last flush somebody asked for that has been answered.
         let mut flushed_to = 0u64;
@@ -9206,6 +9205,18 @@ fn spawn_history_writer(
                     // scrolled back can hold its place while the terminal keeps printing
                     // rather than being dragged along by it.
                     rows_behind.store(history.len(), std::sync::atomic::Ordering::Relaxed);
+                    // The screen that went out while this burst was still unsaved said
+                    // less is behind it than there is, and a terminal that has gone quiet
+                    // sends no other: its wheel and copy mode would find nothing to scroll
+                    // into until something printed again. Only when nothing else is
+                    // waiting to be written: a streaming terminal renders on its own, and
+                    // a refresh per batch would double its screens.
+                    if !finished
+                        && spill.is_empty()
+                        && let Some(commands) = commands.upgrade()
+                    {
+                        let _ = commands.try_send(ClientCommand::Refresh);
+                    }
                     if truncated > 0 {
                         crate::say!(
                             "qoopd: history for {} truncated {truncated} bytes of an \
