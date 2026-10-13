@@ -234,8 +234,8 @@ How a screen is read, and how to override a misreading, is in
 [docs/manifests.md](docs/manifests.md); what each hook installs is in
 [docs/hooks.md](docs/hooks.md).
 
-On a fresh Mac or Linux box, `scripts/install.sh` does all three in one go: binary, hooks,
-skill. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
+On a fresh Mac or Linux box, `scripts/install.sh` does it all in one go: binary, hooks,
+skill, and on a Mac the notch and the font of qoop's icons. Run it as yourself, not with sudo: the binary goes to `~/.local/bin/qoop` (or
 `QOOP_DEST`), and it says so if that directory is not on your PATH. The releases are
 read from `https://qoop.si/releases`, which `qoop update` reads too; no token is needed.
 

@@ -301,10 +301,9 @@ trap - EXIT
 "#;
 
 /// Commit: link the staged file into place, unless a qoop appeared there meanwhile, which
-/// counts as done and is left alone. A qoop just put there installs its hooks and skills, as
-/// one that was swapped in does; best effort, since `qoop hooks install` on that machine
-/// does the same later and a refusal is no reason to undo the install. Each gets `HOOKS_WAIT`
-/// seconds, kept by a watcher since not every machine has `timeout`: a slow machine must not
+/// counts as done and is left alone. A qoop just put there installs its hooks, skills and
+/// icon font, as one that was swapped in does; best effort, since `qoop update` there does the
+/// same later and a refusal is no reason to undo the install. Each gets `HOOKS_WAIT` seconds, kept by a watcher since not every machine has `timeout`: a slow machine must not
 /// run the connection out of its deadline for an install that has already happened.
 const COMMIT: &str = r#"fresh=
 if ln "$1" "$d/qoop" 2>/dev/null; then fresh=1; else [ -e "$d/qoop" ]; fi
@@ -312,7 +311,7 @@ if ln "$1" "$d/qoop" 2>/dev/null; then fresh=1; else [ -e "$d/qoop" ]; fi
 rm -f "$1"
 printf '%s\n' MARKER
 if [ -n "$fresh" ]; then
-  for w in hooks skills; do
+  for w in hooks skills icons; do
     "$d/qoop" "$w" install </dev/null >/dev/null 2>&1 &
     b=$!
     ( sleep HOOKS_WAIT; kill "$b" ) >/dev/null 2>&1 &
@@ -323,7 +322,7 @@ if [ -n "$fresh" ]; then
 fi
 "#;
 
-/// How long each of the two steps at the end of `COMMIT` may take. A second in tests, so one
+/// How long each of the three steps at the end of `COMMIT` may take. A second in tests, so one
 /// that hangs can be seen to be cut off.
 const HOOKS_WAIT: u32 = if cfg!(test) { 1 } else { 5 };
 
@@ -460,8 +459,9 @@ const SWAPPED_MEANWHILE: i32 = 6;
 /// another swap holds the lock (said, not quiet: a lock left by a swap that was killed
 /// would otherwise hide every update), and leaves nothing staged and no lock of its own
 /// behind. A lock older than half an hour is from a swap that was killed, and is swept.
-/// Once swapped, the new qoop refreshes its hooks and skills there (it skips an agent that
-/// is not on that machine); what fails is said after the marker and never fails the swap.
+/// Once swapped, the new qoop refreshes its hooks, skills and icon font there (it skips an
+/// agent that is not on that machine); what fails is said after the marker and never fails
+/// the swap.
 /// It also puts the bridge service there back on the new file: launchd refuses to start a
 /// service whose program file was replaced, so a macOS machine's bridge would otherwise die
 /// at its next start. That reload is for a swap a person asked for (`$4` is 1): an automatic
@@ -500,7 +500,7 @@ t=
 h=
 rmdir "$l" || true
 printf '%s\n' MARKER
-for w in hooks skills; do
+for w in hooks skills icons; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoop $w install on it"
 done
 if [ "$4" != 1 ]; then
@@ -904,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
-            "hooks install\nskills install\n"
+            "hooks install\nskills install\nicons install\n"
         );
 
         let other = tempfile::tempdir().expect("home");
@@ -930,7 +930,7 @@ mod tests {
     fn a_hanging_hooks_step_does_not_fail_the_install() {
         let home = tempfile::tempdir().expect("home");
         let hangs = b"#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop 0.0.2';;\n\
-             hooks|skills) echo \"$*\" >> \"$HOME/ran\"; [ \"$1\" = hooks ] && exec sleep 30; exit 1;;\nesac\n";
+             hooks|skills|icons) echo \"$*\" >> \"$HOME/ran\"; [ \"$1\" = hooks ] && exec sleep 30; exit 1;;\nesac\n";
         let out = stage(home.path(), hangs, hangs.len());
         assert!(out.status.success());
         let text = String::from_utf8_lossy(&out.stdout);
@@ -948,7 +948,7 @@ mod tests {
         // The skills step still ran after the hooks step was cut off, and its failure is quiet.
         assert_eq!(
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
-            "hooks install\nskills install\n"
+            "hooks install\nskills install\nicons install\n"
         );
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
     fn noting(version: &str) -> Vec<u8> {
         format!(
             "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop {version}';;\n\
-             hooks|skills|bridge|update) echo \"$*\" >> \"$HOME/ran\"; \
+             hooks|skills|icons|bridge|update) echo \"$*\" >> \"$HOME/ran\"; \
              [ \"$1\" = skills ] && [ -e \"$HOME/skills-fail\" ] && exit 1; \
              [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-hang\" ] && exec sleep 30; \
              [ \"$1\" = bridge ] && [ -e \"$HOME/bridge-fail\" ] && exit 1; exit 0;;\nesac\n"
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
-            "hooks install\nskills install\nupdate --mark-reload\n"
+            "hooks install\nskills install\nicons install\nupdate --mark-reload\n"
         );
     }
 
@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(said.split_once(RELAY_MARKER).expect("marker").1.trim(), "");
         assert_eq!(
             std::fs::read_to_string(home.path().join("ran")).expect("ran"),
-            "hooks install\nskills install\nbridge reload\n"
+            "hooks install\nskills install\nicons install\nbridge reload\n"
         );
         assert_eq!(std::fs::read(&qoop).expect("qoop"), noting("0.0.2"));
 
@@ -1174,10 +1174,10 @@ mod tests {
     fn swap_lets_go_of_its_lock_before_it_refreshes_anything() {
         let home = tempfile::tempdir().expect("home");
         let qoop = installed(home.path(), &says("0.0.1"));
-        // Notes, each time it is asked for hooks, skills or the bridge, whether the lock
+        // Notes, each time it is asked for hooks, skills, icons or the bridge, whether the lock
         // directory beside the file is still there.
         let probing = "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop 0.0.2';;\n\
-             hooks|skills|bridge) [ -d \"$HOME/.local/bin/.qoop-swap.lock\" ] \
+             hooks|skills|icons|bridge) [ -d \"$HOME/.local/bin/.qoop-swap.lock\" ] \
              && echo \"held during $1\" >> \"$HOME/held\"; exit 0;;\nesac\n";
         let out = swap(home.path(), "0.0.1", "0.0.2", probing.as_bytes());
         assert!(out.status.success());

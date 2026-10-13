@@ -14,9 +14,10 @@ use crate::Phone;
 use crate::places::{human, size};
 
 const USAGE: &str = "usage: qoop uninstall [--yes]\n\
-    take qoop off this machine: the notch (macOS), the hooks, the skills, the account link, the \
-    daemon, qoop's directories and the qoop binary. It lists them and asks first; `--yes` skips \
-    the question. A paired phone must be removed first (`qoop devices rm <name>`).";
+    take qoop off this machine: the notch and the icon font (macOS), the hooks, the skills, the \
+    account link, the daemon, qoop's directories and the qoop binary. It lists them and asks \
+    first; `--yes` skips the question. A paired phone must be removed first \
+    (`qoop devices rm <name>`).";
 
 /// A bridge service file: left behind after `logout`, a phone is still paired.
 const SERVICE_FILES: [&str; 4] = [
@@ -151,8 +152,9 @@ fn list(plan: &Plan) {
     );
     println!("          {}", plan.binary.display());
     println!(
-        "and takes out the notch (macOS), the hooks and skills qoop added, the account link, \
-         and stops the daemon. qass's lessons and its folder go with config and data."
+        "and takes out the notch and the icon font (macOS), the hooks and skills qoop added, the \
+         account link, and stops the daemon. qass's lessons and its folder go with config and \
+         data."
     );
 }
 
@@ -197,6 +199,12 @@ fn steps(plan: &Plan, phone: Option<Phone>) -> std::io::Result<()> {
         "the skills",
         crate::skills::run(&args_for(&["skills", "uninstall"])),
     )?;
+    if cfg!(target_os = "macos") {
+        stage(
+            "the icon font",
+            crate::icons::run(&args_for(&["icons", "uninstall"])),
+        )?;
+    }
     if let Some(phone) = phone {
         stage("logout", phone(&args_for(&["logout"])))?;
     }

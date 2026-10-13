@@ -468,6 +468,9 @@ impl Interface {
             .env_remove("ALACRITTY_WINDOW_ID")
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY")
+            // Nor the tmux the suite may run in, which turns icons off and wraps the questions.
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             // No remote from the machine running the tests: a real one would put ssh
             // connections under every gate here.
             .env("QOOP_REMOTES", dir.join("remotes.json"))
@@ -2568,4 +2571,65 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
             }
         }
     }
+}
+
+/// On a fresh Mac the first interface writes the icon font and draws nothing from it,
+/// so the terminal never looks an icon up before the font is registered and keeps a box for
+/// it; the next start draws the icons. Terminal never answers XTVERSION, so its environment
+/// alone turns icons on.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_icon_font_a_start_writes_is_drawn_from_the_next_start() {
+    use qoop_tui::icons;
+    let home = tempfile::tempdir().expect("home");
+    let open = || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .expect("chmod");
+        let env = [
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("TERM_PROGRAM", "Apple_Terminal".into()),
+        ];
+        Interface::start_from(dir, false, COLS, ROWS, &env)
+    };
+    let drawn = |ui: &Interface| {
+        icons::GLYPHS
+            .iter()
+            .filter(|(_, g)| ui.painted.contains(*g))
+            .count()
+    };
+    let more = icons::MORE.to_string();
+
+    let mut first = open();
+    assert!(
+        first.wait_for_tab(1, Duration::from_secs(20)),
+        "{}",
+        first.screen
+    );
+    assert!(
+        first.wait_for(&more, Duration::from_secs(3)).is_none(),
+        "the first start drew icons from the font it had just written:\n{}",
+        first.screen
+    );
+    assert_eq!(drawn(&first), 0);
+    let fonts: Vec<_> = std::fs::read_dir(home.path().join("Library/Fonts"))
+        .expect("the font folder")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        fonts.iter().any(|f| f.starts_with("QoopSymbols-")),
+        "no font written: {fonts:?}"
+    );
+    drop(first);
+
+    let mut second = open();
+    assert!(
+        second.wait_for(&more, Duration::from_secs(20)).is_some(),
+        "the next start drew no icon:\n{}",
+        second.screen
+    );
 }

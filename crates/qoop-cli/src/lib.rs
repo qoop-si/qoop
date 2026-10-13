@@ -23,6 +23,7 @@ mod board_page;
 mod config;
 mod doctor;
 mod hooks;
+mod icons;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
 #[cfg(target_os = "macos")]
 mod launchd;
@@ -195,6 +196,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("settings") => settings::run(&args),
         Some("onboard") => onboard::run(&args),
         Some("skills") => skills::run(&args),
+        Some("icons") => icons::run(&args),
         Some("paths") => places::run(&args[2..]),
         Some("qass") => qass::run_qass(&args),
         Some("report")
@@ -309,6 +311,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop sound      hear the notification sounds and keep one each\n\
                   \x20 qoop notch install|uninstall|status  on a Mac, your agents in\n\
                   \x20                 the notch, started at login\n\
+                  \x20 qoop icons install|uninstall|status  on a Mac, the font qoop's\n\
+                  \x20                 icons are drawn from\n\
                  \x20 qoop stop       end the daemon and every tab; `qoop` brings them back\n\
                  \x20 qoop restart    move the daemon onto the qoop on disk now, every tab and agent still running\n\
                  \x20 qoop pair [--hub URL]  pair a phone: a QR code, then the code it shows\n\

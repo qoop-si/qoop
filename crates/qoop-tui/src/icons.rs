@@ -6,8 +6,9 @@
 //! `scripts/build-icon-font.py`, which fits every one to one box and one centre line (the
 //! sets were drawn apart and stood at different heights) and puts them at our own codepoints
 //! in the supplementary private use plane. iTerm2, Terminal, Ghostty and kitty draw a glyph
-//! their font lacks from any installed font that has it, which is why the interface installs
-//! its own into the person's font folder. WezTerm and Alacritty never look past their own
+//! their font lacks from any installed font that has it, which is why qoop installs its own
+//! into the person's font folder: `install.sh` and `qoop update` through `qoop icons install`,
+//! and the interface when it finds it missing. WezTerm and Alacritty never look past their own
 //! fonts, and a terminal never says it failed to draw a glyph, so icons are drawn only where
 //! they were seen to draw; everywhere else each one keeps the glyph or word the interface drew
 //! before.
@@ -200,27 +201,69 @@ pub fn installed() -> bool {
 }
 
 /// Put the font where the terminal's font fallback finds it, when the interface runs in one
-/// that draws from installed fonts, on this machine, and it is not there yet. Written beside
-/// itself and renamed in, so a reader never sees half a font. Returns whether the font is in
-/// place.
-pub fn install(env: &Env) -> bool {
-    if installed() {
-        return true;
+/// that draws from installed fonts, on this machine, and it is not there yet.
+///
+/// The interface draws icons only from a font that was there when it started: a terminal
+/// that is already running looks for a glyph before a font written that moment is
+/// registered, and iTerm2 never listens for a font arriving, so the first frames would be
+/// boxes that stay. The install and update put the font in place long before that.
+pub fn install(env: &Env) {
+    if env.ssh || env.tmux || !draws_from_fonts(env) || installed() {
+        return;
     }
-    if env.ssh || env.tmux || !draws_from_fonts(env) {
-        return false;
+    if let Err(e) = install_font() {
+        eprintln!("qoop: the icon font was not installed: {e}");
     }
-    let Some(dir) = font_dir() else { return false };
-    match write_font(&dir) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!(
-                "qoop: the icon font was not installed in {}: {e}",
-                dir.display()
-            );
-            false
+}
+
+/// Put this build's font into the font folder, whatever terminal this runs in: the install
+/// and the update, for the terminals the person opens later. Written beside itself and renamed
+/// in, so a reader never sees half a font. Where it is, or `None` where there is no folder
+/// for it (anything but macOS).
+pub fn install_font() -> std::io::Result<Option<PathBuf>> {
+    let Some(dir) = font_dir() else {
+        return Ok(None);
+    };
+    if !installed() {
+        write_font(&dir)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
+    }
+    Ok(Some(dir.join(font_file())))
+}
+
+/// Take every font of qoop's out of the font folder, this build's and older ones. What it
+/// removed.
+pub fn uninstall_font() -> std::io::Result<Vec<PathBuf>> {
+    let Some(dir) = font_dir() else {
+        return Ok(Vec::new());
+    };
+    remove_fonts(&dir)
+}
+
+fn remove_fonts(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        if is_ours(&entry.file_name().to_string_lossy()) {
+            std::fs::remove_file(entry.path())?;
+            removed.push(entry.path());
         }
     }
+    Ok(removed)
+}
+
+/// A font file qoop wrote: this name, hashed or not, or the one it had before the rename.
+fn is_ours(file: &str) -> bool {
+    let Some(stem) = file.strip_suffix(".ttf") else {
+        return false;
+    };
+    ["QoopSymbols", "QoroSymbols"].iter().any(|name| {
+        stem.strip_prefix(name)
+            .is_some_and(|hash| hash.is_empty() || hash.starts_with('-'))
+    })
 }
 
 fn write_font(dir: &Path) -> std::io::Result<()> {
@@ -245,8 +288,8 @@ fn write_font(dir: &Path) -> std::io::Result<()> {
             .ok()
             .and_then(|at| at.elapsed().ok())
             .is_some_and(|age| age > week);
-        let ours = file.starts_with("QoopSymbols-") && file.ends_with(".ttf");
-        if file != name && (file == "QoopSymbols.ttf" || (ours && stale)) {
+        let hashed = file.starts_with("QoopSymbols-") && is_ours(&file);
+        if file != name && (file == "QoopSymbols.ttf" || (hashed && stale)) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -452,6 +495,39 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no temporary file and no older font left: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uninstalling takes every font qoop wrote, under either name, and nothing beside them.
+    #[test]
+    fn uninstall_takes_only_qoops_fonts() {
+        let dir = std::env::temp_dir().join(format!("qoop-font-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let ours = [
+            "QoopSymbols-aad02378.ttf",
+            "QoopSymbols.ttf",
+            "QoroSymbols-b64d777f.ttf",
+        ];
+        let others = ["Menlo.ttf", "QoopSymbols-1.otf", "QoopSymbolsExtra.ttf"];
+        for f in ours.iter().chain(&others) {
+            std::fs::write(dir.join(f), b"x").expect("write");
+        }
+        let mut removed: Vec<_> = remove_fonts(&dir)
+            .expect("remove")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        removed.sort();
+        assert_eq!(removed, ours);
+        for f in others {
+            assert!(dir.join(f).exists(), "{f} stays");
+        }
+        assert!(
+            remove_fonts(&dir.join("none"))
+                .expect("no folder")
+                .is_empty()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

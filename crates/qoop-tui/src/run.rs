@@ -916,7 +916,9 @@ struct State {
     host_light: Option<bool>,
     /// What the outer terminal said to XTVERSION, for [`crate::icons::decide`].
     icon_reply: crate::icons::Reply,
-    /// Whether this machine has the icon font where iTerm2 and Terminal look.
+    /// Whether this machine had the icon font where iTerm2 and Terminal look when this
+    /// interface started. A font written later counts from the next start: see
+    /// [`crate::icons::install`].
     icon_font: bool,
     /// The colours last told to the daemon, so an unchanged answer is not sent again.
     host_sent: Option<([u8; 3], [u8; 3])>,
@@ -6922,7 +6924,7 @@ where
         host_colors: [None, None],
         host_light: None,
         icon_reply: crate::icons::Reply::Silent,
-        icon_font: false,
+        icon_font: crate::icons::installed(),
         host_sent: None,
         host_refused: false,
         news_sent: None,
@@ -7056,10 +7058,7 @@ where
             state.icon_reply = crate::icons::Reply::Waiting;
         }
     }
-    // The font first, so a terminal that draws from installed fonts finds it on the first
-    // frame, then the first guess, which the terminal's answer may still correct.
-    state.icon_font = state.config.icons != crate::icons::Setting::Off
-        && crate::icons::install(&crate::colorlevel::current_env());
+    // The first guess, which the terminal's answer may still correct.
     reicon(&state);
     out.flush()?;
     // The pet and the update notice, read once so the first frame has them; the
@@ -9946,9 +9945,9 @@ fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
     retheme(state);
-    // Icons turned back on in a running session get their font now, not at the next start.
+    // A font missing here is put in place now and drawn from at the next start.
     if !state.icon_font && state.config.icons != crate::icons::Setting::Off {
-        state.icon_font = crate::icons::install(&crate::colorlevel::current_env());
+        crate::icons::install(&crate::colorlevel::current_env());
     }
     reicon(state);
 }

@@ -863,9 +863,9 @@ fn install(latest: &Release, current: &str, auto: bool) -> std::io::Result<Insta
     Ok(installed)
 }
 
-/// What follows a swap, once the lock is gone. The hooks and skills are files, refreshed
-/// always. The notch and the phone's bridge are put back on the new file at once only when a
-/// person asked for this: doing it unattended would cut a phone's live stream. The
+/// What follows a swap, once the lock is gone. The hooks, skills and icon font are files,
+/// refreshed always. The notch and the phone's bridge are put back on the new file at once
+/// only when a person asked for this: doing it unattended would cut a phone's live stream. The
 /// unattended run leaves a mark, and a later one acts on it when nobody is connected.
 fn after_swap(
     exe: &Path,
@@ -978,10 +978,13 @@ async fn alone_on(version: &str) -> bool {
 
 /// What `scripts/install.sh` does after it puts a binary down: the new build's own `hooks
 /// install` and `skills install`, which skip an agent that is not on this machine, so the
-/// files agents read are never older than the binary. A failure is said and never fails
+/// files agents read are never older than the binary, and `icons install`, so the icon font
+/// is in place before the next interface starts. A failure is said and never fails
 /// an update that has already happened.
 fn refresh_integrations(exe: &Path) {
-    for what in ["hooks", "skills"] {
+    // The icon font only where it is drawn from, as `install.sh` does.
+    let icons = cfg!(target_os = "macos").then_some("icons");
+    for what in ["hooks", "skills"].into_iter().chain(icons) {
         if !Command::new(exe)
             .args([what, "install"])
             .status()

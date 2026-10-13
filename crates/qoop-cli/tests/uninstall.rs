@@ -63,6 +63,10 @@ impl Machine {
     fn fill(&self) -> Vec<PathBuf> {
         self.qoop(&["hooks", "install"]);
         self.qoop(&["skills", "install"]);
+        self.qoop(&["icons", "install"]);
+        let fonts = self.path("h/Library/Fonts");
+        std::fs::create_dir_all(&fonts).expect("fonts");
+        std::fs::write(fonts.join("Neighbour.ttf"), "x").expect("neighbour font");
         let mut dirs = Vec::new();
         for place in ["config", "data", "cache", "logs"] {
             let out = self.qoop(&["paths", place]);
@@ -76,6 +80,15 @@ impl Machine {
         std::fs::write(dirs[4].join("kept"), "x").expect("file");
         std::fs::write(self.path("h/.local/bin/qoro"), "old").expect("qoro");
         dirs
+    }
+
+    /// Whether qoop's icon font is in the font folder; always on a Mac once `fill` ran.
+    fn font_installed(&self) -> bool {
+        std::fs::read_dir(self.path("h/Library/Fonts")).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("QoopSymbols"))
+        })
     }
 
     fn hooks_installed(&self) -> bool {
@@ -96,6 +109,7 @@ fn untouched(m: &Machine, dirs: &[PathBuf]) {
     assert!(dirs.iter().all(|d| d.join("kept").exists()));
     assert!(m.path("h/.local/bin/qoop").exists());
     assert!(m.hooks_installed());
+    assert_eq!(m.font_installed(), cfg!(target_os = "macos"));
 }
 
 #[test]
@@ -103,6 +117,7 @@ fn uninstall_takes_everything_and_leaves_the_neighbours() {
     let m = Machine::new();
     let dirs = m.fill();
     assert!(m.hooks_installed());
+    assert_eq!(m.font_installed(), cfg!(target_os = "macos"));
     let out = m.qoop(&["uninstall", "--yes"]);
     assert!(out.status.success(), "{}", said(&out));
     for d in &dirs {
@@ -113,6 +128,8 @@ fn uninstall_takes_everything_and_leaves_the_neighbours() {
     assert!(!m.hooks_installed());
     assert!(!m.path("h/.claude/skills/qoop").exists());
     assert!(m.path("h/.claude/skills/neighbour/SKILL.md").exists());
+    assert!(!m.font_installed());
+    assert!(m.path("h/Library/Fonts/Neighbour.ttf").exists());
 }
 
 #[test]
@@ -224,4 +241,16 @@ fn a_failing_step_stops_there_and_a_second_run_finishes() {
     assert!(out.status.success(), "{}", said(&out));
     assert!(dirs.iter().all(|d| !d.exists()));
     assert!(!m.path("h/.local/bin/qoop").exists());
+}
+
+/// `icons = "off"` is a person who wants no icons, and no font of qoop's in their font menus.
+#[test]
+fn icons_off_installs_no_font() {
+    let m = Machine::new();
+    let set = m.qoop(&["config", "set", "icons", "off"]);
+    assert!(set.status.success(), "{}", said(&set));
+    let out = m.qoop(&["icons", "install"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(said(&out).contains("icons are off"), "{}", said(&out));
+    assert!(!m.font_installed());
 }

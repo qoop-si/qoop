@@ -1,4 +1,5 @@
-//! `qoop update` leaves the hooks and skills current, the way `scripts/install.sh` does.
+//! `qoop update` leaves the hooks, skills and icon font current, the way `scripts/install.sh`
+//! does.
 //!
 //! The whole chain runs for real inside one temp dir: an installed copy of this build, a
 //! fake release served from `file://`, and a home with one agent in it. Nothing reaches the
@@ -123,4 +124,12 @@ fn an_update_leaves_hooks_and_skills_current() {
         "{}",
         String::from_utf8_lossy(&skills.stdout)
     );
+    // The icon font too, on a Mac: there before the next interface starts.
+    let icons = qoop(root, &exe, &["icons", "status"]);
+    let want = if cfg!(target_os = "macos") {
+        "icon font: installed"
+    } else {
+        "icon font: not needed here, qoop draws its icons from it on a Mac only"
+    };
+    assert_eq!(String::from_utf8_lossy(&icons.stdout).trim(), want);
 }

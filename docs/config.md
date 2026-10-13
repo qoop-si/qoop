@@ -41,7 +41,7 @@ cards = "full"
 |---|---|---|
 | `prefix` | `"ctrl-a"` | the key that starts a command: `ctrl-` and one of `a b e f g k l n o p r t u v w x y` |
 | `theme` | `"auto"` | `auto` asks the terminal for its background; `dark` or `light` say it |
-| `icons` | `"auto"` | the few icons qoop draws (asleep, keep awake, sleep and wake, settings, another machine) where they were seen to draw: iTerm2 and Terminal with qoop's own font, which the interface puts in `~/Library/Fonts`, and Ghostty, kitty and WezTerm, which carry the glyphs; every other terminal, tmux and an ssh session keep the plain glyphs. `on` or `off` force either |
+| `icons` | `"auto"` | the few icons qoop draws (asleep, keep awake, sleep and wake, settings, another machine) where they were seen to draw: iTerm2, Terminal, Ghostty and kitty on a Mac with qoop's own font, which the install and `qoop update` put in `~/Library/Fonts` (`qoop icons install`), drawn from the first interface started after the font is there; WezTerm, Alacritty, every other terminal, tmux and an ssh session keep the plain glyphs. `on` or `off` force either; `on` draws them even with no font in place |
 | `notify.desktop` | `true` | tell the desktop when an agent needs you and you are not looking |
 | `notify.sound` | `false` | and play a sound when it does; the install asks |
 | `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink`, or on Linux a freedesktop name (`complete`, `bell`, `message`, ...; Linux default `complete`); `qoop sound` plays them to choose |

@@ -74,12 +74,14 @@ sh scripts/install.sh >/dev/null || fail "happy path exited nonzero"
 grep -q "hooks install" "$T/calls" || fail "hooks install was not delegated"
 grep -q "skills install" "$T/calls" || fail "skills install was not delegated"
 grep -q "bridge reload" "$T/calls" || fail "bridge reload was not delegated"
-# The notch on a Mac and nowhere else.
-if [ "$(uname -s)" = "Darwin" ]; then
-    grep -q "notch install" "$T/calls" || fail "notch install was not delegated on macOS"
-else
-    grep -q "notch install" "$T/calls" && fail "notch install was delegated off macOS"
-fi
+# The notch and the icon font on a Mac and nowhere else.
+for what in notch icons; do
+    if [ "$(uname -s)" = "Darwin" ]; then
+        grep -q "$what install" "$T/calls" || fail "$what install was not delegated on macOS"
+    else
+        grep -q "$what install" "$T/calls" && fail "$what install was delegated off macOS"
+    fi
+done
 
 # Only the binary is asked of the tarball, and the temp dir is gone afterwards.
 grep -q "qoop$" "$T/tar-calls" || fail "tar was not asked for the qoop member alone"

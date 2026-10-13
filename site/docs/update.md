@@ -37,6 +37,7 @@ each is safe to run again:
 qoop notch uninstall      on a Mac: the notch and its login item
 qoop hooks uninstall
 qoop skills uninstall
+qoop icons uninstall      on a Mac: the font of qoop's icons
 qoop logout               unlinks this machine, even when the hub cannot be reached; with no
                           phone paired here, it also removes the bridge service (with one,
                           `qoop devices rm <name>` for each first: the command stops and says so)

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fresh-machine install: binary, hooks, skills. One command, no questions.
+# Fresh-machine install: binary, hooks, skills, icon font. One command, no questions.
 #
 # Complementary to `qoop update`, not a copy of it: update replaces a live
 # binary in place and refuses while sessions run; this lays a machine out
@@ -249,6 +249,9 @@ main() {
     # fails: a Mac older than 14 says so, and everything above stays installed.
     if [ "$(uname -s)" = "Darwin" ]; then
         "$DEST" notch install || echo "the notch was not turned on; the rest of qoop is installed"
+        # The icons' font, now: a terminal draws a glyph from a font that was there when it
+        # first looked, and the interface draws icons only from one there when it started.
+        "$DEST" icons install || echo "qoop install: the icon font was not installed; run: qoop icons install" >&2
     fi
     # A phone's bridge service, when there is one, back on the file just put in place: launchd
     # will not start an agent whose file was replaced, and a running one is the old build.
