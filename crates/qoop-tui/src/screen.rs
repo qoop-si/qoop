@@ -3193,12 +3193,9 @@ fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
             },
             Pane::Questions => Tab {
                 pane: *pane,
+                // Its count is its state: `questions 2`, the word the header's chip says.
                 count: Some(asks),
-                state: Some(if asks > 0 {
-                    format!("{asks} asks")
-                } else {
-                    "none".to_string()
-                }),
+                state: None,
                 dot: if asks > 0 {
                     theme::Role::Blocked
                 } else {

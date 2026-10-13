@@ -10063,6 +10063,11 @@ fn note_report(state: &mut State, report: crate::input::Report) -> bool {
     match report {
         Report::Focus(focused) => {
             state.outer_focus = Some(focused);
+            // Another interface may have told the daemon its own colours meanwhile: back in
+            // front of the person, this one tells its own again.
+            if focused {
+                state.host_sent = None;
+            }
             focused
         }
         Report::Color { background, rgb } => {
@@ -10317,7 +10322,7 @@ const ACCEPT_DROPS: &[u8] = b"\x1b]72;t=a;text/uri-list text/plain\x1b\\";
 /// Whether the terminal may be asked at all. The Linux console answers none of these and
 /// has been seen to print the question instead; a `dumb` terminal is a pipe, and asking
 /// a pipe prints garbage into whatever reads next.
-fn may_ask_terminal() -> bool {
+pub fn may_ask_terminal() -> bool {
     std::env::var("TERM").map_or(true, |term| term != "linux" && term != "dumb")
 }
 
@@ -11920,7 +11925,7 @@ fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
 /// What a click in the pane means for the question inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AskClick {
-    /// The `[ N asks you ]` chip on qass's header.
+    /// The `[ N questions ]` chip on qass's header.
     Toggle,
     /// Something the inbox drew.
     Inbox(crate::asks::Hit),
@@ -12010,15 +12015,18 @@ fn asks_toggle(state: &mut State) -> bool {
     if state.qass_split() {
         return questions_toggle(state);
     }
-    let (cols, rows) = screen::pane_size_for(
-        state.cols,
-        state.lines,
-        state.collapsed,
-        0,
-        state.sidebar_width,
-    );
-    if !crate::qass_screen::Plan::holds_inbox(cols as usize, rows as usize) {
-        state.message = Some("the pane is too narrow for the questions".to_string());
+    let holds = |state: &State| {
+        let (cols, rows) = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        );
+        crate::qass_screen::Plan::holds_inbox(cols as usize, rows as usize)
+    };
+    if !holds(state) {
+        state.message = Some(no_room(state, "the questions", holds));
         return false;
     }
     if !state.qass_ui.inbox || state.qass_ui.zoomed {
@@ -12035,6 +12043,23 @@ fn asks_toggle(state: &mut State) -> bool {
     }
     state.asks.focus = true;
     false
+}
+
+/// Why `what` does not open: the pane too narrow and the key that folds the agents column,
+/// when `holds` says the pane would hold it with the column folded; else too small (its
+/// rows are short, or even the folded column leaves too few columns).
+fn no_room(state: &mut State, what: &str, holds: impl Fn(&State) -> bool) -> String {
+    let folding = !state.collapsed && {
+        state.collapsed = true;
+        let fits = holds(state);
+        state.collapsed = false;
+        fits
+    };
+    crate::keys::named(&if folding {
+        format!("the pane is too narrow for {what}; ctrl-a b folds the column")
+    } else {
+        format!("the pane is too small for {what}")
+    })
 }
 
 /// [`asks_toggle`] on qass's split tab, where a card only lights the rail's tab: shown, the
@@ -12057,9 +12082,9 @@ fn questions_toggle(state: &mut State) -> bool {
         state.qass_ui.inbox = true;
     }
     if state.questions().is_none() {
+        state.message = Some(no_room(state, "the questions", |s| s.questions().is_some()));
         state.qass_ui.inbox = false;
         state.asks.raised = false;
-        state.message = Some("the pane is too narrow for the questions".to_string());
         return false;
     }
     state.asks.focus = true;
@@ -15802,6 +15827,14 @@ mod tests {
             host_colors_request(&mut state, &mut request).is_none(),
             "unchanged"
         );
+        // Another interface (a dark terminal) may have told the daemon since: back in focus,
+        // this one tells its own again, once.
+        note_report(&mut state, Report::Focus(true));
+        assert!(
+            host_colors_request(&mut state, &mut request).is_some(),
+            "told again after a focus-in"
+        );
+        assert!(host_colors_request(&mut state, &mut request).is_none());
         let mut dirty = false;
         apply(
             &mut state,
@@ -21257,7 +21290,7 @@ mod tests {
     }
 
     /// The questions' tab on the rail opens them on a click, as the chip does, and carries the same
-    /// count as the header's `[ N asks you ]`: before the ask store is read and after.
+    /// count as the header's `[ N questions ]`: before the ask store is read and after.
     #[test]
     fn the_questions_tab_opens_them_and_counts_what_the_header_counts() {
         let mut state = qass_wide();
@@ -21280,7 +21313,7 @@ mod tests {
                 screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
             let chip = screen.chip().expect("the chip");
             let row = written_on(&screen::paint(&frame), 1 + chip.row);
-            let at = row.find(" asks you").expect("the chip's words");
+            let at = row.find(" question").expect("the chip's words");
             row[..at].rsplit(' ').next().unwrap().to_string()
         };
         // Before the store is read: both fall back to the same count.
@@ -21303,9 +21336,9 @@ mod tests {
             screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false).unwrap();
         let painted = screen::paint(&frame);
         let chip = screen.chip().unwrap();
-        assert!(written_on(&painted, 1 + chip.row).contains("[ 3 asks you ]"));
+        assert!(written_on(&painted, 1 + chip.row).contains("[ 3 questions ]"));
         // Its words show under the tab (the ember block itself is the rail's own test).
-        assert!(painted.contains("3 waiting"), "{painted:?}");
+        assert!(painted.contains("3 questions"), "{painted:?}");
         // A click on the tab opens them.
         let rail = state.rail_paint().unwrap();
         let (col, row) = screen_of(&state, rail.x + 2, rail.y);
@@ -21916,7 +21949,7 @@ mod tests {
         assert!(frame.chrome.qass.is_some() && frame.tiles.len() == 2);
         let painted = screen::paint(&frame);
         assert!(
-            painted.contains("qass") && painted.contains("asks you"),
+            painted.contains("qass") && painted.contains("need you"),
             "{painted:?}"
         );
         // The keyboard on the board: still qass's screen.
@@ -22484,7 +22517,7 @@ mod tests {
     }
 
     /// qass's full header stands in the tab bar's rows on qass's screen: no tab is painted
-    /// there and a click there opens none, while the `[ N asks you ]` chip in those rows still
+    /// there and a click there opens none, while the `[ N questions ]` chip in those rows still
     /// opens the questions. On any other tab, or zoomed, the bar is the bar.
     #[test]
     fn qass_screen_wears_its_header_where_the_tab_bar_was() {
@@ -22498,7 +22531,7 @@ mod tests {
         let (first, second) = bar_row(&state);
         assert!(!state.qass_header());
         assert!(
-            !first.contains("asks you"),
+            !first.contains("need you"),
             "the owner's tab: the bar, {first:?}"
         );
         let tab_click = state.clicked(1, (left + 3) as u16);
@@ -22507,7 +22540,7 @@ mod tests {
         assert!(state.header_in_strip());
         let (first, second2) = bar_row(&state);
         assert!(
-            second2.contains("asks you") && second2.contains("working"),
+            second2.contains("need you") && second2.contains("working"),
             "{first:?} / {second2:?}"
         );
         assert_ne!(second, second2);
@@ -22536,7 +22569,45 @@ mod tests {
         state.layouts.get_mut(&9).unwrap().focus_terminal(4);
         zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(!state.header_in_strip());
-        assert!(!bar_row(&state).1.contains("asks you"));
+        assert!(!bar_row(&state).1.contains("need you"));
+    }
+
+    /// On qass's split tab, the last waiting card answered (queued) or gone elsewhere while he
+    /// types for it: the questions stay up with the keyboard and his words, so no letter of his
+    /// reaches qass's chat, until esc lets them go.
+    #[test]
+    fn typing_for_the_last_card_handled_elsewhere_keeps_the_questions_up() {
+        for gone in [false, true] {
+            let mut state = qass_wide();
+            // The frame that came onto qass's screen, before he brings the questions up.
+            state.asks_settle();
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            assert!(questions_toggle(&mut state));
+            state.asks.key(b"t", 1);
+            state.asks.key(b"run it after the", 1);
+            assert!(state.asks.typing() && state.asks.focus);
+            let mut queued = ask_card(1, "korea");
+            queued.status = "queued".into();
+            state
+                .asks
+                .take(if gone { Vec::new() } else { vec![queued] }, Vec::new());
+            state.asks_settle();
+            let kept = (
+                state.asks.typing(),
+                state.asks.typed().to_string(),
+                state.asks.focus,
+                state.asks.raised,
+                state.questions().is_some(),
+            );
+            assert_eq!(
+                kept,
+                (true, "run it after the".to_string(), true, true, true),
+                "gone={gone}"
+            );
+            state.asks.key(b"\x1b", 1);
+            state.asks_settle();
+            assert!(!state.asks.raised, "gone={gone}");
+        }
     }
 
     fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
@@ -22654,22 +22725,43 @@ mod tests {
 
     #[test]
     fn a_pane_too_narrow_or_too_short_says_so_and_changes_nothing() {
-        for (cols, lines) in [(90u16, 50u16), (160, 15)] {
+        // Narrow with the column open: folding it makes the room, so the key is named. Short:
+        // folding makes none.
+        for (cols, lines, says) in [
+            (
+                90u16,
+                50u16,
+                "the pane is too narrow for the questions; ctrl-a b folds the column",
+            ),
+            (160, 15, "the pane is too small for the questions"),
+        ] {
             let mut state = qass_window();
             state.cols = cols;
             state.lines = lines;
             let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
             qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
             assert!(!asks_toggle(&mut state), "{cols}x{lines}");
-            assert!(!state.qass_ui.inbox);
-            assert!(
-                state
-                    .message
-                    .as_deref()
-                    .is_some_and(|m| m.contains("too narrow")),
-                "{:?}",
-                state.message
-            );
+            assert!(!state.qass_ui.inbox && !state.collapsed);
+            assert_eq!(state.message.as_deref(), Some(says), "{cols}x{lines}");
+        }
+        // qass's tab with the board, the same rule by where the questions would stand.
+        for (cols, lines, says) in [
+            (
+                100u16,
+                40u16,
+                "the pane is too narrow for the questions; ctrl-a b folds the column",
+            ),
+            (200, 17, "the pane is too small for the questions"),
+        ] {
+            let mut state = qass_split_window();
+            state.cols = cols;
+            state.lines = lines;
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+            assert!(!questions_toggle(&mut state), "{cols}x{lines}");
+            assert!(!state.asks.raised && !state.collapsed);
+            assert_eq!(state.message.as_deref(), Some(says), "{cols}x{lines}");
         }
         // Away from qass's screen it says where it is.
         let mut state = qass_window();
@@ -22794,7 +22886,7 @@ mod tests {
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         let chip_of = |state: &State| {
             let painted = screen::paint(&state.frame());
-            let at = painted.find("asks you").expect("the chip");
+            let at = painted.find(" question").expect("the chip");
             let head: String = painted[..at]
                 .chars()
                 .rev()
@@ -23012,7 +23104,7 @@ mod tests {
             "qass",
             "idle",
             "listening for changes in 2 agents",
-            "[ 0 waiting ]",
+            "[ 0 need you ]",
             "terminal",
             "T5",
         ] {

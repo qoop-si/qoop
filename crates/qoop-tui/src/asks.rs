@@ -32,6 +32,9 @@ pub const WRITE_ID: &str = "asks-write";
 
 /// The most characters of his own words one answer carries (the daemon's own limit).
 const TEXT_MAX: usize = 400;
+/// What he is told under his words, after the agent's name, when the card they were begun for
+/// was answered, dismissed or closed elsewhere: nothing is sent.
+const HANDLED_ELSEWHERE: &str = "handled elsewhere, enter sends nothing";
 
 /// What a key did, for the loop that owns the keyboard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +71,8 @@ pub struct Pane {
     preview: Option<usize>,
     typing: bool,
     text: String,
+    /// The card the words in the box were begun for, and its agent's handle.
+    typing_for: Option<(String, String)>,
     /// Writes made and not yet sent: the loop sends them on its next tick.
     outbox: Vec<ControlRequest>,
     /// What the daemon last said about an answer: shown in place of the key line.
@@ -121,11 +126,30 @@ impl Pane {
             .unwrap_or(self.selected)
             .min(self.live.len().saturating_sub(1));
         self.preview = None;
-        // Words typed for a card are not for the one that took its place.
-        if self.open_card().map(|c| &c.card) != keep.as_ref() {
-            self.typing = false;
+        // Words kept for a card are not for the one that took its place. While he types they
+        // stay, his card answered, dismissed or closed elsewhere (the phone) or not: the keys
+        // stay in the box, so no letter of his becomes a command (`j` to another card, `x` to
+        // put it away), and enter sends nothing ([`Pane::orphaned`]).
+        if !self.typing && self.open_card().map(|c| &c.card) != keep.as_ref() {
             self.text.clear();
         }
+    }
+
+    /// The card his words were begun for is no longer the open one waiting for him: it was
+    /// answered, dismissed or closed elsewhere, and enter sends nothing.
+    fn orphaned(&self) -> bool {
+        !self.open_card().is_some_and(|c| {
+            c.status == "open" && self.typing_for.as_ref().map(|(card, _)| card) == Some(&c.card)
+        })
+    }
+
+    /// Typing ends. Words no card can take any more go with it, so a later `t` never sends
+    /// them to another card.
+    fn stop_typing(&mut self) {
+        if self.typing && self.orphaned() {
+            self.text.clear();
+        }
+        self.typing = false;
     }
 
     /// A card whose terminal has left the agent rows (and sleeps in no tab) is read again, once:
@@ -242,13 +266,14 @@ impl Pane {
     /// The keyboard leaves the inbox.
     pub fn release(&mut self) {
         self.focus = false;
-        self.typing = false;
+        self.stop_typing();
     }
 
-    /// Whether an answer is on its way or just answered: the questions stay up through both,
-    /// so the last answer's word is still seen.
+    /// Whether an answer is on its way, just answered or being typed: the questions stay up
+    /// through all three, so the last answer's word is still seen and no letter of his goes to
+    /// qass's chat when his card is handled elsewhere.
     pub fn busy(&self) -> bool {
-        !self.outbox.is_empty() || !self.sent.is_empty() || self.notice.is_some()
+        !self.outbox.is_empty() || !self.sent.is_empty() || self.notice.is_some() || self.typing
     }
 
     /// Write now: the one request every answer and every dismissal goes out by.
@@ -331,7 +356,8 @@ impl Pane {
 
     /// Start typing in the one text box.
     pub fn start_typing(&mut self) {
-        if self.open_card().is_some_and(|c| c.status == "open") {
+        if let Some(c) = self.open_card().filter(|c| c.status == "open") {
+            self.typing_for = Some((c.card.clone(), c.body.handle.clone()));
             self.typing = true;
             self.notice = None;
             self.notice_until = None;
@@ -457,7 +483,7 @@ impl Pane {
 
     fn type_key(&mut self, bytes: &[u8]) -> Out {
         if bytes == b"\x1b" {
-            self.typing = false;
+            self.stop_typing();
             return Out::Stay;
         }
         // An arrow, a delete or a paste's brackets are not letters.
@@ -473,7 +499,7 @@ impl Pane {
             match c {
                 '\r' | '\n' => {
                     let text = self.text.trim().to_string();
-                    if !text.is_empty() {
+                    if !text.is_empty() && !self.orphaned() {
                         self.send_answer(None, Some(text));
                     }
                     return Out::Stay;
@@ -806,10 +832,10 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     out.push(hr());
 
     if pane.unsupported {
-        out.push(wrap(&[seg(Role::Detail, "restart qoop for the inbox")]));
+        out.push(wrap(&[seg(Role::Detail, "restart qoop for the questions")]));
     } else if !pane.loaded {
-        out.push(wrap(&[seg(Role::Faint, "reading the inbox")]));
-    } else if pane.live.is_empty() {
+        out.push(wrap(&[seg(Role::Faint, "reading the questions")]));
+    } else if pane.live.is_empty() && !pane.typing {
         out.push(blank());
         out.push(wrap(&[seg(Role::Detail, "Nothing waits for you.")]));
     }
@@ -873,7 +899,11 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             let age = age_short(ctx.now_unix - c.opened_at);
             let name = sidebar::chip_name(&name_of(c, ctx));
             let name_w = 12usize.min(cw / 4);
-            let head = format!("{} {}", at + 1, width::fit(&name, name_w));
+            let head = format!(
+                "{} {}",
+                at + 1,
+                width::fit(&cut_dots(&name, name_w), name_w)
+            );
             let room = cw.saturating_sub(width::width(&head) + 2 + age.len() + 1);
             let asks = cut_dots(&c.body.asks, room);
             let gap = cw.saturating_sub(width::width(&head) + 2 + width::width(&asks) + age.len());
@@ -909,7 +939,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         let name = name_of(card, ctx);
         // The marker takes two columns of the left side; a narrow column keeps a space before the wait.
         let left_w = cw.saturating_sub(width::width(&right) + 4);
-        let title_left = format!("\u{25be} {}", width::fit(&name, left_w.min(24)).trim_end());
+        let title_left = format!("\u{25be} {}", cut_dots(&name, left_w.min(24)));
         let gap = cw.saturating_sub(width::width(&title_left) + width::width(&right));
         out.push(wrap(&[
             bold(Role::Text, title_left),
@@ -990,55 +1020,15 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             out.push(blank());
         }
         // The one text box.
-        let box_w = cw;
-        // Cut to the box: the column may be dragged as narrow as the questions go.
-        let title = cut_dots(" type a different answer ", box_w.saturating_sub(4));
-        let mut top = format!("\u{256d}\u{2500}{title}");
-        top.push_str(&"\u{2500}".repeat(box_w.saturating_sub(width::width(&top) + 1)));
-        top.push('\u{256e}');
-        let box_ink = if pane.typing {
-            Role::Focused
-        } else {
-            Role::Rule
-        };
-        out.push(wrap(&[seg(box_ink, top)]));
-        let inside = box_w.saturating_sub(4);
-        let shown_text = if pane.typing {
-            // The tail of what is typed, with room for the caret.
-            let t = &pane.text;
-            let skip = t.chars().count().saturating_sub(inside.saturating_sub(1));
-            let tail: String = t.chars().skip(skip).collect();
-            format!("{tail}\u{2588}")
-        } else if passed {
-            "waiting for qass".to_string()
-        } else {
-            "t to type".to_string()
-        };
         targets.push(Target {
-            row: out.len(),
+            row: out.len() + 1,
             x0: 2,
             x1: 2 + cw,
             hit: Hit::Box,
         });
-        let text_role = if pane.typing { Role::Text } else { Role::Faint };
-        if pane.typing {
-            cursor = Some((
-                out.len(),
-                2 + 2 + width::width(&shown_text).saturating_sub(1),
-            ));
-        }
-        out.push(wrap(&[
-            seg(box_ink, "\u{2502} "),
-            seg(text_role, width::fit(&shown_text, inside)),
-            seg(box_ink, " \u{2502}"),
-        ]));
-        out.push(wrap(&[seg(
-            box_ink,
-            format!(
-                "\u{2570}{}\u{256f}",
-                "\u{2500}".repeat(box_w.saturating_sub(2))
-            ),
-        )]));
+        let (rows, caret) = text_box(pane, cw, passed, &wrap);
+        cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
+        out.extend(rows);
 
         // What he already handled.
         if b.handled > 0 && !pane.ended.is_empty() {
@@ -1053,8 +1043,15 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             }
         }
     } else if pane.loaded && !pane.unsupported {
-        // Nothing waits: only what was handled.
+        // Nothing waits: his words while he types (their card went elsewhere), and what was
+        // handled.
         out.push(blank());
+        if pane.typing {
+            let (rows, caret) = text_box(pane, cw, false, &wrap);
+            cursor = caret.map(|col| (out.len() + 1, col));
+            out.extend(rows);
+            out.push(blank());
+        }
         if !pane.ended.is_empty() {
             out.push(wrap(&[
                 seg(Role::Faint, "handled for you "),
@@ -1090,6 +1087,70 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     }
 }
 
+/// The one text box, as its three rows, and the caret's column in its middle row while he
+/// types.
+fn text_box(
+    pane: &Pane,
+    cw: usize,
+    passed: bool,
+    wrap: &impl Fn(&[Seg]) -> String,
+) -> ([String; 3], Option<usize>) {
+    let box_w = cw;
+    // Cut to the box: the column may be dragged as narrow as the questions go.
+    let title = cut_dots(" type a different answer ", box_w.saturating_sub(4));
+    let mut top = format!("\u{256d}\u{2500}{title}");
+    top.push_str(&"\u{2500}".repeat(box_w.saturating_sub(width::width(&top) + 1)));
+    top.push('\u{256e}');
+    let box_ink = if pane.typing {
+        Role::Focused
+    } else {
+        Role::Rule
+    };
+    let top = wrap(&[seg(box_ink, top)]);
+    let inside = box_w.saturating_sub(4);
+    let shown_text = if pane.typing {
+        // The tail of what is typed, by cells (a wide letter takes two), with room for the
+        // caret.
+        let mut room = inside.saturating_sub(1);
+        let mut tail: Vec<char> = pane
+            .text
+            .chars()
+            .rev()
+            .take_while(|c| {
+                let fits = width::columns(*c) <= room;
+                room = room.saturating_sub(width::columns(*c));
+                fits
+            })
+            .collect();
+        tail.reverse();
+        format!("{}\u{2588}", tail.into_iter().collect::<String>())
+    } else if passed {
+        "waiting for qass".to_string()
+    } else if !pane.text.is_empty() {
+        // The answer typed and kept, faint until `t` takes it up again.
+        cut_dots(&pane.text, inside)
+    } else {
+        "t to type".to_string()
+    };
+    let text_role = if pane.typing { Role::Text } else { Role::Faint };
+    let caret = pane
+        .typing
+        .then(|| 2 + 2 + width::width(&shown_text).saturating_sub(1));
+    let middle = wrap(&[
+        seg(box_ink, "\u{2502} "),
+        seg(text_role, width::fit(&shown_text, inside)),
+        seg(box_ink, " \u{2502}"),
+    ]);
+    let bottom = wrap(&[seg(
+        box_ink,
+        format!(
+            "\u{2570}{}\u{256f}",
+            "\u{2500}".repeat(box_w.saturating_sub(2))
+        ),
+    )]);
+    ([top, middle, bottom], caret)
+}
+
 fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> String) -> String {
     let result = match (c.status.as_str(), c.note.as_deref()) {
         ("answered", _) => match &c.option {
@@ -1105,7 +1166,11 @@ fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> Stri
         _ => "closed".to_string(),
     };
     let age = age_short(ctx.now_unix - c.closed_at.unwrap_or(c.opened_at));
-    let name = width::fit(&sidebar::chip_name(&name_of(c, ctx)), 12.min(cw / 4));
+    let name_w = 12.min(cw / 4);
+    let name = width::fit(
+        &cut_dots(&sidebar::chip_name(&name_of(c, ctx)), name_w),
+        name_w,
+    );
     let right = format!("{result}  {age}");
     let room = cw.saturating_sub(width::width(&name) + 2 + width::width(&right) + 1);
     let asks = cut_dots(&c.body.asks, room);
@@ -1121,6 +1186,19 @@ fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> Stri
 }
 
 fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
+    // For as long as the words stay, never back to `enter send`; named, since another card
+    // may stand over them.
+    if pane.typing && pane.orphaned() {
+        // The name is cut first, so what enter does always reads whole.
+        let who = pane.typing_for.as_ref().map_or("", |(_, handle)| handle);
+        let room = cw.saturating_sub(width::width(HANDLED_ELSEWHERE) + 2);
+        let say = if who.is_empty() || room < 4 {
+            HANDLED_ELSEWHERE.to_string()
+        } else {
+            format!("{}: {HANDLED_ELSEWHERE}", cut_dots(who, room))
+        };
+        return vec![seg(Role::Detail, cut_dots(&say, cw))];
+    }
     if let Some(n) = &pane.notice {
         return vec![seg(Role::Detail, cut_dots(n, cw))];
     }
@@ -1182,8 +1260,9 @@ fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
     rows
 }
 
-/// `text` cut to `cols` columns with a closing `\u{2026}` when it did not fit.
-fn cut_dots(text: &str, cols: usize) -> String {
+/// `text` cut to `cols` columns with a closing `\u{2026}` when it did not fit, never after a
+/// space.
+pub(crate) fn cut_dots(text: &str, cols: usize) -> String {
     if width::width(text) <= cols {
         return text.to_string();
     }
@@ -1197,6 +1276,7 @@ fn cut_dots(text: &str, cols: usize) -> String {
         out.push(c);
         used += w;
     }
+    let mut out = out.trim_end().to_string();
     out.push('\u{2026}');
     out
 }
@@ -1388,6 +1468,136 @@ mod tests {
         }
     }
 
+    /// An answer typed and left with `esc` stays in the box, faint, until `t` takes it up.
+    #[test]
+    fn a_kept_answer_shows_in_the_box_when_not_typing() {
+        let mut p = pane(3);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"run it after the backup", 1);
+        p.key(b"\x1b", 1);
+        assert!(!p.typing());
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(
+            t.contains("run it after the backup") && !t.contains("t to type"),
+            "{t}"
+        );
+    }
+
+    /// A long answer in wide letters keeps its caret in the box: the tail is taken by cells.
+    #[test]
+    fn a_wide_answer_keeps_its_caret() {
+        let mut p = pane(1);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key("日本語の答えです".repeat(6).as_bytes(), 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("です\u{2588}"), "{t}");
+    }
+
+    /// Answered elsewhere while he types (the phone): the keys stay in the box, so none of his
+    /// letters becomes a command, his words stay, and enter says why it sends nothing.
+    #[test]
+    fn a_card_answered_elsewhere_while_typing_keeps_the_words_and_says_so() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"just do", 1);
+        let mut live = p.live.clone();
+        live[0].status = "passed".into();
+        p.take(live, Vec::new());
+        p.key(b" x and a", 1);
+        assert!(
+            p.typing() && p.typed() == "just do x and a",
+            "{}",
+            p.typed()
+        );
+        p.key(b"\r", 1);
+        assert!(p.outbox.is_empty(), "nothing sent, nothing dismissed");
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains(HANDLED_ELSEWHERE), "{t}");
+    }
+
+    /// The card his words are for leaves the list while he types (dismissed or closed
+    /// elsewhere): he goes on typing, no letter of his becomes a command, enter sends nothing,
+    /// and the key line says so for as long as the words stay. Esc lets them go.
+    #[test]
+    fn a_card_gone_elsewhere_while_typing_keeps_the_words_and_sends_nothing() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"just do", 1);
+        let rest = p.live[1..].to_vec();
+        p.take(rest, Vec::new());
+        p.key(b" jx", 1);
+        assert!(p.typing() && p.typed() == "just do jx", "{}", p.typed());
+        p.key(b"\r", 1);
+        assert!(p.outbox.is_empty(), "nothing sent, nothing dismissed");
+        p.tick(Instant::now() + NOTICE * 2);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(
+            t.contains(HANDLED_ELSEWHERE) && !t.contains("esc stop typing"),
+            "{t}"
+        );
+        p.key(b"\x1b", 1);
+        assert!(!p.typing() && p.typed().is_empty());
+        p.key(b"t", 1);
+        p.key(b"ok\r", 1);
+        assert_eq!(p.outbox.len(), 1, "the card now open takes its own words");
+    }
+
+    /// The last card leaves while he types beside qass's chat: the box with his words stays,
+    /// not "Nothing waits for you.", and the line under it names whose question went.
+    #[test]
+    fn the_last_card_gone_while_typing_keeps_the_box_and_names_it() {
+        let mut p = pane(1);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"run it after the backup", 1);
+        p.take(Vec::new(), Vec::new());
+        assert!(p.busy(), "the questions stay up while he types");
+        let v = view(&p, &ctx(&[], &[]), 60, 36);
+        let t = text(&v);
+        assert!(
+            t.contains("run it after the backup") && !t.contains("Nothing waits for you."),
+            "{t}"
+        );
+        assert!(
+            t.contains(&format!("migrations: {HANDLED_ELSEWHERE}")),
+            "{t}"
+        );
+        assert!(v.cursor.is_some());
+        // Narrow, the name is cut and what enter does still reads whole.
+        let narrow = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(
+            narrow.contains(&format!("\u{2026}: {HANDLED_ELSEWHERE}")),
+            "{narrow}"
+        );
+    }
+
+    /// An agent's name cut to its room ends in an ellipsis, as the question beside it does, in
+    /// the list and on the open card alike. No cut leaves a space before its ellipsis.
+    #[test]
+    fn a_cut_name_ends_in_dots() {
+        assert_eq!(cut_dots("release-build", 11), "release-bu\u{2026}");
+        assert_eq!(cut_dots("ab cd ef", 7), "ab cd\u{2026}");
+        assert_eq!(cut_dots("short", 11), "short");
+        let mut p = Pane::default();
+        p.take(
+            vec![
+                card(1, "release-build-and-notarize", "open"),
+                card(2, "web-app", "open"),
+            ],
+            Vec::new(),
+        );
+        let t = text(&view(&p, &ctx(&[], &[]), 60, 36));
+        assert!(t.contains("1 release-bui\u{2026} "), "{t}");
+        assert!(
+            t.contains("\u{25be} release-build-and-notar\u{2026} "),
+            "{t}"
+        );
+    }
+
     /// The daemon's draft for an agent that waits on him has no options: the card shows its
     /// question and the box for his own words, a key moves nothing, and his words go out.
     #[test]
@@ -1460,11 +1670,11 @@ mod tests {
     #[test]
     fn an_empty_inbox_says_so_and_a_missing_one_says_why() {
         let mut p = Pane::default();
-        assert!(text(&view(&p, &ctx(&[], &[]), 50, 20)).contains("reading the inbox"));
+        assert!(text(&view(&p, &ctx(&[], &[]), 50, 20)).contains("reading the questions"));
         p.take(Vec::new(), Vec::new());
         assert!(text(&view(&p, &ctx(&[], &[]), 50, 20)).contains("Nothing waits for you."));
         p.unsupported = true;
-        assert!(text(&view(&p, &ctx(&[], &[]), 50, 20)).contains("restart qoop for the inbox"));
+        assert!(text(&view(&p, &ctx(&[], &[]), 50, 20)).contains("restart qoop for the questions"));
         assert_eq!(p.count(), None);
     }
 
@@ -1845,8 +2055,11 @@ mod tests {
         p.focus = true;
         p.key(b"t", 1);
         p.key(b"for the first", 1);
-        // The card he types for is gone: the box is empty and closed for the next one.
+        // The card he types for is gone: his words stay while he types and go with esc, never
+        // to the next one.
         p.take(p.live[1..].to_vec(), Vec::new());
+        assert_eq!(p.typed(), "for the first");
+        p.key(b"\x1b", 1);
         assert!(!p.typing() && p.typed().is_empty());
         // Typed text changes with a move to another card, and escapes are not letters.
         p.key(b"t", 1);

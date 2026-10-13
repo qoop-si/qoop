@@ -358,7 +358,7 @@ fn base64(text: &str) -> Option<Vec<u8>> {
 }
 
 /// `rgb:R/G/B` with one to four hex digits a channel, scaled to eight bits.
-fn parse_rgb(text: &[u8]) -> Option<[u8; 3]> {
+pub fn parse_rgb(text: &[u8]) -> Option<[u8; 3]> {
     let text = std::str::from_utf8(text).ok()?;
     let rest = text.strip_prefix("rgb:")?;
     let mut channels = rest.split('/');

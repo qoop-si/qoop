@@ -38,6 +38,12 @@ impl TerminalPhase {
     }
 }
 
+/// Whether a background the terminal reported is a light one: its luminance over a half.
+/// The interface draws its palette by it, and the daemon tells a program that asked.
+pub fn is_light_background([r, g, b]: [u8; 3]) -> bool {
+    (0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)) / 255.0 > 0.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

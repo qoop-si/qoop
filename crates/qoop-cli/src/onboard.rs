@@ -440,6 +440,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         page::show(
             &onboard.draw(w.max(NEED.0), h.max(NEED.1), &onboard.rows()),
             NEED,
+            "esc",
         )?;
         for key in page::next_keys(&session.typed) {
             if !onboard.key(key, &mut player) {

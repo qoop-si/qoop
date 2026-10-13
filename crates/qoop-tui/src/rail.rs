@@ -3,8 +3,9 @@
 //! what waits for the owner, and a cap rule on the last row.
 //!
 //! A tab's text follows a fixed ladder by the width it gets, and never wraps or cuts a word:
-//! word and state, word and count, word, code and count, code, dot and count, dot. Quiet tabs are
-//! never ember; a questions tab with a waiting question is the one ember block on the rail.
+//! word and state, word and count, word, code and count, code, dot and count, dot. A questions
+//! tab with a question waiting skips the word alone, so its count stays. Quiet tabs are never
+//! ember; a questions tab with a waiting question is the one ember block on the rail.
 //!
 //! Pure functions of what the caller read: the same words the header's chip says, so the two
 //! always agree. The left sidebar is not this module's: it paints only at the pane's own columns.
@@ -133,10 +134,13 @@ pub fn ladder(tab: &Tab, w: usize) -> (Vec<Piece>, usize) {
             ],
         ));
     }
-    forms.push((
-        2,
-        vec![caret.clone(), seg(tab.pane.word(), Role::Text, true)],
-    ));
+    // A question waiting keeps its count over the whole word: the count is what the tab signals.
+    if !tab.lit() {
+        forms.push((
+            2,
+            vec![caret.clone(), seg(tab.pane.word(), Role::Text, true)],
+        ));
+    }
     if let Some(n) = &count {
         forms.push((
             1,
@@ -255,7 +259,11 @@ pub fn rows(
         body.push(" ".repeat(w));
         if w >= PREVIEW_MIN {
             body.push(plain(
-                format!("{} waiting", count_text(p.count)),
+                format!(
+                    "{} {}",
+                    count_text(p.count),
+                    crate::qass_screen::questions(p.count)
+                ),
                 Role::Blocked,
                 true,
             ));
@@ -341,7 +349,7 @@ mod tests {
     /// wider than the width, never a cut word.
     #[test]
     fn the_ladder_steps_down_by_width_and_never_cuts_a_word() {
-        let q = tab(Pane::Questions, Some(2), Some("2 asks"));
+        let q = tab(Pane::Questions, Some(2), None);
         let b = tab(Pane::Board, None, None);
         let s = tab(Pane::Qass, None, Some("idle"));
         let at = |t: &Tab| [3, 5, 8, 12, 20, 28].map(|w| text(t, w));
@@ -351,9 +359,9 @@ mod tests {
                 "\u{25cf}2",
                 "\u{25b8} qst",
                 "\u{25b8} qst 2",
-                "\u{25b8} questions",
-                "\u{25b8} questions  2 asks",
-                "\u{25b8} questions  2 asks"
+                "\u{25b8} qst 2",
+                "\u{25b8} questions 2",
+                "\u{25b8} questions 2"
             ]
         );
         assert_eq!(
@@ -378,6 +386,9 @@ mod tests {
                 "\u{25b8} qass  idle"
             ]
         );
+        // With nothing waiting the word stands alone again.
+        let none = tab(Pane::Questions, Some(0), None);
+        assert_eq!(text(&none, 12), "\u{25b8} questions");
         for w in 3..=28 {
             for t in [&q, &b, &s] {
                 assert!(width::width(&text(t, w)) <= w, "{w}: {}", text(t, w));
@@ -387,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_count_past_99_is_capped_and_at_three_cells_it_is_a_plus() {
-        let q = tab(Pane::Questions, Some(120), Some("120 asks"));
+        let q = tab(Pane::Questions, Some(120), None);
         assert_eq!(text(&q, 3), "\u{25cf}+");
         assert_eq!(text(&q, 4), "\u{25cf}99+");
         assert_eq!(text(&q, 20), "\u{25b8} questions 99+");
@@ -398,7 +409,7 @@ mod tests {
     fn only_a_waiting_questions_tab_is_ember() {
         let ember = theme::button(true);
         let quiet = [
-            tab(Pane::Questions, Some(0), Some("none")),
+            tab(Pane::Questions, Some(0), None),
             tab(Pane::Board, None, None),
             tab(Pane::Qass, None, Some("idle")),
         ];
@@ -412,7 +423,7 @@ mod tests {
                 assert_eq!(width::width(&plain(&row)), w);
             }
         }
-        let lit = tab(Pane::Questions, Some(1), Some("1 asks"));
+        let lit = tab(Pane::Questions, Some(1), None);
         let row = tab_row(&lit, 12, false);
         assert!(row.starts_with(&ember));
         assert_eq!(width::width(&plain(&row)), 12);
@@ -432,7 +443,7 @@ mod tests {
     /// Every row is as wide as the rail, the cap is on the last row, the preview says what waits.
     #[test]
     fn the_rail_rows_are_exact_and_the_preview_names_the_first_question() {
-        let tabs = [tab(Pane::Questions, Some(3), Some("3 asks"))];
+        let tabs = [tab(Pane::Questions, Some(3), None)];
         let preview = Preview {
             count: 3,
             title: "Ship the frame polish build now?".to_string(),
@@ -446,7 +457,7 @@ mod tests {
         let plain_rows: Vec<String> = out.iter().map(|r| plain(r)).collect();
         assert!(plain_rows[0].starts_with("\u{25b8} questions 3"));
         assert!(plain_rows[1].starts_with("\u{2500}"));
-        assert!(plain_rows.iter().any(|r| r.starts_with("3 waiting")));
+        assert!(plain_rows.iter().any(|r| r.starts_with("3 questions")));
         assert!(plain_rows.iter().any(|r| r.starts_with("+2 more")));
         assert!(plain_rows[19].starts_with("\u{2500}"));
         assert!(plain_rows.iter().any(|r| r.starts_with("ctrl-a i opens")));

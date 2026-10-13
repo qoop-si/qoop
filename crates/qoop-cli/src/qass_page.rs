@@ -504,7 +504,7 @@ pub fn run() -> std::io::Result<()> {
     let mut quiet = 0;
     'run: loop {
         let (w, h) = page::size();
-        page::show(&page.draw(w.max(NEED.0), h.max(NEED.1)), NEED)?;
+        page::show(&page.draw(w.max(NEED.0), h.max(NEED.1)), NEED, "esc")?;
         let keys = page::next_keys(&session.typed);
         quiet = if keys.is_empty() { quiet + 1 } else { 0 };
         if quiet >= REFRESH {

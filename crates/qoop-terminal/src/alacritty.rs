@@ -76,6 +76,16 @@ pub struct AlacrittyEngine {
     partial_char: Vec<u8>,
     /// The outer terminal's foreground and background, as a client last reported them.
     host_colors: Option<([u8; 3], [u8; 3])>,
+    /// The program asked to be told when the person's terminal turns light or dark
+    /// (`CSI ? 2031 h`), and the scheme it would know by now: `None` while no client said.
+    scheme_reports: bool,
+    scheme_told: Option<bool>,
+}
+
+/// A colour scheme report, as kitty, ghostty and contour say it: `CSI ? 997 ; 1 n` dark,
+/// `; 2 n` light.
+fn scheme_said(light: bool) -> Bytes {
+    Bytes::from(format!("\x1b[?997;{}n", 1 + u8::from(light)))
 }
 
 impl AlacrittyEngine {
@@ -102,7 +112,78 @@ impl AlacrittyEngine {
             title: String::new(),
             evicted_unobserved: 0,
             host_colors: None,
+            scheme_reports: false,
+            scheme_told: None,
         }
+    }
+
+    /// The person's terminal as light (`true`) or dark, once a client has said.
+    fn host_scheme(&self) -> Option<bool> {
+        self.host_colors
+            .map(|(_, bg)| qoop_domain::terminal::is_light_background(bg))
+    }
+
+    /// Whether the program asked for colour scheme reports (`CSI ? 2031 h`).
+    pub fn scheme_reports(&self) -> bool {
+        self.scheme_reports
+    }
+
+    /// What a program that asked for colour scheme reports is told when the person's
+    /// terminal turned light or dark since it last knew (the first client to say, after a
+    /// daemon that started with none, counts), as [`scheme_said`]. Nothing to a program that
+    /// did not ask, and nothing twice for one scheme.
+    pub fn scheme_report(&mut self) -> Option<Bytes> {
+        let light = self.host_scheme().filter(|_| self.scheme_reports)?;
+        if self.scheme_told == Some(light) {
+            return None;
+        }
+        self.scheme_told = Some(light);
+        Some(scheme_said(light))
+    }
+
+    /// What the parser said since it was last asked, as effects: replies, titles, the bell.
+    fn drain_events(&mut self, effects: &mut Vec<TerminalEffect>) {
+        while let Ok(ev) = self.events.try_recv() {
+            match ev {
+                // DECRQM for the colour scheme reports: the parser does not know the mode, this
+                // engine does. Set or reset, so a program that asks before it turns them on
+                // turns them on.
+                Event::PtyWrite(s) if s == "\x1b[?2031;0$y" => {
+                    let state = if self.scheme_reports { 1 } else { 2 };
+                    effects.push(TerminalEffect::Reply(Bytes::from(format!(
+                        "\x1b[?2031;{state}$y"
+                    ))));
+                }
+                Event::PtyWrite(s) => effects.push(TerminalEffect::Reply(Bytes::from(s))),
+                Event::Title(t) => {
+                    // Retained as well as reported: detection reads the latest
+                    // title long after the effect was drained.
+                    self.title = t.clone();
+                    effects.push(TerminalEffect::Title(t));
+                }
+                Event::ResetTitle => {
+                    self.title.clear();
+                    effects.push(TerminalEffect::Title(String::new()));
+                }
+                Event::Bell => effects.push(TerminalEffect::Bell),
+                Event::ClipboardStore(_, s) => {
+                    effects.push(TerminalEffect::ClipboardWrite(Bytes::from(s)))
+                }
+                // `OSC 10 ?` and `OSC 11 ?`: the colour the program set itself if it did, else
+                // the one the person is looking at, else no answer, as before any client said.
+                Event::ColorRequest(index @ (FOREGROUND | BACKGROUND), answer) => {
+                    let host = self.host_colors.map(|(fg, bg)| {
+                        let [r, g, b] = if index == FOREGROUND { fg } else { bg };
+                        Rgb { r, g, b }
+                    });
+                    if let Some(rgb) = self.term.colors()[index].or(host) {
+                        effects.push(TerminalEffect::Reply(Bytes::from(answer(rgb))));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `CSI ? 996 n`: the scheme now, once a client has said; not again as news.
     }
 
     /// One row's colour, as runs of columns that look the same.
@@ -253,6 +334,9 @@ impl AlacrittyEngine {
                 (false, true) => out.push_str(off),
                 _ => {}
             }
+        }
+        if self.scheme_reports {
+            out.push_str("\x1b[?2031h");
         }
         let kitty = (mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18;
         if kitty != 0 {
@@ -583,6 +667,11 @@ impl TerminalEngine for AlacrittyEngine {
         // characters and never halves of them.
         self.filtered.append(&mut self.partial_char);
         self.filter.feed(&self.unsniffed, &mut self.filtered);
+        if let Some(on) = self.filter.take_scheme_reports() {
+            self.scheme_reports = on;
+            // It knows what an `OSC 11 ?` would tell it now: only a change from that is news.
+            self.scheme_told = self.host_scheme();
+        }
 
         // A character split across two reads is held back rather than handed over.
         //
@@ -610,8 +699,24 @@ impl TerminalEngine for AlacrittyEngine {
         let hand_over = self.filtered.len() - keep;
         self.partial_char
             .extend_from_slice(&self.filtered[hand_over..]);
+        // `CSI ? 996 n` is answered where it stands, once a client has said and not again as
+        // news: a program that asks it and then for the device attributes hears the two in
+        // that order, as it would from the terminal itself.
+        let mut effects = Vec::new();
+        let mut from = 0;
+        for at in self.filter.take_scheme_asked() {
+            let at = at.clamp(from, hand_over);
+            self.parser
+                .advance(&mut self.term, &self.filtered[from..at]);
+            from = at;
+            self.drain_events(&mut effects);
+            if let Some(light) = self.host_scheme() {
+                self.scheme_told = Some(light);
+                effects.push(TerminalEffect::Reply(scheme_said(light)));
+            }
+        }
         self.parser
-            .advance(&mut self.term, &self.filtered[..hand_over]);
+            .advance(&mut self.term, &self.filtered[from..hand_over]);
 
         let damage = match self.term.damage() {
             TermDamage::Full => Damage::Full,
@@ -627,38 +732,7 @@ impl TerminalEngine for AlacrittyEngine {
         self.term.reset_damage();
         self.capture_new_history();
 
-        let mut effects = Vec::new();
-        while let Ok(ev) = self.events.try_recv() {
-            match ev {
-                Event::PtyWrite(s) => effects.push(TerminalEffect::Reply(Bytes::from(s))),
-                Event::Title(t) => {
-                    // Retained as well as reported: detection reads the latest
-                    // title long after the effect was drained.
-                    self.title = t.clone();
-                    effects.push(TerminalEffect::Title(t));
-                }
-                Event::ResetTitle => {
-                    self.title.clear();
-                    effects.push(TerminalEffect::Title(String::new()));
-                }
-                Event::Bell => effects.push(TerminalEffect::Bell),
-                Event::ClipboardStore(_, s) => {
-                    effects.push(TerminalEffect::ClipboardWrite(Bytes::from(s)))
-                }
-                // `OSC 10 ?` and `OSC 11 ?`: the colour the program set itself if it did, else
-                // the one the person is looking at, else no answer, as before any client said.
-                Event::ColorRequest(index @ (FOREGROUND | BACKGROUND), answer) => {
-                    let host = self.host_colors.map(|(fg, bg)| {
-                        let [r, g, b] = if index == FOREGROUND { fg } else { bg };
-                        Rgb { r, g, b }
-                    });
-                    if let Some(rgb) = self.term.colors()[index].or(host) {
-                        effects.push(TerminalEffect::Reply(Bytes::from(answer(rgb))));
-                    }
-                }
-                _ => {}
-            }
-        }
+        self.drain_events(&mut effects);
         for img in self.sniffer.take_images() {
             effects.push(TerminalEffect::Image(img));
         }
@@ -1250,6 +1324,74 @@ mod tests {
             replies(&mut e, b"\x1b]4;1;?\x07").is_empty(),
             "palette questions stay as they were"
         );
+    }
+
+    /// DECRQM for the colour scheme reports says set or reset, as this engine keeps them (the
+    /// parser alone says "not recognized"); `CSI ? 996 n` is answered with the scheme now
+    /// once a client has said, and that is not told again as news.
+    #[test]
+    fn the_scheme_reports_mode_and_the_scheme_now_are_answered() {
+        let replies = |fx: Vec<TerminalEffect>| -> Vec<Bytes> {
+            fx.into_iter()
+                .filter_map(|f| match f {
+                    TerminalEffect::Reply(b) => Some(b),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut e = engine();
+        assert_eq!(replies(e.feed(b"\x1b[?2031$p").1), [&b"\x1b[?2031;2$y"[..]]);
+        assert_eq!(
+            replies(e.feed(b"\x1b[?2031h\x1b[?2031$p").1),
+            [&b"\x1b[?2031;1$y"[..]]
+        );
+        assert!(
+            replies(e.feed(b"\x1b[?996n").1).is_empty(),
+            "no client said"
+        );
+        e.set_host_colors(Some(([0; 3], [250; 3])));
+        assert_eq!(replies(e.feed(b"\x1b[?996n").1), [&b"\x1b[?997;2n"[..]]);
+        assert_eq!(e.scheme_report(), None, "told already");
+        // In its place in the stream: before the device attributes asked after it.
+        let da1 = replies(e.feed(b"\x1b[c").1);
+        assert_eq!(da1.len(), 1);
+        assert_eq!(
+            replies(e.feed(b"\x1b[?996n\x1b[c\x1b[?996n").1),
+            [&b"\x1b[?997;2n"[..], &da1[0][..], &b"\x1b[?997;2n"[..]]
+        );
+    }
+
+    /// A program that asked for colour scheme reports (`CSI ? 2031 h`) hears of the person's
+    /// terminal turning light or dark: once a change, the first client to say after none
+    /// counting. A program that never asked, or stopped, hears nothing; a daemon move keeps
+    /// the ask.
+    #[test]
+    fn only_a_program_that_asked_hears_the_scheme_change() {
+        let light = Some(([0; 3], [250; 3]));
+        let dark = Some(([255; 3], [30; 3]));
+        let mut e = engine();
+        e.set_host_colors(light);
+        assert_eq!(e.scheme_report(), None, "nobody asked");
+        let mut e = engine();
+        e.feed(b"\x1b[?2031h");
+        assert_eq!(e.scheme_report(), None, "no client has said yet");
+        e.set_host_colors(light);
+        assert_eq!(e.scheme_report(), Some(Bytes::from_static(b"\x1b[?997;2n")));
+        e.set_host_colors(Some(([0; 3], [255; 3])));
+        assert_eq!(e.scheme_report(), None, "still light");
+        e.set_host_colors(dark);
+        assert_eq!(e.scheme_report(), Some(Bytes::from_static(b"\x1b[?997;1n")));
+        let mut moved = engine();
+        moved.feed(e.replay().as_bytes());
+        assert!(moved.scheme_reports(), "kept over a move");
+        e.feed(b"\x1b[?2031l");
+        e.set_host_colors(light);
+        assert_eq!(e.scheme_report(), None, "it stopped asking");
+        // Asked while the scheme is known: it can ask that, so only a change is news.
+        let mut e = engine();
+        e.set_host_colors(light);
+        e.feed(b"\x1b[?2031h");
+        assert_eq!(e.scheme_report(), None);
     }
 
     /// A program that links every cell to its own long address gets a snapshot that still

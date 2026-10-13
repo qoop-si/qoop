@@ -32,6 +32,17 @@ pub struct ControlStringFilter {
     discarding: bool,
     discarded_sequences: u64,
     discarded_bytes: u64,
+    /// The last `CSI ? 2031 h` or `l` passed since it was taken: the program asking to hear
+    /// of the person's terminal turning light or dark (`true`), or no longer. A full reset
+    /// ends it, and so does leaving the alternate screen it was asked on: a full screen
+    /// program that left without saying so, and the shell under it never asked.
+    scheme_reports: Option<bool>,
+    /// On the alternate screen, and whether the reports were asked for there.
+    alt: bool,
+    asked_on_alt: bool,
+    /// Where each `CSI ? 996 n` passed since the last take ends in what the parser is handed:
+    /// the program asking which scheme the person's terminal is in, answered in its place.
+    scheme_asked: Vec<usize>,
 }
 
 impl ControlStringFilter {
@@ -57,7 +68,11 @@ impl ControlStringFilter {
 
             self.staged.push(b);
             if next.is_ground() {
+                self.follow_modes();
                 out.extend_from_slice(&self.staged);
+                if self.staged == b"\x1b[?996n" {
+                    self.scheme_asked.push(out.len());
+                }
                 self.staged.clear();
             } else if self.staged.len() >= MAX_CONTROL_STRING {
                 self.discarded_sequences += 1;
@@ -78,6 +93,62 @@ impl ControlStringFilter {
     /// Bytes currently held for an incomplete sequence.
     pub fn staged_len(&self) -> usize {
         self.staged.len()
+    }
+
+    /// The colour scheme reports turned on (`true`) or off by what passed since the last
+    /// take, if either.
+    pub fn take_scheme_reports(&mut self) -> Option<bool> {
+        self.scheme_reports.take()
+    }
+
+    /// Where the program asked which scheme the person's terminal is in (`CSI ? 996 n`) since
+    /// the last take: the end of each ask, in what the parser is handed.
+    pub fn take_scheme_asked(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.scheme_asked)
+    }
+
+    /// The colour scheme reports (DEC private mode 2031, which kitty, ghostty and contour
+    /// send) and the alternate screen, as the whole sequence just staged turns them: a set or
+    /// reset among other modes counts (`CSI ? 1049 ; 2031 h`), and a full reset (`ESC c`).
+    ///
+    /// ponytail: one ask a terminal, tied to the screen it was made on rather than to the
+    /// program. A program that asked on the alternate screen and leaves it stops hearing, even
+    /// one that comes back to it; a shell that asked on the main screen stops hearing once a
+    /// child asks on the alternate screen and leaves it. Both ask again to hear again; an ask
+    /// for each screen would cover them, if a program is seen to need it.
+    fn follow_modes(&mut self) {
+        if self.staged == b"\x1bc" {
+            self.alt = false;
+            self.scheme_reports = Some(false);
+            return;
+        }
+        let Some((&last, params)) = self
+            .staged
+            .strip_prefix(b"\x1b[?")
+            .and_then(|seq| seq.split_last())
+        else {
+            return;
+        };
+        let on = match last {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+        for mode in params.split(|b| *b == b';') {
+            match mode {
+                b"2031" => {
+                    self.scheme_reports = Some(on);
+                    self.asked_on_alt = self.alt;
+                }
+                b"1049" | b"1047" | b"47" => {
+                    if self.alt && !on && self.asked_on_alt {
+                        self.scheme_reports = Some(false);
+                    }
+                    self.alt = on;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -139,6 +210,39 @@ mod tests {
             );
         }
         assert!(out.is_empty());
+    }
+
+    /// `CSI ? 2031 h` and `l`, alone, among other modes or cut by a read, are seen once
+    /// whole; the last one wins, and a take empties it. Nothing like it counts.
+    #[test]
+    fn the_colour_scheme_mode_is_seen_whole_and_the_last_one_wins() {
+        let mut f = ControlStringFilter::default();
+        run(&mut f, b"a\x1b[?20");
+        assert_eq!(f.take_scheme_reports(), None);
+        run(&mut f, b"31hb");
+        assert_eq!(f.take_scheme_reports(), Some(true));
+        assert_eq!(f.take_scheme_reports(), None);
+        run(&mut f, b"\x1b[?1049;2031l\x1b[2031h\x1b[?20310h\x1b[?2031n");
+        assert_eq!(f.take_scheme_reports(), Some(false));
+        run(&mut f, b"\x1b[?2031l\x1b[?2031h");
+        assert_eq!(f.take_scheme_reports(), Some(true));
+    }
+
+    /// Asked on the alternate screen, the reports end when the program leaves it without
+    /// saying stop; asked on the main screen, they outlive a child's alternate screen. A full
+    /// reset (`reset`) ends them either way.
+    #[test]
+    fn the_scheme_reports_end_with_the_screen_they_were_asked_on_or_a_reset() {
+        let mut f = ControlStringFilter::default();
+        run(&mut f, b"\x1b[?1049h\x1b[?25l\x1b[?2031h\x1b]11;?\x1b\\");
+        assert_eq!(f.take_scheme_reports(), Some(true));
+        run(&mut f, b"\x1b[?25h\x1b[?1049l");
+        assert_eq!(f.take_scheme_reports(), Some(false));
+        run(&mut f, b"\x1b[?2031h");
+        run(&mut f, b"\x1b[?1049h\x1b[2Jvim\x1b[?1049l");
+        assert_eq!(f.take_scheme_reports(), Some(true));
+        run(&mut f, b"\x1bc");
+        assert_eq!(f.take_scheme_reports(), Some(false));
     }
 
     /// The three byte prefix that used to bypass the bound entirely.

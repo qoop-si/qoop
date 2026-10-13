@@ -670,7 +670,8 @@ pub(crate) fn ink(role: Role, fade: bool) -> String {
     theme::fg(if fade { Role::Unobserved } else { role })
 }
 
-/// `segs` painted into exactly `cols` columns.
+/// `segs` painted into exactly `cols` columns. Words cut at the edge end the line, in an
+/// ellipsis.
 pub(crate) fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -678,20 +679,36 @@ pub(crate) fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
         if used >= cols {
             break;
         }
-        let text = cut(&s.text, cols - used);
+        let all = cut(&s.text, usize::MAX);
+        let cut_off = width::width(&all) > cols - used;
+        let text = match (cut_off, all.trim().is_empty()) {
+            (false, _) => all,
+            (true, true) => cut(&all, cols - used),
+            (true, false) => crate::asks::cut_dots(&all, cols - used),
+        };
         used += width::width(&text);
         out.push_str(&ink(s.role, fade));
         if s.bold && !fade {
             out.push_str("\x1b[1m");
         }
         out.push_str(&text);
+        // Nothing after a cut: the ellipsis is the line's end.
+        if cut_off {
+            break;
+        }
     }
     out.push_str(theme::RESET);
     out.push_str(&" ".repeat(cols.saturating_sub(used)));
     out
 }
 
-/// The three counters, each as `[ N word ]`.
+/// What a count of questions is called, on the chip and under the rail alike.
+pub(crate) fn questions(n: usize) -> &'static str {
+    if n == 1 { "question" } else { "questions" }
+}
+
+/// The three counters, each as `[ N word ]`: the agents that need the owner, those working,
+/// and qass's questions.
 fn chips(f: &Facts) -> Vec<Vec<Seg>> {
     let one = |n: usize, word: &str, lit: Role| {
         vec![
@@ -702,9 +719,9 @@ fn chips(f: &Facts) -> Vec<Vec<Seg>> {
         ]
     };
     vec![
-        one(f.waiting, "waiting", Role::Focused),
+        one(f.waiting, "need you", Role::Focused),
         one(f.working, "working", Role::Working),
-        one(f.asks, "asks you", Role::Blocked),
+        one(f.asks, questions(f.asks), Role::Blocked),
     ]
 }
 
@@ -787,11 +804,11 @@ pub struct Screen {
     side: String,
     /// The inbox's rows, each as wide as its rectangle, while it is open.
     inbox: Vec<String>,
-    /// Where the `[ N asks you ]` chip is, pane-local: its row and its columns.
+    /// Where the `[ N questions ]` chip is, pane-local: its row and its columns.
     chip: Option<Chip>,
 }
 
-/// The `[ N asks you ]` chip's cells in the pane: a click on it opens and closes the inbox.
+/// The `[ N questions ]` chip's cells in the pane: a click on it opens and closes the inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chip {
     /// A header row: with the full header counted from the screen's first row (its first rows
@@ -932,7 +949,7 @@ fn one_line(
     (line(&state, cols, fade), span)
 }
 
-/// Where the last counter, `[ N asks you ]`, stands in the run `fit_chips` made: its first and
+/// Where the last counter, `[ N questions ]`, stands in the run `fit_chips` made: its first and
 /// one past its last column, when all three counters fit whole (four pieces each, and a gap
 /// between every two).
 fn last_chip(f: &Facts, run: &[Seg]) -> Option<(usize, usize)> {
@@ -979,7 +996,7 @@ fn header_rows(
     // pet the first of a four cell gap the lines keep apart.
     let fit = |mid_w: usize| {
         let centred = cols.saturating_sub(mid_w) / 2;
-        let most = cols.saturating_sub(1 + GAP + chips_w + mid_w + GAP);
+        let most = cols.saturating_sub(mid_w + GAP + chips_w + 1);
         let at = centred.min(most);
         (at >= 1 + LEFT_MIN + GAP).then_some(at)
     };
@@ -1278,7 +1295,7 @@ mod tests {
             "keeping watch over 4 agents",
             "last  active 2 min ago, event 2 min ago",
             "now   cargo test",
-            "[ 3 waiting ] [ 1 working ] [ 1 asks you ]",
+            "[ 3 need you ] [ 1 working ] [ 1 question ]",
             "terminal",
             "T7",
         ] {
@@ -1313,6 +1330,20 @@ mod tests {
         assert_eq!(asked.len(), plan.inner.rows);
     }
 
+    /// A line cut at its edge says so: `active 1 m…`, never a bare `active 1`, another fact.
+    #[test]
+    fn a_cut_line_ends_in_an_ellipsis() {
+        let segs = [
+            seg(Role::Faint, "last  "),
+            seg(Role::Detail, "active 1 min ago"),
+        ];
+        assert_eq!(strip(&line(&segs, 17, false)), "last  active 1 m\u{2026}");
+        assert_eq!(strip(&line(&segs, 22, false)), "last  active 1 min ago");
+        // Nothing follows the ellipsis.
+        let two = [seg(Role::Detail, "hello world"), seg(Role::Detail, "next")];
+        assert_eq!(strip(&line(&two, 9, false)), "hello wo\u{2026}");
+    }
+
     #[test]
     fn a_short_pane_gets_one_line_with_the_counters_that_fit() {
         let plan = Plan::new(60, 10, false, false).unwrap();
@@ -1321,7 +1352,7 @@ mod tests {
         let first = strip(&screen.row(0, |_| String::new()));
         assert_eq!(width::width(&first), 60);
         assert!(
-            first.contains("qass") && first.contains("idle") && first.contains("[ 3 waiting ]"),
+            first.contains("qass") && first.contains("idle") && first.contains("[ 3 need you ]"),
             "{first:?}"
         );
         let narrow = Plan::new(30, 10, false, false).unwrap();
@@ -1329,7 +1360,7 @@ mod tests {
             &Screen::new(narrow, &facts_of("idle"), None, ctx(None)).row(0, |_| String::new()),
         );
         assert_eq!(width::width(&first), 30);
-        assert!(!first.contains("asks you"), "{first:?}");
+        assert!(!first.contains("question"), "{first:?}");
     }
 
     #[test]
@@ -1406,7 +1437,7 @@ mod tests {
                 "{first:?}"
             );
             assert!(
-                right.contains("[ 3 waiting ] [ 1 working ] [ 1 asks you ]"),
+                right.contains("[ 3 need you ] [ 1 working ] [ 1 question ]"),
                 "{first:?}"
             );
             assert!(screen.chip().is_some(), "{cols}");
@@ -1415,7 +1446,7 @@ mod tests {
         let plan = Plan::new(161, 40, false, false).unwrap();
         let bare = Screen::new(plan, &facts_of("working"), None, ctx(None));
         assert!(!bare.header.iter().any(|r| r.contains('\u{2501}')));
-        assert!(strip(&bare.header[1]).contains("[ 1 asks you ]"));
+        assert!(strip(&bare.header[1]).contains("[ 1 question ]"));
         // The one line header stays in the pane: nothing for the tab bar's rows.
         let short = Plan::new(60, 10, false, false).unwrap();
         assert_eq!(
@@ -1655,7 +1686,7 @@ mod tests {
             };
             let cells: Vec<char> = row.chars().collect();
             let under: String = cells[chip.x0..chip.x1].iter().collect();
-            assert_eq!(under, "[ 1 asks you ]", "{cols}x{rows} pet={pet}: {row:?}");
+            assert_eq!(under, "[ 1 question ]", "{cols}x{rows} pet={pet}: {row:?}");
         }
         // Too narrow to hold all three counters: no chip to press.
         let narrow = Plan::new(30, 10, false, false).unwrap();

@@ -329,18 +329,26 @@ pub(crate) fn write(row: &Row, value: &str) -> Result<(), String> {
     }
 }
 
-/// Draw for the background the config asks for; `auto` takes `COLORFGBG`, else dark, as
-/// the interface does before it asks the terminal.
+/// Draw for the background the config asks for; `auto` takes what the terminal answered
+/// (`page::ground_light`), then `COLORFGBG`, else dark, as the interface does.
 pub(crate) fn apply_theme() {
-    let light = match config::read().config.theme {
+    let colorfgbg = std::env::var("COLORFGBG").ok();
+    theme::set_light(light_for(
+        config::read().config.theme,
+        crate::page::ground_light(),
+        colorfgbg.as_deref(),
+    ));
+}
+
+/// [`apply_theme`]'s pick: the file, then the terminal's answer, then `COLORFGBG`, then dark.
+fn light_for(theme: Theme, answered: Option<bool>, colorfgbg: Option<&str>) -> bool {
+    match theme {
         Theme::Light => true,
         Theme::Dark => false,
-        Theme::Auto => std::env::var("COLORFGBG")
-            .ok()
-            .and_then(|v| theme::colorfgbg_is_light(&v))
+        Theme::Auto => answered
+            .or_else(|| colorfgbg.and_then(theme::colorfgbg_is_light))
             .unwrap_or(false),
-    };
-    theme::set_light(light);
+    }
 }
 
 /// The pet as it is, or the first of the picker's own when none was picked yet.
@@ -919,7 +927,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         let (w, h) = page::size();
         let (w, h) = (w.max(MIN.0), h.max(MIN.1));
         page.fit(w, h);
-        page::show(&page.draw(w, h), MIN)?;
+        page::show(&page.draw(w, h), MIN, "esc")?;
         for key in page::next_keys(&session.typed) {
             if !page.key(key, &mut player) {
                 break 'run;
@@ -1266,5 +1274,17 @@ mod tests {
         assert_eq!(short_host("onyx").as_deref(), Some("onyx"));
         assert_eq!(short_host(""), None);
         assert_eq!(short_host("\0\0"), None);
+    }
+
+    /// `auto` takes the terminal's answer over `COLORFGBG`, as the interface does: a page in
+    /// a qoop pane on a light terminal draws light. A theme the file names wins over both.
+    #[test]
+    fn auto_draws_for_the_background_the_terminal_answered() {
+        assert!(light_for(Theme::Auto, Some(true), Some("15;0")));
+        assert!(!light_for(Theme::Auto, Some(false), Some("0;15")));
+        assert!(light_for(Theme::Auto, None, Some("0;15")));
+        assert!(!light_for(Theme::Auto, None, None));
+        assert!(!light_for(Theme::Dark, Some(true), None));
+        assert!(light_for(Theme::Light, Some(false), None));
     }
 }

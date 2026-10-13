@@ -5399,12 +5399,18 @@ static HOST_COLORS: AtomicU64 = AtomicU64::new(0);
 
 const HOST_COLORS_SET: u64 = 1 << 48;
 
+/// Rung when the host colours change, so a terminal whose program asked to hear of the
+/// person's terminal turning light or dark (`CSI ? 2031 h`) tells it without waiting for
+/// it to print: a page drawn for the wrong ground prints nothing until told.
+static HOST_COLORS_CHANGED: std::sync::LazyLock<watch::Sender<()>> =
+    std::sync::LazyLock::new(|| watch::Sender::new(()));
+
 fn set_host_colors(fg: [u8; 3], bg: [u8; 3]) {
     let pack = |[r, g, b]: [u8; 3]| (u64::from(r) << 16) | (u64::from(g) << 8) | u64::from(b);
-    HOST_COLORS.store(
-        HOST_COLORS_SET | (pack(fg) << 24) | pack(bg),
-        Ordering::Relaxed,
-    );
+    let packed = HOST_COLORS_SET | (pack(fg) << 24) | pack(bg);
+    if HOST_COLORS.swap(packed, Ordering::Relaxed) != packed {
+        HOST_COLORS_CHANGED.send_replace(());
+    }
 }
 
 /// What a program asking `OSC 10 ?` or `OSC 11 ?` is told, once any client has said.
@@ -10002,6 +10008,9 @@ async fn terminal_task(
     // Bounded by bytes, with capacity reserved for terminal replies so a saturated input
     // queue cannot deadlock an application waiting for a cursor position report.
     let mut writes = WriteQueue::new(1024 * 1024, 64 * 1024);
+    // Rung when the person's terminal may have turned light or dark. Looked at only while
+    // the program asked to hear of it (`CSI ? 2031 h`), so every other terminal stays asleep.
+    let mut host_changed = HOST_COLORS_CHANGED.subscribe();
     // What the daemon this one moved from had not typed into the child yet.
     for chunk in qoop_pty::chunk_paste(&seed.pending) {
         if writes.push(chunk, WritePriority::UserInput).is_err() {
@@ -10312,6 +10321,12 @@ async fn terminal_task(
                                 }
                             }
                         }
+                    }
+                }
+                Ok(()) = host_changed.changed(), if engine.scheme_reports() => {
+                    engine.set_host_colors(host_colors());
+                    if let Some(report) = engine.scheme_report() {
+                        let _ = writes.push(report, WritePriority::TerminalReply);
                     }
                 }
                 ready = afd.readable() => {

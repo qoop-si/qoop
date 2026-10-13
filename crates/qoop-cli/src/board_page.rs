@@ -35,6 +35,11 @@ const QUIET_H: usize = 3;
 /// The words a card says when someone must act: the owner, or qass checking a claim.
 const WAITS: &str = "waits on you";
 const CHECKS: &str = "qass checks";
+/// What a card says while no agent is on it: in Doing, and in Todo or a reopened item.
+const STARTS: &str = "qass will start it";
+const NO_AGENT: &str = "no agent yet";
+/// The fewest cells a card's key keeps when it is cut so that its word shows whole.
+const KEY_MIN: usize = 4;
 /// `[ full · quiet  v ]`, the card switch at the board's top right.
 const SWITCH_W: usize = 19;
 /// Read again after this long with no news, for what changes with time alone (a start that
@@ -285,6 +290,9 @@ struct Page {
     flipped: HashSet<EntryKey>,
     /// The daemon had more activity than it sent.
     older: bool,
+    /// The page runs in qass's tab, whose pane title already says `board`: the heading
+    /// keeps only its sub line.
+    in_qass_tab: bool,
 }
 
 fn now_unix() -> i64 {
@@ -305,7 +313,19 @@ fn span(then: i64, now: i64) -> String {
     }
 }
 
-/// `text` cut to `w` cells, the cut said with an ellipsis.
+/// A card's word as a narrow card says it: `waits`, `checks`, `starts`, `no agent`, any
+/// other as it is.
+fn short(word: &str) -> &str {
+    match word {
+        WAITS => "waits",
+        CHECKS => "checks",
+        STARTS => "starts",
+        NO_AGENT => "no agent",
+        other => other,
+    }
+}
+
+/// `text` cut to `w` cells, the cut said with an ellipsis, never after a space.
 fn fit(text: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
@@ -313,7 +333,7 @@ fn fit(text: &str, w: usize) -> String {
     if width::width(text) <= w {
         return text.to_string();
     }
-    let mut out = clip(text, w.saturating_sub(1));
+    let mut out = clip(text, w.saturating_sub(1)).trim_end().to_string();
     out.push('…');
     out
 }
@@ -449,8 +469,8 @@ fn assignee(item: &ItemInfo) -> (String, String, Role) {
             (a.name.clone(), word, role)
         }
         None => match (item.state.as_str(), item.outcome.as_deref()) {
-            ("doing", _) => (String::new(), "qass will start it".into(), Role::Brand),
-            _ => (String::new(), "no agent yet".into(), Role::Faint),
+            ("doing", _) => (String::new(), STARTS.into(), Role::Brand),
+            _ => (String::new(), NO_AGENT.into(), Role::Faint),
         },
     }
 }
@@ -479,6 +499,7 @@ impl Page {
             all: false,
             flipped: HashSet::new(),
             older: false,
+            in_qass_tab: false,
         }
     }
 
@@ -1063,10 +1084,14 @@ impl Page {
 
     fn draw(&self, w: usize, h: usize) -> Screen {
         let mut s = Screen::new(w, h);
-        let x = s.put(1, 0, "board", &bold(Role::Title));
+        let x = if self.in_qass_tab {
+            0
+        } else {
+            s.put(1, 0, "board", &bold(Role::Title)) + 1
+        };
         let sub = "your tasks, run by qass";
-        if x + 2 + sub.chars().count() + 2 <= self.switch_at(w) {
-            s.put(x + 2, 0, sub, &ink(Role::Faint));
+        if x + 1 + sub.chars().count() + 2 <= self.switch_at(w) {
+            s.put(x + 1, 0, sub, &ink(Role::Faint));
         }
         let search = self.search();
         let sx = self.search_at(w);
@@ -1257,21 +1282,22 @@ impl Page {
                 Some(agent) if item.state != "done" => format!(" {lane_age} · {agent} "),
                 _ => format!(" {lane_age} "),
             };
-            let room = w.saturating_sub(space.chars().count() + 12);
-            let ages = fit(&ages, room);
+            // By cells: a wide name takes two a character.
+            let room = w.saturating_sub(width::width(&space) + 12);
+            // Cut, it keeps one space before the rule.
+            let ages = if width::width(&ages) > room {
+                format!("{} ", fit(&ages, room.saturating_sub(1)))
+            } else {
+                ages
+            };
             if !item.hidden && !ages.trim().is_empty() {
-                s.put(
-                    x + w - 4 - ages.chars().count(),
-                    y,
-                    &ages,
-                    &ink(Role::Faint),
-                );
+                s.put(x + w - 4 - width::width(&ages), y, &ages, &ink(Role::Faint));
             }
             // A narrow card keeps room for its title: the short form of the word.
             let shown = match (acts, inner < 30) {
                 (false, _) => String::new(),
                 (true, false) => word.clone(),
-                (true, true) => if word == WAITS { "waits" } else { "checks" }.to_string(),
+                (true, true) => short(&word).to_string(),
             };
             let done = item.state == "done";
             let lead = if done { "✓ " } else { "" };
@@ -1284,14 +1310,21 @@ impl Page {
         }
         s.put(x + 2, y + 1, &fit(&item.title, inner), &title);
         // The foot: the key, its age in the lane, then its agent and how long it has worked
-        // while there is room, and the word flush right, which always shows.
+        // while there is room, and the word flush right, which always shows: its short form
+        // when the long one does not fit beside the key, and whole while it fits beside
+        // [`KEY_MIN`] cells of the key, the key cut. One space stands between them.
         let (fy, end) = (y + 2, x + w - 2);
-        let word = fit(
-            &word,
-            inner
-                .saturating_sub(item.key.chars().count() + 2)
-                .max(inner / 3),
-        );
+        let key_w = item.key.chars().count() + 1;
+        let word = if word.chars().count() + key_w > inner {
+            short(&word).to_string()
+        } else {
+            word
+        };
+        let word = if word.chars().count() + KEY_MIN < inner {
+            word
+        } else {
+            fit(&word, inner.saturating_sub(key_w).max(inner / 3))
+        };
         let wx = end - word.chars().count();
         s.put(wx, fy, &word, &ink(role));
         let kx = s.put(
@@ -1300,17 +1333,18 @@ impl Page {
             &fit(&item.key, wx.saturating_sub(x + 3)),
             &ink(Role::Faint),
         );
-        let lane_age = if item.state == "done" && !lane_age.is_empty() {
-            format!("{lane_age} ago")
+        // A Done card says when it closed: `just now`, `3 min ago`.
+        let lane_age = if item.state == "done" && item.since != 0 {
+            ago(Some(item.since), self.now)
         } else {
             lane_age
         };
-        let ax = s.put(
-            kx + 2,
-            fy,
-            &fit(&lane_age, wx.saturating_sub(kx + 3)),
-            &ink(Role::Detail),
-        );
+        // The age whole or not at all: a cut one reads as another age.
+        let ax = if lane_age.chars().count() <= wx.saturating_sub(kx + 3) {
+            s.put(kx + 2, fy, &lane_age, &ink(Role::Detail))
+        } else {
+            kx
+        };
         let steps =
             (item.steps_total > 0).then(|| format!("{}/{}", item.steps_done, item.steps_total));
         let mut cx = ax;
@@ -1327,8 +1361,10 @@ impl Page {
             _ => who,
         };
         let agent = fit(&agent, wx.saturating_sub(cx + 3));
-        if agent.chars().count() >= 4 {
-            s.put(wx - 1 - agent.chars().count(), fy, &agent, &ink(Role::Text));
+        // By cells: a wide name takes two a character.
+        let agent_w = width::width(&agent);
+        if agent_w >= 4 {
+            s.put(wx - 1 - agent_w, fy, &agent, &ink(Role::Text));
         }
     }
 
@@ -1921,11 +1957,27 @@ pub(crate) fn activity_words(kind: &str, body: &str) -> String {
 }
 
 /// The bottom row: the page's name filled in the brand ink, then each key and what it does
-/// between ember brackets.
+/// between ember brackets. Only whole chips, and the last one (the way out) always: the
+/// others in order while they fit before it.
 fn chips(s: &mut Screen, keys: &[(&str, &str)]) {
     let y = s.h - 1;
     let mut x = s.put(1, y, " board ", &theme::filled(Role::Brand)) + 2;
-    for (key, what) in keys {
+    let chip_w =
+        |(key, what): &(&str, &str)| 2 + key.chars().count() + what.chars().count() + 3 + 2;
+    let Some((last, rest)) = keys.split_last() else {
+        return;
+    };
+    let mut room = s.w.saturating_sub(x + chip_w(last));
+    let mut shown: Vec<&(&str, &str)> = rest
+        .iter()
+        .take_while(|chip| {
+            let fits = chip_w(chip) <= room;
+            room = room.saturating_sub(chip_w(chip));
+            fits
+        })
+        .collect();
+    shown.push(last);
+    for (key, what) in shown {
         x = s.seg(
             x,
             y,
@@ -2135,9 +2187,21 @@ pub(crate) fn run() -> std::io::Result<()> {
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Err(std::io::Error::other("the board page needs a terminal"));
     }
+    let config_stamp = || {
+        std::fs::metadata(qoop_tui::config::path())
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let mut stamp = config_stamp();
     crate::settings::apply_theme();
     let mut page = Page::new();
     page.quiet = qoop_tui::config::read().config.quiet_cards;
+    // qass's tab opens the board in qass's folder (`qass::show_board`), and a wake brings it
+    // back there.
+    let canonical = |p: std::path::PathBuf| p.canonicalize().ok();
+    let here = std::env::current_dir().ok().and_then(canonical);
+    page.in_qass_tab =
+        here.is_some() && here == qoop_runtime::paths::qass_data_dir().and_then(canonical);
     let (tx, news) = mpsc::channel();
     watch(tx);
     let session = Session::start()?;
@@ -2145,6 +2209,12 @@ pub(crate) fn run() -> std::io::Result<()> {
     let mut polled: Option<Instant> = None;
     let mut last = String::new();
     'run: loop {
+        // A theme changed while the page is up (`qoop config set theme`, settings in another
+        // tab) is drawn at once, as the interface around it draws it.
+        if config_stamp() != stamp {
+            stamp = config_stamp();
+            crate::settings::apply_theme();
+        }
         let mut fresh = false;
         while news.try_recv().is_ok() {
             fresh = true;
@@ -2175,7 +2245,7 @@ pub(crate) fn run() -> std::io::Result<()> {
         page.now = now;
         let frame = format!("{w}x{h}{ageless}");
         if frame != last {
-            page::show(&screen, NEED)?;
+            page::show(&screen, NEED, "q")?;
             last = frame;
         }
         for key in page::next_keys(&session.typed) {
@@ -2967,6 +3037,150 @@ mod tests {
         assert_eq!(keys, ["QOOP-4", "QOOP-5", "QOOP-3"]);
     }
 
+    /// On a narrow full card the word stays readable (the short form of one that asks the
+    /// owner to act) and the key is what gets cut; the key bar shows whole chips and always
+    /// the way out.
+    #[test]
+    fn a_narrow_board_keeps_the_word_and_the_way_out() {
+        let mut p = page();
+        {
+            let items = p.items.as_mut().unwrap();
+            items[3].key = "QOOPPRIVAT-2".into();
+            items[3].updated_at = 100;
+            items[3].agents.push(ItemAgentInfo {
+                task: 9,
+                terminal: Some(4),
+                name: "gtm".into(),
+                machine: "this Mac".into(),
+                stage: "waiting-human".into(),
+                claimed: false,
+                closed: false,
+                since: 0,
+            });
+            items[5].key = "QOOPPRIVAT-6".into();
+            items[5].outcome = Some("failed".into());
+        }
+        let narrow = drawn(&p, NEED.0, NEED.1);
+        assert!(
+            narrow.contains(" waits │") && !narrow.contains("wai…"),
+            "{narrow}"
+        );
+        assert!(
+            narrow.contains(" failed │") && !narrow.contains("fai…"),
+            "{narrow}"
+        );
+        for w in [NEED.0, 120, 200] {
+            let bar = drawn(&p, w, NEED.1);
+            let foot = &bar[bar.rfind(" board ").unwrap()..];
+            assert!(foot.contains("[ q close ]"), "{w}: {foot}");
+            assert_eq!(
+                foot.matches("[ ").count(),
+                foot.matches(" ]").count(),
+                "{w}: {foot}"
+            );
+        }
+    }
+
+    /// A card's foot never cuts its lane age (a cut one reads as another age), says the lane
+    /// words short where the long ones do not fit beside the key (`starts`, `no agent`), and
+    /// places a wide agent name by its cells, never over the word or the card's edge.
+    #[test]
+    fn a_card_foot_cuts_no_fact_into_another() {
+        let mut p = page();
+        let now = p.now;
+        {
+            let items = p.items.as_mut().unwrap();
+            for i in items.iter_mut() {
+                i.since = now - 7200;
+                i.key = format!("QOOPPRIVAT-{}", i.id);
+            }
+            items[2].agents.push(ItemAgentInfo {
+                task: 3,
+                terminal: Some(7),
+                name: "日本語のエージェント".into(),
+                machine: "this Mac".into(),
+                stage: "verifying".into(),
+                claimed: false,
+                closed: false,
+                since: now - 60,
+            });
+        }
+        for w in NEED.0..=120 {
+            let text = drawn(&p, w, NEED.1);
+            assert!(
+                !text.contains("2 …") && !text.contains("2 h…") && !text.contains(" … "),
+                "{w}: {text}"
+            );
+        }
+        // Lanes of (63 - 6) / 3: cards of 13 cells inside, the fewest where `no agent` stands
+        // whole one space from a key cut to `KEY_MIN` (qass's tab at 120 x 40).
+        let tight = drawn(&p, 63, NEED.1);
+        assert!(tight.contains("QOO… no agent │"), "{tight}");
+        let wide = drawn(&p, 200, 30);
+        assert!(
+            wide.contains("日本") && wide.contains(" verifying │"),
+            "{wide}"
+        );
+        let mid = drawn(&p, 80, 30);
+        assert!(
+            mid.contains(" no agent │") && mid.contains(" starts │"),
+            "{mid}"
+        );
+    }
+
+    /// A quiet card's top edge places its ages and a wide agent name by cells: no corner is
+    /// written over, at any width. A Done card closed a moment ago says `just now`.
+    #[test]
+    fn a_quiet_card_s_edge_keeps_its_corners_and_a_done_card_its_words() {
+        let mut p = page();
+        let now = p.now;
+        let with_agent = |p: &mut Page, name: &str| {
+            let items = p.items.as_mut().unwrap();
+            items[2].agents = vec![ItemAgentInfo {
+                task: 3,
+                terminal: Some(7),
+                name: name.into(),
+                machine: "this Mac".into(),
+                stage: "implementing".into(),
+                claimed: false,
+                closed: false,
+                since: now - 60,
+            }];
+            items[2].since = now - 60;
+        };
+        p.quiet = true;
+        for w in [144, 176, 200, 240] {
+            with_agent(&mut p, "日本語のエージェント名前テスト");
+            let wide = drawn(&p, w, 30);
+            with_agent(&mut p, "release-build-and-notarize");
+            let plain = drawn(&p, w, 30);
+            assert_eq!(
+                wide.matches('┐').count(),
+                plain.matches('┐').count(),
+                "{w}: {wide}"
+            );
+            assert!(!wide.contains("…─") && !plain.contains("…─"), "{w}: {wide}");
+        }
+        p.quiet = false;
+        p.items.as_mut().unwrap()[5].since = now - 10;
+        let done = drawn(&p, 120, 30);
+        assert!(
+            done.contains("just now") && !done.contains("now ago"),
+            "{done}"
+        );
+    }
+
+    /// In qass's tab the pane's title already says `board`: the heading keeps its sub line.
+    #[test]
+    fn in_qass_s_tab_the_heading_does_not_say_board_twice() {
+        let mut p = page();
+        let alone = drawn(&p, 120, 30);
+        assert!(alone.starts_with(" board  your tasks"), "{alone}");
+        p.in_qass_tab = true;
+        let in_tab = drawn(&p, 120, 30);
+        assert!(in_tab.starts_with(" your tasks, run by qass"), "{in_tab}");
+    }
+
     /// The full card says its key, how long it has been in its lane, its agent and how long
     /// that agent has worked, and one word; the quiet card says a word only when someone must
     /// act. `v` turns the view and asks for it to be kept; so does a click on the switch.
@@ -3381,5 +3595,6 @@ mod tests {
         assert_eq!(wrap_cells("a b c d e f", 1, Some(2)), ["a", "b"]);
         assert!(wrap_cells("", 5, None).is_empty());
         assert_eq!(fit("中文中文", 5), "中文…");
+        assert_eq!(fit("qass will start it", 6), "qass…");
     }
 }

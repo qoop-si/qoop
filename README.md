@@ -72,7 +72,7 @@ Most keys are `ctrl-a`, then one letter.
 | `ctrl-a tab` | go to the agent that needs you |
 | `ctrl-a space` | find anything: a tab, an agent, a space |
 | `ctrl-a Q`, or a click on the pet | open qass, or go back |
-| `ctrl-a i`, or a click on qass's `asks you` count | the questions qass keeps for you, beside qass's chat: one key answers |
+| `ctrl-a i`, or a click on qass's `questions` count | the questions qass keeps for you, beside qass's chat: one key answers |
 | `ctrl-a ?` | every key, with a search |
 | `ctrl-q` | leave; everything keeps running |
 

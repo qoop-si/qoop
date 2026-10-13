@@ -31,6 +31,14 @@ impl Session {
         }));
         // The guard's restore leaves the alternate screen and shows the cursor again.
         print!("\x1b[?1049h\x1b[?25l");
+        // Its background, as the interface asks it, and to be told when it turns light or
+        // dark (`CSI ? 2031 h`, which the guard turns off): in a qoop pane the daemon answers
+        // with the one the person is looking at, and tells of a change, a first interface
+        // after a daemon that started with none included. Both arrive with the keys
+        // (`Key::Ground`).
+        if qoop_tui::run::may_ask_terminal() {
+            print!("\x1b[?2031h\x1b]11;?\x1b\\");
+        }
         std::io::stdout().flush()?;
         Ok(Session {
             _guard: guard,
@@ -93,6 +101,21 @@ pub enum Key {
     /// What the interface says about a press held in this page and let go outside it: over
     /// qass's pane (`true`), or anywhere else.
     Dropped(bool),
+    /// The terminal's answer to `OSC 11 ?`, or its report of a scheme change (`CSI ? 997 ;
+    /// 2 n`): its background is a light one (`true`) or not.
+    /// [`next_keys`] keeps it for the theme and hands it to no page.
+    Ground(bool),
+}
+
+/// What the terminal said its background is: 0 nothing yet, 1 dark, 2 light.
+static GROUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the terminal said its background is light, once it said.
+pub fn ground_light() -> Option<bool> {
+    match GROUND.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n == 2),
+    }
 }
 
 /// The keys in `bytes`, and how many bytes they used. An escape sequence is read to its
@@ -121,6 +144,8 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
                     let key = match &body[..at] {
                         b"7701;drop=qass" => Some(Key::Dropped(true)),
                         b"7701;drop=none" => Some(Key::Dropped(false)),
+                        [b'1', b'1', b';', rgb @ ..] => qoop_tui::input::parse_rgb(rgb)
+                            .map(|rgb| Key::Ground(theme::is_light_background(rgb))),
                         _ => None,
                     };
                     out.extend(key);
@@ -155,6 +180,12 @@ pub fn decode(bytes: &[u8]) -> (Vec<Key>, usize) {
                     b'Z' => Some(Key::BackTab),
                     b'H' => Some(Key::Home),
                     b'F' => Some(Key::End),
+                    // A colour scheme report (`CSI ? 2031 h` asked for them): dark, light.
+                    b'n' => match params {
+                        b"?997;1" => Some(Key::Ground(false)),
+                        b"?997;2" => Some(Key::Ground(true)),
+                        _ => None,
+                    },
                     b'~' => match params {
                         b"1" | b"7" => Some(Key::Home),
                         b"4" | b"8" => Some(Key::End),
@@ -234,6 +265,20 @@ fn mouse(params: &[u8], down: bool) -> Option<Key> {
 /// within a moment. Nothing following, a lone escape is the escape key. Nothing typed for
 /// 300 ms is no keys, so the caller redraws (the window may have been resized).
 pub fn next_keys(typed: &mpsc::Receiver<Vec<u8>>) -> Vec<Key> {
+    let mut found = typed_keys(typed);
+    // The terminal's background, answered: kept, and the theme drawn for it.
+    found.retain(|key| match key {
+        Key::Ground(light) => {
+            GROUND.store(1 + u8::from(*light), std::sync::atomic::Ordering::Relaxed);
+            crate::settings::apply_theme();
+            false
+        }
+        _ => true,
+    });
+    found
+}
+
+fn typed_keys(typed: &mpsc::Receiver<Vec<u8>>) -> Vec<Key> {
     let mut bytes = match typed.recv_timeout(Duration::from_millis(300)) {
         Ok(bytes) => bytes,
         Err(mpsc::RecvTimeoutError::Timeout) => return Vec::new(),
@@ -514,21 +559,33 @@ pub fn too_small(w: usize, h: usize, need: (usize, usize)) -> bool {
     w < need.0 || h < need.1
 }
 
-/// Paint `screen`, or, when the terminal is smaller than `need`, say how big it must be.
-pub fn show(screen: &Screen, need: (usize, usize)) -> std::io::Result<()> {
+/// `say` on a cleared terminal of `w` x `h`: broken at spaces, never in a word, a line to a
+/// row, and no row below the last.
+fn notice(say: &str, w: usize, h: usize) -> String {
+    let mut text = format!("\x1b[H\x1b[2J{}", ink(Role::Text));
+    for (row, line) in crate::qass_page::wrap(say, w).iter().enumerate().take(h) {
+        text.push_str(&format!("\x1b[{};1H{line}", row + 1));
+    }
+    text.push_str(theme::RESET);
+    text
+}
+
+/// Paint `screen`, or, when the terminal is smaller than `need`, say how big it must be (a
+/// pane in a qoop terminal, else the window) and the page's own key that leaves it (`leave`).
+pub fn show(screen: &Screen, need: (usize, usize), leave: &str) -> std::io::Result<()> {
     let (w, h) = size();
     let mut out = std::io::stdout();
     if too_small(w, h, need) {
-        out.write_all(
-            format!(
-                "\x1b[H\x1b[2J{}make the window at least {} x {} (it is {w} x {h}), esc leaves{}",
-                ink(Role::Text),
-                need.0,
-                need.1,
-                theme::RESET
-            )
-            .as_bytes(),
-        )?;
+        let what = if qoop_runtime::legacy::var("QOOP_TERMINAL").is_ok() {
+            "this pane"
+        } else {
+            "the window"
+        };
+        let say = format!(
+            "make {what} at least {} x {} (it is {w} x {h}), {leave} leaves",
+            need.0, need.1
+        );
+        out.write_all(notice(&say, w, h).as_bytes())?;
     } else {
         out.write_all(screen.frame().as_bytes())?;
     }
@@ -704,6 +761,53 @@ mod tests {
         assert_eq!(s.cells[0][3].extra, "\u{0308}");
         assert!(s.frame().contains("u\u{0308}"));
         assert!(!s.frame().contains(SPACER));
+    }
+
+    /// The too-small notice keeps to the terminal: no row below its last, at any height.
+    #[test]
+    fn the_too_small_notice_writes_no_row_below_the_last() {
+        let say = "make this pane at least 60 x 14 (it is 12 x 4), q leaves";
+        for (w, h) in [(12, 4), (8, 3), (80, 1)] {
+            let text = notice(say, w, h);
+            assert!(text.contains(&format!("\x1b[{h};1H")), "{w}x{h}: {text:?}");
+            assert!(
+                !text.contains(&format!("\x1b[{};1H", h + 1)),
+                "{w}x{h}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_terminal_s_background_is_read_as_light_or_dark_never_as_keys() {
+        assert_eq!(
+            decode(b"\x1b]11;rgb:fafa/fafa/fafa\x1b\\q"),
+            (vec![Key::Ground(true), Key::Char('q')], 26)
+        );
+        assert_eq!(
+            decode(b"\x1b]11;rgb:1e/1e/1e\x07"),
+            (vec![Key::Ground(false)], 18)
+        );
+        // Cut before its end, it waits for the rest.
+        assert_eq!(decode(b"\x1b]11;rgb:fa"), (vec![], 0));
+        // A scheme change the terminal reports, as `CSI ? 2031 h` asked.
+        assert_eq!(
+            decode(b"\x1b[?997;2n\x1b[?997;1n\x1b[?997;3n"),
+            (vec![Key::Ground(true), Key::Ground(false)], 27)
+        );
+    }
+
+    /// The answer reaches no page as a key: it is kept, for the theme drawn next. Dark last,
+    /// so the other tests go on drawing for the dark ground they expect.
+    #[test]
+    fn the_background_answered_is_kept_and_typed_by_no_one() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\".to_vec())
+            .unwrap();
+        assert_eq!(next_keys(&rx), []);
+        assert_eq!(ground_light(), Some(true));
+        tx.send(b"\x1b[?997;1n".to_vec()).unwrap();
+        assert_eq!(next_keys(&rx), []);
+        assert_eq!(ground_light(), Some(false));
     }
 
     #[test]
