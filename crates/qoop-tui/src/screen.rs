@@ -1112,7 +1112,7 @@ pub fn paint(frame: &Frame) -> String {
                     | sidebar::Hit::Search
                     | sidebar::Hit::Foot
                     | sidebar::Hit::Pet(_)
-                    | sidebar::Hit::PetTop(_)
+                    | sidebar::Hit::Eye(_)
                     | sidebar::Hit::Next(_)
                     | sidebar::Hit::Tabs,
                 )

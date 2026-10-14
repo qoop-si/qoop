@@ -17,6 +17,7 @@ holds; a test there checks the two agree.
 
 import hashlib
 import io
+import math
 import pathlib
 import sys
 import urllib.request
@@ -46,7 +47,12 @@ GLYPHS = [
     ("md-power_sleep", 0.86),
     ("md-dots_horizontal", 0.80),
     ("md-chevron_right", 0.72),
+    ("md-eye", 1.00),
+    ("md-eye_off", 1.00),
 ]
+# Glyphs the Nerd sets lack, drawn here over the outline of the one named: the shut eye is a
+# lid and three lashes (every Nerd "closed" eye is a struck-through one).
+DRAWN = {"md-eye_off": "shut_eye"}
 # The first of our codepoints: plane 16, supplementary private use area B.
 FIRST = 0x10C0A0
 # In font units (2048 to the em), set against Menlo: its advance is 1233, a capital 1493
@@ -72,6 +78,11 @@ def main() -> int:
     sub = subset.Subsetter(options)
     sub.populate(unicodes=[by_name[name] for name, _ in GLYPHS])
     sub.subset(font)
+    cmap = font.getBestCmap()
+    for name, how in DRAWN.items():
+        pen = TTGlyphPen(None)
+        globals()[how](pen)
+        font["glyf"][cmap[by_name[name]]] = pen.glyph()
     fit(font, by_name)
     for record in font["name"].names:
         if record.nameID in (1, 4, 16):
@@ -88,6 +99,34 @@ def main() -> int:
     for i, (name, _) in enumerate(GLYPHS):
         print(f"    ({name!r}, '\\u{{{FIRST + i:x}}}'),")
     return 0
+
+
+def shut_eye(pen) -> None:
+    """A shut eye on a 24 unit grid, as wide as the open one: the lid, a curve hanging down
+    between the corners, and three lashes under it. Every contour runs clockwise."""
+
+    def point(x: float, y: float) -> tuple[int, int]:
+        return round(x * 85), round(y * 85)
+
+    curve = [(1 + 22 * t / 24, 13 - 5 * math.sin(math.pi * t / 24)) for t in range(25)]
+    top = [point(x, y + 1) for x, y in curve]
+    shape(pen, top + [point(x, y - 1) for x, y in reversed(curve)])
+    for t, lean in ((0.22, -1.6), (0.5, 0.0), (0.78, 1.6)):
+        x, y = 1 + 22 * t, 13 - 5 * math.sin(math.pi * t) - 0.5
+        foot = y - 3.6
+        shape(pen, [point(x - 0.8, y), point(x + 0.8, y), point(x + 0.8 + lean, foot),
+                    point(x - 0.8 + lean, foot)])
+
+
+def shape(pen, points) -> None:
+    """One closed polygon, turned clockwise as TrueType fills it."""
+    area = sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(points, points[1:] + points[:1]))
+    if area > 0:
+        points = points[::-1]
+    pen.moveTo(points[0])
+    for p in points[1:]:
+        pen.lineTo(p)
+    pen.closePath()
 
 
 def fit(font: TTFont, by_name: dict[str, int]) -> None:

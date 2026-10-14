@@ -321,9 +321,9 @@ pub enum Hit {
     /// A row the pet stands on, with the cells the pet is across: only the last cells of the
     /// row before the column's edge margin answer, the q beside it answers nothing.
     Pet(usize),
-    /// The pet's top row with qass's `watch` word at its left: the word turns the owner's
-    /// switch, the pet's cells (when it stands there) open qass as on the other pet rows.
-    PetTop(Option<usize>),
+    /// The count chip's row with qass's eye on it, at this one based column: the eye turns
+    /// the owner's switch, the rest of the row answers nothing.
+    Eye(usize),
 }
 
 /// What a click on the column asks for, once the column it landed on is known.
@@ -376,7 +376,7 @@ pub enum Act {
     Collapse,
     /// The pet: qass's screen, or back from it, as `ctrl-a Q` does.
     Qass,
-    /// The `watch on` / `watch off` word beside the pet: turn qass's watching over.
+    /// qass's eye beside the count chip: turn qass's watching over.
     QassWatch,
     /// A tab of the inbox: its list, from the top, and the inbox open again if it was folded.
     InboxTab(InboxTab),
@@ -940,7 +940,7 @@ fn parts(
         stand_pet(&mut feet, cols);
     }
     if let Some(on) = watching() {
-        put_watch(&mut feet, c.width, on, pet_cols);
+        put_eye(&mut feet, c.width, on, pet_cols, c.icons);
     }
     let foot = feet.len().min(height);
     let room = height - foot;
@@ -3146,21 +3146,10 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
         Hit::Pet(cols) => (c.width.saturating_sub(cols)..c.width)
             .contains(&col)
             .then_some(Act::Qass),
-        Hit::PetTop(pet) => {
-            if pet.is_some_and(|cols| (c.width.saturating_sub(cols)..c.width).contains(&col)) {
-                Some(Act::Qass)
-            } else {
-                // The word as drawn: the blank after `watch on` turns nothing.
-                let word = if watching() == Some(true) {
-                    WATCH_ON
-                } else {
-                    WATCH_OFF
-                };
-                (1..=1 + word.len())
-                    .contains(&col)
-                    .then_some(Act::QassWatch)
-            }
-        }
+        // The eye's own cell, and the blank on either side of it: one cell is a small target.
+        Hit::Eye(at) => (at.saturating_sub(1)..=at + 1)
+            .contains(&col)
+            .then_some(Act::QassWatch),
         Hit::Foot => {
             if collapsed {
                 return Some(Act::Collapse);
@@ -3535,32 +3524,43 @@ pub(crate) fn pet_width(avatar: &qoop_runtime::avatar::Avatar) -> usize {
     lit_span(&qoop_runtime::avatar::art_cells(avatar)).map_or(0, |(lo, hi)| hi - lo + 1)
 }
 
-/// qass's switch beside the pet, the widest of its two words.
-const WATCH_ON: &str = "watch on";
-const WATCH_OFF: &str = "watch off";
-
-/// Write qass's switch at the left of the pet's top row (the row under the count chip, above
-/// the q), when it fits beside the pet: green while qass watches, faint while it is off.
-fn put_watch(feet: &mut [Row], width: usize, on: bool, pet: Option<usize>) {
+/// Put qass's eye on the count chip's row, open while qass watches (green) and shut while it
+/// does not (faint). With the pet standing, the eye and the chip are one pair inside the pet's
+/// own width: the eye at its left edge, the chip at its right. Without it, or when the count
+/// reaches over the pet's left edge, the eye sits one blank before the chip.
+fn put_eye(feet: &mut [Row], width: usize, on: bool, pet: Option<usize>, icons: bool) {
     use crate::theme::Role;
-    if width < 1 + WATCH_OFF.len() + 1 + pet.unwrap_or(0) + 1 || feet.len() < PET_FOOT_ROWS {
+    if feet.len() < STAGE_FOOT_ROWS {
         return;
     }
-    let (word, ink) = if on {
-        (WATCH_ON, Role::Done)
-    } else {
-        (WATCH_OFF, Role::Faint)
+    let row = feet.len() - STAGE_FOOT_ROWS;
+    let (line, hit) = &mut feet[row];
+    let chars: Vec<char> = line.text.chars().collect();
+    // The chip is only ever ASCII blanks before it, so its index is its column.
+    let chip = chars.iter().position(|c| *c == '[').unwrap_or(width - 1);
+    let left = pet.and_then(|cols| width.checked_sub(cols + 1));
+    let Some(at) = left
+        .filter(|l| l + 1 < chip)
+        .or_else(|| chip.checked_sub(2))
+    else {
+        return;
     };
-    let top = feet.len() - PET_FOOT_ROWS;
-    feet[top] = (
-        Line {
-            text: fit(&format!(" {word}"), width),
-            colour: Some(Role::Faint),
-            runs: vec![(1, word.len(), ink)],
-            ..Line::default()
-        },
-        Some(Hit::PetTop(pet)),
-    );
+    let (glyph, ink) = match (on, icons) {
+        (true, true) => (crate::icons::EYE, Role::Done),
+        // Without qoop's font: a dot open, a lid shut, both in every default font.
+        (true, false) => ('\u{25cf}', Role::Done),
+        (false, true) => (crate::icons::EYE_SHUT, Role::Faint),
+        (false, false) => ('\u{2500}', Role::Faint),
+    };
+    line.text = chars
+        .iter()
+        .enumerate()
+        .map(|(i, c)| if i == at { glyph } else { *c })
+        .collect();
+    line.colour = line.colour.or(Some(Role::Faint));
+    line.runs.push((at, 1, ink));
+    line.runs.sort_by_key(|run| run.0);
+    *hit = Some(Hit::Eye(at + 1));
 }
 
 /// Mark the rows the pet stands on, the foot's five rows under the count box, as the pet's.
@@ -6114,11 +6114,13 @@ mod tests {
         }
     }
 
-    /// qass's switch sits at the left of the pet's top row: its word turns it over, the pet's
-    /// cells on that row still open qass, the cells between answer nothing. Off is faint, on
-    /// green; a column too narrow for the word beside the pet keeps the row blank.
+    /// qass's eye and the count chip are one pair inside the pet's width: the eye at the pet's
+    /// left edge, the chip's `]` at its right. Open and green while it watches, shut and faint
+    /// while it does not; without the pet it stands one blank before the chip, and it alone
+    /// (with the cell either side) turns the switch.
     #[test]
-    fn the_watch_word_stands_beside_the_pet_and_turns_the_switch() {
+    fn the_eye_and_the_chip_stand_over_the_pet_as_one_pair() {
+        use crate::theme::Role;
         let (spaces, agents) = sample();
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let c = column(
@@ -6134,35 +6136,53 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let feet = |on: bool, pet: Option<usize>, width: usize| {
-            let mut feet = foot_rows(width, None, Pending::None, HubLink::Up, false);
-            if let Some(cols) = pet {
-                stand_pet(&mut feet, cols);
-            }
-            put_watch(&mut feet, width, on, pet);
-            feet[feet.len() - PET_FOOT_ROWS].clone()
+        let chip_row = |count: Option<usize>, on: bool, pet: Option<usize>, icons: bool| {
+            let mut feet = foot_rows(WIDTH, count, Pending::None, HubLink::Up, icons);
+            put_eye(&mut feet, WIDTH, on, pet, icons);
+            feet[feet.len() - STAGE_FOOT_ROWS].clone()
         };
-        let (line, hit) = feet(false, Some(6), WIDTH);
-        assert!(line.text.starts_with(" watch off "), "{:?}", line.text);
-        assert_eq!(line.runs, vec![(1, 9, crate::theme::Role::Faint)]);
-        assert_eq!(hit, Some(Hit::PetTop(Some(6))));
-        let at = |col| act(Hit::PetTop(Some(6)), col, &c, false);
+        let cols = |line: &Line| line.text.chars().collect::<Vec<char>>();
+        // With the pet (8 cells): the eye on its left edge, the chip ending on its right edge.
+        let (line, hit) = chip_row(Some(2), true, Some(8), true);
+        let row = cols(&line);
+        let left = WIDTH - 9;
+        assert_eq!(row[left], crate::icons::EYE, "{:?}", line.text);
+        assert_eq!(row[WIDTH - 2], ']', "{:?}", line.text);
+        assert_eq!(row.len(), WIDTH);
+        assert!(line.runs.contains(&(left, 1, Role::Done)));
+        assert!(line.runs.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(hit, Some(Hit::Eye(left + 1)));
+        // Off: shut and faint; without the icon font, the plain eyes.
+        let (line, _) = chip_row(Some(2), false, Some(8), true);
+        assert_eq!(cols(&line)[left], crate::icons::EYE_SHUT);
+        assert!(line.runs.contains(&(left, 1, Role::Faint)));
         assert_eq!(
-            (at(2), at(10)),
-            (Some(Act::QassWatch), Some(Act::QassWatch))
+            cols(&chip_row(Some(2), true, Some(8), false).0)[left],
+            '\u{25cf}'
         );
-        assert_eq!(at(15), None);
         assert_eq!(
-            (at(WIDTH - 6), at(WIDTH - 1)),
-            (Some(Act::Qass), Some(Act::Qass))
+            cols(&chip_row(Some(2), false, Some(8), false).0)[left],
+            '\u{2500}'
         );
-        assert_eq!(at(WIDTH), None);
-        let (line, _) = feet(true, None, WIDTH);
-        assert!(line.text.starts_with(" watch on "), "{:?}", line.text);
-        assert_eq!(line.runs, vec![(1, 8, crate::theme::Role::Done)]);
-        assert_eq!(act(Hit::PetTop(None), WIDTH - 1, &c, false), None);
-        let (line, hit) = feet(true, Some(8), 18);
-        assert!(line.text.trim().is_empty() && hit == Some(Hit::Pet(8)));
+        // No count: the eye stays on the pet's left edge, alone.
+        let (line, _) = chip_row(None, true, Some(8), true);
+        assert_eq!(cols(&line)[left], crate::icons::EYE);
+        // No pet: one blank before the chip.
+        let (line, hit) = chip_row(Some(2), true, None, true);
+        let chip = line.text.chars().position(|c| c == '[').unwrap();
+        assert_eq!(cols(&line)[chip - 2], crate::icons::EYE);
+        assert_eq!(hit, Some(Hit::Eye(chip - 1)));
+        // The eye and the blank either side turn it; the rest of the row does nothing.
+        let at = |col| act(Hit::Eye(left + 1), col, &c, false);
+        assert_eq!(
+            (at(left), at(left + 1), at(left + 2)),
+            (
+                Some(Act::QassWatch),
+                Some(Act::QassWatch),
+                Some(Act::QassWatch)
+            )
+        );
+        assert_eq!((at(left - 1), at(WIDTH - 2)), (None, None));
     }
 
     /// Every cell of the pet answers `Act::Qass`, and no other cell of the column does: the
