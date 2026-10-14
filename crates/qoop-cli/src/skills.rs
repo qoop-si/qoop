@@ -279,6 +279,27 @@ fn current(home: &Path, target: &Target) -> bool {
         .unwrap_or(false)
 }
 
+/// Write the skill of every proven agent on this machine that has none, for the daemon's own
+/// look. Each agent it tried, with whether it wrote. A skill that is there but older is left to
+/// `qoop skills install` and the update, as the hooks are; qass is laid out by those and before
+/// qass starts, never here.
+pub(crate) fn keep(
+    home: &Path,
+    config: &Path,
+    path: &str,
+    dirs: &[PathBuf],
+) -> Vec<(&'static str, std::io::Result<bool>)> {
+    targets()
+        .into_iter()
+        .filter(|t| !t.experimental)
+        .filter(|t| crate::hooks::present_with(t.agent, home, path, dirs))
+        .filter(|t| !path_of(home, t).exists())
+        // Read last, right before the write, so an uninstall racing this look wins.
+        .filter(|t| !crate::hooks::is_off(config, "skills", t.agent))
+        .map(|t| (t.agent, install_into(home, &t)))
+        .collect()
+}
+
 /// What `status` reports for one agent, pure so the experimental mark is testable.
 fn status_of(home: &Path, target: &Target) -> &'static str {
     match (
@@ -542,8 +563,15 @@ fn status() -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to inspect"));
     };
     let dirs = QassDirs::here()?;
+    let config = qoop_runtime::paths::config_dir();
     for target in targets() {
-        println!("  {:<10} {}", target.agent, status_of(&home, &target));
+        let state = match status_of(&home, &target) {
+            "not installed" if crate::hooks::is_off(&config, "skills", target.agent) => {
+                "off, removed on purpose: `qoop skills install <agent>` brings it back"
+            }
+            state => state,
+        };
+        println!("  {:<10} {state}", target.agent);
     }
     let qass = match (dirs.skill_dirs().any(|d| d.exists()), qass_current(&dirs)) {
         (false, _) => "not installed",
@@ -576,11 +604,25 @@ fn install(args: &[String]) -> std::io::Result<()> {
             dirs.data.display()
         );
     }
+    let config = qoop_runtime::paths::config_dir();
+    let _held = crate::hooks::setup_lock(&config)?;
+    // Named, so wanted again: off the list of the ones removed on purpose.
+    if !args.is_empty() {
+        let names: Vec<&str> = wanted.iter().map(|t| t.agent).collect();
+        crate::hooks::set_off(&config, "skills", &names, false)?;
+    }
     for target in wanted {
         // Asked for every agent, only the ones on this machine, as `hooks install` does:
         // an agent named on the command line is installed whether or not it is here yet.
         if args.is_empty() && !crate::hooks::agent_present(target.agent) {
             println!("  {:<10} not present, skipped", target.agent);
+            continue;
+        }
+        if args.is_empty() && crate::hooks::is_off(&config, "skills", target.agent) {
+            println!(
+                "  {:<10} off, removed on purpose: `qoop skills install {}` brings it back",
+                target.agent, target.agent
+            );
             continue;
         }
         if !install_into(&home, &target)? {
@@ -614,7 +656,20 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
             );
         }
     }
-    for target in wanted(args)? {
+    let wanted = wanted(args)?;
+    let config = qoop_runtime::paths::config_dir();
+    let _held = crate::hooks::setup_lock(&config)?;
+    // Listed before anything is removed, so no install that names no agent puts it back. Asked
+    // for every agent, only the ones here or set up: one installed next month is still wanted.
+    let names: Vec<&str> = wanted
+        .iter()
+        .filter(|t| {
+            !args.is_empty() || crate::hooks::agent_present(t.agent) || path_of(&home, t).exists()
+        })
+        .map(|t| t.agent)
+        .collect();
+    crate::hooks::set_off(&config, "skills", &names, true)?;
+    for target in wanted {
         match remove_from(&home, &target)? {
             true => println!("  {:<10} removed from {}", target.agent, target.dir),
             false => println!("  {:<10} was not there", target.agent),

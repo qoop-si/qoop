@@ -24,6 +24,7 @@ mod config;
 mod doctor;
 mod hooks;
 mod icons;
+mod keep;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
 #[cfg(target_os = "macos")]
 mod launchd;
@@ -357,6 +358,8 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
     // can rename a new file over it: on Linux the running path then reads
     // `<path> (deleted)`. It is the file an update replaces and what the daemon becomes.
     let exe = std::env::current_exe().map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe));
+    // Which file that is, for the daemon's look to stop once an update replaced it.
+    let born = exe.as_deref().ok().and_then(keep::identity);
     // The dry run a daemon about to become this binary makes of it: can this read what it
     // wrote? Nothing is started and nothing is deleted.
     if let Some((file, nonce)) = handoff::check_requested(args) {
@@ -452,6 +455,9 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                     if update::release_built() {
                         tokio::spawn(update::auto_timer(exe.clone()));
                     }
+                    if let Some(keeper) = keep::Keeper::for_this(&exe, born) {
+                        tokio::spawn(keeper.run());
+                    }
                     d.leaving_when_idle().restarting_into(exe)
                 }
                 Err(e) => {
@@ -538,30 +544,12 @@ fn run_client() -> std::io::Result<()> {
     // The interface, not the bare attach. `qoop attach` is still there for the one terminal
     // case and for anything driving this program from a script, because a full screen
     // interface is the wrong thing to hand a pipe.
-    // An agent on this machine with no hook installed is worth one line, once. It is not
-    // an error and nothing waits on it: an agent is read from its screen either way, and a
-    // hook makes that reading immediate and tells qoop which conversation the tab is
-    // having, which is what a restart needs.
-    let notice = match hooks::missing().as_slice() {
-        [] => None,
-        agents => Some(format!(
-            "{} here without a qoop hook: `qoop hooks install` reads them better",
-            agents.join(", ")
-        )),
-    };
     // Always through the mux, remotes or not: a machine connected from the `+` has to have
     // somewhere to go without restarting the interface. With none added it relays this
     // machine's renders as they come, undecoded.
     let (remotes, notice) = match qoop_remote::saved::load() {
-        Ok(remotes) => (remotes, notice),
-        Err(e) => {
-            let broken = format!("remotes not loaded: {e}");
-            let notice = match notice {
-                Some(hooks) => format!("{broken}; {hooks}"),
-                None => broken,
-            };
-            (Vec::new(), Some(notice))
-        }
+        Ok(remotes) => (remotes, None),
+        Err(e) => (Vec::new(), Some(format!("remotes not loaded: {e}"))),
     };
     let ran = rt.block_on(qoop_tui::mux::run(
         Some(&socket),
