@@ -1,21 +1,18 @@
 //! A machine with no agent on it yet, as a new computer often is: `qoop hooks install` (which
-//! the install script runs) says what to run once one is installed, not that a running agent
-//! must be started afresh.
-
-use std::process::Command;
+//! the install script runs) says qoop sets one up by itself once it is installed, not that a
+//! running agent must be started afresh.
 
 #[test]
-fn hooks_install_with_no_agent_says_what_to_run_later() {
-    let out = Command::from(qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop")))
+fn hooks_install_with_no_agent_says_it_is_set_up_later() {
+    let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
         .env("PATH", "/usr/bin:/bin")
         .args(["hooks", "install"])
         .output()
         .expect("run qoop hooks install");
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}");
-    assert!(said.contains("claude     not present, skipped"), "{said}");
     assert!(
-        said.contains("once one is installed, run `qoop hooks install` and `qoop skills install`"),
+        said.contains("qoop sets up its hook and skill by itself once one is installed"),
         "{said}"
     );
     assert!(!said.contains("an agent already running"), "{said}");

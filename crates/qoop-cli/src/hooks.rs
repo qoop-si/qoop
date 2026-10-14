@@ -289,30 +289,153 @@ fn config_path_in(target: &Target, home: &Path, moved: Option<PathBuf>) -> PathB
     }
 }
 
-/// Whether a person has this agent: its binary on `PATH`, or its configuration directory.
+/// Whether a person has this agent: its binary on `PATH` or in a folder agents install into,
+/// or its configuration directory.
 ///
 /// An install that names no agent installs only for these, rather than creating a
 /// directory for every agent qoop knows of on a machine that has two of them.
 fn present(target: &Target, home: &Path) -> bool {
-    present_in(target, home, &std::env::var("PATH").unwrap_or_default())
+    present_in(
+        target,
+        home,
+        &std::env::var("PATH").unwrap_or_default(),
+        &agent_dirs(home),
+    )
 }
 
-/// The same, with the search path given.
-fn present_in(target: &Target, home: &Path, path: &str) -> bool {
+/// The same, with the search path and the install folders given.
+fn present_in(target: &Target, home: &Path, path: &str, dirs: &[PathBuf]) -> bool {
     on_path_in(target.agent, path)
+        || dirs
+            .iter()
+            .any(|dir| runnable(&dir.join(binary(target.agent))))
         || config_path(target, home)
             .parent()
             .is_some_and(|dir| dir.is_dir())
+}
+
+/// The folders people install agents into, looked at beside `PATH`: a daemon started by
+/// launchd, systemd or ssh has a bare `PATH` that misses every one of them, and so did the
+/// install a new ssh computer gets, which skipped a `claude` sitting in `~/.local/bin`.
+///
+/// ponytail: a fixed list; a login shell's `PATH` if a real install folder turns up outside it.
+pub(crate) fn agent_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
+        ".local/bin",
+        ".npm-global/bin",
+        ".bun/bin",
+        ".volta/bin",
+        ".claude/local",
+        ".opencode/bin",
+        ".local/share/fnm/aliases/default/bin",
+        ".local/share/mise/shims",
+        ".asdf/shims",
+    ]
+    .iter()
+    .map(|dir| home.join(dir))
+    .collect();
+    if let Ok(versions) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+        dirs.extend(versions.flatten().map(|v| v.path().join("bin")));
+    }
+    dirs.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ]
+        .map(PathBuf::from),
+    );
+    dirs
+}
+
+/// An executable file, through any link: what a package manager leaves in its bin folder.
+fn runnable(file: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Whether the agent named is on this machine, for `skills install` to skip the ones that
 /// are not, the way `hooks install` does.
 pub fn agent_present(agent: &str) -> bool {
     home().is_some_and(|home| {
-        targets()
-            .iter()
-            .any(|t| t.agent == agent && present(t, &home))
+        let path = std::env::var("PATH").unwrap_or_default();
+        present_with(agent, &home, &path, &agent_dirs(&home))
     })
+}
+
+/// The same, with the home, the search path and the install folders given.
+pub(crate) fn present_with(agent: &str, home: &Path, path: &str, dirs: &[PathBuf]) -> bool {
+    targets()
+        .iter()
+        .any(|t| t.agent == agent && present_in(t, home, path, dirs))
+}
+
+/// Held across every change to agents' hooks and skills and to the lists below, by every
+/// `install` and `uninstall` and by the daemon's look, so a removal and a look never interleave
+/// and two writers never share a half-written file. `flock`, released when the holder exits.
+pub(crate) fn setup_lock(config: &Path) -> std::io::Result<qoop_runtime::lock::StartupLock> {
+    std::fs::create_dir_all(config)?;
+    qoop_runtime::lock::StartupLock::acquire(&config.join("setup.lock"))
+}
+
+/// The file that lists the agents whose qoop `kind` ("hooks" or "skills") a person removed on
+/// purpose, one per line, beside the `no-auto-update` mark. An install that names no agent
+/// (the install script, an update, a new ssh computer, the daemon's own look) skips them;
+/// naming the agent takes it off the list.
+pub(crate) fn off_list(config: &Path, kind: &str) -> PathBuf {
+    config.join(format!("no-auto-{kind}"))
+}
+
+/// Whether this agent's `kind` was removed on purpose.
+pub(crate) fn is_off(config: &Path, kind: &str, agent: &str) -> bool {
+    std::fs::read_to_string(off_list(config, kind))
+        .is_ok_and(|list| list.lines().any(|line| line.trim() == agent))
+}
+
+/// Put these agents on the list (`off`) or take them off it.
+pub(crate) fn set_off(
+    config: &Path,
+    kind: &str,
+    agents: &[&str],
+    off: bool,
+) -> std::io::Result<()> {
+    let file = off_list(config, kind);
+    let text = match std::fs::read_to_string(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read?,
+    };
+    let mut list: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !agents.contains(line))
+        .map(String::from)
+        .collect();
+    if off {
+        list.extend(agents.iter().map(|a| a.to_string()));
+    }
+    let was: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if was == list {
+        return Ok(());
+    }
+    if list.is_empty() {
+        return match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(config)?;
+    // Beside and renamed over, so a failed write never loses the list there was.
+    let fresh = file.with_extension(format!("{}.new", std::process::id()));
+    let written = std::fs::write(&fresh, list.join("\n") + "\n")
+        .and_then(|()| std::fs::rename(&fresh, &file));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&fresh);
+    }
+    written
 }
 
 /// Where the installed scripts live.
@@ -365,25 +488,6 @@ fn home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-/// Agents that are on this machine and whose hook is not installed.
-///
-/// What a first start says out loud. An agent is read from its screen with no hook at all,
-/// so this is never an error and never blocks anything; it is the one line that tells a
-/// person a better reading is one command away, and it says nothing at all once they have
-/// run it or if they have no agents installed.
-pub fn missing() -> Vec<&'static str> {
-    let dir = hooks_dir();
-    let Some(home) = home() else {
-        return Vec::new();
-    };
-    targets()
-        .into_iter()
-        .filter(|target| on_path(target.agent))
-        .filter(|target| !registered(target, &dir, &home))
-        .map(|target| target.agent)
-        .collect()
-}
-
 /// Whether this agent's hook is registered where that agent will read it.
 fn registered(target: &Target, dir: &Path, home: &Path) -> bool {
     if matches!(target.shape, Shape::Dropped) {
@@ -414,14 +518,17 @@ pub(crate) fn on_path(agent: &str) -> bool {
 /// that changes one process-wide thing is a test that answers somebody else's question
 /// wrongly, and the parallel runner makes it look like a flake.
 fn on_path_in(agent: &str, path: &str) -> bool {
-    // The name a person types, which is not always the name of the binary.
-    let binary = match agent {
-        "cursor" => "cursor-agent",
-        other => other,
-    };
     path.split(':')
         .filter(|dir| !dir.is_empty())
-        .any(|dir| Path::new(dir).join(binary).exists())
+        .any(|dir| Path::new(dir).join(binary(agent)).exists())
+}
+
+/// The name a person types, which is not always the name of the binary.
+fn binary(agent: &str) -> &str {
+    match agent {
+        "cursor" => "cursor-agent",
+        other => other,
+    }
 }
 
 /// `qoop hooks ...`
@@ -475,7 +582,11 @@ fn status() -> std::io::Result<()> {
             (registered, current)
         };
         let here = home.as_ref().is_some_and(|h| present(&target, h));
+        let off = is_off(&qoop_runtime::paths::config_dir(), "hooks", target.agent);
         let state = match (registered, current) {
+            (false, _) if off => {
+                "off, removed on purpose: `qoop hooks install <agent>` brings it back"
+            }
             (false, _) if !here => "not present",
             (false, _) => "not installed",
             (true, false) => "installed, and older than this build: run install again",
@@ -494,41 +605,49 @@ fn install(args: &[String]) -> std::io::Result<()> {
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to install into"));
     };
+    let config_dir = qoop_runtime::paths::config_dir();
+    let wanted = wanted(args)?;
+    let _held = setup_lock(&config_dir)?;
+    // Named, so wanted again: off the list of the ones removed on purpose.
+    if !args.is_empty() {
+        let names: Vec<&str> = wanted.iter().map(|t| t.agent).collect();
+        set_off(&config_dir, "hooks", &names, false)?;
+    }
     let mut any = false;
-    for target in wanted(args)? {
+    for target in wanted {
         // Asked for every agent, only the ones on this machine: an agent named on the
         // command line is installed whether or not it is here yet.
         if args.is_empty() && !present(&target, &home) {
             println!("  {:<10} not present, skipped", target.agent);
             continue;
         }
+        if args.is_empty() && is_off(&config_dir, "hooks", target.agent) {
+            println!(
+                "  {:<10} off, removed on purpose: `qoop hooks install {}` brings it back",
+                target.agent, target.agent
+            );
+            continue;
+        }
         any = true;
+        // A script that cannot be written stops the command, as it always has: the install
+        // script and an update read the exit status.
+        let edited = install_one(&target, &home, &dir)?;
         // Dropped hooks have no configuration to edit: the file itself goes
-        // into the agent's plugin directory. The file is qoop's own and the
-        // person never edits it, so missing or different means install.
+        // into the agent's plugin directory.
         if matches!(target.shape, Shape::Dropped) {
-            match install_dropped(&home, &target) {
+            match edited {
                 Ok(true) => println!("  {:<10} installed into {}", target.agent, target.config),
                 Ok(false) => println!("  {:<10} already installed", target.agent),
                 Err(e) => println!("  {:<10} {} not written: {e}", target.agent, target.config),
             }
             continue;
         }
-        // Made here rather than up front, so an install that skips every agent leaves
-        // nothing behind.
-        std::fs::create_dir_all(&dir)?;
-        let script = dir.join(target.file);
-        std::fs::write(&script, target.body)?;
-        if target.file.ends_with(".sh") {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let (config, at_root) = config_of(&target, &home);
+        let (config, _) = config_of(&target, &home);
         let shown = config.strip_prefix(&home).unwrap_or(&config).display();
-        let edited = edit(&config, &target, &script, at_root);
         // The entries of the script it replaces, so an agent does not report twice.
         let mut replaced_old = false;
-        let cleanup = if qoop_runtime::legacy::migrating() {
+        // Only once the new entry is in: an agent keeps its old hook rather than none.
+        let cleanup = if edited.is_ok() && qoop_runtime::legacy::migrating() {
             remove_everywhere(&target, &home, &old_script(&target), false)
         } else {
             Vec::new()
@@ -542,10 +661,7 @@ fn install(args: &[String]) -> std::io::Result<()> {
         match edited {
             Ok(true) => println!("  {:<10} installed, and {shown} updated", target.agent),
             Ok(false) => println!("  {:<10} already installed", target.agent),
-            Err(e) => println!(
-                "  {:<10} script written, {shown} not edited: {e}",
-                target.agent
-            ),
+            Err(e) => println!("  {:<10} {shown} not set up: {e}", target.agent),
         }
         // Codex skips a hook it has not been told to trust, without a word: measured, the
         // hooks were installed and none of them ran. Trusting is the person's to do.
@@ -587,13 +703,98 @@ fn install(args: &[String]) -> std::io::Result<()> {
             "\nan agent already running does not read its configuration again: start it afresh."
         );
     } else {
-        // A new computer often has qoop before its agent: nothing installs them later by itself.
+        // A new computer often has qoop before its agent: the daemon's own look picks it up.
         println!(
-            "\nno agent on this machine yet: once one is installed, run `qoop hooks install` and \
-             `qoop skills install`"
+            "\nno agent on this machine yet: qoop sets up its hook and skill by itself once one \
+             is installed"
         );
     }
     Ok(())
+}
+
+/// Put one agent's hook in place: its script, then its entry in the agent's configuration.
+/// The outer error is the script (or a dropped plugin's directory), which stops an install;
+/// the inner one the agent's configuration, which an install reports and goes on past. True
+/// when the entry (or a dropped plugin) was added; the script alone does not count.
+///
+/// Dropped hooks have no configuration to edit: the file itself goes into the agent's plugin
+/// directory. The file is qoop's own and the person never edits it, so missing or different
+/// means install.
+fn install_one(target: &Target, home: &Path, dir: &Path) -> std::io::Result<std::io::Result<bool>> {
+    if matches!(target.shape, Shape::Dropped) {
+        return Ok(install_dropped(home, target));
+    }
+    // Made here rather than up front, so an install that skips every agent leaves
+    // nothing behind.
+    std::fs::create_dir_all(dir)?;
+    let script = dir.join(target.file);
+    write_script(&script, target.body)?;
+    let (config, at_root) = config_of(target, home);
+    Ok(edit(&config, target, &script, at_root))
+}
+
+/// Write a hook's script unless it already holds `body`, beside and renamed over, so an agent
+/// running the old one while this writes reads it whole, and a failure never leaves it cut.
+fn write_script(script: &Path, body: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = script.extension().is_some_and(|e| e == "sh");
+    let mode = |file: &Path| match runs {
+        true => std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700)),
+        false => Ok(()),
+    };
+    if std::fs::read_to_string(script).ok().as_deref() == Some(body) {
+        let current = std::fs::metadata(script)?.permissions().mode() & 0o777;
+        return match !runs || current == 0o700 {
+            true => Ok(()),
+            false => mode(script),
+        };
+    }
+    // Named for this process, so two writers never share one, and made runnable before it
+    // takes the script's name.
+    let name = script.file_name().unwrap_or_default().to_string_lossy();
+    let fresh = script.with_file_name(format!(".{name}.{}.new", std::process::id()));
+    let written = std::fs::write(&fresh, body)
+        .and_then(|()| mode(&fresh))
+        .and_then(|()| std::fs::rename(&fresh, script));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&fresh);
+    }
+    written
+}
+
+/// Set up the hook of every agent on this machine that has none, for the daemon's own look.
+/// Each agent it tried, with whether its entry was added. A hook that is there but older is
+/// left to `qoop hooks install` and the update: a daemon outlives the binary it came from,
+/// and an old one must not write its old script over a new install.
+pub(crate) fn keep(
+    home: &Path,
+    config: &Path,
+    path: &str,
+    dirs: &[PathBuf],
+) -> Vec<(&'static str, std::io::Result<bool>)> {
+    let dir = config.join("hooks");
+    if safe_hook_dir(&dir).is_err() {
+        return Vec::new();
+    }
+    targets()
+        .into_iter()
+        .filter(|t| present_in(t, home, path, dirs))
+        .filter(|t| !set_up(t, &dir, home))
+        // Read last, right before the write, so an uninstall racing this look wins.
+        .filter(|t| !is_off(config, "hooks", t.agent))
+        .map(|t| {
+            (
+                t.agent,
+                install_one(&t, home, &dir).and_then(|edited| edited),
+            )
+        })
+        .collect()
+}
+
+/// Whether this agent's hook is registered and its script is there to run.
+fn set_up(target: &Target, dir: &Path, home: &Path) -> bool {
+    registered(target, dir, home)
+        && (matches!(target.shape, Shape::Dropped) || dir.join(target.file).exists())
 }
 
 /// Drop a Dropped hook's file into the agent's plugin directory.
@@ -624,7 +825,18 @@ fn uninstall(args: &[String]) -> std::io::Result<()> {
     let Some(home) = home() else {
         return Err(std::io::Error::other("no home directory to uninstall from"));
     };
-    for target in wanted(args)? {
+    let wanted = wanted(args)?;
+    let config_dir = qoop_runtime::paths::config_dir();
+    let _held = setup_lock(&config_dir)?;
+    // Listed before anything is removed, so no install that names no agent puts it back. Asked
+    // for every agent, only the ones here or set up: one installed next month is still wanted.
+    let names: Vec<&str> = wanted
+        .iter()
+        .filter(|t| !args.is_empty() || present(t, &home) || registered(t, &dir, &home))
+        .map(|t| t.agent)
+        .collect();
+    set_off(&config_dir, "hooks", &names, true)?;
+    for target in wanted {
         let script = dir.join(target.file);
         if matches!(target.shape, Shape::Dropped) {
             let dropped = home.join(target.config).join(target.file);
@@ -2178,6 +2390,66 @@ mod tests {
         }
     }
 
+    /// An agent in a folder agents install into counts with a bare `PATH`, the way a daemon
+    /// started by ssh or launchd sees it; a file there that cannot run does not.
+    #[test]
+    fn an_agent_in_an_install_folder_is_present_without_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("home");
+        let home = home.path();
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let dirs = agent_dirs(home);
+        assert!(dirs.contains(&bin));
+        assert!(!present_in(
+            &target("gemini"),
+            home,
+            "/usr/bin:/bin",
+            std::slice::from_ref(&bin)
+        ));
+        std::fs::write(bin.join("gemini"), "").expect("file");
+        assert!(
+            !present_in(&target("gemini"), home, "", std::slice::from_ref(&bin)),
+            "not executable"
+        );
+        std::fs::set_permissions(bin.join("gemini"), std::fs::Permissions::from_mode(0o755))
+            .expect("mode");
+        assert!(present_in(
+            &target("gemini"),
+            home,
+            "",
+            std::slice::from_ref(&bin)
+        ));
+        assert!(!present_in(&target("claude"), home, "", &[bin]));
+        let nvm = home.join(".nvm/versions/node/v22.1.0/bin");
+        std::fs::create_dir_all(&nvm).expect("nvm");
+        assert!(agent_dirs(home).contains(&nvm), "every nvm node version");
+    }
+
+    /// Removing on purpose is written before anything goes, naming takes it back, and the
+    /// list goes once empty.
+    #[test]
+    fn the_list_of_removed_agents_adds_and_takes_back() {
+        let config = tempfile::tempdir().expect("config");
+        let config = config.path();
+        assert!(!is_off(config, "hooks", "gemini"));
+        set_off(config, "hooks", &["gemini", "claude"], true).expect("off");
+        set_off(config, "hooks", &["gemini"], true).expect("again");
+        assert!(is_off(config, "hooks", "gemini"));
+        assert!(
+            !is_off(config, "skills", "gemini"),
+            "hooks and skills apart"
+        );
+        let list = std::fs::read_to_string(off_list(config, "hooks")).expect("list");
+        assert_eq!(list, "claude\ngemini\n", "once each");
+        set_off(config, "hooks", &["gemini", "claude"], false).expect("on");
+        assert!(!is_off(config, "hooks", "claude"));
+        assert!(
+            !off_list(config, "hooks").exists(),
+            "an empty list is no file"
+        );
+    }
+
     /// An agent is present by its binary or by its configuration directory, and neither
     /// means absent: an unnamed install skips it rather than creating its directory.
     #[test]
@@ -2188,12 +2460,15 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("dir");
         let path = bin.display().to_string();
         let qwen = target("qwen");
-        assert!(!present_in(&qwen, &home, &path));
+        assert!(!present_in(&qwen, &home, &path, &[]));
         std::fs::create_dir_all(home.join(".qwen")).expect("dir");
-        assert!(present_in(&qwen, &home, &path), "its directory is enough");
+        assert!(
+            present_in(&qwen, &home, &path, &[]),
+            "its directory is enough"
+        );
         std::fs::write(bin.join("qodercli"), "#!/bin/sh\n").expect("write");
         assert!(
-            present_in(&target("qodercli"), &home, &path),
+            present_in(&target("qodercli"), &home, &path, &[]),
             "its binary is enough"
         );
     }

@@ -19,6 +19,12 @@ qoop hooks install claude       one of them
 qoop hooks uninstall claude     exactly what was installed, and nothing else
 ```
 
+Every daemon also looks every 10 s for an agent on its machine with no qoop hook or skill yet
+(one installed after qoop, in `PATH` or a usual install folder) and sets it up
+(`crates/qoop-cli/src/keep.rs`). An agent removed with `uninstall` is listed in
+`no-auto-hooks` / `no-auto-skills` in the config directory and left alone until it is installed
+by name.
+
 amp and goose ship a hook too, but are installed by hand: see "Installing" below.
 A hooks directory whose path holds whitespace or shell syntax is refused rather than
 quoted, because not every agent runs its hook command through a shell.

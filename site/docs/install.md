@@ -28,7 +28,8 @@ cargo build --release -p qoop-cli
 ./target/release/qoop
 ```
 
-Then put it on your `PATH` and install the hooks and the skill:
+Then put it on your `PATH`. qoop sets up the hook and the skill of every agent on the machine by
+itself, one you install later too. To do it right away:
 
 ```
 qoop hooks install

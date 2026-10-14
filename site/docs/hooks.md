@@ -6,6 +6,11 @@ Hooks are optional. Every agent is read from its screen without one. A hook buys
 a state known the moment it changes rather than after it is drawn, and the agent's own id
 for its conversation, which is what lets a stopped session come back to that conversation.
 
+qoop sets them up by itself: when it is installed or updated, on a computer added over ssh, and
+for an agent installed after qoop, which qoop notices within seconds on this machine and on
+every ssh computer. Removing one with `qoop hooks uninstall <agent>` keeps it off until
+`qoop hooks install <agent>`; the same holds for skills.
+
 ```
 qoop hooks status               which are installed, which agents are not on this machine
 qoop hooks install              every agent qoop ships a hook for that is on this machine
