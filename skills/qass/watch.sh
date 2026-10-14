@@ -53,6 +53,16 @@
 #   with no agent working or blocked on it, go to quiet.log only.
 # - With cswap installed, a Claude agent of this Mac that stopped on its usage limit comes out
 #   at once as `->limited ... resets:7:20am` (`again` when it was limited minutes before).
+#
+# The owner's switch, the file `watch` in qass's folder (`qoop qass watch on|off`):
+# - `off`: this says nothing more and ends with the `watch-off: ...` line, at start or within a
+#   tick of the switch; qass does not start it again, so nothing wakes qass until he writes.
+# - `resume <stamp>` (on again): a stamp not in `watch-seen` means no watcher started since. This
+#   writes it there, drops the held lines and marks every machine (`base`, `base-<remote>`): the
+#   first snapshot each one sends is then the base, said nothing of, whichever run of this gets
+#   it. qass gives the owner one summary of the fleet itself, and this says what changes from
+#   then on. Only qoop writes `watch`; this never touches it.
+# - One watcher at a time (`watch.pid`): a second one says `watch-running` and ends.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -121,6 +131,21 @@ has_busy="$defs"'[$a | rows[] | select(.state != "idle" and .state != "done" and
 # Whether routine is silent: unless the owner said `routine on` (the file holds `say`).
 routine_quiet() { [ "$(cat "$dir/routine" 2>/dev/null)" != say ]; }
 
+# Whether the owner turned watching off, and the line that ends this then: in words a qass
+# holding an older skill text still follows.
+watch_off() { [ "$(cat "$dir/watch" 2>/dev/null)" = off ]; }
+# The `resume` stamp no watcher has started on yet, if any.
+watch_unseen() {
+    local w t
+    { read -r w t < "$dir/watch"; } 2>/dev/null || true
+    [ "${w:-}" = resume ] && [ -n "${t:-}" ] && [ "$t" != "$(cat "$dir/watch-seen" 2>/dev/null)" ] && echo "$t"
+}
+base_file() { if [ -z "$1" ]; then echo "$dir/base"; else echo "$dir/base-$1"; fi; }
+# Says `$1` and ends, once: a second stop asked for meanwhile says nothing more.
+end_with() { trap '' USR1 USR2; printf '%s\n' "$1"; exit 0; }
+seen_stamp() { printf '%s\n' "$1" > "$dir/watch-seen.$$" && mv "$dir/watch-seen.$$" "$dir/watch-seen"; }
+off_line='watch-off: the owner turned watching off (qoop qass watch); do not start this again until it reads on'
+
 # Reads held entries ("<t> <gen> <class> <due> <arrival> <line>") against the row array $b and
 # prints each as "P <line to say>" or "D <line>" (went stale). A sleep or a close holds while
 # the agent is still away; any other line is said as the row is now, while it still waits.
@@ -176,6 +201,7 @@ take_due() {
 
 # Lines out one write each, so lines of two machines never run into each other.
 say() {
+    ! watch_off || return 0
     local l
     while IFS= read -r l; do printf '%s\n' "$l"; done <<< "$1"
     touch "$dir/last-wake"
@@ -317,6 +343,8 @@ said_put() { # line arrival
 # the held entries go only after the block is out, so a kill in between says twice, not never.
 flush() {
     local now f label snap sel out l go="" block="" said="" picked=""
+    # Off: everything stays held, and is dropped when the owner turns it on again.
+    ! watch_off || return 0
     now="$(date +%s)"
     [ -z "$1" ] || go=1
     while IFS= read -r l; do
@@ -363,6 +391,7 @@ flush() {
     block="$(printf '%s' "$1${1:+
 }$block")"
     if [ -n "$block" ]; then
+        ! watch_off || return 0
         printf '%s\n' "$block"
         touch "$dir/last-wake"
     fi
@@ -508,9 +537,19 @@ follow() {
     [ -n "$prev" ] || prev='[]'
     while IFS= read -r snap; do
         case "$snap" in \[*) ;; *) continue ;; esac
+        # On again after an off: qass sums the fleet up itself, so the first snapshot a
+        # machine sends is the base and nothing is said of it, nor of its link or daemon then.
+        if [ "$snap" != "[]" ] && [ -e "$(base_file "$label")" ]; then
+            prev="$snap"
+            printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"
+            rm -f "$(base_file "$label")" "$gone" "$dir/down-$label" "$dir/down-$label.said"
+            continue
+        fi
         # Quiet saves the snapshot before its lines are held: a stop in between would lose
         # them, so a stop waits for the end of this snapshot's step (step_end).
-        [ "$quiet" != 1 ] || { stop=""; trap 'stop=1' TERM INT HUP; trap 'stop=${stop:-ends}' USR1; }
+        [ "$quiet" != 1 ] || { stop=""; trap 'stop=1' TERM INT HUP; trap 'stop=${stop:-ends}' USR1; trap 'stop=off' USR2; }
+        # Turned off: nothing more is said, and the stop goes the way the time limit's does.
+        if watch_off; then kill -USR2 $$ 2>/dev/null || true; fi
         if [ -n "$label" ] && [ -e "$dir/down-$label" ]; then
             if [ "$quiet" = 1 ]; then
                 settle_locked link_up "$label"
@@ -552,6 +591,8 @@ follow() {
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
                 --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || { step_end; continue; }
+            # Off: the snapshot is kept, and nothing of it is said or held.
+            ! watch_off || out=""
             # Quiet checks held lines against the saved snapshot: save this one first, so a
             # line held from it is checked against the rows it came from.
             [ "$quiet" != 1 ] || { printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"; }
@@ -569,7 +610,7 @@ follow() {
 "
                 fi
             done <<< "$out"
-            if [ -n "$now_lines" ]; then
+            if [ -n "$now_lines" ] && ! watch_off; then
                 if [ "$quiet" = 1 ]; then
                     settle_locked flush "${now_lines%?}"
                 else
@@ -588,10 +629,12 @@ follow() {
 step_end() {
     [ "$quiet" = 1 ] || return 0
     trap 'exit 143' TERM INT HUP
-    trap 'printf "watch-ends\n"; exit 0' USR1
+    trap 'end_with watch-ends' USR1
+    trap 'end_with "$off_line"' USR2
     case "${stop:-}" in
         '') ;;
-        ends) printf 'watch-ends\n'; exit 0 ;;
+        ends) end_with watch-ends ;;
+        off) end_with "$off_line" ;;
         *) exit 143 ;;
     esac
 }
@@ -674,6 +717,42 @@ due() {
         done
 }
 
+if watch_off; then
+    printf '%s\n' "$off_line"
+    exit 0
+fi
+# One watcher at a time: off and on again inside one tick would otherwise leave the old one
+# running beside the new, both saying the same lines.
+pidf="$dir/watch.pid"
+take_pid() { ( set -C; echo $$ > "$pidf" ) 2>/dev/null; }
+if ! take_pid; then
+    old="$(cat "$pidf" 2>/dev/null || true)"
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null && ps -o command= -p "$old" 2>/dev/null | grep -q 'watch\.sh'; then
+        echo "watch-running: one already runs"
+        exit 0
+    fi
+    rm -f "$pidf"
+    take_pid || { echo "watch-running: one already runs"; exit 0; }
+    # Two that found the same stale file: the one whose pid is not there a moment later leaves.
+    sleep 0.2
+    [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] || { echo "watch-running: one already runs"; exit 0; }
+fi
+drop_pid() { [ "$(cat "$pidf" 2>/dev/null)" != "$$" ] || rm -f "$pidf"; }
+trap drop_pid EXIT
+# Its own time is up: said, so qass starts it again (Start, step 3). Or the owner turned it off.
+# Set before the tick and the remotes start, so a stop asked for while they do is never lost.
+trap 'end_with watch-ends' USR1
+trap 'end_with "$off_line"' USR2
+# On again since the last watcher: qass sums the fleet up, so this starts from now.
+resume=0
+stamp="$(watch_unseen || true)"
+if [ -n "$stamp" ]; then
+    resume=1
+    rm -f "$dir"/held "$dir"/held-* "$dir"/settle "$dir"/settle-*
+    touch "$(base_file "")"
+    seen_stamp "$stamp"
+fi
+
 rmdir "$dir/settle.lock" 2>/dev/null || true
 if [ "$quiet" = 1 ]; then
     # Held lines and marks carry over; the logs are cut, the said lines of a week ago go.
@@ -710,6 +789,14 @@ fi
             kill -TERM $$ 2>/dev/null
             exit 0
         fi
+        if watch_off; then
+            kill -USR2 $$ 2>/dev/null
+            exit 0
+        fi
+        # Off and on again inside one tick: this one never stopped, so nothing was missed;
+        # the stamp is marked seen, and a second watcher qass starts says `watch-running`.
+        stamp="$(watch_unseen || true)"
+        [ -z "$stamp" ] || seen_stamp "$stamp"
         if [ $(( $(date +%s) - started )) -ge "$watch_for" ]; then
             kill -USR1 $$ 2>/dev/null
             exit 0
@@ -755,18 +842,22 @@ fi
 ) &
 kids=$!
 
-for name in $(qoop remote ls 2>/dev/null | awk '$1 ~ /^[A-Za-z0-9_-]+$/ { print $1 }'); do
+# The remotes, read once and after the tick is up (a slow answer never holds it): the base
+# marks of a resume and the streams name the same machines.
+remotes="$(qoop remote ls 2>/dev/null | awk '$1 ~ /^[A-Za-z0-9_-]+$/ { print $1 }')"
+for name in $remotes; do
+    [ "$resume" = 0 ] || touch "$(base_file "$name")"
+done
+for name in $remotes; do
     follow_remote "$name" &
     kids="$kids $!"
 done
 # On the way out, each stream's reader (qoop, ssh) goes with the loop that reads it. IFS
 # is set here because a signal can arrive inside `IFS= read`, where it is empty.
 trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || true; done
-      kill $kids 2>/dev/null || true' EXIT
+      kill $kids 2>/dev/null || true; drop_pid' EXIT
 # Killed rather than ended (Monitor stopping it), go through the same way out.
 trap 'exit 143' TERM INT HUP
-# Its own time is up: said, so qass starts it again (Start, step 3).
-trap 'printf "watch-ends\n"; exit 0' USR1
 
 [ "$quiet" = 1 ] || rm -f "$(gone_file "")"   # a mark left by an earlier run says nothing about this one
 follow "" < <(qoop agents --watch --json)

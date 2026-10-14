@@ -481,6 +481,15 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_when_asleep: Option<bool>,
     },
+    /// Whether qass watches the agents, read or set: with `on` it turns the owner's switch
+    /// (qass's `watch` file) and answers what it now is. Turned on, the daemon types one line
+    /// into qass's tab so it starts its watcher again. A daemon from before it answers
+    /// `unknown variant`.
+    QassWatch {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on: Option<bool>,
+    },
     /// Write to a task: open one, move it, record its plan, evidence or done claim, or
     /// close it.
     ///
@@ -1054,6 +1063,7 @@ impl ControlRequest {
             | Self::RestartWhenSafe { id, .. }
             | Self::UpdateState { id }
             | Self::SleepSettings { id, .. }
+            | Self::QassWatch { id, .. }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
             | Self::AskWrite { id, .. }
@@ -1241,6 +1251,11 @@ pub enum ControlResponse {
         exit_when_asleep: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         problem: Option<String>,
+    },
+    /// What a `QassWatch` left the switch at.
+    QassWatch {
+        id: String,
+        on: bool,
     },
     /// A `TaskWrite` landed on `task`; `key` is an item's, when one was added or started.
     TaskWritten {
@@ -1832,6 +1847,7 @@ impl ControlResponse {
             | Self::RestartArmed { id, .. }
             | Self::UpdateState { id, .. }
             | Self::SleepSettings { id, .. }
+            | Self::QassWatch { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }
             | Self::AskWritten { id, .. }
@@ -2126,6 +2142,27 @@ mod tests {
             answer
         );
         assert_eq!(answer.request_id(), "w");
+    }
+
+    #[test]
+    fn qass_watch_crosses_the_wire_and_a_bare_one_is_a_read() {
+        let read = ControlRequest::QassWatch {
+            id: "q".into(),
+            on: None,
+        };
+        let json = serde_json::to_string(&read).expect("encode");
+        assert_eq!(json, r#"{"op":"QassWatch","id":"q"}"#);
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(&json).expect("decode"),
+            read
+        );
+        let answer = ControlResponse::QassWatch {
+            id: "q".into(),
+            on: false,
+        };
+        let json = serde_json::to_string(&answer).expect("encode");
+        assert_eq!(json, r#"{"op":"QassWatch","id":"q","on":false}"#);
+        assert_eq!(answer.request_id(), "q");
     }
 
     #[test]

@@ -76,11 +76,11 @@ for him. A finish the board shows needs no note.
    task show KEY`), write it back with the old title as its first line (`qoop task describe --id
    KEY -` replaces it whole), then `qoop task goal --id KEY '<short noun phrase>'`; when the
    description is full, rename anyway (the old title stays in its history).
-3. If you have a Monitor tool (Claude Code: ToolSearch `select:Monitor`), start
+3. `qoop qass watch` first: `watching off` skips this step. If you have a Monitor tool (Claude Code: ToolSearch `select:Monitor`), start
    `Monitor(command: "QOOP_SLEEP_SAFE=1 \"<this skill's dir>/watch.sh\"", timeout_ms: 1800000,
    description: "qass fleet")`, and on its line `watch-ends` or its expiry start it again at once, saying nothing. Without one
    (Codex, Gemini, opencode), nothing wakes you between messages: at each message from the
-   owner, first run `qoop agents --json`, compare it with `goals.md`, and handle every
+   owner, unless the switch reads off, first run `qoop agents --json`, compare it with `goals.md`, and handle every
    agent that stopped since your last look as an event line below.
 4. Give him the summary (its shape is under "How you talk to the owner").
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) at every start,
@@ -99,6 +99,10 @@ with a later wake or within 10 minutes (never said: `@QASS_DATA@/quiet.log`); a 
 claim, no question) after 30 minutes if it still holds, a sleep never. His `routine on` (in any
 language) writes `say` to `@QASS_DATA@/routine`, `routine off` removes it. Write to agents only
 with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wait or block come at once.
+
+**Watching, his switch** (the pet's `watch` word, his phone, or "watching off/on" in any language: `qoop qass watch off|on`). A `watch-off: ...` line: run `qoop qass watch`; still off, say and start nothing; on again, start it. `watch-running`: nothing.
+A `watching on: ...` line: one summary of the fleet now, remotes included (`on.sh <name> agents --json`), and start the watcher (Start, step 3) if you have a Monitor; with one, a message of his
+while `qoop qass watch` reads on or `resumed` and none of yours runs: start it (`resumed`: that summary too).
 
 1. `qoop task board --dir @QASS_DATA@/board` (every wake: the files are as fresh as this run),
    then `qoop context 52 --last 1 --lines 40`. If the generation is no longer 3, drop the event.

@@ -813,8 +813,9 @@ mod tests {
         // keep the file small (no log, ended cards out, under 8 KB). 448 since the review of
         // 2026-10-13: the cap counted from his word, the merge ending's own cleanup, a replaced
         // card carried over, the stale-card sweep, design picks under his lesson, no parked bug
-        // and his ask for a qoop agent.
-        assert!(skill.lines().count() <= 448, "SKILL.md grew past 448 lines");
+        // and his ask for a qoop agent. 452 since 2026-10-14: his watching switch (Start's check
+        // and the watch-off, watching on and resumed lines).
+        assert!(skill.lines().count() <= 452, "SKILL.md grew past 452 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

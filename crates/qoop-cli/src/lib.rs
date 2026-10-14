@@ -314,6 +314,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop onboard    the first start: pet, sounds, look, keys, notifications, sleep, qass\n\
                   \x20 qoop qass [page]  open qass, the assistant over your agents, or its page\n\
                   \x20 qoop qass brief <n> [--json]  what qass must know before it writes to agent n\n\
+                  \x20 qoop qass watch [on|off]  whether qass watches your agents, or wakes only when you write\n\
                   \x20 qoop report draft|list|show|rm|send|delete  qass's notes to qoop's maker\n\
                   \x20                 about its own way of working, checked and shown first\n\
                   \x20 qoop sound      hear the notification sounds and keep one each\n\

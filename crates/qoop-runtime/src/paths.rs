@@ -213,6 +213,75 @@ pub fn qass_data_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("qass"))
 }
 
+/// Where `qoop qass` writes which program it last started qass on, in qass's folder: also how
+/// the interface knows qass ever ran on this machine.
+pub const QASS_LAST_AGENT: &str = "last-agent";
+
+/// The owner's switch for qass's watcher, in qass's folder: `off` stops it, `resume <stamp>`
+/// is on again, no file is on. Only `qoop` writes it; the watcher keeps the stamp it last
+/// started on in [`QASS_WATCH_SEEN`], so a stamp it has not seen says no watcher started since.
+pub const QASS_WATCH_FILE: &str = "watch";
+/// The `resume` stamp the watcher last started on, written by the watcher alone.
+pub const QASS_WATCH_SEEN: &str = "watch-seen";
+
+/// Whether qass watches the agents: on unless the switch file says `off`.
+pub fn qass_watching() -> bool {
+    qass_data_dir().is_none_or(|dir| watching_in(&dir))
+}
+
+/// Whether qass's watching was turned back on and its watcher has not started since.
+pub fn qass_watch_resuming() -> bool {
+    qass_data_dir().is_some_and(|dir| resuming_in(&dir))
+}
+
+/// Turn qass's watcher on or off; true when that changed it. On from off writes a fresh
+/// `resume` stamp, the watcher's cue that qass sums the fleet up and it starts from now.
+pub fn set_qass_watching(on: bool) -> std::io::Result<bool> {
+    let dir = qass_data_dir().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    set_watching_in(&dir, on)
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn watching_in(dir: &Path) -> bool {
+    read_trimmed(&dir.join(QASS_WATCH_FILE)).as_deref() != Some("off")
+}
+
+fn resuming_in(dir: &Path) -> bool {
+    read_trimmed(&dir.join(QASS_WATCH_FILE))
+        .and_then(|s| s.strip_prefix("resume ").map(str::to_string))
+        .is_some_and(|stamp| read_trimmed(&dir.join(QASS_WATCH_SEEN)) != Some(stamp))
+}
+
+fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
+    // ponytail: one lock for the process; the daemon is the one writer while it runs.
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    if on == watching_in(dir) {
+        return Ok(false);
+    }
+    // Made when missing: an `off` said before qass ever ran still holds once it starts.
+    std::fs::create_dir_all(dir)?;
+    let body = if on {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("resume {stamp}\n")
+    } else {
+        "off\n".to_string()
+    };
+    // Written beside and renamed over: the watcher reading it mid-write must never see an
+    // empty file, which reads as on.
+    let fresh = dir.join(format!(".{QASS_WATCH_FILE}.{}.new", std::process::id()));
+    std::fs::write(&fresh, body)?;
+    std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE))?;
+    Ok(true)
+}
+
 /// Where the daemon keeps what has to outlive a reboot: its database and its history.
 ///
 /// Not the runtime directory. On macOS that is `$TMPDIR`, which the system clears at boot
@@ -633,6 +702,30 @@ mod tests {
     /// test harness runs them on parallel threads, and one test's `remove_var` landing
     /// between another's `set_var` and its read failed it at random.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// No file is on; off is said once; on from off is a fresh stamp the watcher has not
+    /// seen, and on again (or an on with nothing off) changes nothing. The stamp seen is on.
+    #[test]
+    fn the_qass_watch_switch_reads_and_turns() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("qass");
+        assert!(watching_in(&dir) && !resuming_in(&dir));
+        assert!(!set_watching_in(&dir, true).unwrap());
+        assert!(!dir.join(QASS_WATCH_FILE).exists());
+        assert!(set_watching_in(&dir, false).unwrap());
+        assert!(!watching_in(&dir) && !resuming_in(&dir));
+        assert!(!set_watching_in(&dir, false).unwrap());
+        assert!(set_watching_in(&dir, true).unwrap());
+        assert!(watching_in(&dir) && resuming_in(&dir));
+        assert!(!set_watching_in(&dir, true).unwrap());
+        let stamp = read_trimmed(&dir.join(QASS_WATCH_FILE)).unwrap();
+        std::fs::write(
+            dir.join(QASS_WATCH_SEEN),
+            stamp.strip_prefix("resume ").unwrap(),
+        )
+        .unwrap();
+        assert!(watching_in(&dir) && !resuming_in(&dir));
+    }
 
     /// The bridge's state line: no file is no bridge, a fresh `connected` is up, and anything
     /// else (disconnected, stale, from the future, garbled) is a bridge that does not reach

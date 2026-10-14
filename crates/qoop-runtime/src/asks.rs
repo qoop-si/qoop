@@ -750,6 +750,65 @@ async fn qass_terminal(
     mine.first().copied()
 }
 
+/// What qass is told when the owner turns its watching back on.
+const WATCHING_ON: &str = "watching on: start your watcher again (qass skill, Start step 3) and give the owner one summary of the fleet now; the watcher says only what changes from here.";
+
+/// How long the flusher keeps trying to tell qass its watching is on again.
+const WATCH_TELL_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// Since when qass is to be told its watching is on again, while it has not been.
+static WATCH_TELL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Tell qass its watching was turned back on: the inbox's flusher types the line once qass
+/// has a tab and takes words, between the answers it types, for 30 minutes. A qass asleep,
+/// gone or busy longer starts its watcher at its next start or message instead (the skill).
+pub(crate) fn tell_qass_watching(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    *WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    kick(terminals, agents, connections, store);
+}
+
+/// Whether the line is still to be typed: asked for, under 30 minutes ago, and the switch
+/// still waits for a watcher (not off again, and none started since).
+fn watch_tell_due() -> bool {
+    let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
+    if tell.is_some_and(|at| at.elapsed() >= WATCH_TELL_FOR || !crate::paths::qass_watch_resuming())
+    {
+        *tell = None;
+    }
+    tell.is_some()
+}
+
+/// One look at the watch line, in the flusher's turn: typed when qass takes words and was not
+/// typed to this round or just before.
+async fn flush_watch(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hands: Hands<'_>) {
+    let (terminals, agents, _, store) = hands;
+    if !watch_tell_due() {
+        return;
+    }
+    // No tab yet, or the store slow to answer: looked at again next round, within the 30 minutes.
+    let Some(qass) = qass_terminal(terminals, agents, store).await else {
+        return;
+    };
+    if seen.contains(&qass) || sent.get(&qass).is_some_and(|at| at.elapsed() < SETTLE) {
+        return;
+    }
+    let now = standing(agents, terminals, qass)
+        .map(|s| (qass, s, agents.typed_ago(qass, crate::agents::now_unix())));
+    // Looked at again after the wait for the store: an off since then is not typed over.
+    if takes_words(Route::Qass(qass), None, now.as_ref())
+        && watch_tell_due()
+        && type_into(terminals, qass, WATCHING_ON).await.is_ok()
+    {
+        sent.insert(qass, Instant::now());
+        *WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Type `text`, a pause, then Enter, into a terminal.
 async fn type_into(
     terminals: &Arc<TerminalRegistry>,
@@ -968,8 +1027,8 @@ fn kick(
             FLUSHING.store(false, Ordering::SeqCst);
             // An answer queued after the last look and before the flag went down.
             let waiting = store.run(|s| s.queued_asks()).await;
-            if !waiting.is_ok_and(|rows| !rows.is_empty()) || FLUSHING.swap(true, Ordering::SeqCst)
-            {
+            let waiting = waiting.is_ok_and(|rows| !rows.is_empty()) || watch_tell_due();
+            if !waiting || FLUSHING.swap(true, Ordering::SeqCst) {
                 break;
             }
         }
@@ -989,7 +1048,7 @@ async fn flush(
         let Ok(rows) = store.run(|s| s.queued_asks()).await else {
             return;
         };
-        if rows.is_empty() && sent.values().all(|at| at.elapsed() >= SETTLE) {
+        if rows.is_empty() && !watch_tell_due() && sent.values().all(|at| at.elapsed() >= SETTLE) {
             return;
         }
         // The oldest answer of a target goes first: a target seen once is left to it.
@@ -1003,6 +1062,12 @@ async fn flush(
             )
             .await;
         }
+        flush_watch(
+            &seen,
+            &mut sent,
+            (&terminals, &agents, &connections, &store),
+        )
+        .await;
         tokio::time::sleep(FLUSH_EVERY).await;
     }
 }

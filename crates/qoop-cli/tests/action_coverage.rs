@@ -207,6 +207,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "turn qass's watching on or off from another device",
+            method: || {
+                Method::Control(ControlRequest::QassWatch {
+                    id: "a".into(),
+                    on: Some(false),
+                })
+            },
+        },
+        Action {
             name: "start a workspace",
             method: || {
                 Method::Control(ControlRequest::CreateWorkspace {
@@ -752,6 +761,10 @@ fn every_control_method_is_reachable_from_some_action() {
             idle_minutes: None,
             exit_when_asleep: None,
         },
+        ControlRequest::QassWatch {
+            id: String::new(),
+            on: None,
+        },
         ControlRequest::TaskWrite {
             id: String::new(),
             terminal: None,
@@ -825,6 +838,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
+            | ControlRequest::QassWatch { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }

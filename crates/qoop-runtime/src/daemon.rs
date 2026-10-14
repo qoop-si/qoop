@@ -5252,6 +5252,27 @@ async fn handle_control(
                 Err(reason) => ControlResponse::Failed { id, reason },
             }
         }
+        // One small file in qass's folder, like the sleep settings: the watcher reads it, and
+        // turned on, qass is told to start its watcher again.
+        ControlRequest::QassWatch { id, on } => {
+            if let Some(on) = on {
+                if let Err(e) = crate::paths::set_qass_watching(on) {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: e.to_string(),
+                    };
+                }
+                // Asked again while it still waits for a watcher: told again, so a line that
+                // went untyped (30 minutes passed, a daemon restart) is one more `on` away.
+                if on && crate::paths::qass_watch_resuming() {
+                    crate::asks::tell_qass_watching(terminals, agents, connections, store);
+                }
+            }
+            ControlResponse::QassWatch {
+                id,
+                on: crate::paths::qass_watching(),
+            }
+        }
         ControlRequest::RestartWhenSafe {
             version,
             keep_tabs,

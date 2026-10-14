@@ -327,6 +327,33 @@ fn only_a_terminal_of_qass_writes_a_card_and_only_the_owner_answers_it() {
     assert_eq!(stack.card_status("E5"), "");
 }
 
+/// The owner's watching switch turned back on: qass, at rest, is told once to start its
+/// watcher, by the same flusher that types the inbox's answers. Off tells it nothing.
+#[test]
+fn watching_turned_on_again_is_typed_to_qass_once() {
+    let stack = Stack::start();
+    let _qass = stack.agent("qass", "qass", None);
+    let (ok, out, err) = stack.run(&["qass", "watch", "off"]);
+    assert!(ok && out.trim() == "watching off", "{out} {err}");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(stack.log("qass"), "", "off typed something");
+    let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
+    assert!(ok && out.trim() == "watching resumed", "{out} {err}");
+    // The stand-in was typed into when it opened: the inbox's 30 quiet seconds come first.
+    let told = || {
+        stack
+            .log("qass")
+            .contains("watching on: start your watcher")
+    };
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "qass was never told: {:?}",
+        stack.log("qass")
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
+}
+
 #[test]
 fn an_answer_goes_to_the_worker_when_it_is_the_same_conversation_and_through_qass_otherwise() {
     let stack = Stack::start();

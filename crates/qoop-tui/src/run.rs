@@ -1749,6 +1749,7 @@ impl State {
             sidebar::Act::View => Some(Clicked::View),
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::Qass => Some(Clicked::Qass),
+            sidebar::Act::QassWatch => Some(Clicked::QassWatch),
             sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
             sidebar::Act::InboxFold => Some(Clicked::InboxFold),
             sidebar::Act::Search => Some(Clicked::Search),
@@ -5092,6 +5093,19 @@ fn keep_awake(state: &mut State, space: i64, terminal: Option<u32>, request: &mu
     });
 }
 
+/// Turn qass's watching over, as the word beside the pet showed it: sent with the value, as
+/// keeping awake is, so two quick clicks on a stale word cannot cancel out on the daemon.
+fn qass_watch(state: &mut State, request: &mut u64) {
+    let Some(on) = sidebar::flip_watching() else {
+        return;
+    };
+    *request += 1;
+    state.modes.outbox.push(ControlRequest::QassWatch {
+        id: format!("qass-watch-{request}"),
+        on: Some(on),
+    });
+}
+
 /// Close one terminal, a pane and only that pane, or ask first when an agent in it is busy.
 /// The last pane of a tab takes the tab with it; in a split the other panes stay. A sleeping
 /// tab has nothing running to ask about, and the daemon discards it without waking it.
@@ -6727,6 +6741,8 @@ enum Clicked {
     Collapse,
     /// The pet in the foot: qass, or back, as `ctrl-a Q` does.
     Qass,
+    /// The `watch` word beside the pet: qass's watching turned over.
+    QassWatch,
     Space(i64),
     /// The rule's `sleep`, on the space that rule is for rather than the one on screen:
     /// a person clicking a row means that row.
@@ -8541,6 +8557,10 @@ where
                                         )? {
                                             wr.write_all(&bytes).await?;
                                         }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::QassWatch) => {
+                                        qass_watch(&mut state, &mut request);
                                         dirty = true;
                                     }
                                     Some(Clicked::Collapse) => {

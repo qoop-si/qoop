@@ -448,6 +448,8 @@ pub struct Facts {
     pub waiting: usize,
     pub working: usize,
     pub asks: usize,
+    /// Whether the owner's switch lets qass watch: off, it wakes only when he writes.
+    pub watching: bool,
 }
 
 impl Facts {
@@ -513,6 +515,7 @@ pub fn facts(
         working: mine().filter(|r| r.state == "working").count(),
         // The cards waiting in his inbox once it can be read; the blocked agents before.
         asks: cards.unwrap_or_else(|| mine().filter(|r| r.state == "blocked").count()),
+        watching: sidebar::watching().unwrap_or(true),
     })
 }
 
@@ -536,7 +539,19 @@ fn agents_of(n: usize) -> String {
 
 /// The words for `facts`.
 pub fn say(f: &Facts) -> Say {
-    let calm = ("next", "the watcher's next event".to_string());
+    let calm = if f.watching {
+        ("next", "the watcher's next event".to_string())
+    } else {
+        ("next", "nothing until you write to it".to_string())
+    };
+    // His switch off: qass wakes only when he writes, and the words say so.
+    let watch = |on: String| {
+        if f.watching {
+            on
+        } else {
+            "not watching: wakes when you write".to_string()
+        }
+    };
     let (role, word, sub, line) = match f.state.as_str() {
         "sleeping" => (
             Role::Sleeping,
@@ -547,7 +562,7 @@ pub fn say(f: &Facts) -> Say {
         "working" | "starting" => (
             Role::Working,
             f.state.clone(),
-            format!("keeping watch over {}", agents_of(f.agents)),
+            watch(format!("keeping watch over {}", agents_of(f.agents))),
             (
                 "now",
                 match f.activity.as_deref().map(str::trim) {
@@ -559,7 +574,7 @@ pub fn say(f: &Facts) -> Say {
         "idle" => (
             Role::Idle,
             "idle".to_string(),
-            format!("listening for changes in {}", agents_of(f.agents)),
+            watch(format!("listening for changes in {}", agents_of(f.agents))),
             calm,
         ),
         "blocked" => (
@@ -1120,6 +1135,7 @@ mod tests {
             waiting: 3,
             working: 1,
             asks: 1,
+            watching: true,
         }
     }
 
@@ -1246,6 +1262,15 @@ mod tests {
         working.activity = None;
         assert_eq!(say(&working).line, ("now", "working".to_string()));
         assert_eq!(say(&facts_of("idle")).role, Role::Idle);
+        let off = say(&Facts {
+            watching: false,
+            ..facts_of("idle")
+        });
+        assert_eq!(off.sub, "not watching: wakes when you write");
+        assert_eq!(
+            off.line,
+            ("next", "nothing until you write to it".to_string())
+        );
         assert_eq!(say(&facts_of("blocked")).role, Role::Blocked);
         assert_eq!(say(&facts_of("weird")).word, "weird");
     }

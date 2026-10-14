@@ -40,6 +40,14 @@ pub const MAX_REMOTES: usize = 127;
 /// The longest wait between attempts to reach a remote that is down.
 const BACKOFF_CAP: Duration = Duration::from_secs(10);
 
+/// Whether the interface has a daemon on this machine: attached to remotes alone it has not,
+/// and this machine's own files speak of no machine it shows.
+static HAS_LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn has_local() -> bool {
+    HAS_LOCAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn is_remote_terminal(terminal: u32) -> bool {
     terminal & REMOTE_TERMINAL != 0
 }
@@ -2273,6 +2281,7 @@ pub async fn serve<D>(
 
     let mut links: Vec<Option<Link>> = vec![None];
     let has_local = local.is_some();
+    HAS_LOCAL.store(has_local, std::sync::atomic::Ordering::Relaxed);
     if let Some((stream, leftover)) = local {
         links[0] = Some(Link::new(String::new(), None));
         let events = link_tx.clone();

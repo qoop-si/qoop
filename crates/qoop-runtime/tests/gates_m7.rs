@@ -226,6 +226,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             idle_minutes: None,
             exit_when_asleep: None,
         },
+        // A read too: only the owner turns qass's switch.
+        ControlRequest::QassWatch {
+            id: "x31w".into(),
+            on: None,
+        },
         // A task is a record about the work: text kept by the daemon, never typed.
         ControlRequest::TaskWrite {
             id: "x28".into(),
@@ -310,6 +315,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
+            | ControlRequest::QassWatch { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }

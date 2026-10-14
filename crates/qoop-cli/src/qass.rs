@@ -210,7 +210,7 @@ fn launch(
 
 /// Where `qoop qass` writes which program it last started qass on, in qass's folder: an id is
 /// only carried on by the program that made it.
-const LAST_AGENT: &str = "last-agent";
+const LAST_AGENT: &str = paths::QASS_LAST_AGENT;
 
 /// The id of qass's conversation, as its agent's hook last reported it from qass's folder
 /// ([`note_session`]): the daemon forgets a closed tab's id, this file keeps it. A fresh start
@@ -495,7 +495,12 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("page") if args.len() == 3 => return crate::qass_page::run(),
         Some("brief") if args.len() > 3 => return crate::qass_brief::run(args),
-        Some(_) => return Err(crate::usage("usage: qoop qass [page | brief <n> [--json]]")),
+        Some("watch") if args.len() <= 4 => return watch(args.get(3).map(String::as_str)),
+        Some(_) => {
+            return Err(crate::usage(
+                "usage: qoop qass [page | brief <n> [--json] | watch [on | off]]",
+            ));
+        }
         None => {}
     }
     let folder = paths::qass_data_dir()
@@ -570,6 +575,56 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     }
     // Shown where the person is looking; with no interface open, the number says where.
     let _ = run(&["focus", &terminal.to_string()]);
+    Ok(())
+}
+
+/// `qoop qass watch [on|off]`: read or turn the owner's switch for qass's watcher. Through the
+/// daemon, which tells qass when it is turned on; with no daemon running there is no qass to
+/// tell, so the file is turned here.
+fn watch(word: Option<&str>) -> std::io::Result<()> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let on = match word {
+        None => None,
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some(_) => return Err(crate::usage("usage: qoop qass watch [on | off]")),
+    };
+    let request = ControlRequest::QassWatch {
+        id: crate::request_id("qass-watch"),
+        on,
+    };
+    let now = match crate::task::ask(request, std::time::Duration::from_secs(5)) {
+        Ok(ControlResponse::QassWatch { on, .. }) => on,
+        Ok(ControlResponse::Failed { reason, .. })
+            if qoop_runtime::control::too_old_for(&reason, Some("QassWatch")) =>
+        {
+            return Err(std::io::Error::other(
+                "the running qoop is older than this one: `qoop restart`, then again",
+            ));
+        }
+        Ok(ControlResponse::Failed { reason, .. }) => return Err(std::io::Error::other(reason)),
+        Ok(_) => return Err(std::io::Error::other("the daemon answered something else")),
+        // No daemon at all: nothing to tell.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            if let Some(on) = on {
+                paths::set_qass_watching(on)?;
+            }
+            paths::qass_watching()
+        }
+        Err(e) => return Err(e),
+    };
+    // `resumed`: on again, and no watcher started since; qass gives its summary when it starts one.
+    let word = match (now, paths::qass_watch_resuming()) {
+        (false, _) => "off",
+        (true, true) => "resumed",
+        (true, false) => "on",
+    };
+    println!("watching {word}");
     Ok(())
 }
 

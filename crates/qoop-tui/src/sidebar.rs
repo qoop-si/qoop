@@ -321,6 +321,9 @@ pub enum Hit {
     /// A row the pet stands on, with the cells the pet is across: only the last cells of the
     /// row before the column's edge margin answer, the q beside it answers nothing.
     Pet(usize),
+    /// The pet's top row with qass's `watch` word at its left: the word turns the owner's
+    /// switch, the pet's cells (when it stands there) open qass as on the other pet rows.
+    PetTop(Option<usize>),
 }
 
 /// What a click on the column asks for, once the column it landed on is known.
@@ -373,6 +376,8 @@ pub enum Act {
     Collapse,
     /// The pet: qass's screen, or back from it, as `ctrl-a Q` does.
     Qass,
+    /// The `watch on` / `watch off` word beside the pet: turn qass's watching over.
+    QassWatch,
     /// A tab of the inbox: its list, from the top, and the inbox open again if it was folded.
     InboxTab(InboxTab),
     /// The inbox's caret: fold it to one row, or open it again.
@@ -927,12 +932,15 @@ fn parts(
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
     let mut feet = foot_rows(c.width, count, pending_now().get(), hub_link(), c.icons);
-    if let Some(cols) = avatar
+    let pet_cols = avatar
         .filter(|_| pet)
         .map(pet_width)
-        .filter(|cols| *cols > 0)
-    {
+        .filter(|cols| *cols > 0);
+    if let Some(cols) = pet_cols {
         stand_pet(&mut feet, cols);
+    }
+    if let Some(on) = watching() {
+        put_watch(&mut feet, c.width, on, pet_cols);
     }
     let foot = feet.len().min(height);
     let room = height - foot;
@@ -3138,6 +3146,21 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
         Hit::Pet(cols) => (c.width.saturating_sub(cols)..c.width)
             .contains(&col)
             .then_some(Act::Qass),
+        Hit::PetTop(pet) => {
+            if pet.is_some_and(|cols| (c.width.saturating_sub(cols)..c.width).contains(&col)) {
+                Some(Act::Qass)
+            } else {
+                // The word as drawn: the blank after `watch on` turns nothing.
+                let word = if watching() == Some(true) {
+                    WATCH_ON
+                } else {
+                    WATCH_OFF
+                };
+                (1..=1 + word.len())
+                    .contains(&col)
+                    .then_some(Act::QassWatch)
+            }
+        }
         Hit::Foot => {
             if collapsed {
                 return Some(Act::Collapse);
@@ -3397,12 +3420,14 @@ fn collapse_row() -> Row {
     )
 }
 
-/// What [`FILES`] holds: the picked pet, a newer version when one was seen, and whether the
-/// phone bridge says it reaches the hub.
+/// What [`FILES`] holds: the picked pet, a newer version when one was seen, whether the
+/// phone bridge says it reaches the hub, and whether qass watches (none when qass never ran
+/// on this machine or the interface shows another one).
 type Files = (
     Option<qoop_runtime::avatar::Avatar>,
     Option<String>,
     qoop_runtime::paths::HubLink,
+    Option<bool>,
 );
 
 /// The pet and the update notice as last read off disk.
@@ -3415,7 +3440,7 @@ type Files = (
 // ponytail: process-wide, the interface has one render loop; a State field would
 // thread two more arguments through rows_folded and every hit test.
 static FILES: std::sync::RwLock<Files> =
-    std::sync::RwLock::new((None, None, qoop_runtime::paths::HubLink::Absent));
+    std::sync::RwLock::new((None, None, qoop_runtime::paths::HubLink::Absent, None));
 
 /// Re-read the pet and the update notice. True when either changed, so the
 /// caller repaints. Never under test, so the thirty-odd paints the suite asserts
@@ -3430,8 +3455,30 @@ pub(crate) fn refresh_files() -> bool {
             qoop_runtime::avatar::load(),
             notice_from_disk(),
             qoop_runtime::paths::read_hub_link(),
+            watch_from_disk(),
         ),
     )
+}
+
+/// qass's switch as its file says, when qass ran here and the interface has this machine's
+/// daemon: attached to a remote alone, the file would speak of a machine it does not show.
+fn watch_from_disk() -> Option<bool> {
+    let dir = qoop_runtime::paths::qass_data_dir()?;
+    (crate::mux::has_local() && dir.join(qoop_runtime::paths::QASS_LAST_AGENT).is_file())
+        .then(qoop_runtime::paths::qass_watching)
+}
+
+/// Whether qass watches, as [`refresh_files`] last read it; none when its word is not shown.
+pub(crate) fn watching() -> Option<bool> {
+    FILES.read().unwrap_or_else(|e| e.into_inner()).3
+}
+
+/// Turn the held switch over at a click, so the word answers before the next tick reads the
+/// file the daemon wrote; the new value, none when the word is not shown.
+pub(crate) fn flip_watching() -> Option<bool> {
+    let mut held = FILES.write().unwrap_or_else(|e| e.into_inner());
+    held.3 = held.3.map(|on| !on);
+    held.3
 }
 
 /// Keep `now` in `held`; true when it differs from what was there.
@@ -3486,6 +3533,34 @@ fn lit_span(
 /// the pet lands in: nothing for art with no lit cell.
 pub(crate) fn pet_width(avatar: &qoop_runtime::avatar::Avatar) -> usize {
     lit_span(&qoop_runtime::avatar::art_cells(avatar)).map_or(0, |(lo, hi)| hi - lo + 1)
+}
+
+/// qass's switch beside the pet, the widest of its two words.
+const WATCH_ON: &str = "watch on";
+const WATCH_OFF: &str = "watch off";
+
+/// Write qass's switch at the left of the pet's top row (the row under the count chip, above
+/// the q), when it fits beside the pet: green while qass watches, faint while it is off.
+fn put_watch(feet: &mut [Row], width: usize, on: bool, pet: Option<usize>) {
+    use crate::theme::Role;
+    if width < 1 + WATCH_OFF.len() + 1 + pet.unwrap_or(0) + 1 || feet.len() < PET_FOOT_ROWS {
+        return;
+    }
+    let (word, ink) = if on {
+        (WATCH_ON, Role::Done)
+    } else {
+        (WATCH_OFF, Role::Faint)
+    };
+    let top = feet.len() - PET_FOOT_ROWS;
+    feet[top] = (
+        Line {
+            text: fit(&format!(" {word}"), width),
+            colour: Some(Role::Faint),
+            runs: vec![(1, word.len(), ink)],
+            ..Line::default()
+        },
+        Some(Hit::PetTop(pet)),
+    );
 }
 
 /// Mark the rows the pet stands on, the foot's five rows under the count box, as the pet's.
@@ -3924,22 +3999,28 @@ mod tests {
     /// paints nothing.
     #[test]
     fn the_held_files_ask_for_a_repaint_only_when_they_change() {
-        let held = std::sync::RwLock::new((None, None, HubLink::Absent));
+        let held = std::sync::RwLock::new((None, None, HubLink::Absent, None));
         assert!(
-            !hold(&held, (None, None, HubLink::Absent)),
+            !hold(&held, (None, None, HubLink::Absent, None)),
             "nothing changed"
         );
         assert!(
-            hold(&held, (None, Some("9.9.9".to_string()), HubLink::Absent)),
+            hold(
+                &held,
+                (None, Some("9.9.9".to_string()), HubLink::Absent, None)
+            ),
             "a new notice"
         );
         assert!(
-            !hold(&held, (None, Some("9.9.9".to_string()), HubLink::Absent)),
+            !hold(
+                &held,
+                (None, Some("9.9.9".to_string()), HubLink::Absent, None)
+            ),
             "the same notice"
         );
         assert_eq!(held.read().unwrap().1.as_deref(), Some("9.9.9"));
         assert!(
-            hold(&held, (None, None, HubLink::Absent)),
+            hold(&held, (None, None, HubLink::Absent, None)),
             "the notice went away"
         );
     }
@@ -6031,6 +6112,57 @@ mod tests {
             // The feet are on the pet's last row, the one right above the menu.
             assert!(art[art.len() - 1].contains('\u{2580}'), "{art:?}");
         }
+    }
+
+    /// qass's switch sits at the left of the pet's top row: its word turns it over, the pet's
+    /// cells on that row still open qass, the cells between answer nothing. Off is faint, on
+    /// green; a column too narrow for the word beside the pet keeps the row blank.
+    #[test]
+    fn the_watch_word_stands_beside_the_pet_and_turns_the_switch() {
+        let (spaces, agents) = sample();
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let c = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let feet = |on: bool, pet: Option<usize>, width: usize| {
+            let mut feet = foot_rows(width, None, Pending::None, HubLink::Up, false);
+            if let Some(cols) = pet {
+                stand_pet(&mut feet, cols);
+            }
+            put_watch(&mut feet, width, on, pet);
+            feet[feet.len() - PET_FOOT_ROWS].clone()
+        };
+        let (line, hit) = feet(false, Some(6), WIDTH);
+        assert!(line.text.starts_with(" watch off "), "{:?}", line.text);
+        assert_eq!(line.runs, vec![(1, 9, crate::theme::Role::Faint)]);
+        assert_eq!(hit, Some(Hit::PetTop(Some(6))));
+        let at = |col| act(Hit::PetTop(Some(6)), col, &c, false);
+        assert_eq!(
+            (at(2), at(10)),
+            (Some(Act::QassWatch), Some(Act::QassWatch))
+        );
+        assert_eq!(at(15), None);
+        assert_eq!(
+            (at(WIDTH - 6), at(WIDTH - 1)),
+            (Some(Act::Qass), Some(Act::Qass))
+        );
+        assert_eq!(at(WIDTH), None);
+        let (line, _) = feet(true, None, WIDTH);
+        assert!(line.text.starts_with(" watch on "), "{:?}", line.text);
+        assert_eq!(line.runs, vec![(1, 8, crate::theme::Role::Done)]);
+        assert_eq!(act(Hit::PetTop(None), WIDTH - 1, &c, false), None);
+        let (line, hit) = feet(true, Some(8), 18);
+        assert!(line.text.trim().is_empty() && hit == Some(Hit::Pet(8)));
     }
 
     /// Every cell of the pet answers `Act::Qass`, and no other cell of the column does: the

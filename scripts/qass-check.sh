@@ -693,6 +693,44 @@ got="$(QASS_WATCH_FOR=2 timed 25)"
 [ "$(echo "$got" | lines)" = watch-ends ] && echo "$got" | within 9 13 ||
     { echo "its own end printed: $got"; exit 1; }
 
+# ---- the owner's switch (`qoop qass watch`) ----------------------------------------------------
+off_line='watch-off: the owner turned watching off (qoop qass watch); do not start this again until it reads on'
+# Off at start: the off line and nothing else, a block waiting or not.
+quiet_fresh; stream 0
+echo off > "$q/watch"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 blocked)]" > "$tmp/snapshots"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = "$off_line" ] || { echo "off at start printed: $got"; exit 1; }
+# Turned off while it runs: a block after the switch is not said, and it ends with the off line.
+quiet_fresh; stream 30 4
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 working)]" "[$(row 5 1 blocked)]" > "$tmp/snapshots"
+( sleep 2; echo off > "$q/watch" ) &
+got="$(timed 20)"
+[ "$(echo "$got" | lines)" = "$off_line" ] && echo "$got" | within 2 13 ||
+    { echo "off while running printed: $got"; exit 1; }
+# A second watcher beside a running one says so and leaves.
+quiet_fresh; stream 0
+printf '#!/bin/sh\nsleep 30\n' > "$tmp/watch.sh"; chmod +x "$tmp/watch.sh"
+"$tmp/watch.sh" & other=$!
+echo "$other" > "$q/watch.pid"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+kill "$other" 2>/dev/null || true
+[ "$got" = 'watch-running: one already runs' ] || { echo "a second watcher printed: $got"; exit 1; }
+# On again: its first snapshot is the base and the held lines go (qass sums the fleet up);
+# what changes after is said, and the stamp is marked seen. A stale pid file is taken over.
+quiet_fresh; stream 12 3
+echo 1 > "$q/watch.pid"
+echo 'resume 42' > "$q/watch"
+echo '6 g1 long 0 0 T6 g1 claude working->idle "task" /w' > "$q/held"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 blocked)]" "[$(row 5 1 failed)]" > "$tmp/snapshots"
+got="$(timed 10)"
+[ "$(echo "$got" | lines)" = 'T5 g1 claude blocked->failed "task" /w' ] &&
+    [ "$(cat "$q/watch-seen")" = 42 ] && [ ! -e "$q/held" ] && [ ! -e "$q/base" ] ||
+    { echo "on again printed: $got"; exit 1; }
+
 echo "qass watch: ok"
 
 # cardcheck.sh, the Stop hook: a pointer to a card is no question, also when the listing fails
