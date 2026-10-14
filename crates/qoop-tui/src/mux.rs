@@ -1341,6 +1341,22 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Ok(())
             }
             R::ConnectRemote { id, target } => self.connect_remote(id, target).await,
+            // A picture for a tab is kept where the tab runs, so a remote agent can read it.
+            R::SaveUpload {
+                id,
+                ext,
+                data,
+                terminal: Some(terminal),
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                let request = R::SaveUpload {
+                    id,
+                    ext,
+                    data,
+                    terminal: Some(terminal),
+                };
+                self.send_one(link, request).await
+            }
             // Everything else the interface sends names no terminal: it is about the daemon
             // this machine runs, or the one remote when there is no local one.
             other => self.send_one(self.home, other).await,
@@ -1563,6 +1579,24 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 let body = serde_json::to_vec(&EventMessage::Focus { terminal })
                     .map_err(io::Error::other)?;
+                self.write(Channel::Event, 0, body).await
+            }
+            // Renumbered too: a remote's recording in its terminal 3 must never open the
+            // microphone for the local terminal 3.
+            Incoming::Event(EventMessage::Listen {
+                terminal,
+                listener,
+                on,
+            }) => {
+                let Some(terminal) = terminal_out(link, terminal) else {
+                    return Ok(());
+                };
+                let event = EventMessage::Listen {
+                    terminal,
+                    listener,
+                    on,
+                };
+                let body = serde_json::to_vec(&event).map_err(io::Error::other)?;
                 self.write(Channel::Event, 0, body).await
             }
             Incoming::Event(event) => {
@@ -2512,6 +2546,57 @@ mod tests {
                 row: Some(3),
                 col: 4,
                 resume: None,
+            }
+        );
+    }
+
+    /// A picture for a remote tab is kept by that remote's daemon, under its own number for
+    /// the tab: kept at home, its path would name a file the remote agent cannot read. One
+    /// that names no tab still goes home, as the phone's do.
+    #[tokio::test]
+    async fn a_picture_for_a_remote_tab_is_kept_where_the_tab_runs() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let upload = |id: &str, terminal| ControlRequest::SaveUpload {
+            id: id.into(),
+            ext: "jpg".into(),
+            data: "aGk=".into(),
+            terminal,
+        };
+        mux.control(upload("up-1", Some(terminal_out(1, 21).expect("fits"))))
+            .await
+            .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, upload("up-1", Some(21)));
+        mux.control(upload("up-2", None)).await.expect("sent");
+        assert!(remote_rx.try_recv().is_err(), "the remote was asked");
+        let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+        assert_eq!(asked, upload("up-2", None));
+    }
+
+    /// A remote's recording names its terminal in the interface's numbering: left as the
+    /// remote's own number it would name a local tab, and lend the microphone there.
+    #[tokio::test]
+    async fn a_remote_recording_names_its_tab_in_the_interfaces_numbering() {
+        let (mut mux, _home_rx, _remote_rx, _events) = two_links();
+        let listen = |terminal| {
+            Incoming::Event(EventMessage::Listen {
+                terminal,
+                listener: 5,
+                on: true,
+            })
+        };
+        mux.said(1, listen(3)).await.expect("passed on");
+        let frame = Frame::decode(&mut BytesMut::from(mux.down.as_slice()))
+            .expect("a frame")
+            .expect("whole");
+        let event: EventMessage = serde_json::from_slice(&frame.body).expect("json");
+        assert_eq!(
+            event,
+            EventMessage::Listen {
+                terminal: terminal_out(1, 3).expect("fits"),
+                listener: 5,
+                on: true,
             }
         );
     }

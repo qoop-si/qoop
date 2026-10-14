@@ -15,6 +15,7 @@ fn upload(ext: &str, data: String) -> ControlRequest {
         id: format!("u-{ext}-{}", data.len()),
         ext: ext.into(),
         data,
+        terminal: None,
     }
 }
 

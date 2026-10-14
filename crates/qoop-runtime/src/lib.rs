@@ -16,6 +16,7 @@ pub mod handoff;
 pub mod idle;
 pub mod legacy;
 pub mod lock;
+pub mod microphone;
 pub mod paths;
 pub mod release;
 pub mod say;

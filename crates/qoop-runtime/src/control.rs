@@ -406,6 +406,22 @@ pub enum ControlRequest {
         ext: String,
         /// The bytes, as standard base64.
         data: String,
+        /// The tab the picture is for. Only the interface's mux reads it, to send a picture
+        /// for a remote tab to the daemon that runs the tab; a daemon ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<u32>,
+    },
+    /// Borrow a microphone for a program in `terminal` (qoop's `arecord`): answered
+    /// `Listening`, then `Heard` with what it hears until this connection goes. A `probe`
+    /// only asks whether an interface that lends one is attached. See `microphone`.
+    Listen {
+        id: String,
+        terminal: u32,
+        #[serde(default)]
+        probe: bool,
+        /// `terminal`'s own token (`QOOP_TOKEN`): only a program in that tab may ask.
+        #[serde(default)]
+        token: String,
     },
     /// Record one tab's split tree, so a restart or a new client brings the panes back
     /// as one tab rather than as a tab each.
@@ -989,6 +1005,17 @@ pub struct TaskEventInfo {
 }
 
 impl ControlRequest {
+    /// `SaveUpload` of `bytes`, encoded the way the daemon reads them, for `terminal`.
+    pub fn save_upload(id: String, ext: &str, bytes: &[u8], terminal: u32) -> Self {
+        use base64::Engine as _;
+        Self::SaveUpload {
+            id,
+            ext: ext.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            terminal: Some(terminal),
+        }
+    }
+
     pub fn request_id(&self) -> &str {
         match self {
             Self::CreateTerminal { id, .. }
@@ -1022,6 +1049,7 @@ impl ControlRequest {
             | Self::ListFocusEvents { id, .. }
             | Self::HostColors { id, .. }
             | Self::SaveUpload { id, .. }
+            | Self::Listen { id, .. }
             | Self::SetSplit { id, .. }
             | Self::RestartWhenSafe { id, .. }
             | Self::UpdateState { id }
@@ -1293,6 +1321,16 @@ pub enum ControlResponse {
     Uploaded {
         id: String,
         path: String,
+    },
+    /// `Listen` may go on: a probe is answered, a recording has started.
+    Listening {
+        id: String,
+    },
+    /// What the lent microphone heard for `Listen`: 16 kHz mono signed 16-bit little
+    /// endian samples, as standard base64.
+    Heard {
+        id: String,
+        data: String,
     },
     /// `News` was taken: the rows say it from now on.
     NewsNoted {
@@ -1787,6 +1825,8 @@ impl ControlResponse {
             | Self::RemoteInstalled { id, .. }
             | Self::HostColorsNoted { id }
             | Self::Uploaded { id, .. }
+            | Self::Listening { id }
+            | Self::Heard { id, .. }
             | Self::NewsNoted { id }
             | Self::SplitSaved { id }
             | Self::RestartArmed { id, .. }
@@ -2589,6 +2629,15 @@ pub enum EventMessage {
     /// The question inbox changed: a card came, was answered or ended. Says where to look,
     /// like `AgentChanged`; `AskRead` says what is there. An older client ignores it.
     AsksChanged,
+    /// A program in `terminal` is recording (`on`), and will say so every second while it
+    /// does, or has stopped. `listener` numbers the recording. An interface lends its
+    /// microphone only right after a key the person pressed there; every other client, and
+    /// an older interface, ignores it. See `microphone`.
+    Listen {
+        terminal: TerminalStream,
+        listener: u64,
+        on: bool,
+    },
 }
 
 #[cfg(test)]

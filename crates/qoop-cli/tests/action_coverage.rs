@@ -381,12 +381,28 @@ fn actions() -> Vec<Action> {
                     id: "a".into(),
                     ext: "jpg".into(),
                     data: String::new(),
+                    terminal: None,
                 })
             },
         },
         Action {
             name: "paste the picture's path into the agent",
             method: || Method::Terminal("Paste"),
+        },
+        Action {
+            name: "record from the microphone a window lends (qoop's arecord)",
+            method: || {
+                Method::Control(ControlRequest::Listen {
+                    id: "a".into(),
+                    terminal: 0,
+                    probe: false,
+                    token: String::new(),
+                })
+            },
+        },
+        Action {
+            name: "lend this machine's microphone to a tab's recording",
+            method: || Method::Terminal("Audio"),
         },
         Action {
             name: "split a tab, or take a pane out of it",
@@ -721,6 +737,7 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             ext: String::new(),
             data: String::new(),
+            terminal: None,
         },
         ControlRequest::RestartWhenSafe {
             id: String::new(),
@@ -764,6 +781,12 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             all: false,
         },
+        ControlRequest::Listen {
+            id: String::new(),
+            terminal: 0,
+            probe: false,
+            token: String::new(),
+        },
     ];
     for request in &all {
         match request {
@@ -797,6 +820,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
             | ControlRequest::SaveUpload { .. }
+            | ControlRequest::Listen { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::UpdateState { .. }

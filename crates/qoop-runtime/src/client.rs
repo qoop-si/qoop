@@ -125,8 +125,16 @@ pub const RENDER_WINDOW: &str = "render_window";
 /// leave open on the far side, holding the size of every terminal they showed (ADR-007).
 pub const REPLACES: &str = "replaces";
 
+/// The hello key an interface sets to say it lends a microphone to a tab's program
+/// (`microphone`). An older interface never says it, so a recording is refused at once
+/// rather than left hearing nothing.
+pub const MICROPHONE: &str = "microphone";
+
 fn hello(client_id: &str, observer: bool, replaces: Option<&str>) -> ClientHello {
     let mut extra = serde_json::Map::new();
+    if client_id == qoop_proto::INTERFACE_ID {
+        extra.insert(MICROPHONE.into(), serde_json::Value::Bool(true));
+    }
     if observer {
         extra.insert(OBSERVER.into(), serde_json::Value::Bool(true));
     }

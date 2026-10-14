@@ -303,11 +303,12 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
     events.iter().any(|event| match event {
         EventMessage::AgentChanged { terminal } => watched.contains(terminal),
         EventMessage::Resync => true,
-        // Which terminal an interface shows says nothing about any agent, nor does the board
-        // or the question inbox.
-        EventMessage::Focus { .. } | EventMessage::TasksChanged | EventMessage::AsksChanged => {
-            false
-        }
+        // Which terminal an interface shows says nothing about any agent, nor does the board,
+        // the question inbox or a recording.
+        EventMessage::Focus { .. }
+        | EventMessage::TasksChanged
+        | EventMessage::AsksChanged
+        | EventMessage::Listen { .. } => false,
     })
 }
 

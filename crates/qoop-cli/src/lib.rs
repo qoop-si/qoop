@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod arecord;
 mod ask;
 mod avatar;
 mod board;
@@ -69,6 +70,11 @@ pub type Phone = fn(&[String]) -> std::io::Result<()>;
 
 /// `qoop`, with the phone app's part when the binary carries it.
 pub fn main_with(phone: Option<Phone>) {
+    // Called as `arecord` from a tab: the shim, before anything else touches the home, as
+    // Claude Code checks it on every start of its voice.
+    if arecord::called() {
+        std::process::exit(arecord::run());
+    }
     // Before anything reads a path: what a machine that ran qoro keeps under that name
     // moves to qoop, with the old name left as a link (see `legacy`).
     qoop_runtime::legacy::move_home();

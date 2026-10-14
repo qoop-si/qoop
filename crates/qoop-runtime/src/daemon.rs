@@ -240,6 +240,8 @@ pub struct ConnectionRegistry {
     /// The question inbox changed, fanned out like `focus` and as lossy: a client that missed
     /// one re-reads on the next, and always on a resync.
     asks: tokio::sync::broadcast::Sender<()>,
+    /// The microphone an interface lends a tab's program, and who is listening.
+    pub microphone: Arc<crate::microphone::Hub>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
     /// on, rather than a timer.
     changed: tokio::sync::Notify,
@@ -254,6 +256,7 @@ impl Default for ConnectionRegistry {
             inner: std::sync::Mutex::default(),
             focus: tokio::sync::broadcast::channel(16).0,
             asks: tokio::sync::broadcast::channel(16).0,
+            microphone: Arc::default(),
             changed: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -276,6 +279,8 @@ pub struct Connection {
     /// Whether the peer introduced itself as an interface, the one kind of client that
     /// shows a terminal to a person and so the one `qoop focus` is for.
     interface: std::sync::atomic::AtomicBool,
+    /// Whether that interface said it lends a microphone (`client::MICROPHONE`).
+    microphone: std::sync::atomic::AtomicBool,
     /// The terminals this connection last said are news for its person (`News`).
     news: std::sync::Mutex<BTreeSet<u32>>,
     /// Whether its hello was answered with a welcome. Until then it is nobody yet.
@@ -410,12 +415,31 @@ impl ConnectionRegistry {
             .count()
     }
 
-    fn mark_interface(&self, client: &ClientId) {
+    fn mark_interface(&self, client: &ClientId, microphone: bool) {
         for c in self.inner.lock().unwrap().iter() {
             if &c.client == client {
                 c.interface.store(true, Ordering::Relaxed);
+                c.microphone.store(microphone, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether this connection is an interface that lends a microphone.
+    fn lends(&self, client: &ClientId) -> bool {
+        self.inner.lock().unwrap().iter().any(|c| {
+            &c.client == client
+                && c.interface.load(Ordering::Relaxed)
+                && c.microphone.load(Ordering::Relaxed)
+        })
+    }
+
+    /// Whether an interface that lends a microphone is attached.
+    pub fn can_listen(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.interface.load(Ordering::Relaxed) && c.microphone.load(Ordering::Relaxed))
     }
 
     /// Tell every connection the question inbox changed.
@@ -1157,6 +1181,18 @@ impl Daemon {
         if crate::legacy::migrating() {
             crate::legacy::point_old_path_at(&socket);
         }
+        // A machine with no sound card gives its tabs qoop's `arecord`, which borrows the
+        // microphone of the window a person types into (`microphone`). After the bind, so a
+        // start refused here never re-points the live daemon's link. Claude Code on macOS
+        // records natively and never asks for one, so only Linux.
+        #[cfg(target_os = "linux")]
+        match arm_microphone(dir) {
+            Ok(Some(path)) => {
+                let _ = TAB_PATH.set(path);
+            }
+            Ok(None) => {}
+            Err(e) => crate::say!("qoopd: no arecord for tabs: {e}"),
+        }
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 
@@ -1631,6 +1667,7 @@ impl Daemon {
                 admitted: std::time::Instant::now(),
                 pid: peer_pid(&stream),
                 interface: std::sync::atomic::AtomicBool::new(false),
+                microphone: std::sync::atomic::AtomicBool::new(false),
                 news: std::sync::Mutex::default(),
                 welcomed: std::sync::atomic::AtomicBool::new(false),
                 observer: std::sync::atomic::AtomicBool::new(false),
@@ -2197,10 +2234,13 @@ async fn serve_client(
     // out of the answer.
     let mut focus = connections.focus.subscribe();
     let mut asks = connections.asks.subscribe();
+    let mut listening = connections.microphone.subscribe();
     if hello.client_id == qoop_proto::INTERFACE_ID
         && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
     {
-        connections.mark_interface(&client);
+        let microphone =
+            hello.extra.get(crate::client::MICROPHONE) == Some(&serde_json::Value::Bool(true));
+        connections.mark_interface(&client, microphone);
     }
     if matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_)) {
         let observer =
@@ -2283,6 +2323,14 @@ async fn serve_client(
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         Some(crate::control::EventMessage::AsksChanged)
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                // A missed one is said again within a second while the recording lasts.
+                heard = listening.recv() => match heard {
+                    Ok((terminal, listener, on)) => {
+                        Some(crate::control::EventMessage::Listen { terminal, listener, on })
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
             };
@@ -2471,6 +2519,28 @@ async fn serve_client(
                 };
                 if channel == Channel::Control {
                     let response = match serde_json::from_slice::<ControlRequest>(&message.body) {
+                        // Answered for as long as it records, from a task of its own.
+                        Ok(ControlRequest::Listen {
+                            id,
+                            terminal,
+                            probe,
+                            token,
+                        }) => {
+                            // Only a program in that tab: a microphone is never lent to
+                            // whoever names a terminal number.
+                            let own = agents
+                                .token_of(terminal)
+                                .is_some_and(|t| t.as_str() == token);
+                            tokio::spawn(listen(
+                                connections.clone(),
+                                id,
+                                terminal,
+                                probe,
+                                own,
+                                control_tx.clone(),
+                            ));
+                            continue;
+                        }
                         // Spawned off this loop and answered through the connection's
                         // outbound channel, the way events are: a search step is a
                         // tenth of a second of disk, and the next keystroke on this
@@ -2606,6 +2676,15 @@ async fn serve_client(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
+                if let ClientWire::Audio { data } = cmd {
+                    // Only from a window that said it lends a microphone.
+                    if connections.lends(&client)
+                        && let Some(bytes) = crate::microphone::decode(&data)
+                    {
+                        connections.microphone.hear(&client, message.stream, bytes);
+                    }
+                    continue;
+                }
                 // The frame's stream field is the terminal. A command for a terminal that has
                 // gone is dropped rather than routed to a neighbour, which is why stream
                 // numbers are never reused.
@@ -2646,6 +2725,8 @@ async fn serve_client(
                         from: client.clone(),
                         bytes: Bytes::from(bytes),
                     },
+                    // Taken above, before the terminal is looked up.
+                    ClientWire::Audio { .. } => continue,
                 };
                 // A terminal whose task has ended is one stale address, not the end of
                 // this read: breaking here left every later frame of the read in the
@@ -3518,6 +3599,11 @@ async fn handle_control(
     }
 
     match request {
+        // The read loop answers it on its own connection; nothing else does.
+        ControlRequest::Listen { id, .. } => ControlResponse::Failed {
+            id,
+            reason: "a recording is asked for on the connection that reads it".into(),
+        },
         ControlRequest::CreateTerminal {
             cwd,
             workspace: wanted,
@@ -5804,6 +5890,80 @@ pub enum ClientWire {
     Paste {
         bytes: Vec<u8>,
     },
+    /// What a lent microphone heard for this terminal's recording, as standard base64
+    /// (`microphone`). An older daemon drops it.
+    Audio {
+        data: String,
+    },
+}
+
+/// `Listen` for `terminal`, answered on `tx` (its connection's outbound channel): a probe
+/// once, a recording with `Listening` and then `Heard` until the connection goes, the
+/// interfaces told it is on at once and every `BEAT` while it lasts.
+async fn listen(
+    connections: Arc<ConnectionRegistry>,
+    id: String,
+    terminal: u32,
+    probe: bool,
+    own: bool,
+    tx: mpsc::Sender<BytesMut>,
+) {
+    use base64::Engine as _;
+    let say = |response: ControlResponse| {
+        let tx = tx.clone();
+        async move {
+            match control_bytes(&response) {
+                Ok(out) => tx.send(out).await.is_ok(),
+                Err(_) => false,
+            }
+        }
+    };
+    if !own {
+        let reason = "only a program in that tab may record there".into();
+        say(ControlResponse::Failed { id, reason }).await;
+        return;
+    }
+    if !connections.can_listen() {
+        let reason = "no qoop window that lends a microphone is attached".into();
+        say(ControlResponse::Failed { id, reason }).await;
+        return;
+    }
+    if probe {
+        say(ControlResponse::Listening { id }).await;
+        return;
+    }
+    let Some(mut recording) = connections.microphone.claim(terminal) else {
+        let reason = "the microphone is in use by another recording".into();
+        say(ControlResponse::Failed { id, reason }).await;
+        return;
+    };
+    if !say(ControlResponse::Listening { id: id.clone() }).await {
+        return;
+    }
+    let mut beat = tokio::time::interval(crate::microphone::BEAT);
+    loop {
+        tokio::select! {
+            _ = beat.tick() => connections.microphone.beat(&recording),
+            heard = recording.audio.recv() => {
+                let Some(bytes) = heard else { return };
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                if !say(ControlResponse::Heard { id: id.clone(), data }).await {
+                    return;
+                }
+            }
+            _ = tx.closed() => return,
+        }
+    }
+}
+
+impl ClientWire {
+    /// `Audio` of `bytes`, encoded the way the daemon reads them.
+    pub fn audio(bytes: &[u8]) -> Self {
+        use base64::Engine as _;
+        Self::Audio {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
 }
 
 /// A paste as the program asked to receive it: between `ESC [ 200 ~` and `ESC [ 201 ~`
@@ -9335,6 +9495,32 @@ pub struct Seed {
     pub nudge: bool,
 }
 
+/// The PATH a tab starts with when the daemon gave it qoop's `arecord` (`arm_microphone`).
+static TAB_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+
+/// `<dir>/bin/arecord`, a link to this binary, which runs as the shim when called by that
+/// name; answers the PATH for tabs, that directory first. Made again at every start, so it
+/// follows the binary an update moved onto.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn arm_microphone(dir: &Path) -> io::Result<Option<std::ffi::OsString>> {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let link = bin.join("arecord");
+    let fresh = bin.join(format!(".arecord.{}", std::process::id()));
+    let _ = std::fs::remove_file(&fresh);
+    std::os::unix::fs::symlink(std::env::current_exe()?, &fresh)?;
+    std::fs::rename(&fresh, &link)?;
+    Ok(tab_path(&bin, std::env::var_os("PATH").as_deref()))
+}
+
+/// `bin`, then what PATH was; `None` leaves PATH as it is (no PATH, or a directory a PATH
+/// cannot hold), so a tab never starts without `ls`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn tab_path(bin: &Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let dirs = std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(path?));
+    std::env::join_paths(dirs).ok()
+}
+
 /// Start a shell on a new pty: its master, the shell and the device of its slave.
 fn start_shell(
     shell: &Path,
@@ -9375,6 +9561,9 @@ fn start_shell(
             });
     }
     cmd.env("TERM", "xterm-256color");
+    if let Some(path) = TAB_PATH.get() {
+        cmd.env("PATH", path);
+    }
     scrub_parent_agent_env(&mut cmd);
     // The capability token, handed to the child of a terminal we started. ADR-015: it binds
     // the terminal and not the generation, because a child's environment cannot be rewritten
@@ -12139,5 +12328,48 @@ mod stale_socket_tests {
             std::io::ErrorKind::AddrInUse
         );
         assert!(link.symlink_metadata().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod arecord_tests {
+    use super::*;
+
+    /// The link names this binary and the tab PATH finds it first, ahead of a real one.
+    #[test]
+    fn tabs_find_qoops_arecord_first() {
+        let dir = tempfile_dir();
+        let path = arm_microphone(&dir).expect("armed").expect("a PATH");
+        let link = dir.join("bin").join("arecord");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::env::current_exe().unwrap()
+        );
+        let first = std::env::split_paths(&path).next().unwrap();
+        assert_eq!(first, dir.join("bin"));
+        // Again, over the old link: an update makes it anew.
+        arm_microphone(&dir).expect("armed again");
+        assert!(link.exists());
+        let joined = tab_path(
+            Path::new("/q/bin"),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+        );
+        assert_eq!(
+            joined,
+            Some(std::ffi::OsString::from("/q/bin:/usr/bin:/bin"))
+        );
+        // No PATH, or one a directory cannot join: left as it is, never just the shim's.
+        assert_eq!(tab_path(Path::new("/q/bin"), None), None);
+        assert_eq!(
+            tab_path(Path::new("/a:b"), Some(std::ffi::OsStr::new("/bin"))),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qoop-arecord-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

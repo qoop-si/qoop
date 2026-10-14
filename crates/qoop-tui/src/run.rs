@@ -287,6 +287,8 @@ enum Blocked {
     Answer(u32, Result<crate::answer::Answer, String>),
     /// `qoop qass` ran for `ctrl-a Q`: what it said when it could not start or wake qass.
     Qass(Result<(), String>),
+    /// A picture for a remote tab made small, or the clipboard read for one, by its id.
+    Picture(String, Result<Option<crate::picture::Prepared>, String>),
 }
 
 /// `qoop qass`, which wakes qass or starts it in its own space and shows it: from this
@@ -709,6 +711,15 @@ struct State {
     /// where there is always a write in hand; the shell holds the line as
     /// typeahead, so it lands even before its first prompt is drawn.
     agent_typing: Vec<(u32, Vec<u8>)>,
+    /// Pictures on their way to a remote tab, and the keys held behind them.
+    pictures: crate::picture::Pictures,
+    /// Pictures to make small off the loop, by id: a file, or the clipboard for `None`.
+    picture_work: Vec<(String, Option<std::path::PathBuf>)>,
+    /// Uploads to send and finished pictures to type, drained where a write is in hand.
+    picture_out: Vec<ControlRequest>,
+    picture_done: Vec<crate::picture::Done>,
+    /// Whether this machine's microphone is lent to a tab's recording, and to which.
+    microphone: crate::microphone::Microphone,
     cols: u16,
     lines: u16,
     message: Option<String>,
@@ -6917,6 +6928,11 @@ where
         pending_agents: std::collections::BTreeMap::new(),
         session_titles: std::collections::BTreeMap::new(),
         agent_typing: Vec::new(),
+        pictures: Default::default(),
+        picture_work: Vec::new(),
+        picture_out: Vec::new(),
+        picture_done: Vec::new(),
+        microphone: Default::default(),
         cols,
         lines,
         // What the caller wanted said, or that this is connecting. A notice about a
@@ -7175,6 +7191,11 @@ where
     // Work that blocks (reading /proc, reading a transcript) runs on the blocking pool and
     // comes back here, so the keyboard never waits on a disk. One sample at a time.
     let (blocking_tx, mut blocking_rx) = tokio::sync::mpsc::unbounded_channel::<Blocked>();
+    // This machine's microphone while it is lent to a tab: the recorder, and what it hears.
+    // Each recorder numbered, so what an ended one still says is never taken for the next's.
+    let mut recorder: Option<(u64, tokio::process::Child)> = None;
+    let mut recorders = 0u64;
+    let (heard_tx, mut heard_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u32, Vec<u8>)>();
     let mut sampling = false;
     // The terminal whose last answer is being read, so a result for any other is dropped.
     let mut answer_for: Option<u32> = None;
@@ -7216,6 +7237,39 @@ where
                     )?)
                     .await?;
                 }
+            }
+            // A lent microphone stops when the person looks elsewhere, when its recording is
+            // no longer said to be on, or at its longest.
+            if state.microphone.due(state.focused, std::time::Instant::now()) {
+                recorder = None;
+                stop_lending(&mut state);
+                dirty = true;
+            }
+            // Never unseen while it lasts: whatever said something since, it comes back.
+            if state.microphone.lending().is_some() && state.message.is_none() {
+                state.message = Some(crate::microphone::ON.into());
+                dirty = true;
+            }
+            // Pictures for remote tabs: made small off the loop, sent, then typed.
+            for (id, file) in std::mem::take(&mut state.picture_work) {
+                let tx = blocking_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let picture = match file {
+                        Some(file) => crate::picture::prepare(&file).map(Some),
+                        None => crate::picture::clipboard(),
+                    };
+                    let _ = tx.send(Blocked::Picture(id, picture));
+                });
+            }
+            for upload in std::mem::take(&mut state.picture_out) {
+                wr.write_all(&client::encode_control_seq(&upload, &mut control_seq)?)
+                    .await?;
+            }
+            let expired = state.pictures.expired(std::time::Instant::now());
+            state.picture_done.extend(expired);
+            for done in std::mem::take(&mut state.picture_done) {
+                type_picture(&mut state, done, &mut seqs, &mut wr).await?;
+                dirty = true;
             }
             // A tree came on screen where nothing could write (the index, a bootstrap):
             // its other tiles still need their subscriptions. Only those: the focused
@@ -7960,7 +8014,12 @@ where
                                     wake(&mut state, space, to, &mut request);
                                     dirty = true;
                                 }
-                                if focused != 0 {
+                                if focused != 0 && pictures_take(&mut state, focused, &bytes) {
+                                    dirty = true;
+                                } else if focused != 0 {
+                                    // A key the person pressed here: what may lend this
+                                    // tab the microphone (`microphone`).
+                                    state.microphone.key(focused, std::time::Instant::now());
                                     // Large pastes travel as several small messages
                                     // rather than one huge one: one message
                                     // inflates on the wire and trips the
@@ -9596,6 +9655,36 @@ where
                             }
                             // The board's news: nothing the index draws.
                             Incoming::Event(EventMessage::TasksChanged) => {}
+                            Incoming::Event(EventMessage::Listen { terminal, listener, on }) => {
+                                let now = std::time::Instant::now();
+                                let agent = state.rows.iter().any(|r| r.terminal == terminal && r.agent);
+                                match state.microphone.heard(terminal, listener, on, state.focused, agent, now) {
+                                    crate::microphone::Step::Start => {
+                                        recorders += 1;
+                                        match crate::microphone::record(recorders, terminal, heard_tx.clone()) {
+                                            Ok(child) => {
+                                                recorder = Some((recorders, child));
+                                                state.message = Some(crate::microphone::ON.into());
+                                            }
+                                            Err(e) => {
+                                                state.microphone.stopped();
+                                                state.message = Some(if e.kind() == io::ErrorKind::NotFound {
+                                                    crate::microphone::NO_SOX.into()
+                                                } else {
+                                                    format!("the microphone did not start: {e}")
+                                                });
+                                            }
+                                        }
+                                        dirty = true;
+                                    }
+                                    crate::microphone::Step::Stop => {
+                                        recorder = None;
+                                        stop_lending(&mut state);
+                                        dirty = true;
+                                    }
+                                    crate::microphone::Step::Nothing => {}
+                                }
+                            }
                             Incoming::Control(response) => {
                                 if state.asks.answered(&response) {
                                     dirty = true;
@@ -9667,7 +9756,16 @@ where
                                     index_asked = None;
                                     refresh |= std::mem::take(&mut index_owed);
                                 }
-                                apply(&mut state, response, &mut request, &mut dirty);
+                                // A picture's answer is the picture's: its refusal is said once
+                                // the batch is done, not as every other refusal is.
+                                let picture = response.request_id().starts_with(crate::picture::ID)
+                                    || (matches!(&response, ControlResponse::Failed { id, .. } if id.is_empty())
+                                        && state.pictures.going_one());
+                                if picture {
+                                    state.picture_done.extend(state.pictures.answered(&response));
+                                } else {
+                                    apply(&mut state, response, &mut request, &mut dirty);
+                                }
                                 if state.closing.is_none() {
                                     closing_since = None;
                                 }
@@ -9902,12 +10000,39 @@ where
                         });
                     }
                 }
+                // What the lent microphone heard, from the recorder running now only, for the
+                // tab it is lent to and nowhere else.
+                Some((from, terminal, bytes)) = heard_rx.recv() => {
+                    let current = recorder.as_ref().is_some_and(|(n, _)| *n == from)
+                        && state.microphone.lending() == Some(terminal);
+                    // Its end: killed from here (then no longer current), or by itself.
+                    if bytes.is_empty() {
+                        if current {
+                            recorder = None;
+                            stop_lending(&mut state);
+                            state.message = Some(crate::microphone::STOPPED.into());
+                            dirty = true;
+                        }
+                    } else if current {
+                        wr.write_all(&client::encode_command_to(
+                            terminal,
+                            &ClientWire::audio(&bytes),
+                            seqs.entry(terminal).or_default(),
+                        )?)
+                        .await?;
+                    }
+                }
                 // Blocking work handed back.
                 Some(done) = blocking_rx.recv() => match done {
                     Blocked::Usage { at, targets, found } => {
                         sampling = false;
                         apply_usage(&mut state, at, targets, found);
                         dirty = true;
+                    }
+                    Blocked::Picture(id, picture) => {
+                        let (upload, done) = state.pictures.prepared(&id, picture);
+                        state.picture_out.extend(upload);
+                        state.picture_done.extend(done);
                     }
                     Blocked::Qass(said) => {
                         if let Err(why) = said {
@@ -10175,15 +10300,16 @@ async fn note_drag(
                 out.write_all(b"\x1b]72;t=r:o=0\x1b\\")?;
                 out.flush()?;
             } else if end && let Some((terminal, uris, got)) = state.drop_read.take() {
-                let text = dropped_text(&got, uris);
-                out.write_all(if text.is_empty() {
+                let items = dropped_items(&got, uris);
+                let empty = items.iter().all(|(typed, _)| typed.is_empty());
+                out.write_all(if empty {
                     b"\x1b]72;t=r:o=0\x1b\\".as_slice()
                 } else {
                     b"\x1b]72;t=r:o=1\x1b\\".as_slice()
                 })?;
                 out.flush()?;
-                if !text.is_empty() {
-                    drop_into(state, terminal, text, control_seq, seqs, wr).await?;
+                if !empty {
+                    drop_into(state, terminal, items, control_seq, seqs, wr).await?;
                 }
             }
         }
@@ -10200,12 +10326,13 @@ async fn note_drag(
 /// drop is one paste with one pair of markers.
 const DROP_LIMIT: usize = client::MAX_INPUT_MESSAGE;
 
-/// Type `text` into `terminal`, which takes the keyboard first so the drop is where the
-/// person is looking.
+/// Type what was dropped into `terminal`, which takes the keyboard first so the drop is
+/// where the person is looking. A remote tab gets its pictures sent there first, and their
+/// paths there typed instead (`picture`).
 async fn drop_into(
     state: &mut State,
     terminal: u32,
-    text: String,
+    items: Vec<(String, Option<std::path::PathBuf>)>,
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
     wr: &mut (impl AsyncWriteExt + Unpin),
@@ -10222,9 +10349,83 @@ async fn drop_into(
     if state.focused != terminal {
         return Ok(());
     }
-    let focused = terminal;
-    let bytes = text.into_bytes();
-    for piece in client::split_input(&bytes) {
+    let remote = crate::mux::is_remote_terminal(terminal);
+    let items: Vec<_> = items
+        .into_iter()
+        .map(|(typed, file)| (typed, file.filter(|f| remote && f.is_file())))
+        .collect();
+    // A picture, or text that must wait behind one still on its way.
+    if items.iter().any(|(_, file)| file.is_some()) || state.pictures.busy(terminal) {
+        let go = state.pictures.drop(terminal, items);
+        state.message = Some("sending the picture...".into());
+        state
+            .picture_work
+            .extend(go.into_iter().map(|(id, file)| (id, Some(file))));
+        return Ok(());
+    }
+    let text: String = items_text(items);
+    paste_into(terminal, &text, seqs, wr).await
+}
+
+/// The microphone is no longer lent: its notice goes with it.
+fn stop_lending(state: &mut State) {
+    state.microphone.stopped();
+    if state.message.as_deref() == Some(crate::microphone::ON) {
+        state.message = None;
+    }
+}
+
+/// Whether keys for `focused` go to a picture instead: held behind one on its way, or a
+/// ctrl+v in a remote agent tab, which reads this machine's clipboard for one.
+fn pictures_take(state: &mut State, focused: u32, bytes: &[u8]) -> bool {
+    let agent = state.rows.iter().any(|r| r.terminal == focused && r.agent);
+    // Before holding: a second ctrl+v is a second picture, joining the first.
+    if agent && crate::mux::is_remote_terminal(focused) && crate::picture::is_ctrl_v(bytes) {
+        let id = state.pictures.ctrl_v(focused);
+        state.picture_work.push((id, None));
+        return true;
+    }
+    state.pictures.hold(focused, bytes)
+}
+
+/// A finished picture typed into its terminal: the paste, then the keys held behind it.
+async fn type_picture(
+    state: &mut State,
+    done: crate::picture::Done,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    state.message = done.message;
+    if let Some(paste) = done.paste {
+        paste_into(done.terminal, &paste, seqs, wr).await?;
+    }
+    for piece in client::split_input(&done.input) {
+        wr.write_all(&client::encode_command_to(
+            done.terminal,
+            &ClientWire::Input {
+                bytes: piece.to_vec(),
+                from_terminal: None,
+                from_token: None,
+            },
+            seqs.entry(done.terminal).or_default(),
+        )?)
+        .await?;
+    }
+    Ok(())
+}
+
+fn items_text(items: Vec<(String, Option<std::path::PathBuf>)>) -> String {
+    items.into_iter().map(|(typed, _)| typed).collect()
+}
+
+/// `text` pasted into `terminal` as a person pastes it.
+async fn paste_into(
+    focused: u32,
+    text: &str,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    for piece in client::split_input(text.as_bytes()) {
         // A paste, so the daemon puts the markers on when the program asked for them: an
         // agent attaches a picture whose path is pasted and keeps a typed one as text.
         wr.write_all(&client::encode_command_to(
@@ -10241,30 +10442,38 @@ async fn drop_into(
 
 /// What a drop types: paths as a shell reads them, one space after each, or the dropped
 /// text as it is. An escape is never typed, so dropped text cannot end a paste early.
+#[cfg(test)]
 fn dropped_text(data: &[u8], uris: bool) -> String {
-    let text = String::from_utf8_lossy(data);
-    let text = if uris {
-        text.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| match line.strip_prefix("file://") {
-                // `file:///a` and `file://localhost/a` are both `/a`; a host and no path
-                // is nothing.
-                Some(rest) => rest
-                    .find('/')
-                    .map(|at| shell_path(&percent_decode(&rest.as_bytes()[at..]))),
-                // A link dragged from a browser stays a link.
-                None => Some(line.to_string()),
-            })
-            .map(|path| format!("{path} "))
-            .collect()
-    } else {
-        text.into_owned()
-    };
+    items_text(dropped_items(data, uris))
+}
+
+/// What a drop types, a piece per dropped item, each with its file when it names a picture.
+fn dropped_items(data: &[u8], uris: bool) -> Vec<(String, Option<std::path::PathBuf>)> {
     // Never an escape, so dropped text cannot end a paste early, and no other control
     // character either, bar the line breaks and tabs that text has.
-    text.chars()
-        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+    let clean = |text: &str| -> String {
+        text.chars()
+            .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+            .collect()
+    };
+    let text = String::from_utf8_lossy(data);
+    if !uris {
+        return vec![(clean(&text), None)];
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| match line.strip_prefix("file://") {
+            // `file:///a` and `file://localhost/a` are both `/a`; a host and no path
+            // is nothing.
+            Some(rest) => rest.find('/').map(|at| {
+                let path = percent_decode(&rest.as_bytes()[at..]);
+                let file = crate::picture::is_picture(&path).then(|| path.clone().into());
+                (clean(&format!("{} ", shell_path(&path))), file)
+            }),
+            // A link dragged from a browser stays a link.
+            None => Some((clean(&format!("{line} ")), None)),
+        })
         .collect()
 }
 
@@ -15401,6 +15610,11 @@ mod tests {
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
+            pictures: Default::default(),
+            picture_work: Vec::new(),
+            picture_out: Vec::new(),
+            picture_done: Vec::new(),
+            microphone: Default::default(),
             closing: None,
             armed: None,
             drawer: None,
@@ -16539,6 +16753,11 @@ mod tests {
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
+            pictures: Default::default(),
+            picture_work: Vec::new(),
+            picture_out: Vec::new(),
+            picture_done: Vec::new(),
+            microphone: Default::default(),
             cols: 80,
             lines: 24,
             message: None,
@@ -16683,6 +16902,11 @@ mod tests {
             pending_agents: std::collections::BTreeMap::new(),
             session_titles: std::collections::BTreeMap::new(),
             agent_typing: Vec::new(),
+            pictures: Default::default(),
+            picture_work: Vec::new(),
+            picture_out: Vec::new(),
+            picture_done: Vec::new(),
+            microphone: Default::default(),
             cols: 80,
             lines: 24,
             message: None,
@@ -17493,6 +17717,70 @@ mod tests {
         let typed: Vec<String> = b"/tmp/a\\ b.png ".iter().map(u8::to_string).collect();
         let sent = String::from_utf8_lossy(&wire);
         assert!(sent.contains(&format!("[{}]", typed.join(","))), "{sent}");
+    }
+
+    /// ctrl+v alone in a remote agent tab reads this machine's clipboard for a picture, and
+    /// keys typed meanwhile wait behind it; a local tab, a shell or a ctrl+v among other
+    /// keys go to the program as they are.
+    #[test]
+    fn ctrl_v_in_a_remote_agent_tab_reads_the_clipboard_here() {
+        let mut state = state();
+        let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 7;
+        let mut shell = agent(remote + 1, 1, "zsh", "idle");
+        shell.agent = false;
+        state.rows = vec![
+            agent(remote, 1, "claude", "idle"),
+            agent(5, 1, "claude", "idle"),
+            shell,
+        ];
+        assert!(
+            !pictures_take(&mut state, 5, b"\x16"),
+            "a local tab's own clipboard"
+        );
+        assert!(
+            !pictures_take(&mut state, remote + 1, b"\x16"),
+            "a remote shell"
+        );
+        assert!(
+            !pictures_take(&mut state, remote, b"a\x16"),
+            "a burst holding the byte"
+        );
+        assert!(state.picture_work.is_empty());
+        assert!(pictures_take(&mut state, remote, b"\x16"));
+        assert!(matches!(state.picture_work.as_slice(), [(_, None)]));
+        assert!(
+            pictures_take(&mut state, remote, b"\r"),
+            "Enter overtook the picture"
+        );
+    }
+
+    /// A picture dropped on a remote tab is not typed as this machine's path: it is made
+    /// ready to send, and what else was dropped waits with it.
+    #[tokio::test]
+    async fn a_picture_dropped_on_a_remote_tab_is_sent_not_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"png").unwrap();
+        let mut state = state();
+        let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 7;
+        state.focused = remote;
+        let mut wire = Vec::new();
+        let (mut control, mut seqs) = (0, std::collections::BTreeMap::new());
+        let items = vec![(format!("{} ", png.display()), Some(png.clone()))];
+        drop_into(
+            &mut state,
+            remote,
+            items,
+            &mut control,
+            &mut seqs,
+            &mut wire,
+        )
+        .await
+        .unwrap();
+        let sent = String::from_utf8_lossy(&wire).into_owned();
+        assert!(!sent.contains("\"paste\""), "typed the local path: {sent}");
+        assert!(matches!(state.picture_work.as_slice(), [(_, Some(p))] if *p == png));
+        assert!(state.pictures.busy(remote));
     }
 
     #[tokio::test]

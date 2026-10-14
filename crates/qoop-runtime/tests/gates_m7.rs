@@ -161,6 +161,15 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x25".into(),
             ext: "png".into(),
             data: "aGk=".into(),
+            terminal: None,
+        },
+        // Asks for a microphone: what a window lends comes back to the asker, never to
+        // the child.
+        ControlRequest::Listen {
+            id: "x35".into(),
+            terminal,
+            probe: true,
+            token: String::new(),
         },
         // A search reads history and answers where it matched: a query, never bytes for
         // the child.
@@ -296,6 +305,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::InstallRemote { .. }
             | ControlRequest::HostColors { .. }
             | ControlRequest::SaveUpload { .. }
+            | ControlRequest::Listen { .. }
             | ControlRequest::SetSplit { .. }
             | ControlRequest::RestartWhenSafe { .. }
             | ControlRequest::UpdateState { .. }
