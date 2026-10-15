@@ -20,7 +20,8 @@
    rebase-and-merge it. Pre-authorized here by `AGENTS.md`; never push to `main` directly.
 9. Pull `main` in the plain checkout, take a fresh release build (the qoop app build, never
    this repository alone on a paired machine), install it to
-   `~/.local/bin/qoop`, and run `qoop bridge reload` after replacing the binary.
+   `~/.local/bin/qoop`, run `qoop bridge reload` after replacing the binary, then `qoop hooks install`,
+   `qoop skills install` and `qoop icons install` (what `qoop update` runs; a hand install skips them).
 10. Clean up: remove the worktree, delete the local and remote branch, drop the worktree's
     `target/`.
 

@@ -12,7 +12,9 @@
    fresh release build (the qoop app build), so the installed binary matches the new
    main. Never install a build of this repository alone over
    `~/.local/bin/qoop` on a machine paired with a phone: it has no phone
-   part, and the bridge service there would stop.
+   part, and the bridge service there would stop. Then run `qoop hooks install`,
+   `qoop skills install` and `qoop icons install`, as `qoop update` does: a hand install
+   skips them, and an icon font left out draws the new icons as `?` or as words.
 4. Then clean up: remove the worktree (`git worktree remove <path>`) and
    delete the merged remote branch (`git push origin --delete <branch>`),
    so no stale worktree or branch is left behind.
