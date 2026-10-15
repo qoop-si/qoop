@@ -1744,6 +1744,7 @@ impl State {
             sidebar::Act::Site => Some(Clicked::Site),
             sidebar::Act::Restart => Some(Clicked::Restart),
             sidebar::Act::SettingsPage => Some(Clicked::SettingsPage),
+            sidebar::Act::Mute => Some(Clicked::Mute),
             sidebar::Act::App => Some(Clicked::App),
             sidebar::Act::HubDown => Some(Clicked::HubDown),
             sidebar::Act::View => Some(Clicked::View),
@@ -5093,6 +5094,27 @@ fn keep_awake(state: &mut State, space: i64, terminal: Option<u32>, request: &mu
     });
 }
 
+/// The foot's bell: the next of off, here and everywhere, written to `config.toml` so every
+/// window on this Mac and its bridge follow it, and in effect on this frame. A write that
+/// fails is said and changes nothing.
+fn mute_click(state: &mut State) {
+    use qoop_runtime::config::Mute;
+    let next = state.config.mute.next();
+    if let Err(why) = crate::config::set(&crate::config::path(), "notify.mute", next.name()) {
+        say(state, why);
+        return;
+    }
+    state.config.mute = next;
+    sidebar::set_mute(next);
+    state.ring = false;
+    let said = match next {
+        Mute::Off => "notifications on",
+        Mute::Here => "notifications muted on this Mac",
+        Mute::Everywhere => "notifications muted on this Mac and its phones",
+    };
+    say(state, said.to_string());
+}
+
 /// Turn qass's watching over, as the word beside the pet showed it: sent with the value, as
 /// keeping awake is, so two quick clicks on a stale word cannot cancel out on the daemon.
 fn qass_watch(state: &mut State, request: &mut u64) {
@@ -6728,6 +6750,8 @@ enum Clicked {
     Restart,
     /// The foot's cog: the settings page, in a tab.
     SettingsPage,
+    /// The foot's bell: notifications on, muted here, muted everywhere, in turn.
+    Mute,
     /// The foot's `online` or `local`: the web app, in the browser.
     App,
     /// The foot's `offline`: the news that the hub is not reached.
@@ -8563,6 +8587,10 @@ where
                                         qass_watch(&mut state, &mut request);
                                         dirty = true;
                                     }
+                                    Some(Clicked::Mute) => {
+                                        mute_click(&mut state);
+                                        dirty = true;
+                                    }
                                     Some(Clicked::Collapse) => {
                                         state.collapsed = !state.collapsed;
                                         // The keys of a column that is gone would be taken
@@ -10178,6 +10206,7 @@ fn config_stamp() -> Option<std::time::SystemTime> {
 fn use_config(state: &mut State, read: &crate::config::Read) {
     state.config = read.config;
     crate::keys::show_prefix(read.config.prefix);
+    sidebar::set_mute(read.config.mute);
     retheme(state);
     // A font missing here is put in place now and drawn from at the next start.
     if !state.icon_font && state.config.icons != crate::icons::Setting::Off {
@@ -10627,10 +10656,14 @@ fn news_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> 
 ///
 /// `qoop_attention` decides whether the change is worth it and how urgent it is, the same
 /// rule a push to a phone follows. Each note waits out its own `notify::DELAY`, and is
-/// checked again then (see [`fire_notes`]). True when it will reach the desktop, so the
-/// bell for the same change stays quiet; with nowhere to send it, the bell rings as it
-/// always did and the hint row says why, once.
+/// checked again then (see [`fire_notes`]). True when the bell for the same change stays
+/// quiet: the desktop will say it, or this Mac is muted (`notify.mute`), which quiets the
+/// note, the sound and the bell alike. With nowhere to send it, the bell rings as it always
+/// did and the hint row says why, once.
 fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
+    if state.config.mute != qoop_runtime::config::Mute::Off {
+        return true;
+    }
     let looking = row.terminal == state.focused && state.outer_focus != Some(false);
     if looking || !(state.config.desktop || state.config.sound) {
         return false;
@@ -10688,6 +10721,10 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
         .partition(|note| note.due <= now);
     state.notes_due = waiting.iter().map(|note| note.due).min();
     state.notes = waiting;
+    // Muted since they were held: the ones due now go unsaid, the rest when they come due.
+    if state.config.mute != qoop_runtime::config::Mute::Off {
+        return Ok(());
+    }
     let due: Vec<crate::notify::Note> = ready
         .into_iter()
         .filter(|note| {
@@ -18531,6 +18568,61 @@ mod tests {
         );
     }
 
+    /// A muted Mac says nothing about a change: no note held, no bell, and a note held
+    /// before the mute goes unsaid when its second is up. Here and everywhere alike: the
+    /// phones are the bridge's to quiet.
+    #[test]
+    fn a_muted_mac_holds_no_note_and_rings_no_bell() {
+        use qoop_runtime::config::Mute;
+        for mute in [Mute::Here, Mute::Everywhere] {
+            let mut state = bare_state();
+            state.focused = 1;
+            state.config.sound = true;
+            state.route = crate::notify::Route::Escape {
+                escape: crate::notify::Escape::Osc9,
+                tmux: false,
+            };
+            let working = |t| agent(t, 1, "claude", "working");
+            index(&mut state, vec![working(1), working(2), working(3)]);
+            // Held while on, then muted before its second is up.
+            index(
+                &mut state,
+                vec![working(1), agent(2, 1, "codex", "blocked"), working(3)],
+            );
+            assert_eq!(state.notes.len(), 1, "held while on");
+            state.config.mute = mute;
+            index(
+                &mut state,
+                vec![
+                    working(1),
+                    agent(2, 1, "codex", "blocked"),
+                    agent(3, 1, "aider", "done"),
+                ],
+            );
+            assert!(!state.ring, "{mute:?}: no bell");
+            assert_eq!(state.notes.len(), 1, "{mute:?}: nothing new held");
+            age_notes(&mut state);
+            let mut out = Vec::new();
+            fire_notes(&mut state, &mut out).expect("fire");
+            assert!(out.is_empty(), "{mute:?}: the held note goes unsaid");
+            assert!(state.notes.is_empty() && state.notes_due.is_none());
+            // With no desktop note to say it, the bell is what would: muted, it stays quiet.
+            state.config.desktop = false;
+            let earlier = vec![
+                working(1),
+                agent(2, 1, "codex", "blocked"),
+                agent(3, 1, "aider", "done"),
+            ];
+            index(&mut state, [earlier.clone(), vec![working(4)]].concat());
+            index(
+                &mut state,
+                [earlier, vec![agent(4, 1, "gemini", "failed")]].concat(),
+            );
+            assert!(!state.ring, "{mute:?}: no bell without the desktop either");
+            assert!(state.notes.is_empty(), "{mute:?}: and no sound held");
+        }
+    }
+
     /// Bootstrap parks the space under the keyboard, and a focused terminal
     /// outside the space on screen is pulled back to its first tab: typing
     /// somewhere the person cannot see is never the steady state.
@@ -23752,9 +23844,13 @@ mod tests {
                 .collect()
         };
         let w = sidebar::WIDTH as u16;
-        // Icons are off under test: `set` after `menu `.
+        // Icons are off under test: `bell` and `set` after `menu `.
         assert_eq!(
             at(|c| matches!(c, Clicked::Menu)),
+            vec![w - 15, w - 14, w - 13, w - 12]
+        );
+        assert_eq!(
+            at(|c| matches!(c, Clicked::Mute)),
             vec![w - 10, w - 9, w - 8, w - 7]
         );
         assert_eq!(

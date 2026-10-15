@@ -54,6 +54,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "notify.sound": c.sound,
                 "notify.done_sound": c.done_sound,
                 "notify.alert_sound": c.alert_sound,
+                "notify.mute": c.mute.name(),
                 "notch.enabled": c.notch,
                 "sleep.idle_minutes": c.lifecycle.idle_minutes,
                 "sleep.qass_idle_minutes": c.lifecycle.qass_idle_minutes.unwrap_or(c.lifecycle.idle_minutes),
@@ -71,6 +72,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "icons": ["auto", "on", "off"],
                 "notify.done_sound": config::sounds_here(),
                 "notify.alert_sound": config::sounds_here(),
+                "notify.mute": qoop_runtime::config::MUTES,
                 "qass.agent": crate::settings::qass_agents(&read),
                 "report.send": config::REPORT_SENDS,
             },
@@ -94,6 +96,7 @@ fn show(json: bool) -> std::io::Result<()> {
     println!("notify.sound = {}", c.sound);
     println!("notify.done_sound = \"{}\"", c.done_sound);
     println!("notify.alert_sound = \"{}\"", c.alert_sound);
+    println!("notify.mute = \"{}\"", c.mute.name());
     println!("notch.enabled = {}", c.notch);
     println!("sleep.idle_minutes = {}", c.lifecycle.idle_minutes);
     println!(

@@ -123,6 +123,16 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
             ),
             Kind::Toggle("notify.desktop"),
         ),
+        row(
+            "notifications",
+            "mute",
+            c.mute.name().to_string(),
+            "here quiets this Mac, everywhere its phones too",
+            Kind::Choice(
+                "notify.mute",
+                qoop_runtime::config::MUTES.map(String::from).to_vec(),
+            ),
+        ),
     ];
     if macos {
         out.push(row(

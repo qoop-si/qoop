@@ -1,7 +1,7 @@
 //! The few icons the interface draws, the font that carries them, and whether this terminal
 //! gets them.
 //!
-//! A terminal draws characters from fonts, never pictures, so an icon is a glyph: ten from
+//! A terminal draws characters from fonts, never pictures, so an icon is a glyph: twelve from
 //! the Nerd Fonts symbol sets in `assets/QoopSymbols.ttf`, built by
 //! `scripts/build-icon-font.py`, which fits every one to one box and one centre line (the
 //! sets were drawn apart and stood at different heights) and puts them at our own codepoints
@@ -62,9 +62,13 @@ pub const EYE: char = '\u{10c0a8}';
 /// qass does not watch: the eye shut, a lid and three lashes drawn by the font script in the
 /// place of Material Design `eye-off`.
 pub const EYE_SHUT: char = '\u{10c0a9}';
+/// Notifications on, on the foot beside the cog (Material Design `bell-outline`).
+pub const BELL: char = '\u{10c0aa}';
+/// Notifications muted, here or everywhere by colour (Material Design `bell-off-outline`).
+pub const BELL_OFF: char = '\u{10c0ab}';
 
 /// The glyphs by the Nerd names `scripts/build-icon-font.py` prints, in its order.
-pub const GLYPHS: [(&str, char); 10] = [
+pub const GLYPHS: [(&str, char); 12] = [
     ("md-sleep", ASLEEP),
     ("cod-coffee", CUP),
     ("cod-remote", REMOTE),
@@ -75,6 +79,8 @@ pub const GLYPHS: [(&str, char); 10] = [
     ("md-chevron_right", LESS),
     ("md-eye", EYE),
     ("md-eye_off", EYE_SHUT),
+    ("md-bell_outline", BELL),
+    ("md-bell_off_outline", BELL_OFF),
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);

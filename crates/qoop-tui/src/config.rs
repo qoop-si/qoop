@@ -8,6 +8,7 @@
 //! [notify]
 //! desktop = true
 //! sound = false
+//! mute = "off"      # off | here | everywhere: here quiets this Mac, everywhere its phones too
 //! [notch]
 //! enabled = true      # macOS: the agents in the notch
 //! [sleep]
@@ -86,6 +87,8 @@ pub struct Config {
     pub done_sound: &'static str,
     /// The sound for one that waits on a person or failed, one of [`sounds_here`].
     pub alert_sound: &'static str,
+    /// Who stays quiet when an agent needs a person: this Mac, or its phones too.
+    pub mute: qoop_runtime::config::Mute,
     /// Show the agents in the macOS notch. Read by the notch app, through `qoop config`.
     pub notch: bool,
     /// The daemon's settings, shown here and read by the daemon itself.
@@ -111,6 +114,7 @@ impl Default for Config {
             sound: false,
             done_sound: "Glass",
             alert_sound: "Funk",
+            mute: qoop_runtime::config::Mute::Off,
             notch: true,
             lifecycle: qoop_runtime::config::Lifecycle::default(),
             quiet_cards: false,
@@ -525,6 +529,19 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
             ("notify", toml::Value::Table(notify)) => {
                 for (key, value) in notify {
                     let line = line_of(&nested.notify, key);
+                    if key == "mute" {
+                        match value.as_str().and_then(qoop_runtime::config::Mute::parse) {
+                            Some(mute) => config.mute = mute,
+                            None => refuse(
+                                line,
+                                format!(
+                                    "mute = {value} is not one of {}",
+                                    qoop_runtime::config::MUTES.join(", ")
+                                ),
+                            ),
+                        }
+                        continue;
+                    }
                     if let Some(slot) = match key.as_str() {
                         "done_sound" => Some(&mut config.done_sound),
                         "alert_sound" => Some(&mut config.alert_sound),
@@ -741,7 +758,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 17] = [
+pub const KEYS: [&str; 18] = [
     "prefix",
     "theme",
     "icons",
@@ -749,6 +766,7 @@ pub const KEYS: [&str; 17] = [
     "notify.sound",
     "notify.done_sound",
     "notify.alert_sound",
+    "notify.mute",
     "notch.enabled",
     "sleep.idle_minutes",
     "sleep.qass_idle_minutes",
@@ -775,6 +793,15 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "icons" => return Err("icons is auto, on or off".to_string()),
         "board.cards" if matches!(value, "full" | "quiet") => toml_edit::value(value),
         "board.cards" => return Err("board.cards is full or quiet".to_string()),
+        "notify.mute" if qoop_runtime::config::Mute::parse(value).is_some() => {
+            toml_edit::value(value)
+        }
+        "notify.mute" => {
+            return Err(format!(
+                "notify.mute is one of {}",
+                qoop_runtime::config::MUTES.join(", ")
+            ));
+        }
         "notify.done_sound" | "notify.alert_sound" => match sound_named(value) {
             Some(name) => toml_edit::value(name),
             None => return Err(format!("{key} is one of {}", sounds_here().join(", "))),
@@ -845,6 +872,7 @@ mod tests {
             ("notify.sound", "true"),
             ("notify.done_sound", sound),
             ("notify.alert_sound", sound),
+            ("notify.mute", "here"),
             ("notch.enabled", "false"),
             ("sleep.idle_minutes", "30"),
             ("sleep.qass_idle_minutes", "0"),
@@ -871,6 +899,8 @@ mod tests {
         assert_eq!(read.config.prefix, 0x02);
         assert!(read.config.quiet_cards);
         assert!(set(&path, "board.cards", "loud").is_err());
+        assert_eq!(read.config.mute, qoop_runtime::config::Mute::Here);
+        assert!(set(&path, "notify.mute", "loud").is_err());
         assert_eq!(read.config.theme, Theme::Light);
         assert_eq!(read.config.lifecycle.idle_minutes, 30);
         assert_eq!(read.config.lifecycle.qass_idle_minutes, Some(0));
@@ -1142,6 +1172,21 @@ mod tests {
             parse("prefix = \"ctrl-a\"\ntheme = \"blue\"\n[notify]\n\nsound = \"yes\"\n");
         let lines: Vec<Option<usize>> = problems.iter().map(|p| p.line).collect();
         assert_eq!(lines, vec![Some(2), Some(5)], "{problems:?}");
+    }
+
+    /// `notify.mute` takes its three words; anything else keeps it off and says the words.
+    #[test]
+    fn mute_is_one_of_three_words() {
+        use qoop_runtime::config::Mute;
+        let (config, problems) = parse("[notify]\nmute = \"everywhere\"\n");
+        assert_eq!((config.mute, problems.len()), (Mute::Everywhere, 0));
+        let (config, problems) = parse("[notify]\nmute = true\n");
+        assert_eq!(config.mute, Mute::Off);
+        assert_eq!(problems[0].line, Some(2), "{problems:?}");
+        assert!(
+            problems[0].what.contains("off, here, everywhere"),
+            "{problems:?}"
+        );
     }
 
     /// The two daemon settings are written as the daemon reads them, a whole number of

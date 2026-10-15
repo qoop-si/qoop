@@ -25,6 +25,7 @@ desktop = true
 sound = false
 done_sound = "Glass"
 alert_sound = "Funk"
+mute = "off"
 
 [sleep]
 idle_minutes = 0
@@ -46,6 +47,7 @@ cards = "full"
 | `notify.sound` | `false` | and play a sound when it does; the install asks |
 | `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink`, or on Linux a freedesktop name (`complete`, `bell`, `message`, ...; Linux default `complete`); `qoop sound` plays them to choose |
 | `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list (Linux default `dialog-warning`) |
+| `notify.mute` | `"off"` | `here` keeps this Mac quiet (no desktop note, sound or bell); `everywhere` also stops the alerts its phones get for its agents; the bell beside the cog on the sidebar foot goes through the three |
 | `sleep.idle_minutes` | `0` | a tab idle this many minutes, and unwatched for as long, sleeps by itself, the same way `ctrl-a Z` puts it to sleep, refusals included; the rest of its space is left as it is. A space or an agent whose cup is full (kept awake) is passed by. `0` is never, and then nothing runs for it at all |
 | `sleep.qass_idle_minutes` | follows `sleep.idle_minutes` | the same for the tabs of the space named `qass`, where qass lives: `0` keeps them awake while the others sleep, a number sleeps them after that many idle minutes while the other spaces follow `sleep.idle_minutes`. qass does not wake by itself: `qoop qass`, `ctrl-a Q` or the qass page (`qoop qass page`) wakes it. The running daemon takes it up at its next idle check, as it does `sleep.idle_minutes`; from `0` or unset it starts checking at the next agent activity |
 | `board.cards` | `"full"` | the board page's cards: `full` shows each card's key, how long it has been in its lane, its agent and how long that agent has worked, and one word; `quiet` is one line, with a word only on "waits on you" and "qass checks". `v` on the board, or its `[ full · quiet ]` switch, writes it |

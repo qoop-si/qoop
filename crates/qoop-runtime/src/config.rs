@@ -245,9 +245,109 @@ pub fn write_sleep(
     edit(path, &edits)
 }
 
+/// `[notify] mute`: who stays quiet when an agent needs a person. The interface reads it for
+/// its desktop notes, sounds and bell, and the bridge for the phones' alerts, so the rule
+/// lives here once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mute {
+    #[default]
+    Off,
+    /// This Mac says nothing: no desktop note, no sound, no bell. The phones still hear.
+    Here,
+    /// And the phones get no alert from this Mac either.
+    Everywhere,
+}
+
+/// The words `notify.mute` takes, in the order a click goes through them.
+pub const MUTES: [&str; 3] = ["off", "here", "everywhere"];
+
+impl Mute {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mute::Off => "off",
+            Mute::Here => "here",
+            Mute::Everywhere => "everywhere",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Mute> {
+        [Mute::Off, Mute::Here, Mute::Everywhere]
+            .into_iter()
+            .find(|mute| mute.name() == word)
+    }
+
+    /// The state a click on the bell moves to.
+    pub fn next(self) -> Mute {
+        match self {
+            Mute::Off => Mute::Here,
+            Mute::Here => Mute::Everywhere,
+            Mute::Everywhere => Mute::Off,
+        }
+    }
+}
+
+/// `[notify] mute` from a parsed file: off when it is not there or not one of [`MUTES`].
+pub fn mute_from(table: &toml::Table) -> Mute {
+    table
+        .get("notify")
+        .and_then(|notify| notify.get("mute"))
+        .and_then(|mute| mute.as_str())
+        .and_then(Mute::parse)
+        .unwrap_or_default()
+}
+
+/// `[notify] mute` in the file at `path`; a missing or unreadable file is off.
+pub fn mute_in(path: &Path) -> Mute {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .map(|table| mute_from(&table))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mute_reads_its_three_words_and_anything_else_is_off() {
+        let mute = |text: &str| mute_from(&text.parse::<toml::Table>().expect("toml"));
+        assert_eq!(mute(""), Mute::Off);
+        assert_eq!(mute("[notify]\nsound = true\n"), Mute::Off);
+        assert_eq!(mute("[notify]\nmute = \"here\"\n"), Mute::Here);
+        assert_eq!(mute("notify.mute = \"everywhere\"\n"), Mute::Everywhere);
+        assert_eq!(mute("[notify]\nmute = \"loud\"\n"), Mute::Off);
+        assert_eq!(mute("[notify]\nmute = true\n"), Mute::Off);
+        assert_eq!(mute("notify = 1\n"), Mute::Off);
+    }
+
+    #[test]
+    fn a_file_that_is_missing_or_not_toml_is_not_muted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert_eq!(mute_in(&path), Mute::Off);
+        std::fs::write(&path, "[notify]\nmute = \"here\"\n").expect("write");
+        assert_eq!(mute_in(&path), Mute::Here);
+        std::fs::write(&path, "[notify\nmute = \"here\"\n").expect("write");
+        assert_eq!(mute_in(&path), Mute::Off);
+    }
+
+    #[test]
+    fn a_click_goes_off_here_everywhere_and_back() {
+        let mut seen = vec![Mute::Off];
+        for _ in 0..3 {
+            seen.push(seen.last().expect("one").next());
+        }
+        assert_eq!(
+            seen.iter().map(|m| m.name()).collect::<Vec<_>>(),
+            [MUTES.as_slice(), &["off"]].concat()
+        );
+        assert!(
+            MUTES
+                .iter()
+                .all(|word| Mute::parse(word).is_some_and(|m| m.name() == *word))
+        );
+    }
 
     fn parse(text: &str) -> (Lifecycle, Vec<(String, String)>) {
         lifecycle_from(&text.parse::<toml::Table>().expect("toml"))

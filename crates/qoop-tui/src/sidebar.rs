@@ -14,6 +14,7 @@
 //! marks selection. At frame zero, which is what a test, a pipe and `QOOP_MOTION=0` get,
 //! the rows are the same static text every time.
 
+use qoop_runtime::config::Mute;
 use qoop_runtime::control::{AgentRow, SleepingTab, WorkspaceRow};
 use qoop_runtime::paths::HubLink;
 
@@ -368,6 +369,8 @@ pub enum Act {
     Menu,
     /// The foot's cog: every setting on one page, as the menu's settings row opens it.
     SettingsPage,
+    /// The foot's bell: notifications on, muted here, muted everywhere, in turn.
+    Mute,
     /// The foot's `online` or `local`: the web app, to sign in and pair there.
     App,
     /// The foot's `offline`: nothing opens, the status line says the hub is not reached.
@@ -931,7 +934,14 @@ fn parts(
     let count = Some(inbox_items(c, InboxTab::All).len());
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
-    let mut feet = foot_rows(c.width, count, pending_now().get(), hub_link(), c.icons);
+    let mut feet = foot_rows(
+        c.width,
+        count,
+        pending_now().get(),
+        hub_link(),
+        c.icons,
+        mute_now(),
+    );
     let pet_cols = avatar
         .filter(|_| pet)
         .map(pet_width)
@@ -3166,19 +3176,24 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
 }
 
 /// What a click on the menu row means at one based column `col`: the word `menu` opens the
-/// menu, the cog after it the settings page, the version the site, the hub word the web app
-/// (or, with the hub down, the news that it is). Anywhere else folds the column.
+/// menu, the bell after it mutes in turn, the cog the settings page, the version the site,
+/// the hub word the web app (or, with the hub down, the news that it is). Anywhere else
+/// folds the column.
 fn foot_act(width: usize, icons: bool, col: usize, update: Pending, hub: HubLink) -> Act {
     let at = col.saturating_sub(1);
     let on = |from: usize, len: usize| (from..from + len).contains(&at);
     let tail = foot_tail(width, icons);
     let tail_at = width.saturating_sub(crate::width::width(&tail));
-    let cog_at = tail_at + MENU_LABEL.len() + 1;
+    let bell = bell_mark(width, icons, Mute::Off).map_or(0, |mark| crate::width::width(&mark));
+    let bell_at = tail_at + MENU_LABEL.len() + 1;
+    let cog_at = bell_at + if bell > 0 { bell + 1 } else { 0 };
     let (lead, word) = foot_lead(width, crate::width::width(&tail), update, hub);
     if on(tail_at, MENU_LABEL.len()) {
         Act::Menu
     } else if restart_words(&lead).is_some_and(|len| on(1, len)) {
         Act::Restart
+    } else if bell > 0 && on(bell_at, bell) {
+        Act::Mute
     } else if settings_mark(width, icons).is_some_and(|mark| on(cog_at, crate::width::width(&mark)))
     {
         Act::SettingsPage
@@ -3201,6 +3216,10 @@ const MENU_LABEL: &str = "menu";
 /// the version still fits beside it.
 const SETTINGS_FROM: usize = 24;
 
+/// The narrowest column the foot spells the bell as a word in, where icons are not drawn: `bell `
+/// more than settings needs, so the version and `restart` keep the room they had.
+const BELL_FROM: usize = SETTINGS_FROM + "bell ".len();
+
 /// What opens the settings page on the foot: the cog where icons are drawn, else `set` in a
 /// column with room for it, else nothing (the menu has the same row).
 fn settings_mark(width: usize, icons: bool) -> Option<String> {
@@ -3211,11 +3230,69 @@ fn settings_mark(width: usize, icons: bool) -> Option<String> {
     }
 }
 
-/// What closes the foot's last row: `menu`, the settings mark when there is one, then `« `.
+/// The bell that mutes on the foot, before the settings mark: the bell or the struck one where
+/// icons are drawn, else `bell` or `mute` in a column with room for it ([`BELL_FROM`]), else
+/// nothing. Every state is as wide, so where the foot's words stand never depends on it.
+fn bell_mark(width: usize, icons: bool, mute: Mute) -> Option<String> {
+    let muted = mute != Mute::Off;
+    (icons || width >= BELL_FROM).then(|| match (icons, muted) {
+        (true, false) => crate::icons::BELL.to_string(),
+        (true, true) => crate::icons::BELL_OFF.to_string(),
+        (false, false) => "bell".to_string(),
+        (false, true) => "mute".to_string(),
+    })
+}
+
+/// The bell's ink: the row's own quiet one while notifications are on, the waiting amber when
+/// only this Mac is muted, the failed one when its phones are too.
+fn bell_ink(mute: Mute) -> crate::theme::Role {
+    use crate::theme::Role;
+    match mute {
+        Mute::Off => Role::Faint,
+        Mute::Here => Role::Blocked,
+        Mute::Everywhere => Role::Failed,
+    }
+}
+
+/// Whether notifications are muted here, as the config last put in effect said
+/// ([`set_mute`]). Off under test, like [`pending_now`]: the paints the suite asserts never
+/// depend on another test's click.
+// ponytail: process-wide, the interface has one render loop and one config.
+fn mute_now() -> Mute {
+    if cfg!(test) {
+        return Mute::Off;
+    }
+    match MUTE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Mute::Here,
+        2 => Mute::Everywhere,
+        _ => Mute::Off,
+    }
+}
+
+/// Put a mute in effect for the foot's bell.
+pub(crate) fn set_mute(mute: Mute) {
+    let n = match mute {
+        Mute::Off => 0,
+        Mute::Here => 1,
+        Mute::Everywhere => 2,
+    };
+    MUTE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MUTE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What closes the foot's last row: `menu`, the bell and the settings mark when there is
+/// room for them, then `« `. Drawn with notifications on; [`foot_rows`] draws the bell as it
+/// is, in the same cells.
 fn foot_tail(width: usize, icons: bool) -> String {
-    match settings_mark(width, icons) {
-        Some(mark) => format!("{MENU_LABEL} {mark} \u{ab} "),
-        None => format!("{MENU_LABEL} \u{ab} "),
+    tail_with(width, icons, Mute::Off)
+}
+
+fn tail_with(width: usize, icons: bool, mute: Mute) -> String {
+    match (bell_mark(width, icons, mute), settings_mark(width, icons)) {
+        (Some(bell), Some(mark)) => format!("{MENU_LABEL} {bell} {mark} \u{ab} "),
+        (None, Some(mark)) => format!("{MENU_LABEL} {mark} \u{ab} "),
+        _ => format!("{MENU_LABEL} \u{ab} "),
     }
 }
 
@@ -3685,23 +3762,29 @@ fn foot_rows(
     update: Pending,
     hub: HubLink,
     icons: bool,
+    mute: Mute,
 ) -> Vec<Row> {
     use crate::theme::Role;
-    let tail = foot_tail(width, icons);
-    // The menu closes the last row: `menu <cog> « ` flush right, the version and the hub word
-    // before it.
+    let tail = tail_with(width, icons, mute);
+    // The menu closes the last row: `menu <bell> <cog> « ` flush right, the version and the
+    // hub word before it.
     let (lead, word) = foot_lead(width, crate::width::width(&tail), update, hub);
     let gap = width.saturating_sub(crate::width::width(&lead) + crate::width::width(&tail));
     // `restart for update` in the static ink of a working agent: blue, since green is the
     // `online` word beside it, orange is the q's tail and `offline`, and faint is what a
     // notice must not be.
     let restart = restart_words(&lead).map(|len| (1, len, Role::Working));
+    let bell = bell_mark(width, icons, mute).map(|mark| {
+        let at = width.saturating_sub(crate::width::width(&tail)) + MENU_LABEL.len() + 1;
+        (at, crate::width::width(&mark), bell_ink(mute))
+    });
     let menu_row = Line {
         text: fit(&format!("{lead}{}{tail}", " ".repeat(gap)), width),
         colour: Some(Role::Faint),
         runs: restart
             .into_iter()
             .chain(word.map(|(at, word, ink)| (at, word.len(), ink)))
+            .chain(bell.filter(|_| mute != Mute::Off))
             .collect(),
         ..Line::default()
     };
@@ -5677,7 +5760,7 @@ mod tests {
     fn the_foot_of_the_column_carries_the_mark_the_version_and_the_menu() {
         // The count chip's row (blank with no count), the q alone, its tail in ember, then the
         // menu.
-        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false);
+        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false, Mute::Off);
         assert_eq!(
             rows.len(),
             STAGE_FOOT_ROWS,
@@ -5726,8 +5809,8 @@ mod tests {
             WIDTH,
             &shut,
         );
-        // Icons are off in this column, so the tail is `menu set « `.
-        let menu_at = WIDTH - 10;
+        // Icons are off in this column, so the tail is `menu bell set « `.
+        let menu_at = WIDTH - 15;
         assert_eq!(act(Hit::Foot, menu_at, &c, false), Some(Act::Menu));
         assert_eq!(act(Hit::Foot, WIDTH - 1, &c, false), Some(Act::Collapse));
         assert_eq!(act(Hit::Foot, 2, &c, false), Some(Act::Site));
@@ -5749,7 +5832,7 @@ mod tests {
     fn the_count_chip_stands_over_the_pet() {
         use crate::theme::Role;
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
-            let foot = foot_rows(width, Some(2), Pending::None, HubLink::Up, false);
+            let foot = foot_rows(width, Some(2), Pending::None, HubLink::Up, false, Mute::Off);
             assert_eq!(foot.len(), STAGE_FOOT_ROWS);
             assert_eq!(foot[0].0.text, format!("{}[ 2 ] ", " ".repeat(width - 6)));
             assert_eq!(foot[1].0.text, " ".repeat(width), "the pet's head row");
@@ -5761,7 +5844,7 @@ mod tests {
                     (width - 2, 1, Role::Brand)
                 ]
             );
-            let none = foot_rows(width, None, Pending::None, HubLink::Up, false);
+            let none = foot_rows(width, None, Pending::None, HubLink::Up, false, Mute::Off);
             assert_eq!(none.len(), STAGE_FOOT_ROWS);
             assert_eq!(&none[1..], &foot[1..]);
         }
@@ -5777,7 +5860,7 @@ mod tests {
     fn the_menu_row_carries_the_version_then_the_hub_word() {
         for icons in [false, true] {
             for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-                let rows = foot_rows(width, None, Pending::None, HubLink::Up, icons);
+                let rows = foot_rows(width, None, Pending::None, HubLink::Up, icons, Mute::Off);
                 let (menu, hit) = rows.last().expect("the menu row");
                 assert_eq!(*hit, Some(Hit::Foot));
                 assert_eq!(crate::width::width(&menu.text), width);
@@ -5805,7 +5888,7 @@ mod tests {
             }
         }
         // No room for the version, no link and no word hanging in the air.
-        let tight = foot_rows(8, None, Pending::None, HubLink::Up, false);
+        let tight = foot_rows(8, None, Pending::None, HubLink::Up, false, Mute::Off);
         let text = &tight.last().unwrap().0.text;
         assert!(
             !text.contains("online") && !text.contains(VERSION),
@@ -5821,7 +5904,7 @@ mod tests {
     fn the_hub_word_follows_the_hub_state() {
         use crate::theme::Role;
         let word = |hub| {
-            let rows = foot_rows(WIDTH, None, Pending::None, hub, false);
+            let rows = foot_rows(WIDTH, None, Pending::None, hub, false, Mute::Off);
             let menu = &rows.last().unwrap().0;
             let at = crate::width::width(&format!(" {VERSION}")) + 1;
             let (word, _) = hub_word(hub);
@@ -5877,26 +5960,30 @@ mod tests {
     /// has the same row). It opens the settings page and the cells around it do not.
     #[test]
     fn the_settings_mark_follows_menu_and_opens_the_page() {
-        let cog = crate::icons::SETTINGS;
+        let (cog, bell) = (crate::icons::SETTINGS, crate::icons::BELL);
         let tail = foot_tail(WIDTH, true);
-        assert_eq!(tail, format!("{MENU_LABEL} {cog} \u{ab} "));
-        assert_eq!(crate::width::width(&tail), 9);
-        assert_eq!(foot_tail(WIDTH, false), format!("{MENU_LABEL} set \u{ab} "));
+        assert_eq!(tail, format!("{MENU_LABEL} {bell} {cog} \u{ab} "));
+        assert_eq!(crate::width::width(&tail), 11);
+        assert_eq!(
+            foot_tail(WIDTH, false),
+            format!("{MENU_LABEL} bell set \u{ab} ")
+        );
         assert_eq!(
             foot_tail(SETTINGS_FROM - 1, false),
             format!("{MENU_LABEL} \u{ab} ")
         );
         assert!(!foot_tail(WIDTH, true).contains("settings"));
-        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, true);
+        let rows = foot_rows(WIDTH, None, Pending::None, HubLink::Up, true, Mute::Off);
         let text = &rows.last().unwrap().0.text;
         assert!(text.ends_with(&tail), "{text:?}");
-        // With icons the cog is one cell, 1-based column WIDTH - 3.
+        // With icons the cog is one cell, 1-based column WIDTH - 3, the bell two before it.
         let cog_col = WIDTH - 3;
         let word_at = crate::width::width(&format!(" {VERSION}")) + 1;
         for col in 1..=WIDTH {
             let want = match col {
                 c if c == cog_col => Act::SettingsPage,
-                c if (WIDTH - 8..=WIDTH - 5).contains(&c) => Act::Menu,
+                c if c == cog_col - 2 => Act::Mute,
+                c if (WIDTH - 10..=WIDTH - 7).contains(&c) => Act::Menu,
                 c if (2..=1 + VERSION.len()).contains(&c) => Act::Site,
                 c if (word_at + 1..=word_at + 6).contains(&c) => Act::App,
                 _ => Act::Collapse,
@@ -5915,11 +6002,85 @@ mod tests {
                 "col {col}"
             );
         }
+        // Without icons `bell` is four cells after `menu `.
+        for col in WIDTH - 10..=WIDTH - 7 {
+            assert_eq!(
+                foot_act(WIDTH, false, col, Pending::None, HubLink::Up),
+                Act::Mute,
+                "col {col}"
+            );
+        }
+        // A column too narrow for the bell's word keeps `set` where it was, and nothing in it
+        // mutes.
+        let mid = BELL_FROM - 1;
+        assert_eq!(foot_tail(mid, false), format!("{MENU_LABEL} set \u{ab} "));
+        assert_eq!(
+            foot_tail(BELL_FROM, false),
+            format!("{MENU_LABEL} bell set \u{ab} ")
+        );
+        for col in mid - 5..=mid - 3 {
+            assert_eq!(
+                foot_act(mid, false, col, Pending::None, HubLink::Up),
+                Act::SettingsPage,
+                "col {col}"
+            );
+        }
+        assert!(
+            (1..=mid).all(|col| foot_act(mid, false, col, Pending::None, HubLink::Up) != Act::Mute)
+        );
         // A narrow column without icons has no mark, and nothing in it opens the page.
         let narrow = SETTINGS_FROM - 1;
-        assert!((1..=narrow).all(
-            |col| foot_act(narrow, false, col, Pending::None, HubLink::Up) != Act::SettingsPage
-        ));
+        assert!((1..=narrow).all(|col| !matches!(
+            foot_act(narrow, false, col, Pending::None, HubLink::Up),
+            Act::SettingsPage | Act::Mute
+        )));
+    }
+
+    /// The bell says the mute in its glyph and ink, in the same cells in every state: the
+    /// faint bell while notifications are on, the struck one in amber when this Mac is muted
+    /// and in red when its phones are too. Nothing else on the row moves.
+    #[test]
+    fn the_bell_says_the_mute_in_the_same_cells() {
+        use crate::theme::Role;
+        let menu = |icons, mute| {
+            foot_rows(WIDTH, None, Pending::None, HubLink::Up, icons, mute)
+                .pop()
+                .expect("the menu row")
+                .0
+        };
+        for icons in [true, false] {
+            let on = menu(icons, Mute::Off);
+            // On: the bell in the row's own ink, no run of its own.
+            assert_eq!(on.runs.len(), 1, "{on:?}");
+            for (mute, ink) in [
+                (Mute::Here, Role::Blocked),
+                (Mute::Everywhere, Role::Failed),
+            ] {
+                let row = menu(icons, mute);
+                assert_eq!(
+                    crate::width::width(&row.text),
+                    crate::width::width(&on.text)
+                );
+                let (at, len, got) = *row.runs.last().expect("the bell's run");
+                assert_eq!(got, ink, "{mute:?}");
+                let cells: String = row.text.chars().skip(at).take(len).collect();
+                let want = if icons {
+                    crate::icons::BELL_OFF.to_string()
+                } else {
+                    "mute".to_string()
+                };
+                assert_eq!(cells, want, "{mute:?}");
+                // The words around the bell are where they were.
+                let other = |text: &str| {
+                    text.chars()
+                        .enumerate()
+                        .filter(|(i, _)| !(at..at + len).contains(i))
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                };
+                assert_eq!(other(&row.text), other(&on.text));
+            }
+        }
     }
 
     /// The link and the click cover the version word and nothing else: with an update notice
@@ -5927,7 +6088,14 @@ mod tests {
     /// foot still folds the column.
     #[test]
     fn the_version_link_covers_only_the_version() {
-        let rows = foot_rows(WIDTH, None, Pending::Newer("9.9.9"), HubLink::Up, false);
+        let rows = foot_rows(
+            WIDTH,
+            None,
+            Pending::Newer("9.9.9"),
+            HubLink::Up,
+            false,
+            Mute::Off,
+        );
         let text: Vec<char> = rows.last().unwrap().0.text.chars().collect();
         let at = version_link_in(WIDTH, false, Pending::Newer("9.9.9")).expect("shown");
         let word: String = text[at..at + VERSION.len()].iter().collect();
@@ -5981,7 +6149,7 @@ mod tests {
         let brand = crate::theme::Role::Brand;
         let embers = [vec![], vec![], vec![], vec![(5, 1, brand)]];
         for width in SIDEBAR_MIN..=SIDEBAR_MAX {
-            let rows = foot_rows(width, None, Pending::None, HubLink::Up, false);
+            let rows = foot_rows(width, None, Pending::None, HubLink::Up, false, Mute::Off);
             let logo = &rows[rows.len() - Q_FOOT_ROWS..rows.len() - 1];
             for (i, (line, hit)) in logo.iter().enumerate() {
                 assert_eq!(
@@ -6137,7 +6305,7 @@ mod tests {
             &shut,
         );
         let chip_row = |count: Option<usize>, on: bool, pet: Option<usize>, icons: bool| {
-            let mut feet = foot_rows(WIDTH, count, Pending::None, HubLink::Up, icons);
+            let mut feet = foot_rows(WIDTH, count, Pending::None, HubLink::Up, icons, Mute::Off);
             put_eye(&mut feet, WIDTH, on, pet, icons);
             feet[feet.len() - STAGE_FOOT_ROWS].clone()
         };
@@ -6333,7 +6501,7 @@ mod tests {
         for col in 1..=width {
             assert_ne!(act(Hit::Foot, col, &c, false), Some(Act::Qass), "col {col}");
         }
-        assert_eq!(act(Hit::Foot, WIDTH - 10, &c, false), Some(Act::Menu));
+        assert_eq!(act(Hit::Foot, WIDTH - 15, &c, false), Some(Act::Menu));
         // No pet picked: no row is the pet's.
         assert!(
             without
@@ -6379,7 +6547,7 @@ mod tests {
     #[test]
     fn the_menu_row_never_cuts_a_version_or_a_notice() {
         let menu = |width: usize, update: Pending| {
-            foot_rows(width, None, update, HubLink::Up, false)
+            foot_rows(width, None, update, HubLink::Up, false, Mute::Off)
                 .last()
                 .map(|(line, _)| line.text.clone())
                 .unwrap_or_default()
@@ -6414,7 +6582,7 @@ mod tests {
                         (Pending::Newer("9.9.9"), false),
                         (Pending::Ready, true),
                     ] {
-                        let rows = foot_rows(width, None, pending, hub, icons);
+                        let rows = foot_rows(width, None, pending, hub, icons, Mute::Off);
                         let (row, _) = rows.last().expect("the menu row");
                         let ctx = format!("{width} {hub:?} {icons} {pending:?}: {:?}", row.text);
                         assert!(crate::width::width(&row.text) <= width, "{ctx}");
@@ -8400,7 +8568,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false, Mute::Off).len();
         for h in 1..40 {
             let rows = rows_folded(&c, h, None);
             assert_eq!(rows.len(), h);
@@ -8467,7 +8635,7 @@ mod tests {
         assert!(rows[1].0.text.ends_with('\u{2502}'), "{:?}", rows[1].0);
         assert_eq!(InboxTab::All.step(true), InboxTab::Asleep);
         assert_eq!(InboxTab::Asleep.step(false), InboxTab::All);
-        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false, Mute::Off).len();
         assert_eq!(inbox_room(&c, 40, None), 40 - foot - 4 - SEARCH_ROWS);
         assert_eq!(inbox_room(&c, 3, None), 0);
     }
@@ -9423,7 +9591,7 @@ mod tests {
             agent(3, 1, "gemini", "blocked"),
         ];
         // The least that holds the title, the search chip, one row of list and the foot, then more.
-        let least = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len() + 6;
+        let least = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false, Mute::Off).len() + 6;
         for height in [least, least + 1, 12, 16, 30] {
             let rows = rows12(
                 &spaces,
@@ -9539,7 +9707,9 @@ mod tests {
             let c = clicks(&spaces, &agents, View::Tree, width, &none);
             assert_eq!(act(Hit::Title, width, &c, false), Some(Act::NewSpace));
             assert_eq!(act(Hit::Title, width - 2, &c, false), Some(Act::View));
-            let menu_col = if width >= SETTINGS_FROM {
+            let menu_col = if width >= BELL_FROM {
+                width - 15
+            } else if width >= SETTINGS_FROM {
                 width - 10
             } else {
                 width - 6
@@ -10872,7 +11042,7 @@ mod tests {
         c.nav = Some(&nav);
         let rows = rows_folded(&c, 24, None);
         assert_eq!(rows.len(), plain.len());
-        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false).len();
+        let foot = foot_rows(WIDTH, None, Pending::None, HubLink::Up, false, Mute::Off).len();
         let line = &rows[rows.len() - foot - 1].0;
         assert!(
             line.text.contains("j/k move  enter open  q back"),
