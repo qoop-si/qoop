@@ -6,7 +6,7 @@ use std::path::Path;
 
 fn dirs(root: &Path) -> BaseDirs {
     BaseDirs {
-        claude: root.join("projects"),
+        claude: vec![root.join("projects")],
         codex: root.join("codex"),
         opencode: None,
         gemini: root.join("gemini"),
@@ -279,12 +279,31 @@ fn oversize_gemini_file_is_not_a_match() {
     f.set_len(9 * 1024 * 1024).unwrap();
     drop(f);
     let d = dirs(dir.path());
-    // Locate skips oversize docs, so the id is simply not found there.
+    // An oversize doc is found only when its head names the id (the file is not read whole
+    // to find it). This one is all zeros, so the id is simply not found there.
     let err = history("gemini", Some("bigone"), &d, 10, None).unwrap_err();
     assert!(
         matches!(err, qoop_history::Error::NotFound { .. }),
         "{err:?}"
     );
+}
+
+/// The two refusals differ: a doc whose head holds the id is found, and then refused as too
+/// large to read, not reported as missing.
+#[test]
+fn oversize_gemini_file_that_names_its_id_is_too_large_not_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let chats = dir.path().join("gemini/h/chats");
+    std::fs::create_dir_all(&chats).unwrap();
+    let id = "bigone12-3456-7890-abcd-ef1234567890";
+    let path = chats.join("session-2026-01-01T00-00-bigone12.json");
+    std::fs::write(&path, format!("{{\"sessionId\":\"{id}\",\"messages\":[]}}")).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(9 * 1024 * 1024).unwrap();
+    drop(f);
+    let d = dirs(dir.path());
+    let err = history("gemini", Some(id), &d, 10, None).unwrap_err();
+    assert!(matches!(err, qoop_history::Error::TooLarge), "{err:?}");
 }
 
 /// Gemini names a chat by the first eight characters of its id, so the lookup is by name

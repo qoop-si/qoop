@@ -54,8 +54,9 @@ fn sandbox_root() -> &'static Path {
     })
 }
 
-/// `program` as a test may start it: a home, a temp directory and no `XDG_*` of its own, no
-/// tab or runtime variables of whoever runs the suite, and the mark that says it is a test.
+/// `program` as a test may start it: a home, a temp directory and no `XDG_*` or
+/// `CLAUDE_CONFIG_DIR` of its own, no tab or runtime variables of whoever runs the suite, and
+/// the mark that says it is a test.
 ///
 /// Every test that starts the `qoop` binary starts it through here. The binary moves the
 /// home's `qoro` directories to `qoop` on its first command, but not when it lies under a
@@ -83,6 +84,7 @@ pub fn sandboxed(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command 
         "QORO_TERMINAL",
         "QOOP_TOKEN",
         "QORO_TOKEN",
+        "CLAUDE_CONFIG_DIR",
     ] {
         command.env_remove(name);
     }
@@ -647,3 +649,22 @@ impl TestClient {
 /// Default patience for a real shell to respond. Generous on purpose: a tight bound turns a
 /// loaded CI runner into a red build for a reason unrelated to the code.
 pub const PATIENCE: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+mod tests {
+    use super::sandboxed;
+
+    /// A removed variable shows up in `get_envs` as a name with no value.
+    #[test]
+    fn a_sandboxed_command_drops_the_claude_config_dir_and_the_xdg_variables() {
+        let command = sandboxed("true");
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+            assert!(removed.iter().any(|r| r == name), "{name} is still set");
+        }
+    }
+}

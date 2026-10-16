@@ -16,12 +16,16 @@ use crate::model::Product;
 /// a pathological first line must not grow the probe without limit.
 const HEAD_FIRST_LINE_MAX: u64 = 1024 * 1024;
 
+/// How much of an oversize Gemini chat is read to confirm its session id.
+const GEMINI_HEAD_BYTES: u64 = 64 * 1024;
+
 /// Where the four products keep their history. All fields are product base
 /// directories except `opencode`, which is the database file itself (`None`
-/// when opencode is not installed).
+/// when opencode is not installed). Claude has a list: its `projects` directories in the
+/// order they are tried.
 #[derive(Debug, Clone)]
 pub struct BaseDirs {
-    pub claude: PathBuf,
+    pub claude: Vec<PathBuf>,
     pub codex: PathBuf,
     pub opencode: Option<PathBuf>,
     pub gemini: PathBuf,
@@ -32,14 +36,42 @@ impl BaseDirs {
     /// missing product paths are not (that product is simply absent).
     pub fn from_home() -> Result<Self, Error> {
         let home = std::env::var("HOME").map_err(|_| Error::NoHome)?;
-        let home = PathBuf::from(home);
-        let opencode = home.join(".local/share/opencode/opencode.db");
-        Ok(BaseDirs {
-            claude: home.join(".claude/projects"),
+        Ok(Self::under(
+            Path::new(&home),
+            std::env::var_os("CLAUDE_CONFIG_DIR"),
+            std::env::var_os("XDG_DATA_HOME"),
+        ))
+    }
+
+    /// [`BaseDirs::from_home`] with the environment passed in.
+    ///
+    /// Claude: `$CLAUDE_CONFIG_DIR/projects` first, as Claude reads it, then
+    /// `~/.claude/projects`, the order the daemon's `claude_transcript` uses. A relative or
+    /// empty value is not a directory anyone meant and is ignored. opencode: the database
+    /// under `$XDG_DATA_HOME` (same rule), else under `~/.local/share`.
+    pub fn under(
+        home: &Path,
+        claude_config_dir: Option<std::ffi::OsString>,
+        xdg_data_home: Option<std::ffi::OsString>,
+    ) -> Self {
+        let absolute =
+            |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+        let mut claude: Vec<PathBuf> = absolute(claude_config_dir)
+            .map(|d| d.join("projects"))
+            .into_iter()
+            .collect();
+        claude.push(home.join(".claude/projects"));
+        let opencode = absolute(xdg_data_home)
+            .map(|d| d.join("opencode/opencode.db"))
+            .into_iter()
+            .chain([home.join(".local/share/opencode/opencode.db")])
+            .find(|db| db.is_file());
+        BaseDirs {
+            claude,
             codex: home.join(".codex/sessions"),
-            opencode: opencode.is_file().then_some(opencode),
+            opencode,
             gemini: home.join(".gemini/tmp"),
-        })
+        }
     }
 }
 
@@ -109,18 +141,20 @@ pub fn locate(product: Product, id: &str, dirs: &BaseDirs) -> Result<Located, Er
 /// dir costs one stat and nothing is listed inside it: no cap to trip, however
 /// many projects and transcripts pile up.
 fn locate_claude(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
-    let projects = match std::fs::read_dir(&dirs.claude) {
-        Ok(e) => e,
-        Err(_) => return Err(not_found()),
-    };
-    for slug in projects.flatten() {
-        let dir = slug.path();
-        if !is_plain_dir(&dir) {
+    for base in &dirs.claude {
+        let Ok(projects) = std::fs::read_dir(base) else {
             continue;
-        }
-        let p = dir.join(format!("{id}.jsonl"));
-        if p.is_file() {
-            return Ok(Located::File(checked(&p, &dirs.claude)?));
+        };
+        for slug in projects.flatten() {
+            let dir = slug.path();
+            if !is_plain_dir(&dir) {
+                continue;
+            }
+            let p = dir.join(format!("{id}.jsonl"));
+            // A link that leaves the base is no match; the next root may still hold the id.
+            if let (true, Ok(real)) = (p.is_file(), checked(&p, base)) {
+                return Ok(Located::File(real));
+            }
         }
     }
     Err(not_found())
@@ -163,15 +197,16 @@ fn locate_opencode(_id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
     }
 }
 
-/// `tmp/<hash>/chats/session-<time>-<first 8 of the id>.json`, confirmed on the
-/// embedded `sessionId`.
+/// `tmp/<hash>/chats/session-<time>-<first 8 of the id>.json` (one JSON document, older
+/// Gemini) or `.jsonl` (a header line, then records), confirmed on the embedded `sessionId`.
 ///
 /// By name, like Claude and Codex: only a file whose name ends in the id's first eight
 /// characters is opened. The scan it replaces opened every chat and gave up past 200
 /// directories or 2000 files, so a long Gemini history could never be read at all.
 fn locate_gemini(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
     // Ids are allowlisted ASCII upstream, so a byte slice is a character slice.
-    let suffix = format!("-{}.json", &id[..id.len().min(8)]);
+    let short = &id[..id.len().min(8)];
+    let suffixes = [format!("-{short}.json"), format!("-{short}.jsonl")];
     let mut stack = vec![dirs.gemini.clone()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -183,10 +218,9 @@ fn locate_gemini(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
                 stack.push(p);
                 continue;
             }
-            let named = f
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("session-") && n.ends_with(&suffix));
+            let named = f.file_name().to_str().is_some_and(|n| {
+                n.starts_with("session-") && suffixes.iter().any(|s| n.ends_with(s.as_str()))
+            });
             if named && p.is_file() && gemini_file_matches(&p, id)? {
                 return Ok(Located::File(checked(&p, &dirs.gemini)?));
             }
@@ -242,6 +276,20 @@ fn checked(path: &Path, base: &Path) -> Result<PathBuf, Error> {
 /// `session_meta`, always the first line, so only the first line is read
 /// (bounded: a pathological first line must not grow the probe).
 fn codex_head_matches(path: &Path, id: &str) -> Result<bool, Error> {
+    let Some(v) = first_line_json(path)? else {
+        return Ok(false);
+    };
+    Ok(
+        v.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+            && v.get("payload")
+                .and_then(|p| p.get("session_id"))
+                .and_then(|s| s.as_str())
+                == Some(id),
+    )
+}
+
+/// The first line of a file as JSON, `None` when it is not one or exceeds the probe bound.
+fn first_line_json(path: &Path) -> Result<Option<serde_json::Value>, Error> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|e| Error::Io(e.to_string()))?;
     let len = file.metadata().map_err(|e| Error::Io(e.to_string()))?.len();
@@ -254,29 +302,31 @@ fn codex_head_matches(path: &Path, id: &str) -> Result<bool, Error> {
     let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
     if end == buf.len() && len > take {
         // No newline inside the bound: the first line alone exceeds it, so
-        // this is not a rollout file with a leading session_meta.
-        return Ok(false);
+        // this is not a file with a small leading header.
+        return Ok(None);
     }
     let first = String::from_utf8_lossy(&buf[..end]);
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&first) else {
-        return Ok(false);
-    };
-    Ok(
-        v.get("type").and_then(|t| t.as_str()) == Some("session_meta")
-            && v.get("payload")
-                .and_then(|p| p.get("session_id"))
-                .and_then(|s| s.as_str())
-                == Some(id),
-    )
+    Ok(serde_json::from_str(&first).ok())
 }
 
-/// Small chats docs parse whole; oversize ones are skipped, not failed.
+/// Small chats docs parse whole. An oversize one is not read whole just to be found: its
+/// name already carries the id's first eight characters, and the full id must sit in its head.
+/// Reading it is the caller's call (`history` refuses it, `qoop-parsed` has its own cap).
 fn gemini_file_matches(path: &Path, id: &str) -> Result<bool, Error> {
+    use std::io::Read;
+    if path.extension().is_some_and(|e| e == "jsonl") {
+        let header = first_line_json(path)?;
+        return Ok(header.is_some_and(|v| v.get("sessionId").and_then(|s| s.as_str()) == Some(id)));
+    }
     let len = std::fs::metadata(path)
         .map_err(|e| Error::Io(e.to_string()))?
         .len();
     if len > crate::read::TAIL_WINDOW_BYTES {
-        return Ok(false);
+        let mut head = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|f| f.take(GEMINI_HEAD_BYTES).read_to_end(&mut head))
+            .map_err(|e| Error::Io(e.to_string()))?;
+        return Ok(String::from_utf8_lossy(&head).contains(id));
     }
     let bytes = std::fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
     let text = String::from_utf8_lossy(&bytes);
@@ -310,7 +360,7 @@ mod tests {
         std::fs::create_dir_all(&slug).unwrap();
         std::fs::write(slug.join("abc-123.jsonl"), "{}\n").unwrap();
         let dirs = BaseDirs {
-            claude: dir.path().join("projects"),
+            claude: vec![dir.path().join("projects")],
             codex: dir.path().join("codex"),
             opencode: None,
             gemini: dir.path().join("gemini"),
@@ -323,7 +373,7 @@ mod tests {
     #[test]
     fn bad_id_never_reaches_the_filesystem() {
         let dirs = BaseDirs {
-            claude: "/nonexistent".into(),
+            claude: vec!["/nonexistent".into()],
             codex: "/nonexistent".into(),
             opencode: None,
             gemini: "/nonexistent".into(),
@@ -332,5 +382,129 @@ mod tests {
             locate(Product::Claude, "../x", &dirs),
             Err(Error::BadId { .. })
         ));
+    }
+
+    fn empty_dirs(root: &Path) -> BaseDirs {
+        BaseDirs {
+            claude: vec![root.join("claude")],
+            codex: root.join("codex"),
+            opencode: None,
+            gemini: root.join("gemini"),
+        }
+    }
+
+    #[test]
+    fn claude_config_dir_is_tried_first_then_the_home() {
+        let home = Path::new("/home/u");
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(
+            BaseDirs::under(home, os("/cfg/claude"), None).claude,
+            [
+                PathBuf::from("/cfg/claude/projects"),
+                PathBuf::from("/home/u/.claude/projects")
+            ]
+        );
+        let home_only = [PathBuf::from("/home/u/.claude/projects")];
+        for ignored in [None, os(""), os("relative/dir")] {
+            assert_eq!(BaseDirs::under(home, ignored, None).claude, home_only);
+        }
+    }
+
+    #[test]
+    fn a_session_in_either_claude_location_is_found_config_dir_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, home) = (dir.path().join("cfg"), dir.path().join("home"));
+        let put = |projects: PathBuf, id: &str| {
+            let slug = projects.join("-p");
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        };
+        let (cfg_projects, home_projects) = (cfg.join("projects"), home.join(".claude/projects"));
+        put(cfg_projects.clone(), "in-cfg");
+        put(home_projects.clone(), "in-home");
+        put(cfg_projects, "both");
+        put(home_projects, "both");
+        let dirs = BaseDirs::under(&home, Some(cfg.clone().into_os_string()), None);
+        for id in ["in-cfg", "in-home", "both"] {
+            assert!(locate(Product::Claude, id, &dirs).is_ok(), "{id}");
+        }
+        let Located::File(both) = locate(Product::Claude, "both", &dirs).unwrap() else {
+            panic!("file")
+        };
+        assert!(both.starts_with(cfg.canonicalize().unwrap()), "{both:?}");
+    }
+
+    #[test]
+    fn opencode_follows_xdg_data_home_then_the_home_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let make = |base: &Path| {
+            let db = base.join("opencode/opencode.db");
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(&db, "").unwrap();
+            db
+        };
+        let in_home = make(&home.join(".local/share"));
+        let os = |p: &Path| Some(p.as_os_str().to_owned());
+        assert_eq!(
+            BaseDirs::under(&home, None, os(&xdg)).opencode,
+            Some(in_home.clone())
+        );
+        let in_xdg = make(&xdg);
+        assert_eq!(
+            BaseDirs::under(&home, None, os(&xdg)).opencode,
+            Some(in_xdg)
+        );
+        let relative = Some(std::ffi::OsString::from("xdg"));
+        assert_eq!(
+            BaseDirs::under(&home, None, relative).opencode,
+            Some(in_home)
+        );
+    }
+
+    #[test]
+    fn a_symlinked_transcript_outside_the_base_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = empty_dirs(dir.path());
+        let slug = dirs.claude[0].join("-proj");
+        std::fs::create_dir_all(&slug).unwrap();
+        let outside = dir.path().join("secret.jsonl");
+        std::fs::write(&outside, "{}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, slug.join("abc-1.jsonl")).unwrap();
+        assert!(locate(Product::Claude, "abc-1", &dirs).is_err());
+    }
+
+    #[test]
+    fn gemini_locates_a_jsonl_chat_by_its_header_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = empty_dirs(dir.path());
+        let chats = dirs.gemini.join("hash").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let id = "3c69a60b-e5fd-4d1a-bdb3-27baa190ad10";
+        let file = chats.join("session-2026-10-10T21-18-3c69a60b.jsonl");
+        std::fs::write(&file, format!("{{\"sessionId\":\"{id}\"}}\n{{}}\n")).unwrap();
+        let found = locate(Product::Gemini, id, &dirs).unwrap();
+        assert_eq!(found, Located::File(file.canonicalize().unwrap()));
+        let other = "3c69a60b-0000-4000-8000-000000000000";
+        assert!(locate(Product::Gemini, other, &dirs).is_err());
+    }
+
+    #[test]
+    fn an_oversize_gemini_doc_is_still_found_by_name_and_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = empty_dirs(dir.path());
+        let chats = dirs.gemini.join("hash").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let id = "84c6ca20-0300-4149-bc56-e7b1f7999eb5";
+        let file = chats.join("session-2026-10-02T22-46-84c6ca20.json");
+        std::fs::write(&file, format!("{{\"sessionId\":\"{id}\",\"messages\":[]}}")).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(crate::read::TAIL_WINDOW_BYTES + 1)
+            .unwrap();
+        assert!(locate(Product::Gemini, id, &dirs).is_ok());
     }
 }

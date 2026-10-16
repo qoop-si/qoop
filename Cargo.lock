@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "agentparse"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -555,6 +566,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qoop-parsed"
+version = "0.10.1"
+dependencies = [
+ "agentparse",
+ "qoop-history",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "qoop-plugin"
 version = "0.10.1"
 dependencies = [
@@ -606,6 +631,7 @@ dependencies = [
  "libc",
  "qoop-detect",
  "qoop-domain",
+ "qoop-parsed",
  "qoop-proto",
  "qoop-pty",
  "qoop-store",
@@ -853,6 +879,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1084,6 +1119,12 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "unarray"

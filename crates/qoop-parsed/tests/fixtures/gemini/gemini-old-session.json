@@ -1,0 +1,177 @@
+{
+  "sessionId": "11111111-2222-4333-8444-555555555555",
+  "projectHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "startTime": "2026-03-01T10:00:00.000Z",
+  "lastUpdated": "2026-03-01T10:02:30.000Z",
+  "summary": "Fix failing test in parser",
+  "messages": [
+    {
+      "id": "m-user-1",
+      "timestamp": "2026-03-01T10:00:00.000Z",
+      "type": "user",
+      "content": [{ "text": "Run the tests and fix the failure in src/parser.ts" }]
+    },
+    {
+      "id": "m-gem-1",
+      "timestamp": "2026-03-01T10:00:04.000Z",
+      "type": "gemini",
+      "content": "I'll run the test suite first.",
+      "thoughts": [
+        {
+          "subject": "Planning",
+          "description": "Run the tests to see which one fails.",
+          "timestamp": "2026-03-01T10:00:02.000Z"
+        }
+      ],
+      "tokens": { "input": 1200, "output": 40, "cached": 800, "thoughts": 25, "tool": 0, "total": 1265 },
+      "model": "gemini-2.5-pro",
+      "toolCalls": [
+        {
+          "id": "run_shell_command-1772359204000-1a2b3c",
+          "name": "run_shell_command",
+          "args": { "command": "bun test", "description": "Run the test suite", "dir_path": "/home/user/proj" },
+          "result": [
+            {
+              "functionResponse": {
+                "id": "run_shell_command-1772359204000-1a2b3c",
+                "name": "run_shell_command",
+                "response": { "output": "Output: 3 pass\n1 fail\nExit Code: 1\nProcess Group PGID: 4242" }
+              }
+            }
+          ],
+          "status": "success",
+          "timestamp": "2026-03-01T10:00:09.000Z",
+          "displayName": "Shell",
+          "description": "bun test",
+          "resultDisplay": "3 pass\n1 fail",
+          "renderOutputAsMarkdown": false
+        }
+      ]
+    },
+    {
+      "id": "m-gem-2",
+      "timestamp": "2026-03-01T10:00:20.000Z",
+      "type": "gemini",
+      "content": "The failure is an off-by-one in the loop bound. Fixing it.",
+      "thoughts": [],
+      "tokens": { "input": 1500, "output": 60, "cached": 1200, "thoughts": 0, "tool": 0, "total": 1560 },
+      "model": "gemini-2.5-pro",
+      "toolCalls": [
+        {
+          "id": "replace-1772359220000-4d5e6f",
+          "name": "replace",
+          "args": {
+            "file_path": "/home/user/proj/src/parser.ts",
+            "instruction": "Fix the loop bound",
+            "old_string": "i <= n",
+            "new_string": "i < n",
+            "expected_replacements": 1
+          },
+          "result": [
+            {
+              "functionResponse": {
+                "id": "replace-1772359220000-4d5e6f",
+                "name": "replace",
+                "response": { "output": "Successfully modified file: /home/user/proj/src/parser.ts (1 replacements)." }
+              }
+            }
+          ],
+          "status": "success",
+          "timestamp": "2026-03-01T10:00:24.000Z",
+          "displayName": "Edit",
+          "description": "src/parser.ts: i <= n => i < n",
+          "resultDisplay": {
+            "fileDiff": "Index: parser.ts\n===================================================================\n--- parser.ts\tCurrent\n+++ parser.ts\tProposed\n@@ -1,3 +1,3 @@\n-for (let i = 0; i <= n; i++) {\n+for (let i = 0; i < n; i++) {\n",
+            "fileName": "parser.ts",
+            "filePath": "/home/user/proj/src/parser.ts",
+            "originalContent": "for (let i = 0; i <= n; i++) {\n",
+            "newContent": "for (let i = 0; i < n; i++) {\n",
+            "diffStat": {
+              "model_added_lines": 1,
+              "model_removed_lines": 1,
+              "model_added_chars": 30,
+              "model_removed_chars": 31,
+              "user_added_lines": 0,
+              "user_removed_lines": 0,
+              "user_added_chars": 0,
+              "user_removed_chars": 0
+            }
+          },
+          "renderOutputAsMarkdown": true
+        },
+        {
+          "id": "read_file-1772359220000-7a8b9c",
+          "name": "read_file",
+          "args": { "file_path": "/home/user/proj/src/missing.ts" },
+          "result": [
+            {
+              "functionResponse": {
+                "id": "read_file-1772359220000-7a8b9c",
+                "name": "read_file",
+                "response": { "error": "File not found: /home/user/proj/src/missing.ts" }
+              }
+            }
+          ],
+          "status": "error",
+          "timestamp": "2026-03-01T10:00:24.500Z",
+          "displayName": "ReadFile",
+          "description": "src/missing.ts",
+          "resultDisplay": "File not found.",
+          "renderOutputAsMarkdown": false
+        }
+      ]
+    },
+    {
+      "id": "m-gem-3",
+      "timestamp": "2026-03-01T10:01:00.000Z",
+      "type": "gemini",
+      "content": "Re-running the tests.",
+      "thoughts": [],
+      "tokens": { "input": 1700, "output": 15, "cached": 1500, "thoughts": 0, "tool": 0, "total": 1715 },
+      "model": "gemini-2.5-pro",
+      "toolCalls": [
+        {
+          "id": "run_shell_command-1772359260000-0f1e2d",
+          "name": "run_shell_command",
+          "args": { "command": "bun test" },
+          "result": [
+            {
+              "functionResponse": {
+                "id": "run_shell_command-1772359260000-0f1e2d",
+                "name": "run_shell_command",
+                "response": { "output": "Output: 4 pass\nProcess Group PGID: 4300" }
+              }
+            }
+          ],
+          "status": "success",
+          "timestamp": "2026-03-01T10:01:05.000Z",
+          "displayName": "Shell",
+          "description": "bun test",
+          "resultDisplay": "4 pass",
+          "renderOutputAsMarkdown": false
+        }
+      ]
+    },
+    {
+      "id": "m-gem-4",
+      "timestamp": "2026-03-01T10:01:10.000Z",
+      "type": "gemini",
+      "content": "All four tests pass now.",
+      "thoughts": [],
+      "tokens": { "input": 1800, "output": 8, "cached": 1700, "thoughts": 0, "tool": 0, "total": 1808 },
+      "model": "gemini-2.5-pro"
+    },
+    {
+      "id": "m-info-1",
+      "timestamp": "2026-03-01T10:02:00.000Z",
+      "type": "info",
+      "content": "Example info notice."
+    },
+    {
+      "id": "m-err-1",
+      "timestamp": "2026-03-01T10:02:30.000Z",
+      "type": "error",
+      "content": "[API Error: example error text]"
+    }
+  ]
+}

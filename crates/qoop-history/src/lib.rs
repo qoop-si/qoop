@@ -140,6 +140,12 @@ fn load(
 
 /// Gemini chats files are whole JSON documents, not line streams.
 fn load_gemini(path: &std::path::Path) -> Result<(Vec<Message>, usize, bool), Error> {
+    // Newer Gemini writes a header line and records (`.jsonl`); only `qoop-parsed` reads those.
+    if path.extension().is_some_and(|e| e == "jsonl") {
+        return Err(Error::NoReader {
+            product: "gemini (jsonl chats)".into(),
+        });
+    }
     let len = std::fs::metadata(path)
         .map_err(|e| Error::Io(e.to_string()))?
         .len();
@@ -172,6 +178,14 @@ mod tests {
             .set_len(read::TAIL_WINDOW_BYTES + 1)
             .unwrap();
         assert!(matches!(load_gemini(&path), Err(Error::TooLarge)));
+    }
+
+    #[test]
+    fn a_jsonl_gemini_chat_is_refused_by_name_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-2026-10-10T21-18-3c69a60b.jsonl");
+        std::fs::write(&path, "{\"sessionId\":\"s\"}\n").unwrap();
+        assert!(matches!(load_gemini(&path), Err(Error::NoReader { .. })));
     }
 
     #[test]

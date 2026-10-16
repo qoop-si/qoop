@@ -616,7 +616,7 @@ mod tests {
         let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
         std::fs::write(project.join("sid-1.jsonl"), body).expect("write");
         let dirs = BaseDirs {
-            claude: root.path().join("projects"),
+            claude: vec![root.path().join("projects")],
             codex: root.path().join("codex"),
             opencode: None,
             gemini: root.path().join("gemini"),

@@ -21,6 +21,7 @@ members = [
     "crates/qoop-bench",
     "crates/qoop-detect",
     "crates/qoop-history",
+    "crates/qoop-parsed",
     "spikes/spike-runtime",
 ]
 
@@ -40,6 +41,7 @@ tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 toml_edit = "0.22"
+agentparse = { path = "../agentparse" }
 
 [profile.release]
 debug = 1

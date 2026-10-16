@@ -20,6 +20,7 @@ qoop-proto = { path = "../qoop-proto" }
 qoop-pty = { path = "../qoop-pty" }
 qoop-terminal = { path = "../qoop-terminal" }
 qoop-detect = { path = "../qoop-detect" }
+qoop-parsed = { path = "../qoop-parsed" }
 rusqlite = { workspace = true }
 # config.toml, the same file and crate the interface reads it with.
 toml = { workspace = true }

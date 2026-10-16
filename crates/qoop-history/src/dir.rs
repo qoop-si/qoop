@@ -83,7 +83,11 @@ const MTIME_SLACK_MS: i64 = 86_400_000;
 pub fn typed_in(repo: &Repo, dirs: &BaseDirs, last: usize) -> TypedIn {
     let mut member = Membership::new(repo);
     let mut unread = Vec::new();
-    let mut sources = claude_files(repo, &dirs.claude);
+    let mut sources: Vec<Source> = dirs
+        .claude
+        .iter()
+        .flat_map(|base| claude_files(repo, base))
+        .collect();
     sources.extend(codex_files(&dirs.codex));
     let conn = dirs.opencode.as_ref().and_then(|db| {
         let opened = opencode::open(db).and_then(|c| opencode::top_sessions(&c).map(|s| (c, s)));
@@ -766,7 +770,7 @@ mod tests {
             worktrees: vec![scratch],
         };
         let dirs = BaseDirs {
-            claude,
+            claude: vec![claude],
             codex,
             opencode: Some(db),
             gemini: home.join(".gemini/tmp"),

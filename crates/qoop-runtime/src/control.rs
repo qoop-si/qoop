@@ -9,6 +9,7 @@
 //! rule requires that a create be acknowledged only once it is durable. A message with no
 //! reply cannot carry that promise.
 
+use qoop_parsed::redact;
 use serde::{Deserialize, Serialize};
 
 /// A terminal is addressed by the number that travels in a frame's `stream` field.
@@ -1895,45 +1896,8 @@ pub enum SubagentChange {
 /// Runs of whitespace collapse to one space first: a label travels on one
 /// row, and a multi-line prompt head would otherwise break the row it is
 /// drawn on.
-/// A label with the secrets a command line tends to carry masked: the word after
-/// `Bearer`, the value of a `NAME=value` whose name says key, token, secret, pass or auth,
-/// and words that start like a provider's token. A label travels further than the hook
-/// that wrote it (the sidebar, `qoop agents --json`, another machine's client), so this
-/// runs once, where every label enters.
-/// ponytail: a word list, not a scanner; a secret in a shape not listed here passes.
-fn redact(single: &str) -> String {
-    const PREFIXES: [&str; 7] = [
-        "sk-",
-        "ghp_",
-        "gho_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "AKIA",
-    ];
-    const NAMES: [&str; 5] = ["key", "token", "secret", "pass", "auth"];
-    let mut out: Vec<String> = Vec::new();
-    let mut after_bearer = false;
-    for word in single.split(' ') {
-        let bare = word.trim_matches(|c: char| c == '"' || c == '\'');
-        let masked = if after_bearer {
-            "***".to_string()
-        } else if let Some((name, value)) = word.split_once('=')
-            && !value.is_empty()
-            && NAMES.iter().any(|n| name.to_ascii_lowercase().contains(n))
-        {
-            format!("{name}=***")
-        } else if PREFIXES.iter().any(|p| bare.starts_with(p)) || bare.starts_with("crw_live_") {
-            "***".to_string()
-        } else {
-            word.to_string()
-        };
-        after_bearer = bare.eq_ignore_ascii_case("bearer");
-        out.push(masked);
-    }
-    out.join(" ")
-}
-
+/// The secrets a command line tends to carry are masked first, by `qoop_parsed::redact`,
+/// where every label enters.
 pub fn truncate_focus_label(label: &str) -> String {
     // Control characters out first: a label is shown on screens and printed by
     // `qoop agents --json`, and an escape in a command must not travel as one.
@@ -2494,6 +2458,10 @@ mod tests {
             "Bash gh auth ***"
         );
         assert_eq!(truncate_focus_label("Edit src/key.rs"), "Edit src/key.rs");
+        assert_eq!(
+            truncate_focus_label("Bash deploy --token abc123 https://u:pw@h.io/x?api_key=k1&a=2"),
+            "Bash deploy --token *** https://u:***@h.io/x?api_key=***&a=2"
+        );
         // An escape in a command is text on the way out, never a sequence.
         assert_eq!(
             truncate_focus_label("Bash \x1b]52;c;aGk=\x07 ls"),
