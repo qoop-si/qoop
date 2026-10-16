@@ -119,6 +119,8 @@ pub struct Frame<'a> {
 /// remember, rather than one more field at every place a frame is built.
 #[derive(Clone, Copy, Debug)]
 pub struct Chrome<'a> {
+    /// The daemon would not serve the focused terminal's chat, so the key row does not offer it.
+    pub chat_refused: bool,
     /// The spaces folded away under their rule.
     pub shut: &'a sidebar::Shut,
     /// Where the keyboard's attention is, for the key row.
@@ -231,6 +233,7 @@ static NO_USAGE: sidebar::Usage = sidebar::Usage::new();
 impl Default for Chrome<'_> {
     fn default() -> Self {
         Chrome {
+            chat_refused: false,
             shut: &NO_SHUT,
             keys: KeyContext::default(),
             usage: &NO_USAGE,
@@ -1478,10 +1481,11 @@ pub fn paint(frame: &Frame) -> String {
                     .0
                     .iter()
                     .any(|w| !w.asleep && Some(w.id) != frame.space),
-                chat: frame
-                    .rows
-                    .iter()
-                    .any(|r| r.terminal == frame.focused && r.agent),
+                chat: !frame.chrome.chat_refused
+                    && frame
+                        .rows
+                        .iter()
+                        .any(|r| r.terminal == frame.focused && r.agent),
             },
             frame.cols as usize,
         ))),

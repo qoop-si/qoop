@@ -350,6 +350,7 @@ fn mark_of(status: Status) -> (&'static str, &'static str, Role) {
         Status::Failed => ("\u{25c6}", "failed", Role::Failed),
         Status::Interrupted => ("~", "interrupted", Role::Detail),
         Status::Rejected => ("x", "rejected", Role::Detail),
+        Status::Unknown => ("?", "unknown", Role::Detail),
     }
 }
 
@@ -487,6 +488,11 @@ pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
                 (Kind::Step, vec![dim_row(&format!("{kind}: {text}"), cols)])
             }
             Item::Compaction { .. } => (Kind::Step, vec![dim_row("context compacted", cols)]),
+            // A kind of row a newer daemon sent: said, never dropped, so the page stays whole.
+            Item::Unknown => (
+                Kind::Step,
+                vec![dim_row("item this build cannot show", cols)],
+            ),
             _ => continue,
         };
         if !rows.is_empty() {
@@ -619,6 +625,18 @@ pub fn snapshot(rows: &[StyledRow], cols: usize) -> SnapshotWire {
 
 /// How long typing keeps a tab on its terminal when no Enter or Esc comes.
 const TYPING_FOR: Duration = Duration::from_secs(30);
+/// The first page and the least a refresh asks for; the most is `MAX_PAGE`, so history the
+/// reader has scrolled to survives a refresh.
+const PAGE: u32 = 60;
+const MAX_PAGE: u32 = 200;
+/// News is read after this, so a burst of appends is one read.
+const DEBOUNCE: Duration = Duration::from_millis(250);
+/// The daemon forgets a terminal nobody asked about for 30 s: ask again before that.
+const KEEPALIVE: Duration = Duration::from_secs(20);
+/// Between reads of a session the agent has not named yet.
+const RETRY: Duration = Duration::from_secs(3);
+/// A read with no answer for this long is taken as lost.
+const LOST: Duration = Duration::from_secs(10);
 
 /// A program name as the memory file holds it: one short line of printable characters.
 fn program_line(line: &str) -> Option<String> {
@@ -656,8 +674,37 @@ pub struct ChatState {
     asked: BTreeSet<u32>,
     /// Terminals whose digest just grew at the top, which moves no row the reader sees.
     prepended: BTreeSet<u32>,
+    /// What to ask the daemon for, per flagged terminal.
+    feeds: BTreeMap<u32, Feed>,
+    /// The flagged terminals that are on screen.
+    screen: BTreeSet<u32>,
+    /// Terminals the daemon would not serve (not an agent, no such terminal, too large).
+    refused: BTreeSet<u32>,
     #[cfg(test)]
     layouts: usize,
+}
+
+/// The reads of one terminal's chat.
+#[derive(Default)]
+struct Feed {
+    /// A newest-page read is out, since when.
+    out: Option<Instant>,
+    /// When the next read was asked to happen: the debounce after news, or a retry.
+    due: Option<Instant>,
+    /// News came while a read was out: one more read follows its answer.
+    stale: bool,
+    last_read: Option<Instant>,
+}
+
+/// One `Messages` request to send.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub terminal: u32,
+    pub skip: u32,
+    pub limit: u32,
+    pub revision: Option<u64>,
+    /// A page of older items, put in front, and not the newest page.
+    pub older: bool,
 }
 
 struct Shown {
@@ -822,6 +869,8 @@ impl ChatState {
         self.typing.remove(&terminal);
         self.asked.remove(&terminal);
         self.prepended.remove(&terminal);
+        self.feeds.remove(&terminal);
+        self.refused.remove(&terminal);
     }
 
     /// Flip the switch of `terminal` and remember it for its program. Answers the new state.
@@ -833,10 +882,207 @@ impl ChatState {
         }
         self.scroll.remove(&terminal);
         self.typing.remove(&terminal);
+        self.feeds.remove(&terminal);
+        self.refused.remove(&terminal);
         if let Some(program) = program {
             self.remember(program, on);
         }
         on
+    }
+
+    // The producer: what to ask the daemon for, and what its answers do. Pure, so the loop
+    // only sends what `plan` returns and hands back what comes. Never blocks, never parses.
+
+    /// The flagged terminals that are on screen: only those are kept fresh while they idle.
+    pub fn set_screen(&mut self, on_screen: BTreeSet<u32>) {
+        self.screen = on_screen;
+    }
+
+    /// When the next page is due for `terminal`, if one is: a first read at once, a read
+    /// that news or a retry asked for, or the keepalive of one on screen. Nothing while a
+    /// request is out.
+    fn due_at(&self, terminal: u32, now: Instant) -> Option<Instant> {
+        let Some(feed) = self.feeds.get(&terminal) else {
+            return Some(now);
+        };
+        if feed.out.is_some() {
+            return None;
+        }
+        let keepalive = feed
+            .last_read
+            .filter(|_| self.screen.contains(&terminal))
+            .map(|read| read + KEEPALIVE);
+        [feed.due, keepalive]
+            .into_iter()
+            .flatten()
+            .min()
+            .or(match feed.last_read {
+                None => Some(now),
+                Some(_) => None,
+            })
+    }
+
+    /// When the loop must look again: the soonest due read of a flagged terminal.
+    pub fn wake_at(&self, now: Instant) -> Option<Instant> {
+        self.on
+            .iter()
+            .filter_map(|t| match self.feeds.get(t).and_then(|feed| feed.out) {
+                // A read out is waited for, until it is taken as lost.
+                Some(out) => Some(out + LOST + Duration::from_millis(1)),
+                None => self.due_at(*t, now),
+            })
+            .min()
+    }
+
+    /// The requests to send now. One newest-page read in flight per terminal, the latest
+    /// news wins; a page of older items when the reader is at the top of what is held.
+    /// Nothing for a terminal whose flag is off.
+    pub fn plan(&mut self, now: Instant) -> Vec<Request> {
+        let mut out = Vec::new();
+        for terminal in self.on.iter().copied().collect::<Vec<_>>() {
+            let feed = self.feeds.entry(terminal).or_default();
+            if feed
+                .out
+                .is_some_and(|at| now.saturating_duration_since(at) > LOST)
+            {
+                feed.out = None;
+            }
+            if self.due_at(terminal, now).is_some_and(|at| at <= now) {
+                let held = self
+                    .digests
+                    .get(&terminal)
+                    .map_or(0, |(_, d)| d.items.len());
+                let revision = self.digests.get(&terminal).map(|(_, d)| d.revision);
+                let feed = self.feeds.entry(terminal).or_default();
+                feed.out = Some(now);
+                feed.due = None;
+                feed.stale = false;
+                out.push(Request {
+                    terminal,
+                    skip: 0,
+                    limit: held.clamp(PAGE as usize, MAX_PAGE as usize) as u32,
+                    revision,
+                    older: false,
+                });
+            }
+            if let Some(skip) = self.wants_older(terminal) {
+                let revision = self.digests.get(&terminal).map(|(_, d)| d.revision);
+                out.push(Request {
+                    terminal,
+                    skip: skip as u32,
+                    limit: PAGE,
+                    revision,
+                    older: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// News that the session of `terminal` changed. Read again after the debounce, once:
+    /// news while a read is out is answered by one more read after it.
+    pub fn changed(&mut self, terminal: u32, now: Instant) {
+        if !self.on.contains(&terminal) {
+            return;
+        }
+        let feed = self.feeds.entry(terminal).or_default();
+        if feed.out.is_some() {
+            feed.stale = true;
+        } else if feed.due.is_none_or(|at| at > now + DEBOUNCE) {
+            feed.due = Some(now + DEBOUNCE);
+        }
+    }
+
+    /// A page the daemon sent for `terminal`: `older` for the one asked at the top of the
+    /// chat, else the newest. Either replaces or extends what is held (`set_digest`,
+    /// `set_older`), and `reset` needs nothing more: both take a page of another revision
+    /// as the whole.
+    pub fn answered(&mut self, terminal: u32, older: bool, page: Digest, now: Instant) {
+        if !self.on.contains(&terminal) {
+            return;
+        }
+        if older {
+            return self.set_older(terminal, page);
+        }
+        let feed = self.feeds.entry(terminal).or_default();
+        feed.out = None;
+        feed.last_read = Some(now);
+        if std::mem::take(&mut feed.stale) {
+            feed.due = Some(now + DEBOUNCE);
+        }
+        self.refused.remove(&terminal);
+        self.set_digest(terminal, page);
+    }
+
+    /// The daemon refused a read of `terminal` with `reason`. Answers what to tell the
+    /// person when that ends the chat for the tab; `None` when it only waits.
+    pub fn refused(
+        &mut self,
+        terminal: u32,
+        older: bool,
+        reason: &str,
+        now: Instant,
+    ) -> Option<&'static str> {
+        if !self.on.contains(&terminal) {
+            return None;
+        }
+        // An older page that finds no session is not asked again until a newer read lands.
+        if older && reason != "no_session" {
+            self.asked.remove(&terminal);
+        }
+        match reason {
+            // The agent has not said which session it is in yet: ask again.
+            "no_session" => {
+                let feed = self.feeds.entry(terminal).or_default();
+                if !older {
+                    feed.out = None;
+                    feed.due = Some(now + RETRY);
+                }
+                None
+            }
+            "too_large" => Some(self.give_up(
+                terminal,
+                "this session is too large for chat, use the terminal",
+            )),
+            "not_agent" => Some(self.give_up(terminal, "chat is for agent tabs")),
+            _ => Some(self.give_up(terminal, "chat is not available for this tab")),
+        }
+    }
+
+    /// A daemon too old to know `Messages` answers with no id: every read in flight was its.
+    /// Answers the terminals that gave up.
+    pub fn unsupported(&mut self) -> Vec<u32> {
+        let asked: Vec<u32> = self
+            .feeds
+            .iter()
+            .filter(|(_, feed)| feed.out.is_some())
+            .map(|(t, _)| *t)
+            .chain(self.asked.iter().copied())
+            .collect();
+        for terminal in &asked {
+            self.give_up(*terminal, "");
+        }
+        asked
+    }
+
+    /// The flag goes off for `terminal` because the daemon will not serve it. Not the
+    /// person's choice, so the program's memory is left alone.
+    fn give_up(&mut self, terminal: u32, said: &'static str) -> &'static str {
+        self.on.remove(&terminal);
+        self.digests.remove(&terminal);
+        self.scroll.remove(&terminal);
+        self.shown.remove(&terminal);
+        self.typing.remove(&terminal);
+        self.asked.remove(&terminal);
+        self.prepended.remove(&terminal);
+        self.feeds.remove(&terminal);
+        self.refused.insert(terminal);
+        said
+    }
+
+    /// Whether the daemon refused to serve `terminal`: the key row stops offering the switch.
+    pub fn is_refused(&self, terminal: u32) -> bool {
+        self.refused.contains(&terminal)
     }
 
     /// Put `program` in or out of the memory file. The file is read again first and only this
@@ -2038,5 +2284,246 @@ mod tests {
         assert_eq!(chat.flips(set(&[2])), set(&[2]));
         assert!(chat.flips(set(&[2])).is_empty());
         assert_eq!(chat.flips(set(&[3])), set(&[2, 3]));
+    }
+
+    #[test]
+    fn a_kind_this_build_does_not_know_is_one_dim_row_and_the_page_stays_whole() {
+        let items = [agent("before"), Item::Unknown, agent("after")];
+        let rows = layout(&items, 40);
+        let got: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            got,
+            ["before", "", "item this build cannot show", "", "after"]
+        );
+        assert_eq!(style_at(&rows[2], 0).role, Role::Detail);
+        let unknown = tool("Bash", "make", Status::Unknown, None);
+        let row = &layout(&[unknown], 40)[0];
+        assert_eq!(row.text, "? unknown Bash make");
+        assert_eq!(style_at(row, 0).role, Role::Detail);
+    }
+
+    fn on(chat: &mut ChatState, terminal: u32) {
+        chat.toggle(terminal, None);
+    }
+
+    fn page(revision: u64, items: Vec<Item>) -> Digest {
+        Digest {
+            revision,
+            first_seq: 0,
+            has_older: false,
+            items,
+            warnings: 0,
+        }
+    }
+
+    #[test]
+    fn the_first_read_goes_at_once_one_at_a_time_and_never_for_a_flag_that_is_off() {
+        let now = Instant::now();
+        let mut chat = ChatState::default();
+        assert!(chat.plan(now).is_empty(), "no flag, no request");
+        assert_eq!(chat.wake_at(now), None);
+        on(&mut chat, 3);
+        assert_eq!(chat.wake_at(now), Some(now));
+        assert_eq!(
+            chat.plan(now),
+            [Request {
+                terminal: 3,
+                skip: 0,
+                limit: 60,
+                revision: None,
+                older: false
+            }]
+        );
+        // Out: nothing again, however long, until it is taken as lost.
+        assert!(chat.plan(now + Duration::from_secs(5)).is_empty());
+        assert_eq!(chat.plan(now + Duration::from_secs(11)).len(), 1);
+        chat.toggle(3, None);
+        assert!(chat.plan(now + Duration::from_secs(60)).is_empty());
+        assert_eq!(chat.wake_at(now), None);
+    }
+
+    #[test]
+    fn a_refresh_asks_for_what_is_held_so_loaded_history_survives_it() {
+        let now = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(now);
+        for (held, want) in [(3u32, 60u32), (100, 100), (250, 200)] {
+            chat.answered(3, false, page(7, numbered(held)), now);
+            chat.changed(3, now);
+            let asks = chat.plan(now + DEBOUNCE);
+            assert_eq!(asks.len(), 1, "{held}");
+            assert_eq!(asks[0].limit, want, "{held}");
+            assert_eq!(asks[0].revision, Some(7));
+            assert_eq!(asks[0].skip, 0);
+        }
+    }
+
+    #[test]
+    fn news_is_read_after_the_debounce_once_and_the_latest_wins() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(t0);
+        chat.answered(3, false, page(1, numbered(2)), t0);
+        assert_eq!(chat.wake_at(t0), None, "quiet, and not on screen");
+
+        chat.changed(3, t0 + Duration::from_millis(10));
+        chat.changed(3, t0 + Duration::from_millis(100));
+        assert_eq!(chat.wake_at(t0), Some(t0 + Duration::from_millis(260)));
+        assert!(chat.plan(t0 + Duration::from_millis(200)).is_empty());
+        assert_eq!(chat.plan(t0 + Duration::from_millis(260)).len(), 1);
+
+        // News while that read is out: one more read after its answer, not a second in flight.
+        chat.changed(3, t0 + Duration::from_millis(300));
+        chat.changed(3, t0 + Duration::from_millis(310));
+        assert!(chat.plan(t0 + Duration::from_secs(1)).is_empty());
+        let answered = t0 + Duration::from_millis(1200);
+        chat.answered(3, false, page(2, numbered(3)), answered);
+        assert!(chat.plan(answered + Duration::from_millis(100)).is_empty());
+        assert_eq!(chat.plan(answered + DEBOUNCE).len(), 1);
+
+        // News for a terminal that is not flagged is nothing.
+        chat.changed(9, t0);
+        assert!(!chat.feeds.contains_key(&9));
+    }
+
+    #[test]
+    fn a_chat_on_screen_is_read_again_before_the_daemon_forgets_it() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        on(&mut chat, 4);
+        chat.plan(t0);
+        for t in [3, 4] {
+            chat.answered(t, false, page(1, numbered(2)), t0);
+        }
+        chat.set_screen([3].into());
+        assert!(chat.plan(t0 + Duration::from_secs(19)).is_empty());
+        let asks = chat.plan(t0 + Duration::from_secs(20));
+        assert_eq!(asks.iter().map(|a| a.terminal).collect::<Vec<_>>(), [3]);
+        // Terminal 4 was never on screen: it is read when it comes on screen after a while.
+        chat.set_screen([3, 4].into());
+        assert_eq!(
+            chat.wake_at(t0 + Duration::from_secs(30)),
+            Some(t0 + Duration::from_secs(20))
+        );
+        let asks = chat.plan(t0 + Duration::from_secs(30));
+        assert_eq!(asks.iter().map(|a| a.terminal).collect::<Vec<_>>(), [4]);
+    }
+
+    #[test]
+    fn no_session_waits_three_seconds_and_keeps_the_flag() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(t0);
+        assert_eq!(chat.refused(3, false, "no_session", t0), None);
+        assert!(chat.wants_digest(3) && !chat.is_refused(3));
+        assert!(chat.plan(t0 + Duration::from_secs(2)).is_empty());
+        assert_eq!(chat.plan(t0 + Duration::from_secs(3)).len(), 1);
+        // And again, for as long as the flag is on.
+        chat.refused(3, false, "no_session", t0 + Duration::from_secs(3));
+        assert_eq!(chat.plan(t0 + Duration::from_secs(6)).len(), 1);
+    }
+
+    #[test]
+    fn a_refusal_that_will_not_pass_turns_the_flag_off_and_says_why() {
+        let t0 = Instant::now();
+        for (reason, said) in [
+            ("not_agent", "chat is for agent tabs"),
+            ("unavailable", "chat is not available for this tab"),
+            ("whatever_else", "chat is not available for this tab"),
+            (
+                "too_large",
+                "this session is too large for chat, use the terminal",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("interface-chat");
+            let mut chat = ChatState::read(Some(file.clone()));
+            chat.toggle(3, Some("claude"));
+            chat.plan(t0);
+            assert_eq!(chat.refused(3, false, reason, t0), Some(said), "{reason}");
+            assert!(!chat.wants_digest(3) && chat.is_refused(3), "{reason}");
+            assert!(
+                chat.plan(t0 + Duration::from_secs(60)).is_empty(),
+                "{reason}"
+            );
+            // The program's memory is the person's choice, not the daemon's.
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "claude\n",
+                "{reason}"
+            );
+            // The person asking again is a fresh try.
+            chat.toggle(3, Some("claude"));
+            assert!(!chat.is_refused(3) && chat.wants_digest(3));
+        }
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_messages_ends_what_was_asked_of_it() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        on(&mut chat, 4);
+        chat.plan(t0);
+        chat.answered(4, false, page(1, numbered(2)), t0);
+        chat.changed(4, t0);
+        chat.plan(t0 + DEBOUNCE);
+        let mut gone = chat.unsupported();
+        gone.sort();
+        assert_eq!(gone, [3, 4]);
+        assert!(!chat.wants_digest(3) && !chat.wants_digest(4));
+        assert!(chat.is_refused(3) && chat.is_refused(4));
+        assert!(chat.unsupported().is_empty());
+    }
+
+    #[test]
+    fn the_older_page_is_asked_at_the_top_with_the_items_held_as_skip_and_put_in_front() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(t0);
+        chat.answered(
+            3,
+            false,
+            Digest {
+                has_older: true,
+                ..page(5, numbered(10))
+            },
+            t0,
+        );
+        chat.render(&[want(3, 10, 5)]);
+        assert!(chat.plan(t0).is_empty(), "at the bottom");
+        chat.scroll_by(3, true, 1000);
+        let asks = chat.plan(t0);
+        assert_eq!(
+            asks,
+            [Request {
+                terminal: 3,
+                skip: 10,
+                limit: 60,
+                revision: Some(5),
+                older: true
+            }]
+        );
+        assert!(chat.plan(t0).is_empty(), "asked once");
+        let older: Vec<Item> = (0..4).map(|n| agent(&format!("old{n}"))).collect();
+        chat.answered(3, true, page(5, older), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 14);
+        assert!(chat.plan(t0).is_empty(), "nothing older is left");
+    }
+
+    #[test]
+    fn an_answer_for_a_flag_that_went_off_is_dropped() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(t0);
+        chat.toggle(3, None);
+        chat.answered(3, false, page(1, numbered(2)), t0);
+        assert!(!chat.has_view(3) && chat.digests.is_empty());
     }
 }
