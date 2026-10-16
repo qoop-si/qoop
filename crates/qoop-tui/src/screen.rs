@@ -354,33 +354,39 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("?", Some("keys"), 4),
             ("d", Some("detach"), 0),
         ],
+        // Grouped as the keys box groups them, under the same names, so the row and the
+        // box teach one vocabulary. Within a group the most used comes first.
         KeyContext::Prefix => &[
-            ("n", Some("next"), 1),
-            ("p", Some("prev"), 3),
-            ("o", Some("next pane"), 3),
+            ("tab", None, 0),
             ("c", Some("new"), 1),
+            ("n/p", Some("next/prev"), 1),
             ("x", Some("close"), 2),
+            ("T", Some("fold pane"), 2),
+            ("i", Some("questions"), 3),
             ("r", Some("rename"), 4),
-            ("v", Some("split \u{2502}"), 4),
-            ("-", Some("split \u{2500}"), 4),
-            ("z", Some("zoom"), 5),
-            ("[", Some("copy"), 5),
+            ("1..9", Some("go to"), 6),
+            ("pane", None, 0),
+            ("v/-", Some("split"), 2),
+            ("o", Some("next"), 3),
+            ("z", Some("zoom"), 4),
+            ("[", Some("copy"), 4),
             ("e", Some("resize"), 6),
             ("=", Some("equalize"), 7),
-            ("s", Some("space"), 3),
-            ("w", Some("new space"), 5),
-            ("R", Some("space settings"), 6),
-            ("W", Some("close space"), 7),
-            ("Z", Some("sleep"), 7),
-            ("space", Some("find"), 1),
+            ("space", None, 0),
+            ("s/S", Some("next/prev"), 2),
+            ("w", Some("new"), 5),
             ("f", Some("fold"), 5),
-            ("F", Some("focus"), 5),
-            ("g", Some("view"), 6),
+            ("R", Some("settings"), 6),
+            ("Z", Some("sleep"), 7),
+            ("W", Some("close empty"), 8),
+            ("general", None, 0),
+            ("space", Some("find"), 1),
             ("m", Some("menu"), 4),
+            ("F", Some("focus"), 6),
             ("M", Some("last answer"), 6),
-            ("T", Some("fold"), 6),
-            ("?", Some("keys"), 2),
-            ("U", Some("update"), 7),
+            ("g", Some("tree/priority"), 7),
+            ("U", Some("update"), 8),
+            ("?", Some("keys"), 1),
             ("d", Some("detach"), 0),
         ],
     }
@@ -393,14 +399,35 @@ pub struct Place {
     pub fold: bool,
     /// The column is folded away to its strip.
     pub collapsed: bool,
+    /// The tab the keyboard is in is split, zoomed or not, so the pane keys do something.
+    pub panes: bool,
+    /// qass's screen or its split tab: its questions open and its box zooms.
+    pub qass: bool,
+    /// qass's split tab with the board, the one place its pane folds.
+    pub qass_split: bool,
+    /// Another space awake in the column, so `s` has somewhere to go.
+    pub spaces: bool,
 }
 
-/// The entries that are true right now: no fold where nothing folds, no divider to drag on
-/// the strip, and the strip's `b` shows the column rather than hiding it.
+/// Keys that do nothing in some places, and the fact that makes them work.
+fn works(key: &str, place: Place) -> bool {
+    match key {
+        "f" => place.fold,
+        "T" => place.qass_split,
+        "i" => place.qass,
+        "z" => place.panes || place.qass,
+        "o" | "e" | "=" => place.panes,
+        "s/S" => place.spaces,
+        _ => true,
+    }
+}
+
+/// The entries that are true right now: no key that would do nothing here, no divider to
+/// drag on the strip, and the strip's `b` shows the column rather than hiding it.
 fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
     all_hints(context)
         .iter()
-        .filter(|h| place.fold || h.1 != Some("fold"))
+        .filter(|h| h.1.is_none() || works(h.0, place))
         .filter(|h| !place.collapsed || h.0 != "drag edge")
         .map(|h| {
             if place.collapsed && h.1 == Some("hide column") {
@@ -411,10 +438,33 @@ fn hints(context: KeyContext, place: Place) -> Vec<Hint> {
         })
         .collect()
 }
-/// The columns one entry takes: ` [key→action]`, or ` label` for the prefix.
+
+/// Drop each label with no key left after it: a group's name goes with its last key.
+fn without_empty_labels(hints: &mut Vec<Hint>) {
+    let mut at = 0;
+    while at < hints.len() {
+        let empty = hints[at].1.is_none() && hints.get(at + 1).is_none_or(|next| next.1.is_none());
+        if empty {
+            hints.remove(at);
+        } else {
+            at += 1;
+        }
+    }
+}
+
+/// The ink of a label that names a group of the keys box, which also sets it a step apart.
+fn group_ink(label: &str) -> Option<usize> {
+    KEY_GROUPS
+        .iter()
+        .find(|group| group.0 == label)
+        .map(|group| group.1)
+}
+
+/// The columns one entry takes: ` [key→action]`, ` label` for the prefix, `  group`.
 fn hint_width(hint: &Hint) -> usize {
     match hint.1 {
         Some(action) => 4 + width::width(hint.0) + width::width(action),
+        None if group_ink(hint.0).is_some() => 2 + width::width(hint.0),
         None => 1 + width::width(hint.0),
     }
 }
@@ -423,6 +473,7 @@ fn hint_width(hint: &Hint) -> usize {
 /// before the earliest, and rank zero never goes, so the way out is always on the row.
 fn fitted(context: KeyContext, place: Place, cols: usize) -> Vec<Hint> {
     let mut kept: Vec<Hint> = hints(context, place);
+    without_empty_labels(&mut kept);
     while kept.iter().map(hint_width).sum::<usize>() > cols {
         let Some(worst) = kept
             .iter()
@@ -434,6 +485,7 @@ fn fitted(context: KeyContext, place: Place, cols: usize) -> Vec<Hint> {
             break;
         };
         kept.remove(worst);
+        without_empty_labels(&mut kept);
     }
     // Still too wide with only what never goes: the prefix label gives way to the way out.
     if kept.iter().map(hint_width).sum::<usize>() > cols {
@@ -457,8 +509,12 @@ fn key_row(context: KeyContext, place: Place, cols: usize) -> String {
         used += wide;
         match hint.1 {
             None => {
-                out.push_str(&theme::status_in(theme::Role::Faint));
-                out.push(' ');
+                // A group's name wears its ink from the keys box; the prefix label is faint.
+                let ink = group_ink(hint.0);
+                out.push_str(&theme::status_in(
+                    ink.map_or(theme::Role::Faint, theme::Role::Space),
+                ));
+                out.push_str(if ink.is_some() { "  " } else { " " });
                 out.push_str(hint.0);
             }
             Some(action) => {
@@ -1404,6 +1460,18 @@ pub fn paint(frame: &Frame) -> String {
             Place {
                 fold: frame.view == sidebar::View::Tree,
                 collapsed: frame.collapsed,
+                panes: {
+                    let tab = tab_of(frame.focused, &frame.panes);
+                    frame.panes.values().any(|&of| of == tab)
+                },
+                qass: frame.chrome.qass.is_some(),
+                qass_split: frame.chrome.fold.is_some(),
+                // The way `s` walks: the column's spaces, qass's own left out, the asleep
+                // skipped.
+                spaces: sidebar::shown(frame.spaces, frame.rows)
+                    .0
+                    .iter()
+                    .any(|w| !w.asleep && Some(w.id) != frame.space),
             },
             frame.cols as usize,
         ))),
@@ -5644,7 +5712,9 @@ mod tests {
     fn the_key_row_follows_the_keyboard_and_keeps_the_way_out() {
         let open = Place {
             fold: true,
-            collapsed: false,
+            panes: true,
+            spaces: true,
+            ..Place::default()
         };
         let plain = |context, cols| strip(&key_row(context, open, cols));
         let pane = plain(KeyContext::Pane, 200);
@@ -5678,8 +5748,8 @@ mod tests {
         );
         // Where nothing folds the row offers no fold, and the strip has no edge to drag.
         let strip_place = Place {
-            fold: false,
             collapsed: true,
+            ..Place::default()
         };
         let strip_row = strip(&key_row(KeyContext::Sidebar, strip_place, 200));
         assert!(!strip_row.contains("fold"), "{strip_row:?}");
@@ -5688,6 +5758,59 @@ mod tests {
             strip_row.contains("[b\u{2192}show column]"),
             "{strip_row:?}"
         );
+    }
+    /// While `ctrl-a` waits the row reads in the keys box's groups, offers no key that
+    /// would do nothing here, and a group whose keys all went takes its name with it.
+    #[test]
+    fn the_prefix_row_is_grouped_and_offers_only_what_works_here() {
+        let row = |place, cols| strip(&key_row(KeyContext::Prefix, place, cols));
+        let one = row(Place::default(), 400);
+        let tab = one.find("  tab [c\u{2192}new]").expect(&one);
+        let pane = one.find("  pane [v/-\u{2192}split]").expect(&one);
+        let space = one.find("  space [w\u{2192}new]").expect(&one);
+        let general = one.find("  general [space\u{2192}find]").expect(&one);
+        assert!(tab < pane && pane < space && space < general, "{one:?}");
+        // One pane, one space, off qass's tab, priority view: nothing that would be refused.
+        for gone in ["[T", "[i", "[z", "[o", "[e", "[=", "[s/S", "[f\u{2192}"] {
+            assert!(
+                !one.contains(gone),
+                "{gone} offered where it does nothing: {one:?}"
+            );
+        }
+        let all = row(
+            Place {
+                fold: true,
+                panes: true,
+                qass: true,
+                qass_split: true,
+                spaces: true,
+                ..Place::default()
+            },
+            400,
+        );
+        for there in [
+            "[T\u{2192}fold pane]",
+            "[z\u{2192}zoom]",
+            "[s/S\u{2192}next/prev]",
+            "[f\u{2192}fold]",
+        ] {
+            assert!(all.contains(there), "{there} missing: {all:?}");
+        }
+        // Short rows drop keys, never leave a name with nothing after it.
+        let names = ["tab", "pane", "space", "general"];
+        for cols in [40usize, 60, 80, 100, 120, 160] {
+            let short = row(Place::default(), cols);
+            let words: Vec<&str> = short.split_whitespace().collect();
+            for (at, word) in words.iter().enumerate() {
+                if names.contains(word) {
+                    let next = words.get(at + 1).copied().unwrap_or("");
+                    assert!(
+                        next.starts_with('['),
+                        "{word} with no key at {cols}: {short:?}"
+                    );
+                }
+            }
+        }
     }
     /// The way out is the one key a person stuck in here has to be able to read, so it is
     /// never the one the cut takes.
