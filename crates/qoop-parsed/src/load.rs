@@ -17,6 +17,11 @@ pub const MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 /// The widest tail window a page may read.
 pub const MAX_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The deepest `skip` a page honours. A client that holds this many items has the chat as far
+/// back as it will show; asking for more is clamped, so a hostile `u32::MAX` cannot widen the
+/// parse to the whole file.
+pub const MAX_SKIP: usize = 5000;
+
 /// How far into a file to look for its first record.
 const HEAD_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -28,8 +33,8 @@ pub struct Options {
     pub max_tail_bytes: u64,
     /// Most items returned (default 60).
     pub limit: usize,
-    /// How many items, counted from the newest, the caller already holds. The page is the
-    /// next `limit` items older than those. The cursor is this count plus the `revision` the
+    /// How many items, counted from the newest, the caller already holds (at most
+    /// [`MAX_SKIP`]). The page is the next `limit` items older than those. The cursor is this count plus the `revision` the
     /// caller got: when the revision differs the file changed and the caller starts again at 0.
     pub skip: usize,
     /// Response budget in bytes (default 256 KiB); the oldest items of the page go first.
@@ -74,8 +79,18 @@ impl From<agentparse::Error> for Error {
     }
 }
 
+/// The revision [`load`] would report now, from a stat alone: no parse. `Error::TooLarge`
+/// for a session [`load`] would refuse, `Error::NotFound` when the file is gone.
+pub fn revision_of(source: &Source) -> Result<u64, Error> {
+    stamp(source).map(|s| s.revision)
+}
+
 /// Read one page of a session's items: the `limit` before the newest `skip`.
 pub fn load(source: &Source, opts: &Options) -> Result<Digest, Error> {
+    let opts = &Options {
+        skip: opts.skip.min(MAX_SKIP),
+        ..opts.clone()
+    };
     // Stat once: the revision, the cut decision and the parse window all use this length. A
     // file that grows while it is parsed then shows a revision older than what was read, so
     // the next poll refetches rather than misses.
@@ -241,7 +256,13 @@ fn len_and_mtime(path: &Path) -> Result<(u64, u64), Error> {
     Ok((meta.len(), nanos as u64))
 }
 
+/// The widest revision there is: 53 bits, the integers a JavaScript number (the phone) holds
+/// exactly. A wider one would come back from the phone rounded, differ from the current one,
+/// and make every older-page request a reset.
+pub const REVISION_MASK: u64 = (1 << 53) - 1;
+
 /// FNV-1a over the little-endian bytes: stable across runs and Rust versions, unlike `Hasher`.
+/// Masked to [`REVISION_MASK`] by the last step, so every revision is exact in an `f64`.
 fn fnv(values: &[u64]) -> u64 {
     values
         .iter()
@@ -249,13 +270,18 @@ fn fnv(values: &[u64]) -> u64 {
         .fold(0xcbf29ce484222325, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
         })
+        & REVISION_MASK
 }
 
 /// The page asked for: skip the newest `skip` items, take the `limit` before them, keep the
 /// newest of those that fit the byte budget. `more_before_window` is true when the window
 /// starts inside the file. Returns `(first_seq, has_older, items)`.
 fn page(mut items: Vec<Item>, more_before_window: bool, opts: &Options) -> (u32, bool, Vec<Item>) {
-    items.truncate(items.len().saturating_sub(opts.skip));
+    // Past the oldest item there is no page, and nothing older to point at.
+    if opts.skip >= items.len() {
+        return (0, false, Vec::new());
+    }
+    items.truncate(items.len() - opts.skip);
     let mut start = items.len().saturating_sub(opts.limit);
     let mut bytes = 0;
     for (i, item) in items.iter().enumerate().skip(start).rev() {
@@ -295,6 +321,34 @@ mod tests {
         assert!(!cut("claude.jsonl", 1024 * 1024));
         assert!(!cut("gemini/gemini-new-session.jsonl", 1024));
         assert!(!cut("gemini/gemini-old-session.json", 1024));
+    }
+
+    /// A revision travels as a JSON number and the phone reads it as an `f64`: it must come
+    /// back the same, or the phone's cursor is never the current revision.
+    #[test]
+    fn a_revision_is_below_two_to_the_53_and_survives_an_f64() {
+        let mut seen = std::collections::HashSet::new();
+        let stamps = (0..2000u64).flat_map(|n| {
+            [
+                vec![n * 7919, 1_700_000_000_000_000_000 + n * 1_000_003],
+                vec![u64::MAX - n, u64::MAX / 3 + n, n, u64::MAX - 2 * n],
+            ]
+        });
+        for stamp in stamps {
+            let revision = fnv(&stamp);
+            assert!(revision <= REVISION_MASK, "{revision}");
+            let json = serde_json::to_string(&revision).unwrap();
+            let back = json.parse::<f64>().unwrap();
+            assert_eq!(back as u64, revision, "{json}");
+            assert_eq!(back, revision as f64);
+            seen.insert(revision);
+        }
+        // Masking keeps the hash useful: stamps that differ still mostly differ.
+        assert!(seen.len() > 3990, "{}", seen.len());
+        // The ones a real file and an OpenCode database give.
+        let path = fixture("claude.jsonl");
+        let revision = stamp(&Source::File(path)).unwrap().revision;
+        assert!(revision <= REVISION_MASK);
     }
 
     #[test]

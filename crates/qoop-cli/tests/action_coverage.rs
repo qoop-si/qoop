@@ -324,6 +324,29 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "read the chat of an agent, from `qoop messages`",
+            method: || {
+                Method::Control(ControlRequest::Messages {
+                    id: "a".into(),
+                    terminal: 1,
+                    skip: 0,
+                    limit: 60,
+                    revision: None,
+                })
+            },
+        },
+        Action {
+            name: "open one tool call of an agent's chat, from `qoop messages detail`",
+            method: || {
+                Method::Control(ControlRequest::MessageDetail {
+                    id: "a".into(),
+                    terminal: 1,
+                    tool_id: "t".into(),
+                    max_bytes: None,
+                })
+            },
+        },
+        Action {
             name: "search the history from copy mode",
             method: || {
                 Method::Control(ControlRequest::SearchScrollback {
@@ -672,6 +695,19 @@ fn every_control_method_is_reachable_from_some_action() {
             from: 0,
             backward: false,
         },
+        ControlRequest::Messages {
+            id: String::new(),
+            terminal: 0,
+            skip: 0,
+            limit: 0,
+            revision: None,
+        },
+        ControlRequest::MessageDetail {
+            id: String::new(),
+            terminal: 0,
+            tool_id: String::new(),
+            max_bytes: None,
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -847,6 +883,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
             | ControlRequest::SearchScrollback { .. }
+            | ControlRequest::Messages { .. }
+            | ControlRequest::MessageDetail { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

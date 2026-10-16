@@ -29,6 +29,7 @@ mod keep;
 // Only the notch, a macOS feature, puts a launchd service back on a replaced binary.
 #[cfg(target_os = "macos")]
 mod launchd;
+mod messages;
 mod mirror;
 mod notch;
 mod onboard;
@@ -180,6 +181,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("prompt") => run_prompt(&args),
         Some("history") => run_history(&args),
         Some("context") => run_context(&args),
+        Some("messages") => messages::run(&args),
         Some("agents") => run_agents(&args),
         Some("focus") => run_focus(&args),
         Some("notch") => notch::run(&args),
@@ -286,6 +288,11 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop history --dir <repo> [--last N] [--json]\n\
                   \x20                 what you typed to your agents in a repo and its\n\
                   \x20                 worktrees (Claude Code, Codex, opencode; not Gemini)\n\
+                  \x20 qoop messages <terminal> [--skip N] [--limit N] [--json]\n\
+                  \x20                 the chat of an agent, parsed from its own session file:\n\
+                  \x20                 one row per message, tool call or note, newest last\n\
+                  \x20 qoop messages detail <terminal> <tool_id> [--json]\n\
+                  \x20                 the input and output of one tool call of that chat\n\
                   \x20 qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
                   \x20                 understand another agent before writing to it:\n\
                   \x20                 who it is, whether it is writable, its live screen\n\

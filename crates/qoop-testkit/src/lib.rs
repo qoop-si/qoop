@@ -347,6 +347,7 @@ impl TestDaemon {
             screens: std::collections::BTreeMap::new(),
             seen: std::collections::BTreeMap::new(),
             delivered: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -371,6 +372,8 @@ pub struct TestClient {
     seen: std::collections::BTreeMap<u32, Vec<String>>,
     /// Every snapshot delivered, in order, across terminals.
     delivered: Vec<SnapshotWire>,
+    /// The daemon's own news, in the order it came.
+    events: Vec<qoop_runtime::control::EventMessage>,
 }
 
 impl TestClient {
@@ -397,6 +400,7 @@ impl TestClient {
             screens: std::collections::BTreeMap::new(),
             seen: std::collections::BTreeMap::new(),
             delivered: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -549,9 +553,49 @@ impl TestClient {
                         }
                     }
                 }
+                qoop_proto::Channel::Event => {
+                    if let Ok(event) = serde_json::from_slice(&frame.body) {
+                        self.events.push(event);
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Wait for a piece of the daemon's news that satisfies `pred`, among what has come and
+    /// what comes within `within`. News is kept, so this answers "did it ever arrive".
+    pub async fn wait_for_event(
+        &mut self,
+        pred: impl Fn(&qoop_runtime::control::EventMessage) -> bool,
+        within: Duration,
+    ) -> Option<qoop_runtime::control::EventMessage> {
+        use tokio::io::AsyncReadExt;
+        let deadline = Instant::now() + within;
+        let mut read = [0u8; 64 * 1024];
+        loop {
+            self.decode_buffered();
+            if let Some(event) = self.events.iter().find(|e| pred(e)) {
+                return Some(event.clone());
+            }
+            let tick = deadline
+                .saturating_duration_since(Instant::now())
+                .min(client::ACK_INTERVAL);
+            if tick.is_zero() {
+                return None;
+            }
+            self.ack_if_due().await;
+            match tokio::time::timeout(tick, self.rd.read(&mut read)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return None,
+                Ok(Ok(n)) => self.inbuf.extend_from_slice(&read[..n]),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Forget the news seen so far, so the next wait is about what comes after.
+    pub fn forget_events(&mut self) {
+        self.events.clear();
     }
 
     /// The terminal this client's unqualified input addresses.

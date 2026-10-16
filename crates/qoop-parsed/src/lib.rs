@@ -18,6 +18,6 @@ mod text;
 
 pub use detail::detail;
 pub use item::{Chip, Detail, Digest, Item, Status};
-pub use load::{Error, Options, load};
-pub use locate::{Dirs, Source, locate_session};
+pub use load::{Error, MAX_SKIP, Options, REVISION_MASK, load, revision_of};
+pub use locate::{Dirs, Source, claude_roots_from_env, claude_transcript, locate_session};
 pub use redact::redact;

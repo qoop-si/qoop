@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Digest {
     /// Changes whenever the session file (opencode: the database or its `-wal`) does: a hash
-    /// of length and modification time. A page cursor (`Options::skip`) is only good for the
-    /// revision it was taken at.
+    /// of length and modification time, below 2^53 so a JavaScript number carries it exactly.
+    /// A page cursor (`Options::skip`) is only good for the revision it was taken at.
     pub revision: u64,
     /// The `seq` of the first item returned (0 when there are none), in this response's window.
     pub first_seq: u32,
@@ -19,7 +19,9 @@ pub struct Digest {
     pub warnings: u32,
 }
 
-/// One row of the chat. `seq` is the item's position in the window that served the response,
+/// One row of the chat. A kind this build does not know (a newer daemon's) reads as
+/// [`Item::Unknown`], so one new variant never makes a client drop the whole page: draw it as
+/// one dim line. `seq` is the item's position in the window that served the response,
 /// counted from the window start (the first item the parser produced from the tail, or from
 /// the whole session when it is read whole). It is not an entry id and not a line number:
 /// those can be absent, synthetic (`ord:n`) or cut in two at a tail start. Use it to order
@@ -79,6 +81,10 @@ pub enum Item {
         kind: String,
         text: String,
     },
+    /// A row of a kind this build does not know. Never produced by the parser: it is what a
+    /// client reads from a newer daemon. It carries nothing, not even a `seq`.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A file or image the user attached: its name and size, never its bytes.
@@ -99,6 +105,9 @@ pub enum Status {
     Interrupted,
     /// Denied by the user or a permission rule.
     Rejected,
+    /// A status this build does not know (a newer daemon's); draw it as no status at all.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The full text of one tool call.
@@ -123,6 +132,7 @@ impl Item {
             | Item::Compaction { seq }
             | Item::Error { seq, .. }
             | Item::Notice { seq, .. } => *seq,
+            Item::Unknown => 0,
         }
     }
 
@@ -141,25 +151,14 @@ impl Item {
             | Item::Compaction { seq }
             | Item::Error { seq, .. }
             | Item::Notice { seq, .. } => *seq = value,
+            Item::Unknown => {}
         }
     }
 
-    /// Bytes the item adds to a response, near enough for a budget.
+    /// Bytes the item adds to a response: its JSON, which is what travels. Counting the text
+    /// alone undercounts a page of quotes and newlines by a fifth or more.
     pub(crate) fn weight(&self) -> usize {
-        const BASE: usize = 48;
-        BASE + match self {
-            Item::User {
-                text, attachments, ..
-            } => text.len() + attachments.iter().map(|c| c.name.len() + 16).sum::<usize>(),
-            Item::Agent { text, model, .. } => text.len() + model.as_ref().map_or(0, String::len),
-            Item::Tool {
-                id, name, summary, ..
-            } => id.len() + name.len() + summary.len(),
-            Item::Subagent { summary, .. } => summary.len(),
-            Item::Error { text, .. } => text.len(),
-            Item::Notice { kind, text, .. } => kind.len() + text.len(),
-            Item::Thinking { text, .. } => text.as_ref().map_or(0, String::len),
-            Item::Compaction { .. } => 0,
-        }
+        // One more for the comma between items.
+        serde_json::to_vec(self).map_or(usize::MAX, |json| json.len() + 1)
     }
 }

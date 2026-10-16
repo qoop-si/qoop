@@ -1287,6 +1287,46 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
+            // The chat is parsed from the agent's own files, so the machine that owns the
+            // terminal answers, in its own numbering.
+            R::Messages {
+                id,
+                terminal,
+                skip,
+                limit,
+                revision,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(
+                    link,
+                    R::Messages {
+                        id,
+                        terminal,
+                        skip,
+                        limit,
+                        revision,
+                    },
+                )
+                .await
+            }
+            R::MessageDetail {
+                id,
+                terminal,
+                tool_id,
+                max_bytes,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(
+                    link,
+                    R::MessageDetail {
+                        id,
+                        terminal,
+                        tool_id,
+                        max_bytes,
+                    },
+                )
+                .await
+            }
             // A history search names a terminal like a scrollback read, and goes where it is.
             R::SearchScrollback {
                 id,
@@ -1605,6 +1645,16 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     on,
                 };
                 let body = serde_json::to_vec(&event).map_err(io::Error::other)?;
+                self.write(Channel::Event, 0, body).await
+            }
+            // Renumbered like a change: a remote's chat of terminal 3 is not the local one's.
+            Incoming::Event(EventMessage::MessagesChanged { terminal, revision }) => {
+                let Some(terminal) = terminal_out(link, terminal) else {
+                    return Ok(());
+                };
+                let body =
+                    serde_json::to_vec(&EventMessage::MessagesChanged { terminal, revision })
+                        .map_err(io::Error::other)?;
                 self.write(Channel::Event, 0, body).await
             }
             Incoming::Event(event) => {
@@ -2555,6 +2605,60 @@ mod tests {
                 row: Some(3),
                 col: 4,
                 resume: None,
+            }
+        );
+    }
+
+    /// The chat of a remote tab is parsed by the machine that owns its session file, so the
+    /// request goes there in its own numbering, and that machine's news of a changed chat
+    /// comes back in the interface's: sent home, the home daemon would read its own disk, and
+    /// left in the remote's numbering the news would be taken for a local tab's.
+    #[tokio::test]
+    async fn the_chat_of_a_remote_tab_is_read_where_the_tab_runs_and_its_news_is_renumbered() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let there = terminal_out(1, 21).expect("fits");
+        let page = |terminal| ControlRequest::Messages {
+            id: "chat-1".into(),
+            terminal,
+            skip: 60,
+            limit: 30,
+            revision: Some(7),
+        };
+        mux.control(page(there)).await.expect("sent");
+        mux.control(ControlRequest::MessageDetail {
+            id: "chat-2".into(),
+            terminal: there,
+            tool_id: "toolu_1".into(),
+            max_bytes: None,
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, page(21));
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert!(
+            matches!(asked, ControlRequest::MessageDetail { terminal: 21, .. }),
+            "{asked:?}"
+        );
+        mux.said(
+            1,
+            Incoming::Event(EventMessage::MessagesChanged {
+                terminal: 21,
+                revision: 9,
+            }),
+        )
+        .await
+        .expect("passed on");
+        let frame = Frame::decode(&mut BytesMut::from(mux.down.as_slice()))
+            .expect("a frame")
+            .expect("whole");
+        let event: EventMessage = serde_json::from_slice(&frame.body).expect("json");
+        assert_eq!(
+            event,
+            EventMessage::MessagesChanged {
+                terminal: there,
+                revision: 9,
             }
         );
     }

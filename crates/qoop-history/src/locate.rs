@@ -56,11 +56,7 @@ impl BaseDirs {
     ) -> Self {
         let absolute =
             |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
-        let mut claude: Vec<PathBuf> = absolute(claude_config_dir)
-            .map(|d| d.join("projects"))
-            .into_iter()
-            .collect();
-        claude.push(home.join(".claude/projects"));
+        let claude = claude_roots(Some(home), claude_config_dir);
         let opencode = absolute(xdg_data_home)
             .map(|d| d.join("opencode/opencode.db"))
             .into_iter()
@@ -73,6 +69,31 @@ impl BaseDirs {
             gemini: home.join(".gemini/tmp"),
         }
     }
+}
+
+/// The directories Claude keeps its projects in: `$CLAUDE_CONFIG_DIR/projects` first, as
+/// Claude reads it, then `~/.claude/projects`. Either may be missing, so a daemon with no
+/// `HOME` and a `CLAUDE_CONFIG_DIR` still finds its transcripts. A relative or empty
+/// `CLAUDE_CONFIG_DIR` is not a directory anyone meant and is ignored.
+pub fn claude_roots(
+    home: Option<&Path>,
+    claude_config_dir: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    claude_config_dir
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|d| d.join("projects"))
+        .into_iter()
+        .chain(home.map(|h| h.join(".claude/projects")))
+        .collect()
+}
+
+/// [`claude_roots`] from this process's environment.
+pub fn claude_roots_from_env() -> Vec<PathBuf> {
+    claude_roots(
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+    )
 }
 
 /// A located transcript: either a file to tail or the opencode database.
@@ -120,7 +141,7 @@ pub fn locate(product: Product, id: &str, dirs: &BaseDirs) -> Result<Located, Er
         });
     }
     match product {
-        Product::Claude => locate_claude(id, dirs),
+        Product::Claude => locate_claude(id, &dirs.claude),
         Product::Codex => locate_codex(id, dirs),
         Product::Opencode => locate_opencode(id, dirs),
         Product::Gemini => locate_gemini(id, dirs),
@@ -139,20 +160,27 @@ pub fn locate(product: Product, id: &str, dirs: &BaseDirs) -> Result<Located, Er
 
 /// `<projects>/<slug>/<id>.jsonl`. The id is the file name, so each project
 /// dir costs one stat and nothing is listed inside it: no cap to trip, however
-/// many projects and transcripts pile up.
-fn locate_claude(id: &str, dirs: &BaseDirs) -> Result<Located, Error> {
-    for base in &dirs.claude {
+/// many projects and transcripts pile up. `roots` are the `projects` directories, in the
+/// order they are tried.
+///
+/// A symlinked project directory or transcript is followed, as Claude itself follows it
+/// (people link `~/.claude/projects/<slug>` to a synced folder), and the id is the guard: it
+/// is checked here, so no `..` can climb out of a project directory. The answer is the
+/// resolved path of a regular file.
+pub fn locate_claude(id: &str, roots: &[PathBuf]) -> Result<Located, Error> {
+    if !valid_id(id) {
+        return Err(Error::BadId { product: "" });
+    }
+    let file = format!("{id}.jsonl");
+    for base in roots {
         let Ok(projects) = std::fs::read_dir(base) else {
             continue;
         };
         for slug in projects.flatten() {
-            let dir = slug.path();
-            if !is_plain_dir(&dir) {
-                continue;
-            }
-            let p = dir.join(format!("{id}.jsonl"));
-            // A link that leaves the base is no match; the next root may still hold the id.
-            if let (true, Ok(real)) = (p.is_file(), checked(&p, base)) {
+            // Resolved only to see that it is a regular file; the answer is that file.
+            if let Ok(real) = slug.path().join(&file).canonicalize()
+                && real.is_file()
+            {
                 return Ok(Located::File(real));
             }
         }
@@ -463,16 +491,72 @@ mod tests {
         );
     }
 
+    /// People link `~/.claude/projects/<slug>` to a synced folder, and a link to one
+    /// transcript works too: Claude follows both, so the resolver does, and the answer is
+    /// still a regular file named by the id.
     #[test]
-    fn a_symlinked_transcript_outside_the_base_is_refused() {
+    fn a_symlinked_project_directory_and_a_symlinked_transcript_are_followed() {
         let dir = tempfile::tempdir().unwrap();
         let dirs = empty_dirs(dir.path());
-        let slug = dirs.claude[0].join("-proj");
+        let projects = &dirs.claude[0];
+        std::fs::create_dir_all(projects).unwrap();
+        let synced = dir.path().join("synced");
+        std::fs::create_dir_all(&synced).unwrap();
+        std::fs::write(synced.join("dir-1.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(&synced, projects.join("-linked")).unwrap();
+        let slug = projects.join("-proj");
         std::fs::create_dir_all(&slug).unwrap();
-        let outside = dir.path().join("secret.jsonl");
-        std::fs::write(&outside, "{}\n").unwrap();
-        std::os::unix::fs::symlink(&outside, slug.join("abc-1.jsonl")).unwrap();
-        assert!(locate(Product::Claude, "abc-1", &dirs).is_err());
+        let elsewhere = dir.path().join("elsewhere.jsonl");
+        std::fs::write(&elsewhere, "{}\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, slug.join("file-1.jsonl")).unwrap();
+        assert_eq!(
+            locate(Product::Claude, "dir-1", &dirs).unwrap(),
+            Located::File(synced.join("dir-1.jsonl").canonicalize().unwrap())
+        );
+        assert_eq!(
+            locate(Product::Claude, "file-1", &dirs).unwrap(),
+            Located::File(elsewhere.canonicalize().unwrap())
+        );
+        // A link to a directory named like a transcript is not one.
+        std::os::unix::fs::symlink(&synced, slug.join("dirlike-1.jsonl")).unwrap();
+        assert!(locate(Product::Claude, "dirlike-1", &dirs).is_err());
+    }
+
+    /// `locate_claude` is public: it checks the id itself, so no caller can climb out of a
+    /// project directory by forgetting to.
+    #[test]
+    fn the_claude_lookup_refuses_an_id_that_climbs_out_of_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(projects.join("-proj")).unwrap();
+        std::fs::write(projects.join("secret.jsonl"), "{}\n").unwrap();
+        let roots = [projects];
+        for id in ["../secret", "..", "a/b", "", "x y", "a\nb"] {
+            assert!(locate_claude(id, &roots).is_err(), "{id:?}");
+        }
+    }
+
+    /// A daemon with no `HOME` and a `CLAUDE_CONFIG_DIR` still finds its transcripts.
+    #[test]
+    fn claude_roots_need_neither_home_nor_config_dir() {
+        let config = tempfile::tempdir().unwrap();
+        let slug = config.path().join("projects/-proj");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("id-1.jsonl"), "{}\n").unwrap();
+        let roots = claude_roots(None, Some(config.path().as_os_str().to_owned()));
+        assert_eq!(roots, vec![config.path().join("projects")]);
+        assert!(locate_claude("id-1", &roots).is_ok());
+        let home = Path::new("/home/x");
+        assert_eq!(
+            claude_roots(Some(home), None),
+            vec![home.join(".claude/projects")]
+        );
+        // A relative value is not a directory anyone meant.
+        assert_eq!(
+            claude_roots(Some(home), Some("rel".into())),
+            vec![home.join(".claude/projects")]
+        );
+        assert!(claude_roots(None, None).is_empty());
     }
 
     #[test]

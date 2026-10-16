@@ -9703,6 +9703,8 @@ where
                             }
                             // The board's news: nothing the index draws.
                             Incoming::Event(EventMessage::TasksChanged) => {}
+                            // The chat view asks for the page again when it shows this terminal.
+                            Incoming::Event(EventMessage::MessagesChanged { .. }) => {}
                             Incoming::Event(EventMessage::Listen { terminal, listener, on }) => {
                                 let now = std::time::Instant::now();
                                 let agent = state.rows.iter().any(|r| r.terminal == terminal && r.agent);

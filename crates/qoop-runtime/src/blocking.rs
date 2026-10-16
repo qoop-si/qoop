@@ -36,6 +36,10 @@ pub enum Pool {
     /// Anything touching a path the user controls: a working directory, a git status, a
     /// directory walk, a capture. This is the one that hangs.
     Probe,
+    /// Reading an agent's session file for a chat view, and the watch over it. Its own, so a
+    /// flood of chat reads or a hung agent directory cannot take a probe thread, and the
+    /// other way round. See [`chat`].
+    Chat,
 }
 
 /// Concurrent jobs per pool.
@@ -46,15 +50,22 @@ pub enum Pool {
 pub const LIFECYCLE_THREADS: usize = 2;
 pub const STORE_THREADS: usize = 2;
 pub const PROBE_THREADS: usize = 4;
+pub const CHAT_THREADS: usize = 2;
 
 /// The most pooled blocking threads the daemon will ever have at once. The one exception
 /// is [`probe_asked`], which runs a check a person is waiting on outside the pool while
 /// the pool is held by stuck probes: one thread per such request, bounded by a person's
 /// pace and by the path degrading after `DEGRADE_AFTER` of them.
-pub const MAX_BLOCKING_THREADS: usize = LIFECYCLE_THREADS + STORE_THREADS + PROBE_THREADS;
+pub const MAX_BLOCKING_THREADS: usize =
+    LIFECYCLE_THREADS + STORE_THREADS + PROBE_THREADS + CHAT_THREADS;
 
 /// How many abandoned probes against one prefix before it is refused outright.
 pub const DEGRADE_AFTER: u64 = 3;
+
+/// How long the chat pool refuses work after [`DEGRADE_AFTER`] deadline misses in a row. Unlike
+/// a prefix it recovers by itself: the chat is a view, and a mount that came back should not
+/// need a daemon restart to show it again.
+pub const CHAT_RECOVERY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlockingError {
@@ -76,6 +87,8 @@ struct Pools {
     lifecycle: tokio::sync::Semaphore,
     store: tokio::sync::Semaphore,
     probe: tokio::sync::Semaphore,
+    chat: tokio::sync::Semaphore,
+    chat_health: Mutex<ChatHealth>,
     /// Abandoned probes per path prefix, and the total.
     abandoned_by_prefix: Mutex<BTreeMap<String, u64>>,
     abandoned: AtomicU64,
@@ -87,6 +100,8 @@ fn pools() -> &'static Pools {
         lifecycle: tokio::sync::Semaphore::new(LIFECYCLE_THREADS),
         store: tokio::sync::Semaphore::new(STORE_THREADS),
         probe: tokio::sync::Semaphore::new(PROBE_THREADS),
+        chat: tokio::sync::Semaphore::new(CHAT_THREADS),
+        chat_health: Mutex::new(ChatHealth::default()),
         abandoned_by_prefix: Mutex::new(BTreeMap::new()),
         abandoned: AtomicU64::new(0),
     })
@@ -98,6 +113,7 @@ fn semaphore(pool: Pool) -> &'static tokio::sync::Semaphore {
         Pool::Lifecycle => &p.lifecycle,
         Pool::Store => &p.store,
         Pool::Probe => &p.probe,
+        Pool::Chat => &p.chat,
     }
 }
 
@@ -276,6 +292,67 @@ where
         .try_acquire()
         .map_err(|_| BlockingError::Busy)?;
     run_probe(permit, tokio::time::Instant::now() + within, within, f).await
+}
+
+/// Consecutive deadline misses of the chat pool, and until when it refuses work.
+#[derive(Default)]
+struct ChatHealth {
+    misses: u64,
+    until: Option<std::time::Instant>,
+}
+
+/// Whether the chat pool is refusing work at `now`. Past its time the pool is trusted again
+/// with a clean count.
+fn chat_degraded(now: std::time::Instant) -> bool {
+    let mut health = pools().chat_health.lock().unwrap();
+    match health.until {
+        Some(until) if now < until => true,
+        Some(_) => {
+            *health = ChatHealth::default();
+            false
+        }
+        None => false,
+    }
+}
+
+/// A chat job that finished is a mount that answers: the run of misses ends.
+fn note_chat_answered() {
+    pools().chat_health.lock().unwrap().misses = 0;
+}
+
+/// A chat job that outlived its deadline. Only this counts toward degrading: a refusal for a
+/// busy pool says nothing about the disk.
+fn note_chat_missed(now: std::time::Instant) {
+    let mut health = pools().chat_health.lock().unwrap();
+    health.misses += 1;
+    if health.misses >= DEGRADE_AFTER {
+        health.until = Some(now + CHAT_RECOVERY);
+    }
+}
+
+/// Read an agent's session on the chat pool: two threads, taken now or not at all.
+///
+/// No permit free is `Busy` at once, and never a queue or a thread of its own, so a flood of
+/// chat reads costs the daemon two threads and a refusal each. Deadline misses count against
+/// the chat alone and degrade it for [`CHAT_RECOVERY`]; a busy refusal never does.
+pub async fn chat<T, F>(within: Duration, f: F) -> Result<T, BlockingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if chat_degraded(std::time::Instant::now()) {
+        return Err(BlockingError::Degraded("chat".into()));
+    }
+    let permit = semaphore(Pool::Chat)
+        .try_acquire()
+        .map_err(|_| BlockingError::Busy)?;
+    let result = run_probe(permit, tokio::time::Instant::now() + within, within, f).await;
+    match &result {
+        Err(BlockingError::Abandoned(_)) => note_chat_missed(std::time::Instant::now()),
+        Ok(_) => note_chat_answered(),
+        Err(_) => {}
+    }
+    result
 }
 
 /// Run `f` holding a probe permit until `deadline`.
@@ -503,5 +580,97 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let result = run_within(Duration::from_millis(100), || 7u8).await;
         assert!(matches!(result, Err(BlockingError::Abandoned(_))));
+    }
+
+    /// The chat pool is one test's: its permits and health are the process's.
+    static CHAT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn chat_idle() {
+        while semaphore(Pool::Chat).available_permits() < CHAT_THREADS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Two threads, and the third request is refused on the spot: no queue, no thread of its
+    /// own, no mark against the disk, and the probe pool is not touched.
+    #[tokio::test]
+    async fn the_chat_pool_refuses_at_once_when_both_threads_are_taken() {
+        let _only = CHAT_TESTS.lock().await;
+        chat_idle().await;
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Lets the held jobs go when the test ends however it ends, or a failed assertion
+        // leaves them spinning and the runtime waiting for them.
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _let_go = Release(release.clone());
+        let mut held = Vec::new();
+        for _ in 0..CHAT_THREADS {
+            let release = release.clone();
+            held.push(tokio::spawn(chat(Duration::from_secs(10), move || {
+                while !release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })));
+        }
+        while semaphore(Pool::Chat).available_permits() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            let refused = chat(Duration::from_secs(10), || ()).await;
+            assert!(matches!(refused, Err(BlockingError::Busy)), "{refused:?}");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a refusal waited"
+        );
+        // Fifty busy answers are not a disk that hangs.
+        assert!(!chat_degraded(std::time::Instant::now()));
+        release.store(true, Ordering::Relaxed);
+        for job in held {
+            assert!(job.await.unwrap().is_ok());
+        }
+        chat_idle().await;
+        assert!(chat(Duration::from_secs(1), || 7).await.is_ok());
+    }
+
+    /// A disk that keeps missing its deadline degrades the chat, and only the chat, then comes
+    /// back by itself.
+    #[tokio::test]
+    async fn the_chat_pool_degrades_on_repeated_deadline_misses_and_recovers_by_itself() {
+        let _only = CHAT_TESTS.lock().await;
+        chat_idle().await;
+        for _ in 0..DEGRADE_AFTER {
+            let missed = chat(Duration::from_millis(20), || {
+                std::thread::sleep(Duration::from_millis(120))
+            })
+            .await;
+            assert!(
+                matches!(missed, Err(BlockingError::Abandoned(_))),
+                "{missed:?}"
+            );
+            chat_idle().await;
+        }
+        let refused = chat(Duration::from_secs(1), || ()).await;
+        assert!(
+            matches!(refused, Err(BlockingError::Degraded(_))),
+            "{refused:?}"
+        );
+        assert!(
+            tokio::task::spawn_blocking(|| ()).await.is_ok(),
+            "an ordinary blocking call is held up by the chat"
+        );
+        assert!(
+            !is_degraded("chat"),
+            "the chat is a prefix of the probe pool's"
+        );
+        // Thirty seconds later it is trusted again, with a clean count.
+        let later = std::time::Instant::now() + CHAT_RECOVERY + Duration::from_secs(1);
+        assert!(!chat_degraded(later));
+        assert!(chat(Duration::from_secs(1), || ()).await.is_ok());
     }
 }

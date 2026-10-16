@@ -489,6 +489,7 @@ dependencies = [
  "libc",
  "qoop-domain",
  "qoop-history",
+ "qoop-parsed",
  "qoop-proto",
  "qoop-pty",
  "qoop-remote",

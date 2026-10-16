@@ -107,6 +107,38 @@ pub enum ControlRequest {
         up: usize,
         rows: usize,
     },
+    /// A page of the chat of the agent in a terminal, parsed from the agent's own session
+    /// file by the daemon that owns the disk: the newest `limit` items older than the
+    /// newest `skip`, in order. `revision` (always below 2^53, so a JavaScript number holds it
+    /// exactly) is the one the client's last page carried; when
+    /// it is not the current one the file has changed, `skip` means nothing any more, and
+    /// the answer is the newest page with `reset` set.
+    ///
+    /// Answered for any client and any terminal by number, like `Scrollback`: whoever may
+    /// read a terminal's screen may read its chat. Refused with a short reason code in
+    /// `Failed`: `no_session` (the agent has not said which session it is in, or its file
+    /// is not there yet), `not_agent` (a shell or any other program), `too_large` (a
+    /// session the view does not read, use the terminal), `unavailable` (no such terminal,
+    /// or the disk did not answer in time). An older daemon answers `unknown variant`.
+    Messages {
+        id: String,
+        terminal: TerminalStream,
+        skip: u32,
+        limit: u32,
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    /// The full input and output of one tool call listed by `Messages`, each cut at
+    /// `max_bytes` (64 KiB when absent, never more than 1 MiB), with secrets masked. Same
+    /// authorization and reason codes as `Messages`; `no_session` also when the call is
+    /// not in the file.
+    MessageDetail {
+        id: String,
+        terminal: TerminalStream,
+        tool_id: String,
+        #[serde(default)]
+        max_bytes: Option<u32>,
+    },
     /// Look for text in what has scrolled past, one bounded step at a time.
     ///
     /// A step and not a whole search, because a week of history is millions of rows and a
@@ -1040,6 +1072,8 @@ impl ControlRequest {
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
             | Self::SearchScrollback { id, .. }
+            | Self::Messages { id, .. }
+            | Self::MessageDetail { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -1156,6 +1190,28 @@ pub enum ControlResponse {
         from: u64,
         total: u64,
         lines: Vec<String>,
+    },
+    /// A page of a terminal's chat, newest items last. `revision` stamps the session file at
+    /// the read; `reset` says the client's revision was not it, so `skip` was ignored and
+    /// this is the newest page. `first_seq` is the position of the first item in this
+    /// response's window (an order, not a cursor), `has_older` that more lie before it, and
+    /// `warnings` how many records the parser could not use. At most 256 KiB of items, and
+    /// never a raw record.
+    Messages {
+        id: String,
+        revision: u64,
+        reset: bool,
+        first_seq: u32,
+        has_older: bool,
+        items: Vec<qoop_parsed::Item>,
+        warnings: u32,
+    },
+    /// What `MessageDetail` asked for: `truncated` when `input` or `output` hit the limit.
+    MessageDetail {
+        id: String,
+        input: String,
+        output: String,
+        truncated: bool,
     },
     /// Where a `SearchScrollback` step got to.
     ///
@@ -1830,6 +1886,8 @@ impl ControlResponse {
             | Self::Stopping { id, .. }
             | Self::Scrollback { id, .. }
             | Self::ScrollbackMatch { id, .. }
+            | Self::Messages { id, .. }
+            | Self::MessageDetail { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
@@ -2594,6 +2652,91 @@ mod tests {
         assert_eq!(parse_reported_state(""), None);
     }
 
+    /// The chat requests, answers and news survive the wire, and what an older client or
+    /// daemon does not know degrades to the refusal the clients already handle.
+    #[test]
+    fn the_chat_messages_round_trip_and_an_old_peer_refuses_them_by_name() {
+        fn back<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(value: T) {
+            let wire = serde_json::to_vec(&value).expect("encode");
+            assert_eq!(serde_json::from_slice::<T>(&wire).expect("decode"), value);
+        }
+        back(ControlRequest::Messages {
+            id: "m".into(),
+            terminal: 3,
+            skip: 60,
+            limit: 30,
+            revision: Some(qoop_parsed::REVISION_MASK),
+        });
+        back(ControlRequest::MessageDetail {
+            id: "d".into(),
+            terminal: 3,
+            tool_id: "toolu_1".into(),
+            max_bytes: Some(4096),
+        });
+        back(ControlResponse::Messages {
+            id: "m".into(),
+            revision: qoop_parsed::REVISION_MASK,
+            reset: true,
+            first_seq: 7,
+            has_older: true,
+            items: vec![
+                qoop_parsed::Item::User {
+                    seq: 7,
+                    ts: Some(1),
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+                qoop_parsed::Item::Compaction { seq: 8 },
+            ],
+            warnings: 2,
+        });
+        back(ControlResponse::MessageDetail {
+            id: "d".into(),
+            input: "in".into(),
+            output: "out".into(),
+            truncated: true,
+        });
+        back(EventMessage::MessagesChanged {
+            terminal: 3,
+            revision: 9,
+        });
+        // A client that predates `revision` and `max_bytes` leaves them out.
+        let old = br#"{"op":"Messages","id":"m","terminal":3,"skip":0,"limit":5}"#;
+        assert!(matches!(
+            serde_json::from_slice(old),
+            Ok(ControlRequest::Messages { revision: None, .. })
+        ));
+        let old = br#"{"op":"MessageDetail","id":"d","terminal":3,"tool_id":"t"}"#;
+        assert!(matches!(
+            serde_json::from_slice(old),
+            Ok(ControlRequest::MessageDetail {
+                max_bytes: None,
+                ..
+            })
+        ));
+        // A daemon that does not have the variant answers `unknown variant`, which both
+        // interfaces take for "too old" and fall back to the terminal on.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "op")]
+        #[allow(dead_code)]
+        enum Before {
+            Scrollback { id: String },
+        }
+        let asked = serde_json::to_vec(&ControlRequest::Messages {
+            id: "m".into(),
+            terminal: 1,
+            skip: 0,
+            limit: 1,
+            revision: None,
+        })
+        .expect("encode");
+        let refusal = serde_json::from_slice::<Before>(&asked)
+            .expect_err("an older daemon cannot read it")
+            .to_string();
+        assert!(too_old_for(&refusal, Some("Messages")), "{refusal}");
+        assert!(!too_old_for(&refusal, Some("MessageDetail")), "{refusal}");
+    }
+
     #[test]
     fn an_unknown_operation_is_rejected_rather_than_defaulted() {
         let bad = br#"{"op":"DestroyEverything","id":"x"}"#;
@@ -2634,6 +2777,14 @@ pub enum EventMessage {
     /// The question inbox changed: a card came, was answered or ended. Says where to look,
     /// like `AgentChanged`; `AskRead` says what is there. An older client ignores it.
     AsksChanged,
+    /// The chat of `terminal` has a new `revision`: its session file grew. Sent only for a
+    /// terminal a client asked about in the last 30 seconds, at most once a second; says
+    /// where to look, and `Messages` says what is there. An older client ignores it, the
+    /// event lane being lenient.
+    MessagesChanged {
+        terminal: TerminalStream,
+        revision: u64,
+    },
     /// A program in `terminal` is recording (`on`), and will say so every second while it
     /// does, or has stopped. `listener` numbers the recording. An interface lends its
     /// microphone only right after a key the person pressed there; every other client, and

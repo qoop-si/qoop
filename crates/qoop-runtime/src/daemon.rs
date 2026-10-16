@@ -240,6 +240,8 @@ pub struct ConnectionRegistry {
     /// The question inbox changed, fanned out like `focus` and as lossy: a client that missed
     /// one re-reads on the next, and always on a resync.
     asks: tokio::sync::broadcast::Sender<()>,
+    /// The terminals whose chat a client asked about lately, and the news of their files.
+    pub messages: crate::messages::Watch,
     /// The microphone an interface lends a tab's program, and who is listening.
     pub microphone: Arc<crate::microphone::Hub>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
@@ -256,6 +258,7 @@ impl Default for ConnectionRegistry {
             inner: std::sync::Mutex::default(),
             focus: tokio::sync::broadcast::channel(16).0,
             asks: tokio::sync::broadcast::channel(16).0,
+            messages: crate::messages::Watch::default(),
             microphone: Arc::default(),
             changed: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -1531,6 +1534,13 @@ impl Daemon {
             self.watched.clone(),
         ));
 
+        // The chats clients are reading: parked until one is asked about.
+        tokio::spawn(crate::messages::Watch::run(
+            self.connections.clone(),
+            self.terminals.clone(),
+            self.agents.clone(),
+        ));
+
         // Process changes. On macOS the kqueue descriptor is itself pollable, so this is a
         // subscription and costs nothing while nothing happens. On Linux there is no
         // unprivileged way to be told about an `exec`, so the same task runs ADR-009's
@@ -2298,6 +2308,7 @@ async fn serve_client(
     let event_tx = control_tx.clone();
     let mut changes = agents.subscribe();
     let mut tasks = agents.subscribe_tasks();
+    let mut chats = connections.messages.subscribe();
     let events_task = tokio::spawn(async move {
         loop {
             let event = tokio::select! {
@@ -2324,6 +2335,12 @@ async fn serve_client(
                         Some(crate::control::EventMessage::AsksChanged)
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                // A chat that changed. One missed is a client that does not know it, so it is
+                // told to read again.
+                said = chats.recv() => match crate::messages::news(said) {
+                    Some(event) => Some(event),
+                    None => return,
                 },
                 // A missed one is said again within a second while the recording lasts.
                 heard = listening.recv() => match heard {
@@ -3029,32 +3046,21 @@ fn resumable(program: Option<&str>, session: &str) -> bool {
     program != Some("claude") || claude_transcript(session).is_some()
 }
 
-/// `<projects>/<slug>/<id>.jsonl`: the id is the file name, so one stat per
-/// project directory finds it. `CLAUDE_CONFIG_DIR` first, as Claude reads it.
-/// An id that could climb out of the directory is refused up front.
+/// The transcript of this Claude conversation, found the way the chat view finds it
+/// (`qoop_parsed`, one resolver): `CLAUDE_CONFIG_DIR` first, as Claude reads it, then
+/// `~/.claude`. An id that could climb out of a directory is refused.
 pub fn claude_transcript(id: &str) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        roots.push(PathBuf::from(dir).join("projects"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".claude/projects"));
-    }
-    claude_transcript_in(&roots, id)
+    claude_transcript_in(&qoop_parsed::claude_roots_from_env(), id)
 }
 
 /// The same, under these `projects` directories.
 pub fn claude_transcript_in(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
-    if id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return None;
-    }
-    let file = format!("{id}.jsonl");
-    roots
-        .iter()
-        .filter_map(|root| std::fs::read_dir(root).ok())
-        .flat_map(|dirs| dirs.flatten())
-        .map(|slug| slug.path().join(&file))
-        .find(|path| path.is_file())
+    qoop_parsed::claude_transcript(roots, id)
+}
+
+/// Where the agents keep their history, as this daemon's environment says.
+pub(crate) fn agent_dirs() -> Option<qoop_parsed::Dirs> {
+    qoop_parsed::Dirs::from_home().ok()
 }
 
 /// The title Claude last wrote into this transcript: a `/rename` title
@@ -3534,6 +3540,9 @@ fn dispatch(
         // Seconds of disk for a large picture: never on the read loop, where it would hold
         // up this connection's typing.
         ControlRequest::SaveUpload { .. } => Dispatch::Apart,
+        // A read and a parse of the agent's own session file: off the read loop, where it
+        // would hold up this connection's typing.
+        ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. } => Dispatch::Apart,
         // Runs the binary on disk and waits for a first look across every space.
         ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
         // The first answer after a swap runs that binary.
@@ -5169,6 +5178,9 @@ async fn handle_control(
             ))
             .await
         }
+        request @ (ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. }) => {
+            crate::messages::answer(request, terminals, agents, &connections.messages).await
+        }
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
         }
@@ -6374,7 +6386,10 @@ fn screen_verdict(reading: qoop_detect::Reading, known: bool) -> Option<qoop_det
 }
 
 /// The agent in a terminal, if what is in it is an agent at all.
-fn agent_program(agents: &Arc<crate::agents::AgentRegistry>, stream: u32) -> Option<String> {
+pub(crate) fn agent_program(
+    agents: &Arc<crate::agents::AgentRegistry>,
+    stream: u32,
+) -> Option<String> {
     match agents.agent(stream)?.identity {
         qoop_domain::AgentIdentity::Known {
             program,
@@ -12392,5 +12407,49 @@ mod arecord_tests {
         let dir = std::env::temp_dir().join(format!("qoop-arecord-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+#[cfg(test)]
+mod chat_dispatch_tests {
+    use super::{Bookkeeping, Dispatch, TerminalRegistry, dispatch};
+    use crate::control::ControlRequest;
+
+    /// A chat read parses a file on a disk that may hang: it is answered in a task of its
+    /// own, never on the read loop, where this connection's typing would wait behind it.
+    #[tokio::test]
+    async fn a_chat_read_never_runs_on_the_read_loop() {
+        let books = Bookkeeping::new(
+            crate::store::StoreHandle::new(qoop_store::Store::in_memory().expect("store")),
+            std::sync::Arc::default(),
+        );
+        let terminals = TerminalRegistry::default();
+        let reads = [
+            ControlRequest::Messages {
+                id: "m".into(),
+                terminal: 1,
+                skip: 0,
+                limit: 10,
+                revision: None,
+            },
+            ControlRequest::MessageDetail {
+                id: "d".into(),
+                terminal: 1,
+                tool_id: "t".into(),
+                max_bytes: None,
+            },
+        ];
+        for read in &reads {
+            assert!(matches!(
+                dispatch(read, &books, &terminals, 1),
+                Dispatch::Apart
+            ));
+        }
+        // A cheap read of memory stays where it was.
+        let listing = ControlRequest::ListAgents { id: "l".into() };
+        assert!(matches!(
+            dispatch(&listing, &books, &terminals, 1),
+            Dispatch::Inline(None)
+        ));
     }
 }

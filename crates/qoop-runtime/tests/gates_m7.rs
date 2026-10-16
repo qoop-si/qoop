@@ -180,6 +180,21 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             from: 0,
             backward: true,
         },
+        // The chat of an agent: reads its session file and answers items, never bytes for the
+        // child. A shell is refused as `not_agent`.
+        ControlRequest::Messages {
+            id: "x35".into(),
+            terminal,
+            skip: 0,
+            limit: 10,
+            revision: None,
+        },
+        ControlRequest::MessageDetail {
+            id: "x36".into(),
+            terminal,
+            tool_id: "t".into(),
+            max_bytes: None,
+        },
         ControlRequest::SetSplit {
             id: "x22".into(),
             tree: qoop_runtime::control::Pane::Leaf { terminal },
@@ -324,6 +339,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
             | ControlRequest::SearchScrollback { .. }
+            | ControlRequest::Messages { .. }
+            | ControlRequest::MessageDetail { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }

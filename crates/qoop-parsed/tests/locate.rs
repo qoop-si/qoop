@@ -5,7 +5,7 @@ mod common;
 use std::path::Path;
 
 use common::*;
-use qoop_parsed::{Dirs, Item, Source, locate_session};
+use qoop_parsed::{Dirs, Item, Options, Source, load, locate_session};
 
 fn dirs(root: &Path) -> Dirs {
     Dirs::under(root, None, None)
@@ -92,28 +92,33 @@ fn a_hostile_session_id_finds_nothing() {
     }
 }
 
+/// Linked project directories and transcripts are followed, as Claude follows them: a
+/// symlinked `~/.claude/projects/<slug>` is how people sync their history, and refusing it
+/// made a conversation in it look unwritten.
 #[test]
-fn a_transcript_that_links_outside_the_base_is_not_followed() {
+fn a_linked_project_directory_and_a_linked_transcript_are_followed() {
     let home = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let synced = tempfile::tempdir().unwrap();
     let projects = home.path().join(".claude/projects");
-    let target = outside.path().join("stolen.jsonl");
+    let target = synced.path().join("stolen.jsonl");
     std::fs::copy(fixture("claude.jsonl"), &target).unwrap();
 
     let slug = projects.join("-linked-file");
     std::fs::create_dir_all(&slug).unwrap();
     std::os::unix::fs::symlink(&target, slug.join("file-link.jsonl")).unwrap();
-    std::os::unix::fs::symlink(outside.path(), projects.join("-linked-dir")).unwrap();
+    std::os::unix::fs::symlink(synced.path(), projects.join("-linked-dir")).unwrap();
     std::fs::copy(
         fixture("claude.jsonl"),
-        outside.path().join("dir-link.jsonl"),
+        synced.path().join("dir-link.jsonl"),
     )
     .unwrap();
 
     let d = dirs(home.path());
-    assert_eq!(locate_session("claude", "file-link", &d), None);
-    assert_eq!(locate_session("claude", "dir-link", &d), None);
-    assert_eq!(locate_session("claude", "stolen", &d), None);
+    for id in ["file-link", "dir-link"] {
+        let found = locate_session("claude", id, &d);
+        assert!(matches!(found, Some(Source::File(_))), "{id}: {found:?}");
+        assert!(load(&found.unwrap(), &Options::default()).is_ok(), "{id}");
+    }
 }
 
 #[test]

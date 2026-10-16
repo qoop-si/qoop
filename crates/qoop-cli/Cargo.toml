@@ -18,6 +18,7 @@ qoop-tui = { path = "../qoop-tui" }
 qoop-remote = { path = "../qoop-remote" }
 tempfile = { workspace = true }
 qoop-history = { path = "../qoop-history" }
+qoop-parsed = { path = "../qoop-parsed" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 bytes = { workspace = true }
 serde = { workspace = true }
