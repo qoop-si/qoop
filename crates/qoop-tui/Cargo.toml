@@ -13,6 +13,8 @@ qoop-attention = { path = "../qoop-attention" }
 qoop-domain = { path = "../qoop-domain" }
 qoop-runtime = { path = "../qoop-runtime" }
 qoop-history = { path = "../qoop-history" }
+# The chat view reads a session's digest.
+qoop-parsed = { path = "../qoop-parsed" }
 qoop-remote = { path = "../qoop-remote" }
 bytes = { workspace = true }
 serde = { workspace = true }

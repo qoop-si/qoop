@@ -714,6 +714,7 @@ dependencies = [
  "qoop-attention",
  "qoop-domain",
  "qoop-history",
+ "qoop-parsed",
  "qoop-proto",
  "qoop-remote",
  "qoop-runtime",

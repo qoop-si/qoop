@@ -155,7 +155,7 @@ fn window_rows(state: &State) -> Vec<String> {
     (0..tile.rows)
         .map(|row| {
             screen::window_row(
-                state.snapshot.as_ref(),
+                state.view(),
                 &state.behind,
                 state.scrolled_rows(),
                 state.anchor.unwrap_or_default(),
@@ -736,6 +736,8 @@ struct State {
     asks: crate::asks::Pane,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
+    /// Which terminals show their session as Chat instead of the terminal, and what it shows.
+    chat: crate::chat_view::ChatState,
     /// A terminal to show once an index lists it, and until when: one `qoop focus` named
     /// before this interface listed it (a launcher that opens one and shows it at once gets
     /// there first), or the focused one that went from the index and may come back. Past
@@ -1187,11 +1189,13 @@ impl State {
         {
             for (terminal, rect) in layout.tile_rects(full) {
                 let snapshot = if terminal == self.focused {
-                    self.snapshot.as_ref().or_else(|| self.preview())
+                    self.view().or_else(|| self.preview())
                 } else {
-                    self.snapshots
-                        .get(&terminal)
-                        .or_else(|| self.last_seen.get(&terminal))
+                    self.chat_snapshot(terminal).or_else(|| {
+                        self.snapshots
+                            .get(&terminal)
+                            .or_else(|| self.last_seen.get(&terminal))
+                    })
                 };
                 tiles.push(screen::Tile {
                     terminal,
@@ -1209,15 +1213,12 @@ impl State {
             focused: self.focused,
             armed: self.armed,
             drawer: self.drawer_view(),
-            snapshot: self
-                .peek_view()
-                .or(self.snapshot.as_ref())
-                .or_else(|| self.preview()),
+            snapshot: self.peek_view().or(self.view()).or_else(|| self.preview()),
             cols: self.cols,
             lines: self.lines,
             // A mode speaks for itself on the notice row: its keys, or its question.
             message: self.mode_line().or(self.message.as_deref()),
-            hint: self.hint.as_deref(),
+            hint: self.hint.as_deref().or_else(|| self.chat_hint()),
             view: self.view,
             seen: &self.seen_done,
             unseen: &self.unseen_finished,
@@ -1461,6 +1462,10 @@ impl State {
     /// is what arrives on every frame: a count that only moved when rows were asked for
     /// would be stale exactly while the terminal is busy.
     fn live_behind(&self) -> u64 {
+        // The chat has nothing behind it: its own scroll moves the rows it hands out.
+        if self.chat_shows(self.focused) {
+            return 0;
+        }
         self.snapshot
             .as_ref()
             .map(|s| s.behind)
@@ -1477,12 +1482,13 @@ impl State {
         self.snapshot
             .as_ref()
             .is_some_and(|s| s.modes.mouse_reporting)
+            && !self.chat_shows(self.focused)
     }
 
     /// Whether the program is on the alternate screen, where a wheel is a scroll of its
     /// own view rather than of the scrollback behind it.
     fn pane_is_full_screen(&self) -> bool {
-        self.snapshot.as_ref().is_some_and(|s| s.modes.alt_screen)
+        self.view().is_some_and(|s| s.modes.alt_screen)
     }
 
     /// Whether the program wants its arrows spelled `SS3 A` rather than `CSI A`.
@@ -3418,6 +3424,105 @@ impl State {
             .as_ref()
             .filter(|(shown, _)| *shown == tab)
             .map(|(_, snapshot)| snapshot)
+    }
+
+    /// The focused terminal's screen as the person sees it: its Chat rows while it shows as
+    /// chat, else the terminal's own. Selection, copy mode and the painters read this, so they
+    /// act on what is drawn.
+    fn view(&self) -> Option<&SnapshotWire> {
+        self.chat_snapshot(self.focused).or(self.snapshot.as_ref())
+    }
+
+    /// Whether `terminal` is drawn as Chat: switched on, its session has items, nobody is
+    /// typing into it, and its agent is idle, working or done (in any other state, a prompt,
+    /// a start or a failure, the terminal has what the person needs). A plain shell or a
+    /// terminal the daemon sent no digest for never switches.
+    fn chat_shows(&self, terminal: u32) -> bool {
+        self.chat.has_view(terminal) && !self.chat.typing(terminal) && self.chat_state_ok(terminal)
+    }
+
+    fn chat_state_ok(&self, terminal: u32) -> bool {
+        self.rows.iter().any(|r| {
+            r.terminal == terminal
+                && r.agent
+                && matches!(r.state.as_str(), "idle" | "working" | "done")
+                && r.readiness != "trust_required"
+        })
+    }
+
+    /// A menu, a permission or a trust question is up in the terminal, which only the
+    /// terminal can answer.
+    fn prompt_waits(&self, terminal: u32) -> bool {
+        self.rows.iter().any(|r| {
+            r.terminal == terminal && (r.state == "blocked" || r.readiness == "trust_required")
+        })
+    }
+
+    /// The rows drawn for `terminal` while it shows as chat.
+    fn chat_snapshot(&self, terminal: u32) -> Option<&SnapshotWire> {
+        self.chat_shows(terminal)
+            .then(|| self.chat.shown(terminal))
+            .flatten()
+    }
+
+    /// What the notice row says about the chat when nothing else needs it.
+    fn chat_hint(&self) -> Option<&'static str> {
+        let terminal = self.focused;
+        if self.chat.has_view(terminal) && self.prompt_waits(terminal) {
+            Some("a prompt is waiting here, chat comes back after it")
+        } else if self.chat_shows(terminal) && self.chat.scrolled(terminal) > 0 {
+            Some("scrolled back in chat, type to come down")
+        } else {
+            None
+        }
+    }
+
+    /// Where `terminal` is drawn in the pane, when it is on screen.
+    fn tile_rect_of(&self, terminal: u32) -> Option<layout::Rect> {
+        if terminal == self.focused {
+            return Some(focused_rect(self));
+        }
+        let layout = self.drawn_tree(self.space?)?;
+        layout
+            .tile_rects(pane_area(self))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .map(|(_, rect)| rect)
+    }
+
+    /// Draw the chat of every terminal that shows as one, at the size of its tile. Called
+    /// before a frame is built, since the frame only borrows what is drawn.
+    fn refresh_chat(&mut self) {
+        self.chat.expire(std::time::Instant::now());
+        self.chat.adopt(&self.rows);
+        let shows: std::collections::BTreeSet<u32> = self
+            .chat
+            .wanting()
+            .filter(|t| self.chat_shows(*t))
+            .collect();
+        // The rows a selection, copy mode or a scroll pin point at belong to the view that
+        // went: whatever flipped it (a digest, an answered prompt, typing, a switch).
+        if self.chat.flips(shows).contains(&self.focused) {
+            self.selection = None;
+            self.anchor = None;
+            self.modes.copy = None;
+        }
+        let held = self.selection.is_some() || self.modes.copy.is_some();
+        let wanted: Vec<crate::chat_view::Want> = self
+            .chat
+            .wanting()
+            .filter(|t| self.chat_shows(*t))
+            .filter_map(|t| {
+                let rect = self.tile_rect_of(t)?;
+                Some(crate::chat_view::Want {
+                    terminal: t,
+                    cols: rect.cols,
+                    rows: rect.rows,
+                    held: held && t == self.focused,
+                })
+            })
+            .collect();
+        self.chat.render(&wanted);
     }
 
     /// Whether this space is listed asleep: every tab of it.
@@ -6168,12 +6273,7 @@ fn resize_key(state: &mut State, bytes: &[u8]) -> ModeOutcome {
 fn copy_row(state: &State, at: u64) -> Option<String> {
     let total = state.live_behind();
     if at >= total {
-        return state
-            .snapshot
-            .as_ref()?
-            .lines
-            .get((at - total) as usize)
-            .cloned();
+        return state.view()?.lines.get((at - total) as usize).cloned();
     }
     (state.behind.terminal == state.focused)
         .then(|| state.behind.row(at).map(str::to_string))
@@ -6183,7 +6283,7 @@ fn copy_row(state: &State, at: u64) -> Option<String> {
 /// The rows copy mode may move through, and the height of the view.
 fn copy_bounds(state: &State) -> crate::copy::Bounds {
     let total = state.live_behind();
-    let screen = state.snapshot.as_ref().map_or(1, |s| s.rows.max(1)) as u64;
+    let screen = state.view().map_or(1, |s| s.rows.max(1)) as u64;
     crate::copy::Bounds {
         // A full screen program's screen is all there is of it: the history under it
         // belongs to the shell it was started from.
@@ -6197,10 +6297,38 @@ fn copy_bounds(state: &State) -> crate::copy::Bounds {
     }
 }
 
+/// `ctrl-a t`: show the focused agent's session as Chat, or the terminal as it is. Remembered
+/// for the agent's program, so its next tab starts the same way.
+fn toggle_chat(state: &mut State) {
+    // A chat that is on can always be turned off, whatever the tab has become.
+    let Some(row) = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == state.focused && (r.agent || state.chat.wants_digest(r.terminal)))
+    else {
+        state.message = Some("chat is for agent tabs".to_string());
+        return;
+    };
+    let (terminal, program) = (row.terminal, row.program.clone());
+    let on = state.chat.toggle(terminal, program.as_deref());
+    // Rows picked or scrolled to belong to the view that went.
+    state.selection = None;
+    state.anchor = None;
+    if !on {
+        return;
+    }
+    if state.prompt_waits(terminal) {
+        state.message = Some("a prompt is waiting here, chat shows after it".to_string());
+    } else if !state.chat.has_view(terminal) {
+        state.message = Some("chat shows once the agent has a conversation".to_string());
+    }
+}
+
 /// Open copy mode over the focused terminal, at its cursor, or at the foot of the view when
 /// the view is already scrolled back.
 fn enter_copy(state: &mut State) {
-    let Some(snapshot) = state.snapshot.as_ref().filter(|_| state.focused != 0) else {
+    state.refresh_chat();
+    let Some(snapshot) = state.view().filter(|_| state.focused != 0) else {
         state.message = Some(crate::keys::named(
             "nothing to copy from, ctrl-a c starts a terminal",
         ));
@@ -6938,6 +7066,9 @@ where
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let (cols, lines) = client::outer_size();
+    let chat_file = last_focus
+        .as_ref()
+        .map(|f| f.with_file_name("interface-chat"));
     let mut state = State {
         armed: None,
         drawer: None,
@@ -6986,6 +7117,7 @@ where
         qass_ui: Default::default(),
         // Read once as soon as the loop runs.
         asks: crate::asks::Pane::new(),
+        chat: crate::chat_view::ChatState::read(chat_file),
         last: LastFocus::read(last_focus, own_focus),
         show_when_listed: None,
         elsewhere: None,
@@ -7280,6 +7412,9 @@ where
             }
             // A lent microphone stops when the person looks elsewhere, when its recording is
             // no longer said to be on, or at its longest.
+            if state.chat.expire(std::time::Instant::now()) {
+                dirty = true;
+            }
             if state.microphone.due(state.focused, std::time::Instant::now()) {
                 recorder = None;
                 stop_lending(&mut state);
@@ -7354,6 +7489,7 @@ where
                 // One frame for both paints: a single clock for tiers, order
                 // and the hit testing below, and its time remembered for the
                 // clicks that land between paints.
+                state.refresh_chat();
                 let mut frame = state.frame();
                 // The carried row on the rows of this very frame, its clock and all.
                 let drag = state.drag_paint(frame.now_unix);
@@ -8019,6 +8155,9 @@ where
                                 // The hint has been read or it has not; either way the
                                 // person is working now.
                                 state.hint = None;
+                                // Typing into a tab that shows chat shows its terminal for
+                                // the moment (`ChatState::typed`).
+                                state.chat.typed(state.focused, &bytes, std::time::Instant::now());
                                 // A key for the pane moves the keyboard's attention back there.
                                 if std::mem::take(&mut state.in_column) {
                                     dirty = true;
@@ -8028,6 +8167,11 @@ where
                                 // answer into a view of an hour ago, and the person would
                                 // not see what they typed.
                                 if state.anchor.take().is_some() {
+                                    dirty = true;
+                                }
+                                // Chat has its own scroll, and typing brings it down too.
+                                if state.chat.scrolled(state.focused) > 0 {
+                                    state.chat.to_newest(state.focused);
                                     dirty = true;
                                 }
                                 // Nothing focused is a real state: a space with no
@@ -8987,6 +9131,14 @@ where
                                     dirty = true;
                                     continue;
                                 }
+                                if state.chat_shows(state.focused) {
+                                    // Chat scrolls its own rows; the program underneath
+                                    // never sees the wheel.
+                                    state.refresh_chat();
+                                    state.chat.scroll_by(state.focused, up, WHEEL_ROWS);
+                                    dirty = true;
+                                    continue;
+                                }
                                 if state.pane_wants_mouse() && !shift {
                                     // 64 up, 65 down: the program scrolls its own view,
                                     // which is the only view of it that exists.
@@ -9277,6 +9429,10 @@ where
                             }
                             Action::CopyMode => {
                                 enter_copy(&mut state);
+                                dirty = true;
+                            }
+                            Action::Chat => {
+                                toggle_chat(&mut state);
                                 dirty = true;
                             }
                             Action::Palette => {
@@ -15566,6 +15722,7 @@ mod tests {
             qass_ui: Default::default(),
             asks: Default::default(),
             last: LastFocus::default(),
+            chat: Default::default(),
             show_when_listed: None,
             elsewhere: None,
             waking: None,
@@ -16827,6 +16984,7 @@ mod tests {
             qass_ui: Default::default(),
             asks: Default::default(),
             last: LastFocus::default(),
+            chat: Default::default(),
             show_when_listed: None,
             elsewhere: None,
             waking: None,
@@ -16976,6 +17134,7 @@ mod tests {
             qass_ui: Default::default(),
             asks: Default::default(),
             last: LastFocus::default(),
+            chat: Default::default(),
             show_when_listed: None,
             elsewhere: None,
             waking: None,
@@ -24236,5 +24395,464 @@ mod tests {
             &mut dirty,
         );
         assert!(t.hint.is_none());
+    }
+
+    // Chat view: the rows of an agent's session in the place of its terminal.
+
+    fn chat_digest(first: &str) -> qoop_parsed::Digest {
+        qoop_parsed::Digest {
+            revision: 1,
+            first_seq: 0,
+            has_older: false,
+            warnings: 0,
+            items: vec![
+                qoop_parsed::Item::User {
+                    seq: 0,
+                    ts: None,
+                    text: first.into(),
+                    attachments: Vec::new(),
+                },
+                qoop_parsed::Item::Agent {
+                    seq: 1,
+                    ts: None,
+                    text: "on it".into(),
+                    model: None,
+                },
+            ],
+        }
+    }
+
+    /// A terminal screen that says `says` on its first row and asked for the mouse.
+    fn pty_screen(says: &str) -> SnapshotWire {
+        SnapshotWire {
+            cols: 80,
+            rows: 24,
+            cursor: (0, 3),
+            lines: vec![says.to_string()],
+            modes: qoop_runtime::daemon::ModesWire {
+                mouse_reporting: true,
+                ..Default::default()
+            },
+            behind: 50,
+            ..snapshot_with_behind(50)
+        }
+    }
+
+    fn chat_single() -> State {
+        let mut s = state();
+        s.palette = None;
+        s.snapshot = Some(pty_screen("PTYTEXT"));
+        s
+    }
+
+    fn switch_on(s: &mut State, terminal: u32, first: &str) {
+        s.chat.toggle(terminal, Some("claude"));
+        s.chat.set_digest(terminal, chat_digest(first));
+        s.refresh_chat();
+    }
+
+    #[test]
+    fn a_single_pane_shows_the_chat_in_place_of_the_terminal_and_hides_the_cursor() {
+        let mut s = chat_single();
+        s.refresh_chat();
+        let terminal = screen::paint(&s.frame());
+        assert!(plain(&terminal).contains("PTYTEXT"));
+        assert!(
+            terminal.contains("\x1b[?25h"),
+            "the terminal's cursor shows"
+        );
+
+        // Switched on and no session yet: still the terminal, and it says why.
+        toggle_chat(&mut s);
+        s.refresh_chat();
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+        assert_eq!(
+            s.message.as_deref(),
+            Some("chat shows once the agent has a conversation")
+        );
+
+        s.chat.set_digest(2, chat_digest("fix the build"));
+        s.refresh_chat();
+        let painted = screen::paint(&s.frame());
+        let first = plain(&written_on(&painted, screen::TABS + 1));
+        assert!(first.contains(" > fix the build"), "{first:?}");
+        assert!(!plain(&painted).contains("PTYTEXT"));
+        assert!(!painted.contains("\x1b[?25h"), "chat shows no cursor");
+
+        // Off again: the terminal, as it was.
+        toggle_chat(&mut s);
+        s.refresh_chat();
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+    }
+
+    #[test]
+    fn a_waiting_prompt_puts_the_terminal_back_until_it_is_answered() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        assert!(s.chat_shows(2));
+        assert_eq!(s.chat_hint(), None);
+
+        s.rows[1].state = "blocked".into();
+        s.refresh_chat();
+        assert!(!s.chat_shows(2));
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+        assert!(
+            s.frame()
+                .hint
+                .is_some_and(|h| h.contains("prompt is waiting")),
+            "the notice row says why"
+        );
+        // A trust question is a prompt too.
+        s.rows[1].state = "idle".into();
+        s.rows[1].readiness = "trust_required".into();
+        assert!(!s.chat_shows(2));
+
+        s.rows[1].readiness = "ready".into();
+        s.refresh_chat();
+        assert!(plain(&screen::paint(&s.frame())).contains("fix the build"));
+    }
+
+    #[test]
+    fn a_shell_never_switches_and_the_choice_is_refused_in_words() {
+        let mut s = chat_single();
+        s.rows[1].agent = false;
+        toggle_chat(&mut s);
+        assert_eq!(s.message.as_deref(), Some("chat is for agent tabs"));
+        assert!(!s.chat.wants_digest(2));
+    }
+
+    #[test]
+    fn the_switch_is_remembered_for_the_program_and_the_next_tab_starts_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("interface-chat");
+        let mut s = chat_single();
+        s.chat = crate::chat_view::ChatState::read(Some(file.clone()));
+        toggle_chat(&mut s);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "claude\n");
+
+        let mut next = chat_single();
+        next.chat = crate::chat_view::ChatState::read(Some(file));
+        next.rows.push(agent(7, 2, "claude", "idle"));
+        next.rows.push(agent(8, 2, "codex", "idle"));
+        next.refresh_chat();
+        assert!(next.chat.wants_digest(2) && next.chat.wants_digest(7));
+        assert!(!next.chat.wants_digest(8));
+    }
+
+    #[test]
+    fn tiled_panes_draw_the_chat_in_their_own_tile_and_the_others_stay_terminals() {
+        let mut s = tiled_state();
+        s.palette = None;
+        s.snapshot.as_mut().unwrap().lines = vec!["PTYONE".into()];
+        s.snapshots.get_mut(&2).unwrap().lines = vec!["PTYTWO".into()];
+        s.refresh_chat();
+        let painted = plain(&screen::paint(&s.frame()));
+        assert!(painted.contains("PTYONE") && painted.contains("PTYTWO"));
+
+        // The unfocused tile.
+        switch_on(&mut s, 2, "fix build");
+        let tile = s.tile_rect_of(2).expect("a tile");
+        let painted = screen::paint(&s.frame());
+        let shown = plain(&painted);
+        assert!(
+            shown.contains("fix build") && !shown.contains("PTYTWO"),
+            "{shown}"
+        );
+        assert!(shown.contains("PTYONE"));
+        assert_eq!(
+            (s.chat.shown(2).unwrap().cols, s.chat.shown(2).unwrap().rows),
+            (tile.cols, tile.rows),
+            "drawn at its own tile's size"
+        );
+
+        // The focused tile, and the keyboard stays with the program.
+        switch_on(&mut s, 1, "other chat");
+        let shown = plain(&screen::paint(&s.frame()));
+        assert!(
+            shown.contains("other chat") && !shown.contains("PTYONE"),
+            "{shown}"
+        );
+        assert_eq!(s.focused, 1);
+    }
+
+    #[test]
+    fn qass_draws_the_chat_inside_its_box() {
+        let mut s = qass_window();
+        s.palette = None;
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut s, &mut seq, &mut seqs).unwrap();
+        assert!(s.on_qass_screen());
+        s.snapshot = Some(pty_screen("PTYTEXT"));
+        let (_, inner) = qass_cells(&s);
+        switch_on(&mut s, 5, "what is blocked");
+        let painted = screen::paint(&s.frame());
+        let shown = plain(&painted);
+        assert!(
+            shown.contains("what is blocked") && !shown.contains("PTYTEXT"),
+            "{shown}"
+        );
+        let drawn = s.chat.shown(5).unwrap();
+        assert_eq!((drawn.cols, drawn.rows), (inner.cols, inner.rows));
+        let row = plain(&written_on(&painted, screen::TABS + 1 + inner.y));
+        assert!(row.contains("> what is blocked"), "{row:?}");
+    }
+
+    #[test]
+    fn selection_and_copy_mode_act_on_the_rows_that_are_drawn() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        let window = window_rows(&s);
+        assert!(window[0].contains("> fix the build"), "{window:?}");
+        let tile = focused_rect(&s);
+        let text = crate::selection::Selection::covering((0, 0), (0, 20)).text(&window, tile.cols);
+        assert_eq!(text, " > fix the build");
+
+        // The terminal's own history is not behind the chat, and its mouse is not the pane's.
+        assert_eq!(s.live_behind(), 0);
+        assert_eq!(s.scrolled_rows(), 0);
+        assert!(!s.pane_wants_mouse());
+
+        enter_copy(&mut s);
+        assert!(s.modes.copy.is_some());
+        let bounds = copy_bounds(&s);
+        assert_eq!((bounds.first, bounds.last), (0, tile.rows as u64 - 1));
+        assert_eq!(
+            copy_row(&s, 0).as_deref().map(str::trim_end),
+            Some(" > fix the build")
+        );
+        assert_eq!(copy_row(&s, 2).as_deref(), Some("on it"));
+        leave_copy(&mut s);
+
+        s.chat.toggle(2, Some("claude"));
+        assert!(s.pane_wants_mouse(), "the terminal's mouse is back");
+        assert_eq!(s.live_behind(), 50);
+        assert_eq!(window_rows(&s)[0], "PTYTEXT");
+    }
+
+    #[test]
+    fn the_chat_scrolls_from_the_bottom_and_says_so() {
+        let mut s = chat_single();
+        s.chat.toggle(2, Some("claude"));
+        let items = (0..40)
+            .map(|n| qoop_parsed::Item::Agent {
+                seq: n,
+                ts: None,
+                text: format!("message {n}"),
+                model: None,
+            })
+            .collect();
+        s.chat.set_digest(
+            2,
+            qoop_parsed::Digest {
+                revision: 1,
+                first_seq: 0,
+                has_older: false,
+                warnings: 0,
+                items,
+            },
+        );
+        s.refresh_chat();
+        let rows = focused_rect(&s).rows;
+        let last = |s: &State| s.chat.shown(2).unwrap().lines[rows - 1].clone();
+        assert_eq!(last(&s), "message 39");
+        assert_eq!(s.chat_hint(), None);
+
+        s.chat.scroll_by(2, true, WHEEL_ROWS);
+        s.refresh_chat();
+        assert_ne!(last(&s), "message 39");
+        assert_eq!(
+            s.chat_hint(),
+            Some("scrolled back in chat, type to come down")
+        );
+        // Said on the notice row when nothing more urgent is.
+        assert_eq!(s.frame().hint, s.chat_hint());
+
+        s.chat.to_newest(2);
+        s.refresh_chat();
+        assert_eq!(last(&s), "message 39");
+    }
+
+    fn numbered_digest(count: u32) -> qoop_parsed::Digest {
+        qoop_parsed::Digest {
+            revision: 1,
+            first_seq: 0,
+            has_older: false,
+            warnings: 0,
+            items: (0..count)
+                .map(|n| qoop_parsed::Item::Agent {
+                    seq: n,
+                    ts: None,
+                    text: format!("message {n}"),
+                    model: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn chat_shows_only_while_the_agent_is_idle_working_or_done() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        for state in ["idle", "working", "done"] {
+            s.rows[1].state = state.into();
+            assert!(s.chat_shows(2), "{state}");
+        }
+        for state in [
+            "blocked",
+            "uncertain",
+            "unknown",
+            "starting",
+            "failed",
+            "sleeping",
+        ] {
+            s.rows[1].state = state.into();
+            assert!(!s.chat_shows(2), "{state}");
+            s.refresh_chat();
+            assert!(
+                plain(&screen::paint(&s.frame())).contains("PTYTEXT"),
+                "{state}"
+            );
+        }
+        s.rows[1].state = "idle".into();
+        s.rows[1].readiness = "trust_required".into();
+        assert!(!s.chat_shows(2));
+        // The hint talks of a prompt only where there is one.
+        s.rows[1].readiness = "ready".into();
+        s.rows[1].state = "starting".into();
+        assert_eq!(s.chat_hint(), None);
+        s.rows[1].state = "blocked".into();
+        assert!(s.chat_hint().is_some());
+    }
+
+    #[test]
+    fn typing_shows_the_terminal_until_enter_escape_or_the_time_is_up() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        let now = std::time::Instant::now();
+        s.chat.typed(2, b"l", now);
+        s.refresh_chat();
+        assert!(!s.chat_shows(2));
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+
+        s.chat.typed(2, b"\r", now);
+        s.refresh_chat();
+        assert!(plain(&screen::paint(&s.frame())).contains("fix the build"));
+
+        s.chat.typed(2, b"l", now);
+        s.refresh_chat();
+        assert!(!s.chat_shows(2));
+        assert!(s.chat.expire(now + std::time::Duration::from_secs(31)));
+        s.refresh_chat();
+        assert!(s.chat_shows(2));
+    }
+
+    #[test]
+    fn the_view_flipping_for_any_reason_drops_the_selection_the_pin_and_copy_mode() {
+        let held = |s: &mut State| {
+            s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
+            s.anchor = Some(3);
+        };
+        let spent =
+            |s: &State| s.selection.is_none() && s.anchor.is_none() && s.modes.copy.is_none();
+
+        // A digest arrives: the terminal turns into a chat.
+        let mut s = chat_single();
+        s.chat.toggle(2, Some("claude"));
+        s.refresh_chat();
+        held(&mut s);
+        s.chat.set_digest(2, chat_digest("fix the build"));
+        s.refresh_chat();
+        assert!(spent(&s), "a digest arrived");
+
+        // Copy mode over the chat, and the person types: the terminal comes back.
+        enter_copy(&mut s);
+        assert!(s.modes.copy.is_some());
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
+        s.chat.typed(2, b"x", std::time::Instant::now());
+        s.refresh_chat();
+        assert!(spent(&s), "typing");
+
+        // The chat comes back with Enter, and a prompt then takes it away, and clears.
+        s.chat.typed(2, b"\r", std::time::Instant::now());
+        s.refresh_chat();
+        held(&mut s);
+        s.rows[1].state = "blocked".into();
+        s.refresh_chat();
+        assert!(spent(&s), "a prompt came up");
+        held(&mut s);
+        s.rows[1].state = "idle".into();
+        s.refresh_chat();
+        assert!(spent(&s), "the prompt was answered");
+
+        // Nothing flipped: a selection stays.
+        held(&mut s);
+        s.refresh_chat();
+        assert!(s.selection.is_some() && s.anchor.is_some());
+    }
+
+    #[test]
+    fn an_agent_that_exits_or_is_replaced_takes_the_chat_and_what_was_held_with_it() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
+        s.rows[1].agent = false;
+        s.rows[1].program = Some("zsh".into());
+        s.refresh_chat();
+        assert!(!s.chat.wants_digest(2) && s.selection.is_none());
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        s.rows[1].program = Some("codex".into());
+        s.refresh_chat();
+        assert!(!s.chat.wants_digest(2) && !s.chat.has_view(2));
+        s.rows[1].program = Some("claude".into());
+        s.refresh_chat();
+        assert!(!s.chat.has_view(2), "the old session does not come back");
+    }
+
+    #[test]
+    fn a_chat_that_is_on_can_be_turned_off_whatever_the_tab_has_become() {
+        let mut s = chat_single();
+        s.chat.toggle(2, None);
+        s.rows[1].agent = false;
+        toggle_chat(&mut s);
+        assert!(!s.chat.wants_digest(2));
+        assert_ne!(s.message.as_deref(), Some("chat is for agent tabs"));
+    }
+
+    #[test]
+    fn rows_arriving_under_a_selection_do_not_move_the_text_it_covers() {
+        let mut s = chat_single();
+        s.chat.toggle(2, Some("claude"));
+        s.chat.set_digest(2, numbered_digest(30));
+        s.refresh_chat();
+        let before = window_rows(&s);
+        let row = before
+            .iter()
+            .position(|l| l.starts_with("message"))
+            .expect("a message on screen");
+        s.selection = Some(crate::selection::Selection::covering((row, 0), (row, 6)));
+        let text = |s: &State| {
+            s.selection
+                .unwrap()
+                .text(&window_rows(s), focused_rect(s).cols)
+        };
+        let picked = text(&s);
+        assert!(picked.starts_with("message"), "{picked:?}");
+
+        s.chat.set_digest(2, numbered_digest(34));
+        s.refresh_chat();
+        assert_eq!(window_rows(&s), before);
+        assert_eq!(text(&s), picked);
+        assert!(s.chat.scrolled(2) > 0);
+
+        // Copy mode holds the same way.
+        s.selection = None;
+        enter_copy(&mut s);
+        let before = window_rows(&s);
+        s.chat.set_digest(2, numbered_digest(38));
+        s.refresh_chat();
+        assert_eq!(window_rows(&s), before);
     }
 }

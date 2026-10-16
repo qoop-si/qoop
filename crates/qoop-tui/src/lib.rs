@@ -7,6 +7,7 @@
 
 pub mod answer;
 pub mod asks;
+pub mod chat_view;
 pub mod colorlevel;
 pub mod config;
 pub mod copy;

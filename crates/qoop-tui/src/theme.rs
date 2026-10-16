@@ -504,6 +504,16 @@ fn ink(role: Role) -> u8 {
     }
 }
 
+/// The entry a role is painted in, for a screen drawn as cells (the chat view).
+pub fn indexed(role: Role) -> u8 {
+    ink(role)
+}
+
+/// The raised background of a block that stands off the pane, in the palette in effect.
+pub fn raised_bg() -> u8 {
+    raised().0
+}
+
 /// The raised backgrounds, selected row then status bar, in the palette in effect.
 fn raised() -> (u8, u8) {
     if light() {

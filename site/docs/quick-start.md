@@ -25,6 +25,7 @@ row above the keys says how to start one.
 | the next or previous tab | `ctrl-a n`, `ctrl-a p` |
 | find anything: a space, an agent, a tab, or start an agent tab | `ctrl-a space` |
 | scroll back and copy with the keyboard | `ctrl-a [` |
+| an agent's conversation instead of its terminal, and back | `ctrl-a t` |
 | every key | `ctrl-a ?` |
 | leave, with everything still running | `ctrl-q` |
 

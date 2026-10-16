@@ -215,6 +215,8 @@ pub enum Action {
     /// ctrl-a [: copy mode over the focused terminal, as in tmux: move through the whole
     /// history with the keyboard, select, search, copy.
     CopyMode,
+    /// ctrl-a t: the focused agent's session as a chat, or the terminal as it is.
+    Chat,
 }
 
 impl Action {
@@ -459,6 +461,7 @@ impl Keys {
                     b'e' => Action::Resize,
                     b'=' => Action::Equalize,
                     b'[' => Action::CopyMode,
+                    b't' => Action::Chat,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -583,6 +586,14 @@ mod tests {
                 Action::Redraw,
             ]
         );
+    }
+
+    /// `t` is the chat switch, and `v` stays the split it always was.
+    #[test]
+    fn ctrl_a_t_is_the_chat_switch_and_v_is_still_the_split() {
+        let mut keys = Keys::default();
+        assert_eq!(keys.feed(b"\x01t\x01v"), vec![Action::Chat, Action::SplitV]);
+        assert_eq!(keys.feed(b"t"), vec![input(b"t")], "a bare t is typing");
     }
 
     #[test]

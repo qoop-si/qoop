@@ -47,6 +47,7 @@ program.
 | `ctrl-a tab` | needs you: the agent that needs you next |
 | `ctrl-a M` | last answer: the focused agent's last answer, read from its transcript, as a page |
 | `ctrl-a F` | an agent's focus view: your last prompt, its last turns, one row per tool call |
+| `ctrl-a t` | chat: show an agent's conversation instead of its terminal, and back. The terminal keeps running and typing still goes to it; the wheel scrolls the chat, and copy mode and the mouse copy the text you see. A prompt waiting for you shows the terminal until it is answered. Remembered per agent program (`claude`, `codex`), so the next tab of that program starts the same way |
 | `ctrl-a b` | fold the left column away |
 
 ## The rest

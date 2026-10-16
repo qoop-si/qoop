@@ -328,6 +328,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("c", Some("new tab"), 2),
             ("n", Some("next"), 3),
             ("m", Some("menu"), 4),
+            ("t", Some("chat"), 4),
             ("v", Some("split"), 5),
             ("f", Some("fold"), 6),
             ("F", Some("focus"), 6),
@@ -350,6 +351,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("ctrl-a:", None, 0),
             ("T", Some("fold pane"), 2),
             ("i", Some("questions"), 2),
+            ("t", Some("chat"), 3),
             ("space", Some("find"), 3),
             ("?", Some("keys"), 4),
             ("d", Some("detach"), 0),
@@ -364,6 +366,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("T", Some("fold pane"), 2),
             ("i", Some("questions"), 3),
             ("r", Some("rename"), 4),
+            ("t", Some("chat"), 4),
             ("1..9", Some("go to"), 6),
             ("pane", None, 0),
             ("v/-", Some("split"), 2),
@@ -407,6 +410,8 @@ pub struct Place {
     pub qass_split: bool,
     /// Another space awake in the column, so `s` has somewhere to go.
     pub spaces: bool,
+    /// The focused terminal is an agent's, the only kind `t` shows as a chat.
+    pub chat: bool,
 }
 
 /// Keys that do nothing in some places, and the fact that makes them work.
@@ -418,6 +423,7 @@ fn works(key: &str, place: Place) -> bool {
         "z" => place.panes || place.qass,
         "o" | "e" | "=" => place.panes,
         "s/S" => place.spaces,
+        "t" => place.chat,
         _ => true,
     }
 }
@@ -1472,6 +1478,10 @@ pub fn paint(frame: &Frame) -> String {
                     .0
                     .iter()
                     .any(|w| !w.asleep && Some(w.id) != frame.space),
+                chat: frame
+                    .rows
+                    .iter()
+                    .any(|r| r.terminal == frame.focused && r.agent),
             },
             frame.cols as usize,
         ))),
@@ -2561,7 +2571,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("v/-", "split beside, below"),
             ("H/J/K/L", "focus side"),
             ("o", "next pane"),
-            ("z", "zoom"),
+            ("z/t", "zoom, chat"),
             ("X", "back to a tab"),
             ("e", "resize"),
             ("=", "equalize"),
@@ -5864,8 +5874,65 @@ mod tests {
         }
     }
 
+    /// `t` is offered where it does something: on an agent's tab, never on a shell's.
+    #[test]
+    fn the_chat_key_is_on_the_key_row_of_an_agent_tab_only() {
+        let mut shell = row(2, "zsh", "idle");
+        shell.agent = false;
+        let rows = [row(1, "claude", "idle"), shell];
+        let keys = |focused: u32, cols: u16| {
+            let painted = paint(&Frame {
+                armed: None,
+                drawer: None,
+                rows: &rows,
+                spaces: &spaces(),
+                panes: std::collections::BTreeMap::new(),
+                space: Some(1),
+                focused,
+                snapshot: None,
+                cols,
+                lines: 24,
+                message: None,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Tree,
+                seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &crate::run::Behind::default(),
+                image_notice: None,
+                toast: None,
+                chrome: Default::default(),
+            });
+            strip(painted.rsplit(&at(24, 1)).next().unwrap_or_default())
+        };
+        assert!(
+            keys(1, 120).contains("[t\u{2192}chat]"),
+            "{:?}",
+            keys(1, 120)
+        );
+        assert!(
+            !keys(2, 120).contains("[t\u{2192}chat]"),
+            "{:?}",
+            keys(2, 120)
+        );
+        // Short rows drop it before the way out.
+        assert!(keys(1, 60).contains("[d\u{2192}detach]"));
+    }
+
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 42;
+    const COMMANDS: usize = 43;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5913,7 +5980,7 @@ mod tests {
             Action::SplitH => (const { place(26) }, Some("ctrl-a v/-")),
             Action::PaneMove(_) => (const { place(27) }, Some("ctrl-a H/J/K/L")),
             Action::PaneNext => (const { place(28) }, Some("ctrl-a o")),
-            Action::Zoom => (const { place(29) }, Some("ctrl-a z")),
+            Action::Zoom => (const { place(29) }, Some("ctrl-a z/t")),
             Action::DetachPane => (const { place(30) }, Some("ctrl-a X")),
             Action::Resize => (const { place(31) }, Some("ctrl-a e")),
             Action::Equalize => (const { place(32) }, Some("ctrl-a =")),
@@ -5926,6 +5993,7 @@ mod tests {
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
             Action::Asks => (const { place(40) }, Some("ctrl-a i/T")),
             Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
+            Action::Chat => (const { place(42) }, Some("ctrl-a z/t")),
         }
     }
 
@@ -5992,6 +6060,7 @@ mod tests {
             Action::Agents,
             Action::Asks,
             Action::Fold,
+            Action::Chat,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
