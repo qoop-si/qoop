@@ -202,6 +202,60 @@ fn the_trust_dialog_is_a_setup_gate() {
 }
 
 #[test]
+fn the_first_run_dialogs_are_setup_gates() {
+    let screens: [&[&str]; 4] = [
+        &[
+            " Let's get started.",
+            " Choose the text style that looks best with your terminal",
+            " To change this later, run /theme",
+            "     Auto (match terminal)",
+            " ❯ ✔ Dark mode",
+            "     Light mode",
+        ],
+        &[
+            " Detected a custom API key in your environment",
+            " ANTHROPIC_API_KEY: sk-ant-...abcd",
+            " Do you want to use this API key?",
+            "   Yes",
+            " ❯ No (recommended)",
+        ],
+        &[
+            " Security notes:",
+            " 1. Claude can make mistakes.",
+            " Press Enter to continue…",
+        ],
+        &[
+            " WARNING: Claude Code running in Bypass Permissions mode",
+            " In Bypass Permissions mode, Claude Code will not ask for your approval",
+            " ❯ No, exit",
+            "   Yes, I accept",
+        ],
+    ];
+    for screen in screens {
+        assert_rule("claude", screen, "first_run_dialog", Blocked);
+        assert!(verdict("claude", screen).is_some_and(|v| v.setup_gate));
+    }
+    // The same picker opened later with /theme is the person's own and stays unflagged.
+    assert_not_rule(
+        "claude",
+        &[
+            " Choose the text style that looks best with your terminal",
+            " ❯ ✔ Dark mode",
+            "   Light mode",
+        ],
+        "first_run_dialog",
+    );
+    let quoted = idle_under(&[
+        "● On first start it asks:",
+        "  Security notes:",
+        "  Press Enter to continue…",
+        "",
+    ]);
+    assert_not_rule("claude", &quoted, "first_run_dialog");
+    assert_no_blocker("claude", &quoted);
+}
+
+#[test]
 fn the_login_choice_is_a_setup_gate() {
     let screen = [
         " Claude Code can be used with your Claude subscription or billed based on API usage",

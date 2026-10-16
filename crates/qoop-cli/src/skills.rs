@@ -1152,8 +1152,8 @@ mod tests {
         let read = format!("Read {} whole", skill.join("SKILL.md").display());
 
         assert!(
-            stop("Merged, closed.", false).contains(&read),
-            "never told yet"
+            stop("Merged, closed.", false).is_empty(),
+            "never told yet: the first conversation just loaded this skill"
         );
         assert_eq!(log().lines().count(), 1);
         assert!(stop("Merged, closed.", true).is_empty(), "the second stop");
@@ -1247,12 +1247,16 @@ mod tests {
         let rules = [
             format!("Edit(/{})", dirs.folder_settings().display()),
             format!("Edit(/{})", config.display()),
-            format!("Write(/{})", config.display()),
         ];
         for rule in &rules {
             assert!(rule.contains("(//"), "{rule} is not absolute");
             assert!(deny.contains(&rule.as_str()), "{rule} not in {deny:?}");
         }
+        // Claude warns about a `Write(...)` deny (only `Edit(...)` rules match file writes).
+        assert!(
+            !deny.iter().any(|r| r.starts_with("Write(")),
+            "a Write deny claude ignores: {deny:?}"
+        );
         assert!(
             !deny.iter().any(|r| r.contains("qass.mode")),
             "a deny for a mode that is gone: {deny:?}"

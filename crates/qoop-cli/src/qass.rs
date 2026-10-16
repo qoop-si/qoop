@@ -68,6 +68,15 @@ fn first_message(program: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// What qass runs its agent with when the person typed no line: Claude never stops to ask, the
+/// rules in qass's folder settings (its deny list) still hold under it. Other agents: none yet.
+fn bypass(program: &str) -> &'static [&'static str] {
+    match program {
+        "claude" => &["--dangerously-skip-permissions"],
+        _ => &[],
+    }
+}
+
 /// `words` without a flag the person's own line already carries (`opencode --standalone`).
 fn not_typed(line: Option<&str>, words: impl Iterator<Item = String>) -> Vec<String> {
     words
@@ -184,12 +193,13 @@ fn launch_line(
             config::QASS_AGENTS.join(", ")
         ));
     };
-    let words = line.is_none().then(|| agent.to_string()).into_iter().chain(
-        first
-            .iter()
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string()),
-    );
+    let by_name = line.is_none();
+    let flags = if by_name { bypass(&program) } else { &[] };
+    let said = first.iter().filter(|w| !w.is_empty());
+    let words = by_name
+        .then(|| agent.to_string())
+        .into_iter()
+        .chain(flags.iter().chain(said).map(|w| w.to_string()));
     let words = not_typed(line.as_deref(), words);
     Ok((line, words, program))
 }
@@ -408,12 +418,20 @@ fn resume_command(
         .flatten()
         .filter(|w| !w.is_empty())
         .map(String::from);
+    let by_name = typed.is_none();
     match (typed, argv.split_first()) {
         (Some(line), Some((first, rest))) if first == program => {
             let words = not_typed(Some(&line), rest.iter().cloned().chain(said));
             (Some(line), words)
         }
-        _ => (None, argv.into_iter().chain(said).collect()),
+        _ => {
+            // The manifest's line has no flags of its own: qass's default ones go after the program.
+            let flags = if by_name { bypass(program) } else { &[] };
+            let flags = flags.iter().map(|w| w.to_string());
+            let mut argv = argv.into_iter();
+            let words = argv.next().into_iter().chain(flags).chain(argv).chain(said);
+            (None, words.collect())
+        }
     }
 }
 
@@ -1012,6 +1030,13 @@ mod tests {
             "opencode",
         );
         assert_eq!(said[..2], ["--session", "o"], "no second --standalone");
+        // No line typed: Claude resumes without ever stopping to ask.
+        let (typed, said) = resume_command(None, words(&["claude", "--resume", "c1"]), "claude");
+        assert_eq!(typed, None);
+        assert_eq!(
+            said[..3],
+            ["claude", "--dangerously-skip-permissions", "--resume"]
+        );
         // An override naming another binary is typed whole.
         let mine = Some("claude --x".to_string());
         assert_eq!(
@@ -1031,7 +1056,10 @@ mod tests {
     #[test]
     fn each_agent_is_told_to_start_qass_its_own_way() {
         let words = |agent: &str| launch_line(agent, &[]).expect(agent).1;
-        assert_eq!(words("claude"), ["claude", "/qass"]);
+        assert_eq!(
+            words("claude"),
+            ["claude", "--dangerously-skip-permissions", "/qass"]
+        );
         assert_eq!(words("codex"), ["codex", "$qass"]);
         assert_eq!(words("gemini"), ["gemini", "-i", "Use the qass skill."]);
         assert_eq!(

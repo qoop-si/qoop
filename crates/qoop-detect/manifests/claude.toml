@@ -74,6 +74,39 @@ all = [
   { contains = "Yes, I trust this folder" },
 ]
 
+# The first-run dialogs of a fresh home, read from a real first start of 2.1.296 (qass starts in
+# a background tab, so none of them is seen unless qoop says so): the theme picker, the
+# custom API key question, the security notes (`Press Enter to continue…`) and, under
+# `--dangerously-skip-permissions`, the Bypass Permissions warning. They sit before any
+# composer, so a composer box under the same words means they were quoted.
+[[rules]]
+id = "first_run_dialog"
+state = "blocked"
+priority = 300
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+setup_gate = true
+any = [
+  { all = [
+    { line_regex = '^\s*Let.s get started\.' },
+    { line_regex = '^\s*Choose the text style that looks best with your terminal' },
+    { line_regex = '^\s*([❯>]\s+)?(✔\s+)?(\d+\.\s+)?Dark mode' },
+  ] },
+  { all = [
+    { line_regex = '^\s*Detected a custom API key in your environment' },
+    { line_regex = '^\s*Do you want to use this API key\?' },
+  ] },
+  { all = [
+    { line_regex = '^\s*Security notes:' },
+    { line_regex = '^\s*Press Enter to continue' },
+  ] },
+  { all = [
+    { line_regex = '^\s*WARNING: Claude Code running in Bypass Permissions mode' },
+    { contains = "Yes, I accept" },
+  ] },
+]
+not = [{ regex = '(?m)^─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^\n]*\n)*?─{3,}' }]
+
 # Sign-in: `Select login method:` over `Claude account with subscription · ...`. Where it is
 # drawn relative to a rule is not sourced, so it is read from the bottom rows, and the
 # composer box (a pointer row between two rules) under the same words means they were

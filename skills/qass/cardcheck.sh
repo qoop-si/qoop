@@ -8,7 +8,8 @@
 # blocked once to have it read again, and a line is added. A resumed conversation keeps the skill
 # text it loaded weeks ago, and this script is read from disk on every stop, so a new install
 # reaches the running qass here. The log is one for all of qass's conversations: a fresh one
-# after an install reads its skill once more, which costs one Read. Any failure lets the stop
+# after a later install reads its skill once more, which costs one Read; the very first stop
+# only writes the log, since there is no older install whose skill it could have kept. Any failure lets the stop
 # through: this hook must never hold qass up.
 command -v python3 >/dev/null 2>&1 || exit 0
 input=$(cat)
@@ -69,11 +70,14 @@ def skill_changed():
         with open(log) as f:
             told = (f.read().split() or [""])[-1]
     except OSError:
-        told = ""
+        told = None
     if told == now:
         return
     with open(log, "a") as f:
         f.write(f"{int(time.time())} {now}\n")
+    if told is None:
+        # No log yet: a fresh install, nothing older to re-read.
+        return
     print(json.dumps({"decision": "block", "reason":
         f"Your skill changed since this conversation last read it. Read {skill} whole now (one "
         "Read, no offset or limit) and work by it from here; then end this turn as you were."}))
