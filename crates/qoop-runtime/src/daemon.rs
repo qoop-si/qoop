@@ -5412,7 +5412,8 @@ async fn handle_control(
             }
         }
         // One small file in qass's folder, like the sleep settings: the watcher reads it, and
-        // turned on, qass is told to start its watcher again.
+        // turned on, qass is told to start its watcher again; a qass asleep is woken first, as
+        // the line has no terminal to be typed into otherwise.
         ControlRequest::QassWatch { id, on } => {
             if let Some(on) = on {
                 if let Err(e) = crate::paths::set_qass_watching(on) {
@@ -5425,6 +5426,28 @@ async fn handle_control(
                 // went untyped (30 minutes passed, a daemon restart) is one more `on` away.
                 if on && crate::paths::qass_watch_resuming() {
                     crate::asks::tell_qass_watching(terminals, agents, connections, store);
+                    let into = restore();
+                    tokio::spawn(async move {
+                        // Looked at again here: an off since then wakes nothing.
+                        if !crate::paths::qass_watch_resuming() {
+                            return;
+                        }
+                        // A qass awake takes the line as it is; a tab asleep beside it is none of
+                        // this switch's.
+                        let store = &into.books.store;
+                        if crate::asks::qass_terminal(&into.terminals, &into.agents, store)
+                            .await
+                            .is_some()
+                        {
+                            return;
+                        }
+                        let Some((space, tab)) = crate::asks::sleeping_qass(store).await else {
+                            return;
+                        };
+                        if let Err(why) = wake_space(&into, Some(space), Some(tab)).await {
+                            crate::say!("qoopd: qass could not be woken to start watching: {why}");
+                        }
+                    });
                 }
             }
             ControlResponse::QassWatch {

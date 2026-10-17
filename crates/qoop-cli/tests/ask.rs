@@ -64,7 +64,13 @@ impl Stack {
         cmd.arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            // Its own data folder: the watching switch is a file in it, and the tests that turn it
+            // would otherwise turn it for each other.
+            .env("XDG_DATA_HOME", dir.path().join("data"))
             .env("SHELL", "/bin/sh")
+            // A stand-in woken from sleep is started bare by the daemon, with no `STUB_LOG=` of
+            // its own: it logs here, the file `qass` is read from.
+            .env("STUB_LOG", dir.path().join("qass.log"))
             // A question dialog gets its draft after 2 seconds, not 120.
             .env("QOOP_DIALOG_DRAFT_SECS", "2")
             .env(
@@ -102,7 +108,8 @@ impl Stack {
         let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
         cmd.args(args)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
-            .env("XDG_CONFIG_HOME", self.dir.path().join("config"));
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .env("XDG_DATA_HOME", self.dir.path().join("data"));
         for var in ["QOOP_TERMINAL", "QOOP_TOKEN", "QORO_TERMINAL", "QORO_TOKEN"] {
             cmd.env_remove(var);
         }
@@ -121,6 +128,7 @@ impl Stack {
         cmd.args(args)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -178,6 +186,19 @@ impl Stack {
             .and_then(|s| s.split(' ').next())
             .unwrap_or("")
             .to_string()
+    }
+
+    /// The tabs `qoop ls` lists as asleep, in every space.
+    fn asleep(&self) -> Vec<String> {
+        let (_, out, _) = self.run(&["ls", "--json"]);
+        let spaces: serde_json::Value = serde_json::from_str(&out).expect("json");
+        spaces
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|s| s["sleeping"].as_array().cloned().unwrap_or_default())
+            .map(|t| t.to_string())
+            .collect()
     }
 
     fn wait(&self, mut until: impl FnMut() -> bool) -> bool {
@@ -352,6 +373,71 @@ fn watching_turned_on_again_is_typed_to_qass_once() {
     );
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
+}
+
+/// The owner's eye opened while qass sleeps: the daemon wakes qass's own tab, and once it is
+/// back and at rest the line is typed, once, with no message from the owner. Turned off, it
+/// wakes nothing; another sleeping tab in qass's space stays asleep.
+#[test]
+fn watching_turned_on_wakes_a_sleeping_qass_and_tells_it_once() {
+    let stack = Stack::start();
+    let qass = stack.agent("qass", "qass", Some("sess-qass"));
+    let other = stack.agent("qass", "parked", Some("sess-parked"));
+    for tab in [&other, &qass] {
+        assert!(
+            stack.wait(|| stack.run(&["sleep", "--tab", tab]).0),
+            "tab {tab} never went to sleep"
+        );
+    }
+    let (ok, out, err) = stack.run(&["qass", "watch", "off"]);
+    assert!(ok && out.trim() == "watching off", "{out} {err}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(stack.asleep().contains(&qass), "off woke qass");
+    let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
+    assert!(ok && out.trim() == "watching resumed", "{out} {err}");
+    let told = || {
+        stack
+            .log("qass")
+            .contains("watching on: start your watcher")
+    };
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "a sleeping qass was never woken and told: {:?}",
+        stack.log("qass")
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
+    assert!(!stack.asleep().contains(&qass), "qass is still asleep");
+    assert!(stack.asleep().contains(&other), "a parked tab was woken");
+}
+
+/// A qass that is awake takes the line where it stands: a worker parked asleep in the same
+/// space is not woken by the eye.
+#[test]
+fn watching_turned_on_leaves_a_parked_tab_asleep_beside_an_awake_qass() {
+    let stack = Stack::start();
+    let _qass = stack.agent("qass", "qass", None);
+    let parked = stack.agent("qass", "parked", Some("sess-parked"));
+    assert!(
+        stack.wait(|| stack.run(&["sleep", "--tab", &parked]).0),
+        "the parked tab never went to sleep"
+    );
+    stack.run(&["qass", "watch", "off"]);
+    let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
+    assert!(ok && out.trim() == "watching resumed", "{out} {err}");
+    let told = || {
+        stack
+            .log("qass")
+            .contains("watching on: start your watcher")
+    };
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "an awake qass was never told: {:?}\n{}\n{}",
+        stack.log("qass"),
+        stack.run(&["agents"]).1,
+        stack.run(&["ls", "--json"]).1
+    );
+    assert!(stack.asleep().contains(&parked), "the parked tab was woken");
 }
 
 #[test]

@@ -722,17 +722,25 @@ fn line_for_qass(handle: &str, option: Option<&str>, text: Option<&str>) -> Stri
     }
 }
 
-/// qass's own terminal: the first agent in the space named `qass`.
-async fn qass_terminal(
-    terminals: &Arc<TerminalRegistry>,
-    agents: &Arc<AgentRegistry>,
-    store: &StoreHandle,
-) -> Option<u32> {
+/// The id of the space named `qass`, when it exists.
+pub(crate) async fn qass_space(store: &StoreHandle) -> Option<i64> {
     let spaces = tokio::time::timeout(Duration::from_secs(2), store.workspaces())
         .await
         .ok()?
         .ok()?;
-    let qass = spaces.into_iter().find(|w| w.name == QASS_SPACE)?.id;
+    spaces
+        .into_iter()
+        .find(|w| w.name == QASS_SPACE)
+        .map(|w| w.id)
+}
+
+/// qass's own terminal: the first agent in the space named `qass`.
+pub(crate) async fn qass_terminal(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    store: &StoreHandle,
+) -> Option<u32> {
+    let qass = qass_space(store).await?;
     let mut mine: Vec<u32> = terminals
         .streams()
         .into_iter()
@@ -750,6 +758,21 @@ async fn qass_terminal(
     mine.first().copied()
 }
 
+/// The sleeping tab that is qass: the lowest-numbered one of the `qass` space that held an
+/// agent, the order [`qass_terminal`] picks a running one in. Its space with it.
+pub(crate) async fn sleeping_qass(store: &StoreHandle) -> Option<(i64, u32)> {
+    let space = qass_space(store).await?;
+    let asleep = store.asleep().await.ok()?;
+    let rows = store.open_terminals(space).await.ok()?;
+    asleep
+        .into_iter()
+        .filter(|(_, workspace, _)| *workspace == space)
+        .filter(|(tab, _, _)| rows.iter().any(|r| r.id == *tab && r.agent.is_some()))
+        .filter_map(|(tab, _, _)| u32::try_from(tab).ok())
+        .min()
+        .map(|tab| (space, tab))
+}
+
 /// What qass is told when the owner turns its watching back on.
 const WATCHING_ON: &str = "watching on: start your watcher again (qass skill, Start step 3) and give the owner one summary of the fleet now; the watcher says only what changes from here.";
 
@@ -760,8 +783,9 @@ const WATCH_TELL_FOR: Duration = Duration::from_secs(30 * 60);
 static WATCH_TELL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// Tell qass its watching was turned back on: the inbox's flusher types the line once qass
-/// has a tab and takes words, between the answers it types, for 30 minutes. A qass asleep,
-/// gone or busy longer starts its watcher at its next start or message instead (the skill).
+/// has a tab and takes words, between the answers it types, for 30 minutes. The caller wakes a
+/// qass that sleeps; one gone or busy longer starts its watcher at its next start or message
+/// instead (the skill).
 pub(crate) fn tell_qass_watching(
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
