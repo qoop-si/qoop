@@ -1547,6 +1547,7 @@ impl Daemon {
                 agents: self.agents.clone(),
             },
             self.watched.clone(),
+            self.connections.clone(),
         ));
 
         // The chats clients are reading: parked until one is asked about.
@@ -3364,7 +3365,11 @@ mod park_tests {
 /// Each pass snapshots eligibility for every terminal, applies waiter-edge
 /// vetoes against that snapshot (never pass order), then puts to sleep each
 /// space all of whose tabs are ready, the way a person would ask for it.
-async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
+async fn idle_sleep_loop(
+    into: Restore,
+    watched: crate::idle::WatchCounts,
+    connections: Arc<ConnectionRegistry>,
+) {
     let mut changes = into.agents.subscribe();
     let mut timeouts = IdleTimeouts::read();
     let mut read_at = std::time::Instant::now();
@@ -3427,7 +3432,7 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
         timeouts = IdleTimeouts::read();
         read_at = std::time::Instant::now();
         if timeouts.shortest() > 0 {
-            idle_sleep_pass(&into, &watched, timeouts).await;
+            idle_sleep_pass(&into, &watched, &connections, timeouts).await;
         }
     }
 }
@@ -3437,6 +3442,7 @@ async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
 async fn idle_sleep_pass(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
+    connections: &ConnectionRegistry,
     timeouts: IdleTimeouts,
 ) {
     // Edges older than a day are over by definition; swept over all edges,
@@ -3454,10 +3460,13 @@ async fn idle_sleep_pass(
             Err(()) => return,
         }
     };
-    for ((space, tab), all) in idle_tabs(into, watched, timeouts, qass) {
+    for ((space, tab), all) in idle_tabs(into, watched, connections, timeouts, qass) {
         // Asked again for this tab alone, just before it sleeps: the tabs before it took
         // seconds each, and in them a person may have come back to this one.
-        if !all || idle_tabs(into, watched, timeouts, qass).get(&(space, tab)) != Some(&true) {
+        if !all
+            || idle_tabs(into, watched, connections, timeouts, qass).get(&(space, tab))
+                != Some(&true)
+        {
             continue;
         }
         match sleep_space(into, space, Some(tab)).await {
@@ -3473,16 +3482,20 @@ async fn idle_sleep_pass(
 }
 
 /// Every live tab, by its space and first pane, and whether all of its panes are idle past
-/// the timeout, unwatched and not held by a wait.
+/// the timeout, unwatched, not news to a person and not held by a wait.
 fn idle_tabs(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
+    connections: &ConnectionRegistry,
     timeouts: IdleTimeouts,
     qass: Option<i64>,
 ) -> BTreeMap<(i64, u32), bool> {
     let agents = &into.agents;
     let now = crate::agents::now_unix();
     let streams = agents.streams();
+    // What an interface shows as news (finished while nobody looked) stays awake until a
+    // person looks: asleep, it would leave the list before anyone saw what it finished.
+    let news = connections.news();
     // Snapshot eligibility for every live terminal at pass start. Edge
     // vetoes evaluate against this map, so the outcome never depends on
     // the order the pass happens to visit terminals in.
@@ -3502,6 +3515,12 @@ fn idle_tabs(
             eligible.insert(*stream, false);
             continue;
         };
+        // Held for a day at most, from its last activity, so an interface that never looks
+        // cannot keep a tab awake for ever.
+        if news.contains(stream) && now.saturating_sub(since) < crate::idle::NEWS_HOLD_SECS {
+            eligible.insert(*stream, false);
+            continue;
+        }
         // Idle since the agent went quiet or since a person last looked, whichever is later.
         let since = since.max(watched.left_at(*stream).unwrap_or(since));
         let idle_secs = now.saturating_sub(since);

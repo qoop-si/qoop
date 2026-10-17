@@ -131,6 +131,10 @@ pub fn classify_program(program: Option<&str>, agent: bool) -> ForegroundKind {
     }
 }
 
+/// How long after its last activity a finished agent nobody has looked at yet (news to an
+/// interface) is kept from idle sleep.
+pub const NEWS_HOLD_SECS: i64 = 24 * 3600;
+
 /// Whether a terminal may be reaped. Pure, table-tested.
 ///
 /// Fail closed: only `Idle`/`Done` with an absent, shell or agent foreground
