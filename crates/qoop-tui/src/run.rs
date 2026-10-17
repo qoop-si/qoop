@@ -9888,6 +9888,7 @@ where
                     // query behind every keystroke on a busy daemon. The spaces themselves
                     // only change when a terminal or a workspace does.
                     let mut refresh_spaces = false;
+                    let mut unasked = false;
                     for message in connection.drain(&mut inbuf)? {
                         match message {
                             Incoming::Render { terminal, snapshot } => {
@@ -9946,6 +9947,15 @@ where
                                         }
                                         dirty = true;
                                     }
+                                }
+                                // A render this interface did not ask for: the daemon's own
+                                // subscription of a new connection to its lowest terminal,
+                                // or one on its way out. The daemon counts a subscriber as a
+                                // window showing the terminal, which keeps its geometry
+                                // (ADR-007), so it is held here and the sync below drops it
+                                // unless it is on screen.
+                                if terminal != state.focused && state.subs.insert(terminal) {
+                                    unasked = true;
                                 }
                             }
                             // Only a raw connection says this, and this one is not.
@@ -10183,6 +10193,9 @@ where
                             },
                             &mut control_seq,
                         )?).await?;
+                    }
+                    if unasked && let Some(sync) = sync_subs(&mut state, &mut control_seq)? {
+                        wr.write_all(&sync).await?;
                     }
                     if state.done {
                         return Ok(());

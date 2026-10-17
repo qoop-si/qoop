@@ -711,6 +711,86 @@ async fn ownership_moves_when_the_owner_agrees_and_not_before() {
     );
 }
 
+/// Two windows on one daemon: the geometry goes with the window that shows the terminal. A
+/// window left open behind another sized a new split first, as it sizes every terminal it
+/// lays out, and the window in front drew a crop of it until the other one closed.
+#[tokio::test]
+async fn an_owner_that_stops_showing_a_terminal_yields_it_to_the_window_that_does() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let shows = |on: bool| {
+        if on {
+            ControlRequest::Subscribe {
+                id: "show".into(),
+                terminals: vec![terminal],
+            }
+        } else {
+            ControlRequest::Unsubscribe {
+                id: "hide".into(),
+                terminals: vec![terminal],
+            }
+        }
+    };
+
+    // The window behind sizes it and then looks at another tab.
+    let mut behind = d.attach("behind").await;
+    behind.resize(120, 40).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    behind
+        .control(&shows(false), PATIENCE)
+        .await
+        .expect("hidden");
+
+    // The window in front shows it and asks its own size: it gets it, at once.
+    let mut front = d.attach("front").await;
+    front.resize(90, 30).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    front.input_to(terminal, b"stty size\n").await;
+    assert!(
+        front.wait_for_text_on(terminal, "30 90", PATIENCE).await,
+        "the window showing the terminal kept the hidden window's size"
+    );
+
+    // Both show it now: the owner keeps it, as ADR-007 has it for any two clients.
+    behind.control(&shows(true), PATIENCE).await.expect("shown");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    front.forget_seen();
+    front
+        .input_to(terminal, b"echo BOTH_$((6*7)); stty size\n")
+        .await;
+    assert!(front.wait_for_text_on(terminal, "BOTH_42", PATIENCE).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    front
+        .wait_for_text_on(terminal, "never matches", Duration::from_millis(200))
+        .await;
+    let lines = front.screen(terminal).expect("a screen").lines.clone();
+    let said = lines
+        .iter()
+        .position(|l| l.trim() == "BOTH_42")
+        .and_then(|at| lines.get(at + 1))
+        .map(|l| l.trim().to_string());
+    assert_eq!(
+        said.as_deref(),
+        Some("30 90"),
+        "an owner that still shows the terminal lost it:\n{}",
+        lines.join("\n")
+    );
+
+    // The front window looks away: the one still showing it gets its own size back without
+    // asking again.
+    front
+        .control(&shows(false), PATIENCE)
+        .await
+        .expect("hidden");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    behind.forget_seen();
+    behind.input_to(terminal, b"stty size\n").await;
+    assert!(
+        behind.wait_for_text_on(terminal, "40 120", PATIENCE).await,
+        "the geometry did not come back to the window showing it"
+    );
+}
+
 /// G2.4: a small client sees a window onto a large terminal, and the terminal does not
 /// shrink to fit it.
 ///

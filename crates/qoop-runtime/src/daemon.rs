@@ -81,8 +81,11 @@ pub enum ClientCommand {
     /// program sat quiet (a `starting` report that landed after the first frame) would
     /// never meet the composer already on screen. Internal only, like `Refresh`.
     Look,
-    /// The owner has agreed to hand the geometry to this client. The only path that moves
-    /// ownership other than the owner's connection ending (ADR-007).
+    /// Who watches this terminal changed (`TerminalHandle::watchers`): an owner that stopped
+    /// showing it may now yield to a client that shows it. Internal only, like `Refresh`;
+    /// one lost to a full queue is made up by the next refused size, which looks again.
+    Watchers,
+    /// The owner has agreed to hand the geometry to this client (ADR-007).
     GrantOwnership {
         from: ClientId,
         to: ClientId,
@@ -689,6 +692,10 @@ pub struct TerminalHandle {
     /// restored in the same daemon (a woken space), and a subscription made for the
     /// earlier life must not be taken for one to the new.
     pub incarnation: u64,
+    /// The connections subscribed to this terminal, which for an interface is the set of
+    /// windows showing it. Written where subscriptions are made and dropped, read by the
+    /// terminal's own task: an owner that shows it no longer yields to one that does.
+    pub watchers: Arc<std::sync::Mutex<BTreeSet<ClientId>>>,
 }
 
 /// A fresh [`TerminalHandle::incarnation`], never repeated within a daemon.
@@ -2312,7 +2319,14 @@ async fn serve_client(
     // of what a client with no arguments wants and is what milestone 1 shipped. Everything
     // else is a subscription request on the control channel.
     if let Some(first) = terminals.streams().first().copied() {
-        subscribe(&terminals, &subscriptions, &renders, &watched, first);
+        subscribe(
+            &terminals,
+            &subscriptions,
+            &renders,
+            &watched,
+            &client,
+            first,
+        );
     }
 
     // News for this connection, on its own channel. One task per connection rather than a
@@ -2785,8 +2799,9 @@ async fn serve_client(
     // daemon-wide watch counts the idle reaper reads, and stop the tasks.
     let held = std::mem::take(&mut *subscriptions.lock().unwrap());
     watched.unwatch_all(&held.keys().copied().collect());
-    for (_, (_, task)) in held {
+    for (stream, (_, task)) in held {
         task.abort();
+        unwatch(&terminals, &client, stream);
     }
     writer.abort();
     // Ownership must be released when the connection ends, or a dead owner strands the
@@ -2805,6 +2820,15 @@ async fn serve_client(
     outcome
 }
 
+/// One connection no longer shows this terminal; its task looks at the geometry again.
+fn unwatch(terminals: &TerminalRegistry, client: &ClientId, stream: u32) {
+    if let Some(handle) = terminals.get(stream)
+        && handle.watchers.lock().unwrap().remove(client)
+    {
+        let _ = handle.commands.try_send(ClientCommand::Watchers);
+    }
+}
+
 /// Start watching a terminal on behalf of one connection.
 ///
 /// One task per subscription, holding that terminal's `watch::Receiver`. It coalesces on
@@ -2820,11 +2844,15 @@ fn subscribe(
     subscriptions: &Subscriptions,
     renders: &Arc<RenderQueue>,
     watched: &crate::idle::WatchCounts,
+    client: &ClientId,
     stream: u32,
 ) -> bool {
     let Some(handle) = terminals.get(stream) else {
         return false;
     };
+    if handle.watchers.lock().unwrap().insert(client.clone()) {
+        let _ = handle.commands.try_send(ClientCommand::Watchers);
+    }
     {
         let mut held = subscriptions.lock().unwrap();
         match held.get(&stream) {
@@ -3768,7 +3796,7 @@ async fn handle_control(
                     // Subscribed on creation. A client that asked for a terminal wants to
                     // see it, and a separate round trip to say so is a race in which the
                     // first output is lost.
-                    subscribe(terminals, subscriptions, renders, watched, stream);
+                    subscribe(terminals, subscriptions, renders, watched, client, stream);
                     ControlResponse::TerminalCreated {
                         id,
                         terminal: stream,
@@ -4762,7 +4790,7 @@ async fn handle_control(
         } => {
             let subscribed: Vec<u32> = wanted
                 .into_iter()
-                .filter(|s| subscribe(terminals, subscriptions, renders, watched, *s))
+                .filter(|s| subscribe(terminals, subscriptions, renders, watched, client, *s))
                 .collect();
             ControlResponse::Subscribed {
                 id,
@@ -5461,6 +5489,7 @@ async fn handle_control(
                 .map(|(s, task)| {
                     task.abort();
                     watched.unwatch(s);
+                    unwatch(terminals, client, s);
                     s
                 })
                 .collect();
@@ -6206,6 +6235,7 @@ fn open_terminal_with(
             ((size.cols as u64) << 32) | size.rows as u64,
         )),
         incarnation: next_incarnation(),
+        watchers: Arc::default(),
     };
     terminals.insert(stream, handle.clone());
     if let Some((session, said)) = adopt.as_ref().and_then(|a| a.session.clone()) {
@@ -10212,6 +10242,30 @@ pub fn arbitrate_resize(
     }
 }
 
+/// ADR-007: an owner that no longer shows the terminal yields it to the client that waited
+/// longest among those that show it, and waits in its turn with the size it had. Two
+/// windows on one daemon each size every terminal they lay out, shown or not, so the first
+/// to size a new one is often the window nobody is looking at. Answers the size to take.
+pub fn yield_unseen(
+    policy: &mut SizePolicy,
+    waiting: &mut Vec<(ClientId, PtySize)>,
+    watchers: &BTreeSet<ClientId>,
+    canonical: PtySize,
+) -> Option<PtySize> {
+    let SizePolicy::Owner(owner) = policy else {
+        return None;
+    };
+    if watchers.contains(owner) {
+        return None;
+    }
+    let at = waiting.iter().position(|(c, _)| watchers.contains(c))?;
+    let (next, size) = waiting.remove(at);
+    let previous = std::mem::replace(owner, next);
+    waiting.retain(|(c, _)| *c != previous);
+    waiting.insert(0, (previous, canonical));
+    Some(size)
+}
+
 /// The size every terminal is born with: the PTY, the engine and the tracked
 /// current size below all start here, from this one constant, so changing the
 /// default cannot silently desynchronise the equal-size decision.
@@ -10377,6 +10431,40 @@ async fn terminal_task(
         }
     }
     let trace = trace_latency();
+    // The geometry moved to a client that asked for this size earlier: a real change, never
+    // the repaint nudge, and nothing at all when the child already has it.
+    macro_rules! take_waited_size {
+        ($size:expr) => {{
+            let size: PtySize = $size;
+            let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
+            if size != canonical {
+                nudge_restore = None;
+                sys::resize(master_raw, size.cols, size.rows)?;
+                engine.resize(size.cols, size.rows);
+                current_size = size;
+                if let Some(handle) = terminals.get(stream) {
+                    handle.last_dims.store(
+                        ((size.cols as u64) << 32) | (size.rows as u64),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
+            }
+        }};
+    }
+    // An owner that stopped showing the terminal yields to one that shows it (ADR-007).
+    macro_rules! yield_if_unseen {
+        () => {{
+            let watchers = terminals
+                .get(stream)
+                .map(|h| h.watchers.lock().unwrap().clone())
+                .unwrap_or_default();
+            let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
+            if let Some(size) = yield_unseen(&mut policy, &mut waiting, &watchers, canonical) {
+                take_waited_size!(size);
+            }
+        }};
+    }
 
     // The loop is a closure whose result is captured, so that teardown runs however it
     // ends. Three `?` in here used to propagate straight out of the task: a failing
@@ -10494,7 +10582,11 @@ async fn terminal_task(
                                 }
                                 let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
                             }
+                            if outcome == ResizeOutcome::NotOwner {
+                                yield_if_unseen!();
+                            }
                         }
+                        ClientCommand::Watchers => yield_if_unseen!(),
                         // A close ends the loop, which runs teardown on the way out. It is not
                         // a signal to the child from here: the child is contained by the
                         // teardown that follows, and signalling twice from two places is how a
@@ -10587,20 +10679,7 @@ async fn terminal_task(
                                 if !waiting.is_empty() {
                                     let (next, size) = waiting.remove(0);
                                     policy = SizePolicy::Owner(next);
-                                    let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
-                                    if size != canonical {
-                                        nudge_restore = None;
-                                        sys::resize(master_raw, size.cols, size.rows)?;
-                                        engine.resize(size.cols, size.rows);
-                                        current_size = size;
-                                        if let Some(handle) = terminals.get(stream) {
-                                            handle.last_dims.store(
-                                                ((size.cols as u64) << 32) | (size.rows as u64),
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                        let _ = updates.send(TerminalUpdate::Full(engine.snapshot()));
-                                    }
+                                    take_waited_size!(size);
                                 }
                             }
                         }

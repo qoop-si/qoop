@@ -36,6 +36,7 @@ The full rules:
 | the owner's link reconnects | its new connection names the link (hello key `replaces`), and the daemon closes the ones that link made before: over ssh a dropped network leaves the far relay holding the old socket, and the reconnect is the proof it is dead. The close is the row above, not a steal |
 | a writable client attaches to an unowned terminal | it becomes the owner and may resize |
 | a writable client attaches to an owned terminal | it does not become the owner and cannot resize |
+| the owner no longer shows the terminal (it unsubscribed), and a writable client that shows it was refused a size | ownership passes to the one of those refused first, and its size applies; the old owner waits with the size it had, and gets it back the same way. An owner that still shows the terminal keeps it |
 | a client requests ownership | the current owner is asked; it must actively agree. A silent or slow owner **keeps** ownership |
 | an observer requests ownership | rejected, always |
 
@@ -65,6 +66,14 @@ last size. Another machine's terminals are sized only once shown here, and the t
 screen wait for a drag of a divider or the panel to end. So the first interface on a session owns the geometry of what it shows, as one client
 controls a tab's geometry in a terminal multiplexer. It sends a terminal a size only when that
 size changed, because an equal size is the repaint nudge.
+
+An interface subscribes to exactly the terminals it draws, so "shows" is that subscription.
+The row above exists because every interface also sizes what it does not draw: with two
+windows open, the one behind sized a split made in the one in front before the front one did,
+owned it, and the front window drew the top-left corner of a grid larger than its pane. An
+owner that is not showing a terminal has no view for a reflow to break, so yielding it is not
+the steal the silent-owner rule forbids: the phone never resizes, and a client that never
+asks a size is never refused one.
 
 ## Consequences
 - A small client sees a cropped view rather than a reflowed one. This is the correct
