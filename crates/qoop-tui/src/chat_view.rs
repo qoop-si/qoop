@@ -2046,6 +2046,7 @@ mod tests {
             ts: None,
             output_bytes: 0,
             has_detail: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -2074,6 +2075,7 @@ mod tests {
             ts: None,
             output_bytes: 0,
             has_detail: detail,
+            attachments: Vec::new(),
         }
     }
 
@@ -2372,6 +2374,7 @@ mod tests {
             ts: None,
             output_bytes: 9,
             has_detail: true,
+            attachments: Vec::new(),
         };
         let got = lines(&[item], 36);
         assert_eq!(
@@ -2682,7 +2685,7 @@ mod tests {
                 kind: "hook".into(),
                 text: "ran".into(),
             },
-            Item::Compaction { seq: 0 },
+            Item::Compaction { seq: 0, text: None },
             Item::Subagent {
                 seq: 0,
                 summary: "review".into(),
@@ -2709,7 +2712,7 @@ mod tests {
             user("hi"),
             agent("hello"),
             thinking(None),
-            Item::Compaction { seq: 0 },
+            Item::Compaction { seq: 0, text: None },
             agent("bye"),
         ];
         let got: Vec<String> = lines(&items, 10)
@@ -3648,6 +3651,7 @@ mod tests {
             ts: None,
             output_bytes: 1,
             has_detail: true,
+            attachments: Vec::new(),
         };
         let mut chat = ChatState::default();
         on(&mut chat, 4);
@@ -3749,6 +3753,7 @@ mod tests {
                 ts: None,
                 output_bytes: 0,
                 has_detail: false,
+                attachments: Vec::new(),
             },
         ];
         let mut chat = ChatState::default();

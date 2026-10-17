@@ -2825,7 +2825,7 @@ mod tests {
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },
-                qoop_parsed::Item::Compaction { seq: 8 },
+                qoop_parsed::Item::Compaction { seq: 8, text: None },
             ],
             warnings: 2,
         });

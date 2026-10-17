@@ -1,11 +1,14 @@
 //! Turning parsed entries into chat items.
 
 use agentparse::{
-    Entry, EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Session, Tool, ToolCall,
-    ToolResult, ToolStatus,
+    Agent, Entry, EntryKind, ErrorInfo, Media, Message, Origin, Part, ProcessAction, Role, Session,
+    Tool, ToolCall, ToolResult, ToolStatus,
 };
 
+use std::collections::HashMap;
+
 use crate::item::{Chip, Item, Status};
+use crate::subagent::Spawn;
 use crate::text;
 
 /// Records the agents write for their own bookkeeping, not for the reader (seen in real
@@ -17,6 +20,7 @@ const BOOKKEEPING: &[&str] = &[
     "ai-title",
     "api-request",
     "api-request-blob",
+    "api-request-shape",
     "artifact-autoreact-ledger",
     "artifact-comment-monitor",
     "atis-latch",
@@ -38,6 +42,7 @@ const BOOKKEEPING: &[&str] = &[
     "step-start",
     "SubAgentActivity",
     "task_started",
+    "todos",
     "token_count",
     "world_state",
     "worktree-state",
@@ -62,33 +67,67 @@ pub fn item_id(raw: &str) -> String {
     text::summary(raw)
 }
 
+/// What the walk over a session carries besides the rows: the agent (compaction summaries
+/// read differently) and the spawn rows, by index, with where their child session is.
+struct Cx {
+    agent: Agent,
+    spawns: Vec<(usize, Spawn)>,
+}
+
 /// Every item of the session, oldest first, each numbered by its distance from the end of
 /// what was parsed: the newest is 0. A wider tail window only adds older items in front, so a
-/// number does not change from one page to the next.
-pub fn items(session: &Session) -> Vec<Item> {
+/// number does not change from one page to the next. The map holds the spawn rows by `seq`;
+/// their `steps` are 0 until [`crate::subagent::annotate`] fills the ones a page shows.
+pub(crate) fn project(session: &Session) -> (Vec<Item>, HashMap<u32, Spawn>) {
+    let mut cx = Cx {
+        agent: session.agent,
+        spawns: Vec::new(),
+    };
     let mut out = Vec::new();
     for entry in &session.entries {
-        entry_items(entry, &mut out);
+        entry_items(entry, &mut cx, &mut out);
     }
     let last = out.len().saturating_sub(1);
     for (i, item) in out.iter_mut().enumerate() {
-        item.set_seq(u32::try_from(last - i).unwrap_or(u32::MAX));
+        item.set_seq(seq_of(last, i));
     }
-    out
+    let spawns = cx
+        .spawns
+        .into_iter()
+        .map(|(i, spawn)| (seq_of(last, i), spawn))
+        .collect();
+    (out, spawns)
 }
 
-fn entry_items(entry: &Entry, out: &mut Vec<Item>) {
+fn seq_of(last: usize, index: usize) -> u32 {
+    u32::try_from(last - index).unwrap_or(u32::MAX)
+}
+
+fn entry_items(entry: &Entry, cx: &mut Cx, out: &mut Vec<Item>) {
     let ts = entry.ts;
     match &entry.kind {
-        EntryKind::Message(m) => message_items(m, ts, out),
-        EntryKind::Compaction(_) => out.push(Item::Compaction { seq: 0 }),
+        EntryKind::Message(m) => message_items(m, ts, cx, out),
+        EntryKind::Compaction(c) => out.push(Item::Compaction {
+            seq: 0,
+            text: c
+                .summary
+                .as_deref()
+                .and_then(|s| compaction_line(cx.agent, s)),
+        }),
         EntryKind::Error(e) => out.push(Item::Error {
             seq: 0,
-            text: text::text(&e.message),
+            text: text::text(&error_text(e)),
         }),
         EntryKind::Turn(t) => turn_item(t.status.as_deref(), t.error.as_deref(), out),
         EntryKind::Notice(n) => out.push(notice(n.kind.as_deref().unwrap_or("notice"), &n.text)),
         EntryKind::Rewind(_) => out.push(notice("rewind", "History was rolled back")),
+        // Claude's pointer to the session it went on in: a row only when it names one.
+        EntryKind::Other(o) if o.kind == "continued-in" => {
+            let next = o.data.get("continuedInSessionId").and_then(|v| v.as_str());
+            if next.is_some_and(|id| !id.is_empty()) {
+                out.push(notice("continued-in", "Continued in a new session"));
+            }
+        }
         EntryKind::Other(o) if !is_bookkeeping(&o.kind) => {
             out.push(notice(&o.kind, "Record not shown here"));
         }
@@ -97,26 +136,128 @@ fn entry_items(entry: &Entry, out: &mut Vec<Item>) {
     }
 }
 
+/// What an error row says: the message, the HTTP status where the message does not already
+/// name it (a 2xx is no error), and the retry attempt of a notice that the call is tried again.
+fn error_text(e: &ErrorInfo) -> String {
+    let mut line = e.message.trim().to_string();
+    if line.is_empty() {
+        line = "API error".into();
+    }
+    if let Some(status) = e.status.filter(|s| *s >= 400 && !names_status(&line, *s)) {
+        line = format!("{line} (HTTP {status})");
+    }
+    if let Some(n) = e.retry {
+        line = format!("{line}, retrying (attempt {n})");
+    }
+    line
+}
+
+/// The line carries the number as a word of its own (`(HTTP 429)`, `529 Overloaded`), not as
+/// part of another number or an identifier.
+fn names_status(line: &str, status: u16) -> bool {
+    let status = status.to_string();
+    line.split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == status)
+}
+
 fn turn_item(status: Option<&str>, error: Option<&str>, out: &mut Vec<Item>) {
     match (status, error) {
+        // OpenCode writes a failed turn's error twice: as the error record and on the turn.
+        (_, Some(e)) if repeats_last_error(e, out) => {}
         (_, Some(e)) => out.push(Item::Error {
             seq: 0,
-            text: text::text(e),
+            text: text::text(match e.trim() {
+                "" => "Turn failed",
+                shown => shown,
+            }),
         }),
         (Some("interrupted"), None) => out.push(notice("interrupted", "Interrupted")),
         _ => {}
     }
 }
 
-fn notice(kind: &str, body: &str) -> Item {
-    Item::Notice {
-        seq: 0,
-        kind: text::summary(kind),
-        text: text::text(body),
+/// The turn's error is the one the row just before it shows, said again: the same message
+/// once the status and retry suffixes this file adds are taken off. An empty error never
+/// matches, and neither does a row that was a retry notice: the failure after the last retry
+/// is the news.
+fn repeats_last_error(error: &str, out: &[Item]) -> bool {
+    let error = text::text(error.trim());
+    let Some(Item::Error { text: last, .. }) = out.last() else {
+        return false;
+    };
+    let (base, retried) = strip_suffixes(last);
+    !error.is_empty() && !retried && base == error
+}
+
+/// `line` without a `, retrying (attempt N)` tail and then a ` (HTTP N)` tail, and whether the
+/// first was there.
+fn strip_suffixes(line: &str) -> (&str, bool) {
+    match strip_tail(line, ", retrying (attempt ") {
+        Some(rest) => (strip_tail(rest, " (HTTP ").unwrap_or(rest), true),
+        None => (strip_tail(line, " (HTTP ").unwrap_or(line), false),
     }
 }
 
-fn message_items(m: &Message, ts: Option<i64>, out: &mut Vec<Item>) {
+/// `line` up to the last `open` when the rest is a number and `)`.
+fn strip_tail<'a>(line: &'a str, open: &str) -> Option<&'a str> {
+    let at = line.rfind(open)?;
+    let number = line[at + open.len()..].strip_suffix(')')?;
+    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then(|| &line[..at])
+}
+
+/// The line a compaction row shows: the first one of the summary with words in it, clamped.
+/// Claude opens with a fixed sentence ("This session is being continued...") and markers
+/// (`Summary:`, `## ...`, a bare tag) that say nothing; OpenCode's summary opens with a
+/// `## Goal` heading, which stays, followed by the line under it.
+fn compaction_line(agent: Agent, summary: &str) -> Option<String> {
+    const CONTINUED: &str = "This session is being continued";
+    let mut lines = summary
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.chars().any(char::is_alphabetic));
+    let line = if agent == Agent::Opencode {
+        let first = lines.next()?;
+        match first.strip_prefix('#') {
+            Some(heading) => {
+                let heading = heading.trim_start_matches('#').trim();
+                match lines.next() {
+                    Some(next) => format!("{heading}: {next}"),
+                    None => heading.to_string(),
+                }
+            }
+            None => first.to_string(),
+        }
+    } else {
+        lines
+            .find(|l| {
+                !l.starts_with(CONTINUED)
+                    && !l.starts_with('#')
+                    && !l.trim_end_matches(':').eq_ignore_ascii_case("summary")
+                    && !(l.starts_with('<') && l.ends_with('>'))
+            })?
+            .to_string()
+    };
+    Some(text::short(&line, COMPACTION_MAX))
+}
+
+/// Characters of a compaction row's text.
+const COMPACTION_MAX: usize = 160;
+
+/// A record with no text of its own is named by its kind (`model_refusal_no_fallback` reads
+/// `model refusal no fallback`).
+fn notice(kind: &str, body: &str) -> Item {
+    let body = match body.trim() {
+        "" => kind.replace(['_', '-'], " "),
+        shown => shown.to_string(),
+    };
+    Item::Notice {
+        seq: 0,
+        kind: text::summary(kind),
+        text: text::text(&body),
+    }
+}
+
+fn message_items(m: &Message, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>) {
     // Injected context (environment, instructions, reminders, skill bodies) is the harness's,
     // not the conversation's.
     if m.origin == Origin::Context {
@@ -136,8 +277,9 @@ fn message_items(m: &Message, ts: Option<i64>, out: &mut Vec<Item>) {
             },
             Part::Reasoning { text, .. } => thinking.add(text.as_deref()),
             Part::Attachment(media) => chips.push(chip(media)),
-            Part::ToolCall(call) => push_call(call, out),
+            Part::ToolCall(call) => push_call(call, cx, out),
             Part::ToolResult(result) => out.extend(orphan(result)),
+            Part::Other { kind, data } if kind == "fallback" => out.push(fallback(data)),
             Part::Other { kind, .. } if !is_bookkeeping(kind) => {
                 out.push(notice(kind, "Block not shown here"));
             }
@@ -148,6 +290,21 @@ fn message_items(m: &Message, ts: Option<i64>, out: &mut Vec<Item>) {
     if !user_text.is_empty() || !chips.is_empty() {
         push_user_side(m, ts, &user_text.join("\n\n"), chips, out);
     }
+}
+
+/// Claude's `{"type":"fallback","from":{"model"},"to":{"model"}}` block: the request moved to
+/// another model.
+fn fallback(data: &serde_json::Value) -> Item {
+    let model = |side: &str| data.pointer(&format!("/{side}/model"))?.as_str();
+    let said = match (model("from"), model("to")) {
+        (Some(from), Some(to)) => format!(
+            "Switched from {} to {}",
+            text::summary(from),
+            text::summary(to)
+        ),
+        _ => "Switched model".to_string(),
+    };
+    notice("model fallback", &said)
 }
 
 /// Reasoning parts that follow each other are one row.
@@ -278,6 +435,10 @@ fn plain_name(name: &str) -> bool {
         && !encoded
 }
 
+fn chips(media: &[Media]) -> Vec<Chip> {
+    cap_chips(media.iter().map(chip).collect())
+}
+
 fn cap_chips(mut chips: Vec<Chip>) -> Vec<Chip> {
     if chips.len() > MAX_CHIPS {
         let more = chips.len() - MAX_CHIPS;
@@ -290,7 +451,7 @@ fn cap_chips(mut chips: Vec<Chip>) -> Vec<Chip> {
     chips
 }
 
-fn push_call(call: &ToolCall, out: &mut Vec<Item>) {
+fn push_call(call: &ToolCall, cx: &mut Cx, out: &mut Vec<Item>) {
     if let Tool::Task {
         description,
         prompt,
@@ -301,16 +462,25 @@ fn push_call(call: &ToolCall, out: &mut Vec<Item>) {
             .as_deref()
             .or(prompt.as_deref())
             .unwrap_or("subagent");
+        if let Some(spawn) = Spawn::of(call) {
+            cx.spawns.push((out.len(), spawn));
+        }
         out.push(Item::Subagent {
             seq: 0,
             summary: text::summary(&format!("{}{what}", task_verb(&call.name))),
-            // ponytail: agentparse gives the child's session id, not its length.
-            steps: u32::try_from(call.children.len()).unwrap_or(u32::MAX),
+            steps: 0,
         });
         return;
     }
     out.extend(rows(call).iter().map(tool_item));
 }
+
+/// A call that starts a subagent (its child session has the steps).
+pub(crate) fn is_spawn(call: &ToolCall) -> bool {
+    matches!(call.tool, Tool::Task { .. }) && task_verb(&call.name) == SPAWNED
+}
+
+const SPAWNED: &str = "spawned: ";
 
 /// What a subagent call did, from the tool's own name: Codex `spawn_agent`, `send_message`,
 /// `followup_task`, `wait_agent`, Claude `Task` / `Agent` / `SendMessage`, OpenCode `task`.
@@ -324,7 +494,7 @@ fn task_verb(name: &str) -> &'static str {
     } else if name.contains("spawn")
         || ["task", "agent", "subagent", "invoke_agent"].contains(&&*name)
     {
-        "spawned: "
+        SPAWNED
     } else {
         ""
     }
@@ -384,6 +554,10 @@ fn tool_item(row: &Row) -> Item {
         ts: call.started_at,
         output_bytes: output.len() as u64,
         has_detail: !output.is_empty() || !input_text(call).is_empty(),
+        attachments: call
+            .output
+            .as_ref()
+            .map_or_else(Vec::new, |o| chips(&o.attachments)),
     }
 }
 
@@ -425,6 +599,7 @@ fn orphan(result: &ToolResult) -> Option<Item> {
         ts: None,
         output_bytes: output.len() as u64,
         has_detail: !output.is_empty(),
+        attachments: chips(&result.output.attachments),
     })
 }
 
@@ -629,7 +804,7 @@ mod tests {
         let from_result = text.len() - (text[..at].rfind('\n').unwrap() + 1);
         let session = agentparse::parse_file_tail(&path, from_result as u64).unwrap();
         assert!(!session.warnings.is_empty(), "the parser counts it");
-        let rows = items(&session);
+        let rows = project(&session).0;
         let Item::Tool {
             id,
             name,
@@ -677,6 +852,108 @@ mod tests {
             ..Media::default()
         };
         assert_eq!(chip(&bare).name, "attachment");
+    }
+
+    #[test]
+    fn a_failed_turn_does_not_repeat_the_error_row_before_it() {
+        let error = |text: &str| Item::Error {
+            seq: 0,
+            text: text.into(),
+        };
+        let mut out = vec![error("Rate limit exceeded. (HTTP 429)")];
+        turn_item(Some("failed"), Some("Rate limit exceeded."), &mut out);
+        assert_eq!(out.len(), 1, "same error, once");
+        turn_item(Some("failed"), Some("Quota is gone."), &mut out);
+        assert_eq!(out.len(), 2, "a different error still shows");
+        let agent = Item::Agent {
+            seq: 0,
+            ts: None,
+            text: "x".into(),
+            model: None,
+        };
+        let mut out = vec![error("Boom"), agent];
+        turn_item(Some("failed"), Some("Boom"), &mut out);
+        assert_eq!(out.len(), 3, "an error after other rows is a new one");
+    }
+
+    #[test]
+    fn the_failure_after_the_last_retry_shows_and_an_empty_error_is_not_a_repeat() {
+        let error = |text: &str| Item::Error {
+            seq: 0,
+            text: text.into(),
+        };
+        let mut out = vec![error("API error, retrying (attempt 3)")];
+        turn_item(Some("failed"), Some("API error"), &mut out);
+        assert_eq!(out.len(), 2, "the final failure after a retry row");
+        let mut out = vec![error("Boom (HTTP 500)")];
+        turn_item(Some("failed"), Some(""), &mut out);
+        assert_eq!(
+            out.len(),
+            2,
+            "an empty error does not match, and says something"
+        );
+        assert!(matches!(&out[1], Item::Error { text, .. } if text == "Turn failed"));
+        let mut out = vec![error("Boom (HTTP 500)")];
+        turn_item(Some("failed"), Some("Boom"), &mut out);
+        turn_item(Some("failed"), Some("Boo"), &mut out);
+        assert_eq!(out.len(), 2, "equal, not a prefix");
+    }
+
+    #[test]
+    fn a_status_is_named_only_as_a_word_of_its_own() {
+        assert!(names_status("529 Overloaded", 529));
+        assert!(names_status("Overloaded (HTTP 529)", 529));
+        assert!(names_status("error: 429.", 429));
+        assert!(!names_status("port 15290 refused", 529));
+        assert!(!names_status("request req_4291 failed", 429));
+        let info = ErrorInfo {
+            message: "port 15290 refused".into(),
+            status: Some(529),
+            ..ErrorInfo::default()
+        };
+        assert_eq!(error_text(&info), "port 15290 refused (HTTP 529)");
+    }
+
+    #[test]
+    fn a_compaction_line_by_agent() {
+        let claude = |s| compaction_line(Agent::Claude, s);
+        assert_eq!(
+            claude("Summary:\n<summary>\nDid it."),
+            Some("Did it.".into())
+        );
+        assert_eq!(claude("###\n  \n"), None);
+        let opencode = |s| compaction_line(Agent::Opencode, s);
+        assert_eq!(
+            opencode("## Goal\nFix the build."),
+            Some("Goal: Fix the build.".into())
+        );
+        assert_eq!(opencode("## Goal"), Some("Goal".into()));
+        assert_eq!(opencode("Plain start\nmore"), Some("Plain start".into()));
+    }
+
+    #[test]
+    fn an_error_names_a_status_once_and_never_a_success() {
+        let info = |message: &str, status: Option<u16>| ErrorInfo {
+            message: message.into(),
+            status,
+            ..ErrorInfo::default()
+        };
+        assert_eq!(
+            error_text(&info("Overloaded", Some(529))),
+            "Overloaded (HTTP 529)"
+        );
+        assert_eq!(
+            error_text(&info("529 Overloaded", Some(529))),
+            "529 Overloaded"
+        );
+        assert_eq!(error_text(&info("dropped", Some(200))), "dropped");
+        assert_eq!(error_text(&info("", None)), "API error");
+    }
+
+    #[test]
+    fn opencode_todo_snapshots_are_bookkeeping() {
+        assert!(is_bookkeeping("todos") && is_bookkeeping("api-request-shape"));
+        assert!(!is_bookkeeping("continued-in") && !is_bookkeeping("synthetic"));
     }
 
     #[test]

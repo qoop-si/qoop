@@ -14,6 +14,7 @@ mod load;
 mod locate;
 mod project;
 mod redact;
+mod subagent;
 mod text;
 
 pub use detail::detail;

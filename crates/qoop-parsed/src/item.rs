@@ -67,14 +67,24 @@ pub enum Item {
         output_bytes: u64,
         /// [`detail`](crate::detail) has input or output text to show.
         has_detail: bool,
+        /// Images and files the result carried (a screenshot, a read image): names and sizes,
+        /// never bytes. Absent from the wire when there are none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Chip>,
     },
     Subagent {
         seq: u32,
         summary: String,
+        /// Tool calls the child session made, read from its own session where it can be found
+        /// (a spawn row only; 0 when it cannot, for a message to a child, and past the newest
+        /// 32 spawns of a page).
         steps: u32,
     },
     Compaction {
         seq: u32,
+        /// The first line of the summary the agent wrote, redacted and clamped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     Error {
         seq: u32,
@@ -134,7 +144,7 @@ impl Item {
             | Item::Thinking { seq, .. }
             | Item::Tool { seq, .. }
             | Item::Subagent { seq, .. }
-            | Item::Compaction { seq }
+            | Item::Compaction { seq, .. }
             | Item::Error { seq, .. }
             | Item::Notice { seq, .. } => *seq,
             Item::Unknown => 0,
@@ -153,7 +163,7 @@ impl Item {
             | Item::Thinking { seq, .. }
             | Item::Tool { seq, .. }
             | Item::Subagent { seq, .. }
-            | Item::Compaction { seq }
+            | Item::Compaction { seq, .. }
             | Item::Error { seq, .. }
             | Item::Notice { seq, .. } => *seq = value,
             Item::Unknown => {}

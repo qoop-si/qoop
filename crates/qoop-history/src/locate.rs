@@ -307,12 +307,17 @@ fn codex_head_matches(path: &Path, id: &str) -> Result<bool, Error> {
     let Some(v) = first_line_json(path)? else {
         return Ok(false);
     };
+    // A root thread has `id == session_id`. A subagent thread has its own `id` (the one in its
+    // file name) and its root's `session_id`.
+    let named = |key: &str| {
+        v.get("payload")
+            .and_then(|p| p.get(key))
+            .and_then(|s| s.as_str())
+            == Some(id)
+    };
     Ok(
         v.get("type").and_then(|t| t.as_str()) == Some("session_meta")
-            && v.get("payload")
-                .and_then(|p| p.get("session_id"))
-                .and_then(|s| s.as_str())
-                == Some(id),
+            && (named("session_id") || named("id")),
     )
 }
 

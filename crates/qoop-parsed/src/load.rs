@@ -8,6 +8,7 @@ use agentparse::{Agent, Session};
 use crate::item::{Digest, Item};
 use crate::locate::Source;
 use crate::project;
+use crate::subagent;
 
 /// A session of a format that is parsed whole (Gemini) and is bigger than this is not read:
 /// the view says to use the terminal. Claude and Codex files are read by their tail, so their
@@ -42,6 +43,10 @@ pub struct Options {
     /// a page is never empty because of it. Text is clamped to 4 KiB per item, so that item
     /// is small.
     pub max_total_bytes: usize,
+    /// The directory Codex keeps its rollouts under, where the caller found the session. A
+    /// subagent's rollout is looked for there. Without it the root is read off a
+    /// `YYYY/MM/DD` layout, and a file outside one finds no children.
+    pub codex_root: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -51,6 +56,7 @@ impl Default for Options {
             limit: 60,
             skip: 0,
             max_total_bytes: 256 * 1024,
+            codex_root: None,
         }
     }
 }
@@ -82,7 +88,8 @@ impl From<agentparse::Error> for Error {
 /// The revision [`load`] would report now, from a stat alone: no parse. `Error::TooLarge`
 /// for a session [`load`] would refuse, `Error::NotFound` when the file is gone.
 pub fn revision_of(source: &Source) -> Result<u64, Error> {
-    stamp(source).map(|s| s.revision)
+    let base = stamp(source)?.revision;
+    Ok(subagent::with_children(source, base))
 }
 
 /// Read one page of a session's items: the `limit` before the newest `skip`.
@@ -99,13 +106,24 @@ pub fn load(source: &Source, opts: &Options) -> Result<Digest, Error> {
     let mut window = opts.max_tail_bytes;
     loop {
         let (session, cut) = read(source, stamp.len, window)?;
-        let all = project::items(&session);
+        let (all, spawns) = project::project(&session);
         let items = if cut { drop_leading_orphans(all) } else { all };
-        if !cut || items.len() >= want || window >= MAX_TAIL_BYTES {
+        // The newest `WATCH_ITEMS` are always in the window, so the spawn rows the revision
+        // watches are the same whatever the page asked for.
+        let enough = want.max(subagent::WATCH_ITEMS as usize);
+        if !cut || items.len() >= enough || window >= MAX_TAIL_BYTES {
             let warnings = u32::try_from(session.warnings.len()).unwrap_or(u32::MAX);
-            let (first_seq, has_older, items) = page(items, cut, opts);
+            let (first_seq, has_older, mut items) = page(items, cut, opts);
+            let revision = subagent::annotate(
+                source,
+                &session,
+                &spawns,
+                opts.codex_root.as_deref(),
+                &mut items,
+                stamp.revision,
+            );
             return Ok(Digest {
-                revision: stamp.revision,
+                revision,
                 first_seq,
                 has_older,
                 items,
@@ -243,7 +261,7 @@ fn format_of_record(v: &serde_json::Map<String, serde_json::Value>) -> Format {
     }
 }
 
-fn len_and_mtime(path: &Path) -> Result<(u64, u64), Error> {
+pub(crate) fn len_and_mtime(path: &Path) -> Result<(u64, u64), Error> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::NotFound,
         kind => Error::Io(kind.to_string()),
@@ -263,7 +281,7 @@ pub const REVISION_MASK: u64 = (1 << 53) - 1;
 
 /// FNV-1a over the little-endian bytes: stable across runs and Rust versions, unlike `Hasher`.
 /// Masked to [`REVISION_MASK`] by the last step, so every revision is exact in an `f64`.
-fn fnv(values: &[u64]) -> u64 {
+pub(crate) fn fnv(values: &[u64]) -> u64 {
     values
         .iter()
         .flat_map(|v| v.to_le_bytes())

@@ -469,6 +469,7 @@ fn read(
                 let opts = Options {
                     skip,
                     limit: *limit,
+                    codex_root: agent_dirs().map(|d| d.codex),
                     ..Options::default()
                 };
                 qoop_parsed::load(&source, &opts).map(|d| Arc::new(Reply::Page(d)))

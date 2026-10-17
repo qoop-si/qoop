@@ -161,7 +161,7 @@ fn row(item: &Item) -> String {
             ("tool", line)
         }
         Item::Subagent { summary, steps, .. } => ("subagent", format!("{summary} ({steps} steps)")),
-        Item::Compaction { .. } => ("compaction", String::new()),
+        Item::Compaction { text, .. } => ("compaction", text.clone().unwrap_or_default()),
         Item::Error { text, .. } => ("error", text.clone()),
         Item::Notice { kind, text, .. } => ("notice", format!("{kind}: {text}")),
         Item::Unknown => ("notice", "(a kind this qoop does not know)".to_string()),
@@ -224,11 +224,17 @@ mod tests {
             ts: None,
             output_bytes: 0,
             has_detail: true,
+            attachments: Vec::new(),
         };
         assert_eq!(
             row(&tool),
             "    4  tool       Bash cargo test [failed, exit 101]"
         );
+        let compaction = Item::Compaction {
+            seq: 5,
+            text: Some("Goal: ship it".into()),
+        };
+        assert_eq!(row(&compaction), "    5  compaction Goal: ship it");
     }
 
     /// ESC [ 2 J, an OSC title ended by BEL, a C1 CSI, a right-to-left override and an isolate,
@@ -272,6 +278,7 @@ mod tests {
                 ts: None,
                 output_bytes: 0,
                 has_detail: false,
+                attachments: Vec::new(),
             },
             Item::Notice {
                 seq: 3,

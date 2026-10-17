@@ -25173,6 +25173,7 @@ mod tests {
             ts: None,
             output_bytes: 4,
             has_detail: true,
+            attachments: Vec::new(),
         }
     }
 

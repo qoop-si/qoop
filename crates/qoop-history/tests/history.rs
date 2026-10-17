@@ -121,6 +121,27 @@ fn codex_locates_by_in_file_id() {
 }
 
 #[test]
+fn codex_locates_a_subagent_thread_by_its_own_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let day = dir.path().join("codex/2026/09/04");
+    std::fs::create_dir_all(&day).unwrap();
+    let meta = serde_json::json!({"timestamp":"2026-09-04T13:24:40.608Z","ordinal":0,
+        "type":"session_meta","payload":{"session_id":"root-1","id":"child-2","cwd":"/x"}});
+    std::fs::write(
+        day.join("rollout-2026-09-04T13-24-40-child-2.jsonl"),
+        format!("{meta}\n"),
+    )
+    .unwrap();
+    let d = dirs(dir.path());
+    assert!(matches!(
+        locate::locate(Product::Codex, "child-2", &d),
+        Ok(Located::File(_))
+    ));
+    // The file name still has to carry the id: the root's id names no file here.
+    assert!(locate::locate(Product::Codex, "root-1", &d).is_err());
+}
+
+#[test]
 fn gemini_matches_embedded_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let chats = dir.path().join("gemini/h1/chats");
