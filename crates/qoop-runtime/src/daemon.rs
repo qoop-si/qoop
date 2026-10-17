@@ -242,6 +242,8 @@ pub struct ConnectionRegistry {
     asks: tokio::sync::broadcast::Sender<()>,
     /// The terminals whose chat a client asked about lately, and the news of their files.
     pub messages: crate::messages::Watch,
+    /// A result was shown (`qoop show`), fanned out like `asks`.
+    shows: tokio::sync::broadcast::Sender<()>,
     /// The microphone an interface lends a tab's program, and who is listening.
     pub microphone: Arc<crate::microphone::Hub>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
@@ -259,6 +261,7 @@ impl Default for ConnectionRegistry {
             focus: tokio::sync::broadcast::channel(16).0,
             asks: tokio::sync::broadcast::channel(16).0,
             messages: crate::messages::Watch::default(),
+            shows: tokio::sync::broadcast::channel(16).0,
             microphone: Arc::default(),
             changed: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -448,6 +451,11 @@ impl ConnectionRegistry {
     /// Tell every connection the question inbox changed.
     pub fn asks_changed(&self) {
         let _ = self.asks.send(());
+    }
+
+    /// Tell every connection a result was shown.
+    pub fn shows_changed(&self) {
+        let _ = self.shows.send(());
     }
 
     /// Ask every attached interface to show `terminal`, and say which processes those are.
@@ -1797,6 +1805,16 @@ static ADOPTED: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 /// is one that never moved.
 static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// This daemon's boot id, made on first use.
+pub(crate) fn boot() -> &'static str {
+    BOOT.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}-{}", std::process::id(), now.as_nanos())
+    })
+}
+
 /// The peer's pid, which is how `qoop focus` names the interfaces it moved: a launcher
 /// raises the window the process runs in, and how `qoop restart` tells the daemon that moved
 /// (an exec keeps the pid) from one started in its place. `None` when the kernel will not say.
@@ -2221,14 +2239,8 @@ async fn serve_client(
             w.extra
                 .insert(crate::control::ADOPTED.into(), serde_json::json!(ids));
         }
-        let boot = BOOT.get_or_init(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            format!("{}-{}", std::process::id(), now.as_nanos())
-        });
         w.extra
-            .insert(crate::control::BOOT.into(), serde_json::json!(boot));
+            .insert(crate::control::BOOT.into(), serde_json::json!(boot()));
     }
     let body = match &outcome {
         qoop_proto::HandshakeOutcome::Welcome(w) => serde_json::to_vec(w),
@@ -2244,6 +2256,7 @@ async fn serve_client(
     // out of the answer.
     let mut focus = connections.focus.subscribe();
     let mut asks = connections.asks.subscribe();
+    let mut shows = connections.shows.subscribe();
     let mut listening = connections.microphone.subscribe();
     if hello.client_id == qoop_proto::INTERFACE_ID
         && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
@@ -2341,6 +2354,12 @@ async fn serve_client(
                 said = chats.recv() => match crate::messages::news(said) {
                     Some(event) => Some(event),
                     None => return,
+                },
+                changed = shows.recv() => match changed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Some(crate::control::EventMessage::ShowsChanged)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
                 // A missed one is said again within a second while the recording lasts.
                 heard = listening.recv() => match heard {
@@ -3543,6 +3562,8 @@ fn dispatch(
         // A read and a parse of the agent's own session file: off the read loop, where it
         // would hold up this connection's typing.
         ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. } => Dispatch::Apart,
+        // A chunk of a shown file is disk too, on a path an agent chose.
+        ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // Runs the binary on disk and waits for a first look across every space.
         ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
         // The first answer after a swap runs that binary.
@@ -5184,6 +5205,43 @@ async fn handle_control(
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
         }
+        ControlRequest::ShowWrite {
+            terminal,
+            token,
+            target,
+            note,
+            ..
+        } => {
+            // The token first: a refused caller costs no store read.
+            if !crate::tasks::admitted(agents, terminal, &token) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("the show request for terminal {terminal} was refused"),
+                };
+            }
+            let space = match terminals.workspace_of(terminal) {
+                Some(space) => space_name(store, space).await,
+                None => None,
+            };
+            Box::pin(crate::shows::write(
+                id,
+                terminal,
+                target,
+                note,
+                space,
+                terminals,
+                agents,
+                connections,
+                store,
+            ))
+            .await
+        }
+        ControlRequest::ShowRead { .. } => {
+            Box::pin(crate::shows::read(id, terminals, agents, store)).await
+        }
+        ControlRequest::ShowFetch {
+            show, offset, len, ..
+        } => Box::pin(crate::shows::fetch(id, show, offset, len, store)).await,
         ControlRequest::ListFocusEvents {
             terminal, last_n, ..
         } => {
@@ -8901,7 +8959,7 @@ pub const SEARCH_BYTES: u64 = 64 * 1024 * 1024;
 const SEARCH_CHUNK: u64 = 16_384;
 
 /// How long a check of a directory the user chose may take before it is abandoned.
-const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether each of `paths` is a directory, every one probed at once under the same deadline:
 /// `None` when it did not answer in time or found the pool busy. Such a path is never spawned

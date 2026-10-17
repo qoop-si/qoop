@@ -304,11 +304,12 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
         EventMessage::AgentChanged { terminal } => watched.contains(terminal),
         EventMessage::Resync => true,
         // Which terminal an interface shows says nothing about any agent, nor does the board,
-        // the question inbox, a recording or the words of a chat.
+        // the question inbox, a result shown, a recording or the words of a chat.
         EventMessage::Focus { .. }
         | EventMessage::TasksChanged
         | EventMessage::AsksChanged
         | EventMessage::MessagesChanged { .. }
+        | EventMessage::ShowsChanged
         | EventMessage::Listen { .. } => false,
     })
 }
@@ -465,6 +466,7 @@ async fn follow(
                     EventMessage::Focus { .. }
                         | EventMessage::AsksChanged
                         | EventMessage::MessagesChanged { .. }
+                        | EventMessage::ShowsChanged
                 )
             }) {
                 break;

@@ -15,6 +15,7 @@
 pub mod ask;
 pub mod history;
 pub mod item;
+pub mod show;
 pub mod task;
 
 use std::collections::BTreeSet;
@@ -24,6 +25,7 @@ pub use ask::{Added, AskError, AskRow};
 pub use history::History;
 pub use item::{ItemAgent, ItemCard, ItemRow, ItemState, StepRow};
 use rusqlite::{Connection, OptionalExtension, params};
+pub use show::ShowRow;
 pub use task::{Outcome, TaskError, TaskEventRow, TaskRow};
 
 #[derive(Debug, thiserror::Error)]
@@ -419,6 +421,22 @@ impl Store {
                  option TEXT,
                  opened_at INTEGER NOT NULL,
                  closed_at INTEGER
+             );
+             -- What agents put on the owner's phone (`show.rs`). AUTOINCREMENT, so an id a
+             -- phone marked seen is never given again after a prune. New table, no version
+             -- bump, like `ask`.
+             CREATE TABLE IF NOT EXISTS show (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at INTEGER NOT NULL,
+                 boot TEXT NOT NULL,
+                 terminal INTEGER NOT NULL,
+                 generation INTEGER NOT NULL,
+                 space TEXT,
+                 title TEXT,
+                 kind TEXT NOT NULL,
+                 target TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 note TEXT
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

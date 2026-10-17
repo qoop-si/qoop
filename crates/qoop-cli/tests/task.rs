@@ -85,6 +85,13 @@ impl Daemon {
 
     /// Run a script inside terminal `terminal`'s shell, as its agent would, and wait for it.
     fn inside(&self, terminal: &str, name: &str, body: &str) -> PathBuf {
+        let work = self.begin(terminal, name, body);
+        wait_for(&work, "finished", terminal);
+        work
+    }
+
+    /// Start a script inside terminal `terminal`'s shell, and leave it running.
+    fn begin(&self, terminal: &str, name: &str, body: &str) -> PathBuf {
         let work = self.dir.join(name);
         std::fs::create_dir_all(&work).unwrap();
         let script = work.join("run.sh");
@@ -100,15 +107,19 @@ impl Daemon {
         let line = format!("sh '{}'", script.display());
         let (ok, _, err) = self.run(&["send", terminal, &line, "--enter"]);
         assert!(ok, "send failed: {err}");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !work.join("finished").exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the script in terminal {terminal} never finished"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
         work
+    }
+}
+
+/// Wait for a script in `terminal` to make `file` in its directory.
+fn wait_for(work: &Path, file: &str, terminal: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !work.join(file).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the script in terminal {terminal} never made {file}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -621,10 +632,13 @@ $Q task goal > empty.out 2>&1; echo $? > empty.rc"#,
     assert_eq!(ls.lines().count(), 1, "qass opened nothing: {ls}");
 }
 
-/// Count the board's news this daemon sends, on a connection of its own, as a phone would.
-fn watch_tasks(dir: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+/// Count the news this daemon sends that `want` picks, on a connection of its own, as a
+/// phone would.
+fn watch(
+    dir: &Path,
+    want: fn(&qoop_runtime::control::EventMessage) -> bool,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
     use qoop_runtime::client::{Connection, Incoming};
-    use qoop_runtime::control::EventMessage;
     use tokio::io::AsyncReadExt;
     let heard = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -647,7 +661,7 @@ fn watch_tasks(dir: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
             let mut read = vec![0u8; 64 * 1024];
             loop {
                 for incoming in connection.drain(&mut inbuf).unwrap_or_default() {
-                    if matches!(incoming, Incoming::Event(EventMessage::TasksChanged)) {
+                    if matches!(&incoming, Incoming::Event(event) if want(event)) {
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
@@ -692,7 +706,9 @@ fn board_items(daemon: &Daemon) -> Vec<serde_json::Value> {
 fn a_board_item_is_worked_from_a_terminal_and_moved_from_outside() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(&dir);
-    let heard = watch_tasks(dir.path());
+    let heard = watch(dir.path(), |e| {
+        matches!(e, qoop_runtime::control::EventMessage::TasksChanged)
+    });
     let count = || heard.load(std::sync::atomic::Ordering::SeqCst);
 
     let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "login", "works"]);
@@ -1090,4 +1106,306 @@ fn a_board_agent_has_one_name_and_the_boards_refusals_say_why() {
     );
     let (_, ls, _) = daemon.run(&["task", "ls"]);
     assert_eq!(ls.lines().count(), 1, "only the worker's task: {ls}");
+}
+
+/// One control question to this daemon, from outside every terminal.
+fn control(
+    dir: &Path,
+    request: qoop_runtime::control::ControlRequest,
+) -> qoop_runtime::control::ControlResponse {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (stream, inbuf) =
+            qoop_runtime::client::connect(&qoop_testkit::socket_in(dir), "show-test")
+                .await
+                .expect("connect");
+        let mut c = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
+        c.control(&request, Duration::from_secs(10))
+            .await
+            .expect("an answer")
+    })
+}
+
+fn shows(dir: &Path) -> Vec<qoop_runtime::control::ShowInfo> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    match control(dir, ControlRequest::ShowRead { id: "r".into() }) {
+        ControlResponse::Shows { shows, .. } => shows,
+        other => panic!("ShowRead: {other:?}"),
+    }
+}
+
+/// One chunk of a show, or the daemon's refusal.
+fn fetch(dir: &Path, show: u64, offset: u64, len: u32) -> Result<(Vec<u8>, u64), String> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let request = ControlRequest::ShowFetch {
+        id: "f".into(),
+        show,
+        offset,
+        len,
+    };
+    match control(dir, request) {
+        // Standard base64, as `Heard` carries it: the one decoder this crate can reach.
+        ControlResponse::ShowChunk { data, total, .. } => Ok((
+            qoop_runtime::microphone::decode(&data).expect("base64"),
+            total,
+        )),
+        ControlResponse::Failed { reason, .. } => Err(reason),
+        other => panic!("ShowFetch: {other:?}"),
+    }
+}
+
+/// A whole show, read the way the phone reads it: one chunk after another.
+fn fetch_all(dir: &Path, show: u64) -> Vec<u8> {
+    let mut all = Vec::new();
+    loop {
+        let (data, total) = fetch(dir, show, all.len() as u64, 100_000).expect("a chunk");
+        assert!(
+            data.len() <= 100_000,
+            "a chunk is never more than asked for"
+        );
+        all.extend_from_slice(&data);
+        if data.is_empty() || all.len() as u64 >= total {
+            return all;
+        }
+    }
+}
+
+/// An agent shows a picture, a relative file and a url from inside its terminal: they are
+/// listed newest first with what the daemon knew, the picture's note made one line, a phone
+/// watching hears of it, a file reads back whole in chunks. Once the script ends and the
+/// shell takes the foreground they are no longer its current agent's, and they stay listed
+/// after the terminal closes.
+#[test]
+fn an_agent_shows_a_result_and_the_phone_reads_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let heard = watch(dir.path(), |e| {
+        matches!(e, qoop_runtime::control::EventMessage::ShowsChanged)
+    });
+    let work = dir.path().join("show");
+    std::fs::create_dir_all(&work).unwrap();
+    let picture: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    std::fs::write(work.join("shot.png"), &picture).unwrap();
+    std::fs::write(work.join("rel.txt"), "relative to its cwd").unwrap();
+    // The script's own shell is the terminal's foreground program from its first line, and
+    // it holds there until `go`: the agent that showed them is still the one in the tab.
+    daemon.begin(
+        "1",
+        "show",
+        &format!(
+            r#"echo begin; sleep 1; echo leader
+$Q show '{}' --note "login
+works" > abs.out 2>&1
+$Q show rel.txt > rel.out 2>&1
+$Q show https://github.com/qoop-si/qoop/pull/1 > url.out 2>&1
+$Q show http://localhost:3000/ > local.out 2>&1; echo $? > local.rc
+touch shown
+while [ ! -f go ]; do sleep 0.1; done"#,
+            work.join("shot.png").display()
+        ),
+    );
+    wait_for(&work, "shown", "1");
+    assert_eq!(
+        read(&work, "abs.out").trim(),
+        "shown 1",
+        "{}",
+        read(&work, "abs.out")
+    );
+    assert_eq!(
+        read(&work, "rel.out").trim(),
+        "shown 2",
+        "{}",
+        read(&work, "rel.out")
+    );
+    assert_eq!(
+        read(&work, "url.out").trim(),
+        "shown 3",
+        "{}",
+        read(&work, "url.out")
+    );
+    assert_eq!(read(&work, "local.rc").trim(), "1");
+    assert!(
+        read(&work, "local.out").contains("cannot open a local address"),
+        "{}",
+        read(&work, "local.out")
+    );
+    assert!(
+        heard_after(&heard, 0, Duration::from_secs(5)),
+        "a watching phone hears ShowsChanged"
+    );
+
+    let listed = shows(dir.path());
+    let ids: Vec<u64> = listed.iter().map(|s| s.show).collect();
+    assert_eq!(ids, [3, 2, 1], "newest first: {listed:?}");
+    let (url, rel, shot) = (&listed[0], &listed[1], &listed[2]);
+    assert_eq!(shot.kind, "image");
+    assert_eq!(shot.name, "shot.png");
+    assert_eq!(shot.note.as_deref(), Some("login works"));
+    assert_eq!(shot.size, picture.len() as u64);
+    assert_eq!(shot.terminal, 1);
+    assert!(shot.space.is_some(), "{shot:?}");
+    assert!(shot.current, "its agent is still in the tab: {shot:?}");
+    assert_eq!((rel.kind.as_str(), rel.name.as_str()), ("file", "rel.txt"));
+    assert_eq!(fetch_all(dir.path(), 2), b"relative to its cwd");
+    assert_eq!(url.kind, "url");
+    assert_eq!(url.name, "https://github.com/qoop-si/qoop/pull/1");
+    assert_eq!(url.size, 0);
+    assert!(
+        fetch(dir.path(), 3, 0, 10)
+            .unwrap_err()
+            .contains("is a url")
+    );
+
+    assert_eq!(fetch_all(dir.path(), 1), picture, "reassembled in chunks");
+    let (big, total) = fetch(dir.path(), 1, 0, 1_000_000).unwrap();
+    assert_eq!(big.len(), 128 * 1024, "a chunk is cut at 128 KiB");
+    assert_eq!(total, picture.len() as u64);
+    let (tail, _) = fetch(dir.path(), 1, 299_990, 100).unwrap();
+    assert_eq!(tail, picture[299_990..]);
+
+    std::fs::write(work.join("go"), "").unwrap();
+    wait_for(&work, "finished", "1");
+    // The shell takes the foreground back, and says so with its prompt: a new generation.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while shows(dir.path()).iter().any(|s| s.current) {
+        assert!(
+            Instant::now() < deadline,
+            "still current after the script ended"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let (ok, _, err) = daemon.run(&["close", "1"]);
+    assert!(ok, "close: {err}");
+    let after = shows(dir.path());
+    assert_eq!(after.len(), 3, "a closed tab's shows stay");
+    assert!(after.iter().all(|s| !s.current), "{after:?}");
+}
+
+/// What is not a show is refused: from outside a terminal, with a forged token, a directory,
+/// a file over 25 MiB, and sent straight to the socket a `javascript:` or `file:` url, a url
+/// with a space or with no host, one over 2048 characters. An upper case scheme is a url. A
+/// file deleted, or replaced by a directory or a fifo, after it was shown fails its fetch
+/// with the reason, and the fifo does not hold the fetch.
+#[test]
+fn a_show_is_refused_for_what_it_cannot_be() {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let png = dir.path().join("x.png");
+    std::fs::write(&png, "x").unwrap();
+    let png = png.to_string_lossy().into_owned();
+
+    let (ok, _, err) = daemon.run(&["show", &png]);
+    assert!(!ok && err.contains("runs inside a qoop terminal"), "{err}");
+    let (ok, _, err) = daemon.run_env(
+        &["show", &png],
+        &[("QOOP_TERMINAL", "1"), ("QOOP_TOKEN", "forged")],
+    );
+    assert!(!ok && err.contains("refused"), "a forged token: {err}");
+
+    let work = daemon.inside(
+        "1",
+        "refuse",
+        r#"printf '%s' "$QOOP_TOKEN" > token
+echo gone > gone.txt
+echo swapped > swapped.txt
+echo fifo > fifo.txt
+$Q show gone.txt > gone.out 2>&1
+$Q show swapped.txt > swapped.out 2>&1
+$Q show fifo.txt > fifo.out 2>&1
+mkdir adir
+$Q show adir > adir.out 2>&1; echo $? > adir.rc
+head -c 26214401 /dev/zero > big.bin
+$Q show big.bin > big.out 2>&1; echo $? > big.rc"#,
+    );
+    assert_eq!(read(&work, "adir.rc").trim(), "1");
+    assert!(
+        read(&work, "adir.out").contains("not a regular file"),
+        "{}",
+        read(&work, "adir.out")
+    );
+    assert_eq!(read(&work, "big.rc").trim(), "1");
+    assert!(
+        read(&work, "big.out").contains("over 25 MiB"),
+        "{}",
+        read(&work, "big.out")
+    );
+
+    let token = read(&work, "token");
+    assert!(!token.is_empty());
+    let raw = |target: &str| {
+        control(
+            dir.path(),
+            ControlRequest::ShowWrite {
+                id: "w".into(),
+                terminal: 1,
+                token: token.clone(),
+                target: target.into(),
+                note: None,
+            },
+        )
+    };
+    let long = format!("https://example.com/{}", "a".repeat(2048));
+    for target in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "relative.png",
+        "http://a b",
+        "https://",
+        "http:///path",
+        long.as_str(),
+    ] {
+        let answer = raw(target);
+        assert!(
+            matches!(&answer, ControlResponse::Failed { reason, .. }
+                if reason.contains("absolute file path or an http or https url")),
+            "{target}: {answer:?}"
+        );
+    }
+    assert!(
+        matches!(
+            raw("HTTP://x"),
+            ControlResponse::ShowWritten { show: 4, .. }
+        ),
+        "an upper case scheme is still a url"
+    );
+    assert_eq!(
+        shows(dir.path()).len(),
+        4,
+        "only the three files and the url"
+    );
+
+    std::fs::remove_file(work.join("gone.txt")).unwrap();
+    assert_eq!(fetch(dir.path(), 1, 0, 10).unwrap_err(), "the file is gone");
+    std::fs::remove_file(work.join("swapped.txt")).unwrap();
+    std::fs::create_dir(work.join("swapped.txt")).unwrap();
+    assert_eq!(
+        fetch(dir.path(), 2, 0, 10).unwrap_err(),
+        "the file changed, show it again"
+    );
+    std::fs::remove_file(work.join("fifo.txt")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(work.join("fifo.txt"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let started = Instant::now();
+    assert_eq!(
+        fetch(dir.path(), 3, 0, 10).unwrap_err(),
+        "the file changed, show it again"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a fifo held the fetch {:?}",
+        started.elapsed()
+    );
+    assert!(
+        fetch(dir.path(), 9, 0, 10)
+            .unwrap_err()
+            .contains("no show 9")
+    );
 }

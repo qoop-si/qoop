@@ -143,7 +143,7 @@ fn standing(
     })
 }
 
-fn failed(id: String, reason: impl Into<String>) -> ControlResponse {
+pub(crate) fn failed(id: String, reason: impl Into<String>) -> ControlResponse {
     ControlResponse::Failed {
         id,
         reason: reason.into(),

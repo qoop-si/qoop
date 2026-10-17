@@ -9937,8 +9937,8 @@ where
                                     }
                                 }
                             }
-                            // The board's news: nothing the index draws.
-                            Incoming::Event(EventMessage::TasksChanged) => {}
+                            // The board's news and a result shown: nothing the index draws.
+                            Incoming::Event(EventMessage::TasksChanged | EventMessage::ShowsChanged) => {}
                             // The chat view asks for the page again when it shows this terminal.
                             Incoming::Event(EventMessage::MessagesChanged { terminal, .. }) => {
                                 chat_news(&mut state, terminal, std::time::Instant::now());

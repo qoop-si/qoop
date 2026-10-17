@@ -560,6 +560,33 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "put a result on the owner's phone",
+            method: || {
+                Method::Control(ControlRequest::ShowWrite {
+                    id: "a".into(),
+                    terminal: 1,
+                    token: "t".into(),
+                    target: "/tmp/shot.png".into(),
+                    note: None,
+                })
+            },
+        },
+        Action {
+            name: "list the results shown",
+            method: || Method::Control(ControlRequest::ShowRead { id: "a".into() }),
+        },
+        Action {
+            name: "download a result shown",
+            method: || {
+                Method::Control(ControlRequest::ShowFetch {
+                    id: "a".into(),
+                    show: 1,
+                    offset: 0,
+                    len: 1,
+                })
+            },
+        },
+        Action {
             name: "show a task and what was recorded on it",
             method: || {
                 Method::Control(ControlRequest::TaskRead {
@@ -830,6 +857,20 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             all: false,
         },
+        ControlRequest::ShowWrite {
+            id: String::new(),
+            terminal: 0,
+            token: String::new(),
+            target: String::new(),
+            note: None,
+        },
+        ControlRequest::ShowRead { id: String::new() },
+        ControlRequest::ShowFetch {
+            id: String::new(),
+            show: 0,
+            offset: 0,
+            len: 0,
+        },
         ControlRequest::Listen {
             id: String::new(),
             terminal: 0,
@@ -879,6 +920,9 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }
             | ControlRequest::AskRead { .. }
+            | ControlRequest::ShowWrite { .. }
+            | ControlRequest::ShowRead { .. }
+            | ControlRequest::ShowFetch { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

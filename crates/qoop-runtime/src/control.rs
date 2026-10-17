@@ -575,6 +575,60 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all: bool,
     },
+    /// Put a result on the owner's phone (`qoop show`): `target` is an absolute file path or
+    /// an `http`/`https` url, sent with the token of the terminal whose agent shows it.
+    /// Answered `ShowWritten`.
+    ShowWrite {
+        id: String,
+        terminal: u32,
+        token: String,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// The newest results shown, answered as `Shows`.
+    ShowRead {
+        id: String,
+    },
+    /// Up to `len` bytes (cut at [`SHOW_CHUNK`]) of a shown file from `offset`, answered as
+    /// `ShowChunk`. Only the path recorded for that show is read.
+    ShowFetch {
+        id: String,
+        show: u64,
+        offset: u64,
+        len: u32,
+    },
+}
+
+/// The largest file `qoop show` puts on the phone.
+pub const SHOW_MOST: u64 = 25 * 1024 * 1024;
+
+/// The most bytes one `ShowFetch` answers: small enough to arrive well inside the
+/// reassembly deadline on a slow link.
+pub const SHOW_CHUNK: u32 = 128 * 1024;
+
+/// A result as the phone lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowInfo {
+    pub show: u64,
+    /// `image`, `video`, `file` or `url`: an icon and a label. The viewer goes by the name.
+    pub kind: String,
+    /// The file's name (never its path), or the url itself.
+    pub name: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Bytes when shown; 0 for a url.
+    pub size: u64,
+    /// When it was shown, in unix seconds.
+    pub at: i64,
+    pub terminal: u32,
+    /// Whether the agent that showed it is still the one in that terminal: the same daemon,
+    /// the terminal open, the same generation.
+    pub current: bool,
+    #[serde(default)]
+    pub space: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// What an `AskWrite` does.
@@ -1103,6 +1157,9 @@ impl ControlRequest {
             | Self::TaskRead { id, .. }
             | Self::AskWrite { id, .. }
             | Self::AskRead { id, .. }
+            | Self::ShowWrite { id, .. }
+            | Self::ShowRead { id }
+            | Self::ShowFetch { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -1352,6 +1409,24 @@ pub enum ControlResponse {
         id: String,
         live: Vec<AskInfo>,
         ended: Vec<AskInfo>,
+    },
+    /// A `ShowWrite` was recorded as `show`.
+    ShowWritten {
+        id: String,
+        show: u64,
+    },
+    /// The newest results shown, newest first, at most 50.
+    Shows {
+        id: String,
+        shows: Vec<ShowInfo>,
+    },
+    /// Bytes of a shown file, as standard base64, with the file's size and modification
+    /// time (unix milliseconds) now: a reader starts over when either changed.
+    ShowChunk {
+        id: String,
+        data: String,
+        total: u64,
+        mtime: u64,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -1911,6 +1986,9 @@ impl ControlResponse {
             | Self::Tasks { id, .. }
             | Self::AskWritten { id, .. }
             | Self::Asks { id, .. }
+            | Self::ShowWritten { id, .. }
+            | Self::Shows { id, .. }
+            | Self::ShowChunk { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }
@@ -2785,6 +2863,8 @@ pub enum EventMessage {
         terminal: TerminalStream,
         revision: u64,
     },
+    /// A result was shown: `ShowRead` says what is there. An older client ignores it.
+    ShowsChanged,
     /// A program in `terminal` is recording (`on`), and will say so every second while it
     /// does, or has stopped. `listener` numbers the recording. An interface lends its
     /// microphone only right after a key the person pressed there; every other client, and

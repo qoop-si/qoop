@@ -41,6 +41,7 @@ mod qass_page;
 mod remote;
 pub mod report;
 mod settings;
+mod show;
 mod skills;
 mod sound;
 mod supervise;
@@ -196,6 +197,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("hook-report") => run_hook_report(&args),
         Some("task") => task::run(&args),
         Some("ask") => ask::run(&args),
+        Some("show") => show::run(&args),
         Some("doctor") => doctor::run(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
@@ -254,6 +256,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop task add|describe|steps|check|link|unlink|start|reopen  the board's items\n\
                   \x20 qoop ask add|close|ls  the owner's questions, as qass fills them;\n\
                   \x20                 `qoop ask` for more\n\
+                  \x20 qoop show <file|url> [--note TEXT]  put a screenshot, recording,\n\
+                  \x20                 report or public url on the owner's phone\n\
                   \x20 qoop doctor  whether the board, the questions and the agents agree;\n\
                   \x20                 read-only, `qoop doctor --help` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
@@ -1386,7 +1390,7 @@ where
                     && (response.request_id() == id
                         || matches!(&response, ControlResponse::Failed { id, reason }
                         if id.is_empty()
-                            && ["RestartWhenSafe", "AskWrite", "AskRead"].iter().any(|variant| {
+                            && ["RestartWhenSafe", "AskWrite", "AskRead", "ShowWrite"].iter().any(|variant| {
                                 qoop_runtime::control::too_old_for(reason, Some(variant))
                             })))
                 {

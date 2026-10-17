@@ -28,7 +28,8 @@ checked outside you, so keep working or stop as usual. If a `qoop task` command 
 as literal paths or \"${VAR:?}\". Keep a debrief to 12 short lines, the result first and the \
 owner's one next action last; open a plan or report with a 5-line summary. Run your own \
 browser and simulator tests headless and read the screenshots; open a window only when \
-the owner asks to see something, and close what you open.";
+the owner asks to see something, and close what you open. Put a screenshot, recording or \
+report on the owner's phone with `qoop show <file>` before you finish.";
 
 /// What always asks after "delete", whosever the repository is, and the one sentence that
 /// keeps a repo's own text from widening it. Only an own repo excepts the worker's own
@@ -997,18 +998,19 @@ mod tests {
 
     #[test]
     fn the_rules_stay_short() {
-        // ponytail: 1260 holds when to tick, move and finish, the "dangerous rm" sentence, the
-        // debrief one and the owner's headless-testing one (+160), each a sentence of its own.
+        // ponytail: 1380 holds when to tick, move and finish, the "dangerous rm" sentence, the
+        // debrief one, the owner's headless-testing one (+160) and `qoop show` (+100), each a
+        // sentence of its own.
         assert!(
-            RULES.len() <= 1260,
+            RULES.len() <= 1380,
             "{} chars in every session",
             RULES.len()
         );
-        // ponytail: 2100 is the 1260 above plus the own-repo block (its own cap: 1100 at the
+        // ponytail: 2200 is the 1380 above plus the own-repo block (its own cap: 1100 at the
         // longest name, 815 for pat/qoop-tui): what may ship and what always asks,
         // computed for this repo, said once at session start.
         let session = RULES.len() + repo_rules(Some("pat/qoop-tui")).len();
-        assert!(session <= 2100, "{session} chars at session start");
+        assert!(session <= 2200, "{session} chars at session start");
         assert!(
             RULES.contains("${VAR:?}"),
             "deletion targets that cannot be empty"
@@ -1024,6 +1026,10 @@ mod tests {
         assert!(
             RULES.contains("tests headless") && RULES.contains("close what you open"),
             "no test window on the owner's desktop"
+        );
+        assert!(
+            RULES.contains("`qoop show <file>`"),
+            "a visible result goes to the owner's phone"
         );
     }
 }

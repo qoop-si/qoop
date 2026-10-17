@@ -283,6 +283,22 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x34".into(),
             all: false,
         },
+        // A result is a record of a path or a url: nothing is typed, and a stranger's token
+        // is refused.
+        ControlRequest::ShowWrite {
+            id: "x35".into(),
+            terminal,
+            token: "not-its-token".into(),
+            target: "echo PWNED".into(),
+            note: None,
+        },
+        ControlRequest::ShowRead { id: "x36".into() },
+        ControlRequest::ShowFetch {
+            id: "x37".into(),
+            show: 1,
+            offset: 0,
+            len: 1,
+        },
         ControlRequest::TaskRead {
             id: "x29".into(),
             board: true,
@@ -335,6 +351,9 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }
             | ControlRequest::AskRead { .. }
+            | ControlRequest::ShowWrite { .. }
+            | ControlRequest::ShowRead { .. }
+            | ControlRequest::ShowFetch { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
