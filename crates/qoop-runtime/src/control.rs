@@ -1250,8 +1250,8 @@ pub enum ControlResponse {
     },
     /// A page of a terminal's chat, newest items last. `revision` stamps the session file at
     /// the read; `reset` says the client's revision was not it, so `skip` was ignored and
-    /// this is the newest page. `first_seq` is the position of the first item in this
-    /// response's window (an order, not a cursor), `has_older` that more lie before it, and
+    /// this is the newest page. `first_seq` is the `seq` of the first (oldest) item in this
+    /// response: its distance from the newest item (an order, not a cursor), `has_older` that more lie before it, and
     /// `warnings` how many records the parser could not use. At most 256 KiB of items, and
     /// never a raw record.
     Messages {

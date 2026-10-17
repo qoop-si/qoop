@@ -14,18 +14,25 @@ fn a_claude_session_reads_as_rows() {
     let d = digest(&claude());
     assert_eq!(
         seqs(&d.items),
-        (0..d.items.len() as u32).collect::<Vec<_>>()
+        (0..d.items.len() as u32).rev().collect::<Vec<_>>(),
+        "oldest first, counted from the newest"
     );
-    assert_eq!((d.first_seq, d.has_older, d.warnings), (0, false, 0));
+    assert_eq!(
+        (d.first_seq, d.has_older, d.warnings),
+        (d.items.len() as u32 - 1, false, 0)
+    );
     assert!(matches!(&d.items[0], Item::User { text, .. } if text == "fix the build"));
-    assert!(d.items.iter().any(|i| matches!(
-        i,
-        Item::Thinking {
-            ms: None,
-            text: None,
-            ..
-        }
-    )));
+    assert!(
+        !d.items.iter().any(|i| matches!(
+            i,
+            Item::Thinking {
+                ms: None,
+                text: None,
+                ..
+            }
+        )),
+        "the fixture's encrypted reasoning has no row"
+    );
 
     let Item::Tool {
         status,
@@ -87,11 +94,9 @@ fn slash_commands_attachments_and_subagents_have_their_own_rows() {
     assert!(d.items.iter().any(
         |i| matches!(i, Item::Notice { kind, text, .. } if kind == "command output" && text == "Set model to opus")
     ));
-    assert!(
-        d.items
-            .iter()
-            .any(|i| matches!(i, Item::Subagent { summary, .. } if summary == "Survey the tests"))
-    );
+    assert!(d.items.iter().any(
+        |i| matches!(i, Item::Subagent { summary, .. } if summary == "spawned: Survey the tests")
+    ));
     let chips = d.items.iter().find_map(|i| match i {
         Item::User { attachments, .. } if !attachments.is_empty() => Some(attachments),
         _ => None,
@@ -112,10 +117,7 @@ fn queued_input_has_no_entry_id_and_still_gets_a_seq() {
     let Some(Item::User { text, seq, .. }) = d.items.last() else {
         panic!("last item")
     };
-    assert_eq!(
-        (text.as_str(), *seq),
-        ("also run clippy", d.items.len() as u32 - 1)
-    );
+    assert_eq!((text.as_str(), *seq), ("also run clippy", 0));
 }
 
 #[test]
@@ -204,10 +206,7 @@ fn codex_gemini_and_opencode_sessions_read_as_rows() {
     else {
         panic!("codex tool")
     };
-    assert_eq!(
-        (summary.as_str(), *status),
-        ("ls -la; sh test.sh; cat a.txt", Status::Ok)
-    );
+    assert_eq!((summary.as_str(), *status), ("ls -la", Status::Ok));
 
     let gemini = digest(&Source::File(fixture("gemini/gemini-new-session.jsonl")));
     let statuses: Vec<_> = gemini
@@ -305,21 +304,30 @@ fn orphan_rows_at_a_window_start_are_not_served_even_when_the_window_has_enough_
     let text = std::fs::read_to_string(&path).unwrap();
     let at = text.find("\"tool_use_id\": \"toolu_build\"").unwrap();
     let from_result = (text.len() - (text[..at].rfind('\n').unwrap() + 1)) as u64;
-    // Exactly as many items as the window holds, the orphan row among them.
-    let in_window = {
-        let session = agentparse::parse_file_tail(&path, from_result).unwrap();
-        session.entries.len()
-    };
-    assert!(in_window > 5);
     let whole = digest(&claude()).items.len();
-    let opts = Options {
-        max_tail_bytes: from_result,
-        limit: whole - 3,
-        ..Options::default()
-    };
-    let d = load(&Source::File(path), &opts).unwrap();
-    assert_eq!(d.items.len(), whole - 3);
-    assert!(matches!(tool(&d, "toolu_build"), Item::Tool { name, .. } if name == "Bash"));
+    // Whatever the page size, a window that starts at the result is widened until the call is
+    // in, so the row is the call (a `Bash`) and never an orphan.
+    for limit in 1..=whole {
+        let opts = Options {
+            max_tail_bytes: from_result,
+            limit,
+            ..Options::default()
+        };
+        let d = load(&Source::File(path.clone()), &opts).unwrap();
+        assert_eq!(d.items.len(), limit);
+        assert!(
+            !d.items
+                .iter()
+                .any(|i| matches!(i, Item::Tool { name, .. } if name == "earlier result"))
+        );
+        if let Some(Item::Tool { name, .. }) = d
+            .items
+            .iter()
+            .find(|i| matches!(i, Item::Tool { id, .. } if id == "toolu_build"))
+        {
+            assert_eq!(name, "Bash");
+        }
+    }
 }
 
 #[test]
@@ -480,11 +488,11 @@ fn the_byte_budget_drops_the_oldest_items_first() {
     };
     let d = load(&source, &budget(10_000)).unwrap();
     assert_eq!(d.items.len(), 2, "two 4 KB items fit 10 KB");
-    assert_eq!(seqs(&d.items), [28, 29]);
+    assert_eq!(seqs(&d.items), [1, 0]);
     assert!(d.has_older);
     assert!(matches!(&d.items[1], Item::Agent { text, .. } if text.starts_with("30")));
     let one = load(&source, &budget(1)).unwrap();
-    assert_eq!(seqs(&one.items), [29], "the newest item always comes back");
+    assert_eq!(seqs(&one.items), [0], "the newest item always comes back");
     let all = load(&source, &budget(usize::MAX)).unwrap();
     assert_eq!((all.items.len(), all.has_older), (30, false));
 }

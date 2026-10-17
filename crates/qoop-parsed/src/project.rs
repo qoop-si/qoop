@@ -1,8 +1,8 @@
 //! Turning parsed entries into chat items.
 
 use agentparse::{
-    Entry, EntryKind, Media, Message, Origin, Part, Role, Session, Tool, ToolCall, ToolResult,
-    ToolStatus,
+    Entry, EntryKind, Media, Message, Origin, Part, ProcessAction, Role, Session, Tool, ToolCall,
+    ToolResult, ToolStatus,
 };
 
 use crate::item::{Chip, Item, Status};
@@ -48,7 +48,10 @@ fn is_bookkeeping(kind: &str) -> bool {
 }
 
 /// The name of a result whose call lies outside the window.
-pub const ORPHAN: &str = "result";
+pub const ORPHAN: &str = "earlier result";
+
+/// The name of a Codex code cell that recorded no calls of its own.
+const CODE: &str = "code";
 
 /// The most attachment chips one item carries; more are counted in a trailing `+N` chip.
 const MAX_CHIPS: usize = 8;
@@ -59,14 +62,17 @@ pub fn item_id(raw: &str) -> String {
     text::summary(raw)
 }
 
-/// Every item of the session, numbered from 0 in the order the parser produced them.
+/// Every item of the session, oldest first, each numbered by its distance from the end of
+/// what was parsed: the newest is 0. A wider tail window only adds older items in front, so a
+/// number does not change from one page to the next.
 pub fn items(session: &Session) -> Vec<Item> {
     let mut out = Vec::new();
     for entry in &session.entries {
         entry_items(entry, &mut out);
     }
+    let last = out.len().saturating_sub(1);
     for (i, item) in out.iter_mut().enumerate() {
-        item.set_seq(u32::try_from(i).unwrap_or(u32::MAX));
+        item.set_seq(u32::try_from(last - i).unwrap_or(u32::MAX));
     }
     out
 }
@@ -131,7 +137,7 @@ fn message_items(m: &Message, ts: Option<i64>, out: &mut Vec<Item>) {
             Part::Reasoning { text, .. } => thinking.add(text.as_deref()),
             Part::Attachment(media) => chips.push(chip(media)),
             Part::ToolCall(call) => push_call(call, out),
-            Part::ToolResult(result) => out.push(orphan(result)),
+            Part::ToolResult(result) => out.extend(orphan(result)),
             Part::Other { kind, .. } if !is_bookkeeping(kind) => {
                 out.push(notice(kind, "Block not shown here"));
             }
@@ -147,13 +153,11 @@ fn message_items(m: &Message, ts: Option<i64>, out: &mut Vec<Item>) {
 /// Reasoning parts that follow each other are one row.
 #[derive(Default)]
 struct Thinking {
-    open: bool,
     text: String,
 }
 
 impl Thinking {
     fn add(&mut self, text: Option<&str>) {
-        self.open = true;
         if let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) {
             if !self.text.is_empty() {
                 self.text.push_str("\n\n");
@@ -163,11 +167,13 @@ impl Thinking {
     }
 
     fn flush(&mut self, out: &mut Vec<Item>) {
-        if self.open {
+        // Reasoning that is encrypted or not kept has nothing to show, and no file records
+        // how long it took (`ms` stays `None`): a row with neither is not a row.
+        if !self.text.is_empty() {
             out.push(Item::Thinking {
                 seq: 0,
                 ms: None,
-                text: (!self.text.is_empty()).then(|| text::text(&self.text)),
+                text: Some(text::text(&self.text)),
             });
         }
         *self = Thinking::default();
@@ -205,6 +211,7 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
             return push_notice_text(what, &text::notification_text(body), out);
         }
         (Origin::Summary, _) => return push_notice_text("summary", body, out),
+        (Origin::Agent, _) => return push_agent_message(body, out),
         (_, _) => return push_notice_text("agent message", body, out),
     };
     if !shown.is_empty() || !chips.is_empty() {
@@ -214,6 +221,22 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
             text: text::text(&shown),
             attachments: cap_chips(chips),
         });
+    }
+}
+
+/// What another agent sent: one line, `<sender>: <first line of the payload>`, and nothing at
+/// all for a message with no payload. Text that is not in that shape stays as it came.
+fn push_agent_message(body: &str, out: &mut Vec<Item>) {
+    let Some((sender, payload)) = text::agent_message(body) else {
+        return push_notice_text("agent message", body, out);
+    };
+    if !payload.is_empty() {
+        let line = format!(
+            "{}: {}",
+            text::short(&sender, 60),
+            text::first_line(&payload, 120)
+        );
+        out.push(notice("agent message", &line));
     }
 }
 
@@ -280,42 +303,229 @@ fn push_call(call: &ToolCall, out: &mut Vec<Item>) {
             .unwrap_or("subagent");
         out.push(Item::Subagent {
             seq: 0,
-            summary: text::summary(what),
+            summary: text::summary(&format!("{}{what}", task_verb(&call.name))),
+            // ponytail: agentparse gives the child's session id, not its length.
             steps: u32::try_from(call.children.len()).unwrap_or(u32::MAX),
         });
         return;
     }
+    out.extend(rows(call).iter().map(tool_item));
+}
+
+/// What a subagent call did, from the tool's own name: Codex `spawn_agent`, `send_message`,
+/// `followup_task`, `wait_agent`, Claude `Task` / `Agent` / `SendMessage`, OpenCode `task`.
+/// Empty where the name does not say (`close_agent`, `list_agents`).
+fn task_verb(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if name.contains("wait") {
+        "waited for: "
+    } else if name.contains("send") || name.contains("followup") {
+        "sent: "
+    } else if name.contains("spawn")
+        || ["task", "agent", "subagent", "invoke_agent"].contains(&&*name)
+    {
+        "spawned: "
+    } else {
+        ""
+    }
+}
+
+/// One tool row's source: a call that shows as a row, and the id the row and `detail` share.
+pub(crate) struct Row<'a> {
+    pub id: String,
+    pub call: &'a ToolCall,
+    /// A call made inside a Codex code cell.
+    child: bool,
+}
+
+/// The rows of one call. A Codex code cell that recorded calls is not a row itself: its calls
+/// are, in order, each under its own id (a child with none gets `<cell id>#<n>`), so the raw
+/// JavaScript never shows. Every other call, a cell with no calls included, is one row.
+pub(crate) fn rows(call: &ToolCall) -> Vec<Row<'_>> {
+    if !matches!(call.tool, Tool::Code { .. }) || call.children.is_empty() {
+        return vec![Row {
+            id: item_id(&call.id),
+            call,
+            child: false,
+        }];
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for (n, child) in call.children.iter().enumerate() {
+        let mut id = child.id.clone();
+        if id.is_empty() {
+            id = format!("{}#{n}", call.id);
+        }
+        if !seen.insert(id.clone()) {
+            id = format!("{id}#{n}");
+            seen.insert(id.clone());
+        }
+        rows.push(Row {
+            id: item_id(&id),
+            call: child,
+            child: true,
+        });
+    }
+    rows
+}
+
+fn tool_item(row: &Row) -> Item {
+    let call = row.call;
     let shell = call.output.as_ref().and_then(|o| o.shell.as_ref());
-    let output_bytes = call.output.as_ref().map_or(0, |o| o.text.len() as u64);
-    out.push(Item::Tool {
+    let output = output_text(call);
+    Item::Tool {
         seq: 0,
-        id: item_id(&call.id),
-        name: text::summary(&call.name),
+        id: row.id.clone(),
+        name: tool_name(call, row.child),
         summary: summary(call),
         status: status(call),
         exit_code: shell.and_then(|s| s.exit_code),
         duration_ms: shell.and_then(|s| s.duration_ms).or_else(|| elapsed(call)),
         ts: call.started_at,
-        output_bytes,
-        has_detail: output_bytes > 0 || has_input(call),
-    });
+        output_bytes: output.len() as u64,
+        has_detail: !output.is_empty() || !input_text(call).is_empty(),
+    }
 }
 
-/// A result whose call lies outside the window.
-fn orphan(result: &ToolResult) -> Item {
-    Item::Tool {
+/// A call made inside a code cell is named by what it is (`shell`, `process`, `patch`); the
+/// cell itself, when it shows, is `code`.
+fn tool_name(call: &ToolCall, child: bool) -> String {
+    let named = match &call.tool {
+        Tool::Code { .. } => CODE,
+        _ if !child => return text::summary(&call.name),
+        Tool::Shell(_) => "shell",
+        Tool::Process { .. } => "process",
+        Tool::Patch { .. } => "patch",
+        Tool::Mcp { .. } => "mcp",
+        Tool::Read { .. } => "read",
+        Tool::WebSearch { .. } => "web search",
+        Tool::WebFetch { .. } => "web fetch",
+        _ if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => "patch",
+        _ => return text::summary(&call.name),
+    };
+    named.into()
+}
+
+/// A result whose call lies outside the window: its first line, dim. One with nothing to say
+/// gets no row.
+fn orphan(result: &ToolResult) -> Option<Item> {
+    let output = cell_output(&result.output.text);
+    let summary = text::first_line(&output, text::SUMMARY_MAX);
+    if summary.is_empty() && output.trim().is_empty() {
+        return None;
+    }
+    Some(Item::Tool {
         seq: 0,
         id: item_id(&result.call_id),
         name: ORPHAN.into(),
-        summary: text::summary(&result.output.text),
+        summary,
         status: map_status(result.status, true),
         exit_code: result.output.shell.as_ref().and_then(|s| s.exit_code),
         duration_ms: None,
         ts: None,
-        output_bytes: result.output.text.len() as u64,
-        has_detail: !result.output.text.is_empty(),
+        output_bytes: output.len() as u64,
+        has_detail: !output.is_empty(),
+    })
+}
+
+/// What the call returned, as the agent saw it. A process or a command's own output is its
+/// stdout and stderr; a code cell's is its text without the `Script completed` header and
+/// the JSON envelopes around each chunk.
+pub(crate) fn output_text(call: &ToolCall) -> String {
+    let Some(o) = &call.output else {
+        return String::new();
+    };
+    match (o.text.is_empty(), o.shell.as_ref()) {
+        (true, Some(s)) => [s.stdout.as_deref(), s.stderr.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ if matches!(call.tool, Tool::Code { .. }) => cell_output(&o.text),
+        _ => o.text.clone(),
     }
 }
+
+/// A code cell's output text: `Script completed\nWall time 0.8 seconds\nOutput:\n` and then
+/// one JSON object per chunk, `{"chunk_id","wall_time_seconds","exit_code","output"}`. The
+/// header goes, each chunk becomes its `output`, and what is not JSON (a printed string, a cut
+/// chunk) stays as it is. Text with no such header comes back unchanged.
+pub(crate) fn cell_output(raw: &str) -> String {
+    let Some(body) = raw
+        .strip_prefix("Script ")
+        .and_then(|r| r.split_once("\nOutput:"))
+        .map(|(_, body)| body.strip_prefix('\n').unwrap_or(body))
+    else {
+        return raw.to_string();
+    };
+    let mut out = String::new();
+    let mut chunks = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+    let mut from = 0;
+    loop {
+        let next = chunks.next();
+        let to = chunks.byte_offset();
+        let piece = match next {
+            None => break,
+            Some(Ok(serde_json::Value::Object(o)))
+                if o.contains_key("chunk_id") || o.contains_key("output") =>
+            {
+                out.push_str(o.get("output").and_then(|v| v.as_str()).unwrap_or(""));
+                from = to;
+                continue;
+            }
+            Some(Ok(serde_json::Value::Object(o))) if o.is_empty() => "",
+            Some(Ok(_)) => body[from..to].trim(),
+            Some(Err(_)) => {
+                push_line(&mut out, body[from..].trim());
+                break;
+            }
+        };
+        push_line(&mut out, piece);
+        from = to;
+    }
+    out
+}
+
+fn push_line(out: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(piece);
+}
+
+/// What was asked: the command, the process action, the script, the patch, the file written,
+/// an edit's old and new text (each cut short), else the call's arguments.
+pub(crate) fn input_text(call: &ToolCall) -> String {
+    match &call.tool {
+        Tool::Shell(s) => s.command.clone(),
+        Tool::Process { input, .. } => match input.as_deref().filter(|i| !i.is_empty()) {
+            Some(i) => format!("{}\n{i}", summary_raw(call)),
+            None => summary_raw(call),
+        },
+        Tool::Patch { patch } => patch.clone(),
+        Tool::Code { source } => source.clone(),
+        Tool::Write { path, content } => format!("{path}\n{}", content.as_deref().unwrap_or("")),
+        Tool::Edit { path, edits } => edits.iter().fold(path.clone(), |acc, e| {
+            format!(
+                "{acc}\n- {}\n+ {}",
+                text::preview(&e.old, EDIT_PREVIEW),
+                text::preview(&e.new, EDIT_PREVIEW)
+            )
+        }),
+        _ if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => patched_files(call),
+        _ => match &call.input {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => String::new(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        },
+    }
+}
+
+/// Characters of an edit's old and of its new text that `detail` shows.
+const EDIT_PREVIEW: usize = 600;
 
 /// A call with no result is never `Ok`: it is running, or it was cut short.
 fn status(call: &ToolCall) -> Status {
@@ -338,21 +548,23 @@ fn elapsed(call: &ToolCall) -> Option<u64> {
     u64::try_from(ms).ok()
 }
 
-fn has_input(call: &ToolCall) -> bool {
-    match &call.input {
-        serde_json::Value::Null => false,
-        serde_json::Value::String(s) => !s.is_empty(),
-        serde_json::Value::Object(o) => !o.is_empty(),
-        _ => true,
-    }
-}
-
 /// The one line that says what the call did.
 fn summary(call: &ToolCall) -> String {
+    text::summary(&summary_raw(call))
+}
+
+fn summary_raw(call: &ToolCall) -> String {
     let path = |p: &Option<String>| p.clone().unwrap_or_default();
-    let line = match &call.tool {
+    match &call.tool {
         Tool::Shell(s) => s.command.clone(),
-        Tool::Process { id, .. } => path(id),
+        Tool::Process { id, action, .. } => {
+            let verb = match action {
+                ProcessAction::Read => "read",
+                ProcessAction::Write => "write",
+                ProcessAction::Kill => "kill",
+            };
+            format!("{verb} {}", path(id)).trim_end().to_string()
+        }
         Tool::Read { path, .. } | Tool::Write { path, .. } | Tool::Edit { path, .. } => {
             path.clone()
         }
@@ -366,24 +578,18 @@ fn summary(call: &ToolCall) -> String {
         Tool::WebSearch { query } => path(query),
         Tool::Todo { items } => format!("{} items", items.len()),
         Tool::Mcp { server, tool } => format!("{server}.{tool}"),
-        Tool::Code { source } => code_summary(call, source),
+        // A cell that recorded no calls: the first line of its program, short.
+        Tool::Code { source } => text::first_line(source, CODE_SUMMARY),
         Tool::Skill { name } => path(name),
+        Tool::Other if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => {
+            patched_files(call)
+        }
         Tool::Task { .. } | Tool::Question | Tool::Plan | Tool::Other => String::new(),
-    };
-    text::summary(&line)
+    }
 }
 
-/// A Codex code cell: what its inner calls did, else the program itself.
-fn code_summary(call: &ToolCall, source: &str) -> String {
-    if call.children.is_empty() {
-        return source.to_string();
-    }
-    call.children
-        .iter()
-        .map(summary)
-        .collect::<Vec<_>>()
-        .join("; ")
-}
+/// Characters of a code cell's first line that its row shows.
+const CODE_SUMMARY: usize = 80;
 
 fn join(pattern: &str, path: Option<&str>) -> String {
     match path {

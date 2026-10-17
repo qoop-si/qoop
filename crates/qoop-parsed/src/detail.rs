@@ -1,11 +1,11 @@
 //! The full text of one tool call, fetched when the user opens it.
 
-use agentparse::{Part, Session, Tool, ToolCall};
+use agentparse::{Part, Session};
 
 use crate::item::Detail;
 use crate::load::{Error, MAX_TAIL_BYTES, read, stamp};
 use crate::locate::Source;
-use crate::project::item_id;
+use crate::project::{cell_output, input_text, item_id, output_text, rows};
 use crate::text::redacted_cut;
 
 /// Tail windows tried in turn: the call is usually in the newest, and an older one costs more.
@@ -29,9 +29,15 @@ pub fn detail(source: &Source, tool_id: &str, max_bytes: usize) -> Result<Detail
 }
 
 fn find(session: &Session, tool_id: &str, max_bytes: usize) -> Option<Detail> {
-    for call in session.tool_calls() {
-        if item_id(&call.id) == tool_id {
-            return Some(of_call(call, max_bytes));
+    for part in session.messages().flat_map(|m| &m.parts) {
+        if let Part::ToolCall(call) = part
+            && let Some(row) = rows(call).into_iter().find(|r| r.id == tool_id)
+        {
+            return Some(build(
+                &input_text(row.call),
+                &output_text(row.call),
+                max_bytes,
+            ));
         }
     }
     let orphan = session
@@ -41,22 +47,7 @@ fn find(session: &Session, tool_id: &str, max_bytes: usize) -> Option<Detail> {
             Part::ToolResult(r) if item_id(&r.call_id) == tool_id => Some(r),
             _ => None,
         })?;
-    Some(build("", &orphan.output.text, max_bytes))
-}
-
-fn of_call(call: &ToolCall, max_bytes: usize) -> Detail {
-    let output = call.output.as_ref().map(|o| {
-        let shell = o.shell.as_ref();
-        match (o.text.is_empty(), shell) {
-            (true, Some(s)) => [s.stdout.as_deref(), s.stderr.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => o.text.clone(),
-        }
-    });
-    build(&input_text(call), &output.unwrap_or_default(), max_bytes)
+    Some(build("", &cell_output(&orphan.output.text), max_bytes))
 }
 
 fn build(input: &str, output: &str, max_bytes: usize) -> Detail {
@@ -66,22 +57,5 @@ fn build(input: &str, output: &str, max_bytes: usize) -> Detail {
         input,
         output,
         truncated: cut_in || cut_out,
-    }
-}
-
-fn input_text(call: &ToolCall) -> String {
-    match &call.tool {
-        Tool::Shell(s) => s.command.clone(),
-        Tool::Patch { patch } => patch.clone(),
-        Tool::Code { source } => source.clone(),
-        Tool::Write { path, content } => format!("{path}\n{}", content.as_deref().unwrap_or("")),
-        Tool::Edit { path, edits } => edits.iter().fold(path.clone(), |acc, e| {
-            format!("{acc}\n- {}\n+ {}", e.old, e.new)
-        }),
-        _ => match &call.input {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Null => String::new(),
-            other => serde_json::to_string_pretty(other).unwrap_or_default(),
-        },
     }
 }

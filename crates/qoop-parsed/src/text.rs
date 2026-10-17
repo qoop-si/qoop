@@ -49,13 +49,48 @@ pub fn text(raw: &str) -> String {
 
 /// Redact, put the text on one line and cut it to [`SUMMARY_MAX`] characters.
 pub fn summary(raw: &str) -> String {
-    let (head, _) = cut_bytes(raw, SUMMARY_MAX * 4 + REDACT_SLACK);
+    short(raw, SUMMARY_MAX)
+}
+
+/// Redact, put the text on one line and cut it to `max` characters, marker included.
+pub fn short(raw: &str, max: usize) -> String {
+    let (head, _) = cut_bytes(raw, max * 4 + REDACT_SLACK);
     let line = redact(&head.split_whitespace().collect::<Vec<_>>().join(" "));
-    if line.chars().count() <= SUMMARY_MAX {
+    if line.chars().count() <= max {
         return line;
     }
-    let keep: String = line.chars().take(SUMMARY_MAX - 3).collect();
+    let keep: String = line.chars().take(max.saturating_sub(3)).collect();
     format!("{keep}...")
+}
+
+/// The first line that says something, as one redacted line of at most `max` characters.
+pub fn first_line(raw: &str, max: usize) -> String {
+    short(
+        raw.lines().find(|l| !l.trim().is_empty()).unwrap_or(""),
+        max,
+    )
+}
+
+/// Redact, keep the newlines and cut to `max` characters, with `...` when something was cut.
+pub fn preview(raw: &str, max: usize) -> String {
+    let (head, pre_cut) = cut_bytes(raw.trim(), max * 4 + REDACT_SLACK);
+    let redacted = redact(&head);
+    match redacted.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &redacted[..end]),
+        None if pre_cut => format!("{redacted}..."),
+        None => redacted,
+    }
+}
+
+/// The sender and the payload of a message another agent sent (a Codex inter-agent message):
+/// `Message Type: .. / Task name: .. / Sender: .. / Payload: ..`. `None` for any other text.
+pub fn agent_message(raw: &str) -> Option<(String, String)> {
+    let (head, payload) = raw
+        .trim_start()
+        .strip_prefix("Message Type: ")?
+        .split_once("Payload:")?;
+    let sender = head.lines().find_map(|l| l.strip_prefix("Sender: "))?;
+    Some((sender.trim().to_string(), payload.trim().to_string()))
 }
 
 /// Redact, then cut to `max` bytes without a marker. True when anything was cut.

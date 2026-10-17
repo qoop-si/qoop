@@ -9,7 +9,7 @@ pub struct Digest {
     /// of length and modification time, below 2^53 so a JavaScript number carries it exactly.
     /// A page cursor (`Options::skip`) is only good for the revision it was taken at.
     pub revision: u64,
-    /// The `seq` of the first item returned (0 when there are none), in this response's window.
+    /// The `seq` of the first (oldest) item returned, 0 when there are none.
     pub first_seq: u32,
     /// Older items exist: cut by `limit`, by the byte budget, or beyond the widest window read.
     pub has_older: bool,
@@ -21,12 +21,13 @@ pub struct Digest {
 
 /// One row of the chat. A kind this build does not know (a newer daemon's) reads as
 /// [`Item::Unknown`], so one new variant never makes a client drop the whole page: draw it as
-/// one dim line. `seq` is the item's position in the window that served the response,
-/// counted from the window start (the first item the parser produced from the tail, or from
-/// the whole session when it is read whole). It is not an entry id and not a line number:
-/// those can be absent, synthetic (`ord:n`) or cut in two at a tail start. Use it to order
-/// and to dedupe rows within one response. It is not a cursor: a wider window renumbers it,
-/// so paging goes by `Options::skip` and the `Digest::revision`.
+/// one dim line. `seq` is the item's distance from the end of what the parser read: the newest
+/// item of a revision is 0 and older ones count up, so the items of a page, oldest first, have
+/// falling `seq`. It is the same number in every page of one `Digest::revision`, whatever
+/// window served it. It is not an entry id and not a line number: those can be absent,
+/// synthetic (`ord:n`) or cut in two at a tail start. It is not a cursor either: paging goes
+/// by `Options::skip` and the revision. A new revision (the file grew) shifts every `seq` by
+/// the items it added, so a client keys rows by what they are, never by `seq`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
