@@ -574,6 +574,35 @@ fn detail_rows(got: Option<&Got>, off: bool, cols: usize) -> Vec<StyledRow> {
         .collect()
 }
 
+/// The most rows of a recap shown before it is opened.
+const RECAP_ROWS: usize = 6;
+
+/// The agent's away summary: a dim label row, then the text wrapped to the pane in the same
+/// dim. A long one is cut to `RECAP_ROWS` rows and says how many more, and its label row
+/// opens and closes it, as a tool row does.
+fn recap_lines(item: &Item, text: &str, opened: &Opened, cols: usize) -> Vec<Line> {
+    let dim = style(Role::Detail);
+    let mut rows: Vec<Vec<Cell>> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .flat_map(|line| wrap(&cells(line, dim), cols))
+        .collect();
+    let more = rows.len().saturating_sub(RECAP_ROWS);
+    let key = format!("n:{:x}", item_key(item));
+    let open = opened.keys.contains(&key);
+    if more > 0 && !open {
+        rows.truncate(RECAP_ROWS);
+        rows.push(cells(&format!("\u{2026} {more} more rows"), dim));
+    }
+    let mut label = cells("Recap", dim);
+    if more > 0 {
+        label.extend(cells(chevron(open), dim));
+    }
+    let mut lines = vec![(row_of(&label), (more > 0).then_some(key))];
+    lines.extend(rows.iter().map(|row| (row_of(row), None)));
+    lines
+}
+
 fn dim_row(text: &str, cols: usize) -> StyledRow {
     row_of(&cells(&cut(&one_line(text), cols), style(Role::Detail)))
 }
@@ -784,6 +813,10 @@ fn laid_out(
             Item::Agent { text, .. } => (Kind::Message, agent_rows(text, cols)),
             Item::Error { text, .. } => {
                 (Kind::Step, vec![dim_row(&format!("error: {text}"), cols)])
+            }
+            Item::Notice { kind, text, .. } if kind == "summary" => {
+                blocks.push((Kind::Message, recap_lines(item, text, opened, cols), index));
+                continue;
             }
             Item::Notice { kind, text, .. } => {
                 (Kind::Step, vec![dim_row(&format!("{kind}: {text}"), cols)])
@@ -4408,5 +4441,158 @@ mod tests {
         chat.render(&[want(3, 20, 4)]);
         let now = read(&chat);
         assert_eq!(now.last().unwrap(), &format!("m{}", n - 2), "{now:?}");
+    }
+
+    fn recap(text: &str) -> Item {
+        Item::Notice {
+            seq: 0,
+            kind: "summary".into(),
+            text: text.into(),
+        }
+    }
+
+    fn recap_key(item: &Item) -> String {
+        format!("n:{:x}", item_key(item))
+    }
+
+    fn trimmed(rows: &[StyledRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.text.trim_end()).collect()
+    }
+
+    #[test]
+    fn a_recap_is_a_dim_label_row_and_its_text_wrapped_to_the_pane_between_blank_rows() {
+        let items = [agent("a"), recap("one two three four five six"), agent("b")];
+        let rows = layout(&items, 12);
+        assert_eq!(
+            trimmed(&rows),
+            [
+                "a",
+                "",
+                "Recap",
+                "one two",
+                "three four",
+                "five six",
+                "",
+                "b"
+            ]
+        );
+        for row in &rows[2..6] {
+            assert!(row.runs.iter().all(|r| r.style == style(Role::Detail)));
+        }
+        // A recap that fits has nothing to open.
+        let (_, _, heads) = laid_out(&items, 12, &Opened::default());
+        assert!(heads.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_long_recap_is_cut_to_six_rows_says_how_many_more_and_opens_like_a_tool_row() {
+        let text = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = recap(&text);
+        let rows = layout(std::slice::from_ref(&item), 20);
+        assert_eq!(
+            trimmed(&rows),
+            [
+                "Recap \u{25b8}",
+                "line 1",
+                "line 2",
+                "line 3",
+                "line 4",
+                "line 5",
+                "line 6",
+                "\u{2026} 4 more rows"
+            ]
+        );
+        let mut opened = Opened::default();
+        opened.keys.insert(recap_key(&item));
+        let (rows, _, heads) = laid_out(std::slice::from_ref(&item), 20, &opened);
+        assert_eq!(rows.len(), 11);
+        assert_eq!(rows[0].text.trim_end(), "Recap \u{25be}");
+        assert_eq!(rows[10].text, "line 10");
+        assert!(heads[0].is_some() && heads[1..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_click_or_ctrl_a_enter_opens_a_recap_and_again_closes_it() {
+        let text = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        chat.set_digest(4, page(1, vec![agent("go"), recap(&text)]));
+        chat.render(&[want(4, 30, 14)]);
+        let got = |chat: &ChatState| -> Vec<String> {
+            visible(chat, 4)
+                .iter()
+                .map(|l| l.trim_end().into())
+                .collect()
+        };
+        assert_eq!(got(&chat)[2], "Recap \u{25b8}");
+        assert_eq!(got(&chat)[9], "\u{2026} 4 more rows");
+        // Only the label answers: the text, the blank row above it do not.
+        assert!(!chat.toggle_at(4, 1));
+        assert!(!chat.toggle_at(4, 3));
+        assert!(chat.toggle_at(4, 2));
+        chat.render(&[want(4, 30, 14)]);
+        assert_eq!(got(&chat)[2], "Recap \u{25be}");
+        assert_eq!(got(&chat)[12], "line 10");
+        assert!(chat.toggle_newest(4));
+        chat.render(&[want(4, 30, 14)]);
+        assert_eq!(got(&chat)[2], "Recap \u{25b8}");
+        assert_eq!(got(&chat)[9], "\u{2026} 4 more rows");
+    }
+
+    #[test]
+    fn the_other_kinds_of_notice_stay_one_dim_row_and_take_no_blank_row() {
+        let long = "word ".repeat(30);
+        let items = [
+            Item::Notice {
+                seq: 0,
+                kind: "hook".into(),
+                text: long,
+            },
+            Item::Notice {
+                seq: 0,
+                kind: "interrupted".into(),
+                text: "Interrupted".into(),
+            },
+        ];
+        let rows = layout(&items, 24);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "hook: word word word wo\u{2026}");
+        assert_eq!(rows[1].text, "interrupted: Interrupted");
+    }
+
+    #[test]
+    fn a_recap_is_no_wider_than_the_pane_at_any_width_closed_or_opened() {
+        let long =
+            "recap 世界 \u{2764}\u{fe0f} 🌍 averyveryverylongwordthatneverbreaks and more words. "
+                .repeat(12);
+        let item = recap(&format!("{long}\n\n世界世界世界世界世界世界\tafter a tab"));
+        let mut opened = Opened::default();
+        for open in [false, true] {
+            if open {
+                opened.keys.insert(recap_key(&item));
+            }
+            for cols in 0..=40usize {
+                let (rows, _, _) = laid_out(std::slice::from_ref(&item), cols, &opened);
+                assert_eq!(rows.is_empty(), cols == 0);
+                if cols >= 5 {
+                    assert!(
+                        rows[0].text.starts_with("Recap"),
+                        "{cols}: {:?}",
+                        rows[0].text
+                    );
+                }
+                for row in rows {
+                    let drawn = drawn_columns(&row.text);
+                    assert!(drawn <= cols, "{cols}: {drawn} columns in {:?}", row.text);
+                    assert!(!row.text.contains('\u{fe0f}'), "{cols}: {:?}", row.text);
+                }
+            }
+        }
     }
 }
