@@ -214,6 +214,16 @@ fn result(n: usize, session: &str, id: &str, text: &str) -> String {
     )
 }
 
+/// A time after any agent this test starts.
+const LATER: &str = "2099-01-01T00:00:00.000Z";
+
+/// The record `line` with a later time.
+fn later(line: String) -> String {
+    let mut record: Value = serde_json::from_str(&line).expect("a record");
+    record["timestamp"] = json!(LATER);
+    format!("{record}\n")
+}
+
 fn append(path: &Path, text: &str) {
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -421,6 +431,166 @@ async fn the_chat_pages_back_and_starts_over_when_the_file_changed() {
     assert_eq!(json["items"].as_array().unwrap().len(), 2);
     assert_eq!(json["items"][1]["text"], "answer 14");
     assert_eq!(json["revision"], json!(again.revision));
+}
+
+/// A running subagent, input still queued, a command's coloured output and a turn that ended
+/// with agents still running reach `qoop messages --json` as the fields a client draws: the
+/// subagent's `status`, the user row's `queued`, plain text, and one `background` notice once
+/// a turn ends with agents still running.
+#[tokio::test]
+async fn what_runs_in_the_background_and_what_waits_in_the_queue_is_in_the_json() {
+    let daemon = Daemon::start();
+    let id = fresh_id("parity");
+    let file = transcript(&id);
+    let escaped = "\u{1b}[2mCompacted (ctrl+o to see full summary)\u{1b}[22m";
+    let lines = [
+        user(0, &id, "start the survey"),
+        user(
+            1,
+            &id,
+            &format!("<local-command-stdout>{escaped}</local-command-stdout>"),
+        ),
+        format!(
+            "{}\n",
+            json!({"type": "queue-operation", "operation": "enqueue", "sessionId": id,
+                   "timestamp": "2026-10-12T09:00:02.000Z", "content": "then run the lint"})
+        ),
+        // The call is the last message and later than the agent's own start: it still runs.
+        later(record(
+            "assistant",
+            3,
+            &id,
+            json!({"id": "msg_3", "role": "assistant", "model": "claude-sonnet-5-5",
+                   "content": [{"type": "tool_use", "id": "toolu_agent", "name": "Agent",
+                                "input": {"description": "survey the tests", "prompt": "go"}}],
+                   "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        )),
+    ];
+    std::fs::write(&file, lines.concat()).expect("write");
+    daemon.start_agent(Some(&id));
+
+    let (ok, out, err) = daemon.qoop(&["messages", "1", "--json"]);
+    assert!(ok, "{err}");
+    let json: Value = serde_json::from_str(&out).expect("json");
+    let items = json["items"].as_array().expect("items");
+    let find = |kind: &str| items.iter().find(|i| i["type"] == kind).cloned();
+    let subagent = find("subagent").expect("the subagent row");
+    assert_eq!(subagent["status"], "running", "{subagent}");
+    let queued = items
+        .iter()
+        .find(|i| i["text"] == "then run the lint")
+        .expect("the queued prompt");
+    assert_eq!(queued["type"], "user");
+    assert_eq!(queued["queued"], true, "{queued}");
+    let first = items.iter().find(|i| i["text"] == "start the survey");
+    assert!(
+        first.is_some_and(|i| i.get("queued").is_none()),
+        "false is not sent"
+    );
+    let output = items
+        .iter()
+        .find(|i| i["kind"] == "command output")
+        .expect("the command output");
+    assert_eq!(output["text"], "Compacted (ctrl+o to see full summary)");
+    assert!(
+        !out.contains("\\u001b"),
+        "no escape reaches a client: {out}"
+    );
+    assert!(
+        items.iter().all(|i| i["kind"] != "background"),
+        "no turn has ended yet"
+    );
+    // The text form says the same in words.
+    let (ok, text, _) = daemon.qoop(&["messages", "1"]);
+    assert!(ok);
+    assert!(
+        text.contains("[running] spawned: survey the tests (0 steps)"),
+        "{text}"
+    );
+    assert!(text.contains("[queued] then run the lint"), "{text}");
+    // The turn ends with two agents still running: one quiet row says so.
+    append(
+        &file,
+        &format!(
+            "{}\n",
+            json!({"type": "system", "subtype": "turn_duration", "uuid": "u00004", "sessionId": id,
+                   "timestamp": LATER, "durationMs": 1200,
+                   "pendingBackgroundAgentCount": 2, "pendingWorkflowCount": 0})
+        ),
+    );
+    let (ok, out, err) = daemon.qoop(&["messages", "1", "--json"]);
+    assert!(ok, "{err}");
+    let json: Value = serde_json::from_str(&out).expect("json");
+    let background = json["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|i| i["kind"] == "background"));
+    assert_eq!(
+        background.map(|i| i["text"].clone()),
+        Some(json!("2 background agents still running")),
+        "{out}"
+    );
+}
+
+/// Work the transcript shows as running from before the agent in the terminal started was left
+/// by an agent that is gone (the session was resumed): it reads `interrupted`, and the count of
+/// agents still running of a turn from that time is not said.
+#[tokio::test]
+async fn work_left_running_by_an_earlier_agent_is_interrupted_not_a_spinner() {
+    let daemon = Daemon::start();
+    let id = fresh_id("stale");
+    let file = transcript(&id);
+    let lines = [
+        user(0, &id, "start the survey"),
+        record(
+            "assistant",
+            1,
+            &id,
+            json!({"id": "msg_1", "role": "assistant", "model": "claude-sonnet-5-5",
+                   "content": [{"type": "tool_use", "id": "toolu_bg", "name": "Bash",
+                                "input": {"command": "sleep 600", "run_in_background": true}}],
+                   "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ),
+        // Its launch result: the command runs on until a notification says it ended.
+        {
+            let mut launched = result(
+                2,
+                &id,
+                "toolu_bg",
+                "Command running in background with ID: bx1",
+            );
+            let mut record: Value = serde_json::from_str(&launched).expect("a record");
+            record["toolUseResult"] = json!({"backgroundTaskId": "bx1"});
+            launched = format!("{record}\n");
+            launched
+        },
+        record(
+            "assistant",
+            2,
+            &id,
+            json!({"id": "msg_2", "role": "assistant", "model": "claude-sonnet-5-5",
+                   "content": [{"type": "tool_use", "id": "toolu_agent", "name": "Agent",
+                                "input": {"description": "survey the tests", "prompt": "go"}}],
+                   "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ),
+        format!(
+            "{}\n",
+            json!({"type": "system", "subtype": "turn_duration", "uuid": "u00004", "sessionId": id,
+                   "timestamp": "2026-10-12T09:00:04.000Z", "durationMs": 1200,
+                   "pendingBackgroundAgentCount": 2, "pendingWorkflowCount": 0})
+        ),
+    ];
+    std::fs::write(&file, lines.concat()).expect("write");
+    daemon.start_agent(Some(&id));
+    let (ok, out, err) = daemon.qoop(&["messages", "1", "--json"]);
+    assert!(ok, "{err}");
+    let json: Value = serde_json::from_str(&out).expect("json");
+    let items = json["items"].as_array().expect("items");
+    assert!(
+        items.iter().all(|i| i["status"] != "running"),
+        "nothing may spin: {out}"
+    );
+    assert!(items.iter().any(|i| i["status"] == "interrupted"), "{out}");
+    assert!(items.iter().all(|i| i["kind"] != "background"), "{out}");
 }
 
 #[tokio::test]

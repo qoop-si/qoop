@@ -5,6 +5,7 @@
 //! - Claude: `subagents/agent-<id>.jsonl` next to the parent file, else the number the
 //!   harness wrote into the call's result (`totalToolUseCount`).
 //! - Codex: the child rollout under the sessions root, found by the child's own id.
+//! - Gemini: `chats/<parent session id>/<agent id>.jsonl` next to the parent file.
 //! - OpenCode: a count over the child's rows in the same database, never a parse of it.
 //!
 //! The steps of a spawn row are the tool calls its child made. Only the newest
@@ -57,9 +58,9 @@ pub(crate) struct Spawn {
 
 impl Spawn {
     /// The spawn of a call that starts a subagent whose child id is a plain id.
-    pub(crate) fn of(call: &ToolCall) -> Option<Spawn> {
+    pub(crate) fn of(call: &ToolCall, agent: Agent) -> Option<Spawn> {
         let child = call.child_session.as_deref().filter(|c| valid_id(c))?;
-        project::is_spawn(call).then(|| Spawn {
+        project::is_spawn(call, agent).then(|| Spawn {
             child: child.to_string(),
             // Claude writes the child's tool count into the result of a call that waited.
             reported: call
@@ -76,6 +77,7 @@ impl Spawn {
 enum Kind {
     Claude,
     Codex,
+    Gemini,
 }
 
 #[derive(Default)]
@@ -204,6 +206,7 @@ impl Ctx<'_> {
         match self.session.agent {
             Agent::Claude => Some(claude_file(path, &spawn.child)),
             Agent::Codex => find_codex(&codex_root(path, self.codex_root)?, &spawn.child),
+            Agent::Gemini => Some(gemini_file(path, &self.session.id, &spawn.child)),
             _ => None,
         }
     }
@@ -212,6 +215,7 @@ impl Ctx<'_> {
         let kind = match self.session.agent {
             Agent::Claude => Kind::Claude,
             Agent::Codex => Kind::Codex,
+            Agent::Gemini => Kind::Gemini,
             _ => {
                 let crate::locate::Source::Opencode { db, .. } = source else {
                     return 0;
@@ -237,6 +241,14 @@ fn claude_file(parent: &Path, child: &str) -> PathBuf {
         .with_extension("")
         .join("subagents")
         .join(format!("agent-{child}.jsonl"))
+}
+
+/// `<project>/chats/session-<..>.jsonl` keeps its children in
+/// `<project>/chats/<parent session id>/<agent id>.jsonl`.
+fn gemini_file(parent: &Path, session_id: &str, child: &str) -> PathBuf {
+    parent
+        .with_file_name(session_id)
+        .join(format!("{child}.jsonl"))
 }
 
 /// The sessions root of a Codex parent file: the one the caller located it under, else the
@@ -315,6 +327,7 @@ fn file_calls(path: &Path, kind: Kind) -> Option<u32> {
     let n = clamp(match kind {
         Kind::Claude => claude_calls(reader),
         Kind::Codex => codex_calls(reader),
+        Kind::Gemini => gemini_calls(reader),
     });
     remember(&mut memo().counts, MAX_COUNTS, key, n);
     Some(n)
@@ -378,6 +391,36 @@ fn tool_use_ids<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error
         }
     }
     d.deserialize_any(Blocks)
+}
+
+/// Tool calls of a Gemini child, once per call id: a message is written again as it grows, and
+/// a later `$patch` record can carry the calls of one too. Only a line that has the marker is
+/// parsed.
+fn gemini_calls(reader: impl BufRead) -> usize {
+    fn ids(record: &serde_json::Value, out: &mut HashSet<String>) {
+        let calls = record.get("toolCalls").and_then(|c| c.as_array());
+        for (n, call) in calls.into_iter().flatten().enumerate() {
+            let id = call.get("id").and_then(|i| i.as_str());
+            out.insert(id.map_or_else(|| format!("#{n}"), str::to_string));
+        }
+    }
+    let mut seen = HashSet::new();
+    for line in reader.split(b'\n').map_while(Result::ok) {
+        let text = String::from_utf8_lossy(&line);
+        if !text.contains("\"toolCalls\"") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        ids(&record, &mut seen);
+        let updates = record.pointer("/$patch/updates").and_then(|u| u.as_array());
+        updates
+            .into_iter()
+            .flatten()
+            .for_each(|u| ids(u, &mut seen));
+    }
+    seen.len()
 }
 
 /// Tool calls of a Codex child: the `response_item` records whose payload is a call, from the
@@ -500,6 +543,68 @@ mod tests {
     }
 
     #[test]
+    fn a_gemini_child_counts_each_call_id_once_across_rewrites_and_patches() {
+        let text = [
+            r#"{"sessionId":"c","kind":"subagent"}"#,
+            r#"{"id":"g1","type":"gemini","content":"x","toolCalls":[{"id":"a"},{"id":"b"}]}"#,
+            r#"{"id":"g1","type":"gemini","content":"x","toolCalls":[{"id":"a"},{"id":"b"}]}"#,
+            r#"{"$patch":{"updates":[{"id":"g2","toolCalls":[{"id":"c"},{"id":"a"}]}]}}"#,
+            r#"{"id":"u","type":"user","content":"the word toolCalls in text"}"#,
+            "not json \"toolCalls\"",
+        ]
+        .join("\n");
+        assert_eq!(gemini_calls(text.as_bytes()), 3);
+        assert_eq!(
+            gemini_file(
+                Path::new("/h/tmp/p/chats/session-a-1.jsonl"),
+                "uuid-1",
+                "agent7"
+            ),
+            PathBuf::from("/h/tmp/p/chats/uuid-1/agent7.jsonl")
+        );
+    }
+
+    #[test]
+    fn a_gemini_spawn_row_counts_the_calls_in_its_child_file_next_to_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        std::fs::create_dir_all(chats.join("parent-1")).unwrap();
+        let parent = chats.join("session-2026-10-12T09-00-parent-1.jsonl");
+        std::fs::write(&parent, "").unwrap();
+        std::fs::write(
+            chats.join("parent-1/agent7.jsonl"),
+            "{\"id\":\"g\",\"toolCalls\":[{\"id\":\"a\"},{\"id\":\"b\"}]}\n",
+        )
+        .unwrap();
+        let call = ToolCall {
+            id: "t".into(),
+            name: "codebase_investigator".into(),
+            input: serde_json::Value::Null,
+            tool: agentparse::Tool::Task {
+                description: Some("map".into()),
+                prompt: None,
+                agent_type: None,
+            },
+            status: agentparse::ToolStatus::Pending,
+            status_detail: None,
+            output: None,
+            started_at: None,
+            ended_at: None,
+            child_session: Some("agent7".into()),
+            children: Vec::new(),
+        };
+        let spawn = Spawn::of(&call, Agent::Gemini).expect("a spawn");
+        let mut session = project::blank_session(Agent::Gemini, &parent);
+        session.id = "parent-1".into();
+        let source = crate::locate::Source::File(parent);
+        let ctx = Ctx {
+            session: &session,
+            codex_root: None,
+        };
+        assert_eq!(ctx.steps(&spawn, &source), 2);
+    }
+
+    #[test]
     fn a_codex_root_is_the_one_given_or_the_directory_above_a_dated_layout() {
         let at = |p: &str| codex_root(Path::new(p), None);
         assert_eq!(
@@ -587,7 +692,7 @@ mod tests {
     fn only_the_spawn_rows_of_the_returned_page_are_read() {
         let dir = tempfile::tempdir().unwrap();
         let (session, children) = claude_spawns(dir.path(), 40);
-        let (mut items, spawns) = project::project(&session);
+        let (mut items, spawns) = project::project(&session, None);
         let from = items.len() - 3;
         let mut page = items.split_off(from);
         let source = crate::locate::Source::File(dir.path().join("p/x.jsonl"));

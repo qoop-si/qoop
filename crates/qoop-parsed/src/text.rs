@@ -1,6 +1,6 @@
 //! Caps and wrapper stripping for the text a digest carries.
 
-use crate::redact::redact;
+use crate::redact::{redact, strip_ansi};
 
 /// Longest text of one item, in bytes, marker included.
 pub const TEXT_MAX: usize = 4096;
@@ -23,7 +23,8 @@ const WRAPPERS: [&str; 5] = [
 ];
 
 /// Tags a background-task notification is made of.
-const NOTIFICATION_TAGS: [&str; 10] = [
+const NOTIFICATION_TAGS: [&str; 11] = [
+    "event",
     "task-notification",
     "task-id",
     "tool-use-id",
@@ -55,7 +56,13 @@ pub fn summary(raw: &str) -> String {
 /// Redact, put the text on one line and cut it to `max` characters, marker included.
 pub fn short(raw: &str, max: usize) -> String {
     let (head, _) = cut_bytes(raw, max * 4 + REDACT_SLACK);
-    let line = redact(&head.split_whitespace().collect::<Vec<_>>().join(" "));
+    // Escapes go before the lines are joined: one left open ends at its line.
+    let line = redact(
+        &strip_ansi(&head)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     if line.chars().count() <= max {
         return line;
     }
@@ -65,10 +72,8 @@ pub fn short(raw: &str, max: usize) -> String {
 
 /// The first line that says something, as one redacted line of at most `max` characters.
 pub fn first_line(raw: &str, max: usize) -> String {
-    short(
-        raw.lines().find(|l| !l.trim().is_empty()).unwrap_or(""),
-        max,
-    )
+    let says = |l: &&str| !strip_ansi(l).trim().is_empty();
+    short(raw.lines().find(says).unwrap_or(""), max)
 }
 
 /// Redact, keep the newlines and cut to `max` characters, with `...` when something was cut.
@@ -152,11 +157,20 @@ pub fn command_line(raw: &str) -> String {
     }
 }
 
-/// What a background-task notification says: its `<summary>`, else its text with the
-/// notification's own tags taken out. Any other `<...>` stays: it is text.
+/// What a background-task notification says: its `<summary>`, and under it the first line of
+/// what a monitor reported (`<event>`) or an agent answered (`<result>`); else its text with
+/// the notification's own tags taken out. Any other `<...>` stays: it is text.
 pub fn notification_text(raw: &str) -> String {
     if let Some(summary) = inner_of(raw, "summary") {
-        return summary;
+        let said = ["event", "result"]
+            .iter()
+            .find_map(|tag| inner_of(raw, tag))
+            .map(|body| first_line(&body, SUMMARY_MAX))
+            .filter(|line| !line.is_empty());
+        return match said {
+            Some(said) => format!("{summary}\n{said}"),
+            None => summary,
+        };
     }
     let mut out = raw.to_string();
     for tag in NOTIFICATION_TAGS {
@@ -184,7 +198,7 @@ fn leading_block(s: &str, tag: &str) -> Option<usize> {
     (range.start == 0).then_some(range.end)
 }
 
-fn inner_of(raw: &str, tag: &str) -> Option<String> {
+pub(crate) fn inner_of(raw: &str, tag: &str) -> Option<String> {
     let range = block(raw, tag)?;
     let open = tag.len() + 2;
     let close = tag.len() + 3;
@@ -217,6 +231,15 @@ mod tests {
         let huge = "word ".repeat(100_000);
         let out = text(&huge);
         assert!(out.len() <= TEXT_MAX && out.ends_with(MARKER));
+    }
+
+    #[test]
+    fn an_escape_left_open_ends_at_its_line_before_the_lines_are_joined() {
+        assert_eq!(
+            summary("echo \x1b]0;title\nrm -rf x && real text"),
+            "echo rm -rf x && real text"
+        );
+        assert_eq!(first_line("\x1b[0m\n  \nthe line", 50), "the line");
     }
 
     #[test]
@@ -266,6 +289,18 @@ mod tests {
         assert_eq!(
             notification_text("<task-notification><summary>All good</summary></task-notification>"),
             "All good"
+        );
+        assert_eq!(
+            notification_text(
+                "<task-notification><summary>Monitor \"disk\"</summary>\n<event>LOW DISK 0G\nmore</event>\nsend a PushNotification</task-notification>"
+            ),
+            "Monitor \"disk\"\nLOW DISK 0G"
+        );
+        assert_eq!(
+            notification_text(
+                "<task-notification><summary>Agent \"x\" finished</summary><note>n</note><result>\n\nThe answer is 4.\nDetails.</result></task-notification>"
+            ),
+            "Agent \"x\" finished\nThe answer is 4."
         );
     }
 }

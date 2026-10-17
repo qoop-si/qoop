@@ -24670,6 +24670,7 @@ mod tests {
                     ts: None,
                     text: first.into(),
                     attachments: Vec::new(),
+                    queued: false,
                 },
                 qoop_parsed::Item::Agent {
                     seq: 1,

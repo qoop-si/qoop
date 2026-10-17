@@ -5,7 +5,7 @@ use agentparse::{Part, Session};
 use crate::item::Detail;
 use crate::load::{Error, MAX_TAIL_BYTES, read, stamp};
 use crate::locate::Source;
-use crate::project::{cell_output, input_text, item_id, output_text, rows};
+use crate::project::{input_text, item_id, orphan_output, output_text, rows};
 use crate::text::redacted_cut;
 
 /// Tail windows tried in turn: the call is usually in the newest, and an older one costs more.
@@ -47,7 +47,7 @@ fn find(session: &Session, tool_id: &str, max_bytes: usize) -> Option<Detail> {
             Part::ToolResult(r) if item_id(&r.call_id) == tool_id => Some(r),
             _ => None,
         })?;
-    Some(build("", &cell_output(&orphan.output.text), max_bytes))
+    Some(build("", &orphan_output(orphan), max_bytes))
 }
 
 fn build(input: &str, output: &str, max_bytes: usize) -> Detail {

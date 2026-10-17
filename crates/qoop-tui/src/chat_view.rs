@@ -309,7 +309,7 @@ fn size(bytes: u64) -> String {
 }
 
 /// The person's message: a raised block the width of the pane, `> ` before the first row.
-fn user_rows(text: &str, chips: &[Chip], cols: usize) -> Vec<StyledRow> {
+fn user_rows(text: &str, chips: &[Chip], queued: bool, cols: usize) -> Vec<StyledRow> {
     let raised = Style {
         raised: true,
         ..style(Role::Text)
@@ -329,6 +329,10 @@ fn user_rows(text: &str, chips: &[Chip], cols: usize) -> Vec<StyledRow> {
             None => format!("[{}]", chip.name),
         };
         lines.extend(wrap(&cells(&label, dim), room));
+    }
+    // Typed while the agent worked and not taken yet: the word, in place of colour.
+    if queued {
+        lines.extend(wrap(&cells("queued", dim), room));
     }
     lines
         .into_iter()
@@ -439,13 +443,17 @@ fn tool_line(
     row_of(&row)
 }
 
+/// How a tool call or a subagent stands; nothing else has a status.
+fn status_of(item: &Item) -> Option<Status> {
+    match item {
+        Item::Tool { status, .. } | Item::Subagent { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
 /// The words for what failed or is still going in a run of calls, after the time it took.
 fn trouble(run: &[&Item]) -> (Role, String) {
-    let count = |want: Status| {
-        run.iter()
-            .filter(|it| matches!(it, Item::Tool { status, .. } if *status == want))
-            .count()
-    };
+    let count = |want: Status| run.iter().filter(|it| status_of(it) == Some(want)).count();
     let mut text = String::new();
     for (n, status) in [
         (count(Status::Failed), Status::Failed),
@@ -603,6 +611,25 @@ fn recap_lines(item: &Item, text: &str, opened: &Opened, cols: usize) -> Vec<Lin
     lines
 }
 
+/// A notice as one row: `<kind>: <text>`, or the text alone when it says more than its kind and
+/// already names it (`2 background agents still running`, `Stop hook blocked: ...`).
+fn notice_label(kind: &str, text: &str) -> String {
+    let names_kind = text.to_lowercase().contains(&kind.to_lowercase());
+    if names_kind && text.chars().count() > kind.chars().count() {
+        text.to_string()
+    } else {
+        format!("{kind}: {text}")
+    }
+}
+
+/// `context compacted`, and the line the summary opens with when the agent wrote one.
+fn compaction_label(text: Option<&str>) -> String {
+    match text.map(one_line).filter(|t| !t.is_empty()) {
+        Some(text) => format!("context compacted: {text}"),
+        None => "context compacted".to_string(),
+    }
+}
+
 fn dim_row(text: &str, cols: usize) -> StyledRow {
     row_of(&cells(&cut(&one_line(text), cols), style(Role::Detail)))
 }
@@ -667,6 +694,8 @@ struct Out {
 #[derive(Default)]
 struct Opened {
     keys: BTreeSet<String>,
+    /// The groups with a step that runs that the person closed.
+    shut: BTreeSet<String>,
     details: BTreeMap<String, Got>,
     out: Option<Out>,
     ticks: u64,
@@ -702,6 +731,9 @@ impl Opened {
     }
 }
 
+/// What the key of a group's header ends in while a step of it runs.
+const RUNNING_HEAD: &str = "!";
+
 fn group_key(first: &Item) -> String {
     format!("g:{:x}", item_key(first))
 }
@@ -736,8 +768,10 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
             }
             lines
         }
-        Item::Subagent { summary, .. } => vec![(
-            tool_line(&subagent_label(summary), Status::Ok, None, None, cols),
+        Item::Subagent {
+            summary, status, ..
+        } => vec![(
+            tool_line(&subagent_label(summary), *status, None, None, cols),
             None,
         )],
         _ => vec![(StyledRow::default(), None)],
@@ -774,21 +808,19 @@ fn laid_out(
                 .filter(|it| !matches!(it, Item::Thinking { .. }))
                 .collect();
             if calls.len() >= 2 {
-                // Folded once every step is over, open while one runs.
+                // Folded once every step is over, open while one runs until the person
+                // closes it: that is a choice of its own (`shut`), so what they chose before
+                // is what it shows after, and its header answers with a key of its own.
                 let key = group_key(calls[0]);
-                let running = calls.iter().any(|it| {
-                    matches!(
-                        it,
-                        Item::Tool {
-                            status: Status::Running,
-                            ..
-                        }
-                    )
-                });
-                let open = running || opened.keys.contains(&key);
-                // A group held open by a step that runs is not the person's to close: its
-                // header answers nothing, and what they chose is what it shows after.
-                let head = (!running).then_some(key);
+                let running = calls
+                    .iter()
+                    .any(|it| status_of(it) == Some(Status::Running));
+                let (open, head) = if running {
+                    (!opened.shut.contains(&key), format!("{key}{RUNNING_HEAD}"))
+                } else {
+                    (opened.keys.contains(&key), key)
+                };
+                let head = Some(head);
                 let mut lines = vec![(group_row(&calls, open, cols), head)];
                 if open {
                     for step in &items[at..end] {
@@ -808,8 +840,11 @@ fn laid_out(
         at += 1;
         let (kind, rows) = match item {
             Item::User {
-                text, attachments, ..
-            } => (Kind::Message, user_rows(text, attachments, cols)),
+                text,
+                attachments,
+                queued,
+                ..
+            } => (Kind::Message, user_rows(text, attachments, *queued, cols)),
             Item::Agent { text, .. } => (Kind::Message, agent_rows(text, cols)),
             Item::Error { text, .. } => {
                 (Kind::Step, vec![dim_row(&format!("error: {text}"), cols)])
@@ -819,9 +854,12 @@ fn laid_out(
                 continue;
             }
             Item::Notice { kind, text, .. } => {
-                (Kind::Step, vec![dim_row(&format!("{kind}: {text}"), cols)])
+                (Kind::Step, vec![dim_row(&notice_label(kind, text), cols)])
             }
-            Item::Compaction { .. } => (Kind::Step, vec![dim_row("context compacted", cols)]),
+            Item::Compaction { text, .. } => (
+                Kind::Step,
+                vec![dim_row(&compaction_label(text.as_deref()), cols)],
+            ),
             // A kind of row a newer daemon sent: said, never dropped, so the page stays whole.
             Item::Unknown => (
                 Kind::Step,
@@ -1814,7 +1852,11 @@ impl ChatState {
 
     fn flip(&mut self, terminal: u32, key: String, row: usize) {
         let opened = self.opened.entry(terminal).or_default();
-        if opened.keys.remove(&key) {
+        if let Some(group) = key.strip_suffix(RUNNING_HEAD) {
+            if !opened.shut.remove(group) {
+                opened.shut.insert(group.to_string());
+            }
+        } else if opened.keys.remove(&key) {
             // A tool put away before its answer came frees the read, and a failed one is
             // tried again the next time it is opened.
             if let Some(id) = key.strip_prefix("t:") {
@@ -2047,6 +2089,7 @@ mod tests {
             ts: None,
             text: text.into(),
             attachments: Vec::new(),
+            queued: false,
         }
     }
 
@@ -2174,6 +2217,7 @@ mod tests {
                     bytes: None,
                 },
             ],
+            queued: false,
         };
         let text = lines(&[item], 30);
         assert_eq!(text[1].trim_end(), "   [a.png 20 KB]");
@@ -2479,6 +2523,7 @@ mod tests {
                 seq: 0,
                 summary: "s".into(),
                 steps: 2,
+                status: Status::Ok,
             },
         ];
         assert_eq!(lines(&items, 40), ["3 steps \u{25b8}"]);
@@ -2516,6 +2561,133 @@ mod tests {
         );
         let rows = layout(&running, 40);
         assert_eq!(style_at(&rows[0], 0).role, Role::Working);
+    }
+
+    fn subagent(summary: &str, status: Status) -> Item {
+        Item::Subagent {
+            seq: 0,
+            summary: summary.into(),
+            steps: 1,
+            status,
+        }
+    }
+
+    #[test]
+    fn a_subagent_row_says_running_or_failed_like_a_tool_row_does() {
+        for (status, tail) in [
+            (Status::Running, "  running"),
+            (Status::Failed, "  failed"),
+            (Status::Interrupted, "  interrupted"),
+            (Status::Ok, ""),
+        ] {
+            let items = [subagent("spawned: survey", status)];
+            let rows = layout(&items, 60);
+            assert_eq!(
+                rows[0].text.trim_end(),
+                format!("\u{25cf} Ran a subagent: spawned: survey{tail}")
+            );
+        }
+        let rows = layout(&[subagent("s", Status::Running)], 40);
+        assert_eq!(style_at(&rows[0], 0).role, Role::Working);
+    }
+
+    #[test]
+    fn a_fold_stays_open_and_counts_a_subagent_that_still_runs() {
+        let items = [
+            tool("Read", "a", Status::Ok, None),
+            subagent("spawned: survey", Status::Running),
+        ];
+        assert_eq!(
+            lines(&items, 50),
+            [
+                "2 steps, 1 running \u{25be}",
+                "\u{25cf} Read a",
+                "\u{25cf} Ran a subagent: spawned: survey  running"
+            ]
+        );
+    }
+
+    #[test]
+    fn input_waiting_in_the_queue_says_queued_under_its_text() {
+        let waiting = Item::User {
+            seq: 0,
+            ts: None,
+            text: "do this next".into(),
+            attachments: Vec::new(),
+            queued: true,
+        };
+        let got: Vec<String> = lines(&[waiting], 20)
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(got, [" > do this next", "   queued"]);
+        let sent = lines(&[user("do this next")], 20);
+        assert_eq!(sent.len(), 1, "no word for input that was taken");
+    }
+
+    #[test]
+    fn a_notice_that_names_its_kind_in_its_text_is_not_said_twice() {
+        let notice = |kind: &str, text: &str| Item::Notice {
+            seq: 0,
+            kind: kind.into(),
+            text: text.into(),
+        };
+        let items = [
+            notice("background", "2 background agents still running"),
+            notice("hook", "Stop hook blocked: write a card"),
+            notice("command output", "Set model to opus"),
+        ];
+        assert_eq!(
+            lines(&items, 60)
+                .iter()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>(),
+            [
+                "2 background agents still running",
+                "Stop hook blocked: write a card",
+                "command output: Set model to opus"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_queued_word_wraps_like_the_text_above_it_in_a_narrow_pane() {
+        let waiting = Item::User {
+            seq: 0,
+            ts: None,
+            text: "go".into(),
+            attachments: Vec::new(),
+            queued: true,
+        };
+        for cols in 5..=10 {
+            let rows = layout(std::slice::from_ref(&waiting), cols);
+            assert!(rows.iter().all(|row| width::width(&row.text) <= cols));
+            // Nothing is cut off: the word goes on to the next row, as the text does.
+            let all: String = rows
+                .iter()
+                .map(|r| r.text.replace([' ', '>'], ""))
+                .collect();
+            assert_eq!(all, "goqueued", "{cols} columns");
+        }
+    }
+
+    #[test]
+    fn a_compaction_row_prints_the_line_its_summary_opens_with() {
+        let rows = |text: Option<&str>| {
+            lines(
+                &[Item::Compaction {
+                    seq: 0,
+                    text: text.map(String::from),
+                }],
+                60,
+            )
+        };
+        assert_eq!(rows(None), ["context compacted"]);
+        assert_eq!(rows(Some("  ")), ["context compacted"]);
+        assert_eq!(
+            rows(Some("Goal: ship\nthe chat")),
+            ["context compacted: Goal: ship the chat"]
+        );
     }
 
     #[test]
@@ -2723,6 +2895,7 @@ mod tests {
                 seq: 0,
                 summary: "review".into(),
                 steps: 7,
+                status: Status::Ok,
             },
         ];
         let rows = layout(&items, 40);
@@ -2841,6 +3014,7 @@ mod tests {
                 seq: 0,
                 summary: "review 世界".into(),
                 steps: 3,
+                status: Status::Ok,
             },
         ]
     }
@@ -2889,6 +3063,7 @@ mod tests {
                 seq: 0,
                 summary: "review 世界 \u{2764}\u{fe0f}".into(),
                 steps: 1,
+                status: Status::Ok,
             },
         ];
         let mut opened = Opened::default();
@@ -3565,6 +3740,37 @@ mod tests {
     }
 
     #[test]
+    fn a_group_open_because_a_step_runs_can_be_closed_and_stays_as_the_person_left_it() {
+        let items = |status| {
+            vec![
+                agent("go"),
+                tool("Read", "a.rs", Status::Ok, None),
+                subagent("spawned: survey", status),
+            ]
+        };
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        chat.set_digest(4, page(1, items(Status::Running)));
+        let got = draw(&mut chat);
+        assert_eq!(got[2], "2 steps, 1 running \u{25be}");
+        assert_eq!(got[3], "\u{25cf} Read a.rs");
+        // The header answers a click, though a step runs: the group closes ...
+        assert!(chat.toggle_at(4, 2));
+        let got = draw(&mut chat);
+        assert_eq!(got[2], "2 steps, 1 running \u{25b8}");
+        assert_eq!(got[3], "");
+        // ... and opens again.
+        assert!(chat.toggle_at(4, 2));
+        assert_eq!(draw(&mut chat)[3], "\u{25cf} Read a.rs");
+        // Closed once more, it stays closed when the step ends.
+        assert!(chat.toggle_at(4, 2));
+        chat.set_digest(4, page(2, items(Status::Ok)));
+        let got = draw(&mut chat);
+        assert_eq!(got[2], "2 steps \u{25b8}");
+        assert_eq!(got[3], "");
+    }
+
+    #[test]
     fn with_no_group_or_tool_row_in_view_nothing_is_taken() {
         let mut chat = ChatState::default();
         on(&mut chat, 4);
@@ -3772,7 +3978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_held_open_by_a_running_step_is_not_the_persons_to_flip() {
+    fn a_group_held_open_by_a_running_tool_closes_when_the_person_closes_it() {
         let items = vec![
             timed("a", "Read", "a.rs", Some(1000), true),
             Item::Tool {
@@ -3794,7 +4000,8 @@ mod tests {
         chat.set_digest(4, page(1, items.clone()));
         let got = draw(&mut chat);
         assert_eq!(got[0], "2 steps, 1 running \u{25be}");
-        assert!(!chat.toggle_at(4, 0), "its header answers nothing");
+        assert!(chat.toggle_at(4, 0), "its header answers");
+        assert_eq!(draw(&mut chat)[0], "2 steps, 1 running \u{25b8}");
         assert!(chat.opened.get(&4).is_none_or(|o| o.keys.is_empty()));
         // The step that ran ended: the group shows what the person last chose, closed.
         let mut ended = items;

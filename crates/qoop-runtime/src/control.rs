@@ -2837,6 +2837,7 @@ mod tests {
                     ts: Some(1),
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    queued: false,
                 },
                 qoop_parsed::Item::Compaction { seq: 8, text: None },
             ],

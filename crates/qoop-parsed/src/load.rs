@@ -47,6 +47,11 @@ pub struct Options {
     /// subagent's rollout is looked for there. Without it the root is read off a
     /// `YYYY/MM/DD` layout, and a file outside one finds no children.
     pub codex_root: Option<std::path::PathBuf>,
+    /// When the agent process that now runs the session started, in unix ms. A call that
+    /// still has no result and began before it was started by an agent that is gone, so it
+    /// reads `interrupted`, not `running`; so does the "agents still running" count of a turn
+    /// that ended before it. `None` when the caller does not know: nothing is changed.
+    pub alive_since: Option<i64>,
 }
 
 impl Default for Options {
@@ -57,6 +62,7 @@ impl Default for Options {
             skip: 0,
             max_total_bytes: 256 * 1024,
             codex_root: None,
+            alive_since: None,
         }
     }
 }
@@ -106,7 +112,7 @@ pub fn load(source: &Source, opts: &Options) -> Result<Digest, Error> {
     let mut window = opts.max_tail_bytes;
     loop {
         let (session, cut) = read(source, stamp.len, window)?;
-        let (all, spawns) = project::project(&session);
+        let (all, spawns) = project::project(&session, opts.alive_since);
         let items = if cut { drop_leading_orphans(all) } else { all };
         // The newest `WATCH_ITEMS` are always in the window, so the spawn rows the revision
         // watches are the same whatever the page asked for.
@@ -279,6 +285,16 @@ pub(crate) fn len_and_mtime(path: &Path) -> Result<(u64, u64), Error> {
 /// and make every older-page request a reset.
 pub const REVISION_MASK: u64 = (1 << 53) - 1;
 
+/// `revision` as a client holding a page must see it when the page was made for an agent that
+/// started at `alive_since` (see [`Options::alive_since`]): the same file read for another
+/// agent has other status words and rows, so it is another revision. `None` leaves it alone.
+pub fn revision_with(revision: u64, alive_since: Option<i64>) -> u64 {
+    match alive_since {
+        Some(at) => fnv(&[revision, at as u64]),
+        None => revision,
+    }
+}
+
 /// FNV-1a over the little-endian bytes: stable across runs and Rust versions, unlike `Hasher`.
 /// Masked to [`REVISION_MASK`] by the last step, so every revision is exact in an `f64`.
 pub(crate) fn fnv(values: &[u64]) -> u64 {
@@ -332,6 +348,17 @@ mod tests {
 
     /// `detail` stops after the first parse when this is false: a whole-parsed source gains
     /// nothing from a wider window.
+    #[test]
+    fn a_page_made_for_another_agent_is_another_revision() {
+        let file = 123_456_789;
+        assert_eq!(revision_with(file, None), file);
+        let first = revision_with(file, Some(1_000));
+        assert_ne!(first, file);
+        assert_ne!(first, revision_with(file, Some(2_000)));
+        assert_eq!(first, revision_with(file, Some(1_000)));
+        assert!(first <= REVISION_MASK);
+    }
+
     #[test]
     fn only_a_claude_or_codex_file_longer_than_the_window_is_cut() {
         assert!(cut("claude.jsonl", 1024));

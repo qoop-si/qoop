@@ -143,7 +143,10 @@ fn refused(response: ControlResponse) -> std::io::Error {
 /// said, and for a tool call how it went.
 fn row(item: &Item) -> String {
     let (who, said) = match item {
-        Item::User { text, .. } => ("you", text.clone()),
+        Item::User { text, queued, .. } => {
+            let queued = if *queued { "[queued] " } else { "" };
+            ("you", format!("{queued}{text}"))
+        }
         Item::Agent { text, .. } => ("agent", text.clone()),
         Item::Thinking { text, .. } => ("thinking", text.clone().unwrap_or_default()),
         Item::Tool {
@@ -160,7 +163,15 @@ fn row(item: &Item) -> String {
             line.push(']');
             ("tool", line)
         }
-        Item::Subagent { summary, steps, .. } => ("subagent", format!("{summary} ({steps} steps)")),
+        Item::Subagent {
+            summary,
+            steps,
+            status,
+            ..
+        } => (
+            "subagent",
+            format!("[{}] {summary} ({steps} steps)", status_word(*status)),
+        ),
         Item::Compaction { text, .. } => ("compaction", text.clone().unwrap_or_default()),
         Item::Error { text, .. } => ("error", text.clone()),
         Item::Notice { kind, text, .. } => ("notice", format!("{kind}: {text}")),
@@ -211,8 +222,35 @@ mod tests {
             ts: None,
             text: "first\nsecond".into(),
             attachments: Vec::new(),
+            queued: false,
         };
         assert_eq!(row(&user), "    3  you        first");
+        let queued = Item::User {
+            seq: 3,
+            ts: None,
+            text: "first\nsecond".into(),
+            attachments: Vec::new(),
+            queued: true,
+        };
+        assert_eq!(row(&queued), "    3  you        [queued] first");
+        let subagent = Item::Subagent {
+            seq: 6,
+            summary: "spawned: survey".into(),
+            steps: 2,
+            status: Status::Running,
+        };
+        // The word is before the summary: a long one is cut at the end of the line.
+        let long = Item::Subagent {
+            seq: 7,
+            summary: "x".repeat(200),
+            steps: 1,
+            status: Status::Failed,
+        };
+        assert!(row(&long).contains("[failed] xxx"), "{}", row(&long));
+        assert_eq!(
+            row(&subagent),
+            "    6  subagent   [running] spawned: survey (2 steps)"
+        );
         let tool = Item::Tool {
             seq: 4,
             id: "t".into(),
@@ -266,6 +304,7 @@ mod tests {
                 ts: None,
                 text: hostile.clone(),
                 attachments: Vec::new(),
+                queued: false,
             },
             Item::Tool {
                 seq: 2,

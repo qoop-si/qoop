@@ -591,7 +591,8 @@ The summary below covers the earlier portion of the conversation.\n\nSummary:\n\
 1. Primary Request and Intent:\n   Ship the sweep.";
     assert_eq!(
         summary_of(dir.path(), real).as_deref(),
-        Some("1. Primary Request and Intent:")
+        Some("Ship the sweep."),
+        "a numbered section heading says nothing, the line under it does"
     );
     let headed = "## Overview\n\nThe real first sentence.";
     assert_eq!(

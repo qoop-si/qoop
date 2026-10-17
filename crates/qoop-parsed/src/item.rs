@@ -36,6 +36,10 @@ pub enum Item {
         ts: Option<i64>,
         text: String,
         attachments: Vec<Chip>,
+        /// The agent has not taken this input yet: it was typed while the agent worked and
+        /// waits in its queue. Absent from the wire when false; an older daemon never sends it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queued: bool,
     },
     Agent {
         seq: u32,
@@ -79,6 +83,10 @@ pub enum Item {
         /// (a spawn row only; 0 when it cannot, for a message to a child, and past the newest
         /// 32 spawns of a page).
         steps: u32,
+        /// How the subagent call stands: `running` while its work goes on (a background agent
+        /// included), `failed`, `interrupted`. An older daemon sends none, which reads as `ok`.
+        #[serde(default)]
+        status: Status,
     },
     Compaction {
         seq: u32,
@@ -109,11 +117,12 @@ pub struct Chip {
     pub bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     /// No result yet.
     Running,
+    #[default]
     Ok,
     Failed,
     /// No result, and the run went on or ended without one.

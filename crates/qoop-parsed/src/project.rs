@@ -1,11 +1,11 @@
 //! Turning parsed entries into chat items.
 
 use agentparse::{
-    Agent, Entry, EntryKind, ErrorInfo, Media, Message, Origin, Part, ProcessAction, Role, Session,
-    Tool, ToolCall, ToolResult, ToolStatus,
+    Agent, Entry, EntryKind, ErrorInfo, Hook, Media, Message, Origin, Part, ProcessAction, Role,
+    Session, TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus, Turn,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::item::{Chip, Item, Status};
 use crate::subagent::Spawn;
@@ -30,11 +30,13 @@ const BOOKKEEPING: &[&str] = &[
     "encrypted_content",
     "file-history-delta",
     "file-history-snapshot",
+    "fork-context-ref",
     "frame-link",
     "inter_agent_communication_metadata",
     "isolation-latch",
     "last-prompt",
     "mode",
+    "plan_update",
     "pr-link",
     "queue-operation",
     "relocated",
@@ -44,6 +46,8 @@ const BOOKKEEPING: &[&str] = &[
     "task_started",
     "todos",
     "token_count",
+    "turn_diff",
+    "web_search_end",
     "world_state",
     "worktree-state",
 ];
@@ -68,24 +72,47 @@ pub fn item_id(raw: &str) -> String {
 }
 
 /// What the walk over a session carries besides the rows: the agent (compaction summaries
-/// read differently) and the spawn rows, by index, with where their child session is.
+/// read differently), the spawn rows, by index, with where their child session is, the ids of
+/// the entries a rewind rolled back, and where the newest turn record sits (only it says what
+/// still runs in the background).
 struct Cx {
     agent: Agent,
     spawns: Vec<(usize, Spawn)>,
+    rolled_back: HashSet<String>,
+    newest_turn: Option<usize>,
+    /// See `Options::alive_since`.
+    since: Option<i64>,
 }
 
 /// Every item of the session, oldest first, each numbered by its distance from the end of
 /// what was parsed: the newest is 0. A wider tail window only adds older items in front, so a
 /// number does not change from one page to the next. The map holds the spawn rows by `seq`;
 /// their `steps` are 0 until [`crate::subagent::annotate`] fills the ones a page shows.
-pub(crate) fn project(session: &Session) -> (Vec<Item>, HashMap<u32, Spawn>) {
+pub(crate) fn project(
+    session: &Session,
+    alive_since: Option<i64>,
+) -> (Vec<Item>, HashMap<u32, Spawn>) {
     let mut cx = Cx {
         agent: session.agent,
         spawns: Vec::new(),
+        rolled_back: session
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Rewind(r) => Some(r.dropped.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect(),
+        newest_turn: session
+            .entries
+            .iter()
+            .rposition(|e| matches!(e.kind, EntryKind::Turn(_))),
+        since: alive_since,
     };
     let mut out = Vec::new();
-    for entry in &session.entries {
-        entry_items(entry, &mut cx, &mut out);
+    for (at, entry) in session.entries.iter().enumerate() {
+        entry_items(entry, at, &mut cx, &mut out);
     }
     let last = out.len().saturating_sub(1);
     for (i, item) in out.iter_mut().enumerate() {
@@ -103,8 +130,16 @@ fn seq_of(last: usize, index: usize) -> u32 {
     u32::try_from(last - index).unwrap_or(u32::MAX)
 }
 
-fn entry_items(entry: &Entry, cx: &mut Cx, out: &mut Vec<Item>) {
+fn entry_items(entry: &Entry, at: usize, cx: &mut Cx, out: &mut Vec<Item>) {
     let ts = entry.ts;
+    // What a rewind rolled back is no longer part of the conversation.
+    if entry
+        .id
+        .as_ref()
+        .is_some_and(|id| cx.rolled_back.contains(id))
+    {
+        return;
+    }
     match &entry.kind {
         EntryKind::Message(m) => message_items(m, ts, cx, out),
         EntryKind::Compaction(c) => out.push(Item::Compaction {
@@ -118,8 +153,20 @@ fn entry_items(entry: &Entry, cx: &mut Cx, out: &mut Vec<Item>) {
             seq: 0,
             text: text::text(&error_text(e)),
         }),
-        EntryKind::Turn(t) => turn_item(t.status.as_deref(), t.error.as_deref(), out),
-        EntryKind::Notice(n) => out.push(notice(n.kind.as_deref().unwrap_or("notice"), &n.text)),
+        EntryKind::Turn(t) => {
+            turn_item(t.status.as_deref(), t.error.as_deref(), out);
+            if cx.newest_turn == Some(at) && !before(ts, cx.since) {
+                out.extend(background_notice(t));
+            }
+        }
+        // A record with no text and no kind says nothing (Gemini writes an empty `info` for a
+        // compression); the level names the kind where the record has none.
+        EntryKind::Notice(n) if n.text.trim().is_empty() && n.kind.is_none() => {}
+        EntryKind::Notice(n) => out.push(notice(
+            n.kind.as_deref().or(n.level.as_deref()).unwrap_or("notice"),
+            &n.text,
+        )),
+        EntryKind::Hook(h) => out.extend(hook_notice(h, out)),
         EntryKind::Rewind(_) => out.push(notice("rewind", "History was rolled back")),
         // Claude's pointer to the session it went on in: a row only when it names one.
         EntryKind::Other(o) if o.kind == "continued-in" => {
@@ -129,11 +176,84 @@ fn entry_items(entry: &Entry, cx: &mut Cx, out: &mut Vec<Item>) {
             }
         }
         EntryKind::Other(o) if !is_bookkeeping(&o.kind) => {
-            out.push(notice(&o.kind, "Record not shown here"));
+            let said = own_text(&o.data).unwrap_or_else(|| "Record not shown here".into());
+            out.push(notice(&o.kind, &said));
         }
-        // Settings and hook runs are the harness talking to itself; bookkeeping is above.
-        EntryKind::Settings(_) | EntryKind::Hook(_) | EntryKind::Other(_) => {}
+        // Settings are the harness talking to itself; bookkeeping is above.
+        EntryKind::Settings(_) | EntryKind::Other(_) => {}
     }
+}
+
+/// What a record of a kind this build has no row for says itself: its first message, text,
+/// command or reason, on one line.
+fn own_text(data: &serde_json::Value) -> Option<String> {
+    ["message", "text", "content", "summary", "command", "reason"]
+        .iter()
+        .filter_map(|key| data.get(key)?.as_str())
+        .map(|s| text::first_line(s, text::SUMMARY_MAX))
+        .find(|s| !s.is_empty())
+}
+
+/// The one quiet row that says background work is still going: from the newest turn record,
+/// and only while it counts any.
+fn background_notice(turn: &Turn) -> Option<Item> {
+    let count = |n: Option<u32>, what: &str| {
+        let n = n.filter(|n| *n > 0)?;
+        Some(format!(
+            "{n} background {what}{}",
+            if n == 1 { "" } else { "s" }
+        ))
+    };
+    let counts: Vec<String> = [
+        count(turn.pending_agents, "agent"),
+        count(turn.pending_workflows, "workflow"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!counts.is_empty()).then(|| {
+        notice(
+            "background",
+            &format!("{} still running", counts.join(" and ")),
+        )
+    })
+}
+
+/// A hook run is silent while it went well. One that blocked, exited non-zero or wrote to
+/// stderr is a row: the event, what it did, and the first line it said. A block the agent logs
+/// twice (the blocking attachment, then the stop summary that carries the same error) is one.
+fn hook_notice(h: &Hook, out: &[Item]) -> Option<Item> {
+    let failed = h.exit_code.is_some_and(|code| code != 0);
+    let line = |s: &Option<String>| {
+        s.as_deref()
+            .map(|s| text::first_line(s, text::SUMMARY_MAX))
+            .filter(|l| !l.is_empty())
+    };
+    let said = line(&h.stderr);
+    if !(h.blocked || failed || said.is_some()) {
+        return None;
+    }
+    let name = h.event.as_deref().or(h.name.as_deref()).unwrap_or("hook");
+    // A hook that exited 0 and still wrote to stderr is not in error: it said something.
+    let did = match (h.blocked, h.exit_code) {
+        (true, _) => "blocked",
+        (false, Some(0)) => "said",
+        (false, _) => "error",
+    };
+    let said = said
+        .or_else(|| line(&h.stdout))
+        .or_else(|| h.exit_code.filter(|c| *c != 0).map(|c| format!("exit {c}")));
+    let head = format!("{name} hook {did}");
+    let repeats = said.is_some()
+        && matches!(out.last(), Some(Item::Notice { kind, text, .. })
+            if kind == "hook"
+                && text.starts_with(&format!("{name} hook "))
+                && text.split_once(": ").map(|(_, last)| last) == said.as_deref());
+    let body = match &said {
+        Some(said) => format!("{head}: {said}"),
+        None => head,
+    };
+    (!repeats).then(|| notice("hook", &body))
 }
 
 /// What an error row says: the message, the HTTP status where the message does not already
@@ -208,9 +328,13 @@ fn strip_tail<'a>(line: &'a str, open: &str) -> Option<&'a str> {
 /// The line a compaction row shows: the first one of the summary with words in it, clamped.
 /// Claude opens with a fixed sentence ("This session is being continued...") and markers
 /// (`Summary:`, `## ...`, a bare tag) that say nothing; OpenCode's summary opens with a
-/// `## Goal` heading, which stays, followed by the line under it.
+/// `## Goal` heading, which stays, followed by the line under it. Claude's sections are
+/// numbered (`1. Primary Request and Intent:`), so those headings say nothing either, and
+/// Gemini's `<state_snapshot>` opens with the `<overall_goal>` text.
 fn compaction_line(agent: Agent, summary: &str) -> Option<String> {
     const CONTINUED: &str = "This session is being continued";
+    let goal = text::inner_of(summary, "overall_goal");
+    let summary = goal.as_deref().unwrap_or(summary);
     let mut lines = summary
         .lines()
         .map(str::trim)
@@ -232,6 +356,7 @@ fn compaction_line(agent: Agent, summary: &str) -> Option<String> {
             .find(|l| {
                 !l.starts_with(CONTINUED)
                     && !l.starts_with('#')
+                    && !is_section_heading(l)
                     && !l.trim_end_matches(':').eq_ignore_ascii_case("summary")
                     && !(l.starts_with('<') && l.ends_with('>'))
             })?
@@ -242,6 +367,20 @@ fn compaction_line(agent: Agent, summary: &str) -> Option<String> {
 
 /// Characters of a compaction row's text.
 const COMPACTION_MAX: usize = 160;
+
+/// `1. Primary Request and Intent:`, `1. **Primary Request and Intent**` or `B) Files:`: a
+/// numbered or lettered line that ends in a colon, or is bold all through, opens a section, it
+/// is not what the section says.
+fn is_section_heading(line: &str) -> bool {
+    let Some((mark, rest)) = line.split_once(['.', ')']) else {
+        return false;
+    };
+    let numbered = !mark.is_empty() && mark.bytes().all(|b| b.is_ascii_digit());
+    let lettered = mark.len() == 1 && mark.bytes().all(|b| b.is_ascii_alphabetic());
+    let rest = rest.trim();
+    let bold = rest.len() > 4 && rest.starts_with("**") && rest.ends_with("**");
+    (numbered || lettered) && (rest.ends_with(':') || bold)
+}
 
 /// A record with no text of its own is named by its kind (`model_refusal_no_fallback` reads
 /// `model refusal no fallback`).
@@ -259,8 +398,8 @@ fn notice(kind: &str, body: &str) -> Item {
 
 fn message_items(m: &Message, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>) {
     // Injected context (environment, instructions, reminders, skill bodies) is the harness's,
-    // not the conversation's.
-    if m.origin == Origin::Context {
+    // not the conversation's, and so is Gemini's "Got it" after a compression.
+    if m.origin == Origin::Context || m.kind.as_deref() == Some("compaction_ack") {
         return;
     }
     let mut user_text = Vec::new();
@@ -277,7 +416,7 @@ fn message_items(m: &Message, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>)
             },
             Part::Reasoning { text, .. } => thinking.add(text.as_deref()),
             Part::Attachment(media) => chips.push(chip(media)),
-            Part::ToolCall(call) => push_call(call, cx, out),
+            Part::ToolCall(call) => push_call(call, ts, cx, out),
             Part::ToolResult(result) => out.extend(orphan(result)),
             Part::Other { kind, data } if kind == "fallback" => out.push(fallback(data)),
             Part::Other { kind, .. } if !is_bookkeeping(kind) => {
@@ -377,6 +516,7 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
             ts,
             text: text::text(&shown),
             attachments: cap_chips(chips),
+            queued: m.phase.as_deref() == Some("queued"),
         });
     }
 }
@@ -451,7 +591,7 @@ fn cap_chips(mut chips: Vec<Chip>) -> Vec<Chip> {
     chips
 }
 
-fn push_call(call: &ToolCall, cx: &mut Cx, out: &mut Vec<Item>) {
+fn push_call(call: &ToolCall, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>) {
     if let Tool::Task {
         description,
         prompt,
@@ -462,22 +602,33 @@ fn push_call(call: &ToolCall, cx: &mut Cx, out: &mut Vec<Item>) {
             .as_deref()
             .or(prompt.as_deref())
             .unwrap_or("subagent");
-        if let Some(spawn) = Spawn::of(call) {
+        if let Some(spawn) = Spawn::of(call, cx.agent) {
             cx.spawns.push((out.len(), spawn));
         }
         out.push(Item::Subagent {
             seq: 0,
-            summary: text::summary(&format!("{}{what}", task_verb(&call.name))),
+            summary: text::summary(&format!("{}{what}", verb_of(call, cx.agent))),
             steps: 0,
+            status: live_status(call, ts, cx.since),
         });
         return;
     }
-    out.extend(rows(call).iter().map(tool_item));
+    out.extend(rows(call).iter().map(|row| tool_item(row, ts, cx.since)));
 }
 
 /// A call that starts a subagent (its child session has the steps).
-pub(crate) fn is_spawn(call: &ToolCall) -> bool {
-    matches!(call.tool, Tool::Task { .. }) && task_verb(&call.name) == SPAWNED
+pub(crate) fn is_spawn(call: &ToolCall, agent: Agent) -> bool {
+    matches!(call.tool, Tool::Task { .. }) && verb_of(call, agent) == SPAWNED
+}
+
+/// [`task_verb`] of the call's name; Gemini starts a subagent by calling the agent by its own
+/// name (`codebase_investigator`), so a call it linked to a child session that no verb names is
+/// a spawn.
+fn verb_of(call: &ToolCall, agent: Agent) -> &'static str {
+    match task_verb(&call.name) {
+        "" if agent == Agent::Gemini && call.child_session.is_some() => SPAWNED,
+        verb => verb,
+    }
 }
 
 const SPAWNED: &str = "spawned: ";
@@ -539,7 +690,7 @@ pub(crate) fn rows(call: &ToolCall) -> Vec<Row<'_>> {
     rows
 }
 
-fn tool_item(row: &Row) -> Item {
+fn tool_item(row: &Row, entry_ts: Option<i64>, since: Option<i64>) -> Item {
     let call = row.call;
     let shell = call.output.as_ref().and_then(|o| o.shell.as_ref());
     let output = output_text(call);
@@ -548,7 +699,7 @@ fn tool_item(row: &Row) -> Item {
         id: row.id.clone(),
         name: tool_name(call, row.child),
         summary: summary(call),
-        status: status(call),
+        status: live_status(call, entry_ts, since),
         exit_code: shell.and_then(|s| s.exit_code),
         duration_ms: shell.and_then(|s| s.duration_ms).or_else(|| elapsed(call)),
         ts: call.started_at,
@@ -583,11 +734,16 @@ fn tool_name(call: &ToolCall, child: bool) -> String {
 /// A result whose call lies outside the window: its first line, dim. One with nothing to say
 /// gets no row.
 fn orphan(result: &ToolResult) -> Option<Item> {
-    let output = cell_output(&result.output.text);
-    let summary = text::first_line(&output, text::SUMMARY_MAX);
-    if summary.is_empty() && output.trim().is_empty() {
+    let output = orphan_output(result);
+    // Output that is only escape codes says nothing.
+    if text::preview(&output, text::SUMMARY_MAX).trim().is_empty() {
         return None;
     }
+    let command = result.output.data.as_ref().and_then(command_of);
+    let summary = match command {
+        Some(c) if !c.trim().is_empty() => text::summary(&c),
+        _ => text::first_line(&output, text::SUMMARY_MAX),
+    };
     Some(Item::Tool {
         seq: 0,
         id: item_id(&result.call_id),
@@ -603,6 +759,24 @@ fn orphan(result: &ToolResult) -> Option<Item> {
     })
 }
 
+/// The command a result's data keeps: a string, or an argv, where `[sh|bash|zsh, -c|-lc, script]`
+/// is the script and any other argv is read as one command line.
+fn command_of(data: &serde_json::Value) -> Option<String> {
+    match data.get("command")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(argv) => {
+            let argv: Vec<&str> = argv.iter().filter_map(|a| a.as_str()).collect();
+            let shell = |name: &str| matches!(name.rsplit('/').next(), Some("sh" | "bash" | "zsh"));
+            match argv.as_slice() {
+                [name, "-c" | "-lc", script] if shell(name) => Some((*script).to_string()),
+                [] => None,
+                _ => Some(argv.join(" ")),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// What the call returned, as the agent saw it. A process or a command's own output is its
 /// stdout and stderr; a code cell's is its text without the `Script completed` header and
 /// the JSON envelopes around each chunk.
@@ -610,15 +784,29 @@ pub(crate) fn output_text(call: &ToolCall) -> String {
     let Some(o) = &call.output else {
         return String::new();
     };
-    match (o.text.is_empty(), o.shell.as_ref()) {
-        (true, Some(s)) => [s.stdout.as_deref(), s.stderr.as_deref()]
+    match streams(o) {
+        Some(streams) => streams,
+        None if matches!(call.tool, Tool::Code { .. }) => cell_output(&o.text),
+        None => o.text.clone(),
+    }
+}
+
+/// What a result whose call lies outside the window says: its text, else the output of the
+/// command it came from.
+pub(crate) fn orphan_output(result: &ToolResult) -> String {
+    streams(&result.output).unwrap_or_else(|| cell_output(&result.output.text))
+}
+
+/// A command's own stdout and stderr, for a result that has no text of its own.
+fn streams(o: &ToolOutput) -> Option<String> {
+    let shell = o.shell.as_ref().filter(|_| o.text.is_empty())?;
+    Some(
+        [shell.stdout.as_deref(), shell.stderr.as_deref()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join("\n"),
-        _ if matches!(call.tool, Tool::Code { .. }) => cell_output(&o.text),
-        _ => o.text.clone(),
-    }
+    )
 }
 
 /// A code cell's output text: `Script completed\nWall time 0.8 seconds\nOutput:\n` and then
@@ -682,6 +870,7 @@ pub(crate) fn input_text(call: &ToolCall) -> String {
         },
         Tool::Patch { patch } => patch.clone(),
         Tool::Code { source } => source.clone(),
+        Tool::Todo { items } => checklist(items),
         Tool::Write { path, content } => format!("{path}\n{}", content.as_deref().unwrap_or("")),
         Tool::Edit { path, edits } => edits.iter().fold(path.clone(), |acc, e| {
             format!(
@@ -701,6 +890,21 @@ pub(crate) fn input_text(call: &ToolCall) -> String {
 
 /// Characters of an edit's old and of its new text that `detail` shows.
 const EDIT_PREVIEW: usize = 600;
+
+/// `at` is before `since`: both known, and it came first.
+fn before(at: Option<i64>, since: Option<i64>) -> bool {
+    matches!((at, since), (Some(at), Some(since)) if at < since)
+}
+
+/// [`status`], except that a call still running which began before the agent process that now
+/// runs the session started was left behind by one that is gone: it is `interrupted`. The call's
+/// own start counts, else the time of the message that made it.
+fn live_status(call: &ToolCall, entry_ts: Option<i64>, since: Option<i64>) -> Status {
+    match status(call) {
+        Status::Running if before(call.started_at.or(entry_ts), since) => Status::Interrupted,
+        status => status,
+    }
+}
 
 /// A call with no result is never `Ok`: it is running, or it was cut short.
 fn status(call: &ToolCall) -> Status {
@@ -751,7 +955,7 @@ fn summary_raw(call: &ToolCall) -> String {
         Tool::List { path: p } => path(p),
         Tool::WebFetch { url, .. } => path(url),
         Tool::WebSearch { query } => path(query),
-        Tool::Todo { items } => format!("{} items", items.len()),
+        Tool::Todo { items } => todo_line(items),
         Tool::Mcp { server, tool } => format!("{server}.{tool}"),
         // A cell that recorded no calls: the first line of its program, short.
         Tool::Code { source } => text::first_line(source, CODE_SUMMARY),
@@ -759,8 +963,106 @@ fn summary_raw(call: &ToolCall) -> String {
         Tool::Other if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => {
             patched_files(call)
         }
-        Tool::Task { .. } | Tool::Question | Tool::Plan | Tool::Other => String::new(),
+        Tool::Question => question_line(call),
+        Tool::Plan => plan_line(call),
+        Tool::Other => first_field(&call.input, OTHER_FIELDS),
+        Tool::Task { .. } => String::new(),
     }
+}
+
+/// The fields of a tool this build has no view of that say what it was for, in order.
+const OTHER_FIELDS: &[&str] = &[
+    "subject",
+    "description",
+    "reason",
+    "query",
+    "objective",
+    "skill",
+];
+
+/// The first of `keys` that holds text in a JSON object input.
+fn first_field(input: &serde_json::Value, keys: &[&str]) -> String {
+    keys.iter()
+        .filter_map(|key| input.get(key)?.as_str())
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The first question asked, and the answer the result gives to it (`User has answered your
+/// questions: "<question>"="<answer>"`) once there is one.
+fn question_line(call: &ToolCall) -> String {
+    let asked = call.input.pointer("/questions/0/question");
+    let asked = asked.or_else(|| call.input.get("question"));
+    let Some(question) = asked.and_then(|q| q.as_str()).map(str::trim) else {
+        return String::new();
+    };
+    let answer = call
+        .output
+        .as_ref()
+        .and_then(|o| o.text.split_once(&format!("\"{question}\"=\"")))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(answer, _)| answer.trim())
+        .filter(|a| !a.is_empty());
+    match answer {
+        Some(answer) => format!("{question} {answer}"),
+        None => question.to_string(),
+    }
+}
+
+/// The title of the plan put up for approval: its first heading, else its first line.
+fn plan_line(call: &ToolCall) -> String {
+    let plan = call
+        .input
+        .get("plan")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let lines = || plan.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines()
+        .find(|l| l.starts_with('#'))
+        .or_else(|| lines().next());
+    line.map_or_else(String::new, |l| {
+        l.trim_start_matches('#').trim().to_string()
+    })
+}
+
+/// `2 of 5 done: <the item in progress>`; the item's own text for a list of one with no state
+/// (a created task), the count for a list that keeps no state at all.
+fn todo_line(items: &[TodoItem]) -> String {
+    fn state(item: &TodoItem) -> &str {
+        item.status.as_deref().unwrap_or("")
+    }
+    if items.iter().all(|i| state(i).is_empty()) {
+        return match items {
+            [one] => one.content.clone(),
+            _ => format!("{} items", items.len()),
+        };
+    }
+    let done = items
+        .iter()
+        .filter(|i| matches!(state(i), "completed" | "done"))
+        .count();
+    let head = format!("{done} of {} done", items.len());
+    match items.iter().find(|i| state(i) == "in_progress") {
+        Some(now) => format!("{head}: {}", now.content),
+        None => head,
+    }
+}
+
+/// The list as a checklist, one line per item.
+fn checklist(items: &[TodoItem]) -> String {
+    let mark = |item: &TodoItem| match item.status.as_deref() {
+        Some("completed" | "done") => "[x]",
+        Some("in_progress") => "[~]",
+        Some("cancelled") => "[-]",
+        _ => "[ ]",
+    };
+    let lines: Vec<String> = items
+        .iter()
+        .map(|i| format!("{} {}", mark(i), i.content))
+        .collect();
+    lines.join("\n")
 }
 
 /// Characters of a code cell's first line that its row shows.
@@ -780,6 +1082,29 @@ fn patched_files(call: &ToolCall) -> String {
         "apply patch".to_string()
     } else {
         paths.join(", ")
+    }
+}
+
+/// A session of no entries, for the tests of this module and of `subagent`.
+#[cfg(test)]
+pub(crate) fn blank_session(agent: Agent, path: &std::path::Path) -> Session {
+    Session {
+        agent,
+        id: "sid".into(),
+        source: agentparse::Source::File { path: path.into() },
+        format: "test".into(),
+        parent: None,
+        title: None,
+        cwd: None,
+        git: None,
+        cli_version: None,
+        models: Vec::new(),
+        started_at: None,
+        updated_at: None,
+        usage: Default::default(),
+        entries: Vec::new(),
+        extra: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -804,7 +1129,7 @@ mod tests {
         let from_result = text.len() - (text[..at].rfind('\n').unwrap() + 1);
         let session = agentparse::parse_file_tail(&path, from_result as u64).unwrap();
         assert!(!session.warnings.is_empty(), "the parser counts it");
-        let rows = project(&session).0;
+        let rows = project(&session, None).0;
         let Item::Tool {
             id,
             name,
@@ -976,5 +1301,678 @@ mod tests {
                 bytes: None
             }
         );
+    }
+
+    // Hand-built sessions: what the projection does with each shape, whatever parser made it.
+
+    fn entry(id: &str, kind: EntryKind) -> Entry {
+        Entry {
+            id: Some(id.into()),
+            parent_id: None,
+            turn_id: None,
+            ts: None,
+            line: None,
+            extra: None,
+            kind,
+        }
+    }
+
+    fn session(agent: Agent, kinds: Vec<EntryKind>) -> Session {
+        let mut session = blank_session(agent, std::path::Path::new("/x/chats/session-a.jsonl"));
+        session.entries = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(n, kind)| entry(&format!("e{n}"), kind))
+            .collect();
+        session
+    }
+
+    fn message(role: Role, origin: Origin, kind: Option<&str>, body: &str) -> Message {
+        Message {
+            role,
+            origin,
+            kind: kind.map(String::from),
+            author: None,
+            model: None,
+            agent: None,
+            phase: None,
+            parts: vec![Part::Text { text: body.into() }],
+            usage: None,
+            stop_reason: None,
+        }
+    }
+
+    fn human(body: &str) -> Message {
+        message(Role::User, Origin::Human, None, body)
+    }
+
+    fn call(name: &str, tool: Tool, input: serde_json::Value, status: ToolStatus) -> ToolCall {
+        ToolCall {
+            id: format!("id-{name}"),
+            name: name.into(),
+            input,
+            tool,
+            status,
+            status_detail: None,
+            output: None,
+            started_at: None,
+            ended_at: None,
+            child_session: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn with_text(mut call: ToolCall, text: &str) -> ToolCall {
+        call.output = Some(ToolOutput {
+            text: text.into(),
+            ..ToolOutput::default()
+        });
+        call
+    }
+
+    fn call_message(call: ToolCall) -> EntryKind {
+        let mut m = message(Role::Assistant, Origin::Model, None, "");
+        m.parts = vec![Part::ToolCall(call)];
+        EntryKind::Message(m)
+    }
+
+    fn rows_of(session: &Session) -> Vec<Item> {
+        project(session, None).0
+    }
+
+    fn notices(items: &[Item]) -> Vec<(&str, &str)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Notice { kind, text, .. } => Some((kind.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turn(agents: Option<u32>, workflows: Option<u32>) -> EntryKind {
+        EntryKind::Turn(Turn {
+            pending_agents: agents,
+            pending_workflows: workflows,
+            ..Turn::default()
+        })
+    }
+
+    #[test]
+    fn a_subagent_row_carries_how_its_call_stands() {
+        let task = |status| {
+            let tool = Tool::Task {
+                description: Some("survey".into()),
+                prompt: None,
+                agent_type: None,
+            };
+            let call = call("Agent", tool, serde_json::Value::Null, status);
+            if status == ToolStatus::Pending {
+                call
+            } else {
+                with_text(call, "done")
+            }
+        };
+        let status_of = |status| {
+            let items = rows_of(&session(Agent::Claude, vec![call_message(task(status))]));
+            match &items[0] {
+                Item::Subagent { status, .. } => *status,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(status_of(ToolStatus::Pending), Status::Running);
+        assert_eq!(status_of(ToolStatus::Ok), Status::Ok);
+        assert_eq!(status_of(ToolStatus::Error), Status::Failed);
+        assert_eq!(status_of(ToolStatus::Interrupted), Status::Interrupted);
+    }
+
+    #[test]
+    fn input_still_in_the_queue_is_marked_and_delivered_input_is_not() {
+        let mut waiting = human("do this next");
+        waiting.phase = Some("queued".into());
+        let items = rows_of(&session(
+            Agent::Claude,
+            vec![
+                EntryKind::Message(human("first")),
+                EntryKind::Message(waiting),
+            ],
+        ));
+        let queued: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::User { text, queued, .. } => Some((text.as_str(), *queued)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, [("first", false), ("do this next", true)]);
+    }
+
+    #[test]
+    fn only_the_newest_turn_says_what_still_runs_in_the_background() {
+        let at = |turns: Vec<EntryKind>| {
+            let items = rows_of(&session(Agent::Claude, turns));
+            notices(&items)
+                .into_iter()
+                .map(|(k, t)| (k.to_string(), t.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let said = |text: &str| vec![("background".to_string(), text.to_string())];
+        assert_eq!(
+            at(vec![turn(Some(2), None)]),
+            said("2 background agents still running")
+        );
+        assert_eq!(
+            at(vec![turn(Some(1), None)]),
+            said("1 background agent still running")
+        );
+        assert_eq!(
+            at(vec![turn(Some(2), Some(1))]),
+            said("2 background agents and 1 background workflow still running")
+        );
+        assert_eq!(
+            at(vec![turn(Some(3), None), turn(Some(0), Some(0))]),
+            [],
+            "the newest turn counts none"
+        );
+        assert_eq!(at(vec![turn(None, None)]), []);
+        assert_eq!(
+            at(vec![turn(Some(3), None), turn(Some(1), None)]),
+            said("1 background agent still running"),
+            "one row, from the newest"
+        );
+    }
+
+    #[test]
+    fn work_left_running_by_an_agent_that_is_gone_reads_interrupted() {
+        let shell = |started: Option<i64>| {
+            let mut c = call(
+                "Bash",
+                Tool::Shell(agentparse::Shell::default()),
+                serde_json::Value::Null,
+                ToolStatus::Pending,
+            );
+            c.started_at = started;
+            c
+        };
+        let task = |started: Option<i64>| {
+            let tool = Tool::Task {
+                description: Some("survey".into()),
+                prompt: None,
+                agent_type: None,
+            };
+            let mut c = call("Agent", tool, serde_json::Value::Null, ToolStatus::Pending);
+            c.started_at = started;
+            c
+        };
+        let statuses = |since: Option<i64>, calls: Vec<ToolCall>, ts: Option<i64>| {
+            let mut s = session(Agent::Claude, calls.into_iter().map(call_message).collect());
+            s.entries.iter_mut().for_each(|e| e.ts = ts);
+            project(&s, since)
+                .0
+                .iter()
+                .map(|i| match i {
+                    Item::Tool { status, .. } | Item::Subagent { status, .. } => *status,
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let calls = || {
+            vec![
+                shell(Some(1000)),
+                shell(Some(3000)),
+                task(Some(1000)),
+                task(None),
+            ]
+        };
+        use Status::{Interrupted, Running};
+        assert_eq!(
+            statuses(Some(2000), calls(), None),
+            [Interrupted, Running, Interrupted, Running],
+            "one that began before the agent started is left behind"
+        );
+        assert_eq!(
+            statuses(Some(2000), calls(), Some(500)),
+            [Interrupted, Running, Interrupted, Interrupted],
+            "no start of its own: the message's time"
+        );
+        assert_eq!(
+            statuses(None, calls(), Some(500)),
+            [Running; 4],
+            "no start known for the agent: nothing changes"
+        );
+        // A call that ended is not touched.
+        let mut done = shell(Some(1000));
+        done.status = ToolStatus::Ok;
+        done = with_text(done, "ok");
+        assert_eq!(statuses(Some(2000), vec![done], None), [Status::Ok]);
+        // The count of agents still running belongs to an agent that is there.
+        let at = |since: Option<i64>, ts: i64| {
+            let mut s = session(Agent::Claude, vec![turn(Some(2), None)]);
+            s.entries[0].ts = Some(ts);
+            notices(&project(&s, since).0).len()
+        };
+        assert_eq!(at(Some(2000), 1000), 0, "a turn from before it started");
+        assert_eq!(at(Some(2000), 3000), 1);
+        assert_eq!(at(None, 1000), 1);
+    }
+
+    fn hook(event: &str) -> Hook {
+        Hook {
+            event: Some(event.into()),
+            ..Hook::default()
+        }
+    }
+
+    #[test]
+    fn a_hook_is_a_row_only_when_it_blocked_failed_or_spoke_on_stderr() {
+        let said = |hook: Hook| {
+            let items = rows_of(&session(Agent::Claude, vec![EntryKind::Hook(hook)]));
+            notices(&items)
+                .into_iter()
+                .map(|(k, t)| format!("{k}: {t}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            said(Hook {
+                exit_code: Some(0),
+                stdout: Some("ok".into()),
+                ..hook("PreToolUse")
+            }),
+            Vec::<String>::new(),
+            "a success is silent"
+        );
+        assert_eq!(
+            said(Hook {
+                blocked: true,
+                stderr: Some("no force push\nsecond line".into()),
+                ..hook("PreToolUse")
+            }),
+            ["hook: PreToolUse hook blocked: no force push"]
+        );
+        assert_eq!(
+            said(Hook {
+                exit_code: Some(2),
+                ..hook("Stop")
+            }),
+            ["hook: Stop hook error: exit 2"]
+        );
+        assert_eq!(
+            said(Hook {
+                exit_code: Some(0),
+                stderr: Some("bun: command not found".into()),
+                ..hook("SessionStart")
+            }),
+            ["hook: SessionStart hook said: bun: command not found"],
+            "exit 0 with a word on stderr is not an error"
+        );
+        assert_eq!(
+            said(Hook {
+                stderr: Some("Failed with non-blocking status code".into()),
+                ..hook("SessionStart")
+            }),
+            ["hook: SessionStart hook error: Failed with non-blocking status code"],
+            "no exit code recorded, an error is what the agent called it"
+        );
+        assert_eq!(
+            said(Hook {
+                blocked: true,
+                ..hook("Stop")
+            }),
+            ["hook: Stop hook blocked"]
+        );
+        // The blocking attachment and the stop summary that repeats it are one row.
+        let twice = rows_of(&session(
+            Agent::Claude,
+            vec![
+                EntryKind::Hook(Hook {
+                    blocked: true,
+                    stderr: Some("write a card".into()),
+                    ..hook("Stop")
+                }),
+                EntryKind::Hook(Hook {
+                    exit_code: Some(2),
+                    stderr: Some("write a card".into()),
+                    ..hook("Stop")
+                }),
+                EntryKind::Hook(Hook {
+                    blocked: true,
+                    stderr: Some("another reason".into()),
+                    ..hook("Stop")
+                }),
+                EntryKind::Hook(Hook {
+                    blocked: true,
+                    stderr: Some("another reason".into()),
+                    ..hook("PreToolUse")
+                }),
+            ],
+        ));
+        assert_eq!(
+            notices(&twice),
+            [
+                ("hook", "Stop hook blocked: write a card"),
+                ("hook", "Stop hook blocked: another reason"),
+                ("hook", "PreToolUse hook blocked: another reason")
+            ]
+        );
+    }
+
+    fn other(kind: &str, data: serde_json::Value) -> EntryKind {
+        EntryKind::Other(agentparse::Other {
+            kind: kind.into(),
+            data,
+        })
+    }
+
+    #[test]
+    fn an_unknown_record_says_its_own_text_and_a_bookkeeping_one_says_nothing() {
+        let items = rows_of(&session(
+            Agent::Codex,
+            vec![
+                other(
+                    "warning",
+                    serde_json::json!({"message": "Heads up\nsecond"}),
+                ),
+                other(
+                    "exec_approval_request",
+                    serde_json::json!({"command": "rm -rf x"}),
+                ),
+                other("mystery", serde_json::json!({"n": 1})),
+                other("turn_diff", serde_json::json!({"unified_diff": "x"})),
+                other("plan_update", serde_json::json!({"text": "x"})),
+                other("web_search_end", serde_json::json!({"query": "x"})),
+                other("token_count", serde_json::json!({"n": 1})),
+                other("fork-context-ref", serde_json::json!({"n": 1})),
+            ],
+        ));
+        assert_eq!(
+            notices(&items),
+            [
+                ("warning", "Heads up"),
+                ("exec_approval_request", "rm -rf x"),
+                ("mystery", "Record not shown here"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_notice_without_a_kind_is_named_by_its_level_and_an_empty_one_is_not_a_row() {
+        let notice = |level: Option<&str>, kind: Option<&str>, text: &str| {
+            EntryKind::Notice(agentparse::Notice {
+                level: level.map(String::from),
+                kind: kind.map(String::from),
+                text: text.into(),
+            })
+        };
+        let items = rows_of(&session(
+            Agent::Gemini,
+            vec![
+                notice(Some("info"), None, "Model changed"),
+                notice(Some("warning"), None, "Quota low"),
+                notice(Some("info"), None, ""),
+                notice(None, None, "  "),
+                notice(Some("info"), Some("informational"), "Kept kind"),
+                notice(None, Some("model_refusal_no_fallback"), ""),
+            ],
+        ));
+        assert_eq!(
+            notices(&items),
+            [
+                ("info", "Model changed"),
+                ("warning", "Quota low"),
+                ("informational", "Kept kind"),
+                ("model_refusal_no_fallback", "model refusal no fallback"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compaction_line_skips_numbered_headings_and_reads_a_gemini_goal() {
+        let claude = |s| compaction_line(Agent::Claude, s);
+        assert_eq!(
+            claude(
+                "This session is being continued from a previous one.\nSummary:\n1. Primary Request and Intent:\n   The user asked for a chat fix.\n2. Key Concepts:\n"
+            ),
+            Some("The user asked for a chat fix.".into())
+        );
+        assert_eq!(claude("B) Files:\nEdited a.rs"), Some("Edited a.rs".into()));
+        assert_eq!(
+            claude("1. **Primary Request and Intent**\nThe user wants X."),
+            Some("The user wants X.".into())
+        );
+        assert_eq!(
+            claude("1. **Fix** the build first"),
+            Some("1. **Fix** the build first".into()),
+            "bold words in a sentence are not a heading"
+        );
+        assert_eq!(
+            claude("1. Fix the build first"),
+            Some("1. Fix the build first".into()),
+            "a numbered sentence is not a heading"
+        );
+        let gemini = |s| compaction_line(Agent::Gemini, s);
+        assert_eq!(
+            gemini(
+                "<state_snapshot><overall_goal>Ship the parser.</overall_goal><key_knowledge>x</key_knowledge></state_snapshot>"
+            ),
+            Some("Ship the parser.".into())
+        );
+        assert_eq!(
+            gemini(
+                "<state_snapshot>\n  <overall_goal>\n    Ship the parser.\n  </overall_goal>\n</state_snapshot>"
+            ),
+            Some("Ship the parser.".into())
+        );
+    }
+
+    #[test]
+    fn gemini_got_it_after_a_compression_is_not_a_message() {
+        let ack = message(
+            Role::Assistant,
+            Origin::Model,
+            Some("compaction_ack"),
+            "Got it. Thanks for the additional context!",
+        );
+        let items = rows_of(&session(
+            Agent::Gemini,
+            vec![
+                EntryKind::Message(ack),
+                EntryKind::Message(message(Role::Assistant, Origin::Model, None, "Real reply")),
+            ],
+        ));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], Item::Agent { text, .. } if text == "Real reply"));
+    }
+
+    fn summary_of(call: ToolCall) -> String {
+        let items = rows_of(&session(Agent::Claude, vec![call_message(call)]));
+        match &items[0] {
+            Item::Tool { summary, .. } => summary.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_question_row_says_what_was_asked_and_the_answer_once_there_is_one() {
+        let input = serde_json::json!({"questions": [
+            {"question": "Which database?", "options": []},
+            {"question": "Which cache?"}
+        ]});
+        let asked = call(
+            "AskUserQuestion",
+            Tool::Question,
+            input,
+            ToolStatus::Pending,
+        );
+        assert_eq!(summary_of(asked.clone()), "Which database?");
+        let answered = with_text(
+            asked,
+            "User has answered your questions: \"Which database?\"=\"Postgres\", \"Which cache?\"=\"None\". You can now continue.",
+        );
+        assert_eq!(summary_of(answered), "Which database? Postgres");
+    }
+
+    #[test]
+    fn a_plan_row_is_the_plans_first_heading_else_its_first_line() {
+        let plan = |text: &str| {
+            let input = serde_json::json!({ "plan": text });
+            summary_of(call("ExitPlanMode", Tool::Plan, input, ToolStatus::Ok))
+        };
+        assert_eq!(
+            plan("Intro line\n\n## Fix the chat\n- step"),
+            "Fix the chat"
+        );
+        assert_eq!(plan("\nJust text\nmore"), "Just text");
+        assert_eq!(plan(""), "");
+    }
+
+    #[test]
+    fn a_todo_row_counts_what_is_done_and_names_what_is_in_progress() {
+        let item = |content: &str, status: Option<&str>| TodoItem {
+            content: content.into(),
+            status: status.map(String::from),
+            priority: None,
+        };
+        let items = vec![
+            item("write test", Some("completed")),
+            item("fix chat", Some("in_progress")),
+            item("ship", Some("pending")),
+        ];
+        assert_eq!(todo_line(&items), "1 of 3 done: fix chat");
+        assert_eq!(todo_line(&items[..1]), "1 of 1 done");
+        assert_eq!(todo_line(&[item("only one", None)]), "only one");
+        assert_eq!(todo_line(&[item("a", None), item("b", None)]), "2 items");
+        assert_eq!(checklist(&items), "[x] write test\n[~] fix chat\n[ ] ship");
+        let c = call(
+            "TodoWrite",
+            Tool::Todo { items },
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        assert_eq!(input_text(&c), "[x] write test\n[~] fix chat\n[ ] ship");
+        assert_eq!(summary_of(c), "1 of 3 done: fix chat");
+    }
+
+    #[test]
+    fn a_tool_this_build_has_no_view_of_reads_what_it_was_for_from_its_input() {
+        let other = |input: serde_json::Value| {
+            summary_of(call("ScheduleWakeup", Tool::Other, input, ToolStatus::Ok))
+        };
+        assert_eq!(
+            other(serde_json::json!({"reason": "check the build"})),
+            "check the build"
+        );
+        assert_eq!(
+            other(serde_json::json!({"subject": "Fix it", "description": "long text"})),
+            "Fix it"
+        );
+        assert_eq!(
+            other(serde_json::json!({"query": "select:Read"})),
+            "select:Read"
+        );
+        assert_eq!(
+            other(serde_json::json!({"objective": "ship", "n": 1})),
+            "ship"
+        );
+        assert_eq!(other(serde_json::json!({"n": 1})), "");
+        assert_eq!(other(serde_json::json!("freeform")), "");
+    }
+
+    #[test]
+    fn an_orphan_with_no_text_shows_the_commands_output() {
+        let result = |text: &str, stdout: Option<&str>, stderr: Option<&str>| ToolResult {
+            call_id: "exec-1".into(),
+            status: ToolStatus::Ok,
+            status_detail: None,
+            output: ToolOutput {
+                text: text.into(),
+                shell: Some(agentparse::ShellResult {
+                    exit_code: Some(0),
+                    stdout: stdout.map(String::from),
+                    stderr: stderr.map(String::from),
+                    ..Default::default()
+                }),
+                ..ToolOutput::default()
+            },
+        };
+        let row = orphan(&result("", Some(" 2 files changed\nmore"), None)).expect("a row");
+        assert!(
+            matches!(&row, Item::Tool { summary, has_detail: true, .. } if summary == "2 files changed")
+        );
+        assert_eq!(
+            orphan_output(&result("", Some("out"), Some("err"))),
+            "out\nerr"
+        );
+        assert_eq!(orphan_output(&result("given", Some("out"), None)), "given");
+        assert!(orphan(&result("", None, None)).is_none());
+        let mut named = result("", Some("out"), None);
+        named.output.data =
+            Some(serde_json::json!({"command": ["/bin/zsh", "-lc", "git diff --stat"]}));
+        assert!(
+            matches!(orphan(&named), Some(Item::Tool { summary, .. }) if summary == "git diff --stat")
+        );
+        // A plain argv is one command line, and what it carries is masked: the last word of it
+        // alone would be the secret.
+        let mut direct = result("", Some("out"), None);
+        direct.output.data =
+            Some(serde_json::json!({"command": ["mysql", "-u", "root", "--password", "hunter2"]}));
+        let Some(Item::Tool { summary, .. }) = orphan(&direct) else {
+            panic!("a row")
+        };
+        assert_eq!(summary, "mysql -u root --password ***");
+        direct.output.data = Some(serde_json::json!({"command": ["git", "status"]}));
+        assert!(
+            matches!(orphan(&direct), Some(Item::Tool { summary, .. }) if summary == "git status")
+        );
+        // Output that is only escape codes is no row.
+        assert!(orphan(&result("\x1b[0m\n", None, None)).is_none());
+        assert!(orphan(&result("", Some("\x1b[0m"), None)).is_none());
+    }
+
+    #[test]
+    fn what_a_rewind_rolled_back_is_not_shown_and_the_notice_stays() {
+        let mut s = session(
+            Agent::Gemini,
+            vec![
+                EntryKind::Message(human("keep")),
+                EntryKind::Message(human("Wrong prompt, ignore")),
+                EntryKind::Message(message(Role::Assistant, Origin::Model, None, "Okay.")),
+                EntryKind::Rewind(agentparse::Rewind {
+                    dropped: vec!["e1".into(), "e2".into()],
+                    turns: None,
+                }),
+            ],
+        );
+        let items = rows_of(&s);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(matches!(&items[0], Item::User { text, .. } if text == "keep"));
+        assert!(matches!(&items[1], Item::Notice { kind, .. } if kind == "rewind"));
+        s.entries.pop();
+        assert_eq!(rows_of(&s).len(), 3, "without the rewind they all show");
+    }
+
+    #[test]
+    fn gemini_calls_an_agent_by_its_own_name_and_that_is_a_spawn_with_a_child() {
+        let tool = Tool::Task {
+            description: Some("Map the repo".into()),
+            prompt: None,
+            agent_type: None,
+        };
+        let mut c = call(
+            "codebase_investigator",
+            tool,
+            serde_json::Value::Null,
+            ToolStatus::Pending,
+        );
+        c.child_session = Some("agent7".into());
+        let items = project(&session(Agent::Gemini, vec![call_message(c.clone())]), None);
+        assert!(
+            matches!(&items.0[0], Item::Subagent { summary, .. } if summary == "spawned: Map the repo")
+        );
+        assert_eq!(items.1.len(), 1, "its child is looked up for the steps");
+        let claude = project(&session(Agent::Claude, vec![call_message(c)]), None);
+        assert!(
+            matches!(&claude.0[0], Item::Subagent { summary, .. } if summary == "Map the repo")
+        );
+        assert!(claude.1.is_empty());
     }
 }

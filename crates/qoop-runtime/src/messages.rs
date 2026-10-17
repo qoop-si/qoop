@@ -50,6 +50,19 @@ const DETAIL_MAX: u32 = 1024 * 1024;
 /// refused at once: a client that asks faster than a parse is not waited for.
 const MAX_QUEUED: usize = 4;
 
+/// When the agent now in `terminal` started, in unix ms: its process's own start time where the
+/// system gives one (macOS), else when the daemon first saw that leader in the foreground, kept
+/// across a stop and resume. Work the session file shows as running from before that was left
+/// behind by an agent that is gone. The same value every read, so it can key a memo.
+fn alive_since(agents: &AgentRegistry, terminal: u32) -> Option<i64> {
+    let agent = agents.agent(terminal)?;
+    #[cfg(target_os = "macos")]
+    if let Some(started) = agent.leader.and_then(qoop_pty::sys::start_time_of) {
+        return i64::try_from(started).ok().map(|s| s.saturating_mul(1000));
+    }
+    agent.leader_seen_ms()
+}
+
 /// What one read answers with, and what the memo keeps of it.
 enum Reply {
     Page(Digest),
@@ -65,6 +78,8 @@ struct Key {
     limit: usize,
     max_bytes: usize,
     tool_id: Option<String>,
+    /// When the agent that serves the page started: a new one reads running work as left behind.
+    alive_since: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -86,6 +101,9 @@ struct Watched {
     next_locate: Option<Instant>,
     /// The last reply, for a read that asks the same while the stamp has not moved.
     memo: Option<Memo>,
+    /// When the agent the last page was made for started: the stamp of that page folds it in
+    /// (`qoop_parsed::revision_with`), so the watch must too.
+    alive: Option<i64>,
 }
 
 /// The terminals a client asked about lately, and the news about their chats.
@@ -151,6 +169,7 @@ struct Job {
     program: String,
     session: String,
     source: Option<Source>,
+    alive: Option<i64>,
 }
 
 /// What the look found.
@@ -201,6 +220,7 @@ impl Watch {
         source: Option<Source>,
         revision: Option<u64>,
         memo: Option<Memo>,
+        alive: Option<i64>,
     ) {
         let mut watched = self.watched.lock().unwrap();
         let entry = watched.entry(terminal).or_insert_with(|| Watched {
@@ -210,6 +230,7 @@ impl Watch {
             revision,
             next_locate: None,
             memo: None,
+            alive: None,
         });
         entry.asked = Instant::now();
         if entry.session != session {
@@ -220,12 +241,16 @@ impl Watch {
                 revision,
                 next_locate: None,
                 memo: None,
+                alive: None,
             };
         }
         entry.next_locate = source.is_none().then(|| Instant::now() + RELOCATE);
         entry.source = source;
         if memo.is_some() {
             entry.memo = memo;
+        }
+        if alive.is_some() {
+            entry.alive = alive;
         }
         drop(watched);
         self.wake.notify_one();
@@ -252,6 +277,7 @@ impl Watch {
                         revision: None,
                         next_locate: None,
                         memo: None,
+                        alive: None,
                     };
                 }
                 if w.source.is_none() && w.next_locate.is_some_and(|at| now < at) {
@@ -262,6 +288,7 @@ impl Watch {
                     program,
                     session,
                     source: w.source.clone(),
+                    alive: w.alive,
                 })
             })
             .collect()
@@ -298,7 +325,8 @@ impl Watch {
                         .or_else(|| locate(&dirs, &job.program, &job.session));
                     let revision = source
                         .as_ref()
-                        .and_then(|s| qoop_parsed::revision_of(s).ok());
+                        .and_then(|s| qoop_parsed::revision_of(s).ok())
+                        .map(|r| qoop_parsed::revision_with(r, job.alive));
                     Seen {
                         terminal: job.terminal,
                         session: job.session,
@@ -394,6 +422,7 @@ enum Ask {
         skip: usize,
         limit: usize,
         revision: Option<u64>,
+        alive_since: Option<i64>,
     },
     Detail {
         tool_id: String,
@@ -451,7 +480,11 @@ fn read(
             skip,
             limit,
             revision: client,
+            alive_since,
         } => {
+            // The page is made for the agent that runs now: a new agent in the terminal is
+            // another revision of the same file.
+            let revision = qoop_parsed::revision_with(revision, *alive_since);
             // A client whose stamp is not the file's is told to start over: no `skip`.
             let mut skip = if client.is_some_and(|r| r != revision) {
                 0
@@ -464,15 +497,20 @@ fn read(
                 limit: *limit,
                 max_bytes: 0,
                 tool_id: None,
+                alive_since: *alive_since,
             };
             let load = |skip| {
                 let opts = Options {
                     skip,
                     limit: *limit,
                     codex_root: agent_dirs().map(|d| d.codex),
+                    alive_since: *alive_since,
                     ..Options::default()
                 };
-                qoop_parsed::load(&source, &opts).map(|d| Arc::new(Reply::Page(d)))
+                qoop_parsed::load(&source, &opts).map(|mut d| {
+                    d.revision = qoop_parsed::revision_with(d.revision, *alive_since);
+                    Arc::new(Reply::Page(d))
+                })
             };
             let mut reply = match hit(&key(revision, skip)) {
                 Some(reply) => reply,
@@ -512,6 +550,7 @@ fn read(
                 limit: 0,
                 max_bytes: *max_bytes,
                 tool_id: Some(tool_id.clone()),
+                alive_since: None,
             };
             if let Some(reply) = hit(&key) {
                 return Outcome {
@@ -568,6 +607,7 @@ pub async fn answer(
                     skip,
                     limit,
                     revision,
+                    alive_since: alive_since(agents, terminal),
                 },
             )
         }
@@ -592,6 +632,10 @@ pub async fn answer(
         return failed(id, "unavailable");
     };
     let _turn = ticket.turn().await;
+    let alive = match &ask {
+        Ask::Page { alive_since, .. } => *alive_since,
+        Ask::Detail { .. } => None,
+    };
     let (known, memo) = watch.known(terminal, &session);
     let outcome = {
         let session = session.clone();
@@ -612,6 +656,7 @@ pub async fn answer(
             outcome.source,
             outcome.revision,
             outcome.memo,
+            alive,
         );
     }
     match outcome.result {
@@ -692,10 +737,10 @@ mod tests {
     #[test]
     fn a_watch_keeps_the_first_stamp_and_starts_over_for_another_conversation() {
         let watch = Watch::default();
-        watch.mark(4, "one", None, Some(10), None);
-        watch.mark(4, "one", None, Some(11), None);
+        watch.mark(4, "one", None, Some(10), None, None);
+        watch.mark(4, "one", None, Some(11), None, None);
         assert_eq!(watch.watched.lock().unwrap()[&4].revision, Some(10));
-        watch.mark(4, "two", None, Some(12), None);
+        watch.mark(4, "two", None, Some(12), None, None);
         let held = watch.watched.lock().unwrap();
         assert_eq!(held[&4].revision, Some(12));
         assert_eq!(held[&4].session, "two");
@@ -704,7 +749,7 @@ mod tests {
     #[test]
     fn a_watch_expires_thirty_seconds_after_the_last_ask() {
         let watch = Watch::default();
-        watch.mark(4, "one", None, Some(1), None);
+        watch.mark(4, "one", None, Some(1), None, None);
         let now = Instant::now();
         watch.due_with(now + Duration::from_secs(29), agent("one"));
         assert!(watch.watched.lock().unwrap().contains_key(&4));
@@ -723,7 +768,7 @@ mod tests {
     fn a_watch_does_not_outlive_its_terminal_its_agent_or_its_conversation() {
         let watch = Watch::default();
         for terminal in 1..=3 {
-            watch.mark(terminal, "one", None, Some(1), None);
+            watch.mark(terminal, "one", None, Some(1), None, None);
         }
         let now = Instant::now();
         // Terminal 1 closed, terminal 2 is a shell now, terminal 3 is in another conversation.
@@ -741,10 +786,22 @@ mod tests {
         assert!(held[&3].memo.is_none());
     }
 
+    /// The watch stamps the file the way the last page was stamped, so a page made for an agent
+    /// is not "changed" by the first tick, and a detail read does not unsay the agent.
+    #[test]
+    fn the_watch_looks_with_the_agent_the_last_page_was_made_for() {
+        let watch = Watch::default();
+        watch.mark(4, "one", None, Some(1), None, Some(5_000));
+        watch.mark(4, "one", None, None, None, None);
+        let later = Instant::now() + Duration::from_secs(6);
+        let jobs = watch.due_with(later, agent("one"));
+        assert_eq!(jobs[0].alive, Some(5_000));
+    }
+
     #[test]
     fn a_file_that_is_not_there_is_looked_for_every_five_seconds_not_every_tick() {
         let watch = Watch::default();
-        watch.mark(4, "one", None, None, None);
+        watch.mark(4, "one", None, None, None, None);
         let now = Instant::now();
         assert!(
             watch
@@ -827,6 +884,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let source = Source::File(path.clone());
         let page = Ask::Page {
+            alive_since: None,
             skip: 0,
             limit: 3,
             revision: None,
@@ -847,6 +905,7 @@ mod tests {
         );
         // Another page is another reply.
         let deeper = Ask::Page {
+            alive_since: None,
             skip: 1,
             limit: 3,
             revision: None,
@@ -873,11 +932,82 @@ mod tests {
         assert_ne!(grown.revision, first.revision);
     }
 
+    /// A page is made for the agent that runs now. The same file read for another agent is
+    /// another reply and another revision, never the memo's, so a client never holds pages of
+    /// two agents under one revision; the same agent reads the same.
+    #[test]
+    fn a_page_made_for_another_agent_is_not_served_from_the_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        std::fs::write(
+            &path,
+            line(
+                "user",
+                0,
+                serde_json::json!({"role": "user", "content": "q"}),
+            ),
+        )
+        .unwrap();
+        let source = Source::File(path);
+        let page = |alive_since| Ask::Page {
+            alive_since,
+            skip: 0,
+            limit: 3,
+            revision: None,
+        };
+        let first = read(
+            "claude",
+            "s1",
+            Some(source.clone()),
+            None,
+            &page(Some(1_000)),
+        );
+        let same = read(
+            "claude",
+            "s1",
+            Some(source.clone()),
+            first.memo.clone(),
+            &page(Some(1_000)),
+        );
+        assert!(Arc::ptr_eq(
+            &first.result.as_ref().ok().unwrap().0,
+            &same.result.as_ref().ok().unwrap().0
+        ));
+        assert_eq!(same.revision, first.revision);
+        let other = read(
+            "claude",
+            "s1",
+            Some(source.clone()),
+            first.memo.clone(),
+            &page(Some(2_000)),
+        );
+        assert!(!Arc::ptr_eq(
+            &first.result.as_ref().ok().unwrap().0,
+            &other.result.as_ref().ok().unwrap().0
+        ));
+        assert_ne!(other.revision, first.revision);
+        // A client that holds the first agent's revision is told to start over.
+        let held = Ask::Page {
+            alive_since: Some(2_000),
+            skip: 1,
+            limit: 3,
+            revision: first.revision,
+        };
+        let again = read("claude", "s1", Some(source), None, &held);
+        assert!(again.result.as_ref().is_ok());
+        let digest = |o: &Outcome| match &*o.result.as_ref().ok().unwrap().0 {
+            Reply::Page(d) => d.revision,
+            Reply::Detail(_) => 0,
+        };
+        assert_eq!(digest(&again), digest(&other), "served at the new revision");
+    }
+
     #[test]
     fn a_session_that_is_not_there_is_no_session_and_remembers_no_source() {
         let dir = tempfile::tempdir().unwrap();
         let gone = Source::File(dir.path().join("missing.jsonl"));
         let page = Ask::Page {
+            alive_since: None,
             skip: 0,
             limit: 3,
             revision: None,

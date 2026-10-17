@@ -106,7 +106,15 @@ pub struct TerminalAgent {
     /// process: that look is a change from no leader, so even a terminal spawned straight
     /// into an agent gets the grace.
     pub born: Option<std::time::Instant>,
+    /// The foreground leaders this terminal has had and when each was first seen, in unix ms,
+    /// the newest last and few. A leader that comes back (ctrl+z, then `fg`) keeps its first
+    /// time, which `born` does not: a chat reads work from before the agent started as left
+    /// behind, and a stopped agent that was resumed started when it first did.
+    pub seen: Vec<(i32, i64)>,
 }
+
+/// How many leaders `TerminalAgent::seen` keeps.
+const SEEN_LEADERS: usize = 8;
 
 /// What one terminal's agent record is, as a daemon that is becoming another binary carries
 /// it: the process in the terminal is the same one, so its generation, what was believed
@@ -147,6 +155,27 @@ impl TerminalAgent {
         self.belief = fresh_belief(generation);
         self.born = Some(std::time::Instant::now());
         generation
+    }
+
+    /// The leader `pid` is in the foreground now: its first time is kept if it had one.
+    fn note_leader(&mut self, pid: Pid, now_unix: i64) {
+        if self.seen.iter().any(|(p, _)| *p == pid.0) {
+            return;
+        }
+        if self.seen.len() >= SEEN_LEADERS {
+            self.seen.remove(0);
+        }
+        self.seen.push((pid.0, now_unix.saturating_mul(1000)));
+    }
+
+    /// When the leader in the foreground was first seen, unix ms. `None` for a leader this
+    /// daemon did not see come (one a daemon update carried over).
+    pub fn leader_seen_ms(&self) -> Option<i64> {
+        let pid = self.leader?;
+        self.seen
+            .iter()
+            .find(|(p, _)| *p == pid.0)
+            .map(|(_, at)| *at)
     }
 
     /// When this generation's startup grace ends, if it has not yet.
@@ -523,6 +552,7 @@ impl AgentRegistry {
                 relooked: None,
                 relook_owed: false,
                 born: None,
+                seen: Vec::new(),
             },
         );
         self.announce_new(stream);
@@ -953,6 +983,7 @@ impl AgentRegistry {
             // what was believed about the old one does not carry over, and that is a new
             // generation by definition.
             let generation = agent.advance();
+            agent.note_leader(pid, now_unix);
             agent.last_active_at_unix = Some(now_unix);
             agent.last_io_unix = Some(now_unix);
             // The gate belonged to the old generation's screen: a new process
@@ -1003,6 +1034,9 @@ impl AgentRegistry {
             }
         };
         agent.leader = leader;
+        if let Some(pid) = leader {
+            agent.note_leader(pid, now_unix);
+        }
         agent.relooked = None;
         agent.relook_owed = false;
         // Dropped before announcing: a subscriber that reacts by asking what is there would
@@ -1657,6 +1691,40 @@ mod tests {
             (0, 0),
             "counted inside a process now gone"
         );
+    }
+
+    /// A leader that was in the foreground, went to a shell and came back (ctrl+z, `fg`) keeps
+    /// the time it was first seen, though every change of foreground is a new generation; the
+    /// time of one never seen is `None`, and the list is capped.
+    #[test]
+    fn a_leader_that_comes_back_keeps_the_time_it_was_first_seen() {
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let seen = |r: &AgentRegistry| r.agent(1).expect("agent").leader_seen_ms();
+        let go = |pid: i32, at: i64| {
+            let mut terminals = r.terminals.lock().unwrap();
+            let agent = terminals.get_mut(&1).unwrap();
+            agent.advance();
+            agent.leader = Some(Pid(pid));
+            agent.note_leader(Pid(pid), at);
+        };
+        assert_eq!(seen(&r), None, "no leader yet");
+        go(100, 1_000);
+        assert_eq!(seen(&r), Some(1_000_000));
+        go(200, 2_000);
+        go(100, 3_000);
+        assert_eq!(
+            seen(&r),
+            Some(1_000_000),
+            "the agent started when it first did"
+        );
+        assert_eq!(r.agent(1).unwrap().seen.len(), 2, "one entry per leader");
+        for pid in 300..320 {
+            go(pid, 4_000);
+        }
+        assert!(r.agent(1).unwrap().seen.len() <= SEEN_LEADERS);
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().leader = Some(Pid(7));
+        assert_eq!(seen(&r), None, "a leader this daemon did not see come");
     }
 
     /// Sub-agents a hook names are counted by id beside the agent, with what its screen lists

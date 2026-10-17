@@ -20,6 +20,7 @@ fn rx(pattern: &str) -> Regex {
 }
 
 struct Rules {
+    ansi: Regex,
     pem: Regex,
     header_known: Regex,
     header: Regex,
@@ -37,6 +38,13 @@ struct Rules {
 static RULES: LazyLock<Rules> = LazyLock::new(|| {
     let header = r#"(\b(?:proxy-)?authorization\b["']?\s*[:=]\s*["']?)"#;
     Rules {
+        // CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL` or `ESC \`), the string escapes DCS, SOS, PM
+        // and APC (`ESC P`, `ESC X`, `ESC ^`, `ESC _`, up to `ESC \`: sixel and kitty pictures), a
+        // two byte escape (`ESC 7`, `ESC M`, `ESC ( B`, `ESC SP F`) and any ESC left over. A string
+        // left open ends at its line. A bare `[1m` with no ESC before it is text.
+        ansi: rx(
+            r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\)?|[PX^_][^\x1b\n]*(?:\x1b\\)?| [FGLMN]|[!-/]*[0-~])?",
+        ),
         pem: rx(
             r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----|\z)",
         ),
@@ -64,7 +72,13 @@ static RULES: LazyLock<Rules> = LazyLock::new(|| {
     }
 });
 
-/// Mask what looks like a secret. Covered: private key blocks, `Authorization` and
+/// `text` without terminal escape sequences, for a caller that is about to join its lines: a
+/// string left open ends at its line, which a joined text no longer has.
+pub(crate) fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
+    RULES.ansi.replace_all(text, "")
+}
+
+/// Strip terminal escape sequences, then mask what looks like a secret. Covered: private key blocks, `Authorization` and
 /// `Proxy-Authorization` values of any scheme, a word after `Bearer`, credentials in a URL,
 /// the value of a `NAME=value`, a flag (`--password x`, `--token x`, `-u user:pass`,
 /// `mysql -psecret`, `sshpass -p x`), a JSON string value whose key says key, token, secret,
@@ -80,7 +94,10 @@ static RULES: LazyLock<Rules> = LazyLock::new(|| {
 /// since it is code.
 pub fn redact(text: &str) -> String {
     let r = &*RULES;
-    let mut s = r.pem.replace_all(text, "***").into_owned();
+    // Terminal escapes go first: a tool or a command wrote them for a screen, and one inside a
+    // value would also keep a secret from matching.
+    let mut s = strip_ansi(text).into_owned();
+    s = r.pem.replace_all(&s, "***").into_owned();
     s = r
         .header_known
         .replace_all(&s, "${1}${2}${3}***")
@@ -310,5 +327,39 @@ mod tests {
             "OPENAI_API_KEY=*** npm test"
         );
         assert_eq!(redact("one\nBearer abc\nghp_xyz"), "one\nBearer ***\n***");
+    }
+
+    #[test]
+    fn terminal_escapes_are_stripped_and_a_bare_bracket_code_is_text() {
+        for (raw, clean) in [
+            (
+                "\x1b[2mCompacted (ctrl+o to see full summary)\x1b[22m",
+                "Compacted (ctrl+o to see full summary)",
+            ),
+            (
+                "\x1b[38;5;196mred\x1b[0m and \x1b[1;4mbold\x1b[m",
+                "red and bold",
+            ),
+            ("\x1b]0;window title\x07text", "text"),
+            ("\x1b]8;;https://x.io\x1b\\link\x1b]8;;\x1b\\", "link"),
+            ("\x1b(Bplain", "plain"),
+            ("a\x1b7b\x1b8c\x1bMd\x1b=e", "abcde"),
+            ("x\x1b hello", "x hello"),
+            ("a\x1b Fb", "ab"),
+            ("\x1b_Gf=1;AAAA\x1b\\z", "z"),
+            ("\x1bPq#0;2;0;0;0\x1b\\done", "done"),
+            ("end\x1b", "end"),
+            ("\x1b[31", "31"),
+            ("an \x1b]0;unterminated title\nnext line", "an \nnext line"),
+        ] {
+            assert_eq!(redact(raw), clean, "{raw:?}");
+        }
+        // Prose that names a color code is not an escape.
+        for text in ["the `[1m]` suffix", "use [2m to dim", "a [22m b"] {
+            assert_eq!(redact(text), text);
+        }
+        // An escape between a name and its `=` does not hide the value from the masking.
+        let split = "\x1b[1mPASSWORD\x1b[0m=hunter2";
+        assert!(!redact(split).contains("hunter2"), "{:?}", redact(split));
     }
 }
