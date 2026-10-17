@@ -221,6 +221,7 @@ mod tests {
             status: Status::Failed,
             exit_code: Some(101),
             duration_ms: None,
+            ts: None,
             output_bytes: 0,
             has_detail: true,
         };
@@ -268,6 +269,7 @@ mod tests {
                 status: Status::Ok,
                 exit_code: None,
                 duration_ms: None,
+                ts: None,
                 output_bytes: 0,
                 has_detail: false,
             },

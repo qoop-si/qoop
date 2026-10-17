@@ -45,6 +45,19 @@ fn a_claude_session_reads_as_rows() {
 }
 
 #[test]
+fn a_call_says_when_it_started_so_a_client_can_read_the_span_of_a_run() {
+    let d = digest(&claude());
+    let Item::Tool {
+        ts, duration_ms, ..
+    } = tool(&d, "toolu_build")
+    else {
+        unreachable!()
+    };
+    assert!(ts.is_some_and(|ts| ts > 1_000_000_000_000), "{ts:?}");
+    assert!(duration_ms.is_some(), "{duration_ms:?}");
+}
+
+#[test]
 fn a_call_without_a_result_is_never_ok() {
     let d = digest(&claude());
     let status = |id| match tool(&d, id) {

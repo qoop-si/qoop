@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use qoop_parsed::{Chip, Digest, Item, Status};
+use qoop_parsed::{Chip, Detail, Digest, Item, Status};
 use qoop_runtime::control::AgentRow;
 use qoop_runtime::daemon::{ColourWire, ModesWire, SnapshotWire, SpanWire, attrs};
 
@@ -343,14 +343,15 @@ fn user_rows(text: &str, chips: &[Chip], cols: usize) -> Vec<StyledRow> {
         .collect()
 }
 
-fn mark_of(status: Status) -> (&'static str, &'static str, Role) {
+/// The ink of a status, and the word that says it in place of colour (none for a call that
+/// went well, or one whose status this build does not know).
+fn state_of(status: Status) -> (Role, &'static str) {
     match status {
-        Status::Running => ("\u{25cb}", "running", Role::Working),
-        Status::Ok => ("\u{25cf}", "ok", Role::Done),
-        Status::Failed => ("\u{25c6}", "failed", Role::Failed),
-        Status::Interrupted => ("~", "interrupted", Role::Detail),
-        Status::Rejected => ("x", "rejected", Role::Detail),
-        Status::Unknown => ("?", "unknown", Role::Detail),
+        Status::Running => (Role::Working, "running"),
+        Status::Failed => (Role::Failed, "failed"),
+        Status::Interrupted => (Role::Detail, "interrupted"),
+        Status::Rejected => (Role::Detail, "rejected"),
+        Status::Ok | Status::Unknown => (Role::Detail, ""),
     }
 }
 
@@ -358,65 +359,219 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A tool call as one row: mark and status word (never colour alone), the tool's name, the
-/// one line it was asked to do, and `exit N` when the exit code is not zero. What does not
-/// fit is cut from the line first, then from the name; the status word always stays.
-fn tool_row(
-    name: &str,
-    summary: &str,
+/// The host of a url, as it is read in a row: no scheme, no `user:pass@`, no path.
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.rsplit('@').next().unwrap_or(authority)
+}
+
+/// What a tool call says it did, as a person reads it: `Ran <command>`, `Read <file>`,
+/// `Edited <file>`, `Searched <pattern>`, `Searched the web`, `Fetched <host>`, `Ran a
+/// subagent: <summary>`. Only the tools it knows by name (spelled any way: `Bash`,
+/// `exec_command`) get a sentence; any other is its name and its summary, so a tool that
+/// merely mentions a word (`KillShell`, `BashOutput`, `TodoWrite`) never reads as another.
+fn label(name: &str, summary: &str) -> String {
+    let summary = one_line(summary);
+    let said = |verb: &str| format!("{verb} {summary}").trim_end().to_string();
+    let known: String = name
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match known.as_str() {
+        "bash" | "shell" | "execcommand" | "runshellcommand" => said("Ran"),
+        "read" | "readfile" => said("Read"),
+        "edit" | "write" | "multiedit" | "notebookedit" | "applypatch" | "patch" | "writefile"
+        | "replace" => said("Edited"),
+        "grep" | "glob" | "search" | "searchfilecontent" => said("Searched"),
+        "websearch" | "googlewebsearch" => "Searched the web".to_string(),
+        "webfetch" => match host(&summary) {
+            "" => "Fetched a page".to_string(),
+            host => format!("Fetched {host}"),
+        },
+        "task" | "agent" | "subagent" => subagent_label(&summary),
+        _ => said(name),
+    }
+}
+
+fn subagent_label(summary: &str) -> String {
+    format!("Ran a subagent: {}", one_line(summary))
+        .trim_end_matches([':', ' '])
+        .to_string()
+}
+
+/// The fold glyph a row that opens ends with: closed, or open.
+fn chevron(open: bool) -> &'static str {
+    if open { " \u{25be}" } else { " \u{25b8}" }
+}
+
+/// One step as a quiet row: a mark, what it did, the state in words when it did not go well
+/// (`running`, `failed`, `exit N`, never colour alone), and a chevron at the end when it opens.
+/// What does not fit is cut from the label first; the words and the chevron always stay.
+fn tool_line(
+    text: &str,
     status: Status,
     exit_code: Option<i32>,
+    open: Option<bool>,
     cols: usize,
 ) -> StyledRow {
-    let (mark, word, role) = mark_of(status);
-    let head = format!("{mark} {word} ");
-    let tail = exit_code
+    let (role, word) = state_of(status);
+    let exit = exit_code
         .filter(|code| *code != 0)
-        .map(|code| format!("  exit {code}"))
-        .unwrap_or_default();
-    let room = cols.saturating_sub(width::width(&head) + width::width(&tail));
-    let name = cut(name, room);
-    let room = room.saturating_sub(width::width(&name) + 1);
-    let summary = one_line(summary);
-    let mut row = cells(&head, style(role));
-    row.extend(cells(&name, style(Role::Text)));
-    if room >= 2 && !summary.is_empty() {
-        row.extend(cells(
-            &format!(" {}", cut(&summary, room)),
-            style(Role::Detail),
-        ));
-    }
-    row.extend(cells(&tail, style(Role::Detail)));
+        .map(|code| format!("exit {code}"));
+    let tail = [Some(word.to_string()).filter(|w| !w.is_empty()), exit]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tail = if tail.is_empty() {
+        tail
+    } else {
+        format!("  {tail}")
+    };
+    let end = open.map_or("", chevron);
+    let room = cols.saturating_sub(2 + width::width(&tail) + width::width(end));
+    let mut row = cells("\u{25cf} ", style(role));
+    row.extend(cells(&cut(&one_line(text), room), style(Role::Detail)));
+    row.extend(cells(&tail, style(role)));
+    row.extend(cells(end, style(Role::Detail)));
     row_of(&row)
 }
 
-/// A run of tool calls folded into one row: how many, and which did not go well.
-fn steps_row(run: &[&Item], cols: usize) -> StyledRow {
+/// The words for what failed or is still going in a run of calls, after the time it took.
+fn trouble(run: &[&Item]) -> (Role, String) {
     let count = |want: Status| {
         run.iter()
             .filter(|it| matches!(it, Item::Tool { status, .. } if *status == want))
             .count()
     };
-    let (failed, running) = (count(Status::Failed), count(Status::Running));
-    let (mark, _, role) = if failed > 0 {
-        mark_of(Status::Failed)
-    } else if running > 0 {
-        mark_of(Status::Running)
-    } else {
-        mark_of(Status::Ok)
-    };
-    let mut text = format!("{mark} {} steps", run.len());
-    for (n, word) in [
-        (failed, "failed"),
-        (running, "running"),
-        (count(Status::Interrupted), "interrupted"),
-        (count(Status::Rejected), "rejected"),
+    let mut text = String::new();
+    for (n, status) in [
+        (count(Status::Failed), Status::Failed),
+        (count(Status::Running), Status::Running),
+        (count(Status::Interrupted), Status::Interrupted),
+        (count(Status::Rejected), Status::Rejected),
     ] {
         if n > 0 {
-            text.push_str(&format!(", {n} {word}"));
+            text.push_str(&format!(", {n} {}", state_of(status).1));
         }
     }
-    row_of(&cells(&cut(&text, cols), style(role)))
+    let role = if count(Status::Failed) > 0 {
+        Role::Failed
+    } else if count(Status::Running) > 0 {
+        Role::Working
+    } else {
+        Role::Detail
+    };
+    (role, text)
+}
+
+/// How long, as a person says it: `4 s`, `2 min 5 s`.
+fn took(ms: u64) -> String {
+    let s = ((ms + 500) / 1000).max(1);
+    if s < 60 {
+        format!("{s} s")
+    } else {
+        format!("{} min {} s", s / 60, s % 60)
+    }
+}
+
+/// How long a run of calls took: from the first start to the last end when every call says
+/// when it started (calls overlap, so their times do not add up), else the sum of their times
+/// when every one says, else nothing.
+fn worked(run: &[&Item]) -> Option<u64> {
+    let calls: Vec<(Option<i64>, u64)> = run
+        .iter()
+        .map(|it| match it {
+            Item::Tool {
+                ts,
+                duration_ms: Some(ms),
+                ..
+            } => Some((*ts, *ms)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let spans: Option<Vec<(i64, i64)>> = calls
+        .iter()
+        .map(|(ts, ms)| ts.map(|at| (at, at.saturating_add(i64::try_from(*ms).unwrap_or(0)))))
+        .collect();
+    match spans {
+        Some(spans) => {
+            let first = spans.iter().map(|span| span.0).min()?;
+            let last = spans.iter().map(|span| span.1).max()?;
+            u64::try_from(last - first).ok()
+        }
+        None => Some(calls.iter().map(|call| call.1).sum()),
+    }
+}
+
+/// A run of tool calls folded under one row: how long they took, else how many, and which
+/// did not go well.
+fn group_row(run: &[&Item], open: bool, cols: usize) -> StyledRow {
+    let (role, trouble) = trouble(run);
+    let head = match worked(run) {
+        Some(ms) => format!("Worked for {}", took(ms)),
+        None => format!("{} steps", run.len()),
+    };
+    let end = chevron(open);
+    let room = cols.saturating_sub(width::width(end));
+    let mut row = cells(&cut(&format!("{head}{trouble}"), room), style(role));
+    row.extend(cells(end, style(Role::Detail)));
+    row_of(&row)
+}
+
+/// The most rows of a tool's input and output an opened row shows.
+const DETAIL_ROWS: usize = 30;
+
+/// An opened tool: its input, a blank row, its output, in a dim raised block as wide as the
+/// pane. A read that is out, failed (and waiting to be tried again) or found nothing says so in
+/// one row; a block cut short says how.
+fn detail_rows(got: Option<&Got>, off: bool, cols: usize) -> Vec<StyledRow> {
+    let dim = Style {
+        raised: true,
+        ..style(Role::Detail)
+    };
+    let said = |text: &str| (vec![text.to_string()], false);
+    let (lines, truncated) = match got {
+        _ if off => said("not available"),
+        None => said("loading"),
+        Some(Got { body: None, .. }) => said("not available, retrying"),
+        Some(Got {
+            body: Some(body), ..
+        }) => {
+            let mut lines: Vec<String> = body.input.trim_end().lines().map(String::from).collect();
+            if !lines.is_empty() && !body.output.trim().is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(body.output.trim_end().lines().map(String::from));
+            if lines.is_empty() {
+                lines.push("(nothing recorded)".to_string());
+            }
+            (lines, body.truncated)
+        }
+    };
+    let mut rows: Vec<Vec<Cell>> = lines
+        .iter()
+        .flat_map(|line| chunks(&cells(line, dim), cols.saturating_sub(2)))
+        .collect();
+    let more = rows.len().saturating_sub(DETAIL_ROWS);
+    rows.truncate(DETAIL_ROWS);
+    if more > 0 {
+        rows.push(cells(&format!("\u{2026} {more} more rows"), dim));
+    }
+    if truncated {
+        rows.push(cells("\u{2026} cut by the daemon", dim));
+    }
+    rows.into_iter()
+        .map(|line| {
+            let mut row = cells(" ", dim);
+            row.extend(line);
+            let pad = cols.saturating_sub(cell_width(&row));
+            row.extend(cells(&" ".repeat(pad), dim));
+            row_of(&row)
+        })
+        .collect()
 }
 
 fn dim_row(text: &str, cols: usize) -> StyledRow {
@@ -424,11 +579,14 @@ fn dim_row(text: &str, cols: usize) -> StyledRow {
 }
 
 fn thought_row(ms: Option<u64>, cols: usize) -> StyledRow {
-    dim_row(
+    tool_line(
         &match ms {
-            Some(ms) => format!("Thought for {} s", ((ms + 500) / 1000).max(1)),
+            Some(ms) => format!("Thought for {}", took(ms)),
             None => "Thought".to_string(),
         },
+        Status::Ok,
+        None,
+        None,
         cols,
     )
 }
@@ -447,18 +605,133 @@ fn is_step(item: &Item) -> bool {
     )
 }
 
-/// Every row of the chat at this width, oldest first.
-pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
-    laid_out(items, cols).0
+/// The most tools whose input and output are kept for one chat.
+const DETAILS_KEPT: usize = 32;
+
+/// What was read for one opened tool.
+struct Got {
+    /// What came, or `None` when the daemon would not send it (and `retry` says when to ask
+    /// again).
+    body: Option<Detail>,
+    /// Reads that failed in a row, for the backoff, and when the next may start.
+    fails: u32,
+    retry: Option<Instant>,
+    /// The call was still running when this was read, so a later revision is read again;
+    /// one that had ended is never read twice.
+    running: bool,
+    revision: u64,
+    /// When it was kept, so the oldest goes first.
+    tick: u64,
 }
 
-/// The rows, and for each row the index of the item it was drawn from (a blank row between
-/// two items belongs to the one before it), so a row can be traced back to its item.
-fn laid_out(items: &[Item], cols: usize) -> (Vec<StyledRow>, Vec<usize>) {
-    if cols == 0 {
-        return (Vec::new(), Vec::new());
+/// The read in flight for an opened tool.
+struct Out {
+    id: String,
+    since: Instant,
+    running: bool,
+    revision: u64,
+}
+
+/// What the person opened in one chat, and what was read for it: the keys of the groups and
+/// tool rows that are open (`group_key`, `tool_key`), and the input and output kept for
+/// the tools among them.
+#[derive(Default)]
+struct Opened {
+    keys: BTreeSet<String>,
+    details: BTreeMap<String, Got>,
+    out: Option<Out>,
+    ticks: u64,
+    /// The daemon cannot send a tool's detail: nothing more is asked of it for this chat.
+    off: bool,
+}
+
+impl Opened {
+    /// Whether the tool `id` is to be read (see `ChatState::wants_detail`).
+    fn due(&self, id: &str, revision: u64, now: Instant) -> bool {
+        match self.details.get(id) {
+            None => true,
+            Some(got) if got.retry.is_some_and(|at| now < at) => false,
+            Some(Got { body: None, .. }) => true,
+            Some(got) => got.running && got.revision != revision,
+        }
     }
-    let mut blocks: Vec<(Kind, Vec<StyledRow>, usize)> = Vec::new();
+
+    /// A read of `id` failed: kept as such, to be tried again after the backoff.
+    fn failed(&mut self, id: &str, now: Instant) {
+        self.ticks += 1;
+        let tick = self.ticks;
+        let got = self.details.entry(id.to_string()).or_insert(Got {
+            body: None,
+            fails: 0,
+            retry: None,
+            running: false,
+            revision: 0,
+            tick,
+        });
+        got.fails += 1;
+        got.retry = Some(now + backoff(got.fails));
+    }
+}
+
+fn group_key(first: &Item) -> String {
+    format!("g:{:x}", item_key(first))
+}
+
+fn tool_key(id: &str) -> String {
+    format!("t:{id}")
+}
+
+/// A row, and the key of the group or tool it opens and closes when it is one.
+type Line = (StyledRow, Option<String>);
+
+/// The rows of one step: a tool row opened shows what it did below it.
+fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
+    match item {
+        Item::Thinking { ms, .. } => vec![(thought_row(*ms, cols), None)],
+        Item::Tool {
+            id,
+            name,
+            summary,
+            status,
+            exit_code,
+            has_detail,
+            ..
+        } => {
+            let key = tool_key(id);
+            let open = has_detail.then(|| opened.keys.contains(&key));
+            let row = tool_line(&label(name, summary), *status, *exit_code, open, cols);
+            let mut lines = vec![(row, open.map(|_| key))];
+            if open == Some(true) {
+                let body = detail_rows(opened.details.get(id), opened.off, cols);
+                lines.extend(body.into_iter().map(|row| (row, None)));
+            }
+            lines
+        }
+        Item::Subagent { summary, .. } => vec![(
+            tool_line(&subagent_label(summary), Status::Ok, None, None, cols),
+            None,
+        )],
+        _ => vec![(StyledRow::default(), None)],
+    }
+}
+
+/// Every row of the chat at this width, oldest first.
+pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
+    laid_out(items, cols, &Opened::default()).0
+}
+
+/// The rows, for each row the index of the item it was drawn from (a blank row between two
+/// items belongs to the one before it), so a row can be traced back to its item, and the key
+/// of the group or tool the row opens, if it is the one.
+fn laid_out(
+    items: &[Item],
+    cols: usize,
+    opened: &Opened,
+) -> (Vec<StyledRow>, Vec<usize>, Vec<Option<String>>) {
+    if cols == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let mut blocks: Vec<(Kind, Vec<Line>, usize)> = Vec::new();
     let mut at = 0;
     while at < items.len() {
         let item = &items[at];
@@ -472,10 +745,31 @@ fn laid_out(items: &[Item], cols: usize) -> (Vec<StyledRow>, Vec<usize>) {
                 .filter(|it| !matches!(it, Item::Thinking { .. }))
                 .collect();
             if calls.len() >= 2 {
-                blocks.push((Kind::Step, vec![steps_row(&calls, cols)], at));
+                // Folded once every step is over, open while one runs.
+                let key = group_key(calls[0]);
+                let running = calls.iter().any(|it| {
+                    matches!(
+                        it,
+                        Item::Tool {
+                            status: Status::Running,
+                            ..
+                        }
+                    )
+                });
+                let open = running || opened.keys.contains(&key);
+                // A group held open by a step that runs is not the person's to close: its
+                // header answers nothing, and what they chose is what it shows after.
+                let head = (!running).then_some(key);
+                let mut lines = vec![(group_row(&calls, open, cols), head)];
+                if open {
+                    for step in &items[at..end] {
+                        lines.extend(step_lines(step, opened, cols));
+                    }
+                }
+                blocks.push((Kind::Step, lines, at));
             } else {
                 for (n, item) in items[at..end].iter().enumerate() {
-                    blocks.push((Kind::Step, vec![step_row(item, cols)], at + n));
+                    blocks.push((Kind::Step, step_lines(item, opened, cols), at + n));
                 }
             }
             at = end;
@@ -503,24 +797,29 @@ fn laid_out(items: &[Item], cols: usize) -> (Vec<StyledRow>, Vec<usize>) {
             _ => continue,
         };
         if !rows.is_empty() {
-            blocks.push((kind, rows, index));
+            blocks.push((kind, rows.into_iter().map(|r| (r, None)).collect(), index));
         }
     }
     let mut out: Vec<StyledRow> = Vec::new();
     let mut owner: Vec<usize> = Vec::new();
+    let mut heads: Vec<Option<String>> = Vec::new();
     let mut before = None;
-    for (kind, rows, index) in blocks {
+    for (kind, lines, index) in blocks {
         if before.is_some_and(|b| !(b == Kind::Step && kind == Kind::Step)) {
             out.push(StyledRow::default());
             owner.push(owner.last().copied().unwrap_or(index));
+            heads.push(None);
         }
-        owner.extend(std::iter::repeat_n(index, rows.len()));
-        out.extend(rows);
+        owner.extend(std::iter::repeat_n(index, lines.len()));
+        for (row, head) in lines {
+            out.push(row);
+            heads.push(head);
+        }
         before = Some(kind);
     }
     // A pane too narrow for a row's own margins shows what fits of it, never a wider row.
     out.iter_mut().for_each(|row| clip(row, cols));
-    (out, owner)
+    (out, owner, heads)
 }
 
 /// What an item is, whatever its place in the page: hashed from what it says, not from its
@@ -573,23 +872,6 @@ fn clip(row: &mut StyledRow, cols: usize) {
     row.runs.retain(|run| run.at < keep);
     for run in &mut row.runs {
         run.len = run.len.min(keep - run.at);
-    }
-}
-
-fn step_row(item: &Item, cols: usize) -> StyledRow {
-    match item {
-        Item::Thinking { ms, .. } => thought_row(*ms, cols),
-        Item::Tool {
-            name,
-            summary,
-            status,
-            exit_code,
-            ..
-        } => tool_row(name, summary, *status, *exit_code, cols),
-        Item::Subagent { summary, steps, .. } => {
-            dim_row(&format!("subagent {summary}, {steps} steps"), cols)
-        }
-        _ => StyledRow::default(),
     }
 }
 
@@ -782,6 +1064,8 @@ pub struct ChatState {
     screen: BTreeSet<u32>,
     /// Terminals the daemon would not serve (not an agent, no such terminal, too large).
     refused: BTreeSet<u32>,
+    /// What each chat has open, and what was read for it.
+    opened: BTreeMap<u32, Opened>,
     #[cfg(test)]
     layouts: usize,
 }
@@ -831,6 +1115,8 @@ struct Shown {
     /// The item each row was drawn from, and each item's key (`item_key`).
     owner: Vec<usize>,
     keys: Vec<u64>,
+    /// For each row, the key of the group or tool it opens and closes (`laid_out`).
+    heads: Vec<Option<String>>,
     /// The height and scroll `snapshot` was drawn for.
     drawn: Option<(usize, usize)>,
     snapshot: SnapshotWire,
@@ -906,6 +1192,7 @@ impl ChatState {
             return;
         };
         if older.revision != held.revision {
+            self.drop_details(terminal);
             return self.set_digest(terminal, older);
         }
         let mut items = older.items;
@@ -1007,6 +1294,7 @@ impl ChatState {
         self.refused.remove(&terminal);
         self.changing.remove(&terminal);
         self.notes.remove(&terminal);
+        self.opened.remove(&terminal);
     }
 
     /// Flip the switch of `terminal` and remember it for its program. Answers the new state.
@@ -1068,6 +1356,22 @@ impl ChatState {
                 },
                 feed.and_then(|f| f.older.as_ref()).map(|o| lost(o.since)),
                 feed.and_then(|f| f.older_wait),
+                self.opened
+                    .get(t)
+                    .and_then(|o| o.out.as_ref())
+                    .map(|out| lost(out.since)),
+                // A failed read of a row that is open is tried again when its backoff ends.
+                self.opened
+                    .get(t)
+                    .filter(|o| o.out.is_none() && !o.off)
+                    .and_then(|o| {
+                        o.details
+                            .iter()
+                            .filter(|(id, _)| o.keys.contains(&tool_key(id)))
+                            .filter_map(|(_, got)| got.retry)
+                            .filter(|at| *at > now)
+                            .min()
+                    }),
             ]
         });
         feeds
@@ -1190,6 +1494,11 @@ impl ChatState {
         }
         if reset {
             feed.older = None;
+            // The session is another one: what was read of its tools is not of this.
+            if let Some(opened) = self.opened.get_mut(&terminal) {
+                opened.details.clear();
+                opened.out = None;
+            }
         }
         if !older {
             feed.out = None;
@@ -1265,6 +1574,7 @@ impl ChatState {
         self.shown.remove(&terminal);
         self.typing.remove(&terminal);
         self.feeds.remove(&terminal);
+        self.opened.remove(&terminal);
         self.refused.insert(terminal);
         said
     }
@@ -1364,7 +1674,9 @@ impl ChatState {
                 {
                     self.layouts += 1;
                 }
-                let (all, owner) = laid_out(&digest.items, cols);
+                let none = Opened::default();
+                let opened = self.opened.get(&terminal).unwrap_or(&none);
+                let (all, owner, heads) = laid_out(&digest.items, cols, opened);
                 let keys: Vec<u64> = digest.items.iter().map(item_key).collect();
                 // A chat being read, or selected from, keeps the same text where it was
                 // whatever came or went around it; one at the bottom follows the newest.
@@ -1387,6 +1699,7 @@ impl ChatState {
                         all,
                         owner,
                         keys,
+                        heads,
                         drawn: None,
                         snapshot: snapshot(&[], cols),
                         max: 0,
@@ -1426,6 +1739,250 @@ impl ChatState {
         } else {
             at.saturating_sub(step)
         };
+    }
+
+    /// The rows of `terminal` as last drawn: where the window starts in `all`, and where it ends.
+    fn window_of(&self, terminal: u32) -> Option<(&Shown, usize, usize)> {
+        let shown = self.shown.get(&terminal)?;
+        let (rows, scroll) = shown.drawn?;
+        let end = shown.all.len() - scroll.min(max_scroll(&shown.all, rows));
+        Some((shown, end.saturating_sub(rows), end))
+    }
+
+    /// Open the group or tool row drawn at `row` of `terminal`'s window, or close it. Answers
+    /// whether there was one (a click on any other row is not this view's). The row stays
+    /// where it is on screen.
+    pub fn toggle_at(&mut self, terminal: u32, row: usize) -> bool {
+        let key = self
+            .window_of(terminal)
+            .and_then(|(shown, start, end)| {
+                (start + row < end).then(|| shown.heads[start + row].clone())
+            })
+            .flatten();
+        key.is_some_and(|key| {
+            self.flip(terminal, key, row);
+            true
+        })
+    }
+
+    /// The same for the newest group or tool row in the window, which is what `ctrl-a enter`
+    /// means.
+    pub fn toggle_newest(&mut self, terminal: u32) -> bool {
+        let found = self.window_of(terminal).and_then(|(shown, start, end)| {
+            (start..end)
+                .rev()
+                .find_map(|at| shown.heads[at].clone().map(|key| (key, at - start)))
+        });
+        found.is_some_and(|(key, row)| {
+            self.flip(terminal, key, row);
+            true
+        })
+    }
+
+    fn flip(&mut self, terminal: u32, key: String, row: usize) {
+        let opened = self.opened.entry(terminal).or_default();
+        if opened.keys.remove(&key) {
+            // A tool put away before its answer came frees the read, and a failed one is
+            // tried again the next time it is opened.
+            if let Some(id) = key.strip_prefix("t:") {
+                let _ = opened.out.take_if(|out| out.id == id);
+                if opened.details.get(id).is_some_and(|got| got.body.is_none()) {
+                    opened.details.remove(id);
+                }
+            }
+        } else {
+            opened.keys.insert(key.clone());
+        }
+        self.restamp(terminal);
+        self.hold(terminal, &key, row);
+    }
+
+    /// The rows are laid out again with `key` open or closed, and the view scrolled so its
+    /// row stays at `row` of the window; or at the top of it, when what it opened to is as
+    /// tall as the pane, so the first rows of it show.
+    fn hold(&mut self, terminal: u32, key: &str, row: usize) {
+        let (Some((stamp, digest)), Some(shown), Some(opened)) = (
+            self.digests.get(&terminal),
+            self.shown.get_mut(&terminal),
+            self.opened.get(&terminal),
+        ) else {
+            return;
+        };
+        let Some((rows, _)) = shown.drawn else {
+            return;
+        };
+        let (all, owner, heads) = laid_out(&digest.items, shown.cols, opened);
+        if let Some(head) = heads.iter().position(|h| h.as_deref() == Some(key)) {
+            let extent = 1
+                + (head + 1..all.len())
+                    .take_while(|at| heads[*at].is_none() && owner[*at] == owner[head])
+                    .count();
+            let row = if extent >= rows { 0 } else { row };
+            let end = head + rows - row;
+            let max = max_scroll(&all, rows);
+            self.scroll
+                .insert(terminal, all.len().saturating_sub(end).min(max));
+        }
+        let scroll = self.scroll.get(&terminal).copied().unwrap_or(0);
+        shown.stamp = *stamp;
+        shown.max = max_scroll(&all, rows);
+        shown.snapshot = snapshot(&window(&all, rows, scroll), shown.cols);
+        shown.drawn = Some((rows, scroll.min(shown.max)));
+        shown.all = all;
+        shown.owner = owner;
+        shown.heads = heads;
+    }
+
+    /// The rows are laid out again at the next draw.
+    fn restamp(&mut self, terminal: u32) {
+        self.stamp += 1;
+        if let Some((stamp, _)) = self.digests.get_mut(&terminal) {
+            *stamp = self.stamp;
+        }
+    }
+
+    /// The tool of `terminal` whose input and output are to be read: open, with something to
+    /// show, and either never read, read while it still ran at another revision, or failed
+    /// and past its backoff (3, 6, 12, then 30 s). One read at a time per terminal; one that
+    /// got no answer for `LOST` is a failed one. A new revision alone is no reason to read
+    /// what has ended again.
+    pub fn wants_detail(&mut self, terminal: u32, now: Instant) -> Option<String> {
+        let mut lost = false;
+        let found = self.next_detail(terminal, now, &mut lost);
+        if lost {
+            self.restamp(terminal);
+        }
+        found
+    }
+
+    /// `wants_detail`, and whether a read that never came back was given up on (the row says
+    /// so at the next draw).
+    fn next_detail(&mut self, terminal: u32, now: Instant, lost: &mut bool) -> Option<String> {
+        let (_, held) = self.digests.get(&terminal)?;
+        let revision = held.revision;
+        let opened = self.opened.get_mut(&terminal)?;
+        if opened.off {
+            return None;
+        }
+        if let Some(out) = opened
+            .out
+            .take_if(|out| now.saturating_duration_since(out.since) > LOST)
+        {
+            opened.failed(&out.id, now);
+            *lost = true;
+        }
+        if opened.out.is_some() {
+            return None;
+        }
+        let (id, running) = held.items.iter().find_map(|item| match item {
+            Item::Tool {
+                id,
+                has_detail: true,
+                status,
+                ..
+            } if opened.keys.contains(&tool_key(id)) && opened.due(id, revision, now) => {
+                Some((id.clone(), *status == Status::Running))
+            }
+            _ => None,
+        })?;
+        opened.out = Some(Out {
+            id: id.clone(),
+            since: now,
+            running,
+            revision,
+        });
+        Some(id)
+    }
+
+    /// What the daemon sent for the tool `tool_id` of `terminal`. One that was put away in
+    /// the meantime is not kept.
+    pub fn set_detail(
+        &mut self,
+        terminal: u32,
+        tool_id: &str,
+        input: String,
+        output: String,
+        truncated: bool,
+    ) {
+        let held = self.digests.get(&terminal).map(|(_, d)| d.revision);
+        let Some(opened) = self
+            .opened
+            .get_mut(&terminal)
+            .filter(|o| o.keys.contains(&tool_key(tool_id)))
+        else {
+            return;
+        };
+        let asked = opened.out.take_if(|out| out.id == tool_id);
+        let Some(revision) = asked.as_ref().map(|out| out.revision).or(held) else {
+            return;
+        };
+        opened.ticks += 1;
+        let got = Got {
+            body: Some(Detail {
+                input,
+                output,
+                truncated,
+            }),
+            fails: 0,
+            retry: None,
+            running: asked.is_some_and(|out| out.running),
+            revision,
+            tick: opened.ticks,
+        };
+        opened.details.insert(tool_id.to_string(), got);
+        while opened.details.len() > DETAILS_KEPT {
+            let oldest = opened
+                .details
+                .iter()
+                .min_by_key(|(_, got)| got.tick)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                opened.details.remove(&id);
+            }
+        }
+        self.restamp(terminal);
+    }
+
+    /// The daemon would not send it now (busy, unavailable, too slow): shown as such, and
+    /// asked again after the backoff. Not for good, and never cached as final.
+    pub fn detail_failed(&mut self, terminal: u32, tool_id: &str, now: Instant) {
+        let Some(opened) = self
+            .opened
+            .get_mut(&terminal)
+            .filter(|o| o.keys.contains(&tool_key(tool_id)))
+        else {
+            return;
+        };
+        let _ = opened.out.take_if(|out| out.id == tool_id);
+        opened.failed(tool_id, now);
+        self.restamp(terminal);
+    }
+
+    /// A daemon too old to know `MessageDetail` answered with no id: the chats that were
+    /// waiting on one stop asking, and are answered once. The rows they have open say it.
+    pub fn details_unsupported(&mut self) -> Vec<u32> {
+        let asked: Vec<u32> = self
+            .opened
+            .iter()
+            .filter(|(_, opened)| opened.out.is_some())
+            .map(|(terminal, _)| *terminal)
+            .collect();
+        for terminal in &asked {
+            if let Some(opened) = self.opened.get_mut(terminal) {
+                opened.out = None;
+                opened.off = true;
+            }
+            self.restamp(*terminal);
+        }
+        asked
+    }
+
+    /// What was read for `terminal`'s tools goes: the session is another one.
+    fn drop_details(&mut self, terminal: u32) {
+        if let Some(opened) = self.opened.get_mut(&terminal) {
+            opened.details.clear();
+            opened.out = None;
+        }
     }
 
     /// Back to the newest row, as typing does.
@@ -1486,8 +2043,37 @@ mod tests {
             status,
             exit_code,
             duration_ms: None,
+            ts: None,
             output_bytes: 0,
             has_detail: false,
+        }
+    }
+
+    /// What was read, as a read that came now at revision 1.
+    fn got(body: Option<Detail>) -> Got {
+        Got {
+            fails: u32::from(body.is_none()),
+            body,
+            retry: None,
+            running: false,
+            revision: 1,
+            tick: 0,
+        }
+    }
+
+    /// A tool with an id, a time it took, and input and output to open.
+    fn timed(id: &str, name: &str, summary: &str, ms: Option<u64>, detail: bool) -> Item {
+        Item::Tool {
+            seq: 0,
+            id: id.into(),
+            name: name.into(),
+            summary: summary.into(),
+            status: Status::Ok,
+            exit_code: None,
+            duration_ms: ms,
+            ts: None,
+            output_bytes: 0,
+            has_detail: detail,
         }
     }
 
@@ -1633,105 +2219,267 @@ mod tests {
     #[test]
     fn reasoning_is_one_dim_row_with_no_text() {
         let got = lines(&[thinking(Some(3200))], 40);
-        assert_eq!(got, ["Thought for 3 s"]);
-        assert_eq!(lines(&[thinking(Some(10))], 40), ["Thought for 1 s"]);
-        assert_eq!(lines(&[thinking(None)], 40), ["Thought"]);
+        assert_eq!(got, ["\u{25cf} Thought for 3 s"]);
+        assert_eq!(
+            lines(&[thinking(Some(10))], 40),
+            ["\u{25cf} Thought for 1 s"]
+        );
+        assert_eq!(
+            lines(&[thinking(Some(65_000))], 40),
+            ["\u{25cf} Thought for 1 min 5 s"]
+        );
+        assert_eq!(lines(&[thinking(None)], 40), ["\u{25cf} Thought"]);
         let with_text = Item::Thinking {
             seq: 0,
             ms: Some(2000),
             text: Some("secret plan".into()),
         };
-        assert_eq!(lines(&[with_text], 40), ["Thought for 2 s"]);
-        assert_eq!(
-            style_at(&layout(&[thinking(None)], 40)[0], 0).role,
-            Role::Detail
+        assert_eq!(lines(&[with_text], 40), ["\u{25cf} Thought for 2 s"]);
+        // The same dim ink as a tool row, label and all.
+        let rows = layout(
+            &[thinking(None), tool("Bash", "make", Status::Ok, None)],
+            40,
         );
+        for row in rows {
+            assert!(row.runs.iter().all(|r| r.style.role == Role::Detail));
+        }
     }
 
     #[test]
-    fn every_status_has_its_word_and_mark_and_not_only_a_colour() {
+    fn a_call_that_went_well_has_no_status_word_and_the_rest_say_theirs_in_words() {
         let cases = [
-            (Status::Ok, "\u{25cf} ok Bash cargo test", Role::Done),
+            (Status::Ok, "\u{25cf} Ran cargo test", Role::Detail),
+            (Status::Unknown, "\u{25cf} Ran cargo test", Role::Detail),
             (
                 Status::Failed,
-                "\u{25c6} failed Bash cargo test",
+                "\u{25cf} Ran cargo test  failed",
                 Role::Failed,
             ),
             (
                 Status::Running,
-                "\u{25cb} running Bash cargo test",
+                "\u{25cf} Ran cargo test  running",
                 Role::Working,
             ),
             (
                 Status::Interrupted,
-                "~ interrupted Bash cargo test",
+                "\u{25cf} Ran cargo test  interrupted",
                 Role::Detail,
             ),
-            (Status::Rejected, "x rejected Bash cargo test", Role::Detail),
+            (
+                Status::Rejected,
+                "\u{25cf} Ran cargo test  rejected",
+                Role::Detail,
+            ),
         ];
         for (status, want, role) in cases {
             let rows = layout(&[tool("Bash", "cargo test", status, None)], 60);
             assert_eq!(rows[0].text, want);
             assert_eq!(style_at(&rows[0], 0).role, role, "{want}");
+            // The label is dim whatever the state.
+            assert_eq!(style_at(&rows[0], 4).role, Role::Detail, "{want}");
         }
+    }
+
+    #[test]
+    fn what_a_call_did_is_a_sentence_per_kind_of_tool() {
+        let said = |name: &str, summary: &str| label(name, summary);
+        for shell in ["Bash", "bash", "shell", "exec_command", "run_shell_command"] {
+            assert_eq!(
+                said(shell, "cargo  test\n-q"),
+                "Ran cargo test -q",
+                "{shell}"
+            );
+        }
+        assert_eq!(said("Read", "src/main.rs"), "Read src/main.rs");
+        assert_eq!(said("read_file", "a.rs"), "Read a.rs");
+        for edit in ["Edit", "Write", "MultiEdit", "apply_patch", "replace"] {
+            assert_eq!(said(edit, "a.rs"), "Edited a.rs", "{edit}");
+        }
+        for search in ["Grep", "Glob", "search_file_content"] {
+            assert_eq!(
+                said(search, "todo in src"),
+                "Searched todo in src",
+                "{search}"
+            );
+        }
+        assert_eq!(said("WebSearch", "rust release"), "Searched the web");
+        assert_eq!(said("google_web_search", "q"), "Searched the web");
+        assert_eq!(
+            said("WebFetch", "https://doc.rust-lang.org/std/?x=1"),
+            "Fetched doc.rust-lang.org"
+        );
+        assert_eq!(said("web_fetch", ""), "Fetched a page");
+        assert_eq!(
+            said("Task", "review the diff"),
+            "Ran a subagent: review the diff"
+        );
+        assert_eq!(said("Task", ""), "Ran a subagent");
+        // Nothing to say it with: the name and the summary.
+        assert_eq!(said("TodoWrite", "3 items"), "TodoWrite 3 items");
+        assert_eq!(said("Skill", "ship"), "Skill ship");
+        assert_eq!(said("mcp__crw__search", "q"), "mcp__crw__search q");
+        assert_eq!(said("Mystery", ""), "Mystery");
+        // A tool that only mentions a word is not that tool.
+        assert_eq!(said("KillShell", "12345"), "KillShell 12345");
+        assert_eq!(said("BashOutput", "12345"), "BashOutput 12345");
+        assert_eq!(said("NotebookRead", "n"), "NotebookRead n");
+        assert_eq!(said("WebSearchPlus", "q"), "WebSearchPlus q");
+        assert_eq!(said("subagent", "x"), "Ran a subagent: x");
+        assert_eq!(said("web_search", "q"), "Searched the web");
+        // A url is its host and nothing else: no login, no path.
+        for (url, want) in [
+            (
+                "https://user:pw@example.com:8080/a?b=c#d",
+                "example.com:8080",
+            ),
+            ("http://a@b@example.com/x", "example.com"),
+            ("example.com/path", "example.com"),
+            ("https://example.com?q=1", "example.com"),
+        ] {
+            assert_eq!(said("WebFetch", url), format!("Fetched {want}"), "{url}");
+        }
+        assert_eq!(said("Read", ""), "Read");
+    }
+
+    #[test]
+    fn a_row_ends_with_a_chevron_when_it_opens_and_with_none_when_it_does_not() {
+        let plain = timed("a", "Read", "a.rs", None, false);
+        let opens = timed("b", "Read", "b.rs", None, true);
+        assert_eq!(lines(&[plain], 40), ["\u{25cf} Read a.rs"]);
+        assert_eq!(lines(&[opens], 40), ["\u{25cf} Read b.rs \u{25b8}"]);
     }
 
     #[test]
     fn an_exit_code_shows_when_it_is_not_zero() {
         let failed = tool("Bash", "make", Status::Failed, Some(2));
         let fine = tool("Bash", "make", Status::Ok, Some(0));
-        assert_eq!(lines(&[failed], 60), ["\u{25c6} failed Bash make  exit 2"]);
-        assert_eq!(lines(&[fine], 60), ["\u{25cf} ok Bash make"]);
+        let odd = tool("Bash", "make", Status::Ok, Some(3));
+        assert_eq!(lines(&[failed], 60), ["\u{25cf} Ran make  failed, exit 2"]);
+        assert_eq!(lines(&[fine], 60), ["\u{25cf} Ran make"]);
+        assert_eq!(lines(&[odd], 60), ["\u{25cf} Ran make  exit 3"]);
     }
 
     #[test]
-    fn a_long_summary_is_cut_and_the_exit_code_stays() {
-        let item = tool(
-            "Bash",
-            "cargo test --workspace --all-targets",
-            Status::Failed,
-            Some(101),
+    fn a_long_command_is_cut_and_the_words_and_the_chevron_stay() {
+        let item = Item::Tool {
+            seq: 0,
+            id: "t".into(),
+            name: "Bash".into(),
+            summary: "cargo test --workspace --all-targets".into(),
+            status: Status::Failed,
+            exit_code: Some(101),
+            duration_ms: None,
+            ts: None,
+            output_bytes: 9,
+            has_detail: true,
+        };
+        let got = lines(&[item], 36);
+        assert_eq!(
+            got,
+            ["\u{25cf} Ran cargo tes\u{2026}  failed, exit 101 \u{25b8}"]
         );
-        let got = lines(&[item], 34);
-        assert_eq!(got, ["\u{25c6} failed Bash cargo tes\u{2026}  exit 101"]);
-        assert_eq!(width::width(&got[0]), 34);
+        assert_eq!(width::width(&got[0]), 36);
     }
 
     #[test]
     fn a_summary_is_one_line() {
         let item = tool("Bash", "echo a\n\techo   b", Status::Ok, None);
-        assert_eq!(lines(&[item], 60), ["\u{25cf} ok Bash echo a echo b"]);
+        assert_eq!(lines(&[item], 60), ["\u{25cf} Ran echo a echo b"]);
     }
 
     #[test]
-    fn consecutive_tool_calls_fold_into_one_steps_row() {
+    fn consecutive_tool_calls_fold_under_one_header_with_the_time_they_took() {
         let items = [
-            tool("Read", "a.rs", Status::Ok, None),
+            timed("a", "Read", "a.rs", Some(1200), false),
             thinking(Some(1000)),
-            tool("Edit", "a.rs", Status::Ok, None),
-            tool("Bash", "make", Status::Ok, Some(0)),
+            timed("b", "Edit", "a.rs", Some(2200), false),
+            timed("c", "Bash", "make", Some(1000), false),
         ];
-        assert_eq!(lines(&items, 40), ["\u{25cf} 3 steps"]);
+        assert_eq!(lines(&items, 40), ["Worked for 4 s \u{25b8}"]);
+        let slow = [
+            timed("a", "Read", "a", Some(61_000), false),
+            timed("b", "Read", "b", Some(4_000), false),
+        ];
+        assert_eq!(lines(&slow, 40), ["Worked for 1 min 5 s \u{25b8}"]);
+        let rows = layout(&items, 40);
+        assert!(rows[0].runs.iter().all(|r| r.style.role == Role::Detail));
     }
 
     #[test]
-    fn a_fold_says_what_failed_or_is_still_running() {
+    fn a_fold_reads_the_wall_clock_when_the_calls_say_when_they_started() {
+        let at = |mut item: Item, start: i64| {
+            if let Item::Tool { ts, .. } = &mut item {
+                *ts = Some(start);
+            }
+            item
+        };
+        // Three calls of 4 s that overlap: 5 s on the clock, not 12 s of work.
+        let items = [
+            at(timed("a", "Read", "a", Some(4000), false), 1_000_000),
+            at(timed("b", "Read", "b", Some(4000), false), 1_001_000),
+            at(timed("c", "Read", "c", Some(4000), false), 1_001_000),
+        ];
+        assert_eq!(lines(&items, 40), ["Worked for 5 s \u{25b8}"]);
+        // A gap between them counts too: it is time the agent was at it.
+        let gap = [
+            at(timed("a", "Read", "a", Some(1000), false), 1_000_000),
+            at(timed("b", "Read", "b", Some(1000), false), 1_009_000),
+        ];
+        assert_eq!(lines(&gap, 40), ["Worked for 10 s \u{25b8}"]);
+        // One that does not say when: the sum of what each took.
+        let some = [
+            at(timed("a", "Read", "a", Some(4000), false), 1_000_000),
+            timed("b", "Read", "b", Some(4000), false),
+        ];
+        assert_eq!(lines(&some, 40), ["Worked for 8 s \u{25b8}"]);
+    }
+
+    #[test]
+    fn a_fold_with_a_step_of_no_known_time_counts_steps_instead() {
+        let items = [
+            timed("a", "Read", "a", Some(1000), false),
+            timed("b", "Read", "b", None, false),
+            Item::Subagent {
+                seq: 0,
+                summary: "s".into(),
+                steps: 2,
+            },
+        ];
+        assert_eq!(lines(&items, 40), ["3 steps \u{25b8}"]);
+    }
+
+    #[test]
+    fn a_fold_says_what_failed_or_is_still_running_and_opens_while_one_runs() {
         let failed = [
             tool("Read", "a", Status::Ok, None),
             tool("Bash", "b", Status::Failed, Some(1)),
         ];
-        assert_eq!(lines(&failed, 40), ["\u{25c6} 2 steps, 1 failed"]);
-        let running = [
-            tool("Read", "a", Status::Ok, None),
-            tool("Bash", "b", Status::Running, None),
+        assert_eq!(lines(&failed, 40), ["2 steps, 1 failed \u{25b8}"]);
+        let rows = layout(&failed, 40);
+        assert_eq!(style_at(&rows[0], 0).role, Role::Failed);
+        let stopped = [
+            tool("Read", "a", Status::Interrupted, None),
             tool("Bash", "c", Status::Rejected, None),
         ];
         assert_eq!(
-            lines(&running, 40),
-            ["\u{25cb} 3 steps, 1 running, 1 rejected"]
+            lines(&stopped, 40),
+            ["2 steps, 1 interrupted, 1 rejected \u{25b8}"]
         );
-        let rows = layout(&failed, 40);
-        assert_eq!(style_at(&rows[0], 0).role, Role::Failed);
+        // One still running: the group is open, its steps below it.
+        let running = [
+            tool("Read", "a", Status::Ok, None),
+            tool("Bash", "b", Status::Running, None),
+        ];
+        assert_eq!(
+            lines(&running, 40),
+            [
+                "2 steps, 1 running \u{25be}",
+                "\u{25cf} Read a",
+                "\u{25cf} Ran b  running"
+            ]
+        );
+        let rows = layout(&running, 40);
+        assert_eq!(style_at(&rows[0], 0).role, Role::Working);
     }
 
     #[test]
@@ -1739,7 +2487,7 @@ mod tests {
         let items = [thinking(Some(2000)), tool("Read", "a.rs", Status::Ok, None)];
         assert_eq!(
             lines(&items, 40),
-            ["Thought for 2 s", "\u{25cf} ok Read a.rs"]
+            ["\u{25cf} Thought for 2 s", "\u{25cf} Read a.rs"]
         );
     }
 
@@ -1755,13 +2503,171 @@ mod tests {
         assert_eq!(
             lines(&items, 40),
             [
-                "\u{25cf} 2 steps",
+                "2 steps \u{25b8}",
                 "",
                 "done reading",
                 "",
-                "\u{25cf} 2 steps"
+                "2 steps \u{25b8}"
             ]
         );
+    }
+
+    #[test]
+    fn a_group_that_is_opened_shows_its_steps_and_reasoning_and_closes_again() {
+        let items = [
+            timed("a", "Read", "a.rs", Some(1000), true),
+            thinking(Some(2000)),
+            timed("b", "Bash", "make", Some(1000), false),
+            agent("done"),
+        ];
+        let mut opened = Opened::default();
+        let key = group_key(&items[0]);
+        opened.keys.insert(key.clone());
+        let (rows, owner, heads) = laid_out(&items, 40, &opened);
+        let text: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "Worked for 2 s \u{25be}",
+                "\u{25cf} Read a.rs \u{25b8}",
+                "\u{25cf} Thought for 2 s",
+                "\u{25cf} Ran make",
+                "",
+                "done"
+            ]
+        );
+        // Only the header and the row that opens answer a click, and every row is traced to
+        // the item its group starts at.
+        assert_eq!(heads[0], Some(key));
+        assert_eq!(heads[1], Some(tool_key("a")));
+        assert!(heads[2..].iter().all(Option::is_none));
+        assert_eq!(owner, [0, 0, 0, 0, 0, 3]);
+        let closed = laid_out(&items, 40, &Opened::default()).0;
+        assert_eq!(closed[0].text, "Worked for 2 s \u{25b8}");
+        assert_eq!(closed.len(), 3);
+    }
+
+    #[test]
+    fn a_tool_that_is_opened_shows_its_input_a_blank_row_and_its_output_in_a_dim_block() {
+        let items = [timed("a", "Bash", "make", Some(1000), true)];
+        let mut opened = Opened::default();
+        opened.keys.insert(tool_key("a"));
+        let at = |opened: &Opened| laid_out(&items, 12, opened).0;
+        // Not read yet.
+        let rows = at(&opened);
+        assert_eq!(rows[0].text, "\u{25cf} Ran make \u{25be}");
+        assert_eq!(rows[1].text, " loading    ");
+        opened.details.insert(
+            "a".into(),
+            got(Some(Detail {
+                input: "make all".into(),
+                output: "built\nok\n\n".into(),
+                truncated: false,
+            })),
+        );
+        let rows = at(&opened);
+        let text: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            text,
+            [
+                "\u{25cf} Ran make \u{25be}",
+                " make all   ",
+                "            ",
+                " built      ",
+                " ok         "
+            ]
+        );
+        // The block is dim and raised, as wide as the pane; the row above it is neither.
+        for row in &rows[1..] {
+            assert!(
+                row.runs
+                    .iter()
+                    .all(|r| r.style.raised && r.style.role == Role::Detail)
+            );
+            assert_eq!(width::width(&row.text), 12);
+        }
+        assert!(rows[0].runs.iter().all(|r| !r.style.raised));
+        // Cut by the daemon, or by this view's own limit.
+        opened.details.insert(
+            "a".into(),
+            got(Some(Detail {
+                input: String::new(),
+                output: "x".into(),
+                truncated: true,
+            })),
+        );
+        assert_eq!(
+            laid_out(&items, 40, &opened).0[2].text.trim_end(),
+            " \u{2026} cut by the daemon"
+        );
+        let long = (0..40).map(|n| format!("l{n}\n")).collect::<String>();
+        opened.details.insert(
+            "a".into(),
+            got(Some(Detail {
+                input: String::new(),
+                output: long,
+                truncated: false,
+            })),
+        );
+        let rows = laid_out(&items, 20, &opened).0;
+        assert_eq!(rows.len(), 1 + DETAIL_ROWS + 1);
+        assert_eq!(
+            rows.last().expect("a row").text.trim_end(),
+            " \u{2026} 10 more rows"
+        );
+        // Cut by the limit and by the daemon: both are said.
+        let both = (0..40).map(|n| format!("l{n}\n")).collect::<String>();
+        opened.details.insert(
+            "a".into(),
+            got(Some(Detail {
+                input: String::new(),
+                output: both,
+                truncated: true,
+            })),
+        );
+        let rows = laid_out(&items, 30, &opened).0;
+        let tail: Vec<&str> = rows[rows.len() - 2..]
+            .iter()
+            .map(|r| r.text.trim_end())
+            .collect();
+        assert_eq!(
+            tail,
+            [" \u{2026} 10 more rows", " \u{2026} cut by the daemon"]
+        );
+        // A read that failed is waiting to be tried again; nothing recorded is said.
+        opened.details.insert("a".into(), got(None));
+        assert_eq!(
+            laid_out(&items, 30, &opened).0[1].text.trim_end(),
+            " not available, retrying"
+        );
+        opened.details.insert(
+            "a".into(),
+            got(Some(Detail {
+                input: "  \n".into(),
+                output: String::new(),
+                truncated: false,
+            })),
+        );
+        assert_eq!(
+            laid_out(&items, 30, &opened).0[1].text.trim_end(),
+            " (nothing recorded)"
+        );
+        // A daemon that cannot send it: said, whatever was kept.
+        opened.off = true;
+        assert_eq!(
+            laid_out(&items, 30, &opened).0[1].text.trim_end(),
+            " not available"
+        );
+    }
+
+    #[test]
+    fn a_tool_with_nothing_to_show_has_no_row_to_open() {
+        let items = [timed("a", "Bash", "make", None, false)];
+        let mut opened = Opened::default();
+        opened.keys.insert(tool_key("a"));
+        let (rows, _, heads) = laid_out(&items, 40, &opened);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(heads, [None]);
     }
 
     #[test]
@@ -1791,7 +2697,7 @@ mod tests {
                 "error: rate limited retry in 5s",
                 "hook: ran",
                 "context compacted",
-                "subagent review, 7 steps"
+                "\u{25cf} Ran a subagent: review"
             ]
         );
         assert!(rows.iter().all(|r| style_at(r, 0).role == Role::Detail));
@@ -1817,7 +2723,7 @@ mod tests {
                 "",
                 "hello",
                 "",
-                "Thought",
+                "\u{25cf} Thought",
                 "context c\u{2026}",
                 "",
                 "bye"
@@ -1932,6 +2838,44 @@ mod tests {
     }
 
     #[test]
+    fn opened_rows_are_no_wider_than_the_pane_at_any_width_either() {
+        let items = [
+            timed(
+                "a",
+                "Bash世界",
+                "cargo 🌍 test --workspace",
+                Some(1500),
+                true,
+            ),
+            timed("b", "Read", "a/世界/file.rs", Some(500), true),
+            timed("c", "WebFetch", "https://世界.example/path", None, true),
+            Item::Subagent {
+                seq: 0,
+                summary: "review 世界 \u{2764}\u{fe0f}".into(),
+                steps: 1,
+            },
+        ];
+        let mut opened = Opened::default();
+        for key in [group_key(&items[0]), tool_key("a"), tool_key("c")] {
+            opened.keys.insert(key);
+        }
+        let body = Detail {
+            input: "世界 🌍 a long input line \u{2764}\u{fe0f}\twith a tab".into(),
+            output: "out 世界世界世界世界\n\nlast averyveryverylongwordthatneverbreaks".into(),
+            truncated: true,
+        };
+        opened.details.insert("a".into(), got(Some(body)));
+        opened.details.insert("c".into(), got(None));
+        for cols in 0..=40usize {
+            for row in laid_out(&items, cols, &opened).0 {
+                let drawn = drawn_columns(&row.text);
+                assert!(drawn <= cols, "{cols}: {drawn} columns in {:?}", row.text);
+                assert!(!row.text.contains('\u{fe0f}'), "{cols}: {:?}", row.text);
+            }
+        }
+    }
+
+    #[test]
     fn nothing_from_a_file_draws_as_a_control_or_a_bidi_override() {
         let evil = "a\u{85}b\u{9b}c\u{202e}d\u{2066}e\u{2069}f\u{7}g\u{1b}h";
         let items = [
@@ -1984,7 +2928,7 @@ mod tests {
                 "Sure. Running cargo",
                 "test first.",
                 "",
-                "\u{25c6} failed Ba\u{2026}  exit 2",
+                "\u{25cf} R\u{2026}  failed, exit 2",
                 "",
                 "Two tests failed."
             ]
@@ -2510,7 +3454,8 @@ mod tests {
         assert_eq!(style_at(&rows[2], 0).role, Role::Detail);
         let unknown = tool("Bash", "make", Status::Unknown, None);
         let row = &layout(&[unknown], 40)[0];
-        assert_eq!(row.text, "? unknown Bash make");
+        // A status this build does not know is drawn as no status at all.
+        assert_eq!(row.text, "\u{25cf} Ran make");
         assert_eq!(style_at(row, 0).role, Role::Detail);
     }
 
@@ -2526,6 +3471,348 @@ mod tests {
             items,
             warnings: 0,
         }
+    }
+
+    /// A chat of one agent line and two tools, drawn at 30 by 8 and on.
+    fn with_tools(revision: u64) -> ChatState {
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        let items = vec![
+            agent("go"),
+            timed("a", "Bash", "make", Some(1000), true),
+            timed("b", "Read", "a.rs", Some(2000), true),
+        ];
+        chat.set_digest(4, page(revision, items));
+        chat.render(&[want(4, 30, 8)]);
+        chat
+    }
+
+    /// `with_tools` with the group open and the second tool opened, nothing read yet.
+    fn with_tool_open(revision: u64) -> ChatState {
+        let mut chat = with_tools(revision);
+        chat.toggle_at(4, 2);
+        chat.render(&[want(4, 30, 8)]);
+        chat.toggle_newest(4);
+        chat.render(&[want(4, 30, 8)]);
+        chat
+    }
+
+    fn draw(chat: &mut ChatState) -> Vec<String> {
+        chat.render(&[want(4, 30, 8)]);
+        visible(chat, 4)
+            .iter()
+            .map(|l| l.trim_end().into())
+            .collect()
+    }
+
+    #[test]
+    fn a_click_or_ctrl_a_enter_opens_the_group_or_row_in_view_and_again_closes_it() {
+        let mut chat = with_tools(1);
+        assert_eq!(visible(&chat, 4)[2].trim_end(), "Worked for 3 s \u{25b8}");
+        // Only the header answers: the text above it, the blank rows below it do not.
+        assert!(!chat.toggle_at(4, 0));
+        assert!(!chat.toggle_at(4, 1));
+        assert!(!chat.toggle_at(4, 7));
+        assert!(chat.toggle_at(4, 2));
+        let got = draw(&mut chat);
+        assert_eq!(got[2], "Worked for 3 s \u{25be}");
+        assert_eq!(got[3], "\u{25cf} Ran make \u{25b8}");
+        // The newest row in view: the second tool, then (still) the second tool.
+        assert!(chat.toggle_newest(4));
+        assert_eq!(draw(&mut chat)[4], "\u{25cf} Read a.rs \u{25be}");
+        assert!(chat.toggle_newest(4));
+        assert_eq!(draw(&mut chat)[4], "\u{25cf} Read a.rs \u{25b8}");
+        // The click on the header closes the group, and its steps with it.
+        assert!(chat.toggle_at(4, 2));
+        assert_eq!(draw(&mut chat)[3], "");
+        assert!(chat.has_view(4));
+    }
+
+    #[test]
+    fn with_no_group_or_tool_row_in_view_nothing_is_taken() {
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        chat.set_digest(4, page(1, numbered(3)));
+        chat.render(&[want(4, 30, 8)]);
+        assert!(!chat.toggle_newest(4));
+        assert!(!chat.toggle_at(4, 0));
+        // Not drawn at all: nothing either.
+        assert!(!ChatState::default().toggle_newest(4));
+    }
+
+    #[test]
+    fn a_row_that_opens_keeps_its_place_on_the_screen() {
+        // A long chat ending in one tool: the row is the last of the window, at scroll 0.
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        let mut items = numbered(12);
+        items.push(timed("a", "Bash", "make", Some(1000), true));
+        chat.set_digest(4, page(1, items));
+        assert_eq!(draw(&mut chat)[7], "\u{25cf} Ran make \u{25b8}");
+        assert!(chat.toggle_newest(4));
+        let got = draw(&mut chat);
+        assert_eq!(got[7], "\u{25cf} Ran make \u{25be}", "{got:?}");
+        assert!(
+            chat.scrolled(4) > 0,
+            "what it opened to is below the window"
+        );
+        // Closed again, it is still where it was.
+        assert!(chat.toggle_at(4, 7));
+        assert_eq!(draw(&mut chat)[7], "\u{25cf} Ran make \u{25b8}");
+        assert_eq!(chat.scrolled(4), 0);
+        // A click on a row in the middle of the window, scrolled back.
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        let mut items = numbered(6);
+        items.push(timed("a", "Bash", "make", Some(1000), true));
+        items.extend(numbered(12));
+        chat.set_digest(4, page(1, items));
+        chat.render(&[want(4, 30, 8)]);
+        chat.scroll_by(4, true, 20);
+        let before = draw(&mut chat);
+        let row = before
+            .iter()
+            .position(|l| l.contains("Ran make"))
+            .expect("the row is in view");
+        assert!(chat.toggle_at(4, row));
+        let after = draw(&mut chat);
+        assert_eq!(after[row], "\u{25cf} Ran make \u{25be}");
+        assert_eq!(after[..row], before[..row], "the rows above did not move");
+    }
+
+    #[test]
+    fn a_row_that_opens_taller_than_the_pane_goes_to_the_top_and_shows_its_first_rows() {
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        let mut items = numbered(3);
+        items.push(timed("a", "Bash", "make", Some(1000), true));
+        chat.set_digest(4, page(1, items));
+        let before = draw(&mut chat);
+        assert_eq!(before[6], "\u{25cf} Ran make \u{25b8}");
+        chat.toggle_newest(4);
+        chat.set_detail(
+            4,
+            "a",
+            "make".into(),
+            (0..20).map(|n| format!("l{n}\n")).collect(),
+            false,
+        );
+        // Put away and opened again, the answer is kept: the row opens to 22 rows in 8.
+        chat.toggle_at(4, 6);
+        draw(&mut chat);
+        assert!(chat.toggle_at(4, 6));
+        let got = draw(&mut chat);
+        assert_eq!(got[0], "\u{25cf} Ran make \u{25be}");
+        assert_eq!(got[1], " make");
+        assert_eq!(got[3], " l0");
+        assert_eq!(got[7], " l4");
+    }
+
+    #[test]
+    fn an_opened_row_asks_for_its_detail_once_and_an_ended_call_is_never_read_again() {
+        let now = Instant::now();
+        let mut chat = with_tools(7);
+        assert_eq!(chat.wants_detail(4, now), None, "nothing is open");
+        let mut chat = with_tool_open(7);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("b"));
+        assert_eq!(chat.wants_detail(4, now), None, "one read at a time");
+        assert_eq!(draw(&mut chat)[5], " loading");
+        chat.set_detail(4, "b", "cat a.rs".into(), "fn main() {}".into(), false);
+        let got = draw(&mut chat);
+        assert_eq!(got[5], " cat a.rs");
+        assert_eq!(got[7], " fn main() {}");
+        // Held: closed and opened again, and through any number of new revisions.
+        assert_eq!(chat.wants_detail(4, now), None);
+        chat.toggle_newest(4);
+        chat.toggle_newest(4);
+        assert_eq!(chat.wants_detail(4, now), None);
+        for revision in 8..12 {
+            let items = chat.digests[&4].1.items.clone();
+            chat.set_digest(4, page(revision, items));
+            assert_eq!(chat.wants_detail(4, now), None, "revision {revision}");
+        }
+        assert_eq!(draw(&mut chat)[5], " cat a.rs");
+    }
+
+    #[test]
+    fn a_call_that_was_running_when_read_is_read_again_when_the_session_moves() {
+        let now = Instant::now();
+        let running = |status| Item::Tool {
+            seq: 0,
+            id: "r".into(),
+            name: "Bash".into(),
+            summary: "sleep".into(),
+            status,
+            exit_code: None,
+            duration_ms: None,
+            ts: None,
+            output_bytes: 1,
+            has_detail: true,
+        };
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        chat.set_digest(4, page(1, vec![running(Status::Running)]));
+        chat.render(&[want(4, 30, 8)]);
+        chat.toggle_newest(4);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("r"));
+        chat.set_detail(4, "r", "sleep 9".into(), "partial".into(), false);
+        assert_eq!(chat.wants_detail(4, now), None, "same revision");
+        chat.set_digest(4, page(2, vec![running(Status::Running)]));
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("r"));
+        chat.set_detail(4, "r", "sleep 9".into(), "all".into(), false);
+        chat.set_digest(4, page(3, vec![running(Status::Ok)]));
+        assert_eq!(
+            chat.wants_detail(4, now).as_deref(),
+            Some("r"),
+            "it ended since"
+        );
+        chat.set_detail(4, "r", "sleep 9".into(), "done".into(), false);
+        chat.set_digest(4, page(4, vec![running(Status::Ok)]));
+        assert_eq!(chat.wants_detail(4, now), None, "read once it had ended");
+    }
+
+    #[test]
+    fn a_failed_read_says_so_and_is_tried_again_after_three_six_twelve_then_thirty_seconds() {
+        let now = Instant::now();
+        let mut chat = with_tool_open(7);
+        // The newest page was read: nothing else is waiting on the loop.
+        let items = chat.digests[&4].1.items.clone();
+        chat.answered(4, false, false, page(7, items), now);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("b"));
+        assert_eq!(draw(&mut chat)[5], " loading");
+        let mut at = now;
+        for wait in [3, 6, 12, 30, 30] {
+            chat.detail_failed(4, "b", at);
+            assert_eq!(draw(&mut chat)[5], " not available, retrying");
+            assert_eq!(chat.wake_at(at), Some(at + Duration::from_secs(wait)));
+            let early = at + Duration::from_secs(wait) - Duration::from_millis(1);
+            assert_eq!(chat.wants_detail(4, early), None, "{wait} s");
+            at += Duration::from_secs(wait);
+            assert_eq!(chat.wants_detail(4, at).as_deref(), Some("b"), "{wait} s");
+        }
+        // The answer, when it comes, is the row.
+        chat.set_detail(4, "b", "cat".into(), "ok".into(), false);
+        assert_eq!(draw(&mut chat)[5], " cat");
+        // Opened again after it was put away failed: at once, not after the wait.
+        let mut chat = with_tool_open(7);
+        chat.wants_detail(4, now);
+        chat.detail_failed(4, "b", now);
+        chat.toggle_newest(4);
+        chat.toggle_newest(4);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("b"));
+        // No answer for too long is a failure too.
+        let mut lost = with_tool_open(7);
+        assert!(lost.wants_detail(4, now).is_some());
+        let later = now + LOST + Duration::from_secs(1);
+        assert_eq!(lost.wants_detail(4, later), None);
+        assert_eq!(draw(&mut lost)[5], " not available, retrying");
+        let again = later + Duration::from_secs(3);
+        assert_eq!(lost.wants_detail(4, again).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_row_put_away_before_its_answer_frees_the_read_and_caches_nothing() {
+        let now = Instant::now();
+        let mut chat = with_tool_open(7);
+        // Open the first tool too, then ask: the newest is the one read.
+        chat.toggle_at(4, 3);
+        draw(&mut chat);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("a"));
+        // The first is put away while its answer is out: the other is asked at once, with
+        // no wait for the lost read.
+        chat.toggle_at(4, 3);
+        draw(&mut chat);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("b"));
+        // The late answer and the late failure of the one put away keep nothing.
+        chat.set_detail(4, "a", "x".into(), "y".into(), false);
+        chat.detail_failed(4, "a", now);
+        assert!(!chat.opened[&4].details.contains_key("a"));
+        // Opened again, it is asked for like a row never opened.
+        chat.set_detail(4, "b", "cat".into(), "ok".into(), false);
+        chat.toggle_at(4, 3);
+        draw(&mut chat);
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_group_held_open_by_a_running_step_is_not_the_persons_to_flip() {
+        let items = vec![
+            timed("a", "Read", "a.rs", Some(1000), true),
+            Item::Tool {
+                seq: 0,
+                id: "b".into(),
+                name: "Bash".into(),
+                summary: "make".into(),
+                status: Status::Running,
+                exit_code: None,
+                duration_ms: None,
+                ts: None,
+                output_bytes: 0,
+                has_detail: false,
+            },
+        ];
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        chat.set_digest(4, page(1, items.clone()));
+        let got = draw(&mut chat);
+        assert_eq!(got[0], "2 steps, 1 running \u{25be}");
+        assert!(!chat.toggle_at(4, 0), "its header answers nothing");
+        assert!(chat.opened.get(&4).is_none_or(|o| o.keys.is_empty()));
+        // The step that ran ended: the group shows what the person last chose, closed.
+        let mut ended = items;
+        ended[1] = timed("b", "Bash", "make", Some(500), false);
+        chat.set_digest(4, page(2, ended));
+        assert_eq!(draw(&mut chat)[0], "Worked for 2 s \u{25b8}");
+    }
+
+    #[test]
+    fn what_was_read_is_kept_for_thirty_two_tools_and_goes_with_the_session() {
+        let now = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 4);
+        let items: Vec<Item> = (0..40)
+            .flat_map(|n| {
+                [
+                    timed(&format!("t{n}"), "Read", "x", Some(1), true),
+                    agent("m"),
+                ]
+            })
+            .collect();
+        chat.set_digest(4, page(1, items));
+        chat.render(&[want(4, 30, 8)]);
+        let opened = chat.opened.entry(4).or_default();
+        for n in 0..40 {
+            opened.keys.insert(tool_key(&format!("t{n}")));
+        }
+        for n in 0..40 {
+            chat.set_detail(4, &format!("t{n}"), "i".into(), "o".into(), false);
+        }
+        let kept = &chat.opened[&4].details;
+        assert_eq!(kept.len(), DETAILS_KEPT);
+        assert!(
+            !kept.contains_key("t0") && kept.contains_key("t39"),
+            "oldest first"
+        );
+        // A session that was reset: the rows are asked for again.
+        let items = chat.digests[&4].1.items.clone();
+        chat.answered(4, false, true, page(9, items), now);
+        assert!(chat.opened[&4].details.is_empty());
+        assert!(chat.wants_detail(4, now).is_some());
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_detail_turns_it_off_for_the_chat_that_asked_once() {
+        let now = Instant::now();
+        let mut chat = with_tool_open(7);
+        let mut quiet = ChatState::default();
+        on(&mut quiet, 5);
+        assert_eq!(quiet.details_unsupported(), Vec::<u32>::new());
+        assert_eq!(chat.wants_detail(4, now).as_deref(), Some("b"));
+        assert_eq!(chat.details_unsupported(), [4]);
+        assert_eq!(draw(&mut chat)[5], " not available");
+        assert_eq!(chat.wants_detail(4, now + LOST * 9), None);
+        assert_eq!(chat.details_unsupported(), Vec::<u32>::new(), "told once");
+        assert!(chat.has_view(4), "the chat itself goes on");
     }
 
     #[test]

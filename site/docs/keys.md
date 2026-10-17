@@ -48,6 +48,7 @@ program.
 | `ctrl-a M` | last answer: the focused agent's last answer, read from its transcript, as a page |
 | `ctrl-a F` | an agent's focus view: your last prompt, its last turns, one row per tool call |
 | `ctrl-a t` | chat: show an agent's conversation instead of its terminal, and back. The terminal keeps running and typing still goes to it; the wheel scrolls the chat, and copy mode and the mouse copy the text you see. A prompt waiting for you shows the terminal until it is answered. Remembered per agent program (`claude`, `codex`), so the next tab of that program starts the same way |
+| `ctrl-a enter` | chat: open or close the newest group or tool step in view (what it did, then its input and output). A bare `enter` always goes to the program. A click on a step does the same; with shift held the click selects text instead |
 | `ctrl-a b` | fold the left column away |
 
 ## The rest
@@ -64,7 +65,7 @@ program.
 
 | Do | Does |
 |---|---|
-| click | focus a tab, a pane, a space or an agent |
+| click | focus a tab, a pane, a space or an agent; in a chat, open or close the step you click (shift-click selects over it instead) |
 | drag | select, and copy when you let go |
 | drag a divider | resize the panes on either side |
 | click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |

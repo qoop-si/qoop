@@ -59,6 +59,10 @@ pub enum Item {
         status: Status,
         exit_code: Option<i32>,
         duration_ms: Option<u64>,
+        /// When the call started, in ms since the epoch, where the file records it (a client
+        /// reads the wall clock span of a run of calls from it; calls can overlap).
+        #[serde(default)]
+        ts: Option<i64>,
         output_bytes: u64,
         /// [`detail`](crate::detail) has input or output text to show.
         has_detail: bool,

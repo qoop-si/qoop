@@ -2576,9 +2576,9 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("H/J/K/L", "focus side"),
             ("o", "next pane"),
             ("z/t", "zoom, chat"),
+            ("enter", "open chat step"),
             ("X", "back to a tab"),
-            ("e", "resize"),
-            ("=", "equalize"),
+            ("e =", "resize, equalize"),
         ],
     ),
     (
@@ -2618,7 +2618,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
         "mouse",
         2,
         &[
-            ("click", "focus"),
+            ("click", "focus, open"),
             ("drag", "select"),
             ("drag rule", "resize"),
             ("wheel", "scroll"),
@@ -5936,7 +5936,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 43;
+    const COMMANDS: usize = 44;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5986,8 +5986,8 @@ mod tests {
             Action::PaneNext => (const { place(28) }, Some("ctrl-a o")),
             Action::Zoom => (const { place(29) }, Some("ctrl-a z/t")),
             Action::DetachPane => (const { place(30) }, Some("ctrl-a X")),
-            Action::Resize => (const { place(31) }, Some("ctrl-a e")),
-            Action::Equalize => (const { place(32) }, Some("ctrl-a =")),
+            Action::Resize => (const { place(31) }, Some("ctrl-a e =")),
+            Action::Equalize => (const { place(32) }, Some("ctrl-a e =")),
             Action::CopyMode => (const { place(33) }, Some("ctrl-a [")),
             Action::FoldSpace => (const { place(34) }, Some("ctrl-a f")),
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
@@ -5998,6 +5998,7 @@ mod tests {
             Action::Asks => (const { place(40) }, Some("ctrl-a i/T")),
             Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
             Action::Chat => (const { place(42) }, Some("ctrl-a z/t")),
+            Action::ChatRow => (const { place(43) }, Some("ctrl-a enter")),
         }
     }
 
@@ -6065,6 +6066,7 @@ mod tests {
             Action::Asks,
             Action::Fold,
             Action::Chat,
+            Action::ChatRow,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();

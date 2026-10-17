@@ -6879,6 +6879,61 @@ fn ask_chat(state: &mut State) {
             revision: r.revision,
         });
     }
+    // The input and output of a tool row the person opened: one read at a time per chat. The
+    // id names the terminal and the tool, since the answer names neither.
+    let now = std::time::Instant::now();
+    for terminal in state.chat.wanting().collect::<Vec<_>>() {
+        if let Some(tool_id) = state.chat.wants_detail(terminal, now) {
+            state.modes.outbox.push(ControlRequest::MessageDetail {
+                id: format!("chatd-{terminal}-{tool_id}"),
+                terminal,
+                tool_id,
+                max_bytes: Some(CHAT_DETAIL_BYTES),
+            });
+        }
+    }
+}
+
+/// A group or tool row of a chat opened or closed: the text under a selection or a copy
+/// mode's cursor moved, so they are put down.
+fn chat_rows_moved(state: &mut State) {
+    state.selection = None;
+    state.modes.copy = None;
+}
+
+/// A press at `tile_row` of `terminal`'s pane: opens or closes the group or tool row there,
+/// and answers whether it did (and so the press is not a selection's). Not with shift, which
+/// is how a selection is started over a row, and not on a tile that is not focused.
+fn chat_press(state: &mut State, terminal: u32, tile_row: usize, shift: bool) -> bool {
+    let took = !shift
+        && terminal == state.focused
+        && state.chat_shows(terminal)
+        && state.chat.toggle_at(terminal, tile_row);
+    if took {
+        chat_rows_moved(state);
+    }
+    took
+}
+
+/// `ctrl-a enter`: the newest group or tool row in view of the chat being shown, opened or
+/// closed. Answers whether there was one.
+fn chat_row_key(state: &mut State) -> bool {
+    let terminal = state.focused;
+    let took = state.chat_shows(terminal) && state.chat.toggle_newest(terminal);
+    if took {
+        chat_rows_moved(state);
+    }
+    took
+}
+
+/// How much of a tool's input and of its output a chat row asks for: a screenful of rows
+/// is all it shows.
+const CHAT_DETAIL_BYTES: u32 = 8 * 1024;
+
+/// The terminal and tool an answer's id names: `chatd-5-toolu_01`.
+fn chat_detail_id(id: &str) -> Option<(u32, &str)> {
+    let (terminal, tool) = id.strip_prefix("chatd-")?.split_once('-')?;
+    Some((terminal.parse().ok()?, tool))
 }
 
 /// What a refusal says about one tab: on the notice row while that tab is the one being
@@ -8474,6 +8529,11 @@ where
                                             continue;
                                         }
                                     }
+                                    // A press on a group or tool row of a chat opens or closes it.
+                                    if chat_press(&mut state, terminal, tile_row, shift) {
+                                        dirty = true;
+                                        continue;
+                                    }
                                     // In the focused pane, and the program in it has not
                                     // taken the mouse, or the person said this one is
                                     // theirs: a press starts a selection rather than
@@ -9514,6 +9574,11 @@ where
                             Action::Chat => {
                                 toggle_chat(&mut state);
                                 dirty = true;
+                            }
+                            // Only a chat that shows has a row to open; for anything else the
+                            // keys are not the program's either, so they are dropped.
+                            Action::ChatRow => {
+                                dirty |= chat_row_key(&mut state);
                             }
                             Action::Palette => {
                                 state.palette = Some(Palette::with_agents(crate::config::agents()));
@@ -12959,6 +13024,41 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 }
                 *dirty = true;
             }
+        }
+        ControlResponse::MessageDetail {
+            id,
+            input,
+            output,
+            truncated,
+        } => {
+            if let Some((terminal, tool)) = chat_detail_id(&id) {
+                state
+                    .chat
+                    .set_detail(terminal, tool, input, output, truncated);
+                *dirty = true;
+            }
+        }
+        ControlResponse::Failed { id, .. } if chat_detail_id(&id).is_some() => {
+            if let Some((terminal, tool)) = chat_detail_id(&id) {
+                state
+                    .chat
+                    .detail_failed(terminal, tool, std::time::Instant::now());
+            }
+            *dirty = true;
+        }
+        // A daemon older than the detail answers with no id: the chats waiting on one stop
+        // asking, and are told once.
+        ControlResponse::Failed { id, reason }
+            if id.is_empty() && unknown_variant(&reason) == Some("MessageDetail") =>
+        {
+            for terminal in state.chat.details_unsupported() {
+                say_chat(
+                    state,
+                    terminal,
+                    "opening a step needs a newer daemon: stop the session to upgrade",
+                );
+            }
+            *dirty = true;
         }
         // The daemon will not serve this chat for good (a shell, a session too large), or
         // only not now: the reason says which, and the tab it concerns hears of it.
@@ -25036,6 +25136,149 @@ mod tests {
                 .collect(),
             warnings: 0,
         }
+    }
+
+    #[test]
+    fn the_detail_ids_name_the_terminal_and_the_tool() {
+        assert_eq!(chat_detail_id("chatd-5-toolu_01"), Some((5, "toolu_01")));
+        assert_eq!(chat_detail_id("chatd-12-a-b-c"), Some((12, "a-b-c")));
+        for bad in ["chat-5-new", "chatd-x-t", "chatd-5", "chatd-", ""] {
+            assert_eq!(chat_detail_id(bad), None, "{bad}");
+        }
+        assert_eq!(chat_id("chatd-5-t"), None, "not a page of the chat");
+    }
+
+    fn chat_tool(id: &str, summary: &str) -> qoop_parsed::Item {
+        qoop_parsed::Item::Tool {
+            seq: 0,
+            id: id.into(),
+            name: "Bash".into(),
+            summary: summary.into(),
+            status: qoop_parsed::Status::Ok,
+            exit_code: None,
+            duration_ms: Some(2000),
+            ts: None,
+            output_bytes: 4,
+            has_detail: true,
+        }
+    }
+
+    /// A chat showing in place of the terminal: the person's line on row 0, a tool on row 2.
+    fn chat_with_tool() -> State {
+        let mut s = chat_single();
+        s.chat.toggle(2, Some("claude"));
+        let mut page = chat_digest("go");
+        page.items.truncate(1);
+        page.items.push(chat_tool("t1", "make"));
+        s.chat.set_digest(2, page);
+        s.refresh_chat();
+        assert!(s.chat_shows(2));
+        s
+    }
+
+    fn asked_detail(s: &mut State) -> Vec<ControlRequest> {
+        ask_chat(s);
+        std::mem::take(&mut s.modes.outbox)
+            .into_iter()
+            .filter(|r| matches!(r, ControlRequest::MessageDetail { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn an_opened_tool_row_asks_for_its_detail_and_the_answer_is_drawn_under_it() {
+        let mut s = chat_with_tool();
+        let (mut request, mut dirty) = (0, false);
+        let drawn = plain(&screen::paint(&s.frame()));
+        assert!(drawn.contains("Ran make"), "{drawn}");
+        // A click on the row, as the pane gives it: row 2 of the pane.
+        assert!(chat_press(&mut s, 2, 2, false));
+        s.refresh_chat();
+        let asked = asked_detail(&mut s);
+        assert!(
+            matches!(&asked[..], [ControlRequest::MessageDetail { id, terminal: 2, tool_id, max_bytes: Some(n) }]
+                if id == "chatd-2-t1" && tool_id == "t1" && *n == CHAT_DETAIL_BYTES),
+            "{asked:?}"
+        );
+        assert!(asked_detail(&mut s).is_empty(), "one in flight");
+        let answer = ControlResponse::MessageDetail {
+            id: "chatd-2-t1".into(),
+            input: "make all".into(),
+            output: "built".into(),
+            truncated: false,
+        };
+        apply(&mut s, answer, &mut request, &mut dirty);
+        assert!(dirty);
+        s.refresh_chat();
+        let drawn = plain(&screen::paint(&s.frame()));
+        assert!(
+            drawn.contains("make all") && drawn.contains("built"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_press_or_ctrl_a_enter_opens_a_chat_row_only_where_the_chat_shows_and_the_press_is_plain() {
+        let mut s = chat_with_tool();
+        // Shift is how a selection starts over a row; another tile than the focused one only
+        // takes the focus; a row that opens nothing is the selection's.
+        assert!(!chat_press(&mut s, 2, 2, true));
+        assert!(!chat_press(&mut s, 3, 2, false));
+        assert!(!chat_press(&mut s, 2, 0, false));
+        assert!(asked_detail(&mut s).is_empty(), "nothing was opened");
+        // Somebody typing has the terminal, and a prompt waiting has it too.
+        s.chat.typed(2, b"x", std::time::Instant::now());
+        assert!(!chat_press(&mut s, 2, 2, false));
+        assert!(!chat_row_key(&mut s));
+        s.chat.typed(2, b"\r", std::time::Instant::now());
+        s.rows.iter_mut().for_each(|r| r.state = "blocked".into());
+        assert!(!chat_press(&mut s, 2, 2, false));
+        assert!(!chat_row_key(&mut s));
+        s.rows.iter_mut().for_each(|r| r.state = "idle".into());
+        assert!(asked_detail(&mut s).is_empty(), "still nothing was opened");
+        // A held selection and a copy mode's cursor go when a row opens or closes.
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
+        assert!(chat_press(&mut s, 2, 2, false));
+        assert!(s.selection.is_none());
+        s.refresh_chat();
+        enter_copy(&mut s);
+        assert!(s.modes.copy.is_some());
+        assert!(chat_row_key(&mut s));
+        assert!(s.modes.copy.is_none());
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
+        assert!(chat_press(&mut s, 2, 2, false));
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn a_refused_detail_never_reaches_the_chat_refusals_and_a_daemon_too_old_is_told_once() {
+        let (mut request, mut dirty) = (0, false);
+        let mut s = chat_with_tool();
+        assert!(chat_press(&mut s, 2, 2, false));
+        assert_eq!(asked_detail(&mut s).len(), 1);
+        for reason in ["not_agent", "too_large", "unavailable", "busy"] {
+            apply(&mut s, fail("chatd-2-t1", reason), &mut request, &mut dirty);
+            assert!(!s.chat.is_refused(2), "{reason}");
+            assert!(s.chat.wants_digest(2) && s.chat.has_view(2), "{reason}");
+            assert_eq!(s.message, None, "{reason}");
+        }
+        s.refresh_chat();
+        let drawn = plain(&screen::paint(&s.frame()));
+        assert!(drawn.contains("not available, retrying"), "{drawn}");
+        // A daemon that does not know the request answers with no id.
+        let mut s = chat_with_tool();
+        assert!(chat_press(&mut s, 2, 2, false));
+        assert_eq!(asked_detail(&mut s).len(), 1);
+        let old = "unknown variant `MessageDetail`, expected one of `Messages`";
+        apply(&mut s, fail("", old), &mut request, &mut dirty);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("opening a step needs a newer daemon: stop the session to upgrade")
+        );
+        s.message = None;
+        apply(&mut s, fail("", old), &mut request, &mut dirty);
+        assert_eq!(s.message, None, "told once");
+        assert!(asked_detail(&mut s).is_empty(), "and not asked again");
+        assert!(s.chat.has_view(2), "the chat itself goes on");
     }
 
     #[test]

@@ -295,6 +295,7 @@ fn push_call(call: &ToolCall, out: &mut Vec<Item>) {
         status: status(call),
         exit_code: shell.and_then(|s| s.exit_code),
         duration_ms: shell.and_then(|s| s.duration_ms).or_else(|| elapsed(call)),
+        ts: call.started_at,
         output_bytes,
         has_detail: output_bytes > 0 || has_input(call),
     });
@@ -310,6 +311,7 @@ fn orphan(result: &ToolResult) -> Item {
         status: map_status(result.status, true),
         exit_code: result.output.shell.as_ref().and_then(|s| s.exit_code),
         duration_ms: None,
+        ts: None,
         output_bytes: result.output.text.len() as u64,
         has_detail: !result.output.text.is_empty(),
     }

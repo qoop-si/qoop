@@ -217,6 +217,9 @@ pub enum Action {
     CopyMode,
     /// ctrl-a t: the focused agent's session as a chat, or the terminal as it is.
     Chat,
+    /// ctrl-a enter: open or close the newest group or tool row in view of a chat. A bare
+    /// Enter is the program's, always.
+    ChatRow,
 }
 
 impl Action {
@@ -462,6 +465,7 @@ impl Keys {
                     b'=' => Action::Equalize,
                     b'[' => Action::CopyMode,
                     b't' => Action::Chat,
+                    b'\r' => Action::ChatRow,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
                     // slip of the finger could run something.
                     _ => continue,
@@ -593,6 +597,9 @@ mod tests {
     fn ctrl_a_t_is_the_chat_switch_and_v_is_still_the_split() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01t\x01v"), vec![Action::Chat, Action::SplitV]);
+        // The prefix and Return open a chat's row; Return alone is the program's.
+        assert_eq!(keys.feed(b"\x01\r"), vec![Action::ChatRow]);
+        assert_eq!(keys.feed(b"\r"), vec![Action::Input(b"\r".to_vec())]);
         assert_eq!(keys.feed(b"t"), vec![input(b"t")], "a bare t is typing");
     }
 
