@@ -3494,8 +3494,15 @@ impl State {
     /// Draw the chat of every terminal that shows as one, at the size of its tile. Called
     /// before a frame is built, since the frame only borrows what is drawn.
     fn refresh_chat(&mut self) {
-        self.chat.expire(std::time::Instant::now());
-        self.chat.adopt(&self.rows);
+        self.refresh_chat_at(std::time::Instant::now());
+    }
+
+    fn refresh_chat_at(&mut self, now: std::time::Instant) {
+        self.chat.expire(now);
+        self.chat.adopt(&self.rows, now);
+        if let Some(said) = self.chat.take_note(self.focused) {
+            self.message = Some(said.to_string());
+        }
         let shows: std::collections::BTreeSet<u32> = self
             .chat
             .wanting()
@@ -6874,6 +6881,42 @@ fn ask_chat(state: &mut State) {
     }
 }
 
+/// What a refusal says about one tab: on the notice row while that tab is the one being
+/// looked at, else kept for when it is.
+fn say_chat(state: &mut State, terminal: u32, said: &'static str) {
+    if terminal == state.focused {
+        state.message = Some(said.to_string());
+    } else {
+        state.chat.note(terminal, said);
+    }
+}
+
+/// The variant an `unknown variant` refusal is about: the first name in backquotes after the
+/// words. The names it lists after as expected are the daemon's own, and not what was sent.
+fn unknown_variant(reason: &str) -> Option<&str> {
+    let (name, _) = reason.split_once("unknown variant `")?.1.split_once('`')?;
+    Some(name)
+}
+
+/// When the loop's chat arm wakes: the soonest read due, retry, loss or doubt.
+fn chat_wake(state: &State) -> Option<tokio::time::Instant> {
+    state
+        .chat
+        .wake_at(std::time::Instant::now())
+        .map(tokio::time::Instant::from_std)
+}
+
+/// What the chat arm does when it wakes: the next paint settles what a tab has become, and
+/// `drain_modes` sends what `chat.plan` says is due.
+fn chat_tick(_state: &mut State, dirty: &mut bool) {
+    *dirty = true;
+}
+
+/// News that a session changed: the chat of that terminal is read again, after a pause.
+fn chat_news(state: &mut State, terminal: u32, now: std::time::Instant) {
+    state.chat.changed(terminal, now);
+}
+
 /// The terminal and page an answer's id names: `chat-5-new`, `chat-5-old`.
 fn chat_id(id: &str) -> Option<(u32, bool)> {
     let (terminal, page) = id.strip_prefix("chat-")?.split_once('-')?;
@@ -7714,10 +7757,7 @@ where
             // A write to send, and the moment a notice is let go. `None` with nothing to do.
             let asks_at = state.asks.wake_at().map(tokio::time::Instant::from_std);
             // A chat read that is due: after news, a retry, or the keepalive.
-            let chat_at = state
-                .chat
-                .wake_at(std::time::Instant::now())
-                .map(tokio::time::Instant::from_std);
+            let chat_at = chat_wake(&state);
 
             tokio::select! {
                 biased;
@@ -9901,7 +9941,7 @@ where
                             Incoming::Event(EventMessage::TasksChanged) => {}
                             // The chat view asks for the page again when it shows this terminal.
                             Incoming::Event(EventMessage::MessagesChanged { terminal, .. }) => {
-                                state.chat.changed(terminal, std::time::Instant::now());
+                                chat_news(&mut state, terminal, std::time::Instant::now());
                             }
                             Incoming::Event(EventMessage::Listen { terminal, listener, on }) => {
                                 let now = std::time::Instant::now();
@@ -10133,6 +10173,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    chat_tick(&mut state, &mut dirty);
                     drain_modes(&mut state, &mut control_seq, &mut wr, &mut dirty).await?;
                 }
                 _ = async {
@@ -12893,11 +12934,11 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         ControlResponse::Messages {
             id,
             revision,
+            reset,
             first_seq,
             has_older,
             items,
             warnings,
-            ..
         } => {
             if let Some((terminal, older)) = chat_id(&id) {
                 let page = qoop_parsed::Digest {
@@ -12907,17 +12948,20 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     items,
                     warnings,
                 };
-                state
-                    .chat
-                    .answered(terminal, older, page, std::time::Instant::now());
+                let now = std::time::Instant::now();
+                state.chat.answered(terminal, older, reset, page, now);
                 // The wait that notice named is over.
-                if state.message.as_deref() == Some(CHAT_WAITS) && state.chat.has_view(terminal) {
+                if terminal == state.focused
+                    && state.message.as_deref() == Some(CHAT_WAITS)
+                    && state.chat.has_view(terminal)
+                {
                     state.message = None;
                 }
                 *dirty = true;
             }
         }
-        // The daemon will not serve this chat: the reason says whether to wait or to stop.
+        // The daemon will not serve this chat for good (a shell, a session too large), or
+        // only not now: the reason says which, and the tab it concerns hears of it.
         ControlResponse::Failed { id, reason } if chat_id(&id).is_some() => {
             if let Some((terminal, older)) = chat_id(&id)
                 && let Some(said) =
@@ -12925,17 +12969,20 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                         .chat
                         .refused(terminal, older, &reason, std::time::Instant::now())
             {
-                state.message = Some(said.to_string());
+                say_chat(state, terminal, said);
             }
             *dirty = true;
         }
         // A daemon older than the chat answers with no id: what was asked of it is refused.
         ControlResponse::Failed { id, reason }
-            if id.is_empty() && qoop_runtime::control::too_old_for(&reason, Some("Messages")) =>
+            if id.is_empty() && unknown_variant(&reason) == Some("Messages") =>
         {
-            if !state.chat.unsupported().is_empty() {
-                state.message =
-                    Some("chat needs a newer daemon: stop the session to upgrade".to_string());
+            for terminal in state.chat.unsupported() {
+                say_chat(
+                    state,
+                    terminal,
+                    "chat needs a newer daemon: stop the session to upgrade",
+                );
             }
             *dirty = true;
         }
@@ -24891,22 +24938,29 @@ mod tests {
 
     #[test]
     fn an_agent_that_exits_or_is_replaced_takes_the_chat_and_what_was_held_with_it() {
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_secs(2);
         let mut s = chat_single();
         switch_on(&mut s, 2, "fix the build");
         s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 4)));
         s.rows[1].agent = false;
         s.rows[1].program = Some("zsh".into());
-        s.refresh_chat();
-        assert!(!s.chat.wants_digest(2) && s.selection.is_none());
+        s.refresh_chat_at(now);
+        // A blink is not an exit: the terminal shows meanwhile, and the chat is kept.
+        assert!(s.chat.has_view(2) && s.selection.is_none());
+        assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
+        s.refresh_chat_at(later);
+        assert!(!s.chat.wants_digest(2));
         assert!(plain(&screen::paint(&s.frame())).contains("PTYTEXT"));
 
         let mut s = chat_single();
         switch_on(&mut s, 2, "fix the build");
         s.rows[1].program = Some("codex".into());
-        s.refresh_chat();
+        s.refresh_chat_at(now);
+        s.refresh_chat_at(later);
         assert!(!s.chat.wants_digest(2) && !s.chat.has_view(2));
         s.rows[1].program = Some("claude".into());
-        s.refresh_chat();
+        s.refresh_chat_at(later);
         assert!(!s.chat.has_view(2), "the old session does not come back");
     }
 
@@ -25142,5 +25196,267 @@ mod tests {
         // A fresh ask is a fresh try, and the key is back.
         toggle_chat(&mut s);
         assert!(keys(&s).contains("[t\u{2192}chat]"));
+    }
+
+    fn fail(id: &str, reason: &str) -> ControlResponse {
+        ControlResponse::Failed {
+            id: id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn the_unknown_variant_is_the_one_named_first_and_not_one_listed_after() {
+        let said = "unknown variant `SearchScrollback`, expected one of `Messages`, `Scrollback`";
+        assert_eq!(unknown_variant(said), Some("SearchScrollback"));
+        assert_eq!(
+            unknown_variant("unknown variant `Messages`"),
+            Some("Messages")
+        );
+        assert_eq!(unknown_variant("went offline"), None);
+        assert_eq!(unknown_variant("unknown variant `oops"), None);
+        // Through the loop's answer handler: a refusal that only lists `Messages` is not the chat's.
+        let mut s = chat_single();
+        let (mut request, mut dirty) = (0, false);
+        toggle_chat(&mut s);
+        asked_chat(&mut s);
+        apply(&mut s, fail("", said), &mut request, &mut dirty);
+        assert!(
+            s.chat.wants_digest(2)
+                && s.message.as_deref()
+                    != Some("chat needs a newer daemon: stop the session to upgrade")
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_is_not_for_good_waits_and_never_ends_the_chat() {
+        for reason in [
+            "unavailable",
+            "went offline",
+            "offline: the machine is gone",
+            "no_session",
+        ] {
+            let mut s = chat_single();
+            let (mut request, mut dirty) = (0, false);
+            toggle_chat(&mut s);
+            asked_chat(&mut s);
+            apply(
+                &mut s,
+                chat_answer("chat-2-new", 7, &["on it"]),
+                &mut request,
+                &mut dirty,
+            );
+            s.chat.changed(
+                2,
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            );
+            assert_eq!(asked_chat(&mut s).len(), 1, "{reason}");
+            apply(&mut s, fail("chat-2-new", reason), &mut request, &mut dirty);
+            assert!(
+                s.chat.wants_digest(2) && s.chat.has_view(2) && !s.chat.is_refused(2),
+                "{reason}"
+            );
+            assert_eq!(s.message, None, "{reason}: nothing to tell");
+            s.refresh_chat();
+            assert!(
+                plain(&screen::paint(&s.frame())).contains("on it"),
+                "{reason}: still the chat"
+            );
+            assert!(asked_chat(&mut s).is_empty(), "{reason}: waits its backoff");
+        }
+    }
+
+    #[test]
+    fn a_reset_page_replaces_what_is_held_through_the_answer_handler() {
+        let mut s = chat_single();
+        let (mut request, mut dirty) = (0, false);
+        toggle_chat(&mut s);
+        asked_chat(&mut s);
+        apply(
+            &mut s,
+            chat_answer("chat-2-new", 7, &["first", "second"]),
+            &mut request,
+            &mut dirty,
+        );
+        let mut reset = chat_answer("chat-2-new", 8, &["only"]);
+        if let ControlResponse::Messages { reset: flag, .. } = &mut reset {
+            *flag = true;
+        }
+        apply(&mut s, reset, &mut request, &mut dirty);
+        s.refresh_chat();
+        let shown = plain(&screen::paint(&s.frame()));
+        assert!(
+            shown.contains("only") && !shown.contains("second"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn what_a_refusal_says_waits_for_the_tab_it_concerns() {
+        let mut s = tiled_state();
+        s.palette = None;
+        let (mut request, mut dirty) = (0, false);
+        s.chat.toggle(2, Some("claude"));
+        asked_chat(&mut s);
+        // The keyboard is on terminal 1; the refusal is about 2.
+        apply(
+            &mut s,
+            fail("chat-2-new", "not_agent"),
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.focused, 1);
+        assert_eq!(s.message, None, "not said over another tab");
+        s.refresh_chat();
+        assert_eq!(s.message, None);
+        // The person goes there: it is said.
+        s.focused = 2;
+        s.refresh_chat();
+        assert_eq!(s.message.as_deref(), Some("chat is for agent tabs"));
+        s.message = None;
+        s.refresh_chat();
+        assert_eq!(s.message, None, "once");
+
+        // The old daemon's notice is kept per tab the same way.
+        let mut s = tiled_state();
+        s.palette = None;
+        s.chat.toggle(2, Some("claude"));
+        asked_chat(&mut s);
+        apply(
+            &mut s,
+            fail("", "unknown variant `Messages`"),
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(s.message, None);
+        s.focused = 2;
+        s.refresh_chat();
+        assert_eq!(
+            s.message.as_deref(),
+            Some("chat needs a newer daemon: stop the session to upgrade")
+        );
+    }
+
+    #[test]
+    fn the_loops_chat_arm_wakes_for_news_a_retry_and_a_keepalive_and_the_news_handler_feeds_it() {
+        let mut s = chat_single();
+        let (mut request, mut dirty) = (0, false);
+        assert!(chat_wake(&s).is_none(), "no flag, no wake");
+        toggle_chat(&mut s);
+        assert!(chat_wake(&s).is_some(), "a first read is due");
+        asked_chat(&mut s);
+        apply(
+            &mut s,
+            chat_answer("chat-2-new", 7, &["on it"]),
+            &mut request,
+            &mut dirty,
+        );
+        s.refresh_chat();
+        // On screen, answered: the keepalive is what it waits for.
+        let wake = chat_wake(&s).expect("a keepalive");
+        let waits = wake.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            waits > std::time::Duration::from_secs(15)
+                && waits <= std::time::Duration::from_secs(20),
+            "{waits:?}"
+        );
+        // News, through the handler the loop calls: read after the debounce.
+        let now = std::time::Instant::now();
+        chat_news(&mut s, 2, now);
+        let wake = chat_wake(&s).expect("a read after the news");
+        assert!(
+            wake.saturating_duration_since(tokio::time::Instant::now())
+                <= std::time::Duration::from_millis(250)
+        );
+        // The arm marks the frame dirty so the next paint settles what tabs have become.
+        let mut dirty = false;
+        chat_tick(&mut s, &mut dirty);
+        assert!(dirty);
+        // A refusal sets a retry, which the arm waits for as well.
+        s.chat.plan(now + std::time::Duration::from_secs(1));
+        apply(
+            &mut s,
+            fail("chat-2-new", "unavailable"),
+            &mut request,
+            &mut dirty,
+        );
+        assert!(chat_wake(&s).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_drain_the_arm_calls_sends_what_is_due_and_nothing_for_a_flag_that_is_off() {
+        let mut s = chat_single();
+        let (mut seq, mut dirty) = (0u32, false);
+        let mut wire = Vec::new();
+        drain_modes(&mut s, &mut seq, &mut wire, &mut dirty)
+            .await
+            .unwrap();
+        assert!(wire.is_empty(), "no flag, no request");
+        toggle_chat(&mut s);
+        drain_modes(&mut s, &mut seq, &mut wire, &mut dirty)
+            .await
+            .unwrap();
+        let sent = String::from_utf8_lossy(&wire).into_owned();
+        assert!(
+            sent.contains("Messages") && sent.contains("chat-2-new"),
+            "{sent}"
+        );
+        wire.clear();
+        drain_modes(&mut s, &mut seq, &mut wire, &mut dirty)
+            .await
+            .unwrap();
+        assert!(wire.is_empty(), "one in flight");
+    }
+
+    #[test]
+    fn refresh_keeps_the_screen_set_so_only_tabs_on_screen_are_kept_fresh() {
+        let mut s = tiled_state();
+        s.palette = None;
+        s.rows.push(agent(9, 5, "claude", "idle"));
+        for terminal in [1, 2, 9] {
+            s.chat.toggle(terminal, None);
+            s.chat.set_digest(terminal, chat_digest("fix"));
+        }
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_millis(200);
+        s.chat.plan(now);
+        s.chat.plan(later);
+        s.refresh_chat_at(later);
+        for terminal in [1, 2, 9] {
+            s.chat
+                .answered(terminal, false, false, chat_digest("fix"), later);
+        }
+        // 1 and 2 are tiles; 9 is in a space that is not on screen.
+        let wake = s
+            .chat
+            .wake_at(later)
+            .expect("the keepalive of the tabs on screen");
+        assert_eq!(wake, later + std::time::Duration::from_secs(20));
+        let asks = s.chat.plan(later + std::time::Duration::from_secs(21));
+        let mut asked: Vec<u32> = asks.iter().map(|a| a.terminal).collect();
+        asked.sort();
+        assert_eq!(asked, [1, 2]);
+    }
+
+    #[test]
+    fn a_tab_that_blinks_as_a_shell_costs_no_request_and_no_chat() {
+        let mut s = chat_single();
+        let now = std::time::Instant::now();
+        switch_on(&mut s, 2, "fix the build");
+        let (mut request, mut dirty) = (0, false);
+        apply(
+            &mut s,
+            chat_answer("chat-2-new", 7, &["on it"]),
+            &mut request,
+            &mut dirty,
+        );
+        asked_chat(&mut s);
+        s.rows[1].agent = false;
+        s.refresh_chat_at(now);
+        s.rows[1].agent = true;
+        s.refresh_chat_at(now + std::time::Duration::from_millis(300));
+        assert!(s.chat.has_view(2) && s.chat.wants_digest(2));
+        assert!(asked_chat(&mut s).is_empty(), "nothing asked for the blink");
+        assert!(plain(&screen::paint(&s.frame())).contains("on it"));
     }
 }

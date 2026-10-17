@@ -449,10 +449,16 @@ fn is_step(item: &Item) -> bool {
 
 /// Every row of the chat at this width, oldest first.
 pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
+    laid_out(items, cols).0
+}
+
+/// The rows, and for each row the index of the item it was drawn from (a blank row between
+/// two items belongs to the one before it), so a row can be traced back to its item.
+fn laid_out(items: &[Item], cols: usize) -> (Vec<StyledRow>, Vec<usize>) {
     if cols == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut blocks: Vec<(Kind, Vec<StyledRow>)> = Vec::new();
+    let mut blocks: Vec<(Kind, Vec<StyledRow>, usize)> = Vec::new();
     let mut at = 0;
     while at < items.len() {
         let item = &items[at];
@@ -466,15 +472,16 @@ pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
                 .filter(|it| !matches!(it, Item::Thinking { .. }))
                 .collect();
             if calls.len() >= 2 {
-                blocks.push((Kind::Step, vec![steps_row(&calls, cols)]));
+                blocks.push((Kind::Step, vec![steps_row(&calls, cols)], at));
             } else {
-                for item in &items[at..end] {
-                    blocks.push((Kind::Step, vec![step_row(item, cols)]));
+                for (n, item) in items[at..end].iter().enumerate() {
+                    blocks.push((Kind::Step, vec![step_row(item, cols)], at + n));
                 }
             }
             at = end;
             continue;
         }
+        let index = at;
         at += 1;
         let (kind, rows) = match item {
             Item::User {
@@ -496,21 +503,56 @@ pub fn layout(items: &[Item], cols: usize) -> Vec<StyledRow> {
             _ => continue,
         };
         if !rows.is_empty() {
-            blocks.push((kind, rows));
+            blocks.push((kind, rows, index));
         }
     }
     let mut out: Vec<StyledRow> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
     let mut before = None;
-    for (kind, rows) in blocks {
+    for (kind, rows, index) in blocks {
         if before.is_some_and(|b| !(b == Kind::Step && kind == Kind::Step)) {
             out.push(StyledRow::default());
+            owner.push(owner.last().copied().unwrap_or(index));
         }
+        owner.extend(std::iter::repeat_n(index, rows.len()));
         out.extend(rows);
         before = Some(kind);
     }
     // A pane too narrow for a row's own margins shows what fits of it, never a wider row.
     out.iter_mut().for_each(|row| clip(row, cols));
-    out
+    (out, owner)
+}
+
+/// What an item is, whatever its place in the page: hashed from what it says, not from its
+/// `seq` (a position in the window) or its status (which a running call changes). The same
+/// item in the page before a refresh and the one after has the same key.
+fn item_key(item: &Item) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(item).hash(&mut h);
+    match item {
+        Item::User {
+            ts,
+            text,
+            attachments,
+            ..
+        } => (
+            ts,
+            text,
+            attachments.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        )
+            .hash(&mut h),
+        Item::Agent {
+            ts, text, model, ..
+        } => (ts, text, model).hash(&mut h),
+        Item::Thinking { ms, text, .. } => (ms, text).hash(&mut h),
+        Item::Tool { id, name, .. } => (id, name).hash(&mut h),
+        Item::Subagent { summary, .. } => summary.hash(&mut h),
+        Item::Error { text, .. } => text.hash(&mut h),
+        Item::Notice { kind, text, .. } => (kind, text).hash(&mut h),
+        Item::Compaction { .. } | Item::Unknown => {}
+    }
+    h.finish()
 }
 
 /// `row` cut to `cols` columns, never leaving half of a wide character.
@@ -633,8 +675,23 @@ const MAX_PAGE: u32 = 200;
 const DEBOUNCE: Duration = Duration::from_millis(250);
 /// The daemon forgets a terminal nobody asked about for 30 s: ask again before that.
 const KEEPALIVE: Duration = Duration::from_secs(20);
-/// Between reads of a session the agent has not named yet.
-const RETRY: Duration = Duration::from_secs(3);
+/// How long a change of what a tab is (not an agent, another program) must hold before the
+/// chat it had is let go: a flap is not an exit.
+const FLAP: Duration = Duration::from_secs(1);
+/// Newest-page reads started per look, and the gap before the rest are tried.
+const STAGGER: usize = 2;
+const STAGGER_GAP: Duration = Duration::from_millis(100);
+
+/// How long to wait before trying a read again after it failed `fails` times in a row: 3 s,
+/// 6 s, 12 s, then every 30 s.
+fn backoff(fails: u32) -> Duration {
+    Duration::from_secs(match fails {
+        0 | 1 => 3,
+        2 => 6,
+        3 => 12,
+        _ => 30,
+    })
+}
 /// A read with no answer for this long is taken as lost.
 const LOST: Duration = Duration::from_secs(10);
 
@@ -643,6 +700,51 @@ fn program_line(line: &str) -> Option<String> {
     let line = line.trim();
     (!line.is_empty() && line.chars().count() <= 64 && line.chars().all(width::drawn))
         .then(|| line.to_string())
+}
+
+/// The scroll that puts the same item at the reader's row in a layout that was redone.
+///
+/// The reader's place is the item under the bottom row of what they see, and how far into it.
+/// After the refresh that item is found again by its key (the nearest one to where it was, for
+/// a key that repeats) and put back on the same row. If it is gone the nearest older item that
+/// is still there stands in, at its last row.
+fn anchored(
+    old: &Shown,
+    scroll: usize,
+    keys: &[u64],
+    owner: &[usize],
+    total: usize,
+) -> Option<usize> {
+    let height = old.drawn.map_or(0, |(rows, _)| rows);
+    let end = old
+        .all
+        .len()
+        .checked_sub(scroll.min(max_scroll(&old.all, height)))?;
+    let bottom = end.checked_sub(1)?;
+    let item = *old.owner.get(bottom)?;
+    let offset = bottom - old.owner.iter().position(|o| *o == item)?;
+    let shift = keys.len() as isize - old.keys.len() as isize;
+    for index in (0..=item).rev() {
+        let want = old.keys.get(index)?;
+        let found = keys
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| *key == want)
+            .min_by_key(|(at, _)| (*at as isize - (index as isize + shift)).abs())
+            .map(|(at, _)| at);
+        let Some(found) = found else { continue };
+        let Some(first) = owner.iter().position(|o| *o == found) else {
+            continue;
+        };
+        let bottom = if index == item {
+            let last = owner.iter().rposition(|o| *o == found)?;
+            (first + offset).min(last)
+        } else {
+            owner.iter().rposition(|o| *o == found)?
+        };
+        return Some(total.saturating_sub(bottom + 1));
+    }
+    None
 }
 
 /// What this client knows of each terminal's Chat view: which are switched on, the digest the
@@ -670,10 +772,10 @@ pub struct ChatState {
     visible: BTreeSet<u32>,
     /// Terminals typed into lately: the terminal shows until Enter, Esc or the time is up.
     typing: BTreeMap<u32, Instant>,
-    /// Terminals whose older page has been asked for and not answered.
-    asked: BTreeSet<u32>,
-    /// Terminals whose digest just grew at the top, which moves no row the reader sees.
-    prepended: BTreeSet<u32>,
+    /// What a tab has become, since when, while it is not yet known to be more than a flap.
+    changing: BTreeMap<u32, Instant>,
+    /// Things to say about a tab when the person is looking at it.
+    notes: BTreeMap<u32, &'static str>,
     /// What to ask the daemon for, per flagged terminal.
     feeds: BTreeMap<u32, Feed>,
     /// The flagged terminals that are on screen.
@@ -694,6 +796,20 @@ struct Feed {
     /// News came while a read was out: one more read follows its answer.
     stale: bool,
     last_read: Option<Instant>,
+    /// Reads that failed in a row, for the backoff.
+    fails: u32,
+    /// An older page is out: what it was asked with.
+    older: Option<Older>,
+    /// No older page is asked for before this.
+    older_wait: Option<Instant>,
+}
+
+/// The token of an older page in flight: its answer is taken only for the revision and the
+/// items held that it was asked about.
+struct Older {
+    since: Instant,
+    revision: u64,
+    skip: usize,
 }
 
 /// One `Messages` request to send.
@@ -712,6 +828,9 @@ struct Shown {
     cols: usize,
     /// Every row at this width, so a scroll or a new height does not lay the chat out again.
     all: Vec<StyledRow>,
+    /// The item each row was drawn from, and each item's key (`item_key`).
+    owner: Vec<usize>,
+    keys: Vec<u64>,
     /// The height and scroll `snapshot` was drawn for.
     drawn: Option<(usize, usize)>,
     snapshot: SnapshotWire,
@@ -739,13 +858,9 @@ impl ChatState {
         }
     }
 
-    /// The seam the daemon's answer fills: the newest page of `terminal`'s session.
-    ///
-    /// Nothing calls this yet: the producer is the daemon's `Messages` answer (a client
-    /// polling `wanting()`, sending the request and handing the response here), which comes
-    /// with the daemon work. Until then the view never switches, and fixtures fill it in tests.
+    /// The newest page of `terminal`'s session replaces what is held (the daemon's answer,
+    /// through `answered`; fixtures in tests). The same page again is no change.
     pub fn set_digest(&mut self, terminal: u32, digest: Digest) {
-        self.asked.remove(&terminal);
         if self
             .digests
             .get(&terminal)
@@ -758,30 +873,41 @@ impl ChatState {
     }
 
     /// How many items of `terminal`'s session are held, when the reader is at the oldest of
-    /// them and older ones exist: the `skip` for the next request. Answered once per request,
-    /// until `set_older` or `set_digest` brings the answer.
-    pub fn wants_older(&mut self, terminal: u32) -> Option<usize> {
-        let (_, digest) = self.digests.get(&terminal)?;
+    /// them and older ones exist: the `skip` for the next request, and what it was asked
+    /// about is kept to check the answer by. Answered once per request, until it is answered
+    /// or taken as lost, and not while a failed one waits to be tried again.
+    pub fn wants_older(&mut self, terminal: u32, now: Instant) -> Option<usize> {
+        let (_, held) = self.digests.get(&terminal)?;
         let at_top = self
             .shown
             .get(&terminal)
             .is_some_and(|s| self.scrolled(terminal) >= s.max);
-        (self.on.contains(&terminal) && digest.has_older && at_top && self.asked.insert(terminal))
-            .then_some(digest.items.len())
+        if !self.on.contains(&terminal) || !held.has_older || !at_top {
+            return None;
+        }
+        let (revision, skip) = (held.revision, held.items.len());
+        let feed = self.feeds.entry(terminal).or_default();
+        if feed.older.is_some() || feed.older_wait.is_some_and(|wait| now < wait) {
+            return None;
+        }
+        feed.older_wait = None;
+        feed.older = Some(Older {
+            since: now,
+            revision,
+            skip,
+        });
+        Some(skip)
     }
 
-    /// The answer to `wants_older`: older items, put in front of the ones held without moving
-    /// the reader. A different revision means the session changed under the request, and the
-    /// page replaces everything (the response's `reset`).
+    /// Older items, put in front of the ones held. Whether the page fits what was asked is
+    /// `answered`'s to say; a page of another revision here replaces everything.
     pub fn set_older(&mut self, terminal: u32, older: Digest) {
         let Some((_, held)) = self.digests.get_mut(&terminal) else {
             return;
         };
         if older.revision != held.revision {
-            self.scroll.remove(&terminal);
             return self.set_digest(terminal, older);
         }
-        self.asked.remove(&terminal);
         let mut items = older.items;
         items.append(&mut held.items);
         held.items = items;
@@ -790,7 +916,6 @@ impl ChatState {
         held.warnings += older.warnings;
         self.stamp += 1;
         self.digests.get_mut(&terminal).expect("held above").0 = self.stamp;
-        self.prepended.insert(terminal);
     }
 
     /// Whether `terminal` needs a digest: its Chat switch is on.
@@ -813,9 +938,11 @@ impl ChatState {
     }
 
     /// Settle the terminals the daemon lists. A new agent terminal of a remembered program
-    /// starts on. A terminal that is gone, stopped being an agent, or runs another program
-    /// now takes its state with it: its digest is a session that is not there any more.
-    pub fn adopt(&mut self, rows: &[AgentRow]) {
+    /// starts on. A terminal that is gone takes its state with it at once. One that stopped
+    /// being an agent, or runs another program, loses its chat when it has been so for
+    /// `FLAP`: until then its digest is kept, so a tab that blinks costs nothing and asks
+    /// for nothing.
+    pub fn adopt(&mut self, rows: &[AgentRow], now: Instant) {
         let live: BTreeSet<u32> = rows.iter().map(|r| r.terminal).collect();
         for gone in self
             .known()
@@ -829,16 +956,25 @@ impl ChatState {
             // A program that cannot be read for the moment is not a different program.
             let changed = was.as_ref().is_some_and(|(agent, program)| {
                 (*agent && !row.agent)
-                    || (row.agent
+                    || (*agent
+                        && row.agent
                         && program.is_some()
                         && row.program.is_some()
                         && *program != row.program)
             });
+            let mut letting_go = false;
             if changed {
+                let since = *self.changing.entry(row.terminal).or_insert(now);
+                if now.saturating_duration_since(since) < FLAP {
+                    continue;
+                }
+                letting_go = true;
                 self.forget(row.terminal);
+            } else {
+                self.changing.remove(&row.terminal);
             }
             let program = match (&row.program, was) {
-                (None, Some((_, kept))) if !changed => kept,
+                (None, Some((_, kept))) if !letting_go => kept,
                 (program, _) => program.clone(),
             };
             self.seen.insert(row.terminal, (row.agent, program));
@@ -867,10 +1003,10 @@ impl ChatState {
         self.scroll.remove(&terminal);
         self.shown.remove(&terminal);
         self.typing.remove(&terminal);
-        self.asked.remove(&terminal);
-        self.prepended.remove(&terminal);
         self.feeds.remove(&terminal);
         self.refused.remove(&terminal);
+        self.changing.remove(&terminal);
+        self.notes.remove(&terminal);
     }
 
     /// Flip the switch of `terminal` and remember it for its program. Answers the new state.
@@ -898,9 +1034,9 @@ impl ChatState {
         self.screen = on_screen;
     }
 
-    /// When the next page is due for `terminal`, if one is: a first read at once, a read
-    /// that news or a retry asked for, or the keepalive of one on screen. Nothing while a
-    /// request is out.
+    /// When the next newest-page read of `terminal` is due, if one is: a first read at once,
+    /// a read that news, a retry or a backoff asked for, or the keepalive of one on screen.
+    /// Nothing while a read is out.
     fn due_at(&self, terminal: u32, now: Instant) -> Option<Instant> {
         let Some(feed) = self.feeds.get(&terminal) else {
             return Some(now);
@@ -916,38 +1052,63 @@ impl ChatState {
             .into_iter()
             .flatten()
             .min()
-            .or(match feed.last_read {
-                None => Some(now),
-                Some(_) => None,
-            })
+            .or(feed.last_read.is_none().then_some(now))
     }
 
-    /// When the loop must look again: the soonest due read of a flagged terminal.
+    /// When the loop must look again: the soonest due read, the moment a read out is taken as
+    /// lost, the end of an older page's wait, or the end of a doubt about what a tab is.
     pub fn wake_at(&self, now: Instant) -> Option<Instant> {
-        self.on
-            .iter()
-            .filter_map(|t| match self.feeds.get(t).and_then(|feed| feed.out) {
-                // A read out is waited for, until it is taken as lost.
-                Some(out) => Some(out + LOST + Duration::from_millis(1)),
-                None => self.due_at(*t, now),
-            })
+        let lost = |since: Instant| since + LOST + Duration::from_millis(1);
+        let feeds = self.on.iter().flat_map(|t| {
+            let feed = self.feeds.get(t);
+            [
+                match feed.and_then(|f| f.out) {
+                    Some(out) => Some(lost(out)),
+                    None => self.due_at(*t, now),
+                },
+                feed.and_then(|f| f.older.as_ref()).map(|o| lost(o.since)),
+                feed.and_then(|f| f.older_wait),
+            ]
+        });
+        feeds
+            .flatten()
+            .chain(self.changing.values().map(|since| *since + FLAP))
             .min()
     }
 
-    /// The requests to send now. One newest-page read in flight per terminal, the latest
-    /// news wins; a page of older items when the reader is at the top of what is held.
-    /// Nothing for a terminal whose flag is off.
+    /// The requests to send now. One newest-page read in flight per terminal, the latest news
+    /// wins, and no more than `STAGGER` start in one go, so a window that opens with many
+    /// agent tabs on does not ask for all of them at once. A page of older items when the
+    /// reader is at the top of what is held. Nothing for a terminal whose flag is off.
     pub fn plan(&mut self, now: Instant) -> Vec<Request> {
         let mut out = Vec::new();
+        let mut started = 0;
         for terminal in self.on.iter().copied().collect::<Vec<_>>() {
             let feed = self.feeds.entry(terminal).or_default();
+            // A read that never came back is a failed one, and tried again on its own clock.
             if feed
                 .out
                 .is_some_and(|at| now.saturating_duration_since(at) > LOST)
             {
                 feed.out = None;
+                feed.fails += 1;
+                feed.due = Some(now + backoff(feed.fails));
+            }
+            if feed
+                .older
+                .as_ref()
+                .is_some_and(|o| now.saturating_duration_since(o.since) > LOST)
+            {
+                feed.older = None;
+                feed.fails += 1;
+                feed.older_wait = Some(now + backoff(feed.fails));
             }
             if self.due_at(terminal, now).is_some_and(|at| at <= now) {
+                if started >= STAGGER {
+                    self.feeds.entry(terminal).or_default().due = Some(now + STAGGER_GAP);
+                    continue;
+                }
+                started += 1;
                 let held = self
                     .digests
                     .get(&terminal)
@@ -965,13 +1126,12 @@ impl ChatState {
                     older: false,
                 });
             }
-            if let Some(skip) = self.wants_older(terminal) {
-                let revision = self.digests.get(&terminal).map(|(_, d)| d.revision);
+            if let Some(skip) = self.wants_older(terminal, now) {
                 out.push(Request {
                     terminal,
                     skip: skip as u32,
                     limit: PAGE,
-                    revision,
+                    revision: self.digests.get(&terminal).map(|(_, d)| d.revision),
                     older: true,
                 });
             }
@@ -994,28 +1154,59 @@ impl ChatState {
     }
 
     /// A page the daemon sent for `terminal`: `older` for the one asked at the top of the
-    /// chat, else the newest. Either replaces or extends what is held (`set_digest`,
-    /// `set_older`), and `reset` needs nothing more: both take a page of another revision
-    /// as the whole.
-    pub fn answered(&mut self, terminal: u32, older: bool, page: Digest, now: Instant) {
+    /// chat, else the newest.
+    ///
+    /// A `reset` page is the newest of a session that changed under the read, whichever read
+    /// it answers: it replaces everything, and an older page asked of what the session was is
+    /// stale and will not be taken. Any other older page is taken only if it is of the
+    /// revision it was asked with, still the one held, and was asked for the items still held.
+    pub fn answered(
+        &mut self,
+        terminal: u32,
+        older: bool,
+        reset: bool,
+        page: Digest,
+        now: Instant,
+    ) {
         if !self.on.contains(&terminal) {
             return;
         }
-        if older {
-            return self.set_older(terminal, page);
-        }
+        let held = self
+            .digests
+            .get(&terminal)
+            .map(|(_, d)| (d.revision, d.items.len()));
         let feed = self.feeds.entry(terminal).or_default();
-        feed.out = None;
+        if older && !reset {
+            // The answer to the page asked for is of the revision it was asked with; any
+            // other is for a page asked of a session that has since changed, and is not
+            // this one's to take.
+            let Some(token) = feed.older.take_if(|o| o.revision == page.revision) else {
+                return;
+            };
+            if held == Some((token.revision, token.skip)) {
+                self.set_older(terminal, page);
+            }
+            return;
+        }
+        if reset {
+            feed.older = None;
+        }
+        if !older {
+            feed.out = None;
+        }
         feed.last_read = Some(now);
-        if std::mem::take(&mut feed.stale) {
+        feed.fails = 0;
+        if !older && std::mem::take(&mut feed.stale) {
             feed.due = Some(now + DEBOUNCE);
         }
         self.refused.remove(&terminal);
         self.set_digest(terminal, page);
     }
 
-    /// The daemon refused a read of `terminal` with `reason`. Answers what to tell the
-    /// person when that ends the chat for the tab; `None` when it only waits.
+    /// The daemon refused a read of `terminal` with `reason`. Only `not_agent` and `too_large`
+    /// are for good, and answer what to tell the person. Anything else (no session yet, no
+    /// disk answer, a machine that is offline, words this build does not know) waits and
+    /// tries again, slower each time, and never costs the chat held.
     pub fn refused(
         &mut self,
         terminal: u32,
@@ -1026,38 +1217,38 @@ impl ChatState {
         if !self.on.contains(&terminal) {
             return None;
         }
-        // An older page that finds no session is not asked again until a newer read lands.
-        if older && reason != "no_session" {
-            self.asked.remove(&terminal);
-        }
         match reason {
-            // The agent has not said which session it is in yet: ask again.
-            "no_session" => {
-                let feed = self.feeds.entry(terminal).or_default();
-                if !older {
-                    feed.out = None;
-                    feed.due = Some(now + RETRY);
-                }
-                None
+            "too_large" => {
+                return Some(self.give_up(
+                    terminal,
+                    "this session is too large for chat, use the terminal",
+                ));
             }
-            "too_large" => Some(self.give_up(
-                terminal,
-                "this session is too large for chat, use the terminal",
-            )),
-            "not_agent" => Some(self.give_up(terminal, "chat is for agent tabs")),
-            _ => Some(self.give_up(terminal, "chat is not available for this tab")),
+            "not_agent" => return Some(self.give_up(terminal, "chat is for agent tabs")),
+            _ => {}
         }
+        let feed = self.feeds.entry(terminal).or_default();
+        feed.fails += 1;
+        let at = now + backoff(feed.fails);
+        if older {
+            feed.older = None;
+            feed.older_wait = Some(at);
+        } else {
+            feed.out = None;
+            feed.due = Some(at);
+        }
+        None
     }
 
-    /// A daemon too old to know `Messages` answers with no id: every read in flight was its.
-    /// Answers the terminals that gave up.
+    /// A daemon too old to know `Messages` answers with no id. The reads it was holding were
+    /// its refusal: those chats end, and the terminals are answered. Tabs only waiting for a
+    /// retry had asked nothing of it.
     pub fn unsupported(&mut self) -> Vec<u32> {
         let asked: Vec<u32> = self
             .feeds
             .iter()
-            .filter(|(_, feed)| feed.out.is_some())
+            .filter(|(_, feed)| feed.out.is_some() || feed.older.is_some())
             .map(|(t, _)| *t)
-            .chain(self.asked.iter().copied())
             .collect();
         for terminal in &asked {
             self.give_up(*terminal, "");
@@ -1073,8 +1264,6 @@ impl ChatState {
         self.scroll.remove(&terminal);
         self.shown.remove(&terminal);
         self.typing.remove(&terminal);
-        self.asked.remove(&terminal);
-        self.prepended.remove(&terminal);
         self.feeds.remove(&terminal);
         self.refused.insert(terminal);
         said
@@ -1083,6 +1272,16 @@ impl ChatState {
     /// Whether the daemon refused to serve `terminal`: the key row stops offering the switch.
     pub fn is_refused(&self, terminal: u32) -> bool {
         self.refused.contains(&terminal)
+    }
+
+    /// Something to tell the person about `terminal`, kept until they are looking at it.
+    pub fn note(&mut self, terminal: u32, said: &'static str) {
+        self.notes.insert(terminal, said);
+    }
+
+    /// What is waiting to be said about `terminal`, once.
+    pub fn take_note(&mut self, terminal: u32) -> Option<&'static str> {
+        self.notes.remove(&terminal)
     }
 
     /// Put `program` in or out of the memory file. The file is read again first and only this
@@ -1165,21 +1364,20 @@ impl ChatState {
                 {
                     self.layouts += 1;
                 }
-                let all = layout(&digest.items, cols);
-                // Rows added below stay below the reader: a chat scrolled back, or one being
-                // selected from, keeps the same text in view.
-                // ponytail: counted in rows, so a window that also drops old items at the top
-                // drifts by what it dropped; anchoring by item needs stable ids from the daemon.
-                let added = match self.shown.get(&terminal) {
-                    Some(old) if old.cols == cols && !self.prepended.contains(&terminal) => {
-                        all.len().saturating_sub(old.all.len())
-                    }
-                    _ => 0,
-                };
-                self.prepended.remove(&terminal);
+                let (all, owner) = laid_out(&digest.items, cols);
+                let keys: Vec<u64> = digest.items.iter().map(item_key).collect();
+                // A chat being read, or selected from, keeps the same text where it was
+                // whatever came or went around it; one at the bottom follows the newest.
                 let scroll = self.scroll.entry(terminal).or_default();
                 if *scroll > 0 || held {
-                    *scroll += added;
+                    let at = self
+                        .shown
+                        .get(&terminal)
+                        .filter(|old| old.cols == cols)
+                        .and_then(|old| anchored(old, *scroll, &keys, &owner, all.len()));
+                    if let Some(at) = at {
+                        *scroll = at;
+                    }
                 }
                 self.shown.insert(
                     terminal,
@@ -1187,6 +1385,8 @@ impl ChatState {
                         stamp: *stamp,
                         cols,
                         all,
+                        owner,
+                        keys,
                         drawn: None,
                         snapshot: snapshot(&[], cols),
                         max: 0,
@@ -1886,13 +2086,13 @@ mod tests {
 
         // A new window: a new tab of claude starts on, a codex tab and a shell do not.
         let mut next = ChatState::read(Some(file.clone()));
-        next.adopt(&[row(10, "claude"), row(11, "codex")]);
+        next.adopt(&[row(10, "claude"), row(11, "codex")], Instant::now());
         assert!(next.wants_digest(10));
         assert!(!next.wants_digest(11));
 
         // A person's own switch is not undone by the next list of rows.
         next.toggle(10, Some("claude"));
-        next.adopt(&[row(10, "claude"), row(11, "codex")]);
+        next.adopt(&[row(10, "claude"), row(11, "codex")], Instant::now());
         assert!(!next.wants_digest(10));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
         assert!(!ChatState::read(Some(file)).programs.contains("claude"));
@@ -1904,11 +2104,11 @@ mod tests {
         shell.agent = false;
         let mut chat = ChatState::default();
         chat.programs.insert("claude".into());
-        chat.adopt(&[shell, row(6, "claude")]);
+        chat.adopt(&[shell, row(6, "claude")], Instant::now());
         assert!(!chat.wants_digest(5));
         assert!(chat.wants_digest(6));
         chat.set_digest(6, digest(vec![agent("hi")]));
-        chat.adopt(&[]);
+        chat.adopt(&[], Instant::now());
         assert!(!chat.wants_digest(6));
         assert!(!chat.has_view(6));
     }
@@ -1968,7 +2168,7 @@ mod tests {
     fn a_terminal_that_stops_being_an_agent_or_changes_program_loses_its_chat() {
         let mut chat = ChatState::default();
         chat.programs.insert("claude".into());
-        chat.adopt(&[row(5, "claude"), row(6, "claude")]);
+        chat.adopt(&[row(5, "claude"), row(6, "claude")], Instant::now());
         chat.set_digest(5, digest(numbered(3)));
         chat.set_digest(6, digest(numbered(3)));
         chat.scroll_by(5, true, 1);
@@ -1977,8 +2177,12 @@ mod tests {
         // Claude exits to a shell: no agent, no chat, no digest, and the shell never adopts.
         let mut shell = row(5, "zsh");
         shell.agent = false;
-        // Claude replaced by codex: another session, and codex is not remembered.
-        chat.adopt(&[shell, row(6, "codex")]);
+        // Claude replaced by codex: another session, and codex is not remembered. Held for a
+        // second before it counts, so a blink is not an exit.
+        let t0 = Instant::now();
+        chat.adopt(&[shell.clone(), row(6, "codex")], t0);
+        assert!(chat.has_view(5) && chat.has_view(6), "not yet");
+        chat.adopt(&[shell, row(6, "codex")], t0 + FLAP);
         for terminal in [5, 6] {
             assert!(!chat.wants_digest(terminal), "{terminal}");
             assert!(!chat.has_view(terminal), "{terminal}");
@@ -1989,7 +2193,7 @@ mod tests {
 
         // Claude starts again in the tab: the remembered choice applies afresh, with no
         // digest of the session that ended.
-        chat.adopt(&[row(5, "claude"), row(6, "codex")]);
+        chat.adopt(&[row(5, "claude"), row(6, "codex")], Instant::now());
         assert!(chat.wants_digest(5) && !chat.has_view(5));
         assert!(!chat.wants_digest(6));
     }
@@ -1998,21 +2202,21 @@ mod tests {
     fn a_program_that_cannot_be_read_for_a_moment_is_not_another_program() {
         let mut chat = ChatState::default();
         chat.toggle(5, None);
-        chat.adopt(&[row(5, "claude")]);
+        chat.adopt(&[row(5, "claude")], Instant::now());
         chat.toggle(5, None);
         chat.toggle(5, None);
         chat.set_digest(5, digest(numbered(2)));
         let mut unread = row(5, "claude");
         unread.program = None;
-        chat.adopt(&[unread]);
-        chat.adopt(&[row(5, "claude")]);
+        chat.adopt(&[unread], Instant::now());
+        chat.adopt(&[row(5, "claude")], Instant::now());
         assert!(chat.has_view(5), "kept through the gap");
     }
 
     #[test]
     fn a_reused_terminal_id_starts_clean() {
         let mut chat = ChatState::default();
-        chat.adopt(&[row(7, "claude")]);
+        chat.adopt(&[row(7, "claude")], Instant::now());
         chat.toggle(7, Some("nobody"));
         chat.set_digest(7, digest(numbered(30)));
         chat.render(&[want(7, 10, 4)]);
@@ -2020,11 +2224,11 @@ mod tests {
         chat.typed(7, b"x", Instant::now());
         assert!(chat.typing(7));
 
-        chat.adopt(&[]);
-        chat.adopt(&[row(7, "claude")]);
+        chat.adopt(&[], Instant::now());
+        chat.adopt(&[row(7, "claude")], Instant::now());
         assert!(!chat.wants_digest(7) && !chat.has_view(7) && !chat.typing(7));
         assert_eq!(chat.scrolled(7), 0);
-        assert_eq!(chat.wants_older(7), None);
+        assert_eq!(chat.wants_older(7, Instant::now()), None);
         chat.render(&[want(7, 10, 4)]);
         assert!(chat.shown(7).is_none());
     }
@@ -2178,11 +2382,19 @@ mod tests {
         };
         chat.set_digest(3, newest);
         chat.render(&[want(3, 10, 5)]);
-        assert_eq!(chat.wants_older(3), None, "at the bottom, not the top");
+        assert_eq!(
+            chat.wants_older(3, Instant::now()),
+            None,
+            "at the bottom, not the top"
+        );
         chat.scroll_by(3, true, 1000);
         chat.render(&[want(3, 10, 5)]);
-        assert_eq!(chat.wants_older(3), Some(10), "the items held, for `skip`");
-        assert_eq!(chat.wants_older(3), None, "asked once");
+        assert_eq!(
+            chat.wants_older(3, Instant::now()),
+            Some(10),
+            "the items held, for `skip`"
+        );
+        assert_eq!(chat.wants_older(3, Instant::now()), None, "asked once");
         let before = visible(&chat, 3);
 
         let older = Digest {
@@ -2201,7 +2413,7 @@ mod tests {
         chat.scroll_by(3, true, 1000);
         chat.render(&[want(3, 10, 5)]);
         assert_eq!(visible(&chat, 3)[0], "old0");
-        assert_eq!(chat.wants_older(3), None);
+        assert_eq!(chat.wants_older(3, Instant::now()), None);
     }
 
     #[test]
@@ -2221,7 +2433,7 @@ mod tests {
         chat.render(&[want(3, 10, 5)]);
         chat.scroll_by(3, true, 1000);
         chat.render(&[want(3, 10, 5)]);
-        assert_eq!(chat.wants_older(3), Some(10));
+        assert_eq!(chat.wants_older(3, Instant::now()), Some(10));
         // The session changed under the request: the daemon answers with the newest page.
         chat.set_older(
             3,
@@ -2238,7 +2450,7 @@ mod tests {
         assert_eq!(chat.digests[&3].1.revision, 2);
         assert_eq!(chat.scrolled(3), 0);
         assert_eq!(visible(&chat, 3)[0], "fresh");
-        assert_eq!(chat.wants_older(3), None);
+        assert_eq!(chat.wants_older(3, Instant::now()), None);
     }
 
     #[test]
@@ -2334,9 +2546,11 @@ mod tests {
                 older: false
             }]
         );
-        // Out: nothing again, however long, until it is taken as lost.
+        // Out: nothing again, however long, until it is taken as lost, and then it is a
+        // failed read and waits its backoff.
         assert!(chat.plan(now + Duration::from_secs(5)).is_empty());
-        assert_eq!(chat.plan(now + Duration::from_secs(11)).len(), 1);
+        assert!(chat.plan(now + Duration::from_secs(11)).is_empty());
+        assert_eq!(chat.plan(now + Duration::from_secs(14)).len(), 1);
         chat.toggle(3, None);
         assert!(chat.plan(now + Duration::from_secs(60)).is_empty());
         assert_eq!(chat.wake_at(now), None);
@@ -2349,7 +2563,7 @@ mod tests {
         on(&mut chat, 3);
         chat.plan(now);
         for (held, want) in [(3u32, 60u32), (100, 100), (250, 200)] {
-            chat.answered(3, false, page(7, numbered(held)), now);
+            chat.answered(3, false, false, page(7, numbered(held)), now);
             chat.changed(3, now);
             let asks = chat.plan(now + DEBOUNCE);
             assert_eq!(asks.len(), 1, "{held}");
@@ -2365,7 +2579,7 @@ mod tests {
         let mut chat = ChatState::default();
         on(&mut chat, 3);
         chat.plan(t0);
-        chat.answered(3, false, page(1, numbered(2)), t0);
+        chat.answered(3, false, false, page(1, numbered(2)), t0);
         assert_eq!(chat.wake_at(t0), None, "quiet, and not on screen");
 
         chat.changed(3, t0 + Duration::from_millis(10));
@@ -2379,7 +2593,7 @@ mod tests {
         chat.changed(3, t0 + Duration::from_millis(310));
         assert!(chat.plan(t0 + Duration::from_secs(1)).is_empty());
         let answered = t0 + Duration::from_millis(1200);
-        chat.answered(3, false, page(2, numbered(3)), answered);
+        chat.answered(3, false, false, page(2, numbered(3)), answered);
         assert!(chat.plan(answered + Duration::from_millis(100)).is_empty());
         assert_eq!(chat.plan(answered + DEBOUNCE).len(), 1);
 
@@ -2396,7 +2610,7 @@ mod tests {
         on(&mut chat, 4);
         chat.plan(t0);
         for t in [3, 4] {
-            chat.answered(t, false, page(1, numbered(2)), t0);
+            chat.answered(t, false, false, page(1, numbered(2)), t0);
         }
         chat.set_screen([3].into());
         assert!(chat.plan(t0 + Duration::from_secs(19)).is_empty());
@@ -2413,27 +2627,79 @@ mod tests {
     }
 
     #[test]
-    fn no_session_waits_three_seconds_and_keeps_the_flag() {
+    fn a_read_that_fails_waits_three_six_twelve_then_thirty_seconds_and_keeps_the_flag() {
         let t0 = Instant::now();
         let mut chat = ChatState::default();
         on(&mut chat, 3);
         chat.plan(t0);
-        assert_eq!(chat.refused(3, false, "no_session", t0), None);
-        assert!(chat.wants_digest(3) && !chat.is_refused(3));
-        assert!(chat.plan(t0 + Duration::from_secs(2)).is_empty());
-        assert_eq!(chat.plan(t0 + Duration::from_secs(3)).len(), 1);
-        // And again, for as long as the flag is on.
-        chat.refused(3, false, "no_session", t0 + Duration::from_secs(3));
-        assert_eq!(chat.plan(t0 + Duration::from_secs(6)).len(), 1);
+        let mut now = t0;
+        for wait in [3, 6, 12, 30, 30] {
+            assert_eq!(chat.refused(3, false, "no_session", now), None);
+            assert!(chat.wants_digest(3) && !chat.is_refused(3));
+            let early = now + Duration::from_secs(wait) - Duration::from_millis(1);
+            assert!(chat.plan(early).is_empty(), "{wait}: not before");
+            assert_eq!(chat.wake_at(now), Some(now + Duration::from_secs(wait)));
+            now += Duration::from_secs(wait);
+            assert_eq!(chat.plan(now).len(), 1, "{wait}: then");
+        }
+        // An answer ends the run: the next failure starts from three seconds again.
+        chat.answered(3, false, false, page(1, numbered(2)), now);
+        chat.changed(3, now);
+        chat.plan(now + DEBOUNCE);
+        chat.refused(3, false, "no_session", now + DEBOUNCE);
+        assert_eq!(
+            chat.wake_at(now),
+            Some(now + DEBOUNCE + Duration::from_secs(3))
+        );
     }
 
     #[test]
-    fn a_refusal_that_will_not_pass_turns_the_flag_off_and_says_why() {
+    fn a_refusal_that_is_not_for_good_never_ends_the_chat_or_costs_what_is_held() {
+        let t0 = Instant::now();
+        for reason in [
+            "unavailable",
+            "no_session",
+            "went offline",
+            "offline",
+            "something this build never heard of",
+            "",
+        ] {
+            let mut chat = ChatState::default();
+            on(&mut chat, 3);
+            chat.plan(t0);
+            chat.answered(
+                3,
+                false,
+                false,
+                Digest {
+                    has_older: true,
+                    ..page(5, numbered(10))
+                },
+                t0,
+            );
+            chat.render(&[want(3, 10, 5)]);
+            chat.scroll_by(3, true, 1000);
+            // A refused older page: the digest stays, and it is asked again after a wait.
+            assert_eq!(chat.wants_older(3, t0), Some(10));
+            assert_eq!(chat.refused(3, true, reason, t0), None, "{reason:?}");
+            assert!(chat.has_view(3) && !chat.is_refused(3), "{reason:?}");
+            assert_eq!(chat.digests[&3].1.items.len(), 10);
+            assert_eq!(chat.wants_older(3, t0 + Duration::from_secs(2)), None);
+            assert_eq!(chat.wants_older(3, t0 + Duration::from_secs(3)), Some(10));
+            // A refused refresh: the flag stays, the chat stays, the read comes again.
+            chat.changed(3, t0);
+            chat.plan(t0 + DEBOUNCE);
+            assert_eq!(chat.refused(3, false, reason, t0), None, "{reason:?}");
+            assert!(chat.wants_digest(3) && chat.has_view(3), "{reason:?}");
+            assert!(chat.wake_at(t0).is_some());
+        }
+    }
+
+    #[test]
+    fn only_not_agent_and_too_large_end_the_chat_and_say_why() {
         let t0 = Instant::now();
         for (reason, said) in [
             ("not_agent", "chat is for agent tabs"),
-            ("unavailable", "chat is not available for this tab"),
-            ("whatever_else", "chat is not available for this tab"),
             (
                 "too_large",
                 "this session is too large for chat, use the terminal",
@@ -2469,7 +2735,7 @@ mod tests {
         on(&mut chat, 3);
         on(&mut chat, 4);
         chat.plan(t0);
-        chat.answered(4, false, page(1, numbered(2)), t0);
+        chat.answered(4, false, false, page(1, numbered(2)), t0);
         chat.changed(4, t0);
         chat.plan(t0 + DEBOUNCE);
         let mut gone = chat.unsupported();
@@ -2488,6 +2754,7 @@ mod tests {
         chat.plan(t0);
         chat.answered(
             3,
+            false,
             false,
             Digest {
                 has_older: true,
@@ -2511,7 +2778,7 @@ mod tests {
         );
         assert!(chat.plan(t0).is_empty(), "asked once");
         let older: Vec<Item> = (0..4).map(|n| agent(&format!("old{n}"))).collect();
-        chat.answered(3, true, page(5, older), t0);
+        chat.answered(3, true, false, page(5, older), t0);
         assert_eq!(chat.digests[&3].1.items.len(), 14);
         assert!(chat.plan(t0).is_empty(), "nothing older is left");
     }
@@ -2523,7 +2790,331 @@ mod tests {
         on(&mut chat, 3);
         chat.plan(t0);
         chat.toggle(3, None);
-        chat.answered(3, false, page(1, numbered(2)), t0);
+        chat.answered(3, false, false, page(1, numbered(2)), t0);
         assert!(!chat.has_view(3) && chat.digests.is_empty());
+    }
+
+    fn older_page(first: u32, count: u32, revision: u64, has_older: bool) -> Digest {
+        Digest {
+            revision,
+            first_seq: first,
+            has_older,
+            items: (0..count)
+                .map(|n| agent(&format!("old{first}-{n}")))
+                .collect(),
+            warnings: 0,
+        }
+    }
+
+    /// A chat of `held` items at the top of its scroll, an older page out for it.
+    fn at_the_top(held: u32, now: Instant) -> ChatState {
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(now);
+        let newest = Digest {
+            has_older: true,
+            ..page(5, numbered(held))
+        };
+        chat.answered(3, false, false, newest, now);
+        chat.render(&[want(3, 10, 5)]);
+        chat.scroll_by(3, true, 10_000);
+        chat
+    }
+
+    #[test]
+    fn many_tabs_starting_at_once_are_read_two_at_a_time() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        for terminal in 1..=5 {
+            on(&mut chat, terminal);
+        }
+        let ids = |asks: Vec<Request>| asks.iter().map(|a| a.terminal).collect::<Vec<_>>();
+        assert_eq!(ids(chat.plan(t0)), [1, 2]);
+        assert_eq!(chat.wake_at(t0), Some(t0 + STAGGER_GAP), "the rest soon");
+        assert!(chat.plan(t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(ids(chat.plan(t0 + STAGGER_GAP)), [3, 4]);
+        assert_eq!(ids(chat.plan(t0 + STAGGER_GAP * 2)), [5]);
+        assert!(chat.plan(t0 + STAGGER_GAP * 3).is_empty());
+    }
+
+    #[test]
+    fn a_read_lost_on_a_tab_nobody_looks_at_is_tried_again_on_its_own() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.plan(t0);
+        chat.answered(3, false, false, page(1, numbered(2)), t0);
+        chat.changed(3, t0);
+        chat.plan(t0 + DEBOUNCE);
+        // Never on screen, never answered: the loop is woken for it, and asks again.
+        let lost = t0 + DEBOUNCE + LOST + Duration::from_millis(1);
+        assert_eq!(chat.wake_at(t0), Some(lost));
+        assert!(
+            chat.plan(lost).is_empty(),
+            "a failed read waits its backoff"
+        );
+        assert_eq!(chat.wake_at(lost), Some(lost + backoff(1)));
+        assert_eq!(chat.plan(lost + backoff(1)).len(), 1);
+    }
+
+    #[test]
+    fn a_session_that_changed_under_the_read_replaces_everything_and_cancels_the_older_page() {
+        let t0 = Instant::now();
+        let mut chat = at_the_top(10, t0);
+        assert_eq!(chat.wants_older(3, t0), Some(10));
+        assert_eq!(chat.wants_older(3, t0), None, "one in flight");
+        // A refresh finds the file changed: the newest page of what it is now.
+        chat.answered(
+            3,
+            false,
+            true,
+            Digest {
+                has_older: true,
+                ..page(6, numbered(12))
+            },
+            t0,
+        );
+        assert_eq!(chat.digests[&3].1.revision, 6);
+        assert_eq!(chat.digests[&3].1.items.len(), 12);
+        // A new older page can be asked at once, for what is held now.
+        chat.render(&[want(3, 10, 5)]);
+        chat.scroll_by(3, true, 10_000);
+        assert_eq!(chat.wants_older(3, t0), Some(12));
+        // The older page asked of revision 5 comes back late: it is not taken, nothing
+        // doubles, and the new request is still the one waited for.
+        chat.answered(3, true, false, older_page(0, 10, 5, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 12);
+        assert_eq!(chat.digests[&3].1.revision, 6);
+        assert_eq!(chat.wants_older(3, t0), None);
+        chat.answered(3, true, false, older_page(0, 4, 6, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 16);
+    }
+
+    #[test]
+    fn an_older_page_is_taken_only_for_the_revision_and_the_items_it_was_asked_about() {
+        let t0 = Instant::now();
+        // The right one.
+        let mut chat = at_the_top(10, t0);
+        chat.wants_older(3, t0);
+        chat.answered(3, true, false, older_page(0, 5, 5, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 15);
+        assert!(!chat.digests[&3].1.has_older);
+
+        // Another revision than it was asked with: dropped.
+        let mut chat = at_the_top(10, t0);
+        chat.wants_older(3, t0);
+        chat.answered(3, true, false, older_page(0, 5, 9, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 10);
+
+        // The items held changed since it was asked (a refresh of another size): dropped.
+        let mut chat = at_the_top(10, t0);
+        chat.wants_older(3, t0);
+        chat.answered(
+            3,
+            false,
+            false,
+            Digest {
+                has_older: true,
+                ..page(5, numbered(12))
+            },
+            t0,
+        );
+        chat.answered(3, true, false, older_page(0, 5, 5, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 12, "no duplicated messages");
+
+        // One that was never asked for: dropped.
+        let mut chat = at_the_top(10, t0);
+        chat.answered(3, true, false, older_page(0, 5, 5, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 10);
+    }
+
+    #[test]
+    fn a_refresh_during_an_older_page_leaves_both_reads_standing() {
+        let t0 = Instant::now();
+        let mut chat = at_the_top(10, t0);
+        assert_eq!(chat.wants_older(3, t0), Some(10));
+        // News, a newest read goes out while the older one is out: two at once.
+        chat.changed(3, t0);
+        let asks = chat.plan(t0 + DEBOUNCE);
+        assert_eq!(asks.len(), 1);
+        assert!(!asks[0].older);
+        assert_eq!(chat.wants_older(3, t0 + DEBOUNCE), None, "still one older");
+        // The refresh finds the same revision and the same items: nothing changes, the older
+        // page that follows is taken.
+        chat.answered(
+            3,
+            false,
+            false,
+            Digest {
+                has_older: true,
+                ..page(5, numbered(10))
+            },
+            t0,
+        );
+        chat.answered(3, true, false, older_page(0, 5, 5, false), t0);
+        assert_eq!(chat.digests[&3].1.items.len(), 15);
+        // The same page again while an older one is out does not let a second one go.
+        let mut chat = at_the_top(10, t0);
+        chat.wants_older(3, t0);
+        chat.set_digest(
+            3,
+            Digest {
+                has_older: true,
+                ..page(5, numbered(10))
+            },
+        );
+        assert_eq!(chat.wants_older(3, t0), None);
+    }
+
+    #[test]
+    fn a_daemon_too_old_for_messages_leaves_the_tabs_that_only_wait() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        on(&mut chat, 4);
+        chat.plan(t0);
+        // Terminal 3's read failed and waits its retry; terminal 4's is out.
+        chat.refused(3, false, "unavailable", t0);
+        assert_eq!(chat.unsupported(), [4]);
+        assert!(chat.wants_digest(3) && !chat.wants_digest(4));
+    }
+
+    #[test]
+    fn a_tab_that_blinks_keeps_its_chat_and_asks_for_nothing() {
+        let t0 = Instant::now();
+        let mut chat = ChatState::default();
+        chat.programs.insert("claude".into());
+        chat.adopt(&[row(5, "claude")], t0);
+        chat.plan(t0);
+        chat.answered(5, false, false, page(1, numbered(3)), t0);
+        let mut shell = row(5, "zsh");
+        shell.agent = false;
+        chat.adopt(&[shell], t0 + Duration::from_millis(100));
+        assert_eq!(
+            chat.wake_at(t0),
+            Some(t0 + Duration::from_millis(100) + FLAP),
+            "looked at again when the doubt is over"
+        );
+        chat.adopt(&[row(5, "claude")], t0 + Duration::from_millis(600));
+        assert!(chat.has_view(5) && chat.wants_digest(5));
+        assert!(chat.plan(t0 + Duration::from_millis(700)).is_empty());
+        assert_eq!(chat.wake_at(t0), None, "the doubt is cleared");
+        // Past a second, it is an exit.
+        let mut shell = row(5, "zsh");
+        shell.agent = false;
+        chat.adopt(&[shell.clone()], t0 + Duration::from_secs(2));
+        chat.adopt(&[shell], t0 + Duration::from_secs(3));
+        assert!(!chat.wants_digest(5) && !chat.has_view(5));
+    }
+
+    #[test]
+    fn notes_are_kept_for_the_tab_they_concern_and_said_once() {
+        let mut chat = ChatState::default();
+        chat.note(3, "for three");
+        assert_eq!(chat.take_note(4), None);
+        assert_eq!(chat.take_note(3), Some("for three"));
+        assert_eq!(chat.take_note(3), None);
+    }
+
+    /// The text the reader has in view, newest last.
+    fn read(chat: &ChatState) -> Vec<String> {
+        visible(chat, 3)
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn texts(from: u32, to: u32) -> Vec<Item> {
+        (from..to).map(|n| agent(&format!("m{n}"))).collect()
+    }
+
+    #[test]
+    fn a_full_page_with_one_new_item_does_not_move_what_is_read() {
+        let t0 = Instant::now();
+        // The steady state: sixty items, the oldest falls off as the newest arrives.
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.set_digest(3, digest(texts(0, 60)));
+        chat.render(&[want(3, 20, 8)]);
+        chat.scroll_by(3, true, 25);
+        chat.render(&[want(3, 20, 8)]);
+        let before = read(&chat);
+        assert!(before.len() > 3);
+        for step in 1..=5 {
+            chat.set_digest(3, digest(texts(step, 60 + step)));
+            chat.render(&[want(3, 20, 8)]);
+            assert_eq!(read(&chat), before, "step {step}");
+        }
+        // The same at the cap of two hundred, and with several new items at once.
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.set_digest(3, digest(texts(0, 200)));
+        chat.render(&[want(3, 20, 8)]);
+        chat.scroll_by(3, true, 100);
+        chat.render(&[want(3, 20, 8)]);
+        let before = read(&chat);
+        chat.set_digest(3, digest(texts(4, 204)));
+        chat.render(&[want(3, 20, 8)]);
+        assert_eq!(read(&chat), before);
+        let _ = t0;
+    }
+
+    #[test]
+    fn the_reader_keeps_the_row_inside_a_long_item_and_follows_a_held_selection() {
+        let long = |n: u32| {
+            agent(&format!(
+                "{}\n{}\n{}",
+                "a".repeat(5) + &n.to_string(),
+                "b",
+                "c"
+            ))
+        };
+        let items = |from: u32, to: u32| (from..to).map(long).collect::<Vec<_>>();
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.set_digest(3, digest(items(0, 30)));
+        chat.render(&[want(3, 20, 6)]);
+        chat.scroll_by(3, true, 20);
+        chat.render(&[want(3, 20, 6)]);
+        let before = visible(&chat, 3);
+        chat.set_digest(3, digest(items(3, 34)));
+        chat.render(&[want(3, 20, 6)]);
+        assert_eq!(visible(&chat, 3), before);
+
+        // Held at the bottom, the text under a selection stays through the same refresh.
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.set_digest(3, digest(items(0, 30)));
+        let held = Want {
+            held: true,
+            ..want(3, 20, 6)
+        };
+        chat.render(&[held]);
+        let before = visible(&chat, 3);
+        chat.set_digest(3, digest(items(2, 33)));
+        chat.render(&[Want {
+            held: true,
+            ..want(3, 20, 6)
+        }]);
+        assert_eq!(visible(&chat, 3), before);
+    }
+
+    #[test]
+    fn an_item_that_is_gone_leaves_the_reader_on_the_nearest_older_one() {
+        let mut chat = ChatState::default();
+        on(&mut chat, 3);
+        chat.set_digest(3, digest(texts(0, 30)));
+        chat.render(&[want(3, 20, 4)]);
+        chat.scroll_by(3, true, 20);
+        chat.render(&[want(3, 20, 4)]);
+        let bottom = read(&chat).last().cloned().unwrap();
+        // The item at the reader's row (and the one before it) are gone from the page.
+        let n: u32 = bottom[1..].parse().unwrap();
+        let mut items = texts(0, 30);
+        items.retain(|it| !matches!(it, Item::Agent { text, .. } if *text == format!("m{n}") || *text == format!("m{}", n - 1)));
+        chat.set_digest(3, digest(items));
+        chat.render(&[want(3, 20, 4)]);
+        let now = read(&chat);
+        assert_eq!(now.last().unwrap(), &format!("m{}", n - 2), "{now:?}");
     }
 }
