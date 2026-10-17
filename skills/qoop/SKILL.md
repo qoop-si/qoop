@@ -169,7 +169,9 @@ emulator you started.
 
 When the work ends with something to look at, put it on the owner's phone before you say it is
 done: `qoop show <file> --note "<what it shows>"`. The phone lists it and opens it in its own
-viewer; `qoop show <url>` does the same for a public url (a deploy, a PR). Write captures to
+viewer; `qoop show <url>` does the same for a public url (a deploy, a PR). A dev server running
+here is shown as `qoop show http://localhost:<port>`: the phone opens it as a live preview of the
+running site, hot reload included, for as long as the server runs. Write captures to
 `"${TMPDIR:-/tmp}"`, never into the repo:
 
 - the screen: `screencapture -x "${TMPDIR:-/tmp}/shot.png"`
@@ -180,8 +182,9 @@ viewer; `qoop show <url>` does the same for a public url (a deploy, a PR). Write
 - a browser: a Playwright screenshot or video
 - a long report: write it to a file and show the file
 
-A file is at most 25 MiB, and a url is a public one: the phone cannot open `localhost`. The
-path is read again when the owner opens it, so a file changed or deleted since must be shown again.
+A file is at most 25 MiB. A local url is written `http://localhost:<port>` (or `127.0.0.1`,
+`[::1]`) with a port from 1024; `0.0.0.0` and `*.localhost` are refused. The path is read again
+when the owner opens it, so a file changed or deleted since must be shown again.
 
 ## Tasks
 

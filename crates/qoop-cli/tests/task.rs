@@ -1201,7 +1201,8 @@ $Q show '{}' --note "login
 works" > abs.out 2>&1
 $Q show rel.txt > rel.out 2>&1
 $Q show https://github.com/qoop-si/qoop/pull/1 > url.out 2>&1
-$Q show http://localhost:3000/ > local.out 2>&1; echo $? > local.rc
+$Q show http://localhost:3000/ > local.out 2>&1
+$Q show http://0.0.0.0:3000/ > zero.out 2>&1; echo $? > zero.rc
 touch shown
 while [ ! -f go ]; do sleep 0.1; done"#,
             work.join("shot.png").display()
@@ -1226,11 +1227,18 @@ while [ ! -f go ]; do sleep 0.1; done"#,
         "{}",
         read(&work, "url.out")
     );
-    assert_eq!(read(&work, "local.rc").trim(), "1");
-    assert!(
-        read(&work, "local.out").contains("cannot open a local address"),
+    // The Mac's own dev server is shown, for the phone's preview, in the one form it opens.
+    assert_eq!(
+        read(&work, "local.out").trim(),
+        "shown 4",
         "{}",
         read(&work, "local.out")
+    );
+    assert_eq!(read(&work, "zero.rc").trim(), "1");
+    assert!(
+        read(&work, "zero.out").contains("show it as http://localhost:3000"),
+        "{}",
+        read(&work, "zero.out")
     );
     assert!(
         heard_after(&heard, 0, Duration::from_secs(5)),
@@ -1239,8 +1247,12 @@ while [ ! -f go ]; do sleep 0.1; done"#,
 
     let listed = shows(dir.path());
     let ids: Vec<u64> = listed.iter().map(|s| s.show).collect();
-    assert_eq!(ids, [3, 2, 1], "newest first: {listed:?}");
-    let (url, rel, shot) = (&listed[0], &listed[1], &listed[2]);
+    assert_eq!(ids, [4, 3, 2, 1], "newest first: {listed:?}");
+    let (local, url, rel, shot) = (&listed[0], &listed[1], &listed[2], &listed[3]);
+    assert_eq!(
+        (local.kind.as_str(), local.name.as_str()),
+        ("url", "http://localhost:3000/")
+    );
     assert_eq!(shot.kind, "image");
     assert_eq!(shot.name, "shot.png");
     assert_eq!(shot.note.as_deref(), Some("login works"));
@@ -1281,7 +1293,7 @@ while [ ! -f go ]; do sleep 0.1; done"#,
     let (ok, _, err) = daemon.run(&["close", "1"]);
     assert!(ok, "close: {err}");
     let after = shows(dir.path());
-    assert_eq!(after.len(), 3, "a closed tab's shows stay");
+    assert_eq!(after.len(), 4, "a closed tab's shows stay");
     assert!(after.iter().all(|s| !s.current), "{after:?}");
 }
 

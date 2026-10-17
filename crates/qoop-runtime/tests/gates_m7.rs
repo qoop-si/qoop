@@ -299,6 +299,18 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             offset: 0,
             len: 1,
         },
+        // Bytes to a dev server's socket, never to a terminal.
+        ControlRequest::TunnelOpen {
+            id: "x38".into(),
+            show: 1,
+            conn: 1,
+        },
+        // A read. Not of the victim's own checkout, which here is this repository and would
+        // ask GitHub about its branch.
+        ControlRequest::Changes {
+            id: "x39".into(),
+            terminal: u32::MAX,
+        },
         ControlRequest::TaskRead {
             id: "x29".into(),
             board: true,
@@ -354,6 +366,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
             | ControlRequest::ShowFetch { .. }
+            | ControlRequest::TunnelOpen { .. }
+            | ControlRequest::Changes { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

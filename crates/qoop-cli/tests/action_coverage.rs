@@ -587,6 +587,25 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "preview a dev server shown on the phone",
+            method: || {
+                Method::Control(ControlRequest::TunnelOpen {
+                    id: "a".into(),
+                    show: 1,
+                    conn: 1,
+                })
+            },
+        },
+        Action {
+            name: "see what a terminal's checkout changed",
+            method: || {
+                Method::Control(ControlRequest::Changes {
+                    id: "a".into(),
+                    terminal: 1,
+                })
+            },
+        },
+        Action {
             name: "show a task and what was recorded on it",
             method: || {
                 Method::Control(ControlRequest::TaskRead {
@@ -871,6 +890,15 @@ fn every_control_method_is_reachable_from_some_action() {
             offset: 0,
             len: 0,
         },
+        ControlRequest::TunnelOpen {
+            id: String::new(),
+            show: 0,
+            conn: 0,
+        },
+        ControlRequest::Changes {
+            id: String::new(),
+            terminal: 0,
+        },
         ControlRequest::Listen {
             id: String::new(),
             terminal: 0,
@@ -923,6 +951,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
             | ControlRequest::ShowFetch { .. }
+            | ControlRequest::TunnelOpen { .. }
+            | ControlRequest::Changes { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

@@ -125,6 +125,10 @@ pub const RENDER_WINDOW: &str = "render_window";
 /// leave open on the far side, holding the size of every terminal they showed (ADR-007).
 pub const REPLACES: &str = "replaces";
 
+/// The `client_name` the phone app says in its hello, which the bridge carries unchanged.
+/// Only such a connection opens a preview tunnel or reads a checkout's changes.
+pub const PHONE: &str = "qoro-mobile";
+
 /// The hello key an interface sets to say it lends a microphone to a tab's program
 /// (`microphone`). An older interface never says it, so a recording is refused at once
 /// rather than left hearing nothing.

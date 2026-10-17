@@ -38,7 +38,7 @@ const VIDEOS: [&str; 3] = ["mp4", "mov", "m4v"];
 
 /// An `http` or `https` url with a host, checked here too: a client on the socket can skip
 /// the CLI.
-fn is_url(target: &str) -> bool {
+pub fn is_url(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
     let rest = lower
         .strip_prefix("http://")
@@ -49,6 +49,96 @@ fn is_url(target: &str) -> bool {
             .is_some_and(|h| !h.is_empty())
     }) && target.len() <= URL_MOST
         && !target.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The port of a url on the Mac's own loopback, which the phone opens through a tunnel:
+/// `None` for any other url, a refusal for a loopback url said in a way the phone's own
+/// `localhost` would not mean the same (`0.0.0.0`, `*.localhost`, a low or missing port).
+pub fn local_port(url: &str) -> Option<Result<u16, String>> {
+    let lower = url.to_ascii_lowercase();
+    let (plain, rest) = match lower.strip_prefix("http://") {
+        Some(rest) => (true, rest),
+        None => (false, lower.strip_prefix("https://")?),
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    let (host, port) = match hostport.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map(|(h, p)| (h, p.strip_prefix(':')))?,
+        None => match hostport.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        },
+    };
+    let ip = host.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    });
+    let bare = host.strip_suffix('.').unwrap_or(host);
+    let loopback = bare == "localhost"
+        || bare.ends_with(".localhost")
+        || ip.is_some_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if !loopback {
+        return None;
+    }
+    // Digits as written, no sign and no leading zero: one port has one spelling.
+    let port = port
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()) && !p.starts_with('0'))
+        .and_then(|p| p.parse::<u16>().ok());
+    Some(match port {
+        Some(port)
+            if plain
+                && port >= 1024
+                && ["localhost", "127.0.0.1", "::1"].contains(&host)
+                && authority == hostport =>
+        {
+            Ok(port)
+        }
+        _ => Err(format!(
+            "show it as http://localhost:{}",
+            port.map_or_else(|| "<port>".to_string(), |p| p.to_string())
+        )),
+    })
+}
+
+/// `owner/name` of a GitHub `url` (`git@github.com:o/n`, `ssh://`, `https://` with or without
+/// a user, an optional `.git` and trailing `/`). The host is read up to the first `/`, `?` or
+/// `#`, so `https://evil.com#@github.com/o/n` is `evil.com`; a query or fragment anywhere is
+/// no repository.
+pub fn github_repo(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let at = rest.find(['/', '?', '#'])?;
+            let (host, path) = rest.split_at(at);
+            (host, path.strip_prefix('/')?)
+        }
+        None => url.split_once(':')?,
+    };
+    let odd = |c: char| matches!(c, '/' | '?' | '#' | '\\' | ' ') || c.is_control();
+    if host.contains(odd) || path.contains(['?', '#']) {
+        return None;
+    }
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let plain = |s: &str| !s.is_empty() && !s.contains('/');
+    (host.eq_ignore_ascii_case("github.com") && plain(owner) && plain(name))
+        .then(|| format!("{owner}/{name}"))
+}
+
+/// The port a tunnel for `show` dials: only a loopback url recorded by a show.
+pub(crate) async fn port_of(show: u64, store: &StoreHandle) -> Result<u16, String> {
+    match store.run(move |s| s.show(show as i64)).await {
+        Ok(Some(row)) if row.kind == "url" => match local_port(&row.target) {
+            Some(Ok(port)) => Ok(port),
+            _ => Err(format!("show {show} is not on this Mac's localhost")),
+        },
+        Ok(Some(_)) => Err(format!("show {show} is a file, not a url")),
+        Ok(None) => Err(format!("no show {show}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn kind_of(path: &Path) -> &'static str {
@@ -100,6 +190,9 @@ pub(crate) async fn write(
         return failed(id, format!("terminal {terminal} has ended"));
     };
     let (target, kind, size) = if is_url(&target) {
+        if let Some(Err(reason)) = local_port(&target) {
+            return failed(id, reason);
+        }
         (target, "url", 0)
     } else if target.starts_with('/') {
         // On the probe pool, keyed by the path: a hung mount degrades only itself.
@@ -266,5 +359,50 @@ pub(crate) async fn fetch(
         },
         Ok(Err(reason)) => failed(id, reason),
         Err(_) => failed(id, UNREADABLE),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loopback_url_is_taken_only_as_the_phone_can_open_it() {
+        for (url, port) in [
+            ("http://localhost:3000", 3000),
+            ("http://LOCALHOST:5173/app?x=1", 5173),
+            ("http://127.0.0.1:8080/", 8080),
+            ("http://[::1]:65535#top", 65535),
+        ] {
+            assert_eq!(local_port(url), Some(Ok(port)), "{url}");
+        }
+        for url in [
+            "http://0.0.0.0:3000",
+            "http://app.localhost:5173",
+            "http://localhost",
+            "http://localhost:80",
+            "http://localhost:99999",
+            "https://localhost:3000",
+            "http://127.8.9.1:3000",
+            "http://[::ffff:127.0.0.1]:3000",
+            "http://[::]:3000",
+            "http://localhost.:3000",
+            "http://evil.com:80@localhost:3000",
+            "http://localhost:+3000",
+            "http://localhost:03000",
+        ] {
+            assert!(matches!(local_port(url), Some(Err(_))), "{url}");
+        }
+        assert_eq!(
+            local_port("http://0.0.0.0:3000"),
+            Some(Err("show it as http://localhost:3000".into()))
+        );
+        for url in [
+            "https://github.com/qoop-si/qoop/pull/1",
+            "http://example.com?x=localhost",
+            "https://10.0.0.2:8443",
+        ] {
+            assert_eq!(local_port(url), None, "{url}");
+        }
     }
 }

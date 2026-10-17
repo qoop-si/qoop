@@ -2306,6 +2306,10 @@ async fn serve_client(
     let writer_progress = progress.clone();
     let renders = Arc::new(RenderQueue::new(outbound.clone()));
     let (control_tx, mut control_rx) = mpsc::channel::<BytesMut>(32);
+    // The bytes of this connection's preview tunnels, and the tunnels themselves.
+    let (blob_tx, mut blob_rx) = mpsc::channel::<BytesMut>(crate::tunnel::LANE);
+    let tunnels = crate::tunnel::Tunnels::default();
+    let phone = hello.client_name == crate::client::PHONE;
     // Which history search of this connection may still run. Each one takes the next
     // number and stops at its next chunk once the number has moved on: a newer search from
     // the same person makes the older one moot, and a connection that is gone makes every
@@ -2501,6 +2505,14 @@ async fn serve_client(
                 }
             }
 
+            // A tunnel's bytes last, a few frames a pass, and never counted as a screen.
+            for _ in 0..crate::tunnel::PER_PASS {
+                match blob_rx.try_recv() {
+                    Ok(bytes) => buf.extend_from_slice(&bytes),
+                    Err(_) => break,
+                }
+            }
+
             if !buf.is_empty() {
                 if wr.write_all(&buf).await.is_err() {
                     return;
@@ -2517,6 +2529,12 @@ async fn serve_client(
                 _ = writer_renders.wait(), if !paced => {}
                 _ = writer_renders.wait_ack(), if paced => {}
                 Some(bytes) = control_rx.recv() => {
+                    if wr.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+                // Paced screens never stall a tunnel.
+                Some(bytes) = blob_rx.recv() => {
                     if wr.write_all(&bytes).await.is_err() {
                         return;
                     }
@@ -2557,6 +2575,13 @@ async fn serve_client(
             }
             inbuf.extend_from_slice(&read[..n]);
             while let Some(frame) = Frame::decode(&mut inbuf).map_err(to_io)? {
+                // A tunnel's bytes are whole frames, never reassembled.
+                if frame.channel == Channel::Blob {
+                    if phone {
+                        crate::tunnel::take(&tunnels, frame);
+                    }
+                    continue;
+                }
                 if !matches!(frame.channel, Channel::Terminal | Channel::Control) {
                     continue;
                 }
@@ -2590,6 +2615,27 @@ async fn serve_client(
                                 control_tx.clone(),
                             ));
                             continue;
+                        }
+                        // Only the phone's: keeps ordinary local clients out. A program in
+                        // a tab reaches this socket too, and both run past its sandbox.
+                        Ok(
+                            ControlRequest::TunnelOpen { id, .. }
+                            | ControlRequest::Changes { id, .. },
+                        ) if !phone => ControlResponse::Failed {
+                            id,
+                            reason: "only the phone app asks for that".into(),
+                        },
+                        // Lives as long as this connection, so it is opened here.
+                        Ok(ControlRequest::TunnelOpen { id, show, conn }) => {
+                            let lanes = crate::tunnel::Lanes {
+                                control: control_tx.clone(),
+                                blob: blob_tx.clone(),
+                            };
+                            let store = books.store.clone();
+                            match crate::tunnel::open(&tunnels, id, show, conn, store, lanes) {
+                                Some(refusal) => refusal,
+                                None => continue,
+                            }
                         }
                         // Spawned off this loop and answered through the connection's
                         // outbound channel, the way events are: a search step is a
@@ -2793,6 +2839,7 @@ async fn serve_client(
     // One exit. Aborting the writer is what drops the write half and closes the socket, so
     // it has to happen however the loop ended.
     events_task.abort();
+    crate::tunnel::end(&tunnels);
     searching.fetch_add(1, Ordering::SeqCst);
     renders.close();
     // This connection stops watching: drop its subscriptions from the
@@ -3592,6 +3639,8 @@ fn dispatch(
         ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
+        // git and gh, for seconds at most, in a checkout an agent works in.
+        ControlRequest::Changes { .. } => Dispatch::Apart,
         // Runs the binary on disk and waits for a first look across every space.
         ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
         // The first answer after a swap runs that binary.
@@ -3662,6 +3711,18 @@ async fn handle_control(
             id,
             reason: "a recording is asked for on the connection that reads it".into(),
         },
+        ControlRequest::TunnelOpen { id, .. } => ControlResponse::Failed {
+            id,
+            reason: "a tunnel is opened on the connection that carries it".into(),
+        },
+        ControlRequest::Changes { terminal, .. } => {
+            Box::pin(crate::changes::read(
+                id,
+                terminal,
+                terminals.cwd_of(terminal),
+            ))
+            .await
+        }
         ControlRequest::CreateTerminal {
             cwd,
             workspace: wanted,
@@ -5661,7 +5722,7 @@ fn replayed_response(
 /// A control reply as bytes on the wire: chunked like a request when it is larger than one
 /// frame (every ended card with its whole body passes 64 KB), and all its frames in one buffer
 /// so another reply on the same connection never lands between them.
-fn control_bytes(response: &ControlResponse) -> io::Result<BytesMut> {
+pub(crate) fn control_bytes(response: &ControlResponse) -> io::Result<BytesMut> {
     let body = serde_json::to_vec(response).map_err(to_io)?;
     let mut out = BytesMut::new();
     for frame in qoop_proto::chunk(Channel::Control, 0, 0, None, Bytes::from(body)) {

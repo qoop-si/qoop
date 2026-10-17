@@ -598,6 +598,42 @@ pub enum ControlRequest {
         offset: u64,
         len: u32,
     },
+    /// Open a byte tunnel to the Mac's own `localhost:<port>` of a shown loopback url,
+    /// answered `TunnelOpened`. `conn` is the phone's number for the connection, rising and
+    /// never reused. The bytes ride the Blob channel with `conn` as the stream, every frame
+    /// END-flagged and at most [`BLOB_MOST`] bytes; an empty frame ends that side. The
+    /// tunnel lives as long as the connection that asked.
+    TunnelOpen {
+        id: String,
+        show: u64,
+        conn: u32,
+    },
+    /// What `terminal`'s checkout changed against its default branch, answered `Changes`.
+    Changes {
+        id: String,
+        terminal: u32,
+    },
+}
+
+/// The most bytes one Blob frame of a tunnel carries: inside one record of the phone's link.
+pub const BLOB_MOST: usize = 60 * 1024;
+
+/// One changed file of a `Changes` answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    /// git's letter against the base (`M`, `A`, `D`, `R`, `C`, `T`, `U`), or `?` untracked.
+    pub status: String,
+}
+
+/// The pull request of a `Changes` answer's branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    /// `open`, `closed` or `merged`.
+    pub state: String,
+    /// `passing`, `failing`, `pending`, or `none` when the branch has no checks.
+    pub checks: String,
 }
 
 /// The largest file `qoop show` puts on the phone.
@@ -1160,6 +1196,8 @@ impl ControlRequest {
             | Self::ShowWrite { id, .. }
             | Self::ShowRead { id }
             | Self::ShowFetch { id, .. }
+            | Self::TunnelOpen { id, .. }
+            | Self::Changes { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -1427,6 +1465,27 @@ pub enum ControlResponse {
         data: String,
         total: u64,
         mtime: u64,
+    },
+    /// `TunnelOpen` reached the port: Blob frames on stream `conn` carry its bytes.
+    TunnelOpened {
+        id: String,
+        conn: u32,
+    },
+    /// A terminal's checkout against `base`: `diff` is `git diff` from where the two met,
+    /// committed and uncommitted together (untracked files are only listed), and `cut` when
+    /// it or the list was longer than 256 KiB. `branch` is `None` on a detached HEAD. `pr` is
+    /// the branch's newest pull request; `pr_known` says gh answered, so a `None` there means
+    /// there is none rather than that nobody could ask.
+    Changes {
+        id: String,
+        root: String,
+        branch: Option<String>,
+        base: String,
+        files: Vec<ChangedFile>,
+        diff: String,
+        cut: bool,
+        pr: Option<PullRequest>,
+        pr_known: bool,
     },
     /// A refusal, with a reason a person can act on. Never a silent drop: a client waiting
     /// for a response it will never get is indistinguishable from a hung daemon.
@@ -1989,6 +2048,8 @@ impl ControlResponse {
             | Self::ShowWritten { id, .. }
             | Self::Shows { id, .. }
             | Self::ShowChunk { id, .. }
+            | Self::TunnelOpened { id, .. }
+            | Self::Changes { id, .. }
             | Self::Failed { id, .. } => id,
         }
     }

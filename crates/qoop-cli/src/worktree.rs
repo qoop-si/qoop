@@ -192,67 +192,17 @@ fn own_repo_with(
 /// What `cmd` printed, when it exits 0 by `by`; past it, it and everything it started (its
 /// own process group) are killed and reaped, so nothing is left behind.
 fn run_by(cmd: &mut Command, by: std::time::Instant) -> Option<String> {
-    use std::io::Read;
-    use std::os::unix::process::CommandExt;
-    let mut child = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let mut out = String::new();
-                child.stdout.take()?.read_to_string(&mut out).ok()?;
-                return Some(out);
-            }
-            Ok(None) if std::time::Instant::now() < by => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Ok(Some(_)) => return None,
-            _ => {
-                if let Ok(pid) = i32::try_from(child.id()) {
-                    // SAFETY: a plain signal to the process group this call made.
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
-                }
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
+    qoop_runtime::changes::run_by(cmd, by, None)
+        .map(|(out, _)| String::from_utf8_lossy(&out).into_owned())
 }
 
-/// `owner/name` of a GitHub `url` (`git@github.com:o/n`, `ssh://`, `https://` with or
-/// without a user, an optional `.git` and trailing `/`) when its owner is `login`. The host
-/// is read up to the first `/`, `?` or `#`, so `https://evil.com#@github.com/o/n` is
-/// `evil.com`; a query or fragment anywhere is no repository.
+/// `owner/name` of a GitHub `url` when its owner is `login` (an empty one matches nothing).
 fn owned(url: &str, login: &str) -> Option<String> {
-    let (host, path) = match url.split_once("://") {
-        Some((_, rest)) => {
-            let at = rest.find(['/', '?', '#'])?;
-            let (host, path) = rest.split_at(at);
-            (host, path.strip_prefix('/')?)
-        }
-        None => url.split_once(':')?,
-    };
-    let odd = |c: char| matches!(c, '/' | '?' | '#' | '\\' | ' ') || c.is_control();
-    if host.contains(odd) || path.contains(['?', '#']) {
-        return None;
-    }
-    let host = host.rsplit('@').next()?;
-    let host = host.split(':').next()?;
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, name) = path.split_once('/')?;
-    let plain = |s: &str| !s.is_empty() && !s.contains('/');
-    // An empty login matches nothing: an owner is never empty.
-    (host.eq_ignore_ascii_case("github.com")
-        && plain(owner)
-        && plain(name)
-        && owner.eq_ignore_ascii_case(login))
-    .then(|| format!("{owner}/{name}"))
+    qoop_runtime::shows::github_repo(url).filter(|repo| {
+        repo.split('/')
+            .next()
+            .is_some_and(|o| o.eq_ignore_ascii_case(login))
+    })
 }
 
 /// A branch name as one path component: lowercase letters and digits, every other run

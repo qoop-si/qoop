@@ -328,6 +328,53 @@ impl TestDaemon {
         self.warnings.lock().unwrap().clone()
     }
 
+    /// A connection that says it is the phone app, the way the bridge carries the phone's own
+    /// hello, and the bytes read past the welcome.
+    pub async fn connect_phone(&self) -> (tokio::net::UnixStream, BytesMut) {
+        use tokio::io::AsyncReadExt;
+        let mut stream = tokio::net::UnixStream::connect(&self.socket)
+            .await
+            .expect("connect");
+        let codec = |name: &str| serde_json::json!([name]);
+        let hello = serde_json::json!({
+            "codec_generation_min": qoop_proto::CODEC_GENERATION,
+            "codec_generation_max": qoop_proto::CODEC_GENERATION,
+            "client_id": "phone",
+            "client_name": client::PHONE,
+            "client_version": "0",
+            "codecs": {
+                "control": codec("control.json.v1"),
+                "event": codec("event.json.v1"),
+                "terminal": codec("terminal.frame.v1"),
+                "blob": codec("blob.raw.v1"),
+            },
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&hello).expect("hello"));
+        let mut out = BytesMut::new();
+        qoop_proto::Frame::new(qoop_proto::Channel::Handshake, 0, body)
+            .encode(&mut out)
+            .expect("encode");
+        stream.write_all(&out).await.expect("hello");
+        let mut inbuf = BytesMut::new();
+        let mut read = [0u8; 16 * 1024];
+        while qoop_proto::Frame::decode(&mut inbuf)
+            .expect("decode")
+            .is_none()
+        {
+            let n = stream.read(&mut read).await.expect("welcome");
+            assert!(n > 0, "closed before the welcome");
+            inbuf.extend_from_slice(&read[..n]);
+        }
+        (stream, inbuf)
+    }
+
+    /// [`TestDaemon::attach`] as the phone app.
+    pub async fn attach_phone(&self) -> TestClient {
+        let (stream, inbuf) = self.connect_phone().await;
+        let default_stream = self.connections_terminals().first().copied().unwrap_or(1);
+        TestClient::from_parts(stream, inbuf, default_stream)
+    }
+
     pub async fn attach(&self, id: &str) -> TestClient {
         let (stream, inbuf) = client::connect(&self.socket, id).await.expect("connect");
         // The daemon subscribes a new connection to the lowest numbered terminal, so that
