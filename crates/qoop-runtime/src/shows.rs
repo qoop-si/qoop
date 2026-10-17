@@ -5,8 +5,12 @@
 //! by the show's id. No rule limits which path may be shown: an agent holding a terminal's
 //! token can already type `cat` into any terminal and read its screen, so a root check
 //! would protect nothing. The boundary is that a fetch reads only a recorded path.
+//!
+//! The phone records one too, for a path or url the owner tapped in a chat (`open`). That
+//! needs no token: what it opens is only what the phone can view, and a load nobody tapped
+//! (an inline picture) only from where agents put their results.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use qoop_store::ShowRow;
@@ -35,6 +39,12 @@ const UNREADABLE: &str = "the file is not readable right now";
 /// The extensions shown as a picture or a clip; everything else is a file.
 const IMAGES: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "heic"];
 const VIDEOS: [&str; 3] = ["mp4", "mov", "m4v"];
+
+/// The other files the phone opens from a chat; html, svg, xml and the rest open on the Mac.
+const VIEWED: [&str; 24] = [
+    "pdf", "md", "txt", "log", "json", "csv", "rs", "ts", "tsx", "js", "jsx", "py", "go", "rb",
+    "sh", "swift", "kt", "java", "c", "h", "cpp", "toml", "yaml", "yml",
+];
 
 /// An `http` or `https` url with a host, checked here too: a client on the socket can skip
 /// the CLI.
@@ -155,8 +165,9 @@ fn kind_of(path: &Path) -> &'static str {
     }
 }
 
-/// A file to show: its canonical path, kind and size, or why it is refused.
-fn file(path: &str) -> Result<(String, &'static str, u64), String> {
+/// A file to show: its canonical path, kind, size and modification time (unix milliseconds),
+/// or why it is refused.
+fn file(path: &str) -> Result<(String, &'static str, u64, i64), String> {
     let real = std::fs::canonicalize(path).map_err(|_| format!("no file {path}"))?;
     let meta = std::fs::metadata(&real).map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() {
@@ -170,7 +181,20 @@ fn file(path: &str) -> Result<(String, &'static str, u64), String> {
         .into_os_string()
         .into_string()
         .map_err(|_| format!("{path} is not a UTF-8 path"))?;
-    Ok((real, kind, meta.len()))
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64);
+    Ok((real, kind, meta.len(), mtime))
+}
+
+/// The terminal's title as the Inbox shows it.
+fn title_of(terminal: u32, terminals: &TerminalRegistry) -> Option<String> {
+    let session = terminals.session_of(terminal);
+    terminals
+        .session_title(session.as_deref())
+        .or_else(|| terminals.name_of(terminal))
 }
 
 /// Record a show for `terminal`, whose token the caller has already checked.
@@ -198,7 +222,7 @@ pub(crate) async fn write(
         // On the probe pool, keyed by the path: a hung mount degrades only itself.
         let key = target.clone();
         match crate::blocking::probe(&key, PROBE_DEADLINE, move || file(&target)).await {
-            Ok(Ok(found)) => found,
+            Ok(Ok((real, kind, size, _))) => (real, kind, size),
             Ok(Err(reason)) => return failed(id, reason),
             Err(_) => return failed(id, UNREADABLE),
         }
@@ -216,7 +240,6 @@ pub(crate) async fn write(
                 .collect::<String>()
         })
         .filter(|n| !n.is_empty());
-    let session = terminals.session_of(terminal);
     let row = ShowRow {
         id: 0,
         at: now(),
@@ -224,9 +247,7 @@ pub(crate) async fn write(
         terminal: i64::from(terminal),
         generation: generation as i64,
         space,
-        title: terminals
-            .session_title(session.as_deref())
-            .or_else(|| terminals.name_of(terminal)),
+        title: title_of(terminal, terminals),
         kind: kind.to_string(),
         target,
         size: size as i64,
@@ -240,6 +261,134 @@ pub(crate) async fn write(
                 show: show as u64,
             }
         }
+        Err(e) => failed(id, e.to_string()),
+    }
+}
+
+/// Where a path tapped in `terminal`'s chat points: `~` is this Mac's home, a relative path
+/// is under the terminal's folder.
+fn resolve(target: &str, cwd: Option<&str>) -> Result<String, String> {
+    if target.starts_with('/') {
+        return Ok(target.to_string());
+    }
+    let (base, rest) = match target.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => (
+            std::env::var("HOME").map_err(|_| "this Mac has no home folder set")?,
+            rest.trim_start_matches('/'),
+        ),
+        _ => (
+            cwd.ok_or("the terminal's folder is not known yet")?
+                .to_string(),
+            target,
+        ),
+    };
+    Ok(Path::new(&base).join(rest).to_string_lossy().into_owned())
+}
+
+/// The largest picture loaded without a tap.
+const AUTO_MOST: u64 = 2 << 20;
+
+/// Whether `real` is where an agent puts what it made: under the terminal's folder (`cwd`),
+/// `/tmp` or `$TMPDIR` (`tmps`), all canonical, as `home` is. A root that is `/` or holds the
+/// home folder counts for nothing, since agents are often started there; with no home known,
+/// neither does the terminal's folder.
+fn rooted(real: &Path, cwd: Option<&Path>, tmps: &[PathBuf], home: Option<&Path>) -> bool {
+    cwd.filter(|_| home.is_some())
+        .into_iter()
+        .chain(tmps.iter().map(PathBuf::as_path))
+        .filter(|root| root.parent().is_some() && !home.is_some_and(|h| h.starts_with(root)))
+        .any(|root| real.starts_with(root))
+}
+
+/// A file the phone asked to open: `file`'s checks, then a kind the phone views, then for
+/// `auto` a picture of at most [`AUTO_MOST`] in a place agents put results in.
+fn asked(
+    path: &str,
+    cwd: Option<&str>,
+    auto: bool,
+) -> Result<(String, &'static str, u64, i64), String> {
+    let (real, kind, size, mtime) = file(path)?;
+    let ext = Path::new(&real)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if kind == "file" && !VIEWED.contains(&ext.as_str()) {
+        return Err(format!("{path} opens on the Mac"));
+    }
+    if auto {
+        let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+        let home = std::env::var_os("HOME").and_then(|h| canonical(Path::new(&h)));
+        let cwd = cwd.and_then(|c| canonical(Path::new(c)));
+        let tmps: Vec<PathBuf> = [Path::new("/tmp"), &std::env::temp_dir()]
+            .into_iter()
+            .filter_map(canonical)
+            .collect();
+        let near = rooted(Path::new(&real), cwd.as_deref(), &tmps, home.as_deref());
+        if kind != "image" || size > AUTO_MOST || !near {
+            return Err(format!("{path} is opened only on a tap"));
+        }
+    }
+    Ok((real, kind, size, mtime))
+}
+
+/// Record a show the phone asked for from `terminal`'s chat, answered as `Shows` with that
+/// one. Not news and not listed: it is the phone's own, so it tells no one, and its row is
+/// found by id only.
+pub(crate) async fn open(
+    id: String,
+    terminal: u32,
+    target: String,
+    auto: bool,
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    store: &StoreHandle,
+) -> ControlResponse {
+    let Some(generation) = agents.agent(terminal).map(|a| a.belief.generation.0) else {
+        return failed(id, format!("terminal {terminal} has ended"));
+    };
+    let (target, kind, size, mtime) = if is_url(&target) {
+        if auto {
+            return failed(id, "a url is opened only on a tap");
+        }
+        if let Some(Err(reason)) = local_port(&target) {
+            return failed(id, reason);
+        }
+        (target, "url", 0, 0)
+    } else {
+        let cwd = terminals.cwd_of(terminal);
+        let path = match resolve(&target, cwd.as_deref()) {
+            Ok(path) => path,
+            Err(reason) => return failed(id, reason),
+        };
+        let key = path.clone();
+        match crate::blocking::probe(&key, PROBE_DEADLINE, move || {
+            asked(&path, cwd.as_deref(), auto)
+        })
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(reason)) => return failed(id, reason),
+            Err(_) => return failed(id, UNREADABLE),
+        }
+    };
+    let row = ShowRow {
+        id: 0,
+        at: now(),
+        boot: crate::daemon::boot().to_string(),
+        terminal: i64::from(terminal),
+        generation: generation as i64,
+        space: None,
+        title: title_of(terminal, terminals),
+        kind: kind.to_string(),
+        target,
+        size: size as i64,
+        note: None,
+    };
+    match store.run(move |s| s.ask_show(&row, mtime)).await {
+        Ok(row) => ControlResponse::Shows {
+            id,
+            shows: vec![info(row, terminals, agents)],
+        },
         Err(e) => failed(id, e.to_string()),
     }
 }
@@ -365,6 +514,25 @@ pub(crate) async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_that_holds_the_home_folder_counts_for_nothing() {
+        let home = Some(Path::new("/Users/me"));
+        let shot = Path::new("/Users/me/work/shot.png");
+        let tmp = [PathBuf::from("/private/tmp")];
+        assert!(rooted(shot, Some(Path::new("/Users/me/work")), &tmp, home));
+        for cwd in ["/", "/Users", "/Users/me"] {
+            assert!(!rooted(shot, Some(Path::new(cwd)), &tmp, home), "{cwd}");
+        }
+        // `$TMPDIR` set to the home folder, or to `/`.
+        for tmpdir in ["/Users/me", "/"] {
+            let tmps = [PathBuf::from("/private/tmp"), PathBuf::from(tmpdir)];
+            assert!(!rooted(shot, None, &tmps, home), "{tmpdir}");
+        }
+        // No home known: the terminal's folder is no root, `/tmp` still is.
+        assert!(!rooted(shot, Some(Path::new("/Users/me/work")), &tmp, None));
+        assert!(rooted(Path::new("/private/tmp/a.png"), None, &tmp, None));
+    }
 
     #[test]
     fn a_loopback_url_is_taken_only_as_the_phone_can_open_it() {

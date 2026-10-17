@@ -2620,7 +2620,8 @@ async fn serve_client(
                         // a tab reaches this socket too, and both run past its sandbox.
                         Ok(
                             ControlRequest::TunnelOpen { id, .. }
-                            | ControlRequest::Changes { id, .. },
+                            | ControlRequest::Changes { id, .. }
+                            | ControlRequest::ShowOpen { id, .. },
                         ) if !phone => ControlResponse::Failed {
                             id,
                             reason: "only the phone app asks for that".into(),
@@ -3639,6 +3640,8 @@ fn dispatch(
         ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
+        // A check of a path the phone named, and the store after it.
+        ControlRequest::ShowOpen { .. } => Dispatch::Apart,
         // git and gh, for seconds at most, in a checkout an agent works in.
         ControlRequest::Changes { .. } => Dispatch::Apart,
         // Runs the binary on disk and waits for a first look across every space.
@@ -5331,6 +5334,18 @@ async fn handle_control(
         ControlRequest::ShowFetch {
             show, offset, len, ..
         } => Box::pin(crate::shows::fetch(id, show, offset, len, store)).await,
+        // The phone's own: its gate is on the read loop.
+        ControlRequest::ShowOpen {
+            terminal,
+            target,
+            auto,
+            ..
+        } => {
+            Box::pin(crate::shows::open(
+                id, terminal, target, auto, terminals, agents, store,
+            ))
+            .await
+        }
         ControlRequest::ListFocusEvents {
             terminal, last_n, ..
         } => {

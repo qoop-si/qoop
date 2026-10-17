@@ -437,6 +437,14 @@ impl Store {
                  target TEXT NOT NULL,
                  size INTEGER NOT NULL,
                  note TEXT
+             );
+             -- The shows the phone asked for from a chat, not an agent (`show.rs`): kept out of
+             -- the list and pruned on their own. `mtime` is the file's when it was asked, so an
+             -- unchanged file asked again is the same row. New table, no version bump: an
+             -- older binary lists them as shows.
+             CREATE TABLE IF NOT EXISTS show_asked (
+                 show INTEGER PRIMARY KEY REFERENCES show(id) ON DELETE CASCADE,
+                 mtime INTEGER NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

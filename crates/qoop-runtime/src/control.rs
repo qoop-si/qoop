@@ -613,6 +613,18 @@ pub enum ControlRequest {
         id: String,
         terminal: u32,
     },
+    /// Record a path or url the owner tapped in `terminal`'s chat (the phone's own): an
+    /// absolute, `~` or relative path (under the terminal's folder) to a file the phone can
+    /// view, or an `http`/`https` url. Answered `Shows` with that one show, which `ShowFetch`
+    /// and `TunnelOpen` take by its id; it is not listed by `ShowRead`. `auto` is a load
+    /// nobody tapped, refused outside the terminal's folder, `/tmp` and `$TMPDIR`.
+    ShowOpen {
+        id: String,
+        terminal: u32,
+        target: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        auto: bool,
+    },
 }
 
 /// The most bytes one Blob frame of a tunnel carries: inside one record of the phone's link.
@@ -1198,6 +1210,7 @@ impl ControlRequest {
             | Self::ShowFetch { id, .. }
             | Self::TunnelOpen { id, .. }
             | Self::Changes { id, .. }
+            | Self::ShowOpen { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }

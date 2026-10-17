@@ -597,6 +597,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "open a path or url tapped in a chat on the phone",
+            method: || {
+                Method::Control(ControlRequest::ShowOpen {
+                    id: "a".into(),
+                    terminal: 1,
+                    target: "/tmp/shot.png".into(),
+                    auto: false,
+                })
+            },
+        },
+        Action {
             name: "see what a terminal's checkout changed",
             method: || {
                 Method::Control(ControlRequest::Changes {
@@ -899,6 +910,12 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             terminal: 0,
         },
+        ControlRequest::ShowOpen {
+            id: String::new(),
+            terminal: 0,
+            target: String::new(),
+            auto: false,
+        },
         ControlRequest::Listen {
             id: String::new(),
             terminal: 0,
@@ -953,6 +970,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ShowFetch { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }
+            | ControlRequest::ShowOpen { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }

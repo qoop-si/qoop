@@ -389,7 +389,7 @@ async fn a_server_that_stops_reading_closes_only_its_tunnel() {
 }
 
 #[tokio::test]
-async fn only_the_phone_opens_a_tunnel_or_reads_changes() {
+async fn only_the_phone_opens_a_tunnel_or_a_path_or_reads_changes() {
     let d = TestDaemon::start().await;
     let (port, _ends) = echo().await;
     let show = shown(&d, port).await;
@@ -405,6 +405,12 @@ async fn only_the_phone_opens_a_tunnel_or_reads_changes() {
             id: "c".into(),
             terminal,
         },
+        ControlRequest::ShowOpen {
+            id: "o".into(),
+            terminal,
+            target: "/etc/hosts".into(),
+            auto: false,
+        },
     ] {
         let id = request.request_id().to_string();
         assert_eq!(
@@ -415,6 +421,31 @@ async fn only_the_phone_opens_a_tunnel_or_reads_changes() {
             })
         );
     }
+}
+
+/// A url tapped in a chat is the phone's own show, and opens a tunnel like an agent's.
+#[tokio::test]
+async fn a_url_tapped_in_a_chat_opens_a_tunnel() {
+    let d = TestDaemon::start().await;
+    let (port, _ends) = echo().await;
+    let mut phone = Phone::connect(&d).await;
+    phone
+        .ask(&ControlRequest::ShowOpen {
+            id: "tap".into(),
+            terminal: d.terminals().streams()[0],
+            target: format!("http://localhost:{port}/"),
+            auto: false,
+        })
+        .await;
+    let ControlResponse::Shows { shows, .. } = phone.answer("tap").await else {
+        panic!("not opened");
+    };
+    assert_eq!(shows[0].kind, "url");
+    assert!(matches!(
+        phone.open(shows[0].show, 1).await,
+        ControlResponse::TunnelOpened { conn: 1, .. }
+    ));
+    assert!(phone.until(|p| p.got(1) >= 3).await);
 }
 
 #[tokio::test]

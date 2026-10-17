@@ -311,6 +311,13 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x39".into(),
             terminal: u32::MAX,
         },
+        // A record of a path, as a show is.
+        ControlRequest::ShowOpen {
+            id: "x40".into(),
+            terminal,
+            target: "echo PWNED".into(),
+            auto: false,
+        },
         ControlRequest::TaskRead {
             id: "x29".into(),
             board: true,
@@ -368,6 +375,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ShowFetch { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }
+            | ControlRequest::ShowOpen { .. }
             | ControlRequest::ReloadAgentManifests { .. }
             | ControlRequest::Shutdown { .. }
             | ControlRequest::Scrollback { .. }
