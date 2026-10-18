@@ -110,11 +110,14 @@ pub enum Item {
     Unknown,
 }
 
-/// A file or image the user attached: its name and size, never its bytes.
+/// A file or image the user attached: its name and size, never its bytes. A local image also
+/// carries the path the record names, so a client can fetch the picture itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chip {
     pub name: String,
     pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

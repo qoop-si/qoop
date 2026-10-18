@@ -433,6 +433,52 @@ async fn the_chat_pages_back_and_starts_over_when_the_file_changed() {
     assert_eq!(json["revision"], json!(again.revision));
 }
 
+/// An uploaded picture reaches `qoop messages --json` as a chip with the file's path (the
+/// `[Image: source: ...]` text is not a row of its own) and never as bytes.
+#[tokio::test]
+async fn an_uploaded_picture_is_a_chip_with_its_path_and_no_bytes() {
+    let daemon = Daemon::start();
+    let id = fresh_id("picture");
+    let upload = "/var/folders/T/qoop/uploads/18df68d31731e200-0.jpg";
+    let prompt = record(
+        "user",
+        1,
+        &id,
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "[Image #1] what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/4AAQSkZJRg=="}},
+        ]}),
+    );
+    // Claude writes the file's path as an injected record after the prompt.
+    let marker = record(
+        "user",
+        2,
+        &id,
+        json!({"role": "user", "content": [
+            {"type": "text", "text": format!("[Image: source: {upload}]")},
+        ]}),
+    );
+    let marker = marker.replacen("\"type\":\"user\"", "\"isMeta\":true,\"type\":\"user\"", 1);
+    let body = prompt + &marker;
+    std::fs::write(transcript(&id), body).expect("write");
+    daemon.start_agent(Some(&id));
+
+    let (ok, out, err) = daemon.qoop(&["messages", "1", "--json"]);
+    assert!(ok, "{err}");
+    let json: Value = serde_json::from_str(&out).expect("json");
+    let row = &json["items"][0];
+    assert_eq!(row["text"], "[Image #1] what is this");
+    assert_eq!(json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        row["attachments"],
+        json!([{"name": "image/jpeg", "bytes": 10, "path": upload}])
+    );
+    assert!(
+        !out.contains("/9j/4AAQ") && !out.contains("Image: source"),
+        "{out}"
+    );
+}
+
 /// A running subagent, input still queued, a command's coloured output and a turn that ended
 /// with agents still running reach `qoop messages --json` as the fields a client draws: the
 /// subagent's `status`, the user row's `queued`, plain text, and one `background` notice once

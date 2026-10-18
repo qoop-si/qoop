@@ -773,3 +773,74 @@ fn attachment_chips_are_capped_and_never_named_by_an_encoded_body() {
     assert!(attachments[..8].iter().all(|c| c.name == "image/png"));
     assert!(!serde_json::to_string(&d).unwrap().contains("iVBOR"));
 }
+
+#[test]
+fn a_claude_upload_chip_carries_its_path_and_the_marker_record_is_not_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    // As Claude writes it: the prompt with its image, an injected reminder, then one injected
+    // record per prompt holding `[Image: source: <path>]` for each image.
+    let mut prompt: serde_json::Value = serde_json::from_str(&user_line(1, "x")).unwrap();
+    prompt["message"]["content"] = serde_json::json!([
+        {"type": "text", "text": "[Image #7] what is this"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "iVBORw0KGgo="}},
+    ]);
+    let mut reminder: serde_json::Value = serde_json::from_str(&user_line(2, "x")).unwrap();
+    reminder["isMeta"] = true.into();
+    reminder["message"]["content"] =
+        serde_json::json!([{"type": "text", "text": "<system-reminder>r</system-reminder>"}]);
+    let mut marker: serde_json::Value = serde_json::from_str(&user_line(3, "x")).unwrap();
+    marker["isMeta"] = true.into();
+    marker["message"]["content"] = serde_json::json!([
+        {"type": "text", "text": "[Image: source: /var/folders/T/qoop/uploads/18df-0.jpg]"},
+    ]);
+    let source = write(
+        dir.path(),
+        "s.jsonl",
+        &[line(prompt), line(reminder), line(marker)],
+    );
+    let d = digest(&source);
+    let [
+        Item::User {
+            text, attachments, ..
+        },
+    ] = d.items.as_slice()
+    else {
+        panic!("one user row: {:?}", d.items)
+    };
+    assert_eq!(text, "[Image #7] what is this");
+    assert_eq!(
+        serde_json::to_value(attachments).unwrap(),
+        serde_json::json!([{"name": "image/jpeg", "bytes": 8, "path": "/var/folders/T/qoop/uploads/18df-0.jpg"}])
+    );
+    assert!(!serde_json::to_string(&d).unwrap().contains("Image: source"));
+}
+
+#[test]
+fn a_chip_with_no_path_has_no_path_key_on_the_wire() {
+    let d = digest(&claude());
+    let wire = serde_json::to_string(&d).unwrap();
+    assert!(wire.contains(r#""attachments":[{"name":"image/png","bytes":70}]"#));
+}
+
+#[test]
+fn the_overflow_chip_of_a_big_upload_has_no_path_and_the_first_eight_keep_theirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}});
+    let mut prompt: serde_json::Value = serde_json::from_str(&user_line(1, "x")).unwrap();
+    prompt["message"]["content"] = vec![image; 11].into();
+    let mut marker: serde_json::Value = serde_json::from_str(&user_line(2, "x")).unwrap();
+    marker["isMeta"] = true.into();
+    marker["message"]["content"] = (0..11)
+        .map(|n| serde_json::json!({"type": "text", "text": format!("[Image: source: /up/{n}.png]")}))
+        .collect::<Vec<_>>()
+        .into();
+    let source = write(dir.path(), "s.jsonl", &[line(prompt), line(marker)]);
+    let d = digest(&source);
+    let [Item::User { attachments, .. }] = d.items.as_slice() else {
+        panic!("one user row")
+    };
+    let paths: Vec<_> = attachments.iter().map(|c| c.path.as_deref()).collect();
+    assert_eq!(paths.len(), 9);
+    assert_eq!(paths[7], Some("/up/7.png"));
+    assert_eq!((attachments[8].name.as_str(), paths[8]), ("+3", None));
+}

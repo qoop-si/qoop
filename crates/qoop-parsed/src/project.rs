@@ -6,6 +6,7 @@ use agentparse::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::item::{Chip, Item, Status};
 use crate::subagent::Spawn;
@@ -117,6 +118,10 @@ pub(crate) fn project(
     let last = out.len().saturating_sub(1);
     for (i, item) in out.iter_mut().enumerate() {
         item.set_seq(seq_of(last, i));
+        // Capped only now: a later record can still name the files of the chips.
+        if let Item::User { attachments, .. } = item {
+            *attachments = cap_chips(std::mem::take(attachments));
+        }
     }
     let spawns = cx
         .spawns
@@ -398,8 +403,12 @@ fn notice(kind: &str, body: &str) -> Item {
 
 fn message_items(m: &Message, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>) {
     // Injected context (environment, instructions, reminders, skill bodies) is the harness's,
-    // not the conversation's, and so is Gemini's "Got it" after a compression.
-    if m.origin == Origin::Context || m.kind.as_deref() == Some("compaction_ack") {
+    // not the conversation's, and so is Gemini's "Got it" after a compression. The one thing
+    // it holds that the chat wants is where an uploaded image lives.
+    if m.origin == Origin::Context {
+        return attach_sources(m, out);
+    }
+    if m.kind.as_deref() == Some("compaction_ack") {
         return;
     }
     let mut user_text = Vec::new();
@@ -515,7 +524,7 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
             seq: 0,
             ts,
             text: text::text(&shown),
-            attachments: cap_chips(chips),
+            attachments: chips,
             queued: m.phase.as_deref() == Some("queued"),
         });
     }
@@ -557,7 +566,81 @@ fn chip(media: &Media) -> Chip {
     Chip {
         name: text::summary(name),
         bytes: media.bytes,
+        path: local_image(media),
     }
+}
+
+/// `[Image: source: <path>]`, the text part Claude Code writes after an uploaded image block.
+fn image_source(text: &str) -> Option<String> {
+    let path = text
+        .trim()
+        .strip_prefix("[Image: source: ")?
+        .strip_suffix(']')?;
+    image_path(path)
+}
+
+/// Claude writes where an uploaded image lives as an injected record after the prompt that
+/// holds it, one `[Image: source: <path>]` text per image. Each path goes to the next image
+/// chip, without a path, of the latest sent user row (the row's chips are not capped yet).
+fn attach_sources(m: &Message, out: &mut [Item]) {
+    let paths = m.parts.iter().filter_map(|p| match p {
+        Part::Text { text } => image_source(text),
+        _ => None,
+    });
+    let Some(Item::User { attachments, .. }) = out
+        .iter_mut()
+        .rev()
+        .find(|i| matches!(i, Item::User { queued: false, .. }))
+    else {
+        return;
+    };
+    let open = attachments
+        .iter_mut()
+        .filter(|c| c.path.is_none() && c.name.starts_with("image/"));
+    for (chip, path) in open.zip(paths) {
+        chip.path = Some(path);
+    }
+}
+
+/// The local file of an image: an absolute path or a `file://` URL the record holds, never a
+/// remote or `data:` URL.
+fn local_image(media: &Media) -> Option<String> {
+    let url = media.url.as_deref()?;
+    match url.strip_prefix("file://") {
+        Some(rest) => image_path(&percent_decode(rest)?),
+        None => image_path(url),
+    }
+}
+
+/// What the daemon's `ShowOpen` can open for the phone: an absolute path with an image
+/// extension (`IMAGES` in `qoop-runtime/src/shows.rs`, keep in step). A path is sent as it is
+/// recorded, so one over `PATH_MOST` bytes or with a control character is dropped, not cut.
+fn image_path(path: &str) -> Option<String> {
+    let image = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    let clean = path.len() <= PATH_MOST && !path.chars().any(char::is_control);
+    (Path::new(path).is_absolute() && image && clean).then(|| path.to_string())
+}
+
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "heic"];
+
+/// The longest path kept on a chip (the usual `PATH_MAX` of Linux and macOS).
+const PATH_MOST: usize = 4096;
+
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let hex = [bytes.next()?, bytes.next()?];
+        out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+    }
+    String::from_utf8(out).ok()
 }
 
 /// A name a person gave a file, not a data URL or an encoded body that ended up where a name
@@ -586,6 +669,7 @@ fn cap_chips(mut chips: Vec<Chip>) -> Vec<Chip> {
         chips.push(Chip {
             name: format!("+{more}"),
             bytes: None,
+            path: None,
         });
     }
     chips
@@ -1281,6 +1365,167 @@ mod tests {
         assert!(!is_bookkeeping("continued-in") && !is_bookkeeping("synthetic"));
     }
 
+    fn picture(mime: Option<&str>, url: Option<&str>) -> Media {
+        Media {
+            mime: mime.map(String::from),
+            url: url.map(String::from),
+            ..Media::default()
+        }
+    }
+
+    #[test]
+    fn a_chip_carries_the_local_path_of_an_image_and_nothing_else() {
+        let path = |m: Media| chip(&m).path;
+        // Codex `local_image` (a bare path, no type), OpenCode file part (file URL, encoded).
+        assert_eq!(
+            path(picture(None, Some("/tmp/up/a.PNG"))).as_deref(),
+            Some("/tmp/up/a.PNG")
+        );
+        assert_eq!(
+            path(picture(
+                Some("image/png"),
+                Some("file:///tmp/my%20shot.png")
+            ))
+            .as_deref(),
+            Some("/tmp/my shot.png")
+        );
+        // Remote, relative, not an image, broken encoding and no URL at all have no path.
+        for m in [
+            picture(Some("image/png"), Some("https://x.test/a.png")),
+            picture(Some("image/png"), Some("shots/a.png")),
+            picture(Some("application/pdf"), Some("/tmp/a.pdf")),
+            picture(Some("image/png"), Some("file:///tmp/a%2")),
+            picture(Some("image/png"), None),
+            // The daemon cannot open these as pictures, whatever the type says.
+            picture(Some("image/bmp"), Some("/tmp/a.bmp")),
+            picture(Some("image/heif"), Some("/tmp/a.heif")),
+            picture(Some("image/png"), Some("/tmp/no-extension")),
+            // Over 4096 bytes or holding a control character: dropped, not cut.
+            picture(None, Some(&format!("/{}.png", "a".repeat(4096)))),
+            picture(None, Some("file:///tmp/a%0Ab.png")),
+            picture(None, Some("/tmp/a\u{1b}[31m.png")),
+        ] {
+            assert_eq!(path(m.clone()), None, "{m:?}");
+        }
+        let longest = format!("/{}.png", "a".repeat(4096 - 5));
+        assert_eq!(longest.len(), 4096);
+        assert_eq!(path(picture(None, Some(&longest))), Some(longest));
+    }
+
+    #[test]
+    fn a_claude_image_source_record_gives_its_paths_to_the_prompt_before_it_and_is_no_row() {
+        let image = Media {
+            mime: Some("image/jpeg".into()),
+            bytes: Some(9),
+            ..Media::default()
+        };
+        let mut prompt = human("look [Image #1] [Image #2]");
+        prompt
+            .parts
+            .extend([Part::Attachment(image.clone()), Part::Attachment(image)]);
+        let text = |t: &str| Part::Text { text: t.into() };
+        let mut source = message(Role::User, Origin::Context, Some("meta"), "");
+        source.parts = vec![
+            text("[Image: source: /var/up/one.jpg]"),
+            text("[Image: source: /var/up/two.jpg]"),
+            text("[Image: source: relative.jpg]"),
+        ];
+        let stray = message(
+            Role::User,
+            Origin::Context,
+            Some("meta"),
+            "[Image: source: /x.png]",
+        );
+        let rows = rows_of(&session(
+            Agent::Claude,
+            vec![
+                EntryKind::Message(stray.clone()),
+                EntryKind::Message(prompt),
+                EntryKind::Message(source),
+                EntryKind::Message(stray),
+            ],
+        ));
+        let [
+            Item::User {
+                text, attachments, ..
+            },
+        ] = rows.as_slice()
+        else {
+            panic!("{rows:?}")
+        };
+        assert_eq!(text, "look [Image #1] [Image #2]");
+        let paths: Vec<_> = attachments.iter().map(|c| c.path.as_deref()).collect();
+        assert_eq!(paths, [Some("/var/up/one.jpg"), Some("/var/up/two.jpg")]);
+    }
+
+    fn sources(paths: &[&str]) -> EntryKind {
+        let mut m = message(Role::User, Origin::Context, Some("meta"), "");
+        m.parts = paths
+            .iter()
+            .map(|p| Part::Text {
+                text: format!("[Image: source: {p}]"),
+            })
+            .collect();
+        EntryKind::Message(m)
+    }
+
+    fn prompt_with(attachments: Vec<Part>, phase: Option<&str>) -> EntryKind {
+        let mut m = human("look");
+        m.phase = phase.map(String::from);
+        m.parts.extend(attachments);
+        EntryKind::Message(m)
+    }
+
+    fn image() -> Part {
+        Part::Attachment(Media {
+            mime: Some("image/png".into()),
+            bytes: Some(9),
+            ..Media::default()
+        })
+    }
+
+    fn chip_paths(rows: &[Item]) -> Vec<Vec<Option<&str>>> {
+        rows.iter()
+            .filter_map(|i| match i {
+                Item::User { attachments, .. } => {
+                    Some(attachments.iter().map(|c| c.path.as_deref()).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_source_path_goes_to_an_image_chip_never_to_a_document_ahead_of_it() {
+        let document = Part::Attachment(Media {
+            mime: Some("application/pdf".into()),
+            bytes: Some(5),
+            ..Media::default()
+        });
+        let rows = rows_of(&session(
+            Agent::Claude,
+            vec![
+                prompt_with(vec![document, image()], None),
+                sources(&["/up/a.png"]),
+            ],
+        ));
+        assert_eq!(chip_paths(&rows), [[None, Some("/up/a.png")]]);
+    }
+
+    #[test]
+    fn a_source_path_skips_a_queued_row_and_is_dropped_when_not_an_image_path() {
+        let rows = rows_of(&session(
+            Agent::Claude,
+            vec![
+                prompt_with(vec![image()], None),
+                prompt_with(vec![image()], Some("queued")),
+                sources(&["/up/a.png"]),
+                sources(&["/up/b.bmp", "/up/c\u{7}.png"]),
+            ],
+        ));
+        assert_eq!(chip_paths(&rows), [[Some("/up/a.png")], [None]]);
+    }
+
     #[test]
     fn more_than_eight_chips_end_in_a_count() {
         let chips = |n: usize| {
@@ -1288,6 +1533,7 @@ mod tests {
                 .map(|i| Chip {
                     name: format!("f{i}"),
                     bytes: None,
+                    path: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -1298,7 +1544,8 @@ mod tests {
             capped[8],
             Chip {
                 name: "+3".into(),
-                bytes: None
+                bytes: None,
+                path: None
             }
         );
     }

@@ -250,7 +250,8 @@ fn a_tool_result_with_an_image_shows_its_name_and_size_never_its_bytes() {
         attachments,
         &[Chip {
             name: "image/png".into(),
-            bytes: Some(70)
+            bytes: Some(70),
+            path: None
         }]
     );
     assert!(!serde_json::to_string(&d).unwrap().contains("iVBOR"));

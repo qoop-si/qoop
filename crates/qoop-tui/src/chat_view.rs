@@ -2211,10 +2211,12 @@ mod tests {
                 Chip {
                     name: "a.png".into(),
                     bytes: Some(20_480),
+                    path: None,
                 },
                 Chip {
                     name: "b".into(),
                     bytes: None,
+                    path: None,
                 },
             ],
             queued: false,
