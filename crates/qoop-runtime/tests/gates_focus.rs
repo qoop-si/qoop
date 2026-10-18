@@ -33,6 +33,7 @@ async fn admitted_events_are_listed_and_nothing_else_is() {
         client
             .control(
                 &ControlRequest::ReportAgentState {
+                    from: None,
                     id: id.into(),
                     terminal,
                     token,

@@ -276,6 +276,7 @@ fn actions() -> Vec<Action> {
             name: "report the agent's state from its hooks",
             method: || {
                 Method::Control(ControlRequest::ReportAgentState {
+                    from: None,
                     id: "a".into(),
                     terminal: 1,
                     token: "t".into(),
@@ -294,6 +295,7 @@ fn actions() -> Vec<Action> {
             name: "report the agent's conversation id without claiming a state",
             method: || {
                 Method::Control(ControlRequest::ReportAgentSession {
+                    from: None,
                     id: "a".into(),
                     terminal: 1,
                     token: "t".into(),
@@ -305,6 +307,7 @@ fn actions() -> Vec<Action> {
             name: "report the agent's sub-agents without claiming a state",
             method: || {
                 Method::Control(ControlRequest::ReportSubagents {
+                    from: None,
                     id: "a".into(),
                     terminal: 1,
                     token: "t".into(),
@@ -713,6 +716,7 @@ fn every_control_method_is_reachable_from_some_action() {
             terminal: 0,
         },
         ControlRequest::ReportAgentState {
+            from: None,
             id: String::new(),
             terminal: 0,
             token: String::new(),
@@ -726,12 +730,14 @@ fn every_control_method_is_reachable_from_some_action() {
             label: None,
         },
         ControlRequest::ReportAgentSession {
+            from: None,
             id: String::new(),
             terminal: 0,
             token: String::new(),
             session: String::new(),
         },
         ControlRequest::ReportSubagents {
+            from: None,
             id: String::new(),
             terminal: 0,
             token: String::new(),

@@ -159,7 +159,7 @@ flags = os.environ.get("QOOP_HOOK_FLAGS") or ""
 def subagents(*flag):
     # Its sub-agents, counted beside the tab: never a state.
     try:
-        subprocess.run(["qoop", "hook-report", *flag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        subprocess.run(["qoop", "hook-report", "--agent", "gemini", *flag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
     except Exception:
         pass
 
@@ -188,7 +188,7 @@ if name == "BeforeTool" and payload.get("tool_name") in ("write_file", "replace"
         subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=2)
     except Exception:
         pass
-args = ["qoop", "hook-report", "--state", state]
+args = ["qoop", "hook-report", "--agent", "gemini", "--state", state]
 if flags:
     args.append(flags)
 session = str(payload.get("session_id") or os.environ.get("GEMINI_SESSION_ID") or "")
@@ -245,5 +245,5 @@ fi
 # Without python a sub-agent event has nothing to say: it is never a state.
 [ "$state" = subagent ] && exit 0
 # shellcheck disable=SC2086
-qoop hook-report --state "$state" $flags >/dev/null 2>&1 || true
+qoop hook-report --agent gemini --state "$state" $flags >/dev/null 2>&1 || true
 exit 0

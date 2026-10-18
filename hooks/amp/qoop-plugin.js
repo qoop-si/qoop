@@ -37,7 +37,7 @@ function report(state, threadID) {
   ) {
     return;
   }
-  const args = ["hook-report", "--state", state, ...flagsFor(state)];
+  const args = ["hook-report", "--agent", "amp", "--state", state, ...flagsFor(state)];
   if (threadID) {
     args.push("--session-id", threadID);
   }

@@ -966,6 +966,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let mut visible_working = false;
     let mut id: Option<String> = None;
     let mut session: Option<String> = None;
+    let mut from: Option<String> = None;
     let mut event: Option<String> = None;
     let mut label: Option<String> = None;
     let mut subagent: Option<qoop_runtime::control::SubagentChange> = None;
@@ -1039,6 +1040,14 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             // The agent's own id for this conversation. Optional: most hooks do not know
             // one, and the ones that do are what makes a restart come back to this
             // conversation rather than to the newest one in the directory.
+            // Which agent's hook this is: the daemon refuses a report from an agent that is
+            // not the terminal's own, one the terminal's agent started.
+            "--agent" => {
+                from = match rest.next() {
+                    Some(v) => Some(v.clone()),
+                    None => return Err(usage("usage: qoop hook-report ... --agent <name>")),
+                }
+            }
             "--session-id" => {
                 session = match rest.next() {
                     Some(v) => Some(v.clone()),
@@ -1106,6 +1115,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             }
             let id = id.unwrap_or_else(|| format!("hook-subagents-{terminal}-{nanos}"));
             ControlRequest::ReportSubagents {
+                from: from.clone(),
                 id,
                 terminal,
                 token,
@@ -1125,6 +1135,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             };
             let id = id.unwrap_or_else(|| format!("hook-session-{terminal}-{nanos}"));
             ControlRequest::ReportAgentSession {
+                from: from.clone(),
                 id,
                 terminal,
                 token,
@@ -1149,6 +1160,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
             }
             let id = id.unwrap_or_else(|| format!("hook-{terminal}-{nanos}"));
             ControlRequest::ReportAgentState {
+                from: from.clone(),
                 id,
                 terminal,
                 token,

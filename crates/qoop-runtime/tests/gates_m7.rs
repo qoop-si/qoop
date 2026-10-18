@@ -71,6 +71,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         // A forged token: refused, but answered. The report carries a state for
         // the index, never bytes for the child.
         ControlRequest::ReportAgentState {
+            from: None,
             id: "x11".into(),
             terminal,
             token: "forged".into(),
@@ -87,6 +88,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         // Session identity without a state claim: an id for the store, never
         // bytes for the child, same as the state report above.
         ControlRequest::ReportAgentSession {
+            from: None,
             id: "x12b".into(),
             terminal,
             token: "forged".into(),
@@ -94,6 +96,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         },
         // A sub-agent's id: counted beside the agent, never bytes for the child.
         ControlRequest::ReportSubagents {
+            from: None,
             id: "x12c".into(),
             terminal,
             token: "forged".into(),

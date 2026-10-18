@@ -625,6 +625,7 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
     let refused = client
         .control(
             &ControlRequest::ReportAgentState {
+                from: None,
                 id: "forged".into(),
                 terminal,
                 token: "not-the-token".into(),
@@ -649,6 +650,7 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
     let accepted = client
         .control(
             &ControlRequest::ReportAgentState {
+                from: None,
                 id: "real".into(),
                 terminal,
                 token,
@@ -720,6 +722,7 @@ async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() 
     let refused = client
         .control(
             &ControlRequest::ReportAgentSession {
+                from: None,
                 id: "forged-session".into(),
                 terminal,
                 token: "not-the-token".into(),
@@ -738,6 +741,7 @@ async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() 
     let empty = client
         .control(
             &ControlRequest::ReportAgentSession {
+                from: None,
                 id: "empty-session".into(),
                 terminal,
                 token: token.clone(),
@@ -755,6 +759,7 @@ async fn g13_10_a_session_only_report_is_recorded_without_touching_the_belief() 
     let accepted = client
         .control(
             &ControlRequest::ReportAgentSession {
+                from: None,
                 id: "real-session".into(),
                 terminal,
                 token,
@@ -1152,6 +1157,7 @@ async fn a_session_name_rides_the_index_and_clears() {
     let reported = client
         .control(
             &ControlRequest::ReportAgentSession {
+                from: None,
                 id: "session".into(),
                 terminal,
                 token,

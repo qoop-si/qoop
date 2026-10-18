@@ -74,7 +74,7 @@ function report(state, { sessionID, event, label } = {}) {
     return;
   }
   if (state === "working" && pending.size > 0) state = "blocked";
-  const args = ["hook-report", "--state", state, ...visibleFlag(state)];
+  const args = ["hook-report", "--agent", "opencode", "--state", state, ...visibleFlag(state)];
   if (typeof sessionID === "string" && sessionID && !children.has(sessionID)) {
     args.push("--session-id", sessionID);
   }

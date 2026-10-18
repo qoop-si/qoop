@@ -44,6 +44,7 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
     let accepted = client
         .control(
             &ControlRequest::ReportAgentState {
+                from: None,
                 id: "r1".into(),
                 terminal,
                 token: token.clone(),
@@ -85,6 +86,7 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
     let sessioned = client
         .control(
             &ControlRequest::ReportAgentSession {
+                from: None,
                 id: "s1".into(),
                 terminal,
                 token: token.clone(),
@@ -107,6 +109,7 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
     let forged = client
         .control(
             &ControlRequest::ReportAgentState {
+                from: None,
                 id: "f1".into(),
                 terminal,
                 token: "not-the-token".into(),

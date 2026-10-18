@@ -444,6 +444,54 @@ fn sub_agents_a_hook_names_are_counted_on_the_agents_row() {
     );
 }
 
+/// An agent the terminal's agent started (Claude running `codex exec`) inherits the terminal and
+/// its token: a report that names it is refused, one that names the terminal's own is counted.
+#[test]
+fn a_report_from_an_agent_the_terminals_agent_started_is_refused() {
+    let daemon = Daemon::start();
+    let dir = daemon.dir.path();
+    let reported = dir.join("reported");
+    let rule = "\u{2500}".repeat(40);
+    let agent = dir.join("claude");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nprintf '{rule}\\n{prompt} Try \"fix it\"\\n{rule}\\n  ? for shortcuts\\n'\n\
+             sleep 1\n'{qoop}' hook-report --agent codex --subagent-start c1 && touch '{foreign}'\n\
+             '{qoop}' hook-report --agent claude --subagent-start a1\ntouch '{reported}'\nsleep 60\n",
+            prompt = "\u{276f}",
+            qoop = env!("CARGO_BIN_EXE_qoop"),
+            foreign = dir.join("foreign-admitted").display(),
+            reported = reported.display(),
+        ),
+    )
+    .expect("write");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let number = daemon
+        .qoop(&["new", "--", agent.to_str().unwrap()])
+        .trim()
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !reported.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(reported.exists(), "the stand in never reported");
+    assert!(
+        !dir.join("foreign-admitted").exists(),
+        "codex's report was admitted"
+    );
+    let row = daemon
+        .qoop(&["agents"])
+        .lines()
+        .find(|l| l.starts_with(&format!("term={number} ")))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        row.contains(" subagents=1"),
+        "only claude's own is counted: {row}"
+    );
+}
+
 /// opencode has no hook here: the count in its footer is read off its screen into its row.
 #[test]
 fn opencodes_footer_count_reaches_its_row() {

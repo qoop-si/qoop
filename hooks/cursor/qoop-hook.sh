@@ -60,5 +60,5 @@ if session and len(session) <= 128 and all(
 fi
 
 # shellcheck disable=SC2086
-qoop hook-report --state "$state" $flags $session >/dev/null 2>&1 || true
+qoop hook-report --agent cursor --state "$state" $flags $session >/dev/null 2>&1 || true
 exit 0

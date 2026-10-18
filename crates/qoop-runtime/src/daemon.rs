@@ -4918,8 +4918,12 @@ async fn handle_control(
             session,
             event,
             label,
+            from,
             ..
         } => {
+            if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
+                return refusal;
+            }
             // An arrival, like output: admitted, applied, and announced when it
             // changed something, but never journalled. The wire clock is
             // deliberately not read here at all: it is advisory, and the
@@ -5142,8 +5146,12 @@ async fn handle_control(
             terminal,
             token,
             session,
+            from,
             ..
         } => {
+            if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
+                return refusal;
+            }
             // Session identity without a state claim: admitted like any other
             // report, then written to the same store. The belief is untouched
             // on purpose: saying which conversation this is says nothing
@@ -5189,8 +5197,12 @@ async fn handle_control(
             terminal,
             token,
             change,
+            from,
             ..
         } => {
+            if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
+                return refusal;
+            }
             // Admitted like a session report, then counted; the belief is untouched, so
             // only the row's count moves.
             let terminal_id = TerminalId::new(terminal.to_string());
@@ -6592,6 +6604,27 @@ fn screen_verdict(reading: qoop_detect::Reading, known: bool) -> Option<qoop_det
 }
 
 /// The agent in a terminal, if what is in it is an agent at all.
+/// The refusal for a hook report from another agent than the terminal's own, if it is one. An
+/// agent the terminal's agent starts (Claude running `codex exec` as a reviewer) inherits the
+/// terminal and its token: its hooks would set the terminal's conversation, state and activity to
+/// its own, and Chat would read a session the terminal's agent never had. A report that names no
+/// agent (an older hook) and a terminal whose agent is not known yet are admitted.
+fn foreign(
+    agents: &Arc<crate::agents::AgentRegistry>,
+    terminal: u32,
+    from: Option<&str>,
+    id: &str,
+) -> Option<ControlResponse> {
+    let from = from?;
+    let own = agent_program(agents, terminal)?;
+    (from != own).then(|| ControlResponse::Failed {
+        id: id.to_string(),
+        reason: format!(
+            "a report from {from}, which is not the agent of terminal {terminal} ({own})"
+        ),
+    })
+}
+
 pub(crate) fn agent_program(
     agents: &Arc<crate::agents::AgentRegistry>,
     stream: u32,

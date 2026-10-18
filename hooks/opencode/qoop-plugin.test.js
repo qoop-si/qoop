@@ -40,14 +40,14 @@ test("a turn reports working with its session, then idle", async () => {
   ev("session.execution.started", { sessionID: "ses_a" });
   ev("session.execution.succeeded", { sessionID: "ses_a" });
   expect(await sent(2)).toEqual([
-    "hook-report --state working --visible-working --session-id ses_a --event user",
-    "hook-report --state idle --visible-idle --session-id ses_a --event done",
+    "hook-report --agent opencode --state working --visible-working --session-id ses_a --event user",
+    "hook-report --agent opencode --state idle --visible-idle --session-id ses_a --event done",
   ]);
 });
 
 test("a failed turn reports failed", async () => {
   ev("session.execution.failed", { sessionID: "ses_f" });
-  expect(await sent(1)).toEqual(["hook-report --state failed --session-id ses_f"]);
+  expect(await sent(1)).toEqual(["hook-report --agent opencode --state failed --session-id ses_f"]);
 });
 
 test("a subagent never speaks for the tab", async () => {

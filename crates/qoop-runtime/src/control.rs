@@ -352,6 +352,12 @@ pub enum ControlRequest {
         /// words; a label without an event is refused by the CLI.
         #[serde(default)]
         label: Option<String>,
+        /// The agent whose hook sent this (`claude`, `codex`, ...). A report from another
+        /// agent than the terminal's own is refused: an agent the terminal's agent started (Claude
+        /// running `codex exec` as a reviewer) inherits the terminal and its token, and would
+        /// otherwise speak for it. Absent (an older hook) is admitted as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// Re-read user agent-detection overrides from the config directory.
     ///
@@ -377,6 +383,9 @@ pub enum ControlRequest {
         /// The agent's own id for this conversation. Empty is refused: there
         /// is nothing to record, and silence must not clear what is there.
         session: String,
+        /// The agent whose hook sent this, as in `ReportAgentState`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// A hook or plugin inside the terminal says a sub-agent started or ended, or which ones
     /// run now. Never a state report and never journalled: the agent's own state is left
@@ -387,6 +396,9 @@ pub enum ControlRequest {
         terminal: TerminalStream,
         token: String,
         change: SubagentChange,
+        /// The agent whose hook sent this, as in `ReportAgentState`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// The focus events a terminal's hooks have reported.
     ///
@@ -2591,6 +2603,7 @@ mod tests {
                 terminals: vec![1, 2, 3],
             },
             ControlRequest::ReportAgentState {
+                from: None,
                 id: "d".into(),
                 terminal: 3,
                 token: "qoop-3-abc".into(),
@@ -2621,6 +2634,7 @@ mod tests {
         assert_eq!(
             request,
             ControlRequest::ReportAgentState {
+                from: None,
                 id: "x".into(),
                 terminal: 1,
                 token: "t".into(),

@@ -245,7 +245,7 @@ if name == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write", "Multi
 def subagents(*flag):
     # The agent's sub-agents, counted beside the tab: never a state.
     try:
-        subprocess.run(["qoop", "hook-report", *flag], capture_output=True, timeout=5)
+        subprocess.run(["qoop", "hook-report", "--agent", "claude", *flag], capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -313,7 +313,7 @@ session = str(payload.get("session_id") or "")
 if session and (len(session) > 128 or not all(c.isalnum() or c in "-_." for c in session)):
     session = ""
 
-args = ["qoop", "hook-report", "--state", state]
+args = ["qoop", "hook-report", "--agent", "claude", "--state", state]
 if flags:
     args.append(flags)
 if event:

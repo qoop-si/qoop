@@ -167,7 +167,7 @@ if state == "subagent":
     flag = {"SubagentStart": "--subagent-start", "SubagentStop": "--subagent-end"}.get(name)
     if agent and flag:
         try:
-            subprocess.run(["qoop", "hook-report", flag, agent], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            subprocess.run(["qoop", "hook-report", "--agent", "codex", flag, agent], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         except Exception:
             pass
     raise SystemExit(0)
@@ -182,7 +182,7 @@ if name == "PreToolUse" and (payload.get("tool_name") == "apply_patch" or first_
         subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=2)
     except Exception:
         pass
-args = ["qoop", "hook-report", "--state", state]
+args = ["qoop", "hook-report", "--agent", "codex", "--state", state]
 if flags:
     args.append(flags)
 session = str(payload.get("session_id") or "")
@@ -236,5 +236,5 @@ fi
 # Without python a sub-agent event has nothing to say: it is never a state.
 [ "$state" = subagent ] && exit 0
 # shellcheck disable=SC2086
-qoop hook-report --state "$state" $flags >/dev/null 2>&1 || true
+qoop hook-report --agent codex --state "$state" $flags >/dev/null 2>&1 || true
 exit 0

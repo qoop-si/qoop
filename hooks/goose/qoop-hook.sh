@@ -67,5 +67,5 @@ print(state)
 ' 2>/dev/null)" || exit 0
 
 # shellcheck disable=SC2086
-qoop hook-report --state $report >/dev/null 2>&1 || true
+qoop hook-report --agent goose --state $report >/dev/null 2>&1 || true
 exit 0
