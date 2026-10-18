@@ -177,11 +177,16 @@ Notes:
 
 ```text
 qoop hook-report --state <starting|idle|working|blocked|done|failed|unknown>
-    [--terminal N] [--token T] [--session-id S]
+    [--agent NAME] [--terminal N] [--token T] [--session-id S]
     [--event user|tool|blocked|done] [--label ...]
     [--visible-blocker] [--visible-idle] [--visible-working]
-qoop hook-report --session-id S [--terminal N] [--token T]
+qoop hook-report --session-id S [--agent NAME] [--terminal N] [--token T]
 ```
+
+`--agent` names the agent whose hook sends the report (`claude`, `codex`, ...), as qoop
+detects it. An agent that the terminal's agent starts (Claude running `codex exec` as a
+reviewer) inherits the terminal and its token; the daemon refuses its reports, so it never
+sets the terminal's conversation, state or activity. A report without `--agent` is admitted.
 
 `--event` needs `--state`, and `--label` needs `--event`; anything else is
 a usage error before anything reaches the daemon. An out-of-set `--event`

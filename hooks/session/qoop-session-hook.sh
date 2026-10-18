@@ -68,5 +68,14 @@ if (
 ' 2>/dev/null)" || session=""
 
 [ -n "$session" ] || exit 0
-qoop hook-report --session-id "$session" >/dev/null 2>&1 || true
+# The agent this copy is for, from the name the installer gives it (`qoop-droid-session.sh`): the
+# daemon refuses a report from an agent the terminal's own agent started.
+agent=$(basename "$0")
+agent=${agent#qoop-}
+agent=${agent%-session.sh}
+case "$agent" in
+  "" | *[!a-z0-9]*) set -- ;;
+  *) set -- --agent "$agent" ;;
+esac
+qoop hook-report "$@" --session-id "$session" >/dev/null 2>&1 || true
 exit 0

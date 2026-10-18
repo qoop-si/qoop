@@ -1037,9 +1037,6 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     }
                 }
             }
-            // The agent's own id for this conversation. Optional: most hooks do not know
-            // one, and the ones that do are what makes a restart come back to this
-            // conversation rather than to the newest one in the directory.
             // Which agent's hook this is: the daemon refuses a report from an agent that is
             // not the terminal's own, one the terminal's agent started.
             "--agent" => {
@@ -1048,6 +1045,9 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     None => return Err(usage("usage: qoop hook-report ... --agent <name>")),
                 }
             }
+            // The agent's own id for this conversation. Optional: most hooks do not know
+            // one, and the ones that do are what makes a restart come back to this
+            // conversation rather than to the newest one in the directory.
             "--session-id" => {
                 session = match rest.next() {
                     Some(v) => Some(v.clone()),

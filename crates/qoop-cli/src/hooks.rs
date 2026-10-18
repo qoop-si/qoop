@@ -1822,7 +1822,11 @@ mod tests {
                 "",
                 &format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#),
             );
-            assert_eq!(said.trim(), "hook-report --state starting", "{source}");
+            assert_eq!(
+                said.trim(),
+                "hook-report --agent claude --state starting",
+                "{source}"
+            );
         }
         let said = report(
             "claude",
@@ -1835,7 +1839,11 @@ mod tests {
         );
         for agent in ["codex", "gemini"] {
             let said = report(agent, "working", r#"{"hook_event_name":"SessionStart"}"#);
-            assert_eq!(said.trim(), "hook-report --state starting", "{agent}");
+            assert_eq!(
+                said.trim(),
+                format!("hook-report --agent {agent} --state starting"),
+                "{agent}"
+            );
             let said = report(
                 agent,
                 "working",
@@ -2300,7 +2308,7 @@ mod tests {
         .expect("write");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&qoop, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        let hook = dir.path().join("hook.sh");
+        let hook = dir.path().join("qoop-droid-session.sh");
         std::fs::write(&hook, SESSION_HOOK).expect("write");
 
         let run = |payload: &str| {
@@ -2335,7 +2343,7 @@ mod tests {
         let lines = std::fs::read_to_string(&log).unwrap_or_default();
         assert_eq!(
             lines,
-            "hook-report --session-id abc-123\nhook-report --session-id def_456\n"
+            "hook-report --agent droid --session-id abc-123\nhook-report --agent droid --session-id def_456\n"
         );
     }
 
@@ -2943,7 +2951,12 @@ mod tests {
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| l.starts_with("hook-report"))
-                .map(String::from)
+                .map(|l| {
+                    // Every report names its agent; the rest of the line is what is checked.
+                    let tag = format!("hook-report --agent {agent} ");
+                    assert!(l.starts_with(&tag), "{agent}: {l}");
+                    l.replacen(&tag, "hook-report ", 1)
+                })
                 .collect()
         };
         let only = |said: Vec<String>, want: &str| assert_eq!(said, vec![want.to_string()]);

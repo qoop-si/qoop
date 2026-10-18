@@ -6603,7 +6603,6 @@ fn screen_verdict(reading: qoop_detect::Reading, known: bool) -> Option<qoop_det
     }
 }
 
-/// The agent in a terminal, if what is in it is an agent at all.
 /// The refusal for a hook report from another agent than the terminal's own, if it is one. An
 /// agent the terminal's agent starts (Claude running `codex exec` as a reviewer) inherits the
 /// terminal and its token: its hooks would set the terminal's conversation, state and activity to
@@ -6625,6 +6624,7 @@ fn foreign(
     })
 }
 
+/// The agent in a terminal, if what is in it is an agent at all.
 pub(crate) fn agent_program(
     agents: &Arc<crate::agents::AgentRegistry>,
     stream: u32,
