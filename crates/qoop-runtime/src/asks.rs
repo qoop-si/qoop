@@ -37,7 +37,7 @@ const QASS_SPACE: &str = "qass";
 
 /// How long after a person typed into qass's terminal the inbox leaves it alone: a draft
 /// still reads `idle`, and typing over it would send half a sentence.
-const TYPED_QUIET_SECS: i64 = 30;
+pub const TYPED_QUIET_SECS: i64 = 30;
 
 /// The pause between the words and the Enter that sends them, the one `qoop prompt` leaves so
 /// a bracketed paste lands before the newline submits it.

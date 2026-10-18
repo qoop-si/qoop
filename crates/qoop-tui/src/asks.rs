@@ -47,6 +47,8 @@ pub enum Out {
     Closed,
     /// Go to this agent's tab.
     Jump(u32),
+    /// The keyboard goes to qass's chat with this line to talk the card through.
+    ToQass(String),
     /// Not the inbox's: the prefix, a mouse report or a detach, for the ordinary path.
     Pass(Vec<u8>),
 }
@@ -247,7 +249,7 @@ impl Pane {
     }
 
     /// Say something in place of the key line, for a few seconds.
-    fn say(&mut self, what: impl Into<String>) {
+    pub(crate) fn say(&mut self, what: impl Into<String>) {
         self.notice = Some(what.into());
         self.notice_until = Some(Instant::now() + NOTICE);
     }
@@ -475,6 +477,16 @@ impl Pane {
             }
             Key::Char(b'\r' | b'\n') => match self.open_card().and_then(|c| c.terminal) {
                 Some(terminal) => Out::Jump(terminal),
+                None => Out::Stay,
+            },
+            // A draft's question is already on its agent's screen, so its tab; else qass.
+            Key::Char(b'o') => match self.open_card() {
+                Some(AskInfo {
+                    card,
+                    terminal: Some(terminal),
+                    ..
+                }) if card.starts_with('W') => Out::Jump(*terminal),
+                Some(card) => Out::ToQass(talk_line(card)),
                 None => Out::Stay,
             },
             Key::Char(_) => Out::Stay,
@@ -1185,6 +1197,16 @@ fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> Stri
     ])
 }
 
+/// The line that asks qass to talk `card` through, his words to follow. It never starts with
+/// the handle or `E<n> B`, which qass reads as an answer. The daemon refuses card values with a
+/// control character, so it stays one line.
+pub fn talk_line(card: &AskInfo) -> String {
+    format!(
+        "About {} ({}): {} ",
+        card.card, card.body.handle, card.body.asks
+    )
+}
+
 fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
     // For as long as the words stay, never back to `enter send`; named, since another card
     // may stand over them.
@@ -1205,7 +1227,7 @@ fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
     let keys = if pane.typing {
         "enter send  esc stop typing"
     } else if pane.focus {
-        "j k cards  a-d send  t type  x away  tab chat"
+        "j k cards  a-d send  t type  o talk  x away  tab chat"
     } else {
         "ctrl-a i focuses this"
     };
@@ -1801,6 +1823,36 @@ mod tests {
         assert_eq!(p.key(b"z", 1), Out::Stay);
     }
 
+    /// `o` on qass's card talks it through in qass's chat; on a draft for an agent with a tab it
+    /// goes to that tab, where the question already is; a draft with no tab left goes to qass.
+    #[test]
+    fn o_talks_to_qass_for_its_card_and_to_the_tab_for_a_draft() {
+        let mut talk = card(1, "korea", "open");
+        talk.body.asks = "Question 1?".to_string();
+        let mut p = Pane {
+            focus: true,
+            ..Default::default()
+        };
+        p.take(vec![talk.clone()], Vec::new());
+        assert_eq!(
+            p.key(b"o", 1),
+            Out::ToQass("About E1 (korea): Question 1? ".to_string())
+        );
+        talk.card = "W1".to_string();
+        talk.terminal = Some(5);
+        p.take(vec![talk.clone()], Vec::new());
+        assert_eq!(p.key(b"o", 1), Out::Jump(5));
+        talk.terminal = None;
+        p.take(vec![talk], Vec::new());
+        assert_eq!(
+            p.key(b"o", 1),
+            Out::ToQass("About W1 (korea): Question 1? ".to_string())
+        );
+        p.take(Vec::new(), Vec::new());
+        assert_eq!(p.key(b"o", 1), Out::Stay);
+        assert!(!p.busy(), "nothing was answered");
+    }
+
     #[test]
     fn a_passed_card_cannot_be_answered_again_and_says_where_it_is() {
         let t0 = Instant::now();
@@ -2023,7 +2075,10 @@ mod tests {
             "repainted once to let go"
         );
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("j k cards") && !t.contains("taken back"), "{t}");
+        assert!(
+            t.contains("t type  o talk") && !t.contains("taken back"),
+            "{t}"
+        );
         assert_eq!(p.wake_at(), None, "nothing armed again");
     }
 

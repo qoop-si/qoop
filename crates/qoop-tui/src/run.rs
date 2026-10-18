@@ -734,6 +734,9 @@ struct State {
     qass_ui: crate::qass_screen::Ui,
     /// The question inbox beside qass's terminal: its cards, what is typed, the answer held.
     asks: crate::asks::Pane,
+    /// When this client last forwarded a key or a paste to each terminal, so a talk line is
+    /// never pasted over what he is typing there, nor twice.
+    typed_at: std::collections::BTreeMap<u32, std::time::Instant>,
     /// The terminal this client showed last time, and where that is kept.
     last: LastFocus,
     /// Which terminals show their session as Chat instead of the terminal, and what it shows.
@@ -3148,9 +3151,13 @@ impl State {
     /// The keyboard to qass's terminal of the tab on screen, next: what leaving the questions
     /// of qass's split tab does, wherever the keyboard was before them.
     fn qass_next(&mut self) {
+        self.pending_focus = self.qass_chat().filter(|t| *t != self.focused);
+    }
+
+    /// qass's terminal in the tab on screen.
+    fn qass_chat(&self) -> Option<u32> {
         let qass = sidebar::qass_space(&self.spaces);
-        self.pending_focus = self
-            .space
+        self.space
             .and_then(|space| self.layouts.get(&space))
             .and_then(|tree| {
                 self.rows
@@ -3158,7 +3165,20 @@ impl State {
                     .find(|r| r.agent && Some(r.workspace) == qass && tree.contains(r.terminal))
             })
             .map(|r| r.terminal)
-            .filter(|t| *t != self.focused);
+    }
+
+    /// Whether qass sits at its prompt with nothing of his on it, as far as this client can
+    /// tell: idle or done, no trust or question up, and no key sent to it for the daemon's
+    /// typed quiet (`TYPED_QUIET_SECS` in qoop-runtime's asks). What another client typed
+    /// stays unseen; a paste is never sent, so he sees it and can clear it.
+    fn qass_at_rest(&self, qass: u32) -> bool {
+        self.rows.iter().any(|r| {
+            r.terminal == qass
+                && matches!(r.state.as_str(), "idle" | "done")
+                && r.readiness == "ready"
+        }) && self.typed_at.get(&qass).is_none_or(|at| {
+            at.elapsed().as_secs() >= qoop_runtime::asks::TYPED_QUIET_SECS.unsigned_abs()
+        })
     }
 
     /// Whether the keyboard is in the question inbox: open, shown and given the keys.
@@ -7250,6 +7270,7 @@ where
         qass_ui: Default::default(),
         // Read once as soon as the loop runs.
         asks: crate::asks::Pane::new(),
+        typed_at: Default::default(),
         chat: crate::chat_view::ChatState::read(chat_file),
         last: LastFocus::read(last_focus, own_focus),
         show_when_listed: None,
@@ -8244,6 +8265,9 @@ where
                             wr.write_all(&bytes).await?;
                         }
                         drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                        if let Some((terminal, line)) = &taken.paste {
+                            paste_talk(&mut state, *terminal, line, &mut seqs, &mut wr).await?;
+                        }
                         feed = taken.feed;
                     } else {
                         feed = Some(bytes);
@@ -8293,6 +8317,7 @@ where
                                 // Typing into a tab that shows chat shows its terminal for
                                 // the moment (`ChatState::typed`).
                                 state.chat.typed(state.focused, &bytes, std::time::Instant::now());
+                                state.typed_at.insert(state.focused, std::time::Instant::now());
                                 // A key for the pane moves the keyboard's attention back there.
                                 if std::mem::take(&mut state.in_column) {
                                     dirty = true;
@@ -10740,7 +10765,7 @@ async fn drop_into(
         return Ok(());
     }
     let text: String = items_text(items);
-    paste_into(terminal, &text, seqs, wr).await
+    paste_into(terminal, &text, seqs, wr, &mut state.typed_at).await
 }
 
 /// The microphone is no longer lent: its notice goes with it.
@@ -10773,7 +10798,7 @@ async fn type_picture(
 ) -> io::Result<()> {
     state.message = done.message;
     if let Some(paste) = done.paste {
-        paste_into(done.terminal, &paste, seqs, wr).await?;
+        paste_into(done.terminal, &paste, seqs, wr, &mut state.typed_at).await?;
     }
     for piece in client::split_input(&done.input) {
         wr.write_all(&client::encode_command_to(
@@ -10794,13 +10819,30 @@ fn items_text(items: Vec<(String, Option<std::path::PathBuf>)>) -> String {
     items.into_iter().map(|(typed, _)| typed).collect()
 }
 
-/// `text` pasted into `terminal` as a person pastes it.
+/// A talk line pasted into qass's input, shown there as typing is when its tab shows Chat.
+async fn paste_talk(
+    state: &mut State,
+    qass: u32,
+    line: &str,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+    wr: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
+    paste_into(qass, line, seqs, wr, &mut state.typed_at).await?;
+    state
+        .chat
+        .typed(qass, line.as_bytes(), std::time::Instant::now());
+    Ok(())
+}
+
+/// `text` pasted into `terminal` as a person pastes it, which counts as typing there.
 async fn paste_into(
     focused: u32,
     text: &str,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
     wr: &mut (impl AsyncWriteExt + Unpin),
+    typed_at: &mut std::collections::BTreeMap<u32, std::time::Instant>,
 ) -> io::Result<()> {
+    typed_at.insert(focused, std::time::Instant::now());
     for piece in client::split_input(text.as_bytes()) {
         // A paste, so the daemon puts the markers on when the program asked for them: an
         // agent attaches a picture whose path is pasted and keeps a typed one as text.
@@ -12474,6 +12516,8 @@ struct AskKeys {
     resize: bool,
     /// Go to this agent's tab.
     jump: Option<u32>,
+    /// Paste this line, unsent, into this terminal (qass's).
+    paste: Option<(u32, String)>,
 }
 
 /// Keys typed while the inbox has the keyboard.
@@ -12482,7 +12526,8 @@ fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     let mut taken = AskKeys::default();
     match state.asks.key(bytes, prefix) {
         Out::Stay => {}
-        Out::ToChat => {
+        Out::ToQass(_) if state.qass_chat().is_none() => state.asks.say("qass is not running"),
+        out @ (Out::ToChat | Out::ToQass(_)) => {
             state.asks.release();
             if state.qass_split() {
                 state.qass_next();
@@ -12495,6 +12540,17 @@ fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
             {
                 state.qass_ui.inbox = false;
                 state.asks.raised = false;
+            }
+            // The talk line waits on qass's input for his words, or, while qass is busy or he
+            // types there, stands on the notice row for him to read.
+            if let Out::ToQass(line) = out
+                && let Some(qass) = state.qass_chat()
+            {
+                if state.qass_at_rest(qass) {
+                    taken.paste = Some((qass, line));
+                } else {
+                    say(state, line);
+                }
             }
         }
         Out::Closed => {
@@ -15980,6 +16036,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
@@ -17242,6 +17299,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
@@ -17392,6 +17450,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
@@ -23760,6 +23819,79 @@ mod tests {
         let taken = asks_keys(&mut state, b"\r", 1);
         assert_eq!(taken.jump, Some(1));
         assert!(!state.asks.focus);
+        // `o` talks the card through: the line waits on qass's input while qass is at rest,
+        // and nothing is answered.
+        let line = "About E1 (korea): Question 1? ".to_string();
+        let busy = state.asks.busy();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, Some((5, line.clone())));
+        assert!(!state.asks.focus && state.qass_ui.inbox);
+        assert_eq!(state.asks.busy(), busy);
+        // qass working, or a key sent to it moments ago: the line only on the notice row.
+        fn row(state: &mut State) -> &mut AgentRow {
+            state.rows.iter_mut().find(|r| r.terminal == 5).unwrap()
+        }
+        row(&mut state).state = "working".into();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line.clone()));
+        row(&mut state).state = "idle".into();
+        state.typed_at.insert(5, std::time::Instant::now());
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line.clone()));
+        // Past the window the line is pasted again; a trust question up, never.
+        let quiet = std::time::Duration::from_secs(31);
+        let long_ago = std::time::Instant::now().checked_sub(quiet).unwrap();
+        state.typed_at.insert(5, long_ago);
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, Some((5, line.clone())));
+        row(&mut state).readiness = "trust_required".into();
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken.paste, None);
+        assert_eq!(state.message.take(), Some(line));
+        row(&mut state).readiness = "ready".into();
+        // No qass terminal: the inbox says so and keeps the keyboard.
+        asks_toggle(&mut state);
+        row(&mut state).agent = false;
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!(taken, AskKeys::default());
+        assert!(state.asks.focus);
+        row(&mut state).agent = true;
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("qass is not running"), "{painted}");
+    }
+
+    /// A talk line once pasted counts as typing in qass, its Chat shows the terminal, and `o`
+    /// again at once only says the line.
+    #[tokio::test]
+    async fn a_second_talk_at_once_does_not_paste_the_line_again() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state.chat.toggle(5, Some("claude"));
+        asks_toggle(&mut state);
+        let Some((terminal, line)) = asks_keys(&mut state, b"o", 1).paste else {
+            panic!("pasted")
+        };
+        let mut wire = Vec::new();
+        paste_talk(&mut state, terminal, &line, &mut seqs, &mut wire)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&wire).contains("\"paste\""));
+        assert!(
+            state.chat.typing(5),
+            "qass's Chat shows its terminal, as typing does"
+        );
+        asks_toggle(&mut state);
+        assert_eq!(asks_keys(&mut state, b"o", 1).paste, None);
+        assert_eq!(state.message, Some(line));
     }
 
     #[test]
