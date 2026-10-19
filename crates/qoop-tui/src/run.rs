@@ -1600,7 +1600,11 @@ impl State {
         screen::park_state(&self.rows, self.focused)?;
         let (row, col) = (row as usize, col as usize);
         let hit = match screen::park_spot(&self.frame())?.1 {
-            screen::ParkSpot::Corner(x, y) => (row, col) == (y + screen::TABS + 1, x + left + 1),
+            screen::ParkSpot::Corner(x, y, text) => {
+                let from = x + left + 1;
+                row == y + screen::TABS + 1
+                    && (from..from + crate::width::width(&text)).contains(&col)
+            }
             screen::ParkSpot::Notice(from, text) => {
                 row + 1 == self.lines as usize
                     && (from..from + crate::width::width(&text)).contains(&col)
@@ -20432,7 +20436,7 @@ mod tests {
     }
 
     /// One pane alone: the park label ends the notice row, under the agent's screen and never
-    /// on it, is its own click, stands only while the agent has answered and reads unpark
+    /// on it, is its own click, stands only while the agent has answered and reads parked
     /// once parked.
     #[test]
     fn a_lone_panes_park_label_ends_the_notice_row_and_only_after_an_answer() {
@@ -20485,12 +20489,27 @@ mod tests {
         (s.cols, s.lines) = (120, 30);
         s.rows[0] = agent(1, 1, "claude", "done");
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let Some((false, screen::ParkSpot::Corner(x, y))) = screen::park_spot(&s.frame()) else {
+        let Some((false, screen::ParkSpot::Corner(x, y, label))) = screen::park_spot(&s.frame())
+        else {
             panic!("split panes put the mark in the corner");
         };
         let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
+        let wide = crate::width::width(&label) as u16;
+        assert!(
+            label.starts_with("[ ") && label.ends_with(" park ]"),
+            "{label:?}"
+        );
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(1))));
+        assert!(matches!(
+            s.clicked(row, col + wide - 1),
+            Some(Clicked::Park(1))
+        ));
         assert!(!matches!(s.clicked(row, col - 1), Some(Clicked::Park(_))));
+        // A blank between the label and the corner's arm, which is not the label.
+        assert!(!matches!(
+            s.clicked(row, col + wide),
+            Some(Clicked::Park(_))
+        ));
         let (from, _) = screen::park_notice(s.cols, false);
         assert!(
             !matches!(s.clicked(29, from as u16 + 1), Some(Clicked::Park(_))),

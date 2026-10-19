@@ -776,37 +776,41 @@ pub(crate) fn park_state(rows: &[AgentRow], focused: u32) -> Option<bool> {
     matches!(agent.state.as_str(), "idle" | "done").then(|| sidebar::is_parked(agent))
 }
 
-/// The park control's mark: the bookmark, full once parked, or `p` where icons are not drawn.
-fn park_mark(parked: bool) -> char {
+/// The park control, as the owner picked it (2026-10-20): `[ ⚑ park ]` in a quiet ink,
+/// `[ ⚑ parked ]` in the brand's ember once parked; the bookmark is left out where icons are
+/// not drawn.
+fn park_label(parked: bool) -> String {
+    let word = if parked { "parked" } else { "park" };
     match (crate::icons::on(), parked) {
-        (false, _) => 'p',
-        (true, false) => crate::icons::PARK,
-        (true, true) => crate::icons::PARKED,
+        (false, _) => format!("[ {word} ]"),
+        (true, false) => format!("[ {} {word} ]", crate::icons::PARK),
+        (true, true) => format!("[ {} {word} ]", crate::icons::PARKED),
     }
 }
 
-/// Where the park mark sits among split panes: on the focused pane's bottom edge, against
-/// the arm of its bottom right corner (`⚑─╯`), in pane cells. In qoop's own frame, never
-/// over the agent's screen (the owner's pick, 2026-10-20). `None` without that corner.
-fn park_corner(tiles: &[Tile], cols: usize, rows: usize) -> Option<(usize, usize)> {
+/// Where the park label sits among split panes: on the focused pane's bottom edge, a blank
+/// short of the arm of its bottom right corner (`[ ⚑ park ] ─╯`), as its first pane cell. In
+/// qoop's own frame, never over the agent's screen. `None` without that corner or the room.
+fn park_corner(tiles: &[Tile], cols: usize, rows: usize, wide: usize) -> Option<(usize, usize)> {
     if tiles.len() < 2 {
         return None;
     }
     let r = tiles.iter().find(|t| t.focused)?.rect;
     let (right, bottom) = (r.x + r.cols, r.y + r.rows);
-    (r.x >= 1 && r.y >= 1 && right < cols && bottom < rows && r.cols >= 4)
-        .then_some((right - 2, bottom))
+    // Clear of the bottom left corner and its arm, and a blank before the right one's.
+    (r.x >= 1 && r.y >= 1 && right < cols && bottom < rows && r.cols >= wide + 5)
+        .then_some((right - 2 - wide, bottom))
 }
 
 /// Where the park control stands on a frame.
 pub(crate) enum ParkSpot {
-    /// A cell of the split panes' edge grid, in pane cells.
-    Corner(usize, usize),
+    /// The label on the split panes' edge grid: its first cell, in pane cells, and its text.
+    Corner(usize, usize, String),
     /// The label ending the notice row: its one-based column and its text.
     Notice(usize, String),
 }
 
-/// Whether the park control shows on this frame, where, and whether it says unpark. One
+/// Whether the park control shows on this frame, where, and whether it says parked. One
 /// answer for the paint and for a click, so a click lands only on what was drawn: the
 /// corner when it is free (no pane's name or handle in that cell), else the notice row's
 /// end, which a mode, a close question in that row or the spotlight keeps for themselves.
@@ -823,13 +827,16 @@ pub(crate) fn park_spot(frame: &Frame) -> Option<(bool, ParkSpot)> {
         frame.sidebar_width,
     );
     let (cols, rows) = (cols as usize, rows as usize);
-    if let Some((x, y)) = park_corner(&frame.tiles, cols, rows)
+    let label = park_label(parked);
+    let wide = width::width(&label);
+    // Every cell it takes and the blank after it are free: no pane's name or handle there.
+    if let Some((x, y)) = park_corner(&frame.tiles, cols, rows, wide)
         && edge_grid(frame, cols, rows)
             .get(y)
-            .and_then(|row| row.get(x))
-            .is_some_and(Option::is_none)
+            .and_then(|row| row.get(x..=x + wide))
+            .is_some_and(|cells| cells.iter().all(Option::is_none))
     {
-        return Some((parked, ParkSpot::Corner(x, y)));
+        return Some((parked, ParkSpot::Corner(x, y, label)));
     }
     if frame.chrome.mode.is_some() || frame.confirm().is_some() {
         return None;
@@ -858,15 +865,9 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
 }
 
 /// The park label at the right end of the notice row, for a pane with no corners (one
-/// pane alone): `[park]` or `[unpark]`, in qoop's own row under the agent's screen. Its
-/// one-based column.
+/// pane alone), in qoop's own row under the agent's screen: its one-based column and text.
 pub(crate) fn park_notice(cols: u16, parked: bool) -> (usize, String) {
-    let word = if parked { "unpark" } else { "park" };
-    let text = if crate::icons::on() {
-        format!(" {} {word} ", park_mark(parked))
-    } else {
-        format!(" [{word}] ")
-    };
+    let text = format!(" {} ", park_label(parked));
     let col = (cols as usize + 1).saturating_sub(width::width(&text));
     (col.max(1), text)
 }
@@ -1189,10 +1190,17 @@ pub fn paint(frame: &Frame) -> String {
     // against the focused corner when it stands there.
     let mut edges = edge_grid(frame, pane_cols as usize, pane_rows as usize);
     let park = park_spot(frame);
-    if let Some((parked, ParkSpot::Corner(x, y))) = &park
-        && let Some(cell) = edges.get_mut(*y).and_then(|row| row.get_mut(*x))
+    if let Some((parked, ParkSpot::Corner(x, y, label))) = &park
+        && let Some(row) = edges.get_mut(*y)
     {
-        *cell = Some((park_mark(*parked), EdgeInk::Lit));
+        let ink = if *parked {
+            EdgeInk::Lit
+        } else {
+            EdgeInk::Quiet
+        };
+        for (cell, c) in row.iter_mut().skip(*x).zip(label.chars()) {
+            *cell = Some((c, ink));
+        }
     }
     // qass's rail: its rows, painted over the cells the tree left for it.
     let rail_rows = frame
@@ -1537,10 +1545,14 @@ pub fn paint(frame: &Frame) -> String {
             // Without a corner to carry it, the park label ends this row, and the notice is cut
             // short of it rather than written under it.
             match &park {
-                Some((_, ParkSpot::Notice(_, label))) => {
+                Some((parked, ParkSpot::Notice(_, label))) => {
                     let room = (frame.cols as usize).saturating_sub(width::width(label));
                     out.push_str(&width::fit(&notice, room));
-                    out.push_str(&theme::status_in(theme::Role::Brand));
+                    out.push_str(&theme::status_in(if *parked {
+                        theme::Role::Brand
+                    } else {
+                        theme::Role::Faint
+                    }));
                     out.push_str(label);
                 }
                 _ => out.push_str(&width::fit(&notice, frame.cols as usize)),
@@ -3424,6 +3436,8 @@ enum EdgeInk {
     Title,
     /// The focused pane's name.
     TitleLit,
+    /// The park label before it is used: a quiet ink.
+    Quiet,
 }
 
 /// The marks around split panes, as a grid over the pane area.
@@ -3580,6 +3594,7 @@ fn edge_style(ink: EdgeInk) -> String {
     let mono = crate::colorlevel::level() == crate::colorlevel::Level::Mono;
     match ink {
         EdgeInk::Title => theme::fg(theme::Role::Detail),
+        EdgeInk::Quiet => theme::fg(theme::Role::Faint),
         EdgeInk::Lit if !mono => theme::fg(theme::Role::Brand),
         EdgeInk::Lit | EdgeInk::TitleLit => format!("{}\x1b[1m", theme::fg(theme::Role::Text)),
     }
