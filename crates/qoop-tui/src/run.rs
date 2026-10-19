@@ -1594,6 +1594,21 @@ impl State {
         )
     }
 
+    /// The park control a click lands on, as the paint drew it (`screen::park_spot`).
+    fn park_hit(&self, row: u16, col: u16, left: usize) -> Option<u32> {
+        // Cheap first: no control, nothing to build a frame for.
+        screen::park_state(&self.rows, self.focused)?;
+        let (row, col) = (row as usize, col as usize);
+        let hit = match screen::park_spot(&self.frame())?.1 {
+            screen::ParkSpot::Corner(x, y) => (row, col) == (y + screen::TABS + 1, x + left + 1),
+            screen::ParkSpot::Notice(from, text) => {
+                row + 1 == self.lines as usize
+                    && (from..from + crate::width::width(&text)).contains(&col)
+            }
+        };
+        hit.then_some(self.focused)
+    }
+
     /// Whether a plain press lands on a divider between two tiles, and hold it if so.
     fn split_press(&mut self, col: u16, row: u16) -> bool {
         let first_col = screen::left_for(self.cols, self.collapsed, self.sidebar_width) + 1;
@@ -1696,6 +1711,9 @@ impl State {
         let (pane_cols, _) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        if let Some(terminal) = self.park_hit(row, col, left) {
+            return Some(Clicked::Park(terminal));
+        }
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
             if row == 0 || (row as usize) > screen::TABS || self.header_in_strip() {
@@ -1715,7 +1733,6 @@ impl State {
             ) {
                 Some(tabs::Hit::Terminal(terminal)) => Some(Clicked::Terminal(terminal)),
                 Some(tabs::Hit::Close(_)) => Some(Clicked::CloseFocused),
-                Some(tabs::Hit::Park(terminal)) => Some(Clicked::Park(terminal)),
                 Some(tabs::Hit::New) => Some(Clicked::NewTerminal),
                 None => None,
             };
@@ -7114,7 +7131,7 @@ enum Clicked {
     /// The close on the focused tab: the same as `ctrl-a x`, a question first when an agent
     /// in it is busy.
     CloseFocused,
-    /// The park mark under it: the same as `ctrl-a P`.
+    /// The park label over the agent's pane: the same as `ctrl-a P`.
     Park(u32),
     /// The `x` on an agent's row in the column: that agent's pane, a question first when
     /// it is busy.
@@ -20411,6 +20428,73 @@ mod tests {
         assert_eq!(
             state.message.as_deref(),
             Some("only an agent can be parked")
+        );
+    }
+
+    /// One pane alone: the park label ends the notice row, under the agent's screen and never
+    /// on it, is its own click, stands only while the agent has answered and reads unpark
+    /// once parked.
+    #[test]
+    fn a_lone_panes_park_label_ends_the_notice_row_and_only_after_an_answer() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        s.rows = vec![agent(3, 1, "claude", "idle")];
+        s.focused = 3;
+        // An open box has the screen: no label under it, nothing to click.
+        assert!(s.palette.is_some() && screen::park_spot(&s.frame()).is_none());
+        s.palette = None;
+        let (from, text) = screen::park_notice(s.cols, false);
+        assert!(text.contains("park"));
+        assert_eq!(from + crate::width::width(&text) - 1, 100, "flush right");
+        let (row, col) = (29, from as u16 + 1);
+        assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
+        assert!(
+            !matches!(s.clicked(28, col), Some(Clicked::Park(_))),
+            "not on the agent's screen"
+        );
+        s.rows[0].state = "working".into();
+        assert!(
+            !matches!(s.clicked(row, col), Some(Clicked::Park(_))),
+            "not while it works"
+        );
+        s.rows[0].state = "idle".into();
+        s.rows[0].parked = true;
+        assert_eq!(screen::park_state(&s.rows, 3), Some(true));
+        assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
+        // A mode has the notice row: no label there, and no click on where it would be.
+        s.modes.resizing = true;
+        assert!(
+            !matches!(s.clicked(row, col), Some(Clicked::Park(_))),
+            "a mode keeps the row"
+        );
+        s.modes.resizing = false;
+        s.rows[0].agent = false;
+        assert_eq!(
+            screen::park_state(&s.rows, 3),
+            None,
+            "a shell is not parked"
+        );
+    }
+
+    /// Split panes: the park mark stands on the focused pane's bottom edge against its bottom
+    /// right corner, in the gap between panes, and that one cell is its click; the notice row
+    /// then has no label.
+    #[test]
+    fn split_panes_carry_the_park_mark_against_the_focused_corner() {
+        let mut s = tiled_state();
+        (s.cols, s.lines) = (120, 30);
+        s.rows[0] = agent(1, 1, "claude", "done");
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let Some((false, screen::ParkSpot::Corner(x, y))) = screen::park_spot(&s.frame()) else {
+            panic!("split panes put the mark in the corner");
+        };
+        let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
+        assert!(matches!(s.clicked(row, col), Some(Clicked::Park(1))));
+        assert!(!matches!(s.clicked(row, col - 1), Some(Clicked::Park(_))));
+        let (from, _) = screen::park_notice(s.cols, false);
+        assert!(
+            !matches!(s.clicked(29, from as u16 + 1), Some(Clicked::Park(_))),
+            "one place"
         );
     }
 

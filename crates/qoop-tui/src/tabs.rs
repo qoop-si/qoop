@@ -91,8 +91,6 @@ pub enum Hit {
     Terminal(u32),
     /// The close on the focused tab.
     Close(u32),
-    /// The park mark under the focused agent tab's close: park it to answer later, or back.
-    Park(u32),
     /// The `+` that makes a new terminal.
     New,
 }
@@ -120,9 +118,6 @@ pub fn hit(
                 Some(Hit::Terminal(terminal)) if row == 0 && seg.close == Some(col - start) => {
                     Some(Hit::Close(terminal))
                 }
-                Some(Hit::Terminal(terminal)) if row == 1 && seg.park == Some(col - start) => {
-                    Some(Hit::Park(terminal))
-                }
                 other => other,
             };
         }
@@ -131,12 +126,11 @@ pub fn hit(
 }
 
 /// One piece of the bar, a tab or the new tab button: what it paints on each row, all
-/// `wide` columns, and where its close and its park mark are when it has them.
+/// `wide` columns, and where its close is when it has one.
 struct Segment {
     rows: [Vec<(String, Ink)>; ROWS],
     wide: usize,
     close: Option<usize>,
-    park: Option<usize>,
     hit: Option<Hit>,
 }
 
@@ -189,7 +183,6 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
         ],
         wide,
         close: None,
-        park: None,
         hit: Some(Hit::New),
     });
     out
@@ -206,7 +199,6 @@ fn quiet(text: String) -> Segment {
         ],
         wide,
         close: None,
-        park: None,
         hit: None,
     }
 }
@@ -307,16 +299,12 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
 }
 
 /// One tab: a curve down its left edge binding its label on top to its folder under it,
-/// the close's column at its top right, the park mark's under it, and the gap before the
-/// next tab.
+/// the close's column at its top right, and the gap before the next tab.
 ///
 /// ```text
 /// ╭ 1 claude     ×   ╭ 2 codex
-/// ╰ ~/coding/we  p   ╰ …/qoop-wt-events-log
+/// ╰ ~/coding/wend    ╰ …/qoop-wt-events-log
 /// ```
-///
-/// The park mark is a button on the focused agent's tab and a plain mark on any other tab
-/// whose agent is parked, so a parked agent reads as one from the bar too.
 ///
 /// Only the inks and the close differ between a focused tab and the same tab unfocused,
 /// never a width. The label sets the width and the folder is cut to it: a folder wider than
@@ -341,22 +329,6 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
     } else {
         " ".to_string()
     };
-    let button = focused && row.agent;
-    // The mark says parked as the sidebar does (idle or done, never over a question); the
-    // button takes back the park whatever the agent does now.
-    let shown = crate::sidebar::is_parked(row);
-    let (park, park_ink) = match (button, shown || (button && row.parked)) {
-        (_, true) => (
-            park_mark(true),
-            if focused {
-                Ink::FocusedMark
-            } else {
-                Ink::Other
-            },
-        ),
-        (true, false) => (park_mark(false), Ink::Sub),
-        (false, false) => (" ".to_string(), Ink::Sub),
-    };
     Segment {
         rows: [
             vec![
@@ -367,30 +339,14 @@ fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
             ],
             vec![
                 (CURVE[1].to_string(), mark_ink),
-                (pad(&path, inner - 1), Ink::Sub),
-                (park, park_ink),
+                (pad(&path, inner), Ink::Sub),
                 (GAP.to_string(), Ink::Quiet),
             ],
         ],
         wide: 1 + inner + GAP.len(),
         close: focused.then_some(inner),
-        park: button.then_some(inner),
         hit: Some(Hit::Terminal(row.terminal)),
     }
-}
-
-/// The park mark: the bookmark, full once parked, or `p` where icons are not drawn (the ink
-/// says which).
-fn park_mark(parked: bool) -> String {
-    if !crate::icons::on() {
-        return "p".to_string();
-    }
-    if parked {
-        crate::icons::PARKED
-    } else {
-        crate::icons::PARK
-    }
-    .to_string()
 }
 
 /// The folder a tab runs in, in at most `max` columns.
@@ -522,8 +478,8 @@ mod tests {
 
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
-            parked: false,
             keep_awake: false,
+            parked: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -553,8 +509,8 @@ mod tests {
 
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
-            parked: false,
             keep_awake: false,
+            parked: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -677,49 +633,13 @@ mod tests {
         );
     }
 
-    /// A parked agent's tab shows the full mark wherever it is, a plain mark off focus and
-    /// the button on it; a tab that is not an agent's has no button.
-    #[test]
-    fn a_parked_tab_shows_its_mark_and_only_the_focused_agent_has_the_button() {
-        let mut rows = sample();
-        rows[1].parked = true;
-        let [top, under] = rows_of(&rows, 3, 80);
-        let close = top.chars().position(|c| c == '\u{00d7}').expect("a close");
-        assert_eq!(under.chars().nth(close), Some('p'), "{under:?}");
-        assert_eq!(
-            under.matches('p').count(),
-            2,
-            "the parked tab too: {under:?}"
-        );
-        let col =
-            |row: &str, at: usize| crate::width::width(&row.chars().take(at).collect::<String>());
-        let parked_at = under.chars().position(|c| c == 'p').expect("a mark");
-        assert_eq!(
-            hit(&rows, 3, 80, col(&under, parked_at), 1),
-            Some(Hit::Terminal(2))
-        );
-        rows[2].agent = false;
-        let [_, under] = rows_of(&rows, 3, 80);
-        assert_eq!(under.chars().nth(close), Some(' '), "{under:?}");
-    }
-
     #[test]
     fn focusing_a_tab_does_not_move_the_ones_after_it() {
         let unfocused = rows_of(&sample(), 9, 80);
         for focused in 1..=4 {
             let rows = rows_of(&sample(), focused, 80);
             assert_eq!(rows[0].replace('\u{00d7}', " "), unfocused[0], "{rows:?}");
-            // The park mark stands under the close, in a cell every tab keeps blank.
-            let close = rows[0]
-                .chars()
-                .position(|c| c == '\u{00d7}')
-                .expect("a close");
-            let under: String = rows[1]
-                .chars()
-                .enumerate()
-                .map(|(i, c)| if i == close { ' ' } else { c })
-                .collect();
-            assert_eq!(under, unfocused[1], "{rows:?}");
+            assert_eq!(rows[1], unfocused[1], "{rows:?}");
         }
     }
 
@@ -735,9 +655,7 @@ mod tests {
         let name = crate::width::width(&top[..top.find("3 private").unwrap()]);
         assert!(corner > name, "{top:?}");
         assert_eq!(hit(&rows, 3, 60, corner, 0), Some(Hit::Close(3)));
-        // Under it, the focused agent's park mark, its own click.
-        assert_eq!(hit(&rows, 3, 60, corner, 1), Some(Hit::Park(3)));
-        assert_eq!(hit(&rows, 3, 60, corner - 1, 1), Some(Hit::Terminal(3)));
+        assert_eq!(hit(&rows, 3, 60, corner, 1), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 0), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 1), Some(Hit::Terminal(3)));
         // Cut to the name above it, keeping its end.
@@ -863,8 +781,7 @@ mod tests {
                     match want {
                         Some(terminal) => assert!(
                             got == Some(Hit::Terminal(terminal))
-                                || (row == 0 && terminal == 3 && got == Some(Hit::Close(3)))
-                                || (row == 1 && terminal == 3 && got == Some(Hit::Park(3))),
+                                || (row == 0 && terminal == 3 && got == Some(Hit::Close(3))),
                             "column {col} row {row} of {cols}: {got:?}"
                         ),
                         // Off a tab is the new button or the padding past it, never a
