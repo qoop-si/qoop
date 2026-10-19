@@ -789,17 +789,18 @@ fn park_label(parked: bool) -> String {
 }
 
 /// Where the park label sits among split panes: on the focused pane's bottom edge, a blank
-/// short of the arm of its bottom right corner (`[ ⚑ park ] ─╯`), as its first pane cell. In
-/// qoop's own frame, never over the agent's screen. `None` without that corner or the room.
+/// after the arm of its bottom left corner (`╰─ [ ⚑ park ]`, the owner's pick, 2026-10-20),
+/// as its first pane cell. In qoop's own frame, never over the agent's screen. `None` without
+/// that corner or the room.
 fn park_corner(tiles: &[Tile], cols: usize, rows: usize, wide: usize) -> Option<(usize, usize)> {
     if tiles.len() < 2 {
         return None;
     }
     let r = tiles.iter().find(|t| t.focused)?.rect;
     let (right, bottom) = (r.x + r.cols, r.y + r.rows);
-    // Clear of the bottom left corner and its arm, and a blank before the right one's.
+    // A blank after the bottom left corner's arm, and clear of the right one's.
     (r.x >= 1 && r.y >= 1 && right < cols && bottom < rows && r.cols >= wide + 5)
-        .then_some((right - 2 - wide, bottom))
+        .then_some((r.x + 2, bottom))
 }
 
 /// Where the park control stands on a frame.
@@ -829,11 +830,11 @@ pub(crate) fn park_spot(frame: &Frame) -> Option<(bool, ParkSpot)> {
     let (cols, rows) = (cols as usize, rows as usize);
     let label = park_label(parked);
     let wide = width::width(&label);
-    // Every cell it takes and the blank after it are free: no pane's name or handle there.
+    // Every cell it takes and the blank before it are free: no pane's name or handle there.
     if let Some((x, y)) = park_corner(&frame.tiles, cols, rows, wide)
         && edge_grid(frame, cols, rows)
             .get(y)
-            .and_then(|row| row.get(x..=x + wide))
+            .and_then(|row| row.get(x - 1..x + wide))
             .is_some_and(|cells| cells.iter().all(Option::is_none))
     {
         return Some((parked, ParkSpot::Corner(x, y, label)));
@@ -864,12 +865,10 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
     edges
 }
 
-/// The park label at the right end of the notice row, for a pane with no corners (one
-/// pane alone), in qoop's own row under the agent's screen: its one-based column and text.
-pub(crate) fn park_notice(cols: u16, parked: bool) -> (usize, String) {
-    let text = format!(" {} ", park_label(parked));
-    let col = (cols as usize + 1).saturating_sub(width::width(&text));
-    (col.max(1), text)
+/// The park label opening the notice row, for a pane with no corners (one pane alone), in
+/// qoop's own row under the agent's screen: its one-based column and text.
+pub(crate) fn park_notice(_cols: u16, parked: bool) -> (usize, String) {
+    (1, format!(" {} ", park_label(parked)))
 }
 
 /// The escape sequence that puts the cursor at a one-based row and column.
@@ -1542,18 +1541,22 @@ pub fn paint(frame: &Frame) -> String {
                 Some(role) => theme::status_in(role),
                 None => theme::status(),
             });
-            // Without a corner to carry it, the park label ends this row, and the notice is cut
-            // short of it rather than written under it.
+            // Without a corner to carry it, the park label opens this row and the notice
+            // follows it.
             match &park {
                 Some((parked, ParkSpot::Notice(_, label))) => {
-                    let room = (frame.cols as usize).saturating_sub(width::width(label));
-                    out.push_str(&width::fit(&notice, room));
                     out.push_str(&theme::status_in(if *parked {
                         theme::Role::Brand
                     } else {
                         theme::Role::Faint
                     }));
                     out.push_str(label);
+                    out.push_str(&match notice_role {
+                        Some(role) => theme::status_in(role),
+                        None => theme::status(),
+                    });
+                    let room = (frame.cols as usize).saturating_sub(width::width(label));
+                    out.push_str(&width::fit(&notice, room));
                 }
                 _ => out.push_str(&width::fit(&notice, frame.cols as usize)),
             }

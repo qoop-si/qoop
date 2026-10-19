@@ -1261,7 +1261,10 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
 }
 
 /// A tab's mark in the tab row: the state mark, standing still, without its gap.
-fn tab_mark(tab: InboxTab) -> String {
+fn tab_mark(tab: InboxTab, icons: bool) -> String {
+    if tab == InboxTab::Parked && icons {
+        return crate::icons::PARKED.to_string();
+    }
     cell_mark(tab.role(), false, 0).trim_end().to_string()
 }
 
@@ -1288,14 +1291,14 @@ fn tab_cells(c: &Column, counts: &[usize; 7]) -> Vec<(Option<InboxTab>, usize, S
         head.push((None, "inbox".to_string()));
         for tab in &InboxTab::ORDER[1..] {
             let n = count(*tab);
-            rest.push((Some(*tab), format!(" {}{n}", tab_mark(*tab)), n));
+            rest.push((Some(*tab), format!(" {}{n}", tab_mark(*tab, c.icons)), n));
         }
     } else {
         // The chosen list in the fill: `inbox` for everything, or a state's mark and count,
         // the same cell it is when not chosen, so choosing one moves nothing but the fill.
         let cell = |tab: InboxTab| match tab {
             InboxTab::All => format!(" {} ", tab.word()),
-            _ => format!(" {}{} ", tab_mark(tab), count(tab)),
+            _ => format!(" {}{} ", tab_mark(tab, c.icons), count(tab)),
         };
         head.push((Some(chosen), cell(chosen)));
         for tab in InboxTab::ORDER.iter().filter(|t| **t != chosen) {
@@ -1303,7 +1306,7 @@ fn tab_cells(c: &Column, counts: &[usize; 7]) -> Vec<(Option<InboxTab>, usize, S
             let text = if *tab == InboxTab::All {
                 cell(*tab)
             } else {
-                format!(" {}{n}", tab_mark(*tab))
+                format!(" {}{n}", tab_mark(*tab, c.icons))
             };
             rest.push((Some(*tab), text, n));
         }
@@ -1384,7 +1387,12 @@ fn item_row(c: &Column, item: &Item) -> Line {
         .find(|s| s.id == item.space)
         .map(|s| s.name.clone())
         .unwrap_or_default();
-    let mark = cell_mark(item.role, false, 0);
+    // A parked agent's row wears the bookmark where icons are drawn, as its tab does.
+    let mark = if item.role == crate::theme::Role::BrandCalm && c.icons {
+        format!("{} ", crate::icons::PARKED)
+    } else {
+        cell_mark(item.role, false, 0)
+    };
     let lead = 1 + crate::width::width(&mark);
     // The right side gives way before the name: the space goes, then the wait.
     let mut right: Vec<String> = [
@@ -8427,6 +8435,7 @@ mod tests {
     /// stays where it is: a park never hides a question.
     #[test]
     fn a_parked_agent_leaves_the_news_for_its_own_list_but_never_hides_a_question() {
+        use crate::theme::Role;
         let (spaces, mut agents, unseen) = inbox_fleet();
         agents[2].parked = true;
         agents[0].parked = true;
@@ -8454,6 +8463,16 @@ mod tests {
         assert_eq!(dot_of(&c, &agents[2]).0, crate::theme::Role::BrandCalm);
         assert_eq!(dot_of(&c, &agents[0]).0, crate::theme::Role::Blocked);
         assert_eq!(tab_counts(&c)[InboxTab::Parked as usize], 1);
+        // Its tab wears the bookmark where icons are drawn, its own ink either way.
+        assert_eq!(
+            tab_mark(InboxTab::Parked, true),
+            crate::icons::PARKED.to_string()
+        );
+        assert_eq!(
+            tab_mark(InboxTab::Parked, false),
+            cell_mark(Role::BrandCalm, false, 0).trim_end()
+        );
+        assert_eq!(InboxTab::Parked.role(), Role::BrandCalm);
     }
 
     /// The inbox lists everyone waiting under its tab row, the chosen tab filled, and its
@@ -8584,10 +8603,10 @@ mod tests {
         };
         let working = list(InboxTab::Working);
         assert!(
-            working[0]
-                .0
-                .text
-                .starts_with(&format!("\u{25be}  {}1 ", tab_mark(InboxTab::Working))),
+            working[0].0.text.starts_with(&format!(
+                "\u{25be}  {}1 ",
+                tab_mark(InboxTab::Working, false)
+            )),
             "{:?}",
             working[0].0
         );

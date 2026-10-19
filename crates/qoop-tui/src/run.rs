@@ -20435,11 +20435,11 @@ mod tests {
         );
     }
 
-    /// One pane alone: the park label ends the notice row, under the agent's screen and never
+    /// One pane alone: the park label opens the notice row, under the agent's screen and never
     /// on it, is its own click, stands only while the agent has answered and reads parked
     /// once parked.
     #[test]
-    fn a_lone_panes_park_label_ends_the_notice_row_and_only_after_an_answer() {
+    fn a_lone_panes_park_label_opens_the_notice_row_and_only_after_an_answer() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         s.rows = vec![agent(3, 1, "claude", "idle")];
@@ -20449,7 +20449,7 @@ mod tests {
         s.palette = None;
         let (from, text) = screen::park_notice(s.cols, false);
         assert!(text.contains("park"));
-        assert_eq!(from + crate::width::width(&text) - 1, 100, "flush right");
+        assert_eq!(from, 1, "the label opens the row");
         let (row, col) = (29, from as u16 + 1);
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
         assert!(
@@ -20480,11 +20480,11 @@ mod tests {
         );
     }
 
-    /// Split panes: the park mark stands on the focused pane's bottom edge against its bottom
-    /// right corner, in the gap between panes, and that one cell is its click; the notice row
-    /// then has no label.
+    /// Split panes: the park label stands on the focused pane's bottom edge after its bottom
+    /// left corner, in the gap between panes, and its cells are its click; the notice row then
+    /// has no label.
     #[test]
-    fn split_panes_carry_the_park_mark_against_the_focused_corner() {
+    fn split_panes_carry_the_park_label_after_the_focused_left_corner() {
         let mut s = tiled_state();
         (s.cols, s.lines) = (120, 30);
         s.rows[0] = agent(1, 1, "claude", "done");
@@ -20505,11 +20505,23 @@ mod tests {
             Some(Clicked::Park(1))
         ));
         assert!(!matches!(s.clicked(row, col - 1), Some(Clicked::Park(_))));
-        // A blank between the label and the corner's arm, which is not the label.
+        // Past the label's last cell: not the label.
         assert!(!matches!(
             s.clicked(row, col + wide),
             Some(Clicked::Park(_))
         ));
+        let tile = s
+            .frame()
+            .tiles
+            .iter()
+            .find(|t| t.focused)
+            .map(|t| t.rect)
+            .expect("a tile");
+        assert_eq!(
+            x,
+            tile.x + 2,
+            "after the bottom left corner's arm and a blank"
+        );
         let (from, _) = screen::park_notice(s.cols, false);
         assert!(
             !matches!(s.clicked(29, from as u16 + 1), Some(Clicked::Park(_))),
