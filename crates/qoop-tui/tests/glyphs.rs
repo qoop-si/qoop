@@ -23,6 +23,8 @@ const SAFE_BLOCKS: [(char, char); 2] = [('\u{2500}', '\u{259f}'), ('\u{2800}', '
 const MATCHED: &[(&str, &str)] = &[
     ("qoop-tui/src/notify.rs", "\u{9f}"),
     ("qoop-runtime/src/idle.rs", "⏺◯"),
+    // The trust menu's pointers, looked for on an agent's screen, never drawn.
+    ("qoop-detect/src/lib.rs", "\u{276f}\u{203a}"),
     ("qoop-runtime/src/asks.rs", "üı\u{307}"),
     (
         "qoop-store/src/task.rs",

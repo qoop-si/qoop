@@ -37,18 +37,29 @@ fn refuse(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+const USAGE: &str = "usage: qoop remote add <name> <ssh-target or ssh command>";
+
 fn add(rest: &[String]) -> io::Result<()> {
-    let [name, target] = rest else {
-        return Err(refuse("usage: qoop remote add <name> <ssh-target>".into()));
+    // The target is the rest of the line, so `qoop remote add box ssh -p 2222 me@host` needs
+    // no quotes.
+    let [name, typed @ ..] = rest else {
+        return Err(refuse(USAGE.into()));
     };
+    if typed.is_empty() {
+        return Err(refuse(USAGE.into()));
+    }
     if !saved::valid_name(name) {
         return Err(refuse(format!(
             "{name:?} cannot be a remote's name: letters, digits, `-`, `_` and `.`, up to 24"
         )));
     }
-    if !saved::valid_target(target) {
-        return Err(refuse(format!("{target:?} cannot be an ssh target")));
-    }
+    let typed = typed.join(" ");
+    let Some(target) = &saved::canonical(&typed) else {
+        return Err(refuse(format!(
+            "{typed:?} cannot be an ssh target: a host like me@10.0.0.5, or ssh with -p, -l, \
+             -i, -J, -4, -6 or -o Port, User, IdentityFile, ProxyJump, HostName, IdentitiesOnly"
+        )));
+    };
     let file = saved::path();
     let mut list = saved::load_from(&file)?;
     if list.iter().any(|r| &r.name == name) {

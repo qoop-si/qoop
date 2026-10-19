@@ -206,6 +206,14 @@ pub enum ControlRequest {
         terminal: Option<u32>,
         on: bool,
     },
+    /// Park a terminal's agent to answer later, or take it back: a person read its reply and
+    /// set it aside. Refused while the agent works. Answered `Renamed`, like keep awake; the
+    /// change is announced, so every client and the phone redraw the row.
+    SetParked {
+        id: String,
+        terminal: u32,
+        on: bool,
+    },
     /// End a terminal and everything it contains, per ADR-014.
     CloseTerminal {
         id: String,
@@ -1183,6 +1191,7 @@ impl ControlRequest {
             | Self::SetSpaceGoal { id, .. }
             | Self::MoveWorkspace { id, .. }
             | Self::SetKeepAwake { id, .. }
+            | Self::SetParked { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
             | Self::SearchScrollback { id, .. }
@@ -1942,6 +1951,11 @@ pub struct AgentRow {
     /// the space's row. Written only when true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_awake: bool,
+    /// A person parked this agent to answer later. Clients show it apart only while the agent
+    /// is idle or done: a blocked or failed one shows as such. Written only when true, and
+    /// false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
     /// How many things the agent has running in the background that its own state does not
     /// show: shells and monitors its footer counts, and subagents. An agent with its turn over
     /// reads `idle` while these run, so a client says so beside it. The state is left alone on
@@ -2498,6 +2512,7 @@ mod tests {
         assert_eq!(new.slept_at_unix, Some(1_750_000_000));
         // Skipped on the wire when absent: live rows say nothing new.
         let live = AgentRow {
+            parked: false,
             news: false,
             keep_awake: false,
             background: 0,

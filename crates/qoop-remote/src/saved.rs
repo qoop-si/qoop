@@ -1,8 +1,9 @@
 //! The remotes a person has added, and the one command that reaches each.
 //!
 //! A remote is a name for the interface and an ssh target for the person's own ssh config
-//! to resolve. Nothing else: the host, the user, the key
-//! and the jump host all live in `~/.ssh/config`, where the person already keeps them.
+//! to resolve: a host, or the ssh command a person types to reach it, with its port, user,
+//! key and jump host (see [`parse`]). Everything else lives in `~/.ssh/config`, where the
+//! person already keeps it.
 
 use std::path::{Path, PathBuf};
 
@@ -100,14 +101,127 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Whether a target can be handed to ssh as its host argument.
-///
-/// A leading `-` would be read as an option, which is how a host name becomes
-/// `-oProxyCommand=...`.
+/// Whether a target can be handed to ssh: a host, or the ssh command a person types to reach
+/// it (see [`parse`]).
 pub fn valid_target(target: &str) -> bool {
-    !target.is_empty()
-        && !target.starts_with('-')
-        && !target.chars().any(|c| c.is_whitespace() || c.is_control())
+    parse(target).is_some()
+}
+
+/// A target taken apart: the ssh options a person gave, then the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub options: Vec<String>,
+    pub host: String,
+}
+
+/// ssh's flags that take a value and are let through: the port, the user, the key and the
+/// jump host. Everything else a connection needs lives in `~/.ssh/config`.
+const VALUE_FLAGS: [char; 4] = ['p', 'l', 'i', 'J'];
+/// ssh's flags without a value that are let through: the address family.
+const PLAIN_FLAGS: [char; 2] = ['4', '6'];
+/// The `-o` options let through, the long names of the flags above and two more a typed
+/// command carries. Every other option can run a command here (`ProxyCommand`,
+/// `LocalCommand`, `KnownHostsCommand`), swap the config, forward the agent or change what
+/// qoop runs over the connection, and a target in `remotes.json` is run by the background
+/// fleet with nobody watching.
+const OPTIONS: [&str; 6] = [
+    "Port",
+    "User",
+    "IdentityFile",
+    "ProxyJump",
+    "HostName",
+    "IdentitiesOnly",
+];
+
+/// A target as ssh's options and its host: `me@host`, or the command a person types,
+/// `ssh -p 2222 -i ~/.ssh/k -J jump me@host`, with or without the leading `ssh`. `None` for
+/// anything else: an option not let through (see [`VALUE_FLAGS`], [`PLAIN_FLAGS`],
+/// [`OPTIONS`]), a word with a character outside [`SAFE`] (a quote, a space inside a word, a
+/// `;`), a value or a host that starts with `-`, no host, or a command after the host.
+pub fn parse(text: &str) -> Option<Target> {
+    let mut words = text.split_whitespace().peekable();
+    if words.peek() == Some(&"ssh") {
+        words.next();
+    }
+    let mut options = Vec::new();
+    let mut host: Option<&str> = None;
+    while let Some(word) = words.next() {
+        if !word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c))
+        {
+            return None;
+        }
+        let Some(flags) = word.strip_prefix('-') else {
+            // One host, and nothing after it: a command there would run instead of qoop.
+            if host.replace(word).is_some() {
+                return None;
+            }
+            continue;
+        };
+        let mut chars = flags.chars();
+        let flag = chars.next()?;
+        let joined = chars.as_str();
+        if PLAIN_FLAGS.contains(&flag) && joined.is_empty() {
+            options.push(word.to_string());
+            continue;
+        }
+        if !VALUE_FLAGS.contains(&flag) && flag != 'o' {
+            return None;
+        }
+        let value = if joined.is_empty() {
+            words.next()?
+        } else {
+            joined
+        };
+        if value.starts_with('-')
+            || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || SAFE.contains(c))
+        {
+            return None;
+        }
+        if flag == 'o' {
+            let (name, set) = value.split_once('=')?;
+            if set.is_empty() || !OPTIONS.iter().any(|o| o.eq_ignore_ascii_case(name)) {
+                return None;
+            }
+        }
+        // A jump list is hosts, each of which ssh reads as a command line of its own: none
+        // may start like an option.
+        let hops = match value.split_once('=') {
+            Some((_, set)) if flag == 'o' => set,
+            _ => value,
+        };
+        if hops
+            .split(',')
+            .any(|hop| hop.is_empty() || hop.starts_with('-'))
+        {
+            return None;
+        }
+        options.push(format!("-{flag}"));
+        options.push(value.to_string());
+    }
+    let host = host.filter(|h| !h.starts_with('-'))?;
+    Some(Target {
+        options,
+        host: host.to_string(),
+    })
+}
+
+/// The characters a word may hold besides letters and digits: what hosts, users, ports,
+/// paths and jump specs are written with, and nothing a shell reads as more than a letter.
+/// A `-J` value ends up in a command ssh runs through a shell.
+const SAFE: &str = "._-@:,/~%+[]=";
+
+/// The one way a target is written down: the options, then the host, one space between.
+/// A bare host stays as it was typed, so a list written before options were allowed reads
+/// the same.
+pub fn canonical(text: &str) -> Option<String> {
+    let target = parse(text)?;
+    let mut words = target.options;
+    words.push(target.host);
+    Some(words.join(" "))
 }
 
 /// One word for a posix shell, whatever is in it.
@@ -139,9 +253,12 @@ pub fn remote_command(verb: &str) -> String {
     format!("sh -c {} qoop {}", shell_quote(&script), shell_quote(verb))
 }
 
-/// A name for a machine added by its address: the host, without the user, with anything a
-/// name cannot hold turned into `-`, and a number after it when the name is taken.
+/// A name for a machine added by its address: the host, without the user or the options,
+/// with anything a name cannot hold turned into `-`, and a number after it when the name is
+/// taken.
 pub fn name_for(target: &str, taken: &[&str]) -> String {
+    let parsed = parse(target).map(|t| t.host);
+    let target = parsed.as_deref().unwrap_or(target);
     let host = target.rsplit_once('@').map_or(target, |(_, host)| host);
     let base: String = host
         .chars()
@@ -228,6 +345,70 @@ mod tests {
         assert!(valid_target("me@host"));
         for bad in ["", "-oProxyCommand=x", "a b", "a\nb"] {
             assert!(!valid_target(bad), "{bad}");
+        }
+    }
+
+    /// The ssh command a person types is taken apart into the options let through and the
+    /// host, written down one way, and anything that could run a command, forward the agent
+    /// or replace what qoop runs over the connection is refused.
+    #[test]
+    fn a_typed_ssh_command_keeps_its_port_key_and_jump_and_nothing_else() {
+        let typed = "ssh -p 2222 -i ~/.ssh/work -J me@bastion:22 -4 -oIdentitiesOnly=yes -l me box";
+        let target = parse(typed).expect("parses");
+        assert_eq!(target.host, "box");
+        assert_eq!(
+            target.options,
+            [
+                "-p",
+                "2222",
+                "-i",
+                "~/.ssh/work",
+                "-J",
+                "me@bastion:22",
+                "-4",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-l",
+                "me"
+            ]
+        );
+        let once = canonical(typed).expect("canonical");
+        assert_eq!(
+            once,
+            "-p 2222 -i ~/.ssh/work -J me@bastion:22 -4 -o IdentitiesOnly=yes -l me box"
+        );
+        // Written down again it is the same, so a second connect finds the same machine.
+        assert_eq!(canonical(&once).as_deref(), Some(once.as_str()));
+        assert_eq!(canonical("me@host").as_deref(), Some("me@host"));
+        assert_eq!(canonical("  ssh   me@host ").as_deref(), Some("me@host"));
+        assert_eq!(
+            canonical("-p2222 me@host").as_deref(),
+            Some("-p 2222 me@host")
+        );
+        assert_eq!(name_for(&once, &[]), "box");
+        for bad in [
+            "ssh",
+            "ssh -J a,-oProxyCommand=x me@host",
+            "ssh -o ProxyJump=a,-x me@host",
+            "ssh -p 22",
+            "ssh me@host uptime",
+            "ssh -A me@host",
+            "ssh -X me@host",
+            "ssh -v me@host",
+            "ssh -N me@host",
+            "ssh -F /tmp/c me@host",
+            "ssh -o ProxyCommand=nc me@host",
+            "ssh -oLocalCommand=x me@host",
+            "ssh -o Port me@host",
+            "ssh -o Port=22 -- me@host",
+            "ssh -J -oProxyCommand=x me@host",
+            "ssh -J 'a;touch /tmp/x' me@host",
+            "ssh -J a$(id) me@host",
+            "ssh -i \"my key\" me@host",
+            "ssh -p",
+            "ssh -46 me@host",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
         }
     }
 

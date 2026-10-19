@@ -133,6 +133,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal: None,
             on: true,
         },
+        ControlRequest::SetParked {
+            id: "x29".into(),
+            terminal,
+            on: true,
+        },
         ControlRequest::Shutdown { id: "x15".into() },
         ControlRequest::Scrollback {
             id: "x16".into(),
@@ -352,6 +357,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SetSpaceGoal { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
+            | ControlRequest::SetParked { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }
             | ControlRequest::RequestOwnership { .. }

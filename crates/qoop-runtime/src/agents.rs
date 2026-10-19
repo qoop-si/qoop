@@ -217,6 +217,10 @@ pub struct ReapSnapshot {
 // ponytail: fixed interval, a backoff if a second of idle wrapper looks ever shows up.
 const RELOOK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How soon after a line is sent the agent must start working for the line to count as the
+/// answer that ends a park.
+const ANSWER_WINDOW_SECS: i64 = 30;
+
 pub struct AgentRegistry {
     watch: ProcWatch,
     /// Terminals whose agent has moved, for anyone drawing an index.
@@ -271,6 +275,16 @@ pub struct AgentRegistry {
     /// to leave a composer alone: a half written message still reads `idle`, so only this
     /// stamp says someone is in it. Not the restore replay, not the inbox's own sends.
     typed_at_unix: Mutex<BTreeMap<u32, i64>>,
+    /// The agents a person parked to answer later, and when, as unix seconds. Kept through a
+    /// sleep and a restart (the store's `parked_terminal` has them), taken back by a person,
+    /// by the terminal closing for good, or by an answer: see [`Self::announce`].
+    parked: Mutex<BTreeMap<u32, i64>>,
+    /// Parks an answer took back, for the store: the agent recorder writes them down.
+    unparked: Mutex<Vec<u32>>,
+    /// When a line last reached each terminal from a person (any client, the inbox's
+    /// answers too), as unix seconds: what tells an answer to a parked agent from a key that
+    /// only moved something.
+    sent_at_unix: Mutex<BTreeMap<u32, i64>>,
 }
 
 impl AgentRegistry {
@@ -299,8 +313,90 @@ impl AgentRegistry {
     /// Public because a name is part of the row and nothing in here knows when one is
     /// given: the index is what draws it, so a rename nobody announces is a rename nobody
     /// sees until the next unrelated change.
+    ///
+    /// Every change passes here, which makes it the one place a park ends on an answer: a
+    /// person sent a line to the agent since it was parked (any client, the phone and the
+    /// inbox's answers too, never the restore replay; see [`Self::note_sent`]) and it works
+    /// again. A key that sends no line, a background wake and a resume after a restart do
+    /// not end a park.
     pub fn announce(&self, stream: u32) {
+        self.unpark_if_answered(stream);
         let _ = self.changes.send(stream);
+    }
+
+    fn unpark_if_answered(&self, stream: u32) {
+        let Some(at) = self.parked.lock().unwrap().get(&stream).copied() else {
+            return;
+        };
+        let working = self
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .is_some_and(|a| a.belief.state == AgentRuntimeState::Working);
+        // The line that made it work, sent after the park and moments before: an Enter long
+        // ago that started nothing does not get to end the park when a background wake does.
+        let now = now_unix();
+        let typed = self
+            .sent_at_unix
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .is_some_and(|t| *t >= at && now - *t <= ANSWER_WINDOW_SECS);
+        if working && typed {
+            let mut parked = self.parked.lock().unwrap();
+            // The same park still: one made again in between is not this answer's.
+            if parked.get(&stream) == Some(&at) {
+                parked.remove(&stream);
+                drop(parked);
+                self.unparked.lock().unwrap().push(stream);
+            }
+        }
+    }
+
+    /// Park this terminal's agent at `at`, or take it back, and say so. Refused, false, while
+    /// it works or starts: a park is for a reply that waits on a person, and taking it only
+    /// from a settled agent means an answer's turn to working always comes after the park.
+    pub fn set_parked(&self, stream: u32, on: bool, at: i64) -> bool {
+        let terminals = self.terminals.lock().unwrap();
+        let busy = terminals.get(&stream).is_some_and(|a| {
+            matches!(
+                a.belief.state,
+                AgentRuntimeState::Working | AgentRuntimeState::Starting
+            )
+        });
+        if on && busy {
+            return false;
+        }
+        let mut parked = self.parked.lock().unwrap();
+        if on {
+            parked.insert(stream, at);
+        } else {
+            parked.remove(&stream);
+        }
+        drop(parked);
+        drop(terminals);
+        self.announce(stream);
+        true
+    }
+
+    pub fn is_parked(&self, stream: u32) -> bool {
+        self.parked.lock().unwrap().contains_key(&stream)
+    }
+
+    /// The parks the store kept, at start.
+    pub fn load_parked(&self, parked: BTreeMap<u32, i64>) {
+        *self.parked.lock().unwrap() = parked;
+    }
+
+    /// A terminal closed for good is parked no more: its id may be handed out again.
+    pub fn drop_parked(&self, stream: u32) {
+        self.parked.lock().unwrap().remove(&stream);
+    }
+
+    /// The parks answers took back since the last ask, for the store.
+    pub fn take_unparked(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.unparked.lock().unwrap())
     }
 
     /// Re-announce a terminal without touching its belief.
@@ -475,6 +571,9 @@ impl AgentRegistry {
             expectations: Mutex::new(BTreeMap::new()),
             shield_at_unix: Mutex::new(BTreeMap::new()),
             typed_at_unix: Mutex::new(BTreeMap::new()),
+            parked: Mutex::new(BTreeMap::new()),
+            unparked: Mutex::new(Vec::new()),
+            sent_at_unix: Mutex::new(BTreeMap::new()),
             changes: tokio::sync::broadcast::channel(64).0,
             tasks: tokio::sync::broadcast::channel(16).0,
         })
@@ -647,6 +746,13 @@ impl AgentRegistry {
             return;
         }
         self.typed_at_unix.lock().unwrap().insert(stream, now_unix);
+    }
+
+    /// Record that a line reached this terminal from a person: input with a return in it.
+    pub fn note_sent(&self, stream: u32, bytes: &[u8], now_unix: i64) {
+        if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+            self.sent_at_unix.lock().unwrap().insert(stream, now_unix);
+        }
     }
 
     /// Seconds since a person last typed into this terminal, `None` when nobody has.
@@ -834,6 +940,7 @@ impl AgentRegistry {
         self.closed.lock().unwrap().remove(&stream);
         self.shield_at_unix.lock().unwrap().remove(&stream);
         self.typed_at_unix.lock().unwrap().remove(&stream);
+        self.sent_at_unix.lock().unwrap().remove(&stream);
         self.drop_expectations_touching(stream);
         // A terminal that is gone is a change like any other. Closing one answers as soon
         // as the request is accepted, but the terminal itself lives until its teardown
@@ -2010,6 +2117,67 @@ mod tests {
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Blocked
+        );
+    }
+
+    /// A park ends only on an answer: a person sent a line to the agent after the park and
+    /// it works again. Working without a line sent (a resume, a background wake) keeps it,
+    /// keys that send nothing keep it, and a working agent cannot be parked at all.
+    #[test]
+    fn a_park_ends_when_an_answer_makes_the_agent_work_and_not_otherwise() {
+        use AgentRuntimeState::{Idle, Working};
+        // The answer window is read off the real clock.
+        let now = now_unix();
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let report = |state, now| {
+            r.observe_hook(1, &TerminalId::new("1"), &token, state, false, false, now)
+                .expect("an admitted report applies")
+        };
+        report(Working, now);
+        assert!(!r.set_parked(1, true, now), "a working agent is not parked");
+        assert!(!r.is_parked(1));
+        report(Idle, now);
+        // Sent before the park: not an answer to it.
+        r.note_sent(1, b"x\r", now - 5);
+        assert!(r.set_parked(1, true, now));
+        report(Working, now + 1);
+        assert!(
+            r.is_parked(1),
+            "working with nobody typing since keeps the park"
+        );
+        report(Idle, now + 1);
+        r.note_sent(1, b"\x1b[I", now + 2);
+        r.note_sent(1, b"y", now + 2);
+        report(Working, now + 2);
+        assert!(r.is_parked(1), "keys that send no line keep the park");
+        report(Idle, now + 2);
+        assert!(r.take_unparked().is_empty());
+        r.note_sent(1, b"\r", now + 3);
+        report(Working, now + 3);
+        assert!(!r.is_parked(1), "an answer ended the park");
+        assert_eq!(r.take_unparked(), [1], "and the store is told");
+        assert!(r.take_unparked().is_empty());
+        // A line sent long before the agent works again is not the answer that ends a park.
+        report(Idle, now + 4);
+        assert!(r.set_parked(1, true, now - 100));
+        r.note_sent(1, b"\r", now - 60);
+        report(Working, now + 4);
+        assert!(r.is_parked(1), "a stale line keeps the park");
+        report(Idle, now + 4);
+        assert!(r.set_parked(1, false, now + 4));
+        // Taken back by hand, and gone with a terminal closed for good.
+        report(Idle, now + 4);
+        assert!(r.set_parked(1, true, now + 4));
+        assert!(r.set_parked(1, false, now + 4));
+        assert!(!r.is_parked(1));
+        assert!(r.set_parked(1, true, now + 4));
+        r.drop_parked(1);
+        assert!(!r.is_parked(1));
+        assert!(
+            r.take_unparked().is_empty(),
+            "a hand or a close tells the store itself"
         );
     }
 

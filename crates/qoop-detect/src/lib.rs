@@ -212,6 +212,9 @@ struct Rule {
     /// Set in the manifest, never inferred, because only the rule's author
     /// knows whether the dialog creates a session or continues one.
     setup_gate: bool,
+    /// The words of the option that trusts the folder, on a folder trust dialog: what the
+    /// runtime picks for the person (see [`accept_keys`]).
+    accept: Option<String>,
     gate: Gate,
 }
 
@@ -338,6 +341,8 @@ struct RawRule {
     /// with a live session behind it.
     #[serde(default)]
     setup_gate: bool,
+    #[serde(default)]
+    accept: Option<String>,
     // The gate is spelled out here rather than flattened, because serde's `flatten` and
     // `deny_unknown_fields` cannot both apply to the same struct.
     contains: Option<String>,
@@ -513,6 +518,7 @@ impl Manifest {
                 visible_working: r.visible_working,
                 skip_state_update: r.skip_state_update,
                 setup_gate: r.setup_gate,
+                accept: r.accept,
                 gate,
             });
         }
@@ -556,6 +562,15 @@ impl Manifest {
     /// `skip_state_update` rule won, and those mean opposite things to a caller that falls
     /// back to idle on silence: no match is an agent with nothing on screen, a skip is a
     /// pager over the past that says the last reading still stands.
+    /// The option that trusts the folder on the gate `rule` names, when it is a folder trust
+    /// dialog the runtime answers for the person.
+    pub fn accept_of(&self, rule: &str) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|r| r.id == rule && r.setup_gate)
+            .and_then(|r| r.accept.as_deref())
+    }
+
     pub fn read_with_osc(&self, screen: &[String], osc: &OscContext<'_>) -> Reading {
         let capped = &screen[screen.len().saturating_sub(MAX_REGION_LINES)..];
         let mut best: Option<&Rule> = None;
@@ -589,6 +604,43 @@ impl Manifest {
             setup_gate: rule.setup_gate,
         })
     }
+}
+
+/// The next key toward the option reading `accept` in the menu on `screen`: the arrows from
+/// the row the menu's pointer (`❯` or `›`) is on to that option's row, one per option (blank
+/// rows between are not options), or enter once the pointer is on it. One step at a time, so
+/// enter is pressed only on a screen that shows the pointer on the right option. Arrows are
+/// spelled the way the program asked for (`application_cursor`: `SS3`, else `CSI`). `None`
+/// when the screen shows no such option or no pointer near it, so nothing is typed at a screen
+/// that is not the menu it was read as.
+pub fn accept_keys(screen: &[String], accept: &str, application_cursor: bool) -> Option<Vec<u8>> {
+    let target = screen.iter().rposition(|l| l.contains(accept))?;
+    let pointed = |l: &str| {
+        let l = l.trim_start();
+        ['\u{276f}', '\u{203a}']
+            .iter()
+            .any(|p| l.strip_prefix(*p).is_some_and(|rest| rest.starts_with(' ')))
+    };
+    let from = target.saturating_sub(6);
+    let cursor = screen[from..(target + 7).min(screen.len())]
+        .iter()
+        .position(|l| pointed(l))?
+        + from;
+    let between = screen[cursor.min(target)..cursor.max(target)]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let arrow: &[u8] = match (target >= cursor, application_cursor) {
+        (true, false) => b"\x1b[B",
+        (true, true) => b"\x1bOB",
+        (false, false) => b"\x1b[A",
+        (false, true) => b"\x1bOA",
+    };
+    Some(if between == 0 {
+        b"\r".to_vec()
+    } else {
+        arrow.repeat(between)
+    })
 }
 
 /// The engine's own manifest version.
@@ -2334,5 +2386,63 @@ mod against_a_real_screen {
             "matched {:?}",
             verdict.as_ref().map(|v| &v.rule)
         );
+    }
+
+    /// The folder trust question is answered by moving the menu's pointer onto the trusting
+    /// option and pressing enter: down from `No, exit` on Claude Code, enter alone where the
+    /// pointer already stands on Codex, and nothing at all without a pointer to count from.
+    #[test]
+    fn the_trust_answer_walks_the_pointer_to_the_trusting_option() {
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let claude = lines(&[
+            " Accessing workspace:",
+            " /Users/me",
+            "",
+            " Quick safety check: Is this a project you created or one you trust?",
+            "",
+            " \u{276f} No, exit",
+            "   Yes, I trust this folder",
+            "",
+            " Enter to confirm \u{b7} Esc to cancel",
+        ]);
+        let accept = rules_for("claude")
+            .and_then(|m| m.accept_of("trust_folder").map(str::to_string))
+            .expect("claude answers its trust question");
+        let keys = |screen: &[String], accept: &str, app: bool| accept_keys(screen, accept, app);
+        assert_eq!(
+            keys(&claude, &accept, false).as_deref(),
+            Some(&b"\x1b[B"[..])
+        );
+        // Application cursor keys: the arrow as the program asked for it.
+        assert_eq!(
+            keys(&claude, &accept, true).as_deref(),
+            Some(&b"\x1bOB"[..])
+        );
+        let codex = lines(&[
+            "  Folder access",
+            "  Trust this folder? Codex can read, edit, and run files here.",
+            "\u{203a} 1. Trust and continue",
+            "  2. Quit",
+            "  enter continue \u{b7} esc quit",
+        ]);
+        let accept = rules_for("codex")
+            .and_then(|m| m.accept_of("trust_folder").map(str::to_string))
+            .expect("codex answers its trust question");
+        assert_eq!(keys(&codex, &accept, false).as_deref(), Some(&b"\r"[..]));
+        // Pointer below the option, a blank row between: one option up, not two.
+        let yes = "Yes, I trust this folder";
+        let below = lines(&["   Yes, I trust this folder", "", " \u{276f} No, exit"]);
+        assert_eq!(keys(&below, yes, false).as_deref(), Some(&b"\x1b[A"[..]));
+        let unpointed = lines(&["   No, exit", "   Yes, I trust this folder"]);
+        assert_eq!(keys(&unpointed, yes, false), None);
+        // A quoted line is not a pointer.
+        let quoted = lines(&["> No, exit", "  Yes, I trust this folder"]);
+        assert_eq!(keys(&quoted, yes, false), None);
+        assert_eq!(keys(&claude, "not on screen", false), None);
+        // Once the pointer stands on the option, enter.
+        let moved = lines(&["   No, exit", " \u{276f} Yes, I trust this folder"]);
+        assert_eq!(keys(&moved, yes, false).as_deref(), Some(&b"\r"[..]));
+        // Only a setup gate answers: a rule without an accept has none.
+        assert!(rules_for("claude").is_some_and(|m| m.accept_of("first_run_dialog").is_none()));
     }
 }

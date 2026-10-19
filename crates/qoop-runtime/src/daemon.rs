@@ -1256,6 +1256,17 @@ impl Daemon {
             state_lock.as_ref().map_or(-1, |lock| lock.as_raw_fd()),
             std::sync::atomic::Ordering::SeqCst,
         );
+        // What a person parked to answer later. Unreadable is none: the agents show as they
+        // are, and the next park writes it again.
+        match store.parked().await {
+            Ok(parked) => agents.load_parked(
+                parked
+                    .into_iter()
+                    .map(|(terminal, at)| (terminal as u32, at))
+                    .collect(),
+            ),
+            Err(e) => crate::say!("qoopd: what is parked could not be read: {e}"),
+        }
         // What a person asked to keep awake. Unreadable is empty: idle sleep then treats
         // every tab as it did before the feature, and the next set writes it again.
         match store.kept_awake().await {
@@ -3517,7 +3528,10 @@ fn idle_tabs(
         };
         // Held for a day at most, from its last activity, so an interface that never looks
         // cannot keep a tab awake for ever.
-        if news.contains(stream) && now.saturating_sub(since) < crate::idle::NEWS_HOLD_SECS {
+        // A parked agent the same: its last screen is what the person comes back to read.
+        if (news.contains(stream) || agents.is_parked(*stream))
+            && now.saturating_sub(since) < crate::idle::NEWS_HOLD_SECS
+        {
             eligible.insert(*stream, false);
             continue;
         }
@@ -3646,6 +3660,12 @@ fn dispatch(
             None => Dispatch::Apart,
         },
         ControlRequest::CloseWorkspace { workspace, .. } => take(*workspace),
+        // Under its space's lock, like a close: a close cannot fall between the store's write
+        // and the registry's, and leave a reused id parked.
+        ControlRequest::SetParked { terminal, .. } => match terminals.workspace_of(*terminal) {
+            Some(workspace) => take(workspace),
+            None => Dispatch::Apart,
+        },
         // Under the space's lock, so a close of that space cannot fall between the store's
         // write and the mirror's, and leave a reused id kept awake.
         ControlRequest::SetKeepAwake { workspace, .. } => take(*workspace),
@@ -3961,6 +3981,7 @@ async fn handle_control(
             // it. Anything else is refused.
             match close_sleeping_tab(books, history_dir.as_deref(), terminal).await {
                 Ok(true) => {
+                    agents.drop_parked(terminal);
                     // Its task closed with it, which can move the item it was on.
                     agents.tasks_changed();
                     record_close(store, &id, terminal).await;
@@ -4461,6 +4482,46 @@ async fn handle_control(
                 reason: format!("the order of the spaces could not be saved: {e}"),
             },
         },
+        ControlRequest::SetParked { terminal, on, .. } => {
+            // A terminal on its way out (its row closes in a moment) is not parked: the park
+            // would outlive it and come back on a new tab that gets its id.
+            let Some(workspace) = terminals.workspace_of(terminal) else {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no open terminal {terminal}"),
+                };
+            };
+            let _held = match held {
+                Some(guard) => guard,
+                None => books.lock_of(workspace).lock_owned().await,
+            };
+            let at = crate::agents::now_unix();
+            // The registry first: it refuses a working agent under the same lock its state
+            // changes under. The store after, and the registry put back if the store fails.
+            if !agents.set_parked(terminal, on, at) {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "it is working: park it once it has answered".into(),
+                };
+            }
+            match store.set_parked(terminal, on, at).await {
+                Ok(true) => ControlResponse::Renamed { id },
+                Ok(false) => {
+                    agents.set_parked(terminal, false, at);
+                    ControlResponse::Failed {
+                        id,
+                        reason: format!("there is no open terminal {terminal}"),
+                    }
+                }
+                Err(e) => {
+                    agents.set_parked(terminal, !on, at);
+                    ControlResponse::Failed {
+                        id,
+                        reason: format!("the park could not be saved: {e}"),
+                    }
+                }
+            }
+        }
         ControlRequest::SetKeepAwake {
             workspace,
             terminal,
@@ -4751,6 +4812,7 @@ async fn handle_control(
                     crate::control::AgentRow {
                         news: news.contains(&terminal),
                         keep_awake,
+                        parked: agents.is_parked(terminal),
                         terminal,
                         name: terminals.name_of(terminal),
                         workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
@@ -6421,6 +6483,10 @@ fn open_terminal_with(
             if !keeps && let Some(books) = &books {
                 books.closing.lock().unwrap().insert(stream);
             }
+            // Closed for good is parked no more; asleep, or the daemon going down, it stays.
+            if !keeps {
+                forgetting.drop_parked(stream);
+            }
             registry.remove(stream);
             forgetting.forget(stream);
             // A tab whose process ended is a tab the person is done with, so it stops
@@ -6494,8 +6560,41 @@ fn spawn_agent_recorder(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
+            // Off this loop: it waits on a space's lock, which a wake can hold for seconds.
+            let unparked = agents.take_unparked();
+            if !unparked.is_empty() {
+                let (agents, terminals, books) = (agents.clone(), terminals.clone(), books.clone());
+                tokio::spawn(async move {
+                    forget_answered_parks(&agents, &terminals, &books, unparked).await;
+                });
+            }
         }
     });
+}
+
+/// Take parks that an answer ended out of the store. Under the space's lock and only while
+/// the registry still says unparked, so a park made again in the meantime (which takes the
+/// same lock) is never written over.
+async fn forget_answered_parks(
+    agents: &crate::agents::AgentRegistry,
+    terminals: &TerminalRegistry,
+    books: &Bookkeeping,
+    unparked: Vec<u32>,
+) {
+    for stream in unparked {
+        let Some(workspace) = terminals.workspace_of(stream) else {
+            continue;
+        };
+        let _held = books.lock_of(workspace).lock_owned().await;
+        if !agents.is_parked(stream)
+            && let Err(e) = books
+                .store
+                .set_parked(stream, false, crate::agents::now_unix())
+                .await
+        {
+            crate::say!("qoopd: tab {stream}'s answered park could not be cleared: {e}");
+        }
+    }
 }
 
 /// Write down what is in one terminal, unless the row already says it.
@@ -7141,6 +7240,7 @@ async fn adopt_terminals(into: &Restore, handoff: crate::handoff::Handoff) -> Ve
                 // have been had nobody been moving.
                 crate::say!("qoopd: tab {id} ended while the daemon moved; closing it");
                 let closed = into.books.store.close_terminal(id as i64).await;
+                into.agents.drop_parked(id);
                 if let Ok(true) = closed {
                     into.agents.tasks_changed();
                 }
@@ -7904,6 +8004,7 @@ async fn sleep_tab(
             if into.terminals.get(*stream).is_none()
                 && let Ok(true) = into.books.store.close_terminal(*stream as i64).await
             {
+                into.agents.drop_parked(*stream);
                 into.agents.tasks_changed();
             }
         }
@@ -10463,6 +10564,16 @@ pub fn nudged_size(size: PtySize) -> PtySize {
     }
 }
 
+/// How long a folder trust question stays on screen before it is answered for the person:
+/// the agent draws it before it reads keys (measured: Claude Code 2.1 dropped keys sent the
+/// moment the menu appeared), so the first key waits for it to settle.
+const TRUST_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Between one key and the next look: the screen is read again before each, so an arrow is
+/// seen to have moved the pointer before enter is pressed.
+const TRUST_STEP: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many keys one showing of the question gets before it is left to the person.
+const TRUST_TRIES: u32 = 6;
+
 #[allow(clippy::too_many_arguments)]
 async fn terminal_task(
     master: OwnedFd,
@@ -10552,6 +10663,11 @@ async fn terminal_task(
     // When the run of output that `detect_at` is waiting out began, so that waiting it out
     // can be given a ceiling.
     let mut detect_since: Option<tokio::time::Instant> = None;
+    // The agent's folder trust question, answered for the person: when this showing of it was
+    // first read, when the last key went, and how many went (a few, then it is the person's).
+    let mut trust_seen: Option<std::time::Instant> = None;
+    let mut trust_sent: Option<std::time::Instant> = None;
+    let mut trust_tries = 0;
     // When to re-announce a held blocker so a panel that missed one refresh
     // still converges. `None` unless a blocker holds, for the same reason:
     // the tick is recovery, not polling.
@@ -10648,6 +10764,8 @@ async fn terminal_task(
                             // of a tab that has been quiet for hours.
                             if crate::idle::is_live_input(from.as_str()) {
                                 agents.note_io(stream, crate::agents::now_unix());
+                                // The inbox's answers are a person's too: they end a park.
+                                agents.note_sent(stream, &bytes, crate::agents::now_unix());
                                 if from.as_str() != crate::asks::SENDER {
                                     agents.note_typed(stream, &bytes, crate::agents::now_unix());
                                 }
@@ -11203,6 +11321,45 @@ async fn terminal_task(
                             }
                             None => screen_verdict(reading, known),
                         };
+                        // The owner's standing pick (2026-10-19): an agent's "do you trust this
+                        // folder" question is answered yes for the person, in any folder,
+                        // since picking it by hand (and on a phone) is all it ever was. Keys
+                        // only when the menu and its pointer are both read off this screen.
+                        let accept = verdict.as_ref().and_then(|v| manifest.accept_of(&v.rule));
+                        match accept {
+                            Some(accept) if trust_tries < TRUST_TRIES => {
+                                let now = std::time::Instant::now();
+                                let seen = *trust_seen.get_or_insert(now);
+                                let next = trust_sent.map_or(seen + TRUST_SETTLE, |at| {
+                                    (at + TRUST_STEP).max(seen + TRUST_SETTLE)
+                                });
+                                if now >= next
+                                    && let Some(keys) = qoop_detect::accept_keys(
+                                        &screen,
+                                        accept,
+                                        engine.modes().application_cursor,
+                                    )
+                                {
+                                    trust_sent = Some(now);
+                                    trust_tries += 1;
+                                    if keys == b"\r" {
+                                        crate::say!(
+                                            "qoopd: tab {stream}: {program} asked to trust its folder; answered yes"
+                                        );
+                                    }
+                                    let _ = writes.push(keys.into(), WritePriority::UserInput);
+                                }
+                                // Looked at again even when the program prints nothing: the
+                                // next key, or the one a redraw lost, waits on this look.
+                                let again = trust_sent.map_or(seen + TRUST_SETTLE, |at| at + TRUST_STEP);
+                                detect_at = Some(tokio::time::Instant::from_std(again.max(now)));
+                            }
+                            Some(_) => {}
+                            None if verdict.is_some() => {
+                                (trust_seen, trust_sent, trust_tries) = (None, None, 0);
+                            }
+                            None => {}
+                        }
                         if let Some(verdict) = verdict {
                             // Whether or not this changed the belief: it filters the
                             // repeat and announces the news itself.

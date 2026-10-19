@@ -1715,6 +1715,7 @@ impl State {
             ) {
                 Some(tabs::Hit::Terminal(terminal)) => Some(Clicked::Terminal(terminal)),
                 Some(tabs::Hit::Close(_)) => Some(Clicked::CloseFocused),
+                Some(tabs::Hit::Park(terminal)) => Some(Clicked::Park(terminal)),
                 Some(tabs::Hit::New) => Some(Clicked::NewTerminal),
                 None => None,
             };
@@ -4420,7 +4421,7 @@ impl Naming {
             Naming::SpaceSettings(_) => "space settings",
             Naming::RenameTerminal(_) => "rename this tab",
             Naming::RenameSession(_) => "rename this session",
-            Naming::Remote => "ssh address of the computer",
+            Naming::Remote => "ssh address or command of the computer",
         }
     }
 
@@ -4430,7 +4431,10 @@ impl Naming {
     /// the one cell the cursor needs after the last letter. At 55 the cursor sat on it.
     pub fn limit(self) -> usize {
         match self {
-            Naming::Remote | Naming::Agent(_) | Naming::RenameSession(_) => 54,
+            // A whole ssh command (`ssh -p 2222 -i ~/.ssh/k -J jump me@host`) runs past the
+            // box: the field shows its end, where the typing is.
+            Naming::Remote => 200,
+            Naming::Agent(_) | Naming::RenameSession(_) => 54,
             _ => NAME_LIMIT,
         }
     }
@@ -4470,7 +4474,7 @@ impl Naming {
                 "empty gives it the default name".to_string()
             }
             Naming::Agent(_) => "like claude".to_string(),
-            Naming::Remote => "like admin@10.0.0.5".to_string(),
+            Naming::Remote => "like admin@10.0.0.5 or ssh -p 2222 me@host".to_string(),
             _ if !was.is_empty() => format!("empty keeps \"{was}\""),
             // A space with no name is a space nobody can point at, so there is nothing for
             // empty to mean and it is a cancel.
@@ -5296,6 +5300,35 @@ fn sleep_toggle(state: &mut State, request: &mut u64) {
     } else if let Some(tab) = state.dim_tab() {
         wake(state, space, tab, request);
     }
+}
+
+/// Park an agent to answer later, or take it back: on when it was off, as the last list
+/// said, and sent with the value rather than as a toggle, like keep awake. The daemon refuses
+/// one that is working, and says why.
+fn park(state: &mut State, terminal: u32, request: &mut u64) {
+    let Some(row) = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == terminal && r.agent)
+    else {
+        state.message = Some("only an agent can be parked".to_string());
+        return;
+    };
+    let on = !row.parked;
+    *request += 1;
+    state.message = Some(
+        if on {
+            "parked: it waits under the inbox's parked tab"
+        } else {
+            "unparked"
+        }
+        .to_string(),
+    );
+    state.modes.outbox.push(ControlRequest::SetParked {
+        id: format!("park-{request}"),
+        terminal,
+        on,
+    });
 }
 
 /// Put one tab of `space` to sleep, every pane of it: a key's or a click's, the same request.
@@ -6135,6 +6168,11 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
             _ => state.message = Some("awake already".to_string()),
         },
         ModeKey::Byte(b'S') => side_ask_sleep(state),
+        ModeKey::Byte(b'p') => {
+            if let Some(sidebar::Pick::Terminal(t)) = pick {
+                park(state, t, request);
+            }
+        }
         ModeKey::Byte(b'n' | b'+') => {
             if let Some(space) = space {
                 open_new(state, space);
@@ -7076,6 +7114,8 @@ enum Clicked {
     /// The close on the focused tab: the same as `ctrl-a x`, a question first when an agent
     /// in it is busy.
     CloseFocused,
+    /// The park mark under it: the same as `ctrl-a P`.
+    Park(u32),
     /// The `x` on an agent's row in the column: that agent's pane, a question first when
     /// it is busy.
     CloseAgent(u32),
@@ -8685,6 +8725,10 @@ where
                                         close_focused(&mut state, &mut request);
                                         dirty = true;
                                     }
+                                    Some(Clicked::Park(terminal)) => {
+                                        park(&mut state, terminal, &mut request);
+                                        dirty = true;
+                                    }
                                     Some(Clicked::CloseAgent(terminal)) => {
                                         close_terminal(&mut state, terminal, &mut request);
                                         dirty = true;
@@ -9582,6 +9626,11 @@ where
                             }
                             Action::Sleep => {
                                 sleep_toggle(&mut state, &mut request);
+                                dirty = true;
+                            }
+                            Action::Park => {
+                                let focused = state.focused;
+                                park(&mut state, focused, &mut request);
                                 dirty = true;
                             }
                             Action::Resize => {
@@ -14523,6 +14572,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -20326,6 +20376,44 @@ mod tests {
         assert_eq!(s.drawer_view(), None);
     }
 
+    /// `ctrl-a P`, the tab's park mark and the column's `p` all send the opposite of what the
+    /// last list said, as a value, and only for an agent.
+    #[test]
+    fn a_park_asks_for_the_opposite_of_what_the_list_said() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        park(&mut state, 2, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetParked {
+                terminal: 2,
+                on: true,
+                ..
+            })
+        ));
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.parked = true;
+        }
+        park(&mut state, 2, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetParked {
+                terminal: 2,
+                on: false,
+                ..
+            })
+        ));
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.agent = false;
+        }
+        park(&mut state, 2, &mut request);
+        assert!(state.modes.outbox.is_empty(), "a shell is not parked");
+        assert_eq!(
+            state.message.as_deref(),
+            Some("only an agent can be parked")
+        );
+    }
+
     /// A cup click sends the opposite of what the last list said, as a value, so a stale
     /// double click cannot toggle it back on the daemon.
     #[test]
@@ -24355,7 +24443,8 @@ mod tests {
             Some(Clicked::Search)
         ));
     }
-    /// The search chip is one click row, and no row beside it is.
+    /// The search is three click rows, the chip and a blank row over and under it, and no
+    /// row beside them is.
     #[test]
     fn the_whole_search_chip_is_one_click() {
         let mut s = state();

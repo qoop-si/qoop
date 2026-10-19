@@ -214,6 +214,15 @@ impl StoreHandle {
         self.run(|s| s.kept_awake()).await
     }
 
+    pub async fn set_parked(&self, terminal: u32, on: bool, at: i64) -> Result<bool, HandleError> {
+        self.run(move |s| s.set_parked_terminal(i64::from(terminal), on, at))
+            .await
+    }
+
+    pub async fn parked(&self) -> Result<std::collections::BTreeMap<i64, i64>, HandleError> {
+        self.run(|s| s.parked()).await
+    }
+
     pub async fn delete_workspace(&self, id: i64) -> Result<usize, HandleError> {
         self.run(move |s| s.delete_workspace(id)).await
     }

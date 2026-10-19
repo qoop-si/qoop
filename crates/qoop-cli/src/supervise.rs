@@ -2134,6 +2134,7 @@ mod tests {
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,

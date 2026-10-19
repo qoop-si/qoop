@@ -51,6 +51,8 @@ GLYPHS = [
     ("md-eye_off", 1.00),
     ("md-bell_outline", 0.94),
     ("md-bell_off_outline", 0.94),
+    ("md-bookmark_outline", 0.90),
+    ("md-bookmark", 0.90),
 ]
 # Glyphs the Nerd sets lack, drawn here over the outline of the one named: the shut eye is a
 # lid and three lashes (every Nerd "closed" eye is a struck-through one).

@@ -30,6 +30,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
 fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
     AgentRow {
         keep_awake: false,
+        parked: false,
         background: 0,
         subagents: 0,
         task: None,

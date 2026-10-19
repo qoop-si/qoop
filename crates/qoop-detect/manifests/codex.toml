@@ -66,6 +66,7 @@ priority = 300
 region = "bottom_non_empty_lines(30)"
 visible_blocker = true
 setup_gate = true
+accept = "Trust and continue"
 all = [
   { line_regex = '^\s*Folder access\s*$' },
   { regex = '(?m)^\s*enter continue( and create sandbox)? · esc (quit|back)\s*\z' },

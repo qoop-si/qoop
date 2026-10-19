@@ -178,6 +178,7 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
             Role::Done => '*',
             Role::Sleeping => 'z',
             Role::Background => 'o',
+            Role::BrandCalm => 'p',
             _ => '.',
         };
         return format!("{plain} ");
@@ -201,6 +202,8 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Failed => vec![(0, 0), (2, 0), (1, 1), (0, 2), (2, 2)],
         Role::Done => (0..3).flat_map(|y| (0..3).map(move |x| (x, y))).collect(),
         Role::Sleeping => vec![(0, 1), (1, 1), (2, 1)],
+        // Parked: a bookmark, its top across and its sides down to the notch.
+        Role::BrandCalm => vec![(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)],
         // A braille cell takes one ink, so the centre cannot stay grey beside a sky dot: the
         // dot goes round alone, which no other state is (the centre is never missing from
         // working's frames, and idle's dot is the centre).
@@ -243,6 +246,8 @@ fn one_cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Failed => TL | BR,
         Role::Done => TL | TR | BL | BR,
         Role::Sleeping => BL | BR,
+        // Parked: the top bar, sleep's mirror, in the brand's quiet ink.
+        Role::BrandCalm => TL | TR,
         Role::Background if working => ORBIT[(tick / 2 % 4) as usize],
         Role::Background => ORBIT[0],
         _ => BL,
@@ -399,17 +404,20 @@ pub enum InboxTab {
     Wants,
     Failed,
     Done,
+    /// Agents a person parked to answer later: their own list, out of all and done.
+    Parked,
     Working,
     Asleep,
 }
 
 impl InboxTab {
     /// In the order the tab row draws them after the chosen one.
-    pub const ORDER: [InboxTab; 6] = [
+    pub const ORDER: [InboxTab; 7] = [
         InboxTab::All,
         InboxTab::Wants,
         InboxTab::Failed,
         InboxTab::Done,
+        InboxTab::Parked,
         InboxTab::Working,
         InboxTab::Asleep,
     ];
@@ -421,6 +429,7 @@ impl InboxTab {
             InboxTab::Wants => "wants",
             InboxTab::Failed => "failed",
             InboxTab::Done => "done",
+            InboxTab::Parked => "parked",
             InboxTab::Working => "working",
             InboxTab::Asleep => "asleep",
         }
@@ -434,6 +443,7 @@ impl InboxTab {
             InboxTab::Wants => Role::Blocked,
             InboxTab::Failed => Role::Failed,
             InboxTab::Done => crate::theme::of("done"),
+            InboxTab::Parked => Role::BrandCalm,
             InboxTab::Working => Role::Working,
             InboxTab::Asleep => Role::Sleeping,
         }
@@ -576,6 +586,7 @@ pub fn gen_of(agent: &AgentRow) -> u64 {
 /// here since. The focused row is never unread: standing on it is reading it.
 pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
     agent.state == "done"
+        && !agent.parked
         && agent.terminal != focused
         && !seen.contains(&(agent.terminal, gen_of(agent)))
 }
@@ -590,7 +601,10 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
 /// news yet: not in the done list, not in the queue, no sage. Its unseen entry stays, and
 /// the moment the job ends the row is plain idle and becomes the news it is.
 pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
-    if agent.terminal == focused || role_of(agent) == crate::theme::Role::Background {
+    if agent.terminal == focused
+        || role_of(agent) == crate::theme::Role::Background
+        || is_parked(agent)
+    {
         return false;
     }
     if is_unread(agent, focused, seen) {
@@ -598,6 +612,13 @@ pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> b
     }
     matches!(agent.state.as_str(), "idle" | "done")
         && unseen.contains(&(agent.terminal, gen_of(agent)))
+}
+
+/// Whether a person parked this agent to answer later and it is settled: idle or done. A
+/// parked agent that is blocked or failed shows as that, so a park never hides a question;
+/// one that works again shows working.
+pub fn is_parked(agent: &AgentRow) -> bool {
+    agent.parked && matches!(agent.state.as_str(), "idle" | "done")
 }
 
 /// Where a row sorts in the priority view: what wants a person first, then
@@ -615,6 +636,8 @@ fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> 
         _ if is_new(agent, focused, seen, unseen) => 2,
         "working" => 3,
         "starting" => 4,
+        // Set aside on purpose: with the idle, not with the news.
+        _ if is_parked(agent) => 6,
         "done" => 5,
         "idle" => 6,
         // Slept tabs sink below idle: settled, visible, never attention.
@@ -1150,7 +1173,9 @@ fn wait_role(agent: &AgentRow) -> crate::theme::Role {
 /// its own state here, derived from the row's count: the daemon's word stays `idle`, which
 /// scripts wait on.
 fn role_of(agent: &AgentRow) -> crate::theme::Role {
-    if agent.state == "idle" && agent.background > 0 {
+    if is_parked(agent) {
+        crate::theme::Role::BrandCalm
+    } else if agent.state == "idle" && agent.background > 0 {
         crate::theme::Role::Background
     } else {
         crate::theme::of(&agent.state)
@@ -1197,6 +1222,14 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
             .filter(|a| a.agent && matches!(a.state.as_str(), "working" | "starting"))
             .map(|a| agent_item(a, crate::theme::Role::Working))
             .collect(),
+        // Parked by a person, whatever they do now, unless they want a person or failed:
+        // those are in their own lists, where a park never hides them.
+        InboxTab::Parked => c
+            .agents
+            .iter()
+            .filter(|a| a.agent && a.parked && !matches!(a.state.as_str(), "blocked" | "failed"))
+            .map(|a| agent_item(a, role_of(a)))
+            .collect(),
         // Sleeping tabs are the space's, not the daemon's agents: the ones with an agent in
         // them, as the tree lists them under their rule.
         InboxTab::Asleep => c
@@ -1240,7 +1273,7 @@ fn tab_mark(tab: InboxTab) -> String {
 /// one, then every other tab as its mark and count. Folded: the caret, `inbox`, and every
 /// state as its mark and count. Too narrow for all of them, a zero count goes first, then
 /// the last ones.
-fn tab_cells(c: &Column, counts: &[usize; 6]) -> Vec<(Option<InboxTab>, usize, String)> {
+fn tab_cells(c: &Column, counts: &[usize; 7]) -> Vec<(Option<InboxTab>, usize, String)> {
     let count = |tab: InboxTab| counts[tab as usize];
     let chosen = c.inbox.tab;
     // The caret and the gap after it are one target, two columns wide.
@@ -1300,7 +1333,7 @@ fn tab_cells(c: &Column, counts: &[usize; 6]) -> Vec<(Option<InboxTab>, usize, S
 }
 
 /// How many each of the inbox's lists holds, in [`InboxTab::ORDER`].
-fn tab_counts(c: &Column) -> [usize; 6] {
+fn tab_counts(c: &Column) -> [usize; 7] {
     InboxTab::ORDER.map(|tab| inbox_items(c, tab).len())
 }
 
@@ -1601,8 +1634,10 @@ fn title_line(c: &Column) -> Line {
     }
 }
 
-/// The rows of the search: one, the chip.
-pub const SEARCH_ROWS: usize = 1;
+/// The rows of the search: a blank row, the chip, a blank row. The blank rows give the chip
+/// room from the title and the tree, and a click on either opens the search too, so the
+/// target is three rows tall without a box drawn around it (the owner's pick, 2026-10-19).
+pub const SEARCH_ROWS: usize = 3;
 
 /// The search chip under the title: one row between ember brackets, the left one on the
 /// column of the inbox edge's left corner and of the words below it, the right one on the
@@ -1671,7 +1706,8 @@ fn search_rows(c: &Column) -> Vec<Row> {
         runs: chip_runs,
         ..Line::default()
     };
-    vec![(chip, Some(Hit::Search))]
+    let room = || (blank(c.width).0, Some(Hit::Search));
+    vec![room(), (chip, Some(Hit::Search)), room()]
 }
 
 /// `agent` or `agents` after a count.
@@ -1698,14 +1734,15 @@ fn agent_found(c: &Column, agent: &AgentRow) -> bool {
 
 /// The keys of the column while the keyboard has it, for the line at its foot: the key, what
 /// it does, and how soon it goes when the line is short, where zero never goes.
-const NAV_KEYS: [(&str, &str, u8); 7] = [
+const NAV_KEYS: [(&str, &str, u8); 8] = [
     ("j/k", "move", 1),
     ("enter", "open", 2),
     ("q", "back", 0),
     ("s", "sleep", 3),
     ("/", "find", 4),
-    ("x", "close", 5),
-    ("n", "new", 6),
+    ("p", "park", 5),
+    ("x", "close", 6),
+    ("n", "new", 7),
 ];
 const TYPING_KEYS: [(&str, &str, u8); 3] = [
     ("type", "filter", 1),
@@ -4445,6 +4482,7 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -4475,6 +4513,7 @@ mod tests {
 
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -4743,7 +4782,7 @@ mod tests {
     #[test]
     fn the_focused_space_and_the_focused_terminal_are_found_by_hit_not_by_glyph() {
         let (spaces, agents) = sample();
-        let texts = unboxed(&render(&spaces, &agents, 2, 3, 14));
+        let texts = unboxed(&render(&spaces, &agents, 2, 3, 16));
         // No selection marks anywhere: no hollow ring on every row and no
         // second dot on the selected one. The keyboard's row is the raised
         // background the painter adds. The state mark opens every agent's
@@ -4762,8 +4801,8 @@ mod tests {
             "{texts:?}"
         );
         // And hits still know which rows have the keyboard.
-        let hits: Vec<Option<Hit>> = (0..14)
-            .map(|row| hit(&spaces, &agents, 2, 3, 14, row))
+        let hits: Vec<Option<Hit>> = (0..16)
+            .map(|row| hit(&spaces, &agents, 2, 3, 16, row))
             .collect();
         assert!(hits.contains(&Some(Hit::Space(2))));
         assert!(hits.contains(&Some(Hit::Terminal(3))));
@@ -4775,7 +4814,7 @@ mod tests {
     #[test]
     fn an_agent_is_two_rows_under_its_space_rule() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 1, 1, 16);
+        let lines = render(&spaces, &agents, 1, 1, 18);
         let texts = unboxed(&lines);
         let head = texts
             .iter()
@@ -4830,7 +4869,7 @@ mod tests {
     #[test]
     fn an_agent_row_carries_its_state_on_the_dot_and_a_title_or_rule_carries_none() {
         let (spaces, agents) = sample();
-        let lines = render(&spaces, &agents, 1, 1, 16);
+        let lines = render(&spaces, &agents, 1, 1, 18);
         // A title has a look of its own, and it is never a state's: a heading that
         // came out the colour of `blocked` would be a heading somebody answers.
         assert_eq!(lines[1].colour, Some(crate::theme::Role::Title));
@@ -4943,7 +4982,7 @@ mod tests {
     fn every_space_draws_one_rule_with_its_arrow_count_and_block() {
         use crate::theme::Role;
         let (spaces, agents) = sample();
-        let rows = tree_rows(&spaces, &agents, 1, 20, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 22, &Seen::new(), &Shut::new());
         let app = rule_row(&rows, 1);
         assert_eq!(
             app.text,
@@ -4970,7 +5009,7 @@ mod tests {
 
         // Folded, the mark turns, the name stays put and the count stays.
         let shut = Shut::from([1]);
-        let rows = tree_rows(&spaces, &agents, 9, 20, &Seen::new(), &shut);
+        let rows = tree_rows(&spaces, &agents, 9, 22, &Seen::new(), &shut);
         assert!(
             rule_row(&rows, 1).text.starts_with("\u{25b8}app (1)"),
             "{:?}",
@@ -4991,8 +5030,8 @@ mod tests {
             .collect();
         for focused in 1..=30u32 {
             let home = i64::from((focused - 1) / 3 + 1);
-            let drawn: Vec<Hit> = (0..17)
-                .filter_map(|row| hit(&spaces, &agents, home, focused, 17, row))
+            let drawn: Vec<Hit> = (0..19)
+                .filter_map(|row| hit(&spaces, &agents, home, focused, 19, row))
                 .collect();
             assert!(
                 drawn.contains(&Hit::Terminal(focused)),
@@ -5005,8 +5044,8 @@ mod tests {
         }
         // With no agent to keep, the focused space's rule is what stays.
         for focused_space in 1..=10i64 {
-            let drawn: Vec<Hit> = (0..17)
-                .filter_map(|row| hit(&spaces, &agents, focused_space, 99, 17, row))
+            let drawn: Vec<Hit> = (0..19)
+                .filter_map(|row| hit(&spaces, &agents, focused_space, 99, 19, row))
                 .collect();
             assert!(
                 drawn.contains(&Hit::Space(focused_space)),
@@ -5017,7 +5056,7 @@ mod tests {
         // and the search chip.
         let (spaces, agents) = sample();
         assert_eq!(
-            hit(&spaces, &agents, 3, 3, 17, 2 + SEARCH_ROWS),
+            hit(&spaces, &agents, 3, 3, 19, 2 + SEARCH_ROWS),
             Some(Hit::Space(1))
         );
     }
@@ -5143,9 +5182,13 @@ mod tests {
                     } else if text.trim_start().starts_with('\u{2514}') {
                         second
                     } else if text.is_empty() {
-                        // A space's bottom edge and the gap between two agents are
-                        // blank rows: nothing to click, so nothing they reach.
-                        None
+                        // The blank rows over and under the search chip are the search's;
+                        // a space's bottom edge and the gap between two agents are blank
+                        // rows with nothing to click, so nothing they reach.
+                        let chip = |l: Option<&Line>| l.is_some_and(|l| l.text.starts_with(" [ /"));
+                        (in_tree
+                            && (chip(lines.get(row + 1)) || chip(lines.get(row.wrapping_sub(1)))))
+                        .then_some(Hit::Search)
                     } else if text.starts_with(&format!(" {SPACES_TITLE}")) && text.ends_with('+') {
                         Some(Hit::Title)
                     } else if in_tree && text.starts_with(" [ /") {
@@ -5220,7 +5263,7 @@ mod tests {
     #[test]
     fn an_agent_in_a_space_the_client_has_not_heard_of_still_draws_its_row() {
         let agents = vec![agent(4, 77, "codex", "blocked")];
-        let lines = render(&[], &agents, 1, 4, 12);
+        let lines = render(&[], &agents, 1, 4, 14);
         assert!(
             lines
                 .iter()
@@ -5230,7 +5273,7 @@ mod tests {
         );
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(4, 77, "codex", "idle"), agent(5, 1, "claude", "idle")];
-        let rows = tree_rows(&spaces, &agents, 5, 16, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 5, 18, &Seen::new(), &Shut::new());
         assert_eq!(order(&rows), vec![5, 4], "the stranger follows the tree");
         let stray = tree_row(&rows, 4);
         assert!(
@@ -5243,6 +5286,7 @@ mod tests {
 
     fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -5504,6 +5548,7 @@ mod tests {
     #[test]
     fn a_wrapper_is_shown_as_standing_in_the_way_and_never_as_the_program() {
         let agents = vec![AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -5530,7 +5575,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 11);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 13);
         assert!(
             lines.iter().any(|l| l.text.contains("behind")),
             "{:?}",
@@ -5544,6 +5589,7 @@ mod tests {
     #[test]
     fn an_unknown_state_is_drawn_as_nothing_and_leaves_the_name_the_whole_row() {
         let agents = vec![AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -5570,7 +5616,7 @@ mod tests {
             pgid: None,
             discards: None,
         }];
-        let lines = render(&[space(1, "app")], &agents, 1, 5, 11);
+        let lines = render(&[space(1, "app")], &agents, 1, 5, 13);
         assert!(
             lines.iter().any(|l| l.text.contains("behind docker")),
             "{:?}",
@@ -5587,7 +5633,7 @@ mod tests {
     fn a_wide_name_does_not_cost_the_row_a_space_the_column_put_there() {
         let agents = vec![agent(1, 1, "\u{4e2d}\u{4e2d}", "idle")];
         let spaces = vec![space(1, "\u{4e2d}\u{6587}")];
-        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 15, &Seen::new(), &Shut::new());
         // The space's own rule: the space after its name is one this module wrote, and
         // the grid's rule would have eaten it.
         let rule = rule_row(&rows, 1);
@@ -5610,7 +5656,7 @@ mod tests {
             &[space(1, "app")],
             &agents,
             1,
-            12,
+            14,
             &Seen::new(),
             &Shut::new(),
         );
@@ -5722,7 +5768,7 @@ mod tests {
             &agents,
             1,
             1,
-            16,
+            18,
             0,
             View::Tree,
             &Seen::new(),
@@ -7190,7 +7236,7 @@ mod tests {
         // failed colour and reaching the failed terminal.
         let spaces = vec![space(2, "webshop")];
         let agents = vec![agent(2, 2, "claude", "failed")];
-        let lines = render(&spaces, &agents, 2, 99, 12);
+        let lines = render(&spaces, &agents, 2, 99, 16);
         let mark = cell_mark(crate::theme::of("failed"), false, 0);
         // Column zero is a blank, ahead of the mark.
         let prefix = format!(" {mark}claude");
@@ -7205,7 +7251,7 @@ mod tests {
             Some((BOX_LEAD, 2, crate::theme::of("failed")))
         );
         assert_eq!(
-            hit(&spaces, &agents, 2, 99, 12, row),
+            hit(&spaces, &agents, 2, 99, 16, row),
             Some(Hit::Terminal(2))
         );
         // An unseen failed finish keeps its X: failed is never news.
@@ -7460,7 +7506,7 @@ mod tests {
         for width in [SIDEBAR_MIN, WIDTH, SIDEBAR_MAX] {
             for view in [View::Tree, View::Priority] {
                 let c = clicks(&spaces, &agents, view, width, &none);
-                let rows = rows_folded(&c, 20, None);
+                let rows = rows_folded(&c, 22, None);
                 let title = rows
                     .iter()
                     .find(|(_, h)| *h == Some(Hit::Title))
@@ -7525,7 +7571,7 @@ mod tests {
             }
         }
         // The fold mark before the name and the name itself both fold.
-        let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 16, &Seen::new(), &Shut::new());
         let head: String = rule_row(&rows, 1).text.chars().take(NAME_AT + 1).collect();
         assert_eq!(head, "\u{25be}c");
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
@@ -7555,7 +7601,7 @@ mod tests {
     fn the_tree_opens_right_under_the_title() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "codex", "idle")];
-        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 15, &Seen::new(), &Shut::new());
         assert_eq!(rows[0].1, Some(Hit::Tabs));
         assert_eq!(rows[1].1, Some(Hit::Title));
         for row in &rows[2..2 + SEARCH_ROWS] {
@@ -7585,7 +7631,7 @@ mod tests {
             WIDTH,
             &shut,
         ));
-        let rows = rows_folded(&c, 18, None);
+        let rows = rows_folded(&c, 20, None);
         let texts = texts(&rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>());
         assert!(texts[1].starts_with(" \u{282f}\u{2807}codex"), "{texts:?}");
         assert_eq!(rows[1].1, Some(Hit::Next(Some(1))));
@@ -7996,12 +8042,12 @@ mod tests {
         unseen.insert((7, 3));
         // Finished unread, which would be the done sage for a free agent.
         let agents = vec![busy.clone(), free];
-        let rows = tree_rows(&spaces, &agents, 1, 13, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents, 1, 15, &seen, &shut);
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, Role::Background))
         );
-        let rows = tree_rows(&spaces, &agents[1..], 1, 13, &seen, &shut);
+        let rows = tree_rows(&spaces, &agents[1..], 1, 15, &seen, &shut);
         assert_eq!(tree_row(&rows, 8).indicator.map(|i| i.2), Some(Role::Idle));
 
         let column = column(
@@ -8376,6 +8422,40 @@ mod tests {
         (spaces, vec![blocked, failed, done, working], unseen)
     }
 
+    /// A parked agent leaves the news: not in all, not in done, not new, its dot the brand's
+    /// quiet bookmark, and listed under the parked tab. A parked agent that wants a person
+    /// stays where it is: a park never hides a question.
+    #[test]
+    fn a_parked_agent_leaves_the_news_for_its_own_list_but_never_hides_a_question() {
+        let (spaces, mut agents, unseen) = inbox_fleet();
+        agents[2].parked = true;
+        agents[0].parked = true;
+        let (seen, shut) = (Seen::new(), Shut::new());
+        let c = opened(column(
+            &spaces,
+            &agents,
+            1,
+            99,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        ));
+        let listed =
+            |tab| -> Vec<u32> { inbox_items(&c, tab).iter().map(|i| i.terminal).collect() };
+        assert!(!is_new(&agents[2], 99, &seen, &unseen));
+        assert_eq!(listed(InboxTab::Done), Vec::<u32>::new());
+        assert_eq!(listed(InboxTab::All), vec![1, 2]);
+        assert_eq!(listed(InboxTab::Wants), vec![1]);
+        assert_eq!(listed(InboxTab::Parked), vec![3]);
+        assert_eq!(dot_of(&c, &agents[2]).0, crate::theme::Role::BrandCalm);
+        assert_eq!(dot_of(&c, &agents[0]).0, crate::theme::Role::Blocked);
+        assert_eq!(tab_counts(&c)[InboxTab::Parked as usize], 1);
+    }
+
     /// The inbox lists everyone waiting under its tab row, the chosen tab filled, and its
     /// height never depends on how many wait: nobody, one or six, the title and the tree
     /// under it stay on the same rows.
@@ -8482,7 +8562,7 @@ mod tests {
             &shut,
         ));
         let cells = tab_cells(&c, &tab_counts(&c));
-        assert_eq!(cells.iter().filter(|(t, _, _)| t.is_some()).count(), 6);
+        assert_eq!(cells.iter().filter(|(t, _, _)| t.is_some()).count(), 7);
         for (tab, from, _) in &cells {
             let want = match tab {
                 Some(tab) => Some(Act::InboxTab(*tab)),
@@ -8829,7 +8909,7 @@ mod tests {
             agent(4, 2, "codex", "idle"),
         ];
         let shut = Shut::from([1]);
-        let rows = tree_rows(&spaces, &agents, 2, 16, &Seen::new(), &shut);
+        let rows = tree_rows(&spaces, &agents, 2, 18, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![2, 4]);
         let app = rule_row(&rows, 1);
         assert!(app.text.starts_with("\u{25b8}app (3)"), "{:?}", app.text);
@@ -8844,7 +8924,7 @@ mod tests {
         );
 
         // Off the space, the fold hides all three.
-        let rows = tree_rows(&spaces, &agents, 4, 14, &Seen::new(), &shut);
+        let rows = tree_rows(&spaces, &agents, 4, 16, &Seen::new(), &shut);
         assert_eq!(order(&rows), vec![4]);
         // And the open space next to it is untouched.
         assert!(
@@ -8958,7 +9038,7 @@ mod tests {
         let spaces = vec![space(1, "app")];
         let mut agents = vec![agent(1, 1, "sh", "unknown")];
         agents[0].agent = true;
-        let rows = tree_rows(&spaces, &agents, 1, 13, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 15, &Seen::new(), &Shut::new());
         assert_eq!(unbox(&tree_row(&rows, 1).text), " \u{2810}\u{2800}sh");
     }
 
@@ -8968,7 +9048,7 @@ mod tests {
     fn an_unread_done_draws_in_its_space_with_the_done_dot() {
         let spaces = vec![space(1, "app")];
         let agents = vec![agent(1, 1, "claude", "done")];
-        let rows = tree_rows(&spaces, &agents, 2, 13, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 2, 15, &Seen::new(), &Shut::new());
         assert_eq!(
             tree_row(&rows, 1).indicator,
             Some((BOX_LEAD, 2, crate::theme::of("done")))
@@ -8998,7 +9078,7 @@ mod tests {
             &agents,
             1,
             9,
-            14,
+            16,
             0,
             View::Priority,
             &Seen::new(),
@@ -9041,7 +9121,7 @@ mod tests {
             ],
             1,
             9,
-            14,
+            16,
             0,
             View::Priority,
             &Seen::new(),
@@ -9057,7 +9137,7 @@ mod tests {
         assert_eq!(twin.colour, None);
 
         // The tree keeps daemon order, dimmed or not.
-        let rows = tree_rows(&spaces, &agents, 9, 14, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 9, 16, &Seen::new(), &Shut::new());
         assert_eq!(order(&rows), vec![1, 2], "the tree moved a row");
         assert_eq!(
             tree_row(&rows, 1).indicator,
@@ -9065,7 +9145,7 @@ mod tests {
         );
         assert_eq!(tree_row(&rows, 1).colour, Some(crate::theme::Role::Faint));
         // Focused, the same stale row is read, and reads at full strength.
-        let rows = tree_rows(&spaces, &agents, 1, 14, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &agents, 1, 16, &Seen::new(), &Shut::new());
         assert_eq!(tree_row(&rows, 1).colour, None);
         assert_eq!(
             tree_row(&rows, 1).indicator,
@@ -9400,7 +9480,7 @@ mod tests {
         a.cwd = Some("/home/u/x".into());
         let mut b = agent(2, 2, "codex", "idle");
         b.cwd = Some("/home/u/x".into());
-        let rows = tree_rows(&spaces, &[a, b], 9, 18, &Seen::new(), &Shut::new());
+        let rows = tree_rows(&spaces, &[a, b], 9, 20, &Seen::new(), &Shut::new());
         let lines: Vec<Line> = rows.iter().map(|(l, _)| l.clone()).collect();
         let texts = unboxed(&lines);
         // The rules start under the title and the search chip.
@@ -9757,7 +9837,7 @@ mod tests {
         let idle = agent(8, 1, "claude", "idle");
         assert_eq!(priority_of(&idle, focused, &seen, &unseen), 6);
         // In the tree it wears the mauve mark, and is never next.
-        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 13, &seen, &Shut::new());
+        let rows = tree_rows(&[space(1, "app")], &[slept], 1, 15, &seen, &Shut::new());
         assert_eq!(
             tree_row(&rows, 7).indicator,
             Some((BOX_LEAD, 2, crate::theme::Role::Sleeping))
@@ -10575,7 +10655,7 @@ mod tests {
         let (spaces, agents) = sample();
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
-        let rows = rows_folded(&c, 20, None);
+        let rows = rows_folded(&c, 22, None);
         let row = tree_row(&rows, 1);
         assert!(row.text.ends_with(" z c x "), "{:?}", row.text);
         let on: Vec<usize> = (1..=WIDTH)
@@ -10592,7 +10672,7 @@ mod tests {
         assert!(!on_agent_sleep(WIDTH - 5, 1, &flat));
         // With icons the mark is the moon, in the controls' grey.
         c.icons = true;
-        let rows = rows_folded(&c, 20, None);
+        let rows = rows_folded(&c, 22, None);
         let row = tree_row(&rows, 1);
         assert!(row.text.contains(crate::icons::SLEEP), "{:?}", row.text);
         assert!(
@@ -10750,11 +10830,20 @@ mod tests {
                 .iter()
                 .position(|(_, h)| *h == Some(Hit::Title))
                 .expect("a title");
-            assert_eq!(rows[at + 1].1, Some(Hit::Search));
-            assert_ne!(rows[at + 2].1, Some(Hit::Search), "the chip is one row");
-            assert_ne!(rows[at - 1].1, Some(Hit::Search), "the chip is one row");
-            assert_eq!(crate::width::width(&rows[at + 1].0.text), WIDTH);
-            rows[at + 1].0.clone()
+            // A blank row, the chip, a blank row, all three the search's and nothing else.
+            for (_, hit) in &rows[at + 1..at + 1 + SEARCH_ROWS] {
+                assert_eq!(*hit, Some(Hit::Search));
+            }
+            assert_ne!(
+                rows[at + 1 + SEARCH_ROWS].1,
+                Some(Hit::Search),
+                "three rows"
+            );
+            assert_ne!(rows[at - 1].1, Some(Hit::Search), "three rows");
+            assert_eq!(rows[at + 1].0.text.trim(), "", "room over the chip");
+            assert_eq!(rows[at + 3].0.text.trim(), "", "room under the chip");
+            assert_eq!(crate::width::width(&rows[at + 2].0.text), WIDTH);
+            rows[at + 2].0.clone()
         };
         let brackets = [(1, 1, Role::Brand), (WIDTH - 2, 1, Role::Brand)];
         let idle = chip_of(&c);
@@ -10904,7 +10993,11 @@ mod tests {
                         .map(|(l, _)| l.text.as_str())
                         .find(|t| t.starts_with(" \u{2570}"))
                         .expect("the inbox edge");
-                    let chip = text(Hit::Search);
+                    let chip = rows
+                        .iter()
+                        .find(|(l, h)| *h == Some(Hit::Search) && l.text.contains('['))
+                        .map(|(l, _)| l.text.clone())
+                        .expect("the chip");
                     let why = format!("width {width} icons {icons} query {query:?}: {chip:?}");
                     assert_eq!(crate::width::width(&chip), width, "{why}");
                     let left = col_of(tray, &|ch| ch == '\u{2570}');
@@ -10954,7 +11047,7 @@ mod tests {
             c.nav = Some(&nav);
             let rows = search_rows(&c);
             assert_eq!(rows.len(), SEARCH_ROWS);
-            let chip = &rows[0].0.text;
+            let chip = &rows[1].0.text;
             assert_eq!(crate::width::width(chip), width, "{chip:?}");
             assert!(chip.contains("api\u{258f}"), "width {width}: {chip:?}");
             assert!(chip.starts_with(" [") && chip.ends_with("] "), "{chip:?}");
@@ -10979,7 +11072,7 @@ mod tests {
             &shut,
         );
         c.nav = Some(&wide);
-        let chip = &search_rows(&c)[0].0.text;
+        let chip = &search_rows(&c)[1].0.text;
         assert!(
             chip.contains("\u{258f}") && chip.contains(" of ") && chip.ends_with("] "),
             "{chip:?}"
@@ -11205,7 +11298,7 @@ mod tests {
         agents[0].state = "sleeping".into();
         let none = (Seen::new(), Unseen::new(), Shut::new());
         let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
-        let rows = rows_folded(&c, 20, None);
+        let rows = rows_folded(&c, 22, None);
         let row = tree_row(&rows, 1);
         assert!(row.text.ends_with("   c x "), "{:?}", row.text);
         assert!(!on_agent_sleep(WIDTH - 5, 1, &c));

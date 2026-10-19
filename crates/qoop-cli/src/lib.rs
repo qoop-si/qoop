@@ -240,7 +240,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                  \x20 qoop reset      restore a terminal left in raw mode by a killed client\n\
                  \x20 qoop relay      pipe stdin and stdout to this computer's daemon\n\
                  \x20 qoop ensure-awake  wake the space that slept last, or open a first tab\n\
-                 \x20 qoop --remote <name|ssh-target>  the interface for another computer's qoop\n\
+                 \x20 qoop --remote <name|ssh-target|ssh command>  the interface for another computer's qoop\n\
                  \x20 qoop --space <id|name>  the interface with that one space in it, made\n\
                  \x20                 when the name is new; `qoop` still shows them all\n\
                  \x20 qoop remote add <name> <ssh-target>  show that\n\
@@ -688,20 +688,27 @@ fn run_space(args: &[String]) -> std::io::Result<()> {
 /// target. It goes through the same connection the interface keeps for added remotes, so a
 /// dropped connection comes back on its own rather than ending the interface.
 fn run_remote(args: &[String]) -> std::io::Result<()> {
-    let Some(what) = args.get(2) else {
-        eprintln!("usage: qoop --remote <name|ssh-target>");
+    // The rest of the line, so a whole ssh command needs no quotes.
+    let what = args.get(2..).unwrap_or_default().join(" ");
+    if what.is_empty() {
+        eprintln!("usage: qoop --remote <name|ssh-target|ssh command>");
         std::process::exit(2);
-    };
+    }
     let added = qoop_remote::saved::load()?
         .into_iter()
-        .find(|r| &r.name == what);
-    let remote = match added {
-        Some(remote) => remote,
-        None if qoop_remote::saved::valid_target(what) => qoop_remote::Remote {
-            name: what.clone(),
-            target: what.clone(),
+        .find(|r| r.name == what);
+    let remote = match (added, qoop_remote::saved::canonical(&what)) {
+        (Some(remote), _) => remote,
+        // Named as it always was by a bare host; a command by its host.
+        (None, Some(target)) => qoop_remote::Remote {
+            name: if target == what {
+                what
+            } else {
+                qoop_remote::saved::name_for(&target, &[])
+            },
+            target,
         },
-        None => {
+        (None, None) => {
             eprintln!("qoop: {what:?} is neither an added remote nor an ssh target");
             std::process::exit(2);
         }
@@ -3345,6 +3352,7 @@ mod tests {
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,

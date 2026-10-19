@@ -121,6 +121,14 @@ impl SshTransport {
             argv.push("-o".into());
             argv.push("StrictHostKeyChecking=accept-new".into());
         }
+        // The options the person typed with the host (`ssh -p 2222 me@host`): only the ones
+        // `saved::parse` lets through, none of which qoop sets above, after qoop's own so
+        // ssh, which keeps the first value it is given, keeps qoop's. A target that does not
+        // parse is a host as it always was, whole after the `--`.
+        let target = crate::saved::parse(&self.host);
+        if let Some(target) = &target {
+            argv.extend(target.options.iter().cloned());
+        }
         // No pseudo terminal: this transport carries commands, and the terminal is carried
         // by the protocol inside it. Asking ssh for a tty here would put a second line
         // discipline between the child and us.
@@ -129,7 +137,7 @@ impl SshTransport {
         // loaded from `remotes.json` reach this unvalidated, and `-oProxyCommand=...` as a
         // host would run a command on this machine.
         argv.push("--".into());
-        argv.push(self.host.clone());
+        argv.push(target.map_or_else(|| self.host.clone(), |t| t.host));
         argv.push(command.to_string());
         argv
     }
@@ -270,5 +278,20 @@ mod tests {
             .position(|a| a == "-oProxyCommand=x")
             .expect("host");
         assert_eq!(argv[host - 1], "--");
+    }
+
+    /// A typed command's options go after qoop's own and before `-T --`, so ssh keeps qoop's
+    /// settings and the host is still behind the `--`.
+    #[test]
+    fn a_typed_commands_options_go_after_qoops_and_the_host_stays_behind_the_dashes() {
+        let argv = SshTransport::new("-p 2222 -J me@jump box")
+            .batch()
+            .argv("true");
+        let at = |word: &str| argv.iter().position(|a| a == word).expect(word);
+        assert!(at("BatchMode=yes") < at("-p"));
+        assert_eq!(argv[at("-p") + 1], "2222");
+        assert_eq!(argv[at("-J") + 1], "me@jump");
+        assert!(at("-J") < at("-T"));
+        assert_eq!(&argv[at("--") + 1..], ["box", "true"]);
     }
 }

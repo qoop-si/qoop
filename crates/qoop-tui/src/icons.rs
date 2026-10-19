@@ -1,7 +1,7 @@
 //! The few icons the interface draws, the font that carries them, and whether this terminal
 //! gets them.
 //!
-//! A terminal draws characters from fonts, never pictures, so an icon is a glyph: twelve from
+//! A terminal draws characters from fonts, never pictures, so an icon is a glyph: fourteen from
 //! the Nerd Fonts symbol sets in `assets/QoopSymbols.ttf`, built by
 //! `scripts/build-icon-font.py`, which fits every one to one box and one centre line (the
 //! sets were drawn apart and stood at different heights) and puts them at our own codepoints
@@ -66,9 +66,13 @@ pub const EYE_SHUT: char = '\u{10c0a9}';
 pub const BELL: char = '\u{10c0aa}';
 /// Notifications muted, here or everywhere by colour (Material Design `bell-off-outline`).
 pub const BELL_OFF: char = '\u{10c0ab}';
+/// Park an agent to answer later, on its tab (Material Design `bookmark-outline`).
+pub const PARK: char = '\u{10c0ac}';
+/// A parked agent, on its tab (Material Design `bookmark`).
+pub const PARKED: char = '\u{10c0ad}';
 
 /// The glyphs by the Nerd names `scripts/build-icon-font.py` prints, in its order.
-pub const GLYPHS: [(&str, char); 12] = [
+pub const GLYPHS: [(&str, char); 14] = [
     ("md-sleep", ASLEEP),
     ("cod-coffee", CUP),
     ("cod-remote", REMOTE),
@@ -81,6 +85,8 @@ pub const GLYPHS: [(&str, char); 12] = [
     ("md-eye_off", EYE_SHUT),
     ("md-bell_outline", BELL),
     ("md-bell_off_outline", BELL_OFF),
+    ("md-bookmark_outline", PARK),
+    ("md-bookmark", PARKED),
 ];
 
 static ON: AtomicBool = AtomicBool::new(false);

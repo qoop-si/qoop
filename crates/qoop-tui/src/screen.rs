@@ -366,6 +366,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("c", Some("new"), 1),
             ("n/p", Some("next/prev"), 1),
             ("x", Some("close"), 2),
+            ("P", Some("park"), 5),
             ("T", Some("fold pane"), 2),
             ("i", Some("questions"), 3),
             ("r", Some("rename"), 4),
@@ -735,6 +736,7 @@ pub fn bar_tabs(
         .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
     {
         tabs.push(AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -1676,6 +1678,8 @@ fn here(frame: &Frame) -> String {
                 // A slept tab has no screen and takes no keys: name the way
                 // out, or the blank pane reads as a hang.
                 crate::keys::named(", sleeping  ctrl-a x dismiss")
+            } else if sidebar::is_parked(row) {
+                crate::keys::named(", parked  ctrl-a P unpark")
             } else {
                 format!(", {}", row.state)
             };
@@ -2549,7 +2553,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("1..9", "go to tab"),
             ("c", "new tab"),
             ("r", "rename tab"),
-            ("x", "close tab"),
+            ("x/P", "close, park tab"),
             ("i/T", "questions, fold"),
         ],
     ),
@@ -3898,6 +3902,7 @@ mod tests {
 
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -4696,7 +4701,7 @@ mod tests {
             focused: 1,
             snapshot: Some(&snapshot),
             cols: 80,
-            lines: 24,
+            lines: 28,
             message: None,
             hint: None,
             palette: None,
@@ -5567,7 +5572,7 @@ mod tests {
             focused: 1,
             snapshot: None,
             cols: 80,
-            lines: 24,
+            lines: 28,
             message: None,
             hint: None,
             palette: None,
@@ -5618,7 +5623,7 @@ mod tests {
         // The carried row is written in one faint ink, nothing else on it.
         let faint = theme::fg(theme::Role::Faint);
         let column = frame.column();
-        let panel = sidebar::rows_folded(&column, column_rows(24), None);
+        let panel = sidebar::rows_folded(&column, column_rows(28), None);
         let carried = panel
             .iter()
             .find(|(_, hit)| *hit == Some(sidebar::Hit::Terminal(2)))
@@ -5936,7 +5941,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 44;
+    const COMMANDS: usize = 45;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -5959,7 +5964,7 @@ mod tests {
             Action::Next => (const { place(1) }, Some("ctrl-a n/p")),
             Action::Previous => (const { place(2) }, Some("ctrl-a n/p")),
             Action::Create => (const { place(3) }, Some("ctrl-a c")),
-            Action::Close => (const { place(4) }, Some("ctrl-a x")),
+            Action::Close => (const { place(4) }, Some("ctrl-a x/P")),
             Action::Detach => (const { place(5) }, Some("ctrl-a d")),
             Action::Click { .. } => (const { place(6) }, Some("click")),
             Action::Drag { .. } => (const { place(7) }, Some("drag")),
@@ -5999,6 +6004,7 @@ mod tests {
             Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
             Action::Chat => (const { place(42) }, Some("ctrl-a z/t")),
             Action::ChatRow => (const { place(43) }, Some("ctrl-a enter")),
+            Action::Park => (const { place(44) }, Some("ctrl-a x/P")),
         }
     }
 
@@ -6067,6 +6073,7 @@ mod tests {
             Action::Fold,
             Action::Chat,
             Action::ChatRow,
+            Action::Park,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -6528,6 +6535,7 @@ mod tests {
 
     fn blocked_row(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,
@@ -7180,6 +7188,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, state)| AgentRow {
+                parked: false,
                 keep_awake: false,
                 background: 0,
                 subagents: 0,

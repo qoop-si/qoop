@@ -205,6 +205,9 @@ pub enum Action {
     /// Uppercase on purpose, like the space close: lowercase `z` is the zoom, pressed
     /// often, and a slip of the shift key must not end the processes of a tab.
     Sleep,
+    /// ctrl-a P: park the agent the keyboard is in to answer later, or take it back.
+    /// Uppercase, like sleep: lowercase `p` is the previous tab.
+    Park,
     /// ctrl-a X: drop the focused pane from the tree, keeping its terminal
     /// alive as a tab. Lowercase `x` keeps killing the terminal.
     DetachPane,
@@ -460,6 +463,7 @@ impl Keys {
                     b'o' => Action::PaneNext,
                     b'z' => Action::Zoom,
                     b'Z' => Action::Sleep,
+                    b'P' => Action::Park,
                     b'X' => Action::DetachPane,
                     b'e' => Action::Resize,
                     b'=' => Action::Equalize,
@@ -685,6 +689,7 @@ mod tests {
     fn uppercase_z_sleeps_the_space_while_lowercase_zooms() {
         let mut keys = Keys::default();
         assert_eq!(keys.feed(b"\x01Z"), vec![Action::Sleep]);
+        assert_eq!(keys.feed(b"\x01P"), vec![Action::Park]);
         assert_eq!(keys.feed(b"\x01z"), vec![Action::Zoom]);
     }
 

@@ -1366,6 +1366,7 @@ mod tests {
 
     fn agent_row(terminal: u32) -> AgentRow {
         AgentRow {
+            parked: false,
             keep_awake: false,
             background: 0,
             subagents: 0,

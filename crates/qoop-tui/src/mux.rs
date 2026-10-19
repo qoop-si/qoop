@@ -61,6 +61,14 @@ pub fn machine_of(workspace: i64) -> usize {
     workspace_in(workspace).0
 }
 
+/// Why a typed address was refused: what is accepted, so the next try can be right.
+fn not_ssh(target: &str) -> String {
+    format!(
+        "{target:?} is not an ssh address: a host like me@10.0.0.5, or ssh with -p, -l, -i, \
+         -J, -4, -6 or -o Port, User, IdentityFile, ProxyJump, HostName, IdentitiesOnly"
+    )
+}
+
 /// A daemon's terminal number as the interface sees it, or `None` when it does not fit
 /// the range. Never wrapped: a wrapped number is somebody else's terminal.
 fn terminal_out(link: usize, id: u32) -> Option<u32> {
@@ -775,11 +783,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
     /// and say under what name it will appear. A machine already kept is taken there; a
     /// new one is asked first whether it has a qoop, in a task, since ssh can take seconds.
     async fn connect_remote(&mut self, id: String, target: String) -> io::Result<()> {
-        if !qoop_remote::saved::valid_target(&target) {
-            return self
-                .failed(id, format!("{target:?} is not an ssh address"))
-                .await;
-        }
+        // Written one way whatever way it was typed, so the same command twice is one machine.
+        let Some(target) = qoop_remote::saved::canonical(&target) else {
+            return self.failed(id, not_ssh(&target)).await;
+        };
         let same = |r: &Remote| r.target == target;
         let linked = self
             .links
@@ -1175,6 +1182,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 )
                 .await
             }
+            // The machine the agent runs on, in its own numbering.
+            R::SetParked { id, terminal, on } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(link, R::SetParked { id, terminal, on }).await
+            }
             // The machine whose idle sleep it is: the space's, a pane going with its space.
             R::SetKeepAwake {
                 id,
@@ -1365,11 +1377,9 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 .await
             }
             R::InstallRemote { id, target } => {
-                if !qoop_remote::saved::valid_target(&target) {
-                    return self
-                        .failed(id, format!("{target:?} is not an ssh address"))
-                        .await;
-                }
+                let Some(target) = qoop_remote::saved::canonical(&target) else {
+                    return self.failed(id, not_ssh(&target)).await;
+                };
                 // A copy of several megabytes over ssh: in a task, like the probe.
                 let events = self.events.clone();
                 tokio::spawn(async move {
@@ -3093,6 +3103,30 @@ mod tests {
                 id: "cup-1".into(),
                 workspace: 3,
                 terminal: Some(7),
+                on: true,
+            }
+        );
+    }
+
+    /// A park of an agent on a remote reaches that machine, in its own numbering: sent home,
+    /// the home daemon would park whatever its own terminal of that number is.
+    #[tokio::test]
+    async fn a_remote_park_goes_to_its_machine_in_its_own_numbering() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::SetParked {
+            id: "park-1".into(),
+            terminal: terminal_out(1, 7).expect("fits"),
+            on: true,
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::SetParked {
+                id: "park-1".into(),
+                terminal: 7,
                 on: true,
             }
         );

@@ -18,7 +18,7 @@ pub mod item;
 pub mod show;
 pub mod task;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub use ask::{Added, AskError, AskRow};
@@ -321,6 +321,13 @@ impl Store {
              -- What the owner wants from the work in a space, one line. Cascaded like the
              -- rest, because ids are reused. New table, no version bump: an older binary
              -- ignores it.
+             -- The agents a person parked to answer later, and when. Cascaded like the
+             -- rest, because ids are reused. New table, no version bump: an older binary
+             -- ignores it and shows the agent as it is.
+             CREATE TABLE IF NOT EXISTS parked_terminal (
+                 terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE,
+                 at INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS space_goal (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  goal TEXT NOT NULL,
@@ -609,6 +616,43 @@ impl Store {
         Ok(open)
     }
 
+    /// Park an open terminal's agent at `at`, or take it back. Answers false when there is
+    /// no such open terminal.
+    pub fn set_parked_terminal(&self, id: i64, on: bool, at: i64) -> Result<bool, StoreError> {
+        let open = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if open && on {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO parked_terminal (terminal, at) VALUES (?1, ?2)",
+                params![id, at],
+            )?;
+        } else if open {
+            self.conn.execute(
+                "DELETE FROM parked_terminal WHERE terminal = ?1",
+                params![id],
+            )?;
+        }
+        Ok(open)
+    }
+
+    /// Every parked terminal and when it was parked.
+    pub fn parked(&self) -> Result<BTreeMap<i64, i64>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT terminal, at FROM parked_terminal")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<BTreeMap<i64, i64>, _>>()?;
+        Ok(rows)
+    }
+
     /// Every space and every pane kept awake.
     pub fn kept_awake(&self) -> Result<(BTreeSet<i64>, BTreeSet<i64>), StoreError> {
         let read = |sql: &str| -> Result<BTreeSet<i64>, StoreError> {
@@ -859,6 +903,11 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM awake_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
+        // Nor parked: nobody will answer it.
+        tx.execute(
+            "DELETE FROM parked_terminal WHERE terminal = ?1",
             params![id],
         )?;
         // Nor working on anything: its id may be handed out again.
@@ -2099,6 +2148,30 @@ mod tests {
             s.kept_awake().expect("read"),
             (BTreeSet::new(), BTreeSet::new())
         );
+    }
+
+    /// A park is kept with its time, taken back on request, and never outlives its pane.
+    #[test]
+    fn a_park_round_trips_and_goes_with_its_pane() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t1");
+        s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t2");
+        assert!(s.set_parked_terminal(1, true, 100).expect("park"));
+        assert!(s.set_parked_terminal(2, true, 200).expect("park 2"));
+        assert!(!s.set_parked_terminal(99, true, 1).expect("no pane"));
+        assert_eq!(
+            s.parked().expect("read"),
+            BTreeMap::from([(1, 100), (2, 200)])
+        );
+        assert!(s.set_parked_terminal(2, false, 300).expect("unpark"));
+        s.close_terminal(1, 2).expect("close");
+        assert!(!s.set_parked_terminal(1, true, 400).expect("closed"));
+        assert_eq!(s.parked().expect("read"), BTreeMap::new());
+        s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t3");
+        assert!(s.set_parked_terminal(3, true, 500).expect("park 3"));
+        s.delete_workspace(ws).expect("delete with a parked row");
+        assert_eq!(s.parked().expect("read"), BTreeMap::new());
     }
 
     #[test]
