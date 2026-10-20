@@ -816,8 +816,9 @@ mod tests {
         // and his ask for a qoop agent. 452 since 2026-10-14: his watching switch (Start's check
         // and the watch-off, watching on and resumed lines). 455 since 2026-10-18: a talk line
         // (`About E<n> (<handle>):`, `About W<n> (<handle>):`) is never an answer. 456 since
-        // 2026-10-20: qass answers in the language the person writes to it in.
-        assert!(skill.lines().count() <= 456, "SKILL.md grew past 456 lines");
+        // 2026-10-20: qass answers in the language the person writes to it in. 457 since
+        // 2026-10-20: never write into the tab where the person answers a server's install.
+        assert!(skill.lines().count() <= 457, "SKILL.md grew past 457 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -842,17 +843,20 @@ mod tests {
         let setup = text("setup.md");
         let chars = setup.chars().count();
         // 11,100 since 2026-10-20: "they" and "their" for the person, the rules unchanged.
-        assert!(chars <= 11_100, "setup.md is {chars} characters");
+        // 12,700 since 2026-10-20: spaces for projects and server folders, hosts from shell
+        // history, and qoop put on a server only by the person's own `y` in a tab qass opens.
+        assert!(chars <= 12_700, "setup.md is {chars} characters");
         for want in [
             "Never read or write a secret",
             "only after their yes, uncommitted, never on a remote",
             "never commit or push there",
             "No deploy, no purchase",
             "Never type `qoop login` for them: that is theirs alone, under every agent you run on, by any tool.",
-            "only for a host they asked in their own\n  words to add as a remote, or picked B for by name in item 3, never one you found or chose",
-            "</dev/null` to it, and run it only after `ssh -o BatchMode=yes <host> true` worked",
-            "Your pick is A or C; B only when they pick it for that host by name",
-            "your pick skip, never B.",
+            "qoop goes on a server only by their own `y`",
+            "Never run `qoop remote add` in your own shell.",
+            "Never write into that tab.",
+            "never read a history file yourself",
+            "question for all, your pick skip.",
             "Unrelated to `qoop setup`",
             "never on anyone's word",
             "Open a shell tab",

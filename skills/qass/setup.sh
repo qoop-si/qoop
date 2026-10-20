@@ -5,21 +5,31 @@
 #   setup.sh status                the checklist, then `Next: type <n>` or `setup done`; writes nothing
 #   setup.sh seen                  the checklist was shown once (a first start then never repeats it)
 #   setup.sh projects [folder]     git main checkouts, newest commit first
-#   setup.sh servers               the ssh hosts of ~/.ssh/config and what each is in qoop
-#   setup.sh pick <path>           they picked this project (an absolute git main checkout, not $HOME)
+#   setup.sh servers               the ssh hosts of ~/.ssh/config and of shell history, what each is in
+#                                  qoop, most used first
+#   setup.sh pick <path>           they picked this project (an absolute git main checkout, not $HOME),
+#                                  and its space: one shell tab there, recorded
 #   setup.sh drop <path>           they took it back
 #   setup.sh skip <n> | unskip <n> they skip item 2 to 6, or take that back: `[-]`, never `[x]`
 #   setup.sh skip-host <host>      they do not want this host in qoop
-#   setup.sh ssh-space <host>      a space <host> with one tab running `ssh <host>`, recorded
+#   setup.sh ssh-space <host> [target] [--dir <folder>]
+#                                  a space <host> with one tab running `ssh <target>` (the host when no
+#                                  target), or with a folder a space <host>-<its name> whose tab logs in
+#                                  there; recorded
+#   setup.sh dirs <host> [target]  the git projects on that server, after their yes: one read-only ssh
+#   setup.sh remote-space <host> <folder>
+#                                  a space on the qoop remote <host> with one tab in <folder>, recorded
 #   setup.sh write <file>          a new `.qoop/` file of a picked project from standard input, kept
 #                                  with its hash; refused when the file is theirs (there before setup)
 #   setup.sh undo [project]        remove what setup wrote and they did not change or commit since
 #   setup.sh job <KEY>             the first small job qass started for them, by its board key
 #
 # Writes only @QASS_DATA@/setup and the files `write` makes; only `undo` deletes, only those (and
-# opens a tab in ssh-space). Never runs ssh or the network itself (`qoop task rules` reads gh's
-# local login for item 4), and reads nothing under ~/.ssh but its config. Unrelated to
-# `qoop setup` (Setup files).
+# opens tabs in pick, ssh-space and remote-space). Runs ssh only in `dirs` (one read-only listing
+# that never asks for a password) and through on.sh in `remote-space`; `qoop task rules` reads
+# gh's local login for item 4. Reads nothing under ~/.ssh but its config, and of shell history
+# only the ssh commands whose every word fits `valid_target`: nothing else in it leaves this
+# script. Unrelated to `qoop setup` (Setup files).
 set -eu
 
 state="@QASS_DATA@/setup"
@@ -111,8 +121,9 @@ hosts() {
                 if (h ~ /[*?!]/) continue
                 if (tolower(h) ~ /^(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)$/) continue
                 if (tolower(hn) ~ /^(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)$/) continue
-                if (h !~ /^[A-Za-z0-9._][A-Za-z0-9._-]*$/) { print "!" h; continue }
+                if (h !~ /^[A-Za-z0-9_][A-Za-z0-9._-]*$/) { print "!" h; continue }
                 t = (hn != "" ? hn : h); if (user != "") t = user "@" t
+                if (t !~ /^([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*$/) { print "!" h; continue }
                 print h "\t" t
             }
             n = 0; hn = ""; user = ""
@@ -130,13 +141,173 @@ valid_host() {
     case "$1" in -* | "" | *[!A-Za-z0-9._-]*) return 1 ;; esac
 }
 
-# What a host is in qoop: remote, ssh space, skipped, or open.
+# An ssh destination: [user@]host, plain words that never start with a dash.
+valid_dest() {
+    case "$1" in "" | *@*@* | *@ | *[!A-Za-z0-9._@-]* | [!A-Za-z0-9_]*) return 1 ;; esac
+    case "${1#*@}" in [!A-Za-z0-9_]*) return 1 ;; esac
+}
+
+# The words of an ssh target setup uses: -p <port>, -l <user>, -i <key file>, -4, -6, then one
+# destination last. Nothing else: no -o, no -J, no remote command. A history line holding any of
+# those is dropped whole, so a password or a token typed in one never shows.
+valid_target() {
+    [ $# -gt 0 ] || return 1
+    while [ $# -gt 1 ]; do
+        case "$1" in
+        -4 | -6) shift ;;
+        -p) case "$2" in "" | *[!0-9]*) return 1 ;; esac; shift 2 ;;
+        -l) case "$2" in "" | [!A-Za-z0-9_]* | *[!A-Za-z0-9._-]*) return 1 ;; esac; shift 2 ;;
+        -i) case "$2" in "" | -* | *[!A-Za-z0-9._/~-]*) return 1 ;; esac; shift 2 ;;
+        *) return 1 ;;
+        esac
+    done
+    [ $# -eq 1 ] && valid_dest "$1"
+}
+
+# A folder on a server: absolute, plain characters, no `..`: what `dirs` prints and a tab cds to.
+valid_folder() {
+    case "$1" in /*) ;; *) return 1 ;; esac
+    case "$1" in *[!A-Za-z0-9._/-]* | */../* | */.. | *//*) return 1 ;; esac
+    [ "${#1}" -le 200 ]
+}
+
+# A space name from a folder's name: [A-Za-z0-9._-] only; never all digits (qoop reads those as a
+# space's number), never a leading dash, never qass's own space.
+name_of() {
+    n="$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')"
+    case "$n" in "" | -*) n="p$n" ;; esac
+    case "$n" in *[!0-9]*) ;; *) n="p-$n" ;; esac
+    [ "$n" != qass ] || n=qass-project
+    echo "$n"
+}
+
+# Whether a space name is recorded for something other than $2 (what its record says after it).
+taken() {
+    N="$1" W="$2" awk '
+        ($1 == "space" || $1 == "ssh-dir" || $1 == "remote-space" || $1 == "ssh-space") &&
+            $2 == ENVIRON["N"] {
+            w = $0; sub(/^[^ ]+ [^ ]+ /, "", w); if (w != ENVIRON["W"]) f = 1
+        }
+        END { exit !f }' "$state" 2>/dev/null
+}
+
+# The space name recorded for $2 by a record of kind $1, or nothing.
+named() {
+    K="$1" W="$2" awk '
+        $1 == ENVIRON["K"] { w = $0; sub(/^[^ ]+ [^ ]+ /, "", w); if (w == ENVIRON["W"]) n = $2 }
+        END { if (n != "") print n }' "$state" 2>/dev/null || true
+}
+
+# Whether the `qoop ls --json` text $1 holds a space named $2.
+space_in() { printf '%s' "$1" | grep -qF "\"name\":\"$2\""; }
+
+# The space setup opens for $3 (what its record says after the name) under record kind $2, from
+# the spaces now there ($1, `qoop ls --json`): the one recorded when it is still there (printed
+# with a leading `=`), else a name nothing else has, neither a record nor a space of theirs
+# (`undo` must never send them to remove a space setup did not make).
+space_for() {
+    n="$(named "$2" "$3")"
+    if [ -n "$n" ] && space_in "$1" "$n"; then echo "=$n"; return 0; fi
+    [ -z "$n" ] || { echo "$n"; return 0; }
+    n="$4" i=1
+    while taken "$n" "$3" || space_in "$1" "$n"; do i=$((i + 1)); n="$4-$i"; done
+    echo "$n"
+}
+
+# The space of a picked project: one shell tab in it, unless its recorded space is still there.
+# A space that does not open is said; the pick stays.
+project_space() {
+    n="$(space_for "$(qoop ls --json 2>/dev/null || true)" space "$1" "$(name_of "${1##*/}")")"
+    case "$n" in =*) echo "space ${n#=} is there"; return 0 ;; esac
+    if qoop new --space "$n" --name "$n" --cwd "$1" >/dev/null; then
+        put "space $n $1"
+        echo "space $n opened"
+    else
+        echo "the space for $1 did not open; pick it again to retry"
+    fi
+}
+
+# The ssh commands of shell history (zsh, bash, fish) as `count<TAB>words`, most used first: the
+# words after `ssh`, spaces folded, each command once. A line that continues another (a command
+# over several lines) is left out, and so is any line with a backslash. Bytes stay bytes: zsh
+# writes some of them metafied.
+history_ssh() {
+    {
+        [ -f "$HOME/.zsh_history" ] && LC_ALL=C sed 's/^: [0-9]*:[0-9]*;//' "$HOME/.zsh_history"
+        [ -f "$HOME/.bash_history" ] && LC_ALL=C grep -v '^#[0-9]' "$HOME/.bash_history"
+        f="$HOME/.local/share/fish/fish_history"
+        [ -f "$f" ] && LC_ALL=C sed -n 's/^- cmd: //p' "$f"
+    } 2>/dev/null | LC_ALL=C awk '
+        { cont = prev; prev = /\\$/ }
+        cont || /\\/ { next }
+        $1 == "ssh" && NF > 1 {
+            w = $2; for (i = 3; i <= NF; i++) w = w " " $i
+            if (!(w in c)) order[++n] = w
+            c[w]++
+        }
+        END { for (i = 1; i <= n; i++) printf "%d\t%s\n", c[order[i]], order[i] }' |
+        sort -s -t "$(printf '\t')" -k1,1nr
+}
+
+# ssh hosts as `name<TAB>target<TAB>uses<TAB>from<TAB>address`, an odd config name as `!name`:
+# the config's hosts (target: the alias, so ssh keeps its Port, IdentityFile and ProxyJump;
+# address: user@HostName, to match a remote by), each with how often history ssh-ed to it, and
+# the 10 most used history targets that are none of them, named as a space may be (`name_of`).
+# Most used first; config hosts never used last, in the config's order.
+all_hosts() {
+    tab="$(printf '\t')"
+    hist="$(history_ssh | while IFS="$tab" read -r k w; do
+        set -f
+        # Split on purpose: the words of the command.
+        # shellcheck disable=SC2086
+        set -- $w
+        set +f
+        if valid_target "$@"; then printf '%s\t%s\n' "$k" "$w"; fi
+    done)"
+    CFG="$(hosts)" HIST="$hist" LC_ALL=C awk '
+        BEGIN {
+            nc = split(ENVIRON["CFG"], cl, "\n")
+            for (i = 1; i <= nc; i++) {
+                if (cl[i] == "") continue
+                if (cl[i] ~ /^!/) { print cl[i]; continue }
+                split(cl[i], f, "\t"); m++
+                name[m] = f[1]; tgt[m] = f[1]; addr[m] = f[2]; from[m] = "config"; taken[f[1]] = 1
+                at[f[1]] = m; at[f[2]] = m; h = f[2]; sub(/^.*@/, "", h); at[h] = m
+            }
+            nh = split(ENVIRON["HIST"], hl, "\n")
+            for (i = 1; i <= nh; i++) {
+                if (hl[i] == "") continue
+                split(hl[i], f, "\t"); k = f[1]; w = f[2]
+                # `ssh build`, `ssh me@build`: the config host, when nothing else was typed.
+                h = w; sub(/^.*@/, "", h)
+                if (w in at) { uses[at[w]] += k; continue }
+                if (w !~ / / && (h in at)) { uses[at[h]] += k; continue }
+                if (kept++ >= 10) continue
+                h = w; sub(/^.* /, "", h); sub(/^.*@/, "", h)
+                if (h ~ /^[0-9.]+$/) { nm = "h" h; gsub(/\./, "-", nm) } else { nm = h; sub(/\..*$/, "", nm) }
+                if (nm ~ /^[0-9]+$/) nm = "p-" nm
+                if (nm == "qass") nm = "qass-project"
+                nm = substr(nm, 1, 20)
+                base = nm; j = 1
+                while (nm in taken) nm = base "-" (++j)
+                taken[nm] = 1; m++
+                name[m] = nm; tgt[m] = w; addr[m] = w; uses[m] = k; from[m] = "history"
+            }
+            for (i = 1; i <= m; i++)
+                printf "%07d\t%07d\t%s\t%s\t%d\t%s\t%s\n", 9999999 - uses[i], i, name[i], tgt[i], uses[i], from[i], addr[i]
+        }' | sort | cut -f3-
+}
+
+# What a host is in qoop: remote, ssh space, skipped, or open. A remote matches by its name, its
+# whole saved target, or the host at the end of it.
 host_state() {
     h="$1" t="$2"
-    if qoop remote ls 2>/dev/null | awk -v h="$h" -v t="$t" '
-        $1 == h || $2 == h || $2 == t || substr($2, length($2) - length(h)) == "@" h { ok = 1 } END { exit !ok }'; then
+    if qoop remote ls 2>/dev/null | H="$h" T="$t" awk '
+        { r = $0; sub(/^[^ ]+ +/, "", r); d = $NF; e = ENVIRON["H"] }
+        $1 == e || r == e || r == ENVIRON["T"] || substr(d, length(d) - length(e)) == "@" e { ok = 1 }
+        END { exit !ok }'; then
         echo remote
-    elif has "ssh-space $h" && qoop ls --json 2>/dev/null | grep -qF "\"name\":\"$h\""; then
+    elif ssh_space "$h"; then
         echo "ssh space"
     elif has "skip-host $h"; then
         echo skipped
@@ -145,13 +316,66 @@ host_state() {
     fi
 }
 
+# Whether a host has an ssh space that is still there: its own, or one for a folder on it.
+ssh_space() {
+    ls="$(qoop ls --json 2>/dev/null)" || return 1
+    if has "ssh-space $1" && space_in "$ls" "$1"; then return 0; fi
+    for n in $(H="$1" awk '$1 == "ssh-dir" && $3 == ENVIRON["H"] { print $2 }' "$state" 2>/dev/null); do
+        space_in "$ls" "$n" && return 0
+    done
+    return 1
+}
+
 servers() {
     n=0
-    hosts | while IFS="$(printf '\t')" read -r h t; do
+    all_hosts | while IFS="$(printf '\t')" read -r h t k from addr; do
         case "$h" in !*) echo "    ${h#!}  ignored: odd name"; continue ;; esac
         n=$((n + 1))
-        printf '%2d  %s  %s  %s\n' "$n" "$h" "$t" "$(host_state "$h" "$t")"
+        times="$k times"; [ "$k" != 1 ] || times=once
+        if [ "$from" = history ]; then
+            said="  (history, $times)"
+        elif [ "${k:-0}" -gt 0 ]; then
+            said="  ($times in history)"
+        else
+            said=
+        fi
+        printf '%2d  %s  %s  %s%s\n' "$n" "$h" "$t" "$(host_state "$h" "$addr")" "$said"
     done
+}
+
+# The git projects on a server, absolute paths only, no hidden folder, at most 20; nothing it
+# prints is trusted but paths `valid_folder` takes, and only its first 64 KB are read. BatchMode:
+# ssh never asks for a password or a host key here; nothing is forwarded, no connection is kept.
+dirs() {
+    find='T=; command -v timeout >/dev/null 2>&1 && T="timeout 15"
+for d in "$HOME" /srv /var/www /opt; do
+    [ -d "$d" ] || continue
+    m=2; [ "$d" = "$HOME" ] && m=3
+    $T find "$d" -xdev -maxdepth "$m" -name .git -type d -prune 2>/dev/null
+done
+true'
+    rc="$(mktemp)"
+    out="$({ ssh -a -x -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=2 -o ClearAllForwardings=yes -o ControlMaster=no \
+        -o ControlPath=none "$@" "sh -c '$find'" </dev/null 2>/dev/null && echo 0 > "$rc" ||
+        echo "$?" > "$rc"; } |
+        head -c 65536)"
+    # 255 is ssh's own failure: it could not log in without asking.
+    if [ "$(cat "$rc")" = 255 ]; then
+        rm -f "$rc"
+        echo "this server needs a password or a host-key answer first: type the folder you work in, or I open it as an ssh space"
+        return 3
+    fi
+    rm -f "$rc"
+    k=0
+    printf '%s\n' "$out" | sed -n 's|/\.git$||p' | LC_ALL=C sort -u | while IFS= read -r d; do
+        valid_folder "$d" || continue
+        case "$d" in */.*) continue ;; esac
+        k=$((k + 1))
+        [ "$k" -le 20 ] || break
+        printf '%2d  %s\n' "$k" "$d"
+    done
+    [ -n "$out" ] || echo "no git projects under ~, /srv, /var/www or /opt there: type the folder you work in"
 }
 
 # "yes" when qoop counts the project the person's own repo (its origin's owner is gh's login or
@@ -273,8 +497,21 @@ undo() {
         PREFIX="wrote $r/" awk 'index($0, ENVIRON["PREFIX"]) == 1 { f = 1 } END { exit !f }' \
             "$state" 2>/dev/null || del "pick $r"
     done
-    [ -n "$only" ] || grep '^ssh-space ' "$state" 2>/dev/null | sed 's/^ssh-space //' |
-        while IFS= read -r h; do echo "space $h: close its tab, then qoop space rm $h"; done
+    [ -n "$only" ] || [ ! -f "$state" ] || awk '
+        $1 == "ssh-space" { print "space " $2 ": close its tab, then qoop space rm " $2 }
+        $1 == "space" || $1 == "ssh-dir" { print "space " $2 ": close its tab, then qoop space rm " $2 }
+        $1 == "remote-space" {
+            print "space " $3 ":" $2 ": close its tab, then on " $3 ": qoop space rm " $2
+            if (!($3 in seen)) { seen[$3] = 1; hosts[++n] = $3 }
+        }
+        END {
+            for (i = 1; i <= n; i++)
+                print "qoop on " hosts[i] ": there, ~/.local/bin/qoop uninstall (it asks first); then here, qoop remote rm " hosts[i]
+        }' "$state"
+    if [ -n "$only" ]; then
+        sp="$(named space "$only")"
+        [ -z "$sp" ] || echo "space $sp: close its tab, then qoop space rm $sp"
+    fi
     return 0
 }
 
@@ -306,32 +543,43 @@ status() {
         [ -n "$where" ] && where="in $where" || where="(no ~/code, ~/src or such folder here)"
         s2=no d2="$(found | grep -c . || true) found $where: none picked"
     else
-        s2=yes missing=
+        s2=yes missing= nospace=
+        spaces="$(qoop ls --json 2>/dev/null || true)"
         old="$IFS"; IFS="$nl"; set -f
         for p in $picked; do
             if [ ! -s "$p/.qoop/workflow.md" ] || [ ! -s "$p/.qoop/project.md" ]; then
                 s2=no missing="$missing ${p##*/}"
             fi
+            sp="$(named space "$p")"
+            if [ -z "$sp" ] || ! space_in "$spaces" "$sp"; then
+                s2=no nospace="$nospace ${p##*/}"
+            fi
         done
         IFS="$old"
         set +f
         n="$(printf '%s\n' "$picked" | grep -c .)"
-        if [ "$s2" = yes ]; then d2="$n set up"; else d2="$n picked, not written:$missing"; fi
+        if [ "$s2" = yes ]; then
+            d2="$n set up"
+        else
+            d2="$n picked"
+            [ -z "$missing" ] || d2="$d2, not written:$missing"
+            [ -z "$nospace" ] || d2="$d2, no space:$nospace"
+        fi
     fi
 
     total=0 open=0
     tab="$(printf '\t')"
-    hl="$(hosts | grep -v '^!' || true)"
+    hl="$(all_hosts | grep -v '^!' || true)"
     if [ -n "$hl" ]; then
         old="$IFS"; IFS="$nl"; set -f
         for line in $hl; do
             total=$((total + 1))
-            [ "$(host_state "${line%%"$tab"*}" "${line#*"$tab"}")" = open ] && open=$((open + 1))
+            [ "$(host_state "${line%%"$tab"*}" "${line##*"$tab"}")" = open ] && open=$((open + 1))
         done
         IFS="$old"; set +f
     fi
     if [ "$total" -eq 0 ]; then
-        s3=none d3="none found in ~/.ssh/config"
+        s3=none d3="none in ~/.ssh/config or shell history"
     elif [ "$open" -eq 0 ]; then
         s3=yes d3="$total of $total configured or skipped"
     else
@@ -417,6 +665,7 @@ pick | drop)
     [ "$m" = "$p" ] || { echo "setup: $p is not the main checkout; pick $m" >&2; exit 2; }
     put "pick $p"
     echo "picked $p"
+    project_space "$p"
     ;;
 skip | unskip)
     n="${2:?usage: setup.sh $cmd 2|3|4|5}"
@@ -456,16 +705,64 @@ job)
     without "job "
     put "job $k"
     ;;
-skip-host | ssh-space)
-    h="${2:?usage: setup.sh $cmd <host>}"
+skip-host | ssh-space | dirs)
+    h="${2:?usage: setup.sh $cmd <host> [target]}"
     valid_host "$h" || { echo "setup: '$h' is not a host name it will use" >&2; exit 2; }
     if [ "$cmd" = skip-host ]; then put "skip-host $h"; echo "skipped $h"; exit 0; fi
-    # Recorded only when the tab opened: a failed `qoop new` leaves the host open.
-    qoop new --space "$h" --name "$h" -- ssh "$h"
-    put "ssh-space $h"
+    shift 2
+    dir=
+    if [ "$cmd" = ssh-space ]; then
+        # The target's words, then `--dir <folder>` when one is given.
+        n=$#
+        while [ "$n" -gt 0 ]; do
+            if [ "$1" = --dir ]; then
+                dir="${2:-}"
+                [ "$n" -eq 2 ] || { echo "setup: --dir <folder> comes last" >&2; exit 2; }
+                shift 2
+                break
+            fi
+            set -- "$@" "$1"
+            shift
+            n=$((n - 1))
+        done
+        [ -z "$dir" ] || valid_folder "$dir" ||
+            { echo "setup: '$dir' is not a plain absolute folder" >&2; exit 2; }
+    fi
+    [ $# -gt 0 ] || set -- "$h"
+    valid_target "$@" || { echo "setup: that is not an ssh target it will use" >&2; exit 2; }
+    if [ "$cmd" = dirs ]; then dirs "$@"; exit $?; fi
+    # Without a folder the record says `~`: the home ssh logs in to.
+    base="$(name_of "$h")"
+    [ -z "$dir" ] || base="$(name_of "$h-${dir##*/}")"
+    n="$(space_for "$(qoop ls --json 2>/dev/null || true)" ssh-dir "$h ${dir:-~}" "$base")"
+    case "$n" in =*) echo "space ${n#=} is there"; exit 0 ;; esac
+    # Recorded only when the tab opened: a failed `qoop new` leaves the host open. A folder that
+    # is gone leaves a shell there that says so, not a tab that closes at once.
+    if [ -z "$dir" ]; then
+        qoop new --space "$n" --name "$n" -- ssh "$@"
+    else
+        qoop new --space "$n" --name "$n" -- ssh -t "$@" "cd $dir || echo \"$dir is gone\"; exec \"\$SHELL\" -l"
+    fi
+    put "ssh-dir $n $h ${dir:-~}"
+    echo "space $n opened"
+    ;;
+remote-space)
+    h="${2:?usage: setup.sh remote-space <host> <folder>}"
+    dir="${3:?usage: setup.sh remote-space <host> <folder>}"
+    valid_host "$h" || { echo "setup: '$h' is not a host name it will use" >&2; exit 2; }
+    valid_folder "$dir" || { echo "setup: '$dir' is not a plain absolute folder" >&2; exit 2; }
+    qoop remote ls 2>/dev/null | awk -v h="$h" '$1 == h { f = 1 } END { exit !f }' ||
+        { echo "setup: $h is not a qoop remote yet" >&2; exit 2; }
+    on="$(dirname "$0")/on.sh"
+    "$on" "$h" ensure-awake >/dev/null
+    n="$(space_for "$("$on" "$h" ls --json 2>/dev/null || true)" remote-space "$h $dir" "$(name_of "${dir##*/}")")"
+    case "$n" in =*) echo "space $h:${n#=} is there"; exit 0 ;; esac
+    "$on" "$h" new --space "$n" --name "$n" --cwd "$dir" >/dev/null
+    put "remote-space $n $h $dir"
+    echo "space $h:$n opened"
     ;;
 *)
-    echo "usage: setup.sh status|seen|projects [folder]|servers|pick|drop <path>|skip|unskip <n>|skip-host|ssh-space <host>" >&2
+    echo "usage: setup.sh status|seen|projects [folder]|servers|pick|drop <path>|skip|unskip <n>|skip-host <host>|ssh-space <host> [target] [--dir <folder>]|dirs <host> [target]|remote-space <host> <folder>" >&2
     exit 2
     ;;
 esac

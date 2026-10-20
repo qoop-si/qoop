@@ -21,8 +21,43 @@ fi
 name="${1:?usage: on.sh <remote> <qoop subcommand> [args...]}"
 shift
 [ "$#" -gt 0 ] || { echo "usage: on.sh <remote> <qoop subcommand> [args...]" >&2; exit 2; }
-target="$(qoop remote ls | awk -v n="$name" '$1 == n { print $2; exit }')"
-[[ "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || { echo "on.sh: no usable remote $name" >&2; exit 2; }
+no_usable() { echo "on.sh: no usable remote $name" >&2; exit 2; }
+# The saved target, whole: what `qoop remote add` writes (saved.rs `canonical`), option pairs
+# then the host. Only those forms pass, word by word as saved.rs checks them, so a hand-edited
+# remotes.json can never hand ssh an option that runs a command here.
+read -r -a words <<< "$(qoop remote ls | awk -v n="$name" '$1 == n { $1 = ""; print; exit }')"
+[ "${#words[@]}" -gt 0 ] || no_usable
+host="${words[${#words[@]} - 1]}"
+[[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || no_usable
+safe='^[]A-Za-z0-9._@:,/~%+=[-]+$'
+opts=()
+i=0
+last=$((${#words[@]} - 1))
+while [ "$i" -lt "$last" ]; do
+    w="${words[$i]}"
+    case "$w" in
+    -4 | -6) opts+=("$w"); i=$((i + 1)); continue ;;
+    -p | -l | -i | -J | -o) ;;
+    *) no_usable ;;
+    esac
+    [ $((i + 1)) -lt "$last" ] || no_usable
+    v="${words[$((i + 1))]}"
+    [[ "$v" =~ $safe ]] && [ "${v#-}" = "$v" ] || no_usable
+    hops="$v"
+    if [ "$w" = -o ]; then
+        key="${v%%=*}" hops="${v#*=}"
+        [ "$key" != "$v" ] && [ -n "$hops" ] || no_usable
+        case "$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" in
+        port | user | identityfile | proxyjump | hostname | identitiesonly) ;;
+        *) no_usable ;;
+        esac
+    fi
+    # A jump list is hosts ssh reads as command lines of their own: none may start like an option.
+    IFS=, read -r -a hop <<< "$hops,"
+    for h in "${hop[@]}"; do [ -n "$h" ] && [ "${h#-}" = "$h" ] || no_usable; done
+    opts+=("$w" "$v")
+    i=$((i + 2))
+done
 cmd='"$HOME/.local/bin/qoop"'
 for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
@@ -42,4 +77,4 @@ mkdir -p "$sock"
 chmod 700 "$sock"
 exec ssh -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 \
     -o ServerAliveCountMax=3 -o ControlMaster="$master" -o "ControlPath=$sock/%C" \
-    -- "$target" "$cmd"
+    ${opts[@]+"${opts[@]}"} -- "$host" "$cmd"

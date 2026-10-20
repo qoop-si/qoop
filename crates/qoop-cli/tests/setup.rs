@@ -316,9 +316,23 @@ fn projects_tick_when_every_picked_one_has_both_files() {
         let (ok, _, err) = home.setup(&["pick", s(p)]);
         assert!(ok, "{err}");
     }
+    home.write(
+        "stub/ls.json",
+        r#"[{"id":"1","name":"api"},{"id":"2","name":"py-tool"}]"#,
+    );
     assert!(home.setup(&["pick", s(&api)]).0);
     let state = std::fs::read_to_string(home.at("d/qoop/qass/setup")).expect("state");
     assert_eq!(state.matches("pick ").count(), 2, "{state}");
+    // Each pick opened its space once: the second pick of api found its space there.
+    let log = std::fs::read_to_string(home.at("stub/new.log")).expect("log");
+    assert_eq!(
+        log,
+        format!(
+            "new --space api --name api --cwd {}\nnew --space py-tool --name py-tool --cwd {}\n",
+            s(&api),
+            s(&tool)
+        )
+    );
     home.set_up(&api);
     let line = home.item(2);
     assert!(
@@ -373,11 +387,22 @@ fn servers_tick_only_from_a_remote_a_recorded_space_or_a_skip() {
     home.write("stub/new.rc", "0");
     assert!(home.setup(&["ssh-space", "build"]).0);
     let log = std::fs::read_to_string(home.at("stub/new.log")).expect("log");
+    // Their own space named build is not setup's: the ssh space gets a name of its own.
     assert!(
-        log.ends_with("new --space build --name build -- ssh build\n"),
+        log.ends_with("new --space build-2 --name build-2 -- ssh build\n"),
         "{log}"
     );
+    assert!(
+        home.item(3).contains("3 not decided"),
+        "not on the left yet"
+    );
+    home.write(
+        "stub/ls.json",
+        r#"[{"id":"1","name":"build"},{"id":"2","name":"build-2"}]"#,
+    );
     assert!(home.item(3).contains("2 not decided"), "{}", home.status());
+    let (ok, out, _) = home.setup(&["ssh-space", "build"]);
+    assert!(ok && out.contains("space build-2 is there"), "{out}");
     assert!(!home.setup(&["ssh-space", "-oProxyCommand=x"]).0);
     // A remote named after the host, and one whose target is the other alias.
     let remotes = home.at("c/qoop/remotes.json");
@@ -453,7 +478,11 @@ fn what_i_may_do_shows_own_repo_for_each_picked_project() {
     home.write("bin/gh", "#!/bin/sh\necho me\n");
     std::fs::set_permissions(home.at("bin/gh"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
-    let line = home.item(4);
+    // `own_repo` gives git and gh 300 ms: a loaded test run can miss that once, never thrice.
+    let line = (0..3)
+        .map(|_| home.item(4))
+        .find(|l| l.contains("api yes"))
+        .unwrap_or_else(|| home.item(4));
     assert!(
         line.starts_with("[x]") && line.contains("own repo: api yes, web no"),
         "{line}"
@@ -507,11 +536,369 @@ fn the_phone_ticks_from_a_login_or_a_paired_device_never_from_a_status_line() {
 }
 
 #[test]
+fn a_picked_project_gets_a_space_of_its_own_under_a_name_qoop_reads_as_a_name() {
+    let home = Home::new();
+    let (api, _, _) = home.repos();
+    let year = home.repo("2024", &[]);
+    let qass = home.repo("qass", &[]);
+    let other = home.at("home/work/api");
+    std::fs::create_dir_all(&other).expect("dir");
+    home.git(&other, &["init", "-q"]);
+    for p in [&api, &year, &qass, &other] {
+        let (ok, out, err) = home.setup(&["pick", s(p)]);
+        assert!(ok && out.contains("opened"), "{out} {err}");
+    }
+    let log = std::fs::read_to_string(home.at("stub/new.log")).expect("log");
+    for name in ["api", "p-2024", "qass-project", "api-2"] {
+        assert!(
+            log.contains(&format!("new --space {name} --name {name} --cwd ")),
+            "{name}: {log}"
+        );
+    }
+    // Not on the left yet (no ls.json): the box says which have no space.
+    home.set_up(&api);
+    let line = home.item(2);
+    assert!(
+        line.starts_with("[ ]") && line.contains("no space: api 2024"),
+        "{line}"
+    );
+    // A space that does not open leaves the pick and records no space.
+    home.write("stub/new.rc", "1");
+    let tool = home.repo("tool", &[]);
+    let (ok, out, _) = home.setup(&["pick", s(&tool)]);
+    assert!(ok && out.contains("did not open"), "{out}");
+    let state = std::fs::read_to_string(home.at("d/qoop/qass/setup")).expect("state");
+    assert!(state.contains(&format!("pick {}", s(&tool))), "{state}");
+    assert!(
+        !state.contains(&format!("space tool {}", s(&tool))),
+        "{state}"
+    );
+    let (_, undo, _) = home.setup(&["undo"]);
+    assert!(
+        undo.contains("space api-2: close its tab, then qoop space rm api-2"),
+        "{undo}"
+    );
+    // A space of theirs that only shares the name is never taken, so undo never names it.
+    home.write("stub/new.rc", "0");
+    home.write("stub/ls.json", r#"[{"id":"9","name":"notes"}]"#);
+    let notes = home.repo("notes", &[]);
+    let (ok, out, _) = home.setup(&["pick", s(&notes)]);
+    assert!(ok && out.contains("space notes-2 opened"), "{out}");
+}
+
+const HISTORY_ZSH: &[u8] = b": 1700000000:0;ssh -p 2222 deploy@10.0.0.5
+: 1700000001:0;ssh -p 2222 deploy@10.0.0.5
+: 1700000002:0;ssh -p 2222 deploy@10.0.0.5
+: 1700000002:0;ssh -p 2222 deploy@10.0.0.5
+: 1700000003:0;ssh build
+: 1700000004:0;ssh build
+: 1700000005:0;sshpass -p hunter2 ssh box
+: 1700000006:0;ssh -o ProxyCommand=evil box
+: 1700000007:0;ssh root:pw1@box
+: 1700000008:0;ssh ssh://root:pw2@box
+: 1700000009:0;ssh box 'cat /etc/secret'
+: 1700000010:0;ssh -L 8080:x:80 tunnel
+: 1700000011:0;ssh -J -oProxyCommand=x jump
+: 1700000012:0;ssh -- -oops
+: 1700000013:0;ssh \\
+continued-secret
+: 1700000014:0;echo \x83\xa9 caf\xc3\xa9 && ssh notfirst
+: 1700000015:0;ssh -p2222 glued
+: 1700000016:0;ssh deploy@build
+: 1700000017:0;ssh 1.example.com
+: 1700000018:0;ssh qass.example.com
+";
+
+#[test]
+fn shell_history_offers_only_plain_ssh_targets_and_never_the_rest_of_a_line() {
+    let home = Home::new();
+    home.write("home/.ssh/config", SSH);
+    std::fs::write(home.at("home/.zsh_history"), HISTORY_ZSH).expect("write");
+    home.write(
+        "home/.bash_history",
+        "#1700000000\nssh me@web.example.com\nls\n",
+    );
+    home.write(
+        "home/.local/share/fish/fish_history",
+        "- cmd: ssh -i ~/.ssh/k fishhost\n  when: 1700000000\n",
+    );
+    let (ok, out, err) = home.setup(&["servers"]);
+    assert!(ok, "{out} {err}");
+    for never in [
+        "hunter2",
+        "evil",
+        "pw1",
+        "pw2",
+        "secret",
+        "8080",
+        "tunnel",
+        "jump",
+        "oops",
+        "notfirst",
+        "glued",
+        "continued",
+    ] {
+        assert!(!out.contains(never), "{never}: {out}");
+    }
+    let lines: Vec<&str> = out.lines().filter(|l| !l.contains("ignored")).collect();
+    assert!(
+        lines[0].contains("h10-0-0-5  -p 2222 deploy@10.0.0.5  open  (history, 4 times)"),
+        "most used first: {out}"
+    );
+    assert!(
+        lines[1].contains("build  build  open  (3 times in history)"),
+        "a config host counts its history, with or without a user: {out}"
+    );
+    for host in [
+        "web  me@web.example.com  open  (history, once)",
+        "fishhost  -i ~/.ssh/k fishhost",
+        // Names a space can have: never digits alone, never qass's own.
+        "p-1  1.example.com",
+        "qass-project  qass.example.com",
+        // A config host's target is its alias, so ssh keeps what the config says for it.
+        "api-1  api-1  open",
+    ] {
+        assert!(out.contains(host), "{host}: {out}");
+    }
+    // The three config hosts and five from history.
+    assert!(
+        home.item(3).contains("8 found, 8 not decided"),
+        "{}",
+        home.status()
+    );
+}
+
+#[test]
+fn a_server_folder_gets_its_own_ssh_space_and_only_plain_words_reach_ssh() {
+    let home = Home::new();
+    let (ok, out, err) = home.setup(&[
+        "ssh-space",
+        "h10-0-0-5",
+        "-p",
+        "2222",
+        "deploy@10.0.0.5",
+        "--dir",
+        "/srv/app",
+    ]);
+    assert!(
+        ok && out.contains("space h10-0-0-5-app opened"),
+        "{out} {err}"
+    );
+    let log = std::fs::read_to_string(home.at("stub/new.log")).expect("log");
+    assert_eq!(
+        log,
+        "new --space h10-0-0-5-app --name h10-0-0-5-app -- ssh -t -p 2222 deploy@10.0.0.5 \
+         cd /srv/app || echo \"/srv/app is gone\"; exec \"$SHELL\" -l\n"
+    );
+    home.write("stub/ls.json", r#"[{"id":"3","name":"h10-0-0-5-app"}]"#);
+    let again = [
+        "ssh-space",
+        "h10-0-0-5",
+        "-p",
+        "2222",
+        "deploy@10.0.0.5",
+        "--dir",
+        "/srv/app",
+    ];
+    let (ok, out, _) = home.setup(&again);
+    assert!(ok && out.contains("is there"), "{out}");
+    for bad in [
+        &["ssh-space", "h", "--dir", "srv/app"][..],
+        &["ssh-space", "h", "--dir", "/srv/../etc"],
+        &["ssh-space", "h", "--dir", "/srv/a;b"],
+        &["ssh-space", "h", "--dir", "/srv/app", "x"],
+        &["ssh-space", "h", "-o", "ProxyCommand=x", "h"],
+        &["ssh-space", "h", "-J", "x", "h"],
+        &["ssh-space", "h", "-oProxyCommand=x"],
+        &["ssh-space", "h", "-i", "-oX", "h"],
+        &["ssh-space", "h", "-p", "22x", "h"],
+        &["ssh-space", "h", "user:pw@h"],
+        &["ssh-space", "h", "h", "uptime"],
+        &["dirs", "h", "-F", "/tmp/cfg", "h"],
+    ] {
+        let (ok, _, _) = home.setup(bad);
+        assert!(!ok, "{bad:?}");
+    }
+    let log = std::fs::read_to_string(home.at("stub/new.log")).expect("log");
+    assert_eq!(log.lines().count(), 1, "{log}");
+    let (_, undo, _) = home.setup(&["undo"]);
+    assert!(
+        undo.contains("space h10-0-0-5-app: close its tab"),
+        "{undo}"
+    );
+}
+
+#[test]
+fn a_server_s_projects_are_plain_absolute_folders_read_without_a_password() {
+    let home = Home::new();
+    home.write(
+        "bin/ssh",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SETUP_STUB/ssh.args\"\n\
+         [ -f \"$SETUP_STUB/ssh.rc\" ] && exit \"$(cat \"$SETUP_STUB/ssh.rc\")\"\n\
+         cat \"$SETUP_STUB/ssh.out\"\n",
+    );
+    std::fs::set_permissions(home.at("bin/ssh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    home.write(
+        "stub/ssh.out",
+        "/home/u/api/.git\n/srv/shop/.git\n/home/u/x y/.git\n/srv/\x1b[31mred/.git\nrel/.git\n\
+         /etc/passwd\n/home/u/.cache/x/.git\n\
+         /srv/../etc/.git\n/srv/shop/.git\n",
+    );
+    let (ok, out, err) = home.setup(&["dirs", "box", "-p", "2222", "me@box"]);
+    assert!(ok, "{out} {err}");
+    assert_eq!(out, " 1  /home/u/api\n 2  /srv/shop\n");
+    let args = std::fs::read_to_string(home.at("stub/ssh.args")).expect("args");
+    let args: Vec<&str> = args.lines().collect();
+    // Its own options first (ssh keeps the first value it sees), the person's after them.
+    let batch = args
+        .iter()
+        .position(|a| *a == "BatchMode=yes")
+        .expect("BatchMode");
+    let at = args.iter().position(|a| *a == "-p").expect("-p");
+    assert!(batch < at, "{args:?}");
+    for no in ["-a", "-x", "ControlPath=none"] {
+        assert!(args[..at].contains(&no), "{no}: {args:?}");
+    }
+    assert_eq!(&args[at..at + 3], ["-p", "2222", "me@box"]);
+    assert!(args[at + 3].starts_with("sh -c '"), "{args:?}");
+    home.write("stub/ssh.rc", "255");
+    let (ok, out, _) = home.setup(&["dirs", "box"]);
+    assert!(!ok && out.contains("needs a password"), "{out}");
+}
+
+/// A stand-in `ssh` that notes each call's words, one call a line, and answers `ls --json` with
+/// no spaces.
+const SSH_STUB: &str = "#!/bin/sh\necho \"$*\" >> \"$SETUP_STUB/ssh.log\"\n\
+case \"$*\" in *\"'ls' '--json'\"*) echo '[]' ;; esac\n";
+
+fn remotes(home: &Home, list: &[(&str, &str)]) {
+    let list: Vec<_> = list
+        .iter()
+        .map(|(name, target)| serde_json::json!({"name": name, "target": target}))
+        .collect();
+    home.write(
+        "c/qoop/remotes.json",
+        &serde_json::to_string(&list).expect("json"),
+    );
+}
+
+#[test]
+fn on_sh_hands_ssh_a_saved_target_whole_and_nothing_that_runs_a_command_here() {
+    let home = Home::new();
+    home.write("bin/ssh", SSH_STUB);
+    std::fs::set_permissions(home.at("bin/ssh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let on = home.at("d/qoop/qass/.claude/skills/qass/on.sh");
+    let run = |name: &str| {
+        let _ = std::fs::remove_file(home.at("stub/ssh.log"));
+        let mut cmd = home.command(&on);
+        cmd.args([name, "ls", "--json"]);
+        let (ok, _, err) = Home::output(cmd);
+        let log = std::fs::read_to_string(home.at("stub/ssh.log")).unwrap_or_default();
+        (ok, log, err)
+    };
+    let good = [
+        ("plain", "me@box", "-- me@box "),
+        (
+            "port",
+            "-p 2222 -o User=deploy box",
+            "-p 2222 -o User=deploy -- box ",
+        ),
+        ("jump", "-J [::1],gw -4 me@box", "-J [::1],gw -4 -- me@box "),
+    ];
+    let bad = [
+        ("joined", "-oProxyCommand=x box"),
+        ("cmd", "-o ProxyCommand=x box"),
+        ("local", "-o LocalCommand=x box"),
+        ("config", "-F /tmp/cfg box"),
+        ("shell", "-J h$(touch${IFS}/tmp/x) box"),
+        ("hop", "-o ProxyJump=-oProxyCommand=x box"),
+        ("hops", "-J gw,-oProxyCommand=x box"),
+        ("empty", "-o User= box"),
+        ("novalue", "-p box"),
+        ("dash", "-p 22 -box"),
+        ("after", "box uptime"),
+    ];
+    let mut list: Vec<(&str, &str)> = good.iter().map(|(n, t, _)| (*n, *t)).collect();
+    list.extend(bad.iter().copied());
+    remotes(&home, &list);
+    for (name, _, words) in good {
+        let (ok, log, err) = run(name);
+        assert!(ok && log.contains(words), "{name}: {log} {err}");
+        assert!(log.starts_with("-o BatchMode=yes"), "{name}: {log}");
+    }
+    for (name, _) in bad {
+        let (ok, log, err) = run(name);
+        assert!(
+            !ok && log.is_empty() && err.contains("no usable remote"),
+            "{name}: {log} {err}"
+        );
+    }
+}
+
+#[test]
+fn a_folder_on_a_remote_gets_a_space_there_and_undo_says_how_to_take_qoop_off() {
+    let home = Home::new();
+    home.write("bin/ssh", SSH_STUB);
+    std::fs::set_permissions(home.at("bin/ssh"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let (ok, _, err) = home.setup(&["remote-space", "box", "/srv/shop"]);
+    assert!(!ok && err.contains("not a qoop remote"), "{err}");
+    remotes(&home, &[("box", "-p 2222 me@box")]);
+    let (ok, out, err) = home.setup(&["remote-space", "box", "/srv/shop"]);
+    assert!(ok && out.contains("space box:shop opened"), "{out} {err}");
+    let log = std::fs::read_to_string(home.at("stub/ssh.log")).expect("log");
+    assert!(log.contains("'ensure-awake'"), "{log}");
+    assert!(
+        log.contains("'new' '--space' 'shop' '--name' 'shop' '--cwd' '/srv/shop'"),
+        "{log}"
+    );
+    assert!(!home.setup(&["remote-space", "box", "srv/shop"]).0);
+    assert!(!home.setup(&["remote-space", "box", "/srv/a'b"]).0);
+    let (_, undo, _) = home.setup(&["undo"]);
+    assert!(
+        undo.contains(
+            "there, ~/.local/bin/qoop uninstall (it asks first); then here, qoop remote rm box"
+        ),
+        "{undo}"
+    );
+}
+
+#[test]
+fn qass_never_writes_into_the_tab_where_the_person_answers_an_install() {
+    let skill = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../skills/qass/SKILL.md"
+    ))
+    .expect("skill");
+    let row = skill
+        .lines()
+        .find(|l| l.starts_with("| A tab you opened for them to type into (`add-<name>`"))
+        .expect("the row in the escalate table");
+    assert!(row.contains("never write to it"), "{row}");
+    let setup = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../skills/qass/setup.md"
+    ))
+    .expect("setup");
+    assert!(
+        setup.contains("Never write into that tab."),
+        "setup.md item 3"
+    );
+    assert!(
+        !setup.contains("</dev/null` to it"),
+        "the old way qass ran remote add itself"
+    );
+}
+
+#[test]
 fn a_skipped_box_is_never_shown_done_and_setup_ends_when_none_is_open() {
     let home = Home::new();
     let (api, _, _) = home.repos();
     assert!(home.qoop(&["config", "set", "qass.agent", "claude"]).0);
     assert!(home.setup(&["pick", s(&api)]).0);
+    home.write("stub/ls.json", r#"[{"id":"1","name":"api"}]"#);
     home.set_up(&api);
     for n in ["4", "5", "6"] {
         assert!(home.setup(&["skip", n]).0);
