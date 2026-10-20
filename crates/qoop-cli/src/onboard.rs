@@ -749,7 +749,7 @@ mod tests {
         let mut o = Onboard {
             step: 0,
             row: 2,
-            pet: settings::the_pet(),
+            pet: settings::first_pet(),
             said: None,
         };
         let mut player = Player::new();
@@ -788,7 +788,7 @@ mod tests {
                 let o = Onboard {
                     step,
                     row: 0,
-                    pet: settings::the_pet(),
+                    pet: settings::first_pet(),
                     said: None,
                 };
                 let frame = plain(&o.draw(w, h, &o.rows()).frame());
@@ -834,7 +834,7 @@ mod tests {
                     let o = Onboard {
                         step,
                         row,
-                        pet: settings::the_pet(),
+                        pet: settings::first_pet(),
                         said: None,
                     };
                     let frame = plain(&o.draw(w, h, &rows).frame());

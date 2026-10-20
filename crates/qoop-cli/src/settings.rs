@@ -363,13 +363,19 @@ fn light_for(theme: Theme, answered: Option<bool>, colorfgbg: Option<&str>) -> b
 
 /// The pet as it is, or the first of the picker's own when none was picked yet.
 pub(crate) fn the_pet() -> Avatar {
-    avatar::load().unwrap_or(Avatar {
+    avatar::load().unwrap_or_else(first_pet)
+}
+
+/// The first of the picker's own pets. What a test draws with, so no test reads the pet the
+/// person running it picked.
+pub(crate) fn first_pet() -> Avatar {
+    Avatar {
         body: avatar::BODY.to_string(),
         hair: "block".to_string(),
         eyes: "big".to_string(),
         hair_ink: 212,
         body_ink: avatar::BODY_INK,
-    })
+    }
 }
 
 /// One part of the pet stepped by `by` (plus or minus one), wrapping.
@@ -990,7 +996,7 @@ mod tests {
 
     #[test]
     fn a_pet_part_wraps_both_ways() {
-        let mut pet = the_pet();
+        let mut pet = first_pet();
         pet.hair = avatar::HAIR_STYLES[0].to_string();
         step_part(&mut pet, 0, -1);
         assert_eq!(pet.hair, avatar::HAIR_STYLES[avatar::HAIR_STYLES.len() - 1]);
@@ -1011,7 +1017,7 @@ mod tests {
             chip: 0,
             sel: 0,
             focus: Focus::List,
-            pet: the_pet(),
+            pet: first_pet(),
             said: None,
             host: "devbox".to_string(),
             wide: true,
@@ -1043,7 +1049,7 @@ mod tests {
             chip: 0,
             sel: 1,
             focus: Focus::List,
-            pet: the_pet(),
+            pet: first_pet(),
             said: None,
             host: "devbox".to_string(),
             wide: true,
@@ -1081,7 +1087,7 @@ mod tests {
             chip: 0,
             sel,
             focus: Focus::List,
-            pet: the_pet(),
+            pet: first_pet(),
             said: None,
             host: "devbox".to_string(),
             wide: true,

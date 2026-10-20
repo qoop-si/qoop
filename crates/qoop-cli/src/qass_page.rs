@@ -542,6 +542,7 @@ pub fn run() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::first_pet;
 
     fn facts(life: Life) -> Facts {
         Facts {
@@ -562,7 +563,7 @@ mod tests {
             idle: 30,
             follows: false,
             sel: 0,
-            pet: the_pet(),
+            pet: first_pet(),
             said: None,
             now: 1_000 + 120,
         }
