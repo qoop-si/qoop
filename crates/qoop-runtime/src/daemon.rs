@@ -247,6 +247,8 @@ pub struct ConnectionRegistry {
     pub messages: crate::messages::Watch,
     /// A result was shown (`qoop show`), fanned out like `asks`.
     shows: tokio::sync::broadcast::Sender<()>,
+    /// Every agent session on this computer, for the history lists.
+    pub sessions: crate::sessions::Sessions,
     /// The microphone an interface lends a tab's program, and who is listening.
     pub microphone: Arc<crate::microphone::Hub>,
     /// Rung when a connection comes, is welcomed or goes: what the daemon's leaving waits
@@ -264,6 +266,7 @@ impl Default for ConnectionRegistry {
             focus: tokio::sync::broadcast::channel(16).0,
             asks: tokio::sync::broadcast::channel(16).0,
             messages: crate::messages::Watch::default(),
+            sessions: crate::sessions::Sessions::default(),
             shows: tokio::sync::broadcast::channel(16).0,
             microphone: Arc::default(),
             changed: tokio::sync::Notify::new(),
@@ -1337,12 +1340,16 @@ impl Daemon {
         let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
         terminals.load_session_titles(books.store.session_titles().await.unwrap_or_default());
+        let connections = Arc::new(ConnectionRegistry::default());
+        connections
+            .sessions
+            .place(state.join("sessions-index.json"));
         Ok(Self {
             listener,
             socket,
             shell: shell.to_path_buf(),
             terminals,
-            connections: Arc::new(ConnectionRegistry::default()),
+            connections,
             warnings,
             outbound: Arc::default(),
             store,
@@ -3683,6 +3690,10 @@ fn dispatch(
         ControlRequest::ShowOpen { .. } => Dispatch::Apart,
         // git and gh, for seconds at most, in a checkout an agent works in.
         ControlRequest::Changes { .. } => Dispatch::Apart,
+        // The session index, and a stat of each directory listed: never on the read loop.
+        ControlRequest::AgentSessions { .. } | ControlRequest::AgentActivity { .. } => {
+            Dispatch::Apart
+        }
         // Runs the binary on disk and waits for a first look across every space.
         ControlRequest::RestartWhenSafe { .. } => Dispatch::Apart,
         // The first answer after a swap runs that binary.
@@ -5424,6 +5435,18 @@ async fn handle_control(
         ControlRequest::ShowRead { .. } => {
             Box::pin(crate::shows::read(id, terminals, agents, store)).await
         }
+        ControlRequest::AgentSessions {
+            dirs,
+            from_ms,
+            to_ms,
+            limit,
+            ..
+        } => crate::sessions::list(id, &connections.sessions, dirs, from_ms, to_ms, limit).await,
+        ControlRequest::AgentActivity {
+            days,
+            tz_offset_min,
+            ..
+        } => crate::sessions::activity(id, &connections.sessions, days, tz_offset_min),
         ControlRequest::ShowFetch {
             show, offset, len, ..
         } => Box::pin(crate::shows::fetch(id, show, offset, len, store)).await,
@@ -9166,7 +9189,7 @@ fn sweep_history(dir: &Path, open: &std::collections::BTreeSet<u32>) {
 /// A resume command carries a session id that came from an agent, and a directory name
 /// that came from a person. Neither is guaranteed to be free of the characters a shell
 /// reads, and this text is typed into a shell.
-fn shell_line(argv: &[String]) -> String {
+pub(crate) fn shell_line(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
             if !arg.is_empty()
@@ -12860,8 +12883,8 @@ mod chat_dispatch_tests {
     use super::{Bookkeeping, Dispatch, TerminalRegistry, dispatch};
     use crate::control::ControlRequest;
 
-    /// A chat read parses a file on a disk that may hang: it is answered in a task of its
-    /// own, never on the read loop, where this connection's typing would wait behind it.
+    /// A chat read or a session list reads files on a disk that may hang: it is answered in a
+    /// task of its own, never on the read loop, where this connection's typing would wait.
     #[tokio::test]
     async fn a_chat_read_never_runs_on_the_read_loop() {
         let books = Bookkeeping::new(
@@ -12882,6 +12905,18 @@ mod chat_dispatch_tests {
                 terminal: 1,
                 tool_id: "t".into(),
                 max_bytes: None,
+            },
+            ControlRequest::AgentSessions {
+                id: "s".into(),
+                dirs: Vec::new(),
+                from_ms: None,
+                to_ms: None,
+                limit: 8,
+            },
+            ControlRequest::AgentActivity {
+                id: "a".into(),
+                days: 182,
+                tz_offset_min: 180,
             },
         ];
         for read in &reads {

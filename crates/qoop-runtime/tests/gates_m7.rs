@@ -301,6 +301,19 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             note: None,
         },
         ControlRequest::ShowRead { id: "x36".into() },
+        // Reads of the session files on disk: nothing typed.
+        ControlRequest::AgentSessions {
+            id: "x41".into(),
+            dirs: Vec::new(),
+            from_ms: None,
+            to_ms: None,
+            limit: 8,
+        },
+        ControlRequest::AgentActivity {
+            id: "x42".into(),
+            days: 7,
+            tz_offset_min: 0,
+        },
         ControlRequest::ShowFetch {
             id: "x37".into(),
             show: 1,
@@ -381,6 +394,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::AskRead { .. }
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
+            | ControlRequest::AgentSessions { .. }
+            | ControlRequest::AgentActivity { .. }
             | ControlRequest::ShowFetch { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }

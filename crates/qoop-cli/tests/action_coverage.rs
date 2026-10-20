@@ -589,6 +589,28 @@ fn actions() -> Vec<Action> {
             method: || Method::Control(ControlRequest::ShowRead { id: "a".into() }),
         },
         Action {
+            name: "list the agent sessions of a directory or a day",
+            method: || {
+                Method::Control(ControlRequest::AgentSessions {
+                    id: "a".into(),
+                    dirs: Vec::new(),
+                    from_ms: None,
+                    to_ms: None,
+                    limit: 8,
+                })
+            },
+        },
+        Action {
+            name: "count the agents' work per day",
+            method: || {
+                Method::Control(ControlRequest::AgentActivity {
+                    id: "a".into(),
+                    days: 182,
+                    tz_offset_min: 0,
+                })
+            },
+        },
+        Action {
             name: "download a result shown",
             method: || {
                 Method::Control(ControlRequest::ShowFetch {
@@ -916,6 +938,18 @@ fn every_control_method_is_reachable_from_some_action() {
             note: None,
         },
         ControlRequest::ShowRead { id: String::new() },
+        ControlRequest::AgentSessions {
+            id: String::new(),
+            dirs: Vec::new(),
+            from_ms: None,
+            to_ms: None,
+            limit: 0,
+        },
+        ControlRequest::AgentActivity {
+            id: String::new(),
+            days: 0,
+            tz_offset_min: 0,
+        },
         ControlRequest::ShowFetch {
             id: String::new(),
             show: 0,
@@ -989,6 +1023,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::AskRead { .. }
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
+            | ControlRequest::AgentSessions { .. }
+            | ControlRequest::AgentActivity { .. }
             | ControlRequest::ShowFetch { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }

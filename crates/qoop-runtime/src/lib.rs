@@ -22,6 +22,7 @@ pub mod microphone;
 pub mod paths;
 pub mod release;
 pub mod say;
+mod sessions;
 pub mod shows;
 pub mod spill;
 pub mod state;

@@ -610,6 +610,27 @@ pub enum ControlRequest {
     ShowRead {
         id: String,
     },
+    /// The newest agent sessions on this computer a person typed into, whoever started them,
+    /// answered as `AgentSessions`. `dirs` empty: every directory, else the ones in or under
+    /// one of them; a range (epoch ms, `[from_ms, to_ms)`) keeps the sessions active in it.
+    AgentSessions {
+        id: String,
+        #[serde(default)]
+        dirs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_ms: Option<i64>,
+        limit: u32,
+    },
+    /// Tokens, prompts and sessions per day for the last `days` days, in a zone
+    /// `tz_offset_min` minutes east of UTC, answered as `AgentActivity`.
+    AgentActivity {
+        id: String,
+        days: u32,
+        #[serde(default)]
+        tz_offset_min: i32,
+    },
     /// Up to `len` bytes (cut at [`SHOW_CHUNK`]) of a shown file from `offset`, answered as
     /// `ShowChunk`. Only the path recorded for that show is read.
     ShowFetch {
@@ -674,6 +695,34 @@ pub const SHOW_MOST: u64 = 25 * 1024 * 1024;
 /// The most bytes one `ShowFetch` answers: small enough to arrive well inside the
 /// reassembly deadline on a slow link.
 pub const SHOW_CHUNK: u32 = 128 * 1024;
+
+/// An agent session as a history list shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    /// Unique per session, unlike `id`.
+    pub key: String,
+    /// `claude`, `codex`, `opencode` or `gemini`.
+    pub agent: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    /// Within the asked range, when there was one.
+    pub tokens: u64,
+    pub prompts: u32,
+    /// The line that carries the conversation on, typed in `cwd`; none when the agent has no
+    /// resume or the directory is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// The directory it ran in is no longer there.
+    #[serde(default)]
+    pub gone: bool,
+}
 
 /// A result as the phone lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1228,6 +1277,8 @@ impl ControlRequest {
             | Self::AskRead { id, .. }
             | Self::ShowWrite { id, .. }
             | Self::ShowRead { id }
+            | Self::AgentSessions { id, .. }
+            | Self::AgentActivity { id, .. }
             | Self::ShowFetch { id, .. }
             | Self::TunnelOpen { id, .. }
             | Self::Changes { id, .. }
@@ -1486,6 +1537,18 @@ pub enum ControlResponse {
     ShowWritten {
         id: String,
         show: u64,
+    },
+    /// `reading`: the sessions are still being read for the first time; ask again.
+    AgentSessions {
+        id: String,
+        reading: bool,
+        sessions: Vec<SessionRow>,
+    },
+    /// Only days with something in them, oldest first.
+    AgentActivity {
+        id: String,
+        reading: bool,
+        days: Vec<qoop_parsed::index::Day>,
     },
     /// The newest results shown, newest first, at most 50.
     Shows {
@@ -2086,6 +2149,8 @@ impl ControlResponse {
             | Self::Asks { id, .. }
             | Self::ShowWritten { id, .. }
             | Self::Shows { id, .. }
+            | Self::AgentSessions { id, .. }
+            | Self::AgentActivity { id, .. }
             | Self::ShowChunk { id, .. }
             | Self::TunnelOpened { id, .. }
             | Self::Changes { id, .. }
@@ -2831,6 +2896,60 @@ mod tests {
         assert_eq!(parse_reported_state("uncertain"), None);
         assert_eq!(parse_reported_state("busy"), None);
         assert_eq!(parse_reported_state(""), None);
+    }
+
+    /// The session history survives the wire, and a client that names no range asks for all.
+    #[test]
+    fn the_session_history_round_trips_and_an_old_client_leaves_the_range_out() {
+        fn back<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(value: T) {
+            let wire = serde_json::to_vec(&value).expect("encode");
+            assert_eq!(serde_json::from_slice::<T>(&wire).expect("decode"), value);
+        }
+        back(ControlRequest::AgentSessions {
+            id: "s".into(),
+            dirs: vec!["/w/a".into()],
+            from_ms: Some(1),
+            to_ms: Some(2),
+            limit: 8,
+        });
+        back(ControlResponse::AgentSessions {
+            id: "s".into(),
+            reading: false,
+            sessions: vec![SessionRow {
+                key: "/p/x.jsonl".into(),
+                agent: "claude".into(),
+                id: "x".into(),
+                cwd: Some("/w/a".into()),
+                title: Some("fix it".into()),
+                started_at: Some(1),
+                updated_at: Some(2),
+                tokens: 30,
+                prompts: 2,
+                resume: Some("claude --resume x".into()),
+                gone: false,
+            }],
+        });
+        back(ControlResponse::AgentActivity {
+            id: "a".into(),
+            reading: true,
+            days: vec![qoop_parsed::index::Day {
+                day: "2026-10-20".into(),
+                tokens: 5,
+                prompts: 1,
+                sessions: 1,
+                projects: Vec::new(),
+                agents: Vec::new(),
+            }],
+        });
+        let bare = br#"{"op":"AgentSessions","id":"s","limit":3}"#;
+        assert!(matches!(
+            serde_json::from_slice(bare),
+            Ok(ControlRequest::AgentSessions {
+                from_ms: None,
+                to_ms: None,
+                ..
+            })
+        ));
     }
 
     /// The chat requests, answers and news survive the wire, and what an older client or

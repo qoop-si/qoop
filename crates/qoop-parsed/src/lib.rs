@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod detail;
+pub mod index;
 mod item;
 mod load;
 mod locate;

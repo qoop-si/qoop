@@ -181,6 +181,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("read") => run_read(&args),
         Some("prompt") => run_prompt(&args),
         Some("history") => run_history(&args),
+        Some("sessions-index") => run_sessions_index(&args),
         Some("context") => run_context(&args),
         Some("messages") => messages::run(&args),
         Some("agents") => run_agents(&args),
@@ -292,6 +293,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop history --dir <repo> [--last N] [--json]\n\
                   \x20                 what you typed to your agents in a repo and its\n\
                   \x20                 worktrees (Claude Code, Codex, opencode; not Gemini)\n\
+                  \x20 qoop sessions-index <file>  read every agent session on this computer\n\
+                  \x20                 into the index at <file>; the daemon runs it\n\
                   \x20 qoop messages <terminal> [--skip N] [--limit N] [--json]\n\
                   \x20                 the chat of an agent, parsed from its own session file:\n\
                   \x20                 one row per message, tool call or note, newest last\n\
@@ -2218,6 +2221,16 @@ fn parse_prompt_args(args: &[String]) -> Result<PromptOpts, String> {
 /// product's own store by `qoop-history`, never through the daemon: local
 /// files only, newest last. Every refusal names the product and the id (or
 /// the missing hook report), never a filesystem path.
+/// `qoop sessions-index <file>`: the daemon's session index brought up to date. Its own
+/// process, so the hundreds of megabytes a first read of a large history holds go back to the
+/// system when it ends, not into the daemon.
+fn run_sessions_index(args: &[String]) -> std::io::Result<()> {
+    let [_, _, file] = args else {
+        return Err(usage("usage: qoop sessions-index <file>".to_string()));
+    };
+    qoop_parsed::index::Index::refresh_file(std::path::Path::new(file)).map(|_| ())
+}
+
 fn run_history(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
 

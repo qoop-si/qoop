@@ -85,6 +85,10 @@ pub fn sandboxed(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command 
         "QOOP_TOKEN",
         "QORO_TOKEN",
         "CLAUDE_CONFIG_DIR",
+        // Where the other agents keep their sessions, which the daemon's history reads.
+        "CODEX_HOME",
+        "GEMINI_CLI_HOME",
+        "OPENCODE_DB",
     ] {
         command.env_remove(name);
     }
