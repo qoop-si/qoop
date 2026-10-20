@@ -8,8 +8,8 @@
 #
 # Fail closed: no network, no install. Rerunning changes nothing.
 #
-# Written to be piped (`curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh`,
-# or the same file from a qoop.si/i/ link): everything runs from
+# Written to be piped (`curl -fsSL https://qoop.si/install.sh | sh`, or the same file from a
+# qoop.si/i/ link): everything runs from
 # `main`, called on the last line, so a connection that drops mid-download runs nothing.
 #
 # Into the person's home, never as root: `/usr/local/bin` needs sudo on a stock

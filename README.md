@@ -23,7 +23,7 @@
 ## Get started
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh
+curl -fsSL https://qoop.si/install.sh | sh
 ```
 
 It installs `qoop`, hooks up the agents it finds (Claude Code, Codex and others), lets you
@@ -36,7 +36,7 @@ cd my-project && qoop
 Type `claude` or `codex` in there. macOS and Linux.
 
 <p align="center">
-  <img src="docs/readme/demo.gif" alt="Install, pick a pet, open a space, add a server, an agent asks, the phone rings" width="100%">
+  <img src="docs/readme/demo.gif" alt="Set up in one command, create spaces and agents for your projects, connect remote servers as spaces, see who needs you, let qass answer, answer from your phone" width="100%">
 </p>
 
 ## What you will see

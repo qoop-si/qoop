@@ -62,7 +62,7 @@ export default {
   home: {
     tagline: "Your coding agents in one terminal, and in your pocket.",
     lede: "It tells you when one needs you. Close the lid; they keep working.",
-    install: "curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh",
+    install: "curl -fsSL https://qoop.si/install.sh | sh",
     hero: {
       dark: "img/hero-dark.png",
       light: "img/hero-light.png",

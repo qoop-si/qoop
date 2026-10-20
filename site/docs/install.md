@@ -3,7 +3,7 @@
 ## From a release
 
 ```
-curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh
+curl -fsSL https://qoop.si/install.sh | sh
 ```
 
 The script picks the build for your machine (macOS arm64 or Intel, Linux x86_64 or arm64),
