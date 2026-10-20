@@ -5,7 +5,8 @@
 # API: a `latest` file in its shape, and each asset under `assets/<n>` (GitHub's
 # shape) or `v<version>/<file>` (qoop.si's, with the keys in the other order), the
 # paths install.sh takes an asset url by. The stand-in `qoop` answers
-# --version like the real binary and logs hook/skill delegation.
+# --version like the real binary and logs hook/skill delegation. With QOOP_CHECK_FIRST set
+# it answers like a machine that never ran qoop, and its `onboard` says so on the screen.
 
 set -eu
 
@@ -28,7 +29,7 @@ REL="$T/releases"
 mkdir -p "$T/fake" "$REL/assets"
 release() {
     # shellcheck disable=SC2016 # expanded by the stand-in when it runs, not here
-    printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "qoop %s"; else echo "$@" >> "$T/calls"; fi\n' "$1" > "$T/fake/qoop"
+    printf '#!/bin/sh\ncase "$1" in\n--version) echo "qoop %s"; exit ;;\nconfig) [ -z "${QOOP_CHECK_FIRST:-}" ] || echo "(no file yet)" ;;\navatar) [ -z "${QOOP_CHECK_FIRST:-}" ] || echo null ;;\nonboard) echo onboarding ;;\nesac\necho "$@" >> "$T/calls"\n' "$1" > "$T/fake/qoop"
     chmod 0755 "$T/fake/qoop"
     echo extra > "$T/fake/extra"
     rm -rf "$REL/assets" "$REL/v9.9.9"
@@ -98,6 +99,25 @@ case "$out" in *"next: $HOME/.local/bin/qoop login"*) ;; *) fail "no next step b
 # Not a terminal: no onboarding wizard asked for.
 grep -q "^onboard" "$T/calls" && fail "the wizard ran with no terminal answering"
 [ -z "$(ls -A "$T/tmp")" ] || fail "the default install left its temp dir behind"
+
+# A first install on a terminal (`script` gives it one): the PATH line comes before the
+# onboarding, so a ctrl-c in its sign-in leaves it said, and no "next: qoop login" follows,
+# since the onboarding asks to sign in itself.
+command -v script >/dev/null 2>&1 || fail "no script(1) to give install.sh a terminal"
+rm -rf "$T/dest9"
+if [ "$(uname -s)" = "Darwin" ]; then
+    QOOP_CHECK_FIRST=1 QOOP_DEST="$T/dest9/qoop" script -q "$T/out9" sh scripts/install.sh </dev/null >/dev/null ||
+        fail "a first install on a terminal exited nonzero"
+else
+    QOOP_CHECK_FIRST=1 QOOP_DEST="$T/dest9/qoop" script -qec "sh scripts/install.sh" "$T/out9" </dev/null >/dev/null ||
+        fail "a first install on a terminal exited nonzero"
+fi
+tr -d '\r' <"$T/out9" >"$T/out9.txt"
+grep -q "^onboarding" "$T/out9.txt" || fail "no onboarding on a first install with a terminal: $(cat "$T/out9.txt")"
+path_at="$(grep -n "to PATH" "$T/out9.txt" | head -n 1 | cut -d: -f1)"
+onboard_at="$(grep -n "^onboarding" "$T/out9.txt" | head -n 1 | cut -d: -f1)"
+[ -n "$path_at" ] && [ "$path_at" -lt "$onboard_at" ] || fail "the PATH line is not said before the onboarding: $(cat "$T/out9.txt")"
+grep -q "next: .*login" "$T/out9.txt" && fail "a login hint after an onboarding that asks itself: $(cat "$T/out9.txt")"
 
 # The qoop.si layout: asset urls under releases/v<version>/, keys in the other order. The
 # latest file is named hub-latest, so it is laid out as the base's own `latest`.

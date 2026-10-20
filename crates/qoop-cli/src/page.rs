@@ -3,9 +3,10 @@
 //! grid of cells painted in qoop's own inks with the logo and the pet drawn the way the
 //! sidebar draws them.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use qoop_runtime::avatar::{self, Avatar};
@@ -18,6 +19,7 @@ use qoop_tui::theme::{self, Role};
 pub struct Session {
     _guard: TerminalGuard,
     pub typed: mpsc::Receiver<Vec<u8>>,
+    _reader: Reader,
 }
 
 impl Session {
@@ -40,27 +42,97 @@ impl Session {
             print!("\x1b[?2031h\x1b]11;?\x1b\\");
         }
         std::io::stdout().flush()?;
+        let (typed, reader) = typing(libc::STDIN_FILENO);
         Ok(Session {
             _guard: guard,
-            typed: typing(),
+            typed,
+            _reader: reader,
         })
     }
 }
 
-/// The terminal's bytes, read on a thread of their own so a screen can wait a moment for
-/// the rest of an escape sequence without blocking on it.
-fn typing() -> mpsc::Receiver<Vec<u8>> {
+/// The thread reading the terminal, stopped and waited for when the page ends, so what reads
+/// standard input next (the sign-in question after onboarding, `qoop login`'s yes) gets every
+/// key instead of a reader still blocked on it.
+struct Reader {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The bytes of `fd`, read on a thread of their own so a screen can wait a moment for the
+/// rest of an escape sequence without blocking on it. Read from the descriptor itself, not
+/// through `std::io::stdin`, whose buffer could keep bytes a wait on the descriptor misses.
+fn typing(fd: libc::c_int) -> (mpsc::Receiver<Vec<u8>>, Reader) {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    debug_assert!(
+        fd < libc::FD_SETSIZE as libc::c_int,
+        "fd {fd} does not fit an fd_set"
+    );
+    let thread = std::thread::spawn(move || {
         let mut buf = [0u8; 64];
-        while let Ok(n @ 1..) = stdin.read(&mut buf) {
-            if tx.send(buf[..n].to_vec()).is_err() {
+        // select, not poll: macOS's poll answers POLLNVAL at once for /dev/tty, which is what
+        // install.sh hands `qoop onboard`. fd_set holds descriptors below FD_SETSIZE only.
+        // ponytail: wakes every 50 ms to see the stop flag; a self-pipe if that ever shows.
+        while fd < libc::FD_SETSIZE as libc::c_int && !stopped.load(Ordering::Relaxed) {
+            // SAFETY: an all-zero fd_set is an empty one; it lives on this frame.
+            let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
+            let mut wait = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 50_000,
+            };
+            // SAFETY: `fd` is below FD_SETSIZE (the loop's condition), and `set` and `wait`
+            // are valid for the call; the write and except sets are not asked for.
+            let got = unsafe {
+                libc::FD_SET(fd, &mut set);
+                libc::select(
+                    fd + 1,
+                    &mut set,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut wait,
+                )
+            };
+            if got < 0 && !interrupted() {
+                break;
+            }
+            // SAFETY: `set` is the fd_set select just filled, and `fd` is below FD_SETSIZE.
+            if got <= 0 || !unsafe { libc::FD_ISSET(fd, &set) } {
+                continue;
+            }
+            // SAFETY: reads at most `buf.len()` bytes into `buf`, which outlives the call.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 && interrupted() {
+                continue;
+            }
+            if n <= 0 || tx.send(buf[..n as usize].to_vec()).is_err() {
                 break;
             }
         }
     });
-    rx
+    let reader = Reader {
+        stop,
+        thread: Some(thread),
+    };
+    (rx, reader)
+}
+
+/// The last call failed in a way asking again fixes: a signal, or nothing to read yet.
+fn interrupted() -> bool {
+    matches!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -595,6 +667,167 @@ pub fn show(screen: &Screen, need: (usize, usize), leave: &str) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same on `/dev/tty`, what install.sh gives `qoop onboard`: a terminal of its own in a
+    /// child (this test binary again, running [`dev_tty_child`]), whose page ends at once and
+    /// leaves the next line typed to the read that follows. macOS's poll cannot wait on
+    /// `/dev/tty`, so a reader built on it stays blocked in `read` and the page never ends.
+    #[test]
+    fn a_page_on_dev_tty_ends_at_once_and_leaves_the_next_line_to_the_next_read() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::Mutex;
+        use std::time::Instant;
+
+        let (mut master, mut slave) = (0 as libc::c_int, 0 as libc::c_int);
+        // SAFETY: openpty fills the two descriptors; name, termios and size are not asked for.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "page::tests::dev_tty_child", "--ignored"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env("QOOP_DEV_TTY_CHILD", "1");
+        // SAFETY: only async-signal-safe calls between fork and exec: close, and login_tty
+        // (setsid, the terminal made the controlling one, dup2 onto 0, 1 and 2, close).
+        unsafe {
+            child.pre_exec(move || {
+                libc::close(master);
+                if libc::login_tty(slave) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        /// The child, killed and reaped however the test ends, a failed wait included.
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reaped(child.spawn().unwrap());
+        // SAFETY: the parent's copy of the terminal side, opened above, closed once.
+        unsafe { libc::close(slave) };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let filled = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            loop {
+                // SAFETY: reads at most `buf.len()` bytes into `buf`, from the pty's master.
+                let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                filled.lock().unwrap().extend_from_slice(&buf[..n as usize]);
+            }
+        });
+        let text = || String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+        let wait_for = |mark: &str| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !text().contains(mark) {
+                assert!(Instant::now() < until, "no {mark}: {}", text());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let put = |bytes: &[u8]| {
+            // SAFETY: writes `bytes`, which outlive the call, to the pty's master.
+            let n = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        };
+        wait_for("READY");
+        put(b"x\n");
+        wait_for("ENDED");
+        put(b"y\n");
+        let until = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > until {
+                panic!("the child never ended: {}", text());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{}", text());
+        assert!(text().contains("GOT y"), "{}", text());
+    }
+
+    /// The child of the test above, on the terminal it was given.
+    #[test]
+    #[ignore = "run by a_page_on_dev_tty_ends_at_once_and_leaves_the_next_line_to_the_next_read"]
+    fn dev_tty_child() {
+        if std::env::var_os("QOOP_DEV_TTY_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: a NUL-terminated path, opened for reading and writing.
+        let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let (typed, reader) = typing(fd);
+        println!("READY");
+        let got = typed.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(got, b"x\n");
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(reader);
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the reader is still blocked on /dev/tty"
+        );
+        println!("ENDED");
+        let mut buf = [0u8; 8];
+        // SAFETY: reads at most `buf.len()` bytes into `buf`, from the terminal opened above.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n.max(0) as usize], b"y\n");
+        println!("GOT y");
+    }
+
+    /// A page that ends stops reading: the next reader of the same descriptor (the sign-in
+    /// question after onboarding) gets the very next bytes, none taken by a reader left behind.
+    #[test]
+    fn an_ended_page_leaves_every_later_key_to_the_next_reader() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe fills the two descriptors of this array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let [from, to] = fds;
+        let put = |bytes: &[u8]| {
+            // SAFETY: writes `bytes`, which outlive the call, to the pipe this test owns.
+            let n = unsafe { libc::write(to, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        };
+        let (typed, reader) = typing(from);
+        put(b"x");
+        assert_eq!(typed.recv_timeout(Duration::from_secs(5)).unwrap(), b"x");
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(reader);
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the reader is still blocked on the descriptor"
+        );
+        put(b"y\n");
+        let mut buf = [0u8; 8];
+        // SAFETY: reads at most `buf.len()` bytes into `buf`, from the pipe this test owns.
+        let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"y\n");
+        // SAFETY: closes the two descriptors this test opened, once each.
+        unsafe {
+            libc::close(from);
+            libc::close(to);
+        }
+    }
 
     /// The left button's reports are read whole, the wheel and other buttons are nothing, and
     /// the interface's drop arrives as one key, never as its letters; a report or a drop cut

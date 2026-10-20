@@ -6,13 +6,15 @@
 //! and right choose (a sound plays), up and down move between a step's rows, enter goes on,
 //! esc finishes. Each choice is written as it is made, so leaving early keeps what was set.
 //! The rows are the settings page's own (`settings.rs`), so the two never disagree.
+//! In the release build, a question follows the steps: sign in now (`qoop login`) or later.
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal, Write};
 
 use qoop_runtime::avatar::{self, Avatar};
 use qoop_tui::config;
 use qoop_tui::theme::Role;
 
+use crate::Phone;
 use crate::page::{self, Key, Player, Screen, Session, bold, ink, raised_bold};
 use crate::settings::{self, Kind, Row};
 
@@ -409,8 +411,8 @@ fn pick_lines(list: &[String], at: usize, width: usize, room: usize) -> Vec<Vec<
     shown
 }
 
-/// `qoop onboard`
-pub fn run(args: &[String]) -> std::io::Result<()> {
+/// `qoop onboard`. `phone` is the release build's part, which has `qoop login`.
+pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
     if args.len() > 2 {
         return Err(std::io::Error::other("usage: qoop onboard"));
     }
@@ -418,6 +420,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         println!(
             "qoop onboard needs a terminal to show its steps; qoop settings changes anything later"
         );
+        // install.sh leaves the sign-in to the onboarding: it is still said.
+        if phone.is_some() {
+            println!("{LATER}");
+        }
         return Ok(());
     }
     settings::apply_theme();
@@ -449,8 +455,42 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
     }
     drop(session);
+    if let Some(phone) = phone {
+        // A key typed for the last page (an enter pressed twice) must not answer yes.
+        // SAFETY: tcflush on standard input only discards what is queued there.
+        unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+        print!("{SIGN_IN}");
+        let _ = std::io::stdout().flush();
+        let mut said = String::new();
+        let said = std::io::stdin()
+            .lock()
+            .read_line(&mut said)
+            .ok()
+            .filter(|&n| n > 0)
+            .map(|_| said);
+        if let Some(hint) = sign_in(phone, said.as_deref()) {
+            println!("{hint}");
+        }
+    }
     println!("{}", last_line(config::read().config.prefix));
     Ok(())
+}
+
+const SIGN_IN: &str = "Sign in so this computer shows on qoop.si/app and your phone? [Y/n] ";
+const LATER: &str = "later: qoop login";
+
+/// After a yes (enter alone is one), `qoop login`; the line to print after it, if any. Asked
+/// first because a login waits up to ten minutes for the browser. Nothing here fails
+/// onboarding: a no, no answer, no network or a code nobody confirmed all end on the hint.
+fn sign_in(phone: Phone, said: Option<&str>) -> Option<String> {
+    let yes = said.is_some_and(|a| matches!(a.trim(), "" | "y" | "Y" | "yes" | "Yes"));
+    if !yes {
+        return Some(LATER.into());
+    }
+    match phone(&["qoop".into(), "login".into()]) {
+        Ok(()) => None,
+        Err(e) => Some(format!("not signed in: {e}. {LATER}")),
+    }
 }
 
 /// What onboarding ends on: the next thing to do, with the command key just chosen.
@@ -465,6 +505,46 @@ fn last_line(prefix: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    std::thread_local! {
+        static CALLED: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn signs_in(args: &[String]) -> std::io::Result<()> {
+        CALLED.with(|c| c.borrow_mut().push(args.to_vec()));
+        Ok(())
+    }
+
+    fn cannot_reach(args: &[String]) -> std::io::Result<()> {
+        CALLED.with(|c| c.borrow_mut().push(args.to_vec()));
+        Err(std::io::Error::other("the hub did not answer"))
+    }
+
+    fn calls() -> Vec<Vec<String>> {
+        CALLED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    #[test]
+    fn a_yes_or_enter_runs_qoop_login_and_anything_else_leaves_it_for_later() {
+        let login = vec![vec!["qoop".to_string(), "login".to_string()]];
+        for yes in ["\n", "y\n", "Y\n", "yes\n"] {
+            assert_eq!(sign_in(signs_in, Some(yes)), None, "{yes:?}");
+            assert_eq!(calls(), login, "{yes:?}");
+        }
+        for no in [Some("n\n"), Some("no\n"), Some("later\n"), None] {
+            assert_eq!(
+                sign_in(signs_in, no).as_deref(),
+                Some("later: qoop login"),
+                "{no:?}"
+            );
+            assert!(calls().is_empty(), "{no:?}");
+        }
+        assert_eq!(
+            sign_in(cannot_reach, Some("y\n")).as_deref(),
+            Some("not signed in: the hub did not answer. later: qoop login")
+        );
+        assert_eq!(calls(), login);
+    }
 
     #[test]
     fn it_ends_on_qass_with_the_chosen_key() {

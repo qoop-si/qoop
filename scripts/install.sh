@@ -8,7 +8,8 @@
 #
 # Fail closed: no network, no install. Rerunning changes nothing.
 #
-# Written to be piped (`curl -fsSL https://qoop.si/i/<token> | sh`): everything runs from
+# Written to be piped (`curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh`,
+# or the same file from a qoop.si/i/ link): everything runs from
 # `main`, called on the last line, so a connection that drops mid-download runs nothing.
 #
 # Into the person's home, never as root: `/usr/local/bin` needs sudo on a stock
@@ -257,20 +258,9 @@ main() {
     # will not start an agent whose file was replaced, and a running one is the old build.
     "$DEST" bridge reload || echo "qoop install: the bridge service was not reloaded; run: qoop bridge reload" >&2
 
-    # On a first install, and only when there is a terminal to answer on, the onboarding
-    # steps: the pet, the sounds, light or dark, the command key, notifications, sleep. A
-    # piped run (`curl | sh`) has no stdin to ask on but usually has the terminal, so the
-    # answers are read from it; CI has neither and stays non-interactive by construction.
-    # Quitting keeps the install just done.
-    if [ -n "$first" ] && [ -z "${QOOP_NONINTERACTIVE:-}" ] && ( : </dev/tty ) 2>/dev/null; then
-        "$DEST" onboard </dev/tty || true
-    else
-        echo "the pet, the sounds and every other setting: qoop settings"
-    fi
-
     # The hooks call `qoop` by name, so it has to be on PATH. Said, not done: an rc
-    # file is the person's own. Then the one command to run next, by full path while the
-    # name does not resolve yet.
+    # file is the person's own. Said before the onboarding, so a ctrl-c in its sign-in, which
+    # ends this script too, leaves it on the screen.
     cmd="qoop"
     if ! command -v qoop >/dev/null 2>&1; then
         bindir="$(dirname "$DEST")"
@@ -290,7 +280,20 @@ main() {
         fi
         cmd="$DEST"
     fi
-    echo "next: $cmd login"
+
+    # On a first install, and only when there is a terminal to answer on, the onboarding
+    # steps: the pet, the sounds, light or dark, the command key, notifications, sleep, then
+    # signing in. A piped run (`curl | sh`) has no stdin to ask on but usually has the
+    # terminal, so the answers are read from it; CI has neither and stays non-interactive by
+    # construction. Quitting keeps the install just done.
+    if [ -n "$first" ] && [ -z "${QOOP_NONINTERACTIVE:-}" ] && ( : </dev/tty ) 2>/dev/null; then
+        "$DEST" onboard </dev/tty || true
+    else
+        echo "the pet, the sounds and every other setting: qoop settings"
+        # The onboarding asks to sign in itself; without it, the one command to run next, by
+        # full path while the name does not resolve yet.
+        echo "next: $cmd login"
+    fi
 }
 
 main "$@"

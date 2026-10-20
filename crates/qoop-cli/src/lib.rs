@@ -206,7 +206,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("config") => config::run(&args),
         Some("sound") => sound::run(&args),
         Some("settings") => settings::run(&args),
-        Some("onboard") => onboard::run(&args),
+        Some("onboard") => onboard::run(&args, phone),
         Some("skills") => skills::run(&args),
         Some("icons") => icons::run(&args),
         Some("paths") => places::run(&args[2..]),
