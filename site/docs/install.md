@@ -3,10 +3,8 @@
 ## From a release
 
 ```
-curl -fsSL https://qoop.si/i/<your link> | sh
+curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh
 ```
-
-Your link is on qoop.si/app after you sign in, and in the mail with your seat. It works once.
 
 The script picks the build for your machine (macOS arm64 or Intel, Linux x86_64 or arm64),
 checks its sha256, starts it once to confirm the version, puts it at `~/.local/bin/qoop`
@@ -14,8 +12,11 @@ checks its sha256, starts it once to confirm the version, puts it at `~/.local/b
 Run it as yourself, not with sudo; it says so if `~/.local/bin` is not on your `PATH`, and it
 leaves a `qoop` already at that path alone.
 
-It ends by printing the next command, `qoop login`, with the full path and the line to add to
-your shell profile when `~/.local/bin` is not on your `PATH` yet. The script and `qoop update`
+On a first install it then walks you through a short setup: your pet, sounds, light or dark,
+and signing this computer in to your account, which is what puts your agents on your phone.
+Every answer can be changed later with `qoop settings`; a step you skipped, such as signing in,
+is `qoop login`. When `~/.local/bin` is not on your `PATH` yet, it prints the line to add to
+your shell profile. The script and `qoop update`
 read the releases from `https://qoop.si/releases` over https; no account or token is involved.
 
 Linux builds need glibc 2.17 or newer (CentOS 7 and anything since). On a musl system such as

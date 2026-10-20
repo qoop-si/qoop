@@ -6,8 +6,8 @@ as `node`. It then reads what the agent is doing from its screen, and from its h
 is installed.
 
 States: `starting`, `working`, `blocked` (waiting for you), `done`, `failed`, `idle`,
-`uncertain` (two sources disagree, which never pages you) and `sleeping` (closed by the idle
-timeout, conversation kept).
+`uncertain` (two sources disagree, which never pages you) and `sleeping` (put to sleep by
+hand or after it sat idle, conversation kept; see [Sleep](#sleep)).
 
 ## Detected agents
 
@@ -36,7 +36,7 @@ Anything else is read by the generic rules, and a shell reads as a shell.
 
 `pi`, `hermes`, `kilo`, `muse` and `maki` are also the names of unrelated programs, so they
 count as agents only when the process shows it: the package it came from or a runtime
-running it. A plain `kilo` editor is never treated as an agent, so the idle timeout and
+running it. A plain `kilo` editor is never treated as an agent, so idle sleep and
 restore never act on it. Muse installs only a launcher named `muse`, so it is not
 recognised yet.
 

@@ -7,8 +7,7 @@ cd my-project
 qoop
 ```
 
-That reaches a real shell, with an index of your terminals beside it. No account, no wizard,
-no manifest. Press `ctrl-q` and the shell keeps running; run `qoop` again and you are back in
+That reaches a real shell, with an index of your terminals beside it. No manifest to write. Press `ctrl-q` and the shell keeps running; run `qoop` again and you are back in
 the same one.
 
 ## What it is for
@@ -24,7 +23,7 @@ So the parts that usually get bolted on are the parts qoop is built out of:
 - **Every terminal knows its agent.** The index says which agent is in which terminal and
   what it is doing: working, blocked on a question, done, failed or idle. An agent that
   needs you lights its row, rings the bell and sends a desktop notification.
-- **Sessions come back as themselves.** Stop a session, open it again, and each tab returns
+- **Tabs come back as themselves.** Stop qoop, open it again, and each tab returns
   to its directory and, for agents that report it, to the same conversation.
 - **What scrolls off goes to disk.** Scrollback is kept as rows on disk, searchable from copy
   mode across the whole history.

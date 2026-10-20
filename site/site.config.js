@@ -2,8 +2,8 @@ export default {
   name: "qoop",
   description: "a portable runtime for human and coding-agent workspaces",
   author: {
-    name: "us",
-    url: "https://github.com/us",
+    name: "qoop",
+    url: "https://github.com/qoop-si/qoop",
   },
   navLinks: [
     { label: "Docs", href: "#introduction" },
@@ -26,14 +26,17 @@ export default {
         { title: "Keys", slug: "keys" },
         { title: "Panes and splits", slug: "panes" },
         { title: "Copy mode and search", slug: "copy-mode" },
-        { title: "Sessions and restore", slug: "sessions" },
+        { title: "Detach, stop and restore", slug: "sessions" },
+        { title: "Sleep", slug: "sleep" },
         { title: "Other machines", slug: "remote" },
+        { title: "Your phone", slug: "phone" },
       ],
     },
     {
       title: "Agents",
       children: [
         { title: "Supported agents", slug: "agents" },
+        { title: "qass", slug: "qass" },
         { title: "Hooks and skills", slug: "hooks" },
         { title: "Notifications", slug: "notifications" },
         { title: "Automation", slug: "automation" },
@@ -45,6 +48,7 @@ export default {
         { title: "Configuration", slug: "configuration" },
         { title: "Update and uninstall", slug: "update" },
         { title: "FAQ and troubleshooting", slug: "faq" },
+        { title: "How it is built", slug: "built" },
       ],
     },
   ],
@@ -53,8 +57,21 @@ export default {
     left: "AGPL-3.0-or-later",
     right: "qoop",
   },
-  theme: {
-    light: { "--accent-gold": "#FF6600", "--accent-gold-dim": "rgba(255, 102, 0, .15)", "--accent-blue": "#FD4B03" },
-    dark: { "--accent-gold": "#FF6600", "--accent-gold-dim": "rgba(255, 102, 0, .15)", "--accent-blue": "#FD4B03" },
+  // The top of the introduction page. A phone link with an empty url shows as "soon" and
+  // links nowhere; give it the store url and it turns into a live button.
+  home: {
+    tagline: "Your coding agents in one terminal, and in your pocket.",
+    lede: "It tells you when one needs you. Close the lid; they keep working.",
+    install: "curl -fsSL https://raw.githubusercontent.com/qoop-si/qoop/main/scripts/install.sh | sh",
+    hero: {
+      dark: "img/hero-dark.png",
+      light: "img/hero-light.png",
+      alt: "qoop in a terminal, on an iPhone and on an Android phone",
+    },
+    phone: [
+      { label: "Browser", detail: "qoop.si/app", url: "https://qoop.si/app", icon: "browser" },
+      { label: "App Store", detail: "iPhone", url: "", icon: "apple" },
+      { label: "Google Play", detail: "Android", url: "", icon: "play" },
+    ],
   },
 };

@@ -6,9 +6,14 @@ qoop needs no configuration. For the few things worth changing there is one file
 ```toml
 prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
 theme = "auto"      # auto | dark | light
+icons = "auto"      # auto | on | off: icons where they were seen to draw, plain elsewhere
 [notify]
 desktop = true
 sound = false
+[sleep]
+idle_minutes = 0    # 0 = never; else a tab idle and unwatched this long sleeps
+[daemon]
+exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 ```
 
 | Key | Default | What it does |
@@ -17,6 +22,8 @@ sound = false
 | `theme` | `"auto"` | `auto` asks the terminal for its background and follows it, including when it switches between light and dark; `dark` and `light` fix it |
 | `notify.desktop` | `true` | desktop notifications, see [Notifications](#notifications) |
 | `notify.sound` | `false` | a sound with each notification |
+| `sleep.idle_minutes` | `0` | a tab idle and unwatched this many minutes sleeps by itself; `0` is never. See [Sleep](#sleep) |
+| `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached |
 
 The file is read when the interface starts, and again within two seconds of any change to it,
 so an edit applies without a restart. `qoop settings` (also `ctrl-a space`, then `settings`)
@@ -32,9 +39,11 @@ is left out and the rest of the file is still read.
 
 | Variable | What it does |
 |---|---|
-| `QOOP_SESSION` | which session to open (the `--session` flag wins over it) |
-| `QOOP_IDLE_TIMEOUT_MINUTES` | close terminals idle this long with nothing running in the background; read by the daemon, so set it where the daemon starts. See [Sessions](#sessions) |
 | `QOOP_RELEASE_BASE` | where `qoop update` and the install script look for releases (a mirror, GitHub's API, or `file:///path`; default `https://qoop.si/releases`) |
+
+`QOOP_IDLE_TIMEOUT_MINUTES` is no longer read: `idle_minutes` under `[sleep]` puts idle tabs to
+sleep instead (see [Sleep](#sleep)), and `QOOP_SESSION` is refused, as named sessions became
+spaces.
 
 ## Agent detection
 

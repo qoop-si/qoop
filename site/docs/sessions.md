@@ -1,16 +1,17 @@
-# Sessions and restore
+# Detach, stop and restore
 
-A session is a daemon and everything it holds: its spaces, its terminals and their history.
-Sessions are named, and they do not see each other.
+One daemon per machine holds everything: its spaces, its terminals and their history. Spaces
+group the tabs, usually one per project; there are no separately named sessions.
 
 ```
-qoop --session work     open one, or make it
-qoop ls                 what there is, and what is running
-qoop stop work          end it: the tabs come back on the next open
+qoop                    open it, starting the daemon when there is none
+qoop --space api        the interface with that one space in it
+qoop ls                 every space, and whether it is awake, asleep or stopped
+qoop stop               end everything: the tabs come back on the next open
 ```
 
-`--session` wins over `QOOP_SESSION`, which wins over the session last opened, which wins
-over `default`: a bare `qoop` reopens whatever you opened last.
+An older `qoop --session NAME` (or `QOOP_SESSION`) is refused, and the message says where that
+session's files are and how to use them instead.
 
 ## Detach and reattach
 
@@ -19,14 +20,12 @@ attaches again, from the same terminal or another one.
 
 ## Stop and come back
 
-`qoop stop` ends the processes. Opening the session again brings back its spaces and tabs,
-each in the directory it was last in. An agent that reported its conversation id (through
-its hook, see [Hooks and skills](#hooks)) is started again on that same conversation.
+`qoop stop` ends the processes. Running `qoop` again brings back the spaces and tabs, each in
+the directory it was last in; a tab that was asleep stays asleep. An agent that reported its
+conversation id (through its hook, see [Hooks and skills](#hooks)) is started again on that
+same conversation.
 
-## Idle terminals
+## Sleep
 
-Set `QOOP_IDLE_TIMEOUT_MINUTES` (for example `30`) in the environment the daemon starts
-from, and terminals idle for that long with nothing running in the background are closed
-the same way as closing the tab. They stay listed as `sleeping` until dismissed, and the
-agent's conversation is still in the agent's own store. An agent waiting on another
-terminal stays awake while that wait is alive.
+A tab or a whole space can sleep and wake as itself, by hand or after it sits idle. See
+[Sleep](#sleep).

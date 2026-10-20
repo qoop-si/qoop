@@ -1,13 +1,9 @@
 # Quick start
 
-Installed qoop with the line from [Install](#install)? Sign this computer in, so your account
-(and your phone) knows it is yours:
+Installed qoop with the line from [Install](#install)? Its setup signed this computer in, so your
+account and your phone know it is yours. Skipped that step? Run `qoop login` any time.
 
-```
-qoop login
-```
-
-Then open your project in qoop:
+Open your project in qoop:
 
 ```
 cd my-project
@@ -39,8 +35,5 @@ The prefix is `ctrl-a` unless you set another in [Configuration](#configuration)
 
 ## On your phone
 
-Open [qoop.si/app](https://qoop.si/app) on your phone and sign in with the same account. Your
-computers show up by themselves, with the agent that is waiting for you first: you can read
-it, answer it, or type into any terminal. Notifications need the qoop app on the phone (the
-web page cannot send them): turn them on there to be told when an agent needs you.
+Sign in on your phone with the same account and your agents are there. See [Your phone](#phone).
 

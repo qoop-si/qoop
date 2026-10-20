@@ -8,11 +8,10 @@ one is doing.
 
 | tmux | qoop |
 |---|---|
-| server | daemon, one per session |
-| session | session (`qoop --session work`) |
+| server | daemon, one per machine |
+| session | space: a named group of tabs, usually one per project (`qoop --space work`) |
 | window | tab |
 | pane | pane |
-| (none) | space: a named group of tabs, usually one per project |
 
 ## Keys
 
@@ -39,7 +38,7 @@ over:
 | tmux | qoop |
 |---|---|
 | `tmux ls` | `qoop ls` |
-| `tmux attach -t work` | `qoop --session work` |
+| `tmux attach -t work` | `qoop --space work` |
 | `tmux kill-server` | `qoop stop` |
 | `tmux send-keys -t 3 'y' Enter` | `qoop send 3 y --enter` |
 | `tmux capture-pane -p -t 3` | `qoop read 3` |

@@ -4,7 +4,7 @@
 
 Hooks are optional. Every agent is read from its screen without one. A hook buys two things:
 a state known the moment it changes rather than after it is drawn, and the agent's own id
-for its conversation, which is what lets a stopped session come back to that conversation.
+for its conversation, which is what lets a stopped or sleeping tab come back to that conversation.
 
 qoop sets them up by itself: when it is installed or updated, on a computer added over ssh, and
 for an agent installed after qoop, which qoop notices within seconds on this machine and on

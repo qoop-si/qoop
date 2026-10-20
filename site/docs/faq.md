@@ -3,19 +3,19 @@
 ## Does closing the window stop my agents?
 
 No. The window is only a view. The daemon keeps every terminal running; `qoop` in any other
-window brings the same tabs back. `qoop stop` is what ends a session.
+window brings the same tabs back. `qoop stop` is what ends them.
 
 ## What happens after a reboot?
 
 The tabs, spaces and panes come back with their history the next time you run `qoop`. The
-programs inside them do not survive a reboot: see [Sessions and restore](#sessions) for
+programs inside them do not survive a reboot: see [Detach, stop and restore](#sessions) for
 what comes back and how an agent resumes its conversation.
 
-## `qoop read` says "no session running"
+## `qoop read` says "nothing is awake"
 
-Nothing is running in this session yet, or you are asking a different session than the one
-you started. `qoop ls` lists the sessions and which of them are running; `--session NAME` or
-`QOOP_SESSION` picks one. Commands that act on a terminal never start a daemon themselves.
+No tab is awake, so no daemon is running: `qoop` or `qoop wake` starts it. `qoop ls` lists
+every space and whether it is awake, asleep or stopped. Commands that act on a terminal never
+start a daemon themselves.
 
 ## An agent shows the wrong state
 

@@ -2,20 +2,75 @@ import { searchEngine } from "./search.js";
 import config from "../site.config.js";
 
 const features = Object.assign(
-  { scrollReveal: true, codeCopyButtons: true, readingProgress: true, skeletonLoading: true },
+  { codeCopyButtons: true, readingProgress: true, skeletonLoading: true },
   config.features || {}
 );
 
+// The sidebar's sections are drawn as qoop's own spaces, each in its space colour from
+// docs/brand.md (violet, lime, cyan, pink, sky, yellow in wheel order).
+const SPACE_COUNT = 6;
+
+// ========== Small shared pieces ==========
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+const ICONS = {
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>',
+  check: '<path d="m5 12 5 5 9-10"/>',
+  chev: '<path d="m9 6 6 6-6 6"/>',
+  browser: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3c-2.5 2.6-3.8 5.6-3.8 9s1.3 6.4 3.8 9"/>',
+  apple: '<path d="M12 7.5c-1.4-1-4.2-1.2-5.6.9-1.5 2.2-.9 6.2 1.2 9 .9 1.3 1.9 2 2.8 1.7.6-.2 1-.5 1.6-.5s1 .3 1.6.5c.9.3 1.9-.4 2.8-1.7 2.1-2.8 2.7-6.8 1.2-9-1.4-2.1-4.2-1.9-5.6-.9z"/><path d="M12 7.5c0-2 1-3.4 2.8-4"/>',
+  play: '<path d="M6.5 4.2v15.6a.6.6 0 0 0 .9.5l12.6-7.8a.6.6 0 0 0 0-1L7.4 3.7a.6.6 0 0 0-.9.5z"/>',
+};
+const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+
+// A state picture on the nine-dot grid of docs/brand.md; the dots that are off stay as a
+// faint ghost of the grid.
+const MARKS = {
+  done: [1, 1, 1, 1, 1, 1, 1, 1, 1],
+  ring: [1, 1, 1, 1, 0, 1, 1, 1, 1],
+  idle: [0, 0, 0, 0, 1, 0, 0, 0, 0],
+  line: [0, 0, 0, 1, 1, 1, 0, 0, 0],
+  work: [0, 1, 0, 0, 1, 1, 0, 0, 0],
+};
+const SECTION_MARKS = ["ring", "done", "work", "line"];
+function mark(name, size = 12) {
+  const dots = MARKS[name]
+    .map((on, k) => `<circle cx="${2 + (k % 3) * 4}" cy="${2 + Math.floor(k / 3) * 4}" r="1.45" fill="currentColor"${on ? "" : ' opacity=".16"'}/>`)
+    .join("");
+  return `<svg class="mark" width="${size}" height="${size}" viewBox="0 0 12 12" aria-hidden="true">${dots}</svg>`;
+}
+
+// Inline markdown for a table cell: code spans, bold and links.
+function inlineMarkdown(s) {
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return `\x00${codes.length - 1}\x00`;
+  });
+  s = esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${esc(codes[i])}</code>`);
+}
+
+function copyButton(text, label = "Copy") {
+  return `<button class="copy-btn" data-copy="${esc(text)}" aria-label="${label}">${icon("copy")}<span>${label}</span></button>`;
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-copy]");
+  if (!btn) return;
+  navigator.clipboard.writeText(btn.dataset.copy);
+  btn.classList.add("copied");
+  btn.querySelector("span").textContent = "Copied";
+  setTimeout(() => {
+    btn.classList.remove("copied");
+    btn.querySelector("span").textContent = "Copy";
+  }, 2000);
+});
+
 // ========== Render Navbar ==========
 function renderNavbar() {
-  // Logo: image or text
-  const logoEl = document.querySelector(".logo");
-  if (config.logo) {
-    logoEl.innerHTML = `<img src="${config.logo}" alt="${config.name}" class="logo-img" />`;
-  } else {
-    logoEl.textContent = config.name;
-  }
-
   document.title = config.description
     ? `${config.name} · ${config.description}`
     : config.name;
@@ -30,61 +85,11 @@ function renderNavbar() {
     })
     .join("");
 
-  // Profile link (author branding)
-  const profileLink = document.getElementById("profile-link");
-  if (profileLink && config.author?.url) {
-    profileLink.href = config.author.url;
-    profileLink.textContent = config.author.name || "us";
-    profileLink.title = config.author.url;
-  }
-
-  // Footer
   const footer = document.querySelector(".footer");
-  const authorName = config.author?.name || "us";
-  const authorUrl = config.author?.url || "https://github.com/us";
-  const githubLink = config.navLinks?.find(l => l.href?.includes("github.com"))?.href || "#";
-
-  let footerLeft = config.footer?.left || "";
-  let footerRight = config.footer?.right || "";
-
   footer.innerHTML = `
-    <div class="footer-col">
-      <span class="footer-project">${config.name}</span>
-      <span class="footer-license">${footerLeft}</span>
-    </div>
-    <div class="footer-col footer-col-right">
-      ${githubLink !== "#" ? `<a href="${githubLink}" target="_blank" rel="noopener">GitHub</a>` : ""}
-      <a href="${authorUrl}" target="_blank" rel="noopener">Created by ${authorName}</a>
-      <span class="footer-license">${footerRight}</span>
-    </div>
+    <span>${config.name} · ${config.footer?.left || ""}</span>
+    ${config.author?.url ? `<a href="${config.author.url}" target="_blank" rel="noopener">GitHub</a>` : ""}
   `;
-}
-
-// ========== Apply Custom Theme ==========
-function applyThemeOverrides() {
-  if (!config.theme) return;
-
-  const style = document.createElement("style");
-  let css = "";
-
-  if (config.theme.light) {
-    css += '[data-theme="light"] {\n';
-    for (const [prop, val] of Object.entries(config.theme.light)) {
-      css += `  ${prop}: ${val};\n`;
-    }
-    css += "}\n";
-  }
-
-  if (config.theme.dark) {
-    css += '[data-theme="dark"] {\n';
-    for (const [prop, val] of Object.entries(config.theme.dark)) {
-      css += `  ${prop}: ${val};\n`;
-    }
-    css += "}\n";
-  }
-
-  style.textContent = css;
-  document.head.appendChild(style);
 }
 
 // ========== Minimal Markdown Parser ==========
@@ -227,54 +232,205 @@ function stripMarkdown(md) {
     .trim();
 }
 
-// ========== Sidebar Rendering ==========
+// ========== Sidebar: the agents column ==========
+// Each section is a space: a fold mark in the faint ink, the name in the space's colour and
+// its page count; its pages sit under it the way agents do, in the quieter step of that
+// colour, and the page being read is lit in the full step. The page being read also lists
+// its own headings under it, the way an agent's row carries its second line.
+const folded = new Set();
+
 function renderSidebar() {
   const nav = document.getElementById("sidebar-nav");
   const currentSlug = getCurrentSlug();
+  const pages = config.sidebar.reduce((n, s) => n + s.children.length, 0);
+  const headings = [...document.querySelectorAll("#article h2")];
 
-  nav.innerHTML = config.sidebar
-    .map((section) => {
-      const hasActiveChild = section.children.some(
-        (c) => c.slug === currentSlug
-      );
-      const isOpen = hasActiveChild;
-
-      return `
-        <div class="sidebar-section">
-          <button class="sidebar-group-toggle ${isOpen ? "open" : ""}" data-section="${section.title}">
-            ${section.title}
-            <span class="chevron">&#9654;</span>
+  nav.innerHTML = `
+    <div class="col-head"><span>docs</span><span class="col-head-count">${pages} pages</span></div>
+    <button class="chip" id="sidebar-search"><b>[</b><i>/</i><span>search ${pages} pages</span><b>]</b></button>
+    ${config.sidebar
+      .map((section, si) => {
+        const open = !folded.has(section.title);
+        return `
+        <div class="space space-${si % SPACE_COUNT}${open ? "" : " folded"}">
+          <button class="space-rule" data-section="${esc(section.title)}">
+            <span class="fold">${open ? "&#9662;" : "&#9656;"}</span><span class="space-name">${section.title}</span><span class="space-count">(${section.children.length})</span>
           </button>
-          <div class="sidebar-group-children ${isOpen ? "open" : ""}">
+          <div class="space-pages">
             ${section.children
-              .map(
-                (child) => `
-              <a href="#${child.slug}" class="sidebar-link ${child.slug === currentSlug ? "active" : ""}">${child.title}</a>
-            `
-              )
+              .map((child) => {
+                const active = child.slug === currentSlug;
+                const outline = active && headings.length
+                  ? `<div class="page-outline">${headings
+                      .map((h, hi) => `<button class="outline-row" data-heading="${hi}"><span class="branch">${hi === headings.length - 1 ? "&#9492;" : "&#9500;"}</span>${esc(h.textContent)}</button>`)
+                      .join("")}</div>`
+                  : "";
+                return `<a href="#${child.slug}" class="page-row${active ? " active" : ""}">${mark(active ? "done" : "idle", 11)}<span>${child.title}</span></a>${outline}`;
+              })
               .join("")}
           </div>
-        </div>
-      `;
-    })
-    .join("");
+        </div>`;
+      })
+      .join("")}
+  `;
 
-  // Toggle section collapse
-  nav.querySelectorAll(".sidebar-group-toggle").forEach((btn) => {
+  nav.querySelectorAll(".space-rule").forEach((btn) => {
     btn.addEventListener("click", () => {
-      btn.classList.toggle("open");
-      btn.nextElementSibling.classList.toggle("open");
+      const t = btn.dataset.section;
+      folded.has(t) ? folded.delete(t) : folded.add(t);
+      renderSidebar();
     });
   });
 
-  // Close sidebar on mobile when clicking a link
-  nav.querySelectorAll(".sidebar-link").forEach((link) => {
+  nav.querySelectorAll(".outline-row").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      headings[btn.dataset.heading]?.scrollIntoView({ behavior: "smooth" });
+      if (window.innerWidth <= 768) closeSidebar();
+    });
+  });
+
+  document.getElementById("sidebar-search").addEventListener("click", () => searchEngine.open());
+
+  nav.querySelectorAll(".page-row").forEach((link) => {
     link.addEventListener("click", () => {
       if (window.innerWidth <= 768) {
         closeSidebar();
       }
     });
   });
+}
+
+// ========== Home: the top of the introduction ==========
+function renderHome(slug) {
+  const home = document.getElementById("home");
+  const h = config.home;
+  if (slug !== config.defaultPage || !h) {
+    home.innerHTML = "";
+    return;
+  }
+  const phone = h.phone
+    .map((p) => {
+      const soon = p.url ? "" : "<em>soon</em>";
+      const inner = `${icon(p.icon)}<span class="phone-text"><b>${p.label}</b><small>${p.detail}${soon}</small></span>`;
+      return p.url
+        ? `<a class="phone-link" href="${p.url}" target="_blank" rel="noopener">${inner}${icon("chev")}</a>`
+        : `<span class="phone-link soon" aria-disabled="true">${inner}</span>`;
+    })
+    .join("");
+  const cards = config.sidebar
+    .map(
+      (section, si) => `
+      <div class="card space-${si % SPACE_COUNT}">
+        <div class="card-top">${mark(SECTION_MARKS[si % SECTION_MARKS.length], 36)}<span>${section.children.length} pages</span></div>
+        <h2>${section.title}</h2>
+        <nav>${section.children.map((c) => `<a href="#${c.slug}"><span>${c.title}</span>${icon("chev")}</a>`).join("")}</nav>
+      </div>`
+    )
+    .join("");
+
+  home.innerHTML = `
+    <section class="hero">
+      <div class="hero-text">
+        <p class="hero-kicker">${config.description}</p>
+        <h1>${h.tagline}</h1>
+        <p class="hero-lede">${h.lede}</p>
+        <div class="install">
+          <span class="install-prompt">$</span>
+          <code>${esc(h.install)}</code>
+          ${copyButton(h.install)}
+        </div>
+        <p class="phone-head">On your phone</p>
+        <div class="phone-links">${phone}</div>
+      </div>
+      <div class="hero-art">
+        <img class="hero-img hero-dark" src="${h.hero.dark}" alt="${esc(h.hero.alt)}" onerror="this.remove()">
+        <img class="hero-img hero-light" src="${h.hero.light}" alt="${esc(h.hero.alt)}" onerror="this.remove()">
+      </div>
+    </section>
+    <section class="cards">${cards}</section>
+  `;
+}
+
+// ========== Keys panel ==========
+// Every row of the tables in keys.md, grouped by their heading, with a live filter. Beside
+// every reading page on a wide screen; behind the Keys button on a narrow one.
+function parseKeyTables(md) {
+  const groups = [];
+  let title = "";
+  let header = true;
+  for (const line of md.split("\n")) {
+    if (line.startsWith("## ")) title = line.slice(3).trim();
+    if (!line.startsWith("|")) {
+      header = true;
+      continue;
+    }
+    if (/^\|[-| :]+\|\s*$/.test(line)) continue;
+    const cells = line.trim().slice(1, -1).split("|").map((c) => c.trim());
+    if (header) {
+      header = false;
+      groups.push({ title, rows: [] });
+      continue;
+    }
+    groups[groups.length - 1].rows.push(cells);
+  }
+  return groups;
+}
+
+// One key cell as chips: `ctrl-a n`, `ctrl-a p` is two chords, `ctrl-a 1` .. `ctrl-a 9` a range.
+function chords(cell) {
+  const codes = [...cell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+  if (!codes.length) return `<span class="key-word">${esc(cell)}</span>`;
+  const sep = cell.includes("..") ? '<span class="key-sep">to</span>' : "";
+  return codes
+    .map((c) =>
+      c.startsWith("ctrl-a ")
+        ? `<span class="chord"><kbd class="pre">ctrl-a</kbd><kbd>${esc(c.slice(7))}</kbd></span>`
+        : `<span class="chord"><kbd>${esc(c)}</kbd></span>`
+    )
+    .join(sep);
+}
+
+async function renderKeys() {
+  const list = document.getElementById("keys-list");
+  try {
+    const response = await fetch("docs/keys.md");
+    if (!response.ok) throw new Error("Not found");
+    const groups = parseKeyTables(await response.text());
+    list.innerHTML = groups
+      .map(
+        (g) => `
+        <div class="key-group"><h5>${esc(g.title)}</h5>
+          ${g.rows
+            .map(
+              ([k, d]) => `<div class="key-row" data-q="${esc(`${g.title} ${k} ${d}`.toLowerCase())}">
+                <span class="key-keys">${chords(k)}</span>
+                <span class="key-does">${inlineMarkdown(d)}</span>
+              </div>`
+            )
+            .join("")}
+        </div>`
+      )
+      .join("");
+  } catch {
+    list.innerHTML = '<p class="keys-empty">The keys page could not be loaded.</p>';
+  }
+}
+
+function initKeys() {
+  const filter = document.getElementById("keys-filter");
+  filter.addEventListener("input", () => {
+    const q = filter.value.toLowerCase().trim();
+    document.querySelectorAll(".key-row").forEach((r) => (r.hidden = !r.dataset.q.includes(q)));
+    document.querySelectorAll(".key-group").forEach((g) => (g.hidden = !g.querySelector(".key-row:not([hidden])")));
+  });
+  // A row shows two lines of what it does; a click reads the rest.
+  document.getElementById("keys-list").addEventListener("click", (e) => {
+    if (e.target.closest("a")) return;
+    e.target.closest(".key-row")?.classList.toggle("open");
+  });
+  document.getElementById("keys-fab").addEventListener("click", () => document.body.classList.toggle("keys-open"));
+  document.getElementById("keys-close").addEventListener("click", () => document.body.classList.remove("keys-open"));
+  renderKeys();
 }
 
 // ========== Skeleton Loading ==========
@@ -289,8 +445,6 @@ function showContentSkeleton() {
     <div class="skeleton" style="width:55%;height:24px;margin-bottom:16px"></div>
     <div class="skeleton" style="width:100%;height:14px;margin-bottom:10px"></div>
     <div class="skeleton" style="width:85%;height:14px;margin-bottom:10px"></div>
-    <div class="skeleton" style="width:96%;height:14px;margin-bottom:28px"></div>
-    <div class="skeleton" style="width:100%;height:120px;margin-bottom:20px"></div>
   `;
 }
 
@@ -298,50 +452,9 @@ function showContentSkeleton() {
 function addCodeCopyButtons(container) {
   if (!features.codeCopyButtons) return;
   container.querySelectorAll("pre").forEach((pre) => {
-    pre.style.position = "relative";
-    const btn = document.createElement("button");
-    btn.className = "code-copy-btn";
-    btn.textContent = "COPY";
-    btn.setAttribute("aria-label", "Copy code");
-    btn.addEventListener("click", () => {
-      const code = pre.querySelector("code");
-      navigator.clipboard.writeText(code ? code.textContent : pre.textContent);
-      btn.textContent = "COPIED";
-      btn.classList.add("copied");
-      setTimeout(() => {
-        btn.textContent = "COPY";
-        btn.classList.remove("copied");
-      }, 2000);
-    });
-    pre.appendChild(btn);
+    const code = pre.querySelector("code");
+    pre.insertAdjacentHTML("beforeend", copyButton(code ? code.textContent : pre.textContent));
   });
-}
-
-// ========== Scroll Reveal ==========
-function initScrollReveal() {
-  if (!features.scrollReveal) return;
-  const observer = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          entry.target.classList.add("revealed");
-          observer.unobserve(entry.target);
-        }
-      });
-    },
-    { threshold: 0.15 }
-  );
-
-  document.querySelectorAll(".reveal").forEach((el) => observer.observe(el));
-}
-
-function applyRevealToContent(container) {
-  if (!features.scrollReveal) return;
-  container.querySelectorAll("h1, h2, h3, pre, blockquote, table, img").forEach((el, i) => {
-    el.classList.add("reveal");
-    el.style.transitionDelay = `${Math.min(i * 40, 200)}ms`;
-  });
-  initScrollReveal();
 }
 
 // ========== Reading Progress ==========
@@ -350,11 +463,9 @@ function initReadingProgress() {
   const bar = document.getElementById("reading-progress");
   if (!bar) return;
 
-  const content = document.getElementById("content");
   const update = () => {
-    const scrollTop = window.scrollY;
-    const docHeight = content.scrollHeight - window.innerHeight;
-    const progress = docHeight > 0 ? Math.min(scrollTop / docHeight, 1) : 0;
+    const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+    const progress = docHeight > 0 ? Math.min(window.scrollY / docHeight, 1) : 0;
     bar.style.width = `${progress * 100}%`;
     bar.style.opacity = progress > 0.01 ? "1" : "0";
   };
@@ -379,6 +490,9 @@ function getPageTitle(slug) {
 async function loadPage(slug) {
   const article = document.getElementById("article");
 
+  document.body.dataset.page = slug;
+  document.body.classList.remove("keys-open");
+  renderHome(slug);
   showContentSkeleton();
 
   try {
@@ -387,11 +501,10 @@ async function loadPage(slug) {
     const md = await response.text();
     article.innerHTML = parseMarkdown(md);
     addCodeCopyButtons(article);
-    applyRevealToContent(article);
   } catch {
     article.innerHTML = `
       <h1>Page Not Found</h1>
-      <p>The page <code>${slug}</code> could not be found.</p>
+      <p>The page <code>${esc(slug)}</code> could not be found.</p>
       <p><a href="#${config.defaultPage}">Go to ${getPageTitle(config.defaultPage)}</a></p>
     `;
   }
@@ -409,13 +522,11 @@ const overlay = document.getElementById("overlay");
 function openSidebar() {
   sidebar.classList.add("open");
   overlay.classList.add("active");
-  hamburger.classList.add("active");
 }
 
 function closeSidebar() {
   sidebar.classList.remove("open");
   overlay.classList.remove("active");
-  hamburger.classList.remove("active");
 }
 
 hamburger.addEventListener("click", () => {
@@ -451,7 +562,7 @@ async function buildSearchIndex() {
 // ========== Init ==========
 function init() {
   renderNavbar();
-  applyThemeOverrides();
+  initKeys();
   loadPage(getCurrentSlug());
   initReadingProgress();
 

@@ -9,7 +9,9 @@ qoop update             install it and move every machine onto it
 
 `--check` leaves a note the interface reads, so the index signs itself `0.3.0>0.4.0` while
 an update is waiting; the interface itself never touches the network. `ctrl-a U` says how it
-installs.
+installs. A release build's daemon also runs `qoop update --auto` a few minutes after it
+starts and every six hours after that; a file named `no-auto-update` in `$(qoop paths config)`
+turns that off.
 
 After the install, `qoop update` asks the daemon on this machine, and on each saved remote,
 to move onto the new binary. A working agent or a running command is never ended. When both
