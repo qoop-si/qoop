@@ -426,12 +426,24 @@ fn lanes<'a>(
             out[lane].push(item);
         }
     }
-    // Newest activity first: the item's and its agents' newest change (`updated_at`), so what
-    // moved last is on top in every lane; a tie keeps the daemon's order.
+    // Newest first in every lane: Todo and Doing by the item's and its agents' newest change
+    // (`updated_at`), Done by when it closed, since a closed item's `updated_at` can still
+    // move; a tie keeps the daemon's order.
     for lane in &mut out {
-        lane.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
+        lane.sort_by_key(|i| std::cmp::Reverse(lane_stamp(i)));
     }
     out
+}
+
+/// What a lane is ordered by: a Done item's close time (`closed_at`, else `since`, which an
+/// older daemon leaves 0), anything else's last change.
+fn lane_stamp(item: &ItemInfo) -> i64 {
+    if item.state != "done" {
+        return item.updated_at;
+    }
+    item.closed_at
+        .or((item.since > 0).then_some(item.since))
+        .unwrap_or(item.updated_at)
 }
 
 /// What an agent on a card is doing, in words and ink.
@@ -3035,6 +3047,30 @@ mod tests {
         }
         let keys: Vec<&str> = p.lanes()[1].iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["QOOP-4", "QOOP-5", "QOOP-3"]);
+    }
+
+    /// The Done lane follows when items closed, not their last change (an ended agent can write
+    /// after the close); an older daemon sends no close time and falls back to the last change.
+    #[test]
+    fn the_done_lane_reads_close_time_first() {
+        let mut p = page();
+        {
+            let items = p.items.as_mut().unwrap();
+            items.push(item(7, "done", "closed first, changed last", 1));
+            items.push(item(8, "done", "closed last", 1));
+            items.push(item(9, "done", "older daemon", 1));
+            for (n, closed, since, updated) in [
+                (6, Some(20), 20, 25),
+                (7, Some(10), 10, 900),
+                (8, Some(50), 50, 60),
+            ] {
+                let i = &mut items[n - 1];
+                (i.closed_at, i.since, i.updated_at) = (closed, since, updated);
+            }
+            items[8].updated_at = 30;
+        }
+        let keys: Vec<&str> = p.lanes()[2].iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["QOOP-8", "QOOP-9", "QOOP-6", "QOOP-7"]);
     }
 
     /// On a narrow full card the word stays readable (the short form of one that asks the
