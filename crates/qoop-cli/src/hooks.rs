@@ -1774,6 +1774,56 @@ mod tests {
         }
     }
 
+    /// A backgrounded Claude session runs under Claude's own daemon, which carries the
+    /// terminal and token of the tab that started it: reporting from there filed the
+    /// onboarding conversation, its title and its subagent under another space's tab.
+    #[test]
+    fn the_claude_hook_reports_nothing_from_a_backgrounded_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a directory");
+        let script = dir.path().join("qoop-hook.sh");
+        std::fs::write(&script, target("claude").body).expect("write");
+        let log = dir.path().join("reports");
+        let fake = dir.path().join("qoop");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let report = |job_dir: &str| -> String {
+            let _ = std::fs::remove_file(&log);
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
+                .env("CLAUDE_JOB_DIR", job_dir)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(
+                    br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}"#,
+                )
+                .expect("payload");
+            assert!(child.wait().expect("wait").success(), "a hook must exit 0");
+            std::fs::read_to_string(&log).unwrap_or_default()
+        };
+        assert!(
+            report("/Users/me/.claude/jobs/s1").is_empty(),
+            "a backgrounded session reported"
+        );
+        assert!(
+            report("").contains("--session-id s1"),
+            "a session in its own tab has to keep reporting"
+        );
+    }
+
     /// A session opening is `starting`, never `working`: an agent that opens and sits
     /// idle did no turn, and a turn settling is what says "finished". Codex and gemini
     /// installed earlier still pass `working` for it, and still report `starting`.

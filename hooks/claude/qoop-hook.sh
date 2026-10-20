@@ -73,6 +73,11 @@ set -eu
 export QOOP_TERMINAL="${QOOP_TERMINAL:-${QORO_TERMINAL:-}}" QOOP_TOKEN="${QOOP_TOKEN:-${QORO_TOKEN:-}}"
 [ -n "${QOOP_TERMINAL:-}" ] || exit 0
 [ -n "${QOOP_TOKEN:-}" ] || exit 0
+# A backgrounded session runs under Claude's own daemon, which inherited the terminal and
+# token of whichever tab started it first: that tab is not where this session lives, and
+# reporting there puts another conversation, its title and its subagents in that tab.
+# `CLAUDE_JOB_DIR` is what reaches the hook: Claude keeps `CLAUDE_CODE_SESSION_KIND` from it.
+[ -z "${CLAUDE_JOB_DIR:-}" ] || exit 0
 # The installer puts qoop in ~/.local/bin, which a stock Mac does not have on PATH until
 # the person adds it: looked for there too, rather than every hook going quiet.
 command -v qoop >/dev/null 2>&1 || PATH="${HOME:-/nonexistent}/.local/bin:$PATH"
