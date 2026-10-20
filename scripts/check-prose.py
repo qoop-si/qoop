@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """No em dash, and no double hyphen or lone hyphen used as a stylistic dash.
 
+`skills/` and `hooks/` also carry no Turkish letters: they reach every person's agents, so their
+examples are English and qass answers in the person's own language by its own rule.
+
 A hyphen inside a compound word or a CLI flag is fine. A hyphen standing in for a dash is
 not. This runs over documents we ship, not over vendored reference material.
 """
@@ -9,6 +12,9 @@ import pathlib, re, sys
 # Written as escapes so this checker does not trip over itself.
 EM = "\u2014"
 EN = "\u2013"
+# The letters only Turkish uses: g breve, dotless i, s cedilla, dotted capital I, small and
+# capital. A German or French example (o, u, c with their marks) passes.
+TURKISH = re.compile("[\u011f\u0131\u015f\u0130\u011e\u015e]")
 
 # `reviews/` is excluded on purpose: a review quotes a violation in order to argue about
 # it, and a checker that reddens on a quoted counterexample punishes the discipline it
@@ -27,7 +33,13 @@ for r in roots:
     if p.is_file():
         files.append(p)
     elif p.is_dir():
-        files.extend(x for x in p.rglob("*") if x.suffix in {".md", ".py", ".sh", ".yml", ".rs", ".js", ".ts", ".tsx"})
+        files.extend(
+            x
+            for x in p.rglob("*")
+            if x.suffix in {".md", ".py", ".sh", ".yml", ".rs", ".js", ".ts", ".tsx"}
+            # Everything in skills/ and hooks/ ships, its JSON included.
+            or (r in {"skills", "hooks"} and x.is_file())
+        )
 
 for f in files:
     if any(s in str(f) for s in skip):
@@ -42,6 +54,8 @@ for f in files:
             continue
         if EM in line or EN in line:
             fail.append(f"{f}:{n}: em or en dash: {line.strip()[:90]}")
+        if f.parts[0] in {"skills", "hooks"} and TURKISH.search(line):
+            fail.append(f"{f}:{n}: Turkish letter in a shipped skill or hook: {line.strip()[:90]}")
         # A CLI invocation legitimately contains " -- ", so strip inline code spans and
         # skip code blocks and tables before looking for a dash used as punctuation.
         # A Rust doc comment is prose and is checked; the code around it is not. Everywhere
@@ -66,4 +80,4 @@ if fail:
     for x in fail:
         print("FAIL " + x)
     sys.exit(1)
-print(f"OK  {len(files)} files, no dash violations")
+print(f"OK  {len(files)} files, no dash violations, no Turkish letters in skills/ or hooks/")

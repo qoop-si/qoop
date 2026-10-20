@@ -323,8 +323,8 @@ pub(crate) fn not_his(prompt: &str) -> bool {
 }
 
 /// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
-/// digits, then `tail`: its task id, so no two drafts share one ("dub52"), or for an agent
-/// with no task `-t` and its terminal, which no task's handle can be ("dub-t3").
+/// digits, then `tail`: its task id, so no two drafts share one ("api52"), or for an agent
+/// with no task `-t` and its terminal, which no task's handle can be ("api-t3").
 fn draft_handle(name: &str, tail: impl std::fmt::Display) -> String {
     let word: String = name
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn a_prompt_head_names_its_card_whole() {
         assert_eq!(
-            card_in_prompt("The owner answered E7: \"korea B\"").as_deref(),
+            card_in_prompt("The owner answered E7: \"billing B\"").as_deref(),
             Some("E7")
         );
         assert_eq!(
@@ -1226,26 +1226,26 @@ mod tests {
             Some("W12")
         );
         assert_eq!(card_in_prompt("The owner answered X12"), None);
-        assert_eq!(draft_handle("Dub-local PR 513", 52), "dub52");
+        assert_eq!(draft_handle("Api-local PR 513", 52), "api52");
         assert_eq!(draft_handle("ödeme", 3), "deme3");
         assert_eq!(draft_handle("***", 4), "agent4");
-        assert_eq!(draft_handle("Dub-local PR 513", "-t3"), "dub-t3");
+        assert_eq!(draft_handle("Api-local PR 513", "-t3"), "api-t3");
     }
 
     #[test]
     fn the_worker_is_told_what_qass_tells_it_today() {
         assert_eq!(
-            line_for_worker("E7", "korea B", Some(("b", "Do not run 0042 yet."))),
-            "The owner answered E7: \"korea B\". He chose B: Do not run 0042 yet. Those are the words of the owner: do only what they allow, and ask before anything more."
+            line_for_worker("E7", "billing B", Some(("b", "Do not run 0042 yet."))),
+            "The owner answered E7: \"billing B\". He chose B: Do not run 0042 yet. Those are the words of the owner: do only what they allow, and ask before anything more."
         );
         assert_eq!(
             line_for_worker("E7", "use the old column", None),
             "The owner answered E7: \"use the old column\". Those are the words of the owner: do only what they allow, and ask before anything more."
         );
-        assert_eq!(line_for_qass("korea", Some("b"), None), "korea B");
+        assert_eq!(line_for_qass("billing", Some("b"), None), "billing B");
         assert_eq!(
-            line_for_qass("korea", None, Some("run it twice")),
-            "korea run it twice"
+            line_for_qass("billing", None, Some("run it twice")),
+            "billing run it twice"
         );
     }
 
@@ -1389,13 +1389,13 @@ mod tests {
 
     #[test]
     fn a_queued_answer_is_typed_as_the_route_says_when_it_is_sent() {
-        let body = r#"{"handle":"korea","urgency":"now","doing":"d","why":"w","asks":"a","options":[{"key":"b","label":"B","reason":"r","words":"Do not run 0042 yet."}]}"#;
+        let body = r#"{"handle":"billing","urgency":"now","doing":"d","why":"w","asks":"a","options":[{"key":"b","label":"B","reason":"r","words":"Do not run 0042 yet."}]}"#;
         let mut row = card(None);
         row.body = body.into();
         row.card = "E7".into();
         row.option = Some("b".into());
         row.answer = Some("b".into());
-        assert_eq!(line_for(&row, Route::Qass(9)).as_deref(), Some("korea B"));
+        assert_eq!(line_for(&row, Route::Qass(9)).as_deref(), Some("billing B"));
         assert!(
             line_for(&row, Route::Worker(5))
                 .unwrap()
@@ -1405,7 +1405,7 @@ mod tests {
         row.answer = Some("run it twice".into());
         assert_eq!(
             line_for(&row, Route::Qass(9)).as_deref(),
-            Some("korea run it twice")
+            Some("billing run it twice")
         );
         assert_eq!(line_for(&row, Route::NoQass), None);
     }

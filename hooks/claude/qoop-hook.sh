@@ -61,7 +61,7 @@
 #     for the rest (they carry no tool); every other notification type reports nothing
 #   Stop -> idle + `--event done`, labelled with the last paragraph of its last message; the
 #   daemon keeps it only when it asks the owner something, and files it as a draft card when
-#   the agent waits on him; SessionEnd -> idle + `--event done`, no label
+#   the agent waits on them; SessionEnd -> idle + `--event done`, no label
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 #   Stop, StopFailure with a `background_tasks` list -> also `--subagents` with
@@ -135,7 +135,7 @@ def last_paragraph(payload):
         if not isinstance(message, dict):
             continue
         content = message.get("content")
-        # His last prompt ends the turn read back: a question before it was already answered.
+        # Their last prompt ends the turn read back: a question before it was already answered.
         if message.get("role") == "user":
             results = isinstance(content, list) and any(
                 isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
@@ -147,8 +147,8 @@ def last_paragraph(payload):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
         if not texts:
             continue
-        # Its last paragraph, whatever it says: the daemon decides whether it asks him (a
-        # "?", or an offer such as "istersen ..."). Each line's markdown off.
+        # Its last paragraph, whatever it says: the daemon decides whether it asks them (a
+        # "?", or an offer such as "if you like, I can ..."). Each line's markdown off.
         # (A backtick is chr(96): one written out would end the shell's command substitution.)
         paragraph = []
         for text_line in reversed("\n".join(texts).splitlines()):
@@ -163,7 +163,7 @@ def last_paragraph(payload):
 
 def ends_kept(text, limit=120):
     """One line of at most `limit` characters that keeps both ends of a longer text: an offer
-    is often near its start ("istersen ...") and a question near its end."""
+    is often near its start ("if you like, I can ...") and a question near its end."""
     single = " ".join(str(text).split())
     if len(single) <= limit:
         return single

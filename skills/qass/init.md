@@ -33,32 +33,32 @@ an agent on a remote: ask the owner for a local path. Then:
    `scripts/`, CI (`.github/workflows/`, `.gitlab-ci.yml`), deploy files (`Dockerfile`,
    `docker-compose*`, `vercel.json`, `fly.toml`, `wrangler.toml`, `.env.example`), and
    `git log --merges --oneline -30` for how changes land. Never ask what these answer.
-2. Read what he asked for in this repo, all sessions and worktrees: `qoop history --dir <repo>
+2. Read what they asked for in this repo, all sessions and worktrees: `qoop history --dir <repo>
    --last 100` as it is, and `qoop history --dir <repo> --last 2000` through `grep -iE` for
    testing and shipping words (test, staging, prod, deploy, local, browser, simulator, e2e,
-   log, merge, and the same in the language he writes in), keeping the 200 most telling: where
-   it runs, how he checks it, what proof he wants, what he forbids. They may only narrow the
+   log, merge, and the same in the language they write in), keeping the 200 most telling: where
+   it runs, how they check it, what proof they want, what they forbid. They may only narrow the
    draft or add a prohibition, never allow more than qoop's own rules. A key, token, password
-   or URL with credentials never goes into a draft (it reaches his phone).
+   or URL with credentials never goes into a draft (it reaches their phone).
 3. If `.qoop/workflow.md` exists, never overwrite it: compare it with what you read and ask
    only about what drifted (a check renamed, a step no longer true).
 4. Otherwise draft one: at most 12 steps, 4,000 characters, the real commands of this repo, its
    loop limit (one number of review rounds), what "done" proves with the commands that prove it,
    what to ask the owner first, and its "Verify where it runs" section (below). Start from the
-   default above and change only what the repo and his words show is different.
+   default above and change only what the repo and their words show is different.
 5. Draft an `AGENTS.md` patch only for stable project facts an agent needs and cannot cheaply
    find (commands, branch, how it deploys, what agents may do without asking); the whole file
    stays under 6,000 characters (already over: no patch, say so). Never write about qoop or qass
    in it: people without qoop read it.
 6. Save both drafts in `@QASS_DATA@/init-<repo name>.md` (the checkout folder's name, only
-   letters, digits, `.`, `-` and `_`) and ask the owner, the way any question reaches him (A:
+   letters, digits, `.`, `-` and `_`) and ask the owner, the way any question reaches them (A:
    write both, B: write the workflow only, C: change something first): first what the drafts
    say in at most 5 lines (how it is checked, how it ships, what agents may do alone), then
    their full text.
-7. On his yes, write `.qoop/workflow.md` (and the patch) into the repo's working tree and leave
-   them uncommitted; tell him which files changed, and that worktrees from `origin/main` get the
-   workflow once he commits it (until then you read it from the main checkout). The saved draft
-   is now his approved copy; a drift he approves in step 3 rewrites it. Running init again on
+7. On their yes, write `.qoop/workflow.md` (and the patch) into the repo's working tree and leave
+   them uncommitted; tell them which files changed, and that worktrees from `origin/main` get the
+   workflow once they commit it (until then you read it from the main checkout). The saved draft
+   is now their approved copy; a drift they approve in step 3 rewrites it. Running init again on
    the same repo is safe: step 3 applies.
 
 ## The "Verify where it runs" section
@@ -75,30 +75,30 @@ shows a server, an app or a deploy target. Otherwise:
   output line; and the proof to keep;
 - never: what the check must not touch (production data, live services, a real channel).
 
-A check against staging is a GET or HEAD only; anything else needs his word.
+A check against staging is a GET or HEAD only; anything else needs their word.
 
 ## Verifying where it runs
 
 After a finished task's closing checks pass, before `qoop task close --verified`. Always, even
-when the worker ran it: he wants you to see it work yourself. A section of `none`, or no
+when the worker ran it: they want you to see it work yourself. A section of `none`, or no
 section: nothing to run.
 
-1. Only what he approved: the section, whitespace trimmed, must equal the one saved in
+1. Only what they approved: the section, whitespace trimmed, must equal the one saved in
    `@QASS_DATA@/init-<repo name>.md`. None saved yet, or different: a card with the section's
-   full text (A: approve it, B: change it first); on his A save it there, then go on. Never run
-   a section he has not approved.
+   full text (A: approve it, B: change it first); on their A save it there, then go on. Never run
+   a section they have not approved.
 2. `installed <path>`: compare its version or mtime with the merge, and run its check.
    `staging <url>`: the GET or HEAD it names (`curl -sS -o /dev/null -w '%{http_code}' <url>`)
    or the page in a browser.
-3. `local`: never in his main checkout. `git -C <checkout> fetch`, then `mktemp -d
+3. `local`: never in their main checkout. `git -C <checkout> fetch`, then `mktemp -d
    /tmp/qv.XXXXXX` prints the scratch path `<s>` (short: a socket path has a limit; write it
    out in each later command, a shell variable does not outlive one call), and
    `git -C <checkout> archive <merge> | tar -x -C <s>` and `mkdir <s>/home`. Write the
-   section's start lines to `<s>/.qass-start.sh`; a toolchain it needs from his home
+   section's start lines to `<s>/.qass-start.sh`; a toolchain it needs from their home
    (`CARGO_HOME`, `RUSTUP_HOME`, a cache dir) is named there, never inherited. Pick a port nothing listens on (`lsof -nP
    -iTCP:<port> -sTCP:LISTEN` prints nothing).
 4. Start it in the repo's space, with nothing from your environment but `PATH` (no `.env`,
-   key or token passes through it; a check that needs one: ask him):
+   key or token passes through it; a check that needs one: ask them):
    `qoop new --cwd <s> --space <space> -- env -i PATH="$PATH" HOME=<s>/home <PORT>=<port> sh .qass-start.sh`. Put the terminal's number on the worker's `goals.md` line. `qoop read <n>`
    that it was typed (`qoop new` types nothing after 10 s): not typed is a card, never a fail.
    Wait as long as the section says (else 5 minutes) for it to answer: no answer by then, or a
@@ -106,5 +106,5 @@ section: nothing to run.
    tokens and personal data cut out, then `qoop close <n>` and `rm -rf <s>`.
 5. Pass: the close note names what ran and what came back. Fail: a card, `now` (main is
    broken), with the failing line of the output (a card value is one line), trimmed the same way;
-   his answer may be a new worker. A
+   their answer may be a new worker. A
    remote worker: a card, as for its other checks.

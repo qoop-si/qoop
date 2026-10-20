@@ -56,7 +56,7 @@
 #
 # The owner's switch, the file `watch` in qass's folder (`qoop qass watch on|off`):
 # - `off`: this says nothing more and ends with the `watch-off: ...` line, at start or within a
-#   tick of the switch; qass does not start it again, so nothing wakes qass until he writes.
+#   tick of the switch; qass does not start it again, so nothing wakes qass until they write.
 # - `resume <stamp>` (on again): a stamp not in `watch-seen` means no watcher started since. This
 #   writes it there, drops the held lines and marks every machine (`base`, `base-<remote>`): the
 #   first snapshot each one sends is then the base, said nothing of, whichever run of this gets

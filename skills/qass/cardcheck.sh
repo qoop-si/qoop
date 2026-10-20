@@ -1,6 +1,6 @@
 #!/bin/sh
 # qass's Stop hook. First, a question for the owner is a card. When this turn's last message
-# asks him something (a line ending in "?", or answer words such as `dub A` that name no open
+# asks them something (a line ending in "?", or answer words such as `api A` that name no open
 # card, nor one ended in the last ten minutes) and the turn wrote no card (`escalate.sh new
 # ... -`, or `escalate.sh show`), the stop is blocked once with one sentence; `stop_hook_active` lets the next stop through, so it never
 # loops. Second, when that lets the stop through: the skill installed beside this script is not
@@ -92,7 +92,7 @@ tick = chr(96)
 asked = [l for l in last.splitlines() if l.strip().strip("*_#> -" + tick).strip().endswith("?")]
 handles = set(re.findall(tick + r"([a-z0-9][a-z0-9-]*) [A-Da-d]" + tick, last))
 if handles or asked:
-    # The cards he can see, and those ended in the last ten minutes (an answer just passed on
+    # The cards they can see, and those ended in the last ten minutes (an answer just passed on
     # names its card). No listing: answer words cannot be told from a pointer, so only a line
     # that asks still needs a card.
     try:
@@ -115,7 +115,7 @@ if not asked and not handles:
 print(json.dumps({"decision": "block", "reason":
     "You asked the owner something in chat and wrote no card this turn. Write it as a card "
     "(escalate.sh new ... - <<'END'), then point to it in one line by its handle. If it was "
-    "not a question for him, end your message without one."}))
+    "not a question for them, end your message without one."}))
 PY
 )
 printf '%s' "$input" | python3 -c "$prog" "$(dirname "$0")" 2>/dev/null || true

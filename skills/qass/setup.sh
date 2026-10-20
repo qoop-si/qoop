@@ -6,15 +6,15 @@
 #   setup.sh seen                  the checklist was shown once (a first start then never repeats it)
 #   setup.sh projects [folder]     git main checkouts, newest commit first
 #   setup.sh servers               the ssh hosts of ~/.ssh/config and what each is in qoop
-#   setup.sh pick <path>           he picked this project (an absolute git main checkout, not $HOME)
-#   setup.sh drop <path>           he took it back
-#   setup.sh skip <n> | unskip <n> he skips item 2 to 6, or takes that back: `[-]`, never `[x]`
-#   setup.sh skip-host <host>      he does not want this host in qoop
+#   setup.sh pick <path>           they picked this project (an absolute git main checkout, not $HOME)
+#   setup.sh drop <path>           they took it back
+#   setup.sh skip <n> | unskip <n> they skip item 2 to 6, or take that back: `[-]`, never `[x]`
+#   setup.sh skip-host <host>      they do not want this host in qoop
 #   setup.sh ssh-space <host>      a space <host> with one tab running `ssh <host>`, recorded
 #   setup.sh write <file>          a new `.qoop/` file of a picked project from standard input, kept
-#                                  with its hash; refused when the file is his (there before setup)
-#   setup.sh undo [project]        remove what setup wrote and he did not change or commit since
-#   setup.sh job <KEY>             the first small job qass started for him, by its board key
+#                                  with its hash; refused when the file is theirs (there before setup)
+#   setup.sh undo [project]        remove what setup wrote and they did not change or commit since
+#   setup.sh job <KEY>             the first small job qass started for them, by its board key
 #
 # Writes only @QASS_DATA@/setup and the files `write` makes; only `undo` deletes, only those (and
 # opens a tab in ssh-space). Never runs ssh or the network itself (`qoop task rules` reads gh's
@@ -244,8 +244,8 @@ owner_of() {
     has "pick $r" && echo "$r"
 }
 
-# Take back what setup wrote: a file still as written and untracked goes; one he changed or
-# committed is his, kept and named. Then the picks left with nothing, and how to drop a space.
+# Take back what setup wrote: a file still as written and untracked goes; one they changed or
+# committed is theirs, kept and named. Then the picks left with nothing, and how to drop a space.
 undo() {
     only="${1:-}"
     [ -z "$only" ] || only="$(cd "$only" 2>/dev/null && pwd -P || echo "$only")"
@@ -435,7 +435,7 @@ write)
         h="$(PREFIX="wrote $f " awk 'index($0, ENVIRON["PREFIX"]) == 1 { print $NF }' "$state" 2>/dev/null)"
         [ -n "$h" ] && [ "$h" = "$(sha "$f")" ] &&
             tracked="$(git -C "$r" ls-files -- "$f" 2>/dev/null)" && [ -z "$tracked" ] || {
-            echo "setup: $f was there before, or he changed or added it: it is his; edit it in place" >&2
+            echo "setup: $f was there before, or they changed or added it: it is theirs; edit it in place" >&2
             exit 2
         }
     fi

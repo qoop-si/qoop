@@ -8,7 +8,7 @@ the files below, not here.
   `@QASS_DATA@/.agents/skills/qass/SKILL.md` (Codex, Gemini, opencode), the same files. Its
   scripts (`watch.sh`, `escalate.sh`, `spawn.sh`, `on.sh`) sit beside it: run them from there,
   never from an older path you remember, and quote the path: on a Mac it holds a space.
-- The owner's lessons: `@QASS_CONFIG@/lessons.md`. Read it at every start: it is how he wants
+- The owner's lessons: `@QASS_CONFIG@/lessons.md`. Read it at every start: it is how they want
   things done.
 - Memory: `@QASS_DATA@/memory.md`, your own notes that should outlive this conversation (what
   you learned about the fleet, the repos, the machines). Read it at every start; keep it short

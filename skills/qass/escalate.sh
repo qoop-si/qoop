@@ -20,7 +20,7 @@
 #                            nothing. The trailing `-` is what asks for the block: without it
 #                            standard input is never read.
 #   escalate.sh done E<n> [note]  the card is handled (answered in the chat, by you, or gone)
-#   escalate.sh show E<n>    the card qass is showing him now: his next message answers it
+#   escalate.sh show E<n>    the card qass is showing them now: their next message answers it
 #   escalate.sh next E|P     the number for a proposal (P), or a card (E) in the old form: never
 #                            one used before, even when it is long answered and gone from goals.md
 #
@@ -73,7 +73,7 @@ urgency="${3:-now}"
 handle="${4:-$id}"
 mkdir -p "$dir"
 # A card for later is only written down, in goals.md. Only now rings.
-# The options as given, so qass shows him exactly what a letter will send.
+# The options as given, so qass shows them exactly what a letter will send.
 shift 4 2>/dev/null || true
 if [ "$id" = new ]; then
     [ "${1:-}" = - ] && [ $# -eq 1 ] || {

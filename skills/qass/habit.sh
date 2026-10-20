@@ -1,12 +1,12 @@
 #!/bin/sh
-# The owner's habits: a kind of question he answered with qass's own pick three times in a row,
-# which qass then settles itself and tells him in a two-line note. A kind is `<verb>:<repo>`, and
+# The owner's habits: a kind of question they answered with qass's own pick three times in a row,
+# which qass then settles itself and tells them in a two-line note. A kind is `<verb>:<repo>`, and
 # only reversible work inside a repo can be one: the verbs below. Everything else (commit, push,
 # merge, release, deploy, delete, anything external, production, billing, secrets, a design or a
 # name) is refused here, so it always stays a card whatever qass counts. qass never edits this
 # file by hand; the owner reads it with `habits` and turns one off with `habit off <kind>`.
 #
-#   habit.sh answered <verb:repo> same|other   count his answer (same as qass's pick, or not)
+#   habit.sh answered <verb:repo> same|other   count their answer (same as qass's pick, or not)
 #   habit.sh may <verb:repo>                   exit 0 when qass may settle it itself
 #   habit.sh ls                                one line per kind: count, last answer, off
 #   habit.sh off <verb:repo> | on <verb:repo> | clear

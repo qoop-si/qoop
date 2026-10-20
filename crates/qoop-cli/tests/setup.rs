@@ -610,7 +610,7 @@ fn undo_takes_back_only_what_setup_wrote_and_he_left_alone() {
     std::fs::create_dir_all(tool.join(".qoop")).expect("dir");
     std::fs::write(tool.join(".qoop/workflow.md"), "his\n").expect("his");
     let (ok, _, err) = home.setup_in(&["write", s(&tool.join(".qoop/workflow.md"))], "mine\n");
-    assert!(!ok && err.contains("it is his"), "{err}");
+    assert!(!ok && err.contains("it is theirs"), "{err}");
     assert_eq!(
         std::fs::read_to_string(tool.join(".qoop/workflow.md")).expect("read"),
         "his\n"
@@ -689,7 +689,7 @@ fn undo_takes_back_only_what_setup_wrote_and_he_left_alone() {
         ],
     );
     let (ok, _, err) = home.setup_in(&["write", s(&tool.join(".qoop/project.md"))], "facts\n");
-    assert!(!ok && err.contains("it is his"), "{err}");
+    assert!(!ok && err.contains("it is theirs"), "{err}");
     // A repo whose git cannot answer keeps its files.
     let notes = home.repo("notes", &[]);
     assert!(home.setup(&["pick", s(&notes)]).0);

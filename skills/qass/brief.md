@@ -4,13 +4,13 @@ Read this before `qoop task add`, `spawn.sh` and the first `qoop prompt` to the 
 
 ## Before you create
 
-Check his request says what, where (repo or space), when it is done, its fences (what not to
+Check their request says what, where (repo or space), when it is done, its fences (what not to
 touch) and how urgent. The tier is your pick (below), never a question. Missing one that changes
-the work: ask ONE card ("Cards" in SKILL.md; agent `-`, its handle a word of his request) with
+the work: ask ONE card ("Cards" in SKILL.md; agent `-`, its handle a word of their request) with
 every missing point at once, options with reasons and your pick. Never a second round, never what
 the repo, the lessons or the screen answers. Nothing missing: create, do not ask.
-After his answer: the item (a short title, a real description, his steps, a `done when` line),
-the worker started with the brief below, and one line to him with its key and space.
+After their answer: the item (a short title, a real description, their steps, a `done when` line),
+the worker started with the brief below, and one line to them with its key and space.
 
 ## Tier
 
@@ -21,10 +21,10 @@ Pick one for the work, and say which and why in one clause of the brief:
 - `low`: mechanical, bulk or read-heavy work: scans, listings, simple edits, summaries.
 
 Pass it as `spawn.sh ... --tier <tier>`: a claude worker on that tier's model from `[qass.models]`
-in config.toml (the newest Opus, Sonnet and Haiku by default; never a Fable model). He changes it
-with one word (`best`, `mid`, `low`): spawn again, or tell him it takes a new worker. spawn.sh
+in config.toml (the newest Opus, Sonnet and Haiku by default; never a Fable model). They change it
+with one word (`best`, `mid`, `low`): spawn again, or tell them it takes a new worker. spawn.sh
 says on stderr which model it used (the worker's banner, `qoop read`, shows the exact id): tell
-him once. An opencode worker keeps its own model. A woken worker comes back on claude's default
+them once. An opencode worker keeps its own model. A woken worker comes back on claude's default
 (a restore types a bare `claude --resume`): the tier holds only from its start.
 
 ## The brief
@@ -35,7 +35,7 @@ One `qoop prompt` line, in this order:
    steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the
    fence allows. Each `qoop task`
    command alone, one per call, never chained (a chain asks permission)."
-2. The goal in the owner's words and when it is done (already cleared up with him: no second round).
+2. The goal in the owner's words and when it is done (already cleared up with them: no second round).
 3. `tier: <tier>, because <why>`.
 4. Sub-agents (claude workers only), a few clauses: where the work fans out and on which tier
    (its subagent `model`: best `opus`, mid `sonnet`, low `haiku`), and that it uses them there and
@@ -46,7 +46,7 @@ One `qoop prompt` line, in this order:
    simulator tests headless and read the screenshots yourself; open a window only when the owner
    asks to see something, and close what you open."
 
-A step the fence forbids comes back to you. A file his message names (a screenshot) you may Read,
+A step the fence forbids comes back to you. A file their message names (a screenshot) you may Read,
 and put its path in the brief.
 
 ## Example
