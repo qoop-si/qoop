@@ -178,7 +178,7 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
             Role::Done => '*',
             Role::Sleeping => 'z',
             Role::Background => 'o',
-            Role::BrandCalm => 'p',
+            Role::Saved => 'p',
             _ => '.',
         };
         return format!("{plain} ");
@@ -203,7 +203,7 @@ fn cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Done => (0..3).flat_map(|y| (0..3).map(move |x| (x, y))).collect(),
         Role::Sleeping => vec![(0, 1), (1, 1), (2, 1)],
         // Parked: a bookmark, its top across and its sides down to the notch.
-        Role::BrandCalm => vec![(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)],
+        Role::Saved => vec![(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)],
         // A braille cell takes one ink, so the centre cannot stay grey beside a sky dot: the
         // dot goes round alone, which no other state is (the centre is never missing from
         // working's frames, and idle's dot is the centre).
@@ -247,7 +247,7 @@ fn one_cell_mark(role: crate::theme::Role, working: bool, tick: u64) -> String {
         Role::Done => TL | TR | BL | BR,
         Role::Sleeping => BL | BR,
         // Parked: the top bar, sleep's mirror, in the brand's quiet ink.
-        Role::BrandCalm => TL | TR,
+        Role::Saved => TL | TR,
         Role::Background if working => ORBIT[(tick / 2 % 4) as usize],
         Role::Background => ORBIT[0],
         _ => BL,
@@ -429,7 +429,7 @@ impl InboxTab {
             InboxTab::Wants => "wants",
             InboxTab::Failed => "failed",
             InboxTab::Done => "done",
-            InboxTab::Parked => "parked",
+            InboxTab::Parked => "saved",
             InboxTab::Working => "working",
             InboxTab::Asleep => "asleep",
         }
@@ -443,7 +443,7 @@ impl InboxTab {
             InboxTab::Wants => Role::Blocked,
             InboxTab::Failed => Role::Failed,
             InboxTab::Done => crate::theme::of("done"),
-            InboxTab::Parked => Role::BrandCalm,
+            InboxTab::Parked => Role::Saved,
             InboxTab::Working => Role::Working,
             InboxTab::Asleep => Role::Sleeping,
         }
@@ -954,7 +954,7 @@ fn parts(
     // The foot, with the pet in it, is taken first, so the list above is laid out in the
     // rows that are really its own and a scroll never keeps the focused row under the pet.
     let pet = pet_shown(c, height, avatar.is_some());
-    let count = Some(inbox_items(c, InboxTab::All).len());
+    let count = Some(waiting_count(c));
     // A column shorter than the foot keeps the foot's last rows: the menu row is the one
     // that must survive, and it is always the column's last row.
     let mut feet = foot_rows(
@@ -1174,7 +1174,7 @@ fn wait_role(agent: &AgentRow) -> crate::theme::Role {
 /// scripts wait on.
 fn role_of(agent: &AgentRow) -> crate::theme::Role {
     if is_parked(agent) {
-        crate::theme::Role::BrandCalm
+        crate::theme::Role::Saved
     } else if agent.state == "idle" && agent.background > 0 {
         crate::theme::Role::Background
     } else {
@@ -1215,7 +1215,7 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
             0
         },
     };
-    match tab {
+    let mut items: Vec<Item> = match tab {
         InboxTab::Working => c
             .agents
             .iter()
@@ -1257,14 +1257,25 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
             })
             .map(|a| agent_item(a, wait_role(a)))
             .collect(),
+    };
+    // All ends with what was saved for later, under everything that waits on the person: one
+    // list to look down, and each row opens its agent like any other (the owner's ask,
+    // 2026-10-20).
+    if tab == InboxTab::All {
+        items.extend(inbox_items(c, InboxTab::Parked));
     }
+    items
+}
+
+/// How many on the all list wait on the person: the saved ones at its bottom do not.
+fn waiting_count(c: &Column) -> usize {
+    waiting(c.agents, c.focused_terminal, c.seen, c.unseen).len()
 }
 
 /// A tab's mark in the tab row: the state mark, standing still, without its gap.
-fn tab_mark(tab: InboxTab, icons: bool) -> String {
-    if tab == InboxTab::Parked && icons {
-        return crate::icons::PARKED.to_string();
-    }
+fn tab_mark(tab: InboxTab, _icons: bool) -> String {
+    // The saved tab too: the same dots its agents wear, in its gold, never the bookmark
+    // (the owner's word, 2026-10-20).
     cell_mark(tab.role(), false, 0).trim_end().to_string()
 }
 
@@ -1337,7 +1348,10 @@ fn tab_cells(c: &Column, counts: &[usize; 7]) -> Vec<(Option<InboxTab>, usize, S
 
 /// How many each of the inbox's lists holds, in [`InboxTab::ORDER`].
 fn tab_counts(c: &Column) -> [usize; 7] {
-    InboxTab::ORDER.map(|tab| inbox_items(c, tab).len())
+    InboxTab::ORDER.map(|tab| match tab {
+        InboxTab::All => waiting_count(c),
+        _ => inbox_items(c, tab).len(),
+    })
 }
 
 /// The inbox's tab row, or the one row it folds to.
@@ -1388,7 +1402,7 @@ fn item_row(c: &Column, item: &Item) -> Line {
         .map(|s| s.name.clone())
         .unwrap_or_default();
     // A parked agent's row wears the bookmark where icons are drawn, as its tab does.
-    let mark = if item.role == crate::theme::Role::BrandCalm && c.icons {
+    let mark = if item.role == crate::theme::Role::Saved && c.icons {
         format!("{} ", crate::icons::PARKED)
     } else {
         cell_mark(item.role, false, 0)
@@ -1528,7 +1542,8 @@ fn inbox_rows(c: &Column, height: usize) -> Vec<Row> {
     }
     let items = inbox_items(c, c.inbox.tab);
     let at = c.inbox.scroll.min(items.len().saturating_sub(rows));
-    if items.is_empty() {
+    let calm = c.inbox.tab == InboxTab::All && waiting_count(c) == 0;
+    if items.is_empty() || calm {
         // Nothing on this list. On all, nothing waits on the person at all, which is worth
         // saying in words; any other list just has nobody on it.
         let indent = 1;
@@ -1748,7 +1763,7 @@ const NAV_KEYS: [(&str, &str, u8); 8] = [
     ("q", "back", 0),
     ("s", "sleep", 3),
     ("/", "find", 4),
-    ("p", "park", 5),
+    ("p", "save", 5),
     ("x", "close", 6),
     ("n", "new", 7),
 ];
@@ -8457,22 +8472,47 @@ mod tests {
             |tab| -> Vec<u32> { inbox_items(&c, tab).iter().map(|i| i.terminal).collect() };
         assert!(!is_new(&agents[2], 99, &seen, &unseen));
         assert_eq!(listed(InboxTab::Done), Vec::<u32>::new());
-        assert_eq!(listed(InboxTab::All), vec![1, 2]);
+        // All: who waits on the person, then what was saved for later, at its bottom.
+        assert_eq!(listed(InboxTab::All), vec![1, 2, 3]);
+        assert_eq!(
+            tab_counts(&c)[InboxTab::All as usize],
+            2,
+            "the saved one waits on nobody"
+        );
         assert_eq!(listed(InboxTab::Wants), vec![1]);
         assert_eq!(listed(InboxTab::Parked), vec![3]);
-        assert_eq!(dot_of(&c, &agents[2]).0, crate::theme::Role::BrandCalm);
+        assert_eq!(dot_of(&c, &agents[2]).0, crate::theme::Role::Saved);
         assert_eq!(dot_of(&c, &agents[0]).0, crate::theme::Role::Blocked);
         assert_eq!(tab_counts(&c)[InboxTab::Parked as usize], 1);
-        // Its tab wears the bookmark where icons are drawn, its own ink either way.
+        // Its tab wears the dots its agents wear, never the bookmark, in its own ink.
         assert_eq!(
             tab_mark(InboxTab::Parked, true),
-            crate::icons::PARKED.to_string()
+            tab_mark(InboxTab::Parked, false)
         );
         assert_eq!(
             tab_mark(InboxTab::Parked, false),
-            cell_mark(Role::BrandCalm, false, 0).trim_end()
+            cell_mark(Role::Saved, false, 0).trim_end()
         );
-        assert_eq!(InboxTab::Parked.role(), Role::BrandCalm);
+        assert_eq!(InboxTab::Parked.role(), Role::Saved);
+        // Nobody waiting: the inbox says so, and the saved one stands under it, its click
+        // opening its agent.
+        let calm: Vec<AgentRow> = vec![agents[2].clone()];
+        let quiet = opened(column(
+            &spaces,
+            &calm,
+            1,
+            99,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        ));
+        let rows = inbox_rows(&quiet, 4);
+        assert!(rows[1].0.text.contains(NOTHING), "{:?}", rows[1].0.text);
+        assert_eq!(rows[2].1, Some(Hit::Next(Some(calm[0].terminal))));
     }
 
     /// The inbox lists everyone waiting under its tab row, the chosen tab filled, and its

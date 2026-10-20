@@ -366,7 +366,7 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("c", Some("new"), 1),
             ("n/p", Some("next/prev"), 1),
             ("x", Some("close"), 2),
-            ("P", Some("park"), 5),
+            ("P", Some("save"), 5),
             ("T", Some("fold pane"), 2),
             ("i", Some("questions"), 3),
             ("r", Some("rename"), 4),
@@ -800,7 +800,11 @@ pub(crate) fn park_state(rows: &[AgentRow], focused: u32) -> Option<bool> {
 /// `[ ⚑ parked ]` in the brand's ember once parked; the bookmark is left out where icons are
 /// not drawn.
 fn park_label(parked: bool) -> String {
-    let word = if parked { "parked" } else { "park" };
+    let word = if parked {
+        "saved for later"
+    } else {
+        "save for later"
+    };
     match (crate::icons::on(), parked) {
         (false, _) => format!("[ {word} ]"),
         (true, false) => format!("[ {} {word} ]", crate::icons::PARK),
@@ -1213,7 +1217,7 @@ pub fn paint(frame: &Frame) -> String {
         && let Some(row) = edges.get_mut(*y)
     {
         let ink = if *parked {
-            EdgeInk::Lit
+            EdgeInk::Saved
         } else {
             EdgeInk::Quiet
         };
@@ -1565,7 +1569,7 @@ pub fn paint(frame: &Frame) -> String {
             match &park {
                 Some((parked, ParkSpot::Notice(_, label))) => {
                     out.push_str(&theme::status_in(if *parked {
-                        theme::Role::Brand
+                        theme::Role::Saved
                     } else {
                         theme::Role::Faint
                     }));
@@ -1815,7 +1819,7 @@ fn here(frame: &Frame) -> String {
                 // out, or the blank pane reads as a hang.
                 crate::keys::named(", sleeping  ctrl-a x dismiss")
             } else if sidebar::is_parked(row) {
-                crate::keys::named(", parked  ctrl-a P unpark")
+                crate::keys::named(", saved for later  ctrl-a P unsave")
             } else {
                 format!(", {}", row.state)
             };
@@ -2689,7 +2693,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("1..9", "go to tab"),
             ("c", "new tab"),
             ("r", "rename tab"),
-            ("x/P", "close, park tab"),
+            ("x/P", "close, save"),
             ("i/T", "questions, fold"),
         ],
     ),
@@ -3460,6 +3464,8 @@ enum EdgeInk {
     TitleLit,
     /// The park label before it is used: a quiet ink.
     Quiet,
+    /// The label once saved: the saved gold.
+    Saved,
 }
 
 /// The marks around split panes, as a grid over the pane area.
@@ -3618,6 +3624,7 @@ fn edge_style(ink: EdgeInk) -> String {
     match ink {
         EdgeInk::Title => theme::fg(theme::Role::Detail),
         EdgeInk::Quiet => theme::fg(theme::Role::Faint),
+        EdgeInk::Saved => theme::fg(theme::Role::Saved),
         EdgeInk::Lit if !mono => theme::fg(theme::Role::Brand),
         EdgeInk::Lit | EdgeInk::TitleLit => format!("{}\x1b[1m", theme::fg(theme::Role::Text)),
     }

@@ -5479,16 +5479,16 @@ fn park(state: &mut State, terminal: u32, request: &mut u64) {
         .iter()
         .find(|r| r.terminal == terminal && r.agent)
     else {
-        state.message = Some("only an agent can be parked".to_string());
+        state.message = Some("only an agent can be saved for later".to_string());
         return;
     };
     let on = !row.parked;
     *request += 1;
     state.message = Some(
         if on {
-            "parked: it waits under the inbox's parked tab"
+            "saved for later: at the bottom of the inbox"
         } else {
-            "unparked"
+            "no longer saved"
         }
         .to_string(),
     );
@@ -20726,7 +20726,7 @@ mod tests {
         assert!(state.modes.outbox.is_empty(), "a shell is not parked");
         assert_eq!(
             state.message.as_deref(),
-            Some("only an agent can be parked")
+            Some("only an agent can be saved for later")
         );
     }
 
@@ -20753,7 +20753,7 @@ mod tests {
             (pane.x + 2, pane.y + pane.rows),
             "after the bottom left corner"
         );
-        assert!(label.contains("park"));
+        assert!(label.contains("save for later"), "{label:?}");
         let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
         assert!(
@@ -20772,7 +20772,7 @@ mod tests {
         else {
             panic!("still in the corner once parked");
         };
-        assert!(label.contains("parked"), "{label:?}");
+        assert!(label.contains("saved for later"), "{label:?}");
         s.rows[0].agent = false;
         assert_eq!(
             screen::park_state(&s.rows, 3),
@@ -20797,7 +20797,7 @@ mod tests {
         let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
         let wide = crate::width::width(&label) as u16;
         assert!(
-            label.starts_with("[ ") && label.ends_with(" park ]"),
+            label.starts_with("[ ") && label.ends_with(" save for later ]"),
             "{label:?}"
         );
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(1))));

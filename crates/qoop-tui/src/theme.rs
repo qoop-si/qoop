@@ -34,6 +34,9 @@ pub enum Role {
     /// The brand one step quieter: a keep awake cup that is full because its whole space is
     /// kept awake rather than this pane.
     BrandCalm,
+    /// An agent saved for later: gold, apart from every state's ink and from the brand's
+    /// ember (the owner's pick, 2026-10-20).
+    Saved,
     /// An agent's state.
     Working,
     Blocked,
@@ -208,6 +211,7 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Rule => 237,
         Role::Brand => 202,
         Role::BrandCalm => 130,
+        Role::Saved => 220,
         Role::Working => 39,
         Role::Blocked => 208,
         Role::Done => 35,
@@ -545,6 +549,7 @@ const fn light_ink(role: Role) -> u8 {
         Role::Rule => 250,
         Role::Brand => 202,
         Role::BrandCalm => 173,
+        Role::Saved => 136,
         Role::Working => 32,
         Role::Blocked => 130,
         Role::Done => 28,
