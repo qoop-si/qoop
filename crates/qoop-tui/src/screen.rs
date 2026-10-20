@@ -2565,6 +2565,22 @@ fn machine_line(
     )
 }
 
+/// How many menu rows show in a window `lines` tall: the two borders, the hint row and a
+/// line above and below the box take five, so a long list scrolls rather than the box
+/// running off the screen or not drawing at all.
+pub(crate) fn menu_shown(lines: usize, rows: usize) -> usize {
+    rows.min(lines.saturating_sub(5)).max(1)
+}
+
+/// The first of `rows` on show when `shown` fit and `selected` is picked: the list scrolls
+/// as the pick moves past its last row, so the pick is always in view.
+pub(crate) fn menu_first(rows: usize, shown: usize, selected: usize) -> usize {
+    selected
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(rows.saturating_sub(shown))
+}
+
 /// Where the centred menu box sits: left, top, width and height in cells.
 ///
 /// Zero based, like the painter counts. The height covers both borders (the title sits
@@ -2591,7 +2607,7 @@ pub(crate) fn menu_rect(
         .max(width::width(title.trim()) + 4)
         .max(footer_width(MENU_HINT));
     let w = inner + 2;
-    let height = rows.len() + 3;
+    let height = menu_shown(lines, rows.len()) + 3;
     if cols < w + 2 || lines < height + 2 {
         return None;
     }
@@ -2600,14 +2616,15 @@ pub(crate) fn menu_rect(
     Some((left, top, w, height))
 }
 
-/// Which menu row a one based screen position lands on, if it lands on one.
+/// Which menu row a one based screen position lands on, if it lands on one, with
+/// `selected` picked: the rows on show are the ones the painter drew for that pick.
 pub(crate) fn menu_row_at(
     cols: u16,
     lines: u16,
     rows: &[(String, String)],
     title: &str,
-    row: u16,
-    col: u16,
+    selected: usize,
+    (row, col): (u16, u16),
 ) -> Option<usize> {
     let (left, top, w, height) = menu_rect(cols, lines, rows, title)?;
     let r = (row as usize).checked_sub(1)?;
@@ -2615,8 +2632,10 @@ pub(crate) fn menu_row_at(
     if c < left || c >= left + w || r < top || r >= top + height {
         return None;
     }
-    let item = r.checked_sub(top + BOX_FIRST_ROW)?;
-    (item < rows.len()).then_some(item)
+    let shown = height - 3;
+    let line = r.checked_sub(top + BOX_FIRST_ROW)?;
+    let item = menu_first(rows.len(), shown, selected) + line;
+    (line < shown && item < rows.len()).then_some(item)
 }
 
 /// The menu's keys, said once for the box and for the width it needs.
@@ -2632,13 +2651,16 @@ const MENU_HINT: &[(&str, &str)] = &[("j k", "move"), ("enter", "choose"), ("esc
 fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: &mut String) {
     let rows = crate::run::menu_rows(kind);
     let title = crate::run::menu_title(kind);
-    let Some((left, top, w, _)) = menu_rect(frame.cols, frame.lines, &rows, &title) else {
+    let Some((left, top, w, height)) = menu_rect(frame.cols, frame.lines, &rows, &title) else {
         return;
     };
     let inner = w.saturating_sub(2);
+    let shown = height - 3;
     let mut body: Vec<String> = rows
         .iter()
         .enumerate()
+        .skip(menu_first(rows.len(), shown, selected))
+        .take(shown)
         .map(|(i, (name, keypart))| {
             let ink = if i == selected {
                 theme::selected()
@@ -5099,6 +5121,39 @@ mod tests {
         assert_eq!(chips_width(&chips), 31);
     }
 
+    /// A list longer than the window scrolls with the pick instead of running off the screen or
+    /// not drawing at all, and a click lands on the row drawn where it lands.
+    #[test]
+    fn a_long_menu_scrolls_with_the_pick_and_a_click_takes_what_is_drawn() {
+        let rows: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("row {i}"), String::new()))
+            .collect();
+        let Some((left, top, _, height)) = menu_rect(80, 24, &rows, " list") else {
+            panic!("a long list still draws");
+        };
+        let shown = height - 3;
+        assert_eq!(shown, 19);
+        assert!(top + height <= 24);
+        assert_eq!(menu_first(40, shown, 0), 0);
+        assert_eq!(
+            menu_first(40, shown, 18),
+            0,
+            "no scroll while the pick is in view"
+        );
+        assert_eq!(menu_first(40, shown, 30), 30 + 1 - shown);
+        assert_eq!(menu_first(40, shown, 39), 40 - shown);
+        let first_line = (top + BOX_FIRST_ROW + 1) as u16;
+        let col = (left + 3 + 1) as u16;
+        assert_eq!(
+            menu_row_at(80, 24, &rows, " list", 30, (first_line, col)),
+            Some(30 + 1 - shown)
+        );
+        assert_eq!(
+            menu_row_at(80, 24, &rows, " list", 0, (first_line, col)),
+            Some(0)
+        );
+    }
+
     #[test]
     fn a_menu_click_address_matches_the_painted_rows() {
         // Row 0 sits right under the top edge, which carries the title.
@@ -5109,12 +5164,12 @@ mod tests {
         let row = (top + BOX_FIRST_ROW + 4 + 1) as u16;
         let col = (left + 3 + 1) as u16;
         assert_eq!(
-            menu_row_at(80, 24, &rows, " menu", row, col),
+            menu_row_at(80, 24, &rows, " menu", 0, (row, col)),
             Some(4),
             "close tab row"
         );
         assert_eq!(
-            menu_row_at(80, 24, &rows, " menu", 1, 1),
+            menu_row_at(80, 24, &rows, " menu", 0, (1, 1)),
             None,
             "outside reads as a row"
         );

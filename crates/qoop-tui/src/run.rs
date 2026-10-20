@@ -3873,8 +3873,9 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
 const MENU_COMMAND: usize = 30;
 /// The most columns an earlier conversation's title takes in the agents list.
 const MENU_TITLE: usize = 44;
-/// Earlier conversations the agents list offers at most.
-const EARLIER: usize = 5;
+/// Earlier conversations the agents list offers at most; a list longer than the window
+/// scrolls with the pick.
+const EARLIER: usize = 50;
 
 /// The directories `space`'s tabs are in, each once: where its earlier conversations were.
 fn space_dirs(state: &State, space: i64) -> Vec<String> {
@@ -3901,14 +3902,49 @@ fn ask_earlier(state: &mut State, space: i64) {
         dirs,
         from_ms: None,
         to_ms: None,
-        // Room for the ones already open in the space, which are left out.
-        limit: (EARLIER * 4) as u32,
+        // Room for the ones already open, which are left out.
+        limit: (EARLIER * 2) as u32,
     });
 }
 
-/// The agents list asks again for the earlier conversations the daemon was still reading, while
-/// it is open: a list put away (esc, a click elsewhere) keeps its kind but asks for nothing.
+/// The id the palette asks for every earlier conversation by.
+const PALETTE_EARLIER: &str = "earlier-palette";
+/// Earlier conversations the palette finds among at most.
+const PALETTE_MOST: usize = 200;
+
+/// Asks this computer's daemon for all its earlier conversations, for the palette to find.
+fn ask_palette_earlier(state: &mut State) {
+    state.modes.outbox.push(ControlRequest::AgentSessions {
+        id: PALETTE_EARLIER.to_string(),
+        dirs: Vec::new(),
+        from_ms: None,
+        to_ms: None,
+        limit: PALETTE_MOST as u32,
+    });
+}
+
+/// The palette asks for the earlier conversations once something is typed or the agent filter
+/// is on, the two times it lists them: an opening only to jump to a tab asks for nothing.
+fn palette_wants_earlier(state: &mut State) {
+    let Some(open) = state.palette.as_mut() else {
+        return;
+    };
+    let wants = !open.query.is_empty() || open.filter == palette::Filter::Agents;
+    if wants && !open.earlier_asked {
+        open.earlier_asked = true;
+        ask_palette_earlier(state);
+    }
+}
+
+/// The agents list and the palette ask again for the earlier conversations the daemon was still
+/// reading, while they are open: one put away (esc, a click elsewhere) asks for nothing.
 fn earlier_again(state: &mut State) {
+    if let Some(palette) = state.palette.as_mut()
+        && palette.earlier_again
+    {
+        palette.earlier_again = false;
+        ask_palette_earlier(state);
+    }
     if state.menu.is_none() {
         return;
     }
@@ -3923,14 +3959,44 @@ fn earlier_again(state: &mut State) {
     }
 }
 
-/// The agents list's earlier conversations from the daemon's answer: ones that can be carried on
-/// and are not open in a tab already, in any space, newest first.
+/// Earlier conversations that can be carried on and are not open in a tab already, in any
+/// space, newest first, `most` of them.
+fn resumable(
+    rows: &[AgentRow],
+    sessions: Vec<qoop_runtime::control::SessionRow>,
+    most: usize,
+) -> Vec<qoop_runtime::control::SessionRow> {
+    let open: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.agent_session.as_deref())
+        .collect();
+    sessions
+        .into_iter()
+        .filter(|row| row.resume.is_some() && !row.gone && !open.contains(&row.id.as_str()))
+        .take(most)
+        .collect()
+}
+
+/// The earlier conversations from the daemon's answer, for the agents list or the palette that
+/// asked. Still being read (the first time, or after a quiet while): asked again in a moment.
 fn take_earlier(
     state: &mut State,
     id: &str,
     reading: bool,
     sessions: Vec<qoop_runtime::control::SessionRow>,
 ) -> bool {
+    if id == PALETTE_EARLIER {
+        // Only for a palette that asked: one reopened since has not, yet.
+        let Some(palette) = state.palette.as_mut().filter(|p| p.earlier_asked) else {
+            return false;
+        };
+        palette.earlier_again = reading;
+        if reading {
+            return false;
+        }
+        palette.earlier = resumable(&state.rows, sessions, PALETTE_MOST);
+        return true;
+    }
     let MenuKind::Agents {
         space,
         earlier,
@@ -3943,22 +4009,69 @@ fn take_earlier(
     if id != format!("earlier-{space}") {
         return false;
     }
-    // Read the first time, or brought up to date after a quiet while: in a moment.
     *again = reading;
     if reading {
         return false;
     }
-    let open: Vec<&str> = state
+    *earlier = resumable(&state.rows, sessions, EARLIER);
+    true
+}
+
+/// The space a conversation that ran in `dir` belongs in, among this computer's spaces: one
+/// with a tab in that very directory, else in a directory inside it, else in the nearest one
+/// around it. The home directory and the root are around everything and say nothing.
+fn space_of_dir(state: &State, dir: Option<&str>) -> Option<i64> {
+    let dir = dir?.trim_end_matches('/');
+    if dir.is_empty() {
+        return None;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.trim_end_matches('/');
+    let within = |a: &str, b: &str| a.strip_prefix(b).is_some_and(|r| r.starts_with('/'));
+    state
         .rows
         .iter()
-        .filter_map(|row| row.agent_session.as_deref())
-        .collect();
-    *earlier = sessions
-        .into_iter()
-        .filter(|row| row.resume.is_some() && !row.gone && !open.contains(&row.id.as_str()))
-        .take(EARLIER)
-        .collect();
-    true
+        .filter(|row| !crate::mux::is_remote_workspace(row.workspace))
+        .filter_map(|row| {
+            let cwd = row.cwd.as_deref()?.trim_end_matches('/');
+            // How close: the same directory, then one inside it, then the deepest around it.
+            let rank = if cwd == dir {
+                (3, 0)
+            } else if within(cwd, dir) && dir != home {
+                (2, 0)
+            } else if within(dir, cwd) && !cwd.is_empty() && cwd != home {
+                (1, cwd.len())
+            } else {
+                return None;
+            };
+            Some((rank, row.workspace))
+        })
+        // Ties go to the lowest space, so the pick does not depend on the tabs' order.
+        .max_by_key(|(rank, space)| (*rank, std::cmp::Reverse(*space)))
+        .map(|(_, space)| space)
+}
+
+/// Carries on an earlier conversation from the palette: a new tab where it ran, in the space
+/// that works there or else the one on screen when it is on this computer (the conversation
+/// is in this computer's files), typing its agent's resume line.
+fn resume_from_palette(state: &mut State, request: &mut u64, cwd: Option<String>, line: &str) {
+    let here = state
+        .space
+        .filter(|space| !crate::mux::is_remote_workspace(*space));
+    let space = space_of_dir(state, cwd.as_deref()).or(here);
+    *request += 1;
+    let mut ask = start_agent_terminal(state, *request, line, space, None);
+    // No directory recorded: the space's own, as any new tab.
+    if let ControlRequest::CreateTerminal { cwd: at, .. } = &mut ask
+        && cwd.is_some()
+    {
+        *at = cwd;
+    }
+    let ask = match space {
+        Some(space) => follow_elsewhere(state, space, ask),
+        None => ask,
+    };
+    state.modes.outbox.push(ask);
 }
 
 /// Open what a `+` offers for `space`.
@@ -4254,7 +4367,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             {
                 *request += 1;
                 let mut ask = start_agent_terminal(state, *request, line, Some(space), None);
-                if let ControlRequest::CreateTerminal { cwd, .. } = &mut ask {
+                if let ControlRequest::CreateTerminal { cwd, .. } = &mut ask
+                    && row.cwd.is_some()
+                {
                     *cwd = row.cwd.clone();
                 }
                 return MenuSend::Control(follow_elsewhere(state, space, ask));
@@ -4436,7 +4551,13 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
 /// `Some(Some(row))` is a press on a row, `Some(None)` a press anywhere else,
 /// `None` no press in these bytes at all. Wheel, motion, releases and other
 /// buttons are not a choice, so they read as no press rather than as outside.
-fn menu_click(bytes: &[u8], cols: u16, lines: u16, kind: &MenuKind) -> Option<Option<usize>> {
+fn menu_click(
+    bytes: &[u8],
+    cols: u16,
+    lines: u16,
+    kind: &MenuKind,
+    selected: usize,
+) -> Option<Option<usize>> {
     let rows = menu_rows(kind);
     let title = menu_title(kind);
     let mut at = 0;
@@ -4447,7 +4568,12 @@ fn menu_click(bytes: &[u8], cols: u16, lines: u16, kind: &MenuKind) -> Option<Op
             crate::keys::Report::Whole(used, action) => {
                 if let Some(Action::Click { row, col, .. }) = action {
                     found = Some(crate::screen::menu_row_at(
-                        cols, lines, &rows, &title, row, col,
+                        cols,
+                        lines,
+                        &rows,
+                        &title,
+                        selected,
+                        (row, col),
                     ));
                 }
                 at = from + used;
@@ -8191,6 +8317,7 @@ where
                     if state.palette.is_some() {
                         match palette_key(&mut state, &bytes) {
                             PaletteOutcome::Updated | PaletteOutcome::Closed => {
+                                palette_wants_earlier(&mut state);
                                 dirty = true;
                             }
                             PaletteOutcome::Confirm(item) => {
@@ -8235,6 +8362,9 @@ where
                                     palette::Item::NewSpace => {
                                         state.prompt = Some(Prompt::new(Naming::Space, ""));
                                     }
+                                    palette::Item::Resume { cwd, line } => {
+                                        resume_from_palette(&mut state, &mut request, cwd, &line);
+                                    }
                                     palette::Item::CopyMode => enter_copy(&mut state),
                                     palette::Item::Resize => enter_resize(&mut state),
                                     palette::Item::Equalize => equalize(&mut state),
@@ -8249,7 +8379,7 @@ where
                         // A click chooses a row, or closes on the box around it. Checked
                         // before the keyboard owns the bytes, or the press reads as an
                         // escape and the menu shuts without choosing anything.
-                        if let Some(hit) = menu_click(&bytes, state.cols, state.lines, &state.menu_kind) {
+                        if let Some(hit) = menu_click(&bytes, state.cols, state.lines, &state.menu_kind, selected) {
                             match hit {
                                 Some(item) => {
                                     state.menu = None;
@@ -16604,6 +16734,141 @@ mod tests {
         assert!(s.prompt.is_none(), "no name is asked");
     }
 
+    /// The palette asks for every earlier conversation when it opens, takes the answer while it
+    /// is open, and carries one on in the space that works in its directory.
+    #[test]
+    fn the_palette_carries_an_earlier_conversation_on_in_its_own_space() {
+        use qoop_runtime::control::SessionRow;
+        let dir = std::env::temp_dir().display().to_string();
+        let mut s = state();
+        let row = s
+            .rows
+            .iter_mut()
+            .find(|r| r.terminal == 1)
+            .expect("space 1 row");
+        row.cwd = Some(dir.clone());
+        let space = row.workspace;
+        s.palette = Some(Palette::open());
+        s.palette.as_mut().unwrap().query = "f".into();
+        palette_wants_earlier(&mut s);
+        assert!(matches!(
+            s.modes.outbox.as_slice(),
+            [ControlRequest::AgentSessions { id, dirs, .. }] if id == PALETTE_EARLIER && dirs.is_empty()
+        ));
+        let mut request = 0;
+        let mut dirty = false;
+        let found = SessionRow {
+            key: "/k/a".into(),
+            agent: "claude".into(),
+            id: "a".into(),
+            cwd: Some(format!("{dir}/sub")),
+            title: Some("fix the login".into()),
+            started_at: None,
+            updated_at: Some(1),
+            tokens: 1,
+            prompts: 1,
+            resume: Some("claude --resume a".into()),
+            gone: false,
+        };
+        apply(
+            &mut s,
+            ControlResponse::AgentSessions {
+                id: PALETTE_EARLIER.into(),
+                reading: false,
+                sessions: vec![found.clone()],
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(dirty);
+        assert_eq!(s.palette.as_ref().map(|p| p.earlier.len()), Some(1));
+        s.modes.outbox.clear();
+        resume_from_palette(&mut s, &mut request, found.cwd.clone(), "claude --resume a");
+        match s.modes.outbox.as_slice() {
+            [
+                ControlRequest::CreateTerminal {
+                    id, workspace, cwd, ..
+                },
+            ] => {
+                assert_eq!(
+                    *workspace,
+                    Some(space),
+                    "the space that works around that directory"
+                );
+                assert_eq!(cwd.as_deref(), Some(format!("{dir}/sub").as_str()));
+                assert_eq!(
+                    s.pending_agents.get(id).map(|(c, _)| c.as_str()),
+                    Some("claude --resume a")
+                );
+            }
+            other => panic!("carrying on is one create, got {other:?}"),
+        }
+
+        // Opening asks for nothing; the first key asks once.
+        s.modes.outbox.clear();
+        s.palette = Some(Palette::open());
+        palette_wants_earlier(&mut s);
+        assert!(
+            s.modes.outbox.is_empty(),
+            "an opening only to jump asks nothing"
+        );
+        s.palette.as_mut().unwrap().query = "log".into();
+        palette_wants_earlier(&mut s);
+        s.palette.as_mut().unwrap().query = "login".into();
+        palette_wants_earlier(&mut s);
+        assert_eq!(s.modes.outbox.len(), 1, "one ask, not one per key");
+
+        // No directory recorded: the tab starts where the space on screen already is.
+        s.space = Some(space);
+        s.modes.outbox.clear();
+        resume_from_palette(&mut s, &mut request, None, "claude --resume a");
+        match s.modes.outbox.as_slice() {
+            [ControlRequest::CreateTerminal { cwd, .. }] => {
+                assert_eq!(cwd.as_deref(), Some(dir.as_str()))
+            }
+            other => panic!("one create, got {other:?}"),
+        }
+    }
+
+    /// A conversation goes to the space working in its very directory, else in one inside it,
+    /// else the nearest around it; a tab at home is around everything and says nothing.
+    #[test]
+    fn a_conversation_finds_the_space_working_closest_to_where_it_ran() {
+        let mut s = state();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let at = |terminal: u32, workspace: i64, cwd: &str| {
+            let mut row = agent(terminal, workspace, "claude", "idle");
+            row.cwd = Some(cwd.to_string());
+            row
+        };
+        s.rows = vec![at(1, 1, &home), at(2, 2, "/w"), at(3, 3, "/w/shop/web")];
+        assert_eq!(
+            space_of_dir(&s, Some("/w/shop")),
+            Some(3),
+            "a tab inside it beats one around it"
+        );
+        assert_eq!(
+            space_of_dir(&s, Some("/w/other")),
+            Some(2),
+            "the nearest around it"
+        );
+        assert_eq!(
+            space_of_dir(&s, Some("/w/shop/web/")),
+            Some(3),
+            "the same directory"
+        );
+        assert_eq!(
+            space_of_dir(&s, Some("/elsewhere")),
+            None,
+            "home says nothing"
+        );
+        assert_eq!(
+            space_of_dir(&s, Some("/wx")),
+            None,
+            "a longer name is not inside"
+        );
+    }
+
     /// A space's `+` starts its tab in that space and that space's directory, even when
     /// another space is on screen: `agent` lists the agents, `terminal` opens a shell, and
     /// the last agent row asks for any command, still for that space.
@@ -19163,12 +19428,15 @@ mod tests {
         let row = (top + crate::screen::BOX_FIRST_ROW + 2 + 1) as u16;
         let col = (left + w / 2 + 1) as u16;
         let press = format!("\x1b[<0;{col};{row}M").into_bytes();
-        assert_eq!(menu_click(&press, cols, lines, &main), Some(Some(2)));
+        assert_eq!(menu_click(&press, cols, lines, &main, 0), Some(Some(2)));
         // Far away from the centred box is outside.
-        assert_eq!(menu_click(b"\x1b[<0;1;1M", cols, lines, &main), Some(None));
+        assert_eq!(
+            menu_click(b"\x1b[<0;1;1M", cols, lines, &main, 0),
+            Some(None)
+        );
         // A release is not a choice.
         let release = format!("\x1b[<0;{col};{row}m").into_bytes();
-        assert_eq!(menu_click(&release, cols, lines, &main), None);
+        assert_eq!(menu_click(&release, cols, lines, &main, 0), None);
     }
     #[test]
     fn a_first_render_from_another_space_never_adopts() {

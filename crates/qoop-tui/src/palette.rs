@@ -29,6 +29,11 @@ pub enum Item {
     Equalize,
     /// Put the tab the keyboard is in to sleep, as `ctrl-a Z` does.
     Sleep,
+    /// Carry on an earlier conversation: a new tab in `cwd`, typing its agent's resume `line`.
+    Resume {
+        cwd: Option<String>,
+        line: String,
+    },
 }
 
 /// One filtered row: what it does, which section it is under, and what to draw.
@@ -87,7 +92,10 @@ impl Filter {
     /// Whether a row of this item stays under this filter. By what the row does, not by
     /// the header it sits under, so a new section can never slip past a filter.
     fn keeps(self, item: &Item) -> bool {
-        let agent = matches!(item, Item::NewAgent(_) | Item::NewAgentAsk);
+        let agent = matches!(
+            item,
+            Item::NewAgent(_) | Item::NewAgentAsk | Item::Resume { .. }
+        );
         match self {
             Filter::All => true,
             Filter::Tabs => matches!(item, Item::Terminal(_)),
@@ -108,6 +116,13 @@ pub struct Palette {
     /// The config's `[agents]`, read when the palette opened, so an edit shows the next
     /// time without the file being read per frame.
     pub agents: Vec<crate::config::Launcher>,
+    /// This computer's earlier conversations, as its daemon listed them after the palette
+    /// opened: found by a query, or listed under the agent filter.
+    pub earlier: Vec<qoop_runtime::control::SessionRow>,
+    /// The daemon was still reading them: asked again at the next tick.
+    pub earlier_again: bool,
+    /// They were asked for: at the first key or the agent filter, not at every opening.
+    pub earlier_asked: bool,
 }
 
 impl Palette {
@@ -322,11 +337,61 @@ impl Palette {
                     });
                 }
             }
+            // Earlier conversations last, so their arrival (the daemon answers a moment after
+            // the first key) never moves the row already picked. Found by their title, their
+            // agent or where they ran (`program`, matched but not drawn), never by their age.
+            let now = crate::sidebar::now_unix();
+            for row in &self.earlier {
+                let Some(line) = row.resume.clone() else {
+                    continue;
+                };
+                let place = row
+                    .cwd
+                    .as_deref()
+                    .map(|d| {
+                        let parts: Vec<&str> = d.rsplit('/').take(2).collect();
+                        parts.into_iter().rev().collect::<Vec<_>>().join("/")
+                    })
+                    .unwrap_or_default();
+                let age = row
+                    .updated_at
+                    .or(row.started_at)
+                    .map(|ms| crate::asks::age_short(now - ms / 1000))
+                    .unwrap_or_default();
+                out.push(Entry {
+                    item: Item::Resume {
+                        cwd: row.cwd.clone(),
+                        line,
+                    },
+                    section: "earlier",
+                    text: row.title.clone().unwrap_or_else(|| "untitled".to_string()),
+                    sub: [row.agent.as_str(), age.as_str(), place.as_str()]
+                        .into_iter()
+                        .filter(|w| !w.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    space: None,
+                    space_len: 0,
+                    state: None,
+                    // Its place by the last two parts, as drawn: the whole path would match
+                    // every conversation under a home directory on `us` or `coding`.
+                    program: Some(format!("{} {place}", row.agent)),
+                });
+            }
         }
         let query = self.query.to_lowercase();
         out.into_iter()
             .filter(|e| self.filter.keeps(&e.item))
             .filter(|e| {
+                // An earlier conversation by its title, agent or place only: its age and its
+                // header would match half the alphabet.
+                if matches!(e.item, Item::Resume { .. }) {
+                    return query.is_empty()
+                        || e.text.to_lowercase().contains(&query)
+                        || e.program
+                            .as_ref()
+                            .is_some_and(|p| p.to_lowercase().contains(&query));
+                }
                 query.is_empty()
                     || e.text.to_lowercase().contains(&query)
                     || e.sub.to_lowercase().contains(&query)
@@ -461,6 +526,87 @@ mod tests {
             pgid: None,
             discards: None,
         }
+    }
+
+    /// An earlier conversation is found by its title, its agent or where it ran, never on an
+    /// empty query (where the list stays short), and listed under the agent filter.
+    #[test]
+    fn a_query_finds_earlier_conversations_by_title_agent_or_place() {
+        let (rows, spaces) = sample();
+        let mut p = Palette::open();
+        p.earlier = vec![qoop_runtime::control::SessionRow {
+            key: "/k/a".into(),
+            agent: "codex".into(),
+            id: "a".into(),
+            cwd: Some("/w/shop".into()),
+            title: Some("fix the login".into()),
+            started_at: None,
+            updated_at: Some(1),
+            tokens: 1,
+            prompts: 1,
+            resume: Some("codex resume a".into()),
+            gone: false,
+        }];
+        let earlier = |p: &Palette| {
+            p.items(
+                &rows,
+                &spaces,
+                0,
+                &crate::sidebar::Seen::new(),
+                &crate::sidebar::Unseen::new(),
+            )
+            .into_iter()
+            .filter(|e| e.section == "earlier")
+            .collect::<Vec<_>>()
+        };
+        assert!(earlier(&p).is_empty(), "not on an empty query");
+        for query in ["login", "codex", "shop"] {
+            p.query = query.into();
+            let found = earlier(&p);
+            assert_eq!(found.len(), 1, "{query}");
+            assert_eq!(
+                found[0].item,
+                Item::Resume {
+                    cwd: Some("/w/shop".into()),
+                    line: "codex resume a".into()
+                }
+            );
+        }
+        p.query = "nothing like it".into();
+        assert!(earlier(&p).is_empty());
+        p.query = "5d".into();
+        assert!(earlier(&p).is_empty(), "never by its age");
+        // By the last two parts of where it ran, not the whole path above them.
+        p.earlier[0].cwd = Some("/Users/pat/coding/shop".into());
+        p.query = "users".into();
+        assert!(
+            earlier(&p).is_empty(),
+            "the path above the place does not match"
+        );
+        p.query = "coding/shop".into();
+        assert_eq!(earlier(&p).len(), 1);
+        p.earlier[0].cwd = Some("/w/shop".into());
+        p.query.clear();
+        p.filter = Filter::Agents;
+        assert_eq!(earlier(&p).len(), 1, "the agent filter lists them");
+        // Last, so their arrival never moves a row already picked, under one header.
+        let all = p.items(
+            &rows,
+            &spaces,
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        assert_eq!(all.last().map(|e| e.section), Some("earlier"));
+        let headers: Vec<&str> = all
+            .windows(2)
+            .filter(|w| w[0].section != w[1].section)
+            .map(|w| w[1].section)
+            .collect();
+        assert!(
+            !headers.contains(&"agents") || all[0].section == "agents",
+            "no second agents header: {headers:?}"
+        );
     }
 
     fn sample() -> (Vec<AgentRow>, Vec<WorkspaceRow>) {
