@@ -409,7 +409,7 @@ fn matches(item: &ItemInfo, space: &str, filter: &str) -> bool {
             .any(|s| s.to_lowercase().contains(&filter))
 }
 
-/// The items in their lanes, in the daemon's order, those `filter` hides left out.
+/// The items in their lanes, newest first, those `filter` hides left out.
 fn lanes<'a>(
     items: &'a [ItemInfo],
     spaces: &[WorkspaceRow],
@@ -428,8 +428,10 @@ fn lanes<'a>(
     }
     // Newest first in every lane: Todo and Doing by the item's and its agents' newest change
     // (`updated_at`), Done by when it closed, since a closed item's `updated_at` can still
-    // move; a tie keeps the daemon's order.
+    // move. The daemon sends a tie oldest first, so a lane is reversed before the stable sort:
+    // a tie is newest first too, as on the phone.
     for lane in &mut out {
+        lane.reverse();
         lane.sort_by_key(|i| std::cmp::Reverse(lane_stamp(i)));
     }
     out
@@ -2384,7 +2386,8 @@ mod tests {
             steps_done: 0,
             steps_total: 0,
             agents: Vec::new(),
-            updated_at: 0,
+            // Earlier ids are newer, so a lane reads in id order unless a test says otherwise.
+            updated_at: 1_000 - id,
             since: 0,
             closed_at: None,
             hidden: false,
@@ -3049,6 +3052,26 @@ mod tests {
         assert_eq!(keys, ["QOOP-4", "QOOP-5", "QOOP-3"]);
     }
 
+    /// A tie is newest first: the daemon sends cards oldest first within one second, and a lane
+    /// reads as the phone's does, on every lane, the Done lane included.
+    #[test]
+    fn a_tie_in_a_lane_is_newest_first() {
+        let mut p = page();
+        {
+            let items = p.items.as_mut().unwrap();
+            items.push(item(7, "done", "closed with 6", 1));
+            items.push(item(8, "todo", "made with 1 and 2", 1));
+            for i in items.iter_mut() {
+                (i.updated_at, i.closed_at, i.since) = (50, (i.state == "done").then_some(50), 0);
+            }
+        }
+        let keys =
+            |n: usize| -> Vec<String> { p.lanes()[n].iter().map(|i| i.key.clone()).collect() };
+        assert_eq!(keys(0), ["QOOP-8", "QOOP-2", "QOOP-1"]);
+        assert_eq!(keys(1), ["QOOP-5", "QOOP-4", "QOOP-3"]);
+        assert_eq!(keys(2), ["QOOP-7", "QOOP-6"]);
+    }
+
     /// The Done lane follows when items closed, not their last change (an ended agent can write
     /// after the close); an older daemon sends no close time and falls back to the last change.
     #[test]
@@ -3082,7 +3105,7 @@ mod tests {
         {
             let items = p.items.as_mut().unwrap();
             items[3].key = "QOOPPRIVAT-2".into();
-            items[3].updated_at = 100;
+            items[3].updated_at = 2_000;
             items[3].agents.push(ItemAgentInfo {
                 task: 9,
                 terminal: Some(4),
