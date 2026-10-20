@@ -3785,11 +3785,15 @@ pub enum MenuKind {
     /// What a space's `+`, or the tab bar's, offers: a terminal or an agent there. `name`
     /// is the space's, for the title.
     New { space: i64, name: String },
-    /// The agents a new tab in `space` can start, found when the list opened.
+    /// The agents a new tab in `space` can start, found when the list opened, then the
+    /// space's earlier conversations to carry on, as the daemon lists them a moment later.
     Agents {
         space: i64,
         name: String,
         agents: Vec<crate::config::Launcher>,
+        earlier: Vec<qoop_runtime::control::SessionRow>,
+        /// The daemon was still reading them: asked again at the next tick.
+        again: bool,
     },
     /// A machine being connected has no qoop: put this version there, or not.
     Install {
@@ -3822,7 +3826,9 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             ("agent".to_string(), String::new()),
             ("terminal".to_string(), String::new()),
         ],
-        MenuKind::Agents { agents, .. } => agents
+        MenuKind::Agents {
+            agents, earlier, ..
+        } => agents
             .iter()
             .map(|a| {
                 // A long command is cut, so the box stays a box and not the width of the
@@ -3838,6 +3844,20 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
                 (a.name.clone(), right)
             })
             .chain([("other command".to_string(), String::new())])
+            .chain(earlier.iter().map(|row| {
+                let title = row.title.as_deref().unwrap_or("untitled");
+                let title = if crate::width::width(title) > MENU_TITLE {
+                    format!(
+                        "{}\u{2026}",
+                        crate::width::text(title, MENU_TITLE - 1).trim_end()
+                    )
+                } else {
+                    title.to_string()
+                };
+                let at = row.updated_at.or(row.started_at).unwrap_or(0) / 1000;
+                let age = crate::asks::age_short(crate::sidebar::now_unix() - at);
+                (title, format!("{} {age}", row.agent))
+            }))
             .collect(),
         MenuKind::Install { platform, .. } => vec![
             (
@@ -3851,6 +3871,95 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
 
 /// The most columns an `[agents]` command takes on the right of the agents list.
 const MENU_COMMAND: usize = 30;
+/// The most columns an earlier conversation's title takes in the agents list.
+const MENU_TITLE: usize = 44;
+/// Earlier conversations the agents list offers at most.
+const EARLIER: usize = 5;
+
+/// The directories `space`'s tabs are in, each once: where its earlier conversations were.
+fn space_dirs(state: &State, space: i64) -> Vec<String> {
+    let mut dirs: Vec<String> = state
+        .rows
+        .iter()
+        .filter(|row| row.workspace == space)
+        .filter_map(usable_cwd)
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Asks this computer's daemon for `space`'s earlier conversations, for the agents list. Not
+/// for a space on another computer: its conversations are in that computer's files.
+fn ask_earlier(state: &mut State, space: i64) {
+    let dirs = space_dirs(state, space);
+    if dirs.is_empty() || crate::mux::is_remote_workspace(space) {
+        return;
+    }
+    state.modes.outbox.push(ControlRequest::AgentSessions {
+        id: format!("earlier-{space}"),
+        dirs,
+        from_ms: None,
+        to_ms: None,
+        // Room for the ones already open in the space, which are left out.
+        limit: (EARLIER * 4) as u32,
+    });
+}
+
+/// The agents list asks again for the earlier conversations the daemon was still reading, while
+/// it is open: a list put away (esc, a click elsewhere) keeps its kind but asks for nothing.
+fn earlier_again(state: &mut State) {
+    if state.menu.is_none() {
+        return;
+    }
+    if let MenuKind::Agents {
+        space, again: true, ..
+    } = state.menu_kind
+    {
+        if let MenuKind::Agents { again, .. } = &mut state.menu_kind {
+            *again = false;
+        }
+        ask_earlier(state, space);
+    }
+}
+
+/// The agents list's earlier conversations from the daemon's answer: ones that can be carried on
+/// and are not open in a tab already, in any space, newest first.
+fn take_earlier(
+    state: &mut State,
+    id: &str,
+    reading: bool,
+    sessions: Vec<qoop_runtime::control::SessionRow>,
+) -> bool {
+    let MenuKind::Agents {
+        space,
+        earlier,
+        again,
+        ..
+    } = &mut state.menu_kind
+    else {
+        return false;
+    };
+    if id != format!("earlier-{space}") {
+        return false;
+    }
+    // Read the first time, or brought up to date after a quiet while: in a moment.
+    *again = reading;
+    if reading {
+        return false;
+    }
+    let open: Vec<&str> = state
+        .rows
+        .iter()
+        .filter_map(|row| row.agent_session.as_deref())
+        .collect();
+    *earlier = sessions
+        .into_iter()
+        .filter(|row| row.resume.is_some() && !row.gone && !open.contains(&row.id.as_str()))
+        .take(EARLIER)
+        .collect();
+    true
+}
 
 /// Open what a `+` offers for `space`.
 fn open_new(state: &mut State, space: i64) {
@@ -4113,8 +4222,11 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     space,
                     name,
                     agents: installed_agents(),
+                    earlier: Vec::new(),
+                    again: false,
                 };
                 state.menu = Some(0);
+                ask_earlier(state, space);
                 return MenuSend::Nothing;
             }
             *request += 1;
@@ -4127,7 +4239,26 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             };
             return MenuSend::Control(follow_elsewhere(state, space, ask));
         }
-        MenuKind::Agents { space, agents, .. } => {
+        MenuKind::Agents {
+            space,
+            agents,
+            earlier,
+            ..
+        } => {
+            // An earlier conversation is carried on in a new tab where it ran, with the line its
+            // agent resumes by, and no name asked: it has one.
+            if let Some(row) = item
+                .checked_sub(agents.len() + 1)
+                .and_then(|n| earlier.get(n))
+                && let Some(line) = row.resume.as_deref()
+            {
+                *request += 1;
+                let mut ask = start_agent_terminal(state, *request, line, Some(space), None);
+                if let ControlRequest::CreateTerminal { cwd, .. } = &mut ask {
+                    *cwd = row.cwd.clone();
+                }
+                return MenuSend::Control(follow_elsewhere(state, space, ask));
+            }
             state.prompt = Some(match agents.get(item) {
                 Some(agent) => agent_name(Some(space), agent.command.clone()),
                 None => Prompt::new(Naming::Agent(Some(space)), ""),
@@ -7919,6 +8050,7 @@ where
                         wr.write_all(&ack).await?;
                     }
                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                    earlier_again(&mut state);
                     if sidebar::refresh_files() {
                         dirty = true;
                     }
@@ -13153,6 +13285,15 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         state.modes.refetching = false;
     }
     match response {
+        ControlResponse::AgentSessions {
+            id,
+            reading,
+            sessions,
+        } => {
+            if take_earlier(state, &id, reading, sessions) {
+                *dirty = true;
+            }
+        }
         ControlResponse::Messages {
             id,
             revision,
@@ -16331,6 +16472,138 @@ mod tests {
         );
     }
 
+    /// The agents list asks this computer for the space's earlier conversations and, when they
+    /// come, offers the ones it can carry on that are not open there already, under the agents;
+    /// one picked starts a tab where it ran, typing its resume line, with no name asked.
+    #[test]
+    fn the_agents_list_offers_a_spaces_earlier_conversations_to_carry_on() {
+        use qoop_runtime::control::SessionRow;
+        let dir = std::env::temp_dir().display().to_string();
+        let mut s = state();
+        let row = s
+            .rows
+            .iter_mut()
+            .find(|r| r.terminal == 1)
+            .expect("space 1 row");
+        row.cwd = Some(dir.clone());
+        row.agent_session = Some("open-now".to_string());
+        let mut request = 0;
+        open_new(&mut s, 1);
+        assert!(matches!(
+            apply_menu_choice(&mut s, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        match s.modes.outbox.as_slice() {
+            [ControlRequest::AgentSessions { id, dirs, .. }] => {
+                assert_eq!(id, "earlier-1");
+                assert_eq!(dirs, &vec![dir.clone()]);
+            }
+            other => panic!("one ask for the space's sessions, got {other:?}"),
+        }
+        let session = |id: &str, title: &str, resume: Option<&str>, gone: bool| SessionRow {
+            key: format!("/k/{id}"),
+            agent: "claude".to_string(),
+            id: id.to_string(),
+            cwd: Some("/w/old".to_string()),
+            title: Some(title.to_string()),
+            started_at: None,
+            updated_at: Some((crate::sidebar::now_unix() - 3 * 3600) * 1000),
+            tokens: 10,
+            prompts: 1,
+            resume: resume.map(String::from),
+            gone,
+        };
+        let sessions = vec![
+            session(
+                "open-now",
+                "already in a tab",
+                Some("claude --resume open-now"),
+                false,
+            ),
+            session("a", "fix the login", Some("claude --resume a"), false),
+            session("b", "no way back", None, false),
+            session("c", "its folder is gone", None, true),
+        ];
+        let mut dirty = false;
+        // Still being read: nothing yet, and asked again at the next tick.
+        s.modes.outbox.clear();
+        apply(
+            &mut s,
+            ControlResponse::AgentSessions {
+                id: "earlier-1".into(),
+                reading: true,
+                sessions: Vec::new(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!dirty);
+        earlier_again(&mut s);
+        assert!(matches!(
+            s.modes.outbox.as_slice(),
+            [ControlRequest::AgentSessions { .. }]
+        ));
+        earlier_again(&mut s);
+        assert_eq!(s.modes.outbox.len(), 1, "one more ask, not one per tick");
+        // Put away while it was still read: no more asks.
+        let put_away = || ControlResponse::AgentSessions {
+            id: "earlier-1".into(),
+            reading: true,
+            sessions: Vec::new(),
+        };
+        s.menu = None;
+        apply(&mut s, put_away(), &mut request, &mut dirty);
+        earlier_again(&mut s);
+        assert_eq!(s.modes.outbox.len(), 1, "a closed list asks for nothing");
+        s.menu = Some(0);
+        // Another space's answer, or one for a list no longer open, changes nothing.
+        apply(
+            &mut s,
+            ControlResponse::AgentSessions {
+                id: "earlier-2".into(),
+                reading: false,
+                sessions: sessions.clone(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(!dirty);
+        apply(
+            &mut s,
+            ControlResponse::AgentSessions {
+                id: "earlier-1".into(),
+                reading: false,
+                sessions,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(dirty);
+        let rows = menu_rows(&s.menu_kind);
+        let agents = rows
+            .iter()
+            .position(|(name, _)| name == "other command")
+            .expect("other command");
+        assert_eq!(
+            &rows[agents + 1..],
+            &[("fix the login".to_string(), "claude 3h".to_string())]
+        );
+        match apply_menu_choice(&mut s, agents + 1, &mut request) {
+            MenuSend::Control(ControlRequest::CreateTerminal {
+                id, workspace, cwd, ..
+            }) => {
+                assert_eq!(workspace, Some(1));
+                assert_eq!(cwd.as_deref(), Some("/w/old"));
+                assert_eq!(
+                    s.pending_agents.get(&id).map(|(c, _)| c.as_str()),
+                    Some("claude --resume a")
+                );
+            }
+            _ => panic!("carrying on is a create"),
+        }
+        assert!(s.prompt.is_none(), "no name is asked");
+    }
+
     /// A space's `+` starts its tab in that space and that space's directory, even when
     /// another space is on screen: `agent` lists the agents, `terminal` opens a shell, and
     /// the last agent row asks for any command, still for that space.
@@ -16388,6 +16661,8 @@ mod tests {
             space: 1,
             name: "app".to_string(),
             agents: agents.clone(),
+            earlier: Vec::new(),
+            again: false,
         };
         assert_eq!(menu_title(&s.menu_kind), " new agent in app");
         assert_eq!(
@@ -16424,6 +16699,8 @@ mod tests {
             space: 1,
             name: "app".to_string(),
             agents,
+            earlier: Vec::new(),
+            again: false,
         };
         assert!(matches!(
             apply_menu_choice(&mut s, 1, &mut request),

@@ -610,7 +610,7 @@ pub struct View {
     pub cursor: Option<(usize, usize)>,
 }
 
-fn age_short(secs: i64) -> String {
+pub(crate) fn age_short(secs: i64) -> String {
     match secs.max(0) {
         0..=59 => "now".to_string(),
         s @ 60..=3599 => format!("{}m", s / 60),
