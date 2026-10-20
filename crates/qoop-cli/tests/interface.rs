@@ -1148,7 +1148,7 @@ fn g12_3_the_child_is_sized_to_the_pane_and_not_to_the_window() {
     // connecting, and keys typed then reach no terminal.
     assert!(ui.wait_for_focused(Duration::from_secs(20)));
     ui.type_in(b"stty size\n");
-    let (want_cols, want_rows) = qoop_tui::screen::pane_size(COLS, ROWS);
+    let (want_cols, want_rows) = qoop_tui::screen::lone_pane_size(COLS, ROWS);
     let expected = format!("{want_rows} {want_cols}");
     assert!(
         ui.wait_for(&expected, Duration::from_secs(10)).is_some(),
@@ -2179,7 +2179,7 @@ fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
     let mut ui2 = Interface::attach_sized(&ui.runtime_dir(), 120, 34);
     assert!(ui2.wait_for_tab(1, Duration::from_secs(20)));
     ui2.type_in(b"stty size\n");
-    let (want_cols, want_rows) = qoop_tui::screen::pane_size(120, 34);
+    let (want_cols, want_rows) = qoop_tui::screen::lone_pane_size(120, 34);
     let expected = format!("{want_rows} {want_cols}");
     assert!(
         ui2.wait_for(&expected, Duration::from_secs(10)).is_some(),

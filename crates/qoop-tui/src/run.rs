@@ -1208,6 +1208,16 @@ impl State {
                 });
             }
         }
+        // No tree yet (a space just made, an adopt before its first focus): the pane is drawn
+        // in its frame all the same, as it is sized (`focused_rect`).
+        if tiles.is_empty() && self.focused != 0 && !self.on_qass_screen() {
+            tiles.push(screen::Tile {
+                terminal: self.focused,
+                rect: layout::framed(full),
+                snapshot: self.view().or_else(|| self.preview()),
+                focused: true,
+            });
+        }
         Frame {
             rows: &self.rows,
             spaces: &self.spaces,
@@ -1431,7 +1441,13 @@ impl State {
                 .map(|(_, r)| r)?;
             return Some((hit, (within, x), (within - rect.y, x - rect.x)));
         }
-        Some((self.focused, (within, x), (within, x)))
+        // No tree yet: the pane stands in its frame as it is drawn (`frame`), and the frame's
+        // own cells are not the terminal's.
+        let r = layout::framed(pane_area(self));
+        if within < r.y || within >= r.y + r.rows || x < r.x || x >= r.x + r.cols {
+            return None;
+        }
+        Some((self.focused, (within, x), (within - r.y, x - r.x)))
     }
 
     /// How many of the pane's rows come from behind the screen.
@@ -11453,18 +11469,19 @@ fn pane_area(state: &State) -> layout::Rect {
 /// The rectangle of the focused terminal, or the whole pane when there is no
 /// tiling tree for this space.
 fn focused_rect(state: &State) -> layout::Rect {
-    if state.focused != 0
-        && state.on_qass_screen()
-        && let Some(inner) = state.qass_rect()
-    {
-        return inner;
-    }
     let area = pane_area(state);
+    // qass's lone screen draws its own box; a pane too small for one stands in the frame
+    // every pane has, so leaving it for another tab resizes nothing.
+    if state.focused != 0 && state.on_qass_screen() {
+        return state.qass_rect().unwrap_or_else(|| layout::framed(area));
+    }
     if state.focused == 0 {
         return area;
     }
+    // A pane with no tree yet (a space just made) is drawn as one in its frame will be.
+    let framed = layout::framed(area);
     let Some(space) = state.space else {
-        return area;
+        return framed;
     };
     state
         .drawn_tree(space)
@@ -11475,7 +11492,7 @@ fn focused_rect(state: &State) -> layout::Rect {
                 .find(|(t, _)| *t == state.focused)
                 .map(|(_, r)| r)
         })
-        .unwrap_or(area)
+        .unwrap_or(framed)
 }
 
 /// Where the split asked for by `id` is waiting: its space, and which of that
@@ -12246,7 +12263,8 @@ fn size_terminals(
         .rows
         .iter()
         .filter(|row| !asleep.contains(&row.terminal))
-        .map(|row| (row.terminal, size(area)))
+        // Sized as it will be drawn: inside the frame every pane on screen has.
+        .map(|row| (row.terminal, size(layout::framed(area))))
         .collect();
     let mut zoomed_away = std::collections::BTreeSet::new();
     // Parked first, so the tree on screen is what a terminal in both is sized by.
@@ -20257,7 +20275,7 @@ mod tests {
         state.rows.push(agent(5, 2, "claude", "sleeping"));
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut state, &mut seqs).unwrap();
-        let area = pane_area(&state);
+        let area = layout::framed(pane_area(&state));
         let whole = (area.cols as u16, area.rows as u16);
         assert_eq!(state.sized.get(&3), Some(&whole));
         assert_eq!(state.sized.get(&4), Some(&whole));
@@ -20303,7 +20321,7 @@ mod tests {
         let tile = state.sized[&2];
         assert!(state.layouts.get_mut(&1).unwrap().toggle_zoom());
         size_terminals(&mut state, &mut seqs).unwrap();
-        let area = pane_area(&state);
+        let area = layout::framed(pane_area(&state));
         assert_eq!(state.sized[&1], (area.cols as u16, area.rows as u16));
         assert_eq!(state.sized[&2], tile, "kept while hidden");
         assert_eq!(seqs[&2], 1, "the hidden pane was not sent anything");
@@ -20435,11 +20453,11 @@ mod tests {
         );
     }
 
-    /// One pane alone: the park label opens the notice row, under the agent's screen and never
-    /// on it, is its own click, stands only while the agent has answered and reads parked
-    /// once parked.
+    /// One pane alone stands in its frame like a split one: the park label follows its bottom
+    /// left corner, under the agent's screen and never on it, is its own click, stands only
+    /// while the agent has answered and reads parked once parked.
     #[test]
-    fn a_lone_panes_park_label_opens_the_notice_row_and_only_after_an_answer() {
+    fn a_lone_panes_park_label_follows_its_bottom_left_corner_after_an_answer() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         s.rows = vec![agent(3, 1, "claude", "idle")];
@@ -20447,13 +20465,22 @@ mod tests {
         // An open box has the screen: no label under it, nothing to click.
         assert!(s.palette.is_some() && screen::park_spot(&s.frame()).is_none());
         s.palette = None;
-        let (from, text) = screen::park_notice(s.cols, false);
-        assert!(text.contains("park"));
-        assert_eq!(from, 1, "the label opens the row");
-        let (row, col) = (29, from as u16 + 1);
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let Some((false, screen::ParkSpot::Corner(x, y, label))) = screen::park_spot(&s.frame())
+        else {
+            panic!("a lone pane carries the label in its corner");
+        };
+        let pane = layout::framed(pane_area(&s));
+        assert_eq!(
+            (x, y),
+            (pane.x + 2, pane.y + pane.rows),
+            "after the bottom left corner"
+        );
+        assert!(label.contains("park"));
+        let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
         assert!(
-            !matches!(s.clicked(28, col), Some(Clicked::Park(_))),
+            !matches!(s.clicked(row - 1, col), Some(Clicked::Park(_))),
             "not on the agent's screen"
         );
         s.rows[0].state = "working".into();
@@ -20463,15 +20490,12 @@ mod tests {
         );
         s.rows[0].state = "idle".into();
         s.rows[0].parked = true;
-        assert_eq!(screen::park_state(&s.rows, 3), Some(true));
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
-        // A mode has the notice row: no label there, and no click on where it would be.
-        s.modes.resizing = true;
-        assert!(
-            !matches!(s.clicked(row, col), Some(Clicked::Park(_))),
-            "a mode keeps the row"
-        );
-        s.modes.resizing = false;
+        let Some((true, screen::ParkSpot::Corner(.., label))) = screen::park_spot(&s.frame())
+        else {
+            panic!("still in the corner once parked");
+        };
+        assert!(label.contains("parked"), "{label:?}");
         s.rows[0].agent = false;
         assert_eq!(
             screen::park_state(&s.rows, 3),
@@ -20709,7 +20733,8 @@ mod tests {
             behind: 1_000,
             links: Default::default(),
         });
-        state.lines = 4 + (screen::TABS + screen::STATUS) as u16;
+        // Four rows of pane inside its frame.
+        state.lines = 4 + 2 + (screen::TABS + screen::STATUS) as u16;
         state
     }
 
@@ -23042,8 +23067,8 @@ mod tests {
         let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(changed && !state.qass_header());
         assert_eq!(pane_area(&state).y, 0);
-        assert_eq!(focused_rect(&state).rows, rows as usize);
-        assert_eq!(state.sized.get(&4), Some(&(cols, rows)));
+        assert_eq!(focused_rect(&state).rows, rows as usize - 2, "in its frame");
+        assert_eq!(state.sized.get(&4), Some(&(cols - 2, rows - 2)));
         assert!(state.frame().chrome.qass.is_none());
         let (changed, _) = zoom_flip(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(changed && state.qass_header());
@@ -23073,8 +23098,10 @@ mod tests {
             state.sized.get(&5),
             Some(&(inner.cols as u16, inner.rows as u16))
         );
-        assert_eq!(state.sized.get(&1), Some(&(cols, rows)));
-        assert_eq!(state.sized.get(&3), Some(&(cols, rows)));
+        // The owner's agents: the pane inside its frame.
+        let framed = (cols - 2, rows - 2);
+        assert_eq!(state.sized.get(&1), Some(&framed));
+        assert_eq!(state.sized.get(&3), Some(&framed));
         assert!(inner.rows < rows as usize && inner.cols < cols as usize);
 
         let before = state.sized.clone();
@@ -23086,7 +23113,7 @@ mod tests {
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         assert!(!state.on_qass_screen());
         assert_eq!(state.sized, before, "and neither does coming back");
-        assert_eq!(focused_rect(&state), pane_area(&state));
+        assert_eq!(focused_rect(&state), layout::framed(pane_area(&state)));
     }
 
     /// The box is qass's agent alone: a shell opened in its space, or a split there, is the
@@ -23106,7 +23133,7 @@ mod tests {
         state.rows.push(shell);
         state.focused = 6;
         assert!(!state.on_qass_screen(), "a shell in qass's space");
-        assert_eq!(focused_rect(&state), pane_area(&state));
+        assert_eq!(focused_rect(&state), layout::framed(pane_area(&state)));
 
         state.focused = 5;
         let mut layout = Layout::single(5);
@@ -24208,7 +24235,8 @@ mod tests {
         assert!(painted.contains("Question 1?"), "{painted}");
     }
 
-    /// A window too small to frame anything leaves qass's pane plain and its pty whole.
+    /// A window too small for qass's box leaves its pane plain, its pty in the frame every
+    /// pane has, so leaving it for another tab resizes nothing.
     #[test]
     fn a_tiny_pane_stays_plain_for_qass() {
         let mut state = qass_window();
@@ -24217,7 +24245,7 @@ mod tests {
         let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
         assert_eq!(state.qass_rect(), None);
-        assert_eq!(focused_rect(&state), pane_area(&state));
+        assert_eq!(focused_rect(&state), layout::framed(pane_area(&state)));
         assert!(
             state.frame().chrome.qass.is_some(),
             "asked for, and refused by the plan"
@@ -25070,7 +25098,8 @@ mod tests {
         s.chat.set_digest(2, chat_digest("fix the build"));
         s.refresh_chat();
         let painted = screen::paint(&s.frame());
-        let first = plain(&written_on(&painted, screen::TABS + 1));
+        // The pane's first row inside its frame.
+        let first = plain(&written_on(&painted, screen::TABS + 2));
         assert!(first.contains(" > fix the build"), "{first:?}");
         assert!(!plain(&painted).contains("PTYTEXT"));
         assert!(!painted.contains("\x1b[?25h"), "chat shows no cursor");

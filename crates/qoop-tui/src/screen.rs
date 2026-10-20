@@ -600,6 +600,26 @@ pub fn pane_size_for(
     )
 }
 
+/// Whether the pane area paints as tiles inside their frame: always, but for qass's lone box,
+/// which draws its own. One pane is a tile like any split one, framed, with its corners.
+fn tiled(frame: &Frame) -> bool {
+    frame.tiles.len() >= 2
+        || (frame.tiles.len() == 1 && (frame.chrome.qass.is_none() || qass_plan(frame).is_none()))
+}
+
+/// The size a lone pane's terminal is given in a window of `cols` by `lines`: the pane inside
+/// the frame every pane stands in.
+pub fn lone_pane_size(cols: u16, lines: u16) -> (u16, u16) {
+    let (pane_cols, pane_rows) = pane_size(cols, lines);
+    let framed = layout::framed(layout::Rect {
+        x: 0,
+        y: 0,
+        cols: pane_cols as usize,
+        rows: pane_rows as usize,
+    });
+    (framed.cols as u16, framed.rows as u16)
+}
+
 /// The qass screen's plan for this frame's pane, when the pane is qass's screen and big
 /// enough to frame.
 pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
@@ -793,7 +813,7 @@ fn park_label(parked: bool) -> String {
 /// as its first pane cell. In qoop's own frame, never over the agent's screen. `None` without
 /// that corner or the room.
 fn park_corner(tiles: &[Tile], cols: usize, rows: usize, wide: usize) -> Option<(usize, usize)> {
-    if tiles.len() < 2 {
+    if tiles.is_empty() {
         return None;
     }
     let r = tiles.iter().find(|t| t.focused)?.rect;
@@ -846,10 +866,10 @@ pub(crate) fn park_spot(frame: &Frame) -> Option<(bool, ParkSpot)> {
     Some((parked, ParkSpot::Notice(col, text)))
 }
 
-/// The lines around split panes and what rides them: the folded panes' titles and the
-/// handles. Empty for one pane alone.
+/// The lines around the panes and what rides them: the folded panes' titles and the
+/// handles. Empty where nothing paints as tiles (qass's lone box).
 fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, EdgeInk)>>> {
-    if frame.tiles.len() < 2 {
+    if !tiled(frame) {
         return Vec::new();
     }
     let mut edges = pane_edges(&frame.tiles, frame.rows, cols, rows);
@@ -990,7 +1010,7 @@ pub(crate) fn picture_cell(frame: &Frame) -> Option<(usize, usize)> {
         return None;
     }
     let left = left_for(frame.cols, frame.collapsed, frame.sidebar_width);
-    if frame.tiles.len() < 2 {
+    if !tiled(frame) {
         let (y, x) = qass_plan(frame).map_or((0, 0), |p| (p.inner.y, p.inner.x));
         return Some((TABS + 1 + y, left + 1 + x));
     }
@@ -1019,7 +1039,7 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     {
         return None;
     }
-    if frame.tiles.len() < 2 {
+    if !tiled(frame) {
         let (row, cell) = snapshot.cursor;
         let col = cursor_column(
             snapshot.lines.get(row).map(String::as_str).unwrap_or(""),
@@ -1377,10 +1397,9 @@ pub fn paint(frame: &Frame) -> String {
         // of the live screen, so a person reading upwards sees one continuous terminal
         // rather than two. The rows behind it are text alone: what was written to disk is
         // rows, and colour there would be a second format nobody reads back.
-        // Tiled rows only when there is more than one tile to show: a single
-        // tile paints the legacy path, so one terminal paints pixel for pixel
-        // what it always has.
-        if frame.tiles.len() < 2 {
+        // Tiled rows for every pane in its frame; the plain path for qass's lone box, which
+        // draws its own, and a frame with no tile at all.
+        if !tiled(frame) {
             if let Some((plan, screen)) = &qass {
                 // qass's screen: its header and the frame around its terminal, whose rows
                 // are the box's inside, counted from its first.
@@ -1615,7 +1634,7 @@ pub fn paint(frame: &Frame) -> String {
     // row. Before the floating overlays, so an open palette covers it the way it
     // covers terminal text.
     if let Some(notice) = frame.image_notice {
-        let (tile_x, tile_y, tile_cols, tile_rows) = if frame.tiles.len() < 2 {
+        let (tile_x, tile_y, tile_cols, tile_rows) = if !tiled(frame) {
             match qass_plan(frame) {
                 Some(p) => (p.inner.x, p.inner.y, p.inner.cols, p.inner.rows),
                 None => (0, 0, pane_cols as usize, pane_rows as usize),
@@ -3477,8 +3496,9 @@ fn pane_edges(
             grid[y][arm] = Some(('\u{2500}', EdgeInk::Lit));
         }
     }
-    // Each pane's name on its top edge, two cells in from its corner.
-    for tile in tiles {
+    // Each pane's name on its top edge, two cells in from its corner: one pane alone is
+    // named on the tab bar already.
+    for tile in tiles.iter().filter(|_| tiles.len() >= 2) {
         let r = tile.rect;
         let Some(top) = r.y.checked_sub(1) else {
             continue;
@@ -7783,48 +7803,23 @@ mod tests {
         })
     }
 
+    /// One pane alone is a tile in its frame, as a split one is: the four ember corners stand
+    /// round it in the frame's cells, it is not named on its top edge (the tab bar names it),
+    /// and its text is painted one cell in.
     #[test]
-    fn a_single_tile_paints_exactly_what_a_single_pane_always_has() {
+    fn a_lone_pane_stands_in_its_frame_with_four_corners() {
         let rows = [row(1, "zsh", "idle")];
         let spaces = spaces();
         let snap = snapshot(&["hello from the shell"]);
         let behind = crate::run::Behind::default();
         let (pane_cols, pane_rows) = pane_size(80, 24);
-        let legacy = paint(&Frame {
-            armed: None,
-            drawer: None,
-            rows: &rows,
-            spaces: &spaces,
-            panes: std::collections::BTreeMap::new(),
-            space: Some(1),
-            focused: 1,
-            snapshot: Some(&snap),
-            cols: 80,
-            lines: 24,
-            message: None,
-            hint: None,
-            palette: None,
-            prompt: None,
-            menu: None,
-            collapsed: false,
-            reading: None,
-            selection: None,
-            scroll: 0,
-            anchor: 0,
-            rows_back: 0,
-            tiles: Vec::new(),
-            tick: 0,
-            now_unix: TEST_NOW,
-            sidebar_width: sidebar::WIDTH,
-            view: sidebar::View::Tree,
-            seen: &sidebar::Seen::new(),
-            unseen: &sidebar::Unseen::new(),
-            behind: &behind,
-            image_notice: None,
-            toast: None,
-            chrome: Default::default(),
-        });
-        let tiled = paint(&Frame {
+        let area = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            cols: pane_cols as usize,
+            rows: pane_rows as usize,
+        };
+        let frame = Frame {
             armed: None,
             drawer: None,
             rows: &rows,
@@ -7848,12 +7843,7 @@ mod tests {
             rows_back: 0,
             tiles: vec![Tile {
                 terminal: 1,
-                rect: crate::layout::Rect {
-                    x: 0,
-                    y: 0,
-                    cols: pane_cols as usize,
-                    rows: pane_rows as usize,
-                },
+                rect: crate::layout::framed(area),
                 snapshot: Some(&snap),
                 focused: true,
             }],
@@ -7867,8 +7857,28 @@ mod tests {
             image_notice: None,
             toast: None,
             chrome: Default::default(),
-        });
-        assert_eq!(tiled, legacy);
+        };
+        let edges = edge_grid(&frame, area.cols, area.rows);
+        let (right, bottom) = (area.cols - 1, area.rows - 1);
+        for (x, y, corner) in [
+            (0, 0, '\u{256d}'),
+            (right, 0, '\u{256e}'),
+            (0, bottom, '\u{2570}'),
+            (right, bottom, '\u{256f}'),
+        ] {
+            assert_eq!(edges[y][x], Some((corner, EdgeInk::Lit)), "{x},{y}");
+        }
+        assert!(
+            edges[0][2..right - 1].iter().all(Option::is_none),
+            "no name on a lone pane's top edge"
+        );
+        let left = left_for(80, false, sidebar::WIDTH);
+        let painted = paint(&frame);
+        // The text's row starts one cell in: the frame's column, then the shell's first letter.
+        assert!(
+            painted.contains(&at(TABS + 2, left + 2)) && painted.contains("hello"),
+            "{painted:?}"
+        );
     }
 
     /// A picture the outer terminal cannot draw is named on the pane's last row,

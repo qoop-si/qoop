@@ -414,7 +414,7 @@ impl Layout {
         if let Some(z) = self.zoomed
             && self.contains(z)
         {
-            return vec![(z, area)];
+            return vec![(z, self.inner(area))];
         }
         if let Some(folded) = self.folded(area) {
             return folded;
@@ -553,14 +553,12 @@ impl Layout {
     }
 
     /// The part of `area` the panes share once a frame is drawn around them: one cell in
-    /// from every side while a split is on screen, all of it for one pane or a zoom.
+    /// from every side, for one pane and a zoom as for a split, so the focused pane's
+    /// corners and its park label always have their cells (the owner's pick, 2026-10-20).
     ///
     /// The one place the frame is taken off, so sizing, painting, clicks and drags all
     /// measure the same tiles.
     pub fn inner(&self, area: Rect) -> Rect {
-        if self.zoomed.is_some() || !matches!(self.root, Node::Split { .. }) {
-            return area;
-        }
         framed(area)
     }
 
@@ -972,7 +970,7 @@ fn layout_node(node: &Node, area: Rect, out: &mut Vec<(u32, Rect)>) {
 
 /// `area` one cell in from every side, for the frame around split panes. An area too small
 /// to give up the cells is left whole.
-fn framed(area: Rect) -> Rect {
+pub(crate) fn framed(area: Rect) -> Rect {
     if area.cols < 3 || area.rows < 3 {
         return area;
     }
@@ -1272,9 +1270,12 @@ mod tests {
     }
 
     #[test]
-    fn a_single_terminal_fills_the_area() {
+    fn a_single_terminal_fills_the_area_inside_its_frame() {
         let layout = Layout::single(1);
-        assert_eq!(layout.tile_rects(area(80, 24)), vec![(1, area(80, 24))]);
+        assert_eq!(
+            layout.tile_rects(area(80, 24)),
+            vec![(1, framed(area(80, 24)))]
+        );
     }
 
     #[test]
@@ -1302,11 +1303,12 @@ mod tests {
         assert!(rects.iter().all(|(_, r)| r.cols == 78));
     }
 
-    /// The frame is there only while panes share the area: one pane and a zoom fill it.
+    /// The frame is there for every pane, one alone and a zoom as for a split, so the
+    /// focused pane's corners always have their cells.
     #[test]
-    fn a_frame_surrounds_split_panes_and_nothing_else() {
+    fn a_frame_surrounds_every_pane() {
         let mut layout = Layout::single(1);
-        assert_eq!(layout.inner(area(80, 24)), area(80, 24));
+        assert_eq!(layout.inner(area(80, 24)), framed(area(80, 24)));
         assert!(layout.split_placeholder(1, Dir::V, area(80, 24)));
         assert!(layout.bind_placeholder(2));
         let inner = layout.inner(area(80, 24));
@@ -1318,7 +1320,10 @@ mod tests {
                 .all(|(_, r)| r.x >= 1 && r.y == 1)
         );
         layout.toggle_zoom();
-        assert_eq!(layout.tile_rects(area(80, 24)), vec![(2, area(80, 24))]);
+        assert_eq!(
+            layout.tile_rects(area(80, 24)),
+            vec![(2, framed(area(80, 24)))]
+        );
     }
 
     #[test]
@@ -1426,7 +1431,10 @@ mod tests {
         assert!(layout.bind_placeholder(2));
         assert!(layout.toggle_zoom());
         assert_eq!(layout.visible(), vec![2]);
-        assert_eq!(layout.tile_rects(area(80, 24)), vec![(2, area(80, 24))]);
+        assert_eq!(
+            layout.tile_rects(area(80, 24)),
+            vec![(2, framed(area(80, 24)))]
+        );
         assert!(layout.toggle_zoom());
         assert_eq!(layout.visible().len(), 2);
     }
@@ -1527,7 +1535,10 @@ mod tests {
         assert!(layout.bind_placeholder(2));
         layout.fold = Some(1);
         layout.zoomed = Some(1);
-        assert_eq!(layout.tile_rects(area(120, 30)), vec![(1, area(120, 30))]);
+        assert_eq!(
+            layout.tile_rects(area(120, 30)),
+            vec![(1, framed(area(120, 30)))]
+        );
     }
 
     /// The rail comes off the board (the first pane, or the second with qass first, then the
