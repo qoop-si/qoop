@@ -5,13 +5,14 @@
 //! hundreds of megabytes at its peak (699 MB measured), which go back to the system when that
 //! process ends instead of staying with the daemon. A request only ever reads the last
 //! finished index: one that finds it older than [`STALE`] starts the next refresh and answers
-//! from the one it has; with none yet it says it is still reading, and the client asks again.
+//! from the one it has. With none yet, or with one older than [`SERVE_STALE`] while a fresh one is
+//! read, it says it is still reading, and the client asks again.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use qoop_parsed::index::{self, Index};
 
@@ -20,6 +21,14 @@ use crate::control::{ControlResponse, SessionRow};
 /// How old an index may be before a request asks for a fresh one. Refreshes follow the asks:
 /// none runs while no one looks.
 const STALE: Duration = Duration::from_secs(30);
+/// How old an index may be and still be answered while a fresher one is read. Refreshes follow
+/// the asks, so after a quiet night the index is hours old: answered as it is, it would show that
+/// night's last work as the latest. Past this the asker waits the second or so a refresh takes.
+const SERVE_STALE: Duration = Duration::from_secs(120);
+/// The longest a refresh may take: a first read of a large history takes about a minute (five on
+/// an unoptimized build), and one held up longer (a dead mount, a disk that stopped answering) is
+/// stopped, so the index before it is answered again rather than every ask waiting on it.
+const REFRESH_MOST: Duration = Duration::from_secs(900);
 /// Sessions a list holds at most.
 const MOST: u32 = 200;
 /// Days an activity covers at most.
@@ -34,9 +43,11 @@ pub struct Sessions {
     shared: Arc<Shared>,
 }
 
+/// The index and when it was read, by the wall clock: a Mac asleep overnight keeps no monotonic
+/// time, and its index must look a night old in the morning.
 #[derive(Default)]
 struct Shared {
-    last: Mutex<Option<(Arc<Index>, Instant)>>,
+    last: Mutex<Option<(Arc<Index>, SystemTime)>>,
     refreshing: AtomicBool,
 }
 
@@ -51,11 +62,38 @@ impl Drop for Done<'_> {
 }
 
 impl Shared {
-    fn publish(&self, index: Index, at: Instant) {
+    fn publish(&self, index: Index, at: SystemTime) {
         if let Ok(mut last) = self.last.lock() {
             *last = Some((Arc::new(index), at));
         }
     }
+
+    /// A refresh that failed: the index held counts as just read, so it is answered and the
+    /// next refresh waits [`STALE`], rather than every ask waiting on a refresh that fails.
+    fn restamp(&self) {
+        if let Ok(mut last) = self.last.lock()
+            && let Some((_, at)) = last.as_mut()
+        {
+            *at = SystemTime::now();
+        }
+    }
+}
+
+/// How long ago `at` was; nothing for a time ahead of the clock.
+fn age(at: SystemTime) -> Duration {
+    at.elapsed().unwrap_or_default()
+}
+
+/// Whether an index this old is answered: always when no fresher one is being read.
+fn answerable(age: Duration, refreshing: bool) -> bool {
+    !refreshing || age <= SERVE_STALE
+}
+
+/// When `path` was written; now when that is unknown.
+fn written(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|_| SystemTime::now())
 }
 
 impl Sessions {
@@ -64,15 +102,17 @@ impl Sessions {
         let _ = self.path.set(path);
     }
 
-    /// The last finished index, starting a refresh when it is missing or stale.
+    /// The last finished index, starting a refresh when it is missing or stale; none while a
+    /// refresh reads one to replace an index too old to show.
     fn current(&self) -> Option<Arc<Index>> {
         let last = self.shared.last.lock().ok()?.clone();
-        if last.as_ref().is_none_or(|(_, at)| at.elapsed() > STALE)
+        if last.as_ref().is_none_or(|(_, at)| age(*at) > STALE)
             && let Some(path) = self.path.get()
         {
             self.refresh(path.clone(), last.is_none());
         }
-        last.map(|(index, _)| index)
+        let (index, at) = last?;
+        answerable(age(at), self.shared.refreshing.load(Ordering::Acquire)).then_some(index)
     }
 
     fn refresh(&self, path: PathBuf, first: bool) {
@@ -84,19 +124,18 @@ impl Sessions {
             .name("qoop-sessions".into())
             .spawn(move || {
                 let _done = Done(&shared.refreshing);
-                // What the last run wrote is shown while it is brought up to date, marked
-                // stale so the next ask after this refresh starts another.
+                // What the last run wrote, as old as its file: shown while it is brought up to
+                // date when it is recent, waited past when it is not.
                 if first {
                     let saved = Index::load(&path);
                     if !saved.summaries().is_empty() {
-                        let old = Instant::now()
-                            .checked_sub(STALE)
-                            .unwrap_or_else(Instant::now);
-                        shared.publish(saved, old);
+                        shared.publish(saved, written(&path));
                     }
                 }
-                if read_sessions(&path) {
-                    shared.publish(Index::load(&path), Instant::now());
+                if read_sessions(&path, REFRESH_MOST) {
+                    shared.publish(Index::load(&path), SystemTime::now());
+                } else {
+                    shared.restamp();
                 }
             });
         if spawned.is_err() {
@@ -105,26 +144,44 @@ impl Sessions {
     }
 }
 
-/// Runs `qoop sessions-index <path>` with this daemon's own binary and waits for it. Its
-/// failures go to the daemon's log; the index kept is then the one before.
-fn read_sessions(path: &Path) -> bool {
-    let ran = std::env::current_exe().and_then(|exe| {
+/// Runs `qoop sessions-index <path>` with this daemon's own binary and waits for it, `most` at
+/// the longest: past that it is stopped. Its failures go to the daemon's log; the index kept is
+/// then the one before.
+fn read_sessions(path: &Path, most: Duration) -> bool {
+    let child = std::env::current_exe().and_then(|exe| {
         Command::new(exe)
             .arg("sessions-index")
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .status()
+            .spawn()
     });
-    match ran {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            crate::say!("qoopd: reading the agent sessions ended with {status}");
-            false
-        }
+    let mut child = match child {
+        Ok(child) => child,
         Err(e) => {
             crate::say!("qoopd: the agent sessions could not be read: {e}");
-            false
+            return false;
+        }
+    };
+    let until = Instant::now() + most;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return true,
+            Ok(Some(status)) => {
+                crate::say!("qoopd: reading the agent sessions ended with {status}");
+                return false;
+            }
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(200)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                crate::say!("qoopd: reading the agent sessions took over {most:?}; stopped");
+                return false;
+            }
+            Err(e) => {
+                crate::say!("qoopd: the agent sessions could not be read: {e}");
+                return false;
+            }
         }
     }
 }
@@ -275,6 +332,55 @@ mod tests {
         let odd = resume_line("codex", "a b;rm").unwrap();
         assert!(odd.ends_with("'a b;rm'"), "{odd}");
         assert_eq!(resume_line("zsh", "x"), None);
+    }
+
+    #[test]
+    fn an_old_index_waits_for_the_refresh_reading_its_replacement() {
+        let minute = Duration::from_secs(60);
+        assert!(
+            answerable(minute, true),
+            "a recent index is answered while one is read"
+        );
+        assert!(
+            answerable(10 * 60 * minute, false),
+            "with nothing being read, what there is"
+        );
+        assert!(
+            !answerable(10 * 60 * minute, true),
+            "a night-old index waits for the fresh one"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_lets_the_old_index_be_answered() {
+        let shared = Shared::default();
+        let night = SystemTime::now() - Duration::from_secs(36_000);
+        shared.publish(Index::default(), night);
+        shared.restamp();
+        let at = shared
+            .last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, at)| *at)
+            .unwrap();
+        assert!(age(at) < STALE);
+    }
+
+    #[test]
+    fn a_saved_index_is_as_old_as_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sessions-index.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let hours = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(hours)
+            .unwrap();
+        assert!(age(written(&file)) > Duration::from_secs(7000));
+        assert!(age(written(&dir.path().join("none"))) < Duration::from_secs(1));
     }
 
     #[test]
