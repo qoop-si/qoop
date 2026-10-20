@@ -2604,7 +2604,8 @@ pub(crate) fn menu_rect(
         (n.max(width::width(name)), k.max(keypart))
     });
     let inner = (1 + max_name + 1 + max_key)
-        .max(width::width(title.trim()) + 4)
+        // The title is cut to the box when painted, so it never keeps the menu from showing.
+        .max((width::width(title.trim()) + 4).min(cols.saturating_sub(4)))
         .max(footer_width(MENU_HINT));
     let w = inner + 2;
     let height = menu_shown(lines, rows.len()) + 3;
@@ -5152,6 +5153,13 @@ mod tests {
             menu_row_at(80, 24, &rows, " list", 0, (first_line, col)),
             Some(0)
         );
+    }
+
+    #[test]
+    fn a_title_wider_than_the_pane_still_shows_the_menu() {
+        let rows = vec![("claude".to_string(), String::new())];
+        let title = format!(" new agent in {}, nothing earlier here", "x".repeat(60));
+        assert!(menu_rect(40, 24, &rows, &title).is_some());
     }
 
     #[test]

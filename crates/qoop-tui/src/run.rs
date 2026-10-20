@@ -3794,6 +3794,9 @@ pub enum MenuKind {
         earlier: Vec<qoop_runtime::control::SessionRow>,
         /// The daemon was still reading them: asked again at the next tick.
         again: bool,
+        /// The daemon answered: an empty list then says so in the title, rather than
+        /// leaving the person to wonder whether anything is still coming.
+        heard: bool,
     },
     /// A machine being connected has no qoop: put this version there, or not.
     Install {
@@ -3885,6 +3888,17 @@ fn space_dirs(state: &State, space: i64) -> Vec<String> {
         .filter(|row| row.workspace == space)
         .filter_map(usable_cwd)
         .collect();
+    // And where its sleeping tabs were: a space asleep but one tab worked in every one of them.
+    dirs.extend(
+        state
+            .spaces
+            .iter()
+            .filter(|w| w.id == space)
+            .flat_map(|w| w.sleeping.iter())
+            .map(|tab| tab.cwd.clone())
+            // No look at the disk here: a gone directory comes back marked gone.
+            .filter(|cwd| std::path::Path::new(cwd).is_absolute()),
+    );
     dirs.sort();
     dirs.dedup();
     dirs
@@ -4001,6 +4015,7 @@ fn take_earlier(
         space,
         earlier,
         again,
+        heard,
         ..
     } = &mut state.menu_kind
     else {
@@ -4014,6 +4029,7 @@ fn take_earlier(
         return false;
     }
     *earlier = resumable(&state.rows, sessions, EARLIER);
+    *heard = true;
     true
 }
 
@@ -4087,7 +4103,18 @@ pub fn menu_title(kind: &MenuKind) -> String {
         MenuKind::Main => " menu".to_string(),
         MenuKind::Plus => " spaces".to_string(),
         MenuKind::New { name, .. } => format!(" new in {name}"),
-        MenuKind::Agents { name, .. } => format!(" new agent in {name}"),
+        MenuKind::Agents {
+            name,
+            earlier,
+            heard,
+            ..
+        } => {
+            if *heard && earlier.is_empty() {
+                format!(" new agent in {name}, nothing earlier here")
+            } else {
+                format!(" new agent in {name}")
+            }
+        }
         // As root said out loud: every agent started there will run as root.
         MenuKind::Install { target, root, .. } => {
             let who = if *root { " as root" } else { "" };
@@ -4337,6 +4364,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     agents: installed_agents(),
                     earlier: Vec::new(),
                     again: false,
+                    heard: false,
                 };
                 state.menu = Some(0);
                 ask_earlier(state, space);
@@ -16602,6 +16630,64 @@ mod tests {
         );
     }
 
+    /// A space's sleeping tabs count for where its earlier conversations were, and a list the
+    /// daemon answered with nothing says so in its title instead of looking unfinished.
+    #[test]
+    fn the_agents_list_looks_where_sleeping_tabs_were_and_says_when_nothing_is_there() {
+        let awake = tempfile::tempdir().expect("dir");
+        let asleep = tempfile::tempdir().expect("dir");
+        let mut s = state();
+        let row = s
+            .rows
+            .iter_mut()
+            .find(|r| r.terminal == 1)
+            .expect("space 1 row");
+        row.cwd = Some(awake.path().display().to_string());
+        let space = row.workspace;
+        let w = s.spaces.iter_mut().find(|w| w.id == space).expect("space");
+        w.sleeping = vec![qoop_runtime::control::SleepingTab {
+            terminal: 77,
+            lead: None,
+            title: None,
+            agent: Some("claude".to_string()),
+            session: None,
+            cwd: asleep.path().display().to_string(),
+        }];
+        let mut request = 0;
+        open_new(&mut s, space);
+        assert!(matches!(
+            apply_menu_choice(&mut s, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        match s.modes.outbox.as_slice() {
+            [ControlRequest::AgentSessions { dirs, .. }] => {
+                assert!(dirs.contains(&awake.path().display().to_string()));
+                assert!(
+                    dirs.contains(&asleep.path().display().to_string()),
+                    "{dirs:?}"
+                );
+            }
+            other => panic!("one ask, got {other:?}"),
+        }
+        let title = menu_title(&s.menu_kind);
+        assert!(
+            !title.contains("nothing earlier"),
+            "not before the answer: {title}"
+        );
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::AgentSessions {
+                id: format!("earlier-{space}"),
+                reading: false,
+                sessions: Vec::new(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(menu_title(&s.menu_kind).ends_with("nothing earlier here"));
+    }
+
     /// The agents list asks this computer for the space's earlier conversations and, when they
     /// come, offers the ones it can carry on that are not open there already, under the agents;
     /// one picked starts a tab where it ran, typing its resume line, with no name asked.
@@ -16928,6 +17014,7 @@ mod tests {
             agents: agents.clone(),
             earlier: Vec::new(),
             again: false,
+            heard: false,
         };
         assert_eq!(menu_title(&s.menu_kind), " new agent in app");
         assert_eq!(
@@ -16966,6 +17053,7 @@ mod tests {
             agents,
             earlier: Vec::new(),
             again: false,
+            heard: false,
         };
         assert!(matches!(
             apply_menu_choice(&mut s, 1, &mut request),
