@@ -57,7 +57,10 @@ start <agent> so it never stops to ask: it runs commands without asking you or m
 outside its sandbox); what AGENTS.md says still guides it. A: add <the proposed lines>, B: keep as
 is." Your pick: A. On A: `setup.sh agents-add` (it writes only what it proposed); on B: `setup.sh
 agents-done`. No `propose:` line: `agents-done` and one line saying how each starts. A line of
-their own: only in their words, by `qoop config set agents.<name>`. A config not saved: `qoop config set qass.agent
+their own: only in their words, by `qoop config set agents.<name>`. Then one question: "Shall I watch your
+agents? I answer their routine questions the way you would and bring you only what you must
+decide. A: watch, B: not now." Your pick: A. `setup.sh watch on` or `setup.sh watch off`; a `watching on` line during setup
+starts the watcher with no summary. A config not saved: `qoop config set qass.agent
 <its current value>`. Other settings (`qoop config --json`): only on their word.
 
 ## 3. Item 2, their projects

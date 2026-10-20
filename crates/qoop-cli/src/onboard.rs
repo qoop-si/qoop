@@ -7,8 +7,8 @@
 //! esc finishes. Each choice is written as it is made, so leaving early keeps what was set.
 //! The rows are the settings page's own (`settings.rs`), so the two never disagree.
 //! In the release build, a question follows the steps: sign in now (`qoop login`) or later.
-//! Then, in every build with an agent qass runs on, a last one: set up projects and servers
-//! with qass now, which starts qass and opens qoop on it.
+//! Then, in every build with an agent qass runs on, qass starts and qoop opens on it, where qass
+//! sets up the projects, servers and settings with the person.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -471,18 +471,27 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         println!("{NO_AGENT}");
         return Ok(());
     };
-    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or(home);
-    let fresh = agent == "claude" && claude_dir.is_none_or(|d| claude_fresh(&d));
-    // A qass already there keeps the agent it runs on: the question names none then.
-    let new = matches!(crate::qass::look().life, crate::qass::Life::NotStarted);
-    println!("{}", first_start(&agent, &key, fresh));
-    if !yes(ask(&qass_question(new.then_some(agent.as_str()))).as_deref()) {
-        println!("{}", last_line(&key));
-        return Ok(());
+    // Claude's own settings: under CLAUDE_CONFIG_DIR, else `~/.claude.json` and `~/.claude/`.
+    let (json, settings) = match std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
+        Some(dir) => (
+            Some(dir.join(".claude.json")),
+            Some(dir.join("settings.json")),
+        ),
+        None => (
+            home.as_deref().map(|h| h.join(".claude.json")),
+            home.as_deref().map(|h| h.join(".claude/settings.json")),
+        ),
+    };
+    let warns = agent == "claude" && claude_warns(json.as_deref(), settings.as_deref());
+    if warns {
+        // Its warning defaults to "No, exit": this line is read before it comes.
+        println!("{}", claude_warning(&key));
+        let _ = ask(GO_ON);
     }
-    match open_qass(&agent) {
+    // Inside a qoop tab, an interface is already around it: qass is shown there, never nested.
+    let here = qoop_runtime::legacy::var_os("QOOP_TERMINAL").is_some();
+    match open_qass(&agent, here) {
+        Ok(()) if here => {}
         Ok(()) => println!("{}", after_qass()),
         Err(e) => {
             println!("qass did not start: {e}");
@@ -515,6 +524,7 @@ fn yes(said: Option<&str>) -> bool {
 
 const SIGN_IN: &str = "Sign in so this computer shows on qoop.si/app and your phone? [Y/n] ";
 const LATER: &str = "later: qoop login";
+const GO_ON: &str = "Press enter to open qoop with qass. ";
 const NO_AGENT: &str =
     "qass runs on claude, codex, gemini or opencode; install one, then: qoop qass";
 
@@ -564,46 +574,39 @@ fn here(agent: &str, home: Option<&Path>) -> bool {
         || (agent == "claude" && home.is_some_and(|h| h.join(".claude/local/claude").exists()))
 }
 
-/// Whether Claude has never finished its own first start with its settings in `dir` (the home,
-/// or `CLAUDE_CONFIG_DIR`): its first screens then come before qass.
-fn claude_fresh(dir: &Path) -> bool {
-    let done = std::fs::read(dir.join(".claude.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v["hasCompletedOnboarding"] == true);
-    !done
+/// Whether Claude shows a screen before qass can start on it: its first start not finished
+/// (`json`, `.claude.json`), or its permissions warning never accepted (`settings`), which
+/// qass's flag brings up.
+fn claude_warns(json: Option<&Path>, settings: Option<&Path>) -> bool {
+    let holds = |file: Option<&Path>, key: &str| {
+        file.and_then(|f| std::fs::read(f).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v[key] == true)
+    };
+    !(holds(json, "hasCompletedOnboarding") && holds(settings, "skipDangerousModePermissionPrompt"))
 }
 
-/// Said before the question: what the agent may ask on its first start, and the way back.
-fn first_start(agent: &str, key: &str, fresh_claude: bool) -> String {
-    let again = format!("If it exits, {key} Q starts qass again.");
-    if fresh_claude {
-        format!(
-            "claude asks a few first questions on its first start. At its warning choose \
-             \"Yes, I accept\":\nqass then runs commands without asking each time, inside its own \
-             rules. {again}"
-        )
-    } else {
-        format!("{agent} may ask you to sign in on its first start: answer it there. {again}")
-    }
+/// Said before Claude's screens: what to choose at its warning, what that means, the way back.
+fn claude_warning(key: &str) -> String {
+    format!(
+        "claude may ask a few first questions. At its warning choose \"Yes, I accept\":\nqass then \
+         runs commands without asking each time, inside its own rules. If it exits, {key} Q starts \
+         qass again."
+    )
 }
 
-/// The question, naming the agent a new qass starts on.
-fn qass_question(new_on: Option<&str>) -> String {
-    let on = new_on.map_or_else(String::new, |a| {
-        format!(" It runs on {a}, a few minutes per project.")
-    });
-    format!("Set up your projects and servers with qass now?{on} [Y/n] ")
-}
-
-/// After a yes: `agent` saved as qass's (which also writes the settings file, so qass's setup
+/// `agent` saved as qass's (which also writes the settings file, so qass's setup
 /// finds them kept), the daemon, qass started without its board, then qoop opened on it as its
 /// own process, so a restart of that interface starts a plain `qoop` and never onboarding again.
-fn open_qass(agent: &str) -> std::io::Result<()> {
+fn open_qass(agent: &str, inside: bool) -> std::io::Result<()> {
     config::set(&config::path(), "qass.agent", agent).map_err(std::io::Error::other)?;
     let dir = qoop_runtime::paths::runtime_dir().map_err(std::io::Error::other)?;
     crate::ensure_daemon(&qoop_runtime::paths::socket_path(&dir))?;
     let terminal = crate::qass::start(false)?;
+    if inside {
+        let _ = crate::qass::run(&["focus", &terminal.to_string()]);
+        return Ok(());
+    }
     // qass runs from here on: a qoop that does not open is said, and the line after says how.
     let opened = crate::own_path()
         .ok_or_else(|| std::io::Error::other("no path to this program"))
@@ -705,31 +708,29 @@ mod tests {
     }
 
     #[test]
-    fn claude_is_fresh_until_it_finished_its_first_start() {
+    fn claude_warns_until_its_first_start_is_done_and_its_warning_accepted() {
         let home = tempfile::tempdir().unwrap();
-        assert!(claude_fresh(home.path()));
-        let file = home.path().join(".claude.json");
-        std::fs::write(&file, r#"{"hasCompletedOnboarding": false}"#).unwrap();
-        assert!(claude_fresh(home.path()));
+        let (json, settings) = (home.path().join(".claude.json"), home.path().join("s.json"));
+        let warns = || claude_warns(Some(&json), Some(&settings));
+        assert!(warns());
+        std::fs::write(&json, r#"{"hasCompletedOnboarding": false}"#).unwrap();
+        assert!(warns());
         std::fs::write(
-            &file,
+            &json,
             r#"{"numStartups": 3, "hasCompletedOnboarding": true}"#,
         )
         .unwrap();
-        assert!(!claude_fresh(home.path()));
+        assert!(warns(), "a claude user who never accepted the warning");
+        std::fs::write(&settings, r#"{"skipDangerousModePermissionPrompt": true}"#).unwrap();
+        assert!(!warns());
+        assert!(claude_warns(None, None));
     }
 
     #[test]
-    fn the_first_start_line_says_the_way_back_and_what_claude_s_warning_means() {
-        let fresh = first_start("claude", "ctrl-b", true);
-        assert!(fresh.contains("\"Yes, I accept\"") && fresh.contains("without asking"));
-        assert!(fresh.ends_with("ctrl-b Q starts qass again."));
-        let other = first_start("codex", "ctrl-a", false);
-        assert!(other.starts_with("codex may ask you to sign in"));
-        assert!(other.ends_with("ctrl-a Q starts qass again."));
-        assert!(qass_question(Some("opencode")).contains("runs on opencode"));
-        assert!(qass_question(Some("opencode")).ends_with("[Y/n] "));
-        assert!(!qass_question(None).contains("runs on"));
+    fn the_warning_line_says_what_to_choose_what_it_means_and_the_way_back() {
+        let line = claude_warning("ctrl-b");
+        assert!(line.contains("\"Yes, I accept\"") && line.contains("without asking"));
+        assert!(line.ends_with("ctrl-b Q starts qass again."), "{line}");
     }
 
     #[test]

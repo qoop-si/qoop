@@ -297,6 +297,16 @@ fn settings_tick_once_saved_and_clean() {
     let home = Home::new();
     assert!(home.item(1).starts_with("[ ]"));
     assert!(home.qoop(&["config", "set", "qass.agent", "claude"]).0);
+    let line = home.item(1);
+    assert!(
+        line.starts_with("[ ]") && line.ends_with("not decided: watching"),
+        "{line}"
+    );
+    let (ok, _, err) = home.setup(&["watch", "off"]);
+    assert!(ok, "{err}");
+    let (_, watch, _) = home.qoop(&["qass", "watch"]);
+    assert!(watch.contains("off"), "{watch}");
+    assert!(!home.setup(&["watch", "maybe"]).0);
     assert!(home.item(1).starts_with("[x]"), "{}", home.status());
     let path = home.at("c/qoop/config.toml");
     let body = std::fs::read_to_string(&path).expect("config");
@@ -329,6 +339,7 @@ fn settings_wait_on_how_the_agents_start_and_propose_only_flags_their_help_lists
     stub("gemini", "  -s, --sandbox  Run in sandbox?");
     stub("opencode", "  --auto  Auto-approve permissions");
     assert!(home.qoop(&["config", "set", "qass.agent", "claude"]).0);
+    assert!(home.setup(&["watch", "on"]).0);
     assert!(
         home.qoop(&["config", "set", "agents.oc", "OPENCODE_X=1 opencode --auto"])
             .0
@@ -1002,6 +1013,7 @@ fn a_skipped_box_is_never_shown_done_and_setup_ends_when_none_is_open() {
     let home = Home::new();
     let (api, _, _) = home.repos();
     assert!(home.qoop(&["config", "set", "qass.agent", "claude"]).0);
+    assert!(home.setup(&["watch", "on"]).0);
     assert!(home.setup(&["pick", s(&api)]).0);
     home.write("stub/ls.json", r#"[{"id":"1","name":"api"}]"#);
     home.set_up(&api);

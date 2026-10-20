@@ -23,6 +23,7 @@
 #                                  flag that skips its approval prompts when its own --help has it
 #   setup.sh agents-add            add the proposed lines (`qoop config set agents.<name>`), recorded
 #   setup.sh agents-done           they decided how their agents start
+#   setup.sh watch on|off          whether qass watches their agents (`qoop qass watch`), recorded
 #   setup.sh write <file>          a new `.qoop/` file of a picked project from standard input, kept
 #                                  with its hash; refused when the file is theirs (there before setup)
 #   setup.sh undo [project]        remove what setup wrote and they did not change or commit since
@@ -609,9 +610,12 @@ status() {
     else
         s1=no d1="not saved yet: say keep, or change one"
     fi
-    later1=
-    if [ "$s1" = yes ] && ! has "agents done" && [ -n "$(agents_here)" ]; then
-        s1=no d1="saved; how your agents start: not decided" later1=yes
+    later1= open1=
+    has "agents done" || [ -z "$(agents_here)" ] || open1="how your agents start"
+    # A switch they already turned (the pet's `watch` word) is their decision too.
+    has "watch decided" || [ -f "@QASS_DATA@/watch" ] || open1="${open1:+$open1, }watching"
+    if [ "$s1" = yes ] && [ -n "$open1" ]; then
+        s1=no d1="saved; not decided: $open1" later1=yes
     fi
 
     picked="$(grep '^pick ' "$state" 2>/dev/null | sed 's/^pick //' || true)"
@@ -730,6 +734,11 @@ status) status ;;
 seen) put seen ;;
 agents) agents ;;
 agents-done) put "agents done" ;;
+watch)
+    case "${2:-}" in on | off) ;; *) echo "usage: setup.sh watch on|off" >&2; exit 2 ;; esac
+    qoop qass watch "$2"
+    put "watch decided"
+    ;;
 agents-add)
     # Only what propose_for builds from fixed parts, never text read from anywhere.
     for a in $(agents_here); do
