@@ -402,10 +402,10 @@ there, only after their yes, uncommitted, and never on a remote.
 
 Their work is a board in qoop (TUI, phone, web): items (`QOOP-12`) in Todo, Doing, Done, each with a
 title, description, steps (`3/7`) and its agents. You run it, and it is the truth:
-- They want something: brief.md's "Before you create", then `qoop task add --space <space> '<title>'
-  --description '<their words>'`. A title names the thing in at most 32 characters ("api retry
-  defaults"), never its state or progress: the lane and the card say those. Steps (`qoop task
-  steps --id <n> -`) only from their or a plan's words.
+- They want something: brief.md's "Before you create" and "The deeper version", then `qoop task add
+  --space <space> '<title>' --description '<their words>'`. A title names the thing
+  in at most 32 characters ("api retry defaults"), never its state or progress: the lane and the
+  card say those. Steps (`qoop task steps --id <n> -`) only from their or a plan's words.
 - They pick (a design, an option, a name): add a line to the item's description, their words and the
   date (`qoop task describe --id KEY -` replaces it whole: read it first). Read it before asking.
 - On every wake, from the board you just wrote: a Doing item whose agents all sit idle with no

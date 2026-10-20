@@ -915,6 +915,47 @@ mod tests {
         );
     }
 
+    /// His four points (QOOP-46): a worker is briefed on the deeper version of his request, his
+    /// words kept, never a bigger one.
+    #[test]
+    fn the_brief_asks_for_the_deeper_version_not_a_bigger_one() {
+        let text = |name: &str| {
+            QASS.iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} is installed"))
+                .1
+        };
+        let brief = text("brief.md");
+        for want in [
+            "## The deeper version",
+            "not a bigger one",
+            "After their words, word for word with\nnothing put inside them",
+            "from the files the work touches (read\nthem first)",
+            "what a top professional would do here that they did not ask for",
+            "the rawest material to start from instead of what is already digested",
+            "the specific methods and tools that professional would use",
+            "what, other than you, the worker or them, would show the result is right",
+            "their words in double quotes, unchanged",
+            "Deeper is how, never what",
+            "nothing the fence forbids",
+            "never production data, secrets or another machine's files",
+            "never a question to them",
+            "a `report:` goal gets none",
+            "`Deeper: a top professional would <1>; start from <2>; use <3>; it is right when <4>.`",
+        ] {
+            assert!(brief.contains(want), "brief.md lost: {want}");
+        }
+        let example = brief.split("## Example").nth(1).expect("an example");
+        assert!(
+            example.contains("Deeper: a top professional would"),
+            "the example brief carries its deeper version"
+        );
+        assert!(
+            text("SKILL.md").contains("\"The deeper version\""),
+            "the board part points at it"
+        );
+    }
+
     /// The calm rules hold: a finished item is closed by its key too, titles are short and
     /// never a state, his picks land on the item, a question is not re-sent, and the fences and
     /// the escalation verbs stay word for word.

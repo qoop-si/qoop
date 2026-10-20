@@ -12,6 +12,24 @@ the repo, the lessons or the screen answers. Nothing missing: create, do not ask
 After their answer: the item (a short title, a real description, their steps, a `done when` line),
 the worker started with the brief below, and one line to them with its key and space.
 
+## The deeper version
+
+Brief the deeper version of their request, not a bigger one. After their words, word for word with
+nothing put inside them, come four answers, one clause each, from the files the work touches (read
+them first):
+
+1. what a top professional would do here that they did not ask for;
+2. the rawest material to start from instead of what is already digested (the code, a real failing
+   input, the real log, over a summary of them);
+3. the specific methods and tools that professional would use;
+4. what, other than you, the worker or them, would show the result is right: a check inside the
+   fence (a test that fails without the change, a real run's output) that proves their `done when`.
+
+Deeper is how, never what: no feature, refactor, deliverable, review round or `done when` they did
+not ask for, nothing the fence forbids. Name only a file, test or tool you saw, else its kind ("a
+row that breaks"); never production data, secrets or another machine's files. Yours to write,
+never a question to them; a `report:` goal gets none.
+
 ## Tier
 
 Pick one for the work, and say which and why in one clause of the brief:
@@ -35,7 +53,9 @@ One `qoop prompt` line, in this order:
    steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the
    fence allows. Each `qoop task`
    command alone, one per call, never chained (a chain asks permission)."
-2. The goal in the owner's words and when it is done (already cleared up with them: no second round).
+2. The goal: their words in double quotes, unchanged, with when it is done (cleared up with them:
+   no second round), then
+   `Deeper: a top professional would <1>; start from <2>; use <3>; it is right when <4>.`
 3. `tier: <tier>, because <why>`.
 4. Sub-agents (claude workers only), a few clauses: where the work fans out and on which tier
    (its subagent `model`: best `opus`, mid `sonnet`, low `haiku`), and that it uses them there and
@@ -53,5 +73,5 @@ and put its path in the brief.
 
 ```
 "<this skill's dir>/spawn.sh" ~/src/shop fix/cart-total --tier mid       # prints "57 1"
-qoop prompt 57 --generation 1 -- 'First run `qoop task link SHOP-4` and keep its steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per call, never chained (a chain asks permission). Goal: the cart total is wrong when a coupon and free shipping meet; done when a test shows the right total and the fix is in a PR. tier: mid, because it is one bug in known code. Sub-agents: one low agent to find every place the total is computed; two reviewers on your plan, best for the one that tries to break it, mid for the other; none anywhere else. Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.'
+qoop prompt 57 --generation 1 -- 'First run `qoop task link SHOP-4` and keep its steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the fence allows. Each `qoop task` command alone, one per call, never chained (a chain asks permission). Goal: "the cart total is wrong when a coupon and free shipping meet; done when a test shows the right total and the fix is in a PR." Deeper: a top professional would find why the two rules clash, not patch the sum; start from an order that came out wrong and the code that sums it; use a failing test first; it is right when that test fails before the fix and passes after. tier: mid, because it is one bug in known code. Sub-agents: one low agent to find every place the total is computed; two reviewers on your plan, best for the one that tries to break it, mid for the other; none anywhere else. Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.'
 ```
