@@ -521,6 +521,15 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
         }
         None => {}
     }
+    let terminal = start(true)?;
+    // Shown where the person is looking; with no interface open, the number says where.
+    let _ = run(&["focus", &terminal.to_string()]);
+    Ok(())
+}
+
+/// qass, running: said when it already runs, woken when it sleeps, else started on `[qass]
+/// agent`; its terminal. With `board`, the board opens above it.
+pub(crate) fn start(board: bool) -> std::io::Result<u64> {
     let folder = paths::qass_data_dir()
         .ok_or_else(|| std::io::Error::other("no HOME to keep qass's folder under"))?;
     let terminal = if let Some(terminal) = running(&folder) {
@@ -588,12 +597,10 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     };
     // The board on top of it; qass is there without it, so a board that cannot open is said
     // and nothing more.
-    if let Err(why) = show_board(terminal, &folder) {
+    if board && let Err(why) = show_board(terminal, &folder) {
         eprintln!("qoop: the board did not open above qass: {why}");
     }
-    // Shown where the person is looking; with no interface open, the number says where.
-    let _ = run(&["focus", &terminal.to_string()]);
-    Ok(())
+    Ok(terminal)
 }
 
 /// `qoop qass watch [on|off]`: read or turn the owner's switch for qass's watcher. Through the

@@ -7,8 +7,11 @@
 //! esc finishes. Each choice is written as it is made, so leaving early keeps what was set.
 //! The rows are the settings page's own (`settings.rs`), so the two never disagree.
 //! In the release build, a question follows the steps: sign in now (`qoop login`) or later.
+//! Then, in every build with an agent qass runs on, a last one: set up projects and servers
+//! with qass now, which starts qass and opens qoop on it.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use qoop_runtime::avatar::{self, Avatar};
 use qoop_tui::config;
@@ -455,36 +458,71 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         }
     }
     drop(session);
-    if let Some(phone) = phone {
-        // A key typed for the last page (an enter pressed twice) must not answer yes.
-        // SAFETY: tcflush on standard input only discards what is queued there.
-        unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
-        print!("{SIGN_IN}");
-        let _ = std::io::stdout().flush();
-        let mut said = String::new();
-        let said = std::io::stdin()
-            .lock()
-            .read_line(&mut said)
-            .ok()
-            .filter(|&n| n > 0)
-            .map(|_| said);
-        if let Some(hint) = sign_in(phone, said.as_deref()) {
-            println!("{hint}");
+    if let Some(phone) = phone
+        && let Some(hint) = sign_in(phone, ask(SIGN_IN).as_deref())
+    {
+        println!("{hint}");
+    }
+    let key = command_key(config::read().config.prefix);
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    let Some(agent) = qass_agent(&config::read(), |a| here(a, home.as_deref())) else {
+        println!("{NO_AGENT}");
+        return Ok(());
+    };
+    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or(home);
+    let fresh = agent == "claude" && claude_dir.is_none_or(|d| claude_fresh(&d));
+    // A qass already there keeps the agent it runs on: the question names none then.
+    let new = matches!(crate::qass::look().life, crate::qass::Life::NotStarted);
+    println!("{}", first_start(&agent, &key, fresh));
+    if !yes(ask(&qass_question(new.then_some(agent.as_str()))).as_deref()) {
+        println!("{}", last_line(&key));
+        return Ok(());
+    }
+    match open_qass(&agent) {
+        Ok(()) => println!("{}", after_qass()),
+        Err(e) => {
+            println!("qass did not start: {e}");
+            println!("{}", last_line(&key));
         }
     }
-    println!("{}", last_line(config::read().config.prefix));
     Ok(())
+}
+
+/// `question` asked on the terminal, its answer when one was typed. A key typed for what came
+/// before (an enter pressed twice on the last page) is dropped first, so it never answers.
+fn ask(question: &str) -> Option<String> {
+    // SAFETY: tcflush on standard input only discards what is queued there.
+    unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+    print!("{question}");
+    let _ = std::io::stdout().flush();
+    let mut said = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut said)
+        .ok()
+        .filter(|&n| n > 0)
+        .map(|_| said)
+}
+
+/// A yes: enter alone is one; no answer is not.
+fn yes(said: Option<&str>) -> bool {
+    said.is_some_and(|a| matches!(a.trim(), "" | "y" | "Y" | "yes" | "Yes"))
 }
 
 const SIGN_IN: &str = "Sign in so this computer shows on qoop.si/app and your phone? [Y/n] ";
 const LATER: &str = "later: qoop login";
+const NO_AGENT: &str =
+    "qass runs on claude, codex, gemini or opencode; install one, then: qoop qass";
 
-/// After a yes (enter alone is one), `qoop login`; the line to print after it, if any. Asked
-/// first because a login waits up to ten minutes for the browser. Nothing here fails
-/// onboarding: a no, no answer, no network or a code nobody confirmed all end on the hint.
+/// After a yes, `qoop login`; the line to print after it, if any. Asked first because a login
+/// waits up to ten minutes for the browser. Nothing here fails onboarding: a no, no answer, no
+/// network or a code nobody confirmed all end on the hint.
 fn sign_in(phone: Phone, said: Option<&str>) -> Option<String> {
-    let yes = said.is_some_and(|a| matches!(a.trim(), "" | "y" | "Y" | "yes" | "Yes"));
-    if !yes {
+    if !yes(said) {
         return Some(LATER.into());
     }
     match phone(&["qoop".into(), "login".into()]) {
@@ -493,13 +531,102 @@ fn sign_in(phone: Phone, said: Option<&str>) -> Option<String> {
     }
 }
 
-/// What onboarding ends on: the next thing to do, with the command key just chosen.
-fn last_line(prefix: u8) -> String {
-    let key = format!("ctrl-{}", char::from(b'a' + prefix - 1));
+/// The command key as it is pressed: `ctrl-b` for prefix 2.
+fn command_key(prefix: u8) -> String {
+    format!("ctrl-{}", char::from(b'a' + prefix - 1))
+}
+
+/// What onboarding ends on without qass: the next thing to do, with the command key just chosen.
+fn last_line(key: &str) -> String {
     format!(
         "qoop is set up. Next: start qoop, then {key} Q opens qass, which sets up your projects \
          with you (settings: qoop settings)"
     )
+}
+
+/// The agent qass starts on: the one the file names when it is here (a person's own `[agents]`
+/// line always is: its shell may know names this process does not), else the first one here.
+fn qass_agent(read: &config::Read, here: impl Fn(&str) -> bool) -> Option<String> {
+    let named = &read.qass_agent;
+    if read.agents.iter().any(|a| &a.name == named) || here(named) {
+        return Some(named.clone());
+    }
+    ["claude", "codex", "opencode", "gemini"]
+        .into_iter()
+        .find(|a| here(a))
+        .map(String::from)
+}
+
+/// Whether an agent qass runs on by name is installed: on `PATH`, or Claude's own local
+/// install, which its installer reaches through a shell alias.
+fn here(agent: &str, home: Option<&Path>) -> bool {
+    crate::hooks::on_path(agent)
+        || (agent == "claude" && home.is_some_and(|h| h.join(".claude/local/claude").exists()))
+}
+
+/// Whether Claude has never finished its own first start with its settings in `dir` (the home,
+/// or `CLAUDE_CONFIG_DIR`): its first screens then come before qass.
+fn claude_fresh(dir: &Path) -> bool {
+    let done = std::fs::read(dir.join(".claude.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v["hasCompletedOnboarding"] == true);
+    !done
+}
+
+/// Said before the question: what the agent may ask on its first start, and the way back.
+fn first_start(agent: &str, key: &str, fresh_claude: bool) -> String {
+    let again = format!("If it exits, {key} Q starts qass again.");
+    if fresh_claude {
+        format!(
+            "claude asks a few first questions on its first start. At its warning choose \
+             \"Yes, I accept\":\nqass then runs commands without asking each time, inside its own \
+             rules. {again}"
+        )
+    } else {
+        format!("{agent} may ask you to sign in on its first start: answer it there. {again}")
+    }
+}
+
+/// The question, naming the agent a new qass starts on.
+fn qass_question(new_on: Option<&str>) -> String {
+    let on = new_on.map_or_else(String::new, |a| {
+        format!(" It runs on {a}, a few minutes per project.")
+    });
+    format!("Set up your projects and servers with qass now?{on} [Y/n] ")
+}
+
+/// After a yes: `agent` saved as qass's (which also writes the settings file, so qass's setup
+/// finds them kept), the daemon, qass started without its board, then qoop opened on it as its
+/// own process, so a restart of that interface starts a plain `qoop` and never onboarding again.
+fn open_qass(agent: &str) -> std::io::Result<()> {
+    config::set(&config::path(), "qass.agent", agent).map_err(std::io::Error::other)?;
+    let dir = qoop_runtime::paths::runtime_dir().map_err(std::io::Error::other)?;
+    crate::ensure_daemon(&qoop_runtime::paths::socket_path(&dir))?;
+    let terminal = crate::qass::start(false)?;
+    // qass runs from here on: a qoop that does not open is said, and the line after says how.
+    let opened = crate::own_path()
+        .ok_or_else(|| std::io::Error::other("no path to this program"))
+        .and_then(|me| {
+            std::process::Command::new(me)
+                .env(qoop_tui::run::FOCUS_ENV, terminal.to_string())
+                .status()
+        });
+    if let Err(e) = opened {
+        println!("qoop did not open: {e}");
+    }
+    Ok(())
+}
+
+/// Said when that qoop is closed: qass still runs, and the command that opens it again, by
+/// full path while `qoop` is not on `PATH` yet.
+fn after_qass() -> String {
+    let cmd = if crate::hooks::on_path("qoop") {
+        "qoop".to_string()
+    } else {
+        crate::own_path().map_or_else(|| "qoop".into(), |p| p.display().to_string())
+    };
+    format!("qass keeps running in qoop; open it again: {cmd}")
 }
 
 #[cfg(test)]
@@ -548,8 +675,73 @@ mod tests {
 
     #[test]
     fn it_ends_on_qass_with_the_chosen_key() {
-        assert!(last_line(2).contains("ctrl-b Q opens qass"));
-        assert!(last_line(1).contains("ctrl-a Q"));
+        assert!(last_line(&command_key(2)).contains("ctrl-b Q opens qass"));
+        assert!(last_line(&command_key(1)).contains("ctrl-a Q"));
+    }
+
+    fn read_naming(agent: &str, launchers: &str) -> config::Read {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, format!("[qass]\nagent = \"{agent}\"\n{launchers}")).unwrap();
+        config::read_from(&file)
+    }
+
+    #[test]
+    fn qass_starts_on_the_named_agent_when_it_is_here_else_on_the_first_one_here() {
+        let only = |have: &'static [&'static str]| move |a: &str| have.contains(&a);
+        let codex = read_naming("codex", "");
+        assert_eq!(
+            qass_agent(&codex, only(&["codex", "claude"])).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            qass_agent(&codex, only(&["gemini", "opencode"])).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(qass_agent(&codex, only(&[])), None);
+        // A person's own line is theirs, whatever this process finds on its PATH.
+        let own = read_naming("mine", "[agents]\nmine = \"FOO=1 ~/bin/claude\"\n");
+        assert_eq!(qass_agent(&own, only(&[])).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn claude_is_fresh_until_it_finished_its_first_start() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(claude_fresh(home.path()));
+        let file = home.path().join(".claude.json");
+        std::fs::write(&file, r#"{"hasCompletedOnboarding": false}"#).unwrap();
+        assert!(claude_fresh(home.path()));
+        std::fs::write(
+            &file,
+            r#"{"numStartups": 3, "hasCompletedOnboarding": true}"#,
+        )
+        .unwrap();
+        assert!(!claude_fresh(home.path()));
+    }
+
+    #[test]
+    fn the_first_start_line_says_the_way_back_and_what_claude_s_warning_means() {
+        let fresh = first_start("claude", "ctrl-b", true);
+        assert!(fresh.contains("\"Yes, I accept\"") && fresh.contains("without asking"));
+        assert!(fresh.ends_with("ctrl-b Q starts qass again."));
+        let other = first_start("codex", "ctrl-a", false);
+        assert!(other.starts_with("codex may ask you to sign in"));
+        assert!(other.ends_with("ctrl-a Q starts qass again."));
+        assert!(qass_question(Some("opencode")).contains("runs on opencode"));
+        assert!(qass_question(Some("opencode")).ends_with("[Y/n] "));
+        assert!(!qass_question(None).contains("runs on"));
+    }
+
+    #[test]
+    fn claude_s_local_install_counts_as_claude_being_here() {
+        let home = tempfile::tempdir().unwrap();
+        let on_path = crate::hooks::on_path("claude");
+        assert_eq!(here("claude", Some(home.path())), on_path);
+        std::fs::create_dir_all(home.path().join(".claude/local")).unwrap();
+        std::fs::write(home.path().join(".claude/local/claude"), "").unwrap();
+        assert!(here("claude", Some(home.path())));
+        assert!(!here("no-such-agent-here", Some(home.path())));
+        assert!(!here("no-such-agent-here", None));
     }
 
     #[test]
