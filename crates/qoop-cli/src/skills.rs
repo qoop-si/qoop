@@ -845,7 +845,9 @@ mod tests {
         // 11,100 since 2026-10-20: "they" and "their" for the person, the rules unchanged.
         // 12,700 since 2026-10-20: spaces for projects and server folders, hosts from shell
         // history, and qoop put on a server only by the person's own `y` in a tab qass opens.
-        assert!(chars <= 12_700, "setup.md is {chars} characters");
+        // 13,400 since 2026-10-20: how their agents start (launchers that skip approval prompts),
+        // a named pick of projects, and one language through setup.
+        assert!(chars <= 13_400, "setup.md is {chars} characters");
         for want in [
             "Never read or write a secret",
             "only after their yes, uncommitted, never on a remote",

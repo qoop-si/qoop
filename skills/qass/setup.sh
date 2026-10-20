@@ -19,6 +19,10 @@
 #   setup.sh dirs <host> [target]  the git projects on that server, after their yes: one read-only ssh
 #   setup.sh remote-space <host> <folder>
 #                                  a space on the qoop remote <host> with one tab in <folder>, recorded
+#   setup.sh agents                each agent qass knows that is installed, its [agents] lines, and the
+#                                  flag that skips its approval prompts when its own --help has it
+#   setup.sh agents-add            add the proposed lines (`qoop config set agents.<name>`), recorded
+#   setup.sh agents-done           they decided how their agents start
 #   setup.sh write <file>          a new `.qoop/` file of a picked project from standard input, kept
 #                                  with its hash; refused when the file is theirs (there before setup)
 #   setup.sh undo [project]        remove what setup wrote and they did not change or commit since
@@ -326,6 +330,75 @@ ssh_space() {
     return 1
 }
 
+# The flag that lets agent $1 run without asking before each command, only when its own --help
+# lists it (read from each CLI's help on 2026-10-20); nothing for an agent without one.
+skip_flag() {
+    case "$1" in
+    claude) f=--dangerously-skip-permissions ;;
+    codex) f=--dangerously-bypass-approvals-and-sandbox ;;
+    gemini) f=--yolo ;;
+    opencode) f=--auto ;;
+    *) return 0 ;;
+    esac
+    "$(agent_bin "$1")" --help 2>&1 </dev/null |
+        grep -qE -- "(^|[[:space:],])$f([[:space:],=]|\$)" && echo "$f"
+    return 0
+}
+
+# Where agent $1 runs from: on PATH, or Claude's own local install (reached through an alias).
+agent_bin() {
+    if command -v "$1" >/dev/null 2>&1; then echo "$1"
+    elif [ "$1" = claude ] && [ -x "$HOME/.claude/local/claude" ]; then echo "$HOME/.claude/local/claude"
+    fi
+}
+
+# The agents qass knows that are installed.
+agents_here() {
+    for a in claude codex gemini opencode; do [ -z "$(agent_bin "$a")" ] || echo "$a"; done
+    return 0
+}
+
+# The `[agents]` lines as `<name> = <line>`; a line JSON had to escape is left out.
+launchers() {
+    qoop config --json 2>/dev/null | grep -o '{"name":"[^"]*","command":"[^"\\]*"}' |
+        sed 's/^{"name":"\([^"]*\)","command":"\([^"]*\)"}$/\1 = \2/' || true
+}
+
+# Of the lines $2, those that run agent $1 (the first word that is not an assignment, by name).
+lines_of() {
+    printf '%s\n' "$2" | A="$1" awk -F' = ' 'NF > 1 {
+        n = split($2, w, " "); for (i = 1; i <= n && w[i] ~ /=/; i++) ; p = w[i]; sub(/^.*\//, "", p)
+        if (p == ENVIRON["A"]) printf "%s%s", (o++ ? ", " : ""), $0 }'
+}
+
+# The line A adds for agent $1, as `<name><TAB><line>`, from fixed parts only: its flag (when its
+# help has one and no line of it holds that flag), the program where it runs, and a name no line
+# has. Nothing else, so no text in a config line or a help page becomes a proposal.
+propose_for() {
+    f="$(skip_flag "$1")"
+    [ -n "$f" ] || return 0
+    all="$(launchers)"
+    if lines_of "$1" "$all" | grep -qE -- "(^|[[:space:]])$f([[:space:],]|\$)"; then return 0; fi
+    # Every name in the file, a line JSON had to escape included.
+    names="$(qoop config --json 2>/dev/null | grep -o '"name":"[^"]*"' || true)"
+    n="$1-auto" i=1
+    while printf '%s\n' "$names" | grep -qxF "\"name\":\"$n\""; do i=$((i + 1)); n="$1-auto-$i"; done
+    printf '%s\t%s %s\n' "$n" "$(agent_bin "$1")" "$f"
+}
+
+# Per agent installed: `<agent>  lines: <name> = <line>, ...  skip prompts: <flag>  propose: <name> =
+# <line>`.
+agents() {
+    all="$(launchers)"
+    agents_here | while IFS= read -r a; do
+        mine="$(lines_of "$a" "$all")"
+        printf '%s  lines: %s  skip prompts: %s' "$a" "${mine:--}" "$(skip_flag "$a" | grep . || echo none)"
+        p="$(propose_for "$a")"
+        [ -z "$p" ] || printf '  propose: %s = %s' "${p%%"$(printf '\t')"*}" "${p#*"$(printf '\t')"}"
+        echo
+    done
+}
+
 servers() {
     n=0
     all_hosts | while IFS="$(printf '\t')" read -r h t k from addr; do
@@ -504,6 +577,7 @@ undo() {
             print "space " $3 ":" $2 ": close its tab, then on " $3 ": qoop space rm " $2
             if (!($3 in seen)) { seen[$3] = 1; hosts[++n] = $3 }
         }
+        $1 == "launcher" { print "agents." $2 ": delete its line under [agents] in config.toml (qoop config shows where)" }
         END {
             for (i = 1; i <= n; i++)
                 print "qoop on " hosts[i] ": there, ~/.local/bin/qoop uninstall (it asks first); then here, qoop remote rm " hosts[i]
@@ -534,6 +608,10 @@ status() {
         s1=no d1="config.toml has a line qoop cannot use: qoop config"
     else
         s1=no d1="not saved yet: say keep, or change one"
+    fi
+    later1=
+    if [ "$s1" = yes ] && ! has "agents done" && [ -n "$(agents_here)" ]; then
+        s1=no d1="saved; how your agents start: not decided" later1=yes
     fi
 
     picked="$(grep '^pick ' "$state" 2>/dev/null | sed 's/^pick //' || true)"
@@ -624,9 +702,12 @@ status() {
     for i in 1 2 3 4 5 6; do
         eval "s=\$s$i d=\$d$i"
         if [ "$s" = none ]; then b="[-]"; else b="$(box "$i" "$s")"; fi
-        [ -z "$next" ] && [ "$b" = "[ ]" ] && next=$i
+        # How the agents start is asked after the projects, never before them.
+        if [ -z "$next" ] && [ "$b" = "[ ]" ]; then
+            [ "$i" = 1 ] && [ -n "$later1" ] && [ "$s2" != yes ] && ! has "skip 2" || next=$i
+        fi
         case $i in
-        1) l="qoop's settings" ;; 2) l="your projects" ;; 3) l="your servers" ;;
+        1) l="settings, how agents start" ;; 2) l="your projects" ;; 3) l="your servers" ;;
         4) l="what I may do without asking" ;; 5) l="your phone" ;; 6) l="a first small job" ;;
         esac
         printf '%s %s %-30s %s\n' "$b" "$i" "$l" "$d"
@@ -647,6 +728,25 @@ cmd="${1:-status}"
 case "$cmd" in
 status) status ;;
 seen) put seen ;;
+agents) agents ;;
+agents-done) put "agents done" ;;
+agents-add)
+    # Only what propose_for builds from fixed parts, never text read from anywhere.
+    for a in $(agents_here); do
+        p="$(propose_for "$a")"
+        [ -n "$p" ] || continue
+        n="${p%%"$(printf '\t')"*}" line="${p#*"$(printf '\t')"}"
+        if qoop config set "agents.$n" "$line" >/dev/null; then
+            put "launcher $n"
+            echo "added $n = $line"
+        else
+            failed=yes
+        fi
+    done
+    # A line that was not written leaves the question open.
+    [ -z "${failed:-}" ] || exit 1
+    put "agents done"
+    ;;
 projects) projects "${2:-}" ;;
 servers) servers ;;
 pick | drop)

@@ -309,6 +309,111 @@ fn settings_tick_once_saved_and_clean() {
 }
 
 #[test]
+fn settings_wait_on_how_the_agents_start_and_propose_only_flags_their_help_lists() {
+    let home = Home::new();
+    let stub = |name: &str, help: &str| {
+        home.write(
+            &format!("bin/{name}"),
+            &format!("#!/bin/sh\necho '{help}'\n"),
+        );
+        std::fs::set_permissions(
+            home.at(&format!("bin/{name}")),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+    };
+    stub(
+        "claude",
+        "  --dangerously-skip-permissions  Bypass all permission checks",
+    );
+    stub("gemini", "  -s, --sandbox  Run in sandbox?");
+    stub("opencode", "  --auto  Auto-approve permissions");
+    assert!(home.qoop(&["config", "set", "qass.agent", "claude"]).0);
+    assert!(
+        home.qoop(&["config", "set", "agents.oc", "OPENCODE_X=1 opencode --auto"])
+            .0
+    );
+    // A name already taken, and a line whose own text reads like a proposal.
+    for (name, line) in [
+        ("claude-auto", "claude --model opus"),
+        // JSON escapes this one's quotes: its name is still taken.
+        ("claude-auto-2", "claude --model \"x\""),
+        ("gm", "gemini  propose: pwn-auto = gemini --evil"),
+    ] {
+        assert!(
+            home.qoop(&["config", "set", &format!("agents.{name}"), line])
+                .0
+        );
+    }
+    let line = home.item(1);
+    assert!(
+        line.starts_with("[ ]") && line.contains("how your agents start"),
+        "{line}"
+    );
+    let (ok, out, err) = home.setup(&["agents"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        out,
+        "claude  lines: claude-auto = claude --model opus  \
+         skip prompts: --dangerously-skip-permissions  \
+         propose: claude-auto-3 = claude --dangerously-skip-permissions\n\
+         gemini  lines: gm = gemini  propose: pwn-auto = gemini --evil  skip prompts: none\n\
+         opencode  lines: oc = OPENCODE_X=1 opencode --auto  skip prompts: --auto\n"
+    );
+    // Asked after the projects: the first message's numbers are the projects'.
+    assert!(
+        home.status()
+            .ends_with("Next: type 2 (about 2 to 3 minutes a project).\n")
+    );
+    assert!(home.setup(&["skip", "2"]).0);
+    assert!(home.status().ends_with("Next: type 1 (under a minute).\n"));
+    let (ok, out, _) = home.setup(&["agents-add"]);
+    assert!(
+        ok && out == "added claude-auto-3 = claude --dangerously-skip-permissions\n",
+        "{out}"
+    );
+    let (_, config, _) = home.qoop(&["config", "--json"]);
+    assert!(
+        config.contains(
+            r#"{"name":"claude-auto-3","command":"claude --dangerously-skip-permissions"}"#
+        ) && config.contains(r#"{"name":"claude-auto","command":"claude --model opus"}"#)
+            && !config.contains("pwn-auto\","),
+        "{config}"
+    );
+    assert!(home.item(1).starts_with("[x]"), "{}", home.status());
+    let (_, undo, _) = home.setup(&["undo"]);
+    assert!(
+        undo.contains("agents.claude-auto-3: delete its line under [agents]"),
+        "{undo}"
+    );
+    // A line that cannot be written leaves the question open.
+    let state = home.at("d/qoop/qass/setup");
+    let kept = std::fs::read_to_string(&state).expect("state");
+    std::fs::write(&state, kept.replace("agents done\n", "")).expect("write");
+    let config = home.at("c/qoop/config.toml");
+    let body = std::fs::read_to_string(&config).expect("config");
+    stub(
+        "codex",
+        "  --dangerously-bypass-approvals-and-sandbox  Skip all",
+    );
+    std::fs::write(&config, "not = [toml").expect("write");
+    assert!(!home.setup(&["agents-add"]).0);
+    assert!(
+        !std::fs::read_to_string(&state)
+            .expect("state")
+            .contains("agents done")
+    );
+    std::fs::write(&config, body).expect("write");
+    // A flag is found as a whole word in the help, never inside a longer one.
+    stub("opencode", "  --auto-share  Share sessions");
+    let (_, out, _) = home.setup(&["agents"]);
+    assert!(
+        out.contains("opencode  lines: oc = OPENCODE_X=1 opencode --auto  skip prompts: none"),
+        "{out}"
+    );
+}
+
+#[test]
 fn projects_tick_when_every_picked_one_has_both_files() {
     let home = Home::new();
     let (api, _, tool) = home.repos();

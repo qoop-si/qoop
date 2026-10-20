@@ -34,8 +34,10 @@ ssh commands in your shell history (only the host, its port, user and key file).
 ```
 
 Then `setup.sh seen`, and in the same message item 2's list (`setup.sh projects`, numbered) with
-"Which do you work on? Numbers, `all`, or a path." Items 1 and 5 often show done already: the
-onboarding saved the settings and signed in; say nothing about a box that is done. Each explanation at most 100 words; they can say "simpler" (everyday words, no
+"Which do you work on? Numbers, `all`, or a path." and your pick: the ones with a commit in the
+last 7 days, at most 5 ("my pick: 1, 2, 4"). Item 5 often shows done (onboarding signed in); say
+nothing about a box that is done. During setup, no fleet line (who waits, who works) in any message.
+Keep the language of their first words; a bare answer (`mocker C`, `3`) has none. Each explanation at most 100 words; they can say "simpler" (everyday words, no
 terms, at most 100) or "more detail" (the real files and keys named, at most 160), in their language,
 on any item. With a folder (`/qass setup ~/work/x`): skip the five lines, run item 2 on
 `setup.sh projects <folder>`. Later messages: what happened in one line, then `setup.sh status`
@@ -46,12 +48,17 @@ and `status` shows it open, say in one line what is missing. `skip <n>`: `setup.
 Every command they run themselves is said as: "Open a shell tab (<prefix> c, any name, enter) and paste:"
 then the command alone on its line. Typed to you, it would only be a message.
 
-## 2. Item 1, qoop's settings
+## 2. Item 1, qoop's settings and how their agents start
 
-From `qoop config --json` and `qoop notch status`, in plain words: the agent you run on, the models
-for your helpers, when idle agents sleep, the notch. They say `keep`: run `qoop config set qass.agent
-<its current value>` (that saves the file and ticks the box). A change: `qoop config set <key>
-<value>` on their word only.
+Right after item 2. `setup.sh agents`: each agent installed, its
+`[agents]` lines (a name on the left that starts it with that line) and the flag that lets it work
+without asking before each command. Its `propose:` lines become one question, its warning said as written: "A new tab can
+start <agent> so it never stops to ask: it runs commands without asking you or me first (codex: also
+outside its sandbox); what AGENTS.md says still guides it. A: add <the proposed lines>, B: keep as
+is." Your pick: A. On A: `setup.sh agents-add` (it writes only what it proposed); on B: `setup.sh
+agents-done`. No `propose:` line: `agents-done` and one line saying how each starts. A line of
+their own: only in their words, by `qoop config set agents.<name>`. A config not saved: `qoop config set qass.agent
+<its current value>`. Other settings (`qoop config --json`): only on their word.
 
 ## 3. Item 2, their projects
 

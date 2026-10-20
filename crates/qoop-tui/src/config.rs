@@ -784,6 +784,20 @@ pub const KEYS: [&str; 18] = [
 /// the file never holds something the reader would refuse; a file that is not TOML is
 /// left alone and said, since writing over it would lose what a person was typing.
 pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    // An `[agents]` line: a plain name that is not an agent's own, its line as the reader takes it.
+    if let Some(name) = key.strip_prefix("agents.") {
+        let plain = name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if !plain || name.is_empty() || name.len() > 24 || QASS_AGENTS.contains(&name) {
+            return Err(format!(
+                "agents.<name> is up to 24 small letters, digits, - or _, and none of {}",
+                QASS_AGENTS.join(", ")
+            ));
+        }
+        let line = launcher(name, &toml::Value::String(value.to_string()))?;
+        return qoop_runtime::config::edit(path, &[(key, toml_edit::value(line.command))]);
+    }
     let item = match key {
         "prefix" if prefix_byte(value).is_some() => toml_edit::value(value),
         "prefix" => return Err(format!("prefix is {PREFIX_SAID}")),
@@ -855,6 +869,47 @@ fn prefix_byte(name: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `agents.<name>` writes a launcher the reader lists, one line and under its own name,
+    /// keeping the file's other lines; an agent's own name or a second line is refused.
+    #[test]
+    fn set_writes_an_agents_line_the_reader_lists() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[qass]\nagent = \"codex\"\n").expect("write");
+        set(
+            &path,
+            "agents.claude-auto",
+            "claude --dangerously-skip-permissions",
+        )
+        .expect("set");
+        let read = read_from(&path);
+        assert!(read.problems.is_empty(), "{:?}", read.problems);
+        let line = read
+            .agents
+            .iter()
+            .find(|a| a.name == "claude-auto")
+            .expect("listed");
+        assert_eq!(line.command, "claude --dangerously-skip-permissions");
+        assert_eq!(read.qass_agent, "codex");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .starts_with("# mine\n")
+        );
+        set(&path, "qass.agent", "claude-auto").expect("qass on it");
+        for (key, value) in [
+            ("agents.claude", "claude --yolo"),
+            ("agents.", "claude"),
+            ("agents.a b", "claude"),
+            ("agents.Claude", "claude"),
+            ("agents.abcdefghijklmnopqrstuvwxy", "claude"),
+            ("agents.x", "claude\nrm -rf ~"),
+            ("agents.x", "  "),
+        ] {
+            assert!(set(&path, key, value).is_err(), "{key} = {value:?}");
+        }
+    }
 
     /// `set` now writes through the runtime's one core; every key still lands, reads back,
     /// keeps what was around it, and a file that is not TOML is refused with the old words.
