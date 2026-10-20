@@ -2158,6 +2158,7 @@ async fn pump<S>(
     stream: S,
     leftover: BytesMut,
     server_version: String,
+    connection: Connection,
     events: &mpsc::Sender<FromLink>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -2186,7 +2187,7 @@ async fn pump<S>(
         writer.abort();
         return;
     }
-    let mut connection = Connection::raw();
+    let mut connection = connection;
     let mut inbuf = leftover;
     let mut tick = tokio::time::interval(client::ACK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2261,7 +2262,7 @@ async fn supervise(
                 // dropped either way, and with it the ssh.
                 let mut parking = parked.subscribe();
                 tokio::select! {
-                    _ = pump(link, conn, stream, leftover, server_version, &events) => {}
+                    _ = pump(link, conn, stream, leftover, server_version, Connection::raw().paced().deltas(), &events) => {}
                     _ = parking.wait_for(|parked| *parked) => {}
                 }
                 drop(child);
@@ -2346,7 +2347,16 @@ pub async fn serve<D>(
         links[0] = Some(Link::new(String::new(), None));
         let events = link_tx.clone();
         tokio::spawn(async move {
-            pump(0, 1, stream, leftover, String::new(), &events).await;
+            pump(
+                0,
+                1,
+                stream,
+                leftover,
+                String::new(),
+                Connection::raw(),
+                &events,
+            )
+            .await;
             let _ = events
                 .send(FromLink::Down {
                     link: 0,

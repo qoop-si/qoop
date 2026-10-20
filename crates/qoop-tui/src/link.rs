@@ -68,6 +68,9 @@ pub fn control_path() -> Option<String> {
 /// is kept for the offline row instead of being written over the interface.
 /// `key` is the link's own, the same on every reconnect, so the far daemon ends the
 /// connection this one replaces.
+/// The link asks for a render window and row deltas, so it is read through
+/// `Connection::raw().paced().deltas()`, which acknowledges every read and gives back whole
+/// screens.
 pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
     let mut transport = SshTransport::new(&remote.target);
     if let Some(path) = control_path() {
@@ -114,12 +117,7 @@ pub async fn open(remote: &Remote, batch: bool, key: &str) -> io::Result<Link> {
     let connected = tokio::time::timeout(OPEN_DEADLINE, async {
         let mut out = BufReader::new(stdout);
         skip_to_marker(&mut out).await?;
-        client::handshake(
-            tokio::io::join(out, stdin),
-            qoop_proto::INTERFACE_ID,
-            Some(key),
-        )
-        .await
+        client::handshake_link(tokio::io::join(out, stdin), qoop_proto::INTERFACE_ID, key).await
     })
     .await;
     let failure = |e: io::Error| {

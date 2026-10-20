@@ -20,7 +20,9 @@ use qoop_proto::{Channel, ClientHello, CodecOffers, Frame, Reassembler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::daemon::{ClientWire, CopyWire, ImageWire, SnapshotWire, StoredImage};
+use crate::daemon::{
+    ClientWire, CopyWire, DELTA_PREFIX, DeltaWire, ImageWire, SnapshotWire, StoredImage,
+};
 
 /// Sent on attach. Reconciling unconditionally is cheaper than tracking what a previous
 /// client may have left behind, and a previous client may not have exited cleanly at all.
@@ -120,6 +122,16 @@ pub const OBSERVER: &str = "observer";
 /// relay gets the newest screen instead of a queue of old ones. Absent means unpaced.
 pub const RENDER_WINDOW: &str = "render_window";
 
+/// The render window an ssh link asks for. The phone's two held a 60 to 85 ms link to about
+/// twenty five screens a second and doubled the echo's median under a streaming agent; four
+/// keeps it near the interface's sixty, with at most four stale screens ahead of the echo.
+pub const LINK_WINDOW: u64 = 4;
+
+/// The hello key a client sets to be sent only the rows that changed since the last screen
+/// of a terminal ([`crate::daemon::DeltaWire`]). An older daemon ignores it and sends whole
+/// screens, which such a client reads as before.
+pub const ROW_DELTAS: &str = "row_deltas";
+
 /// The hello key a link sets to a random value it keeps across its reconnects (at most 64
 /// bytes). The daemon ends the connections that link made before, which a dropped ssh can
 /// leave open on the far side, holding the size of every terminal they showed (ADR-007).
@@ -134,8 +146,12 @@ pub const PHONE: &str = "qoro-mobile";
 /// rather than left hearing nothing.
 pub const MICROPHONE: &str = "microphone";
 
-fn hello(client_id: &str, observer: bool, replaces: Option<&str>) -> ClientHello {
+fn hello(client_id: &str, observer: bool, replaces: Option<&str>, link: bool) -> ClientHello {
     let mut extra = serde_json::Map::new();
+    if link {
+        extra.insert(RENDER_WINDOW.into(), LINK_WINDOW.into());
+        extra.insert(ROW_DELTAS.into(), serde_json::Value::Bool(true));
+    }
     if client_id == qoop_proto::INTERFACE_ID {
         extra.insert(MICROPHONE.into(), serde_json::Value::Bool(true));
     }
@@ -191,7 +207,7 @@ async fn connect_as(
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoop_proto::reassembly::SEQUENCE_DEADLINE, async {
         let stream = UnixStream::connect(socket).await.map_err(not_running)?;
-        let (stream, leftover, _) = handshake_as(stream, client_id, observer, None).await?;
+        let (stream, leftover, _) = handshake_as(stream, client_id, observer, None, false).await?;
         Ok((stream, leftover))
     })
     .await
@@ -230,7 +246,21 @@ pub async fn handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, false, replaces).await
+    handshake_as(stream, client_id, false, replaces, false).await
+}
+
+/// [`handshake`] for a link to another machine's daemon: paced, so screens never queue in
+/// the ssh pipe ahead of a typed key's echo. Its reader acks every read
+/// ([`Connection::paced`]).
+pub async fn handshake_link<S>(
+    stream: S,
+    client_id: &str,
+    replaces: &str,
+) -> io::Result<(S, BytesMut, qoop_proto::ServerWelcome)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    handshake_as(stream, client_id, false, Some(replaces), true).await
 }
 
 /// [`handshake`] as one that only watches, over any byte stream: the asker of a move that
@@ -242,7 +272,7 @@ pub async fn handshake_observer<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, true, None).await
+    handshake_as(stream, client_id, true, None, false).await
 }
 
 async fn handshake_as<S>(
@@ -250,11 +280,12 @@ async fn handshake_as<S>(
     client_id: &str,
     observer: bool,
     replaces: Option<&str>,
+    link: bool,
 ) -> io::Result<(S, BytesMut, qoop_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let body = serde_json::to_vec(&hello(client_id, observer, replaces))
+    let body = serde_json::to_vec(&hello(client_id, observer, replaces, link))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = BytesMut::new();
     Frame::new(Channel::Handshake, 0, Bytes::from(body))
@@ -496,6 +527,9 @@ pub struct RenderStream {
     received: u64,
     acked: u64,
     last_ack: std::time::Instant,
+    /// Asked for a render window: every read is acknowledged, or the daemon holds the
+    /// window full until the two second tick.
+    paced: bool,
 }
 
 impl Default for RenderStream {
@@ -511,6 +545,7 @@ impl RenderStream {
             received: 0,
             acked: 0,
             last_ack: std::time::Instant::now(),
+            paced: false,
         }
     }
 
@@ -569,7 +604,10 @@ impl RenderStream {
         if outstanding == 0 {
             return None;
         }
-        if outstanding < ACK_EVERY && now.duration_since(self.last_ack) < ACK_INTERVAL {
+        if !self.paced
+            && outstanding < ACK_EVERY
+            && now.duration_since(self.last_ack) < ACK_INTERVAL
+        {
             return None;
         }
         self.acked = self.received;
@@ -632,6 +670,10 @@ pub struct Connection {
     /// else: parsing a whole screen to write the same screen out again is the one cost
     /// such a relay would add to every frame.
     raw: bool,
+    /// The last whole screen per terminal, when the hello asked for row deltas: what each
+    /// delta is put into before anything above this sees it, so every reader still gets
+    /// whole screens.
+    screens: Option<std::collections::BTreeMap<u32, SnapshotWire>>,
 }
 
 impl Connection {
@@ -645,6 +687,49 @@ impl Connection {
             raw: true,
             ..Self::default()
         }
+    }
+
+    /// For a connection made with [`handshake_link`]: acknowledged on every read.
+    pub fn paced(mut self) -> Self {
+        self.renders.paced = true;
+        self
+    }
+
+    /// For a connection made with [`handshake_link`]: deltas are rebuilt into whole screens.
+    pub fn deltas(mut self) -> Self {
+        self.screens = Some(Default::default());
+        self
+    }
+
+    /// A delta put into its terminal's last screen and given back whole, a whole screen kept
+    /// as the next base, anything else as it came.
+    ///
+    /// A delta that does not fit is an error, not a dropped screen: the daemon's base has
+    /// moved on, so every later delta would patch a stale screen. Ending the connection
+    /// starts both ends again without one.
+    fn whole(&mut self, terminal: u32, body: Bytes) -> io::Result<Bytes> {
+        let Some(screens) = &mut self.screens else {
+            return Ok(body);
+        };
+        if body.starts_with(DELTA_PREFIX) {
+            let unfit = || {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a delta for terminal {terminal} does not fit its last screen"),
+                )
+            };
+            let delta: DeltaWire = serde_json::from_slice(&body).map_err(|_| unfit())?;
+            let screen = delta
+                .apply(screens.get(&terminal).ok_or_else(unfit)?)
+                .ok_or_else(unfit)?;
+            let body = serde_json::to_vec(&screen).map_err(|_| unfit())?;
+            screens.insert(terminal, screen);
+            return Ok(Bytes::from(body));
+        }
+        if let Ok(screen) = serde_json::from_slice::<SnapshotWire>(&body) {
+            screens.insert(terminal, screen);
+        }
+        Ok(body)
     }
 
     /// How many renders have arrived, which is what an acknowledgement reports.
@@ -668,9 +753,10 @@ impl Connection {
             let message = target
                 .push(frame, std::time::Instant::now())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let Some(message) = message else { continue };
+            let Some(mut message) = message else { continue };
             match channel {
                 Channel::Terminal => {
+                    message.body = self.whole(terminal, message.body)?;
                     if self.raw {
                         // Counted like a decoded one: the acknowledgement reports messages
                         // taken off the lane, whatever the reader then does with them.
@@ -766,6 +852,67 @@ mod tests {
             styles: Vec::new(),
             links: Vec::new(),
         }
+    }
+
+    /// A paced reader acknowledges every screen it takes. Acknowledging every sixteen or two
+    /// seconds, as an unpaced one does, held a link's window of four full until the tick.
+    #[test]
+    fn a_paced_reader_acknowledges_every_screen() {
+        let now = std::time::Instant::now();
+        let mut unpaced = Connection::raw();
+        unpaced.renders.received = 1;
+        assert!(unpaced.renders().due_ack(now).is_none());
+        let mut paced = Connection::raw().paced();
+        paced.renders.received = 1;
+        assert!(paced.renders().due_ack(now).is_some());
+        assert!(
+            paced.renders().due_ack(now).is_none(),
+            "nothing new to acknowledge"
+        );
+    }
+
+    fn terminal_message(stream: u32, seq: &mut u32, body: Vec<u8>) -> BytesMut {
+        let mut buf = BytesMut::new();
+        for frame in qoop_proto::chunk(Channel::Terminal, stream, *seq, None, Bytes::from(body)) {
+            frame.encode(&mut buf).expect("encode");
+            *seq += 1;
+        }
+        buf
+    }
+
+    /// A reader that asked for deltas passes on whole screens only: a delta is put into its
+    /// terminal's last screen, and one with no screen to go into ends the connection.
+    #[test]
+    fn a_delta_reader_passes_on_whole_screens() {
+        let base = snap(&["one", "two"]);
+        let next = snap(&["one", "TWO"]);
+        let delta = DeltaWire::between(&base, &next).expect("delta");
+        let mut seq = 0;
+        let mut inbuf = terminal_message(3, &mut seq, serde_json::to_vec(&base).unwrap());
+        inbuf.extend_from_slice(&terminal_message(
+            3,
+            &mut seq,
+            serde_json::to_vec(&delta).unwrap(),
+        ));
+        let mut link = Connection::raw().deltas();
+        let said = link.drain(&mut inbuf).expect("drain");
+        let screens: Vec<(u32, SnapshotWire)> = said
+            .into_iter()
+            .map(|incoming| match incoming {
+                Incoming::Raw { terminal, body } => (
+                    terminal,
+                    serde_json::from_slice(&body).expect("a whole screen"),
+                ),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(screens, vec![(3, base), (3, next)]);
+        let mut seq = 0;
+        let mut stray = terminal_message(7, &mut seq, serde_json::to_vec(&delta).unwrap());
+        assert!(
+            link.drain(&mut stray).is_err(),
+            "a delta with no base was passed on"
+        );
     }
 
     /// An older daemon never sent the field, and its cursor was always shown:

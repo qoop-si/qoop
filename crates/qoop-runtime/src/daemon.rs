@@ -2316,6 +2316,7 @@ async fn serve_client(
         .get(crate::client::RENDER_WINDOW)
         .and_then(serde_json::Value::as_u64)
         .map(|w| w.clamp(1, 16));
+    let deltas = hello.extra.get(crate::client::ROW_DELTAS) == Some(&serde_json::Value::Bool(true));
     stream.write_all(&out).await?;
     if matches!(outcome, qoop_proto::HandshakeOutcome::Refuse(_)) {
         return Ok(());
@@ -2433,6 +2434,8 @@ async fn serve_client(
         // One sequence per stream, because the reassembler requires consecutive numbers
         // within a chunk sequence and streams are reassembled independently.
         let mut seq: BTreeMap<u32, u32> = BTreeMap::new();
+        // The last screen sent per terminal, the base of the next delta, when asked for them.
+        let mut sent: BTreeMap<u32, SnapshotWire> = BTreeMap::new();
         loop {
             let mut buf = BytesMut::new();
 
@@ -2451,6 +2454,8 @@ async fn serve_client(
             } else {
                 writer_renders.take()
             };
+            // A closed terminal's base goes with it.
+            sent.retain(|stream, _| writer_terminals.get(*stream).is_some());
             for (stream, snapshot) in fresh {
                 let mut wire = SnapshotWire::from(&snapshot);
                 // What is behind this terminal's screen, as of now. The renderer has the
@@ -2459,10 +2464,17 @@ async fn serve_client(
                     .get(stream)
                     .map(|h| h.history.load(std::sync::atomic::Ordering::Relaxed))
                     .unwrap_or(0);
-                let body = match serde_json::to_vec(&wire) {
-                    Ok(b) => b,
-                    Err(_) => return,
+                let delta = sent
+                    .get(&stream)
+                    .and_then(|base| DeltaWire::between(base, &wire));
+                let body = match &delta {
+                    Some(delta) => serde_json::to_vec(delta),
+                    None => serde_json::to_vec(&wire),
                 };
+                let Ok(body) = body else { return };
+                if deltas {
+                    sent.insert(stream, wire);
+                }
                 // A full snapshot at a large size does not fit in one frame, so the render
                 // lane chunks like any other message. All the frames of one snapshot are
                 // written together, which is what makes ADR-013's rule true by
@@ -5929,6 +5941,94 @@ pub struct SnapshotWire {
     /// and a person reading is dragged along by the output they are trying to read past.
     #[serde(default)]
     pub behind: u64,
+}
+
+/// Only the rows of a screen that changed since the last screen this connection was sent,
+/// for a client that asked (`row_deltas`): an ssh link, where a whole screen per spinner tick
+/// queued kilobytes ahead of every typed key's echo.
+///
+/// Its own shape rather than a field on [`SnapshotWire`], so a reader that never asked fails
+/// the snapshot parse and skips it instead of drawing a screen with most rows missing. The
+/// base is the last screen on the same ordered connection, on both ends, so nothing is
+/// acknowledged for it and a reconnect starts both ends without one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeltaWire {
+    /// The rows `screen.lines` and `screen.styles` carry, in that order. Serialized first,
+    /// which is how a reader tells a delta from a screen without parsing it twice.
+    pub delta: Vec<usize>,
+    /// Everything else whole: size, cursor, modes, `behind` and the link table.
+    pub screen: SnapshotWire,
+}
+
+/// What a delta starts with on the wire.
+pub const DELTA_PREFIX: &[u8] = b"{\"delta\":";
+
+fn style_row(s: &SnapshotWire, row: usize) -> &[SpanWire] {
+    s.styles.get(row).map_or(&[], Vec::as_slice)
+}
+
+impl DeltaWire {
+    /// `next` as the rows that differ from `base`, or `None` when the whole screen should go:
+    /// another size, another link table (the runs of the rows left out point into it), or
+    /// every row changed.
+    pub fn between(base: &SnapshotWire, next: &SnapshotWire) -> Option<DeltaWire> {
+        if (base.cols, base.rows, base.lines.len()) != (next.cols, next.rows, next.lines.len())
+            || base.links != next.links
+        {
+            return None;
+        }
+        let delta: Vec<usize> = (0..next.lines.len())
+            .filter(|&i| base.lines[i] != next.lines[i] || style_row(base, i) != style_row(next, i))
+            .collect();
+        if delta.len() == next.lines.len() {
+            return None;
+        }
+        let mut styles: Vec<Vec<SpanWire>> =
+            delta.iter().map(|&i| style_row(next, i).to_vec()).collect();
+        if styles.iter().all(Vec::is_empty) {
+            styles.clear();
+        }
+        let screen = SnapshotWire {
+            lines: delta.iter().map(|&i| next.lines[i].clone()).collect(),
+            styles,
+            links: next.links.clone(),
+            ..*next
+        };
+        Some(DeltaWire { delta, screen })
+    }
+
+    /// `base` with this delta's rows put in, or `None` when it does not fit `base`.
+    pub fn apply(self, base: &SnapshotWire) -> Option<SnapshotWire> {
+        let DeltaWire { delta, screen } = self;
+        if (base.cols, base.rows) != (screen.cols, screen.rows)
+            || delta.len() != screen.lines.len()
+            || delta.iter().any(|&i| i >= base.lines.len())
+        {
+            return None;
+        }
+        let mut lines = base.lines.clone();
+        let mut styles = base.styles.clone();
+        let styled = !screen.styles.is_empty();
+        if styled || !styles.is_empty() {
+            styles.resize(lines.len(), Vec::new());
+        }
+        let mut from = screen.styles.into_iter();
+        for (i, line) in delta.into_iter().zip(screen.lines) {
+            lines[i] = line;
+            if let Some(row) = styles.get_mut(i) {
+                *row = if styled {
+                    from.next().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+        Some(SnapshotWire {
+            lines,
+            styles,
+            ..screen
+        })
+    }
 }
 
 /// What the program in a terminal has asked its terminal to be, as it crosses the socket.
@@ -11881,6 +11981,58 @@ mod image_wire_tests {
         };
         let body = serde_json::to_vec(&snap).expect("serialize");
         assert!(serde_json::from_slice::<ImageWire>(&body).is_err());
+    }
+
+    /// A delta put into the screen it was made from gives the next screen back exactly, a row
+    /// that gained a colour and one that lost its bold included; and it never parses as a
+    /// screen, so a reader that did not ask skips it.
+    #[test]
+    fn a_delta_rebuilds_the_next_screen_and_is_never_a_screen() {
+        use qoop_terminal::TerminalEngine as _;
+        let mut engine = qoop_terminal::AlacrittyEngine::new(20, 4);
+        engine.feed(b"\x1b[1mone\x1b[0m\r\ntwo\r\nthree");
+        let base = super::SnapshotWire::from(&engine.snapshot());
+        engine.feed(b"\x1b[1;1Hplain\x1b[3;1H\x1b[31mred");
+        let next = super::SnapshotWire::from(&engine.snapshot());
+        let delta = super::DeltaWire::between(&base, &next).expect("a delta");
+        assert_eq!(delta.delta, vec![0, 2]);
+        let body = serde_json::to_vec(&delta).expect("serialize");
+        assert!(body.starts_with(super::DELTA_PREFIX));
+        assert!(serde_json::from_slice::<super::SnapshotWire>(&body).is_err());
+        let back: super::DeltaWire = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(back.apply(&base), Some(next));
+    }
+
+    /// The whole screen goes when a delta could not be put into the last one: another size,
+    /// another link table, every row changed. A delta that does not fit is refused.
+    #[test]
+    fn a_whole_screen_goes_when_a_delta_would_not_fit() {
+        let snap = |lines: &[&str], cols: usize| super::SnapshotWire {
+            cols,
+            rows: lines.len(),
+            cursor: (0, 0),
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            styles: Vec::new(),
+            links: Vec::new(),
+            modes: Default::default(),
+            behind: 0,
+        };
+        let between = super::DeltaWire::between;
+        let base = snap(&["a", "b"], 20);
+        assert_eq!(between(&base, &snap(&["x", "y"], 20)), None, "every row");
+        assert_eq!(between(&base, &snap(&["a", "y"], 30)), None, "another size");
+        let mut linked = snap(&["a", "y"], 20);
+        linked.links = vec!["https://example.com".into()];
+        assert_eq!(between(&base, &linked), None, "another link table");
+        let delta = between(&base, &snap(&["a", "y"], 20)).expect("one row");
+        assert!(
+            delta.screen.styles.is_empty(),
+            "no styles said for plain rows"
+        );
+        assert_eq!(delta.clone().apply(&base), Some(snap(&["a", "y"], 20)));
+        let mut short = base.clone();
+        short.lines.pop();
+        assert_eq!(delta.apply(&short), None, "a row the base does not have");
     }
 
     /// Hostile input decodes to absent, never panics: wrong version, unknown
