@@ -1401,12 +1401,8 @@ fn item_row(c: &Column, item: &Item) -> Line {
         .find(|s| s.id == item.space)
         .map(|s| s.name.clone())
         .unwrap_or_default();
-    // A parked agent's row wears the bookmark where icons are drawn, as its tab does.
-    let mark = if item.role == crate::theme::Role::Saved && c.icons {
-        format!("{} ", crate::icons::PARKED)
-    } else {
-        cell_mark(item.role, false, 0)
-    };
+    // A saved agent's row wears the dots its tab wears, in gold (the owner's word, 2026-10-20).
+    let mark = cell_mark(item.role, false, 0);
     let lead = 1 + crate::width::width(&mark);
     // The right side gives way before the name: the space goes, then the wait.
     let mut right: Vec<String> = [
