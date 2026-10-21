@@ -650,7 +650,7 @@ async fn a_watched_chat_says_when_its_file_grows_and_is_quiet_when_it_does_not()
     let served = page(ask(&mut c, messages(0, 10, None)).await);
     let changed = |e: &EventMessage| matches!(e, EventMessage::MessagesChanged { terminal: 1, .. });
 
-    // Nothing changed: nothing is said (well past the one second tick).
+    // Nothing changed: nothing is said (well past a tick and the spacing of news).
     assert!(
         c.wait_for_event(changed, Duration::from_millis(2500))
             .await
@@ -678,6 +678,55 @@ async fn a_watched_chat_says_when_its_file_grows_and_is_quiet_when_it_does_not()
             .await
             .is_none()
     );
+}
+
+/// A message sent to a quiet chat is news within a fraction of a second, so the phone shows it
+/// without waiting for a slow look; a file that keeps growing is news at most once a second, so
+/// its readers parse no more often than that.
+#[tokio::test]
+async fn a_watched_chat_hears_a_change_at_once_and_a_stream_once_a_second() {
+    let daemon = Daemon::start();
+    let id = fresh_id("prompt");
+    let file = transcript(&id);
+    std::fs::write(&file, turns(&id, 2)).expect("write");
+    daemon.start_agent(Some(&id));
+    let mut c = daemon.client().await;
+    page(ask(&mut c, messages(0, 10, None)).await);
+    let changed = |e: &EventMessage| matches!(e, EventMessage::MessagesChanged { terminal: 1, .. });
+
+    // Six writes 1.2 s apart start at six phases of any one second poll: with one, at least
+    // one of them waits past 450 ms.
+    for n in 0..6 {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        c.forget_events();
+        let at = Instant::now();
+        append(&file, &user(100 + n, &id, &format!("sent {n}")));
+        c.wait_for_event(changed, Duration::from_secs(3))
+            .await
+            .expect("the daemon never said the chat changed");
+        assert!(
+            at.elapsed() < Duration::from_millis(450),
+            "write {n} was said after {:?}",
+            at.elapsed()
+        );
+    }
+
+    // A write every 100 ms for 3 s: news at its start and once a second after.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    c.forget_events();
+    let mut heard = 0;
+    for n in 0..30 {
+        append(&file, &agent(200 + n, &id, &format!("streamed {n}")));
+        let slot = Instant::now() + Duration::from_millis(100);
+        while let Some(left) = slot.checked_duration_since(Instant::now()) {
+            if c.wait_for_event(changed, left).await.is_none() {
+                break;
+            }
+            heard += 1;
+            c.forget_events();
+        }
+    }
+    assert!((3..=5).contains(&heard), "{heard} news for 3 s of writes");
 }
 
 #[tokio::test]

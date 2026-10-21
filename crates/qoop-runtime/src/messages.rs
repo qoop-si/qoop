@@ -7,9 +7,11 @@
 //! at once, a terminal has at most [`MAX_QUEUED`] reads waiting on its turn, and the last
 //! page of a watched terminal is kept while its file is unchanged.
 //!
-//! No file watcher exists, so a terminal a client asked about is stat-ed once a second for
-//! 30 seconds after its last question, and a changed stamp is said as an event. With nobody
-//! asking the task is parked and the daemon wakes for nothing.
+//! No file watcher exists, so a terminal a client asked about is stat-ed every 200 ms for 30
+//! seconds after its last question, and a changed stamp is said as an event: the first change
+//! at once, so a message sent shows without waiting, then at most once a second while the file
+//! keeps growing, so every reader reads no more often than that. With nobody asking the task
+//! is parked and the daemon wakes for nothing.
 //!
 //! The stamp of an OpenCode session is the stamp of the shared database (and its `-wal`), so
 //! any OpenCode write says the chat of every watched OpenCode terminal changed. A client that
@@ -29,8 +31,12 @@ use crate::daemon::{TerminalRegistry, agent_dirs, agent_program};
 /// How long a terminal stays watched after the last `Messages` or `MessageDetail` for it.
 const WATCH_FOR: Duration = Duration::from_secs(30);
 
-/// How often a watched terminal's session file is looked at.
-const TICK: Duration = Duration::from_secs(1);
+/// How often a watched terminal's session file is looked at. A stat each, on the chat pool.
+const TICK: Duration = Duration::from_millis(200);
+
+/// The least time between two `MessagesChanged` for one terminal: each sends its readers to
+/// parse the page again.
+const NEWS_EVERY: Duration = Duration::from_secs(1);
 
 /// How often a watched terminal whose file is not there yet is looked for.
 const RELOCATE: Duration = Duration::from_secs(5);
@@ -104,6 +110,8 @@ struct Watched {
     /// When the agent the last page was made for started: the stamp of that page folds it in
     /// (`qoop_parsed::revision_with`), so the watch must too.
     alive: Option<i64>,
+    /// When a change was last said: the next waits until [`NEWS_EVERY`] after it.
+    told: Option<Instant>,
 }
 
 /// The terminals a client asked about lately, and the news about their chats.
@@ -115,7 +123,7 @@ pub struct Watch {
     /// `focus`: a client that missed one is told to read again.
     changed: tokio::sync::broadcast::Sender<(u32, u64)>,
     /// Whether the last look of the watch is still running: a hung disk is not asked again
-    /// every second.
+    /// every tick.
     looking: Arc<AtomicBool>,
     /// Reads of a terminal in the daemon: the turn lock and how many hold or wait for it.
     flights: Mutex<HashMap<u32, Flight>>,
@@ -231,6 +239,7 @@ impl Watch {
             next_locate: None,
             memo: None,
             alive: None,
+            told: None,
         });
         entry.asked = Instant::now();
         if entry.session != session {
@@ -242,6 +251,7 @@ impl Watch {
                 next_locate: None,
                 memo: None,
                 alive: None,
+                told: None,
             };
         }
         entry.next_locate = source.is_none().then(|| Instant::now() + RELOCATE);
@@ -278,6 +288,7 @@ impl Watch {
                         next_locate: None,
                         memo: None,
                         alive: None,
+                        told: None,
                     };
                 }
                 if w.source.is_none() && w.next_locate.is_some_and(|at| now < at) {
@@ -350,6 +361,11 @@ impl Watch {
             }
             Err(_) => return,
         };
+        self.saw(now, seen);
+    }
+
+    /// What a look at `now` found: each watched terminal's file, and the news of a changed one.
+    fn saw(&self, now: Instant, seen: Vec<Seen>) {
         let mut watched = self.watched.lock().unwrap();
         for seen in seen {
             let Some(entry) = watched
@@ -360,17 +376,22 @@ impl Watch {
             };
             entry.next_locate = seen.source.is_none().then(|| now + RELOCATE);
             entry.source = seen.source;
+            // A change inside a second of the last one said keeps the old stamp, so a later
+            // tick still finds it changed and says it, with the newest stamp, once the second
+            // is up.
             if let Some(revision) = seen.revision
                 && entry.revision != Some(revision)
+                && entry.told.is_none_or(|at| now >= at + NEWS_EVERY)
             {
                 entry.revision = Some(revision);
+                entry.told = Some(now);
                 // Nobody listening is not an error: nobody is drawing the chat.
                 let _ = self.changed.send((seen.terminal, revision));
             }
         }
     }
 
-    /// The task that stats the watched files: once a second while there are any, parked
+    /// The task that stats the watched files: every [`TICK`] while there are any, parked
     /// while there are none.
     pub async fn run(
         connections: Arc<crate::daemon::ConnectionRegistry>,
@@ -835,6 +856,37 @@ mod tests {
             watch.flights.lock().unwrap().is_empty(),
             "a turn lock is left behind"
         );
+    }
+
+    /// A change is said at the first look that sees it; the next waits a second, then goes with
+    /// the newest stamp, so a growing file sends its readers back once a second at most.
+    #[test]
+    fn a_change_is_said_at_once_and_then_at_most_once_a_second() {
+        let watch = Watch::default();
+        let mut heard = watch.subscribe();
+        watch.mark(4, "one", None, Some(1), None, None);
+        let look = |revision| {
+            vec![Seen {
+                terminal: 4,
+                session: "one".into(),
+                source: None,
+                revision: Some(revision),
+            }]
+        };
+        let now = Instant::now();
+        watch.saw(now, look(1));
+        assert!(
+            heard.try_recv().is_err(),
+            "nothing changed, nothing is said"
+        );
+        watch.saw(now + Duration::from_millis(200), look(2));
+        assert_eq!(heard.try_recv().ok(), Some((4, 2)));
+        watch.saw(now + Duration::from_millis(400), look(3));
+        watch.saw(now + Duration::from_millis(1000), look(4));
+        assert!(heard.try_recv().is_err(), "said again inside the second");
+        watch.saw(now + Duration::from_millis(1200), look(5));
+        assert_eq!(heard.try_recv().ok(), Some((4, 5)));
+        assert!(heard.try_recv().is_err());
     }
 
     /// A client that missed news is told to read again; the channel closing ends the task.
