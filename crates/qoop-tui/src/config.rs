@@ -5,6 +5,7 @@
 //! prefix = "ctrl-a"   # ctrl- and one of a b e f g k l n o p r t u v w x y
 //! theme = "auto"      # auto | dark | light
 //! icons = "auto"      # auto | on | off: the icon font, where it was seen to draw
+//! copy_on_select = true   # false: a mouse selection waits for the copy key (prefix y)
 //! [notify]
 //! desktop = true
 //! sound = false
@@ -95,6 +96,9 @@ pub struct Config {
     pub lifecycle: qoop_runtime::config::Lifecycle,
     /// The board's quiet cards: one line, a word only on a card someone must act on.
     pub quiet_cards: bool,
+    /// A mouse selection goes to the clipboard when the button comes up. Off, it stays
+    /// highlighted until the copy key.
+    pub copy_on_select: bool,
 }
 
 /// The agents qass's skill installs beside, and so the ones `qoop qass` can start by name.
@@ -118,6 +122,7 @@ impl Default for Config {
             notch: true,
             lifecycle: qoop_runtime::config::Lifecycle::default(),
             quiet_cards: false,
+            copy_on_select: true,
         }
     }
 }
@@ -521,6 +526,13 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 line,
                 format!("icons = {value} is not \"auto\", \"on\" or \"off\""),
             ),
+            ("copy_on_select", toml::Value::Boolean(on)) => config.copy_on_select = *on,
+            ("copy_on_select", _) => {
+                refuse(
+                    line,
+                    format!("copy_on_select = {value} is not true or false"),
+                );
+            }
             ("prefix", _) => refuse(line, format!("prefix = {value} is not {PREFIX_SAID}")),
             ("theme", _) => refuse(
                 line,
@@ -758,10 +770,11 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 18] = [
+pub const KEYS: [&str; 19] = [
     "prefix",
     "theme",
     "icons",
+    "copy_on_select",
     "notify.desktop",
     "notify.sound",
     "notify.done_sound",
@@ -837,13 +850,15 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
             Ok(minutes) if minutes >= 0 => toml_edit::value(minutes),
             _ => return Err(format!("{key} is a whole number of minutes, 0 or more")),
         },
-        "notify.desktop" | "notify.sound" | "notch.enabled" | "daemon.exit_when_asleep" => {
-            match value {
-                "true" => toml_edit::value(true),
-                "false" => toml_edit::value(false),
-                _ => return Err(format!("{key} is true or false")),
-            }
-        }
+        "notify.desktop"
+        | "notify.sound"
+        | "notch.enabled"
+        | "daemon.exit_when_asleep"
+        | "copy_on_select" => match value {
+            "true" => toml_edit::value(true),
+            "false" => toml_edit::value(false),
+            _ => return Err(format!("{key} is true or false")),
+        },
         _ => {
             return Err(format!(
                 "there is no setting {key}; the settings are {}",
@@ -923,6 +938,7 @@ mod tests {
             ("prefix", "ctrl-b"),
             ("theme", "light"),
             ("icons", "off"),
+            ("copy_on_select", "false"),
             ("notify.desktop", "false"),
             ("notify.sound", "true"),
             ("notify.done_sound", sound),
@@ -953,6 +969,8 @@ mod tests {
         );
         assert_eq!(read.config.prefix, 0x02);
         assert!(read.config.quiet_cards);
+        assert!(!read.config.copy_on_select);
+        assert!(set(&path, "copy_on_select", "maybe").is_err());
         assert!(set(&path, "board.cards", "loud").is_err());
         assert_eq!(read.config.mute, qoop_runtime::config::Mute::Here);
         assert!(set(&path, "notify.mute", "loud").is_err());

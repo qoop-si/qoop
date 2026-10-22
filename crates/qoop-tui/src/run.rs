@@ -167,6 +167,11 @@ fn window_rows(state: &State) -> Vec<String> {
         .collect()
 }
 
+/// The text a mouse selection covers, as drawn in the focused tile.
+fn selection_text(state: &State, selection: &crate::selection::Selection) -> String {
+    selection.text(&window_rows(state), focused_rect(state).cols)
+}
+
 /// Copy `text` to the clipboard and say what left, the way every copy path does.
 ///
 /// Answers whether anything was copied: empty text writes nothing and says nothing.
@@ -1147,6 +1152,10 @@ struct Modes {
     yank: Option<crate::copy::Yank>,
     /// A finished yank's text, waiting for the loop to put it on the clipboard.
     clipboard: Option<String>,
+    /// With `copy_on_select` off: the text a mouse selection covered when the button came
+    /// up, which the copy key puts on the clipboard. Read then, because rows move under a
+    /// highlight that is still drawn (the wheel, a program printing).
+    held: Option<String>,
     /// Requests made where no write is in hand, sent at the loop's next write.
     outbox: Vec<ControlRequest>,
     /// Resize mode: `h j k l` move the nearest divider (and `<` `>` the questions) until the mode
@@ -8960,7 +8969,8 @@ where
                                 // the person has left and cannot see.
                                 //
                                 // Typing also drops a selection: the text is already on
-                                // the clipboard from the button release, so the invert
+                                // the clipboard from the button release (or was left
+                                // uncopied on purpose, `copy_on_select` off), so the invert
                                 // staying up only reads as the program's own colours
                                 // going wrong.
                                 if state.selection.take().is_some() {
@@ -9261,14 +9271,19 @@ where
                                             {
                                                 let text = word.text(&window, tile.cols);
                                                 state.selection = Some(word);
-                                                let mut out = std::io::stdout();
-                                                copy_and_say(&mut state, &text, &mut out)?;
+                                                if state.config.copy_on_select {
+                                                    let mut out = std::io::stdout();
+                                                    copy_and_say(&mut state, &text, &mut out)?;
+                                                } else {
+                                                    state.modes.held = Some(text);
+                                                }
                                                 dirty = true;
                                                 continue;
                                             }
                                         }
                                         state.last_press =
                                             Some((terminal, tile_row, tile_col, now));
+                                        state.modes.held = None;
                                         state.selection =
                                             Some(crate::selection::Selection::start(
                                                 tile_row, tile_col,
@@ -9897,14 +9912,17 @@ where
                                 if let Some(selection) = state.selection {
                                     // Copied when the button comes up, with no key to
                                     // press: a selection that has to be confirmed is a
-                                    // selection a person makes twice.
-                                    let tile = focused_rect(&state);
-                                    let window = window_rows(&state);
-                                    let text = selection.text(&window, tile.cols);
+                                    // selection a person makes twice. With `copy_on_select`
+                                    // off it stays highlighted for the copy key instead.
+                                    let text = selection_text(&state, &selection);
                                     if !text.is_empty() {
-                                        let mut out = std::io::stdout();
-                                        if copy_and_say(&mut state, &text, &mut out)? {
-                                            dirty = true;
+                                        if state.config.copy_on_select {
+                                            let mut out = std::io::stdout();
+                                            if copy_and_say(&mut state, &text, &mut out)? {
+                                                dirty = true;
+                                            }
+                                        } else {
+                                            state.modes.held = Some(text);
                                         }
                                     } else {
                                         // A click, not a drag. Nothing was selected, so
@@ -10277,6 +10295,26 @@ where
                             }
                             Action::CopyMode => {
                                 enter_copy(&mut state);
+                                dirty = true;
+                            }
+                            // The held mouse selection, copied on the person's word.
+                            Action::CopySelection => {
+                                // Only while a selection is still held: any other end of
+                                // it (typing, a new tab) has dropped the text with it.
+                                let text = match state.selection {
+                                    Some(s) => state
+                                        .modes
+                                        .held
+                                        .clone()
+                                        .unwrap_or_else(|| selection_text(&state, &s)),
+                                    None => String::new(),
+                                };
+                                if text.is_empty() {
+                                    say(&mut state, "nothing selected: drag over text first".to_string());
+                                } else {
+                                    let mut out = std::io::stdout();
+                                    copy_and_say(&mut state, &text, &mut out)?;
+                                }
                                 dirty = true;
                             }
                             Action::Chat => {
@@ -26563,6 +26601,23 @@ mod tests {
         assert_eq!((drawn.cols, drawn.rows), (inner.cols, inner.rows));
         let row = plain(&written_on(&painted, screen::TABS + 1 + inner.y));
         assert!(row.contains("> what is blocked"), "{row:?}");
+    }
+
+    /// The held mouse selection is what the copy key (prefix y) copies, whatever
+    /// `copy_on_select` says; the setting is on unless a person turns it off.
+    #[test]
+    fn the_copy_key_reads_the_held_selection_whatever_the_setting() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        assert!(s.config.copy_on_select, "on unless a person turns it off");
+        s.config.copy_on_select = false;
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 20)));
+        assert_eq!(
+            crate::keys::Keys::default().feed(b"\x01y"),
+            vec![crate::keys::Action::CopySelection]
+        );
+        let held = s.selection.expect("still held with the setting off");
+        assert_eq!(selection_text(&s, &held), " > fix the build");
     }
 
     #[test]

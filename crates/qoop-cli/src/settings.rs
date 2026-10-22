@@ -113,6 +113,13 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
             Kind::Choice("prefix", config::prefixes()),
         ),
         row(
+            "keys",
+            "copy on select",
+            on(c.copy_on_select),
+            "off: a selection waits for the prefix, then y",
+            Kind::Toggle("copy_on_select"),
+        ),
+        row(
             "notifications",
             "desktop",
             on(c.desktop),

@@ -5,7 +5,8 @@
 //! wants to copy a line out of an agent's answer finds that dragging over it does nothing.
 //! That is a regression against a bare terminal, so the selection has to be ours.
 //!
-//! Copy on select, with no key to press. A selection that has to be confirmed is a
+//! Copy on select by default, with no key to press (`copy_on_select = false` waits for the
+//! copy key). A selection that has to be confirmed is a
 //! selection a person makes twice. Nothing is put on the clipboard until the button comes up, so a drag
 //! that turns out to be a click writes nothing.
 //!
@@ -203,11 +204,13 @@ pub fn in_columns(line: &str, range: Range<usize>) -> String {
 
 /// Put text on the system clipboard.
 ///
-/// Two ways, and which one is right depends on where the person is sitting. Locally the
+/// Three ways, and which one is right depends on where the person is sitting. Locally the
 /// platform's own tool writes the clipboard the rest of the desktop reads. Over ssh there is
 /// no such tool on the far side worth writing to: the clipboard that matters belongs to the
 /// terminal in front of the person, and OSC 52 is how a program asks it for one. The same
-/// is true inside an editor's integrated terminal.
+/// is true inside an editor's integrated terminal. Inside tmux the third way is tmux's own
+/// clipboard command, which carries any length and needs no passthrough setting; the escape
+/// is wrapped for tmux only when that command fails.
 ///
 /// The escape is BEL terminated. ST is correct and newer emulators take both; some still
 /// only honour BEL, and a clipboard write that silently does nothing is worse than an
@@ -217,7 +220,7 @@ pub fn in_columns(line: &str, range: Range<usize>) -> String {
 /// escape the outer terminal swallows is not a clipboard write, and saying
 /// "copied" for one is a false report.
 pub fn copy(text: &str, out: &mut impl std::io::Write) -> std::io::Result<Option<CopyVia>> {
-    copy_with(text, &Environment::read(), platform_copy, out)
+    copy_with(text, &Environment::read(), platform_copy, tmux_copy, out)
 }
 
 /// Which way a copy went, so the notice can say what actually happened.
@@ -225,8 +228,8 @@ pub fn copy(text: &str, out: &mut impl std::io::Write) -> std::io::Result<Option
 pub enum CopyVia {
     /// The platform tool took it: the desktop clipboard has it.
     System,
-    /// An OSC 52 escape was written to the terminal in front of the person:
-    /// it arrives only if that terminal honours OSC 52.
+    /// An OSC 52 escape was written to the terminal in front of the person (or handed to
+    /// tmux, which wrote it): it arrives only if that terminal honours OSC 52.
     TerminalEscape,
 }
 
@@ -237,6 +240,7 @@ fn copy_with(
     text: &str,
     env: &Environment,
     platform: impl FnOnce(&str) -> bool,
+    tmux: impl FnOnce(&str) -> bool,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<Option<CopyVia>> {
     if text.is_empty() {
@@ -246,6 +250,13 @@ fn copy_with(
     // the two reads and route the write by a mix of two worlds.
     if !prefer_escape(env) && platform(text) {
         return Ok(Some(CopyVia::System));
+    }
+    // Inside tmux its own clipboard command beats the DCS wrap: tmux drops a passthrough
+    // string past about a megabyte without a word, and since tmux 3.3 drops every one
+    // unless `allow-passthrough` is on. A copy of a few screens of history is in range
+    // of the first, so the wrap stays only as the fallback.
+    if env.tmux && tmux(text) {
+        return Ok(Some(CopyVia::TerminalEscape));
     }
     out.write_all(escape_for(env, text.as_bytes()).as_bytes())?;
     out.flush()?;
@@ -336,6 +347,53 @@ fn platform_copy(text: &str) -> bool {
     }
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
+
+/// Hand `text` to tmux's own clipboard command, which sends it to the terminal in front of
+/// the person (`-w`) however long it is. Answers whether tmux took it.
+///
+/// A named buffer, so repeated copies replace one paste buffer instead of pushing older
+/// ones out. The wait is bounded: a tmux server that hangs must not freeze the interface.
+fn tmux_copy(text: &str) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = std::process::Command::new("tmux")
+        .args(["load-buffer", "-b", "qoop", "-w", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // Written from a thread: tmux answers only once it has read the lot, and a pipe holds
+    // far less than a long copy.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let text = text.to_owned();
+        std::thread::spawn(move || stdin.write_all(text.as_bytes()))
+    });
+    let deadline = std::time::Instant::now() + TMUX_WAIT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+        }
+    };
+    // Not joined after a timeout: a wrapper that outlives the kill leaves the writer blocked
+    // on a full pipe, and waiting for it would hang the interface after all.
+    let written = timed_out || writer.is_none_or(|w| w.join().is_ok_and(|r| r.is_ok()));
+    !timed_out && status.is_some_and(|s| s.success()) && written
+}
+
+/// How long tmux gets to take a copy.
+const TMUX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Try one clipboard tool. `None` means it is not installed, which is not a failure.
 fn pipe_into(tool: &str, text: &str) -> Option<bool> {
@@ -550,7 +608,7 @@ mod tests {
         // Locally the platform tool wins and nothing is written to the terminal.
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            copy_with("hi", &local, |_| true, &mut out).expect("copy"),
+            copy_with("hi", &local, |_| true, |_| false, &mut out).expect("copy"),
             Some(CopyVia::System)
         );
         assert!(out.is_empty());
@@ -562,6 +620,7 @@ mod tests {
                 "hi",
                 &ssh,
                 |_| panic!("far-side tool must not run"),
+                |_| false,
                 &mut out
             )
             .expect("copy"),
@@ -575,6 +634,7 @@ mod tests {
                 "hi",
                 &editor,
                 |_| panic!("host tool must not run"),
+                |_| false,
                 &mut out
             )
             .expect("copy"),
@@ -584,10 +644,60 @@ mod tests {
         // rather than reporting success while writing nothing.
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            copy_with("hi", &local, |_| false, &mut out).expect("copy"),
+            copy_with("hi", &local, |_| false, |_| false, &mut out).expect("copy"),
             Some(CopyVia::TerminalEscape)
         );
         assert_eq!(out, escape(b"hi").as_bytes());
+    }
+
+    /// A copy of several screens inside tmux: tmux drops a DCS passthrough string past about
+    /// a megabyte, so the text goes to tmux's own clipboard command whole, and nothing is
+    /// written to the terminal.
+    #[test]
+    fn a_long_copy_inside_tmux_goes_to_tmux_whole() {
+        let rows: Vec<String> = (0..20_000)
+            .map(|i| {
+                format!("line {i:06} the quick brown fox jumps over the lazy dog \u{4e2d}\u{6587}")
+            })
+            .collect();
+        let text = rows.join("\n");
+        assert!(text.len() > 1_200_000, "past what tmux passes through");
+        let env = Environment {
+            tmux: true,
+            ..Environment::default()
+        };
+        for ssh in [false, true] {
+            let env = Environment { ssh, ..env };
+            let mut taken = String::new();
+            let mut out: Vec<u8> = Vec::new();
+            let via = copy_with(
+                &text,
+                &env,
+                |_| false,
+                |t| {
+                    taken = t.to_owned();
+                    true
+                },
+                &mut out,
+            )
+            .expect("copy");
+            assert_eq!(via, Some(CopyVia::TerminalEscape));
+            assert_eq!(taken, text, "tmux got every byte (ssh: {ssh})");
+            assert!(out.is_empty(), "no passthrough string for tmux to drop");
+        }
+    }
+
+    /// tmux refusing the copy (no server, old tmux) is not a lost copy: the wrap still goes.
+    #[test]
+    fn tmux_failing_falls_back_to_the_wrapped_escape() {
+        let env = Environment {
+            tmux: true,
+            ..Environment::default()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let via = copy_with("hi", &env, |_| false, |_| false, &mut out).expect("copy");
+        assert_eq!(via, Some(CopyVia::TerminalEscape));
+        assert_eq!(out, escape_for(&env, b"hi").as_bytes());
     }
 
     /// Inside tmux or screen a bare OSC 52 never reaches the outer terminal.

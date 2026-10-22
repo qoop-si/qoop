@@ -50,6 +50,7 @@ fn show(json: bool) -> std::io::Result<()> {
                 "prefix": prefix,
                 "theme": c.theme.name(),
                 "icons": c.icons.name(),
+                "copy_on_select": c.copy_on_select,
                 "notify.desktop": c.desktop,
                 "notify.sound": c.sound,
                 "notify.done_sound": c.done_sound,
@@ -92,6 +93,7 @@ fn show(json: bool) -> std::io::Result<()> {
     );
     println!("prefix = \"{prefix}\"");
     println!("theme = \"{}\"", c.theme.name());
+    println!("copy_on_select = {}", c.copy_on_select);
     println!("notify.desktop = {}", c.desktop);
     println!("notify.sound = {}", c.sound);
     println!("notify.done_sound = \"{}\"", c.done_sound);

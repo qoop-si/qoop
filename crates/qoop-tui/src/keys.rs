@@ -228,6 +228,9 @@ pub enum Action {
     /// ctrl-a [: copy mode over the focused terminal, as in tmux: move through the whole
     /// history with the keyboard, select, search, copy.
     CopyMode,
+    /// ctrl-a y: copy the mouse selection that is held, which is what a selection waits for
+    /// when `copy_on_select` is off.
+    CopySelection,
     /// ctrl-a t: the focused agent's session as a chat, or the terminal as it is.
     Chat,
     /// ctrl-a enter: open or close the newest group or tool row in view of a chat. A bare
@@ -483,6 +486,7 @@ impl Keys {
                     b'e' => Action::Resize,
                     b'=' => Action::Equalize,
                     b'[' => Action::CopyMode,
+                    b'y' => Action::CopySelection,
                     b't' => Action::Chat,
                     b'\r' => Action::ChatRow,
                     // Anything else is a mistyped command and is dropped. Passing it through would send it to a shell, where a
@@ -686,6 +690,7 @@ mod tests {
         );
         let mut keys = Keys::with_prefix(0x02);
         assert_eq!(keys.feed(b"\x02["), vec![Action::CopyMode]);
+        assert_eq!(keys.feed(b"\x02y"), vec![Action::CopySelection]);
         assert_eq!(
             keys.feed(b"e=["),
             vec![input(b"e=[")],

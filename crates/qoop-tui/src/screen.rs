@@ -6203,7 +6203,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 47;
+    const COMMANDS: usize = 48;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -6270,6 +6270,9 @@ mod tests {
             Action::Clock => (const { place(45) }, Some("ctrl-a Q/C")),
             // A right press on a row of the column: the menu says what it offers.
             Action::Context { .. } => (const { place(46) }, None),
+            // Copies a held mouse selection when `copy_on_select` is off: a setting's key, not
+            // a line of the overlay, which has no room left at 80 by 24.
+            Action::CopySelection => (const { place(47) }, None),
         }
     }
 
@@ -6341,6 +6344,7 @@ mod tests {
             Action::Park,
             Action::Clock,
             Action::Context { row: 1, col: 1 },
+            Action::CopySelection,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
