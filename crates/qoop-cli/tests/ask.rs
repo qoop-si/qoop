@@ -411,6 +411,76 @@ fn watching_turned_on_wakes_a_sleeping_qass_and_tells_it_once() {
     assert!(stack.asleep().contains(&other), "a parked tab was woken");
 }
 
+/// The eye opened while qass is busy, and the daemon moved onto its binary again before qass
+/// came to rest (`qoop restart`, or a daemon that died): the line is not lost with the old
+/// process, and it is typed once qass takes words, once.
+#[test]
+fn watching_turned_on_reaches_a_busy_qass_across_a_restart() {
+    let stack = Stack::start();
+    let qass = stack.agent("qass", "qass", None);
+    stack.run(&["qass", "watch", "off"]);
+    let (ok, _, err) = stack.run(&["send", &qass, "BUSY", "--enter"]);
+    assert!(ok, "send failed: {err}");
+    assert!(
+        stack.wait(|| stack.state_of(&qass) == "working"),
+        "qass never got busy"
+    );
+    let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
+    assert!(ok && out.trim() == "watching resumed", "{out} {err}");
+    let (ok, out, err) = stack.run(&["restart"]);
+    assert!(ok, "restart failed: {out} {err}");
+    assert_eq!(
+        stack.log("qass").matches("watching on:").count(),
+        0,
+        "typed while busy"
+    );
+    let (ok, _, err) = stack.run(&["send", &qass, "FREE", "--enter"]);
+    assert!(ok, "send failed: {err}");
+    let told = || {
+        stack
+            .log("qass")
+            .contains("watching on: start your watcher")
+    };
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "the line was lost across the restart: {:?}",
+        stack.log("qass")
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
+}
+
+/// The line still untold when the daemon moves onto its binary, and the owner halfway through a
+/// sentence in qass: who typed there is not carried over the move, so the new process waits
+/// out the same 30 quiet seconds from its start before it types the line over his draft.
+#[test]
+fn watching_turned_on_waits_for_a_draft_across_a_restart() {
+    let stack = Stack::start();
+    let qass = stack.agent("qass", "qass", None);
+    stack.run(&["qass", "watch", "off"]);
+    stack.run(&["send", &qass, "BUSY", "--enter"]);
+    assert!(
+        stack.wait(|| stack.state_of(&qass) == "working"),
+        "qass never got busy"
+    );
+    stack.run(&["qass", "watch", "on"]);
+    stack.run(&["send", &qass, "FREE", "--enter"]);
+    assert!(
+        stack.wait(|| stack.state_of(&qass) == "idle"),
+        "qass never came to rest"
+    );
+    let (ok, _, err) = stack.run(&["send", &qass, "half a sente"]);
+    assert!(ok, "send failed: {err}");
+    let (ok, out, err) = stack.run(&["restart"]);
+    assert!(ok, "restart failed: {out} {err}");
+    std::thread::sleep(Duration::from_secs(20));
+    assert!(
+        !stack.log("qass").contains("watching on:"),
+        "typed over the draft: {:?}",
+        stack.log("qass")
+    );
+}
+
 /// A qass that is awake takes the line where it stands: a worker parked asleep in the same
 /// space is not woken by the eye.
 #[test]

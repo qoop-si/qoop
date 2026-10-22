@@ -1568,6 +1568,14 @@ impl Daemon {
             self.connections.clone(),
         ));
 
+        // qass's eye turned on before this process, and the line not typed yet.
+        crate::asks::tell_qass_watching_after_start(
+            &self.terminals,
+            &self.agents,
+            &self.connections,
+            &self.books.store,
+        );
+
         // The chats clients are reading: parked until one is asked about.
         tokio::spawn(crate::messages::Watch::run(
             self.connections.clone(),
@@ -5559,16 +5567,19 @@ async fn handle_control(
         // the line has no terminal to be typed into otherwise.
         ControlRequest::QassWatch { id, on } => {
             if let Some(on) = on {
-                if let Err(e) = crate::paths::set_qass_watching(on) {
-                    return ControlResponse::Failed {
-                        id,
-                        reason: e.to_string(),
-                    };
-                }
+                let turned = match crate::paths::set_qass_watching(on) {
+                    Ok(turned) => turned,
+                    Err(e) => {
+                        return ControlResponse::Failed {
+                            id,
+                            reason: e.to_string(),
+                        };
+                    }
+                };
                 // Asked again while it still waits for a watcher: told again, so a line that
-                // went untyped (30 minutes passed, a daemon restart) is one more `on` away.
+                // went unheeded (qass stuck, gone for good) is one more `on` away.
                 if on && crate::paths::qass_watch_resuming() {
-                    crate::asks::tell_qass_watching(terminals, agents, connections, store);
+                    crate::asks::tell_qass_watching(terminals, agents, connections, store, !turned);
                     let into = restore();
                     tokio::spawn(async move {
                         // Looked at again here: an off since then wakes nothing.

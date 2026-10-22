@@ -776,32 +776,79 @@ pub(crate) async fn sleeping_qass(store: &StoreHandle) -> Option<(i64, u32)> {
 /// What qass is told when the owner turns its watching back on.
 const WATCHING_ON: &str = "watching on: start your watcher again (qass skill, Start step 3) and give the owner one summary of the fleet now; the watcher says only what changes from here.";
 
-/// How long the flusher keeps trying to tell qass its watching is on again.
+/// How long the flusher keeps trying to tell qass its watching is on again, from the switch or
+/// from the last time qass was seen working.
 const WATCH_TELL_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// The oldest switch a daemon start or a working qass still tells qass of: a qass on an agent
+/// with no watcher never marks the stamp seen, and must not hear of it days later.
+const WATCH_TELL_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
 /// Since when qass is to be told its watching is on again, while it has not been.
 static WATCH_TELL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// Tell qass its watching was turned back on: the inbox's flusher types the line once qass
-/// has a tab and takes words, between the answers it types, for 30 minutes. The caller wakes a
-/// qass that sleeps; one gone or busy longer starts its watcher at its next start or message
-/// instead (the skill).
+/// has a tab and takes words, between the answers it types, for 30 minutes, longer while qass
+/// works. The caller wakes a qass that sleeps; one gone or stuck longer starts its watcher at
+/// its next start or message instead (the skill). `again`: asked again while it waits, so the
+/// told stamp is forgotten and qass told again, under the same lock the flusher keeps it under.
 pub(crate) fn tell_qass_watching(
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
+    again: bool,
 ) {
-    *WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    {
+        let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
+        if again {
+            let _ = crate::paths::set_qass_watch_told(None);
+        }
+        *tell = Some(Instant::now());
+    }
     kick(terminals, agents, connections, store);
 }
 
-/// Whether the line is still to be typed: asked for, under 30 minutes ago, and the switch
-/// still waits for a watcher (not off again, and none started since).
+/// At a daemon start, a line the last process did not type (it moved onto a new binary or
+/// died before qass came to rest) is told after all. Only 30 seconds in: who typed in qass is
+/// not carried over a move, and his draft there must not be typed over.
+pub(crate) fn tell_qass_watching_after_start(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    if !untold_recent() {
+        return;
+    }
+    let (terminals, agents, connections, store) = (
+        terminals.clone(),
+        agents.clone(),
+        connections.clone(),
+        store.clone(),
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(TYPED_QUIET_SECS.unsigned_abs())).await;
+        if untold_recent() {
+            tell_qass_watching(&terminals, &agents, &connections, &store, false);
+        }
+    });
+}
+
+/// Whether a switch under [`WATCH_TELL_MAX_AGE`] old is still untold.
+fn untold_recent() -> bool {
+    crate::paths::qass_watch_untold()
+        .and_then(|stamp| crate::paths::qass_watch_age(&stamp))
+        .is_some_and(|age| age < WATCH_TELL_MAX_AGE)
+}
+
+/// Whether the line is still to be typed: asked for, or qass last seen working, under 30
+/// minutes ago, and the switch still waits for it (not off again, no watcher started since, not told yet).
 fn watch_tell_due() -> bool {
     let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
-    if tell.is_some_and(|at| at.elapsed() >= WATCH_TELL_FOR || !crate::paths::qass_watch_resuming())
-    {
+    if tell.is_some_and(|at| {
+        at.elapsed() >= WATCH_TELL_FOR || crate::paths::qass_watch_untold().is_none()
+    }) {
         *tell = None;
     }
     tell.is_some()
@@ -818,18 +865,49 @@ async fn flush_watch(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
     let Some(qass) = qass_terminal(terminals, agents, store).await else {
         return;
     };
+    let now = standing(agents, terminals, qass)
+        .map(|s| (qass, s, agents.typed_ago(qass, crate::agents::now_unix())));
+    if !takes_words(Route::Qass(qass), None, now.as_ref()) {
+        // A turn ends by itself: the 30 minutes start again while qass works, an answer queued
+        // for it or not. Blocked or starting may never end, and are left to run out.
+        if now.as_ref().is_some_and(|(_, s, _)| s.state == "working") && untold_recent() {
+            let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
+            if tell.is_some() {
+                *tell = Some(Instant::now());
+            }
+        }
+        return;
+    }
     if seen.contains(&qass) || sent.get(&qass).is_some_and(|at| at.elapsed() < SETTLE) {
         return;
     }
-    let now = standing(agents, terminals, qass)
-        .map(|s| (qass, s, agents.typed_ago(qass, crate::agents::now_unix())));
-    // Looked at again after the wait for the store: an off since then is not typed over.
-    if takes_words(Route::Qass(qass), None, now.as_ref())
-        && watch_tell_due()
-        && type_into(terminals, qass, WATCHING_ON).await.is_ok()
-    {
+    // Looked at again after the wait for the store: an off since then is not typed over. Kept
+    // as told before it is typed, as a card is flipped before its answer goes, so a move onto a
+    // new binary mid-type cannot tell it twice; and taken off the flusher either way, so a write
+    // that fails does not type it every round.
+    let (kept, was) = {
+        let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
+        let stamp = tell
+            .filter(|at| at.elapsed() < WATCH_TELL_FOR)
+            .and_then(|_| crate::paths::qass_watch_untold());
+        let Some(stamp) = stamp else {
+            *tell = None;
+            return;
+        };
+        (
+            crate::paths::set_qass_watch_told(Some(&stamp)).is_ok(),
+            tell.take(),
+        )
+    };
+    if type_into(terminals, qass, WATCHING_ON).await.is_ok() {
         sent.insert(qass, Instant::now());
-        *WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        return;
+    }
+    // Not typed: forgotten again with the time it had left, unless an on since then asked anew.
+    let mut tell = WATCH_TELL.lock().unwrap_or_else(|e| e.into_inner());
+    if kept && tell.is_none() && crate::paths::qass_watch_untold().is_none() {
+        let _ = crate::paths::set_qass_watch_told(None);
+        *tell = was;
     }
 }
 

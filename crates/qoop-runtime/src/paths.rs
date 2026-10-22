@@ -223,6 +223,10 @@ pub const QASS_LAST_AGENT: &str = "last-agent";
 pub const QASS_WATCH_FILE: &str = "watch";
 /// The `resume` stamp the watcher last started on, written by the watcher alone.
 pub const QASS_WATCH_SEEN: &str = "watch-seen";
+/// The `resume` stamp qass was told of (`watching on: ...`), written by the daemon alone: a
+/// restart does not tell it twice, nor a qass whose agent has no watcher to write
+/// [`QASS_WATCH_SEEN`].
+pub const QASS_WATCH_TOLD: &str = "watch-told";
 
 /// Whether qass watches the agents: on unless the switch file says `off`.
 pub fn qass_watching() -> bool {
@@ -232,6 +236,28 @@ pub fn qass_watching() -> bool {
 /// Whether qass's watching was turned back on and its watcher has not started since.
 pub fn qass_watch_resuming() -> bool {
     qass_data_dir().is_some_and(|dir| resuming_in(&dir))
+}
+
+/// The `resume` stamp qass is still to be told of: on again, no watcher started since, and not
+/// told yet.
+pub fn qass_watch_untold() -> Option<String> {
+    qass_data_dir().and_then(|dir| untold_in(&dir))
+}
+
+/// Keep `stamp` as told, or with none forget the one kept, so qass is told again.
+pub fn set_qass_watch_told(stamp: Option<&str>) -> std::io::Result<()> {
+    let dir = qass_data_dir().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    told_in(&dir, stamp)
+}
+
+/// How long ago a `resume` stamp was written; none when it does not read as one.
+pub fn qass_watch_age(stamp: &str) -> Option<std::time::Duration> {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(stamp.parse().ok()?);
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(at)
+            .unwrap_or_default(),
+    )
 }
 
 /// Turn qass's watcher on or off; true when that changed it. On from off writes a fresh
@@ -251,10 +277,31 @@ fn watching_in(dir: &Path) -> bool {
     read_trimmed(&dir.join(QASS_WATCH_FILE)).as_deref() != Some("off")
 }
 
-fn resuming_in(dir: &Path) -> bool {
+/// The stamp of a switch turned on again that no watcher started on yet.
+fn resuming_stamp(dir: &Path) -> Option<String> {
     read_trimmed(&dir.join(QASS_WATCH_FILE))
         .and_then(|s| s.strip_prefix("resume ").map(str::to_string))
-        .is_some_and(|stamp| read_trimmed(&dir.join(QASS_WATCH_SEEN)) != Some(stamp))
+        .filter(|stamp| read_trimmed(&dir.join(QASS_WATCH_SEEN)).as_ref() != Some(stamp))
+}
+
+fn resuming_in(dir: &Path) -> bool {
+    resuming_stamp(dir).is_some()
+}
+
+fn untold_in(dir: &Path) -> Option<String> {
+    resuming_stamp(dir)
+        .filter(|stamp| read_trimmed(&dir.join(QASS_WATCH_TOLD)).as_ref() != Some(stamp))
+}
+
+fn told_in(dir: &Path, stamp: Option<&str>) -> std::io::Result<()> {
+    let path = dir.join(QASS_WATCH_TOLD);
+    match stamp {
+        Some(stamp) => std::fs::write(path, format!("{stamp}\n")),
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
 }
 
 fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
@@ -725,6 +772,41 @@ mod tests {
         )
         .unwrap();
         assert!(watching_in(&dir) && !resuming_in(&dir));
+    }
+
+    /// On again is untold until the daemon keeps its stamp as told; forgotten, or on again
+    /// after an off, it is untold again; a watcher started on it leaves nothing to tell.
+    #[test]
+    fn the_qass_watch_line_is_told_once_per_stamp() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("qass");
+        assert_eq!(untold_in(&dir), None);
+        set_watching_in(&dir, false).unwrap();
+        assert_eq!(untold_in(&dir), None);
+        set_watching_in(&dir, true).unwrap();
+        let stamp = untold_in(&dir).expect("untold");
+        assert!(qass_watch_age(&stamp).is_some_and(|age| age.as_secs() < 60));
+        told_in(&dir, Some(&stamp)).unwrap();
+        assert_eq!(untold_in(&dir), None);
+        assert!(resuming_in(&dir));
+        told_in(&dir, None).unwrap();
+        told_in(&dir, None).unwrap();
+        assert_eq!(untold_in(&dir).as_deref(), Some(stamp.as_str()));
+        told_in(&dir, Some(&stamp)).unwrap();
+        set_watching_in(&dir, false).unwrap();
+        set_watching_in(&dir, true).unwrap();
+        let again = untold_in(&dir).expect("untold after off and on");
+        assert_ne!(again, stamp);
+        std::fs::write(dir.join(QASS_WATCH_SEEN), &again).unwrap();
+        assert_eq!(untold_in(&dir), None);
+        assert_eq!(qass_watch_age("not a stamp"), None);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
+        let old = old
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
+        assert!(qass_watch_age(&old).is_some_and(|age| age.as_secs() >= 7 * 3600 - 5));
     }
 
     /// The bridge's state line: no file is no bridge, a fresh `connected` is up, and anything
