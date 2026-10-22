@@ -153,6 +153,8 @@ pub struct Chrome<'a> {
     pub qass: Option<crate::qass_screen::Ui>,
     /// The question inbox, as this client keeps it, while qass's screen is up.
     pub asks: Option<&'a crate::asks::Pane>,
+    /// The schedules ("on the clock"), as this client keeps them, while qass's screen is up.
+    pub clock: Option<&'a crate::schedules::Pane>,
     /// Where the questions are drawn on qass's split tab: cut from the board beside it, or
     /// over the board's tile. The tree knows where the board is, so the client says.
     pub questions: Option<crate::qass_screen::Side>,
@@ -248,6 +250,7 @@ impl Default for Chrome<'_> {
             nav: None,
             qass: None,
             asks: None,
+            clock: None,
             questions: None,
             rail: None,
             handle: None,
@@ -637,11 +640,12 @@ pub(crate) fn qass_plan(frame: &Frame) -> Option<crate::qass_screen::Plan> {
         return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
             crate::qass_screen::Plan {
                 side: frame.chrome.questions,
-                ..plan
+                ..plan.with_clock(ui.clock)
             }
         });
     }
     crate::qass_screen::Plan::new(cols as usize, rows as usize, ui.zoomed, ui.inbox)
+        .map(|plan| plan.with_clock(ui.clock))
 }
 
 /// qass's screen painted for this frame, with its plan, when the pane is qass's and qass has
@@ -680,7 +684,26 @@ pub(crate) fn qass_screen_of(
         let view = crate::asks::view(asks, &seen, side.rect.cols, side.rect.rows);
         screen = screen.with_inbox(view.rows);
     }
+    if let (Some(clock), Some(pane)) = (plan.clock, frame.chrome.clock) {
+        let view = crate::schedules::view(
+            pane,
+            &clock_ctx(frame, spotlight),
+            clock.rect.cols,
+            clock.rect.rows,
+        );
+        screen = screen.with_clock(view.rows);
+    }
     Some((plan, screen))
+}
+
+/// What the "on the clock" panel is painted with: this frame's clock, in the machine's zone
+/// (the one the daemon words its times in).
+pub(crate) fn clock_ctx(frame: &Frame, fade: bool) -> crate::schedules::Ctx {
+    crate::schedules::Ctx {
+        now_unix: frame.now_unix,
+        zone: qoop_runtime::schedule::system_zone(),
+        fade,
+    }
 }
 
 /// The columns spent before the pane starts: the left column and the rule beside it, or
@@ -1040,6 +1063,12 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     // The keyboard is in the inbox: its own caret is drawn, and the chat's is not.
     if frame.chrome.asks.is_some_and(|asks| asks.focus)
         && qass_plan(frame).is_some_and(|p| p.side.is_some())
+    {
+        return None;
+    }
+    // The same for the schedules: their form draws its own caret.
+    if frame.chrome.clock.is_some_and(|clock| clock.focus)
+        && qass_plan(frame).is_some_and(|p| p.clock.is_some())
     {
         return None;
     }
@@ -1465,6 +1494,14 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + side.rect.x));
                 out.push_str(&row);
             }
+            // The schedules under the panes, in the rows the tree leaves free.
+            if let Some((plan, screen)) = &qass
+                && let Some(clock) = plan.clock
+                && let Some(row) = screen.clock_row(pane_row)
+            {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + clock.rect.x));
+                out.push_str(&row);
+            }
             if let (Some(rail), Some(rows)) = (frame.chrome.rail, &rail_rows)
                 && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
             {
@@ -1709,7 +1746,8 @@ pub fn paint(frame: &Frame) -> String {
     let held = frame.menu.is_some()
         || confirm.is_some()
         || frame.reading.is_some()
-        || frame.chrome.asks.is_some_and(|asks| asks.focus);
+        || frame.chrome.asks.is_some_and(|asks| asks.focus)
+        || frame.chrome.clock.is_some_and(|clock| clock.focus);
     if let Some(prompt) = frame.prompt {
         // At the end of what has been typed, as much of it as the field shows, or at the
         // start of an empty field before the faint name it keeps.
@@ -2728,7 +2766,7 @@ pub(crate) const KEY_GROUPS: &[KeyGroup] = &[
             ("w", "new space"),
             ("W", "close empty"),
             ("R", "settings"),
-            ("Q", "qass, or pet"),
+            ("Q/C", "qass, clock"),
             ("Z", "sleep, wake"),
             ("f", "fold"),
             ("g", "tree/priority"),
@@ -6151,7 +6189,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 45;
+    const COMMANDS: usize = 46;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -6208,13 +6246,14 @@ mod tests {
             Action::Answer => (const { place(35) }, Some("ctrl-a M")),
             Action::Sleep => (const { place(36) }, Some("ctrl-a Z")),
             Action::UpNext => (const { place(37) }, Some("ctrl-a tab")),
-            Action::Qass => (const { place(38) }, Some("ctrl-a Q")),
+            Action::Qass => (const { place(38) }, Some("ctrl-a Q/C")),
             Action::Agents => (const { place(39) }, Some("ctrl-a a")),
             Action::Asks => (const { place(40) }, Some("ctrl-a i/T")),
             Action::Fold => (const { place(41) }, Some("ctrl-a i/T")),
             Action::Chat => (const { place(42) }, Some("ctrl-a z/t")),
             Action::ChatRow => (const { place(43) }, Some("ctrl-a enter")),
             Action::Park => (const { place(44) }, Some("ctrl-a x/P")),
+            Action::Clock => (const { place(45) }, Some("ctrl-a Q/C")),
         }
     }
 
@@ -6284,6 +6323,7 @@ mod tests {
             Action::Chat,
             Action::ChatRow,
             Action::Park,
+            Action::Clock,
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();

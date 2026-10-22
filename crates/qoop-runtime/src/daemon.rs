@@ -247,6 +247,9 @@ pub struct ConnectionRegistry {
     pub messages: crate::messages::Watch,
     /// A result was shown (`qoop show`), fanned out like `asks`.
     shows: tokio::sync::broadcast::Sender<()>,
+    /// A schedule was added, changed, removed or run, fanned out like `asks`. The schedule
+    /// loop listens too: it is what wakes it when it is parked with nothing active.
+    schedules: tokio::sync::broadcast::Sender<()>,
     /// Every agent session on this computer, for the history lists.
     pub sessions: crate::sessions::Sessions,
     /// The microphone an interface lends a tab's program, and who is listening.
@@ -268,6 +271,7 @@ impl Default for ConnectionRegistry {
             messages: crate::messages::Watch::default(),
             sessions: crate::sessions::Sessions::default(),
             shows: tokio::sync::broadcast::channel(16).0,
+            schedules: tokio::sync::broadcast::channel(16).0,
             microphone: Arc::default(),
             changed: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -462,6 +466,22 @@ impl ConnectionRegistry {
     /// Tell every connection a result was shown.
     pub fn shows_changed(&self) {
         let _ = self.shows.send(());
+    }
+
+    /// Tell every connection, and the schedule loop, that a schedule changed.
+    pub fn schedules_changed(&self) {
+        let _ = self.schedules.send(());
+    }
+
+    /// The schedule loop's own ear on [`ConnectionRegistry::schedules_changed`].
+    pub(crate) fn subscribe_schedules(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.schedules.subscribe()
+    }
+
+    /// Make the daemon's leaving look again: what it waits on changed without a connection or
+    /// a tab coming or going (a schedule became active, or the last one went).
+    pub(crate) fn wake_leaving(&self) {
+        self.changed.notify_one();
     }
 
     /// Ask every attached interface to show `terminal`, and say which processes those are.
@@ -1644,6 +1664,11 @@ impl Daemon {
             });
         }
 
+        // Scheduled agents: the slots missed while qoop was down are decided before the first
+        // client is accepted, so one that connects knows what became of them. Parked, and so
+        // free, while no schedule is active.
+        crate::schedules::start(self.books.clone(), self.connections.clone()).await;
+
         let mut next_client = 0u64;
         let mut failing = None;
         loop {
@@ -2291,6 +2316,7 @@ async fn serve_client(
     let mut focus = connections.focus.subscribe();
     let mut asks = connections.asks.subscribe();
     let mut shows = connections.shows.subscribe();
+    let mut schedules = connections.schedules.subscribe();
     let mut listening = connections.microphone.subscribe();
     if hello.client_id == qoop_proto::INTERFACE_ID
         && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
@@ -2404,6 +2430,12 @@ async fn serve_client(
                 changed = shows.recv() => match changed {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         Some(crate::control::EventMessage::ShowsChanged)
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                changed = schedules.recv() => match changed {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Some(crate::control::EventMessage::SchedulesChanged)
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -5455,6 +5487,33 @@ async fn handle_control(
         ControlRequest::ShowRead { .. } => {
             Box::pin(crate::shows::read(id, terminals, agents, store)).await
         }
+        ControlRequest::ScheduleWrite {
+            terminal,
+            token,
+            action,
+            ..
+        } => {
+            // The space the caller is in, read in time or not at all: only qass's own space
+            // may write schedules from a terminal.
+            let space = match terminal.and_then(|t| terminals.workspace_of(t)) {
+                Some(space) => space_name(store, space).await,
+                None => None,
+            };
+            Box::pin(crate::schedules::write(
+                id,
+                crate::asks::Caller {
+                    terminal,
+                    token,
+                    space,
+                },
+                action,
+                agents,
+                connections,
+                books,
+            ))
+            .await
+        }
+        ControlRequest::ScheduleRead { .. } => crate::schedules::read(id, books).await,
         ControlRequest::AgentSessions {
             dirs,
             from_ms,
@@ -7021,6 +7080,9 @@ pub struct Bookkeeping {
     /// Told when `config.toml` was changed through the socket, so an idle sleep loop parked
     /// with both timeouts off looks at the file now and not at the next agent change.
     pub nudge: Arc<tokio::sync::Notify>,
+    /// Whether a schedule is waiting for its time and how many runs are starting: the daemon
+    /// does not leave for the first, and does not move onto a new binary for the second.
+    pub schedules: Arc<crate::schedules::Schedules>,
 }
 
 /// What [`Bookkeeping::awake`] holds.
@@ -7160,8 +7222,13 @@ impl Restart {
     }
 
     /// Whether a move onto a new binary is ending things right now.
-    fn gated(&self) -> bool {
+    pub(crate) fn gated(&self) -> bool {
         self.gate.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The binary this daemon runs as, when it was told (`Daemon::restarting_into`).
+    pub(crate) fn exe(&self) -> Option<PathBuf> {
+        self.exe.get().cloned()
     }
 
     fn keeps_tabs(&self) -> bool {
@@ -7189,6 +7256,9 @@ impl Restart {
             && crate::paths::no_auto_update_path().exists()
     }
 }
+
+/// Why a move waits for a scheduled run that is opening its terminal.
+const SCHEDULED_RUN: &str = "a scheduled agent is starting";
 
 /// Why a quiet arm waits.
 const WINDOW_OPEN: &str = "a qoop window is open here, the restart is offered in its foot";
@@ -7218,6 +7288,7 @@ impl Bookkeeping {
             restart: Arc::default(),
             awake: Arc::default(),
             nudge: Arc::default(),
+            schedules: Arc::default(),
         }
     }
 
@@ -8403,10 +8474,12 @@ struct Leaving {
 }
 
 impl Leaving {
-    /// Nothing awake, nobody attached, and not already on the way out.
+    /// Nothing awake, nobody attached, no schedule waiting for its time, and not already on the
+    /// way out.
     fn quiet(&self) -> bool {
         self.terminals.is_empty()
             && self.connections.holders() == 0
+            && !self.books.schedules.busy()
             && !self
                 .books
                 .stopping
@@ -8742,6 +8815,10 @@ async fn restart_look(
     if books.restart.window_holds() {
         return Err(WINDOW_OPEN.into());
     }
+    // A scheduled run that is opening its terminal talks to this daemon: it is let finish.
+    if books.schedules.in_flight() > 0 {
+        return Err(SCHEDULED_RUN.into());
+    }
     let mut held = BTreeMap::new();
     lock_spaces(books, &mut held).await?;
     // Only what is awake is looked at and written down. A tab marked asleep is not running,
@@ -8810,6 +8887,11 @@ async fn restart_look(
         // A window that came during the look: after this the tabs are ended or parked.
         if books.restart.window_holds() {
             return Err(WINDOW_OPEN.into());
+        }
+        // The schedule loop takes a run before it looks at the gate and this looks at the runs
+        // after it went up, so a run that started is seen here, and one that did not is refused.
+        if books.schedules.in_flight() > 0 {
+            return Err(SCHEDULED_RUN.into());
         }
         if live {
             // Nothing is ended, so nothing says the daemon is going: a tab ending now is

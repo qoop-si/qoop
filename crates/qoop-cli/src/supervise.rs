@@ -310,6 +310,7 @@ fn touches(events: &[EventMessage], watched: &[u32]) -> bool {
         | EventMessage::AsksChanged
         | EventMessage::MessagesChanged { .. }
         | EventMessage::ShowsChanged
+        | EventMessage::SchedulesChanged
         | EventMessage::Listen { .. } => false,
     })
 }
@@ -467,6 +468,7 @@ async fn follow(
                         | EventMessage::AsksChanged
                         | EventMessage::MessagesChanged { .. }
                         | EventMessage::ShowsChanged
+                        | EventMessage::SchedulesChanged
                 )
             }) {
                 break;

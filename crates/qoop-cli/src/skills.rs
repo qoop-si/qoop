@@ -127,6 +127,11 @@ const QASS: &[(&str, &str, bool)] = &[
         false,
     ),
     (
+        "schedules.md",
+        include_str!("../../../skills/qass/schedules.md"),
+        false,
+    ),
+    (
         "setup.md",
         include_str!("../../../skills/qass/setup.md"),
         false,
@@ -817,8 +822,10 @@ mod tests {
         // and the watch-off, watching on and resumed lines). 455 since 2026-10-18: a talk line
         // (`About E<n> (<handle>):`, `About W<n> (<handle>):`) is never an answer. 456 since
         // 2026-10-20: qass answers in the language the person writes to it in. 457 since
-        // 2026-10-20: never write into the tab where the person answers a server's install.
-        assert!(skill.lines().count() <= 457, "SKILL.md grew past 457 lines");
+        // 2026-10-20: never write into the tab where the person answers a server's install. 462
+        // since 2026-10-22: the pointer to schedules.md and the rule that a scheduled run is the
+        // owner's, not a worker of qass's (the rest is in schedules.md).
+        assert!(skill.lines().count() <= 462, "SKILL.md grew past 462 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

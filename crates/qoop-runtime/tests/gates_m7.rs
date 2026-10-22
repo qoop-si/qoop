@@ -301,6 +301,22 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             note: None,
         },
         ControlRequest::ShowRead { id: "x36".into() },
+        // A schedule is a record: a stranger's token is refused, and nothing is typed.
+        ControlRequest::ScheduleWrite {
+            id: "x43".into(),
+            terminal: Some(terminal),
+            token: Some("not-its-token".into()),
+            action: Box::new(qoop_runtime::control::ScheduleOp::Add {
+                name: "pwned".into(),
+                cron: Some("* * * * *".into()),
+                at: None,
+                agent: None,
+                cwd: "/tmp".into(),
+                space: None,
+                prompt: "echo PWNED".into(),
+            }),
+        },
+        ControlRequest::ScheduleRead { id: "x44".into() },
         // Reads of the session files on disk: nothing typed.
         ControlRequest::AgentSessions {
             id: "x41".into(),
@@ -394,6 +410,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::AskRead { .. }
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
+            | ControlRequest::ScheduleWrite { .. }
+            | ControlRequest::ScheduleRead { .. }
             | ControlRequest::AgentSessions { .. }
             | ControlRequest::AgentActivity { .. }
             | ControlRequest::ShowFetch { .. }

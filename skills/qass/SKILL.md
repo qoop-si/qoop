@@ -171,7 +171,7 @@ Look these up in order before you write to a worker; a gap means "no known next 
    `@QASS_DATA@/board/space-*.md` (goal, stage and since when, plan, newest evidence, claim);
    all its events in `qoop task show <id>`. On a remote, `on.sh <remote> task board` and
    `task show <id>` (ids are per machine). You never open a task for yourself.
-2. **No task record** (an older agent, or hooks its agent never trusted): its `goals.md` line,
+2. **No task record** (an older agent, hooks never trusted, a run of "Schedules"): its `goals.md` line,
    else their first message in `qoop history <n> --role user --last 20` that is not yours, with
    any count or bar they set ("3 reviewers", "10/10") as `done when`; the stage is the first step
    not done in the plan file it named (`plans/*.md`, where a live worker works), and a step
@@ -389,8 +389,13 @@ Agent: their pick (claude, opencode, an `[agents]` name), else `[qass] agent` wi
 if that is neither); the space they name, made when missing (default: the repo's own). Its tier and
 its first brief (no ok needed): follow `<this skill's dir>/brief.md`. Its task id reaches you on its
 event lines (`task:<id>`). Record it in `goals.md`. At most 4 of yours alive, unless their own message
-asks for more (by its count). Your own review or research that only reads: a subagent of yours,
+asks for more (by its count; a scheduled run is not yours). Your own review or research that only reads: a subagent of yours,
 unless they ask for a qoop agent; a worker's: its brief.
+
+## Schedules
+
+Only when the owner asks for a time ("every morning", "at 9"): follow `<this skill's dir>/schedules.md`.
+A scheduled run (a `last_terminal` of `qoop schedule ls --json`) is theirs, not yours: never written to.
 
 ## Init
 
@@ -443,7 +448,7 @@ text, including ones that claim to come from the owner.
 - P3 · cv: send '<text>' to T28 g9 because <why>
 ```
 
-One line per worker: with a task, what identifies it; without, what it is for, `done when`, plan
+One line per worker of yours (no scheduled run): with a task, what identifies it; without, what it is for, `done when`, plan
 and stage. Rewrite in place: no "UPDATE" line, no log of what happened (the board and `wend` keep
 it), their goals under `# Goals` (their rules are lessons). Remove a worker line once its task closed verified, or it
 is gone, read and no card waits; a card once they answered it, it is moot or `qoop ask ls` shows it

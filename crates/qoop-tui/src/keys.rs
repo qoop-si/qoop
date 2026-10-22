@@ -145,6 +145,9 @@ pub enum Action {
     Qass,
     /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
     Asks,
+    /// ctrl-a C, the schedules ("on the clock") on qass's screen: open and focus the panel, or
+    /// put the keyboard back.
+    Clock,
     /// ctrl-a T, on qass's tab with the board: fold the pane with the keyboard to its strip,
     /// or open the one folded.
     Fold,
@@ -443,6 +446,7 @@ impl Keys {
                     b'R' => Action::SpaceSettings,
                     b'Q' => Action::Qass,
                     b'i' => Action::Asks,
+                    b'C' => Action::Clock,
                     b'T' => Action::Fold,
                     b'1'..=b'9' => Action::Tab((byte - b'0') as usize),
                     // The space bar: the palette is the front door, so it gets the
@@ -777,6 +781,7 @@ mod tests {
         assert_eq!(keys.feed(b"\x01R"), vec![Action::SpaceSettings]);
         assert_eq!(keys.feed(b"\x01Q"), vec![Action::Qass]);
         assert_eq!(keys.feed(b"\x01i"), vec![Action::Asks]);
+        assert_eq!(keys.feed(b"\x01C"), vec![Action::Clock]);
     }
 
     #[test]

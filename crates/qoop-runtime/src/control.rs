@@ -666,7 +666,109 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         auto: bool,
     },
+    /// Add, pause, resume, remove or run a schedule, or report how a run went (`qoop schedule`).
+    /// A write from a terminal carries its token and is refused unless that terminal is qass's;
+    /// a client that speaks for no terminal (the app, the CLI outside qoop, the run itself
+    /// reporting) sends none. Answered `ScheduleWritten`.
+    ScheduleWrite {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        action: Box<ScheduleOp>,
+    },
+    /// Every schedule, answered as `Schedules`.
+    ScheduleRead {
+        id: String,
+    },
 }
+
+/// What a `ScheduleWrite` does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleOp {
+    /// Make a schedule: `cron` (five fields, local time) for a repeat or `at` (unix seconds)
+    /// for one moment, exactly one of them. `agent` defaults to qass's agent, `space` is made
+    /// when the run starts.
+    Add {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cron: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<String>,
+        prompt: String,
+    },
+    Pause {
+        schedule: i64,
+    },
+    /// Fire again from now on, with nothing caught up for the time it was paused.
+    Resume {
+        schedule: i64,
+    },
+    Remove {
+        schedule: i64,
+    },
+    /// Start it now, as a run of its own: its slot and its next time are not touched.
+    Run {
+        schedule: i64,
+    },
+    /// How the run of `slot` went (`started` with its terminal, or `failed: <why>`), from the
+    /// run itself. Applied only while the schedule still holds that slot.
+    Report {
+        schedule: i64,
+        slot: i64,
+        result: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<i64>,
+    },
+}
+
+/// A schedule as a client lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub id: i64,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+    pub agent: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    pub prompt: String,
+    pub paused: bool,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_slot: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<i64>,
+    /// `claimed`, `started`, `skipped: <why>` or `failed: <why>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// The terminal of the last run, which may be closed by now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_terminal: Option<i64>,
+    /// When it next comes due, in unix seconds; none when paused or done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_at: Option<i64>,
+    /// The daemon's words for the timing, the same on every client: `every day 09:00`,
+    /// `weekdays 09:00`, `mondays 08:30`, `every 2h`, `every 15m`, `once oct 24 17:00`, else
+    /// the cron text.
+    pub when: String,
+}
+
+/// The most bytes of prompt a schedule keeps.
+pub const SCHEDULE_PROMPT_MAX: usize = 8_000;
+
+/// The most schedules there are at once.
+pub const SCHEDULES_MOST: usize = 50;
 
 /// The most bytes one Blob frame of a tunnel carries: inside one record of the phone's link.
 pub const BLOB_MOST: usize = 60 * 1024;
@@ -1283,6 +1385,8 @@ impl ControlRequest {
             | Self::TunnelOpen { id, .. }
             | Self::Changes { id, .. }
             | Self::ShowOpen { id, .. }
+            | Self::ScheduleWrite { id, .. }
+            | Self::ScheduleRead { id }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -1554,6 +1658,16 @@ pub enum ControlResponse {
     Shows {
         id: String,
         shows: Vec<ShowInfo>,
+    },
+    /// A `ScheduleWrite` was applied to `schedule`.
+    ScheduleWritten {
+        id: String,
+        schedule: i64,
+    },
+    /// Every schedule, oldest first.
+    Schedules {
+        id: String,
+        schedules: Vec<ScheduleInfo>,
     },
     /// Bytes of a shown file, as standard base64, with the file's size and modification
     /// time (unix milliseconds) now: a reader starts over when either changed.
@@ -2152,6 +2266,8 @@ impl ControlResponse {
             | Self::AgentSessions { id, .. }
             | Self::AgentActivity { id, .. }
             | Self::ShowChunk { id, .. }
+            | Self::ScheduleWritten { id, .. }
+            | Self::Schedules { id, .. }
             | Self::TunnelOpened { id, .. }
             | Self::Changes { id, .. }
             | Self::Failed { id, .. } => id,
@@ -3088,6 +3204,9 @@ pub enum EventMessage {
     },
     /// A result was shown: `ShowRead` says what is there. An older client ignores it.
     ShowsChanged,
+    /// A schedule was added, changed, removed or run: `ScheduleRead` says what is there. An
+    /// older client ignores it.
+    SchedulesChanged,
     /// A program in `terminal` is recording (`on`), and will say so every second while it
     /// does, or has stopped. `listener` numbers the recording. An interface lends its
     /// microphone only right after a key the person pressed there; every other client, and

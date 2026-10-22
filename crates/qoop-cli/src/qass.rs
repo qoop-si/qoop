@@ -53,18 +53,39 @@ fn note_prompted_in(
         .write_all(format!("{now} {from} T{target}\n").as_bytes())
 }
 
+/// How each agent takes its first message, as each was seen to: Claude and Codex as the
+/// argument itself, Gemini after `-i` (which stays interactive) and opencode after `--prompt`.
+/// The one table for every place qoop starts an agent with words to say (qass here, a
+/// scheduled run in `schedule.rs`); `None` for a program qoop does not know.
+pub(crate) fn first_message_args(program: &str, text: &str) -> Option<Vec<String>> {
+    let flag: &[&str] = match program {
+        "claude" | "codex" => &[],
+        "gemini" => &["-i"],
+        "opencode" => &["--prompt"],
+        _ => return None,
+    };
+    let said = flag.iter().map(|w| w.to_string());
+    Some(said.chain([text.to_string()]).collect())
+}
+
 /// What starts the qass skill as each agent's first message, as each was seen to take it:
 /// Claude a slash command, Codex a `$skill` mention, Gemini and opencode a request to use
-/// it (both pick a skill by name from the prompt; neither has a skill command). opencode runs
-/// its own server (`--standalone`), so the qoop hook loads in qass's tab and not in the shared
-/// background service, whose environment is the first tab's.
-fn first_message(program: &str) -> Option<&'static [&'static str]> {
+/// it (both pick a skill by name from the prompt; neither has a skill command).
+fn skill_start(program: &str) -> &'static str {
     match program {
-        "claude" => Some(&["", "/qass"]),
-        "codex" => Some(&["", "$qass"]),
-        "gemini" => Some(&["-i", "Use the qass skill."]),
-        "opencode" => Some(&["--standalone", "--prompt", "Use the qass skill."]),
-        _ => None,
+        "claude" => "/qass",
+        "codex" => "$qass",
+        _ => "Use the qass skill.",
+    }
+}
+
+/// What qass's agent is run with besides its words. opencode runs its own server
+/// (`--standalone`), so the qoop hook loads in qass's tab and not in the shared background
+/// service, whose environment is the first tab's.
+fn own_server(program: &str) -> &'static [&'static str] {
+    match program {
+        "opencode" => &["--standalone"],
+        _ => &[],
     }
 }
 
@@ -87,7 +108,7 @@ fn not_typed(line: Option<&str>, words: impl Iterator<Item = String>) -> Vec<Str
 }
 
 /// The program a launcher line runs: its first word that is not an assignment, by name.
-fn program_of(line: &str) -> &str {
+pub(crate) fn program_of(line: &str) -> &str {
     line.split_whitespace()
         .find(|w| !w.contains('='))
         .map_or("", |w| w.rsplit('/').next().unwrap_or(w))
@@ -187,7 +208,7 @@ fn launch_line(
         .find(|a| a.name == agent)
         .map(|a| a.command.clone());
     let program = line.as_deref().map_or(agent, program_of).to_string();
-    let Some(first) = first_message(&program) else {
+    let Some(first) = first_message_args(&program, skill_start(&program)) else {
         return Err(format!(
             "qass starts on {}; {agent} runs {program}",
             config::QASS_AGENTS.join(", ")
@@ -195,11 +216,15 @@ fn launch_line(
     };
     let by_name = line.is_none();
     let flags = if by_name { bypass(&program) } else { &[] };
-    let said = first.iter().filter(|w| !w.is_empty());
+    let own = flags
+        .iter()
+        .chain(own_server(&program))
+        .map(|w| w.to_string());
     let words = by_name
         .then(|| agent.to_string())
         .into_iter()
-        .chain(flags.iter().chain(said).map(|w| w.to_string()));
+        .chain(own)
+        .chain(first);
     let words = not_typed(line.as_deref(), words);
     Ok((line, words, program))
 }
@@ -1057,7 +1082,12 @@ mod tests {
         assert_eq!(program_of("claude --model sonnet"), "claude");
         assert_eq!(program_of("FOO=1 /usr/local/bin/codex -m gpt-5.5"), "codex");
         assert_eq!(program_of(""), "");
-        assert!(first_message("aider").is_none());
+        assert!(first_message_args("aider", "x").is_none());
+        let said = |program: &str| first_message_args(program, "go").expect(program);
+        assert_eq!(said("claude"), ["go"]);
+        assert_eq!(said("codex"), ["go"]);
+        assert_eq!(said("gemini"), ["-i", "go"]);
+        assert_eq!(said("opencode"), ["--prompt", "go"]);
     }
 
     #[test]

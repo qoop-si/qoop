@@ -15,6 +15,7 @@
 pub mod ask;
 pub mod history;
 pub mod item;
+pub mod schedule;
 pub mod show;
 pub mod task;
 
@@ -25,6 +26,7 @@ pub use ask::{Added, AskError, AskRow};
 pub use history::History;
 pub use item::{ItemAgent, ItemCard, ItemRow, ItemState, StepRow};
 use rusqlite::{Connection, OptionalExtension, params};
+pub use schedule::{ScheduleError, ScheduleRow};
 pub use show::ShowRow;
 pub use task::{Outcome, TaskError, TaskEventRow, TaskRow};
 
@@ -41,6 +43,9 @@ pub enum StoreError {
     /// An ask write refused for what it asked: the message is the answer to give.
     #[error("{0}")]
     Ask(#[from] ask::AskError),
+    /// A schedule write refused for what it asked: the message is the answer to give.
+    #[error("{0}")]
+    Schedule(#[from] schedule::ScheduleError),
     #[error(
         "this database was written by a newer qoop (schema {found}, this build understands \
          {understood}); use that build or move the file aside"
@@ -452,6 +457,26 @@ impl Store {
              CREATE TABLE IF NOT EXISTS show_asked (
                  show INTEGER PRIMARY KEY REFERENCES show(id) ON DELETE CASCADE,
                  mtime INTEGER NOT NULL
+             );
+             -- Agents the owner asked qoop to start at a time (`schedule.rs`). AUTOINCREMENT,
+             -- so a removed schedule's id is never given again to a run still reporting.
+             -- New table, no version bump, like `ask` and `show`: an older binary never
+             -- reads it.
+             CREATE TABLE IF NOT EXISTS schedule (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL UNIQUE,
+                 cron TEXT,
+                 at INTEGER,
+                 agent TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 space TEXT,
+                 prompt TEXT NOT NULL,
+                 paused INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL,
+                 last_slot INTEGER,
+                 last_at INTEGER,
+                 last_result TEXT,
+                 last_terminal INTEGER
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

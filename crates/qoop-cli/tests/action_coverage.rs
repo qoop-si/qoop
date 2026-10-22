@@ -8,7 +8,7 @@
 //! Asserted over the registered handlers rather than over a list somebody maintains: a list
 //! stops covering the surface the first time an action is added.
 
-use qoop_runtime::control::ControlRequest;
+use qoop_runtime::control::{ControlRequest, ScheduleOp};
 
 /// What the client can do, and the protocol method behind each one.
 ///
@@ -622,6 +622,40 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "add a schedule",
+            method: || {
+                Method::Control(ControlRequest::ScheduleWrite {
+                    id: "a".into(),
+                    terminal: None,
+                    token: None,
+                    action: Box::new(ScheduleOp::Add {
+                        name: "morning".into(),
+                        cron: Some("0 9 * * *".into()),
+                        at: None,
+                        agent: None,
+                        cwd: "/tmp".into(),
+                        space: None,
+                        prompt: "look at the inbox".into(),
+                    }),
+                })
+            },
+        },
+        Action {
+            name: "pause, resume, remove or run a schedule",
+            method: || {
+                Method::Control(ControlRequest::ScheduleWrite {
+                    id: "a".into(),
+                    terminal: None,
+                    token: None,
+                    action: Box::new(ScheduleOp::Pause { schedule: 1 }),
+                })
+            },
+        },
+        Action {
+            name: "list the schedules",
+            method: || Method::Control(ControlRequest::ScheduleRead { id: "a".into() }),
+        },
+        Action {
             name: "preview a dev server shown on the phone",
             method: || {
                 Method::Control(ControlRequest::TunnelOpen {
@@ -956,6 +990,13 @@ fn every_control_method_is_reachable_from_some_action() {
             offset: 0,
             len: 0,
         },
+        ControlRequest::ScheduleWrite {
+            id: String::new(),
+            terminal: None,
+            token: None,
+            action: Box::new(ScheduleOp::Pause { schedule: 0 }),
+        },
+        ControlRequest::ScheduleRead { id: String::new() },
         ControlRequest::TunnelOpen {
             id: String::new(),
             show: 0,
@@ -1026,6 +1067,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::AgentSessions { .. }
             | ControlRequest::AgentActivity { .. }
             | ControlRequest::ShowFetch { .. }
+            | ControlRequest::ScheduleWrite { .. }
+            | ControlRequest::ScheduleRead { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }
             | ControlRequest::ShowOpen { .. }

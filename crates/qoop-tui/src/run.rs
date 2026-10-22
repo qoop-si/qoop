@@ -734,6 +734,8 @@ struct State {
     qass_ui: crate::qass_screen::Ui,
     /// The question inbox beside qass's terminal: its cards, what is typed, the answer held.
     asks: crate::asks::Pane,
+    /// The schedules ("on the clock") on qass's screen: the rows, the pick, the form.
+    clock: crate::schedules::Pane,
     /// When this client last forwarded a key or a paste to each terminal, so a talk line is
     /// never pasted over what he is typing there, nor twice.
     typed_at: std::collections::BTreeMap<u32, std::time::Instant>,
@@ -1257,8 +1259,12 @@ impl State {
             image_notice: None,
             toast: toast_text(self),
             chrome: screen::Chrome {
-                qass: self.qass_header().then_some(self.qass_ui),
+                qass: self.qass_header().then(|| crate::qass_screen::Ui {
+                    clock: self.clock_rows(),
+                    ..self.qass_ui
+                }),
                 asks: self.qass_header().then_some(&self.asks),
+                clock: self.qass_header().then_some(&self.clock),
                 questions: self.qass_split().then(|| self.questions()).flatten(),
                 rail: self.qass_split().then(|| self.rail_paint()).flatten(),
                 handle: self.qass_split().then(|| self.handle()).flatten(),
@@ -3079,7 +3085,7 @@ impl State {
         if self.band_over(tree) > 0
             && let Some(plan) = crate::qass_screen::Plan::band(cols as usize, rows as usize)
         {
-            return plan.frame;
+            return plan.with_clock(self.clock_rows()).frame;
         }
         layout::Rect {
             x: 0,
@@ -3130,7 +3136,7 @@ impl State {
             return crate::qass_screen::Plan::band(cols as usize, rows as usize).map(|plan| {
                 crate::qass_screen::Plan {
                     side: self.questions(),
-                    ..plan
+                    ..plan.with_clock(self.clock_rows())
                 }
             });
         }
@@ -3140,6 +3146,7 @@ impl State {
             self.qass_ui.zoomed,
             self.qass_ui.inbox,
         )
+        .map(|plan| plan.with_clock(self.clock_rows()))
     }
 
     /// qass's page as home, and the keyboard in the inbox only while the inbox is shown.
@@ -3179,6 +3186,15 @@ impl State {
         }
         if self.asks.focus && !self.asks_focused() {
             self.asks.release();
+            if self.qass_split() {
+                self.qass_next();
+            }
+        }
+        // The same for the schedules: the keyboard never stays in a panel that is not shown.
+        if self.clock.focus && !self.clock_focused() {
+            let shown = self.clock.shown();
+            self.clock.release();
+            resize |= shown != self.clock.shown();
             if self.qass_split() {
                 self.qass_next();
             }
@@ -3225,6 +3241,35 @@ impl State {
             && (self.qass_ui.inbox || self.qass_split())
             && self.qass_header()
             && self.qass_plan().is_some_and(|p| p.side.is_some())
+    }
+
+    /// The rows the schedules panel wants in this pane: none while it is not shown.
+    fn clock_rows(&self) -> usize {
+        let (cols, _) =
+            screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
+        self.clock.rows_wanted(cols as usize)
+    }
+
+    /// Whether the keyboard is in the schedules panel: shown and given the keys.
+    fn clock_focused(&self) -> bool {
+        self.clock.focus
+            && self.clock.shown()
+            && self.qass_header()
+            && self.qass_plan().is_some_and(|p| p.clock.is_some())
+    }
+
+    /// The folder a new schedule starts from: where the owner was before qass's screen (qass's
+    /// own folder is no one's work), else the folder this client was started in.
+    fn clock_folder(&self) -> String {
+        self.qass_back
+            .and_then(|t| self.rows.iter().find(|r| r.terminal == t))
+            .and_then(|r| r.cwd.clone())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default()
     }
 
     /// Whether the questions want to be on screen: he brought them up (`ctrl-a i`, the rail's
@@ -7632,6 +7677,7 @@ where
         qass_ui: Default::default(),
         // Read once as soon as the loop runs.
         asks: crate::asks::Pane::new(),
+        clock: crate::schedules::Pane::new(),
         typed_at: Default::default(),
         chat: crate::chat_view::ChatState::read(chat_file),
         last: LastFocus::read(last_focus, own_focus),
@@ -8193,7 +8239,11 @@ where
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
             // A write to send, and the moment a notice is let go. `None` with nothing to do.
-            let asks_at = state.asks.wake_at().map(tokio::time::Instant::from_std);
+            let asks_at = [state.asks.wake_at(), state.clock.wake_at()]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(tokio::time::Instant::from_std);
             // A chat read that is due: after news, a retry, or the keepalive.
             let chat_at = chat_wake(&state);
 
@@ -8636,6 +8686,28 @@ where
                             paste_talk(&mut state, *terminal, line, &mut seqs, &mut wr).await?;
                         }
                         feed = taken.feed;
+                    } else if state.clock_focused()
+                        && !keys.prefix_pending()
+                        && !keys.mouse_pending()
+                        && !is_report_head(&bytes)
+                    {
+                        // The schedules own the keyboard while they are given it, and hand
+                        // back the prefix, the mouse and what is not theirs.
+                        dirty = true;
+                        let taken = clock_keys(&mut state, &bytes, keys.prefix());
+                        if taken.resize
+                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                        {
+                            wr.write_all(&resize).await?;
+                        }
+                        if let Some(terminal) = taken.jump
+                            && let Some(bytes) =
+                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                        {
+                            wr.write_all(&bytes).await?;
+                        }
+                        drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                        feed = taken.feed;
                     } else {
                         feed = Some(bytes);
                     }
@@ -8793,6 +8865,31 @@ where
                                 }
                                 // The question inbox and the chip that opens it answer their own
                                 // clicks; a click in qass's terminal takes the keyboard back.
+                                // The schedules answer their own clicks; a click on one takes the
+                                // keyboard from the questions.
+                                if let Some(click) = state.clock_click(row, col) {
+                                    state.asks.release();
+                                    state.clock.focus = true;
+                                    let before = state.clock_rows();
+                                    let out = match click {
+                                        Some(hit) => state.clock.click(hit),
+                                        None => crate::schedules::Out::Stay,
+                                    };
+                                    let taken = clock_out(&mut state, out, before);
+                                    if taken.resize
+                                        && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                    {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    if let Some(terminal) = taken.jump
+                                        && let Some(bytes) =
+                                            focus(&mut state, terminal, &mut control_seq, &mut seqs)?
+                                    {
+                                        wr.write_all(&bytes).await?;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
                                 match state.ask_click(row, col) {
                                     Some(AskClick::Toggle) => {
                                         if asks_toggle(&mut state)
@@ -9924,6 +10021,15 @@ where
                                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
                                 dirty = true;
                             }
+                            Action::Clock => {
+                                if clock_toggle(&mut state)
+                                    && let Some(resize) = size_terminals(&mut state, &mut seqs)?
+                                {
+                                    wr.write_all(&resize).await?;
+                                }
+                                drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                                dirty = true;
+                            }
                             Action::Fold => {
                                 if fold_key(&mut state)
                                     && let Some(resize) = size_terminals(&mut state, &mut seqs)?
@@ -10386,6 +10492,7 @@ where
                                 // A resync may have missed a card too.
                                 if matches!(message, Incoming::Event(EventMessage::Resync)) {
                                     state.asks.stale = true;
+                                    state.clock.stale = true;
                                 }
                                 // What changed is not in the message on purpose, so the
                                 // answer comes from the one place that has it. A resync
@@ -10415,6 +10522,8 @@ where
                             }
                             // The board's news and a result shown: nothing the index draws.
                             Incoming::Event(EventMessage::TasksChanged | EventMessage::ShowsChanged) => {}
+                            // The schedules' list is read again; the panel is what draws it.
+                            Incoming::Event(EventMessage::SchedulesChanged) => state.clock.stale = true,
                             // The chat view asks for the page again when it shows this terminal.
                             Incoming::Event(EventMessage::MessagesChanged { terminal, .. }) => {
                                 chat_news(&mut state, terminal, std::time::Instant::now());
@@ -10450,6 +10559,14 @@ where
                                 }
                             }
                             Incoming::Control(response) => {
+                                // The schedules: a new list can bring the panel or take it
+                                // away, which sizes qass's terminal again.
+                                if state.clock.answered(&response) {
+                                    dirty = true;
+                                    if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                }
                                 if state.asks.answered(&response) {
                                     dirty = true;
                                     // The last card going takes questions he brought up out
@@ -10624,6 +10741,9 @@ where
                     if let Some(read) = state.asks.read_request() {
                         wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
                     }
+                    if let Some(read) = state.clock.read_request() {
+                        wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
+                    }
                 }
                 // A held escape that nothing completed: it was a key. Released into the
                 // filter, and the stdin arm is woken to type it through the ordinary path.
@@ -10661,7 +10781,10 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
-                    let (sends, moved) = state.asks.tick(std::time::Instant::now());
+                    let (mut sends, mut moved) = state.asks.tick(std::time::Instant::now());
+                    let (clock_sends, clock_moved) = state.clock.tick(std::time::Instant::now());
+                    sends.extend(clock_sends);
+                    moved |= clock_moved;
                     for request in sends {
                         wr.write_all(&client::encode_control_seq(&request, &mut control_seq)?).await?;
                     }
@@ -13029,6 +13152,118 @@ impl State {
         }
         (!side.replaces && inside(plan.frame)).then_some(AskClick::Chat)
     }
+
+    /// What a one based screen position is in the schedules panel, when it is in it: the
+    /// thing it drew there, else (`Some(None)`) a blank cell of it. Asked of the same painter
+    /// that drew them, so a click lands on what was shown.
+    fn clock_click(&self, row: u16, col: u16) -> Option<Option<crate::schedules::Hit>> {
+        if !self.qass_header() || !self.clock.shown() {
+            return None;
+        }
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let pane_col = (col as usize).checked_sub(left + 1)?;
+        let pane_row = (row as usize).checked_sub(screen::TABS + 1)?;
+        let frame = self.frame();
+        let (plan, _) = screen::qass_screen_of(&frame, sidebar::current_avatar().as_ref(), false)?;
+        let rect = plan.clock?.rect;
+        let inside = pane_row >= rect.y
+            && pane_row < rect.y + rect.rows
+            && pane_col >= rect.x
+            && pane_col < rect.x + rect.cols;
+        inside.then(|| {
+            let ctx = screen::clock_ctx(&frame, false);
+            let view = crate::schedules::view(&self.clock, &ctx, rect.cols, rect.rows);
+            crate::schedules::hit_at(&view, rect, pane_row, pane_col)
+        })
+    }
+}
+
+/// What the schedules panel did with some keys, for the loop that owns the keyboard.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClockKeys {
+    /// What is not the panel's, for the ordinary path.
+    feed: Option<Vec<u8>>,
+    /// The layout changed: qass's terminal must be sized again.
+    resize: bool,
+    /// Go to this terminal's tab.
+    jump: Option<u32>,
+}
+
+/// Keys typed while the schedules have the keyboard.
+fn clock_keys(state: &mut State, bytes: &[u8], prefix: u8) -> ClockKeys {
+    let before = state.clock_rows();
+    let out = state.clock.key(bytes, prefix);
+    clock_out(state, out, before)
+}
+
+/// What a key or a click on the schedules asks of the client. `before` is the rows the panel
+/// wanted before it, so a form opening or the list changing sizes the terminals again.
+fn clock_out(state: &mut State, out: crate::schedules::Out, before: usize) -> ClockKeys {
+    use crate::schedules::Out;
+    let mut taken = ClockKeys::default();
+    match out {
+        Out::Stay => {}
+        Out::Back => {
+            state.clock.release();
+            if state.qass_split() {
+                state.qass_next();
+            }
+        }
+        Out::Jump(terminal) if state.rows.iter().any(|r| r.terminal == terminal) => {
+            state.clock.release();
+            taken.jump = Some(terminal);
+        }
+        Out::Jump(terminal) => state.clock.say(format!("tab {terminal} is closed")),
+        Out::Add => {
+            let folder = state.clock_folder();
+            state.clock.open_form(folder);
+            let holds = |s: &State| {
+                s.qass_plan()
+                    .is_some_and(|p| p.clock.is_some_and(|c| c.rect.rows >= s.clock_rows()))
+            };
+            if !holds(state) {
+                state.clock.form = None;
+                state.message = Some(no_room(state, "the schedule form", holds));
+            }
+        }
+        Out::Pass(rest) => taken.feed = Some(rest),
+    }
+    taken.resize = state.clock_rows() != before;
+    taken
+}
+
+/// `ctrl-a C`: open the schedules panel and give it the keyboard; with it shown and the
+/// keyboard in the chat, give it the keyboard; with the keyboard in it, give it back. True
+/// when the layout changed, so qass's terminal must be sized again.
+fn clock_toggle(state: &mut State) -> bool {
+    if !state.qass_header() {
+        state.message = Some(crate::keys::named(
+            "the schedules are on qass's screen: ctrl-a Q",
+        ));
+        return false;
+    }
+    if state.clock_focused() {
+        let shown = state.clock.shown();
+        state.clock.release();
+        if state.qass_split() {
+            state.qass_next();
+        }
+        return shown != state.clock.shown();
+    }
+    let was = state.clock.shown();
+    state.clock.raised = true;
+    state.clock.stale = true;
+    // The panel must have a place in this pane, or there is nothing to give the keyboard to.
+    if state.qass_plan().is_none_or(|p| p.clock.is_none()) {
+        state.clock.raised = false;
+        state.message = Some(no_room(state, "the schedules", |s| {
+            s.qass_plan().is_some_and(|p| p.clock.is_some())
+        }));
+        return false;
+    }
+    state.asks.release();
+    state.clock.focus = true;
+    !was
 }
 
 /// `ctrl-a i`, or a click on the chip: open the inbox and give it the keyboard; with it open
@@ -13039,6 +13274,8 @@ fn asks_toggle(state: &mut State) -> bool {
         state.message = Some("the questions are on qass's screen: ctrl-a Q".to_string());
         return false;
     }
+    // One panel has the keyboard at a time.
+    state.clock.release();
     if state.qass_split() {
         return questions_toggle(state);
     }
@@ -16424,6 +16661,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
@@ -18018,6 +18256,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
@@ -18169,6 +18408,7 @@ mod tests {
             qass_asked: None,
             qass_ui: Default::default(),
             asks: Default::default(),
+            clock: crate::schedules::Pane::new(),
             typed_at: Default::default(),
             last: LastFocus::default(),
             chat: Default::default(),
@@ -24350,6 +24590,108 @@ mod tests {
             state.asks_settle();
             assert!(!state.asks.raised, "gone={gone}");
         }
+    }
+
+    fn clock_row(id: i64, name: &str) -> qoop_runtime::control::ScheduleInfo {
+        qoop_runtime::control::ScheduleInfo {
+            id,
+            name: name.to_string(),
+            cron: Some("0 9 * * 1-5".into()),
+            at: None,
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            space: None,
+            prompt: "review".into(),
+            paused: false,
+            created_at: sidebar::now_unix() - 3600,
+            last_slot: None,
+            last_at: None,
+            last_result: None,
+            last_terminal: None,
+            next_at: Some(sidebar::now_unix() + 3600),
+            when: "weekdays 09:00".into(),
+        }
+    }
+
+    /// Schedules on the clock draw their panel on qass's screen, beside its terminal in a wide
+    /// window and under it in a narrow one, and qass's terminal is sized to what is left; with
+    /// nothing on the clock there is no panel and the terminal has the pane.
+    #[test]
+    fn schedules_draw_their_panel_beside_or_under_qass_and_size_its_terminal_to_fit() {
+        for (cols, beside) in [(160, true), (90, false)] {
+            let mut state = qass_window();
+            state.cols = cols;
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            let bare = state.qass_rect().unwrap();
+            assert!(state.qass_plan().unwrap().clock.is_none());
+            state.clock.take(vec![clock_row(1, "morning review")]);
+            let plan = state.qass_plan().unwrap();
+            let panel = plan.clock.expect("a panel for a schedule");
+            assert_eq!(!panel.under, beside, "{cols} columns");
+            let inner = state.qass_rect().unwrap();
+            if beside {
+                assert!(inner.cols < bare.cols && inner.rows == bare.rows);
+            } else {
+                assert!(inner.rows < bare.rows && inner.cols == bare.cols);
+            }
+            // The pty is told the smaller size, so nothing of qass hides under the panel.
+            size_terminals(&mut state, &mut seqs).unwrap();
+            assert_eq!(
+                state.sized.get(&5),
+                Some(&(inner.cols as u16, inner.rows as u16))
+            );
+            let painted = screen::paint(&state.frame());
+            assert!(painted.contains("on the clock"), "{cols} columns");
+            assert!(painted.contains("morning review"), "{cols} columns");
+            // Gone from the list: the terminal has the pane back.
+            state.clock.take(Vec::new());
+            assert_eq!(state.qass_rect().unwrap(), bare);
+        }
+    }
+
+    /// `ctrl-a C` gives the panel the keyboard and again gives it back; with the keyboard in it
+    /// space writes a pause, `+` opens the form with the folder the owner came from, and
+    /// escape closes the form. Off qass's screen it only says where the schedules are.
+    #[test]
+    fn ctrl_a_capital_c_gives_the_schedules_the_keyboard() {
+        let mut state = qass_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        assert!(!clock_toggle(&mut state), "not on qass's screen");
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("qass's screen"))
+        );
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.clock.take(vec![clock_row(7, "morning review")]);
+        assert!(!state.clock_focused());
+        clock_toggle(&mut state);
+        assert!(state.clock_focused() && !state.asks_focused());
+        let sent = clock_keys(&mut state, b" ", 1);
+        assert_eq!(sent, ClockKeys::default());
+        let (sends, _) = state.clock.tick(std::time::Instant::now());
+        assert!(matches!(
+            &sends[0],
+            ControlRequest::ScheduleWrite { action, .. }
+                if **action == qoop_runtime::control::ScheduleOp::Pause { schedule: 7 }
+        ));
+        let opened = clock_keys(&mut state, b"+", 1);
+        assert!(opened.resize, "the form is taller than the list");
+        let form = state.clock.form.as_ref().expect("the form is open");
+        assert!(form.folder.starts_with('/'), "{}", form.folder);
+        assert!(screen::paint(&state.frame()).contains("new schedule"));
+        // The prefix is not the form's.
+        assert_eq!(
+            clock_keys(&mut state, b"\x01c", 1).feed,
+            Some(b"\x01c".to_vec())
+        );
+        clock_keys(&mut state, b"\x1b", 1);
+        assert!(state.clock.form.is_none());
+        // Tab hands the keyboard back to qass's chat.
+        clock_keys(&mut state, b"\t", 1);
+        assert!(!state.clock_focused());
     }
 
     fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {

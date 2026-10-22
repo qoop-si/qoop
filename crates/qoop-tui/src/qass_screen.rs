@@ -46,6 +46,12 @@ pub const INBOX_MIN_ROWS: usize = 14;
 const INBOX_BOX_ROWS: usize = 14;
 const INBOX_SHARE: usize = 43;
 const INBOX_WIDTH: (usize, usize) = (48, 56);
+/// The "on the clock" panel beside qass's terminal: its width keeps between these two, about
+/// this share of the pane.
+const CLOCK_WIDTH: (usize, usize) = (38, 46);
+const CLOCK_SHARE: usize = 30;
+/// The columns qass's terminal keeps beside the panel: with fewer the panel goes under it.
+const CLOCK_BESIDE_LEAVES: usize = 56;
 /// The narrowest the board page draws in (`qoop task board --page` asks for this much).
 pub const BOARD_MIN_COLS: usize = 60;
 /// The narrowest qass's terminal gets beside the board.
@@ -250,6 +256,10 @@ pub struct Ui {
     /// The quarter minute the ages were last drawn in, so a line that says `2 min ago` is
     /// repainted soon after it stops being true.
     pub bucket: i64,
+    /// The rows the "on the clock" panel wants, none while it is not shown. Not remembered:
+    /// the client fills it in each frame from the schedules it holds, so the painter and the
+    /// client lay the pane out from the same number.
+    pub clock: usize,
 }
 
 impl Ui {
@@ -315,6 +325,16 @@ pub struct Plan {
     pub inner: Rect,
     /// The question inbox, when it is open and the pane is big enough for it.
     pub side: Option<Side>,
+    /// The "on the clock" panel, when schedules are shown and the pane has room for it.
+    pub clock: Option<Clock>,
+}
+
+/// The "on the clock" panel's rectangle in the pane, and where it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clock {
+    pub rect: Rect,
+    /// Under the terminal, the pane's whole width: the pane is too narrow for it beside.
+    pub under: bool,
 }
 
 impl Plan {
@@ -355,6 +375,7 @@ impl Plan {
                 rows: rows - top - 2,
             },
             side: None,
+            clock: None,
         };
         if inbox && !zoomed && cols >= INBOX_MIN_COLS && rows >= INBOX_MIN_ROWS {
             let below = Rect {
@@ -389,6 +410,51 @@ impl Plan {
             }
         }
         Some(plan)
+    }
+
+    /// The plan with the "on the clock" panel `rows` tall wanted (none: no panel). Beside the
+    /// terminal while the terminal keeps [`CLOCK_BESIDE_LEAVES`] columns, else under it, the
+    /// pane's whole width, while the terminal keeps its [`MIN_INSIDE`] rows; with room for
+    /// neither the panel is not drawn. Never over the inbox standing in the terminal's place,
+    /// and never on the zoomed screen. On qass's split tab, whose panes lay themselves out in
+    /// `frame`, only under.
+    pub fn with_clock(mut self, rows: usize) -> Plan {
+        if rows == 0 || self.header == Header::None || self.side.is_some_and(|s| s.replaces) {
+            return self;
+        }
+        let split = self.frame == self.inner;
+        let w = (self.cols * CLOCK_SHARE / 100).clamp(CLOCK_WIDTH.0, CLOCK_WIDTH.1);
+        if !split && self.frame.cols >= w + CLOCK_BESIDE_LEAVES {
+            let rect = Rect {
+                x: self.frame.x + self.frame.cols - w,
+                y: self.frame.y,
+                cols: w,
+                rows: self.frame.rows,
+            };
+            self.frame.cols -= w;
+            self.inner.cols -= w;
+            self.clock = Some(Clock { rect, under: false });
+            return self;
+        }
+        // The terminal inside its box needs its rows and the box's two borders.
+        let room = self.frame.rows.saturating_sub(MIN_INSIDE + 2);
+        let n = rows.min(room);
+        if n < crate::schedules::LIST_MIN_ROWS {
+            return self;
+        }
+        let rect = Rect {
+            x: 0,
+            y: self.rows - n,
+            cols: self.cols,
+            rows: n,
+        };
+        self.frame.rows -= n;
+        self.inner.rows -= n;
+        if let Some(side) = &mut self.side {
+            side.rect.rows -= n;
+        }
+        self.clock = Some(Clock { rect, under: true });
+        self
     }
 
     /// Whether a pane of this size can hold the inbox at all.
@@ -428,6 +494,7 @@ impl Plan {
             frame: panes,
             inner: panes,
             side: None,
+            clock: None,
         })
     }
 }
@@ -821,6 +888,8 @@ pub struct Screen {
     inbox: Vec<String>,
     /// Where the `[ N questions ]` chip is, pane-local: its row and its columns.
     chip: Option<Chip>,
+    /// The "on the clock" panel's rows, each as wide as its rectangle, while it is shown.
+    clock: Vec<String>,
 }
 
 /// The `[ N questions ]` chip's cells in the pane: a click on it opens and closes the inbox.
@@ -858,6 +927,7 @@ impl Screen {
             plan,
             header,
             inbox: Vec::new(),
+            clock: Vec::new(),
             chip,
             top: edge(
                 plan.frame.cols,
@@ -881,6 +951,19 @@ impl Screen {
     pub fn with_inbox(mut self, rows: Vec<String>) -> Screen {
         self.inbox = rows;
         self
+    }
+
+    /// The "on the clock" panel's painted rows, one per row of its rectangle.
+    pub fn with_clock(mut self, rows: Vec<String>) -> Screen {
+        self.clock = rows;
+        self
+    }
+
+    /// One row of the panel in a split tab, whose panes paint themselves: the row of the pane
+    /// `pane_row` falls on, while the panel is shown.
+    pub fn clock_row(&self, pane_row: usize) -> Option<String> {
+        let clock = self.plan.clock?;
+        self.clock.get(pane_row.checked_sub(clock.rect.y)?).cloned()
     }
 
     /// One row of the inbox in a split tab, whose panes paint themselves: the row of the pane
@@ -922,9 +1005,24 @@ impl Screen {
             return header.clone();
         }
         let blank = || " ".repeat(p.cols);
+        // The panel under the terminal stands in rows the box no longer has.
+        if p.clock.is_some_and(|c| c.under)
+            && let Some(row) = self.clock_row(pane_row)
+        {
+            return row;
+        }
         if pane_row < p.frame.y || pane_row >= p.frame.y + p.frame.rows {
             return blank();
         }
+        // The panel beside the terminal ends every row of the box's rows.
+        let beside = p
+            .clock
+            .filter(|c| !c.under)
+            .map(|c| {
+                self.clock_row(pane_row)
+                    .unwrap_or_else(|| " ".repeat(c.rect.cols))
+            })
+            .unwrap_or_default();
         let inbox = |at: usize| self.inbox.get(at).cloned().unwrap_or_else(blank);
         // A narrow pane: the inbox is where the terminal box would be.
         if let Some(side) = p.side.filter(|s| s.replaces) {
@@ -935,12 +1033,16 @@ impl Screen {
             .map(|s| inbox(pane_row - s.rect.y))
             .unwrap_or_default();
         if pane_row == p.frame.y {
-            return format!("{left}{}", self.top);
+            return format!("{left}{}{beside}", self.top);
         }
         if pane_row + 1 == p.frame.y + p.frame.rows {
-            return format!("{left}{}", self.bottom);
+            return format!("{left}{}{beside}", self.bottom);
         }
-        format!("{left}{0}{1}{0}", self.side, terminal(pane_row - p.inner.y))
+        format!(
+            "{left}{0}{1}{0}{beside}",
+            self.side,
+            terminal(pane_row - p.inner.y)
+        )
     }
 }
 
@@ -1689,6 +1791,106 @@ mod tests {
                     "{mid}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_clock_panel_stands_beside_a_wide_terminal_and_under_a_narrow_one() {
+        let rows = 14;
+        // Wide: it takes its width off the right of the box and spans the box's rows.
+        let p = Plan::new(140, 40, false, false).unwrap().with_clock(rows);
+        let c = p.clock.unwrap();
+        assert!(!c.under);
+        assert_eq!((c.rect.rows, c.rect.y), (p.frame.rows, p.frame.y));
+        assert_eq!(c.rect.x, p.frame.cols);
+        assert_eq!(p.frame.cols + c.rect.cols, 140);
+        assert_eq!(p.inner.cols, p.frame.cols - 2);
+        // Narrow: under the terminal, the pane's whole width, which loses those rows.
+        let whole = Plan::new(90, 40, false, false).unwrap();
+        let p = whole.with_clock(rows);
+        let c = p.clock.unwrap();
+        assert!(c.under);
+        assert_eq!((c.rect.x, c.rect.cols, c.rect.rows), (0, 90, rows));
+        assert_eq!(c.rect.y, 40 - rows);
+        assert_eq!(p.frame.rows, whole.frame.rows - rows);
+        assert_eq!(p.inner.rows, whole.inner.rows - rows);
+        // No panel wanted, none made.
+        assert_eq!(
+            Plan::new(140, 40, false, false)
+                .unwrap()
+                .with_clock(0)
+                .clock,
+            None
+        );
+    }
+
+    #[test]
+    fn the_clock_panel_never_overlaps_the_terminal_or_leaves_it_too_small() {
+        for cols in MIN_COLS..200 {
+            for rows in MIN_ROWS..60 {
+                for inbox in [false, true] {
+                    let Some(base) = Plan::new(cols, rows, false, inbox) else {
+                        continue;
+                    };
+                    let p = base.with_clock(UNDER_ROWS_FOR_TEST);
+                    let Some(c) = p.clock else { continue };
+                    // The box and the panel share no cell.
+                    let (f, r) = (p.frame, c.rect);
+                    let apart = f.x + f.cols <= r.x
+                        || r.x + r.cols <= f.x
+                        || f.y + f.rows <= r.y
+                        || r.y + r.rows <= f.y;
+                    assert!(apart, "{cols}x{rows} inbox {inbox}: {f:?} vs {r:?}");
+                    assert!(r.x + r.cols <= cols && r.y + r.rows <= rows);
+                    assert!(p.inner.cols >= 22, "{cols}x{rows}");
+                    // Under it, the panel keeps rows to read and the terminal its own; beside,
+                    // the terminal keeps its columns and every row it had.
+                    if c.under {
+                        assert!(r.rows >= crate::schedules::LIST_MIN_ROWS);
+                        assert!(p.inner.rows >= MIN_INSIDE, "{cols}x{rows}");
+                    } else {
+                        assert!(p.frame.cols >= CLOCK_BESIDE_LEAVES);
+                        assert_eq!(p.inner.rows, base.inner.rows);
+                    }
+                    // The inbox standing in the terminal's place keeps the whole pane.
+                    assert!(!p.side.is_some_and(|s| s.replaces));
+                }
+            }
+        }
+        // Zoomed, there is no header and no panel.
+        let zoomed = Plan::new(140, 40, true, false)
+            .unwrap()
+            .with_clock(UNDER_ROWS_FOR_TEST);
+        assert_eq!(zoomed.clock, None);
+    }
+
+    /// More rows than any pane here can give, so the plan takes what it can.
+    const UNDER_ROWS_FOR_TEST: usize = 12;
+
+    #[test]
+    fn a_row_with_the_clock_panel_is_the_terminal_box_then_the_panel_and_as_wide_as_the_pane() {
+        for (cols, rows) in [(140, 40), (90, 40)] {
+            let plan = Plan::new(cols, rows, false, false).unwrap().with_clock(10);
+            let c = plan.clock.unwrap();
+            let panel: Vec<String> = (0..c.rect.rows)
+                .map(|i| format!("{:<w$}", format!("C{i}"), w = c.rect.cols))
+                .collect();
+            let screen = Screen::new(plan, &facts_of("idle"), None, ctx(None)).with_clock(panel);
+            for r in 0..plan.rows {
+                let row = strip(&screen.row(r, |_| "T".repeat(plan.inner.cols)));
+                assert_eq!(width::width(&row), cols, "{cols}x{rows} row {r}: {row:?}");
+                let in_panel = r >= c.rect.y && r < c.rect.y + c.rect.rows;
+                assert_eq!(
+                    row.contains('C'),
+                    in_panel,
+                    "{cols}x{rows} row {r}: {row:?}"
+                );
+            }
+            // Beside, the panel ends the box's rows, edges included; under, it starts a row.
+            let at = if c.under { c.rect.y } else { plan.frame.y + 2 };
+            let row = strip(&screen.row(at, |_| "T".repeat(plan.inner.cols)));
+            assert_eq!(row.starts_with('C'), c.under, "{row:?}");
+            assert_eq!(row.contains("\u{2502}C"), !c.under, "{row:?}");
         }
     }
 

@@ -27,6 +27,7 @@ pub mod present;
 pub mod qass_screen;
 pub mod rail;
 pub mod run;
+pub mod schedules;
 pub mod screen;
 pub mod selection;
 pub mod sidebar;

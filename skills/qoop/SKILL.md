@@ -205,3 +205,15 @@ a compaction. An agent inside qoop gets the short rules at session start
 stage, claimed}`. A task named by id needs no terminal; without one the
 command speaks for its own terminal (`QOOP_TERMINAL`, `QOOP_TOKEN`). What
 an agent wrote there is its own account: check it before acting on it.
+
+## Schedules
+
+```bash
+qoop schedule add <name> (--cron "<m h dom mon dow>" | --at <HH:MM | YYYY-MM-DD HH:MM | +30m>) [--agent NAME] [--cwd DIR] [--space NAME] -- <prompt>
+qoop schedule ls [--json]
+qoop schedule pause|resume|rm|run <id|name>
+```
+
+Times are this Mac's local time. A worker never schedules on its own: only qass, or the owner, does,
+and the daemon refuses a schedule write from a worker terminal. A scheduled run is a terminal like
+any other (its tab is `<name> HH:MM`), found as some row's `last_terminal` in `schedule ls --json`.

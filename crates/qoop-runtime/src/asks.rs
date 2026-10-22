@@ -33,7 +33,7 @@ use crate::store::{HandleError, StoreHandle, now};
 pub(crate) const SENDER: &str = "qoop-ask";
 
 /// The space qass works in.
-const QASS_SPACE: &str = "qass";
+pub(crate) const QASS_SPACE: &str = "qass";
 
 /// How long after a person typed into qass's terminal the inbox leaves it alone: a draft
 /// still reads `idle`, and typing over it would send half a sentence.

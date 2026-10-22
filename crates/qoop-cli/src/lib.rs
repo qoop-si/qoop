@@ -40,6 +40,7 @@ mod qass_brief;
 mod qass_page;
 mod remote;
 pub mod report;
+mod schedule;
 mod settings;
 mod show;
 mod skills;
@@ -199,6 +200,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("task") => task::run(&args),
         Some("ask") => ask::run(&args),
         Some("show") => show::run(&args),
+        Some("schedule") => schedule::run(&args),
         Some("doctor") => doctor::run(&args),
         Some("reload-manifests") => run_reload_manifests(),
         Some("hooks") => hooks::run(&args),
@@ -259,6 +261,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 `qoop ask` for more\n\
                   \x20 qoop show <file|url> [--note TEXT]  put a screenshot, recording,\n\
                   \x20                 report or public url on the owner's phone\n\
+                  \x20 qoop schedule add|ls|pause|resume|rm|run  start an agent at a time, once\n\
+                  \x20                 or on a repeat; `qoop schedule` for more\n\
                   \x20 qoop doctor  whether the board, the questions and the agents agree;\n\
                   \x20                 read-only, `qoop doctor --help` for more\n\
                   \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
@@ -1412,7 +1416,7 @@ where
                     && (response.request_id() == id
                         || matches!(&response, ControlResponse::Failed { id, reason }
                         if id.is_empty()
-                            && ["RestartWhenSafe", "AskWrite", "AskRead", "ShowWrite"].iter().any(|variant| {
+                            && ["RestartWhenSafe", "AskWrite", "AskRead", "ShowWrite", "ScheduleWrite", "ScheduleRead"].iter().any(|variant| {
                                 qoop_runtime::control::too_old_for(reason, Some(variant))
                             })))
                 {

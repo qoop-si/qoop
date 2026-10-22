@@ -100,7 +100,7 @@ pub struct StoreHandle {
     inner: Arc<Mutex<Store>>,
 }
 
-pub(crate) fn now() -> i64 {
+pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
