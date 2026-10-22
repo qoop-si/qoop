@@ -2613,6 +2613,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                         id,
                         workspaces: vec![WorkspaceRow {
                             keep_awake: false,
+                            qass_skip: false,
                             id: 1,
                             name: "work".into(),
                             terminals: 1,

@@ -25,9 +25,9 @@ render() { # home -> the skill's dir
 }
 skill_w="$(render "$tmp/home")"
 
-row() { # terminal generation state [agent] [title]
-    printf '{"terminal":%s,"generation":%s,"state":"%s","agent":%s,"program":"claude","name":null,"agent_title":"%s","cwd":"/w","activity":"%s"}' \
-        "$1" "$2" "$3" "${4:-true}" "${5:-task}" "$RANDOM"
+row() { # terminal generation state [agent] [title] [skip: any word marks it qass_skip]
+    printf '{"terminal":%s,"generation":%s,"state":"%s","agent":%s,"program":"claude","name":null,"agent_title":"%s","cwd":"/w","activity":"%s"%s}' \
+        "$1" "$2" "$3" "${4:-true}" "${5:-task}" "$RANDOM" "${6:+,\"qass_skip\":true}"
 }
 
 # One snapshot per line, in the order the daemon would print them.
@@ -167,7 +167,7 @@ stream() { # hold-open-seconds [gap-seconds]
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 [ "\$1" = remote ] && { cat "$tmp/remotes" 2>/dev/null; exit 0; }
 [ "\$1" = read ] && { cat "$tmp/screen" 2>/dev/null; exit 0; }
-[ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
+[ "\$1" = ask ] && { cat "$tmp/asks" 2>/dev/null || echo '{"live":[],"ended":[]}'; exit 0; }
 while IFS= read -r l; do printf '%s\n' "\$l"; sleep ${2:-0}; done < "$tmp/snapshots"
 exec sleep $1
 EOF
@@ -730,6 +730,66 @@ got="$(timed 10)"
 [ "$(echo "$got" | lines)" = 'T5 g1 claude blocked->failed "task" /w' ] &&
     [ "$(cat "$q/watch-seen")" = 42 ] && [ ! -e "$q/held" ] && [ ! -e "$q/base" ] ||
     { echo "on again printed: $got"; exit 1; }
+
+# ---- tabs the owner asked qass to leave alone (qass_skip on the row) -------------------------------
+# A skipped tab going idle, blocked, failed and away says nothing, and holds nothing; the tab beside
+# it is still said.
+fresh; stream 0
+printf '%s\n' "[$(row 5 1 working true task skip),$(row 6 1 working)]" > "$q/last.json"
+cat > "$tmp/snapshots" <<EOF
+[$(row 5 1 working true task skip),$(row 6 1 working)]
+[$(row 5 1 idle true task skip),$(row 6 1 working)]
+[$(row 5 1 blocked true task skip),$(row 6 1 working)]
+[$(row 5 1 failed true task skip),$(row 6 1 working)]
+[$(row 6 1 working)]
+[$(row 6 1 blocked)]
+EOF
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ "$got" = 'T6 g1 claude working->blocked "task" /w' ] && [ ! -s "$q/held" ] \
+    || { echo "a skipped tab was said: $got"; exit 1; }
+# The flag set while the tab works is not a close, and cleared on one that rests is not a new tab.
+fresh; stream 0
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+cat > "$tmp/snapshots" <<EOF
+[$(row 5 1 working true task skip)]
+[$(row 5 1 idle true task skip)]
+[$(row 5 1 idle)]
+[$(row 5 1 working)]
+EOF
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+[ -z "$got" ] && [ ! -s "$q/held" ] || { echo "the flag set or cleared was said: $got"; exit 1; }
+# A held idle line of a tab skipped before the flush is dropped, and says why in the log.
+fresh; stream 30 3
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle)]" "[$(row 5 1 idle true task skip)]" > "$tmp/snapshots"
+got="$(QASS_SETTLE=2 QASS_QUIET_HOLD=4 timed 14)"
+[ -z "$got" ] && grep -q 'stale.*T5 g1 claude working->idle' "$q/quiet.log" \
+    || { echo "a held line of a skipped tab was said: $got"; exit 1; }
+# An answer to a card of a skipped tab is the owner's alone: remembered, never said.
+fresh; stream 14
+: > "$q/asks-seen"
+printf '%s\n' "[$(row 5 1 idle true task skip),$(row 6 1 idle)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 idle true task skip),$(row 6 1 idle)]" > "$tmp/snapshots"
+echo '{"live":[],"ended":[{"card":"E1","status":"answered","option":"a","agent":"T5","closed_at":10},{"card":"E2","status":"answered","option":"b","agent":"T6","closed_at":11}]}' > "$tmp/asks"
+got="$(timed 13)"
+rm -f "$tmp/asks"
+[ "$(echo "$got" | lines)" = 'ASK E2 answered b -> T6' ] && grep -q 'ASK E1 answered a -> T5' "$q/asks-seen" \
+    || { echo "an ask of a skipped tab was said: $got"; exit 1; }
+# A remote's tab with the number of a skipped tab here is still said: the flag is per machine.
+fresh; stream 10
+echo "ubox  fake-host" > "$tmp/remotes"
+printf '%s\n' "[$(row 5 1 idle true task skip)]" > "$tmp/snapshots"; printf '%s\n' "[$(row 5 1 idle true task skip)]" > "$q/last.json"
+printf '%s\n' "[$(row 5 1 working)]" > "$q/last-ubox.json"
+cat > "$tmp/bin/ssh" <<EOF
+#!/bin/sh
+case "\$*" in *watch*) echo '[$(row 5 1 idle)]'; exec sleep 3 ;; esac
+echo '[]'
+EOF
+chmod +x "$tmp/bin/ssh"
+got="$(timed 5)"
+[ "$(echo "$got" | lines)" = 'ubox/T5 g1 claude working->idle "task" /w' ] ||
+    { echo "a remote tab beside a skipped one printed: $got"; exit 1; }
+rm -f "$tmp/bin/ssh" "$tmp/remotes"
 
 echo "qass watch: ok"
 

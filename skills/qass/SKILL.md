@@ -129,6 +129,13 @@ while `qoop qass watch` reads on or `resumed` and none of yours runs: start it (
 6. Act, or write it down, or escalate (below). Then stay quiet until the next
    event. No polling, no progress messages.
 
+## Left alone
+
+A row with `"qass_skip": true` is a tab or a space the owner keeps from you, inbox cards of it too:
+theirs alone. Do not read, brief, type to, close, count or report it, not even as stuck. The watcher
+says nothing of it and `qoop` refuses your command aimed at it, but the rule is yours to keep, also
+for a transcript on disk. `qoop qass watch` lists what you skip; only they change it.
+
 ## Remotes
 
 The machines in `qoop remote ls` (`ubox`, ...) run their own qoop; the watch already

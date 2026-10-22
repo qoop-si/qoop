@@ -15,6 +15,7 @@ use qoop_tui::{sidebar, theme};
 fn space(id: i64, name: &str) -> WorkspaceRow {
     WorkspaceRow {
         keep_awake: false,
+        qass_skip: false,
         id,
         name: name.to_string(),
         terminals: 4,
@@ -30,6 +31,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
 fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
     AgentRow {
         keep_awake: false,
+        qass_skip: false,
         parked: false,
         background: 0,
         subagents: 0,

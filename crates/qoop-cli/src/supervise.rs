@@ -820,6 +820,12 @@ pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
     }
     let deadline = timeout.map(|t| Instant::now() + t);
     let own = own_terminal();
+    // Named tabs are checked one by one; with none named, qass is not made to wait on what the
+    // owner keeps from it.
+    for target in &targets {
+        super::qass_guard(target)?;
+    }
+    let hide_skipped = targets.is_empty() && crate::qass::called_by_qass();
 
     let rt = tokio::runtime::Runtime::new()?;
     let matched = rt.block_on(async {
@@ -828,6 +834,7 @@ pub(crate) fn run_wait(args: &[String]) -> std::io::Result<()> {
         let watched: Vec<u32> = if targets.is_empty() {
             rows.iter()
                 .filter(|r| r.agent && Some(r.terminal) != own)
+                .filter(|r| !(hide_skipped && r.qass_skip))
                 .map(|r| r.terminal)
                 .collect()
         } else {
@@ -1696,6 +1703,7 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
             "refusing to close the terminal this command runs in",
         ));
     }
+    super::qass_guard(&terminal.to_string())?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let mut link = Link::open("qoop-close").await?;
@@ -2138,6 +2146,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -2265,6 +2274,7 @@ mod tests {
         let spaces = vec![
             WorkspaceRow {
                 keep_awake: false,
+                qass_skip: false,
                 id: 1,
                 name: "default".into(),
                 terminals: 1,
@@ -2277,6 +2287,7 @@ mod tests {
             },
             WorkspaceRow {
                 keep_awake: false,
+                qass_skip: false,
                 id: 2,
                 name: "work".into(),
                 terminals: 0,
@@ -2294,6 +2305,7 @@ mod tests {
         assert!(pick_space(&spaces, "7").is_err());
         let named = vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 3,
             name: "2024".into(),
             terminals: 0,
@@ -2327,6 +2339,7 @@ mod tests {
         };
         let space = |id, sleeping| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: "docs".into(),
             terminals: 2,

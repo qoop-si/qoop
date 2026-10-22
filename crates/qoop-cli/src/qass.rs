@@ -162,6 +162,57 @@ pub(crate) fn in_folder(cwd: &str, folder: &Path) -> bool {
         .is_some_and(|(cwd, folder)| cwd == folder)
 }
 
+/// The row of qass in the daemon's agent listing: the agent in the `qass` space that was
+/// started in `folder`, qass's own. `spaces` is `qoop ls --json`.
+pub(crate) fn row_in<'a>(
+    agents: &'a [serde_json::Value],
+    spaces: &serde_json::Value,
+    folder: &Path,
+) -> Option<&'a serde_json::Value> {
+    let space_of = |id: &serde_json::Value| {
+        spaces
+            .as_array()?
+            .iter()
+            .find(|w| &w["id"] == id)?
+            .get("name")?
+            .as_str()
+    };
+    agents.iter().find(|r| {
+        r["agent"] == true
+            && space_of(&r["workspace"]) == Some(SPACE)
+            && r["cwd"].as_str().is_some_and(|cwd| in_folder(cwd, folder))
+    })
+}
+
+/// Whether this command could be qass's: it runs in a terminal, or is marked `QOOP_FROM_QASS`.
+/// Cheap, so the daemon calls that find out are skipped for a plain shell.
+pub(crate) fn may_be_qass() -> bool {
+    ["QOOP_TERMINAL", "QOOP_FROM_QASS"]
+        .iter()
+        .any(|k| qoop_runtime::legacy::var(k).is_ok_and(|v| !v.is_empty()))
+}
+
+/// Whether the command running is qass's own: `QOOP_FROM_QASS=1`, which qass's `on.sh` puts
+/// before what it runs on another computer, or the terminal it runs in is the one that is qass.
+/// The owner's own tabs and shells are never qass, whatever space they sit in.
+pub(crate) fn called_by_qass() -> bool {
+    let var = |k: &str| qoop_runtime::legacy::var(k).ok().filter(|v| !v.is_empty());
+    if var("QOOP_FROM_QASS").as_deref() == Some("1") {
+        return true;
+    }
+    let Some(caller) = var("QOOP_TERMINAL").and_then(|t| t.parse::<u64>().ok()) else {
+        return false;
+    };
+    let (Some(agents), Some(spaces)) = (json(&["agents", "--json"]), json(&["ls", "--json"]))
+    else {
+        return false;
+    };
+    paths::qass_data_dir()
+        .zip(agents.as_array())
+        .and_then(|(folder, rows)| row_in(rows, &spaces, &folder))
+        .is_some_and(|row| row["terminal"].as_u64() == Some(caller))
+}
+
 /// The sleeping tab that is qass, among the stored tabs of the `qass` space: one that holds
 /// an agent and was started in qass's own folder, the way a running one is found. The space
 /// may hold other tabs (a worker parked there, this page's own tab), and none of them is it.
@@ -538,10 +589,15 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("page") if args.len() == 3 => return crate::qass_page::run(),
         Some("brief") if args.len() > 3 => return crate::qass_brief::run(args),
-        Some("watch") if args.len() <= 4 => return watch(args.get(3).map(String::as_str)),
+        Some("watch") if args.len() <= 5 => {
+            return watch(
+                args.get(3).map(String::as_str),
+                args.get(4).map(String::as_str),
+            );
+        }
         Some(_) => {
             return Err(crate::usage(
-                "usage: qoop qass [page | brief <n> [--json] | watch [on | off]]",
+                "usage: qoop qass [page | brief <n> [--json] | watch [on | off [T52 | space]]]",
             ));
         }
         None => {}
@@ -628,17 +684,27 @@ pub(crate) fn start(board: bool) -> std::io::Result<u64> {
     Ok(terminal)
 }
 
+const WATCH_USAGE: &str = "usage: qoop qass watch [on | off [T52 | space]]";
+
 /// `qoop qass watch [on|off]`: read or turn the owner's switch for qass's watcher. Through the
 /// daemon, which tells qass when it is turned on; with no daemon running there is no qass to
-/// tell, so the file is turned here.
-fn watch(word: Option<&str>) -> std::io::Result<()> {
+/// tell, so the file is turned here. With a tab (`T52`) or a space after the word, that one is
+/// skipped (`off`) or watched again (`on`) instead, and a bare `qoop qass watch` also lists what
+/// qass skips.
+fn watch(word: Option<&str>, target: Option<&str>) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
     let on = match word {
         None => None,
         Some("on") => Some(true),
         Some("off") => Some(false),
-        Some(_) => return Err(crate::usage("usage: qoop qass watch [on | off]")),
+        Some(_) => return Err(crate::usage(WATCH_USAGE)),
     };
+    if let Some(target) = target {
+        let Some(on) = on else {
+            return Err(crate::usage(WATCH_USAGE));
+        };
+        return skip(target, !on);
+    }
     let request = ControlRequest::QassWatch {
         id: crate::request_id("qass-watch"),
         on,
@@ -675,7 +741,134 @@ fn watch(word: Option<&str>) -> std::io::Result<()> {
         (true, false) => "on",
     };
     println!("watching {word}");
+    // Best effort: a daemon that predates the skips, or none at all, has nothing to list.
+    for line in skipped().unwrap_or_default() {
+        println!("skipping {line}");
+    }
     Ok(())
+}
+
+/// What the daemon answered to `request`, with an older daemon's refusal said in words.
+fn ask_daemon(
+    request: qoop_runtime::control::ControlRequest,
+    op: &str,
+) -> std::io::Result<qoop_runtime::control::ControlResponse> {
+    use qoop_runtime::control::ControlResponse;
+    match crate::task::ask(request, std::time::Duration::from_secs(5))? {
+        ControlResponse::Failed { reason, .. }
+            if qoop_runtime::control::too_old_for(&reason, Some(op)) =>
+        {
+            Err(std::io::Error::other(
+                "the running qoop is older than this one: `qoop restart`, then again",
+            ))
+        }
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        other => Ok(other),
+    }
+}
+
+/// Every space and every tab qass leaves alone, one line each: a tab is listed only when its own
+/// flag is set, and a tab of a skipped space goes with the space.
+fn skipped() -> std::io::Result<Vec<String>> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let ControlResponse::Workspaces { workspaces, .. } = ask_daemon(
+        ControlRequest::ListWorkspaces {
+            id: crate::request_id("qass-skips"),
+        },
+        "ListWorkspaces",
+    )?
+    else {
+        return Err(std::io::Error::other("the daemon answered something else"));
+    };
+    let ControlResponse::Agents { agents, .. } = ask_daemon(
+        ControlRequest::ListAgents {
+            id: crate::request_id("qass-skips"),
+        },
+        "ListAgents",
+    )?
+    else {
+        return Err(std::io::Error::other("the daemon answered something else"));
+    };
+    let mut lines: Vec<String> = workspaces
+        .iter()
+        .filter(|w| w.qass_skip)
+        .map(|w| format!("space {}", w.name))
+        .collect();
+    lines.extend(
+        agents
+            .iter()
+            .filter(|a| a.qass_skip)
+            .filter(|a| {
+                !workspaces
+                    .iter()
+                    .any(|w| w.id == a.workspace && w.qass_skip)
+            })
+            .map(|a| format!("T{} {}", a.terminal, a.name.as_deref().unwrap_or("-"))),
+    );
+    Ok(lines)
+}
+
+/// `qoop qass watch off|on <T52 | space>`: have qass leave a tab or a space alone, or watch it
+/// again. A tab is `T` and its number; anything else is a space, by id or by a name only one
+/// space has.
+fn skip(target: &str, on: bool) -> std::io::Result<()> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    // The owner's word alone: qass never takes back what he kept from it, nor adds to it.
+    if called_by_qass() {
+        return Err(std::io::Error::other(
+            "only the owner changes what qass skips",
+        ));
+    }
+    let tab = target
+        .strip_prefix(['T', 't'])
+        .and_then(|n| n.parse::<u32>().ok());
+    let (workspace, terminal) = match tab {
+        Some(terminal) => {
+            let ControlResponse::Agents { agents, .. } = ask_daemon(
+                ControlRequest::ListAgents {
+                    id: crate::request_id("qass-skip"),
+                },
+                "ListAgents",
+            )?
+            else {
+                return Err(std::io::Error::other("the daemon answered something else"));
+            };
+            let row = agents
+                .iter()
+                .find(|a| a.terminal == terminal)
+                .ok_or_else(|| std::io::Error::other(format!("no terminal {terminal}")))?;
+            (row.workspace, Some(terminal))
+        }
+        None => {
+            let ControlResponse::Workspaces { workspaces, .. } = ask_daemon(
+                ControlRequest::ListWorkspaces {
+                    id: crate::request_id("qass-skip"),
+                },
+                "ListWorkspaces",
+            )?
+            else {
+                return Err(std::io::Error::other("the daemon answered something else"));
+            };
+            (crate::supervise::resolve_space(&workspaces, target)?, None)
+        }
+    };
+    let request = ControlRequest::SetQassSkip {
+        id: crate::request_id("qass-skip"),
+        workspace,
+        terminal,
+        on,
+    };
+    match ask_daemon(request, "SetQassSkip")? {
+        ControlResponse::Renamed { .. } => {
+            if on {
+                println!("qass leaves {target} alone");
+            } else {
+                println!("qass watches {target} again");
+            }
+            Ok(())
+        }
+        _ => Err(std::io::Error::other("the daemon answered something else")),
+    }
 }
 
 /// Refuses a line for qass while it waits on the owner (its state `blocked`): the enter after
@@ -849,9 +1042,10 @@ mod tests {
         let look = |json: &str| -> String {
             std::fs::write(&listing, json).expect("listing");
             let script = format!(
-                "set -euo pipefail\ndir={dir}\n{say}\n{asks}\nasks_said\n",
+                "set -euo pipefail\ndir={dir}\n{say}\n{skips}\n{asks}\nasks_said\n",
                 dir = root.path().display(),
                 say = function("say"),
+                skips = function("skips_of"),
                 asks = function("asks_said"),
             );
             let out = std::process::Command::new("bash")
@@ -892,6 +1086,38 @@ mod tests {
             "ASK E3 passed text -> qass\nASK E75 answered a -> T224\n"
         );
         assert_eq!(look(&json), "", "each answer is said once");
+        // An answer to a card of a tab qass leaves alone is the owner's alone: never said, and
+        // remembered, so it is not said either when the tab is watched again.
+        std::fs::write(
+            root.path().join("last.json"),
+            r#"[{"terminal":225,"qass_skip":true},{"terminal":9}]"#,
+        )
+        .expect("snapshot");
+        let skipped = card("E76", "answered", r#""a""#, r#""T225""#, 30);
+        let plain = card("E77", "answered", r#""b""#, r#""T9""#, 31);
+        let json = format!(r#"{{"live":[],"ended":[{skipped},{plain},{sent},{old}]}}"#);
+        assert_eq!(look(&json), "ASK E77 answered b -> T9\n");
+        std::fs::remove_file(root.path().join("last.json")).expect("watched again");
+        assert_eq!(look(&json), "", "what was skipped is not said later");
+    }
+
+    /// qass is the agent of the `qass` space that was started in qass's folder, and no other
+    /// tab: not one beside it in the space, not one in qass's folder under another space.
+    #[test]
+    fn only_the_agent_in_qasss_space_and_folder_is_qass() {
+        let folder = tempfile::tempdir().expect("folder");
+        let at = folder.path().to_str().expect("utf8");
+        let spaces = serde_json::json!([{"id": 1, "name": "work"}, {"id": 2, "name": "qass"}]);
+        let row = |terminal: u64, space: u64, cwd: &str, agent: bool| serde_json::json!({"terminal": terminal, "workspace": space, "cwd": cwd, "agent": agent});
+        let agents = [
+            row(5, 1, at, true),
+            row(6, 2, "/elsewhere", true),
+            row(7, 2, at, false),
+            row(8, 2, at, true),
+        ];
+        let found = row_in(&agents, &spaces, folder.path());
+        assert_eq!(found.and_then(|r| r["terminal"].as_u64()), Some(8));
+        assert!(row_in(&agents[..3], &spaces, folder.path()).is_none());
     }
 
     #[test]

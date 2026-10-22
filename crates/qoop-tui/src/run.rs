@@ -1778,6 +1778,9 @@ impl State {
             if sidebar::on_agent_cup(col as usize, terminal, &column) {
                 return Some(Clicked::KeepAwakeAgent(terminal));
             }
+            if sidebar::on_agent_eye(col as usize, terminal, &column) {
+                return Some(Clicked::QassSkipAgent(terminal));
+            }
         }
         // A row that does two things answers with the row; the column decides which.
         match sidebar::act(hit, col as usize, &column, self.collapsed)? {
@@ -1787,6 +1790,7 @@ impl State {
             sidebar::Act::Wake(space) => Some(Clicked::Wake(space)),
             sidebar::Act::Settings(space) => Some(Clicked::Settings(space)),
             sidebar::Act::KeepAwake(space) => Some(Clicked::KeepAwake(space)),
+            sidebar::Act::QassSkip(space) => Some(Clicked::QassSkip(space)),
             sidebar::Act::Drawer(space) => Some(Clicked::Drawer(space)),
             sidebar::Act::New(space) => Some(Clicked::New(space)),
             sidebar::Act::Close(space) => Some(Clicked::Close(space)),
@@ -3843,6 +3847,14 @@ pub enum MenuKind {
         /// leaving the person to wonder whether anything is still coming.
         heard: bool,
     },
+    /// What a right press on a row of the column offers: qass leaving that tab or space alone,
+    /// or watching it again. `name` is the row's, for the title.
+    Skip {
+        space: i64,
+        terminal: Option<u32>,
+        name: String,
+        skipped: bool,
+    },
     /// A machine being connected has no qoop: put this version there, or not.
     Install {
         target: String,
@@ -3907,6 +3919,15 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
                 (title, format!("{} {age}", row.agent))
             }))
             .collect(),
+        MenuKind::Skip { skipped, .. } => vec![(
+            if *skipped {
+                "qass watches this"
+            } else {
+                "qass skips this"
+            }
+            .to_string(),
+            String::new(),
+        )],
         MenuKind::Install { platform, .. } => vec![
             (
                 format!("install qoop {} there", env!("CARGO_PKG_VERSION")),
@@ -4147,6 +4168,7 @@ pub fn menu_title(kind: &MenuKind) -> String {
     match kind {
         MenuKind::Main => " menu".to_string(),
         MenuKind::Plus => " spaces".to_string(),
+        MenuKind::Skip { name, .. } => format!(" {name}"),
         MenuKind::New { name, .. } => format!(" new in {name}"),
         MenuKind::Agents {
             name,
@@ -4453,6 +4475,12 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             });
             return MenuSend::Nothing;
         }
+        MenuKind::Skip {
+            space, terminal, ..
+        } => {
+            qass_skip(state, space, terminal, request);
+            return MenuSend::Nothing;
+        }
         MenuKind::Install { target, .. } => {
             if item != 0 {
                 state.connecting = None;
@@ -4681,6 +4709,10 @@ pub struct Prompt {
     pub ink: Option<InkPick>,
     /// The machine a remote space lives on and how it is reached, for its settings box.
     pub machine: Option<(String, qoop_runtime::control::LinkState)>,
+    /// Whether qass leaves the space alone, in its settings box and nowhere else: what it was
+    /// when the box opened, and what it is now. Not asked of qass's own space, which the daemon
+    /// never skips.
+    pub skip: Option<SkipPick>,
     /// The command an agent's name box starts. Held here so a cancel leaves nothing
     /// behind: it goes with the box.
     pub command: Option<String>,
@@ -4698,10 +4730,18 @@ impl Prompt {
             was: was.into(),
             ink: None,
             machine: None,
+            skip: None,
             command: None,
             held: Vec::new(),
         }
     }
+}
+
+/// Whether qass left a space alone when its settings box opened, and whether it does now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkipPick {
+    pub was: bool,
+    pub now: bool,
 }
 
 /// The colour a space had when its settings box opened, and the one picked since. `None`
@@ -4736,9 +4776,16 @@ fn space_settings(state: &State, space: i64) -> Prompt {
     let machine = row
         .and_then(|s| s.link)
         .map(|link| (sidebar::machine_of(&name).0.to_string(), link));
+    let skipped = row.is_some_and(|s| s.qass_skip);
+    // qass is never skipped from where it lives: no button for it there.
+    let skip = (sidebar::machine_of(&name).1 != "qass").then_some(SkipPick {
+        was: skipped,
+        now: skipped,
+    });
     Prompt {
         ink: Some(InkPick { was: ink, now: ink }),
         machine,
+        skip,
         ..Prompt::new(Naming::SpaceSettings(space), name)
     }
 }
@@ -4927,7 +4974,15 @@ fn answer_prompt(
                     ink: pick.now,
                 }
             });
-            rename.into_iter().chain(ink).collect()
+            let skip = prompt.skip.filter(|skip| skip.now != skip.was).map(|skip| {
+                ControlRequest::SetQassSkip {
+                    id: format!("skip-{request}"),
+                    workspace,
+                    terminal: None,
+                    on: skip.now,
+                }
+            });
+            rename.into_iter().chain(ink).chain(skip).collect()
         }
         Naming::Terminal => vec![ControlRequest::CreateTerminal {
             id: format!("new-{request}"),
@@ -5105,7 +5160,8 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                 if !colours && let Some(pick) = prompt.ink.as_mut() {
                     pick.now = pick.was;
                 }
-                let picked = prompt.ink.is_some_and(|pick| pick.now != pick.was);
+                let picked = prompt.ink.is_some_and(|pick| pick.now != pick.was)
+                    || prompt.skip.is_some_and(|skip| skip.now != skip.was);
                 // Nothing typed over a name keeps it, the same as esc, unless a colour was
                 // picked: that is still an answer. The keys after the enter still run.
                 if text.is_empty() && !prompt.was.is_empty() && !picked {
@@ -5139,6 +5195,12 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
             }
             // ctrl-u, the line kill every shell knows: start the answer over.
             0x15 => prompt.text.clear(),
+            // ctrl-e, qass leaving the space alone, or watching it again: saved with the rest.
+            0x05 => {
+                if let Some(skip) = prompt.skip.as_mut() {
+                    skip.now = !skip.now;
+                }
+            }
             // ctrl-r, back to the default name, where the thing has one to go back to.
             0x12 if prompt.what.resets() => {
                 let Some(taken) = state.prompt.take() else {
@@ -5604,6 +5666,110 @@ fn keep_awake(state: &mut State, space: i64, terminal: Option<u32>, request: &mu
     });
 }
 
+impl State {
+    /// The tab or space a right press at `row`, `col` is on, in the column: its space, and its
+    /// terminal when it is a tab. Nothing off the column's rows.
+    fn skip_target_at(&self, row: u16, col: u16) -> Option<(i64, Option<u32>)> {
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        if self.collapsed || left == 0 || col as usize > left {
+            return None;
+        }
+        match self.column_hit(row)?.0 {
+            sidebar::Hit::Space(space) => Some((space, None)),
+            sidebar::Hit::Terminal(t) => self
+                .rows
+                .iter()
+                .find(|r| r.terminal == t)
+                .map(|r| (r.workspace, Some(t))),
+            _ => None,
+        }
+    }
+
+    /// Every terminal of the tab `terminal` is in: the panes of its split, or itself alone.
+    fn tab_leaves(&self, terminal: u32) -> Vec<u32> {
+        self.trees()
+            .map(|tree| tree.leaves())
+            .find(|leaves| leaves.contains(&terminal))
+            .unwrap_or_else(|| vec![terminal])
+    }
+}
+
+/// Turn qass leaving a space alone over, or with `terminal` a tab, every pane of it: on when it
+/// was off, off when it was on, as the last list said, and sent with the value like keep awake.
+/// A tab of a skipped space is turned off on the space: its own flag is not on its row, and
+/// clearing it blind would leave the tab skipped again the day the space is let go.
+fn qass_skip(state: &mut State, space: i64, terminal: Option<u32>, request: &mut u64) {
+    let space_on = state.spaces.iter().any(|s| s.id == space && s.qass_skip);
+    let (panes, was) = match terminal {
+        Some(_) if space_on => {
+            say(
+                state,
+                "qass skips the whole space: turn that off on the space".to_string(),
+            );
+            return;
+        }
+        Some(t) => (
+            state.tab_leaves(t).into_iter().map(Some).collect(),
+            state.rows.iter().any(|r| r.terminal == t && r.qass_skip),
+        ),
+        None => (vec![None], space_on),
+    };
+    for pane in panes {
+        *request += 1;
+        state.modes.outbox.push(ControlRequest::SetQassSkip {
+            id: format!("skip-{request}"),
+            workspace: space,
+            terminal: pane,
+            on: !was,
+        });
+    }
+    let what = match terminal {
+        Some(t) => format!("tab {t}"),
+        None => format!("space {}", space_name(state, space)),
+    };
+    say(
+        state,
+        if was {
+            format!("qass watches {what} again")
+        } else {
+            format!("qass leaves {what} alone")
+        },
+    );
+}
+
+/// What a right press on a tab or a rule offers: qass leaving it alone, or watching it again. A
+/// tab of a skipped space has nothing to offer but the reason, said as a click on its eye says it.
+fn open_skip_menu(state: &mut State, space: i64, terminal: Option<u32>, request: &mut u64) {
+    // qass's own space and its tabs are never skipped (the daemon refuses): no menu offers it,
+    // as the space's settings leave it out.
+    if sidebar::machine_of(&space_name(state, space)).1 == "qass" {
+        return;
+    }
+    let space_on = state.spaces.iter().any(|s| s.id == space && s.qass_skip);
+    if terminal.is_some() && space_on {
+        qass_skip(state, space, terminal, request);
+        return;
+    }
+    let (name, skipped) = match terminal {
+        Some(t) => (
+            state
+                .rows
+                .iter()
+                .find(|r| r.terminal == t)
+                .map_or_else(|| format!("tab {t}"), sidebar::session_name),
+            state.rows.iter().any(|r| r.terminal == t && r.qass_skip),
+        ),
+        None => (space_name(state, space), space_on),
+    };
+    state.menu_kind = MenuKind::Skip {
+        space,
+        terminal,
+        name,
+        skipped,
+    };
+    state.menu = Some(0);
+}
+
 /// The foot's bell: the next of off, here and everywhere, written to `config.toml` so every
 /// window on this Mac and its bridge follow it, and in effect on this frame. A write that
 /// fails is said and changes nothing.
@@ -5754,6 +5920,16 @@ fn slept_or_woken(spaces: &[qoop_runtime::control::WorkspaceRow], agents: &[Agen
     spaces.iter().any(|space| {
         let held = agents.iter().filter(|r| r.workspace == space.id).count();
         held != space.terminals
+    })
+}
+
+/// Whether an index says qass's skip moved on a tab it already listed. A space skipped or
+/// watched again somewhere else (the phone, `qoop qass watch off <space>`) announces only its
+/// tabs, so the space list, which draws the space's own crossed eye, is asked for again.
+fn skip_moved(rows: &[AgentRow], agents: &[AgentRow]) -> bool {
+    agents.iter().any(|r| {
+        rows.iter()
+            .any(|old| old.terminal == r.terminal && old.qass_skip != r.qass_skip)
     })
 }
 
@@ -7467,6 +7643,10 @@ enum Clicked {
     Drawer(i64),
     /// The cup on an agent's row: the same for that agent's pane.
     KeepAwakeAgent(u32),
+    /// The crossed eye on a skipped space's rule: have qass watch it again.
+    QassSkip(i64),
+    /// The crossed eye on a skipped agent's row: have qass watch that tab again.
+    QassSkipAgent(u32),
     /// The sleep mark on an agent's row: that tab alone goes to sleep.
     SleepAgent(u32),
     /// The search chip under the title: the keyboard takes the column, typing.
@@ -8829,6 +9009,12 @@ where
                                 state.message = Some(update_message());
                                 dirty = true;
                             }
+                            Action::Context { row, col } => {
+                                if let Some((space, terminal)) = state.skip_target_at(row, col) {
+                                    open_skip_menu(&mut state, space, terminal, &mut request);
+                                    dirty = true;
+                                }
+                            }
                             Action::Click { row, col, shift } => {
                                 // Where the press landed is where the key row points next.
                                 let in_column = {
@@ -9191,6 +9377,21 @@ where
                                             .map(|r| r.workspace)
                                         {
                                             keep_awake(&mut state, space, Some(terminal), &mut request);
+                                        }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::QassSkip(space)) => {
+                                        qass_skip(&mut state, space, None, &mut request);
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::QassSkipAgent(terminal)) => {
+                                        if let Some(space) = state
+                                            .rows
+                                            .iter()
+                                            .find(|r| r.terminal == terminal)
+                                            .map(|r| r.workspace)
+                                        {
+                                            qass_skip(&mut state, space, Some(terminal), &mut request);
                                         }
                                         dirty = true;
                                     }
@@ -10622,7 +10823,8 @@ where
                                     refresh_spaces = true;
                                 }
                                 if let ControlResponse::Agents { agents, .. } = &response
-                                    && slept_or_woken(&state.spaces, agents)
+                                    && (slept_or_woken(&state.spaces, agents)
+                                        || skip_moved(&state.rows, agents))
                                 {
                                     refresh_spaces = true;
                                 }
@@ -13645,9 +13847,11 @@ fn open_answer_list(state: &mut State, id: &str, kind: MenuKind) {
     state.probing = None;
     let target = match &kind {
         MenuKind::Install { target, .. } => target.clone(),
-        MenuKind::Main | MenuKind::Plus | MenuKind::New { .. } | MenuKind::Agents { .. } => {
-            String::new()
-        }
+        MenuKind::Main
+        | MenuKind::Plus
+        | MenuKind::New { .. }
+        | MenuKind::Agents { .. }
+        | MenuKind::Skip { .. } => String::new(),
     };
     let fits = crate::screen::menu_rect(
         state.cols,
@@ -15133,6 +15337,7 @@ mod tests {
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.to_string(),
             terminals: 1,
@@ -15149,6 +15354,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -19553,6 +19759,7 @@ mod tests {
         state.lines = 30;
         state.spaces = vec![qoop_runtime::control::WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             closable: true,
             id: 1,
             name: "default".to_string(),
@@ -21464,6 +21671,152 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Turning qass's skip over on a tab sets every pane of the tab, as a value; on a tab of a
+    /// skipped space it sends nothing and says to turn the space off; on a space it is the space's.
+    #[test]
+    fn a_qass_skip_covers_every_pane_of_the_tab_and_waits_on_its_space() {
+        let mut state = tiled_state();
+        let mut request = 0;
+        assert_eq!(state.tab_leaves(2), vec![1, 2], "one split of two panes");
+        qass_skip(&mut state, 1, Some(2), &mut request);
+        let sent = std::mem::take(&mut state.modes.outbox);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    ControlRequest::SetQassSkip {
+                        terminal: Some(1),
+                        on: true,
+                        ..
+                    },
+                    ControlRequest::SetQassSkip {
+                        terminal: Some(2),
+                        on: true,
+                        ..
+                    },
+                ]
+            ),
+            "{sent:?}"
+        );
+        // Marked on its row, it is turned back off: the opposite of what the list said.
+        for row in &mut state.rows {
+            row.qass_skip = true;
+        }
+        qass_skip(&mut state, 1, Some(1), &mut request);
+        assert!(
+            state
+                .modes
+                .outbox
+                .drain(..)
+                .all(|r| matches!(r, ControlRequest::SetQassSkip { on: false, .. }))
+        );
+        // The space skipped: its tabs say so and send nothing, and the space's own turns it off.
+        state.spaces[0].qass_skip = true;
+        qass_skip(&mut state, 1, Some(1), &mut request);
+        assert!(state.modes.outbox.is_empty());
+        assert_eq!(
+            state.message.as_deref(),
+            Some("qass skips the whole space: turn that off on the space")
+        );
+        qass_skip(&mut state, 1, None, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetQassSkip {
+                workspace: 1,
+                terminal: None,
+                on: false,
+                ..
+            })
+        ));
+    }
+
+    /// A right press on a tab or a rule of the column offers qass's skip as a one row menu that
+    /// reads as the way back once it is on; choosing it sends the value. A tab of a skipped space
+    /// opens nothing and says why.
+    #[test]
+    fn a_right_press_on_a_row_offers_the_qass_skip() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let mut request = 0;
+        let targets: Vec<_> = (1..s.lines)
+            .filter_map(|row| s.skip_target_at(row, 3))
+            .collect();
+        let tab = *targets.iter().find(|t| t.1.is_some()).expect("a tab row");
+        let rule = *targets.iter().find(|t| t.1.is_none()).expect("a rule");
+        assert_eq!(s.skip_target_at(3, 90), None, "the pane is not the column");
+
+        open_skip_menu(&mut s, tab.0, tab.1, &mut request);
+        assert_eq!(s.menu, Some(0));
+        assert_eq!(
+            menu_rows(&s.menu_kind),
+            [("qass skips this".to_string(), String::new())]
+        );
+        assert!(matches!(
+            apply_menu_choice(&mut s, 0, &mut request),
+            MenuSend::Nothing
+        ));
+        assert!(matches!(
+            s.modes.outbox.pop(),
+            Some(ControlRequest::SetQassSkip { terminal, on: true, .. }) if terminal == tab.1
+        ));
+        // Skipped, the same row is the way back.
+        for row in &mut s.rows {
+            row.qass_skip = true;
+        }
+        open_skip_menu(&mut s, tab.0, tab.1, &mut request);
+        assert_eq!(menu_rows(&s.menu_kind)[0].0, "qass watches this");
+        // A rule's menu is the space's, and a tab of a skipped space has none.
+        s.menu = None;
+        s.spaces.iter_mut().for_each(|w| w.qass_skip = true);
+        open_skip_menu(&mut s, rule.0, None, &mut request);
+        assert_eq!(menu_rows(&s.menu_kind)[0].0, "qass watches this");
+        s.menu = None;
+        open_skip_menu(&mut s, tab.0, tab.1, &mut request);
+        assert_eq!(s.menu, None);
+        assert!(
+            s.message
+                .as_deref()
+                .is_some_and(|m| m.contains("whole space"))
+        );
+    }
+
+    /// The space's settings box turns qass's skip over with ctrl-e and saves it with the rest,
+    /// and says nothing of it for qass's own space.
+    #[test]
+    fn the_settings_box_turns_the_qass_skip_over() {
+        let mut s = state();
+        (s.cols, s.lines) = (100, 30);
+        let mut request = 0;
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"\x05");
+        let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
+            panic!("a skip picked over an empty name was not saved");
+        };
+        let asks = answer_prompt(&mut s, *prompt, name, &mut request);
+        assert!(
+            matches!(
+                asks.as_slice(),
+                [ControlRequest::SetQassSkip {
+                    workspace: 1,
+                    terminal: None,
+                    on: true,
+                    ..
+                }]
+            ),
+            "{asks:?}"
+        );
+        // Twice is back where it was: nothing to send.
+        s.prompt = Some(space_settings(&s, 1));
+        prompt_key(&mut s, b"\x05\x05");
+        let PromptOutcome::Passthrough(_) = prompt_key(&mut s, b"\r") else {
+            panic!("a skip turned over twice was saved");
+        };
+        // qass's own space has no skip to turn.
+        s.spaces[0].name = "qass".into();
+        s.prompt = Some(space_settings(&s, 1));
+        assert!(s.prompt.as_ref().expect("open").skip.is_none());
     }
 
     /// The `x` on an agent's row closes that agent's pane and nothing else: in a split the
@@ -25389,6 +25742,21 @@ mod tests {
         assert!(slept_or_woken(&[space(1, "app"), space(2, "api")], &rows));
         assert!(slept_or_woken(&[asleep(1, "app", &[1])], &rows));
         assert!(!slept_or_woken(&[asleep(2, "api", &[5])], &rows));
+    }
+
+    /// A space skipped from the phone announces only its tabs: a tab whose skip moved asks
+    /// for the space list, a tab as it was does not.
+    #[test]
+    fn a_tab_whose_qass_skip_moved_asks_for_the_space_list() {
+        let was = [agent(1, 1, "claude", "idle")];
+        let mut now = was.clone();
+        assert!(!skip_moved(&was, &now));
+        now[0].qass_skip = true;
+        assert!(skip_moved(&was, &now));
+        assert!(
+            !skip_moved(&[], &now),
+            "a tab not listed before is the other check's"
+        );
     }
 
     /// Adopted from a first render, the space list lands before the first index: its

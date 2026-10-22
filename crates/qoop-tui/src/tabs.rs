@@ -479,6 +479,7 @@ mod tests {
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            qass_skip: false,
             parked: false,
             background: 0,
             subagents: 0,
@@ -510,6 +511,7 @@ mod tests {
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
             keep_awake: false,
+            qass_skip: false,
             parked: false,
             background: 0,
             subagents: 0,

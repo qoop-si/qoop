@@ -305,7 +305,7 @@ impl Link {
     ///
     /// A remote's own default space (its lowest id, which its daemon never closes) is left
     /// out while it holds nothing and nobody gave it anything (no name, colour, goal or
-    /// keep-awake), as long as the machine has another space: it is a row nobody made and
+    /// keep-awake or qass skip), as long as the machine has another space: it is a row nobody made and
     /// nobody can remove. A machine with only its default keeps it, that is where the first
     /// tab starts. The lowest id, not
     /// `closable == false`: an older daemon omits `closable`, which would hide a person's own
@@ -319,6 +319,7 @@ impl Link {
                 || row.terminals > 0
                 || row.asleep
                 || row.keep_awake
+                || row.qass_skip
                 || row.ink.is_some()
                 || row.name != "default"
                 || row.goal.is_some()
@@ -373,6 +374,7 @@ impl Link {
         }
         vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: (link as i64) << WORKSPACE_SHIFT,
             name: format!("{} ({})", self.name, self.reason),
             terminals: 0,
@@ -1199,6 +1201,26 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 self.send_one(
                     link,
                     R::SetKeepAwake {
+                        id,
+                        workspace,
+                        terminal,
+                        on,
+                    },
+                )
+                .await
+            }
+            // The machine whose qass it is: the space's, a pane going with its space.
+            R::SetQassSkip {
+                id,
+                workspace,
+                terminal,
+                on,
+            } => {
+                let (link, workspace) = workspace_in(workspace);
+                let terminal = terminal.map(|t| terminal_in(t).1);
+                self.send_one(
+                    link,
+                    R::SetQassSkip {
                         id,
                         workspace,
                         terminal,
@@ -2842,6 +2864,7 @@ mod tests {
         let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         let row = |id: i64, name: &str| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.into(),
             terminals: 1,
@@ -2922,6 +2945,7 @@ mod tests {
         mux.order_file = Some(file.clone());
         let row = |id: i64, name: &str| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.into(),
             terminals: 1,
@@ -3015,6 +3039,7 @@ mod tests {
         let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
         let row = |id: i64, name: &str| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.into(),
             terminals: 1,
@@ -3118,6 +3143,33 @@ mod tests {
         );
     }
 
+    /// A qass skip on a remote space or one of its panes reaches that machine's watcher, in its
+    /// own numbering: sent home, the home daemon would hide whatever its own tab of that
+    /// number is.
+    #[tokio::test]
+    async fn a_remote_qass_skip_goes_to_its_machine_in_its_own_numbering() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::SetQassSkip {
+            id: "skip-1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            terminal: Some(terminal_out(1, 7).expect("fits")),
+            on: true,
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::SetQassSkip {
+                id: "skip-1".into(),
+                workspace: 3,
+                terminal: Some(7),
+                on: true,
+            }
+        );
+    }
+
     /// A park of an agent on a remote reaches that machine, in its own numbering: sent home,
     /// the home daemon would park whatever its own terminal of that number is.
     #[tokio::test]
@@ -3175,6 +3227,7 @@ mod tests {
         };
         let row = WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1 << WORKSPACE_SHIFT,
             name: "devbox:api".into(),
             terminals: 0,
@@ -3213,6 +3266,7 @@ mod tests {
     fn a_remote_hides_its_empty_default_but_nothing_a_person_made() {
         let row = |n: i64, terminals: usize| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: n << WORKSPACE_SHIFT,
             name: if n == 1 {
                 "default".into()
@@ -3252,6 +3306,9 @@ mod tests {
         used[0].keep_awake = true;
         assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "kept awake");
         used[0].keep_awake = false;
+        used[0].qass_skip = true;
+        assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "skipped by qass");
+        used[0].qass_skip = false;
         used[0].ink = Some(2);
         assert_eq!(ids("devbox", used.clone()), [1, 2, 3], "coloured");
         used[0].ink = None;
@@ -3643,6 +3700,7 @@ mod tests {
         };
         let space = |id: i64, name: &str| WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.into(),
             terminals: 1,

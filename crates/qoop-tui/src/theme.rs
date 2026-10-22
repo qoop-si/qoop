@@ -907,6 +907,7 @@ mod tests {
     fn a_picked_colour_wins_and_anything_else_is_auto() {
         let row = |id, ink| qoop_runtime::control::WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: String::new(),
             terminals: 0,

@@ -240,8 +240,25 @@ fn write(task: Option<i64>, action: TaskOp) -> std::io::Result<i64> {
     written(task, action).map(|(task, _)| task)
 }
 
+/// qass does not act on the task of a tab the owner keeps from it: a task named by id is looked
+/// up, and the terminal it belongs to goes through the guard. A task that cannot be looked up
+/// passes, for the daemon to refuse in its own words.
+fn guard_named(task: Option<i64>) -> std::io::Result<()> {
+    let Some(id) = task.filter(|_| crate::qass::may_be_qass()) else {
+        return Ok(());
+    };
+    match read(Some(id), None, false, std::time::Duration::from_secs(10)) {
+        Ok(found) => match found.tasks.first().and_then(|t| t.terminal) {
+            Some(terminal) => crate::qass_guard(&terminal.to_string()),
+            None => Ok(()),
+        },
+        Err(_) => Ok(()),
+    }
+}
+
 /// The same, with the key of an item it added.
 pub(crate) fn written(task: Option<i64>, action: TaskOp) -> std::io::Result<(i64, Option<String>)> {
+    guard_named(task)?;
     // A task named by id is spoken for by nobody: qass closes a worker's task from its own
     // terminal, and sending that terminal along would make the daemon ask whether the task
     // is qass's. Nor is an item added, or a remote agent reported: they name no task here.
@@ -696,6 +713,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             if task.is_none() && here().0.is_none() {
                 return Err(usage("not inside a qoop terminal: qoop task show <id>"));
             }
+            guard_named(task)?;
             let found = read(
                 task,
                 before,

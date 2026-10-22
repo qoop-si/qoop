@@ -90,6 +90,13 @@ pub enum Action {
         /// this way when the program in front of them has taken the mouse.
         shift: bool,
     },
+    /// A press of the right button, in one based screen coordinates. Only the column's rows
+    /// answer it, with what they offer for themselves; anywhere else it does nothing, as every
+    /// button but the left one did before.
+    Context {
+        row: u16,
+        col: u16,
+    },
     /// The pointer moved with the button held. What a selection follows.
     Drag {
         row: u16,
@@ -322,9 +329,13 @@ pub(crate) fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
             }),
             _ => None,
         }
+    } else if plain == 2 {
+        // The right button, pressed: a context menu where a row has one. Its motion and its
+        // release are nothing.
+        (press && !motion).then_some(Action::Context { row, col })
     } else if plain != 0 {
-        // A button other than the left one. Nothing here uses them, and treating one as a
-        // left click would move the focus on a middle click paste.
+        // A button other than the left or the right one. Nothing here uses them, and treating
+        // one as a left click would move the focus on a middle click paste.
         None
     } else if motion {
         press.then_some(Action::Drag { row, col, shift })
@@ -869,7 +880,13 @@ mod tests {
         // A button this interface has nothing for is dropped rather than read as the left
         // one: a middle click paste would otherwise move the focus.
         assert_eq!(keys.feed(b"\x1b[<1;4;4M"), vec![]);
-        assert_eq!(keys.feed(b"\x1b[<2;4;4M"), vec![]);
+        // The right button is a context press: only its press, not its release or its motion.
+        assert_eq!(
+            keys.feed(b"\x1b[<2;4;4M"),
+            vec![Action::Context { row: 4, col: 4 }]
+        );
+        assert_eq!(keys.feed(b"\x1b[<2;4;4m"), vec![]);
+        assert_eq!(keys.feed(b"\x1b[<34;5;4M"), vec![]);
         // And the sideways wheel scrolls nothing here, rather than scrolling vertically.
         assert_eq!(keys.feed(b"\x1b[<66;4;4M"), vec![]);
     }

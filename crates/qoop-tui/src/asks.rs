@@ -1368,6 +1368,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,

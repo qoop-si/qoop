@@ -323,6 +323,15 @@ impl Store {
              CREATE TABLE IF NOT EXISTS awake_terminal (
                  terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE
              );
+             -- The spaces and the panes a person asked qass to leave alone. Cascaded like the
+             -- rest, because ids are reused. New tables, no version bump: an older binary
+             -- ignores them and qass watches the tab as before.
+             CREATE TABLE IF NOT EXISTS qass_skip_workspace (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS qass_skip_terminal (
+                 terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE
+             );
              -- What the owner wants from the work in a space, one line. Cascaded like the
              -- rest, because ids are reused. New table, no version bump: an older binary
              -- ignores it.
@@ -641,6 +650,49 @@ impl Store {
         Ok(open)
     }
 
+    /// Have qass leave a space alone, or watch it again. Answers false when there is no
+    /// such space.
+    pub fn set_qass_skip_workspace(&self, id: i64, on: bool) -> Result<bool, StoreError> {
+        let exists = self
+            .conn
+            .query_row("SELECT 1 FROM workspace WHERE id = ?1", params![id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if exists {
+            let sql = if on {
+                "INSERT OR IGNORE INTO qass_skip_workspace (workspace) VALUES (?1)"
+            } else {
+                "DELETE FROM qass_skip_workspace WHERE workspace = ?1"
+            };
+            self.conn.execute(sql, params![id])?;
+        }
+        Ok(exists)
+    }
+
+    /// The same for one pane. Answers false when there is no such open terminal.
+    pub fn set_qass_skip_terminal(&self, id: i64, on: bool) -> Result<bool, StoreError> {
+        let open = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if open {
+            let sql = if on {
+                "INSERT OR IGNORE INTO qass_skip_terminal (terminal) VALUES (?1)"
+            } else {
+                "DELETE FROM qass_skip_terminal WHERE terminal = ?1"
+            };
+            self.conn.execute(sql, params![id])?;
+        }
+        Ok(open)
+    }
+
     /// Park an open terminal's agent at `at`, or take it back. Answers false when there is
     /// no such open terminal.
     pub fn set_parked_terminal(&self, id: i64, on: bool, at: i64) -> Result<bool, StoreError> {
@@ -690,6 +742,21 @@ impl Store {
         Ok((
             read("SELECT workspace FROM awake_workspace")?,
             read("SELECT terminal FROM awake_terminal")?,
+        ))
+    }
+
+    /// Every space and every pane qass leaves alone.
+    pub fn qass_skips(&self) -> Result<(BTreeSet<i64>, BTreeSet<i64>), StoreError> {
+        let read = |sql: &str| -> Result<BTreeSet<i64>, StoreError> {
+            let mut stmt = self.conn.prepare(sql)?;
+            let ids = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<BTreeSet<i64>, _>>()?;
+            Ok(ids)
+        };
+        Ok((
+            read("SELECT workspace FROM qass_skip_workspace")?,
+            read("SELECT terminal FROM qass_skip_terminal")?,
         ))
     }
 
@@ -928,6 +995,11 @@ impl Store {
         )?;
         tx.execute(
             "DELETE FROM awake_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
+        // Nor skipped by qass: its id may be handed out again.
+        tx.execute(
+            "DELETE FROM qass_skip_terminal WHERE terminal = ?1",
             params![id],
         )?;
         // Nor parked: nobody will answer it.
@@ -2171,6 +2243,35 @@ mod tests {
         s.delete_workspace(ws).expect("delete with rows kept awake");
         assert_eq!(
             s.kept_awake().expect("read"),
+            (BTreeSet::new(), BTreeSet::new())
+        );
+    }
+
+    /// A qass skip is kept for a space and a pane, taken back on request, and never
+    /// outlives the space or the pane: ids are reused, and a new tab must not inherit it.
+    #[test]
+    fn qass_skip_round_trips_and_goes_with_its_space_and_pane() {
+        let mut s = store();
+        let ws = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).expect("t1");
+        s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).expect("t2");
+        assert!(s.set_qass_skip_workspace(ws, true).expect("space"));
+        assert!(s.set_qass_skip_workspace(ws, true).expect("twice is fine"));
+        assert!(s.set_qass_skip_terminal(1, true).expect("pane"));
+        assert!(s.set_qass_skip_terminal(2, true).expect("pane 2"));
+        assert!(!s.set_qass_skip_workspace(99, true).expect("no space"));
+        assert!(!s.set_qass_skip_terminal(99, true).expect("no pane"));
+        let (spaces, panes) = s.qass_skips().expect("read");
+        assert_eq!((spaces.len(), panes.len()), (1, 2));
+        assert!(s.set_qass_skip_terminal(2, false).expect("off"));
+        s.close_terminal(1, 2).expect("close");
+        assert!(!s.set_qass_skip_terminal(1, true).expect("closed"));
+        assert_eq!(s.qass_skips().expect("read").1, BTreeSet::new());
+        s.create_terminal(3, ws, "/tmp", "/bin/sh", 1).expect("t3");
+        assert!(s.set_qass_skip_terminal(3, true).expect("pane 3"));
+        s.delete_workspace(ws).expect("delete with rows skipped");
+        assert_eq!(
+            s.qass_skips().expect("read"),
             (BTreeSet::new(), BTreeSet::new())
         );
     }

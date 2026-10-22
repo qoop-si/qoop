@@ -133,6 +133,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal: None,
             on: true,
         },
+        ControlRequest::SetQassSkip {
+            id: "x29b".into(),
+            workspace: 1,
+            terminal: None,
+            on: true,
+        },
         ControlRequest::SetParked {
             id: "x29".into(),
             terminal,
@@ -386,6 +392,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SetSpaceGoal { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
+            | ControlRequest::SetQassSkip { .. }
             | ControlRequest::SetParked { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }

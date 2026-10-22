@@ -197,6 +197,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "have qass leave a space or a pane alone",
+            method: || {
+                Method::Control(ControlRequest::SetQassSkip {
+                    id: "a".into(),
+                    workspace: 1,
+                    terminal: Some(2),
+                    on: true,
+                })
+            },
+        },
+        Action {
             name: "park an agent to answer later",
             method: || {
                 Method::Control(ControlRequest::SetParked {
@@ -873,6 +884,12 @@ fn every_control_method_is_reachable_from_some_action() {
             terminal: None,
             on: false,
         },
+        ControlRequest::SetQassSkip {
+            id: String::new(),
+            workspace: 0,
+            terminal: None,
+            on: false,
+        },
         ControlRequest::SetParked {
             id: String::new(),
             terminal: 0,
@@ -1040,6 +1057,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SetSpaceGoal { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
+            | ControlRequest::SetQassSkip { .. }
             | ControlRequest::SetParked { .. }
             | ControlRequest::Subscribe { .. }
             | ControlRequest::Unsubscribe { .. }

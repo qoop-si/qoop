@@ -1300,6 +1300,16 @@ impl Daemon {
             }
             Err(e) => crate::say!("qoopd: what is kept awake could not be read: {e}"),
         }
+        // What a person asked qass to leave alone. Unreadable is empty: qass watches every tab
+        // as it did before the feature, and the next set writes it again.
+        match store.qass_skips().await {
+            Ok((spaces, panes)) => {
+                let mut skip = books.skip.lock().unwrap();
+                skip.spaces = spaces;
+                skip.panes = panes.into_iter().map(|t| t as u32).collect();
+            }
+            Err(e) => crate::say!("qoopd: what qass skips could not be read: {e}"),
+        }
         // Which tabs are asleep, read before anything is restored: they stay down, and
         // their rows must keep their place from the first teardown on.
         match store.asleep().await {
@@ -1480,6 +1490,12 @@ impl Daemon {
     /// Warnings the daemon has recorded.
     pub fn warnings(&self) -> Arc<std::sync::Mutex<Vec<Warning>>> {
         self.warnings.clone()
+    }
+
+    /// What the daemon holds as skipped by qass, so a gate can see the mirror and not only the
+    /// rows it shows.
+    pub fn qass_skips(&self) -> Arc<std::sync::Mutex<QassSkips>> {
+        self.books.skip.clone()
     }
 
     pub fn socket(&self) -> &Path {
@@ -3728,6 +3744,9 @@ fn dispatch(
         // Under the space's lock, so a close of that space cannot fall between the store's
         // write and the mirror's, and leave a reused id kept awake.
         ControlRequest::SetKeepAwake { workspace, .. } => take(*workspace),
+        // The same lock for the same reason: a close of that space cannot fall between the
+        // store's write and the mirror's, and leave a reused id skipped.
+        ControlRequest::SetQassSkip { workspace, .. } => take(*workspace),
         // Two spaces' locks, taken in order off the read loop.
         ControlRequest::MoveTerminal { .. } => Dispatch::Apart,
         // Seconds of disk for a large picture: never on the read loop, where it would hold
@@ -4021,6 +4040,7 @@ async fn handle_control(
                             record_close(store, &id, terminal).await;
                             books.awake.lock().unwrap().panes.remove(&terminal);
                             books.awake.lock().unwrap().panes.remove(&terminal);
+                            books.skip.lock().unwrap().panes.remove(&terminal);
                             ControlResponse::TerminalClosed { id, terminal }
                         }
                         Err(e) => {
@@ -4238,8 +4258,10 @@ async fn handle_control(
                 });
                 // Read into a local, so the lock is not held through the literal.
                 let keep_awake = books.awake.lock().unwrap().spaces.contains(&row.id);
+                let qass_skip = books.skip.lock().unwrap().spaces.contains(&row.id);
                 workspaces.push(crate::control::WorkspaceRow {
                     keep_awake,
+                    qass_skip,
                     id: row.id,
                     name: row.name,
                     terminals: live
@@ -4625,6 +4647,18 @@ async fn handle_control(
                 },
             }
         }
+        ControlRequest::SetQassSkip {
+            workspace,
+            terminal,
+            on,
+            ..
+        } => {
+            // Boxed: this arm's future is part of every request's, and stays small that way.
+            Box::pin(set_qass_skip(
+                id, workspace, terminal, on, held, terminals, agents, books,
+            ))
+            .await
+        }
         ControlRequest::CreateWorkspace { .. } if books.restart.gated() => {
             ControlResponse::Failed {
                 id,
@@ -4693,6 +4727,7 @@ async fn handle_control(
                     // keeping it awake, since the id may be given to a new space.
                     books.asleep.lock().unwrap().retain(|_, w| *w != target);
                     books.awake.lock().unwrap().spaces.remove(&target);
+                    books.skip.lock().unwrap().spaces.remove(&target);
                     // Its open items closed with it: off every board.
                     agents.tasks_changed();
                     ControlResponse::WorkspaceClosed {
@@ -4871,10 +4906,15 @@ async fn handle_control(
                     )
                     .to_string();
                     let keep_awake = books.awake.lock().unwrap().panes.contains(&terminal);
+                    // The space read first, so the registry and the skips are never locked at
+                    // once; a tab with no space left (closing now) has only its own flag.
+                    let space = terminals.workspace_of(terminal);
+                    let qass_skip = books.skip.lock().unwrap().covers(space, terminal);
                     let (background, subagents) = agents.background_of(terminal);
                     crate::control::AgentRow {
                         news: news.contains(&terminal),
                         keep_awake,
+                        qass_skip,
                         parked: agents.is_parked(terminal),
                         terminal,
                         name: terminals.name_of(terminal),
@@ -6694,6 +6734,8 @@ fn open_terminal_with(
                     let _owed = owed;
                     let closed = books.store.close_terminal(stream as i64).await;
                     books.closing.lock().unwrap().remove(&stream);
+                    // Its id may be handed out again: a new tab starts watched.
+                    books.skip.lock().unwrap().panes.remove(&stream);
                     // Its task closed with it, which can move the item it was on.
                     if let Ok(true) = closed {
                         news.tasks_changed();
@@ -6721,6 +6763,73 @@ fn open_terminal_with(
         return Err(e);
     }
     Ok(handle)
+}
+
+/// `SetQassSkip`: write the flag, then the mirror, then tell every client whose row it reaches.
+#[allow(clippy::too_many_arguments)]
+async fn set_qass_skip(
+    id: String,
+    workspace: i64,
+    terminal: Option<u32>,
+    on: bool,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<crate::agents::AgentRegistry>,
+    books: &Bookkeeping,
+) -> ControlResponse {
+    let store = &books.store;
+    let _held = match held {
+        Some(guard) => guard,
+        None => books.lock_of(workspace).lock_owned().await,
+    };
+    // qass's own space holds qass's own tabs: skipping them would blind it to itself.
+    let space = terminal
+        .and_then(|t| terminals.workspace_of(t))
+        .unwrap_or(workspace);
+    if crate::asks::qass_space(store).await == Some(space) {
+        return ControlResponse::Failed {
+            id,
+            reason: "qass is not skipped from its own space".into(),
+        };
+    }
+    match store.set_qass_skip(workspace, terminal, on).await {
+        Ok(false) => ControlResponse::Failed {
+            id,
+            reason: match terminal {
+                Some(t) => format!("there is no open terminal {t}"),
+                None => format!("there is no workspace {workspace}"),
+            },
+        },
+        Ok(true) => {
+            // A tab that closed between the store's write and this one took its row with it:
+            // marked here, its id would hand the skip to the next tab given that number.
+            let gone = |t: u32| terminals.workspace_of(t).is_none() && !books.is_marked(t);
+            let mut skip = books.skip.lock().unwrap();
+            match (terminal, on) {
+                (Some(t), true) if gone(t) => false,
+                (Some(t), true) => skip.panes.insert(t),
+                (Some(t), false) => skip.panes.remove(&t),
+                (None, true) => skip.spaces.insert(workspace),
+                (None, false) => skip.spaces.remove(&workspace),
+            };
+            drop(skip);
+            // Every row the flag reaches is announced, so every client and the watcher's agent
+            // stream see the change in the same breath.
+            match terminal {
+                Some(t) => agents.announce(t),
+                None => terminals
+                    .streams()
+                    .into_iter()
+                    .filter(|t| terminals.workspace_of(*t) == Some(workspace))
+                    .for_each(|t| agents.announce(t)),
+            }
+            ControlResponse::Renamed { id }
+        }
+        Err(e) => ControlResponse::Failed {
+            id,
+            reason: format!("the qass skip could not be saved: {e}"),
+        },
+    }
 }
 
 /// Record which agent is in each terminal, as the registry decides it.
@@ -7077,6 +7186,9 @@ pub struct Bookkeeping {
     /// say, held here so idle sleep and the lists read them without a store round trip.
     /// Written after the store, so a failed write changes neither.
     pub awake: Arc<std::sync::Mutex<KeptAwake>>,
+    /// The spaces and panes a person asked qass to leave alone, as the store's `qass_skip_*`
+    /// tables say, held here for the same reason and written in the same order.
+    pub skip: Arc<std::sync::Mutex<QassSkips>>,
     /// Told when `config.toml` was changed through the socket, so an idle sleep loop parked
     /// with both timeouts off looks at the file now and not at the next agent change.
     pub nudge: Arc<tokio::sync::Notify>,
@@ -7090,6 +7202,20 @@ pub struct Bookkeeping {
 pub struct KeptAwake {
     pub spaces: BTreeSet<i64>,
     pub panes: BTreeSet<u32>,
+}
+
+/// What [`Bookkeeping::skip`] holds.
+#[derive(Debug, Default)]
+pub struct QassSkips {
+    pub spaces: BTreeSet<i64>,
+    pub panes: BTreeSet<u32>,
+}
+
+impl QassSkips {
+    /// Whether qass leaves a pane alone: its space is skipped, or the pane itself.
+    pub fn covers(&self, space: Option<i64>, pane: u32) -> bool {
+        space.is_some_and(|w| self.spaces.contains(&w)) || self.panes.contains(&pane)
+    }
 }
 
 impl KeptAwake {
@@ -7287,6 +7413,7 @@ impl Bookkeeping {
             locks: Arc::default(),
             restart: Arc::default(),
             awake: Arc::default(),
+            skip: Arc::default(),
             nudge: Arc::default(),
             schedules: Arc::default(),
         }
@@ -8279,6 +8406,7 @@ async fn close_sleeping_tab(
         .await
         .map_err(|e| format!("tab {terminal} could not be closed: {e}"))?;
     books.mark(workspace, &[terminal], false);
+    books.skip.lock().unwrap().panes.remove(&terminal);
     if let Some(dir) = history_dir.map(|dir| dir.join(terminal.to_string())) {
         let _ = crate::blocking::run(move || std::fs::remove_dir_all(dir)).await;
     }

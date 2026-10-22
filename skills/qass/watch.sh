@@ -5,7 +5,8 @@
 # of every remote in `qoop remote ls`, and prints a line only when an agent reaches a
 # state that waits on somebody (idle, blocked, failed, done, sleeping), or sleeps, or
 # closes. A row also changes on every tool call (activity, cwd), so only terminal,
-# generation and state are compared. Its own terminal is skipped.
+# generation and state are compared. Its own terminal is skipped, and so is every tab the owner
+# asked qass to leave alone (`qass_skip` on its row): nothing is said of it, whatever it does.
 #
 # The last snapshot of each machine is kept in last.json (this Mac) or last-<remote>.json
 # in qass's data folder and diffed against on start, so a restart does not lose what
@@ -82,7 +83,8 @@ watch_for="${QASS_WATCH_FOR:-1740}"
 started="$(date +%s)"
 
 defs='
-def rows: map(select(.agent == true and ($at != "" or .terminal != $self)))
+def rows: map(select(.agent == true and ($at != "" or .terminal != $self)
+                     and (.terminal as $t | $skip | index($t)) == null))
           | map({key: (.terminal | tostring), value: .}) | from_entries;
 def waits: . as $s | ["idle", "blocked", "failed", "done", "sleeping"] | index($s) != null;
 def clean: tostring | gsub("[^\\p{L}\\p{N} ._/-]"; "") | .[0:40];
@@ -93,6 +95,10 @@ def line($r; $from):
   "\($at)T\($r.terminal) g\($r.generation) \($r.program // "-" | clean) \($from)->\($r.state)"
   + " \"\(($r.name // $r.agent_title // "") | clean)\" \($r.cwd // "-" | place)\($r | task)";
 '
+# Every program below takes $skip, the terminals of one machine the owner asked qass to leave
+# alone, so `rows` drops them: a skipped tab going idle, blocked, failed or away says nothing, and
+# a flag set mid-work is not a close, nor a flag cleared a new tab. (skips_of builds it.)
+
 # $a and $b are row arrays; prints the lines for what changed from $a to $b.
 diff="$defs"'
 ($a | rows) as $old | ($b | rows) as $new
@@ -148,18 +154,29 @@ off_line='watch-off: the owner turned watching off (qoop qass watch); do not sta
 
 # Reads held entries ("<t> <gen> <class> <due> <arrival> <line>") against the row array $b and
 # prints each as "P <line to say>" or "D <line>" (went stale). A sleep or a close holds while
-# the agent is still away; any other line is said as the row is now, while it still waits.
+# the agent is still away; any other line is said as the row is now, while it still waits. A
+# line of a tab skipped since goes stale first, whatever it was.
 recheck="$defs"'
 ($b | rows) as $new
 | capture("^(?<t>[0-9]+) (?<g>[^ ]+) [^ ]+ [0-9]+ (?<arr>[0-9]+) (?<line>.*)$") as $h
 | ($h.line | capture("^(?:[A-Za-z0-9_-]+/)?T[0-9]+ g[^ ]+ [^ ]+ (?<from>[a-z-]+)->(?<state>[a-z]+)")) as $m
 | $new[$h.t] as $r
 | "P \($h.arr) " as $say
-| if $m.state == "sleeping" or $m.state == "closed" then
+| if ($skip | index($h.t | tonumber)) != null then "D " + $h.line
+  elif $m.state == "sleeping" or $m.state == "closed" then
     (if $r == null then $say + $h.line else "D " + $h.line end)
   elif $r == null or (($r.state | waits) | not) then "D " + $h.line
   elif ($r.generation | tostring) == $h.g then $say + line($r; $m.from)
   else $say + line($r; "restarted") end'
+
+# The terminals of one machine that carry `qass_skip` in any of the row arrays given, as a JSON
+# array. Read from all the rows, before the agent filter: a tab whose agent exited keeps its flag.
+# The previous snapshot counts too, so a flag set or cleared between two snapshots never reads as
+# a close or a new tab.
+skips_of() {
+    printf '%s\n' "$@" | jq -sc '[.[][]? | select(.qass_skip == true) | .terminal] | unique' 2>/dev/null ||
+        echo '[]'
+}
 
 # A machine's lines held until they settle: "<terminal> <generation> <from> <state> <due>".
 settle_file() { if [ -z "$1" ]; then echo "$dir/settle"; else echo "$dir/settle-$1"; fi; }
@@ -221,12 +238,17 @@ said_file() { if [ -z "$1" ]; then echo "$dir/said"; else echo "$dir/said-$1"; f
 # worker was already told. The first look only records what is there. A card answered again
 # after it came back open is a new line (its closed time is part of what is remembered).
 asks_said() {
-    local f="$dir/asks-seen" cur new
+    local f="$dir/asks-seen" cur new skipped
     cur="$(qoop ask ls --json 2>/dev/null | jq -r '(.live + .ended)[]
         | select(.status == "answered" or .status == "passed")
         | "\(.closed_at // 0) ASK \(.card) \(.status) \(.option // "text") -> \(if .status == "passed" then "qass" else (.agent // "-") end)"' 2>/dev/null)" || return 0
     if [ -f "$f" ]; then
         new="$(printf '%s\n' "$cur" | grep -vxFf "$f" || true)"
+        # An ask of a tab qass leaves alone is the owner's alone: remembered, never said.
+        skipped="$(skips_of "$(cat "$dir/last.json" 2>/dev/null || echo '[]')" | tr -d '[]' | tr ',' ' ')"
+        new="$(printf '%s\n' "$new" | awk -v skip="$skipped" '
+            BEGIN { n = split(skip, a, " "); for (i = 1; i <= n; i++) s["T" a[i]] = 1 }
+            !($NF in s)')"
         [ -z "$new" ] || say "$(printf '%s\n' "$new" | sed -E 's/^[0-9]+ //')"
     fi
     printf '%s\n' "$cur" > "$f"
@@ -376,7 +398,7 @@ flush() {
         [ -n "$sel" ] || continue
         # Taken only once checked: a failed check keeps them held for the next round.
         out="$(printf '%s\n' "$sel" | jq -rR --argjson b "$snap" --argjson self "$self" \
-            --arg at "$(at_of "$label")" "$recheck" 2>/dev/null)" || continue
+            --argjson skip "$(skips_of "$snap")" --arg at "$(at_of "$label")" "$recheck" 2>/dev/null)" || continue
         picked="$picked$f
 "
         while IFS= read -r l; do
@@ -529,7 +551,7 @@ sleeping_on() {
 # Reads one machine's snapshots on stdin and prints its lines. Anything that is not a row
 # array (a login banner, a broken line) is passed over, never fatal.
 follow() {
-    local label="$1" at prev snap out sleeping file gone
+    local label="$1" at prev snap out sleeping file gone skip
     at="$(at_of "$label")"
     file="$(snapshot_file "$label")"
     gone="$(gone_file "$label")"
@@ -572,7 +594,7 @@ follow() {
                 busy="$has_agents"
                 if routine_quiet; then busy="$has_busy"; fi
                 if jq -en --argjson a "$prev" --argjson self "$self" --arg at "$at" \
-                    "$busy" >/dev/null 2>&1; then
+                    --argjson skip "$(skips_of "$prev")" "$busy" >/dev/null 2>&1; then
                     settle_locked flush "${at}daemon-gone"
                 else
                     note "daemon gone, no agent" "${at}daemon-gone"
@@ -584,13 +606,14 @@ follow() {
         fi
         if [ ! -e "$gone" ]; then
             sleeping='[]'
+            skip="$(skips_of "$prev" "$snap")"
             if jq -en --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
-                --arg at "$at" "$vanished" >/dev/null 2>&1; then
+                --argjson skip "$skip" --arg at "$at" "$vanished" >/dev/null 2>&1; then
                 # A tab that slept leaves the agent rows too; `qoop ls` still names it.
                 sleeping="$(sleeping_on "$label")"
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
-                --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || { step_end; continue; }
+                --argjson skip "$skip" --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || { step_end; continue; }
             # Off: the snapshot is kept, and nothing of it is said or held.
             ! watch_off || out=""
             # Quiet checks held lines against the saved snapshot: save this one first, so a
@@ -820,8 +843,8 @@ fi
             settle_locked take_due "$f" | while read -r t g from state _; do
                 snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
                 out="$(jq -rn --argjson b "$snap" --arg t "$t" --argjson g "$g" --arg from "$from" \
-                    --arg state "$state" --argjson self "$self" --arg at "$(at_of "$label")" \
-                    "$settled" 2>/dev/null)" || continue
+                    --arg state "$state" --argjson self "$self" --argjson skip "$(skips_of "$snap")" \
+                    --arg at "$(at_of "$label")" "$settled" 2>/dev/null)" || continue
                 if [ -n "$out" ]; then
                     say "$out"
                 fi
@@ -833,7 +856,7 @@ fi
             [ ! -e "$(gone_file "$label")" ] || continue
             snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
             out="$(jq -rn --argjson b "$snap" --argjson due "[\"$t\"]" --argjson self "$self" \
-                --arg at "$(at_of "$label")" "$again" 2>/dev/null)" || continue
+                --argjson skip "$(skips_of "$snap")" --arg at "$(at_of "$label")" "$again" 2>/dev/null)" || continue
             if [ -n "$out" ]; then
                 if [ "$quiet" = 1 ]; then settle_locked flush "$out"; else say "$out"; fi
             fi

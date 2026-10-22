@@ -351,6 +351,8 @@ pub enum Act {
     Settings(i64),
     /// The cup on a space's rule: keep the space awake, or let idle sleep take it again.
     KeepAwake(i64),
+    /// The crossed eye on a skipped space's rule: have qass watch it again.
+    QassSkip(i64),
     /// The toggle at the end of a space's rule: open its drawer of controls, or close it.
     Drawer(i64),
     /// The `+` on a space's rule: a new terminal or agent in that space.
@@ -2076,10 +2078,12 @@ fn pick_hit(pick: Pick) -> Hit {
 fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Line {
     use crate::theme::Role;
     let width = c.width;
-    let ink = if space.asleep {
-        crate::theme::space_calm_in(c.spaces, space.id)
-    } else {
-        crate::theme::space_in(c.spaces, space.id)
+    // A space qass leaves alone wears its name one step quieter, a sleeping one's calm ink
+    // already being that step.
+    let ink = match (space.asleep, space.qass_skip) {
+        (false, false) => crate::theme::space_in(c.spaces, space.id),
+        (true, false) | (false, true) => crate::theme::space_calm_in(c.spaces, space.id),
+        (true, true) => Role::Faint,
     };
     let agents: Vec<&AgentRow> = kids.iter().copied().filter(|a| a.agent).collect();
     let hot = if open { None } else { urgent_ink(c, &agents) };
@@ -2272,6 +2276,8 @@ enum Ctl {
     Wake,
     /// Keep it out of idle sleep: the cup, full while it is kept.
     Cup,
+    /// qass leaves it alone: the crossed eye, drawn only while that holds.
+    Eye,
     /// Its settings.
     Settings,
     /// Close it, which only asks first.
@@ -2344,6 +2350,7 @@ impl Block {
             Ctl::Sleep => icon(crate::icons::SLEEP, "sleep"),
             Ctl::Wake => icon(crate::icons::WAKE, "wake"),
             Ctl::Cup => icon(crate::icons::CUP, "c"),
+            Ctl::Eye => icon(crate::icons::EYE_SHUT, "q"),
             Ctl::Settings => icon(crate::icons::SETTINGS, "set"),
             Ctl::Close => "x".into(),
             Ctl::Toggle if self.open => icon(crate::icons::LESS, "\u{203a}"),
@@ -2419,12 +2426,18 @@ fn layout(
         for (ctl, w) in drawer.into_iter().take(shown) {
             place(ctl, w, &mut cells);
         }
+        if space.qass_skip {
+            place(Some(Ctl::Eye), 1, &mut cells);
+        }
     } else {
         if wakes {
             place(Some(Ctl::Wake), moon_w, &mut cells);
         }
         if space.keep_awake {
             place(Some(Ctl::Cup), 1, &mut cells);
+        }
+        if space.qass_skip {
+            place(Some(Ctl::Eye), 1, &mut cells);
         }
     }
     if armed {
@@ -2469,9 +2482,9 @@ fn block(c: &Column, space: &WorkspaceRow) -> Block {
     )
 }
 
-/// The widest a closed rule's block is: plain words, a space asleep and kept awake, with the
-/// blank before it and the one after.
-const CLOSED_BLOCK_MAX: usize = 1 + (WORD_W + 1) + (1 + 1) + (1 + 1) + (1 + 1) + 1;
+/// The widest a closed rule's block is: plain words, a space asleep, kept awake and skipped by
+/// qass, with the blank before it and the one after.
+const CLOSED_BLOCK_MAX: usize = 1 + (WORD_W + 1) + (1 + 1) + (1 + 1) + (1 + 1) + (1 + 1) + 1;
 
 /// What a closed rule pays for besides its name: the fold column and that block.
 const BLOCK_TAIL_MAX: usize = NAME_AT + CLOSED_BLOCK_MAX;
@@ -2900,24 +2913,27 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     let tail = cost
         .as_ref()
         .map_or(0, |text| crate::width::width(text) + 2);
-    let room = c.width.saturating_sub(lead + tail + LIVE_TAIL);
+    // A blank and the crossed eye ahead of the cup and the close, while qass leaves it alone.
+    let eye_w = if agent.qass_skip { EYE_W } else { 0 };
+    let room = c.width.saturating_sub(lead + tail + LIVE_TAIL + eye_w);
     let name = shorten_middle(&session_name(agent), room);
     let mut text = format!("{}{name}", mark_of(c, agent, role));
     let focused = agent.terminal == c.focused_terminal;
     let calm = !focused
         && !matches!(agent.state.as_str(), "working" | "starting")
         && !needs_person(agent, c.focused_terminal, c.seen, c.unseen);
-    let ink = if calm {
-        crate::theme::space_calm_in(c.spaces, agent.workspace)
-    } else {
-        crate::theme::space_in(c.spaces, agent.workspace)
+    // One step quieter again for a tab qass leaves alone.
+    let ink = match (calm, agent.qass_skip) {
+        (false, false) => crate::theme::space_in(c.spaces, agent.workspace),
+        (true, false) | (false, true) => crate::theme::space_calm_in(c.spaces, agent.workspace),
+        (true, true) => crate::theme::Role::Faint,
     };
     let mut runs = Vec::new();
     if !stale {
         runs.push((lead, crate::width::width(&name), ink));
     }
     if let Some(cost) = cost {
-        let at = c.width - crate::width::width(&cost) - LIVE_TAIL;
+        let at = c.width - crate::width::width(&cost) - LIVE_TAIL - eye_w;
         text = format!("{}{cost}", fit_to(&text, at));
         runs.push((at, crate::width::width(&cost), crate::theme::Role::Faint));
     }
@@ -2928,6 +2944,11 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         .iter()
         .any(|s| s.id == agent.workspace && s.keep_awake);
     let at = c.width.saturating_sub(LIVE_TAIL);
+    if agent.qass_skip {
+        let eye = if c.icons { crate::icons::EYE_SHUT } else { 'q' };
+        text = format!("{} {eye}", fit_to(&text, at.saturating_sub(eye_w)));
+        runs.push((at.saturating_sub(eye_w) + 1, 1, crate::theme::Role::Faint));
+    }
     let (sleep, cup) = if c.icons {
         (
             crate::icons::SLEEP.to_string(),
@@ -2968,6 +2989,10 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
 
 /// The columns the close at the end of an agent's row takes: a blank and the `x`.
 const CLOSE_W: usize = 2;
+
+/// The columns the crossed eye of a tab qass leaves alone takes, left of the sleep mark: a blank
+/// and the eye.
+const EYE_W: usize = 2;
 
 /// The columns a live agent's row ends in: a blank and the sleep mark, a blank and the keep
 /// awake cup, then the close.
@@ -3018,6 +3043,19 @@ pub fn on_agent_cup(col: usize, terminal: u32, c: &Column) -> bool {
         && col + 3 == c.width
         && c.agents.iter().any(|a| {
             a.terminal == terminal && a.agent && c.spaces.iter().any(|s| s.id == a.workspace)
+        })
+}
+
+/// Whether a click at `col` (counted from one) on the first row of `terminal` lands on the
+/// crossed eye of a tab qass leaves alone, two columns left of its sleep mark.
+pub fn on_agent_eye(col: usize, terminal: u32, c: &Column) -> bool {
+    c.view == View::Tree
+        && col + 5 + EYE_W == c.width
+        && c.agents.iter().any(|a| {
+            a.terminal == terminal
+                && a.agent
+                && a.qass_skip
+                && c.spaces.iter().any(|s| s.id == a.workspace)
         })
 }
 
@@ -3182,6 +3220,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
                     Some(Ctl::Sleep) => return Some(Act::Sleep(id)),
                     Some(Ctl::Wake) => return Some(Act::Wake(id)),
                     Some(Ctl::Cup) => return Some(Act::KeepAwake(id)),
+                    Some(Ctl::Eye) => return Some(Act::QassSkip(id)),
                     Some(Ctl::Settings) => return Some(Act::Settings(id)),
                     Some(Ctl::Close) => return Some(Act::Close(id)),
                     Some(Ctl::No | Ctl::Ask) | None => {}
@@ -4487,6 +4526,7 @@ mod tests {
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id,
             name: name.to_string(),
             terminals: 1,
@@ -4503,6 +4543,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -4534,6 +4575,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -5307,6 +5349,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -5569,6 +5612,7 @@ mod tests {
         let agents = vec![AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -5610,6 +5654,7 @@ mod tests {
         let agents = vec![AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -10046,6 +10091,7 @@ mod tests {
     ) -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
         let space = WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1,
             name: name.to_string(),
             terminals: held,
@@ -10302,6 +10348,7 @@ mod tests {
                         Ctl::Sleep => Act::Sleep(1),
                         Ctl::Wake => Act::Wake(1),
                         Ctl::Cup => Act::KeepAwake(1),
+                        Ctl::Eye => Act::QassSkip(1),
                         Ctl::Settings => Act::Settings(1),
                         Ctl::Close => Act::Close(1),
                         Ctl::Yes | Ctl::No | Ctl::Ask => unreachable!("not armed"),
@@ -10494,6 +10541,62 @@ mod tests {
         assert!(first_rule(&c).runs.contains(&(at, 1, Brand)));
     }
 
+    /// A tab qass leaves alone ends in a dim crossed eye, left of its sleep mark, and its name
+    /// is one step quieter; a click on the eye is a click to watch it again. A space qass leaves
+    /// alone wears the eye on its rule, the same.
+    #[test]
+    fn a_tab_and_a_space_qass_leaves_alone_wear_a_dim_crossed_eye() {
+        use crate::theme::Role::{Faint, Space, SpaceCalm};
+        let (mut spaces, mut agents) = sample();
+        spaces[0].ink = Some(2);
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let eye = |spaces: &[WorkspaceRow], agents: &[AgentRow]| {
+            let mut c = clicks(spaces, agents, View::Tree, WIDTH, &none);
+            c.icons = true;
+            let rows = rows_folded(&c, 20, None);
+            let line = tree_row(&rows, 1).clone();
+            let at = WIDTH - 4 - 2 - EYE_W;
+            (line, at, on_agent_eye(at + 1, 1, &c))
+        };
+        // Watched: no eye, no click on it, the name in its full ink.
+        let (line, at, clicked) = eye(&spaces, &agents);
+        assert_ne!(line.text.chars().nth(at), Some(crate::icons::EYE_SHUT));
+        assert!(!clicked);
+        assert!(line.runs.iter().any(|(_, _, r)| *r == Space(2)));
+        // Skipped: the eye is there, dim, answers a click, and the name is a step quieter.
+        agents[0].qass_skip = true;
+        let (line, at, clicked) = eye(&spaces, &agents);
+        assert_eq!(
+            line.text.chars().nth(at),
+            Some(crate::icons::EYE_SHUT),
+            "{:?}",
+            line.text
+        );
+        assert!(line.runs.contains(&(at, 1, Faint)));
+        assert!(clicked);
+        assert!(!line.runs.iter().any(|(_, _, r)| *r == Space(2)));
+        assert!(line.runs.iter().any(|(_, _, r)| *r == SpaceCalm(2)));
+        // Its cup and close are where they were.
+        assert_eq!(line.text.chars().nth(WIDTH - 2), Some('x'));
+        // A space: the eye peeks on the closed rule, and the click on it is the space's.
+        spaces[0].qass_skip = true;
+        let mut c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        c.icons = true;
+        let rule = first_rule(&c);
+        let (at, _) = cell_of(&c, 1, Ctl::Eye).expect("the eye peeks");
+        assert_eq!(
+            rule.text.chars().nth(at),
+            Some(crate::icons::EYE_SHUT),
+            "{:?}",
+            rule.text
+        );
+        assert!(rule.runs.contains(&(at, 1, Faint)));
+        assert_eq!(
+            act(Hit::Space(1), at + 1, &c, false),
+            Some(Act::QassSkip(1))
+        );
+    }
+
     /// With icons an asleep tab wears the zzz, and a space of another machine the remote mark
     /// in its link's colour, its name pushed over by exactly the mark and a blank.
     #[test]
@@ -10662,6 +10765,7 @@ mod tests {
     fn a_sleeping_rule_keeps_its_space_colour_one_step_quieter() {
         let spaces = vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1,
             name: "qoop".into(),
             terminals: 3,

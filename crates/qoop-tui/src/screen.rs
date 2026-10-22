@@ -781,6 +781,7 @@ pub fn bar_tabs(
         tabs.push(AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -2303,14 +2304,23 @@ impl PromptBox {
 
     /// The buttons: clear and reset on the left, cancel and the answer on the right, the
     /// answer last where the eye ends. A narrow box drops the left ones first, then
-    /// cancel, and never the answer.
-    fn buttons(&self, what: crate::run::Naming) -> Vec<PromptButton> {
+    /// cancel, and never the answer. `skip` is a space's qass skip as the box holds it, which
+    /// puts a button for turning it over beside the others, and says which way it turns.
+    fn buttons(&self, what: crate::run::Naming, skip: Option<bool>) -> Vec<PromptButton> {
         let chip = |label: &str, key: u8, primary: bool| (label.to_string(), key, primary);
         let verb = format!("\u{21b5} {}", what.verb());
         let mut right = vec![chip("esc cancel", 0x1b, false), chip(&verb, b'\r', true)];
         let mut left = vec![chip("^u clear", 0x15, false)];
         if what.resets() {
             left.push(chip("^r reset", 0x12, false));
+        }
+        if let Some(skipped) = skip {
+            let label = if skipped {
+                "^e qass watches"
+            } else {
+                "^e qass skips"
+            };
+            left.push(chip(label, 0x05, false));
         }
         // A prefix chosen as ctrl-u or ctrl-r is the prefix in here too, so its button
         // would say a key that does something else.
@@ -2361,7 +2371,7 @@ pub(crate) fn prompt_click(
     if b.swatch_row() == Some(row) {
         return b.swatch_at(col).map(BoxClick::Pick);
     }
-    b.buttons(prompt.what)
+    b.buttons(prompt.what, prompt.skip.map(|s| s.now))
         .into_iter()
         .find(|b| b.row == row && (b.col..b.col + b.width()).contains(&col))
         .map(|b| BoxClick::Key(b.key))
@@ -2383,7 +2393,7 @@ pub(crate) fn prompt_button(
     key: u8,
 ) -> Option<(usize, usize)> {
     PromptBox::at(cols, lines, prompt)?
-        .buttons(prompt.what)
+        .buttons(prompt.what, prompt.skip.map(|s| s.now))
         .into_iter()
         .find(|b| b.key == key)
         .map(|b| (b.row, b.col))
@@ -2497,7 +2507,7 @@ fn paint_prompt(frame: &Frame, prompt: &crate::run::Prompt, out: &mut String) {
     );
     let mut buttons = theme::RESET.to_string();
     let mut used = 0;
-    for button in b.buttons(prompt.what) {
+    for button in b.buttons(prompt.what, prompt.skip.map(|s| s.now)) {
         let at = button.col - (b.left + 1);
         buttons.push_str(&" ".repeat(at - used));
         buttons.push_str(&theme::button(button.primary));
@@ -4096,6 +4106,7 @@ mod tests {
     fn spaces() -> Vec<WorkspaceRow> {
         vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1,
             name: "app".to_string(),
             terminals: 1,
@@ -4112,6 +4123,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -4669,7 +4681,7 @@ mod tests {
         let what = crate::run::Naming::RenameTerminal(1);
         let asked = prompt(what, "", "");
         let b = PromptBox::at(100, 24, &asked).expect("fits");
-        let buttons = b.buttons(what);
+        let buttons = b.buttons(what, None);
         let keys: Vec<u8> = buttons.iter().map(|b| b.key).collect();
         assert_eq!(keys, [0x15, 0x12, 0x1b, b'\r']);
         let painted = painted_prompt(&prompt(what, "", ""), 100, 24);
@@ -4685,7 +4697,9 @@ mod tests {
         }
         assert_eq!(prompt_click(100, 24, &asked, buttons[0].row, 0), None);
         // A window too narrow for all of them keeps the answer.
-        let narrow = PromptBox::at(24, 24, &asked).expect("fits").buttons(what);
+        let narrow = PromptBox::at(24, 24, &asked)
+            .expect("fits")
+            .buttons(what, None);
         assert!(narrow.iter().any(|b| b.key == b'\r'), "{:?}", narrow.len());
     }
 
@@ -6189,7 +6203,7 @@ mod tests {
     }
 
     /// How many commands there are, the one number the list below and the match share.
-    const COMMANDS: usize = 46;
+    const COMMANDS: usize = 47;
 
     /// A command's place in the list, checked against [`COMMANDS`] when this compiles.
     const fn place(at: usize) -> usize {
@@ -6254,6 +6268,8 @@ mod tests {
             Action::ChatRow => (const { place(43) }, Some("ctrl-a enter")),
             Action::Park => (const { place(44) }, Some("ctrl-a x/P")),
             Action::Clock => (const { place(45) }, Some("ctrl-a Q/C")),
+            // A right press on a row of the column: the menu says what it offers.
+            Action::Context { .. } => (const { place(46) }, None),
         }
     }
 
@@ -6324,6 +6340,7 @@ mod tests {
             Action::ChatRow,
             Action::Park,
             Action::Clock,
+            Action::Context { row: 1, col: 1 },
         ];
         // Every place has exactly one sample: no command listed twice, none left out.
         let mut numbers: Vec<usize> = every.iter().map(|a| taught_as(a).0).collect();
@@ -6613,6 +6630,7 @@ mod tests {
     fn an_accented_row_is_still_exactly_the_column_wide() {
         let wide = vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1,
             name: "\u{4e2d}\u{6587}".to_string(),
             terminals: 1,
@@ -6787,6 +6805,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,
@@ -6988,6 +7007,7 @@ mod tests {
         let space = |name: &str| {
             vec![WorkspaceRow {
                 keep_awake: false,
+                qass_skip: false,
                 id: 1,
                 name: name.to_string(),
                 terminals: 1,
@@ -7421,6 +7441,7 @@ mod tests {
     fn a_tree_fits_nine_agents_without_scrolling() {
         let spaces = vec![WorkspaceRow {
             keep_awake: false,
+            qass_skip: false,
             id: 1,
             name: "app".to_string(),
             terminals: 9,
@@ -7440,6 +7461,7 @@ mod tests {
             .map(|(i, state)| AgentRow {
                 parked: false,
                 keep_awake: false,
+                qass_skip: false,
                 background: 0,
                 subagents: 0,
                 task: None,

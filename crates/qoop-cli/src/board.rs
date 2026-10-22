@@ -8,7 +8,7 @@
 //! spaces may share a name), rewritten whole each time, so a copy never drifts from the
 //! record; it only ages, and says how old it is.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -122,7 +122,15 @@ fn closing_note(store: &Store, task: i64) -> std::io::Result<String> {
         .unwrap_or_default())
 }
 
-fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
+/// The spaces and tabs the owner keeps from qass: left out of the board when qass is the one
+/// reading it (see [`crate::qass::called_by_qass`]), whatever they hold.
+#[derive(Default)]
+struct Hidden {
+    spaces: BTreeSet<i64>,
+    tabs: BTreeSet<i64>,
+}
+
+fn read(store: &Store, live: &HashMap<i64, String>, hidden: &Hidden) -> std::io::Result<Board> {
     let now = now();
     let stored: HashMap<String, String> = store
         .session_titles()
@@ -155,16 +163,25 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
         .map_err(std::io::Error::other)?
         .into_iter()
         .map(|row| item_info(row, name_of))
+        .filter(|item| !item.workspace.is_some_and(|w| hidden.spaces.contains(&w)))
+        .map(|mut item| {
+            item.agents
+                .retain(|a| !a.terminal.is_some_and(|t| hidden.tabs.contains(&t)));
+            item
+        })
         .collect();
     let mut spaces = Vec::new();
     let mut names = HashMap::new();
     for w in workspaces {
         names.insert(w.id, w.name.clone());
-        if w.name == QASS_SPACE {
+        if w.name == QASS_SPACE || hidden.spaces.contains(&w.id) {
             continue;
         }
         let mine: Vec<TaskRow>;
         (mine, tasks) = tasks.into_iter().partition(|t| t.workspace == Some(w.id));
+        let mine = mine
+            .into_iter()
+            .filter(|t| !t.terminal.is_some_and(|t| hidden.tabs.contains(&t)));
         let mut open = Vec::new();
         for task in mine {
             let name = task.terminal.and_then(name_of).unwrap_or_else(|| {
@@ -208,7 +225,10 @@ fn read(store: &Store, live: &HashMap<i64, String>) -> std::io::Result<Board> {
         .map_err(std::io::Error::other)?
     {
         let space = task.workspace.and_then(|w| names.get(&w)).cloned();
-        if space.as_deref() == Some(QASS_SPACE) {
+        if space.as_deref() == Some(QASS_SPACE)
+            || task.workspace.is_some_and(|w| hidden.spaces.contains(&w))
+            || task.terminal.is_some_and(|t| hidden.tabs.contains(&t))
+        {
             continue;
         }
         let note = closing_note(store, task.id)?;
@@ -443,6 +463,18 @@ fn write_dir(b: &Board, dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What qass is not shown: the owner's skips when qass is the reader, nothing for anyone else.
+fn hidden_from_qass(store: &Store) -> std::io::Result<Hidden> {
+    if !crate::qass::may_be_qass() {
+        return Ok(Hidden::default());
+    }
+    let (spaces, tabs) = store.qass_skips().map_err(std::io::Error::other)?;
+    if (spaces.is_empty() && tabs.is_empty()) || !crate::qass::called_by_qass() {
+        return Ok(Hidden::default());
+    }
+    Ok(Hidden { spaces, tabs })
+}
+
 /// `qoop task board [--json] [--dir DIR]`.
 pub(crate) fn run(dir: Option<&Path>, json: bool) -> std::io::Result<()> {
     let runtime = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -454,7 +486,7 @@ pub(crate) fn run(dir: Option<&Path>, json: bool) -> std::io::Result<()> {
         }
         return Ok(());
     };
-    let board = read(&store, &live_titles())?;
+    let board = read(&store, &live_titles(), &hidden_from_qass(&store)?)?;
     if json {
         println!(
             "{}",
@@ -510,7 +542,7 @@ mod tests {
             )
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut b = read(&store, &HashMap::new()).unwrap();
+        let mut b = read(&store, &HashMap::new(), &Hidden::default()).unwrap();
         b.asof = "2026-10-10 21:40".into();
         (dir, b)
     }
@@ -540,7 +572,7 @@ mod tests {
         store
             .close_task(alone, qoop_store::Outcome::Verified, "ran", now())
             .unwrap();
-        let b = read(&store, &HashMap::new()).unwrap();
+        let b = read(&store, &HashMap::new(), &Hidden::default()).unwrap();
         let readme = index(&b);
         assert!(
             readme.contains(&format!(
@@ -555,6 +587,44 @@ mod tests {
         );
         assert!(!readme.contains("waiting-human"), "{readme}");
         assert!(!readme.contains("None."), "{readme}");
+    }
+
+    /// A board read for qass leaves out what the owner keeps from it: a skipped space has no row
+    /// and no file, a skipped tab's task is not listed. The owner's own board shows all of it.
+    #[test]
+    fn a_board_read_for_qass_leaves_out_what_the_owner_keeps_from_it() {
+        let mut store = Store::in_memory().expect("store");
+        let shown = store.create_workspace("shown", 1).unwrap();
+        let kept = store.create_workspace("kept", 1).unwrap();
+        let plain = store.create_terminal(5, shown, "/w", "/bin/sh", 2).unwrap();
+        let private = store.create_terminal(6, shown, "/w", "/bin/sh", 2).unwrap();
+        let inside = store.create_terminal(7, kept, "/w", "/bin/sh", 2).unwrap();
+        store.open_task(plain, "plain work", false, 3).unwrap();
+        store.open_task(private, "private work", false, 3).unwrap();
+        store
+            .open_task(inside, "kept space work", false, 3)
+            .unwrap();
+        let text = |hidden: &Hidden| {
+            let dir = tempfile::tempdir().unwrap();
+            write_dir(&read(&store, &HashMap::new(), hidden).unwrap(), dir.path()).unwrap();
+            let mut all = String::new();
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                all += &std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            }
+            all
+        };
+        let owner = text(&Hidden::default());
+        for word in ["plain work", "private work", "kept space work", "kept"] {
+            assert!(owner.contains(word), "{word}: {owner}");
+        }
+        let qass = text(&Hidden {
+            spaces: BTreeSet::from([kept]),
+            tabs: BTreeSet::from([private]),
+        });
+        assert!(qass.contains("plain work"), "{qass}");
+        for word in ["private work", "kept space work", "kept"] {
+            assert!(!qass.contains(word), "{word}: {qass}");
+        }
     }
 
     /// The folder holds the owner's goal and each open task's goal, stage, plan, newest

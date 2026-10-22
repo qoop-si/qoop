@@ -918,6 +918,7 @@ async fn pre_feature_daemon(
                                 id,
                                 workspaces: vec![WorkspaceRow {
                                     keep_awake: false,
+                                    qass_skip: false,
                                     id: 1,
                                     name: "work".into(),
                                     terminals: 1,

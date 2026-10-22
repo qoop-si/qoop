@@ -200,6 +200,7 @@ pub struct TestDaemon {
     agents: std::sync::Arc<qoop_runtime::agents::AgentRegistry>,
     scanner: std::sync::Arc<qoop_runtime::daemon::ContainmentScanner>,
     warnings: std::sync::Arc<Mutex<Vec<qoop_runtime::daemon::Warning>>>,
+    skips: std::sync::Arc<Mutex<qoop_runtime::daemon::QassSkips>>,
 }
 
 /// Held across `Daemon::bind`, and the reason is a fork racing a file descriptor.
@@ -255,6 +256,7 @@ impl TestDaemon {
         let agents = daemon.agents();
         let scanner = daemon.scanner();
         let warnings = daemon.warnings();
+        let skips = daemon.qass_skips();
         let store = daemon.store();
         let workspace = daemon.workspace();
         tokio::spawn(async move {
@@ -268,6 +270,7 @@ impl TestDaemon {
             agents,
             scanner,
             warnings,
+            skips,
             store,
             workspace,
         }
@@ -320,6 +323,11 @@ impl TestDaemon {
 
     pub fn warnings_arc(&self) -> std::sync::Arc<Mutex<Vec<qoop_runtime::daemon::Warning>>> {
         self.warnings.clone()
+    }
+
+    /// The tabs the daemon holds as skipped by qass, whatever the rows say.
+    pub fn qass_skipped_tabs(&self) -> Vec<u32> {
+        self.skips.lock().unwrap().panes.iter().copied().collect()
     }
 
     /// Who the daemon believes is running in a terminal.

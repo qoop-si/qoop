@@ -206,6 +206,17 @@ pub enum ControlRequest {
         terminal: Option<u32>,
         on: bool,
     },
+    /// Have qass leave a space alone, or with `terminal` one pane of it: the watcher says
+    /// nothing about it and qass's own commands refuse it. Refused for the qass space and
+    /// qass's own tab. Answered `Renamed`, like keep awake; the change is announced, so every
+    /// client and the phone redraw the rows.
+    SetQassSkip {
+        id: String,
+        workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<u32>,
+        on: bool,
+    },
     /// Park a terminal's agent to answer later, or take it back: a person read its reply and
     /// set it aside. Refused while the agent works. Answered `Renamed`, like keep awake; the
     /// change is announced, so every client and the phone redraw the row.
@@ -1342,6 +1353,7 @@ impl ControlRequest {
             | Self::SetSpaceGoal { id, .. }
             | Self::MoveWorkspace { id, .. }
             | Self::SetKeepAwake { id, .. }
+            | Self::SetQassSkip { id, .. }
             | Self::SetParked { id, .. }
             | Self::Shutdown { id, .. }
             | Self::Scrollback { id, .. }
@@ -1897,6 +1909,10 @@ pub struct WorkspaceRow {
     /// true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_awake: bool,
+    /// A person asked qass to leave it alone: the space's own flag, which every tab in it
+    /// takes. Written only when true, and false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qass_skip: bool,
     /// What the owner wants from the work in it, one line, when he said. Absent from a
     /// daemon that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2128,6 +2144,11 @@ pub struct AgentRow {
     /// the space's row. Written only when true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_awake: bool,
+    /// qass leaves this agent alone: its pane's own flag or its space's, so a reader needs
+    /// no second look. A client that toggles it per tab reads the space's row first. Written
+    /// only when true, and false from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qass_skip: bool,
     /// A person parked this agent to answer later. Clients show it apart only while the agent
     /// is idle or done: a blocked or failed one shows as such. Written only when true, and
     /// false from a daemon that predates it.
@@ -2696,6 +2717,7 @@ mod tests {
             parked: false,
             news: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,

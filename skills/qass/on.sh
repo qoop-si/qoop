@@ -58,7 +58,8 @@ while [ "$i" -lt "$last" ]; do
     opts+=("$w" "$v")
     i=$((i + 2))
 done
-cmd='"$HOME/.local/bin/qoop"'
+# Marked as qass's own, so the qoop there refuses a tab its owner keeps from qass (`qass_skip`).
+cmd='QOOP_FROM_QASS=1 "$HOME/.local/bin/qoop"'
 for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
     cmd="$cmd '$a'"

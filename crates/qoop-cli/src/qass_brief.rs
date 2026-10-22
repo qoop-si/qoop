@@ -8,7 +8,7 @@ use std::path::Path;
 use qoop_history::{BaseDirs, Message, Role};
 use qoop_runtime::paths;
 
-use crate::qass::{PROMPTED_LOG, SPACE, json};
+use crate::qass::{PROMPTED_LOG, json};
 
 /// A message within this many seconds after a write from qass to that tab is qass's.
 const QASS_SAYS: i64 = 5;
@@ -470,6 +470,7 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
                 .trim_start_matches(['T', 't'])
                 .parse()
                 .map_err(|_| crate::usage("usage: qoop qass brief <n> [--json]"))?;
+            crate::qass_guard(&n.to_string())?;
             let (lines, json) = compose(&gather(n)?);
             print_out(as_json, lines, json)
         }
@@ -531,14 +532,9 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         .iter()
         .find(|r| caller.is_some() && r["terminal"].as_u64() == caller)
         .or_else(|| {
-            agents.iter().find(|r| {
-                r["agent"] == true
-                    && space_of(&r["workspace"]).as_deref() == Some(SPACE)
-                    && folder
-                        .as_deref()
-                        .zip(r["cwd"].as_str())
-                        .is_some_and(|(f, cwd)| crate::qass::in_folder(cwd, f))
-            })
+            folder
+                .as_deref()
+                .and_then(|f| crate::qass::row_in(&agents, &spaces, f))
         });
     let dirs = BaseDirs::from_home().ok();
     let text = |key: &str| row[key].as_str().filter(|s| !s.is_empty());

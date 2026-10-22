@@ -135,3 +135,156 @@ fn a_word_other_than_on_or_off_is_refused() {
     assert!(!out.status.success());
     assert!(runtime.switch().is_none());
 }
+
+impl Runtime {
+    /// `qoop <args>` with `env` set: whether it succeeded, and what it printed or said.
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String, String) {
+        let mut command = self.command();
+        command.args(args);
+        for var in ["QOOP_TERMINAL", "QOOP_TOKEN", "QOOP_FROM_QASS"] {
+            command.env_remove(var);
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let out = command.output().expect("run qoop");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )
+    }
+
+    /// A new shell in `space`: its number.
+    fn open(&self, space: &str) -> String {
+        let (ok, out, err) = self.run(&["new", "--space", space], &[]);
+        assert!(ok, "new failed: {err}");
+        out
+    }
+}
+
+/// `qoop qass watch off|on <T52|space>` skips and unskips a tab or a space, `qoop qass watch`
+/// lists what is skipped, and the row says so: `qoop agents --json` is what the watcher reads.
+#[test]
+fn a_tab_and_a_space_are_skipped_and_watched_again_from_the_command_line() {
+    let runtime = Runtime::new("s");
+    let _daemon = start(&runtime);
+    let (tab, other) = (runtime.open("work"), runtime.open("work"));
+    let in_space = runtime.open("kept");
+    let skipped = |terminal: &str| -> bool {
+        let (_, out, _) = runtime.run(&["agents", "--json"], &[]);
+        let rows: serde_json::Value = serde_json::from_str(&out).expect("json");
+        rows.as_array()
+            .and_then(|r| {
+                r.iter().find(|r| {
+                    r["terminal"].as_u64().map(|t| t.to_string()).as_deref() == Some(terminal)
+                })
+            })
+            .is_some_and(|r| r["qass_skip"] == true)
+    };
+    assert_eq!(runtime.watch(None), "watching on");
+
+    let (ok, out, err) = runtime.run(&["qass", "watch", "off", &format!("T{tab}")], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(out, format!("qass leaves T{tab} alone"));
+    assert!(skipped(&tab) && !skipped(&other));
+    let (_, listed, _) = runtime.run(&["qass", "watch"], &[]);
+    assert!(
+        listed.starts_with("watching on\nskipping T") && listed.contains(&format!("T{tab}")),
+        "{listed}"
+    );
+
+    // A space is skipped by name, and every tab in it with it; a name that is no space is refused.
+    assert!(runtime.run(&["qass", "watch", "off", "kept"], &[]).0);
+    assert!(skipped(&in_space));
+    assert!(
+        runtime
+            .run(&["qass", "watch"], &[])
+            .1
+            .contains("skipping space kept")
+    );
+    assert!(
+        !runtime
+            .run(&["qass", "watch", "off", "nothing-here"], &[])
+            .0
+    );
+
+    let (ok, out, _) = runtime.run(&["qass", "watch", "on", &format!("T{tab}")], &[]);
+    assert!(ok);
+    assert_eq!(out, format!("qass watches T{tab} again"));
+    assert!(!skipped(&tab));
+    assert!(runtime.run(&["qass", "watch", "on", "kept"], &[]).0);
+    assert!(!skipped(&in_space));
+}
+
+/// Commands aimed at a skipped tab are refused when they are qass's (`QOOP_FROM_QASS=1`, which
+/// on.sh sets), allowed for the owner's own shell and for any other terminal's, and allowed
+/// again once the tab is watched; a tab beside it is never refused. `task board --dir`
+/// leaves a skipped space out for qass only.
+#[test]
+fn qass_is_refused_a_skipped_tab_and_the_owner_is_not() {
+    let runtime = Runtime::new("g");
+    let _daemon = start(&runtime);
+    let (tab, beside) = (runtime.open("work"), runtime.open("work"));
+    let in_kept = runtime.open("kept");
+    assert!(
+        runtime
+            .run(&["qass", "watch", "off", &format!("T{tab}")], &[])
+            .0
+    );
+    assert!(runtime.run(&["qass", "watch", "off", "kept"], &[]).0);
+
+    let qass = [("QOOP_FROM_QASS", "1")];
+    for args in [
+        vec!["read", &tab],
+        vec!["send", &tab, "--enter", "echo hi"],
+        vec!["prompt", &tab, "--", "hi"],
+        vec!["history", &tab],
+        vec!["context", &tab],
+        vec!["messages", &tab],
+        vec!["agents", "explain", &tab],
+        vec!["close", &tab],
+        vec!["read", &in_kept],
+    ] {
+        let (ok, _, err) = runtime.run(&args, &qass);
+        assert!(
+            !ok && err.contains("leave alone"),
+            "{args:?} was not refused: {err}"
+        );
+    }
+    // qass cannot take the skip back to get in, nor skip a tab itself.
+    let (ok, _, err) = runtime.run(&["qass", "watch", "on", &format!("T{tab}")], &qass);
+    assert!(!ok && err.contains("only the owner"), "{err}");
+    let (ok, _, err) = runtime.run(&["qass", "watch", "off", &format!("T{beside}")], &qass);
+    assert!(!ok && err.contains("only the owner"), "{err}");
+    // The tab beside it is read, and the skipped one by the owner, by another terminal's number
+    // that is not qass's, and with the mark gone.
+    assert!(runtime.run(&["read", &beside], &qass).0);
+    assert!(runtime.run(&["read", &tab], &[]).0, "the owner's shell");
+    assert!(
+        runtime
+            .run(&["read", &tab], &[("QOOP_TERMINAL", &beside)])
+            .0,
+        "a tab that is not qass"
+    );
+    assert!(
+        runtime
+            .run(&["qass", "watch", "on", &format!("T{tab}")], &[])
+            .0
+    );
+    assert!(runtime.run(&["read", &tab], &qass).0);
+
+    // The board qass reads leaves a skipped space out; the owner's own board keeps it.
+    let board = |env: &[(&str, &str)]| {
+        let dir = runtime.0.join(format!("board-{}", env.len()));
+        let (ok, _, err) = runtime.run(&["task", "board", "--dir", dir.to_str().unwrap()], env);
+        assert!(ok, "{err}");
+        std::fs::read_to_string(dir.join("README.md")).expect("README")
+    };
+    let (mine, theirs) = (board(&[]), board(&qass));
+    assert!(mine.contains("kept") && mine.contains("work"), "{mine}");
+    assert!(
+        !theirs.contains("kept") && theirs.contains("work"),
+        "{theirs}"
+    );
+}

@@ -332,7 +332,9 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop onboard    the first start: pet, sounds, look, keys, notifications, sleep, qass\n\
                   \x20 qoop qass [page]  open qass, the assistant over your agents, or its page\n\
                   \x20 qoop qass brief <n> [--json]  what qass must know before it writes to agent n\n\
-                  \x20 qoop qass watch [on|off]  whether qass watches your agents, or wakes only when you write\n\
+                  \x20 qoop qass watch [on|off]  whether qass watches your agents, or wakes only when you write;\n\
+                  \x20                 plain, it also lists what qass skips\n\
+                  \x20 qoop qass watch off|on <T52|space>  have qass leave a tab or a space alone, or watch it again\n\
                   \x20 qoop report draft|list|show|rm|send|delete  qass's notes to qoop's maker\n\
                   \x20                 about its own way of working, checked and shown first\n\
                   \x20 qoop sound      hear the notification sounds and keep one each\n\
@@ -1591,6 +1593,50 @@ fn into_qass_refusal(target: u32, cwd: impl FnOnce() -> Option<String>) -> Optio
     )
 }
 
+/// Refuses a command qass aims at a tab the owner asked it to leave alone, with one plain line.
+/// It is qass's command when `QOOP_TERMINAL` names the terminal that is qass, or `QOOP_FROM_QASS=1`
+/// is set (what its `on.sh` puts before a command it runs on another computer); the owner's own
+/// tabs and shells are never refused. `target` is a terminal number, name or program, as the
+/// command takes it; one that names nothing passes, for the command to refuse in its own words.
+///
+/// A speed bump for a polite qass, not a lock: the skill is the rule, and a transcript on disk
+/// is read without the daemon.
+pub(crate) fn qass_guard(target: &str) -> std::io::Result<()> {
+    if !qass::may_be_qass() || !skips_any() {
+        return Ok(());
+    }
+    let Some(listing) = qass::json(&["agents", "--json"]) else {
+        return Ok(());
+    };
+    let rows: Vec<qoop_runtime::control::AgentRow> =
+        serde_json::from_value(listing).unwrap_or_default();
+    let Ok(row) = resolve_target(&rows, target) else {
+        return Ok(());
+    };
+    if !row.qass_skip || !qass::called_by_qass() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "terminal {} is one the owner asked qass to leave alone: it is not yours to read or touch",
+        row.terminal
+    )))
+}
+
+/// Whether this computer's qoop skips anything for qass, as the store says. Most never do, and
+/// then no command pays for a listing; a store that cannot be read says yes, so the full check runs.
+fn skips_any() -> bool {
+    let Ok(dir) = paths::runtime_dir() else {
+        return true;
+    };
+    match existing_store(&dir) {
+        Ok(Some(store)) => store.qass_skips().map_or(true, |(spaces, tabs)| {
+            !spaces.is_empty() || !tabs.is_empty()
+        }),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// `qoop send`: type into another terminal's session.
 ///
 /// This travels on the terminal channel's addressed input, the same lane every
@@ -1634,6 +1680,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         )));
     }
     supervise::check_generation(terminal, generation)?;
+    qass_guard(&terminal.to_string())?;
     if let Some(reason) = into_qass_refusal(terminal, || {
         crate::qass::json(&["agents", "--json"])?
             .as_array()?
@@ -1872,6 +1919,7 @@ fn run_read(args: &[String]) -> std::io::Result<()> {
         .get(2)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| usage(help))?;
+    qass_guard(&terminal.to_string())?;
     let mut lines: Option<usize> = None;
     let mut back: Option<usize> = None;
     let (mut json, mut watch) = (false, false);
@@ -2054,6 +2102,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         timeout,
         generation,
     } = parse_prompt_args(args).map_err(usage)?;
+    qass_guard(&target)?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -2242,6 +2291,7 @@ fn run_history(args: &[String]) -> std::io::Result<()> {
         return run_history_dir(args);
     }
     let opts = parse_history_args(args).map_err(usage)?;
+    qass_guard(&opts.target)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -2497,6 +2547,7 @@ fn run_context(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse};
 
     let opts = parse_context_args(args).map_err(usage)?;
+    qass_guard(&opts.target)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -2774,6 +2825,7 @@ fn run_agents(args: &[String]) -> std::io::Result<()> {
                 return Err(usage(format!("unknown flag {arg}; {help}")));
             }
         }
+        qass_guard(target)?;
         mode = Mode::Explain { target, json };
     } else {
         for arg in rest {
@@ -3371,6 +3423,7 @@ mod tests {
         AgentRow {
             parked: false,
             keep_awake: false,
+            qass_skip: false,
             background: 0,
             subagents: 0,
             task: None,

@@ -31,6 +31,7 @@ fn terminal_of(word: Option<&String>) -> std::io::Result<u32> {
 
 fn page(args: &[String]) -> std::io::Result<()> {
     let terminal = terminal_of(args.first())?;
+    crate::qass_guard(&terminal.to_string())?;
     let (mut skip, mut limit, mut json) = (0u32, 0u32, false);
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
@@ -86,6 +87,7 @@ fn page(args: &[String]) -> std::io::Result<()> {
 
 fn detail(args: &[String]) -> std::io::Result<()> {
     let terminal = terminal_of(args.first())?;
+    crate::qass_guard(&terminal.to_string())?;
     let tool_id = args.get(1).ok_or_else(|| usage(USAGE))?.clone();
     let mut json = false;
     for arg in args.iter().skip(2) {

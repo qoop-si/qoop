@@ -202,6 +202,31 @@ impl StoreHandle {
         .await
     }
 
+    pub async fn set_qass_skip(
+        &self,
+        workspace: i64,
+        terminal: Option<u32>,
+        on: bool,
+    ) -> Result<bool, HandleError> {
+        self.run(move |s| match terminal {
+            Some(t) => s.set_qass_skip_terminal(i64::from(t), on),
+            None => s.set_qass_skip_workspace(workspace, on),
+        })
+        .await
+    }
+
+    pub async fn qass_skips(
+        &self,
+    ) -> Result<
+        (
+            std::collections::BTreeSet<i64>,
+            std::collections::BTreeSet<i64>,
+        ),
+        HandleError,
+    > {
+        self.run(|s| s.qass_skips()).await
+    }
+
     pub async fn kept_awake(
         &self,
     ) -> Result<
