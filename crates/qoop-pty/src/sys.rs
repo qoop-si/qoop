@@ -733,6 +733,41 @@ mod argv_tests {
         assert!(argv.first().is_some_and(|a| a.contains("sh")), "{argv:?}");
     }
 
+    /// What `a_live_process_reports_the_environment_it_was_started_with` reads: this test
+    /// binary, sleeping. Not `/bin/sleep`, since macOS hides the environment of its own
+    /// platform binaries, which no agent is.
+    #[test]
+    #[ignore = "a helper the environment test starts"]
+    fn sleeps_with_a_marker_in_its_environment() {
+        if std::env::var_os("QOOP_ENV_MARKER").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn a_live_process_reports_the_environment_it_was_started_with() {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("this test"))
+            .args([
+                "--exact",
+                "sys::argv_tests::sleeps_with_a_marker_in_its_environment",
+            ])
+            .arg("--ignored")
+            .env("QOOP_ENV_MARKER", "qoop-env-value")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = Pid(child.id() as i32);
+        let (found, missing) = (
+            env_of(pid, "QOOP_ENV_MARKER"),
+            env_of(pid, "QOOP_ENV_MARKE"),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found.as_deref(), Some("qoop-env-value"));
+        assert_eq!(missing, None, "a prefix of a name is not the name");
+        assert_eq!(env_of(Pid(i32::MAX), "HOME"), None);
+    }
+
     #[test]
     fn a_process_that_is_gone_answers_nothing_rather_than_failing() {
         // Pid 1 is not ours to read on a mac, and a pid that never existed is not readable
@@ -751,6 +786,34 @@ mod argv_tests {
 /// cannot tell" and is what the caller already handles.
 #[cfg(target_os = "macos")]
 pub fn argv_of(pid: Pid) -> Vec<String> {
+    let (argc, rest) = procargs(pid);
+    rest.split(|b| *b == 0)
+        .take(argc)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// One variable of the environment a process was started with, as `argv_of` reads its argv.
+/// What it exported later is not seen. `None` when the process is gone, not ours to read, or
+/// was started without it.
+#[cfg(target_os = "macos")]
+pub fn env_of(pid: Pid, name: &str) -> Option<String> {
+    let (argc, rest) = procargs(pid);
+    // The environment follows the arguments and ends at an empty string, after which come
+    // the loader's own `key=value` strings, which are not the environment.
+    let wanted = format!("{name}=");
+    rest.split(|b| *b == 0)
+        .skip(argc)
+        .take_while(|s| !s.is_empty())
+        .find_map(|s| s.strip_prefix(wanted.as_bytes()))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
+/// The argument count and the run of NUL terminated strings after the executable path that
+/// `KERN_PROCARGS2` answers: the arguments, then the environment. Left as bytes, so a caller
+/// that wants the arguments decodes no environment.
+#[cfg(target_os = "macos")]
+fn procargs(pid: Pid) -> (usize, Vec<u8>) {
     // `KERN_PROCARGS2` answers with a small header and then a run of NUL terminated
     // strings: an `argc`, the executable path, padding, and then `argc` arguments. There is
     // no other unprivileged way to read another process's argv on macOS.
@@ -769,7 +832,7 @@ pub fn argv_of(pid: Pid) -> Vec<String> {
         )
     };
     if rc != 0 || size == 0 || size > 4 * 1024 * 1024 {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let mut buf = vec![0u8; size];
     // SAFETY: buf is live and `size` is the length sysctl just asked for.
@@ -784,7 +847,7 @@ pub fn argv_of(pid: Pid) -> Vec<String> {
         )
     };
     if rc != 0 || size < 4 {
-        return Vec::new();
+        return (0, Vec::new());
     }
     buf.truncate(size);
     let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
@@ -795,10 +858,9 @@ pub fn argv_of(pid: Pid) -> Vec<String> {
     while rest.first() == Some(&0) {
         rest = &rest[1..];
     }
-    rest.split(|b| *b == 0)
-        .take(argc)
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect()
+    let start = buf.len() - rest.len();
+    buf.drain(..start);
+    (argc, buf)
 }
 
 /// A process's argument vector. See the macOS version for what this is for.
@@ -809,6 +871,16 @@ pub fn argv_of(pid: Pid) -> Vec<String> {
         .ok()
         .and_then(|exe| emulated_argv(&exe.display().to_string(), &argv))
         .unwrap_or(argv)
+}
+
+/// One variable of the environment a process was started with. See the macOS version.
+#[cfg(not(target_os = "macos"))]
+pub fn env_of(pid: Pid, name: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{}/environ", pid.0)).ok()?;
+    raw.split(|b| *b == 0).find_map(|s| {
+        let s = String::from_utf8_lossy(s);
+        Some(s.strip_prefix(name)?.strip_prefix('=')?.to_string())
+    })
 }
 
 /// `/proc/pid/cmdline` as it is, emulator and all.

@@ -4,6 +4,7 @@
 // `say!`, never `eprintln!`, which panics on a full disk (`say`, `clippy.toml`).
 #![deny(clippy::disallowed_macros)]
 
+pub mod agent_view;
 pub mod agents;
 pub mod asks;
 pub mod avatar;

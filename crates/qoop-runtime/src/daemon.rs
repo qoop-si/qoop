@@ -7048,6 +7048,63 @@ fn here() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// How often the job a Claude agent view has open is looked up while one shows: a look
+/// reads Claude's pid files, and the screen of a working agent changes many times a second.
+const AGENT_VIEW_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Follow the job a Claude agent view in this tab has open (`crate::agent_view`): its
+/// conversation becomes the tab's, as a hook report from the tab would make it, so its
+/// title and chat are the ones every reader shows. The job's own hooks cannot say it: they
+/// run under Claude's daemon with the terminal of whichever tab started that.
+///
+/// In memory only: `claude --resume` refuses a conversation still running as a job, so a
+/// restore keeps the one the disk had. A tab that leaves the job keeps showing it until
+/// the host's own hook names another, which beats a bare number.
+///
+/// Answers when to look again: another job's name is looked at at once, and a look at the
+/// same name skipped for coming too soon is taken a second later even if the screen goes
+/// quiet, since a `/clear` in the job, which keeps its name, can land just after the redraw
+/// that was looked at.
+fn note_agent_view(
+    screen: &[String],
+    leader: Option<qoop_pty::Pid>,
+    looked: &mut Option<(String, std::time::Instant)>,
+    (agents, terminals): (&Arc<crate::agents::AgentRegistry>, &TerminalRegistry),
+    stream: u32,
+) -> Option<std::time::Instant> {
+    let Some(name) = crate::agent_view::border_name(screen) else {
+        // The list, or a screen of the host's own: the next job opened is looked at at once.
+        *looked = None;
+        return None;
+    };
+    let now = std::time::Instant::now();
+    if let Some((last, at)) = looked.as_ref()
+        && *last == name
+        && now.duration_since(*at) < AGENT_VIEW_LOOK
+    {
+        return Some(*at + AGENT_VIEW_LOOK);
+    }
+    *looked = Some((name.clone(), now));
+    let pid = leader?;
+    // Anywhere in the argv, since flags with values (`--model opus attach x`) come first.
+    let attach = qoop_pty::sys::argv_of(pid)
+        .iter()
+        .skip(1)
+        .any(|a| a == "attach");
+    let session = crate::agent_view::config_dir(pid.0)
+        .and_then(|config| crate::agent_view::shown_session(&config, pid.0, attach, &name))?;
+    if terminals.session_of(stream).as_deref() == Some(session.as_str()) {
+        return None;
+    }
+    let program = agent_program(agents, stream)?;
+    let generation = agents.agent(stream)?.belief.generation.0;
+    if terminals.set_session(stream, Some(session), Some(Said::By(program, generation))) {
+        // The index carries the id, so its readers hear of the new one.
+        agents.announce(stream);
+    }
+    None
+}
+
 /// Read where a terminal's shell is, and write it to the registry and the store when it
 /// moved. The index reads the registry, not the store: one synchronous write from the
 /// single writer, ordered with every later read by construction, and live even for a
@@ -11012,6 +11069,8 @@ async fn terminal_task(
     let mut trust_seen: Option<std::time::Instant> = None;
     let mut trust_sent: Option<std::time::Instant> = None;
     let mut trust_tries = 0;
+    // When the job a Claude agent view has open was last looked up (`note_agent_view`).
+    let mut agent_view_at: Option<(String, std::time::Instant)> = None;
     // When to re-announce a held blocker so a panel that missed one refresh
     // still converges. `None` unless a blocker holds, for the same reason:
     // the tick is recovery, not polling.
@@ -11624,6 +11683,18 @@ async fn terminal_task(
                         && let Some(manifest) = qoop_detect::rules_for(&program)
                     {
                         let screen = engine.visible_text();
+                        if program == "claude"
+                            && let Some(at) = note_agent_view(
+                                &screen,
+                                qoop_pty::sys::foreground_leader(master_raw),
+                                &mut agent_view_at,
+                                (&agents, &terminals),
+                                stream,
+                            )
+                        {
+                            let at = tokio::time::Instant::from_std(at);
+                            detect_at = Some(detect_at.map_or(at, |d| d.min(at)));
+                        }
                         // Counted from the live screen here, where it is read whether or
                         // not anyone watches: the published copy goes stale unwatched.
                         // Each program lists its sub-agents its own way: Claude in a panel
