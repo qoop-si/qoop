@@ -9,7 +9,8 @@
 //! an older one is refused (ADR-008, invariant I5).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use qoop_domain::{
     AgentBelief, AgentIdentity, AgentRuntimeState, Boundary, CapabilityToken, ClaimRefusal,
@@ -235,6 +236,14 @@ pub struct AgentRegistry {
     /// Tasks, board items or a space goal changed: a board reads them again. Its own
     /// channel, because it is not about any terminal's row.
     tasks: tokio::sync::broadcast::Sender<()>,
+    /// Each terminal's last [`Coarse`] state: what tells a change a board shows from one it does
+    /// not. A terminal's entry goes when it closes, so a number handed out again starts clean.
+    tokens: Mutex<BTreeMap<u32, Coarse>>,
+    /// The terminals that hold an open task, read from the store at start and after every task
+    /// write: a plain shell, or qass's tab, never makes a board read again.
+    task_terminals: Mutex<BTreeSet<u32>>,
+    /// A board re-read is already owed (see [`Self::tasks_changed_soon`]).
+    tasks_due: Arc<AtomicBool>,
     /// Which terminal a watched pid belongs to.
     by_pid: Mutex<HashMap<i32, u32>>,
     terminals: Mutex<BTreeMap<u32, TerminalAgent>>,
@@ -405,7 +414,54 @@ impl AgentRegistry {
     /// not end a park.
     pub fn announce(&self, stream: u32) {
         self.unpark_if_answered(stream);
+        self.note_token(stream);
         let _ = self.changes.send(stream);
+    }
+
+    /// A board draws what its agents are doing, so an agent of an open task moving between
+    /// working, idle, blocked and failed makes it read again. Only a change of that coarse
+    /// state: a terminal's first sighting is none (the wake calls [`Self::tasks_changed_soon`]
+    /// itself), and a repeat is not news.
+    fn note_token(&self, stream: u32) {
+        let now = self.terminals.lock().unwrap().get(&stream).map(coarse);
+        let mut tokens = self.tokens.lock().unwrap();
+        let changed = match now {
+            Some(now) => tokens.insert(stream, now).is_some_and(|was| was != now),
+            None => tokens.remove(&stream).is_some(),
+        };
+        drop(tokens);
+        if changed && self.task_terminals.lock().unwrap().contains(&stream) {
+            self.tasks_changed_soon();
+        }
+    }
+
+    /// The terminals that hold an open task, as the store has them.
+    pub fn set_task_terminals(&self, terminals: BTreeSet<u32>) {
+        *self.task_terminals.lock().unwrap() = terminals;
+    }
+
+    /// [`Self::tasks_changed`] on the trailing edge of a one-second window: the first call
+    /// starts a timer and the ones inside it ride on it, so a flapping agent costs a board
+    /// one read a second and the newest change always goes out. Never waits in the caller.
+    pub fn tasks_changed_soon(&self) {
+        if self.tasks_due.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (due, tasks) = (self.tasks_due.clone(), self.tasks.clone());
+        let send = move || {
+            // Down first: a change after this send starts the next window.
+            due.store(false, Ordering::SeqCst);
+            let _ = tasks.send(());
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(TASKS_WINDOW).await;
+                    send();
+                });
+            }
+            Err(_) => send(),
+        }
     }
 
     fn unpark_if_answered(&self, stream: u32) {
@@ -579,6 +635,34 @@ fn subagents(agent: &TerminalAgent) -> usize {
     agent.subagents.len().max(agent.background_agents)
 }
 
+/// How long a board re-read waits for more changes before it goes out.
+pub const TASKS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What an agent is doing, coarsely: the states a board words differently. A change between
+/// two of them is news to a board; a change inside one is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coarse {
+    Working,
+    Idle,
+    Blocked,
+    Failed,
+    Unknown,
+}
+
+/// The same order a status reads: blocked first, then work (its state or its sub-agents),
+/// then a failure.
+fn coarse(agent: &TerminalAgent) -> Coarse {
+    use AgentRuntimeState as S;
+    match agent.belief.state {
+        S::Blocked => Coarse::Blocked,
+        S::Working | S::Starting => Coarse::Working,
+        _ if subagents(agent) > 0 => Coarse::Working,
+        S::Failed => Coarse::Failed,
+        S::Idle | S::Done => Coarse::Idle,
+        S::Uncertain | S::Unknown => Coarse::Unknown,
+    }
+}
+
 fn fresh_belief(generation: GenerationId) -> AgentBelief {
     AgentBelief {
         generation,
@@ -645,6 +729,9 @@ impl AgentRegistry {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             watch: ProcWatch::new()?,
+            tokens: Mutex::new(BTreeMap::new()),
+            task_terminals: Mutex::new(BTreeSet::new()),
+            tasks_due: Arc::new(AtomicBool::new(false)),
             by_pid: Mutex::new(HashMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             focus: Mutex::new(BTreeMap::new()),
@@ -1139,6 +1226,19 @@ impl AgentRegistry {
             AgentIdentity::Known { agent: false, .. } => Some("generic".to_string()),
             _ => None,
         }
+    }
+
+    /// What a terminal's live row says, as far as a status reads it; no clone of the record.
+    pub fn live(&self, stream: u32) -> Option<crate::control::Live> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map(|a| crate::control::Live {
+                state: crate::control::state_name(a.belief.state),
+                last_active: a.last_active_at_unix,
+                subagents: subagents(a),
+            })
     }
 
     pub fn agent(&self, stream: u32) -> Option<TerminalAgent> {
@@ -2410,6 +2510,58 @@ mod tests {
             r.take_unparked().is_empty(),
             "a hand or a close tells the store itself"
         );
+    }
+
+    /// A board draws what the agent of an open task is doing, so it reads again when that
+    /// changes: once for a run of changes (the trailing edge of a one-second window), not for
+    /// a repeat, and never for a terminal that holds no task.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_terminal_changing_state_makes_a_board_read_once_per_window() {
+        use AgentRuntimeState::{Blocked, Idle, Working};
+        let r = registry();
+        let (one, two) = (mint_token(1), mint_token(2));
+        r.register(1, TerminalId::new("1"), one.clone());
+        r.register(2, TerminalId::new("2"), two.clone());
+        r.set_task_terminals([1].into());
+        let mut rx = r.subscribe_tasks();
+        let report = |stream: u32, token: &CapabilityToken, state| {
+            r.observe_hook(
+                stream,
+                &TerminalId::new(stream.to_string()),
+                token,
+                state,
+                false,
+                false,
+                now_unix(),
+            )
+            .expect("an admitted report applies")
+        };
+        // Paused time: a sleep here moves the clock the window waits on, and nothing else.
+        let window = TASKS_WINDOW + std::time::Duration::from_millis(1);
+        report(1, &one, Working);
+        report(1, &one, Idle);
+        report(1, &one, Blocked);
+        assert!(rx.try_recv().is_err(), "it goes out at the window's end");
+        tokio::time::sleep(window).await;
+        rx.try_recv().expect("one read for the run of changes");
+        assert!(rx.try_recv().is_err(), "only one");
+        // The same token again, and a terminal with no task: nothing to read again.
+        report(1, &one, Blocked);
+        report(2, &two, Working);
+        report(2, &two, Idle);
+        tokio::time::sleep(window).await;
+        assert!(rx.try_recv().is_err(), "no change a board shows");
+        // A closed terminal's agent is gone, which a board shows, and its token goes with it:
+        // a number handed out again starts clean.
+        r.forget(1);
+        tokio::time::sleep(window).await;
+        rx.try_recv().expect("a closed agent is a change");
+        r.register(1, TerminalId::new("1"), one.clone());
+        tokio::time::sleep(window).await;
+        assert!(rx.try_recv().is_err(), "a first sighting is no change");
+        report(1, &one, Idle);
+        tokio::time::sleep(window).await;
+        rx.try_recv().expect("and its next change is");
     }
 
     /// D2: a soak of identical evaluations publishes nothing, while a newly

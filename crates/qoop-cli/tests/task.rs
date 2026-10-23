@@ -807,7 +807,9 @@ $Q task stage waiting-human > stage.out 2>&1"#
     let (_, ls, _) = daemon.run(&["task", "ls"]);
     assert_eq!(ls.lines().count(), 1, "only the terminal's task: {ls}");
 
-    // A write that changes nothing is not news.
+    // A write that changes nothing is not news. A change of what a tab does is sent at the
+    // end of a one-second window: let the ones above come out first.
+    std::thread::sleep(qoop_runtime::agents::TASKS_WINDOW + Duration::from_millis(300));
     let before = count();
     let (ok, _, err) = daemon.run(&["task", "reopen", &key]);
     assert!(ok, "reopen an open item: {err}");

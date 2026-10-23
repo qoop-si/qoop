@@ -59,9 +59,10 @@
 #     -> blocked + `--event blocked`, labelled with the type for the two question
 #     dialogs (the daemon drafts an inbox card for one still up after 120 s), no label
 #     for the rest (they carry no tool); every other notification type reports nothing
-#   Stop -> idle + `--event done`, labelled with the last paragraph of its last message; the
-#   daemon keeps it only when it asks the owner something, and files it as a draft card when
-#   the agent waits on them; SessionEnd -> idle + `--event done`, no label
+#   Stop -> idle + `--event done`, labelled with the last paragraph of its last message
+#     (the payload's own, else the transcript's); the daemon keeps it only when it asks the
+#     owner something, and files it as a draft card when the agent waits on them;
+#     SessionEnd -> idle + `--event done`, no label
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 #   Stop, StopFailure with a `background_tasks` list -> also `--subagents` with
@@ -118,9 +119,29 @@ def one_line(text, limit=120):
     return single[:limit]
 
 
+def paragraph_of(text):
+    """The last paragraph of a message as one line. Its last paragraph, whatever it says: the
+    daemon decides whether it asks them (a "?", or an offer such as "if you like, I can ...").
+    Each line's markdown off. (A backtick is chr(96): one written out would end the shell's
+    command substitution.)"""
+    paragraph = []
+    for text_line in reversed(text.splitlines()):
+        bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
+        if bare:
+            paragraph.insert(0, bare)
+        elif paragraph:
+            break
+    return ends_kept(" ".join(paragraph))
+
+
 def last_paragraph(payload):
-    """The last paragraph of the turn's last message as one line, read from the end of the
-    transcript; "" when the turn has none or it cannot be read."""
+    """The last paragraph of the turn's last message as one line: the Stop payload's own
+    "last_assistant_message" (the transcript is written after the hook can run, so it may
+    not hold the turn yet), else read from the end of the transcript; "" when the turn has
+    none or it cannot be read."""
+    said = payload.get("last_assistant_message")
+    if isinstance(said, str) and said.strip():
+        return paragraph_of(said)
     path = payload.get("transcript_path")
     if not isinstance(path, str) or not path:
         return ""
@@ -152,17 +173,7 @@ def last_paragraph(payload):
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
         if not texts:
             continue
-        # Its last paragraph, whatever it says: the daemon decides whether it asks them (a
-        # "?", or an offer such as "if you like, I can ..."). Each line's markdown off.
-        # (A backtick is chr(96): one written out would end the shell's command substitution.)
-        paragraph = []
-        for text_line in reversed("\n".join(texts).splitlines()):
-            bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
-            if bare:
-                paragraph.insert(0, bare)
-            elif paragraph:
-                break
-        return ends_kept(" ".join(paragraph))
+        return paragraph_of("\n".join(texts))
     return ""
 
 

@@ -10,6 +10,8 @@
 //! done, so the claim can still be checked. Done from the agent is a claim, recorded and
 //! cleared by the next stage write; only a close ends a task, and the outcome says how.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::{Store, StoreError};
@@ -178,6 +180,15 @@ pub(crate) const COLUMNS: &str = "id, workspace, terminal, goal, stage, opened_a
      COALESCE((SELECT tm.cwd FROM terminal tm WHERE tm.id = task.terminal), \
      (SELECT e.body FROM task_event e WHERE e.task = task.id AND e.kind = 'folder' \
      ORDER BY e.id DESC LIMIT 1))";
+
+/// A subquery for when the task row named `alias` was last put to `waiting-human`: the time
+/// of its newest such stage event, `NULL` when it never was.
+pub(crate) fn waiting_at(alias: &str) -> String {
+    format!(
+        "(SELECT MAX(w.at) FROM task_event w WHERE w.task = {alias}.id \
+         AND w.kind = 'stage' AND w.body = 'waiting-human')"
+    )
+}
 
 pub(crate) fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -715,6 +726,56 @@ impl Store {
              AND id NOT IN (SELECT task FROM board_item) ORDER BY id"
         ))?;
         let rows = stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The open tasks no open item has: not an item, not linked to one still open, and not in
+    /// the space named `except` (qass's own), newest first. What a board shows apart from its
+    /// items.
+    pub fn loose_tasks(&self, except: &str) -> Result<Vec<TaskRow>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM task WHERE closed_at IS NULL \
+             AND id NOT IN (SELECT task FROM board_item) \
+             AND id NOT IN (SELECT l.task FROM task_item l JOIN task i ON i.id = l.item \
+                            WHERE i.closed_at IS NULL) \
+             AND (workspace IS NULL \
+                  OR workspace NOT IN (SELECT id FROM workspace WHERE name = ?1)) \
+             ORDER BY id DESC"
+        ))?;
+        let rows = stmt
+            .query_map(params![except], row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// When each open task now at `waiting-human` got there: its newest such stage event.
+    pub fn waiting_since(&self) -> Result<BTreeMap<i64, i64>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT task.id, {} FROM task \
+             WHERE closed_at IS NULL AND stage = 'waiting-human'",
+            waiting_at("task")
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?
+            .filter_map(|r| match r {
+                Ok((id, Some(at))) => Some(Ok((id, at))),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// The terminals that hold an open task.
+    pub fn open_task_terminals(&self) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT terminal FROM task WHERE closed_at IS NULL AND terminal IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 

@@ -25,7 +25,7 @@ const MATCHED: &[(&str, &str)] = &[
     ("qoop-runtime/src/idle.rs", "⏺◯"),
     // The trust menu's pointers, looked for on an agent's screen, never drawn.
     ("qoop-detect/src/lib.rs", "\u{276f}\u{203a}"),
-    ("qoop-runtime/src/asks.rs", "üı\u{307}"),
+    ("qoop-runtime/src/asks.rs", "üı\u{307}ö\u{201d}"),
     (
         "qoop-store/src/task.rs",
         "\u{200b}\u{200f}\u{202a}\u{202e}\u{2060}\u{206f}\u{feff}\u{e0000}\u{e007f}",

@@ -6,13 +6,15 @@
 //! terminal, because the socket is the owner's own. Who closes a task is a convention (qass
 //! or the person), not a check.
 
+use std::collections::BTreeMap;
+
 use qoop_domain::{CapabilityToken, TerminalId};
 use qoop_store::{Outcome, TaskEventRow, TaskRow};
 
 use crate::agents::AgentRegistry;
 use crate::control::{
-    ControlResponse, ItemCardInfo, ItemEventInfo, StepInfo, TASK_REF_GOAL, TaskEventInfo, TaskInfo,
-    TaskOp, TaskOutcome, TaskRef, item_info,
+    ControlResponse, ItemCardInfo, ItemEventInfo, StepInfo, TASK_REF_GOAL, Tab, TaskEventInfo,
+    TaskInfo, TaskOp, TaskOutcome, TaskRef, item_info, tab_of, task_status,
 };
 use crate::store::{HandleError, StoreHandle, now};
 
@@ -431,7 +433,8 @@ async fn item_write(
     }
 }
 
-fn info(t: TaskRow) -> TaskInfo {
+fn info(t: TaskRow, tab: Tab, waiting_at: Option<i64>) -> TaskInfo {
+    let (state, status_at) = task_status(&t, waiting_at, tab);
     TaskInfo {
         id: t.id,
         workspace: t.workspace,
@@ -444,6 +447,8 @@ fn info(t: TaskRow) -> TaskInfo {
         closed_at: t.closed_at,
         outcome: t.outcome,
         folder: t.folder,
+        status: state.as_str().to_string(),
+        status_at,
     }
 }
 
@@ -454,6 +459,14 @@ fn event_info(e: TaskEventRow) -> TaskEventInfo {
         kind: e.kind,
         body: e.body,
     }
+}
+
+/// Where a status stands in the order a board lists loose work: what needs the owner first.
+fn need_rank(status: &str) -> u8 {
+    ["waits", "checks", "error", "asleep", "idle", "working"]
+        .iter()
+        .position(|s| *s == status)
+        .map_or(6, |p| p as u8)
 }
 
 /// Keep items, in order, while the answer stays under the cap. Answers whether any was cut.
@@ -495,6 +508,7 @@ pub(crate) async fn read(
     let now = now();
     let found = store
         .run(move |s| {
+            let mut loose = None;
             let items = if board { Some(s.items(now)?) } else { None };
             let mut card = match task {
                 Some(task) => s.item_card(task, now)?,
@@ -530,20 +544,40 @@ pub(crate) async fn read(
                     };
                     (row.into_iter().collect::<Vec<_>>(), events, true)
                 }
+                // A board's tasks are the ones it has no card for, and how many there are.
+                None if board => {
+                    let all = s.loose_tasks(QASS_SPACE)?;
+                    loose = Some(all.len());
+                    (all, Vec::new(), false)
+                }
                 // Every open task.
                 None => (s.open_tasks()?, Vec::new(), false),
             };
-            Ok((items, card, tasks, events, one))
+            // What a status reads beyond the record: when each tab went to sleep, and when
+            // each waiting task began to wait.
+            let asleep: BTreeMap<i64, i64> = s
+                .asleep()?
+                .into_iter()
+                .map(|(terminal, _, since)| (terminal, since))
+                .collect();
+            let waiting = s.waiting_since()?;
+            Ok((items, card, tasks, events, one, loose, asleep, waiting))
         })
         .await;
-    let (items, card, tasks, events, one) = match found {
+    let (items, card, tasks, events, one, loose, asleep, waiting) = match found {
         Ok(found) => found,
         Err(e) => return store_failed(id, e),
     };
     let name = |t: i64| names.get(&t).cloned();
-    let items: Option<Vec<_>> = items.map(|v| v.into_iter().map(|r| item_info(r, name)).collect());
+    // A tab's live row is the registry's, a sleep the store's: the same two for every agent.
+    let tab = |terminal: i64| {
+        let live = u32::try_from(terminal).ok().and_then(|t| agents.live(t));
+        tab_of(live, &asleep, terminal)
+    };
+    let items: Option<Vec<_>> =
+        items.map(|v| v.into_iter().map(|r| item_info(r, name, tab)).collect());
     let card = card.map(|c| ItemCardInfo {
-        item: item_info(c.item, name),
+        item: item_info(c.item, name, tab),
         description: c.description,
         steps: c
             .steps
@@ -589,10 +623,11 @@ pub(crate) async fn read(
         space: space.clone(),
         items: items.as_ref().map(|_| Vec::new()),
         item: card.clone().map(Box::new),
+        loose: loose.map(|_| 0),
     })
     .map_or(ANSWER_BYTES, |v| v.len() + 64);
     let mut budget = ANSWER_BYTES.saturating_sub(envelope);
-    let (tasks, rows_cut) = fit(tasks.into_iter().map(info).collect(), &mut budget);
+    // Items first: a board that outgrows the frame loses loose tasks before it loses a card.
     let (items, items_cut) = match items {
         Some(items) => {
             let (kept, cut) = fit(items, &mut budget);
@@ -600,6 +635,24 @@ pub(crate) async fn read(
         }
         None => (None, false),
     };
+    let mut tasks: Vec<TaskInfo> = tasks
+        .into_iter()
+        .map(|t| {
+            let tab = t.terminal.map(tab).unwrap_or_default();
+            let waiting_at = waiting.get(&t.id).copied();
+            info(t, tab, waiting_at)
+        })
+        .collect();
+    if loose.is_some() {
+        // What the folded row lists: the tasks that need him first, so a cut loses the
+        // quiet ones; a stable sort keeps each rank newest first. A line carries a short
+        // goal, as the agents listing does.
+        tasks.sort_by_key(|t| need_rank(&t.status));
+        for t in &mut tasks {
+            t.goal = t.goal.chars().take(TASK_REF_GOAL).collect();
+        }
+    }
+    let (tasks, rows_cut) = fit(tasks, &mut budget);
     let (events, events_cut) = fit(events.into_iter().map(event_info).collect(), &mut budget);
     let (activity, activity_cut) = fit(activity, &mut budget);
     let item = card.map(|mut c| {
@@ -614,6 +667,7 @@ pub(crate) async fn read(
         space,
         items,
         item,
+        loose,
     }
 }
 
@@ -734,16 +788,114 @@ mod tests {
 
         let live = |t: i64| (t == 1).then(|| "its tab".to_string());
         let read = || store.run(move |s| s.items(10));
-        let open = crate::control::item_info(read().await.unwrap().remove(0), live);
+        let open =
+            crate::control::item_info(read().await.unwrap().remove(0), live, |_| Tab::default());
         assert_eq!(open.agents[0].name, "its tab", "open: the live name");
         store.run(|s| s.close_terminal(1, 5)).await.unwrap();
         // The terminal is gone, and its number may name another tab now.
-        let closed = crate::control::item_info(read().await.unwrap().remove(0), live);
+        let closed =
+            crate::control::item_info(read().await.unwrap().remove(0), live, |_| Tab::default());
         let agent = &closed.agents[0];
         assert!(agent.closed);
         assert_eq!(
             (agent.name.as_str(), agent.stage.as_str()),
             ("worker", crate::control::FINISHED)
+        );
+    }
+
+    /// A board's `tasks` are the open ones no open item has, outside qass's space, those that
+    /// need him first and then newest first, each with its status and a short goal, and
+    /// `loose` counts them all. Items are fitted first: four hundred long tasks cut the
+    /// tasks, never the item, and never the one that waits on him, though it is the oldest.
+    #[tokio::test]
+    async fn a_board_read_carries_the_loose_tasks_newest_first_and_never_loses_an_item() {
+        let agents = AgentRegistry::new().expect("registry");
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        let qass = s.create_workspace(QASS_SPACE, 1).unwrap();
+        let (item, _) = s.add_item(ws, "the item", "", 1).unwrap();
+        let t = s.create_terminal(1, ws, "/tmp", "/bin/sh", 2).unwrap();
+        let linked = s.open_task(t, "on the item", false, 3).unwrap();
+        s.link_task(linked, item, 4).unwrap();
+        let q = s.create_terminal(2, qass, "/tmp", "/bin/sh", 2).unwrap();
+        s.open_task(q, "in qass's space", false, 5).unwrap();
+        let goal = "x".repeat(qoop_store::task::GOAL_MAX);
+        let mut made = Vec::new();
+        for n in 10..410 {
+            let t = s.create_terminal(n, ws, "/tmp", "/bin/sh", 6).unwrap();
+            made.push(s.open_task(t, &goal, false, 100 + n).unwrap());
+        }
+        let waiting = made[0];
+        s.set_task_stage(waiting, "waiting-human", 900).unwrap();
+        let store = StoreHandle::new(s);
+        let answer = read(
+            "r".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            &agents,
+            &store,
+        )
+        .await;
+        let ControlResponse::Tasks {
+            tasks,
+            items,
+            loose,
+            more,
+            ..
+        } = answer
+        else {
+            panic!("not a board: {answer:?}")
+        };
+        assert_eq!(items.expect("the board").len(), 1, "the item survives");
+        assert_eq!(
+            loose,
+            Some(400),
+            "the true count, linked and qass's left out"
+        );
+        assert!(
+            more && !tasks.is_empty() && tasks.len() < 400,
+            "{}",
+            tasks.len()
+        );
+        let ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+        let mut rest: Vec<i64> = made[1..].iter().rev().copied().collect();
+        rest.truncate(ids.len() - 1);
+        assert_eq!(ids[0], waiting, "the wait leads, though it is the oldest");
+        assert_eq!(tasks[0].status, "waits");
+        assert_eq!(ids[1..], rest, "then newest first");
+        assert!(tasks.iter().all(|t| !t.status.is_empty()));
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.goal.chars().count() <= TASK_REF_GOAL)
+        );
+        // Read as a task of its own it keeps its whole goal.
+        let answer = read(
+            "r".into(),
+            false,
+            Some(waiting),
+            None,
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            &agents,
+            &store,
+        )
+        .await;
+        let ControlResponse::Tasks { tasks, loose, .. } = answer else {
+            panic!("not a task: {answer:?}")
+        };
+        assert_eq!(loose, None);
+        assert_eq!(tasks[0].goal.chars().count(), qoop_store::task::GOAL_MAX);
+        assert_eq!(
+            (tasks[0].status.as_str(), tasks[0].status_at),
+            ("waits", 900)
         );
     }
 

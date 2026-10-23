@@ -844,6 +844,8 @@ mod tests {
             closed_at: None,
             outcome: None,
             folder: None,
+            status: String::new(),
+            status_at: 0,
         }
     }
 

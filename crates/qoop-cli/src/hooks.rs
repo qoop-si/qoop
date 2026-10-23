@@ -1957,8 +1957,9 @@ mod tests {
     }
 
     /// A turn's end carries its last paragraph as one line, markdown off, read from the
-    /// transcript, so the daemon can tell whether it asks the owner and put it in his inbox; a
-    /// long one keeps both ends within the label's 120 characters.
+    /// payload's own message, else the transcript, so the daemon can tell whether it asks the
+    /// owner and put it in his inbox; a long one keeps both ends within the label's 120
+    /// characters.
     #[test]
     fn the_claude_hook_reports_the_turns_last_paragraph_at_its_end() {
         use std::os::unix::fs::PermissionsExt;
@@ -1973,14 +1974,22 @@ mod tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let script = dir.path().join("qoop-hook.sh");
         std::fs::write(&script, target("claude").body).expect("write");
-        let stop = |said: &str| -> String {
+        // A Stop payload as a real one has it (captured from Claude Code), with the transcript
+        // the test chooses and, when given, the turn's message.
+        let stop = |transcript: &str, message: Option<&str>| -> String {
             let _ = std::fs::remove_file(&log);
-            let transcript = dir.path().join("t.jsonl");
-            let turn = serde_json::json!({"type": "assistant", "message": {"role": "assistant",
-                "content": [{"type": "text", "text": said}]}});
-            std::fs::write(&transcript, format!("{turn}\n")).expect("write");
-            let payload = serde_json::json!({"hook_event_name": "Stop",
-                "transcript_path": transcript, "cwd": dir.path()});
+            let path = dir.path().join("t.jsonl");
+            std::fs::write(&path, transcript).expect("write");
+            let mut payload = serde_json::json!({
+                "session_id": "f339fcc3-ddfe-4fe2-8dc0-e4b6ddbf18f9",
+                "transcript_path": path, "cwd": dir.path(),
+                "prompt_id": "7fc6b60f-5f51-4333-999e-4b03ffb3218e",
+                "permission_mode": "default", "effort": {"level": "medium"},
+                "hook_event_name": "Stop", "stop_hook_active": false,
+                "background_tasks": [], "session_crons": []});
+            if let Some(message) = message {
+                payload["last_assistant_message"] = message.into();
+            }
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&script)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
@@ -1999,20 +2008,31 @@ mod tests {
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
-        let said = stop("Built and tested.\n**Merge PR #513 now or deploy first?**\nSay which.");
+        let turn = |said: &str| -> String {
+            let turn = serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": said}]}});
+            format!("{turn}\n")
+        };
+        let said = stop(
+            &turn("Built and tested.\n**Merge PR #513 now or deploy first?**\nSay which."),
+            None,
+        );
         assert!(
             said.contains(
                 "--event|done|--label|Built and tested. Merge PR #513 now or deploy first? Say which.|"
             ),
             "{said}"
         );
-        let said = stop("Fixed the 404.\n\nIstersen bunu ayri bir is olarak guncellerim.");
+        let said = stop(
+            &turn("Fixed the 404.\n\nIstersen bunu ayri bir is olarak guncellerim."),
+            None,
+        );
         assert!(
             said.contains("--label|Istersen bunu ayri bir is olarak guncellerim.|"),
             "only the last paragraph: {said}"
         );
         let long = format!("Istersen {} hazirlayayim mi?", "x ".repeat(100));
-        let said = stop(&long);
+        let said = stop(&turn(&long), None);
         let label = said
             .split("--label|")
             .nth(1)
@@ -2025,34 +2045,17 @@ mod tests {
             "{label}"
         );
         // A question he already answered is not the turn's: his prompt ends the read back.
-        let _ = std::fs::remove_file(&log);
-        let transcript = dir.path().join("t.jsonl");
         let ask = serde_json::json!({"message": {"role": "assistant",
             "content": [{"type": "text", "text": "Merge PR #513 now?"}]}});
         let answer = serde_json::json!({"message": {"role": "user", "content": "merge it"}});
         let tool = serde_json::json!({"message": {"role": "assistant",
             "content": [{"type": "tool_use", "input": {"command": "qoop task stage implementing"}}]}});
-        std::fs::write(&transcript, format!("{ask}\n{answer}\n{tool}\n")).expect("write");
-        let payload = serde_json::json!({"hook_event_name": "Stop",
-            "transcript_path": transcript, "cwd": dir.path()});
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
-            .env("QOOP_TERMINAL", "1")
-            .env("QOOP_TOKEN", "t")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .expect("run the hook");
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(payload.to_string().as_bytes())
-            .expect("payload");
-        assert!(child.wait().expect("wait").success());
-        let said = std::fs::read_to_string(&log).unwrap_or_default();
+        let said = stop(&format!("{ask}\n{answer}\n{tool}\n"), None);
         assert!(!said.contains("--label"), "an answered question: {said}");
+        // The payload carries the message itself while the transcript does not hold the turn
+        // yet (it is written after the hook runs): the payload's message is the label.
+        let said = stop("", Some("Built it.\n\nMerge now?"));
+        assert!(said.contains("--event|done|--label|Merge now?|"), "{said}");
     }
 
     /// What a subagent fires describes the subagent: its tool calls and its end would

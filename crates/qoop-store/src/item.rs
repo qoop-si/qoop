@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::task::{
     COLUMNS, Outcome, STAGES, TaskError, TaskEventRow, TaskRow, close, event, goal_text, one_line,
-    open_row, printable, row, row_of, touch, within,
+    open_row, printable, row, row_of, touch, waiting_at, within,
 };
 use crate::{Store, StoreError};
 
@@ -116,6 +116,12 @@ pub struct ItemAgent {
     pub updated_at: i64,
     /// When it began on the item: a local task's opening, a remote agent's first report.
     pub since: i64,
+    /// How its task was closed; `None` while open, and for a remote agent.
+    pub outcome: Option<String>,
+    pub claimed_at: Option<i64>,
+    pub closed_at: Option<i64>,
+    /// When its task was last put to `waiting-human`, if ever (a local task).
+    pub waiting_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,11 +362,12 @@ fn state(
 }
 
 fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare(&format!(
         "SELECT t.id, t.terminal, t.stage, t.claimed_at IS NOT NULL, t.closed_at IS NOT NULL, \
-         t.updated_at, l.name, t.opened_at FROM task_item l JOIN task t ON t.id = l.task \
-         WHERE l.item = ?1 ORDER BY t.id",
-    )?;
+         t.updated_at, l.name, t.opened_at, t.outcome, t.claimed_at, t.closed_at, {} \
+         FROM task_item l JOIN task t ON t.id = l.task WHERE l.item = ?1 ORDER BY t.id",
+        waiting_at("t")
+    ))?;
     let mut all = stmt
         .query_map(params![item], |r| {
             Ok(ItemAgent {
@@ -373,6 +380,10 @@ fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
                 closed: r.get(4)?,
                 updated_at: r.get(5)?,
                 since: r.get(7)?,
+                outcome: r.get(8)?,
+                claimed_at: r.get(9)?,
+                closed_at: r.get(10)?,
+                waiting_at: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -394,6 +405,10 @@ fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
             updated_at: r.get(4)?,
             // A remote agent's start is not reported, and its newest report is no start: none.
             since: 0,
+            outcome: None,
+            claimed_at: None,
+            closed_at: None,
+            waiting_at: None,
         })
     })?;
     for agent in remote {
@@ -1269,6 +1284,91 @@ mod tests {
         s.close_task(item, Outcome::Verified, "checked", 50)
             .unwrap();
         assert_eq!(since(51), 50);
+    }
+
+    /// An agent carries the times and the outcome a status reads: when its task last went to
+    /// `waiting-human`, when it was claimed, and how it ended.
+    #[test]
+    fn an_agent_carries_the_times_a_status_reads() {
+        let (s, ws, t) = setup();
+        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let task = s.open_task(t, "ship it", false, 20).unwrap();
+        s.link_task(task, item, 30).unwrap();
+        let agent = |s: &Store, at| {
+            s.item_card(item, at)
+                .unwrap()
+                .unwrap()
+                .item
+                .agents
+                .remove(0)
+        };
+        let a = agent(&s, 31);
+        assert_eq!(
+            (a.waiting_at, a.claimed_at, a.closed_at, a.outcome),
+            (None, None, None, None)
+        );
+        s.set_task_stage(task, "waiting-human", 40).unwrap();
+        s.set_task_stage(task, "implementing", 50).unwrap();
+        s.set_task_stage(task, "waiting-human", 60).unwrap();
+        assert_eq!(agent(&s, 61).waiting_at, Some(60), "the newest wait");
+        s.set_task_stage(task, "verifying", 70).unwrap();
+        s.claim_task_done(task, "done", 75).unwrap();
+        assert_eq!(agent(&s, 76).claimed_at, Some(75));
+        s.close_task(task, Outcome::Verified, "checked", 80)
+            .unwrap();
+        let a = agent(&s, 81);
+        assert_eq!(
+            (a.closed_at, a.outcome.as_deref()),
+            (Some(80), Some("verified"))
+        );
+    }
+
+    /// The loose set is the open tasks no open item has, newest first, and not those of the
+    /// space named.
+    #[test]
+    fn the_loose_tasks_are_the_open_ones_no_open_item_has() {
+        let (mut s, ws, t) = setup();
+        let qass = s.create_workspace("qass", 3).unwrap();
+        let other = s.create_terminal(9, ws, "/tmp", "/bin/sh", 4).unwrap();
+        let third = s.create_terminal(10, ws, "/tmp", "/bin/sh", 5).unwrap();
+        let inside = s.create_terminal(11, qass, "/tmp", "/bin/sh", 6).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let linked = s.open_task(t, "linked", false, 20).unwrap();
+        s.link_task(linked, item, 21).unwrap();
+        let first = s.open_task(other, "first", false, 22).unwrap();
+        let second = s.open_task(third, "second", false, 23).unwrap();
+        s.open_task(inside, "qass's own", false, 24).unwrap();
+        let ids = |s: &Store| -> Vec<i64> {
+            s.loose_tasks("qass")
+                .unwrap()
+                .iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&s),
+            [second, first],
+            "newest first, none linked, none of qass"
+        );
+        // The item closed: the agent that worked on it has no open item left, so it is loose.
+        s.close_task(item, Outcome::Verified, "checked", 30)
+            .unwrap();
+        assert_eq!(ids(&s), [second, first, linked]);
+    }
+
+    /// The terminals that hold an open task are the ones whose task is open, each once.
+    #[test]
+    fn the_task_terminals_are_those_holding_an_open_task() {
+        let (mut s, ws, t) = setup();
+        let other = s.create_terminal(9, ws, "/tmp", "/bin/sh", 4).unwrap();
+        s.create_terminal(10, ws, "/tmp", "/bin/sh", 5).unwrap();
+        let first = s.open_task(t, "a", false, 20).unwrap();
+        s.open_task(other, "b", false, 21).unwrap();
+        let mut held = s.open_task_terminals().unwrap();
+        held.sort();
+        assert_eq!(held, [t, other], "the third terminal holds none");
+        s.close_task(first, Outcome::Verified, "done", 30).unwrap();
+        assert_eq!(s.open_task_terminals().unwrap(), [other]);
     }
 
     /// An ended agent's task points at the open item it worked on, and at nothing once that

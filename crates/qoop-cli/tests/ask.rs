@@ -653,12 +653,21 @@ fn a_card_ends_when_the_owner_puts_it_away_or_its_worker_is_told_in_the_chat() {
     );
     let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
     assert!(out.contains("answered in chat"), "{out}");
-    // E20 is not E2: only the card a head names is closed.
+    // E20 is not E200: only the card a head names is closed as answered. The prompt itself may
+    // still close it as taken, when it lands in a later second than the card (`prompt_taken`
+    // compares whole seconds), so the reason is what is checked, not that it stays open.
     add(&stack, &shell, "E20", &format!("T{korea}"), "korea");
     let (ok, _, err) = stack.run(&["send", &korea, "RELAY E200", "--enter"]);
     assert!(ok, "{err}");
     std::thread::sleep(Duration::from_millis(800));
-    assert_eq!(stack.card_status("E20"), "open");
+    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
+    let all: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let e20 = ["live", "ended"]
+        .iter()
+        .flat_map(|k| all[k].as_array().cloned().unwrap_or_default())
+        .find(|c| c["card"] == "E20")
+        .expect("E20 is listed");
+    assert_ne!(e20["note"], "answered in chat", "{out}");
 }
 
 #[test]

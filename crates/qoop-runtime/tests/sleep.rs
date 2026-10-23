@@ -907,3 +907,86 @@ async fn a_wake_types_the_board_page_only_into_qasss_board_tab() {
         );
     }
 }
+
+/// Board re-reads heard while `wait` passes.
+async fn board_reads(heard: &mut tokio::sync::broadcast::Receiver<()>, wait: Duration) -> usize {
+    tokio::time::sleep(wait).await;
+    let mut n = 0;
+    while heard.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// A board words an agent asleep, so a tab with an open task going to sleep, and coming back,
+/// each make a board read again, once: a task write says nothing about either.
+///
+/// The sleep needs no call of its own: the tab's end changes its token, and the read goes out at
+/// the end of the window, after the sleep mark is written. A woken tab is a first sighting, which
+/// changes no token, so the wake asks for the read itself; the test takes the tab out of the
+/// registry's set of task terminals before the wake, so that its later changes cannot stand in
+/// for that call.
+#[tokio::test]
+async fn a_task_tab_sleeping_and_waking_each_make_a_board_read_once() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("board").await;
+    let space = new_space(&mut c, "board").await;
+    let tab = new_tab(&mut c, space, "t1").await;
+    let token = d
+        .agents_arc()
+        .token_of(tab)
+        .expect("a token")
+        .as_str()
+        .to_string();
+    let opened = ask(
+        &mut c,
+        ControlRequest::TaskWrite {
+            id: "w".into(),
+            terminal: Some(tab),
+            token: Some(token),
+            task: None,
+            action: qoop_runtime::control::TaskOp::New {
+                goal: "keep the board true".into(),
+                replace: false,
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(opened, ControlResponse::TaskWritten { .. }),
+        "{opened:?}"
+    );
+    let mut heard = d.agents_arc().subscribe_tasks();
+    // What the open and the tab's start said, said before the sleep is asked.
+    // The window a board read waits out, and a margin for the daemon's own pace.
+    let settled = qoop_runtime::agents::TASKS_WINDOW + Duration::from_millis(300);
+    board_reads(&mut heard, settled).await;
+    let slept = sleep_tab(&mut c, space, Some(tab)).await;
+    assert_eq!(changed(&slept), vec![tab], "{slept:?}");
+    assert_eq!(board_reads(&mut heard, settled).await, 1, "the sleep");
+    d.agents_arc().set_task_terminals(Default::default());
+    let woke = wake_tab(&mut c, space, Some(tab)).await;
+    assert_eq!(changed(&woke), vec![tab], "{woke:?}");
+    assert_eq!(board_reads(&mut heard, settled).await, 1, "the wake");
+    // Read after it, the board no longer says the task's agent is asleep.
+    let board = ask(
+        &mut c,
+        ControlRequest::TaskRead {
+            id: "board".into(),
+            board: true,
+            task: None,
+            terminal: None,
+            token: None,
+            before: None,
+        },
+    )
+    .await;
+    let ControlResponse::Tasks { tasks, .. } = board else {
+        panic!("not a board: {board:?}")
+    };
+    let task = tasks.iter().find(|t| t.terminal == Some(i64::from(tab)));
+    assert!(
+        task.is_some_and(|t| !t.status.is_empty() && t.status != "asleep"),
+        "{tasks:?}"
+    );
+}

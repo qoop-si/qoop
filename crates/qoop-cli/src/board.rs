@@ -8,13 +8,16 @@
 //! spaces may share a name), rewritten whole each time, so a copy never drifts from the
 //! record; it only ages, and says how old it is.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::qass_page::ago;
 
-use qoop_runtime::control::{ControlRequest, ControlResponse, ItemInfo, agent_name, item_info};
+use qoop_runtime::control::{
+    AgentRow, ControlRequest, ControlResponse, ItemInfo, Live, Status, agent_name, item_info,
+    tab_of, task_status,
+};
 use qoop_runtime::{client, paths};
 use qoop_store::task::one_line;
 use qoop_store::{Store, TaskRow};
@@ -39,6 +42,9 @@ struct Space {
 struct Open {
     task: TaskRow,
     name: String,
+    /// What its agent is doing and since when, as the board's other readers word it.
+    status: Status,
+    status_at: i64,
     /// When it moved to its stage: its newest stage event, else its opening.
     staged: i64,
     plan: Option<String>,
@@ -81,8 +87,9 @@ fn local_now() -> String {
         .unwrap_or_else(|| format!("unix {}", now()))
 }
 
-/// The live sidebar names of this machine's agents, by terminal; empty without a daemon.
-fn live_titles() -> HashMap<i64, String> {
+/// The live rows of this machine's agents, by terminal: their sidebar names and what each tab
+/// is doing. Empty without a daemon.
+fn live_rows() -> HashMap<i64, AgentRow> {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -104,7 +111,7 @@ fn live_titles() -> HashMap<i64, String> {
         match crate::ask_over(stream, inbuf, &request, crate::ASK_PATIENCE).await {
             Ok(ControlResponse::Agents { agents, .. }) => agents
                 .into_iter()
-                .filter_map(|a| Some((i64::from(a.terminal), a.agent_title?)))
+                .map(|a| (i64::from(a.terminal), a))
                 .collect(),
             _ => HashMap::new(),
         }
@@ -130,7 +137,7 @@ struct Hidden {
     tabs: BTreeSet<i64>,
 }
 
-fn read(store: &Store, live: &HashMap<i64, String>, hidden: &Hidden) -> std::io::Result<Board> {
+fn read(store: &Store, live: &HashMap<i64, AgentRow>, hidden: &Hidden) -> std::io::Result<Board> {
     let now = now();
     let stored: HashMap<String, String> = store
         .session_titles()
@@ -152,17 +159,32 @@ fn read(store: &Store, live: &HashMap<i64, String>, hidden: &Hidden) -> std::io:
         let session = row.agent_session.as_deref();
         Some(agent_name(
             terminal,
-            live.get(&terminal).cloned(),
+            live.get(&terminal).and_then(|a| a.agent_title.clone()),
             session.and_then(|s| stored.get(s).cloned()),
             row.title.clone(),
             session,
         ))
     };
+    // What a tab is doing: the daemon's live row, or the sleep the store kept for it.
+    let asleep: BTreeMap<i64, i64> = store
+        .asleep()
+        .map_err(std::io::Error::other)?
+        .into_iter()
+        .map(|(terminal, _, since)| (terminal, since))
+        .collect();
+    let tab = |terminal: i64| {
+        tab_of(
+            live.get(&terminal).and_then(Live::of_row),
+            &asleep,
+            terminal,
+        )
+    };
+    let waiting = store.waiting_since().map_err(std::io::Error::other)?;
     let items: Vec<ItemInfo> = store
         .items(now)
         .map_err(std::io::Error::other)?
         .into_iter()
-        .map(|row| item_info(row, name_of))
+        .map(|row| item_info(row, name_of, tab))
         .filter(|item| !item.workspace.is_some_and(|w| hidden.spaces.contains(&w)))
         .map(|mut item| {
             item.agents
@@ -203,9 +225,13 @@ fn read(store: &Store, live: &HashMap<i64, String>, hidden: &Hidden) -> std::io:
                 Some(_) => newest("done", 1)?.into_iter().next().map(|e| e.body),
                 None => None,
             };
+            let tab = task.terminal.map(tab).unwrap_or_default();
+            let (state, status_at) = task_status(&task, waiting.get(&task.id).copied(), tab);
             open.push(Open {
                 task,
                 name,
+                status: state,
+                status_at,
                 staged,
                 plan,
                 evidence,
@@ -395,9 +421,13 @@ fn space(b: &Board, s: &Space) -> String {
     }
     for o in &s.tasks {
         let t = &o.task;
+        // What its agent is doing, as the board page words it (`asleep · 13 d`); a status with no
+        // word of its own leaves the stage to say it.
+        let doing = crate::board_page::status_said(o.status.as_str(), o.status_at, b.now)
+            .map_or(String::new(), |(word, _)| format!(" · {word}"));
         let _ = writeln!(
             out,
-            "\n## {} · task #{} · {} since {} · updated {}\n\nGoal: {}",
+            "\n## {} · task #{} · {} since {}{doing} · updated {}\n\nGoal: {}",
             one_line(&o.name),
             t.id,
             t.stage,
@@ -486,7 +516,7 @@ pub(crate) fn run(dir: Option<&Path>, json: bool) -> std::io::Result<()> {
         }
         return Ok(());
     };
-    let board = read(&store, &live_titles(), &hidden_from_qass(&store)?)?;
+    let board = read(&store, &live_rows(), &hidden_from_qass(&store)?)?;
     if json {
         println!(
             "{}",
@@ -545,6 +575,52 @@ mod tests {
         let mut b = read(&store, &HashMap::new(), &Hidden::default()).unwrap();
         b.asof = "2026-10-10 21:40".into();
         (dir, b)
+    }
+
+    /// An open task's heading says what its agent is doing and since when, in the board page's
+    /// words: a slept tab, a live one and a claim, each from the same status.
+    #[test]
+    fn an_open_tasks_line_says_its_status_and_its_age() {
+        let mut store = Store::in_memory().expect("store");
+        let ws = store.create_workspace("web", 1).unwrap();
+        let now = now();
+        let day = 86_400;
+        let mut tabs = Vec::new();
+        for n in 5..8 {
+            let t = store.create_terminal(n, ws, "/w", "/bin/sh", 2).unwrap();
+            let task = store
+                .open_task(t, &format!("job {n}"), false, now - 30 * day)
+                .unwrap();
+            tabs.push((t, task));
+        }
+        store
+            .sleep_terminals(
+                now - 13 * day,
+                &[qoop_store::Checkpoint {
+                    terminal: tabs[0].0,
+                    agent: None,
+                    agent_session: None,
+                }],
+            )
+            .unwrap();
+        let busy: AgentRow = serde_json::from_value(serde_json::json!({
+            "terminal": 6, "workspace": ws, "state": "working", "readiness": "ready",
+            "agent": true, "last_active_at_unix": now - 3 * day,
+        }))
+        .unwrap();
+        store
+            .claim_task_done(tabs[2].1, "ok", now - 8 * day)
+            .unwrap();
+        let live = HashMap::from([(6, busy)]);
+        let b = read(&store, &live, &Hidden::default()).unwrap();
+        let text = space(&b, &b.spaces[0]);
+        for want in [
+            "task #1 · investigating since 30 d ago · asleep · 13 d · updated",
+            "task #2 · investigating since 30 d ago · working · 3 d · updated",
+            "task #3 · investigating since 30 d ago · qass checks · 8 d · updated",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
     }
 
     /// A closed item is listed among the closed with its close time, and the agent task that

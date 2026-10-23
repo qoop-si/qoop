@@ -1346,6 +1346,7 @@ impl Daemon {
         // Armed before anything is restored, so an agent that comes back is recorded the
         // first time it is recognised rather than the first time it changes.
         spawn_agent_recorder(agents.clone(), terminals.clone(), books.clone());
+        spawn_task_terminals(agents.clone(), books.store.clone());
 
         // What the last daemon was holding when it stopped. A person who closed qoop and
         // opened it again asked for their work back, not for an empty screen.
@@ -3310,25 +3311,6 @@ fn claude_session_title_at(path: &Path) -> Option<String> {
     custom.or(generated)
 }
 
-/// The wire name of a runtime state.
-///
-/// A table and not a derive, because this string is on the socket: ADR-010 freezes the
-/// shape of what crosses it, and a rename in the domain would silently rename a field
-/// clients match on.
-fn state_name(state: qoop_domain::AgentRuntimeState) -> &'static str {
-    use qoop_domain::AgentRuntimeState as S;
-    match state {
-        S::Starting => "starting",
-        S::Idle => "idle",
-        S::Working => "working",
-        S::Blocked => "blocked",
-        S::Done => "done",
-        S::Failed => "failed",
-        S::Uncertain => "uncertain",
-        S::Unknown => "unknown",
-    }
-}
-
 /// Seconds a tab idles before it sleeps by itself: for every tab, and for the tab of qass's
 /// space. `0` is never.
 #[derive(Clone, Copy)]
@@ -4873,7 +4855,7 @@ async fn handle_control(
                         };
                     let state = agent
                         .as_ref()
-                        .map(|a| state_name(a.belief.state))
+                        .map(|a| crate::control::state_name(a.belief.state))
                         .unwrap_or("unknown")
                         .to_string();
                     let agent_session = terminals.session_of(terminal);
@@ -5236,8 +5218,14 @@ async fn handle_control(
                         // it asks him something. Masked and cut like any label: a token in the
                         // question never reaches the card or the phone.
                         let label = if kind == "done" {
+                            let asks = label.as_deref().is_some_and(crate::asks::asks_owner);
+                            // The verdict and nothing of the text, for finding a turn the
+                            // reader got wrong without keeping what the agent said.
+                            crate::say!(
+                                "qoopd: terminal {terminal} ended its turn; its label asks him: {asks}"
+                            );
                             label
-                                .filter(|l| crate::asks::asks_owner(l))
+                                .filter(|_| asks)
                                 .map(|l| crate::control::truncate_focus_label(&l))
                         } else {
                             label
@@ -6857,6 +6845,28 @@ async fn set_qass_skip(
             reason: format!("the qass skip could not be saved: {e}"),
         },
     }
+}
+
+/// Keeps the registry's set of terminals holding an open task: read once now, then again after
+/// every task write, each of which says `tasks_changed`. Without it the registry would tell a
+/// board about every plain shell too.
+fn spawn_task_terminals(
+    agents: Arc<crate::agents::AgentRegistry>,
+    store: crate::store::StoreHandle,
+) {
+    // Subscribed before the first read, so a write in between is not lost.
+    let mut changed = agents.subscribe_tasks();
+    tokio::spawn(async move {
+        loop {
+            match store.run(|s| s.open_task_terminals()).await {
+                Ok(held) => agents.set_task_terminals(held.into_iter().map(|t| t as u32).collect()),
+                Err(e) => crate::say!("qoopd: the terminals holding a task could not be read: {e}"),
+            }
+            if let Err(tokio::sync::broadcast::error::RecvError::Closed) = changed.recv().await {
+                return;
+            }
+        }
+    });
 }
 
 /// Record which agent is in each terminal, as the registry decides it.
@@ -8631,6 +8641,10 @@ async fn wake_locked(
     if unmarked.is_err() {
         unmarked = into.books.store.unmark(ids).await;
     }
+    // A woken tab is a first sighting to the registry, which notes no change of token for it:
+    // a board that said asleep is told to read again (a sleep needs no call, its tab's end
+    // changes the token).
+    into.agents.tasks_changed_soon();
     // Off here either way: the tabs are running, and a mark here would leave them neither
     // awake to a client nor able to wake again.
     into.books.mark(workspace, &opened, false);

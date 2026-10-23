@@ -1169,7 +1169,7 @@ pub struct ItemInfo {
 }
 
 /// An agent working on an item.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemAgentInfo {
     pub task: i64,
     #[serde(default)]
@@ -1186,6 +1186,13 @@ pub struct ItemAgentInfo {
     /// When it began on the item, for how long it has worked; 0 from an older daemon.
     #[serde(default)]
     pub since: i64,
+    /// What it is doing, one token for every surface (see [`Status`]); empty from an older
+    /// daemon, which a client reads by the stage as it always did.
+    #[serde(default)]
+    pub status: String,
+    /// When `status` began, for its age; 0 when empty.
+    #[serde(default)]
+    pub status_at: i64,
 }
 
 /// One step of an item.
@@ -1245,13 +1252,29 @@ pub const FINISHED: &str = "finished";
 /// ([`agent_name`]), for a terminal still open; a closed one keeps the name it was linked
 /// under (its terminal may be gone, or its number handed to another tab), and its stage
 /// reads [`FINISHED`]. A remote one comes with the name and stage qass reported.
-pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>) -> ItemInfo {
+///
+/// `tab` answers for a terminal: what its tab is doing, for the agent's status.
+pub fn item_info(
+    row: qoop_store::ItemRow,
+    name: impl Fn(i64) -> Option<String>,
+    tab: impl Fn(i64) -> Tab,
+) -> ItemInfo {
     let agents = row
         .agents
         .into_iter()
         .map(|a| {
             let live = a.terminal.filter(|_| !a.closed).and_then(&name);
             let local = a.remote.is_none();
+            let (token, at) = status(StatusInput {
+                remote: !local,
+                outcome: a.outcome.as_deref(),
+                claimed_at: a.claimed_at,
+                closed_at: a.closed_at,
+                stage: &a.stage,
+                waiting_at: a.waiting_at,
+                updated_at: a.updated_at,
+                tab: a.terminal.map(&tab).unwrap_or_default(),
+            });
             ItemAgentInfo {
                 // A closed agent never borrows the name of whatever tab holds its old number now.
                 name: live
@@ -1272,6 +1295,8 @@ pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>)
                 claimed: a.claimed,
                 closed: a.closed,
                 since: a.since,
+                status: token.as_str().to_string(),
+                status_at: at,
             }
         })
         .collect();
@@ -1290,6 +1315,164 @@ pub fn item_info(row: qoop_store::ItemRow, name: impl Fn(i64) -> Option<String>)
         closed_at: row.task.closed_at,
         hidden: row.hidden,
     }
+}
+
+/// What the board says an agent is doing, decided in one place from the task's record and its
+/// tab, and sent as a token: each surface words it as it already words things and draws the
+/// age beside it. `Remote` is an agent on another machine, which keeps the stage it reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Closed checked or failed, or replaced after it was claimed.
+    Finished,
+    /// Closed because a newer request took its place, with nothing claimed.
+    Replaced,
+    /// Closed with its tab or its space.
+    Closed,
+    /// Waits on the owner.
+    Waits,
+    /// Said it is done; qass checks.
+    Checks,
+    Asleep,
+    Working,
+    Error,
+    Idle,
+    /// Nothing is known of its tab.
+    Unknown,
+    Remote,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Replaced => "replaced",
+            Self::Closed => "closed",
+            Self::Waits => "waits",
+            Self::Checks => "checks",
+            Self::Asleep => "asleep",
+            Self::Working => "working",
+            Self::Error => "error",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// A terminal's live row, as far as the status reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Live {
+    /// The belief's state by its wire name (`working`, `blocked`, ...).
+    pub state: &'static str,
+    /// When the agent last did something, on the daemon's clock.
+    pub last_active: Option<i64>,
+    /// Sub-agents and background agents running.
+    pub subagents: usize,
+}
+
+impl Live {
+    /// What a daemon's agents listing says of a terminal: `None` for a tombstone of a sleeping
+    /// tab, which has no live row to read.
+    pub fn of_row(row: &AgentRow) -> Option<Live> {
+        (row.state != "sleeping").then(|| Live {
+            state: state_name(state_from_name(&row.state)),
+            last_active: row.last_active_at_unix,
+            subagents: row.subagents.max(row.background) as usize,
+        })
+    }
+}
+
+/// What a task's terminal is: a live row, a sleep since some time, or nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tab {
+    pub live: Option<Live>,
+    pub asleep_since: Option<i64>,
+}
+
+/// A terminal's tab: its live row, if any, and its sleep from `asleep` (terminal to since).
+/// The one way every reader of a board makes a [`Tab`].
+pub fn tab_of(
+    live: Option<Live>,
+    asleep: &std::collections::BTreeMap<i64, i64>,
+    terminal: i64,
+) -> Tab {
+    Tab {
+        live,
+        asleep_since: asleep.get(&terminal).copied(),
+    }
+}
+
+/// Everything [`status`] reads, as plain values.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatusInput<'a> {
+    pub remote: bool,
+    pub outcome: Option<&'a str>,
+    pub claimed_at: Option<i64>,
+    pub closed_at: Option<i64>,
+    pub stage: &'a str,
+    /// When the task last went to `waiting-human`.
+    pub waiting_at: Option<i64>,
+    pub updated_at: i64,
+    pub tab: Tab,
+}
+
+/// The status of one agent's task and the moment it began. The first case that holds wins.
+/// The time is the field that names the moment (`updated_at` moves on every write), and
+/// `updated_at` only where nothing better is known.
+pub fn status(i: StatusInput) -> (Status, i64) {
+    if i.remote {
+        return (Status::Remote, i.updated_at);
+    }
+    if i.closed_at.is_some() || i.outcome.is_some() {
+        let at = i.closed_at.unwrap_or(i.updated_at);
+        return match i.outcome {
+            Some("verified" | "failed") => (Status::Finished, at),
+            // A new request after a done claim ends the claimed work; one with no claim
+            // replaced work nobody said was done.
+            Some("superseded") if i.claimed_at.is_some() => (Status::Finished, at),
+            Some("superseded") => (Status::Replaced, at),
+            _ => (Status::Closed, at),
+        };
+    }
+    let live = i.tab.live;
+    let last_active = live.and_then(|l| l.last_active).unwrap_or(i.updated_at);
+    if i.stage == "waiting-human" {
+        return (Status::Waits, i.waiting_at.unwrap_or(i.updated_at));
+    }
+    if live.is_some_and(|l| l.state == "blocked") {
+        return (Status::Waits, last_active);
+    }
+    if let Some(at) = i.claimed_at {
+        return (Status::Checks, at);
+    }
+    if let Some(since) = i.tab.asleep_since {
+        return (Status::Asleep, since);
+    }
+    let Some(live) = live else {
+        return (Status::Unknown, i.updated_at);
+    };
+    match live.state {
+        "working" | "starting" => (Status::Working, last_active),
+        _ if live.subagents > 0 => (Status::Working, last_active),
+        "failed" => (Status::Error, last_active),
+        "idle" | "done" => (Status::Idle, last_active),
+        _ => (Status::Unknown, i.updated_at),
+    }
+}
+
+/// The status of a stored open or closed task, for `tab` and with `waiting_at` the time it
+/// last went to `waiting-human`. The one place a task's record becomes a [`StatusInput`].
+pub fn task_status(t: &qoop_store::TaskRow, waiting_at: Option<i64>, tab: Tab) -> (Status, i64) {
+    status(StatusInput {
+        remote: false,
+        outcome: t.outcome.as_deref(),
+        claimed_at: t.claimed_at,
+        closed_at: t.closed_at,
+        stage: &t.stage,
+        waiting_at,
+        updated_at: t.updated_at,
+        tab,
+    })
 }
 
 /// A task as a row in the agents listing: enough to say what the terminal is working on.
@@ -1328,6 +1511,12 @@ pub struct TaskInfo {
     /// Where its agent works, kept past its tab (see `TaskRow::folder`).
     #[serde(default)]
     pub folder: Option<String>,
+    /// What its agent is doing and since when, as on [`ItemAgentInfo`]; empty from an older
+    /// daemon.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub status_at: i64,
 }
 
 /// One thing recorded on a task.
@@ -1651,6 +1840,11 @@ pub enum ControlResponse {
         /// The card of the item `task` named.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item: Option<Box<ItemCardInfo>>,
+        /// For a board read: how many open tasks no open item has, of which `tasks` holds
+        /// the newest that fit. Absent from an older daemon, whose `tasks` is every open
+        /// task with no status: a client then draws no row of them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loose: Option<usize>,
     },
     /// An `AskWrite` landed on `card`.
     AskWritten {
@@ -2367,6 +2561,41 @@ pub fn truncate_focus_label(label: &str) -> String {
         .chars()
         .take(MAX_FOCUS_LABEL_CHARS)
         .collect::<String>()
+}
+
+/// The wire name of a runtime state.
+///
+/// A table and not a derive, because this string is on the socket: ADR-010 freezes the
+/// shape of what crosses it, and a rename in the domain would silently rename a field
+/// clients match on.
+pub fn state_name(state: qoop_domain::AgentRuntimeState) -> &'static str {
+    use qoop_domain::AgentRuntimeState as S;
+    match state {
+        S::Starting => "starting",
+        S::Idle => "idle",
+        S::Working => "working",
+        S::Blocked => "blocked",
+        S::Done => "done",
+        S::Failed => "failed",
+        S::Uncertain => "uncertain",
+        S::Unknown => "unknown",
+    }
+}
+
+/// The runtime state a wire name stands for, the inverse of [`state_name`]; a name it does not
+/// know (a tombstone's `sleeping`, a newer daemon's) is `Unknown`.
+pub fn state_from_name(name: &str) -> qoop_domain::AgentRuntimeState {
+    use qoop_domain::AgentRuntimeState as S;
+    match name {
+        "starting" => S::Starting,
+        "idle" => S::Idle,
+        "working" => S::Working,
+        "blocked" => S::Blocked,
+        "done" => S::Done,
+        "failed" => S::Failed,
+        "uncertain" => S::Uncertain,
+        _ => S::Unknown,
+    }
 }
 
 /// The state a hook may report, as the daemon reads it.
@@ -3196,6 +3425,199 @@ mod tests {
     fn an_unknown_operation_is_rejected_rather_than_defaulted() {
         let bad = br#"{"op":"DestroyEverything","id":"x"}"#;
         assert!(serde_json::from_slice::<ControlRequest>(bad).is_err());
+    }
+
+    /// A state read back from its wire name is the state: no name is lost on the way, and one
+    /// nobody knows reads `unknown`.
+    #[test]
+    fn a_state_name_reads_back_as_its_state() {
+        use qoop_domain::AgentRuntimeState as S;
+        for state in [
+            S::Starting,
+            S::Idle,
+            S::Working,
+            S::Blocked,
+            S::Done,
+            S::Failed,
+            S::Uncertain,
+            S::Unknown,
+        ] {
+            assert_eq!(state_from_name(state_name(state)), state);
+        }
+        assert_eq!(state_from_name("sleeping"), S::Unknown);
+    }
+
+    fn live(state: &'static str, last_active: Option<i64>, subagents: usize) -> Tab {
+        Tab {
+            live: Some(Live {
+                state,
+                last_active,
+                subagents,
+            }),
+            asleep_since: None,
+        }
+    }
+
+    /// One case per row of the status table, in its order: the first that holds wins, and
+    /// each takes its time from the field that names the moment.
+    #[test]
+    fn a_status_is_decided_by_the_first_case_that_holds() {
+        let open = StatusInput {
+            stage: "implementing",
+            updated_at: 500,
+            ..Default::default()
+        };
+        let closed = |outcome, claimed_at| StatusInput {
+            outcome: Some(outcome),
+            claimed_at,
+            closed_at: Some(300),
+            ..open
+        };
+        assert_eq!(status(closed("verified", None)), (Status::Finished, 300));
+        assert_eq!(status(closed("failed", None)), (Status::Finished, 300));
+        assert_eq!(
+            status(closed("superseded", Some(200))),
+            (Status::Finished, 300)
+        );
+        assert_eq!(status(closed("superseded", None)), (Status::Replaced, 300));
+        assert_eq!(status(closed("abandoned", None)), (Status::Closed, 300));
+        // A stage wait: the time of the event, whatever `updated_at` says now.
+        let waits = StatusInput {
+            stage: "waiting-human",
+            waiting_at: Some(400),
+            ..open
+        };
+        assert_eq!(status(waits), (Status::Waits, 400));
+        assert_eq!(
+            status(StatusInput {
+                waiting_at: None,
+                ..waits
+            }),
+            (Status::Waits, 500)
+        );
+        // A blocked tab: the live row's time.
+        let blocked = StatusInput {
+            tab: live("blocked", Some(450), 0),
+            ..open
+        };
+        assert_eq!(status(blocked), (Status::Waits, 450));
+        // Claimed beats asleep and a live tab; a wait beats a claim.
+        let claimed = StatusInput {
+            claimed_at: Some(420),
+            tab: live("working", Some(490), 0),
+            ..open
+        };
+        assert_eq!(status(claimed), (Status::Checks, 420));
+        assert_eq!(
+            status(StatusInput {
+                tab: live("blocked", Some(1), 0),
+                ..claimed
+            })
+            .0,
+            Status::Waits
+        );
+        let asleep = StatusInput {
+            tab: Tab {
+                live: None,
+                asleep_since: Some(100),
+            },
+            ..open
+        };
+        assert_eq!(status(asleep), (Status::Asleep, 100));
+        for state in ["working", "starting"] {
+            let tab = live(state, Some(490), 0);
+            assert_eq!(
+                status(StatusInput { tab, ..open }),
+                (Status::Working, 490),
+                "{state}"
+            );
+        }
+        // Running sub-agents keep a settled or failed tab working.
+        for state in ["idle", "done", "failed", "unknown"] {
+            let tab = live(state, Some(480), 2);
+            assert_eq!(
+                status(StatusInput { tab, ..open }),
+                (Status::Working, 480),
+                "{state}"
+            );
+        }
+        let failed = StatusInput {
+            tab: live("failed", Some(470), 0),
+            ..open
+        };
+        assert_eq!(status(failed), (Status::Error, 470));
+        for state in ["idle", "done"] {
+            let tab = live(state, Some(460), 0);
+            assert_eq!(
+                status(StatusInput { tab, ..open }),
+                (Status::Idle, 460),
+                "{state}"
+            );
+        }
+        // No last-active time yet (a restart): the record's.
+        let tab = live("idle", None, 0);
+        assert_eq!(status(StatusInput { tab, ..open }), (Status::Idle, 500));
+        // Not known: an unsure tab, or a task with a terminal and no live row.
+        for tab in [
+            live("unknown", Some(460), 0),
+            live("uncertain", Some(460), 0),
+            Tab::default(),
+        ] {
+            assert_eq!(status(StatusInput { tab, ..open }), (Status::Unknown, 500));
+        }
+        // A remote agent keeps the stage it reported, at its report.
+        let remote = StatusInput {
+            remote: true,
+            outcome: Some("verified"),
+            ..open
+        };
+        assert_eq!(status(remote), (Status::Remote, 500));
+    }
+
+    /// An agent whose tab closed reads `closed` on its item and one that was checked reads
+    /// `finished`; an agent still open reads from its tab.
+    #[test]
+    fn an_abandoned_agent_reads_closed_and_a_verified_one_finished() {
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", 2).unwrap();
+        let mut tasks = Vec::new();
+        for terminal in [1, 2, 3] {
+            let t = s
+                .create_terminal(terminal, ws, "/tmp", "/bin/sh", 3)
+                .unwrap();
+            let task = s.open_task(t, "work", false, 4).unwrap();
+            s.link_task(task, item, 5).unwrap();
+            tasks.push((t, task));
+        }
+        s.close_task(tasks[0].1, qoop_store::Outcome::Verified, "checked", 10)
+            .unwrap();
+        s.close_terminal(tasks[1].0, 11).unwrap();
+        let row = s.items(20).unwrap().remove(0);
+        let info = item_info(
+            row,
+            |_| None,
+            |t| {
+                if t == tasks[2].0 {
+                    live("working", Some(19), 0)
+                } else {
+                    Tab::default()
+                }
+            },
+        );
+        let said: Vec<_> = info
+            .agents
+            .iter()
+            .map(|a| (a.task, a.status.as_str(), a.status_at))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                (tasks[0].1, "finished", 10),
+                (tasks[1].1, "closed", 11),
+                (tasks[2].1, "working", 19)
+            ]
+        );
     }
 }
 

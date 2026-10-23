@@ -106,27 +106,13 @@ impl Standing {
     }
 }
 
-fn state_word(state: qoop_domain::AgentRuntimeState) -> &'static str {
-    use qoop_domain::AgentRuntimeState as S;
-    match state {
-        S::Starting => "starting",
-        S::Idle => "idle",
-        S::Working => "working",
-        S::Blocked => "blocked",
-        S::Done => "done",
-        S::Failed => "failed",
-        S::Uncertain => "uncertain",
-        S::Unknown => "unknown",
-    }
-}
-
 fn standing(
     agents: &AgentRegistry,
     terminals: &TerminalRegistry,
     terminal: u32,
 ) -> Option<Standing> {
     let agent = agents.agent(terminal)?;
-    let state = state_word(agent.belief.state);
+    let state = crate::control::state_name(agent.belief.state);
     let readiness = crate::control::readiness_of(
         match &agent.identity {
             qoop_domain::AgentIdentity::Known { program, .. } => Some(program.as_str()),
@@ -268,23 +254,47 @@ pub(crate) fn is_dialog(label: &str) -> bool {
 }
 
 /// Words that offer the owner an action and wait for his go, in the forms agents end a turn
-/// with: "istersen ... yaparım", "'tamam' dersen ...", "shall I". Cut boilerplate stays out
-/// ("let me know if", "if you want"): those close nearly every report. Lowercase, ASCII
-/// spellings too, since agents often write Turkish without its letters.
+/// with: "istersen ... yaparım", "'tamam' dersen ...", "shall I". The quoted answer closed
+/// by "de" or "deyin" is [`quoted_answer`]. Cut boilerplate stays out ("let me know if",
+/// "if you want"): those close nearly every report. Lowercase, ASCII spellings too, since
+/// agents often write Turkish without its letters, and the dotted capital I lowercased.
 const OFFERS: &[&str] = &[
     "istersen",
     "i̇stersen",
     "dersen",
+    "demen yeter",
+    "istiyorsan söyle",
+    "i̇stiyorsan söyle",
+    "istiyorsan soyle",
+    "numarayla cevapla",
     "ister misin",
     "shall i ",
     "want me to ",
     "would you like",
 ];
 
+/// Whether the line tells him a word to answer with: a quote (`"`, `”` or a backtick), a space,
+/// then `de` or `deyin` and a mark or the end ("`sil` de."). "deyince", a report's "de çıkıyor"
+/// and a quote followed by more words do not count.
+fn quoted_answer(lower: &str) -> bool {
+    let lower = lower.trim_end();
+    lower.match_indices(['"', '”', '`']).any(|(at, quote)| {
+        lower[at + quote.len()..]
+            .strip_prefix(' ')
+            .is_some_and(|rest| {
+                ["deyin", "de"].iter().any(|word| {
+                    rest.strip_prefix(word).is_some_and(|after| {
+                        after.chars().next().is_none_or(|c| ".,;:)!".contains(c))
+                    })
+                })
+            })
+    })
+}
+
 /// Whether the last paragraph of an agent's turn asks the owner something: a sentence in it
-/// ends in "?", it offers him an action (see [`OFFERS`]), or it closes on the Turkish question
-/// word without its mark ("hazırlayayım mı"). The one rule the daemon reads a turn's end by;
-/// the hook only sends the paragraph.
+/// ends in "?", it offers him an action (see [`OFFERS`], [`quoted_answer`]), or it closes on
+/// the Turkish question word without its mark ("hazırlayayım mı"). The one rule the daemon
+/// reads a turn's end by; the hook only sends the paragraph.
 pub(crate) fn asks_owner(line: &str) -> bool {
     let line = line
         .trim()
@@ -306,7 +316,7 @@ pub(crate) fn asks_owner(line: &str) -> bool {
         return true;
     }
     let lower = format!(" {} ", line.to_lowercase());
-    if OFFERS.iter().any(|w| lower.contains(&format!(" {w}"))) {
+    if OFFERS.iter().any(|w| lower.contains(&format!(" {w}"))) || quoted_answer(&lower) {
         return true;
     }
     matches!(
@@ -1248,6 +1258,16 @@ mod tests {
             "Built and tested. Merge PR #513 now or deploy first? Say which.",
             "Makineyi yeniden başlatayım mı (`sudo reboot`)? Açılınca kontrol ederim.",
             "Merge it now (\"yes\" or \"no\")?\"",
+            "Hazır. Başka bir şey gerekmiyorsa demen yeter.",
+            "Hazır, demen yeterli.",
+            "Sıradaki işi başlatırım, istiyorsan söyle.",
+            "Sıradaki işi başlatırım, İstiyorsan söyle.",
+            "Siradaki isi baslatirim, istiyorsan soyle.",
+            "Seçenekler yukarıda, numarayla cevapla.",
+            "Silmemi istiyorsan \"sil\" de.",
+            "Hepsini kapatmak için \"10'u da\" deyin.",
+            "Devam için `evet` de, sonra açarım.",
+            "Onay için “tamam” de",
         ] {
             assert!(asks_owner(asks), "{asks}");
         }
@@ -1261,6 +1281,9 @@ mod tests {
             "The report is at https://x.dev/r?id=4 now.",
             "Why did it fail? Because the cache was stale. Fixed in PR #3.",
             "let x = ok ? a : b; it is set.",
+            "Bulundu: kaynağında \"zaten ücretsiz\" de çıkıyor.",
+            "Ron \"tamam\" deyince test eder.",
+            "Düzelttim, şöyle yaptım.",
         ] {
             assert!(!asks_owner(not), "{not}");
         }

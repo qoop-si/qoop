@@ -30,5 +30,7 @@ unicode-width = "0.2"
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# Paused time for the tests that wait on a window.
+tokio = { version = "1", features = ["test-util"] }
 qoop-store = { path = "../qoop-store" }
 qoop-testkit = { path = "../qoop-testkit" }
