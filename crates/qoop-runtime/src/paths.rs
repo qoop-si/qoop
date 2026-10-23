@@ -326,7 +326,22 @@ fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
     let fresh = dir.join(format!(".{QASS_WATCH_FILE}.{}.new", std::process::id()));
     std::fs::write(&fresh, body)?;
     std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE))?;
+    note_watch_turn(dir, on);
     Ok(true)
+}
+
+/// One line in qass's `watch.log` for a turn of the switch, beside the watcher's own starts and
+/// ends: the day it went dark has its time on record. A failure to note it changes nothing.
+fn note_watch_turn(dir: &Path, on: bool) {
+    use std::io::Write;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(dir.join("watch.log"))
+        .and_then(|mut f| writeln!(f, "{at} switch {}", if on { "on" } else { "off" }));
 }
 
 /// Where the daemon keeps what has to outlive a reboot: its database and its history.
@@ -765,6 +780,13 @@ mod tests {
         assert!(set_watching_in(&dir, true).unwrap());
         assert!(watching_in(&dir) && resuming_in(&dir));
         assert!(!set_watching_in(&dir, true).unwrap());
+        // Each real turn, and only those, is on record with its time.
+        let log = std::fs::read_to_string(dir.join("watch.log")).unwrap();
+        let turns: Vec<&str> = log
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|x| x.1))
+            .collect();
+        assert_eq!(turns, ["switch off", "switch on"], "{log}");
         let stamp = read_trimmed(&dir.join(QASS_WATCH_FILE)).unwrap();
         std::fs::write(
             dir.join(QASS_WATCH_SEEN),

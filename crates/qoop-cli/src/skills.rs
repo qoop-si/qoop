@@ -825,8 +825,11 @@ mod tests {
         // 2026-10-20: never write into the tab where the person answers a server's install. 462
         // since 2026-10-22: the pointer to schedules.md and the rule that a scheduled run is the
         // owner's, not a worker of qass's (the rest is in schedules.md). 469 since 2026-10-22: the
-        // rule for what the owner keeps from qass (`qass_skip`).
-        assert!(skill.lines().count() <= 469, "SKILL.md grew past 469 lines");
+        // rule for what the owner keeps from qass (`qass_skip`). 486 since 2026-10-23 (QOOP-55):
+        // work that stops reaches qass in seconds and his go means keep going, the rows that
+        // answer a reversible ask, resume an error, a limit and a finished job and push the
+        // step a goal still lacks, the ceiling `qoop prompt` keeps, and the agents in a summary.
+        assert!(skill.lines().count() <= 486, "SKILL.md grew past 486 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -988,7 +991,7 @@ mod tests {
             "never\n  the question again at the end of another message",
             "A question for them is a card first",
             "becomes a card before any chat line about it",
-            "| Finished with a question for them in its last words | a card now |",
+            "| Finished with a question for them in its last words | a reversible step its rules allow (continue, its plan's next step, a pick between reversible options, commit, PR or install where the brief's ending allows): answer with that step; anything else a card now |",
             "habit.sh\" may <verb>:<repo>`",
             "A `W<n>` card for that agent is the daemon's draft",
             "Nothing new for them, no progress line: write nothing.",
@@ -997,8 +1000,8 @@ mod tests {
             "`Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch, open a PR for it and rebase-merge that PR; once `gh pr view` shows it merged, as your last step and from the main checkout, remove your own worktree (no --force) and its branch, local and remote. Do not delete anything else, deploy, or contact anything external in this step; ask first.`",
-            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, merge, install only) |",
-            "the step is commit, push, PR, merge or install\n(never a release, deploy or migration), else a card.",
+            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, install only; merge only where its ending is `merge`) |",
+            "the step is commit, push, PR, merge or install\n(merge only where its ending is `merge`; never a release, deploy or migration), else a card.",
             "The brief's `ending` picks it: `none`, the one above; `merge`, the third; `pr`, the second",
             "| Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |",
             "config.toml is theirs: never edit it; `qoop config set` only on their word, in setup.",
@@ -1015,6 +1018,12 @@ mod tests {
             "A spawn and its first brief need no ok.",
             "A message that starts `About E<n> (<handle>):` or `About W<n> (<handle>):` asks to talk that card\nthrough with you: discuss it, it is never an answer (not even as their next message after you\nshowed that card)",
             "| Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |",
+            "means keep it going to the end, never hands off.",
+            "| Failed on an API, network or overload error | one scoped prompt to resume where it stopped; failed again: escalate |",
+            "prompt the step the goal still lacks in its words",
+            "**What they ask you to do, do in that turn**",
+            "| Stopped while its job still runs (`background` or subagents on its row, `← N agents` on its screen) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on |",
+            "| Stopped on a usage limit with a reset time, no `cswap` | `hands off until <reset + 120>` (its clock time as unix through `date`); said again and still idle: prompt it to resume |",
         ] {
             assert!(skill.contains(want), "SKILL.md lost: {want}");
         }

@@ -285,6 +285,90 @@ pub struct AgentRegistry {
     /// answers too), as unix seconds: what tells an answer to a parked agent from a key that
     /// only moved something.
     sent_at_unix: Mutex<BTreeMap<u32, i64>>,
+    /// When a person last pressed a key in each terminal, and when they last sent a line there,
+    /// as unix seconds: only a person's connection (not `qoop prompt` or `qoop send`), only keys
+    /// a person presses ([`person_key`]). What another sender must not type over.
+    person_typed: Mutex<BTreeMap<u32, i64>>,
+    person_sent: Mutex<BTreeMap<u32, i64>>,
+    /// Terminals where a person pressed keys after the last line they sent: a draft, kept as
+    /// its own fact so a line and a new draft in the same second are told apart.
+    person_draft: Mutex<std::collections::BTreeSet<u32>>,
+}
+
+/// A person who sent a line into a terminal is at it for this long.
+pub const PERSON_SENT_SECS: i64 = 120;
+/// A person who typed and sent nothing (a draft, or an Esc and a thought) for this long.
+pub const PERSON_DRAFT_SECS: i64 = 180;
+
+/// Whether input from a person's connection holds a key they pressed, not only what their
+/// terminal sent by itself. A read may hold several keys (an arrow and the text after it), so
+/// each escape sequence in it is judged on its own, and any text is a key.
+pub fn person_key(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if rest[0] != 0x1b {
+            return true;
+        }
+        let len = sequence_len(rest);
+        if one_key(&rest[..len]) {
+            return true;
+        }
+        rest = &rest[len..];
+    }
+    false
+}
+
+/// The length of the escape sequence at the start of `bytes` (which starts with Esc): a CSI up
+/// to its final byte, an SS3 key, an OSC or DCS up to its terminator, else Esc and one byte.
+fn sequence_len(bytes: &[u8]) -> usize {
+    match bytes.get(1) {
+        None => 1,
+        // An X10 mouse report: `ESC [ M` and three raw bytes.
+        Some(b'[') if bytes.get(2) == Some(&b'M') => bytes.len().min(6),
+        Some(b'[') => bytes[2..]
+            .iter()
+            .position(|b| (0x40..=0x7e).contains(b))
+            .map_or(bytes.len(), |i| i + 3),
+        Some(b'O') => bytes.len().min(3),
+        Some(b']' | b'P') => {
+            let end = bytes[2..]
+                .windows(2)
+                .position(|w| w == b"\x1b\\")
+                .map(|i| i + 4);
+            let bel = bytes[2..].iter().position(|b| *b == 0x07).map(|i| i + 3);
+            end.into_iter().chain(bel).min().unwrap_or(bytes.len())
+        }
+        Some(_) => 2,
+    }
+}
+
+/// One escape sequence as a key a person pressed: a lone Esc, Alt and a key (`ESC x`), SS3
+/// keys (`ESC O A`..`ESC O S`), or a CSI with digits, `;` and `:` only that ends in an arrow,
+/// Home, End, F1, F2, F4, `~` or a kitty key report (`ESC[27u`). Not a mouse, focus, colour,
+/// device or mode report, nor a DCS or OSC reply: an allow list, since terminals answer in
+/// many shapes. A bracketed paste reaches [`AgentRegistry::note_person`] as a paste.
+fn one_key(seq: &[u8]) -> bool {
+    let Some(rest) = seq.strip_prefix(b"\x1b") else {
+        return !seq.is_empty();
+    };
+    match rest {
+        [] => true,
+        [b'O', k] => matches!(k, b'A'..=b'D' | b'H' | b'F' | b'P'..=b'S'),
+        [b'[', csi @ ..] => match csi.split_last() {
+            // Not `R`: a cursor position report ends in it (`ESC[12;40R`).
+            Some((last, params)) => {
+                matches!(
+                    last,
+                    b'A'..=b'D' | b'H' | b'F' | b'P' | b'Q' | b'S' | b'~' | b'u'
+                ) && params
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b';' | b':'))
+            }
+            None => false,
+        },
+        [k] => k.is_ascii_graphic() && *k != b'[' && *k != b']' && *k != b'P',
+        _ => false,
+    }
 }
 
 impl AgentRegistry {
@@ -574,6 +658,9 @@ impl AgentRegistry {
             parked: Mutex::new(BTreeMap::new()),
             unparked: Mutex::new(Vec::new()),
             sent_at_unix: Mutex::new(BTreeMap::new()),
+            person_typed: Mutex::new(BTreeMap::new()),
+            person_sent: Mutex::new(BTreeMap::new()),
+            person_draft: Mutex::new(std::collections::BTreeSet::new()),
             changes: tokio::sync::broadcast::channel(64).0,
             tasks: tokio::sync::broadcast::channel(16).0,
         })
@@ -753,6 +840,61 @@ impl AgentRegistry {
         if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
             self.sent_at_unix.lock().unwrap().insert(stream, now_unix);
         }
+    }
+
+    /// Input from a person's own connection: a key they pressed stamps the draft clock, a line
+    /// with a return the sent one. A paste is typed, never sent: its return waits for theirs.
+    pub fn note_person(&self, stream: u32, bytes: &[u8], paste: bool, now_unix: i64) {
+        if !paste && !person_key(bytes) {
+            return;
+        }
+        self.person_typed.lock().unwrap().insert(stream, now_unix);
+        // A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`), sends the line and
+        // ends the draft; any key after the last one in the same read starts the next draft.
+        let (mut sent, mut after) = (false, false);
+        let mut rest = bytes;
+        while !rest.is_empty() && !paste {
+            let len = if rest[0] == 0x1b {
+                sequence_len(rest)
+            } else {
+                1
+            };
+            let key = &rest[..len];
+            let enter = matches!(key, b"\r" | b"\n")
+                || (key.starts_with(b"\x1b[13") && key.ends_with(b"u"));
+            if enter {
+                (sent, after) = (true, false);
+            } else if one_key(key) {
+                after = true;
+            }
+            rest = &rest[len..];
+        }
+        if sent {
+            self.person_sent.lock().unwrap().insert(stream, now_unix);
+        }
+        let mut draft = self.person_draft.lock().unwrap();
+        if !sent || after {
+            draft.insert(stream);
+        } else {
+            draft.remove(&stream);
+        }
+    }
+
+    /// Until when a person is at this terminal, as unix seconds, `None` when nobody is: a line
+    /// they sent holds it [`PERSON_SENT_SECS`], keys they pressed after their last line (a
+    /// draft) [`PERSON_DRAFT_SECS`].
+    pub fn person_until(&self, stream: u32, now_unix: i64) -> Option<i64> {
+        let typed = self.person_typed.lock().unwrap().get(&stream).copied();
+        let sent = self.person_sent.lock().unwrap().get(&stream).copied();
+        let draft = typed
+            .filter(|_| self.person_draft.lock().unwrap().contains(&stream))
+            .map(|t| t + PERSON_DRAFT_SECS);
+        let line = sent.map(|s| s + PERSON_SENT_SECS);
+        draft
+            .into_iter()
+            .chain(line)
+            .max()
+            .filter(|until| *until > now_unix)
     }
 
     /// Seconds since a person last typed into this terminal, `None` when nobody has.
@@ -941,6 +1083,9 @@ impl AgentRegistry {
         self.shield_at_unix.lock().unwrap().remove(&stream);
         self.typed_at_unix.lock().unwrap().remove(&stream);
         self.sent_at_unix.lock().unwrap().remove(&stream);
+        self.person_typed.lock().unwrap().remove(&stream);
+        self.person_sent.lock().unwrap().remove(&stream);
+        self.person_draft.lock().unwrap().remove(&stream);
         self.drop_expectations_touching(stream);
         // A terminal that is gone is a change like any other. Closing one answers as soon
         // as the request is accepted, but the terminal itself lives until its teardown
@@ -1548,6 +1693,92 @@ mod tests {
 
     fn registry() -> AgentRegistry {
         AgentRegistry::new().expect("registry")
+    }
+
+    /// Keys a person presses count; what a terminal sends by itself does not.
+    #[test]
+    fn a_person_key_is_one_they_pressed() {
+        for key in [
+            &b"a"[..],
+            b"\r",
+            b"\x7f",
+            b"\x1b",
+            b"\x1b[27u",
+            b"\x1b[A",
+            b"\x1b[1;5C",
+            b"\x1b[3~",
+            b"\x1bOP",
+            b"\x1bb",
+            b"\x1b[97;1:3u",
+            b"ab\x1b[D",
+            b"\x1b[Ahello",
+            b"\x1b[I\x1b[A",
+        ] {
+            assert!(person_key(key), "{key:?}");
+        }
+        for not in [
+            &b""[..],
+            b"\x1b[<0;10;5M",
+            b"\x1b[M !!",
+            b"\x1b[I",
+            b"\x1b[O",
+            b"\x1b[?62;22c",
+            b"\x1b[12;40R",
+            b"\x1b]11;rgb:0000/0000/0000\x1b\\",
+            b"\x1b[>1;10;0c",
+            b"\x1b[?0u",
+            b"\x1b[?2004;1$y",
+            b"\x1b[?997;1n",
+            b"\x1b[8;40;120t",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1b[I\x1b[<0;3;4M",
+        ] {
+            assert!(!person_key(not), "{not:?}");
+        }
+    }
+
+    /// A line holds the tab two minutes, a draft (keys after it, an Esc) three; both run out.
+    #[test]
+    fn a_person_holds_a_tab_while_they_type_or_just_sent() {
+        let r = registry();
+        assert_eq!(r.person_until(4, NOW), None);
+        r.note_person(4, b"\x1b[<0;1;1M", false, NOW);
+        assert_eq!(r.person_until(4, NOW), None, "a mouse report is nobody");
+        r.note_person(4, b"go on\r", false, NOW);
+        assert_eq!(r.person_until(4, NOW + 10), Some(NOW + PERSON_SENT_SECS));
+        assert_eq!(r.person_until(4, NOW + PERSON_SENT_SECS), None);
+        r.note_person(4, b"\x1b", false, NOW + 200);
+        assert_eq!(
+            r.person_until(4, NOW + 210),
+            Some(NOW + 200 + PERSON_DRAFT_SECS)
+        );
+        r.note_person(4, b"ok\r", false, NOW + 230);
+        r.note_person(4, b"and th", false, NOW + 230);
+        assert_eq!(
+            r.person_until(4, NOW + 231),
+            Some(NOW + 230 + PERSON_DRAFT_SECS),
+            "a new draft in the second of a line is a draft"
+        );
+        r.note_person(4, b"\x1b[13u\x1b[97u", false, NOW + 240);
+        assert_eq!(
+            r.person_until(4, NOW + 241),
+            Some(NOW + 240 + PERSON_DRAFT_SECS),
+            "a key after a kitty Enter is a new draft"
+        );
+        r.note_person(4, b"\x1b[13u", false, NOW + 250);
+        assert_eq!(
+            r.person_until(4, NOW + 251),
+            Some(NOW + 250 + PERSON_SENT_SECS),
+            "a kitty Enter sends"
+        );
+        r.note_person(4, b"half a sente", true, NOW + 300);
+        assert_eq!(
+            r.person_until(4, NOW + 301),
+            Some(NOW + 300 + PERSON_DRAFT_SECS),
+            "a paste is a draft"
+        );
+        r.forget(4);
+        assert_eq!(r.person_until(4, NOW + 301), None);
     }
 
     /// What one registry exports another adopts, through the file between them: the same

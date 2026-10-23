@@ -237,6 +237,15 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "hold a prompt back while a person is at that terminal",
+            method: || {
+                Method::Control(ControlRequest::PersonAt {
+                    id: "a".into(),
+                    terminal: 1,
+                })
+            },
+        },
+        Action {
             name: "start a workspace",
             method: || {
                 Method::Control(ControlRequest::CreateWorkspace {
@@ -952,6 +961,10 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             on: None,
         },
+        ControlRequest::PersonAt {
+            id: String::new(),
+            terminal: 0,
+        },
         ControlRequest::TaskWrite {
             id: String::new(),
             terminal: None,
@@ -1076,6 +1089,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::PersonAt { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }

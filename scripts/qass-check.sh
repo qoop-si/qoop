@@ -693,6 +693,62 @@ got="$(QASS_WATCH_FOR=2 timed 25)"
 [ "$(echo "$got" | lines)" = watch-ends ] && echo "$got" | within 9 13 ||
     { echo "its own end printed: $got"; exit 1; }
 
+# ---- work in progress that came to rest: said in seconds (QOOP-55) ----------------------------
+# An agent on an open task, not claimed, not waiting on him, that stops: short hold, whether
+# routine is silent or said; one another terminal wrote to in the last hour keeps the long hold,
+# an older record does not; one that works again before the settle is stale, never said.
+trow() { # terminal generation state stage
+    printf '{"terminal":%s,"generation":%s,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"%s","claimed":false}}' \
+        "$1" "$2" "$3" "$4"
+}
+for mode in silent say; do
+    quiet_fresh; [ "$mode" = say ] && echo say > "$q/routine"
+    stream 30
+    printf '%s\n' "[$(trow 5 1 working implementing)]" > "$q/last.json"
+    printf '%s\n' "[$(trow 5 1 idle implementing)]" > "$tmp/snapshots"
+    got="$(QASS_SETTLE=2 QASS_QUIET_HOLD=600 QASS_ROUTINE_HOLD=60 timed 14)"
+    [ "$(echo "$got" | lines)" = 'T5 g1 claude working->idle "fix" /w task:12:implementing' ] \
+        || { echo "work rest ($mode) printed: $got"; exit 1; }
+    echo "$got" | within 0 12 || { echo "work rest ($mode) waited: $got"; exit 1; }
+done
+# Driven: terminal 88 (a running agent, not qass) wrote to it just now. With routine said it waits
+# the long hold; with routine silent (the default) it stays routine, held, as before. An hour-old
+# record, or a writer no longer running, drives nothing: short again.
+for case in said silent old gone; do
+    quiet_fresh; [ "$case" = silent ] || echo say > "$q/routine"
+    stream 30
+    case "$case" in old) at=$(($(date +%s) - 4000)) ;; *) at=$(date +%s) ;; esac
+    echo "$at 88 T5" > "$q/prompted.log"
+    lead="$(row 88 1 working)"; [ "$case" = gone ] && lead=""
+    printf '%s\n' "[$(trow 5 1 working implementing)${lead:+,$lead}]" > "$q/last.json"
+    printf '%s\n' "[$(trow 5 1 idle implementing)${lead:+,$lead}]" > "$tmp/snapshots"
+    got="$(QASS_SETTLE=2 QASS_QUIET_HOLD=15 QASS_ROUTINE_HOLD=60 timed 24)"
+    case "$case" in
+        said) echo "$got" | within 15 24 && [ -n "$got" ] || { echo "a driven agent did not wait: $got"; exit 1; } ;;
+        silent) [ -z "$got" ] || { echo "a driven agent left routine: $got"; exit 1; } ;;
+        *) echo "$got" | within 0 12 && [ -n "$got" ] || { echo "work rest ($case) held: $got"; exit 1; } ;;
+    esac
+done
+quiet_fresh; stream 20 1
+printf '%s\n' "[$(trow 5 1 working implementing)]" > "$q/last.json"
+printf '%s\n' "[$(trow 5 1 idle implementing)]" "[$(trow 5 1 working implementing)]" > "$tmp/snapshots"
+got="$(QASS_SETTLE=4 QASS_ROUTINE_HOLD=60 timed 14)"
+[ -z "$got" ] || { echo "a work rest that went back to work was said: $got"; exit 1; }
+grep -q 'stale T5 g1' "$q/quiet.log" || { echo "a flapping work rest left no stale"; exit 1; }
+
+# A start the switch refuses is on record too.
+quiet_fresh; stream 5
+echo off > "$q/watch"
+HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" > /dev/null 2>&1
+grep -q ' said watch-off at start' "$q/watch.log" || { echo "a refused start left no line"; exit 1; }
+rm -f "$q/watch"
+# Every run leaves its start and its exit in watch.log, a Monitor kill (TERM) included.
+quiet_fresh; stream 30
+printf '%s\n' "[$(trow 5 1 working implementing)]" > "$tmp/snapshots"
+timed 3 > /dev/null
+grep -q ' start [0-9]' "$q/watch.log" || { echo "no start in watch.log"; cat "$q/watch.log"; exit 1; }
+grep -q ' exit 143' "$q/watch.log" || { echo "a killed watcher left no exit"; cat "$q/watch.log"; exit 1; }
+
 # ---- the owner's switch (`qoop qass watch`) ----------------------------------------------------
 off_line='watch-off: the owner turned watching off (qoop qass watch); do not start this again until it reads on'
 # Off at start: the off line and nothing else, a block waiting or not.

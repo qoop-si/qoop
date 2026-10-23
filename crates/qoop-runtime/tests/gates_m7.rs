@@ -260,6 +260,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x31w".into(),
             on: None,
         },
+        // A read: whether a person is at a terminal, nothing typed.
+        ControlRequest::PersonAt {
+            id: "x31p".into(),
+            terminal,
+        },
         // A task is a record about the work: text kept by the daemon, never typed.
         ControlRequest::TaskWrite {
             id: "x28".into(),
@@ -411,6 +416,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::PersonAt { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }

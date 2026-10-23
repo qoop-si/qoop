@@ -109,6 +109,37 @@ pub(crate) fn repo_of(dir: &std::path::Path) -> std::io::Result<qoop_history::Re
     })
 }
 
+/// Whether the repository at `root` says merging is pre-authorized, in its committed files
+/// (AGENTS.md, CLAUDE.md, `.qoop/workflow.md` at `HEAD`), on one line that names merging and
+/// "pre-authorized" and holds back nothing ("not", "never", "ask", "need", "word", "unless",
+/// or "release": a release PR's merge is a release).
+/// Only there may a worker or qass merge: a merge may deploy, and that is the owner's word.
+pub(crate) fn merge_authorized(root: &std::path::Path) -> bool {
+    ["AGENTS.md", "CLAUDE.md", ".qoop/workflow.md"]
+        .iter()
+        .any(|f| {
+            let spec = format!("HEAD:{f}");
+            let shown = git(
+                root,
+                &[std::ffi::OsStr::new("show"), std::ffi::OsStr::new(&spec)],
+            );
+            shown.is_ok_and(|t| t.lines().any(granted))
+        })
+}
+
+/// One line that pre-authorizes merging, with no word on it that takes it back.
+fn granted(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("merge")
+        && (l.contains("pre-authorized") || l.contains("pre-authorised"))
+        && !["not", "never", "ask", "need", "word", "unless", "release"]
+            .iter()
+            .any(|w| {
+                l.split(|c: char| !c.is_alphanumeric())
+                    .any(|x| x.starts_with(w))
+            })
+}
+
 /// `owner/name` when the top-level repository `dir` is in has an `origin` on `github.com`
 /// whose owner is the person's, any case, and every push address of that `origin` is the
 /// person's too: the person's own repository. The person's owners are this machine's GitHub
@@ -1081,5 +1112,49 @@ mod tests {
                 "{bad:?} parsed"
             );
         }
+    }
+
+    /// Merging is pre-authorized only by a repository file that says so, as qoop's do.
+    #[test]
+    fn only_a_repo_file_pre_authorizes_merging() {
+        assert!(granted(
+            "2. Commit, push, opening a PR and rebase-and-merge are pre-authorized."
+        ));
+        assert!(!granted("Merge after review."));
+        assert!(!granted(
+            "Commit and push are pre-authorized; merging needs his word."
+        ));
+        assert!(!granted("Merging is never pre-authorized."));
+        assert!(!granted("Merging the release PR is pre-authorized."));
+        let dir = tempfile::tempdir().expect("dir");
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git")
+        };
+        run(&["init", "-q"]);
+        assert!(!merge_authorized(dir.path()), "no commit, no grant");
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "2. Commit, push, opening a PR and rebase-and-merge are pre-authorized.\n",
+        )
+        .expect("write");
+        assert!(
+            !merge_authorized(dir.path()),
+            "uncommitted text grants nothing"
+        );
+        run(&["add", "AGENTS.md"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@localhost",
+            "commit",
+            "-qm",
+            "rules",
+        ]);
+        assert!(merge_authorized(dir.path()));
     }
 }

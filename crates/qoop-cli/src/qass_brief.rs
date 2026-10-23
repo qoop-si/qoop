@@ -63,6 +63,12 @@ pub(crate) struct Task {
     pub(crate) evidence: Vec<String>,
     /// Where its agent works, as the record keeps it past its tab.
     pub(crate) folder: Option<std::path::PathBuf>,
+    /// What the owner wants and when it is done, as the record says it now.
+    pub(crate) goal: String,
+    /// The goal it was opened with, which the agent cannot rewrite.
+    pub(crate) first_goal: String,
+    /// Its last step forward: a stage above every earlier one, or evidence; else when opened.
+    pub(crate) forward: i64,
 }
 
 /// Everything a brief is made of, read before it is composed.
@@ -89,6 +95,9 @@ struct Facts {
     /// `owner/name` when the agent works in the owner's own repository
     /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
     own: Option<String>,
+    /// A file of that repository (AGENTS.md, CLAUDE.md, `.qoop/workflow.md`) pre-authorizes
+    /// merging: only there does a prompt end with the merge ending.
+    merge_ok: bool,
     now: i64,
     /// Seconds east of UTC, for a clock time he reads.
     offset: i64,
@@ -100,7 +109,7 @@ struct Facts {
 fn owner_typed(messages: &[Message], by_other: impl Fn(i64) -> bool) -> Result<Option<i64>, ()> {
     for m in messages.iter().rev() {
         let text = m.text.trim();
-        if text.starts_with('<') || launch(text) {
+        if text.starts_with('<') || launch(text) || peer(text) {
             continue;
         }
         let at = m.ts.ok_or(())? / 1000;
@@ -109,6 +118,46 @@ fn owner_typed(messages: &[Message], by_other: impl Fn(i64) -> bool) -> Result<O
         }
     }
     Ok(None)
+}
+
+/// What Claude Code types into a session for another one of an agent team: a peer's turn,
+/// never his.
+const PEER: &str = "Another Claude session sent a message";
+
+fn peer(text: &str) -> bool {
+    text.starts_with(PEER)
+}
+
+/// Who typed the agent's newest message, and when: him, qass, another agent through `qoop
+/// prompt`, or a teammate. Not who started its turn: a background job's notice starts one
+/// too and is no message here. `None` with no message read.
+fn last_typed(
+    messages: &[Message],
+    log: &[Record],
+    tab: &str,
+    qass: Option<u32>,
+) -> Option<(&'static str, Option<i64>)> {
+    let m = messages.iter().rev().find(|m| !m.text.trim().is_empty())?;
+    let text = m.text.trim();
+    let at = m.ts.map(|t| t / 1000);
+    if peer(text) || text.starts_with("<teammate-message") {
+        return Some(("a teammate", at));
+    }
+    let by = at.and_then(|at| {
+        log.iter()
+            .rev()
+            .find(|r| r.to == tab && (-1..=QASS_SAYS).contains(&(at - r.at)))
+            .map(|r| r.from)
+    });
+    Some((
+        match by {
+            Some(from) if Some(from) == qass => "qass",
+            Some(_) => "another agent's prompt",
+            None if text.starts_with('<') => "a notice",
+            None => "him",
+        },
+        at,
+    ))
 }
 
 /// Whether a record in `log` for which `pick` holds was written at most `QASS_SAYS` seconds
@@ -133,6 +182,40 @@ fn rounds<'a>(stages: impl IntoIterator<Item = &'a str>) -> u32 {
         last = stage;
     }
     n
+}
+
+/// The stages in the order work moves through them; `waiting-human` is none of them.
+const ORDER: [&str; 5] = [
+    "investigating",
+    "planning",
+    "implementing",
+    "reviewing",
+    "verifying",
+];
+
+/// The last step forward, from `(kind, body, at)` events oldest first: a stage above every
+/// stage before it (a task opens at the first), or an evidence line not written before. A
+/// claim is no step: the missing step it is told and the claim again would reset the count
+/// without end; nor is the same evidence again ("tests still fail").
+fn forward<'a>(events: impl IntoIterator<Item = (&'a str, &'a str, i64)>, opened: i64) -> i64 {
+    let mut top = 0;
+    let mut at = opened;
+    let mut seen = std::collections::HashSet::new();
+    for (kind, body, when) in events {
+        match kind {
+            "evidence" if seen.insert(body.trim()) => at = at.max(when),
+            "stage" => {
+                if let Some(i) = ORDER.iter().position(|s| *s == body)
+                    && i > top
+                {
+                    top = i;
+                    at = at.max(when);
+                }
+            }
+            _ => {}
+        }
+    }
+    at
 }
 
 /// "at most N review rounds", any case, from a workflow's text, across a line break too.
@@ -168,6 +251,19 @@ pub(crate) fn cut(text: &str, chars: usize) -> String {
     }
     let kept: String = line.chars().take(chars.saturating_sub(3)).collect();
     format!("{kept}...")
+}
+
+/// Whether a task was opened as a report from a stranger's note: its goal starts `report:`,
+/// as typed or after the `opened by <who>: ` its record may carry.
+fn reported(first_goal: &str) -> bool {
+    let goal = first_goal.trim_start();
+    let goal = goal
+        .strip_prefix("opened by ")
+        .and_then(|rest| rest.split_once(": ").map(|(_, g)| g))
+        .unwrap_or(goal);
+    goal.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("report:")
 }
 
 /// At most `max` words: lines before the last are dropped from the end, and `+N more` says
@@ -242,6 +338,17 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         }
     };
 
+    if let Some((by, at)) = f
+        .typed_here
+        .as_deref()
+        .and_then(|m| last_typed(m, &f.log, &tab, f.qass))
+    {
+        let ago = at.map_or(String::new(), |a| {
+            format!(" {} min ago", (f.now - a).max(0) / 60)
+        });
+        lines.push(format!("last typed: by {by}{ago}"));
+    }
+
     // Writes: qass's own records since the owner last wrote to qass, and in the last hour.
     let mine: Vec<&Record> = f.log.iter().filter(|r| Some(r.from) == f.qass).collect();
     let to_qass = f.qass.map(|q| format!("T{q}"));
@@ -259,13 +366,22 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         .ok()
         .flatten();
     let since = spoke.unwrap_or(f.now - 3600);
-    let to_agent = mine.iter().filter(|r| r.to == tab && r.at >= since).count();
+    // A step forward gives room too, for that agent only: three pushes with none is a stall.
+    let task = f.task.as_ref().and_then(|t| t.as_ref().ok());
+    let moved = task
+        .map(|t| t.forward.max(t.opened))
+        .filter(|at| *at > since);
+    let to_agent = mine
+        .iter()
+        .filter(|r| r.to == tab && r.at >= moved.unwrap_or(since))
+        .count();
     // His word gives room: the hour's count starts again when he speaks.
     let hour_from = since.max(f.now - 3600);
     let hour = mine.iter().filter(|r| r.at >= hour_from).count();
-    let since_words = match spoke {
-        Some(_) => "since he spoke to you",
-        None => "in the last hour (when he last spoke to you is unknown)",
+    let since_words = match (moved, spoke) {
+        (Some(_), _) => "since its last step forward",
+        (None, Some(_)) => "since he spoke to you",
+        (None, None) => "in the last hour (when he last spoke to you is unknown)",
     };
     let hour_words = if hour_from > f.now - 3600 {
         "since he spoke to you"
@@ -290,19 +406,19 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         not_now.push("write (qass's terminal unknown)".to_string());
     }
 
-    let task = f.task.as_ref().and_then(|t| t.as_ref().ok());
     if let Some(Err(id)) = &f.task {
         lines.push(format!("task: #{id} unreadable"));
         not_now.push("another review round (task unreadable)".to_string());
     } else if let Some(t) = task {
         lines.push(format!(
-            "task: #{} {} {}{}, review rounds {} of {}; evidence: {}",
+            "task: #{} {} {}{}, review rounds {} of {}, last step forward {} ago; evidence: {}",
             t.id,
             t.stage,
             minutes(Some(t.since), f.now),
             if t.claimed { ", claimed" } else { "" },
             t.rounds,
             f.limit,
+            minutes(Some(t.forward.max(t.opened)), f.now),
             t.evidence.first().map_or("none".into(), |e| cut(e, 80))
         ));
         if t.rounds >= f.limit {
@@ -331,9 +447,21 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
 
     // Which of the skill's three prompt endings: merge in the owner's own repository, else the
     // strict one; the middle one (`pr`) where that repository's files ask before merging.
-    let end = if f.own.is_some() { "merge" } else { "none" };
+    // Work a stranger's note started (`report:`, as it was opened) stops at the PR: its AGENTS.md.
+    // An unreadable task may be a report: it gets the PR too.
+    let report = task.is_some_and(|t| reported(&t.first_goal)) || matches!(f.task, Some(Err(_)));
+    // A merge may deploy: his word, unless the repository itself pre-authorizes it.
+    let end = match (f.own.is_some(), f.merge_ok && !report) {
+        (true, true) => "merge",
+        (true, false) => "pr",
+        (false, _) => "none",
+    };
     lines.push(match f.own.as_deref() {
-        Some(r) => format!("repo: own {r}; ending merge (pr if a repo file asks before merging)"),
+        Some(r) if report => format!("repo: own {r}; ending pr (a report: task stops at its PR)"),
+        Some(r) if f.merge_ok => {
+            format!("repo: own {r}; ending merge (pr if a repo file asks before merging)")
+        }
+        Some(r) => format!("repo: own {r}; ending pr (no repo file pre-authorizes merging)"),
         None => "repo: not own; ending none".into(),
     });
 
@@ -346,6 +474,11 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     } else {
         "screen: not blocked on a menu".into()
     });
+
+    // The goal last before the verdict: the 200-word cut drops it before the ending.
+    if let Some(t) = task.filter(|t| !t.goal.trim().is_empty()) {
+        lines.push(format!("goal: {}", cut(&t.goal, 300)));
+    }
 
     let write_ok = !not_now.iter().any(|n| n.starts_with("write"));
     let allowed = write_ok.then(|| format!("write (ending {end})"));
@@ -367,6 +500,8 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "task": f.task.as_ref().map(|t| t.as_ref().map_or_else(|id| *id, |t| t.id)),
         "task_readable": f.task.as_ref().map(Result::is_ok),
         "review_rounds": task.map(|t| t.rounds),
+        "goal": task.map(|t| &t.goal),
+        "last_forward_at": task.map(|t| t.forward),
         "review_limit": f.limit,
         "card": f.card.as_ref().map(|c| &c.0),
         "own_repo": f.own,
@@ -429,6 +564,22 @@ pub(crate) fn task_of(id: i64, now: i64) -> Option<Task> {
             .map(String::from)
             .collect(),
         folder: task["folder"].as_str().map(std::path::PathBuf::from),
+        goal: task["goal"].as_str().unwrap_or("").to_string(),
+        // Events are newest first: the first `opened` is the last one.
+        first_goal: events
+            .iter()
+            .rev()
+            .find(|e| e["kind"] == "opened")
+            .and_then(|e| e["body"].as_str())
+            .or_else(|| task["goal"].as_str())
+            .unwrap_or("")
+            .to_string(),
+        forward: forward(
+            events.iter().rev().filter_map(|e| {
+                Some((e["kind"].as_str()?, e["body"].as_str()?, e["at"].as_i64()?))
+            }),
+            task["opened_at"].as_i64().unwrap_or(now),
+        ),
     })
 }
 
@@ -596,6 +747,9 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         limit,
         card,
         own: cwd.and_then(crate::worktree::own_repo),
+        merge_ok: root
+            .as_deref()
+            .is_some_and(crate::worktree::merge_authorized),
         now,
         offset: utc_offset(),
     })
@@ -833,10 +987,11 @@ mod tests {
             rounds: 2,
             evidence: vec![format!("cargo test: ok {}\nsecond line", "x".repeat(120))],
             folder: None,
+            ..Task::default()
         }));
         let out = brief(&f);
         assert!(
-            out.contains("task: #12 reviewing 10 min, claimed, review rounds 2 of 2; evidence: cargo test: ok xx"),
+            out.contains("task: #12 reviewing 10 min, claimed, review rounds 2 of 2, last step forward 15 min ago; evidence: cargo test: ok xx"),
             "{out}"
         );
         let evidence = out.lines().find(|l| l.starts_with("task:")).expect("task");
@@ -857,12 +1012,14 @@ mod tests {
         assert_eq!(review_limit("at most 3 reviewers"), None);
     }
 
-    /// The owner's own repository gets the merge ending, any other the strict one; writing is
-    /// allowed with nothing set: qass has no mode, and the brief never names one.
+    /// The owner's own repository gets the merge ending where its files pre-authorize merging,
+    /// the PR ending where they do not, any other the strict one; writing is allowed with
+    /// nothing set: qass has no mode, and the brief never names one.
     #[test]
     fn the_repo_line_gives_the_ending() {
         let mut f = facts();
         f.own = Some("pat/x".into());
+        f.merge_ok = true;
         let out = brief(&f);
         assert!(
             out.contains(
@@ -875,6 +1032,13 @@ mod tests {
         assert_eq!(json["own_repo"], "pat/x");
         assert_eq!(json["ending"], "merge");
         assert!(json.get("mode").is_none(), "{json}");
+        f.merge_ok = false;
+        let out = brief(&f);
+        assert!(
+            out.contains("\nrepo: own pat/x; ending pr (no repo file pre-authorizes merging)\n"),
+            "{out}"
+        );
+        assert_eq!(compose(&f).1["ending"], "pr");
         f.own = None;
         let out = brief(&f);
         assert!(out.contains("\nrepo: not own; ending none\n"), "{out}");
@@ -1058,5 +1222,166 @@ mod tests {
         );
         f.card = Some(("E128".into(), "ios".into(), "open".into(), Some(NOW - 200)));
         assert!(brief(&f).contains("card: E128 ios open\n"), "{}", brief(&f));
+    }
+
+    fn task_at(forward: i64, goal: &str) -> Task {
+        Task {
+            id: 9,
+            stage: "implementing".into(),
+            since: NOW - 3000,
+            opened: NOW - 5000,
+            goal: goal.into(),
+            first_goal: goal.into(),
+            forward,
+            ..Task::default()
+        }
+    }
+
+    /// A step forward is a stage above every earlier one, or evidence; the daemon's
+    /// `waiting-human` and the way back from it, a stage written again, and a claim are none.
+    #[test]
+    fn a_step_forward_is_a_higher_stage_or_evidence() {
+        let ev = |k: &'static str, b: &'static str, at: i64| (k, b, at);
+        assert_eq!(forward([], 10), 10, "nothing yet: when it opened");
+        assert_eq!(
+            forward(
+                [
+                    ev("stage", "investigating", 20),
+                    ev("stage", "implementing", 30),
+                    ev("stage", "waiting-human", 40),
+                    ev("stage", "implementing", 50),
+                    ev("done", "claimed", 60),
+                    ev("stage", "reviewing", 70),
+                    ev("stage", "implementing", 80),
+                    ev("stage", "reviewing", 90),
+                ],
+                10
+            ),
+            70,
+            "the first rise to reviewing counts, the round trip back and forth does not"
+        );
+        assert_eq!(forward([ev("evidence", "tests: ok", 95)], 10), 95);
+        assert_eq!(
+            forward(
+                [
+                    ev("evidence", "tests still fail", 20),
+                    ev("evidence", "tests still fail", 90)
+                ],
+                10
+            ),
+            20,
+            "the same evidence again is no step"
+        );
+    }
+
+    /// Three pushes with no step forward are the cap; a step forward after them gives room.
+    #[test]
+    fn writes_count_since_its_last_step_forward() {
+        let mut f = facts();
+        f.typed_to_qass = transcript(&[said(NOW - 2000, "go")]);
+        f.log = parse_log(
+            &[NOW - 1500, NOW - 1200, NOW - 900]
+                .iter()
+                .map(|at| format!("{at} 128 T52"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        f.task = Some(Ok(task_at(
+            NOW - 2500,
+            "fix the parser; done when cargo test passes",
+        )));
+        let out = brief(&f);
+        assert!(
+            out.contains("writes: 3 of 3 to T52 since he spoke to you"),
+            "{out}"
+        );
+        assert!(out.contains("Not now: write (3 of 3"), "{out}");
+        f.task = Some(Ok(task_at(
+            NOW - 1000,
+            "fix the parser; done when cargo test passes",
+        )));
+        let out = brief(&f);
+        assert!(
+            out.contains("writes: 1 of 3 to T52 since its last step forward"),
+            "{out}"
+        );
+        assert!(out.contains("Allowed now: write"), "{out}");
+    }
+
+    /// The goal is said whole, last before the verdict, so a cut drops it before the ending.
+    #[test]
+    fn the_goal_is_said_and_cut_before_the_ending() {
+        let mut f = facts();
+        let goal = "make the parser right; done when cargo test passes and the real run shows it";
+        f.task = Some(Ok(task_at(NOW - 600, goal)));
+        let lines = compose(&f).0;
+        let n = lines.len();
+        assert_eq!(lines[n - 2], format!("goal: {goal}"));
+        assert!(lines[n - 1].starts_with("Allowed now"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("last step forward 10 min ago")),
+            "{lines:?}"
+        );
+        f.name = "x ".repeat(40);
+        f.task = Some(Ok(task_at(NOW - 600, &"word ".repeat(60))));
+        f.card = Some(("E1".into(), "h".into(), "open".into(), None));
+        let lines = compose(&f).0;
+        assert!(lines.iter().any(|l| l.starts_with("repo:")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .map(|l| l.split_whitespace().count())
+                .sum::<usize>()
+                <= WORDS
+        );
+    }
+
+    /// Work opened from a stranger's note stops at its PR, whatever the goal says now.
+    #[test]
+    fn a_report_task_ends_at_the_pr() {
+        assert!(reported("report: the tab title is wrong"));
+        assert!(reported(
+            "opened by a link to QOOP-9: Report: crash on start"
+        ));
+        assert!(!reported("fix the report page"));
+        let mut f = facts();
+        f.own = Some("me/app".into());
+        f.merge_ok = true;
+        let mut t = task_at(NOW - 600, "fix the crash");
+        t.first_goal = "report: crash on start".into();
+        f.task = Some(Ok(t));
+        let (lines, json) = compose(&f);
+        assert!(lines.iter().any(|l| l.contains("ending pr")), "{lines:?}");
+        assert_eq!(json["ending"], "pr");
+        f.task = Some(Ok(task_at(NOW - 600, "fix the crash")));
+        assert_eq!(compose(&f).1["ending"], "merge");
+    }
+
+    /// A teammate's message is not his word, and the brief says who typed last.
+    #[test]
+    fn a_teammate_turn_is_not_his() {
+        let mut f = facts();
+        f.typed_here = transcript(&[
+            said(NOW - 900, "build the dashboard"),
+            said(
+                NOW - 30,
+                "Another Claude session sent a message: <teammate-message>done</teammate-message>",
+            ),
+        ]);
+        let out = brief(&f);
+        assert!(
+            out.contains("owner here: typed 15 min ago, not engaged"),
+            "{out}"
+        );
+        assert!(out.contains("last typed: by a teammate 0 min ago"), "{out}");
+        f.typed_here = transcript(&[said(NOW - 900, "build the dashboard")]);
+        f.log = parse_log(&format!("{} 77 T52", NOW - 902));
+        assert!(brief(&f).contains("last typed: by another agent's prompt 15 min ago"));
+        f.log = parse_log(&format!("{} 128 T52", NOW - 902));
+        assert!(brief(&f).contains("last typed: by qass 15 min ago"));
+        f.log = Vec::new();
+        assert!(brief(&f).contains("last typed: by him 15 min ago"));
     }
 }

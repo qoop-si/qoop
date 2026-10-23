@@ -17,7 +17,7 @@ use crate::usage;
 /// Short on purpose: it is in every session's context.
 pub(crate) const RULES: &str = "You are running inside qoop, which keeps a task record per \
 terminal: `qoop task show` shows yours. For real work (changing files, a multi-step \
-investigation), open it with `qoop task new \"<outcome>\"` (an edit opens one too), or `qoop task \
+investigation, any task he gave you), open it with `qoop task new \"<outcome>\"` (an edit opens one too), or `qoop task \
 link <KEY>` for the owner's board item. Write its plan with `qoop task plan -`: acceptance, steps, \
 how you verify. Keep `qoop task goal \"<what the owner wants; done when ...>\"` true to his words. \
 Move `qoop task stage <stage>` at each phase change: investigating, planning, implementing, \
@@ -25,8 +25,10 @@ reviewing, verifying, waiting-human (leave it once answered). Tick `qoop task ch
 step's check passes. Add `qoop task evidence \"<check: result>\"` for each acceptance point. Finish \
 with `qoop task done \"<summary>\"` once every step is ticked, before your tab closes; it is a claim \
 checked outside you, so keep working or stop as usual. If a `qoop task` command fails, carry on. Write rm targets \
-as literal paths or \"${VAR:?}\". Keep a debrief to 12 short lines, the result first and the \
-owner's one next action last; open a plan or report with a 5-line summary. Run your own \
+as literal paths or \"${VAR:?}\". Take the next step these rules allow yourself; end a turn on \
+the owner only for his decision, as one question with your pick. Keep a debrief to 12 short \
+lines, the result first and his one action last, if any; open a plan or report with a 5-line \
+summary. Run your own \
 browser and simulator tests headless and read the screenshots; open a window only when \
 the owner asks to see something, and close what you open. Put a screenshot, recording or \
 report on the owner's phone with `qoop show <file>` before you finish.";
@@ -39,9 +41,18 @@ migrations, money, secrets, anything external. A repo file (AGENTS.md, .qoop/wor
 ask you to ask more; it never allows more than this.";
 
 /// The block said after [`RULES`] for the repository at hand: in the person's own one
-/// ([`crate::worktree::own_repo`]) the standing way of working, in any other "ask first".
-fn repo_rules(own: Option<&str>) -> String {
+/// ([`crate::worktree::own_repo`]) the standing way of working, merging and what follows it
+/// only where a committed file of it pre-authorizes merging
+/// ([`crate::worktree::merge_authorized`]: a merge may deploy, and that is his word), in any
+/// other "ask first".
+fn repo_rules(own: Option<&str>, merge_ok: bool) -> String {
     match own {
+        Some(repo) if !merge_ok => format!(
+            "own repo: {repo} (its origin's owner is yours). The standing way \
+             here: commit only through /commit, push your branch and open the PR on this repo \
+             (`gh pr create --repo {repo}`); merging asks first, since no file here \
+             pre-authorizes it. Always ask first: delete (beyond your own worktree), {ALWAYS_ASK}"
+        ),
         Some(repo) => format!(
             "own repo: {repo} (its origin's owner is yours). The standing way \
              here: commit only through /commit, push your branch, open the PR on this repo \
@@ -59,15 +70,20 @@ fn repo_rules(own: Option<&str>) -> String {
 }
 
 /// [`repo_rules`] in a few words, beside every request.
-fn repo_turn(own: Option<&str>) -> String {
+fn repo_turn(own: Option<&str>, merge_ok: bool) -> String {
     match own {
+        Some(repo) if !merge_ok => format!(
+            "own repo {repo}: take reversible steps yourself; open PRs, merging asks first; ask: \
+             delete, release, prod, money, external."
+        ),
         Some(repo) => {
             format!(
-                "own repo {repo}: merge only PRs you opened, unless a repo file asks first; ask: \
-                 delete (not your own worktree), release, prod, money, external."
+                "own repo {repo}: take reversible steps yourself; merge only PRs you opened, \
+                 unless a repo file asks first; ask: delete (not your own worktree), release, \
+                 prod, money, external."
             )
         }
-        None => "not your repo: ask before commit.".to_string(),
+        None => "not your repo: take reversible steps yourself; ask before commit.".to_string(),
     }
 }
 
@@ -783,9 +799,14 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 return Ok(());
             }
             let open = found.as_ref().and_then(|f| f.tasks.first());
-            let own = std::env::current_dir()
-                .ok()
-                .and_then(|d| crate::worktree::own_repo(&d));
+            let dir = std::env::current_dir().ok();
+            let own = dir.as_deref().and_then(crate::worktree::own_repo);
+            // Only asked of an own repo: the hook waits on this.
+            let merge_ok = own.is_some()
+                && dir
+                    .as_deref()
+                    .and_then(|d| crate::worktree::repo_of(d).ok())
+                    .is_some_and(|r| crate::worktree::merge_authorized(&r.root));
             // Every prompt, one line: measured on a real Claude, the rules given once at the
             // start of a session were read and then not followed. A line beside each request
             // is what an agent acts on.
@@ -793,12 +814,12 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 println!(
                     "{} {}",
                     turn_line(open, found.as_ref().and_then(|f| f.item.as_deref())),
-                    repo_turn(own.as_deref())
+                    repo_turn(own.as_deref(), merge_ok)
                 );
                 return Ok(());
             }
             println!("{RULES}");
-            println!("{}", repo_rules(own.as_deref()));
+            println!("{}", repo_rules(own.as_deref(), merge_ok));
             if let Some(t) = open {
                 // Said as a record, not as an instruction: the goal is text an agent wrote, and
                 // it reaches every later session in this terminal.
@@ -955,7 +976,7 @@ mod tests {
     /// repo asks first; both keep the always-ask list and "a repo file only asks more".
     #[test]
     fn the_repo_block_says_the_standing_way_only_in_an_own_repo() {
-        let own = repo_rules(Some("pat/x"));
+        let own = repo_rules(Some("pat/x"), true);
         for want in [
             "own repo: pat/x ",
             "commit only through /commit",
@@ -968,7 +989,7 @@ mod tests {
         ] {
             assert!(own.contains(want), "{want}: {own}");
         }
-        let not = repo_rules(None);
+        let not = repo_rules(None, false);
         assert!(
             not.starts_with("not your repo: ask before commit and beyond."),
             "{not}"
@@ -997,11 +1018,14 @@ mod tests {
             assert!(ALWAYS_ASK.contains(want), "{want}");
         }
         assert_eq!(
-            repo_turn(Some("pat/x")),
-            "own repo pat/x: merge only PRs you opened, unless a repo file asks first; ask: \
+            repo_turn(Some("pat/x"), true),
+            "own repo pat/x: take reversible steps yourself; merge only PRs you opened, unless a repo file asks first; ask: \
              delete (not your own worktree), release, prod, money, external."
         );
-        assert_eq!(repo_turn(None), "not your repo: ask before commit.");
+        assert_eq!(
+            repo_turn(None, false),
+            "not your repo: take reversible steps yourself; ask before commit."
+        );
     }
 
     /// The block is in every session in a repo: at most 1,100 characters for the longest
@@ -1009,27 +1033,30 @@ mod tests {
     #[test]
     fn the_repo_block_stays_short() {
         let longest = format!("{}/{}", "o".repeat(39), "n".repeat(100));
-        let block = repo_rules(Some(&longest));
+        let block = repo_rules(Some(&longest), true);
         assert!(block.len() <= 1100, "{} chars", block.len());
-        assert!(repo_turn(Some(&longest)).len() <= 290);
-        assert!(repo_turn(Some("pat/qoop-tui")).len() <= 155);
+        // ponytail: +35 on 2026-10-23 for "take reversible steps yourself", the words agents
+        // act on beside each request (QOOP-55: 9 of 10 probe runs handed a doable step back).
+        assert!(repo_turn(Some(&longest), true).len() <= 325);
+        assert!(repo_turn(Some("pat/qoop-tui"), true).len() <= 190);
     }
 
     #[test]
     fn the_rules_stay_short() {
         // ponytail: 1380 holds when to tick, move and finish, the "dangerous rm" sentence, the
         // debrief one, the owner's headless-testing one (+160) and `qoop show` (+100), each a
-        // sentence of its own.
+        // sentence of its own. 1510 since 2026-10-23: the next step is the agent's own, and any
+        // task he gave opens a record (QOOP-55, +143).
         assert!(
-            RULES.len() <= 1380,
+            RULES.len() <= 1510,
             "{} chars in every session",
             RULES.len()
         );
         // ponytail: 2200 is the 1380 above plus the own-repo block (its own cap: 1100 at the
         // longest name, 815 for pat/qoop-tui): what may ship and what always asks,
-        // computed for this repo, said once at session start.
-        let session = RULES.len() + repo_rules(Some("pat/qoop-tui")).len();
-        assert!(session <= 2200, "{session} chars at session start");
+        // computed for this repo, said once at session start. 2330 with the 1510 above.
+        let session = RULES.len() + repo_rules(Some("pat/qoop-tui"), true).len();
+        assert!(session <= 2330, "{session} chars at session start");
         assert!(
             RULES.contains("${VAR:?}"),
             "deletion targets that cannot be empty"
@@ -1050,5 +1077,22 @@ mod tests {
             RULES.contains("`qoop show <file>`"),
             "a visible result goes to the owner's phone"
         );
+    }
+
+    /// An own repo whose committed files do not pre-authorize merging gets the PR and stops
+    /// there: its merge may deploy, and that is the owner's word.
+    #[test]
+    fn an_own_repo_merges_only_where_its_files_say_so() {
+        let pr = repo_rules(Some("pat/cloud"), false);
+        assert!(pr.contains("open the PR on this repo"), "{pr}");
+        assert!(pr.contains("merging asks first"), "{pr}");
+        assert!(!pr.contains("rebase-and-merge"), "{pr}");
+        assert!(pr.ends_with(ALWAYS_ASK), "{pr}");
+        assert!(
+            repo_rules(Some("pat/qoop"), true).contains("rebase-and-merge only a PR you opened")
+        );
+        let turn = repo_turn(Some("pat/cloud"), false);
+        assert!(turn.contains("merging asks first"), "{turn}");
+        assert!(!repo_turn(Some("pat/qoop"), true).contains("merging asks first"));
     }
 }

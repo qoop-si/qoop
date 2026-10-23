@@ -40,16 +40,21 @@
 #   one block, so Monitor brings several in one wake.
 # - Short hold (QASS_SETTLE): a line about work qass started (the newest record in
 #   prompted.log for that terminal comes from qass's own terminal, written by `qoop prompt`,
-#   `qoop send` and on.sh), new, restarted and starting lines, remote agents.
+#   `qoop send` and on.sh), new, restarted and starting lines, remote agents, and work in
+#   progress that came to rest: an agent on an open task, not claimed, not waiting on the owner,
+#   that no other agent drives (`work_rest`, `driven`: another running terminal, not qass, wrote
+#   to it in the last hour; such an agent stays routine or long, as before). Work that stops is qass's to
+#   move on in seconds, not after he did it himself.
 # - Long hold (QASS_QUIET_HOLD, 600 s from its first line): everything else, an agent woken
-#   by its own background work or driven by the owner. It rides along with any earlier block.
+#   by its own background work, or one another agent drives. It rides along with any earlier
+#   block.
 # - Ride: a repeat of an agent already said waiting on the owner, and a sleep after an idle
 #   already said, only ever go with another block.
 # - A remote whose daemon left with no agent on it, and lines that went stale, go to
 #   quiet.log instead. Held lines and marks outlive a restart of this script.
 # - Routine, silent unless the file `routine` in qass's folder holds `say` (the owner's word:
-#   `routine off`, `routine on`): a plain rest (working or starting to idle or done, no claim,
-#   not waiting-human) is held QASS_ROUTINE_HOLD seconds (1800) and said only if the agent is
+#   `routine off`, `routine on`): a plain rest with no open task (working or starting to idle or
+#   done, no claim, not waiting-human) is held QASS_ROUTINE_HOLD seconds (1800) and said only if the agent is
 #   still there, never riding along with another block; a sleep, and a daemon leaving
 #   with no agent working or blocked on it, go to quiet.log only.
 # - With cswap installed, a Claude agent of this Mac that stopped on its usage limit comes out
@@ -148,7 +153,11 @@ watch_unseen() {
 }
 base_file() { if [ -z "$1" ]; then echo "$dir/base"; else echo "$dir/base-$1"; fi; }
 # Says `$1` and ends, once: a second stop asked for meanwhile says nothing more.
-end_with() { trap '' USR1 USR2; printf '%s\n' "$1"; exit 0; }
+# One line in watch.log (qass's folder, beside the switch's own turns that the daemon writes there)
+# a start, a line it ends on, and an exit (its code): a start with no exit before the next start
+# is a watcher killed, and a day with no start is a day nobody watched.
+wlog() { printf '%s %s\n' "$(date +%s)" "$1" >> "$dir/watch.log" 2>/dev/null || true; }
+end_with() { trap '' USR1 USR2; wlog "said ${1%%:*}"; printf '%s\n' "$1"; exit 0; }
 seen_stamp() { printf '%s\n' "$1" > "$dir/watch-seen.$$" && mv "$dir/watch-seen.$$" "$dir/watch-seen"; }
 off_line='watch-off: the owner turned watching off (qoop qass watch); do not start this again until it reads on'
 
@@ -320,6 +329,10 @@ hold_class() {
         [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ]; then
         echo ride; return
     fi
+    # Work in progress that came to rest, not driven by another agent (`work_rest`).
+    if work_rest; then
+        echo short; return
+    fi
     echo long
 }
 
@@ -337,6 +350,9 @@ hold_put() { # label terminal generation class line
         arr="$o_arr"
         # A routine line is the agent's newest word: it never inherits an earlier class.
         [ "$class" != routine ] || { due=$((now + rhold)); arr="$now"; }
+        # A short line again: the agent stopped anew, so it settles anew from now. An agent that
+        # stops more often than the settle is said once it stays stopped, not before.
+        [ "$class.$o_class" != short.short ] || due=$((now + settle))
         case "$class.$o_class" in
             routine.*) ;;
             short.* | *.short) class=short ;;
@@ -492,11 +508,34 @@ quiet_hold() { # label line
     fi
 }
 
+# Whether the line just parsed is work in progress that came to rest: an agent on an open task,
+# not claimed, not waiting on the owner, from working or starting to idle or done. qass hears it
+# in seconds (`short`), not after the routine or long hold: work that stops must not wait for him.
+work_rest() {
+    case "$L_FROM.$L_STATE" in working.idle | working.done | starting.idle | starting.done) ;; *) return 1 ;; esac
+    [ "$L_STAGE" != - ] && [ "$L_STAGE" != waiting-human ] && [ -z "$L_CLAIMED" ] && ! driven
+}
+
+# Whether another agent drives the agent of the line just parsed (this Mac only): the newest
+# prompted.log record for it is under an hour old and from a terminal still running that is not
+# qass (an earlier qass tab works in qass's folder too, and a writer gone drives nothing).
+driven() {
+    local at from
+    [ -z "$L_LABEL" ] || return 1
+    read -r at from <<< "$(record_of "$L_T")"
+    [ -n "${at:-}" ] && [ "$at" != unreadable ] && [ "${from:-}" != "$self" ] || return 1
+    [ $(($(date +%s) - at)) -lt 3600 ] || return 1
+    jq -e --argjson t "$from" --arg d "$dir" \
+        'any(.[]?; .terminal == $t and ((.cwd // "") | startswith($d) | not))' \
+        "$dir/last.json" > /dev/null 2>&1
+}
+
 # Whether a line is routine (see the top of this file). Run after `urgent`, which parsed it.
 routine() {
     parse_line "$1" || return 1
     [ "$L_STATE" != sleeping ] || return 0
     case "$L_FROM.$L_STATE" in working.idle | working.done | starting.idle | starting.done) ;; *) return 1 ;; esac
+    ! work_rest || return 1
     [ "$L_STAGE" != waiting-human ] && [ -z "$L_CLAIMED" ]
 }
 
@@ -741,6 +780,7 @@ due() {
 }
 
 if watch_off; then
+    wlog "said watch-off at start"
     printf '%s\n' "$off_line"
     exit 0
 fi
@@ -751,17 +791,24 @@ take_pid() { ( set -C; echo $$ > "$pidf" ) 2>/dev/null; }
 if ! take_pid; then
     old="$(cat "$pidf" 2>/dev/null || true)"
     if [ -n "$old" ] && kill -0 "$old" 2>/dev/null && ps -o command= -p "$old" 2>/dev/null | grep -q 'watch\.sh'; then
+        wlog watch-running
         echo "watch-running: one already runs"
         exit 0
     fi
     rm -f "$pidf"
-    take_pid || { echo "watch-running: one already runs"; exit 0; }
+    take_pid || { wlog watch-running; echo "watch-running: one already runs"; exit 0; }
     # Two that found the same stale file: the one whose pid is not there a moment later leaves.
     sleep 0.2
-    [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] || { echo "watch-running: one already runs"; exit 0; }
+    [ "$(cat "$pidf" 2>/dev/null)" = "$$" ] || { wlog watch-running; echo "watch-running: one already runs"; exit 0; }
 fi
-drop_pid() { [ "$(cat "$pidf" 2>/dev/null)" != "$$" ] || rm -f "$pidf"; }
+drop_pid() {
+    local st="${1:-$?}"
+    wlog "exit $st"
+    [ "$(cat "$pidf" 2>/dev/null)" != "$$" ] || rm -f "$pidf"
+}
 trap drop_pid EXIT
+[ -f "$dir/watch.log" ] && tail -n 2000 "$dir/watch.log" > "$dir/watch.log.tmp" && mv "$dir/watch.log.tmp" "$dir/watch.log"
+wlog "start $$"
 # Its own time is up: said, so qass starts it again (Start, step 3). Or the owner turned it off.
 # Set before the tick and the remotes start, so a stop asked for while they do is never lost.
 trap 'end_with watch-ends' USR1
@@ -877,8 +924,8 @@ for name in $remotes; do
 done
 # On the way out, each stream's reader (qoop, ssh) goes with the loop that reads it. IFS
 # is set here because a signal can arrive inside `IFS= read`, where it is empty.
-trap 'IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || true; done
-      kill $kids 2>/dev/null || true; drop_pid' EXIT
+trap 'st=$?; IFS=$'"'"' \t\n'"'"'; for k in $kids $$; do pkill -P "$k" 2>/dev/null || true; done
+      kill $kids 2>/dev/null || true; drop_pid "$st"' EXIT
 # Killed rather than ended (Monitor stopping it), go through the same way out.
 trap 'exit 143' TERM INT HUP
 

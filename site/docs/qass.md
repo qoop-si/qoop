@@ -16,10 +16,18 @@ default, codex, gemini, opencode, or one of your own `[agents]` lines, such as
 Close it as any tab: `ctrl-a x` in it, or `qoop close`.
 Its rules live in the skill itself: what it answers alone, what it asks you, and what it
 never does. It writes to an agent within those rules without asking you first; tell it "ask me
-first" and it keeps that until you say otherwise. In a repository whose GitHub
+first" and it keeps that until you say otherwise. Work that stops is its to move on: an agent on
+an open task that comes to rest reaches it within half a minute, and it answers a question the
+agent's rules already settle, resumes after an error or a usage limit, and pushes the step the
+task's goal still lacks. It never types into a tab while you are at it (your keys there in the last
+minutes), and stops after a few writes to one agent that do not move it, asking you instead.
+Agents themselves are told to take the next step their rules allow and to end a turn on you only
+for your decision. In a repository whose GitHub
 `origin` belongs to the login `gh` is signed in as, every agent is told the standing way
-(`qoop task rules`): commit through /commit, push, open a PR, rebase-and-merge its own PR,
-install and clean up; elsewhere it asks first, and delete, release, production, money and
+(`qoop task rules`): commit through /commit, push, open a PR, and, where a committed
+`AGENTS.md`, `CLAUDE.md` or `.qoop/workflow.md` of the repository pre-authorizes merging,
+rebase-and-merge its own PR, install and clean up (elsewhere it stops at the PR and asks before
+merging, since a merge may deploy); in a repository not its owner's it asks first, and delete, release, production, money and
 anything external always ask. A repository's `AGENTS.md` may ask for more, never allow
 more. When you correct it or say how you want things, it keeps the rule in
 `$(qoop paths qass-config)/lessons.md` (3,000 characters at most, loaded at every start); a lesson can

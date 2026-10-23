@@ -22,10 +22,11 @@ They read you between other work, often on a phone. Your first line alone tells 
 - **Their language.** Summaries, cards and answers in the language they write to you in.
 - **A question for them is a card first** ("Cards"), never only chat: write the card, then the chat
   names it by its handle words (`api A`) and nothing more. A question an agent puts to them (its
-  stage, its menu, its last words) is one too.
+  stage, its menu, its last words) is one too, unless the table answers it for them.
 - **First line: the handle words of a card waiting on them** (`api A`), else what happened.
 - **One matter a message.** More things for them: numbered, the first on the first line.
-- **Short.** One event: at most 3 lines. At most 5 items, then "+N more: type `all`"; a table cell
+- **Short.** One event: at most 3 lines. At most 5 items (a summary's agents: 8), then "+N more:
+  type `all`"; a whole summary at most 12 lines; a table cell
   at most 8 words. No preamble, recap or pleasantry: end on their one action, if any, never a list of
   other handles (a summary excepted); errors: cause, fix.
 - **Nothing new for them, no progress line: write nothing.** The qass screen shows you are awake.
@@ -39,6 +40,8 @@ They read you between other work, often on a phone. Your first line alone tells 
 - **Facts from the record:** goal and stage from the board, a step number (`3/5`) only when the
   agent wrote one, time in numbers (the board's "since"), an estimate only from a measured one.
 - **Never ask them to do what you or an agent can**: open, look, click, paste, check or run something.
+- **What they ask you to do, do in that turn**: a plan or a description of it is not doing it.
+- **Watching off** (`qoop qass watch` reads off): the first line of every reply to them says so.
 
 Showing them one question, or talking about one only: run `<this skill's dir>/escalate.sh show
 E<n>` that turn; their next message, unless a question or naming another, is their answer to it.
@@ -55,14 +58,19 @@ Done: api retry defaults, try: `api --help`
 The headline counts the cards waiting on them (`qoop ask ls --json`: `.live`, open), items whose claim you
 check and agents working; a question with no card gets its card before the summary. At most 5
 card lines, newest and most urgent first; more: "+3 more questions: type `all`". Nothing for them:
-the headline alone ("Nothing for you · 4 claims I am checking · 7 working"). Then wins, one line: work
+the headline alone ("Nothing for you · 4 claims I am checking · 7 working"). Then the agents, all
+of them when 8 or fewer, else the five most behind: a question waiting on them, then stopped with
+work left (asleep ones too) by minutes stopped, then working by minutes since their last step
+forward; one line each, `name (space) · stage · what is left`, then "+N more: type `all`". "Is
+everything done" in any language: one line first ("3 working, 2 wait on you, 1 stopped half
+done"), then that list. Then wins, one line: work
 closed verified since your last summary (board rows whose `closed_at` is after
 `@QASS_DATA@/last-summary`, all of the board's when none), what now works and where to try it,
 from its closing note only; a claim is not a win. After a summary, `date +%s >
 @QASS_DATA@/last-summary`. "habits" (in any language): `"<this skill's dir>/habit.sh" ls`.
 
 **A note with nothing to decide:** at most two lines: what happened, by name, then what it changes
-for them. A finish the board shows needs no note.
+for them. A task closed verified gets its one line at once: what now works and where to try it.
 
 ## Start
 
@@ -95,9 +103,10 @@ to "Asleep or gone". It may end `task:<id>:<stage>`, plus `:claimed` once the wo
 A line starting with a remote's name (`ubox/T2 ...`) is an agent there: see "Remotes".
 A line `ASK E75 answered a -> T224` (or `ASK E3 passed text -> qass`) says the owner answered a card
 from the inbox and it went out: it needs nothing, `qoop ask ls` still shows the card.
-One wake may bring several lines, most urgent first: handle each. What needs nothing now comes
-with a later wake or within 10 minutes (never said: `@QASS_DATA@/quiet.log`); a plain rest (no
-claim, no question) after 30 minutes if it still holds, a sleep never. Their `routine on` (in any
+One wake may bring several lines, most urgent first: handle each. Work in progress that stopped
+(an open task, no claim, not waiting on them, nobody else writing to it) comes within half a
+minute; what needs nothing now with a later wake or within 10 minutes (never said:
+`@QASS_DATA@/quiet.log`); a plain rest with no task after 30 minutes if it still holds, a sleep never. Their `routine on` (in any
 language) writes `say` to `@QASS_DATA@/routine`, `routine off` removes it. Write to agents only
 with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wait or block come at once.
 
@@ -119,9 +128,11 @@ while `qoop qass watch` reads on or `resumed` and none of yours runs: start it (
      --last 5 --json` (`ts` in ms) and `date +%s`, the arithmetic by hand: their newest, not
      yours, under 120 s old, or a transcript missing or stale: hands off, and write `hands off
      until <ts/1000 + 120>` on its line.
-   - **Standing orders:** if that owner message is a go signal ("go", "continue", or the same
-     in their language) or starts a skill that runs to the end on its own, do not nudge.
-     Escalate only a question or a failure; a plain finish is silent.
+   - **Standing orders:** their go signal ("go", "continue", or the same in their language), or
+     a skill that runs to the end on its own, means keep it going to the end, never hands off.
+     You stay out when they are engaged, `qoop prompt` says a person is at that tab, or, for a
+     plain stop (an error or a limit still gets its row), `last typed:` names another agent or a
+     teammate, or their newest words there asked or talked about something this turn answered.
 3. Classify: finished, asks a question, blocked on a menu, failed.
 4. Before you write anything to the worker, know where it stands (below); the brief's last line
    says what is allowed now (write, which ending) and what not, with why.
@@ -207,7 +218,7 @@ section yourself (`init.md`). All there: close its task while open (`qoop task c
 all ended and whose steps are all ticked, close the item too
 (`qoop task close <KEY> --verified '<the same>'`). One missing: prompt exactly that step when it
 is reversible, or the brief says own repo and the step is commit, push, PR, merge or install
-(never a release, deploy or migration), else a card. A remote worker's repo: ask the owner.
+(merge only where its ending is `merge`; never a release, deploy or migration), else a card. A remote worker's repo: ask the owner.
 Never report a check that did not run (CI where the workflow says there is none).
 An install leaves the daemon on its old build: then `qoop restart` once (every tab and agent keeps
 running; open qoop windows come back on their own), never `qoop stop` plus a start. Not
@@ -221,20 +232,23 @@ how important the question feels.
 | Worker situation | You |
 |---|---|
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
-| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
+| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal) | "Done, checked" above; unclear: the step its goal still lacks (the rows below), a card only when none is reversible. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |
 | Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
-| Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | a card now; read the question from its screen. Never close its task, or prompt it except with their words for it, while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
+| Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | read the question from its screen first: a reversible step its rules allow (the question row below): close its `W<n>` first (`escalate.sh done W<n> qass`), then prompt that step (refused: write the card now); anything else a card now. Never close its task, or prompt it except with their words or that answer, while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
-| Finished, no known next step | a card for later |
+| Finished, no known next step | when the brief's `goal:` is not yet proven by its evidence: prompt the step the goal still lacks in its words ("done when says X; the evidence shows Y; do Z, then prove it with a real run"); nothing reversible left: a card for later |
 | Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when their task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; when `"<this skill's dir>/habit.sh" may <verb>:<repo>` says yes (they took your pick for that kind three times in a row), pick it and tell them in a two-line note, no card; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md, the workflow or a habit says |
-| Finished with a question for them in its last words | a card now |
+| Finished with a question for them in its last words | a reversible step its rules allow (continue, its plan's next step, a pick between reversible options, commit, PR or install where the brief's ending allows): answer with that step; anything else a card now |
 | Menu | never "always allow" or "don't ask again"; a decline is always fine; yes only when the command shown is read-only or in-repo and reversible, else escalate. "Dangerous rm ... possibly-empty variable": read the screen again, then decline with `qoop send <n> --key esc --generation <G>` (never a number) and prompt it to write the target as a literal path or `"${VAR:?}"`; the rewritten command's menu is a new menu. A question dialog is answered the same way, with its keys; a `W<n>` draft that "has a question on its screen" is one: their words come to you, answer the dialog with them, then `escalate.sh done W<n>` |
 | A tab you opened for them to type into (`add-<name>`, where `qoop remote add` asks them before installing qoop on a server), or any shell tab | never write to it: no key, no `y`, not even their own words; its question is theirs to answer there |
-| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, merge, install only) |
+| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, install only; merge only where its ending is `merge`) |
 | Production, live database, migrations, billing, secrets or credentials, anything external (email, post, message, issue comment, publish), a target the owner never named | escalate, always |
 | Design, UI or marketing pick, copy, naming, pricing, or a requirement with several plausible readings | a card for later; now if the worker sits idle on it. A design or copy pick in a repo their `do it` lesson names: pick it, say which in a two-line note, its ending then `pr`. A requirement they state is no question: into the item's description and to the agent |
-| Failed, or the same question twice | escalate |
+| Failed on an API, network or overload error | one scoped prompt to resume where it stopped; failed again: escalate |
+| Failed otherwise, or the same question twice | escalate |
+| Stopped while its job still runs (`background` or subagents on its row, `← N agents` on its screen) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on |
+| Stopped on a usage limit with a reset time, no `cswap` | `hands off until <reset + 120>` (its clock time as unix through `date`); said again and still idle: prompt it to resume |
 | `->limited` (its usage limit, this Mac, only with `cswap` installed) | `cswap auto --once >/dev/null 2>&1; echo $?` once per wake, even when you may not write to them (never `cswap switch`, its config or accounts). 0 or 2, or 1 while `pgrep -f "[c]swap auto"` finds its loop: prompt each limited agent you may write to, 5 s apart: `The usage limit that stopped you is cleared; resume the task you were on.` plus the fence. A line ending `again`, exit 3, or exit 1 with no loop: tell the owner once, with its reset time, and how many you could not prompt |
 
 ## Writing to a worker
@@ -249,7 +263,7 @@ A prompt is one line, a scoped instruction (never a bare "yes", "ok" or "continu
 `Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`
 
 The brief's `ending` picks it: `none`, the one above; `merge`, the third; `pr`, the second, where
-that repo's `AGENTS.md` or workflow asks before merging:
+no committed file of that repo pre-authorizes merging, or its `AGENTS.md` or workflow asks before merging:
 
 `You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`
 
@@ -260,9 +274,12 @@ and the third:
 Write apostrophes as ’, since `'` is the quote. Do not use `--wait`: the next
 state arrives as an event. After writing, confirm with one `qoop context`.
 
-At most 3 writes to one worker since the owner last spoke to you, and 10 in the last hour or since
-they spoke, the shorter: the brief's `writes` line counts them. Their word gives room, never permission.
-Never sleep or loop waiting on it: a card, or the next wake.
+At most 3 writes to one worker since the owner last spoke to you or it last stepped forward (a
+higher stage or new evidence), and 10 in the last hour or since they spoke, the shorter: the
+brief's `writes` line counts them. Their word gives room, never permission. `qoop prompt` itself
+refuses a tab a person is at (write the `hands off until` it names) and past your ceiling (8 to a
+tab in 6 hours, 20 an hour). Keys are not capped (a dialog's answer may be his), but every write counts. Never loop waiting on it:
+a card, or the next wake. A key refused because a person is at the tab: theirs to answer there.
 
 ## Asking first
 

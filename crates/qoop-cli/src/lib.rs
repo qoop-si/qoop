@@ -1691,7 +1691,21 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     }) {
         return Err(std::io::Error::other(reason));
     }
+    let cwd_of = |t: u32| {
+        crate::qass::json(&["agents", "--json"])?
+            .as_array()?
+            .iter()
+            .find(|r| r["terminal"].as_u64() == Some(u64::from(t)))?["cwd"]
+            .as_str()
+            .map(String::from)
+    };
     if !keys.is_empty() {
+        // A key lands in his draft as surely as text: held while he is at the tab too. Not
+        // capped: a menu or a dialog answered with keys may carry his own answer (it still
+        // counts in the log toward the next text write).
+        if let Some(reason) = person_refusal(person_until_now(terminal), terminal, unix_now()) {
+            return Err(std::io::Error::other(reason));
+        }
         supervise::send_keys(terminal, &keys)?;
         crate::qass::note_prompted(terminal);
         println!("sent to terminal {terminal}");
@@ -1700,6 +1714,9 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     let mut text = parts.join(" ");
     if text.is_empty() {
         return Err(usage(format!("refusing to send empty input; {help}")));
+    }
+    if let Some(reason) = ceiling_refusal(terminal, &text, cwd_of) {
+        return Err(std::io::Error::other(reason));
     }
     if enter {
         text.push('\r');
@@ -1738,6 +1755,20 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
                     "no such terminal: {terminal}"
                 )));
             }
+        }
+        let until = person_at(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            terminal,
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(reason) = person_refusal(until, terminal, unix_now()) {
+            return Err(std::io::Error::other(reason));
         }
         let mut term_seq = 0u32;
         // Who sends, when the sender runs inside a terminal: binds the
@@ -2080,6 +2111,156 @@ fn prompt_refusal(row: &qoop_runtime::control::AgentRow) -> Option<String> {
     None
 }
 
+/// A person at the target tab, as the daemon saw their keys (`PersonAt`): refused, with the
+/// second it frees, so a caller can wait that long. `None` once it is past or nobody is there.
+fn person_refusal(until: Option<i64>, terminal: u32, now: i64) -> Option<String> {
+    let until = until.filter(|u| *u > now)?;
+    Some(format!(
+        "a person is at terminal {terminal} until {until} (in {} s): nothing was sent",
+        until - now
+    ))
+}
+
+/// Writes to one tab from anyone, in [`CEILING_WINDOW`] seconds, past which qass stops.
+const CEILING_TAB: usize = 8;
+const CEILING_WINDOW: i64 = 6 * 3600;
+/// Writes from qass's terminal to all tabs in an hour, past which qass stops.
+const CEILING_HOUR: usize = 20;
+
+/// Whether a prompt passes on the owner's answer to a card, in the one form qass writes it:
+/// `The owner answered E12: ...` (or a daemon draft's `W12`).
+fn his_answer(text: &str) -> bool {
+    text.strip_prefix("The owner answered ")
+        .and_then(|rest| rest.strip_prefix('E').or_else(|| rest.strip_prefix('W')))
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// qass's hard ceiling, from `prompted.log` alone: at most [`CEILING_TAB`] writes to one tab
+/// from anyone in [`CEILING_WINDOW`] seconds (a tab another agent drives fills it, and qass
+/// should not push that one), and [`CEILING_HOUR`] from qass's terminal to all in an hour.
+/// The owner's own answer passes on whatever the count. Arithmetic on the log, no transcript.
+fn qass_ceiling(log: &str, target: u32, qass: u32, now: i64, text: &str) -> Option<String> {
+    if his_answer(text) {
+        return None;
+    }
+    let tab = format!("T{target}");
+    let (mut to_tab, mut mine) = (0, 0);
+    for line in log.lines() {
+        let mut w = line.split_whitespace();
+        let (Some(at), Some(from), Some(to)) = (w.next(), w.next(), w.next()) else {
+            continue;
+        };
+        let Ok(at) = at.parse::<i64>() else { continue };
+        if to == tab && at >= now - CEILING_WINDOW {
+            to_tab += 1;
+        }
+        if from.parse() == Ok(qass) && at >= now - 3600 {
+            mine += 1;
+        }
+    }
+    if to_tab >= CEILING_TAB {
+        return Some(format!(
+            "qass's ceiling: {to_tab} writes to terminal {target} in 6 hours; ask him instead"
+        ));
+    }
+    (mine >= CEILING_HOUR)
+        .then(|| format!("qass's ceiling: {mine} writes in the last hour; ask him instead"))
+}
+
+/// The caller's terminal when it is qass (`QOOP_TERMINAL` names a tab working in qass's
+/// folder), else `None`: only qass is held to its ceiling.
+fn qass_caller(cwd_of: impl FnOnce(u32) -> Option<String>) -> Option<u32> {
+    let me: u32 = qoop_runtime::legacy::var("QOOP_TERMINAL")
+        .ok()?
+        .parse()
+        .ok()?;
+    let folder = paths::qass_data_dir()?;
+    cwd_of(me)
+        .is_some_and(|cwd| crate::qass::in_folder(&cwd, &folder))
+        .then_some(me)
+}
+
+/// qass's ceiling for a write it is about to make to `target`, `None` for any other caller.
+/// The log is counted first; only a write over the ceiling asks who the caller is.
+fn ceiling_refusal(
+    target: u32,
+    text: &str,
+    cwd_of: impl FnOnce(u32) -> Option<String>,
+) -> Option<String> {
+    let me: u32 = qoop_runtime::legacy::var("QOOP_TERMINAL")
+        .ok()?
+        .parse()
+        .ok()?;
+    let log = paths::qass_data_dir()
+        .and_then(|f| std::fs::read_to_string(f.join(crate::qass::PROMPTED_LOG)).ok())?;
+    let why = qass_ceiling(&log, target, me, unix_now(), text)?;
+    qass_caller(cwd_of)?;
+    Some(why)
+}
+
+/// [`person_at`] on a connection of its own, for a caller with no runtime: `None` on any
+/// failure, so a write goes as it always did.
+fn person_until_now(terminal: u32) -> Option<i64> {
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    rt.block_on(async {
+        let dir = paths::runtime_dir().ok()?;
+        let (stream, mut inbuf) = client::connect(&paths::socket_path(&dir), "qoop-send")
+            .await
+            .ok()?;
+        let (mut rd, mut wr) = stream.into_split();
+        let (mut connection, mut seq) = (client::Connection::new(), 0u32);
+        person_at(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            terminal,
+        )
+        .await
+        .ok()
+        .flatten()
+    })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Asks the daemon until when a person is at `terminal`; a daemon from before `PersonAt`, or
+/// any other answer, is `None`: the write goes as it always did.
+async fn person_at(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    wr: &mut tokio::net::unix::OwnedWriteHalf,
+    inbuf: &mut bytes::BytesMut,
+    connection: &mut client::Connection,
+    seq: &mut u32,
+    terminal: u32,
+) -> std::io::Result<Option<i64>> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let id = format!("person-{terminal}-{}", unix_now());
+    Ok(
+        match control_roundtrip(
+            rd,
+            wr,
+            inbuf,
+            connection,
+            seq,
+            &ControlRequest::PersonAt { id, terminal },
+            Duration::from_secs(5),
+        )
+        .await?
+        .0
+        {
+            ControlResponse::PersonAt { until, .. } => until,
+            _ => None,
+        },
+    )
+}
+
 /// `qoop prompt`: send text plus Enter to another session, unless it is blocked.
 ///
 /// Not limited to agents: a
@@ -2151,6 +2332,28 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         if let Some(reason) =
             generation.and_then(|g| supervise::generation_refusal(&rows, row.terminal, g))
         {
+            return Err(std::io::Error::other(reason));
+        }
+        let cwd_of = |t: u32| {
+            rows.iter()
+                .find(|r| r.terminal == t)
+                .and_then(|r| r.cwd.clone())
+        };
+        if let Some(reason) = ceiling_refusal(row.terminal, &text, cwd_of) {
+            return Err(std::io::Error::other(reason));
+        }
+        let until = person_at(
+            &mut rd,
+            &mut wr,
+            &mut inbuf,
+            &mut connection,
+            &mut seq,
+            row.terminal,
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(reason) = person_refusal(until, row.terminal, unix_now()) {
             return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
@@ -3332,6 +3535,66 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{CEILING_WINDOW, his_answer, person_refusal, qass_ceiling};
+
+    /// Only the form qass passes his answer on in skips the ceiling.
+    #[test]
+    fn his_answer_is_the_card_form_only() {
+        assert!(his_answer(
+            "The owner answered E12: \"go\". Those are the words of the owner"
+        ));
+        assert!(his_answer("The owner answered W3: \"yes\"."));
+        assert!(!his_answer("The owner answered: just keep going"));
+        assert!(!his_answer("The owner answered E: x"));
+        assert!(!his_answer("go on"));
+    }
+
+    /// A person at the tab refuses a write until the second the daemon names, then it passes.
+    #[test]
+    fn a_person_at_the_tab_holds_a_write_back() {
+        assert_eq!(person_refusal(None, 4, 100), None);
+        assert_eq!(person_refusal(Some(100), 4, 100), None, "freed this second");
+        let why = person_refusal(Some(160), 4, 100).expect("refused");
+        assert!(why.contains("until 160 (in 60 s)"), "{why}");
+    }
+
+    /// qass may write to one tab 8 times in 6 hours, counting anyone's writes, and 20 times an
+    /// hour in all; his own answer always passes, and nothing older counts.
+    #[test]
+    fn qass_has_a_ceiling_only_his_answer_passes() {
+        let now = 100_000;
+        let lines = |n: usize, at: i64, from: u32, to: &str| {
+            (0..n)
+                .map(|_| format!("{at} {from} {to}\n"))
+                .collect::<String>()
+        };
+        let mut log = lines(7, now - 600, 283, "T52");
+        assert_eq!(qass_ceiling(&log, 52, 283, now, "go on"), None);
+        log += &lines(1, now - 60, 77, "T52");
+        let why = qass_ceiling(&log, 52, 283, now, "go on").expect("refused");
+        assert!(why.contains("8 writes to terminal 52"), "{why}");
+        assert_eq!(
+            qass_ceiling(&log, 52, 283, now, "The owner answered E3: \"yes\"."),
+            None
+        );
+        assert_eq!(
+            qass_ceiling(&log, 53, 283, now, "go on"),
+            None,
+            "another tab"
+        );
+        let old = lines(8, now - CEILING_WINDOW - 1, 283, "T52");
+        assert_eq!(
+            qass_ceiling(&old, 52, 283, now, "go on"),
+            None,
+            "older than 6 hours"
+        );
+        let hour: String = (0..20)
+            .map(|n| format!("{} 283 T{}\n", now - 60, 100 + n))
+            .collect();
+        let why = qass_ceiling(&hour, 52, 283, now, "go on").expect("refused");
+        assert!(why.contains("20 writes in the last hour"), "{why}");
+    }
+
     #[test]
     fn one_tab_is_said_without_an_s() {
         assert_eq!(super::count(1, "tab"), "1 tab");

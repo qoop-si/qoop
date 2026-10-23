@@ -554,6 +554,12 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<bool>,
     },
+    /// Until when a person is at a terminal (typing there, or a line just sent), so another
+    /// sender does not type over them. A daemon from before it answers `unknown variant`.
+    PersonAt {
+        id: String,
+        terminal: TerminalStream,
+    },
     /// Write to a task: open one, move it, record its plan, evidence or done claim, or
     /// close it.
     ///
@@ -1388,6 +1394,7 @@ impl ControlRequest {
             | Self::UpdateState { id }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::PersonAt { id, .. }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
             | Self::AskWrite { id, .. }
@@ -1612,6 +1619,11 @@ pub enum ControlResponse {
     QassWatch {
         id: String,
         on: bool,
+    },
+    /// The answer to `PersonAt`: until when, as unix seconds, `None` when nobody is there.
+    PersonAt {
+        id: String,
+        until: Option<i64>,
     },
     /// A `TaskWrite` landed on `task`; `key` is an item's, when one was added or started.
     TaskWritten {
@@ -2281,6 +2293,7 @@ impl ControlResponse {
             | Self::UpdateState { id, .. }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::PersonAt { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }
             | Self::AskWritten { id, .. }

@@ -2380,6 +2380,10 @@ async fn serve_client(
     let (blob_tx, mut blob_rx) = mpsc::channel::<BytesMut>(crate::tunnel::LANE);
     let tunnels = crate::tunnel::Tunnels::default();
     let phone = hello.client_name == crate::client::PHONE;
+    // A person's connection, decided once: the interface or the phone. Every `qoop-*` client
+    // (`qoop new` typing an agent's command, `qoop prompt`, `qoop send`) types for a program.
+    // What a person presses is what `qoop prompt` must not type over (`PersonAt`).
+    let person = hello.client_id == qoop_proto::INTERFACE_ID || phone;
     // Which history search of this connection may still run. Each one takes the next
     // number and stops at its next chunk once the number has moved on: a newer search from
     // the same person makes the older one moot, and a connection that is gone makes every
@@ -2885,6 +2889,14 @@ async fn serve_client(
                         // another records the wait: the waiter is vetoed
                         // while the target is busy. Verified by
                         // `verify_waiter`; anything unverified is ignored.
+                        if person {
+                            agents.note_person(
+                                message.stream,
+                                &bytes,
+                                false,
+                                crate::agents::now_unix(),
+                            );
+                        }
                         if let (Some(waiter), Some(token)) = (from_terminal, from_token)
                             && verify_waiter(&agents, &terminals, waiter, &token, message.stream)
                         {
@@ -2905,10 +2917,20 @@ async fn serve_client(
                         cols,
                         rows,
                     },
-                    ClientWire::Paste { bytes } => ClientCommand::Paste {
-                        from: client.clone(),
-                        bytes: Bytes::from(bytes),
-                    },
+                    ClientWire::Paste { bytes } => {
+                        if person {
+                            agents.note_person(
+                                message.stream,
+                                &bytes,
+                                true,
+                                crate::agents::now_unix(),
+                            );
+                        }
+                        ClientCommand::Paste {
+                            from: client.clone(),
+                            bytes: Bytes::from(bytes),
+                        }
+                    }
                     // Taken above, before the terminal is looked up.
                     ClientWire::Audio { .. } => continue,
                 };
@@ -5661,6 +5683,11 @@ async fn handle_control(
                 Err(reason) => ControlResponse::Failed { id, reason },
             }
         }
+        // Read only: until when a person is at that terminal, so `qoop prompt` waits for them.
+        ControlRequest::PersonAt { id, terminal } => ControlResponse::PersonAt {
+            id,
+            until: agents.person_until(terminal, crate::agents::now_unix()),
+        },
         // One small file in qass's folder, like the sleep settings: the watcher reads it, and
         // turned on, qass is told to start its watcher again; a qass asleep is woken first, as
         // the line has no terminal to be typed into otherwise.
