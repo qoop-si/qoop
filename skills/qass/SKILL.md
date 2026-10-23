@@ -263,7 +263,7 @@ A prompt is one line, a scoped instruction (never a bare "yes", "ok" or "continu
 `Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`
 
 The brief's `ending` picks it: `none`, the one above; `merge`, the third; `pr`, the second, where
-no committed file of that repo pre-authorizes merging, or its `AGENTS.md` or workflow asks before merging:
+that repo's `AGENTS.md` or workflow asks before merging, or its task came from a `report:` note:
 
 `You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`
 

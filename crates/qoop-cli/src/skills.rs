@@ -46,9 +46,9 @@ const QASS_POINTERS: [(&str, &str); 2] = [
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
 /// `qoop paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`
 /// (qoop's own settings folder, its parent, as `@QOOP_CONFIG@`), filled in here at install.
-/// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking and loads its lessons, for any Claude started there, by
+/// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking, loads its lessons and caps its context for compaction, for any Claude started there, by
 /// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
-/// launch do not come back).
+/// launch do not come back, and an env var set there does).
 struct QassDirs {
     data: PathBuf,
     owner: PathBuf,
@@ -1316,6 +1316,9 @@ mod tests {
         // is an absolute path, Claude Code's own syntax; `Edit` covers every tool that writes a
         // file, and a deny wins over `dontAsk`). qass has no mode left to deny.
         let settings: serde_json::Value = serde_json::from_str(&folder).expect("settings json");
+        // qass alone compacts before its conversation passes about 100k tokens (QOOP-55): every
+        // wake reads it again, so a smaller one is a cheaper wake; workers keep their windows.
+        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "100000");
         let deny: Vec<&str> = settings["permissions"]["deny"]
             .as_array()
             .expect("a deny list")

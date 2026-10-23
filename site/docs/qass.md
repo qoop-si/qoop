@@ -24,12 +24,12 @@ minutes), and stops after a few writes to one agent that do not move it, asking 
 Agents themselves are told to take the next step their rules allow and to end a turn on you only
 for your decision. In a repository whose GitHub
 `origin` belongs to the login `gh` is signed in as, every agent is told the standing way
-(`qoop task rules`): commit through /commit, push, open a PR, and, where a committed
-`AGENTS.md`, `CLAUDE.md` or `.qoop/workflow.md` of the repository pre-authorizes merging,
-rebase-and-merge its own PR, install and clean up (elsewhere it stops at the PR and asks before
-merging, since a merge may deploy); in a repository not its owner's it asks first, and delete, release, production, money and
+(`qoop task rules`): commit through /commit, push, open a PR, rebase-and-merge its own PR,
+install and clean up; elsewhere it asks first, and delete, release, production, money and
 anything external always ask. A repository's `AGENTS.md` may ask for more, never allow
 more. When you correct it or say how you want things, it keeps the rule in
 `$(qoop paths qass-config)/lessons.md` (3,000 characters at most, loaded at every start); a lesson can
-let it settle a kind of reversible step at once, never anything that always asks. `qoop paths`
+let it settle a kind of reversible step at once, never anything that always asks. qass alone
+compacts its conversation before it passes about 100k tokens (its folder's `.claude/settings.json`
+sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), since every wake reads it again. `qoop paths`
 lists every folder qoop writes to and how big each is.

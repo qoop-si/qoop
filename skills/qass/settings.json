@@ -1,4 +1,5 @@
 {
+  "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000" },
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"],

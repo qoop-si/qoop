@@ -95,9 +95,6 @@ struct Facts {
     /// `owner/name` when the agent works in the owner's own repository
     /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
     own: Option<String>,
-    /// A file of that repository (AGENTS.md, CLAUDE.md, `.qoop/workflow.md`) pre-authorizes
-    /// merging: only there does a prompt end with the merge ending.
-    merge_ok: bool,
     now: i64,
     /// Seconds east of UTC, for a clock time he reads.
     offset: i64,
@@ -450,18 +447,14 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     // Work a stranger's note started (`report:`, as it was opened) stops at the PR: its AGENTS.md.
     // An unreadable task may be a report: it gets the PR too.
     let report = task.is_some_and(|t| reported(&t.first_goal)) || matches!(f.task, Some(Err(_)));
-    // A merge may deploy: his word, unless the repository itself pre-authorizes it.
-    let end = match (f.own.is_some(), f.merge_ok && !report) {
-        (true, true) => "merge",
-        (true, false) => "pr",
+    let end = match (f.own.is_some(), report) {
+        (true, false) => "merge",
+        (true, true) => "pr",
         (false, _) => "none",
     };
     lines.push(match f.own.as_deref() {
         Some(r) if report => format!("repo: own {r}; ending pr (a report: task stops at its PR)"),
-        Some(r) if f.merge_ok => {
-            format!("repo: own {r}; ending merge (pr if a repo file asks before merging)")
-        }
-        Some(r) => format!("repo: own {r}; ending pr (no repo file pre-authorizes merging)"),
+        Some(r) => format!("repo: own {r}; ending merge (pr if a repo file asks before merging)"),
         None => "repo: not own; ending none".into(),
     });
 
@@ -747,9 +740,6 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         limit,
         card,
         own: cwd.and_then(crate::worktree::own_repo),
-        merge_ok: root
-            .as_deref()
-            .is_some_and(crate::worktree::merge_authorized),
         now,
         offset: utc_offset(),
     })
@@ -1012,14 +1002,12 @@ mod tests {
         assert_eq!(review_limit("at most 3 reviewers"), None);
     }
 
-    /// The owner's own repository gets the merge ending where its files pre-authorize merging,
-    /// the PR ending where they do not, any other the strict one; writing is allowed with
-    /// nothing set: qass has no mode, and the brief never names one.
+    /// The owner's own repository gets the merge ending, any other the strict one; writing is
+    /// allowed with nothing set: qass has no mode, and the brief never names one.
     #[test]
     fn the_repo_line_gives_the_ending() {
         let mut f = facts();
         f.own = Some("pat/x".into());
-        f.merge_ok = true;
         let out = brief(&f);
         assert!(
             out.contains(
@@ -1032,13 +1020,6 @@ mod tests {
         assert_eq!(json["own_repo"], "pat/x");
         assert_eq!(json["ending"], "merge");
         assert!(json.get("mode").is_none(), "{json}");
-        f.merge_ok = false;
-        let out = brief(&f);
-        assert!(
-            out.contains("\nrepo: own pat/x; ending pr (no repo file pre-authorizes merging)\n"),
-            "{out}"
-        );
-        assert_eq!(compose(&f).1["ending"], "pr");
         f.own = None;
         let out = brief(&f);
         assert!(out.contains("\nrepo: not own; ending none\n"), "{out}");
@@ -1348,7 +1329,6 @@ mod tests {
         assert!(!reported("fix the report page"));
         let mut f = facts();
         f.own = Some("me/app".into());
-        f.merge_ok = true;
         let mut t = task_at(NOW - 600, "fix the crash");
         t.first_goal = "report: crash on start".into();
         f.task = Some(Ok(t));
