@@ -443,6 +443,7 @@ fn info(t: TaskRow) -> TaskInfo {
         claimed_at: t.claimed_at,
         closed_at: t.closed_at,
         outcome: t.outcome,
+        folder: t.folder,
     }
 }
 

@@ -1319,6 +1319,9 @@ pub struct TaskInfo {
     pub closed_at: Option<i64>,
     #[serde(default)]
     pub outcome: Option<String>,
+    /// Where its agent works, kept past its tab (see `TaskRow::folder`).
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 /// One thing recorded on a task.

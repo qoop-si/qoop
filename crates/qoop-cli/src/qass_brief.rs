@@ -61,6 +61,8 @@ pub(crate) struct Task {
     pub(crate) rounds: u32,
     /// Every evidence body, newest first.
     pub(crate) evidence: Vec<String>,
+    /// Where its agent works, as the record keeps it past its tab.
+    pub(crate) folder: Option<std::path::PathBuf>,
 }
 
 /// Everything a brief is made of, read before it is composed.
@@ -426,6 +428,7 @@ pub(crate) fn task_of(id: i64, now: i64) -> Option<Task> {
             .filter_map(|e| e["body"].as_str())
             .map(String::from)
             .collect(),
+        folder: task["folder"].as_str().map(std::path::PathBuf::from),
     })
 }
 
@@ -829,6 +832,7 @@ mod tests {
             claimed: true,
             rounds: 2,
             evidence: vec![format!("cargo test: ok {}\nsecond line", "x".repeat(120))],
+            folder: None,
         }));
         let out = brief(&f);
         assert!(

@@ -59,11 +59,34 @@ struct Repo {
     gh: Result<(String, String), String>,
     /// The branches of its listed worktrees, the main one left out.
     branches: Vec<String>,
-    /// Each PR named and what gh said of it; `None`: not asked (another repo's, or gh failed).
-    prs: Vec<(Named, Option<Result<Pr, String>>)>,
     /// The approved copy's `installed <path>` and its mtime (`None`: not there), or why
     /// there is nothing to compare.
     install: Result<(PathBuf, Option<i64>), String>,
+}
+
+/// What gh says of one PR named, in the repo it was asked of: that repo's `owner/repo`,
+/// default branch and listed worktree branches, and whether it is the worker's own repo.
+#[derive(Clone, Debug)]
+struct Asked {
+    repo: String,
+    default: String,
+    branches: Vec<String>,
+    own: bool,
+    pr: Pr,
+}
+
+/// Why a task has no repo to judge it by.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Folder {
+    /// No folder: no live row, none kept on its record, no `--repo`.
+    #[default]
+    Unknown,
+    Gone(PathBuf),
+    /// `/`, the home folder or a folder holding repos: where an agent starts, not where it
+    /// works.
+    NoRepo(PathBuf),
+    /// A folder in no git repo: work with no PR to show.
+    NonGit(PathBuf),
 }
 
 /// One task to verify.
@@ -76,6 +99,10 @@ struct Work {
     /// Every evidence body, newest first.
     evidence: Vec<String>,
     repo: Option<Repo>,
+    /// Each PR named and what gh said of it; none without a repo.
+    prs: Vec<(Named, Result<Asked, String>)>,
+    /// Why there is no repo, when there is none.
+    place: Folder,
 }
 
 /// Every task the target covers: an item's linked tasks, or the one task. `Err`: its id,
@@ -172,13 +199,13 @@ fn main_of(dir: &Path) -> Option<PathBuf> {
     repo_of(dir).ok().map(|r| r.root)
 }
 
-/// The main checkout of a worker's repo and its worktree's slug, from its live row's folder,
-/// else from `--repo` standing in for it (its `-wt-` folder, even when gone): a live folder
-/// through git; a folder gone, from its `-wt-` name when the prefix is a main checkout. A
-/// main checkout has no slug, so nothing is tied to it.
-fn locate(cwd: Option<&Path>, flag: Option<&Path>) -> Option<(PathBuf, Option<String>)> {
+/// The main checkout of a worker's repo and its worktree's slug, from the first of `first`
+/// and `then` that names one (its `-wt-` folder, even when gone): a live folder through git;
+/// a folder gone, from its `-wt-` name when the prefix is a main checkout. A main checkout
+/// has no slug, so nothing is tied to it.
+fn locate(first: Option<&Path>, then: Option<&Path>) -> Option<(PathBuf, Option<String>)> {
     let gone = |m: &Path| m.is_dir() && main_of(m).is_some_and(|r| same(&r, m));
-    cwd.into_iter().chain(flag).find_map(|dir| {
+    first.into_iter().chain(then).find_map(|dir| {
         if dir.is_dir()
             && let Some(root) = main_of(dir)
         {
@@ -249,14 +276,22 @@ fn install_of(root: &Path, data: Option<&Path>) -> Result<(PathBuf, Option<i64>)
     Ok((path, mtime))
 }
 
-/// Everything about one repo: gh, its worktrees, each PR named, the approved install.
-fn repo_facts(
-    root: PathBuf,
-    slug: Option<String>,
-    evidence: &[String],
-    path: &OsStr,
-    data: Option<&Path>,
-) -> Repo {
+/// The branches of a checkout's listed worktrees, the main one left out.
+fn branches_of(root: &Path) -> Vec<String> {
+    let list = git(
+        root,
+        &["worktree", "list", "--porcelain", "-z"].map(OsStr::new),
+    )
+    .unwrap_or_default();
+    parse_worktrees(&list)
+        .into_iter()
+        .skip(1)
+        .filter_map(|w| w.branch)
+        .collect()
+}
+
+/// Everything about one repo: gh, its worktrees, the approved install.
+fn repo_facts(root: PathBuf, slug: Option<String>, path: &OsStr, data: Option<&Path>) -> Repo {
     let gh_repo = gh(
         path,
         &root,
@@ -267,90 +302,203 @@ fn repo_facts(
         let default = v["defaultBranchRef"]["name"].as_str().map(String::from);
         name.zip(default).ok_or("gh named no repo".to_string())
     });
-    let prs = named_prs(evidence.iter().map(String::as_str))
-        .into_iter()
-        .map(|named| {
-            let Ok((name, _)) = &gh_repo else {
-                return (named, None);
-            };
-            if named.repo.as_ref().is_some_and(|r| r != name) {
-                return (named, None);
-            }
-            let n = named.number.to_string();
-            let fields = "baseRefName,headRefName,createdAt,mergedAt";
-            let said = gh(
-                path,
-                &root,
-                &["pr", "view", &n, "--repo", name, "--json", fields],
-            )
-            .map(|v| {
-                let head = v["headRefName"].as_str().unwrap_or("").to_string();
-                let list = ["pr", "list", "--repo", name, "--head", &head];
-                // No head branch: nothing to look up, and never a pass.
-                let open = if head.is_empty() {
-                    Err("no head branch".to_string())
-                } else {
-                    gh(
-                        path,
-                        &root,
-                        &[&list[..], &["--state", "open", "--json", "number"]].concat(),
-                    )
-                }
-                .map(|v| {
-                    v.as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|p| p["number"].as_u64())
-                        .collect()
-                });
-                Pr {
-                    base: v["baseRefName"].as_str().unwrap_or("").to_string(),
-                    created: seconds(&v["createdAt"]),
-                    merged: seconds(&v["mergedAt"]),
-                    head,
-                    open,
-                }
-            });
-            (named, Some(said))
-        })
-        .collect();
-    let list = git(
-        &root,
-        &["worktree", "list", "--porcelain", "-z"].map(OsStr::new),
-    )
-    .unwrap_or_default();
-    let branches = parse_worktrees(&list)
-        .into_iter()
-        .skip(1)
-        .filter_map(|w| w.branch)
-        .collect();
+    let branches = branches_of(&root);
     let install = install_of(&root, data);
     Repo {
         root,
         slug,
         gh: gh_repo,
         branches,
-        prs,
         install,
     }
 }
 
-/// One local task's facts, its repo found from its folder or `--repo`.
+/// `owner/repo` of a GitHub remote URL, lower case: `git@github.com:o/r.git`,
+/// `https://github.com/o/r` or `ssh://git@github.com/o/r.git`.
+fn github_name(url: &str) -> Option<String> {
+    let (_, rest) = url.trim().split_once("github.com")?;
+    let rest = rest.trim_start_matches([':', '/']);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (o, r) = rest.split_once('/')?;
+    (!o.is_empty() && !r.is_empty() && !r.contains('/'))
+        .then(|| format!("{o}/{r}").to_ascii_lowercase())
+}
+
+/// The main checkout of another repo of a multi-repo task, beside the worker's repo: found
+/// by its `origin` remote, never by its folder's name. Two such checkouts are not guessed
+/// between: either one's worktrees could be the ones still listed.
+fn beside(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let origin = ["remote", "get-url", "origin"].map(OsStr::new);
+    let found: Vec<PathBuf> = root
+        .parent()
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        // A main checkout has a `.git` folder; a worktree's is a file.
+        .filter(|d| d.join(".git").is_dir())
+        .filter(|d| {
+            git(d, &origin)
+                .ok()
+                .and_then(|u| github_name(&u))
+                .as_deref()
+                == Some(name)
+        })
+        .collect();
+    match &found[..] {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no checkout of {name} beside {}", root.display())),
+        _ => Err(format!(
+            "{} checkouts of {name} beside {}",
+            found.len(),
+            root.display()
+        )),
+    }
+}
+
+/// What gh says of PR `n` in `repo`, and the open PRs from its head branch.
+fn ask_pr(path: &OsStr, dir: &Path, repo: &str, n: u64) -> Result<Pr, String> {
+    let n = n.to_string();
+    let fields = "baseRefName,headRefName,createdAt,mergedAt";
+    gh(
+        path,
+        dir,
+        &["pr", "view", &n, "--repo", repo, "--json", fields],
+    )
+    .map(|v| {
+        let head = v["headRefName"].as_str().unwrap_or("").to_string();
+        let list = ["pr", "list", "--repo", repo, "--head", &head];
+        // No head branch: nothing to look up, and never a pass.
+        let open = if head.is_empty() {
+            Err("no head branch".to_string())
+        } else {
+            gh(
+                path,
+                dir,
+                &[&list[..], &["--state", "open", "--json", "number"]].concat(),
+            )
+        }
+        .map(|v| {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["number"].as_u64())
+                .collect()
+        });
+        Pr {
+            base: v["baseRefName"].as_str().unwrap_or("").to_string(),
+            created: seconds(&v["createdAt"]),
+            merged: seconds(&v["mergedAt"]),
+            head,
+            open,
+        }
+    })
+}
+
+/// Each PR the evidence names, asked of its own repo: the worker's, or another one checked
+/// out beside it. Nothing is asked when gh cannot name the worker's repo.
+fn asked(repo: &Repo, evidence: &[String], path: &OsStr) -> Vec<(Named, Result<Asked, String>)> {
+    let Ok((own, own_default)) = &repo.gh else {
+        return Vec::new();
+    };
+    named_prs(evidence.iter().map(String::as_str))
+        .into_iter()
+        .map(|named| {
+            let name = named.repo.clone().unwrap_or_else(|| own.clone());
+            let place = if name == *own {
+                Ok((
+                    repo.root.clone(),
+                    own_default.clone(),
+                    repo.branches.clone(),
+                ))
+            } else {
+                beside(&repo.root, &name).and_then(|dir| {
+                    let v = gh(
+                        path,
+                        &dir,
+                        &["repo", "view", &name, "--json", "defaultBranchRef"],
+                    )?;
+                    let default = v["defaultBranchRef"]["name"]
+                        .as_str()
+                        .ok_or("gh named no default branch")?
+                        .to_string();
+                    let branches = branches_of(&dir);
+                    Ok((dir, default, branches))
+                })
+            };
+            let said = place.and_then(|(dir, default, branches)| {
+                Ok(Asked {
+                    pr: ask_pr(path, &dir, &name, named.number)?,
+                    own: name == *own,
+                    repo: name,
+                    default,
+                    branches,
+                })
+            });
+            (named, said)
+        })
+        .collect()
+}
+
+/// Why a folder in no repo leaves its task without one: gone; a place that proves nothing
+/// (outside the home folder, the home folder itself, a hidden folder, one holding repos, or
+/// one inside a repo git could not read); or non-git work.
+fn place_of(dir: &Path, home: Option<&Path>) -> Folder {
+    let holds_repos = || {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().join(".git").exists())
+    };
+    let in_repo = || dir.ancestors().any(|a| a.join(".git").exists());
+    // Below the home folder, no part hidden: `/tmp` or `~/.cache` is where an agent wanders,
+    // not where its work is.
+    let mine = home.is_some_and(|h| {
+        dir.strip_prefix(h).is_ok_and(|rest| {
+            rest.components().next().is_some()
+                && rest
+                    .components()
+                    .all(|c| !c.as_os_str().to_string_lossy().starts_with('.'))
+        })
+    });
+    let dir = dir.to_path_buf();
+    if !dir.is_dir() {
+        Folder::Gone(dir)
+    } else if !mine || holds_repos() || in_repo() {
+        Folder::NoRepo(dir)
+    } else {
+        Folder::NonGit(dir)
+    }
+}
+
+/// One local task's facts: its repo found from `--repo` (qass's own word for where the work
+/// is), else from its folder.
 fn work(
     task: &Task,
     cwd: Option<&Path>,
     flag: Option<&Path>,
     path: &OsStr,
     data: Option<&Path>,
+    home: Option<&Path>,
 ) -> Work {
-    let repo =
-        locate(cwd, flag).map(|(root, slug)| repo_facts(root, slug, &task.evidence, path, data));
+    let repo = locate(flag, cwd).map(|(root, slug)| repo_facts(root, slug, path, data));
+    let prs = repo
+        .as_ref()
+        .map_or_else(Vec::new, |r| asked(r, &task.evidence, path));
+    let place = match (&repo, flag.or(cwd)) {
+        (None, Some(dir)) => place_of(dir, home),
+        _ => Folder::Unknown,
+    };
     Work {
         id: task.id,
         remote: None,
         opened: task.opened,
         evidence: task.evidence.clone(),
         repo,
+        prs,
+        place,
     }
 }
 
@@ -388,7 +536,7 @@ fn check(w: &Work, lines: &mut Vec<String>, missing: &mut Vec<String>) {
         w.evidence.first().map_or("none".into(), |e| cut(e, 80))
     ));
     let Some(repo) = &w.repo else {
-        missing.push(format!("{me} repo unknown"));
+        no_repo(w, &me, lines, missing);
         return;
     };
     let worktree = repo
@@ -407,33 +555,32 @@ fn check(w: &Work, lines: &mut Vec<String>, missing: &mut Vec<String>) {
         "{me} repo {} ({name}, default {default}), {worktree}",
         repo.root.display()
     ));
-    if repo.prs.is_empty() {
+    if w.prs.is_empty() {
         missing.push(format!("{me} no PR named in its evidence"));
     }
     let mut newest = None;
-    for (named, said) in &repo.prs {
+    for (named, said) in &w.prs {
         let label = named.label();
-        let pr = match said {
-            None => {
-                missing.push(format!("{me} {label} is another repo's, not {name}"));
-                continue;
-            }
-            Some(Err(why)) => {
+        let a = match said {
+            Err(why) => {
                 missing.push(format!("{me} {label}: {why}"));
                 continue;
             }
-            Some(Ok(pr)) => pr,
+            Ok(a) => a,
         };
-        match verdict(pr, w.opened, default, repo.slug.as_deref()) {
+        let pr = &a.pr;
+        match verdict(pr, w.opened, &a.default, repo.slug.as_deref()) {
             Err(why) => missing.push(format!("{me} {label} {why}")),
             Ok(at) => {
                 lines.push(format!(
-                    "{me} {label} merged {} {} UTC from {} into {default}",
+                    "{me} {label} merged {} {} UTC from {} into {} of {}",
                     qoop_history::date_utc(at * 1000),
                     clock(at, 0),
-                    pr.head
+                    pr.head,
+                    a.default,
+                    a.repo
                 ));
-                if repo.branches.contains(&pr.head) {
+                if a.branches.contains(&pr.head) {
                     missing.push(format!("{me} worktree of {} still listed", pr.head));
                 }
                 match &pr.open {
@@ -448,7 +595,10 @@ fn check(w: &Work, lines: &mut Vec<String>, missing: &mut Vec<String>) {
                     }
                     Err(why) => missing.push(format!("{me} open PRs from {}: {why}", pr.head)),
                 }
-                newest = newest.max(Some(at));
+                // The install is this repo's: only its own merges are compared with it.
+                if a.own {
+                    newest = newest.max(Some(at));
+                }
             }
         }
     }
@@ -468,6 +618,35 @@ fn check(w: &Work, lines: &mut Vec<String>, missing: &mut Vec<String>) {
             path.display(),
             (at - merged) / 60
         )),
+    }
+}
+
+/// A task with no repo to judge it by: its folder says why. Non-git work passes on its
+/// evidence alone, which qass then reads; a PR it names cannot be checked from there.
+fn no_repo(w: &Work, me: &str, lines: &mut Vec<String>, missing: &mut Vec<String>) {
+    let fix = "pass --repo <its -wt- folder>";
+    match &w.place {
+        Folder::Unknown => missing.push(format!("{me} no folder recorded; {fix}")),
+        Folder::Gone(dir) => missing.push(format!("{me} folder {} is gone", dir.display())),
+        Folder::NoRepo(dir) => {
+            missing.push(format!("{me} folder {} is no repo; {fix}", dir.display()))
+        }
+        Folder::NonGit(dir) => {
+            let named = named_prs(w.evidence.iter().map(String::as_str));
+            if let Some(pr) = named.first() {
+                missing.push(format!(
+                    "{me} names {} but its folder is no repo; {fix}",
+                    pr.label()
+                ));
+            } else if w.evidence.is_empty() {
+                missing.push(format!("{me} no evidence"));
+            } else {
+                lines.push(format!(
+                    "{me} {} is not a git folder: evidence only, read it",
+                    dir.display()
+                ));
+            }
+        }
     }
 }
 
@@ -538,6 +717,23 @@ fn workers(page: &serde_json::Value, id: i64) -> Vec<(i64, Option<String>)> {
         .collect()
 }
 
+/// The folder a task's agent works in: its live row's (a closed task's terminal number may be
+/// another tab's, so the row is found by its task), else the one its record keeps: an asleep
+/// tab's, or a claimed task's whose tab closed.
+fn folder_of(rows: &[serde_json::Value], task: &Task) -> Option<PathBuf> {
+    rows.iter()
+        .find(|r| r["task"]["id"].as_i64() == Some(task.id))
+        .and_then(|r| r["cwd"].as_str())
+        .map(PathBuf::from)
+        .or_else(|| task.folder.clone())
+}
+
+/// `--repo` for one task: qass's own word, before its folder. For an item's tasks it would
+/// put every agent in one repo: it stands in only for a task with no folder.
+fn flag_for<'a>(single: bool, cwd: Option<&Path>, flag: Option<&'a Path>) -> Option<&'a Path> {
+    flag.filter(|_| single || cwd.is_none())
+}
+
 /// Reads every task the target covers: the daemon's record, its live row's folder, git,
 /// gh and qass's approved copy.
 fn gather(target: &str, flag: Option<&Path>) -> std::io::Result<Facts> {
@@ -549,11 +745,13 @@ fn gather(target: &str, flag: Option<&Path>) -> std::io::Result<Facts> {
         .ok_or_else(|| std::io::Error::other(format!("no task {target} could be read")))?;
     let id = page["task"]["id"].as_i64().unwrap_or_default();
     let workers = workers(&page, id);
+    let single = page["item"]["id"].as_i64() != Some(id);
     let rows = json(&["agents", "--json"])
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let data = paths::qass_data_dir();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let works = workers
         .into_iter()
         .map(|(id, remote)| {
@@ -565,13 +763,15 @@ fn gather(target: &str, flag: Option<&Path>) -> std::io::Result<Facts> {
                 });
             }
             let task = task_of(id, now).ok_or(id)?;
-            // The live row of this task: a closed task's terminal number may be another tab's.
-            let cwd = rows
-                .iter()
-                .find(|r| r["task"]["id"].as_i64() == Some(id))
-                .and_then(|r| r["cwd"].as_str())
-                .map(PathBuf::from);
-            Ok(work(&task, cwd.as_deref(), flag, &path, data.as_deref()))
+            let cwd = folder_of(&rows, &task);
+            Ok(work(
+                &task,
+                cwd.as_deref(),
+                flag_for(single, cwd.as_deref(), flag),
+                &path,
+                data.as_deref(),
+                home.as_deref(),
+            ))
         })
         .collect();
     Ok(Facts {
@@ -672,19 +872,35 @@ mod tests {
 
         /// The same, with open PRs (number, head) that `gh pr list --head` lists.
         fn gh_open(&self, prs: &[(u64, &str, &str, i64, Option<i64>)], open: &[(u64, &str)]) {
+            let prs: Vec<_> = prs
+                .iter()
+                .map(|&(n, base, head, created, merged)| {
+                    ("pat/demo", n, base, head, created, merged)
+                })
+                .collect();
+            self.gh_repos(&prs, open);
+        }
+
+        /// gh answering for PRs of any repo: (repo, number, base, head, created, merged).
+        #[allow(clippy::type_complexity)]
+        fn gh_repos(
+            &self,
+            prs: &[(&str, u64, &str, &str, i64, Option<i64>)],
+            open: &[(u64, &str)],
+        ) {
             let mut heads = String::new();
             for (n, head) in open {
                 heads += &format!("  {head}) echo '[{{\"number\":{n}}}]' ;;\n");
             }
             let mut cases = String::new();
-            for (n, base, head, created, merged) in prs {
+            for (repo, n, base, head, created, merged) in prs {
                 let pr = serde_json::json!({"baseRefName": base, "headRefName": head,
                     "createdAt": iso(*created), "mergedAt": merged.map(iso)});
-                cases += &format!("  {n}) echo '{pr}' ;;\n");
+                cases += &format!("  {repo}#{n}) echo '{pr}' ;;\n");
             }
             self.stub(&format!(
                 "case \"$1 $2\" in\n\"repo view\") echo '{{\"nameWithOwner\":\"pat/demo\",\
-                 \"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\n\"pr view\") case \"$3\" in\n\
+                 \"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\n\"pr view\") case \"$5#$3\" in\n\
                  {cases}  *) echo \"no pull request $3\" >&2; exit 1 ;;\n  esac ;;\n\
                  \"pr list\") while [ $# -gt 0 ]; do [ \"$1\" = --head ] && h=$2; shift; done\n\
                  case \"$h\" in\n{heads}  *) echo '[]' ;;\n  esac ;;\nesac\n"
@@ -720,7 +936,14 @@ mod tests {
                 evidence: evidence.iter().map(|e| e.to_string()).collect(),
                 ..Task::default()
             };
-            let w = work(&task, cwd, flag, &self.path(), Some(&self.at("data")));
+            let w = work(
+                &task,
+                cwd,
+                flag,
+                &self.path(),
+                Some(&self.at("data")),
+                Some(self.dir.path()),
+            );
             let facts = Facts {
                 target: "12".into(),
                 works: vec![Ok(w)],
@@ -816,8 +1039,9 @@ mod tests {
         );
     }
 
+    /// Another repo's PR is asked only through its checkout beside the worker's repo.
     #[test]
-    fn a_pr_of_another_repo_is_never_asked() {
+    fn a_pr_of_another_repo_needs_its_checkout_beside() {
         let p = Place::new();
         let cwd = p.worktree("feat/x", "feat-x", true);
         p.gh(&[(7, "main", "feat/x", OPENED + 60, Some(OPENED + 600))]);
@@ -826,8 +1050,14 @@ mod tests {
             Some(&cwd),
             None,
         );
-        assert!(out.contains("other/demo#7 is another repo's"), "{out}");
-        assert!(out.contains("other/lib#7 is another repo's"), "{out}");
+        assert!(
+            out.contains("other/demo#7: no checkout of other/demo beside"),
+            "{out}"
+        );
+        assert!(
+            out.contains("other/lib#7: no checkout of other/lib beside"),
+            "{out}"
+        );
         assert!(!out.contains("merged 20"), "{out}");
         // The same repo by URL or owner/repo is a PR like any other.
         let out = p.verify(&["https://github.com/pat/demo/pull/7"], Some(&cwd), None);
@@ -902,9 +1132,178 @@ mod tests {
         assert!(out.contains("#12 PR #45 merged"), "{out}");
         let elsewhere = p.at("gone/somewhere");
         let out = p.verify(&["PR #45"], Some(&elsewhere), None);
-        assert!(out.contains("#12 repo unknown"), "{out}");
+        assert!(
+            out.contains("#12 folder ") && out.contains(" is gone"),
+            "{out}"
+        );
         let out = p.verify(&["PR #45"], Some(&elsewhere), Some(&p.at("demo")));
         assert!(out.contains("PR #45 not tied to this task"), "{out}");
+    }
+
+    /// A multi-repo task: its PR in the repo beside, found by its origin, passes from the same
+    /// worktree slug; another slug or that repo's worktree still listed misses; the install
+    /// is compared with this repo's merges only.
+    #[test]
+    fn a_pr_in_the_repo_beside_is_checked_there() {
+        let p = Place::new();
+        let lib = p.at("lib");
+        std::fs::create_dir_all(&lib).expect("lib");
+        sh(&lib, &["init", "-q", "-b", "main"]);
+        sh(&lib, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        sh(
+            &lib,
+            &["remote", "add", "origin", "git@github.com:Pat/Lib.git"],
+        );
+        let cwd = p.worktree("feat/x", "feat-x", true);
+        p.gh_repos(
+            &[
+                (
+                    "pat/demo",
+                    45,
+                    "main",
+                    "feat/x",
+                    OPENED + 60,
+                    Some(OPENED + 600),
+                ),
+                (
+                    "pat/lib",
+                    7,
+                    "main",
+                    "feat/x",
+                    OPENED + 60,
+                    Some(OPENED + 1800),
+                ),
+                (
+                    "pat/lib",
+                    8,
+                    "main",
+                    "feat/y",
+                    OPENED + 60,
+                    Some(OPENED + 600),
+                ),
+            ],
+            &[],
+        );
+        p.installed(OPENED + 900);
+        let out = p.verify(&["PR #45; pat/lib#7 merged"], Some(&cwd), None);
+        assert_eq!(last(&out), PASSED, "{out}");
+        assert!(
+            out.contains("pat/lib#7 merged") && out.contains("of pat/lib"),
+            "{out}"
+        );
+        let out = p.verify(&["PR #45; pat/lib#8"], Some(&cwd), None);
+        assert!(
+            out.contains("pat/lib#8 from feat/y, not this worker's worktree"),
+            "{out}"
+        );
+        let wt = lib.with_file_name("lib-wt-feat-x");
+        sh(
+            &lib,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/x",
+                wt.to_str().expect("utf8"),
+            ],
+        );
+        let out = p.verify(&["PR #45; pat/lib#7"], Some(&cwd), None);
+        assert!(out.contains("worktree of feat/x still listed"), "{out}");
+        // A second checkout of the same repo: not guessed between.
+        let copy = p.at("lib-old");
+        std::fs::create_dir_all(&copy).expect("copy");
+        sh(&copy, &["init", "-q", "-b", "main"]);
+        sh(
+            &copy,
+            &["remote", "add", "origin", "https://github.com/pat/lib"],
+        );
+        let out = p.verify(&["PR #45; pat/lib#7"], Some(&cwd), None);
+        assert!(
+            out.contains("pat/lib#7: 2 checkouts of pat/lib beside"),
+            "{out}"
+        );
+        assert!(github_name("https://github.com/o/r").as_deref() == Some("o/r"));
+        assert!(github_name("ssh://git@github.com/O/R.git").as_deref() == Some("o/r"));
+        assert_eq!(github_name("git@gitlab.com:o/r.git"), None);
+    }
+
+    /// No live row: the folder its record keeps finds the repo; `--repo` comes before both.
+    #[test]
+    fn the_folder_comes_from_repo_then_the_row_then_the_record() {
+        let row = serde_json::json!([{"task": {"id": 12}, "cwd": "/live"}]);
+        let rows = row.as_array().expect("rows");
+        let task = Task {
+            id: 12,
+            folder: Some("/kept".into()),
+            ..Task::default()
+        };
+        assert_eq!(folder_of(rows, &task), Some(PathBuf::from("/live")));
+        assert_eq!(folder_of(&[], &task), Some(PathBuf::from("/kept")));
+        let p = Place::new();
+        let gone = p.worktree("feat/x", "feat-x", true);
+        p.gh(&[(45, "main", "feat/x", OPENED + 60, Some(OPENED + 600))]);
+        p.installed(OPENED + 900);
+        // Its tab sat in the main checkout; qass names its worktree.
+        let out = p.verify(&["PR #45"], Some(&p.at("demo")), Some(&gone));
+        assert_eq!(last(&out), PASSED, "{out}");
+        let out = p.verify(&["PR #45"], None, None);
+        assert!(
+            out.contains("#12 no folder recorded; pass --repo <its -wt- folder>"),
+            "{out}"
+        );
+    }
+
+    /// Work in a folder in no repo passes on its evidence alone; a PR it names, no evidence,
+    /// or a folder agents only start from (the home folder, one holding repos) does not.
+    #[test]
+    fn non_git_work_passes_on_its_evidence() {
+        let p = Place::new();
+        let notes = p.at("notes");
+        std::fs::create_dir_all(&notes).expect("notes");
+        let out = p.verify(
+            &["report written: notes/scan.md, 40 rows"],
+            Some(&notes),
+            None,
+        );
+        assert_eq!(last(&out), PASSED, "{out}");
+        assert!(
+            out.contains("is not a git folder: evidence only, read it"),
+            "{out}"
+        );
+        let out = p.verify(&["merged PR #9"], Some(&notes), None);
+        assert!(
+            out.contains("#12 names PR #9 but its folder is no repo"),
+            "{out}"
+        );
+        let out = p.verify(&[], Some(&notes), None);
+        assert!(out.contains("#12 no evidence"), "{out}");
+        let out = p.verify(&["done"], Some(p.dir.path()), None);
+        assert!(out.contains("is no repo; pass --repo"), "{out}");
+        assert_eq!(
+            place_of(&notes, Some(&notes)),
+            Folder::NoRepo(notes.clone())
+        );
+        assert_eq!(place_of(&notes, None), Folder::NoRepo(notes.clone()));
+        assert_eq!(place_of(Path::new("/"), None), Folder::NoRepo("/".into()));
+        let hidden = p.at(".cache/x");
+        std::fs::create_dir_all(&hidden).expect("hidden");
+        assert_eq!(
+            place_of(&hidden, Some(p.dir.path())),
+            Folder::NoRepo(hidden)
+        );
+        // Inside a repo git could not read: not non-git work.
+        let inside = p.at("demo/docs");
+        std::fs::create_dir_all(&inside).expect("docs");
+        assert_eq!(
+            place_of(&inside, Some(p.dir.path())),
+            Folder::NoRepo(inside)
+        );
+        // An item's tasks keep their own folders; `--repo` fills in only where one is missing.
+        let (a, b) = (Path::new("/a"), Path::new("/b"));
+        assert_eq!(flag_for(true, Some(a), Some(b)), Some(b));
+        assert_eq!(flag_for(false, Some(a), Some(b)), None);
+        assert_eq!(flag_for(false, None, Some(b)), Some(b));
     }
 
     #[test]
@@ -1000,6 +1399,7 @@ mod tests {
                 None,
                 &p.path(),
                 Some(&data),
+                None,
             )),
             Ok(work(
                 &task(13, "PR #46"),
@@ -1007,6 +1407,7 @@ mod tests {
                 None,
                 &p.path(),
                 Some(&data),
+                None,
             )),
             Ok(Work {
                 id: 14,

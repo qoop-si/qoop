@@ -197,13 +197,13 @@ Look these up in order before you write to a worker; a gap means "no known next 
 ## Done, checked
 
 When a worker's line ends `:claimed`, or it finished with its task still open and unclaimed,
-run `qoop task verify <id> --repo <its cwd: its -wt- folder, even when gone>` (an item:
-`<KEY>`, every linked task still open). It checks the closing facts, never its words, and its
-last line says what is missing. A PR its evidence names only as context (an older one) blocks
-the pass: tell the worker to name only its own. `Missing: none`: read the real run with its
-output in the evidence, then run its "Verify where it runs" section yourself (`init.md`). All
-there: close its task while open (`qoop task close <id> --verified '<what you checked; what now
-works, where to try it>'`). Then, when it is on an item whose agents have
+run `qoop task verify <id>` (an item: `<KEY>`, every linked task still open; `--repo <its -wt- folder,
+even when gone>` when it asks). It checks the closing facts, never its words; its last line says what
+is missing; `evidence only` (no git repo): read that evidence as the proof. A PR its evidence names
+only as context (an older one) blocks the pass: tell the worker to name only its own. `Missing:
+none`: read the real run with its output in the evidence, then run its "Verify where it runs"
+section yourself (`init.md`). All there: close its task while open (`qoop task close <id> --verified
+'<what you checked; what now works, where to try it>'`); its item closes by itself when that was its last work; if not, on an item whose agents have
 all ended and whose steps are all ticked, close the item too
 (`qoop task close <KEY> --verified '<the same>'`). One missing: prompt exactly that step when it
 is reversible, or the brief says own repo and the step is commit, push, PR, merge or install
@@ -221,7 +221,7 @@ how important the question feels.
 | Worker situation | You |
 |---|---|
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
-| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
+| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal) | "Done, checked" above; unclear: a card. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |
 | Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
 | Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | a card now; read the question from its screen. Never close its task, or prompt it except with their words for it, while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
@@ -426,7 +426,7 @@ title, description, steps (`3/7`) and its agents. You run it, and it is the trut
   repo's space, an ssh remote when they named one), the brief's first line "First run `qoop task
   link <KEY>`"; a remote worker you link on each event: `qoop task link <KEY> --remote <r> --task
   <id> --name '<name>' --stage <stage|finished>`. `about <KEY>: <text>` is their word on it.
-- Done: checked as in "Done, checked", then `qoop task close <KEY> --verified '<checked; what
+- Done: checked as in "Done, checked"; its item closes with it, else `qoop task close <KEY> --verified '<checked; what
   works, where>'`. Reopened by them: carry on. Goals: `qoop space goal <space> '<their words>'`,
   `qoop task goal --id KEY` only renames the title; their words go in the description; "done when"
   only if they named it; an older daemon refuses: keep it in `goals.md`.

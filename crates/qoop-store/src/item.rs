@@ -170,7 +170,7 @@ pub fn prefix_of(name: &str) -> String {
     }
 }
 
-fn is_item(tx: &Connection, id: i64) -> rusqlite::Result<bool> {
+pub(crate) fn is_item(tx: &Connection, id: i64) -> rusqlite::Result<bool> {
     Ok(tx
         .query_row(
             "SELECT 1 FROM board_item WHERE task = ?1",
@@ -229,6 +229,67 @@ pub(crate) fn carry_link(tx: &Connection, old: i64, new: i64, now: i64) -> rusql
         touch(tx, item, now)?;
     }
     Ok(())
+}
+
+/// A claimed task just closed verified takes its open item to Done when it was the last work
+/// on it: no linked task still open (from before a reopen too), every task linked since the
+/// item's last reopen closed verified, no remote agent on it, every step ticked (none counts,
+/// as qass's rule has it). Anything else leaves the item
+/// for qass or the owner. Runs after the close, in its transaction.
+pub(crate) fn follow_last_agent(
+    tx: &Connection,
+    task: i64,
+    reason: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let item: Option<i64> = tx
+        .query_row(
+            "SELECT l.item FROM task_item l JOIN task i ON i.id = l.item \
+             WHERE l.task = ?1 AND i.closed_at IS NULL",
+            params![task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(item) = item else {
+        return Ok(());
+    };
+    let waiting: i64 = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM task_item_remote WHERE item = ?1) \
+         + (SELECT COUNT(*) FROM task_step WHERE task = ?1 AND done_at IS NULL)",
+        params![item],
+        |r| r.get(0),
+    )?;
+    if waiting > 0 {
+        return Ok(());
+    }
+    let reopened = newest(tx, item, "reopened")?.map_or(0, |(id, _)| id);
+    let since = |t: i64| -> rusqlite::Result<bool> {
+        let linked: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM task_event \
+             WHERE task = ?1 AND kind = 'linked' AND body = ?2",
+            params![item, format!("#{t}")],
+            |r| r.get(0),
+        )?;
+        Ok(linked > reopened)
+    };
+    if !since(task)? {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT t.id, t.outcome FROM task_item l JOIN task t ON t.id = l.task WHERE l.item = ?1",
+    )?;
+    let links = stmt
+        .query_map(params![item], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (t, outcome) in links {
+        let open = outcome.is_none();
+        if open || (outcome.as_deref() != Some("verified") && since(t)?) {
+            return Ok(());
+        }
+    }
+    close(tx, item, Outcome::Verified, reason, now)
 }
 
 /// Close a space's open items as abandoned, inside the transaction that removes it.
@@ -1224,6 +1285,103 @@ mod tests {
         s.close_task(item, Outcome::Verified, "checked", 14)
             .unwrap();
         assert_eq!(s.open_item_key(task).unwrap(), None);
+    }
+
+    /// The last agent's claimed work closed verified takes its item to Done, and a second close
+    /// of the item is no error; anything still open, unticked, unclaimed, not verified, remote
+    /// or from before a reopen leaves it for qass.
+    #[test]
+    fn an_item_follows_its_last_agents_checked_work() {
+        let (mut s, ws, _) = setup();
+        let mut n = 10;
+        // An item with `steps` (ticked or not) and one linked agent per `agents` entry, each
+        // claimed or not; answers the item and its agents' tasks.
+        let mut item_with = |s: &mut Store, steps: &[bool], agents: &[bool]| {
+            n += 10;
+            let (item, _) = s.add_item(ws, "ship", "", n).unwrap();
+            let list: Vec<String> = (1..=steps.len()).map(|i| format!("s{i}")).collect();
+            s.set_steps(item, &list, n).unwrap();
+            for (i, done) in steps.iter().enumerate() {
+                s.check_step(item, i as i64 + 1, *done, n).unwrap();
+            }
+            let tasks: Vec<i64> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, claimed)| {
+                    let t = s
+                        .create_terminal(100 + n + i as i64, ws, "/tmp", "/bin/sh", n)
+                        .unwrap();
+                    let task = s.open_task(t, "part", false, n).unwrap();
+                    s.link_task(task, item, n).unwrap();
+                    if *claimed {
+                        s.claim_task_done(task, "merged", n).unwrap();
+                    }
+                    task
+                })
+                .collect();
+            (item, tasks)
+        };
+        let done = |s: &Store, item| s.task(item).unwrap().unwrap().outcome;
+
+        let (item, t) = item_with(&mut s, &[true, true], &[true]);
+        s.close_task(t[0], Outcome::Verified, "PR #3 merged", 900)
+            .unwrap();
+        assert_eq!(done(&s, item).as_deref(), Some("verified"));
+        assert_eq!(state_of(&s, item, 901), ItemState::Done);
+        s.close_task(item, Outcome::Verified, "checked", 902)
+            .expect("the same close again");
+        assert!(s.close_task(item, Outcome::Failed, "x", 903).is_err());
+        assert!(
+            s.close_task(t[0], Outcome::Verified, "again", 904).is_err(),
+            "an agent's task closed twice still says so"
+        );
+        // No steps counts as all ticked.
+        let (item, t) = item_with(&mut s, &[], &[true]);
+        s.close_task(t[0], Outcome::Verified, "ok", 900).unwrap();
+        assert_eq!(done(&s, item).as_deref(), Some("verified"));
+
+        let (item, t) = item_with(&mut s, &[true, false], &[true]);
+        s.close_task(t[0], Outcome::Verified, "ok", 900).unwrap();
+        assert_eq!(done(&s, item), None, "a step left");
+        let (item, t) = item_with(&mut s, &[], &[false]);
+        s.close_task(t[0], Outcome::Verified, "ok", 900).unwrap();
+        assert_eq!(done(&s, item), None, "never claimed done");
+        let (item, t) = item_with(&mut s, &[], &[true]);
+        s.close_task(t[0], Outcome::Failed, "no", 900).unwrap();
+        assert_eq!(done(&s, item), None, "failed");
+        let (item, t) = item_with(&mut s, &[], &[true, true]);
+        s.close_task(t[0], Outcome::Verified, "ok", 900).unwrap();
+        assert_eq!(done(&s, item), None, "another agent still open");
+        s.close_task(t[1], Outcome::Verified, "ok", 901).unwrap();
+        assert_eq!(done(&s, item).as_deref(), Some("verified"), "the last one");
+        let (item, t) = item_with(&mut s, &[], &[false, true]);
+        s.close_task(t[0], Outcome::Failed, "broke", 900).unwrap();
+        s.close_task(t[1], Outcome::Verified, "ok", 901).unwrap();
+        assert_eq!(done(&s, item), None, "a failed sibling");
+        let (item, t) = item_with(&mut s, &[], &[true]);
+        s.link_remote(item, "box", 7, "T3", "implementing", 900)
+            .unwrap();
+        s.close_task(t[0], Outcome::Verified, "ok", 901).unwrap();
+        assert_eq!(done(&s, item), None, "a remote agent on it");
+
+        // Linked before a reopen: its work was for the closed round.
+        let (item, t) = item_with(&mut s, &[], &[true, true]);
+        s.close_task(t[0], Outcome::Verified, "ok", 900).unwrap();
+        s.close_task(item, Outcome::Failed, "not really", 901)
+            .unwrap();
+        assert!(s.reopen_item(item, 902).unwrap());
+        s.close_task(t[1], Outcome::Verified, "ok", 903).unwrap();
+        assert_eq!(done(&s, item), None, "reopened, nobody linked since");
+        // One still at work from before a reopen: not the last work.
+        let (item, t) = item_with(&mut s, &[], &[false]);
+        s.close_task(item, Outcome::Failed, "not yet", 900).unwrap();
+        assert!(s.reopen_item(item, 901).unwrap());
+        let late = s.create_terminal(999, ws, "/tmp", "/bin/sh", 902).unwrap();
+        let b = s.open_task(late, "rest", false, 902).unwrap();
+        s.link_task(b, item, 902).unwrap();
+        s.claim_task_done(b, "merged", 903).unwrap();
+        s.close_task(b, Outcome::Verified, "ok", 904).unwrap();
+        assert_eq!(done(&s, item), None, "#{} still open", t[0]);
     }
 
     /// A long title fits a card: cut at a word (or at the limit when there is none), its whole

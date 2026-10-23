@@ -840,6 +840,7 @@ mod tests {
             claimed_at: None,
             closed_at: None,
             outcome: None,
+            folder: None,
         }
     }
 

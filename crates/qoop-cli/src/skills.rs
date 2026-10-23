@@ -976,6 +976,9 @@ mod tests {
             .1;
         for want in [
             "close the item too\n(`qoop task close <KEY> --verified",
+            "its item closes by itself when that was its last work",
+            "`evidence only` (no git repo): read that evidence as the proof",
+            "each task the board lists as claimed done with no terminal",
             "whose agents have\nall ended and whose steps are all ticked",
             "write it back with the old title as its first line",
             "is yours to move (prompt its next step, or one question to them)",

@@ -70,6 +70,9 @@ pub struct TaskRow {
     pub claimed_at: Option<i64>,
     pub closed_at: Option<i64>,
     pub outcome: Option<String>,
+    /// Where its agent works: its terminal's folder while it has one (asleep too), else the
+    /// one kept when a claimed task's tab closed.
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,8 +174,10 @@ pub(crate) fn within(what: &'static str, text: &str, max: usize) -> Result<(), S
     Ok(())
 }
 
-pub(crate) const COLUMNS: &str =
-    "id, workspace, terminal, goal, stage, opened_at, updated_at, claimed_at, closed_at, outcome";
+pub(crate) const COLUMNS: &str = "id, workspace, terminal, goal, stage, opened_at, updated_at, claimed_at, closed_at, outcome, \
+     COALESCE((SELECT tm.cwd FROM terminal tm WHERE tm.id = task.terminal), \
+     (SELECT e.body FROM task_event e WHERE e.task = task.id AND e.kind = 'folder' \
+     ORDER BY e.id DESC LIMIT 1))";
 
 pub(crate) fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
@@ -186,6 +191,7 @@ pub(crate) fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         claimed_at: r.get(7)?,
         closed_at: r.get(8)?,
         outcome: r.get(9)?,
+        folder: r.get(10)?,
     })
 }
 
@@ -201,6 +207,22 @@ pub(crate) fn event(
         params![task, now, kind, body],
     )?;
     Ok(())
+}
+
+/// Keep the terminal's folder on a claimed task before it lets go of the terminal: its check
+/// still finds the repo once the tab is gone.
+fn keep_folder(tx: &Connection, task: i64, terminal: i64, now: i64) -> rusqlite::Result<()> {
+    let cwd: Option<String> = tx
+        .query_row(
+            "SELECT cwd FROM terminal WHERE id = ?1",
+            params![terminal],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match cwd {
+        Some(cwd) => event(tx, task, "folder", &cwd, now),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn close(
@@ -254,6 +276,7 @@ pub(crate) fn abandon_open_tasks(
             .optional()?;
         match open {
             Some((task, Some(_))) => {
+                keep_folder(tx, task, terminal, now)?;
                 tx.execute(
                     "UPDATE task SET terminal = NULL, updated_at = ?2 WHERE id = ?1",
                     params![task, now],
@@ -652,8 +675,18 @@ impl Store {
         let reason = printable(reason);
         within("the reason", &reason, REASON_MAX)?;
         let tx = self.conn.unchecked_transaction()?;
+        // An item its last agent already closed: the same close again is no error.
+        if let Some(done) = row_of(&tx, task).optional()?
+            && done.outcome.as_deref() == Some(outcome.as_str())
+            && crate::item::is_item(&tx, task)?
+        {
+            return Ok(done.terminal);
+        }
         let t = open_row(&tx, task)?;
         close(&tx, task, outcome, &reason, now)?;
+        if outcome == Outcome::Verified && t.claimed_at.is_some() {
+            crate::item::follow_last_agent(&tx, task, &reason, now)?;
+        }
         tx.commit()?;
         Ok(t.terminal)
     }
@@ -888,6 +921,24 @@ mod tests {
             s.task(b).unwrap().unwrap().outcome.as_deref(),
             Some("abandoned")
         );
+    }
+
+    /// Its check finds the repo from the folder: the terminal's while it has one, asleep too,
+    /// and the one kept when a claimed task's tab closed.
+    #[test]
+    fn a_task_keeps_its_folder_past_its_tab() {
+        let (s, _, t) = store_with_terminal();
+        let a = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_cwd(t, "/w/demo-wt-ship").unwrap();
+        assert_eq!(
+            s.task(a).unwrap().unwrap().folder.as_deref(),
+            Some("/w/demo-wt-ship")
+        );
+        s.claim_task_done(a, "merged", 11).unwrap();
+        s.close_terminal(t, 12).unwrap();
+        let row = s.task(a).unwrap().unwrap();
+        assert_eq!(row.terminal, None);
+        assert_eq!(row.folder.as_deref(), Some("/w/demo-wt-ship"));
     }
 
     #[test]
