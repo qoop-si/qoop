@@ -1,16 +1,29 @@
 {
-  "env": { "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000" },
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000",
+    "SLASH_COMMAND_TOOL_CHAR_BUDGET": "3000"
+  },
+  "bashOutputMaxChars": 15000,
+  "disableClaudeAiConnectors": true,
   "permissions": {
     "defaultMode": "dontAsk",
-    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite"],
-    "deny": ["Edit(/@QOOP_CONFIG@/config.toml)", "Edit(/@QASS_DATA@/.claude/settings.json)"]
+    "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite", "TaskStop"],
+    "deny": [
+      "Edit(/@QOOP_CONFIG@/config.toml)",
+      "Edit(/@QASS_DATA@/.claude/settings.json)",
+      "mcp__*",
+      "WebFetch", "WebSearch", "NotebookEdit", "Artifact", "ArtifactComments", "ArtifactData", "Workflow",
+      "CronCreate", "CronDelete", "CronList", "DesignSync", "EnterPlanMode", "ExitPlanMode", "EnterWorktree",
+      "ExitWorktree", "PublishPlugin", "PushNotification", "RemoteTrigger", "ReportFindings",
+      "ShareOnboardingGuide", "ScheduleWakeup", "AskUserQuestion", "ListAgents", "SendMessage"
+    ]
   },
   "hooks": {
     "Stop": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"@QASS_DATA@/.claude/skills/qass/cardcheck.sh\"" }] }
     ],
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; cat \"$f\"; fi; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; head -c 8000 \"$f\"; [ \"$(wc -c < \"$f\")\" -gt 8000 ] && printf '\\n%s\\n' \"(cut at 8000 characters: the rest of $f is not loaded)\"; fi; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
     ]
   }
 }

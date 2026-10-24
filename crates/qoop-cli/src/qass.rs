@@ -613,6 +613,11 @@ pub fn run_qass(args: &[String]) -> std::io::Result<()> {
 pub(crate) fn start(board: bool) -> std::io::Result<u64> {
     let folder = paths::qass_data_dir()
         .ok_or_else(|| std::io::Error::other("no HOME to keep qass's folder under"))?;
+    // Before a start and a wake alike: a woken qass reads its folder settings again. A file
+    // that cannot be written is said and qass starts on the one it has.
+    if let Err(e) = crate::skills::refresh_qass_settings() {
+        eprintln!("qoop: qass's folder settings were not brought up to date: {e}");
+    }
     let terminal = if let Some(terminal) = running(&folder) {
         println!("qass is terminal {terminal}");
         terminal

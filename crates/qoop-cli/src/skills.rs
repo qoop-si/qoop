@@ -48,10 +48,12 @@ const QASS_POINTERS: [(&str, &str); 2] = [
 /// (qoop's own settings folder, its parent, as `@QOOP_CONFIG@`), filled in here at install.
 /// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking, loads its lessons and caps its context for compaction, for any Claude started there, by
 /// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
-/// launch do not come back, and an env var set there does).
+/// launch do not come back, and an env var set there does). It also turns off, for qass alone,
+/// every plugin the person turned on in Claude's user settings (`claude_user`).
 struct QassDirs {
     data: PathBuf,
     owner: PathBuf,
+    claude_user: PathBuf,
 }
 
 impl QassDirs {
@@ -60,6 +62,7 @@ impl QassDirs {
             data: qoop_runtime::paths::qass_data_dir()
                 .ok_or_else(|| std::io::Error::other("no HOME to keep qass's files under"))?,
             owner: qoop_runtime::paths::qass_config_dir(),
+            claude_user: claude_user_settings().unwrap_or_default(),
         })
     }
 
@@ -76,6 +79,12 @@ impl QassDirs {
 
     fn folder_settings(&self) -> PathBuf {
         self.data.join(".claude/settings.json")
+    }
+
+    /// What the folder settings hold: the template, with the person's plugins turned off.
+    fn folder_body(&self) -> String {
+        let user = std::fs::read_to_string(&self.claude_user).unwrap_or_default();
+        plugins_off(self.render(qass_settings()), &user)
     }
 
     fn skill_dirs(&self) -> impl Iterator<Item = PathBuf> + '_ {
@@ -392,11 +401,7 @@ fn install_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
             changed |= write_changed(&dir.join(name), &dirs.render(body), *program)?;
         }
     }
-    changed |= write_changed(
-        &dirs.folder_settings(),
-        &dirs.render(qass_settings()),
-        false,
-    )?;
+    changed |= write_changed(&dirs.folder_settings(), &dirs.folder_body(), false)?;
     let agents = [("AGENTS.md", dirs.render(QASS_AGENTS))];
     for (name, body) in agents
         .into_iter()
@@ -506,6 +511,51 @@ fn qass_settings() -> &'static str {
         .map_or("", |(_, body, _)| body)
 }
 
+/// Claude's user settings, as Claude reads them: under `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_user_settings() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir).join("settings.json")),
+        None => home().map(|h| h.join(".claude/settings.json")),
+    }
+}
+
+/// qass's folder settings with every plugin `user` turns on turned off. A plugin's hooks and
+/// skills land in qass's context at every start and after every compaction, and filled it to
+/// its compaction line on their own; Claude takes no wildcard there, so each is named. User
+/// settings that cannot be read turn nothing off.
+fn plugins_off(folder: String, user: &str) -> String {
+    let on: Vec<String> = serde_json::from_str::<serde_json::Value>(user)
+        .ok()
+        .and_then(|u| u.get("enabledPlugins")?.as_object().cloned())
+        .into_iter()
+        .flatten()
+        .filter(|(_, v)| !matches!(v, serde_json::Value::Bool(false) | serde_json::Value::Null))
+        .map(|(k, _)| k)
+        .collect();
+    if on.is_empty() {
+        return folder;
+    }
+    let Ok(serde_json::Value::Object(mut settings)) = serde_json::from_str(&folder) else {
+        return folder;
+    };
+    let off = on.into_iter().map(|k| (k, false.into())).collect();
+    settings.insert("enabledPlugins".into(), serde_json::Value::Object(off));
+    serde_json::to_string_pretty(&settings).map_or(folder, |s| s + "\n")
+}
+
+/// qass's folder settings brought up to date, where qass is installed, before qass starts or
+/// wakes: a plugin the person turned on since the install is off for qass from then on.
+pub(crate) fn refresh_qass_settings() -> std::io::Result<()> {
+    refresh_qass_settings_in(&QassDirs::here()?).map(|_| ())
+}
+
+fn refresh_qass_settings_in(dirs: &QassDirs) -> std::io::Result<bool> {
+    if !dirs.folder_settings().exists() {
+        return Ok(false);
+    }
+    write_changed(&dirs.folder_settings(), &dirs.folder_body(), false)
+}
+
 /// Take qass's files out of its folder, and each directory only when left empty. Its own
 /// state (goals, notes, scratch) and the owner's lessons stay; a `CLAUDE.md` or
 /// `GEMINI.md` goes only while it is the one install wrote.
@@ -539,7 +589,7 @@ fn qass_current(dirs: &QassDirs) -> bool {
     dirs.skill_dirs().all(|dir| {
         QASS.iter()
             .all(|(name, body, _)| holds(dir.join(name), &dirs.render(body)))
-    }) && holds(dirs.folder_settings(), &dirs.render(qass_settings()))
+    }) && holds(dirs.folder_settings(), &dirs.folder_body())
         && dirs.data.join("AGENTS.md").exists()
 }
 
@@ -1258,7 +1308,51 @@ mod tests {
         QassDirs {
             data: home.path().join("data/qass"),
             owner: home.path().join("config/qass"),
+            claude_user: home.path().join(".claude/settings.json"),
         }
+    }
+
+    /// Every plugin the person turned on in Claude's user settings is off in qass's folder,
+    /// one they turned off is left out, and the next install follows a change to that list.
+    #[test]
+    fn qass_runs_without_the_persons_plugins() {
+        let home = tempfile::tempdir().expect("home");
+        let dirs = qass_dirs(&home);
+        let plugins = |body: &str| {
+            std::fs::create_dir_all(home.path().join(".claude")).expect("claude dir");
+            std::fs::write(&dirs.claude_user, body).expect("user settings");
+        };
+        let read = || -> serde_json::Value {
+            let text = std::fs::read_to_string(dirs.folder_settings()).expect("folder settings");
+            serde_json::from_str(&text).expect("settings json")
+        };
+        // Not installed: nothing written before a start.
+        assert!(!refresh_qass_settings_in(&dirs).expect("not installed"));
+        assert!(!dirs.folder_settings().exists());
+        // No user settings: nothing to turn off, the template as it is.
+        assert!(install_qass(home.path(), &dirs).expect("install"));
+        assert!(read().get("enabledPlugins").is_none());
+        plugins(r#"{"enabledPlugins": {"a@m": true, "b@m": false, "c@n": ["x"], "d@n": null}}"#);
+        assert!(!qass_current(&dirs), "a new plugin is a stale install");
+        assert!(install_qass(home.path(), &dirs).expect("again"));
+        assert_eq!(
+            read()["enabledPlugins"],
+            serde_json::json!({"a@m": false, "c@n": false})
+        );
+        assert!(qass_current(&dirs));
+        assert!(!install_qass(home.path(), &dirs).expect("unchanged"));
+        // The rest of the template survives the rewrite.
+        assert_eq!(read()["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "100000");
+        assert!(read()["hooks"]["SessionStart"].is_array());
+        // A plugin turned on since: off at qass's next start, with no install between.
+        plugins(r#"{"enabledPlugins": {"a@m": false, "b@m": true}}"#);
+        assert!(refresh_qass_settings_in(&dirs).expect("changed"));
+        assert_eq!(read()["enabledPlugins"], serde_json::json!({"b@m": false}));
+        assert!(!refresh_qass_settings_in(&dirs).expect("again"));
+        // Settings Claude could not read turn nothing off.
+        plugins("not json");
+        assert!(install_qass(home.path(), &dirs).expect("unreadable"));
+        assert!(read().get("enabledPlugins").is_none());
     }
 
     /// qass installs whole into its own folder, where every agent reads it, its programs
@@ -1325,6 +1419,19 @@ mod tests {
             .iter()
             .filter_map(|r| r.as_str())
             .collect();
+        // No MCP tool and no built-in qass never calls: each one is in its context otherwise.
+        assert!(deny.contains(&"mcp__*"), "{deny:?}");
+        assert!(deny.contains(&"WebFetch"), "{deny:?}");
+        for kept in [
+            "Bash",
+            "Monitor",
+            "Agent",
+            "Skill",
+            "ToolSearch",
+            "TaskStop",
+        ] {
+            assert!(!deny.contains(&kept), "{kept} denied: {deny:?}");
+        }
         let config = home.path().join("config/config.toml");
         let rules = [
             format!("Edit(/{})", dirs.folder_settings().display()),
@@ -1487,6 +1594,7 @@ mod tests {
         let dirs = QassDirs {
             data: home.path().join("data/qass"),
             owner: home.path().join("config/qass"),
+            claude_user: home.path().join(".claude/settings.json"),
         };
         std::fs::create_dir_all(&dirs.data).expect("data");
         std::fs::write(dirs.data.join("gate.jsonl"), "newer").expect("newer");

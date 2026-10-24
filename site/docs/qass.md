@@ -31,5 +31,8 @@ more. When you correct it or say how you want things, it keeps the rule in
 `$(qoop paths qass-config)/lessons.md` (3,000 characters at most, loaded at every start); a lesson can
 let it settle a kind of reversible step at once, never anything that always asks. qass alone
 compacts its conversation before it passes about 100k tokens (its folder's `.claude/settings.json`
-sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), since every wake reads it again. `qoop paths`
+sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), since every wake reads it again. The same file keeps
+what would fill that window on its own out of qass: every plugin you turned on in Claude (turned
+off for qass alone, again at each `qoop qass`), every MCP tool, the built-in tools qass never
+calls, a skill list past 3,000 characters and a command's output past 15,000. `qoop paths`
 lists every folder qoop writes to and how big each is.
