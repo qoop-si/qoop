@@ -1883,9 +1883,11 @@ mod tests {
             "",
             r#"{"hook_event_name":"SessionStart","source":"compact"}"#,
         );
+        // Claude compacts an idle session too, with no Stop after it: a compaction leaves
+        // the state as it was, working inside a turn and idle outside one.
         assert!(
-            said.contains("--state working"),
-            "compact is mid turn: {said:?}"
+            !said.contains("hook-report"),
+            "compact reports no state: {said:?}"
         );
         for agent in ["codex", "gemini"] {
             let said = report(agent, "working", r#"{"hook_event_name":"SessionStart"}"#);

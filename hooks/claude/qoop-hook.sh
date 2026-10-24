@@ -43,7 +43,7 @@
 # state alone.
 #
 # Event map:
-#   SessionStart -> starting (working when `source` is `compact`), no event
+#   SessionStart -> starting, no event; nothing when `source` is `compact`
 #   SubagentStart, SubagentStop -> `--subagent-start` / `--subagent-end` with
 #     its `agent_id`: counted beside the tab, never its state
 #   anything else a subagent fired (the payload carries `agent_id`) -> nothing:
@@ -278,9 +278,11 @@ if agent:
 if name == "SessionStart":
     # A session opening, resuming or clearing is not a turn: `starting`, so an
     # agent the screen then reads as idle is not news that it finished. A
-    # compaction runs inside a turn and stays working.
+    # compaction says nothing: inside a turn the tab is working already, and
+    # Claude also compacts an idle session before its prompt cache expires, with
+    # no turn and so no `Stop` after it: reported as working, that tab stayed so.
     if payload.get("source") == "compact":
-        state, flags, event, label = "working", "--visible-working", "", ""
+        state, flags, event, label = "", "", "", ""
     else:
         state, flags, event, label = "starting", "", "", ""
 elif name == "UserPromptSubmit":
@@ -338,10 +340,11 @@ if label:
     args += ["--label", label]
 if session:
     args += ["--session-id", session]
-try:
-    subprocess.run(args, timeout=5, capture_output=True)
-except Exception:
-    pass
+if state:
+    try:
+        subprocess.run(args, timeout=5, capture_output=True)
+    except Exception:
+        pass
 # The turn is over: a subagent missing from its own list of what still runs has ended, even
 # when its end never came. After the report, so the state is never late for it.
 tasks = payload.get("background_tasks")
