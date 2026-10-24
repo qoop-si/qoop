@@ -46,7 +46,7 @@ const QASS_POINTERS: [(&str, &str); 2] = [
 /// Where qass keeps its own state and works (`data`), and the owner's files (`owner`), as
 /// `qoop paths` shows them. The skill's files name them as `@QASS_DATA@` and `@QASS_CONFIG@`
 /// (qoop's own settings folder, its parent, as `@QOOP_CONFIG@`), filled in here at install.
-/// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking, loads its lessons and caps its context for compaction, for any Claude started there, by
+/// The working folder's `.claude/settings.json` lets Claude run qass's commands without asking and loads its lessons, for any Claude started there, by
 /// hand, restored or woken (a restore types a bare `claude --resume`, so flags given at
 /// launch do not come back, and an env var set there does). It also turns off, for qass alone,
 /// every plugin the person turned on in Claude's user settings (`claude_user`).
@@ -1342,7 +1342,7 @@ mod tests {
         assert!(qass_current(&dirs));
         assert!(!install_qass(home.path(), &dirs).expect("unchanged"));
         // The rest of the template survives the rewrite.
-        assert_eq!(read()["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "100000");
+        assert_eq!(read()["env"]["SLASH_COMMAND_TOOL_CHAR_BUDGET"], "3000");
         assert!(read()["hooks"]["SessionStart"].is_array());
         // A plugin turned on since: off at qass's next start, with no install between.
         plugins(r#"{"enabledPlugins": {"a@m": false, "b@m": true}}"#);
@@ -1358,6 +1358,48 @@ mod tests {
     /// qass installs whole into its own folder, where every agent reads it, its programs
     /// runnable, changes nothing the second time, and uninstalls to its own state while a
     /// neighbour's file stays.
+    /// At every start and compaction qass is handed its lessons and its own notes, each cut at
+    /// 8,000 characters with a line that says so, and nothing for a file that is not there.
+    #[test]
+    fn qass_starts_with_its_lessons_and_notes() {
+        let home = tempfile::tempdir().expect("home");
+        // A Mac's qass folder sits under `Application Support`: a space in every path.
+        let dirs = QassDirs {
+            data: home.path().join("Application Support/qass"),
+            ..qass_dirs(&home)
+        };
+        let settings: serde_json::Value =
+            serde_json::from_str(&dirs.render(qass_settings())).expect("settings json");
+        let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("a SessionStart command")
+            .to_string();
+        let start = || {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .expect("sh");
+            assert!(out.status.success(), "the hook exits 0");
+            String::from_utf8(out.stdout).expect("utf-8")
+        };
+        let said = start();
+        assert!(!said.contains("Lessons from the owner") && !said.contains("Your notes"));
+        std::fs::create_dir_all(&dirs.owner).expect("owner dir");
+        std::fs::create_dir_all(&dirs.data).expect("data dir");
+        std::fs::write(dirs.owner.join("lessons.md"), "- a lesson -> do it\n").expect("lessons");
+        std::fs::write(dirs.data.join("memory.md"), "n".repeat(9000)).expect("memory");
+        let said = start();
+        assert!(said.contains("Lessons from the owner") && said.contains("- a lesson -> do it"));
+        assert!(said.contains("Your notes"));
+        assert!(said.contains(&"n".repeat(8000)) && !said.contains(&"n".repeat(8001)));
+        assert!(said.contains("(cut at 8000 characters: the rest of"));
+        assert_eq!(
+            said.matches("cut at 8000").count(),
+            1,
+            "only the notes are cut"
+        );
+    }
+
     #[test]
     fn qass_installs_whole_into_its_folder_and_leaves_neighbours() {
         use std::os::unix::fs::PermissionsExt;
@@ -1410,9 +1452,13 @@ mod tests {
         // is an absolute path, Claude Code's own syntax; `Edit` covers every tool that writes a
         // file, and a deny wins over `dontAsk`). qass has no mode left to deny.
         let settings: serde_json::Value = serde_json::from_str(&folder).expect("settings json");
-        // qass alone compacts before its conversation passes about 100k tokens (QOOP-55): every
-        // wake reads it again, so a smaller one is a cheaper wake; workers keep their windows.
-        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "100000");
+        // qass keeps the model's own window: under a cap of its own it compacted every few
+        // turns and lost what it had learned about the owner.
+        assert!(
+            settings["env"]
+                .get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+                .is_none()
+        );
         let deny: Vec<&str> = settings["permissions"]["deny"]
             .as_array()
             .expect("a deny list")

@@ -1,10 +1,10 @@
 {
   "env": {
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000",
     "SLASH_COMMAND_TOOL_CHAR_BUDGET": "3000"
   },
   "bashOutputMaxChars": 15000,
   "disableClaudeAiConnectors": true,
+  "autoMemoryEnabled": false,
   "permissions": {
     "defaultMode": "dontAsk",
     "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Monitor", "Agent", "Skill", "ToolSearch", "TodoWrite", "TaskStop"],
@@ -23,7 +23,7 @@
       { "matcher": "", "hooks": [{ "type": "command", "command": "\"@QASS_DATA@/.claude/skills/qass/cardcheck.sh\"" }] }
     ],
     "SessionStart": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "f=\"@QASS_CONFIG@/lessons.md\"; if [ -s \"$f\" ]; then echo \"Lessons from the owner ($f):\"; head -c 8000 \"$f\"; [ \"$(wc -c < \"$f\")\" -gt 8000 ] && printf '\\n%s\\n' \"(cut at 8000 characters: the rest of $f is not loaded)\"; fi; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "show() { if [ -s \"$2\" ]; then echo \"$1 ($2):\"; head -c 8000 \"$2\"; [ \"$(wc -c < \"$2\")\" -gt 8000 ] && printf '\\n%s\\n' \"(cut at 8000 characters: the rest of $2 is not loaded)\"; fi; }; show \"Lessons from the owner\" \"@QASS_CONFIG@/lessons.md\"; show \"Your notes\" \"@QASS_DATA@/memory.md\"; echo \"qass: your skill is @QASS_DATA@/.claude/skills/qass (its scripts too), your notes @QASS_DATA@/memory.md, your scratch @QASS_DATA@/scratch/. After a wake or a resume the fleet watcher is not running; start it again (Start, step 3) from that dir before anything else.\"; true" }] }
     ]
   }
 }
