@@ -522,6 +522,23 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
         "draft_after_turn",
         Idle,
     );
+    // Claude compacts an idle session before its prompt cache expires and says so; its
+    // suggested next prompt sits in the composer (tab 456, 2026-10-25).
+    assert_rule(
+        "claude",
+        &[
+            "  ⎿  Skills restored (commit)",
+            "",
+            "⏺ Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json",
+            "",
+            RULE,
+            "❯ deploy, then try it live",
+            RULE,
+            footer,
+        ],
+        "draft_after_turn",
+        Idle,
+    );
     // A prompt just sent sits between the old summary and the composer.
 
     assert_not_rule(

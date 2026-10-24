@@ -260,8 +260,9 @@ line_regex = '^│ >\s*│$'
 
 # A draft in the composer, right under the end of a turn: the turn's summary
 # (`✻ Crunched for 16m 31s · done 6:31 PM`, from real sessions) or
-# `⎿  Interrupted · What should Claude do instead?`, with only indented notices
-# (`You've used 75% of your weekly limit`) between it and the composer's top rule. A prompt
+# `⎿  Interrupted · What should Claude do instead?`, or the note a compaction of an idle session
+# leaves (`⏺ Compacted while idle, before the prompt cache expired · ...`), with only indented
+# notices (`You've used 75% of your weekly limit`) between it and the composer's top rule. A prompt
 # just sent sits between an older summary and the composer, unindented, and breaks the chain.
 [[rules]]
 id = "draft_after_turn"
@@ -269,7 +270,7 @@ state = "idle"
 priority = 100
 region = "bottom_non_empty_lines(12)"
 visible_idle = true
-regex = '(?m)^(?:[·✢✳✶✻✽*] \S+ for [^\n]*|\s*⎿\s+Interrupted · What should Claude do instead\?)\s*\n(?:\s{4,}\S[^\n]*\n)*─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^─\n][^\n]*\n)*─{3,}'
+regex = '(?m)^(?:[·✢✳✶✻✽*] \S+ for [^\n]*|\s*⎿\s+Interrupted · What should Claude do instead\?|⏺ Compacted while idle[^\n]*)\s*\n(?:\s{4,}\S[^\n]*\n)*─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^─\n][^\n]*\n)*─{3,}'
 
 # Any other draft. Real sessions draw a draft under a streaming answer with no spinner and
 # no interrupt hint for most frames, so a draft alone is no sign that the turn is over:
