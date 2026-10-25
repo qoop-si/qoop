@@ -5252,7 +5252,8 @@ async fn handle_control(
                                 .await;
                             // A prompt reached an agent waiting on the owner: its answer. The
                             // stage goes back, so no board still says it waits on him. A notice
-                            // the harness typed (its own background work done) is no answer.
+                            // the harness typed (its own background work done) is no answer, nor
+                            // qass setting it to other work while the question waits.
                             // It also moved past its question, his answer in its tab or new
                             // work: a card still open about it is stale.
                             let now = crate::agents::now_unix();

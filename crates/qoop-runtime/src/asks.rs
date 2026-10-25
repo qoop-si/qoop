@@ -326,10 +326,16 @@ pub(crate) fn asks_owner(line: &str) -> bool {
 }
 
 /// Whether a prompt is one nobody typed: the harness's notice that the agent's own background
-/// work ended, or another agent's message. Neither answers a question the agent left him.
+/// work ended, or another agent's message. Neither answers a question the agent left him, nor
+/// does qass's `While E7 waits on the owner: ...`, which sets it to the work the question does
+/// not hold up and keeps the question open for his answer.
 pub(crate) fn not_his(prompt: &str) -> bool {
     let prompt = prompt.trim_start();
-    prompt.starts_with("<task-notification") || prompt.starts_with("<agent-message")
+    prompt.starts_with("<task-notification")
+        || prompt.starts_with("<agent-message")
+        || card_after(prompt, "While ").is_some_and(|card| {
+            prompt["While ".len() + card.len()..].starts_with(" waits on the owner")
+        })
 }
 
 /// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
@@ -546,7 +552,12 @@ pub(crate) async fn relayed(
 /// `E7` (qass's card) or `W12` (the daemon's draft) from a prompt head that starts `The owner
 /// answered E7`, matched whole so it never reads E70 as E7.
 fn card_in_prompt(head: &str) -> Option<String> {
-    let rest = head.strip_prefix("The owner answered ")?;
+    card_after(head, "The owner answered ")
+}
+
+/// The card a head names right after `prefix`, matched whole.
+fn card_after(head: &str, prefix: &str) -> Option<String> {
+    let rest = head.strip_prefix(prefix)?;
     let kind = rest.chars().next().filter(|c| matches!(c, 'E' | 'W'))?;
     let rest = &rest[1..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -1383,6 +1394,18 @@ mod tests {
         ] {
             assert!(!asks_owner(not), "{not}");
         }
+    }
+
+    #[test]
+    fn qass_setting_it_to_other_work_answers_nothing() {
+        assert!(not_his(
+            "While E7 waits on the owner: do the parts it does not hold up."
+        ));
+        assert!(not_his("While W12 waits on the owner: go on."));
+        assert!(!not_his("While E2E tests run, fix the lint."));
+        assert!(!not_his("While E7 runs, look at the logs."));
+        assert!(!not_his("The owner answered E7: \"B\"."));
+        assert!(not_his("<task-notification>done</task-notification>"));
     }
 
     #[test]

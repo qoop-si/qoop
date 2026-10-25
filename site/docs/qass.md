@@ -19,7 +19,8 @@ never does. It writes to an agent within those rules without asking you first; t
 first" and it keeps that until you say otherwise. Work that stops is its to move on: an agent on
 an open task that comes to rest reaches it within half a minute, and it answers a question the
 agent's rules already settle, resumes after an error or a usage limit, and pushes the step the
-task's goal still lacks. It never types into a tab while you are at it (your keys there in the last
+task's goal still lacks. A question left to you for 5 minutes stays open while the agent does the
+parts of its task that do not depend on it; your answer reaches it once it is at rest. It never types into a tab while you are at it (your keys there in the last
 minutes), and stops after a few writes to one agent that do not move it, asking you instead.
 Agents themselves are told to take the next step their rules allow and to end a turn on you only
 for your decision. In a repository whose GitHub
