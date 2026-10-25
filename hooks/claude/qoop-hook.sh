@@ -52,6 +52,7 @@
 #   PreToolUse, PostToolUse -> working + `--event tool` (`tool_name` plus
 #     the first file-ish `tool_input` field, a command's description before
 #     the command itself, best-effort)
+#   PostToolUse of AskUserQuestion -> working + `--event user`, no label (his answer)
 #   PermissionRequest -> blocked + `--event blocked` (tool label, best-effort)
 #   Notification (`permission_prompt`, `elicitation_dialog`,
 #     `elicitation_url_dialog`, `agent_needs_input`, `quota_auto_resume_stale`,
@@ -288,6 +289,10 @@ if name == "SessionStart":
 elif name == "UserPromptSubmit":
     state, flags, event = "working", "--visible-working", "user"
     label = one_line(payload.get("prompt") or "")
+elif name == "PostToolUse" and payload.get("tool_name") == "AskUserQuestion":
+    # His answer in the question dialog reached the agent: an answer as a typed prompt is,
+    # so a task waiting on him goes back to work. No label: it is no request, never a goal.
+    state, flags, event, label = "working", "--visible-working", "user", ""
 elif name in ("PreToolUse", "PostToolUse"):
     state, flags, event = "working", "--visible-working", "tool"
     tool = str(payload.get("tool_name") or "").strip()

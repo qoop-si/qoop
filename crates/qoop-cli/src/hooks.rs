@@ -2106,6 +2106,17 @@ mod tests {
         // The main thread's own tool call still reports.
         let said = report(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#);
         assert!(said.contains("--state working"), "{said:?}");
+        // His answer in a question dialog is his answer, as a prompt is: the daemon takes a
+        // task waiting on him back to work. Asking is still a tool, and so is any other end.
+        let said = report(r#"{"hook_event_name":"PostToolUse","tool_name":"AskUserQuestion"}"#);
+        assert!(
+            said.contains("--event user") && !said.contains("--label"),
+            "{said:?}"
+        );
+        let said = report(r#"{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}"#);
+        assert!(said.contains("--event tool"), "{said:?}");
+        let said = report(r#"{"hook_event_name":"PostToolUse","tool_name":"Bash"}"#);
+        assert!(said.contains("--event tool"), "{said:?}");
     }
 
     /// A configuration that is not JSON is reported, not overwritten.

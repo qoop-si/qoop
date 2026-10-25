@@ -3942,9 +3942,15 @@ pub fn paint_focus_list(
                 // does not name: one collapsed row, never a failure.
                 _ => ("▸", theme::Role::Faint),
             };
+            // A prompt with no words is his answer in a question dialog.
+            let label = if event.kind == "user" && event.label.is_empty() {
+                "answered"
+            } else {
+                event.label.as_str()
+            };
             // Fitted here, so every row paints exactly `width` columns and
             // nothing of the terminal shows through the list.
-            (width::fit(&format!("{mark} {}", event.label), width), role)
+            (width::fit(&format!("{mark} {label}"), width), role)
         })
         .collect()
 }
@@ -7855,6 +7861,8 @@ mod tests {
         assert_eq!(rows[2].1, theme::Role::Blocked);
         assert!(rows[3].0.starts_with("· "), "{rows:?}");
         assert_eq!(rows[3].1, theme::Role::Faint);
+        let rows = paint_focus_list(&[focus_event("user", "")], 40, 0, 20);
+        assert!(rows[0].0.starts_with("› answered"), "{rows:?}");
         // A kind a newer daemon stored that this build does not name is one
         // collapsed row, never a failure.
         let rows = paint_focus_list(&[focus_event("note", "hi")], 40, 0, 20);
