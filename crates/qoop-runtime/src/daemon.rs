@@ -2311,6 +2311,7 @@ async fn serve_client(
     if let qoop_proto::HandshakeOutcome::Welcome(w) = &mut outcome {
         w.capabilities
             .push(crate::control::SAME_VERSION_RESTART.into());
+        w.capabilities.push(crate::control::SPACE_HOMES.into());
         if let Some(ids) = ADOPTED.get() {
             w.extra
                 .insert(crate::control::ADOPTED.into(), serde_json::json!(ids));
@@ -3763,6 +3764,8 @@ fn dispatch(
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
         ControlRequest::ShowOpen { .. } => Dispatch::Apart,
+        // A check of the directory a person named, and the store after it.
+        ControlRequest::SetSpaceDir { .. } => Dispatch::Apart,
         // git and gh, for seconds at most, in a checkout an agent works in.
         ControlRequest::Changes { .. } => Dispatch::Apart,
         // The session index, and a stat of each directory listed: never on the read loop.
@@ -3887,7 +3890,13 @@ async fn handle_control(
             // `TerminalCreated` while ignoring the field was the first version, and it left
             // a client with no way to tell where its shell actually started.
             let cwd = match cwd.map(PathBuf::from) {
-                None => None,
+                // Named no directory: the space's home, the folder it is about, never where
+                // one of its tabs moved to since. A home gone since, or none yet, is the
+                // daemon's own directory, as before there were homes: never a refusal.
+                None => match space_home(store, workspace).await {
+                    Some(home) => matches!(probe_dir_asked(&home).await, Ok(true)).then_some(home),
+                    None => None,
+                },
                 Some(path) if !path.is_absolute() => {
                     return ControlResponse::Failed {
                         id,
@@ -4281,6 +4290,7 @@ async fn handle_control(
                     ink: row.ink,
                     link: None,
                     goal: row.goal,
+                    dir: row.dir,
                 });
             }
             ControlResponse::Workspaces { id, workspaces }
@@ -4558,6 +4568,46 @@ async fn handle_control(
                 reason: format!("the space goal was not saved: {e}"),
             },
         },
+        ControlRequest::SetSpaceDir { workspace, dir, .. } => {
+            let path = lexical(Path::new(dir.trim()));
+            if !path.is_absolute() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: format!("{} is not an absolute path", path.display()),
+                };
+            }
+            match probe_dir_asked(&path).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("{} is not a directory", path.display()),
+                    };
+                }
+                Err(e) => {
+                    return ControlResponse::Failed {
+                        id,
+                        reason: format!("{} could not be checked: {e}", path.display()),
+                    };
+                }
+            }
+            let dir = path.display().to_string();
+            let dir = match dir.trim_end_matches('/') {
+                "" => "/".to_string(),
+                trimmed => trimmed.to_string(),
+            };
+            match store.set_space_dir(workspace, dir).await {
+                Ok(false) => ControlResponse::Failed {
+                    id,
+                    reason: format!("there is no workspace {workspace}"),
+                },
+                Ok(true) => ControlResponse::Renamed { id },
+                Err(e) => ControlResponse::Failed {
+                    id,
+                    reason: format!("the space's folder was not saved: {e}"),
+                },
+            }
+        }
         ControlRequest::MoveWorkspace {
             workspace, before, ..
         } => match store.move_workspace(workspace, before).await {
@@ -9807,6 +9857,130 @@ fn parent_below_root(path: &Path) -> Option<PathBuf> {
     path.parent()
         .filter(|parent| *parent != Path::new("/"))
         .map(Path::to_path_buf)
+}
+
+/// Where a tab of `workspace` starts when it names no directory: its home, or, with none yet,
+/// where its tabs were (`guess_space_dir`), a worktree's being its main checkout. That guess is
+/// kept as the home unless it is a worktree or scratch folder that led nowhere better, which is
+/// good for this one tab only. `None` on a store error, a hung disk, or nothing to go by.
+async fn space_home(store: &crate::store::StoreHandle, workspace: i64) -> Option<PathBuf> {
+    match store.run(move |s| s.space_dir(workspace)).await {
+        Ok(Some(home)) => return Some(PathBuf::from(home)),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    let (guessed, passing) = store
+        .run(move |s| s.guess_space_dir(workspace, &say_nothing_dirs()))
+        .await
+        .ok()??;
+    let at = PathBuf::from(&guessed);
+    let asked = at.clone();
+    let home =
+        crate::blocking::probe_asked(&guessed, PROBE_DEADLINE, move || main_checkout(&asked))
+            .await
+            .ok()?;
+    if !passing || home != at {
+        let dir = home.display().to_string();
+        let _ = store.run(move |s| s.claim_space_dir(workspace, &dir)).await;
+    }
+    Some(home)
+}
+
+/// Directories that say nothing about what a space is for, so never its home: the daemon's
+/// own (where a tab nobody placed starts), `/` and the home folder.
+fn say_nothing_dirs() -> [String; 3] {
+    [
+        here().display().to_string(),
+        "/".to_string(),
+        std::env::var("HOME").unwrap_or_default(),
+    ]
+}
+
+/// `path` with its `.` and `..` taken out by their names, not by the disk: a home kept as
+/// `/c/wt/../repo` would stop working once `/c/wt` is gone.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => out.push(part),
+        }
+    }
+    out
+}
+
+/// The main checkout of the git worktree `dir` is in, or `dir` itself when it is in none.
+///
+/// A linked worktree's `.git` is a file naming `<main>/.git/worktrees/<name>`; a checkout's
+/// is a directory. Read off the disk, so only ever on the probe pool.
+fn main_checkout(dir: &Path) -> PathBuf {
+    for at in dir.ancestors() {
+        let dot = at.join(".git");
+        if dot.is_dir() {
+            break;
+        }
+        if !dot.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&dot) else {
+            break;
+        };
+        let Some(target) = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(|t| at.join(t.trim()))
+        else {
+            break;
+        };
+        let common = target.parent().filter(|p| p.ends_with("worktrees"));
+        if let Some(main) = common
+            .and_then(Path::parent)
+            .filter(|g| g.ends_with(".git"))
+        {
+            return lexical(main.parent().unwrap_or(dir));
+        }
+        break;
+    }
+    dir.to_path_buf()
+}
+
+#[cfg(test)]
+mod main_checkout_tests {
+    use super::main_checkout;
+
+    /// A folder inside a linked worktree names its main checkout; a checkout, a plain
+    /// folder and a `.git` file that is not a worktree's name themselves.
+    #[test]
+    fn a_worktree_names_its_main_checkout() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let main = tmp.path().join("qoop");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt-a")).expect("main");
+        let wt = tmp.path().join("qoop-wt-a");
+        std::fs::create_dir_all(wt.join("crates/x")).expect("wt");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt-a").display()),
+        )
+        .expect("dot git");
+        assert_eq!(main_checkout(&wt.join("crates/x")), main);
+        std::fs::write(wt.join(".git"), "gitdir: ../qoop/.git/worktrees/wt-a\n").expect("relative");
+        assert_eq!(
+            main_checkout(&wt),
+            main,
+            "a relative gitdir, with no `..` left in it"
+        );
+        assert_eq!(main_checkout(&main), main);
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("plain");
+        assert_eq!(main_checkout(&plain), plain);
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join(".git"), "gitdir: ../qoop/.git/modules/sub\n").expect("module");
+        assert_eq!(main_checkout(&sub), sub);
+    }
 }
 
 /// Whether a directory a person is waiting on exists: like [`is_dir_probed`], but never

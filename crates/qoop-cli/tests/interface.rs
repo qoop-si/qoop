@@ -2612,6 +2612,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                     "ListWorkspaces" => ControlResponse::Workspaces {
                         id,
                         workspaces: vec![WorkspaceRow {
+                            dir: None,
                             keep_awake: false,
                             qass_skip: false,
                             id: 1,

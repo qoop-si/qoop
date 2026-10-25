@@ -176,6 +176,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "give a space its folder",
+            method: || {
+                Method::Control(ControlRequest::SetSpaceDir {
+                    id: "a".into(),
+                    workspace: 1,
+                    dir: "/tmp".into(),
+                })
+            },
+        },
+        Action {
             name: "move a workspace in the list",
             method: || {
                 Method::Control(ControlRequest::MoveWorkspace {
@@ -883,6 +893,11 @@ fn every_control_method_is_reachable_from_some_action() {
             workspace: 0,
             goal: String::new(),
         },
+        ControlRequest::SetSpaceDir {
+            id: String::new(),
+            workspace: 0,
+            dir: String::new(),
+        },
         ControlRequest::MoveWorkspace {
             id: String::new(),
             workspace: 0,
@@ -1069,6 +1084,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::RenameWorkspace { .. }
             | ControlRequest::SetWorkspaceInk { .. }
             | ControlRequest::SetSpaceGoal { .. }
+            | ControlRequest::SetSpaceDir { .. }
             | ControlRequest::MoveWorkspace { .. }
             | ControlRequest::SetKeepAwake { .. }
             | ControlRequest::SetQassSkip { .. }

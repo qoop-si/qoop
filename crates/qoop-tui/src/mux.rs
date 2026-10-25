@@ -373,6 +373,7 @@ impl Link {
                 .collect();
         }
         vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: (link as i64) << WORKSPACE_SHIFT,
@@ -989,6 +990,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 workspace,
                 name,
             } => {
+                let merged = workspace;
                 let (link, workspace) = match workspace {
                     Some(w) => {
                         let (link, w) = workspace_in(w);
@@ -1009,6 +1011,18 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                         .is_some_and(|l| l.agents.iter().any(|a| a.cwd.as_ref() == Some(dir)))
                 };
                 let cwd = cwd.filter(|dir| link == self.last_link || known(dir));
+                // A remote older than space folders starts a tab asked for with no directory in
+                // its own: it is sent where that space already works, as before folders.
+                let cwd = cwd.or_else(|| {
+                    let l = self.links.get(link).and_then(Option::as_ref)?;
+                    let old = !l.server_version.is_empty()
+                        && !qoop_runtime::paths::is_newer_version(&l.server_version, BEFORE_HOMES);
+                    l.agents
+                        .iter()
+                        .filter(|_| old)
+                        .find(|a| Some(a.workspace) == merged && a.cwd.is_some())
+                        .and_then(|a| a.cwd.clone())
+                });
                 self.send_one(
                     link,
                     R::CreateTerminal {
@@ -1064,6 +1078,12 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             R::SetWorkspaceInk { id, workspace, ink } => {
                 let (link, workspace) = workspace_in(workspace);
                 self.send_one(link, R::SetWorkspaceInk { id, workspace, ink })
+                    .await
+            }
+            // A directory is a place on the space's own machine: set there.
+            R::SetSpaceDir { id, workspace, dir } => {
+                let (link, workspace) = workspace_in(workspace);
+                self.send_one(link, R::SetSpaceDir { id, workspace, dir })
                     .await
             }
             R::CloseWorkspace { id, workspace } => {
@@ -2064,6 +2084,10 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 /// would take a placed move, or a pane leaving its split, as done without doing it.
 const BEFORE_PLACES: &str = "0.5.2";
 
+/// The last release whose daemon keeps no folder per space: one this old starts a tab asked
+/// for with no directory in its own directory, not in its space's.
+const BEFORE_HOMES: &str = "0.11.0";
+
 /// The file the merged list's order is kept in, beside the list of remotes.
 const ORDER_FILE: &str = "space-order.json";
 
@@ -2863,6 +2887,7 @@ mod tests {
     async fn spaces_move_anywhere_and_each_machine_keeps_its_part() {
         let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
         let row = |id: i64, name: &str| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,
@@ -2944,6 +2969,7 @@ mod tests {
         let (mut mux, _home_rx, _remote_rx, _events) = two_links();
         mux.order_file = Some(file.clone());
         let row = |id: i64, name: &str| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,
@@ -3038,6 +3064,7 @@ mod tests {
     async fn a_machine_out_of_step_is_sent_its_whole_order() {
         let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
         let row = |id: i64, name: &str| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,
@@ -3114,6 +3141,37 @@ mod tests {
                 panic!("{asked:?}");
             };
             assert_eq!(sent.is_some(), kept, "{cwd}");
+        }
+    }
+
+    /// A tab with no directory goes to a remote with space folders as it is, and to an older
+    /// one with the directory a tab of that space is in, as clients did before folders.
+    #[tokio::test]
+    async fn a_new_tab_on_an_older_remote_keeps_its_space_directory() {
+        let (mut mux, _home_rx, mut remote_rx, _events) = two_links();
+        let space = (1i64 << WORKSPACE_SHIFT) | 2;
+        let mut tab: AgentRow = serde_json::from_value(serde_json::json!({
+            "terminal": 4, "workspace": space, "agent": true, "state": "idle",
+            "readiness": "ready", "cwd": "/srv/app",
+        }))
+        .expect("a row");
+        tab.cwd = Some("/srv/app".into());
+        mux.link(1).expect("remote").agents = vec![tab];
+        for (version, sent) in [("0.11.0", Some("/srv/app")), ("0.11.1", None)] {
+            mux.link(1).expect("remote").server_version = version.into();
+            mux.control(ControlRequest::CreateTerminal {
+                id: "new-1".into(),
+                cwd: None,
+                workspace: Some(space),
+                name: None,
+            })
+            .await
+            .expect("sent");
+            let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("remote was asked"));
+            let ControlRequest::CreateTerminal { cwd, workspace, .. } = asked else {
+                panic!("{asked:?}");
+            };
+            assert_eq!((cwd.as_deref(), workspace), (sent, Some(2)), "{version}");
         }
     }
 
@@ -3226,6 +3284,7 @@ mod tests {
             link.listed_spaces(1).iter().map(|row| row.link).collect()
         };
         let row = WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1 << WORKSPACE_SHIFT,
@@ -3265,6 +3324,7 @@ mod tests {
     #[test]
     fn a_remote_hides_its_empty_default_but_nothing_a_person_made() {
         let row = |n: i64, terminals: usize| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: n << WORKSPACE_SHIFT,
@@ -3699,6 +3759,7 @@ mod tests {
             tried: BTreeSet::new(),
         };
         let space = |id: i64, name: &str| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,

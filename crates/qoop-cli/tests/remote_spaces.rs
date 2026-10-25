@@ -917,6 +917,7 @@ async fn pre_feature_daemon(
                             "ListWorkspaces" => ControlResponse::Workspaces {
                                 id,
                                 workspaces: vec![WorkspaceRow {
+                                    dir: None,
                                     keep_awake: false,
                                     qass_skip: false,
                                     id: 1,

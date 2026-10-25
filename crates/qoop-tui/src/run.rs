@@ -4209,27 +4209,6 @@ enum MenuSend {
     Zoom,
 }
 
-/// Where a new terminal starts: the focused terminal's directory, as last reported.
-///
-/// A new tab opens where the
-/// person already is rather than where the daemon started. The daemon cannot do this
-/// itself: focus lives in this client, so the row's last known cwd travels on the
-/// request. A stale, relative or vanished directory falls back to `None`, which is the
-/// daemon's own directory, rather than failing the create.
-fn focused_cwd(state: &State) -> Option<String> {
-    let row = state.rows.iter().find(|r| r.terminal == state.focused)?;
-    usable_cwd(row)
-}
-
-/// The focused terminal's directory for a new tab in `space`, only when the two are on one
-/// machine: a directory is a place on its own machine and nowhere else.
-fn focused_cwd_in(state: &State, space: i64) -> Option<String> {
-    let focused = state.rows.iter().find(|r| r.terminal == state.focused)?;
-    (crate::mux::machine_of(focused.workspace) == crate::mux::machine_of(space))
-        .then(|| usable_cwd(focused))
-        .flatten()
-}
-
 /// A row's last reported directory, when a new tab can start there.
 fn usable_cwd(row: &AgentRow) -> Option<String> {
     let cwd = row.cwd.clone()?;
@@ -4237,30 +4216,6 @@ fn usable_cwd(row: &AgentRow) -> Option<String> {
     // the mux carries it only to that same machine.
     let here = crate::mux::is_remote_terminal(row.terminal) || std::path::Path::new(&cwd).is_dir();
     (!cwd.is_empty() && std::path::Path::new(&cwd).is_absolute() && here).then_some(cwd)
-}
-
-/// Where a new tab in `space` starts: the focused terminal's directory when the
-/// focused terminal is itself in that space, else the first of that space's tabs
-/// with a usable one, else the daemon's own.
-///
-/// Per space on purpose: a tab opened for space B starts where B already is,
-/// never where the keyboard last was in space A. The focused directory only
-/// counts when it is in the space being opened in.
-fn space_cwd(state: &State, space: i64) -> Option<String> {
-    // The focused terminal is not always in the space on screen (a space just made is shown
-    // before its first tab is, or a `+` aimed at another space): its directory only counts
-    // where it is in the space the new tab goes to.
-    if let Some(focused) = state.rows.iter().find(|r| r.terminal == state.focused)
-        && focused.workspace == space
-        && let Some(cwd) = usable_cwd(focused)
-    {
-        return Some(cwd);
-    }
-    state
-        .rows
-        .iter()
-        .filter(|r| r.workspace == space)
-        .find_map(usable_cwd)
 }
 
 /// Remember a create aimed at a space that is not on screen, so its tab is shown with its
@@ -4345,13 +4300,8 @@ fn start_agent_terminal(
         .insert(id.clone(), (command.to_string(), given));
     ControlRequest::CreateTerminal {
         id,
-        // Like every other new tab: the agent starts where that
-        // space already is rather than where the daemon started, and never where
-        // another space is.
-        cwd: match space {
-            Some(space) => space_cwd(state, space),
-            None => focused_cwd(state),
-        },
+        // No directory: the daemon starts it in the space's home, as every new tab.
+        cwd: None,
         workspace: space,
         name,
     }
@@ -4450,7 +4400,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
             state.message = Some("starting a terminal".to_string());
             let ask = ControlRequest::CreateTerminal {
                 id: format!("new-{request}"),
-                cwd: space_cwd(state, space),
+                cwd: None,
                 workspace: Some(space),
                 name: None,
             };
@@ -4601,7 +4551,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                     }
                     MenuSend::Control(ControlRequest::CreateTerminal {
                         id: format!("split-{request}"),
-                        cwd: focused_cwd(state),
+                        cwd: None,
                         workspace: space,
                         name: None,
                     })
@@ -4995,12 +4945,7 @@ fn answer_prompt(
         }
         Naming::Terminal => vec![ControlRequest::CreateTerminal {
             id: format!("new-{request}"),
-            // The new tab follows its own space's directory, never the
-            // focused terminal's when that one lives in another space.
-            cwd: match state.space {
-                Some(space) => space_cwd(state, space),
-                None => focused_cwd(state),
-            },
+            cwd: None,
             // The space the person is looking at.
             workspace: state.space,
             name,
@@ -10504,9 +10449,7 @@ where
                                         wr.write_all(&client::encode_control_seq(
                                             &ControlRequest::CreateTerminal {
                                                 id: format!("split-{request}"),
-                                                // The split follows
-                                                // the focused pane's directory.
-                                                cwd: focused_cwd(&state),
+                                                cwd: None,
                                                 workspace: space,
                                                 name: None,
                                             },
@@ -10896,17 +10839,14 @@ where
                     if let Some(ack) = connection.renders().due_ack(std::time::Instant::now()) {
                         wr.write_all(&ack).await?;
                     }
-                    // A new space's first terminal follows the
-                    // focused terminal's directory, which still names the space
-                    // the person came from at this point, when the new space is on
-                    // the same machine.
+                    // A new space's first terminal names no directory: the focused one still
+                    // belongs to the space the person came from, and is not the new one's.
                     for space in std::mem::take(&mut state.wants_terminal_in) {
-                        let cwd = focused_cwd_in(&state, space);
                         request += 1;
                         wr.write_all(&client::encode_control_seq(
                             &ControlRequest::CreateTerminal {
                                 id: format!("new-{request}"),
-                                cwd: cwd.clone(),
+                                cwd: None,
                                 workspace: Some(space),
                                 // The terminal a new space comes up with, which nobody
                                 // was asked about: they named the space.
@@ -15374,6 +15314,7 @@ mod tests {
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,
@@ -15610,46 +15551,34 @@ mod tests {
         );
     }
 
-    /// The focused terminal's directory starts a new tab only on its own machine.
+    /// A new tab, agent or split names no directory, so the daemon starts it in the space's
+    /// home: never where the focused tab or the space's first tab moved to (a worktree).
     #[test]
-    fn a_directory_stays_on_its_machine() {
+    fn a_new_tab_never_follows_a_tab_that_moved() {
         let mut s = drag_state();
+        let moved = std::env::temp_dir().display().to_string();
         s.focused = 1;
-        s.rows[0].cwd = Some(std::env::temp_dir().display().to_string());
-        assert!(
-            focused_cwd_in(&s, 2).is_some(),
-            "another space, same machine"
-        );
-        assert_eq!(
-            focused_cwd_in(&s, (1i64 << 40) | 3),
-            None,
-            "another machine"
-        );
-    }
-
-    /// A new tab starts where its own space is, never where another space was left.
-    #[test]
-    fn a_new_tab_starts_in_its_own_space() {
-        let mut s = drag_state();
-        let tmp = std::env::temp_dir().display().to_string();
-        // Focused tab lives in space 1; space 2 has its own tab with its own directory.
-        s.focused = 1;
-        s.space = Some(2);
-        let other = std::env::temp_dir()
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| tmp.clone());
-        s.rows[0].cwd = Some(tmp.clone());
-        s.rows[3].cwd = Some(other.clone());
-        // Same space: the focused directory counts.
-        assert_eq!(space_cwd(&s, 1), Some(tmp.clone()));
-        // Another space on screen while focus still rests in space 1: space 2's own
-        // tab wins over the focused one.
-        assert_eq!(space_cwd(&s, 2), Some(other.clone()));
-        // Focused in space 1 must never leak into space 2 when space 2 has no
-        // usable directory of its own.
-        s.rows[3].cwd = None;
-        assert_eq!(space_cwd(&s, 2), None);
+        s.space = Some(1);
+        for row in &mut s.rows {
+            row.cwd = Some(moved.clone());
+        }
+        let ControlRequest::CreateTerminal { cwd, .. } =
+            start_agent_terminal(&mut s, 1, "claude", Some(1), None)
+        else {
+            panic!("an agent is a create");
+        };
+        assert_eq!(cwd, None, "agent");
+        s.menu_kind = MenuKind::New {
+            space: 1,
+            name: "one".into(),
+        };
+        let mut request = 0;
+        let MenuSend::Control(ControlRequest::CreateTerminal { cwd, .. }) =
+            apply_menu_choice(&mut s, 1, &mut request)
+        else {
+            panic!("a terminal is a create");
+        };
+        assert_eq!(cwd, None, "terminal");
     }
 
     /// A pane of a split, let go in its own space, leaves the split for a tab of its own
@@ -17024,57 +16953,6 @@ mod tests {
         }
     }
 
-    /// A new tab follows the focused terminal's directory,
-    /// so it opens where the person is rather than where the daemon started.
-    #[test]
-    fn a_new_terminal_follows_the_focused_terminal_directory() {
-        let mut s = state();
-        let dir = std::env::temp_dir().display().to_string();
-        s.rows
-            .iter_mut()
-            .find(|r| r.terminal == s.focused)
-            .expect("focused row")
-            .cwd = Some(dir.clone());
-        assert_eq!(focused_cwd(&s), Some(dir));
-    }
-
-    #[test]
-    fn a_new_terminal_without_a_focused_directory_falls_back_to_the_daemon() {
-        // Nothing focused: no row to follow.
-        let mut s = state();
-        s.focused = 0;
-        assert_eq!(focused_cwd(&s), None);
-        // Focused but unknown: the index has not reported a directory yet.
-        let s = state();
-        assert_eq!(focused_cwd(&s), None);
-    }
-
-    #[test]
-    fn a_new_terminal_ignores_a_stale_or_relative_directory() {
-        // Vanished: sending it would fail the create instead of opening a tab.
-        let mut s = state();
-        s.rows
-            .iter_mut()
-            .find(|r| r.terminal == s.focused)
-            .expect("focused row")
-            .cwd = Some(
-            std::env::temp_dir()
-                .join("qoop-no-such-dir")
-                .display()
-                .to_string(),
-        );
-        assert_eq!(focused_cwd(&s), None);
-        // Relative: it would resolve against the daemon's directory, which is
-        // where the fallback already starts.
-        let mut s = state();
-        s.rows
-            .iter_mut()
-            .find(|r| r.terminal == s.focused)
-            .expect("focused row")
-            .cwd = Some("relative/path".to_string());
-        assert_eq!(focused_cwd(&s), None);
-    }
-
     /// An agent tab takes the command's first word as its name, so it reads as
     /// the agent until renamed, and remembers the whole line to type.
     #[test]
@@ -17386,14 +17264,13 @@ mod tests {
         palette_wants_earlier(&mut s);
         assert_eq!(s.modes.outbox.len(), 1, "one ask, not one per key");
 
-        // No directory recorded: the tab starts where the space on screen already is.
+        // No directory recorded: no directory asked for, so the daemon starts it in the
+        // space's home, never where a tab of the space on screen moved to.
         s.space = Some(space);
         s.modes.outbox.clear();
         resume_from_palette(&mut s, &mut request, None, "claude --resume a");
         match s.modes.outbox.as_slice() {
-            [ControlRequest::CreateTerminal { cwd, .. }] => {
-                assert_eq!(cwd.as_deref(), Some(dir.as_str()))
-            }
+            [ControlRequest::CreateTerminal { cwd, .. }] => assert_eq!(cwd.as_deref(), None),
             other => panic!("one create, got {other:?}"),
         }
     }
@@ -17437,8 +17314,8 @@ mod tests {
         );
     }
 
-    /// A space's `+` starts its tab in that space and that space's directory, even when
-    /// another space is on screen: `agent` lists the agents, `terminal` opens a shell, and
+    /// A space's `+` starts its tab in that space, at its home (no directory asked for), even
+    /// when another space is on screen: `agent` lists the agents, `terminal` opens a shell, and
     /// the last agent row asks for any command, still for that space.
     #[test]
     fn a_spaces_plus_starts_a_terminal_or_an_agent_in_that_space() {
@@ -17460,7 +17337,11 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(workspace, Some(1));
-                assert_eq!(cwd.as_deref(), Some(dir.as_str()));
+                assert_eq!(
+                    cwd.as_deref(),
+                    None,
+                    "the daemon starts it in the space's home"
+                );
                 assert_eq!(name, None);
             }
             _ => panic!("terminal is a create"),
@@ -17520,7 +17401,11 @@ mod tests {
                 },
             ] => {
                 assert_eq!(*workspace, Some(1));
-                assert_eq!(cwd.as_deref(), Some(dir.as_str()));
+                assert_eq!(
+                    cwd.as_deref(),
+                    None,
+                    "the daemon starts it in the space's home"
+                );
                 assert_eq!(
                     s.pending_agents.get(id).map(|(c, _)| c.as_str()),
                     Some("claude --resume")
@@ -19796,6 +19681,7 @@ mod tests {
         state.cols = 100;
         state.lines = 30;
         state.spaces = vec![qoop_runtime::control::WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             closable: true,

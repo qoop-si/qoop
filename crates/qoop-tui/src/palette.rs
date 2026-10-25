@@ -453,6 +453,7 @@ mod tests {
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,

@@ -28,7 +28,8 @@ pub enum Place {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum ControlRequest {
-    /// Start a terminal. `cwd` is where the shell starts; `None` means the daemon's own.
+    /// Start a terminal. `cwd` is where the shell starts; `None` means the space's folder, or
+    /// the daemon's own directory when it has none.
     CreateTerminal {
         id: String,
         cwd: Option<String>,
@@ -186,6 +187,14 @@ pub enum ControlRequest {
         id: String,
         workspace: i64,
         goal: String,
+    },
+    /// Give a workspace its home: where a new tab in it starts when the request names no
+    /// directory. Absolute and an existing directory, or refused. Answered `Renamed`, like
+    /// the goal; clients see it on their next list.
+    SetSpaceDir {
+        id: String,
+        workspace: i64,
+        dir: String,
     },
     /// Put a workspace just before `before` in the list, or last. Answered `Renamed`, like
     /// the colour; the list is read again by whoever asked, and by the others at their next
@@ -1561,6 +1570,7 @@ impl ControlRequest {
             | Self::RenameWorkspace { id, .. }
             | Self::SetWorkspaceInk { id, .. }
             | Self::SetSpaceGoal { id, .. }
+            | Self::SetSpaceDir { id, .. }
             | Self::MoveWorkspace { id, .. }
             | Self::SetKeepAwake { id, .. }
             | Self::SetQassSkip { id, .. }
@@ -2138,6 +2148,10 @@ pub struct WorkspaceRow {
     /// daemon that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// Its home: where a new tab in it starts when nobody names a directory. Absent when it
+    /// has none yet, and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// Whether the machine behind a space answers.
@@ -2439,6 +2453,11 @@ pub const KEEPS_PROMISES_FROM: &str = "0.9.2";
 /// What a daemon that moves onto a build of its own version (`RestartWhenSafe`'s
 /// `same_version`) says among the welcome's capabilities. One without it stays where it is.
 pub const SAME_VERSION_RESTART: &str = "restart-same-version";
+
+/// What a daemon that keeps a folder per space says among the welcome's capabilities: a tab
+/// asked for with no `cwd` starts in its space's folder, so a client sends none rather than
+/// guessing one from where the space's tabs are.
+pub const SPACE_HOMES: &str = "space-homes";
 
 /// The welcome's key for the tabs a daemon took over running when it became its binary.
 pub const ADOPTED: &str = "adopted";

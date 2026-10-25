@@ -189,6 +189,10 @@ impl StoreHandle {
         self.run(move |s| s.set_space_goal(id, &goal, at)).await
     }
 
+    pub async fn set_space_dir(&self, id: i64, dir: String) -> Result<bool, HandleError> {
+        self.run(move |s| s.set_space_dir(id, &dir)).await
+    }
+
     pub async fn set_keep_awake(
         &self,
         workspace: i64,

@@ -4525,6 +4525,7 @@ mod tests {
 
     fn space(id: i64, name: &str) -> WorkspaceRow {
         WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,
@@ -10090,6 +10091,7 @@ mod tests {
         closable: bool,
     ) -> (Vec<WorkspaceRow>, Vec<AgentRow>) {
         let space = WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1,
@@ -10764,6 +10766,7 @@ mod tests {
     #[test]
     fn a_sleeping_rule_keeps_its_space_colour_one_step_quieter() {
         let spaces = vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1,

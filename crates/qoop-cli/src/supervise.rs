@@ -1750,9 +1750,10 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
 const SPACE_USAGE: &str = "usage:
   qoop space rm <id|name>              remove a space with no tab in it
   qoop space goal <id|name> [text|-]   what the owner wants from it: no text prints it,
-                                       an empty text clears it";
+                                       an empty text clears it
+  qoop space dir <id|name> [path]      the folder its new tabs start in: no path prints it";
 
-/// `qoop space rm|goal`.
+/// `qoop space rm|goal|dir`.
 pub(crate) fn run_space(args: &[String]) -> std::io::Result<()> {
     match (
         args.get(2).map(String::as_str),
@@ -1766,6 +1767,12 @@ pub(crate) fn run_space(args: &[String]) -> std::io::Result<()> {
                 Some(crate::task::text(words)?)
             };
             space_goal(wanted, goal)
+        }
+        (Some("dir"), [wanted]) => space_dir(wanted, None),
+        (Some("dir"), [wanted, dir]) => {
+            // Where the caller is for a relative path, as `qoop new --cwd` reads one.
+            let dir = std::path::absolute(dir)?;
+            space_dir(wanted, Some(dir.display().to_string()))
         }
         _ => Err(super::usage(SPACE_USAGE)),
     }
@@ -1812,6 +1819,43 @@ fn space_goal(wanted: &str, goal: Option<String>) -> std::io::Result<()> {
             ControlResponse::Renamed { .. } => Ok(()),
             ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
             _ => Err(std::io::Error::other("unexpected answer to a space goal")),
+        }
+    })
+}
+
+/// Print a space's folder, or set it: where a new tab in it starts when nobody names one.
+fn space_dir(wanted: &str, dir: Option<String>) -> std::io::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut link = space_link("qoop-space-dir").await?;
+        let spaces = link.spaces().await?;
+        let space = resolve_space(&spaces, wanted)?;
+        let row = spaces
+            .iter()
+            .find(|s| s.id == space)
+            .expect("resolved above");
+        let Some(dir) = dir else {
+            match &row.dir {
+                Some(dir) => println!("{dir}"),
+                None => println!(
+                    "space {} ({}) has no folder: its new tabs start where qoop does",
+                    row.id, row.name
+                ),
+            }
+            return Ok(());
+        };
+        match link
+            .ask(&ControlRequest::SetSpaceDir {
+                id: super::request_id("space-dir"),
+                workspace: space,
+                dir,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Renamed { .. } => Ok(()),
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to a space folder")),
         }
     })
 }
@@ -2273,6 +2317,7 @@ mod tests {
     fn a_space_is_found_by_id_then_name_and_an_unknown_id_is_refused() {
         let spaces = vec![
             WorkspaceRow {
+                dir: None,
                 keep_awake: false,
                 qass_skip: false,
                 id: 1,
@@ -2286,6 +2331,7 @@ mod tests {
                 goal: None,
             },
             WorkspaceRow {
+                dir: None,
                 keep_awake: false,
                 qass_skip: false,
                 id: 2,
@@ -2304,6 +2350,7 @@ mod tests {
         assert_eq!(pick_space(&spaces, "fresh").unwrap(), None);
         assert!(pick_space(&spaces, "7").is_err());
         let named = vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 3,
@@ -2338,6 +2385,7 @@ mod tests {
             cwd: "/".into(),
         };
         let space = |id, sleeping| WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id,

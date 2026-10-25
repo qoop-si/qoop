@@ -92,6 +92,8 @@ pub struct WorkspaceRow {
     pub ink: Option<u8>,
     /// What the owner wants from the work in this space, one line, when he said.
     pub goal: Option<String>,
+    /// Where a new tab in it starts when nobody names a directory (`space_dir`).
+    pub dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -346,6 +348,14 @@ impl Store {
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  goal TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
+             );
+             -- Where a new tab in a space starts when nobody names a directory: its home,
+             -- the space's own folder, never where some tab of it moved to since. Cascaded
+             -- like the rest, because ids are reused. New table, no version bump: an older
+             -- binary ignores it and opens a tab where it did before.
+             CREATE TABLE IF NOT EXISTS space_dir (
+                 workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
+                 dir TEXT NOT NULL
              );
              -- Where a person put each space in the list. A space never placed has no row
              -- and comes after the placed ones, by id, so a new one lands at the end.
@@ -615,6 +625,103 @@ impl Store {
         Ok(true)
     }
 
+    /// Where a new tab in a space starts when nobody names a directory, if it has a home.
+    pub fn space_dir(&self, id: i64) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dir FROM space_dir WHERE workspace = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Give a space its home. Answers false when there is no such space.
+    pub fn set_space_dir(&self, id: i64, dir: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "INSERT OR REPLACE INTO space_dir (workspace, dir) \
+             SELECT id, ?2 FROM workspace WHERE id = ?1",
+            params![id, dir],
+        )? > 0)
+    }
+
+    /// Make `dir` a space's home unless it already has one. A space that does not exist is
+    /// left alone.
+    pub fn claim_space_dir(&self, id: i64, dir: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO space_dir (workspace, dir) \
+             SELECT id, ?2 FROM workspace WHERE id = ?1",
+            params![id, dir],
+        )?;
+        Ok(())
+    }
+
+    /// A home for a space that has had tabs and has none, from where its tabs were: a directory
+    /// named like the space first, then one that is not a worktree or a scratch folder, then
+    /// the one most of its tabs were in, then the earliest. With it, whether it is a worktree
+    /// or a scratch folder (only good enough for one tab, never to keep). `skip` holds
+    /// directories that say nothing about a space (the daemon's own, where a tab nobody placed
+    /// starts, `/`, the home folder). Read off the database only.
+    ///
+    /// ponytail: a guess from history, made once per space; `qoop space dir` corrects it.
+    pub fn guess_space_dir(
+        &self,
+        space: i64,
+        skip: &[String],
+    ) -> Result<Option<(String, bool)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.name, t.cwd, COUNT(*), MIN(t.created_at) FROM workspace w \
+             JOIN terminal t ON t.workspace = w.id \
+             WHERE w.id = ?1 \
+             AND NOT EXISTS (SELECT 1 FROM space_dir d WHERE d.workspace = w.id) \
+             GROUP BY t.cwd",
+        )?;
+        let rows = stmt
+            .query_map(params![space], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        type Rank = (bool, bool, i64, std::cmp::Reverse<i64>);
+        let mut best: Option<(Rank, String)> = None;
+        for (name, cwd, count, first) in rows {
+            let path = std::path::Path::new(&cwd);
+            let trimmed = cwd.trim_end_matches('/');
+            if !path.is_absolute() || skip.iter().any(|s| s.trim_end_matches('/') == trimmed) {
+                continue;
+            }
+            let base = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let named = base == name.trim().to_lowercase();
+            // By the folder names worktrees and scratch get, not by asking the disk: a hung
+            // mount must not hold the daemon (ADR-011).
+            let passing = base.contains("-wt-")
+                || ["/.worktrees/", "/.claude/worktrees/"]
+                    .iter()
+                    .any(|part| cwd.contains(part))
+                || [
+                    "/tmp/",
+                    "/private/tmp/",
+                    "/var/folders/",
+                    "/private/var/folders/",
+                ]
+                .iter()
+                .any(|prefix| cwd.starts_with(prefix));
+            let rank = (named, !passing, count, std::cmp::Reverse(first));
+            if best.as_ref().is_none_or(|(had, _)| rank > *had) {
+                best = Some((rank, cwd));
+            }
+        }
+        Ok(best.map(|((_, keep, ..), dir)| (dir, !keep)))
+    }
+
     /// Keep a space awake, or let idle sleep take its tabs again. Answers false when there
     /// is no such space.
     pub fn set_keep_awake_workspace(&self, id: i64, on: bool) -> Result<bool, StoreError> {
@@ -798,9 +905,10 @@ impl Store {
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT w.id, w.name, w.created_at, i.ink, g.goal FROM workspace w \
+            "SELECT w.id, w.name, w.created_at, i.ink, g.goal, d.dir FROM workspace w \
                  LEFT JOIN workspace_ink i ON i.workspace = w.id \
                  LEFT JOIN space_goal g ON g.workspace = w.id \
+                 LEFT JOIN space_dir d ON d.workspace = w.id \
                  LEFT JOIN workspace_order o ON o.workspace = w.id \
                  ORDER BY o.position IS NULL, o.position, w.id",
         )?;
@@ -815,6 +923,7 @@ impl Store {
                         .get::<_, Option<i64>>(3)?
                         .and_then(|ink| u8::try_from(ink).ok()),
                     goal: r.get(4)?,
+                    dir: r.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2224,6 +2333,77 @@ mod tests {
         s.sleep_terminals(5, &[bare(1)]).expect("sleep");
         s.delete_workspace(ws).expect("delete");
         assert!(s.asleep().expect("asleep").is_empty());
+    }
+
+    /// A space's home is guessed from where its tabs were: a folder named like the space beats
+    /// a worktree more tabs sat in, scratch and worktrees come last and say so, the daemon's own
+    /// directory never counts, and a space with a home is not guessed for.
+    #[test]
+    fn a_space_home_is_guessed_from_its_tabs_and_kept() {
+        let mut s = store();
+        let qoop = s.create_workspace("qoop", 1).expect("ws");
+        let other = s.create_workspace("other", 1).expect("ws");
+        let only_home = s.create_workspace("h", 1).expect("ws");
+        let fresh = s.create_workspace("fresh", 1).expect("ws");
+        let worktrees = s.create_workspace("w", 1).expect("ws");
+        s.create_terminal(1, qoop, "/c/qoop-wt-a", "/bin/sh", 1)
+            .expect("t");
+        s.create_terminal(2, qoop, "/c/qoop-wt-a", "/bin/sh", 2)
+            .expect("t");
+        s.create_terminal(3, qoop, "/c/qoop/", "/bin/sh", 3)
+            .expect("t");
+        s.close_terminal(3, 4).expect("closed history counts too");
+        s.create_terminal(4, other, "/w/b", "/bin/sh", 2)
+            .expect("t");
+        s.create_terminal(5, other, "/w/a", "/bin/sh", 1)
+            .expect("t");
+        s.create_terminal(6, other, "/w/a", "/bin/sh", 3)
+            .expect("t");
+        s.create_terminal(7, only_home, "/home/me", "/bin/sh", 1)
+            .expect("t");
+        s.create_terminal(9, fresh, "/private/tmp/x", "/bin/sh", 9)
+            .expect("t");
+        s.create_terminal(10, fresh, "/c/private/fresh-wt-a", "/bin/sh", 9)
+            .expect("t");
+        s.create_terminal(11, fresh, "/c/private/app", "/bin/sh", 10)
+            .expect("t");
+        s.create_terminal(12, worktrees, "/c/r-wt-x", "/bin/sh", 1)
+            .expect("t");
+        let skip = ["/home/me".to_string(), "/".to_string()];
+        let guess = |s: &Store, ws| s.guess_space_dir(ws, &skip).expect("guess");
+        assert_eq!(guess(&s, qoop), Some(("/c/qoop/".into(), false)));
+        assert_eq!(guess(&s, other), Some(("/w/a".into(), false)));
+        assert_eq!(guess(&s, only_home), None);
+        assert_eq!(
+            guess(&s, fresh),
+            Some(("/c/private/app".into(), false)),
+            "a folder merely under one named private is no scratch"
+        );
+        assert_eq!(guess(&s, worktrees), Some(("/c/r-wt-x".into(), true)));
+        s.claim_space_dir(qoop, "/c/qoop").expect("claim");
+        s.claim_space_dir(qoop, "/elsewhere")
+            .expect("a second claim is ignored");
+        assert_eq!(s.space_dir(qoop).expect("read").as_deref(), Some("/c/qoop"));
+        assert_eq!(
+            guess(&s, qoop),
+            None,
+            "a space with a home is not guessed for"
+        );
+        assert!(s.set_space_dir(qoop, "/c/qoop2").expect("set"));
+        assert!(!s.set_space_dir(99, "/x").expect("no space"));
+        let listed = s.workspaces().expect("list");
+        assert_eq!(listed[0].dir.as_deref(), Some("/c/qoop2"));
+        s.claim_space_dir(99, "/x").expect("no space, no row");
+        let last = s.create_workspace("last", 9).expect("ws");
+        assert!(s.set_space_dir(last, "/f").expect("set"));
+        s.delete_workspace(last).expect("delete");
+        let back = s.create_workspace("again", 9).expect("ws");
+        assert_eq!(back, last, "ids are reused");
+        assert_eq!(
+            s.space_dir(back).expect("read"),
+            None,
+            "went with its space"
+        );
     }
 
     /// Keep awake is kept for a space and a pane, taken back on request, and never outlives

@@ -291,6 +291,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 branch; refused while any process is inside\n\
                   \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
                   \x20 qoop space goal <id|name> [text|-]  what you want from a space: print it, set it, an empty text clears it\n\
+                  \x20 qoop space dir <id|name> [path]  the folder a space's new tabs and agents start in: print it or set it\n\
                   \x20 qoop close <terminal>  end a terminal and what it started\n\
                   \x20 qoop history <target> [--last N] [--role user|assistant] [--json]\n\
                   \x20                 print another agent's recent transcript window,\n\
@@ -3264,7 +3265,13 @@ pub(crate) fn ensure_daemon(socket: &std::path::Path) -> std::io::Result<()> {
     let spawned = std::time::SystemTime::now();
     // Its own process group, so the hangup a closing window or a dropped ssh connection
     // sends the starter's job does not take the daemon, and every tab, with it.
-    Command::new(exe)
+    // In the home folder, never where this command ran: the daemon's own directory is where a
+    // tab of a space with no folder starts, and a worktree the first `qoop` ran in goes away.
+    let mut daemon = Command::new(exe);
+    if let Some(home) = std::env::var_os("HOME").filter(|h| std::path::Path::new(h).is_dir()) {
+        daemon.current_dir(home);
+    }
+    daemon
         .arg("daemon")
         .process_group(0)
         .stdin(std::process::Stdio::null())
@@ -3402,15 +3409,17 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
         } else {
             "stopped".to_string()
         };
-        rows.push((space.id, space.name, state, tabs, sleeping, space.goal));
+        rows.push((
+            space.id, space.name, state, tabs, sleeping, space.goal, space.dir,
+        ));
     }
     if json {
         let list: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(id, name, state, tabs, sleeping, goal)| {
+            .map(|(id, name, state, tabs, sleeping, goal, dir)| {
                 serde_json::json!({
                     "id": id, "name": name, "state": state, "tabs": tabs, "sleeping": sleeping,
-                    "goal": goal
+                    "goal": goal, "dir": dir
                 })
             })
             .collect();
@@ -3424,7 +3433,7 @@ fn run_list_spaces(args: &[String]) -> std::io::Result<()> {
     // terminal as a command (retitle it, write the clipboard).
     let drawn =
         |s: String| -> String { s.chars().filter(|c| qoop_tui::width::drawn(*c)).collect() };
-    for (id, name, state, tabs, sleeping, goal) in rows {
+    for (id, name, state, tabs, sleeping, goal, _) in rows {
         let (name, goal) = (drawn(name), goal.map(drawn));
         let tabs = count(tabs, "tab");
         let sleeping = if sleeping.is_empty() {

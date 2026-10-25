@@ -4111,6 +4111,7 @@ mod tests {
 
     fn spaces() -> Vec<WorkspaceRow> {
         vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1,
@@ -6639,6 +6640,7 @@ mod tests {
     #[test]
     fn an_accented_row_is_still_exactly_the_column_wide() {
         let wide = vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1,
@@ -7016,6 +7018,7 @@ mod tests {
         };
         let space = |name: &str| {
             vec![WorkspaceRow {
+                dir: None,
                 keep_awake: false,
                 qass_skip: false,
                 id: 1,
@@ -7450,6 +7453,7 @@ mod tests {
     #[test]
     fn a_tree_fits_nine_agents_without_scrolling() {
         let spaces = vec![WorkspaceRow {
+            dir: None,
             keep_awake: false,
             qass_skip: false,
             id: 1,
