@@ -74,7 +74,7 @@ static RULES: LazyLock<Rules> = LazyLock::new(|| {
 
 /// `text` without terminal escape sequences, for a caller that is about to join its lines: a
 /// string left open ends at its line, which a joined text no longer has.
-pub(crate) fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
     RULES.ansi.replace_all(text, "")
 }
 

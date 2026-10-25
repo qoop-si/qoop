@@ -321,6 +321,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
                 name: "pwned".into(),
                 cron: Some("* * * * *".into()),
                 at: None,
+                watch: None,
                 agent: None,
                 cwd: "/tmp".into(),
                 space: None,

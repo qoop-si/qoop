@@ -24989,6 +24989,7 @@ mod tests {
             name: name.to_string(),
             cron: Some("0 9 * * 1-5".into()),
             at: None,
+            watch: None,
             agent: "claude".into(),
             cwd: "/tmp".into(),
             space: None,

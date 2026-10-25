@@ -1,6 +1,7 @@
 //! Schedules: an agent the owner asked qoop to start at a time, once or on a repeat.
 //!
-//! A row is the whole job: when (`cron` in local time, or `at`, one moment), what to start
+//! A row is the whole job: when (`cron` in local time, `at`, one moment, or `watch`, a command
+//! whose new output starts the run), what to start
 //! (`agent`, `prompt`) and where (`cwd`, `space`), and what became of the last try. The
 //! daemon's loop reads the rows and decides; this file only keeps them and makes the two
 //! moves that have to be exact.
@@ -51,10 +52,15 @@ pub struct ScheduleRow {
     pub last_result: Option<String>,
     /// The terminal the last run opened.
     pub last_terminal: Option<i64>,
+    /// The shell command of a watch: checked every few minutes, its new lines start the run.
+    /// Kept in `schedule_watch`, so an older binary reads the row as one with no timing.
+    pub watch: Option<String>,
 }
 
-const COLUMNS: &str = "id, name, cron, at, agent, cwd, space, prompt, paused, created_at, \
-                       last_slot, last_at, last_result, last_terminal";
+const COLUMNS: &str = "s.id, s.name, s.cron, s.at, s.agent, s.cwd, s.space, s.prompt, s.paused, \
+                       s.created_at, s.last_slot, s.last_at, s.last_result, s.last_terminal, w.command";
+
+const FROM: &str = "schedule s LEFT JOIN schedule_watch w ON w.schedule = s.id";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
     Ok(ScheduleRow {
@@ -72,6 +78,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
         last_at: r.get(11)?,
         last_result: r.get(12)?,
         last_terminal: r.get(13)?,
+        watch: r.get(14)?,
     })
 }
 
@@ -118,6 +125,12 @@ impl Store {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(command) = &row.watch {
+            tx.execute(
+                "INSERT INTO schedule_watch (schedule, command) VALUES (?1, ?2)",
+                params![id, command],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -126,7 +139,7 @@ impl Store {
     pub fn schedules(&self) -> Result<Vec<ScheduleRow>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {COLUMNS} FROM schedule ORDER BY id"))?;
+            .prepare(&format!("SELECT {COLUMNS} FROM {FROM} ORDER BY s.id"))?;
         Ok(stmt.query_map([], row)?.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -135,7 +148,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT {COLUMNS} FROM schedule WHERE id = ?1"),
+                &format!("SELECT {COLUMNS} FROM {FROM} WHERE s.id = ?1"),
                 params![id],
                 row,
             )
@@ -172,40 +185,87 @@ impl Store {
     /// (`expected`), writing the slot, when, the `result` (`claimed`, or `skipped: ...`) and
     /// no terminal yet. Answers whether this call changed the row, which is whether it won:
     /// a second caller with the same `expected` changes nothing. A paused row is not taken.
+    /// No `result` is a watch's check, which moves the slot and leaves the last run as it was,
+    /// so the panel keeps showing the last start while checks come and go.
     pub fn claim_schedule(
         &self,
         id: i64,
         expected: Option<i64>,
         slot: i64,
         now: i64,
-        result: &str,
+        result: Option<&str>,
     ) -> Result<bool, StoreError> {
-        Ok(self.conn.execute(
-            "UPDATE schedule SET last_slot = ?3, last_at = ?4, last_result = ?5, \
-             last_terminal = NULL \
-             WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
-            params![id, expected, slot, now, result],
-        )? > 0)
+        let changed = match result {
+            Some(result) => self.conn.execute(
+                "UPDATE schedule SET last_slot = ?3, last_at = ?4, last_result = ?5, \
+                 last_terminal = NULL \
+                 WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
+                params![id, expected, slot, now, result],
+            )?,
+            None => self.conn.execute(
+                "UPDATE schedule SET last_slot = ?3 \
+                 WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
+                params![id, expected, slot],
+            )?,
+        };
+        Ok(changed > 0)
+    }
+
+    /// The lines a watch's last check saw; `None` when it was never checked.
+    pub fn watch_seen(&self, id: i64) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seen FROM schedule_watch WHERE schedule = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// How the run of `slot` went, applied only while the row still holds that slot. A row
     /// that never fired holds slot 0, which is what a run asked for by hand carries. Answers
-    /// whether it was applied.
+    /// whether it was applied. `seen` is a watch's new baseline, written with it; the result
+    /// `checked` is a watch's check that started nothing, which writes the baseline only.
     pub fn report_schedule(
         &self,
         id: i64,
         slot: i64,
         result: &str,
         terminal: Option<i64>,
+        seen: Option<&str>,
     ) -> Result<bool, StoreError> {
-        Ok(self.conn.execute(
-            // `last_at` too: a run the owner asked for now claimed nothing, so the time it
-            // shows would otherwise be the last scheduled one's.
-            "UPDATE schedule SET last_result = ?3, last_terminal = ?4, \
-             last_at = CAST(strftime('%s', 'now') AS INTEGER) \
-             WHERE id = ?1 AND COALESCE(last_slot, 0) = ?2",
-            params![id, slot, result, terminal],
-        )? > 0)
+        let tx = self.conn.unchecked_transaction()?;
+        let held = tx
+            .query_row(
+                "SELECT 1 FROM schedule WHERE id = ?1 AND COALESCE(last_slot, 0) = ?2",
+                params![id, slot],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !held {
+            return Ok(false);
+        }
+        if let Some(seen) = seen {
+            tx.execute(
+                "UPDATE schedule_watch SET seen = ?2 WHERE schedule = ?1",
+                params![id, seen],
+            )?;
+        }
+        if result != "checked" {
+            tx.execute(
+                // `last_at` too: a run the owner asked for now claimed nothing, so the time it
+                // shows would otherwise be the last scheduled one's.
+                "UPDATE schedule SET last_result = ?3, last_terminal = ?4, \
+                 last_at = CAST(strftime('%s', 'now') AS INTEGER) \
+                 WHERE id = ?1",
+                params![id, slot, result, terminal],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Mark the run of `slot` failed with `why`, only while it still reads `claimed`: the
@@ -249,6 +309,7 @@ mod tests {
             last_at: None,
             last_result: None,
             last_terminal: None,
+            watch: None,
         }
     }
 
@@ -277,9 +338,13 @@ mod tests {
     fn claiming_a_slot_twice_changes_one_row_then_zero() {
         let s = Store::in_memory().expect("open");
         let id = s.add_schedule(&made("a")).unwrap();
-        assert!(s.claim_schedule(id, None, 500, 501, "claimed").unwrap());
         assert!(
-            !s.claim_schedule(id, None, 500, 502, "claimed").unwrap(),
+            s.claim_schedule(id, None, 500, 501, Some("claimed"))
+                .unwrap()
+        );
+        assert!(
+            !s.claim_schedule(id, None, 500, 502, Some("claimed"))
+                .unwrap(),
             "the second caller lost"
         );
         let held = s.schedule(id).unwrap().unwrap();
@@ -289,11 +354,11 @@ mod tests {
         assert_eq!(held.last_terminal, None);
         // The next slot is claimed from the one just taken.
         assert!(
-            s.claim_schedule(id, Some(500), 560, 561, "skipped: too old")
+            s.claim_schedule(id, Some(500), 560, 561, Some("skipped: too old"))
                 .unwrap()
         );
         assert!(
-            !s.claim_schedule(id, Some(500), 560, 561, "claimed")
+            !s.claim_schedule(id, Some(500), 560, 561, Some("claimed"))
                 .unwrap()
         );
     }
@@ -303,7 +368,10 @@ mod tests {
         let s = Store::in_memory().expect("open");
         let id = s.add_schedule(&made("a")).unwrap();
         assert!(s.pause_schedule(id).unwrap());
-        assert!(!s.claim_schedule(id, None, 500, 501, "claimed").unwrap());
+        assert!(
+            !s.claim_schedule(id, None, 500, 501, Some("claimed"))
+                .unwrap()
+        );
         assert!(s.resume_schedule(id, 900).unwrap());
         let held = s.schedule(id).unwrap().unwrap();
         assert!(!held.paused);
@@ -318,13 +386,20 @@ mod tests {
     fn a_report_lands_only_on_the_slot_the_row_still_holds() {
         let s = Store::in_memory().expect("open");
         let id = s.add_schedule(&made("a")).unwrap();
-        assert!(s.claim_schedule(id, None, 500, 501, "claimed").unwrap());
-        assert!(s.report_schedule(id, 500, "started", Some(7)).unwrap());
+        assert!(
+            s.claim_schedule(id, None, 500, 501, Some("claimed"))
+                .unwrap()
+        );
+        assert!(
+            s.report_schedule(id, 500, "started", Some(7), None)
+                .unwrap()
+        );
         let held = s.schedule(id).unwrap().unwrap();
         assert_eq!(held.last_result.as_deref(), Some("started"));
         assert_eq!(held.last_terminal, Some(7));
         assert!(
-            !s.report_schedule(id, 440, "failed: late", None).unwrap(),
+            !s.report_schedule(id, 440, "failed: late", None, None)
+                .unwrap(),
             "a report for an older slot is dropped"
         );
         assert_eq!(
@@ -333,7 +408,10 @@ mod tests {
         );
         // A row that never fired holds slot 0: what a run by hand reports against.
         let fresh = s.add_schedule(&made("b")).unwrap();
-        assert!(s.report_schedule(fresh, 0, "started", Some(9)).unwrap());
+        assert!(
+            s.report_schedule(fresh, 0, "started", Some(9), None)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -341,9 +419,11 @@ mod tests {
         let s = Store::in_memory().expect("open");
         let a = s.add_schedule(&made("a")).unwrap();
         let b = s.add_schedule(&made("b")).unwrap();
-        s.claim_schedule(a, None, 500, 501, "claimed").unwrap();
-        s.claim_schedule(b, None, 500, 501, "claimed").unwrap();
-        s.report_schedule(b, 500, "started", Some(3)).unwrap();
+        s.claim_schedule(a, None, 500, 501, Some("claimed"))
+            .unwrap();
+        s.claim_schedule(b, None, 500, 501, Some("claimed"))
+            .unwrap();
+        s.report_schedule(b, 500, "started", Some(3), None).unwrap();
         assert_eq!(s.fail_stale_claims().unwrap(), 1);
         assert_eq!(
             s.schedule(a).unwrap().unwrap().last_result.as_deref(),
@@ -354,7 +434,8 @@ mod tests {
             Some("started")
         );
         // One run that ended without reporting, named by its slot.
-        s.claim_schedule(a, Some(500), 560, 561, "claimed").unwrap();
+        s.claim_schedule(a, Some(500), 560, 561, Some("claimed"))
+            .unwrap();
         assert!(!s.fail_claimed_schedule(a, 500, "x").unwrap());
         assert!(s.fail_claimed_schedule(a, 560, "exited with 1").unwrap());
         assert_eq!(
@@ -371,5 +452,73 @@ mod tests {
         assert!(!s.remove_schedule(a).unwrap());
         assert_eq!(s.add_schedule(&made("a")).unwrap(), a + 1);
         assert_eq!(s.schedules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_watch_keeps_its_command_and_its_baseline_and_goes_with_its_schedule() {
+        let s = Store::in_memory().expect("open");
+        let row = ScheduleRow {
+            cron: None,
+            watch: Some("gh issue list".into()),
+            ..made("issues")
+        };
+        let id = s.add_schedule(&row).unwrap();
+        assert_eq!(
+            s.schedule(id).unwrap().unwrap().watch.as_deref(),
+            Some("gh issue list")
+        );
+        assert_eq!(
+            s.schedules().unwrap()[0].watch.as_deref(),
+            Some("gh issue list")
+        );
+        assert_eq!(s.watch_seen(id).unwrap(), None, "never checked");
+        // A run starts and reports; then a check claims the next slot and keeps the run shown.
+        assert!(s.claim_schedule(id, None, 500, 500, None).unwrap());
+        assert!(
+            !s.claim_schedule(id, None, 500, 500, None).unwrap(),
+            "once per slot"
+        );
+        assert!(
+            s.report_schedule(id, 500, "started", Some(4), Some("#1 a"))
+                .unwrap()
+        );
+        assert!(s.claim_schedule(id, Some(500), 800, 800, None).unwrap());
+        let held = s.schedule(id).unwrap().unwrap();
+        assert_eq!(
+            (
+                held.last_slot,
+                held.last_result.as_deref(),
+                held.last_terminal
+            ),
+            (Some(800), Some("started"), Some(4))
+        );
+        let shown_at = held.last_at;
+        // A check that started nothing writes its baseline and nothing else.
+        assert!(
+            s.report_schedule(id, 800, "checked", None, Some("#1 a\n#2 b"))
+                .unwrap()
+        );
+        let held = s.schedule(id).unwrap().unwrap();
+        assert_eq!(
+            (
+                held.last_result.as_deref(),
+                held.last_terminal,
+                held.last_at
+            ),
+            (Some("started"), Some(4), shown_at)
+        );
+        assert_eq!(s.watch_seen(id).unwrap().as_deref(), Some("#1 a\n#2 b"));
+        // A late report of an older slot writes no baseline.
+        assert!(
+            !s.report_schedule(id, 500, "checked", None, Some("x"))
+                .unwrap()
+        );
+        assert_eq!(s.watch_seen(id).unwrap().as_deref(), Some("#1 a\n#2 b"));
+        assert!(s.remove_schedule(id).unwrap());
+        let left: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM schedule_watch", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the watch goes with its schedule");
     }
 }

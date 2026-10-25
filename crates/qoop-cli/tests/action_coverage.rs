@@ -652,6 +652,7 @@ fn actions() -> Vec<Action> {
                         name: "morning".into(),
                         cron: Some("0 9 * * *".into()),
                         at: None,
+                        watch: None,
                         agent: None,
                         cwd: "/tmp".into(),
                         space: None,

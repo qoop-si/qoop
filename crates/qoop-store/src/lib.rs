@@ -486,6 +486,14 @@ impl Store {
                  last_at INTEGER,
                  last_result TEXT,
                  last_terminal INTEGER
+             );
+             -- The command of a schedule that starts on new output (`schedule.rs`), and the
+             -- lines its last check saw (NULL: never checked). A table of its own, so an older
+             -- binary reads such a schedule as one with no timing and never fires it.
+             CREATE TABLE IF NOT EXISTS schedule_watch (
+                 schedule INTEGER PRIMARY KEY REFERENCES schedule(id) ON DELETE CASCADE,
+                 command TEXT NOT NULL,
+                 seen TEXT
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

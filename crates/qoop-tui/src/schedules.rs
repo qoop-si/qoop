@@ -65,15 +65,18 @@ pub enum Preset {
     EveryDay,
     EveryTwoHours,
     Custom,
+    /// A watch: a command checked every few minutes, its new lines start the run.
+    OnChange,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 5] = [
+    pub const ALL: [Preset; 6] = [
         Preset::Once,
         Preset::Weekdays,
         Preset::EveryDay,
         Preset::EveryTwoHours,
         Preset::Custom,
+        Preset::OnChange,
     ];
 
     pub fn label(self) -> &'static str {
@@ -83,15 +86,18 @@ impl Preset {
             Preset::EveryDay => "every day",
             Preset::EveryTwoHours => "every 2h",
             Preset::Custom => "custom",
+            Preset::OnChange => "on change",
         }
     }
 }
 
-/// When a form's schedule fires, as the daemon takes it: a cron line or one moment.
+/// When a form's schedule fires, as the daemon takes it: a cron line, one moment, or a
+/// command to watch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Timing {
     Cron(String),
     At(i64),
+    Watch(String),
 }
 
 /// `H:MM` or `HH:MM` as an hour and a minute.
@@ -128,9 +134,10 @@ fn chip_rows(room: usize) -> usize {
     rows
 }
 
-/// What a preset, its time (or the custom cron line) and the clock make of the timing:
-/// `once` is the next time the clock reads that time, the repeats are the cron lines the
-/// daemon names `weekdays 09:00`, `every day 09:00` and `every 2h`.
+/// What a preset, its time (or its text: the custom cron line, the command of on change) and
+/// the clock make of the timing: `once` is the next time the clock reads that time, the
+/// repeats are the cron lines the daemon names `weekdays 09:00`, `every day 09:00` and
+/// `every 2h`, on change the command as typed.
 pub fn timing(
     preset: Preset,
     time: &str,
@@ -151,6 +158,13 @@ pub fn timing(
             Cron::parse(&text).map_err(|e| format!("{text:?}: {e}"))?;
             Ok(Timing::Cron(text))
         }
+        Preset::OnChange => {
+            let command = cron.trim();
+            if command.is_empty() {
+                return Err("write the command to check, like gh issue list".to_string());
+            }
+            Ok(Timing::Watch(command.to_string()))
+        }
     }
 }
 
@@ -159,6 +173,8 @@ pub fn first_run(timing: &Timing, now: i64, zone: Zone) -> Option<i64> {
     match timing {
         Timing::At(at) => Some(*at),
         Timing::Cron(text) => next_slot(&Cron::parse(text).ok()?, now, zone),
+        // Not a run: its first check notes what is there, which the form says in words.
+        Timing::Watch(_) => None,
     }
 }
 
@@ -284,6 +300,8 @@ pub struct Form {
     pub time: String,
     /// The cron line of the custom preset.
     pub cron: String,
+    /// The command of on change.
+    pub check: String,
     pub agents: Vec<String>,
     /// The agent picked, by position.
     pub agent: usize,
@@ -301,6 +319,7 @@ impl Form {
             field: Field::When,
             time: "09:00".to_string(),
             cron: String::new(),
+            check: String::new(),
             agents,
             agent: 0,
             folder,
@@ -353,6 +372,7 @@ impl Form {
     fn text(&mut self) -> Option<&mut String> {
         match self.field {
             Field::Time if self.preset == Preset::Custom => Some(&mut self.cron),
+            Field::Time if self.preset == Preset::OnChange => Some(&mut self.check),
             Field::Time if self.has_time() => Some(&mut self.time),
             Field::Folder => Some(&mut self.folder),
             Field::Prompt => Some(&mut self.prompt),
@@ -362,7 +382,12 @@ impl Form {
 
     /// The timing as typed, or why it is not one.
     pub fn timing(&self, now: i64, zone: Zone) -> Result<Timing, String> {
-        timing(self.preset, &self.time, &self.cron, now, zone)
+        let text = if self.preset == Preset::OnChange {
+            &self.check
+        } else {
+            &self.cron
+        };
+        timing(self.preset, &self.time, text, now, zone)
     }
 
     /// The write that adds what the form says, or why it cannot yet.
@@ -390,14 +415,16 @@ impl Form {
             .get(self.agent)
             .cloned()
             .ok_or("there is no agent to start")?;
-        let (cron, at) = match timing {
-            Timing::Cron(text) => (Some(text), None),
-            Timing::At(at) => (None, Some(at)),
+        let (cron, at, watch) = match timing {
+            Timing::Cron(text) => (Some(text), None, None),
+            Timing::At(at) => (None, Some(at), None),
+            Timing::Watch(command) => (None, None, Some(command)),
         };
         Ok(ScheduleOp::Add {
             name: name_of(prompt, taken),
             cron,
             at,
+            watch,
             agent: Some(agent),
             cwd,
             space: None,
@@ -878,9 +905,10 @@ fn keys_of(bytes: &[u8]) -> Vec<Key> {
 /// One typed character into the field with the keys.
 fn type_into(form: &mut Form, c: char) {
     form.error = None;
-    let (is_time, is_prompt) = (
-        form.field == Field::Time && form.preset != Preset::Custom,
-        form.field == Field::Prompt,
+    let on_change = form.preset == Preset::OnChange;
+    let (is_time, is_long) = (
+        form.field == Field::Time && form.preset != Preset::Custom && !on_change,
+        form.field == Field::Prompt || (form.field == Field::Time && on_change),
     );
     let Some(text) = form.text() else {
         return;
@@ -896,7 +924,7 @@ fn type_into(form: &mut Form, c: char) {
                 text.push(c);
             }
         }
-        c if is_prompt => {
+        c if is_long => {
             if text.len() + c.len_utf8() <= PROMPT_MAX {
                 text.push(c);
             }
@@ -1283,12 +1311,12 @@ fn form_rows(
             if on { CARET.to_string() } else { String::new() },
         )
     };
-    // The time, or the cron line of the custom chip.
+    // The time, the cron line of the custom chip, or the command of on change.
     let mut row = vec![label(
-        if form.preset == Preset::Custom {
-            "cron"
-        } else {
-            "time"
+        match form.preset {
+            Preset::Custom => "cron",
+            Preset::OnChange => "check",
+            _ => "time",
         },
         Field::Time,
     )];
@@ -1296,6 +1324,15 @@ fn form_rows(
         (Preset::EveryTwoHours, _) => row.push(seg(Role::Faint, "on the hour")),
         (Preset::Custom, on) => {
             row.extend(typed(&form.cron, "m h dom mon dow", room, on, &caret));
+        }
+        (Preset::OnChange, on) => {
+            row.extend(typed(
+                &form.check,
+                "a command, like gh issue list",
+                room,
+                on,
+                &caret,
+            ));
         }
         (_, on) => {
             row.extend(typed(&form.time, "HH:MM", room, on, &caret));
@@ -1350,16 +1387,24 @@ fn form_rows(
     field_row(out, targets, Field::Prompt, row);
 
     // The first run, worked out on the local clock; the list shows the daemon's after saving.
-    let first = match form
-        .timing(ctx.now_unix, ctx.zone)
-        .map(|t| first_run(&t, ctx.now_unix, ctx.zone))
-    {
-        Ok(Some(at)) => vec![
-            seg(Role::Faint, "first run "),
-            seg(Role::Working, moment(at, ctx.now_unix, ctx.zone)),
-        ],
-        Ok(None) => vec![seg(Role::Faint, "first run never")],
-        Err(_) => vec![seg(Role::Faint, "first run after the time is set")],
+    // A watch has no first run: its first check notes what is there.
+    let first = if form.preset == Preset::OnChange {
+        vec![seg(
+            Role::Faint,
+            "checked every 5m; new lines start the agent",
+        )]
+    } else {
+        match form
+            .timing(ctx.now_unix, ctx.zone)
+            .map(|t| first_run(&t, ctx.now_unix, ctx.zone))
+        {
+            Ok(Some(at)) => vec![
+                seg(Role::Faint, "first run "),
+                seg(Role::Working, moment(at, ctx.now_unix, ctx.zone)),
+            ],
+            Ok(None) => vec![seg(Role::Faint, "first run never")],
+            Err(_) => vec![seg(Role::Faint, "first run after the time is set")],
+        }
     };
     out.push(wrap(&first));
 }
@@ -1423,6 +1468,7 @@ mod tests {
             name: name.to_string(),
             cron: Some("0 9 * * 1-5".to_string()),
             at: None,
+            watch: None,
             agent: "claude".to_string(),
             cwd: "/tmp".to_string(),
             space: None,
@@ -1543,6 +1589,7 @@ mod tests {
                 name: "review-the-open-prs".to_string(),
                 cron: Some("0 9 * * 1-5".to_string()),
                 at: None,
+                watch: None,
                 agent: Some("claude".to_string()),
                 cwd: "/Users/x/app".to_string(),
                 space: None,
@@ -1567,6 +1614,31 @@ mod tests {
             (agent.as_deref(), cwd.as_str()),
             (Some("codex"), "/srv/app")
         );
+        // On change sends the command to check and no time at all.
+        form.preset = Preset::OnChange;
+        assert!(
+            form.request(at(8, 0), utc(), None, &[])
+                .unwrap_err()
+                .contains("command to check")
+        );
+        form.field = Field::Time;
+        for c in "gh issue list --json number".chars() {
+            type_into(&mut form, c);
+        }
+        let ScheduleOp::Add {
+            cron,
+            at: when,
+            watch,
+            ..
+        } = form.request(at(8, 0), utc(), None, &[]).unwrap()
+        else {
+            panic!("an add");
+        };
+        assert_eq!(
+            (cron, when, watch.as_deref()),
+            (None, None, Some("gh issue list --json number"))
+        );
+        assert_eq!(form.time, "09:00", "the command is not typed into the time");
     }
 
     #[test]
@@ -1707,6 +1779,35 @@ mod tests {
         );
         assert!(!rows[6].contains("last"), "{text}");
         assert!(rows.iter().all(|r| width::width(r) == 60), "{text}");
+    }
+
+    #[test]
+    fn a_watch_is_drawn_from_the_daemons_words_and_its_form_asks_for_the_command() {
+        let mut watch = info(1, "app-errors");
+        (watch.cron, watch.watch) = (None, Some("tail log | grep ERROR".to_string()));
+        watch.when = "on change, every 5m".to_string();
+        watch.next_at = Some(at(8, 5));
+        let rows = painted(&pane(vec![watch]), 60, 8).join("\n");
+        assert!(
+            rows.contains("app-errors") && rows.contains("on change, every 5m"),
+            "{rows}"
+        );
+        let mut open = pane(Vec::new());
+        open.form = Some(Form {
+            preset: Preset::OnChange,
+            field: Field::Time,
+            ..Form::new("~/app".to_string(), vec!["claude".into()])
+        });
+        let rows = painted(&open, 70, 14).join("\n");
+        assert!(rows.contains("[on change]"), "{rows}");
+        assert!(
+            rows.contains("check") && rows.contains("a command, like gh issue list"),
+            "{rows}"
+        );
+        assert!(
+            rows.contains("checked every 5m; new lines start the agent"),
+            "{rows}"
+        );
     }
 
     #[test]

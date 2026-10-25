@@ -387,6 +387,20 @@ fn latest_slot(cron: &Cron, from: i64, now: i64, zone: Zone) -> Option<i64> {
     latest
 }
 
+/// How often a watch's command is run, in seconds. A check is a short process, never an agent:
+/// an agent starts only when the output has lines the last check did not.
+pub const WATCH_EVERY: i64 = 300;
+
+/// When a watch is next checked: at once when it never was, then every [`WATCH_EVERY`]. A slot
+/// further ahead than that is a clock that was set back, and is due now. Missed checks are not
+/// caught up one by one: one check sees everything that is new.
+fn watch_due(row: &ScheduleRow, now: i64) -> i64 {
+    let due = row
+        .last_slot
+        .map_or(row.created_at, |slot| slot + WATCH_EVERY);
+    if due > now + WATCH_EVERY { now } else { due }
+}
+
 /// What to do with `row` at `now`.
 ///
 /// A slot that came due is fired when it is on time, and, when it was missed (the Mac slept,
@@ -397,6 +411,14 @@ fn latest_slot(cron: &Cron, from: i64, now: i64, zone: Zone) -> Option<i64> {
 pub fn decide(row: &ScheduleRow, now: i64, zone: Zone) -> Decision {
     if row.paused {
         return Decision::Idle;
+    }
+    if row.watch.is_some() {
+        let due = watch_due(row, now);
+        return if due <= now {
+            Decision::Fire(now)
+        } else {
+            Decision::Wait(due)
+        };
     }
     if let Some(at) = row.at {
         return decide_once(row, at, now);
@@ -452,6 +474,9 @@ pub fn next_at(row: &ScheduleRow, now: i64, zone: Zone) -> Option<i64> {
     if row.paused {
         return None;
     }
+    if row.watch.is_some() {
+        return Some(watch_due(row, now));
+    }
     match (row.at, row.cron.as_deref()) {
         (Some(at), _) => row.last_slot.is_none_or(|last| last < at).then_some(at),
         (None, Some(cron)) => Cron::parse(cron)
@@ -478,6 +503,9 @@ const MONTHS: [&str; 12] = [
 /// The words every client shows for a schedule's timing: `every day 09:00`, `weekdays 09:00`,
 /// `mondays 08:30`, `every 2h`, `every 15m`, `once oct 24 17:00`, else the cron text itself.
 pub fn when_words(row: &ScheduleRow, zone: Zone) -> String {
+    if row.watch.is_some() {
+        return format!("on change, every {}m", WATCH_EVERY / 60);
+    }
     if let Some(at) = row.at {
         let wall = (zone.local)(at);
         return format!(
@@ -662,6 +690,7 @@ mod tests {
             last_at: None,
             last_result: None,
             last_terminal: None,
+            watch: None,
         }
     }
 
@@ -1021,5 +1050,47 @@ mod tests {
         let slot = next_slot(&daily, at, zone).unwrap();
         assert!(slot > at && slot - at <= 86_400 + 3600);
         assert_eq!((zone.local)(slot).clock(), "09:00");
+    }
+
+    #[test]
+    fn a_watch_is_checked_at_once_then_every_five_minutes() {
+        let zone = plus3();
+        let made = utc(2026, 10, 25, 9, 0);
+        let row = ScheduleRow {
+            cron: None,
+            watch: Some("gh issue list".into()),
+            ..repeat("", made, None)
+        };
+        assert_eq!(
+            decide(&row, made, zone),
+            Decision::Fire(made),
+            "the baseline at once"
+        );
+        let checked = ScheduleRow {
+            last_slot: Some(made),
+            ..row.clone()
+        };
+        assert_eq!(
+            decide(&checked, made + 60, zone),
+            Decision::Wait(made + WATCH_EVERY)
+        );
+        assert_eq!(next_at(&checked, made + 60, zone), Some(made + WATCH_EVERY));
+        // A Mac asleep for a day checks once when it wakes, not once per missed slot.
+        assert_eq!(
+            decide(&checked, made + 86_400, zone),
+            Decision::Fire(made + 86_400)
+        );
+        // A clock set back an hour: the slot ahead of it is due now.
+        assert_eq!(
+            decide(&checked, made - 3600, zone),
+            Decision::Fire(made - 3600)
+        );
+        let paused = ScheduleRow {
+            paused: true,
+            ..checked.clone()
+        };
+        assert_eq!(decide(&paused, made + 86_400, zone), Decision::Idle);
+        assert_eq!(next_at(&paused, made, zone), None);
+        assert_eq!(when_words(&checked, zone), "on change, every 5m");
     }
 }

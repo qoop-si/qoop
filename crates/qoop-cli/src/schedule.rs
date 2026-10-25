@@ -1,4 +1,5 @@
-//! `qoop schedule`: start an agent at a time, once or on a repeat.
+//! `qoop schedule`: start an agent at a time, once or on a repeat, or when a command's output
+//! has lines its last check did not (a watch: a new issue, an error in a server's log).
 //!
 //! The daemon keeps the schedules and fires them (`qoop-runtime`'s `schedules.rs`); this is the
 //! owner's way in, and qass's through its skill. `fire` is the other half of a run: the daemon
@@ -18,11 +19,13 @@ use crate::supervise::{NewOpts, open_terminal};
 use crate::usage;
 
 const USAGE: &str = "usage:
-  qoop schedule add <name> (--cron \"<m h dom mon dow>\" | --at <HH:MM|YYYY-MM-DD HH:MM|+30s|+10m|+2h>)
-                    [--agent NAME] [--cwd DIR] [--space NAME] [--json] -- <prompt>
+  qoop schedule add <name> (--cron \"<m h dom mon dow>\" | --at <HH:MM|YYYY-MM-DD HH:MM|+30s|+10m|+2h>
+                    | --watch \"<command>\") [--agent NAME] [--cwd DIR] [--space NAME] [--json] -- <prompt>
   qoop schedule ls [--json]
   qoop schedule pause|resume|rm|run <id|name>
-  times are the computer's local time; a bare HH:MM that has passed today means tomorrow";
+  times are the computer's local time; a bare HH:MM that has passed today means tomorrow
+  a watch runs its command in the folder every 5 minutes; lines its last check did not see
+  start the agent, with them under the prompt; the first check only notes what is there";
 
 /// How long the daemon has to answer.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -111,8 +114,8 @@ fn agent_ok(agent: &str, launchers: &[config::Launcher]) -> Result<(), String> {
 }
 
 fn add(args: &[String]) -> std::io::Result<()> {
-    let (mut name, mut cron, mut at, mut agent, mut cwd, mut space) =
-        (None, None, None, None, None, None);
+    let (mut name, mut cron, mut at, mut watch, mut agent, mut cwd, mut space) =
+        (None, None, None, None, None, None, None);
     let mut json = false;
     let mut prompt = Vec::new();
     let mut words = args.iter();
@@ -121,6 +124,7 @@ fn add(args: &[String]) -> std::io::Result<()> {
         match word.as_str() {
             "--cron" => cron = Some(value()?),
             "--at" => at = Some(value()?),
+            "--watch" => watch = Some(value()?),
             "--agent" => agent = Some(value()?),
             "--cwd" => cwd = Some(value()?),
             "--space" => space = Some(value()?),
@@ -143,16 +147,17 @@ fn add(args: &[String]) -> std::io::Result<()> {
     if prompt.is_empty() {
         return Err(usage(USAGE));
     }
-    let (cron, at) = match (cron, at) {
-        (Some(cron), None) => {
+    let (cron, at) = match (cron, at, &watch) {
+        (Some(cron), None, None) => {
             Cron::parse(&cron).map_err(|e| std::io::Error::other(format!("{cron:?}: {e}")))?;
             (Some(cron), None)
         }
-        (None, Some(text)) => {
+        (None, Some(text), None) => {
             let at = parse_at(&text, qoop_runtime::store::now(), system_zone())
                 .map_err(std::io::Error::other)?;
             (None, Some(at))
         }
+        (None, None, Some(_)) => (None, None),
         _ => return Err(usage(USAGE)),
     };
     let read = config::read();
@@ -166,6 +171,7 @@ fn add(args: &[String]) -> std::io::Result<()> {
         name,
         cron,
         at,
+        watch,
         agent: Some(agent),
         cwd: cwd.to_string_lossy().into_owned(),
         space,
@@ -181,9 +187,13 @@ fn add(args: &[String]) -> std::io::Result<()> {
             serde_json::to_string(&made).map_err(std::io::Error::other)?
         );
     } else {
-        let next = made.next_at.map_or_else(String::new, |at| {
-            format!(", next {}", clock_of(at, system_zone()))
-        });
+        let next = if made.watch.is_some() {
+            " (the first check notes what is there)".to_string()
+        } else {
+            made.next_at.map_or_else(String::new, |at| {
+                format!(", next {}", clock_of(at, system_zone()))
+            })
+        };
         println!("added {} {}: {}{next}", made.id, made.name, made.when);
     }
     Ok(())
@@ -347,21 +357,32 @@ fn launch(
     Ok((line, command))
 }
 
-/// `qoop schedule fire <id> --slot <s> [--now]`: what the daemon starts at a claimed slot.
+/// `qoop schedule fire <id> --slot <s> [--now] [--seen]`: what the daemon starts at a claimed
+/// slot. A watch's run is given the lines of its last check on stdin (`--seen`); a watch with
+/// none was never checked.
 fn fire(args: &[String]) -> std::io::Result<()> {
-    let bad = || usage("usage: qoop schedule fire <id> --slot <s> [--now]");
-    let (mut id, mut slot, mut now) = (None, None, false);
+    let bad = || usage("usage: qoop schedule fire <id> --slot <s> [--now] [--seen]");
+    let (mut id, mut slot, mut now, mut seen) = (None, None, false, false);
     let mut words = args.iter();
     while let Some(word) = words.next() {
         match word.as_str() {
             "--slot" => slot = words.next().and_then(|s| s.parse::<i64>().ok()),
             "--now" => now = true,
+            "--seen" => seen = true,
             _ if id.is_none() => id = word.parse::<i64>().ok(),
             _ => return Err(bad()),
         }
     }
     let (Some(id), Some(slot)) = (id, slot) else {
         return Err(bad());
+    };
+    // First, before anything can fail: the daemon is writing it and waits for it to be read.
+    let seen = if seen {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        Some(text)
+    } else {
+        None
     };
     // The daemon starts this with no terminal's identity. One that has it is a worker running
     // it by hand, which is the write the daemon refuses it everywhere else.
@@ -375,18 +396,50 @@ fn fire(args: &[String]) -> std::io::Result<()> {
     if row.last_slot.unwrap_or(0) != slot {
         return Ok(());
     }
-    let report = |result: String, terminal: Option<u32>| {
+    let report = |result: String, terminal: Option<i64>, seen: Option<String>| {
         write(ScheduleOp::Report {
             schedule: id,
             slot,
             result,
-            terminal: terminal.map(i64::from),
+            terminal,
+            seen,
         })
         .map(|_| ())
     };
-    // `--now` is the owner asking, which is not held back by a run that is still going.
+    // `--now` is the owner asking, which is not held back by a run that is still going. A
+    // watch says nothing: its lines stay new until the run is done, and its row keeps showing
+    // the run that is going.
     if !now && still_working(&row.name)? {
-        return report("skipped: last run still working".into(), None);
+        if row.watch.is_some() {
+            return Ok(());
+        }
+        return report("skipped: last run still working".into(), None, None);
+    }
+    let mut prompt = row.prompt.clone();
+    let mut baseline = None;
+    if let Some(command) = &row.watch {
+        let output = match crate::watch::check(command, &row.cwd) {
+            Ok(output) => output,
+            Err(why) => return report(format!("failed: {why}"), row.last_terminal, None),
+        };
+        let before: Vec<String> = seen
+            .as_deref()
+            .map(|s| s.split('\n').map(String::from).collect())
+            .unwrap_or_default();
+        let new = crate::watch::news(&before, &output);
+        // The first check notes what is there; a check with nothing new starts nothing.
+        if !now && (seen.is_none() || new.is_empty()) {
+            return report(
+                "checked".into(),
+                None,
+                Some(crate::watch::baseline(&output, &[])),
+            );
+        }
+        let (shown, left) = crate::watch::shown(&new);
+        if !shown.is_empty() {
+            prompt.push_str(&crate::watch::block(command, &shown, left.len()));
+        }
+        baseline = Some(crate::watch::baseline(&output, &left));
     }
     let read = config::read();
     let zone = system_zone();
@@ -395,9 +448,9 @@ fn fire(args: &[String]) -> std::io::Result<()> {
     } else {
         slot
     };
-    let (typed, command) = match launch(&row.agent, &row.prompt, &read.agents) {
+    let (typed, command) = match launch(&row.agent, &prompt, &read.agents) {
         Ok(line) => line,
-        Err(why) => return report(format!("failed: {why}"), None),
+        Err(why) => return report(format!("failed: {why}"), None, None),
     };
     let opts = NewOpts {
         name: Some(tab_name(&row.name, due, zone)),
@@ -407,12 +460,12 @@ fn fire(args: &[String]) -> std::io::Result<()> {
         typed,
     };
     let mut opened = None;
+    // The baseline moves only with an agent that started: lines that reached nobody stay new.
     match open_terminal(&opts, |terminal| opened = Some(terminal)) {
-        Ok(()) => report("started".into(), opened),
-        Err(e) => {
-            let _ = report(format!("failed: {e}"), opened);
-            Err(e)
-        }
+        Ok(()) => report("started".into(), opened.map(i64::from), baseline),
+        // Said in the report: the run ending in an error as well would have the daemon write
+        // its own, vaguer words over it.
+        Err(e) => report(format!("failed: {e}"), opened.map(i64::from), None),
     }
 }
 

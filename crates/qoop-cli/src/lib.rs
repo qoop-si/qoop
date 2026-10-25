@@ -50,6 +50,7 @@ mod task;
 mod task_verify;
 mod uninstall;
 mod update;
+mod watch;
 mod worktree;
 
 use qoop_runtime::client::{self, RenderStream, TerminalGuard};

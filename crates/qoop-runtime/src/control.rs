@@ -705,15 +705,18 @@ pub enum ControlRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScheduleOp {
-    /// Make a schedule: `cron` (five fields, local time) for a repeat or `at` (unix seconds)
-    /// for one moment, exactly one of them. `agent` defaults to qass's agent, `space` is made
-    /// when the run starts.
+    /// Make a schedule: `cron` (five fields, local time) for a repeat, `at` (unix seconds)
+    /// for one moment, or `watch`, a shell command whose new output lines start the run,
+    /// exactly one of them. `agent` defaults to qass's agent, `space` is made when the run
+    /// starts.
     Add {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cron: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watch: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         cwd: String,
@@ -736,13 +739,16 @@ pub enum ScheduleOp {
         schedule: i64,
     },
     /// How the run of `slot` went (`started` with its terminal, or `failed: <why>`), from the
-    /// run itself. Applied only while the schedule still holds that slot.
+    /// run itself. Applied only while the schedule still holds that slot. A watch's run also
+    /// sends the lines its check saw (`seen`), and `checked` when it started nothing.
     Report {
         schedule: i64,
         slot: i64,
         result: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen: Option<String>,
     },
 }
 
@@ -755,6 +761,9 @@ pub struct ScheduleInfo {
     pub cron: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<i64>,
+    /// The command a watch checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<String>,
     pub agent: String,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -776,12 +785,15 @@ pub struct ScheduleInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_at: Option<i64>,
     /// The daemon's words for the timing, the same on every client: `every day 09:00`,
-    /// `weekdays 09:00`, `mondays 08:30`, `every 2h`, `every 15m`, `once oct 24 17:00`, else
-    /// the cron text.
+    /// `weekdays 09:00`, `mondays 08:30`, `every 2h`, `every 15m`, `once oct 24 17:00`,
+    /// `on change, every 5m`, else the cron text.
     pub when: String,
 }
 
 /// The most bytes of prompt a schedule keeps.
+/// The most of a watch's check output kept as the lines it saw, which its run sends back.
+pub const SEEN_MOST: usize = 64 * 1024;
+
 pub const SCHEDULE_PROMPT_MAX: usize = 8_000;
 
 /// The most schedules there are at once.

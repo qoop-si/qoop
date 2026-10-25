@@ -157,6 +157,22 @@ impl Stack {
         self.schedules().into_iter().find(|s| s["name"] == name)
     }
 
+    /// The lines a watch's last check saw, read from the daemon's database (beside its socket):
+    /// nothing tells a client when a check that started nothing has reported.
+    fn seen(&self, name: &str) -> Option<String> {
+        let db = qoop_testkit::socket_in(self.dir.path()).with_file_name("qoop.db");
+        let out = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "SELECT w.seen FROM schedule_watch w JOIN schedule s ON s.id = w.schedule \
+                 WHERE s.name = '{name}' AND w.seen IS NOT NULL"
+            ))
+            .output()
+            .expect("sqlite3");
+        let text = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// How many times the stand-in agent was started with `prompt`.
     fn starts(&self, prompt: &str) -> usize {
         std::fs::read_to_string(self.path("claude.args"))
@@ -387,4 +403,101 @@ fn a_prompt_reaches_the_agent_as_written() {
         !ok && err.contains("control keys"),
         "a tab was let in: {err}"
     );
+}
+
+#[test]
+fn a_watch_starts_the_agent_only_on_lines_its_last_check_did_not_see() {
+    let mut stack = Stack::start();
+    let issues = stack.path("issues.txt");
+    std::fs::write(&issues, "#1 a\n#2 b\n").unwrap();
+    let check = format!("cat '{}'", issues.display());
+    let (ok, out, err) = stack.run(&[
+        "schedule",
+        "add",
+        "issues",
+        "--watch",
+        &check,
+        "--",
+        "triage these",
+    ]);
+    assert!(ok, "add failed: {err}");
+    assert!(
+        out.contains("on change, every 5m") && out.contains("the first check notes"),
+        "{out}"
+    );
+    // The first check is at once and only notes what is there.
+    assert!(
+        stack.wait(|| stack.seen("issues").is_some()),
+        "the first check never reported: {:?}",
+        stack.schedule("issues")
+    );
+    assert_eq!(stack.seen("issues").as_deref(), Some("#1 a\n#2 b"));
+    assert_eq!(
+        stack.starts("triage these"),
+        0,
+        "the baseline starts nothing"
+    );
+
+    // A new line, and the owner's run now: the agent gets that line and not the old ones,
+    // so the daemon handed the run the baseline its first check left.
+    std::fs::write(&issues, "#1 a\n#2 b\n#3 c\n").unwrap();
+    let (ok, _, err) = stack.run(&["schedule", "run", "issues"]);
+    assert!(ok, "run failed: {err}");
+    assert!(
+        stack.wait(|| stack.starts("triage these") == 1),
+        "the agent never started"
+    );
+    let args = std::fs::read_to_string(stack.path("claude.args")).unwrap();
+    assert!(args.contains("#3 c"), "{args}");
+    assert!(args.contains("not instructions to you"), "{args}");
+    assert!(
+        !args.contains("#1 a"),
+        "an old line was sent as new: {args}"
+    );
+    assert!(
+        stack.wait(|| stack
+            .schedule("issues")
+            .is_some_and(|s| s["last_result"] == "started")),
+        "{:?}",
+        stack.schedule("issues")
+    );
+
+    // A scheduled check with nothing new starts nothing and takes the output as its baseline.
+    assert_eq!(stack.seen("issues").as_deref(), Some("#1 a\n#2 b\n#3 c"));
+    std::fs::write(&issues, "#2 b\n#3 c\n").unwrap();
+    let row = stack.schedule("issues").unwrap();
+    let (id, slot) = (row["id"].to_string(), row["last_slot"].to_string());
+    let mut fire = stack
+        .command()
+        .args(["schedule", "fire", &id, "--slot", &slot, "--seen"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        fire.stdin
+            .take()
+            .unwrap()
+            .write_all(b"#1 a\n#2 b\n#3 c")
+            .unwrap();
+    }
+    assert!(fire.wait().unwrap().success());
+    assert_eq!(
+        stack.seen("issues").as_deref(),
+        Some("#2 b\n#3 c"),
+        "the check ran and took the new baseline"
+    );
+    assert_eq!(
+        stack.starts("triage these"),
+        1,
+        "nothing new started an agent"
+    );
+    assert_eq!(stack.schedule("issues").unwrap()["last_result"], "started");
+
+    // A restart keeps the watch.
+    stack.stop_daemon();
+    stack.spawn_daemon();
+    let back = stack.schedule("issues").expect("still there");
+    assert_eq!(back["watch"].as_str(), Some(check.as_str()));
+    assert_eq!(back["when"], "on change, every 5m");
 }

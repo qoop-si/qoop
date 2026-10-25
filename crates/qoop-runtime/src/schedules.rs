@@ -29,7 +29,7 @@ use qoop_store::ScheduleRow;
 use crate::agents::AgentRegistry;
 use crate::asks::{Caller, QASS_SPACE, failed};
 use crate::control::{
-    ControlResponse, SCHEDULE_PROMPT_MAX, SCHEDULES_MOST, ScheduleInfo, ScheduleOp,
+    ControlResponse, SCHEDULE_PROMPT_MAX, SCHEDULES_MOST, SEEN_MOST, ScheduleInfo, ScheduleOp,
 };
 use crate::daemon::{Bookkeeping, ConnectionRegistry, PROBE_DEADLINE};
 use crate::schedule::{Cron, Decision, Zone, decide, next_at, system_zone, when_words};
@@ -52,6 +52,9 @@ const AGENT_MOST: usize = 40;
 
 /// The longest space name.
 const SPACE_MOST: usize = 60;
+
+/// The longest command a watch runs.
+const WATCH_MOST: usize = 2000;
 
 /// What the rest of the daemon reads of the schedules.
 #[derive(Default)]
@@ -138,6 +141,7 @@ fn info(row: ScheduleRow, at: i64, zone: Zone) -> ScheduleInfo {
         name: row.name,
         cron: row.cron,
         at: row.at,
+        watch: row.watch,
         agent: row.agent,
         cwd: row.cwd,
         space: row.space,
@@ -209,24 +213,39 @@ async fn made(
     name: String,
     cron: Option<String>,
     at: Option<i64>,
+    watch: Option<String>,
     agent: Option<String>,
     cwd: String,
     space: Option<String>,
     prompt: String,
     created_at: i64,
 ) -> Result<ScheduleRow, String> {
-    match (&cron, at) {
-        (Some(_), Some(_)) | (None, None) => {
-            return Err("give the timing as a cron line or as one moment, not both".into());
-        }
-        (Some(text), None) => {
+    match (&cron, at, &watch) {
+        (Some(text), None, None) => {
             Cron::parse(text).map_err(|e| format!("{text:?}: {e}"))?;
         }
         // A client's clock is a little behind this one's: a few seconds are forgiven.
-        (None, Some(at)) if at + 30 < created_at => {
+        (None, Some(at), None) if at + 30 < created_at => {
             return Err("that moment has already passed".into());
         }
-        (None, Some(_)) => {}
+        (None, Some(_), None) => {}
+        // Run by `sh -c` in the folder, as the owner: the same text they could type there.
+        (None, None, Some(command)) => {
+            if command.trim().is_empty()
+                || command.len() > WATCH_MOST
+                || command.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "a watch is a command of one to {WATCH_MOST} bytes on one line"
+                ));
+            }
+        }
+        _ => {
+            return Err(
+                "give the timing as a cron line, one moment or a command to watch, one of them"
+                    .into(),
+            );
+        }
     }
     // The default agent is the one the person set for qass; a client that does not say is
     // started as `claude`, which the CLI replaces with that setting before it sends.
@@ -284,6 +303,7 @@ async fn made(
         cwd,
         space,
         prompt,
+        watch,
         paused: false,
         created_at,
         last_slot: None,
@@ -294,8 +314,11 @@ async fn made(
 }
 
 /// What a report may say: how the run went, never `claimed`, which is the daemon's word.
+/// `checked` is a watch's check that found nothing new.
 fn reportable(result: &str) -> bool {
-    result == "started" || result.starts_with("failed: ") || result.starts_with("skipped: ")
+    matches!(result, "started" | "checked")
+        || result.starts_with("failed: ")
+        || result.starts_with("skipped: ")
 }
 
 pub(crate) async fn write(
@@ -315,12 +338,13 @@ pub(crate) async fn write(
             name,
             cron,
             at,
+            watch,
             agent,
             cwd,
             space,
             prompt,
         } => {
-            let row = match made(name, cron, at, agent, cwd, space, prompt, now()).await {
+            let row = match made(name, cron, at, watch, agent, cwd, space, prompt, now()).await {
                 Ok(row) => row,
                 Err(reason) => return failed(id, reason),
             };
@@ -372,14 +396,23 @@ pub(crate) async fn write(
                     slot,
                     result,
                     terminal,
+                    seen,
                     ..
                 } => {
                     let result = qoop_store::task::one_line(&result);
                     if !reportable(&result) || result.chars().count() > 300 {
                         return failed(id, "a run reports started, skipped: why or failed: why");
                     }
+                    if seen.as_ref().is_some_and(|s| s.len() > SEEN_MOST) {
+                        return failed(
+                            id,
+                            format!("a watch's lines are at most {SEEN_MOST} bytes"),
+                        );
+                    }
                     store
-                        .run(move |s| s.report_schedule(schedule, slot, &result, terminal))
+                        .run(move |s| {
+                            s.report_schedule(schedule, slot, &result, terminal, seen.as_deref())
+                        })
                         .await
                 }
                 ScheduleOp::Add { .. } => unreachable!("an add is handled above"),
@@ -476,7 +509,9 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
                     waiting_on_gate = true;
                     continue;
                 }
-                if claim(books, &row, slot, at, "claimed".into()).await {
+                // A watch's check keeps the last run shown: most checks start nothing.
+                let result = row.watch.is_none().then(|| "claimed".to_string());
+                if claim(books, &row, slot, at, result).await {
                     claimed = true;
                     spawn_run(books, connections, row, slot, starting, false);
                 } else {
@@ -489,7 +524,7 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
                     continue;
                 }
                 crate::say!("qoopd: schedule {} skipped: {because}", row.name);
-                if claim(books, &row, slot, at, format!("skipped: {because}")).await {
+                if claim(books, &row, slot, at, Some(format!("skipped: {because}"))).await {
                     claimed = true;
                 } else {
                     lost = true;
@@ -516,11 +551,17 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
 
 /// Take `slot` of `row` for a run. False when somebody else did (a second look, a pause, a
 /// remove), or the store did not answer.
-async fn claim(books: &Bookkeeping, row: &ScheduleRow, slot: i64, at: i64, result: String) -> bool {
+async fn claim(
+    books: &Bookkeeping,
+    row: &ScheduleRow,
+    slot: i64,
+    at: i64,
+    result: Option<String>,
+) -> bool {
     let (id, expected) = (row.id, row.last_slot);
     match books
         .store
-        .run(move |s| s.claim_schedule(id, expected, slot, at, &result))
+        .run(move |s| s.claim_schedule(id, expected, slot, at, result.as_deref()))
         .await
     {
         Ok(won) => won,
@@ -551,18 +592,35 @@ fn spawn_run(
     let (books, connections) = (books.clone(), connections.clone());
     tokio::spawn(async move {
         let (id, name) = (row.id, row.name.clone());
+        let (watch, terminal) = (row.watch.is_some(), row.last_terminal);
+        // A watch's run is handed the lines its last check saw: none is a watch never checked.
+        let seen = if watch {
+            match books.store.run(move |s| s.watch_seen(id)).await {
+                Ok(seen) => seen,
+                Err(e) => {
+                    crate::say!("qoopd: schedule {name}: {}", why(e));
+                    drop(starting);
+                    connections.wake_leaving();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let ran = match own_exe(&books) {
-            Some(exe) => run_child(exe, row.cwd, id, slot, manual).await,
+            Some(exe) => run_child(exe, row.cwd, id, slot, manual, seen).await,
             None => Err("this daemon does not know its own binary".to_string()),
         };
         if let Err(reason) = ran {
             crate::say!("qoopd: schedule {name}: {reason}");
-            // A run the owner asked for claimed nothing, so it is written down as it ended.
+            // A run the owner asked for, or a watch's check, claimed nothing that says
+            // `claimed`, so it is written down as it ended; a watch keeps its last run's tab.
             let failed = books
                 .store
                 .run(move |s| {
-                    if manual {
-                        s.report_schedule(id, slot, &format!("failed: {reason}"), None)
+                    if manual || watch {
+                        let terminal = terminal.filter(|_| watch);
+                        s.report_schedule(id, slot, &format!("failed: {reason}"), terminal, None)
                     } else {
                         s.fail_claimed_schedule(id, slot, &reason)
                     }
@@ -581,14 +639,17 @@ fn spawn_run(
 /// Run the child in the schedule's folder (the daemon's own may be a removed worktree) with
 /// nothing of a terminal's identity, so what it does is the owner's and not a worker's, and
 /// wait for it, polling, so that no thread is held while it opens a terminal. A child that
-/// takes longer than [`RUN_PATIENCE`] is killed.
+/// takes longer than [`RUN_PATIENCE`] is killed. A watch's child gets its last check's lines
+/// on its stdin (`--seen`).
 async fn run_child(
     exe: PathBuf,
     cwd: String,
     id: i64,
     slot: i64,
     manual: bool,
+    seen: Option<String>,
 ) -> Result<(), String> {
+    let piped = seen.is_some();
     let mut child = crate::blocking::run_on(crate::blocking::Pool::Lifecycle, move || {
         let mut command = std::process::Command::new(&exe);
         command
@@ -606,19 +667,32 @@ async fn run_child(
         if manual {
             command.arg("--now");
         }
+        if piped {
+            command.arg("--seen").stdin(std::process::Stdio::piped());
+        }
         for name in ["QOOP_TERMINAL", "QOOP_TOKEN", "QORO_TERMINAL", "QORO_TOKEN"] {
             command.env_remove(name);
         }
-        command.spawn().map_err(|e| {
+        let child = command.spawn().map_err(|e| {
             if std::path::Path::new(&cwd).is_dir() {
                 format!("could not start the run: {e}")
             } else {
                 format!("the folder {cwd} is gone")
             }
-        })
+        })?;
+        Ok::<_, String>(child)
     })
     .await
     .map_err(|e| format!("could not start the run: {e}"))??;
+    // The child reads its stdin before anything else. Written on a thread of its own, not the
+    // pool's: a child stalled before reading is then only this run's, killed at the deadline
+    // below, which breaks the pipe and ends the write.
+    if let (Some(seen), Some(mut stdin)) = (seen, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(seen.as_bytes());
+        });
+    }
     let deadline = tokio::time::Instant::now() + RUN_PATIENCE;
     loop {
         match child.try_wait() {
