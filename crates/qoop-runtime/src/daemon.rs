@@ -5253,19 +5253,33 @@ async fn handle_control(
                             // A prompt reached an agent waiting on the owner: its answer. The
                             // stage goes back, so no board still says it waits on him. A notice
                             // the harness typed (its own background work done) is no answer, nor
-                            // qass setting it to other work while the question waits.
-                            // It also moved past its question, his answer in its tab or new
-                            // work: a card still open about it is stale.
-                            let now = crate::agents::now_unix();
-                            if !label.as_deref().is_some_and(crate::asks::not_his) {
+                            // qass setting it to other work while the question waits, nor a
+                            // prompt with no input in this tab since the wait (a scheduled wake).
+                            // It also moved past what was asked before his input, his answer in
+                            // its tab or new work: a card still open about it is stale.
+                            if !label.as_deref().is_some_and(crate::asks::not_his)
+                                && let Some(at) = agents.input_at(terminal)
+                            {
                                 let back = store
-                                    .run(move |s| s.answer_waiting(i64::from(terminal), now))
+                                    .run(move |s| {
+                                        s.answer_waiting(
+                                            i64::from(terminal),
+                                            at,
+                                            crate::agents::now_unix(),
+                                        )
+                                    })
                                     .await;
                                 if matches!(back, Ok(Some(_))) {
                                     agents.tasks_changed();
                                 }
                                 let ended = store
-                                    .run(move |s| s.prompt_taken(i64::from(terminal), now))
+                                    .run(move |s| {
+                                        s.prompt_taken(
+                                            i64::from(terminal),
+                                            at,
+                                            crate::agents::now_unix(),
+                                        )
+                                    })
                                     .await;
                                 if matches!(back, Ok(Some(_))) || matches!(ended, Ok(n) if n > 0) {
                                     connections.asks_changed();

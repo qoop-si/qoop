@@ -329,6 +329,28 @@ pub fn person_key(bytes: &[u8]) -> bool {
 
 /// The length of the escape sequence at the start of `bytes` (which starts with Esc): a CSI up
 /// to its final byte, an SS3 key, an OSC or DCS up to its terminator, else Esc and one byte.
+/// A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`).
+fn is_enter(key: &[u8]) -> bool {
+    matches!(key, b"\r" | b"\n") || (key.starts_with(b"\x1b[13") && key.ends_with(b"u"))
+}
+
+/// Whether input holds an Enter anywhere, a pasted line's return too.
+fn has_enter(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let len = if rest[0] == 0x1b {
+            sequence_len(rest)
+        } else {
+            1
+        };
+        if is_enter(&rest[..len]) {
+            return true;
+        }
+        rest = &rest[len..];
+    }
+    false
+}
+
 fn sequence_len(bytes: &[u8]) -> usize {
     match bytes.get(1) {
         None => 1,
@@ -922,11 +944,20 @@ impl AgentRegistry {
         self.typed_at_unix.lock().unwrap().insert(stream, now_unix);
     }
 
-    /// Record that a line reached this terminal from a person: input with a return in it.
+    /// Record that a line reached this terminal from a person: input with an Enter in it.
     pub fn note_sent(&self, stream: u32, bytes: &[u8], now_unix: i64) {
-        if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+        if has_enter(bytes) {
             self.sent_at_unix.lock().unwrap().insert(stream, now_unix);
         }
+    }
+
+    /// When this terminal last took input from a person: a key they pressed in an interface
+    /// or the phone (never a mouse or terminal report), or a line sent (the inbox's answers
+    /// too). A scheduled wake or a harness notice types nothing.
+    pub fn input_at(&self, stream: u32) -> Option<i64> {
+        let typed = self.person_typed.lock().unwrap().get(&stream).copied();
+        let sent = self.sent_at_unix.lock().unwrap().get(&stream).copied();
+        typed.max(sent)
     }
 
     /// Input from a person's own connection: a key they pressed stamps the draft clock, a line
@@ -947,9 +978,7 @@ impl AgentRegistry {
                 1
             };
             let key = &rest[..len];
-            let enter = matches!(key, b"\r" | b"\n")
-                || (key.starts_with(b"\x1b[13") && key.ends_with(b"u"));
-            if enter {
+            if is_enter(key) {
                 (sent, after) = (true, false);
             } else if one_key(key) {
                 after = true;
@@ -2454,6 +2483,26 @@ mod tests {
     /// A park ends only on an answer: a person sent a line to the agent after the park and
     /// it works again. Working without a line sent (a resume, a background wake) keeps it,
     /// keys that send nothing keep it, and a working agent cannot be parked at all.
+    /// What says a person answered in a tab: a key or a line from them, the latest; a kitty
+    /// Enter sends a line as a return does, and a focus report is no input.
+    #[test]
+    fn input_is_a_persons_key_or_line_and_a_kitty_enter_sends() {
+        let r = registry();
+        assert_eq!(r.input_at(1), None, "nothing typed: a scheduled wake");
+        r.note_person(1, b"\x1b[I", false, 5);
+        r.note_person(1, b"\x1b[<35;10;5M", false, 5);
+        assert_eq!(r.input_at(1), None, "a focus or mouse report");
+        r.note_person(1, b"2", false, 7);
+        assert_eq!(r.input_at(1), Some(7), "one key picks a dialog option");
+        r.note_sent(1, b"\x1b[13u", 9);
+        assert_eq!(r.input_at(1), Some(9), "a kitty Enter sends the line");
+        r.note_sent(1, b"\x1b[13;1u", 10);
+        assert_eq!(r.input_at(1), Some(10));
+        r.note_sent(1, b"y", 12);
+        assert_eq!(r.input_at(1), Some(10), "a key with no Enter sends nothing");
+        assert_eq!(r.input_at(2), None, "another tab");
+    }
+
     #[test]
     fn a_park_ends_when_an_answer_makes_the_agent_work_and_not_otherwise() {
         use AgentRuntimeState::{Idle, Working};

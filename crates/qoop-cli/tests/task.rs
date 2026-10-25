@@ -1006,12 +1006,24 @@ fn an_answer_reaching_the_agent_moves_its_stage_back() {
     let work = daemon.inside(
         "1",
         "asker",
+        // The second after this line was typed, so the wait begins after it: a prompt with no
+        // input since (a scheduled wake) is no answer.
         r#"$Q task new "pick a logo" > new.out 2>&1
 $Q task stage planning > a.out 2>&1
+sleep 1.1
 $Q task stage waiting-human > b.out 2>&1
-$Q task show --json > before.json 2>&1
-$Q hook-report --state working --event user --label "B, the round one" > hook.out 2>&1
-$Q task show --json > after.json 2>&1"#,
+$Q hook-report --state working --event user --label "check the build" > wake.out 2>&1
+$Q task show --json > before.json 2>&1"#,
+    );
+    // His answer: a line typed in the tab after the wait, then the prompt it made.
+    daemon.inside(
+        "1",
+        "answer",
+        &format!(
+            r#"$Q hook-report --state working --event user --label "B, the round one" > hook.out 2>&1
+$Q task show --json > '{}' 2>&1"#,
+            work.join("after.json").display()
+        ),
     );
     let stage = |file: &str| -> String {
         let v: serde_json::Value = serde_json::from_str(&read(&work, file)).unwrap();

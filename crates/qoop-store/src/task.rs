@@ -552,16 +552,26 @@ impl Store {
     }
 
     /// The open task of `terminal`, waiting on the owner, took his answer (a prompt reached the
-    /// agent): its stage goes back to the one before `waiting-human`, else `implementing`. Only
-    /// the stage moves: a claim stays. Answers the stage it went back to, `None` when the task
-    /// was not waiting.
-    pub fn answer_waiting(&self, terminal: i64, now: i64) -> Result<Option<String>, StoreError> {
+    /// agent after his input in its tab at `input`): its stage goes back to the one before
+    /// `waiting-human`, else `implementing`. Input from before the wait began answers nothing.
+    /// Only the stage moves: a claim stays. Answers the stage it went back to, `None` when the
+    /// task was not waiting or the input came before it did.
+    pub fn answer_waiting(
+        &self,
+        terminal: i64,
+        input: i64,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let waiting: Option<i64> = tx
             .query_row(
-                "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL \
-                 AND stage = 'waiting-human' ORDER BY id DESC LIMIT 1",
-                params![terminal],
+                &format!(
+                    "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL \
+                     AND stage = 'waiting-human' AND COALESCE({}, 0) <= ?2 \
+                     ORDER BY id DESC LIMIT 1",
+                    waiting_at("task")
+                ),
+                params![terminal, input],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1129,7 +1139,7 @@ mod tests {
         let (s, _, t) = store_with_terminal();
         let id = s.open_task(t, "x", false, 10).unwrap();
         assert_eq!(
-            s.answer_waiting(t, 11).unwrap(),
+            s.answer_waiting(t, 11, 11).unwrap(),
             None,
             "not waiting: nothing moves"
         );
@@ -1137,13 +1147,31 @@ mod tests {
         s.set_task_stage(id, "waiting-human", 13).unwrap();
         s.claim_task_done(id, "asks before the merge", 14).unwrap();
         assert_eq!(
-            s.answer_waiting(t, 15).unwrap().as_deref(),
+            s.answer_waiting(t, 15, 15).unwrap().as_deref(),
             Some("planning")
         );
         let row = s.task(id).unwrap().unwrap();
         assert_eq!(row.stage, "planning", "the stage before it");
         assert_eq!(row.claimed_at, Some(14), "the claim stays");
-        assert_eq!(s.answer_waiting(t, 16).unwrap(), None, "said once");
+        assert_eq!(s.answer_waiting(t, 16, 16).unwrap(), None, "said once");
+        // Input from before the wait began is no answer to it.
+        s.set_task_stage(id, "waiting-human", 20).unwrap();
+        assert_eq!(
+            s.answer_waiting(t, 19, 19).unwrap(),
+            None,
+            "typed before the wait"
+        );
+        assert_eq!(s.task(id).unwrap().unwrap().stage, "waiting-human");
+        assert_eq!(
+            s.answer_waiting(t, 20, 25).unwrap().as_deref(),
+            Some("planning"),
+            "typed as it began"
+        );
+        assert_eq!(
+            s.task(id).unwrap().unwrap().updated_at,
+            25,
+            "moved when the prompt came"
+        );
         // Waiting with no stage before it: implementing.
         let (other, _, u) = {
             let (s2, ws, u) = store_with_terminal();
@@ -1152,7 +1180,7 @@ mod tests {
         let fresh = other.open_task(u, "y", false, 10).unwrap();
         other.set_task_stage(fresh, "waiting-human", 11).unwrap();
         assert_eq!(
-            other.answer_waiting(u, 12).unwrap().as_deref(),
+            other.answer_waiting(u, 12, 12).unwrap().as_deref(),
             Some("implementing")
         );
     }
@@ -1172,7 +1200,7 @@ mod tests {
         assert_eq!(row.claimed_at, Some(12), "the claim stays");
         assert_eq!(s.wait_on_owner(t, 14).unwrap(), None, "already waits");
         assert_eq!(
-            s.answer_waiting(t, 15).unwrap().as_deref(),
+            s.answer_waiting(t, 15, 15).unwrap().as_deref(),
             Some("verifying")
         );
         // A new task, no stage written: back to the one it opened in.
@@ -1180,7 +1208,7 @@ mod tests {
         let fresh = other.open_task(u, "y", false, 10).unwrap();
         let opened = other.task(fresh).unwrap().unwrap().stage;
         assert_eq!(other.wait_on_owner(u, 11).unwrap(), Some(fresh));
-        assert_eq!(other.answer_waiting(u, 12).unwrap(), Some(opened));
+        assert_eq!(other.answer_waiting(u, 12, 12).unwrap(), Some(opened));
     }
 
     #[test]

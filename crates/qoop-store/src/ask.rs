@@ -299,14 +299,15 @@ impl Store {
         )? > 0)
     }
 
-    /// A prompt reached the agent in `terminal` (his answer typed in its tab, or new work):
-    /// it moved past the question, so its open cards end, written before now. An answer he
-    /// gave that waits to be typed or passed on stays. Answers how many ended.
-    pub fn prompt_taken(&self, terminal: i64, now: i64) -> Result<usize, StoreError> {
+    /// A prompt reached the agent in `terminal` after his input in its tab at `input` (his
+    /// answer, or new work): it moved past the question, so its open cards end, written before
+    /// that input. An answer he gave that waits to be typed or passed on stays. Answers how
+    /// many ended.
+    pub fn prompt_taken(&self, terminal: i64, input: i64, now: i64) -> Result<usize, StoreError> {
         Ok(self.conn.execute(
             "UPDATE ask SET status = 'closed', note = 'it took a prompt in its tab', \
-             closed_at = ?2 WHERE terminal = ?1 AND status = 'open' AND opened_at < ?2",
-            params![terminal, now],
+             closed_at = ?3 WHERE terminal = ?1 AND status = 'open' AND opened_at < ?2",
+            params![terminal, input, now],
         )?)
     }
 
@@ -507,7 +508,7 @@ mod tests {
             "a live card stands"
         );
         // His answer in its tab ends the wait and the draft; the same spell never asks again.
-        s.answer_waiting(t, 14).unwrap();
+        s.answer_waiting(t, 14, 14).unwrap();
         assert_eq!(
             s.ask(&card).unwrap().unwrap().note.as_deref(),
             Some("answered in its tab")
@@ -879,7 +880,7 @@ mod tests {
         let (s, t) = store_with_terminal();
         s.add_ask("E1", Some("T5"), Some(t), None, "{}", 10)
             .unwrap();
-        assert_eq!(s.prompt_taken(t, 20).unwrap(), 1);
+        assert_eq!(s.prompt_taken(t, 20, 20).unwrap(), 1);
         let e1 = s.ask("E1").unwrap().unwrap();
         assert_eq!(
             (e1.status.as_str(), e1.note.as_deref()),
@@ -887,7 +888,7 @@ mod tests {
         );
         s.add_ask("E2", Some("T5"), Some(t), None, "{}", 30)
             .unwrap();
-        assert_eq!(s.prompt_taken(t, 30).unwrap(), 0, "written this second");
+        assert_eq!(s.prompt_taken(t, 30, 30).unwrap(), 0, "written this second");
         let task = s.open_task(t, "ship it", false, 31).unwrap();
         let stage = s.task(task).unwrap().unwrap().stage;
         s.set_task_stage(task, &stage, 36).unwrap();
@@ -910,7 +911,7 @@ mod tests {
         assert_eq!(s.ask("E3").unwrap().unwrap().status, "closed");
         // His answer waiting to be typed survives a prompt; only open cards end.
         let w = draft_on(&s, t, "T5", true, 80);
-        assert_eq!(s.prompt_taken(t, 90).unwrap(), 0);
+        assert_eq!(s.prompt_taken(t, 90, 90).unwrap(), 0);
         assert_eq!(s.ask(&w).unwrap().unwrap().status, "queued");
     }
 
