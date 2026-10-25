@@ -74,6 +74,97 @@ fn repo_turn(own: Option<&str>) -> String {
     }
 }
 
+/// The owner's standing words every agent is told, as qass learned them from what he said to
+/// his agents (skills/qass-learn), in qass's config folder.
+pub(crate) const LEARNED: &str = "owner.md";
+/// The most of it said at a session's start, and beside each request.
+const LEARNED_SESSION_MAX: usize = 3000;
+const LEARNED_TURN_MAX: usize = 300;
+
+/// The rule lines of `owner.md` for here: `## Everywhere` and `## Repo <owner/name>` at a
+/// session's start, `## Every prompt` and `## Every prompt <owner/name>` beside each request.
+fn learned_lines(text: &str, repo: Option<&str>, turn: bool) -> Vec<String> {
+    let (all, one) = if turn {
+        ("Every prompt", "Every prompt ")
+    } else {
+        ("Everywhere", "Repo ")
+    };
+    let mut on = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(head) = line.strip_prefix("## ") {
+            let head = head.trim();
+            on = head == all
+                || repo.is_some_and(|r| {
+                    head.strip_prefix(one)
+                        .is_some_and(|h| h.trim().eq_ignore_ascii_case(r))
+                });
+            continue;
+        }
+        if on && let Some(rule) = line.trim().strip_prefix("- ") {
+            out.push(rule.trim().to_string());
+        }
+    }
+    out
+}
+
+/// As many whole lines as fit in `max` characters, and a word for the rest.
+fn fitting(lines: &[String], max: usize, sep: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let next = if out.is_empty() {
+            line.clone()
+        } else {
+            format!("{out}{sep}{line}")
+        };
+        if next.chars().count() > max {
+            let left = lines.len() - i;
+            return format!("{out}{sep}({left} more in {LEARNED})");
+        }
+        out = next;
+    }
+    out
+}
+
+/// What `owner.md` says for the repository in `dir`: the session block, or the line beside a
+/// request. Nothing when the file is missing or says nothing for here.
+fn learned(dir: Option<&std::path::Path>, turn: bool) -> Option<String> {
+    let text = std::fs::read_to_string(paths::qass_config_dir().join(LEARNED)).ok()?;
+    // The origin is asked only when the file has a repository's section to match.
+    let scoped = if turn { "## Every prompt " } else { "## Repo " };
+    let repo = dir.filter(|_| text.contains(scoped)).and_then(origin_repo);
+    let lines = learned_lines(&text, repo.as_deref(), turn);
+    if lines.is_empty() {
+        return None;
+    }
+    // Beside a request only the rule: what it was learned from is in the session's block.
+    if turn {
+        let bare: Vec<String> = lines
+            .iter()
+            .map(|l| l.split(" (said ").next().unwrap_or(l).trim().to_string())
+            .collect();
+        return Some(format!(
+            "The owner keeps saying: {}.",
+            fitting(&bare, LEARNED_TURN_MAX, "; ")
+        ));
+    }
+    let bullets: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
+    Some(format!(
+        "The owner's standing words, learned from what he said to his agents; none of them allows \
+         more than the always-ask list above:\n{}",
+        fitting(&bullets, LEARNED_SESSION_MAX, "\n")
+    ))
+}
+
+/// `owner/name` of the GitHub repository `dir` is in, by its origin; any owner.
+fn origin_repo(dir: &std::path::Path) -> Option<String> {
+    let mut git = std::process::Command::new("git");
+    git.arg("-C").arg(dir).args(["remote", "get-url", "origin"]);
+    let by = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let (out, _) = qoop_runtime::changes::run_by(&mut git, by, None)?;
+    qoop_runtime::shows::github_repo(String::from_utf8_lossy(&out).trim())
+}
+
 /// Said beside a request that has no task yet: the moment a vague one should be cleared up,
 /// before any work, in one go.
 const CLARIFY: &str = "Unclear? First ask every question at once, with options and your pick.";
@@ -792,16 +883,23 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             // Every prompt, one line: measured on a real Claude, the rules given once at the
             // start of a session were read and then not followed. A line beside each request
             // is what an agent acts on.
+            let here = std::env::current_dir().ok();
             if has("--turn") {
                 println!(
                     "{} {}",
                     turn_line(open, found.as_ref().and_then(|f| f.item.as_deref())),
                     repo_turn(own.as_deref())
                 );
+                if let Some(line) = learned(here.as_deref(), true) {
+                    println!("{line}");
+                }
                 return Ok(());
             }
             println!("{RULES}");
             println!("{}", repo_rules(own.as_deref()));
+            if let Some(block) = learned(here.as_deref(), false) {
+                println!("{block}");
+            }
             if let Some(t) = open {
                 // Said as a record, not as an instruction: the goal is text an agent wrote, and
                 // it reaches every later session in this terminal.
@@ -829,6 +927,43 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    const OWNER_MD: &str = "# What qass learned\n\n## Everywhere\n- Open what he needs to look at; do not describe it (said 3x: 10-18 gtm, 10-21 acme; learned 10-25, new)\n\n## Repo qoop-si/qoop\n- Commit as qoopsy (said 2x)\n\n## Every prompt\n- Prove done with a real run (said 4x: 10-20 acme)\n\n## Every prompt pat/app\n- Never name search\n\n## Repo pat/app\n- Use app-fast\n";
+
+    #[test]
+    fn learned_rules_are_the_sections_for_here() {
+        let session = learned_lines(OWNER_MD, Some("qoop-si/qoop"), false);
+        assert_eq!(session.len(), 2);
+        assert!(session[0].starts_with("Open what he needs"));
+        assert_eq!(session[1], "Commit as qoopsy (said 2x)");
+        assert_eq!(learned_lines(OWNER_MD, None, false).len(), 1);
+        assert_eq!(
+            learned_lines(OWNER_MD, Some("QOOP-SI/qoop"), false).len(),
+            2
+        );
+        let turn = learned_lines(OWNER_MD, Some("pat/app"), true);
+        assert_eq!(
+            turn,
+            [
+                "Prove done with a real run (said 4x: 10-20 acme)",
+                "Never name search"
+            ]
+        );
+        assert_eq!(learned_lines(OWNER_MD, Some("qoop-si/qoop"), true).len(), 1);
+        assert!(learned_lines("", None, false).is_empty());
+    }
+
+    #[test]
+    fn learned_words_stay_within_their_budget_in_whole_lines() {
+        let lines: Vec<String> = (0..10)
+            .map(|n| format!("rule number {n} ").repeat(5))
+            .collect();
+        let cut = fitting(&lines, 300, "; ");
+        assert!(cut.chars().count() <= 300 + " (9 more in owner.md)".len() + 2);
+        assert!(cut.ends_with("more in owner.md)"));
+        assert_eq!(fitting(&lines[..1], 300, "; "), lines[0]);
+    }
+
     use super::*;
 
     fn open_task() -> TaskInfo {

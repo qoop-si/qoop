@@ -70,11 +70,17 @@ impl QassDirs {
         body.replace("@QASS_DATA@", &self.data.display().to_string())
             .replace("@QASS_CONFIG@", &self.owner.display().to_string())
             .replace("@QOOP_CONFIG@", &self.qoop_config().display().to_string())
+            .replace("@LEARN@", &self.learn().display().to_string())
     }
 
     /// qoop's settings folder, where `config.toml` is: the owner folder's parent.
     fn qoop_config(&self) -> PathBuf {
         self.owner.parent().unwrap_or(&self.owner).to_path_buf()
+    }
+
+    /// The nightly learning run's folder: `learn` beside qass's own.
+    fn learn(&self) -> PathBuf {
+        self.data.parent().unwrap_or(&self.data).join("learn")
     }
 
     fn folder_settings(&self) -> PathBuf {
@@ -141,6 +147,11 @@ const QASS: &[(&str, &str, bool)] = &[
         false,
     ),
     (
+        "learned.md",
+        include_str!("../../../skills/qass/learned.md"),
+        false,
+    ),
+    (
         "setup.sh",
         include_str!("../../../skills/qass/setup.sh"),
         true,
@@ -149,6 +160,16 @@ const QASS: &[(&str, &str, bool)] = &[
         "settings.json",
         include_str!("../../../skills/qass/settings.json"),
         false,
+    ),
+];
+
+/// The nightly learning run's folder, beside qass's (a run in qass's own folder would read
+/// itself as qass): its brief and its settings, which let it run with nobody at it.
+const LEARN: &[(&str, &str)] = &[
+    ("CLAUDE.md", include_str!("../../../skills/learn/CLAUDE.md")),
+    (
+        ".claude/settings.json",
+        include_str!("../../../skills/learn/settings.json"),
     ),
 ];
 
@@ -415,6 +436,17 @@ fn install_qass(home: &Path, dirs: &QassDirs) -> std::io::Result<bool> {
         }
     }
     std::fs::create_dir_all(dirs.data.join("scratch"))?;
+    let learn = dirs.learn();
+    for (name, body) in LEARN {
+        let path = learn.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        changed |= write_changed(&path, &dirs.render(body), false)?;
+    }
+    for sub in ["scratch", "classes", "reports", "history"] {
+        std::fs::create_dir_all(learn.join(sub))?;
+    }
     // An older qass's Codex hooks call a gate that is long gone, on every tool call.
     let hooks = dirs.data.join(".codex/hooks.json");
     if std::fs::read_to_string(&hooks).is_ok_and(|b| b.contains("skills/qass/gate.sh")) {
@@ -592,6 +624,9 @@ fn qass_current(dirs: &QassDirs) -> bool {
             .all(|(name, body, _)| holds(dir.join(name), &dirs.render(body)))
     }) && holds(dirs.folder_settings(), &dirs.folder_body())
         && dirs.data.join("AGENTS.md").exists()
+        && LEARN
+            .iter()
+            .all(|(name, body)| holds(dirs.learn().join(name), &dirs.render(body)))
 }
 
 /// Remove one agent's skill, answering whether anything changed.
@@ -1285,6 +1320,27 @@ mod tests {
         );
         assert!(qass_current(&dirs));
         assert!(!install_qass(home.path(), &dirs).expect("unchanged"));
+        // The nightly learning run's folder beside qass's, its paths filled in, with no hooks of
+        // qass's (it is not qass) and nothing that asks.
+        let learn = dirs.data.parent().unwrap().join("learn");
+        let brief = std::fs::read_to_string(learn.join("CLAUDE.md")).expect("learn brief");
+        assert!(brief.contains(&format!("{}/owner.md", dirs.owner.display())));
+        assert!(!brief.contains("@QASS_"));
+        let learn_settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(learn.join(".claude/settings.json")).expect("learn settings"),
+        )
+        .expect("learn settings json");
+        assert!(learn_settings.get("hooks").is_none());
+        assert_eq!(learn_settings["permissions"]["defaultMode"], "dontAsk");
+        // It writes its own folder and the learned file only, and runs only what it needs.
+        let allow = learn_settings["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.contains(&serde_json::json!(format!("Edit(/{}/**)", learn.display()))));
+        assert!(
+            !allow
+                .iter()
+                .any(|a| a == "Bash" || a == "Write" || a == "Edit")
+        );
+        assert!(learn.join("reports").is_dir() && learn.join("history").is_dir());
         // The rest of the template survives the rewrite.
         assert_eq!(read()["env"]["SLASH_COMMAND_TOOL_CHAR_BUDGET"], "3000");
         assert!(read()["hooks"]["SessionStart"].is_array());

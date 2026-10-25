@@ -1663,6 +1663,8 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
             .cloned()
             .chain(opts.command.iter().map(|w| shell_quote(w)))
             .collect();
+        // An agent started with words: those are not the person's, wherever they are said.
+        paths::note_typed(terminal, &super::typed_by(), &line.join(" "));
         link.input(terminal, format!("{}\r", line.join(" ")).into_bytes())
             .await
     })

@@ -95,6 +95,8 @@ for them. A task closed verified gets its one line at once: what now works and w
    Under Claude Code a hook loads your lessons (`@QASS_CONFIG@/lessons.md`) and `memory.md` at every
    start, resume and compaction; else read both now. Notes, scratch, skill dir: your folder's AGENTS.md.
 5. `qoop doctor --new @QASS_DATA@/doctor-said`, now and when they ask: fix or escalate each line.
+6. Learning: no `qass-learn` row in `qoop schedule ls --json`: add it. Their "learn drop|keep <n>" and
+   "learned" act on `@QASS_CONFIG@/owner.md` (what every agent is told): `<this skill's dir>/learned.md`.
 
 ## On every event line
 
@@ -414,7 +416,7 @@ unless they ask for a qoop agent; a worker's: its brief.
 
 ## Schedules
 
-Only when the owner asks for a time ("every morning", "at 9"): follow `<this skill's dir>/schedules.md`.
+Only when the owner asks for a time ("every morning", "at 9"), and the learning run of Start step 6: follow `<this skill's dir>/schedules.md`.
 A scheduled run (a `last_terminal` of `qoop schedule ls --json`) is theirs, not yours: never written to.
 
 ## Init

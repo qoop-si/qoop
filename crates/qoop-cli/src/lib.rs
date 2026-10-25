@@ -299,6 +299,9 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop history --dir <repo> [--last N] [--json]\n\
                   \x20                 what you typed to your agents in a repo and its\n\
                   \x20                 worktrees (Claude Code, Codex, opencode; not Gemini)\n\
+                  \x20 qoop history --since <Nd|Nh|unix> [--json] [--out FILE]\n\
+                  \x20                 what you typed to any agent since then, every repo,\n\
+                  \x20                 less what qoop or qass typed for you\n\
                   \x20 qoop sessions-index <file>  read every agent session on this computer\n\
                   \x20                 into the index at <file>; the daemon runs it\n\
                   \x20 qoop messages <terminal> [--skip N] [--limit N] [--json]\n\
@@ -1720,6 +1723,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     if let Some(reason) = ceiling_refusal(terminal, &text, cwd_of) {
         return Err(std::io::Error::other(reason));
     }
+    let said = text.clone();
     if enter {
         text.push('\r');
     }
@@ -1788,9 +1792,16 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         .await?;
         wr.flush().await?;
         crate::qass::note_prompted(terminal);
+        paths::note_typed(terminal, &typed_by(), &said);
         println!("sent to terminal {terminal}");
         Ok(())
     })
+}
+
+/// Who typed through this call, for `typed.jsonl`: the terminal it runs in, else the CLI.
+fn typed_by() -> String {
+    qoop_runtime::legacy::var("QOOP_TERMINAL")
+        .map_or_else(|_| "cli".to_string(), |t| format!("T{t}"))
 }
 
 /// Who this CLI call runs as, when it runs inside a qoop terminal: the
@@ -2359,6 +2370,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
             return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
+        let said = text.clone();
         let mut term_seq = 0u32;
         // The Enter carries the sender, which records the wait edge.
         let (from_terminal, from_token) = cli_sender();
@@ -2386,6 +2398,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         .await?;
         wr.flush().await?;
         crate::qass::note_prompted(terminal);
+        paths::note_typed(terminal, &typed_by(), &said);
         println!("prompted terminal {terminal}");
         if !wait {
             return Ok(());
@@ -2495,6 +2508,9 @@ fn run_history(args: &[String]) -> std::io::Result<()> {
     if args.iter().skip(2).any(|a| a == "--dir") {
         return run_history_dir(args);
     }
+    if args.iter().skip(2).any(|a| a == "--since") {
+        return run_history_since(args);
+    }
     let opts = parse_history_args(args).map_err(usage)?;
     qass_guard(&opts.target)?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -2587,6 +2603,120 @@ fn run_history_dir(args: &[String]) -> std::io::Result<()> {
         print!("{}", render_typed(&typed));
     }
     Ok(())
+}
+
+/// `qoop history --since <when> [--json]`: what the person typed to any agent on this computer
+/// since then, every repo and every agent, less what qoop typed for someone else (an agent's or
+/// qass's prompt, an agent started with words, the inbox's lines), his pasted blocks and other
+/// agents' messages. qass's nightly learning reads it.
+fn run_history_since(args: &[String]) -> std::io::Result<()> {
+    let usage_line = "usage: qoop history --since <Nd|Nh|unix seconds> [--json] [--out FILE]";
+    let mut since = None;
+    let mut json = false;
+    let mut to = None;
+    let mut rest = args.iter().skip(2);
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--since" => since = rest.next().and_then(|w| since_millis(w, unix_now())),
+            "--json" => json = true,
+            // Into a new file rather than the terminal: a run that may not redirect a shell's output.
+            "--out" => to = rest.next().map(PathBuf::from),
+            _ => return Err(usage(format!("unknown argument {arg}; {usage_line}"))),
+        }
+    }
+    let since = since.ok_or_else(|| usage(usage_line.to_string()))?;
+    let typed = paths::read_typed();
+    let typed: Vec<qoop_parsed::said::Typed> = typed
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            Some(qoop_parsed::said::Typed {
+                at: v["at"].as_i64()?,
+                text: v["text"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+    let prompted: Vec<i64> = paths::qass_data_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join(crate::qass::PROMPTED_LOG)).ok())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_whitespace().next()?.parse::<i64>().ok())
+        .map(|secs| secs * 1000)
+        .collect();
+    let qass = paths::qass_data_dir();
+    let mut said = qoop_parsed::said::said(
+        &qoop_parsed::index::Roots::from_env(),
+        since,
+        &typed,
+        &prompted,
+        qass.as_deref(),
+    );
+    let mut repos: std::collections::HashMap<String, Option<String>> = Default::default();
+    for s in &mut said {
+        if let Some(cwd) = &s.cwd {
+            s.repo = repos
+                .entry(cwd.clone())
+                .or_insert_with(|| repo_at(cwd))
+                .clone();
+        }
+    }
+    let mut out = String::new();
+    for s in &said {
+        if json {
+            out.push_str(&serde_json::to_string(s).map_err(std::io::Error::other)?);
+        } else {
+            let place = s
+                .cwd
+                .as_deref()
+                .and_then(|c| c.rsplit('/').next())
+                .unwrap_or("-");
+            let text: String = s.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let text: String = text.chars().take(400).collect();
+            out.push_str(&format!("{} {} {place}: {text}", s.ts / 1000, s.agent));
+        }
+        out.push('\n');
+    }
+    match to {
+        // Only a new file: a run allowed this command alone cannot empty one that is there.
+        Some(file) => {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)?
+                .write_all(out.as_bytes())?;
+            println!("{} messages in {}", said.len(), file.display());
+        }
+        None => print!("{out}"),
+    }
+    Ok(())
+}
+
+/// `owner/name` of the GitHub repository a folder is in, by its origin; a folder since removed
+/// (a merged worktree) is read at the nearest one that is still there.
+fn repo_at(cwd: &str) -> Option<String> {
+    let dir = std::path::Path::new(cwd).ancestors().find(|d| d.is_dir())?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["remote", "get-url", "origin"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    qoop_runtime::shows::github_repo(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// `7d`, `24h` or unix seconds, as unix milliseconds.
+fn since_millis(word: &str, now: i64) -> Option<i64> {
+    let unit = |n: &str, secs: i64| n.parse::<i64>().ok().map(|n| (now - n * secs) * 1000);
+    match word.strip_suffix('d') {
+        Some(n) => unit(n, 86_400),
+        None => match word.strip_suffix('h') {
+            Some(n) => unit(n, 3_600),
+            None => word.parse::<i64>().ok().map(|secs| secs * 1000),
+        },
+    }
 }
 
 /// Parsed `qoop history --dir` arguments.

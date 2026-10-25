@@ -15,6 +15,7 @@ mod load;
 mod locate;
 mod project;
 mod redact;
+pub mod said;
 mod subagent;
 mod text;
 

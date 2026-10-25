@@ -375,6 +375,29 @@ fn watching_turned_on_again_is_typed_to_qass_once() {
     assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
 }
 
+/// qass's watcher gone with its session, no switch turned (2026-10-24: 16 hours with no
+/// watcher): the daemon, looking once a minute, sees no watcher twice in a row and tells qass
+/// once to start it again. Slow, so run by hand: `cargo test --test ask -- --ignored gone`.
+#[test]
+#[ignore = "slow: the daemon looks once a minute"]
+fn a_qass_whose_watcher_is_gone_is_told_to_start_it_again() {
+    let stack = Stack::start();
+    let _qass = stack.agent("qass", "qass", None);
+    let told = || {
+        stack
+            .log("qass")
+            .contains("watching on: start your watcher")
+    };
+    let deadline = Instant::now() + Duration::from_secs(200);
+    while !told() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    assert!(told(), "qass was never told: {:?}", stack.log("qass"));
+    // Once: the next tell waits 30 minutes.
+    std::thread::sleep(Duration::from_secs(70));
+    assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
+}
+
 /// The owner's eye opened while qass sleeps: the daemon wakes qass's own tab, and once it is
 /// back and at rest the line is typed, once, with no message from the owner. Turned off, it
 /// wakes nothing; another sleeping tab in qass's space stays asleep.

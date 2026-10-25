@@ -1612,6 +1612,13 @@ impl Daemon {
             &self.connections,
             &self.books.store,
         );
+        // And from here on, a watcher gone with qass's session is noticed and qass told.
+        crate::asks::heal_qass_watcher(
+            &self.terminals,
+            &self.agents,
+            &self.connections,
+            &self.books.store,
+        );
 
         // The chats clients are reading: parked until one is asked about.
         tokio::spawn(crate::messages::Watch::run(

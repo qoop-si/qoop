@@ -32,6 +32,14 @@ more. When you correct it or say how you want things, it keeps the rule in
 every compaction, with its own notes in `memory.md`); a lesson can
 let it settle a kind of reversible step at once, never anything that always asks. qass keeps
 its conversation in the model's full window, so it compacts rarely and keeps what it learned.
+Each night at 04:30 a run in `$(qoop paths data)/learn` reads what you typed to every agent that
+day (`qoop history --since <when>`, which leaves out what qoop and qass typed for you, other
+agents' messages, pasted blocks and runs nobody sat at) and keeps what you said in two or more
+sessions in `$(qoop paths qass-config)/owner.md`. Every agent is handed it with `qoop task rules`;
+a rule you keep repeating although it is written moves to the line said beside each request. A
+learned rule never lets an agent do what it asks about today; one that would waits for your
+word. When anything changed, a short report reaches your phone; tell qass "learn drop <n>" to
+remove a rule, "learn keep <n>" to accept one that waited, "learned" to see them.
 Its folder's `.claude/settings.json` keeps what would fill that window on its own out of
 qass: every plugin you turned on in Claude (turned off for qass alone, again at each
 `qoop qass`), every MCP tool, the built-in tools qass never calls, a skill list past 3,000

@@ -744,17 +744,26 @@ pub(crate) async fn qass_space(store: &StoreHandle) -> Option<i64> {
         .map(|w| w.id)
 }
 
-/// qass's own terminal: the first agent in the space named `qass`.
+/// qass's own terminal: the first agent in the space named `qass`, other than the nightly
+/// learning run, which runs there too and is never qass.
 pub(crate) async fn qass_terminal(
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
     store: &StoreHandle,
 ) -> Option<u32> {
     let qass = qass_space(store).await?;
+    let learn = crate::paths::learn_dir();
     let mut mine: Vec<u32> = terminals
         .streams()
         .into_iter()
         .filter(|t| terminals.workspace_of(*t) == Some(qass))
+        .filter(|t| {
+            !learn.as_ref().is_some_and(|dir| {
+                terminals
+                    .cwd_of(*t)
+                    .is_some_and(|cwd| std::path::Path::new(&cwd).starts_with(dir))
+            })
+        })
         .filter(|t| {
             agents.agent(*t).is_some_and(|a| {
                 matches!(
@@ -843,6 +852,77 @@ pub(crate) fn tell_qass_watching_after_start(
             tell_qass_watching(&terminals, &agents, &connections, &store, false);
         }
     });
+}
+
+/// How often the daemon looks whether qass's watcher still runs.
+const HEAL_EVERY: Duration = Duration::from_secs(60);
+/// Looks in a row that found no watcher before qass is told: a watcher starting or between two
+/// runs (it ends itself every 29 minutes and qass starts the next) is not taken for gone.
+const HEAL_AFTER: u32 = 2;
+/// The least time between two tells: a qass that does not start its watcher is not typed to
+/// every two minutes.
+const HEAL_GAP: Duration = Duration::from_secs(30 * 60);
+
+/// qass's watcher lives in the Monitor of its Claude session. A session that restarts or
+/// resumes takes it down, and with no watcher no event comes to wake qass to start one again
+/// (2026-10-24: 16 hours with none). So every minute: watching on, a qass on Claude here at
+/// rest, and no watcher on [`HEAL_AFTER`] looks in a row: the switch is renewed and qass told,
+/// as `qoop qass watch off` then `on` would. An agent of another kind has no Monitor, so it is
+/// never told: it watches when the owner writes to it (the skill).
+pub(crate) fn heal_qass_watcher(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let (terminals, agents, connections, store) = (
+        terminals.clone(),
+        agents.clone(),
+        connections.clone(),
+        store.clone(),
+    );
+    tokio::spawn(async move {
+        let mut gone = 0;
+        let mut told: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(HEAL_EVERY).await;
+            let missing = watcher_missing(&terminals, &agents, &store).await;
+            let (looks, tell) = heal_step(gone, missing, told.map(|at| at.elapsed()));
+            gone = looks;
+            if tell && crate::paths::renew_qass_watch().unwrap_or(false) {
+                told = Some(Instant::now());
+                tell_qass_watching(&terminals, &agents, &connections, &store, false);
+            }
+        }
+    });
+}
+
+/// One look: the looks in a row that found no watcher, and whether qass is to be told now.
+fn heal_step(gone: u32, missing: bool, since_told: Option<Duration>) -> (u32, bool) {
+    if !missing {
+        return (0, false);
+    }
+    let gone = gone + 1;
+    let tell = gone >= HEAL_AFTER && since_told.is_none_or(|ago| ago >= HEAL_GAP);
+    (if tell { 0 } else { gone }, tell)
+}
+
+/// Watching on, qass a Claude agent here at rest, and no watcher running.
+async fn watcher_missing(
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+    store: &StoreHandle,
+) -> bool {
+    if !crate::paths::qass_watching() || crate::paths::qass_watcher_alive() {
+        return false;
+    }
+    let Some(qass) = qass_terminal(terminals, agents, store).await else {
+        return false;
+    };
+    let claude = agents.agent(qass).is_some_and(|a| {
+        matches!(&a.identity, qoop_domain::AgentIdentity::Known { program, .. } if program == "claude")
+    });
+    claude && standing(agents, terminals, qass).is_some_and(|s| s.at_rest())
 }
 
 /// Whether a switch under [`WATCH_TELL_MAX_AGE`] old is still untold.
@@ -939,6 +1019,7 @@ async fn type_into(
     send(text.as_bytes().to_vec())
         .await
         .map_err(|_| format!("terminal {terminal} did not take the words"))?;
+    crate::paths::note_typed(terminal, "daemon", text);
     tokio::time::sleep(BEFORE_ENTER).await;
     if send(vec![b'\r']).await.is_err() {
         // The words may sit in the composer: clear the line so a second try does not double them.
@@ -1240,6 +1321,21 @@ async fn flush_card(
 
 #[cfg(test)]
 mod tests {
+
+    /// qass is told only after two looks in a row found no watcher, then not again for 30
+    /// minutes; a watcher seen in between starts the count over.
+    #[test]
+    fn a_gone_watcher_is_told_after_two_looks_and_not_again_soon() {
+        assert_eq!(heal_step(0, false, None), (0, false));
+        assert_eq!(heal_step(0, true, None), (1, false));
+        assert_eq!(heal_step(1, true, None), (0, true));
+        assert_eq!(heal_step(1, false, None), (0, false));
+        let soon = Some(Duration::from_secs(60));
+        assert_eq!(heal_step(1, true, soon), (2, false));
+        assert_eq!(heal_step(5, true, soon), (6, false));
+        assert_eq!(heal_step(5, true, Some(HEAL_GAP)), (0, true));
+    }
+
     use super::*;
 
     /// The three turn ends the devbox agent left him on 2026-10-12, two with no "?", ask him;

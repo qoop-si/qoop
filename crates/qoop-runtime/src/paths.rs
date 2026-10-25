@@ -304,15 +304,24 @@ fn told_in(dir: &Path, stamp: Option<&str>) -> std::io::Result<()> {
     }
 }
 
+// ponytail: one lock for the process; the daemon is the one writer while it runs.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
-    // ponytail: one lock for the process; the daemon is the one writer while it runs.
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     if on == watching_in(dir) {
         return Ok(false);
     }
     // Made when missing: an `off` said before qass ever ran still holds once it starts.
     std::fs::create_dir_all(dir)?;
+    write_switch(dir, on)?;
+    note_watch(dir, if on { "switch on" } else { "switch off" });
+    Ok(true)
+}
+
+/// The switch's file: `off`, or on with a fresh `resume` stamp. Written beside and renamed over:
+/// the watcher reading it mid-write must never see an empty file, which reads as on.
+fn write_switch(dir: &Path, on: bool) -> std::io::Result<()> {
     let body = if on {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -321,18 +330,149 @@ fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
     } else {
         "off\n".to_string()
     };
-    // Written beside and renamed over: the watcher reading it mid-write must never see an
-    // empty file, which reads as on.
     let fresh = dir.join(format!(".{QASS_WATCH_FILE}.{}.new", std::process::id()));
     std::fs::write(&fresh, body)?;
-    std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE))?;
-    note_watch_turn(dir, on);
+    std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE))
+}
+
+/// The nightly learning run's folder (skills/learn), beside qass's own: it runs in qass's
+/// space and is never qass.
+pub fn learn_dir() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("learn"))
+}
+
+/// Words qoop typed into a terminal for someone other than the person at it: an agent's or
+/// qass's `qoop prompt` and `qoop send`, an agent started with words (`qoop new`, a worktree, a
+/// schedule, qass itself), and the inbox's lines. Kept so a reader of the person's own messages
+/// (`qoop said`) leaves them out: a transcript cannot tell them from his typing.
+pub const TYPED_LOG: &str = "typed.jsonl";
+/// The most of one text kept: a message is matched on its start.
+const TYPED_KEEP: usize = 2000;
+/// The size past which the log keeps only its newer half.
+const TYPED_MAX_BYTES: u64 = 2 << 20;
+
+/// Note words typed into `terminal` by `from`. Never fails the typing it records.
+pub fn note_typed(terminal: u32, from: &str, text: &str) {
+    if let Some(dir) = data_dir() {
+        let _ = note_typed_in(&dir, terminal, from, text, now_millis());
+    }
+}
+
+/// The words qoop typed, read under the log's lock: never a log caught halfway through being cut.
+pub fn read_typed() -> String {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let Some(Ok(mut file)) = data_dir().map(|dir| std::fs::File::open(dir.join(TYPED_LOG))) else {
+        return String::new();
+    };
+    // SAFETY: the descriptor is open for the whole call; the lock goes with it when it closes.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    let mut all = String::new();
+    let _ = file.read_to_string(&mut all);
+    all
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn note_typed_in(
+    dir: &Path,
+    terminal: u32,
+    from: &str,
+    text: &str,
+    at: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let text: String = text
+        .trim_end_matches(['\r', '\n'])
+        .chars()
+        .take(TYPED_KEEP)
+        .collect();
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    use std::io::{Read, Seek};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    // Only the person reads it, as their scrollback beside it.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(dir.join(TYPED_LOG))?;
+    // One writer at a time across processes: a log cut to its newer half while another adds a
+    // line would lose that line, and the words it names would read as the person's.
+    // SAFETY: the descriptor is open for the whole call; the lock goes with it when it closes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if file.metadata()?.len() > TYPED_MAX_BYTES {
+        let mut all = String::new();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.read_to_string(&mut all)?;
+        let lines: Vec<&str> = all.lines().collect();
+        let keep = format!("{}\n", lines[lines.len() / 2..].join("\n"));
+        file.set_len(0)?;
+        file.write_all(keep.as_bytes())?;
+    }
+    let line = serde_json::json!({ "at": at, "terminal": terminal, "from": from, "text": text });
+    file.write_all(format!("{line}\n").as_bytes())
+}
+
+/// The pid qass's watcher keeps while it runs (watch.sh writes it and leaves it behind when it
+/// ends or is killed).
+pub const QASS_WATCH_PID: &str = "watch.pid";
+
+/// Whether qass's watcher runs: the pid it kept is alive and is the watcher (`watch.sh` in its
+/// command line), the check watch.sh makes of a watcher before it.
+pub fn qass_watcher_alive() -> bool {
+    qass_data_dir().is_some_and(|dir| watcher_alive_in(&dir))
+}
+
+fn watcher_alive_in(dir: &Path) -> bool {
+    let Some(pid) = read_trimmed(&dir.join(QASS_WATCH_PID))
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only says whether the pid is there.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("watch.sh"))
+}
+
+/// The switch on again with a fresh stamp, as `off` then `on` would leave it, for a watcher that
+/// died after it started on the last one: qass is told again and the watcher, started, marks
+/// the new stamp seen. Nothing while the switch is off; true when renewed.
+pub fn renew_qass_watch() -> std::io::Result<bool> {
+    let dir = qass_data_dir().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    renew_in(&dir)
+}
+
+fn renew_in(dir: &Path) -> std::io::Result<bool> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    if !watching_in(dir) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(dir)?;
+    write_switch(dir, true)?;
+    note_watch(dir, "watcher gone, told again");
     Ok(true)
 }
 
 /// One line in qass's `watch.log` for a turn of the switch, beside the watcher's own starts and
 /// ends: the day it went dark has its time on record. A failure to note it changes nothing.
-fn note_watch_turn(dir: &Path, on: bool) {
+fn note_watch(dir: &Path, what: &str) {
     use std::io::Write;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -341,7 +481,7 @@ fn note_watch_turn(dir: &Path, on: bool) {
         .append(true)
         .create(true)
         .open(dir.join("watch.log"))
-        .and_then(|mut f| writeln!(f, "{at} switch {}", if on { "on" } else { "off" }));
+        .and_then(|mut f| writeln!(f, "{at} {what}"));
 }
 
 /// Where the daemon keeps what has to outlive a reboot: its database and its history.
@@ -764,6 +904,97 @@ mod tests {
     /// test harness runs them on parallel threads, and one test's `remove_var` landing
     /// between another's `set_var` and its read failed it at random.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// What qoop typed is kept a line each, cut, and an empty one not at all; past its size the
+    /// log keeps its newer half.
+    #[test]
+    fn typed_words_are_kept_a_line_each_and_the_log_stays_small() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path();
+        note_typed_in(dir, 7, "T466", "do the thing\r", 1000).unwrap();
+        note_typed_in(dir, 7, "T466", " \r", 1001).unwrap();
+        note_typed_in(dir, 8, "daemon", &"x".repeat(5000), 1002).unwrap();
+        let all = std::fs::read_to_string(dir.join(TYPED_LOG)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join(TYPED_LOG))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let rows: Vec<serde_json::Value> = all
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["text"], "do the thing");
+        assert_eq!(rows[0]["from"], "T466");
+        assert_eq!(rows[1]["text"].as_str().unwrap().len(), TYPED_KEEP);
+        let big = "y".repeat(1000);
+        for n in 0..2200 {
+            note_typed_in(dir, 1, "x", &big, n).unwrap();
+        }
+        assert!(std::fs::metadata(dir.join(TYPED_LOG)).unwrap().len() <= TYPED_MAX_BYTES + 2048);
+    }
+
+    /// A watcher runs only when the pid it kept is alive and is `watch.sh`: no file, a pid
+    /// gone, and a live process that is something else all read as none.
+    #[test]
+    fn a_watcher_runs_only_while_its_pid_is_a_live_watch_sh() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path();
+        assert!(!watcher_alive_in(dir));
+        // This test's own process is alive and is no watcher.
+        std::fs::write(
+            dir.join(QASS_WATCH_PID),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(!watcher_alive_in(dir));
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        std::fs::write(dir.join(QASS_WATCH_PID), format!("{}\n", gone.id())).unwrap();
+        assert!(!watcher_alive_in(dir));
+        let script = dir.join("watch.sh");
+        std::fs::write(&script, "sleep 30\n").unwrap();
+        let mut watcher = std::process::Command::new("sh")
+            .arg(&script)
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.join(QASS_WATCH_PID), format!("{}\n", watcher.id())).unwrap();
+        assert!(watcher_alive_in(dir));
+        watcher.kill().unwrap();
+        watcher.wait().unwrap();
+        assert!(!watcher_alive_in(dir));
+    }
+
+    /// Renewing gives the switch a stamp no watcher has seen, so qass is told again; nothing
+    /// while it is off.
+    #[test]
+    fn a_renewed_switch_is_a_stamp_no_watcher_has_seen() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("qass");
+        assert!(set_watching_in(&dir, false).unwrap());
+        assert!(!renew_in(&dir).unwrap());
+        assert!(!watching_in(&dir));
+        assert!(set_watching_in(&dir, true).unwrap());
+        let first = resuming_stamp(&dir).unwrap();
+        // The watcher started on it, and later died.
+        std::fs::write(dir.join(QASS_WATCH_SEEN), format!("{first}\n")).unwrap();
+        std::fs::write(dir.join(QASS_WATCH_TOLD), format!("{first}\n")).unwrap();
+        assert!(untold_in(&dir).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(renew_in(&dir).unwrap());
+        let again = untold_in(&dir).unwrap();
+        assert_ne!(again, first);
+        assert!(watching_in(&dir));
+        let log = std::fs::read_to_string(dir.join("watch.log")).unwrap();
+        assert!(
+            log.lines()
+                .last()
+                .unwrap()
+                .ends_with("watcher gone, told again")
+        );
+    }
 
     /// No file is on; off is said once; on from off is a fresh stamp the watcher has not
     /// seen, and on again (or an on with nothing off) changes nothing. The stamp seen is on.
