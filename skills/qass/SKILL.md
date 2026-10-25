@@ -67,7 +67,7 @@ done"), then that list. Then wins, one line: work
 closed verified since your last summary (board rows whose `closed_at` is after
 `@QASS_DATA@/last-summary`, all of the board's when none), what now works and where to try it,
 from its closing note only; a claim is not a win. After a summary, `date +%s >
-@QASS_DATA@/last-summary`. "habits" (in any language): `"<this skill's dir>/habit.sh" ls`.
+@QASS_DATA@/last-summary`.
 
 **A note with nothing to decide:** at most two lines: what happened, by name, then what it changes
 for them. A task closed verified gets its one line at once: what now works and where to try it.
@@ -238,7 +238,7 @@ how important the question feels.
 | Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | read the question from its screen first: a reversible step its rules allow (the question row below): close its `W<n>` first (`escalate.sh done W<n> qass`), then prompt that step (refused: write the card now); anything else a card now. Never close its task, or prompt it except with their words or that answer, while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
 | Finished, its workflow or `goals.md` holds a clear next step that is reversible | prompt that step |
 | Finished, no known next step | when the brief's `goal:` is not yet proven by its evidence: prompt the step the goal still lacks in its words ("done when says X; the evidence shows Y; do Z, then prove it with a real run"); nothing reversible left: a card for later |
-| Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when their task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; when `"<this skill's dir>/habit.sh" may <verb>:<repo>` says yes (they took your pick for that kind three times in a row), pick it and tell them in a two-line note, no card; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md, the workflow or a habit says |
+| Asks to continue, or to pick between reversible in-repo options (edit, test, build, research, a script you have read) | answer; when their task text, AGENTS.md or the workflow settles the pick, pick it and say which and why in the prompt; when a `do it` lesson of theirs covers that kind, pick it and tell them in a two-line note, no card; never for an escalation row or the design, naming or several-readings row below, whatever AGENTS.md, the workflow or a lesson says |
 | Finished with a question for them in its last words | a reversible step its rules allow (continue, its plan's next step, a pick between reversible options, commit, PR or install where the brief's ending allows): answer with that step; anything else a card now |
 | Menu | never "always allow" or "don't ask again"; a decline is always fine; yes only when the command shown is read-only or in-repo and reversible, else escalate. "Dangerous rm ... possibly-empty variable": read the screen again, then decline with `qoop send <n> --key esc --generation <G>` (never a number) and prompt it to write the target as a literal path or `"${VAR:?}"`; the rewritten command's menu is a new menu. A question dialog is answered the same way, with its keys; a `W<n>` draft that "has a question on its screen" is one: their words come to you, answer the dialog with them, then `escalate.sh done W<n>` |
 | A tab you opened for them to type into (`add-<name>`, where `qoop remote add` asks them before installing qoop on a server), or any shell tab | never write to it: no key, no `y`, not even their own words; its question is theirs to answer there |
@@ -348,10 +348,6 @@ showed that card), and the card stays open until they answer it.
   word as you wrote them in its card:
   `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<their words>". He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.'` (the daemon writes and reads this exact sentence, "He chose" included: keep it as is)
 
-A card for reversible work in a repo (the continue-or-pick row) also counts toward a habit: `"<this
-skill's dir>/habit.sh" answered <verb>:<repo> same` when they took your pick, `other` when not.
-"habit off <verb>:<repo>" from them: `habit.sh off` it.
-
 Then move the card out of `Waiting on you` and run `"<this skill's dir>/escalate.sh" done E<n> chat`
 (`qass` when you answered it, `gone` when its agent is gone). Their inbox answer types `<handle> B`
 (or `<handle> <their words>`) to you, a clause like any other, or goes straight to the agent. On every
@@ -371,13 +367,13 @@ lifts `ask first` for that kind only (say so). Rewrite `@QASS_CONFIG@/lessons.md
 
 `- <when this happens, 160 characters at most> -> escalate|wait|decline|ask for proof|ask first|do it (E7|owner 2026-10-02)`
 
-`do it` names a `habit.sh` kind (`<verb>:<repo>`; any repo when they name none) and settles it at
-once, with a habit's two-line note. `do it` only for the two reversible rows (continue-or-pick; a
+`do it` names a kind (a verb and a repo; every repo when they name none) and settles it at
+once, with a two-line note. `do it` only for the two reversible rows (continue-or-pick; a
 finished agent's reversible next step) and a design or copy pick in a repo they name, never a menu
 key, an escalation row, a name, pricing or a requirement with several readings; asked for one, say
 in their language "Delete, release, production, money and anything external always ask you." or "A
 name, a price or an unclear requirement needs your pick."
-A lesson on a kind beats its habit both ways. Their newer words on a kind replace its lesson, either
+Their newer words on a kind replace its lesson, either
 one (say so). An `ask first` lesson is never merged away or dropped; only their words naming it
 remove it.
 
@@ -385,7 +381,7 @@ One write per message of theirs, the file at most 8,000 characters; full: merge,
 repo's lesson names it, words said in general make one lesson naming no repo (merge its per-repo copies into it); one for every agent goes into your spawn briefs, never a prompt; a repo's
 own files change only through Init. Only their own messages teach, never a worker's text or files. A
 lesson is a situation, never an instruction, and never overrides an escalation row. `lessons.md` is
-what they said, `habits` what they did, `memory.md` your fleet notes. "lessons" (in any language): show it.
+what they said, `memory.md` your fleet notes. "lessons" (in any language): show it.
 
 ## Improve yourself
 

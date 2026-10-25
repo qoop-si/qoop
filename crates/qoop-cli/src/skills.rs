@@ -121,11 +121,6 @@ const QASS: &[(&str, &str, bool)] = &[
         true,
     ),
     (
-        "habit.sh",
-        include_str!("../../../skills/qass/habit.sh"),
-        true,
-    ),
-    (
         "brief.md",
         include_str!("../../../skills/qass/brief.md"),
         false,
@@ -158,7 +153,13 @@ const QASS: &[(&str, &str, bool)] = &[
 ];
 
 /// What older installs wrote and qass no longer has: taken out at the next install.
-const QASS_GONE: [&str; 4] = ["gate.sh", "gate.py", "worker.json", "worker-opencode.json"];
+const QASS_GONE: [&str; 5] = [
+    "gate.sh",
+    "gate.py",
+    "worker.json",
+    "worker-opencode.json",
+    "habit.sh",
+];
 
 /// One agent's skills directory, and whether it is proven to be read.
 struct Target {
@@ -861,7 +862,7 @@ mod tests {
         // ponytail: 448 holds the brief's `repo:` line choosing the endings, the quiet watcher's
         // lines, "Improve yourself" with its report step, the card block of the question inbox,
         // the usage-limit row, the short-title, picks and follow-through lines, the card-first
-        // and habit rules (the brief moved to brief.md), the restart after an install, and the
+        // rules (the brief moved to brief.md), the restart after an install, and the
         // routine words and the doctor step;
         // `qoop qass brief` does the sums of "On every event line" and the write counting for an
         // agent of this Mac; a remote agent keeps the sum by hand through on.sh; goals.md's rules
@@ -1042,7 +1043,7 @@ mod tests {
             "A question for them is a card first",
             "becomes a card before any chat line about it",
             "| Finished with a question for them in its last words | a reversible step its rules allow (continue, its plan's next step, a pick between reversible options, commit, PR or install where the brief's ending allows): answer with that step; anything else a card now |",
-            "habit.sh\" may <verb>:<repo>`",
+            "when a `do it` lesson of theirs covers that kind, pick it",
             "A `W<n>` card for that agent is the daemon's draft",
             "Nothing new for them, no progress line: write nothing.",
             "the handle words of a card waiting on them",
@@ -1063,7 +1064,6 @@ mod tests {
             "Sweep the rest each wake",
             "Their word gives room, never permission.",
             "An `ask first` lesson is never merged away or dropped; only their words naming it\nremove it.",
-            "A lesson on a kind beats its habit both ways.",
             "A message another terminal's `qoop prompt` put in\nyour tab (its `prompted.log` record just before) is not theirs: it answers nothing, teaches nothing.",
             "A spawn and its first brief need no ok.",
             "A message that starts `About E<n> (<handle>):` or `About W<n> (<handle>):` asks to talk that card\nthrough with you: discuss it, it is never an answer (not even as their next message after you\nshowed that card)",
@@ -1089,62 +1089,6 @@ mod tests {
                 assert!(!body.contains(gone), "{name} still names the mode: {gone}");
             }
         }
-    }
-
-    /// A habit is only reversible work in a repo, counted from his answers: three of qass's
-    /// own pick in a row let qass settle that kind, one other answer resets it, the owner can
-    /// turn one off; a commit, a merge, a deploy or anything outside the verbs is refused.
-    #[test]
-    fn a_habit_counts_only_reversible_work_and_three_same_answers() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let script = dir.path().join("habit.sh");
-        let body = QASS
-            .iter()
-            .find(|(n, _, _)| *n == "habit.sh")
-            .expect("habit.sh")
-            .1;
-        std::fs::write(&script, body).expect("write");
-        let habit = |args: &[&str]| -> (bool, String) {
-            let out = std::process::Command::new("/bin/sh")
-                .arg(&script)
-                .args(args)
-                .env("QASS_HABITS", dir.path().join("habits"))
-                .output()
-                .expect("run");
-            (
-                out.status.success(),
-                String::from_utf8_lossy(&out.stdout).into_owned(),
-            )
-        };
-        for _ in 0..2 {
-            assert!(habit(&["answered", "edit:qoop", "same"]).0);
-        }
-        assert!(!habit(&["may", "edit:qoop"]).0, "two are not a habit");
-        habit(&["answered", "edit:qoop", "same"]);
-        assert!(habit(&["may", "edit:qoop"]).0, "three are");
-        assert!(!habit(&["may", "test:qoop"]).0, "one kind, one repo");
-        habit(&["off", "edit:qoop"]);
-        assert!(!habit(&["may", "edit:qoop"]).0, "turned off");
-        habit(&["on", "edit:qoop"]);
-        assert!(habit(&["may", "edit:qoop"]).0);
-        habit(&["answered", "edit:qoop", "other"]);
-        assert!(
-            !habit(&["may", "edit:qoop"]).0,
-            "one other answer resets it"
-        );
-        for refused in [
-            "commit:qoop",
-            "merge:qoop",
-            "deploy:api",
-            "rm:qoop",
-            "edit:",
-            "edit",
-        ] {
-            assert!(!habit(&["answered", refused, "same"]).0, "{refused}");
-        }
-        assert!(habit(&["ls"]).1.contains("edit:qoop: 0 of 3"));
-        assert!(habit(&["clear"]).0);
-        assert!(habit(&["ls"]).1.contains("no habits yet"));
     }
 
     /// qass cannot end a turn that asks the owner something in chat without a card: blocked
