@@ -137,16 +137,8 @@ fn learned(dir: Option<&std::path::Path>, turn: bool) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    // Beside a request only the rule: what it was learned from is in the session's block.
     if turn {
-        let bare: Vec<String> = lines
-            .iter()
-            .map(|l| l.split(" (said ").next().unwrap_or(l).trim().to_string())
-            .collect();
-        return Some(format!(
-            "The owner keeps saying: {}.",
-            fitting(&bare, LEARNED_TURN_MAX, "; ")
-        ));
+        return Some(turn_text(&lines));
     }
     let bullets: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
     Some(format!(
@@ -154,6 +146,22 @@ fn learned(dir: Option<&std::path::Path>, turn: bool) -> Option<String> {
          more than the always-ask list above:\n{}",
         fitting(&bullets, LEARNED_SESSION_MAX, "\n")
     ))
+}
+
+/// The line beside a request: only each rule, without what it was learned from (that is in the
+/// session's block), as one sentence.
+fn turn_text(lines: &[String]) -> String {
+    let bare: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            let rule = l.split(" (said ").next().unwrap_or(l).trim();
+            rule.trim_end_matches('.').to_string()
+        })
+        .collect();
+    format!(
+        "The owner keeps saying: {}.",
+        fitting(&bare, LEARNED_TURN_MAX, "; ")
+    )
 }
 
 /// `owner/name` of the GitHub repository `dir` is in, by its origin; any owner.
@@ -951,6 +959,23 @@ mod tests {
         );
         assert_eq!(learned_lines(OWNER_MD, Some("qoop-si/qoop"), true).len(), 1);
         assert!(learned_lines("", None, false).is_empty());
+    }
+
+    #[test]
+    fn the_line_beside_a_request_is_the_rules_alone_in_one_sentence() {
+        let lines = learned_lines(OWNER_MD, Some("pat/app"), true);
+        assert_eq!(
+            turn_text(&lines),
+            "The owner keeps saying: Prove done with a real run; Never name search."
+        );
+        let dotted = [
+            "Open it yourself.".to_string(),
+            "Short recaps. (said 2x)".to_string(),
+        ];
+        assert_eq!(
+            turn_text(&dotted),
+            "The owner keeps saying: Open it yourself; Short recaps."
+        );
     }
 
     #[test]
