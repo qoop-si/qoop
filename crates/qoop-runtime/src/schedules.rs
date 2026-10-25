@@ -409,11 +409,18 @@ pub(crate) async fn write(
                             format!("a watch's lines are at most {SEEN_MOST} bytes"),
                         );
                     }
-                    store
+                    let started = result == "started";
+                    let applied = store
                         .run(move |s| {
                             s.report_schedule(schedule, slot, &result, terminal, seen.as_deref())
                         })
-                        .await
+                        .await;
+                    // A run that opened an agent, once: a watch's check that found nothing new
+                    // reports something else, and a late report for an old slot is not applied.
+                    if started && matches!(applied, Ok(true)) {
+                        crate::telemetry::count(crate::telemetry::Event::ScheduleRan);
+                    }
+                    applied
                 }
                 ScheduleOp::Add { .. } => unreachable!("an add is handled above"),
             };

@@ -423,6 +423,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::Telemetry { .. }
             | ControlRequest::PersonAt { .. }
             | ControlRequest::TaskWrite { .. }
             | ControlRequest::TaskRead { .. }

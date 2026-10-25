@@ -2496,6 +2496,13 @@ pub async fn run(
     only: Option<i64>,
     focus: Option<u32>,
 ) -> io::Result<()> {
+    // Said in the hello, for the usage counts: which terminal app and multiplexer.
+    let (term, mux) = crate::colorlevel::runs_in(
+        &crate::colorlevel::current_env(),
+        std::env::var_os("ZELLIJ").is_some(),
+        std::env::var_os("STY").is_some(),
+    );
+    qoop_runtime::client::set_runs_in(term, mux);
     let local = match socket {
         Some(socket) => Some(client::connect(socket, qoop_proto::INTERFACE_ID).await?),
         None => None,

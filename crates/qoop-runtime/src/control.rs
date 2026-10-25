@@ -563,6 +563,19 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<bool>,
     },
+    /// Usage counts (ADR-023). `Status` looks at the conditions and acts on them now, `Show`
+    /// answers every day not yet sent as it would be sent, `Off` stops counting and any send at
+    /// once and deletes the counts, the id and the notice mark, `On` lifts an `Off`. `On` is
+    /// refused to a terminal's token and to the phone: an agent does not undo the owner's off
+    /// (a guard, not a boundary). A daemon from before it answers `unknown variant`.
+    Telemetry {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalStream>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        action: TelemetryOp,
+    },
     /// Until when a person is at a terminal (typing there, or a line just sent), so another
     /// sender does not type over them. A daemon from before it answers `unknown variant`.
     PersonAt {
@@ -886,6 +899,16 @@ pub struct ShowInfo {
     pub space: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+}
+
+/// What a `Telemetry` request does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryOp {
+    Status,
+    Show,
+    On,
+    Off,
 }
 
 /// What an `AskWrite` does.
@@ -1605,6 +1628,7 @@ impl ControlRequest {
             | Self::UpdateState { id }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
             | Self::TaskWrite { id, .. }
             | Self::TaskRead { id, .. }
@@ -1830,6 +1854,18 @@ pub enum ControlResponse {
     QassWatch {
         id: String,
         on: bool,
+    },
+    /// Where usage counts stand after a `Telemetry`: `on`, `paused` or `off`, why when not on,
+    /// and for `Show` the days as they would be sent. `counting` is false on a daemon that
+    /// keeps no counts at all (not a release build).
+    Telemetry {
+        id: String,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+        counting: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        days: Option<serde_json::Value>,
     },
     /// The answer to `PersonAt`: until when, as unix seconds, `None` when nobody is there.
     PersonAt {
@@ -2518,6 +2554,7 @@ impl ControlResponse {
             | Self::UpdateState { id, .. }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
             | Self::TaskWritten { id, .. }
             | Self::Tasks { id, .. }

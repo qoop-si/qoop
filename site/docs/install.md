@@ -18,6 +18,8 @@ Every answer can be changed later with `qoop settings`; a step you skipped, such
 is `qoop login`. When `~/.local/bin` is not on your `PATH` yet, it prints the line to add to
 your shell profile. The script and `qoop update`
 read the releases from `https://qoop.si/releases` over https; no account or token is involved.
+qoop also sends a few numbers a day about how it is used, never content, once it has told you
+so; [Usage counts](telemetry.md) shows exactly what and how to stop it.
 
 Linux builds need glibc 2.17 or newer (CentOS 7 and anything since). On a musl system such as
 Alpine the script says so and stops: build from source there.

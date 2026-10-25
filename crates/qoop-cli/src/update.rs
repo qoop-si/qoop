@@ -1,7 +1,7 @@
 //! `qoop update`: replace this binary with the newest release.
 //!
-//! The one subcommand that needs the network, and it says so in
-//! `docs/cli-surface.md`. Everything else behaves the same offline; this one fails
+//! A subcommand that needs the network, and it says so in `docs/cli-surface.md` (the other
+//! reach of a release build is its daemon's daily usage counts, ADR-023). Everything else behaves the same offline; this one fails
 //! closed instead: with the network gone it installs nothing, says so, and exits nonzero.
 //!
 //! The daemon never fetches or installs anything itself (ADR-019), and neither does the

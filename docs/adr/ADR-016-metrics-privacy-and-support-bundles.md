@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-09-10
 Amended: 2026-09-29, recorded that no bundle was ever producible from a running daemon.
+Amended by: ADR-023 (2026-10-26), usage counts leave the machine by default.
 Evidence: `crates/qoop-support/src/lib.rs` and its tests
 Reproduce: `./scripts/bundle-check.sh`
 
@@ -84,12 +85,15 @@ anything derived from what a person typed or an agent produced, including length
 hashes. A hash of a command line is a fingerprint of a command line.
 
 Counters are local. Nothing leaves the machine unless a person exports a bundle, and
-exporting is an explicit act with an explicit destination.
+exporting is an explicit act with an explicit destination. (Amended by ADR-023: a release
+build sends a day's usage counts, numbers and fixed names only, unless turned off.)
 
 ### Privacy is a property of the default, not of a setting
 
 There is no telemetry to turn off. A setting that defaults to on and can be turned off is a
-decision made by whoever did not read the setting.
+decision made by whoever did not read the setting. (Amended by ADR-023, which answers this
+argument: the usage counts are on by default, shown before anything is counted, printable
+with `qoop telemetry show` and stopped by one command.)
 
 ## Consequences
 

@@ -13,6 +13,16 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         None => show(false),
         Some("--json") if args.len() == 3 => show(true),
         Some("set") => match (args.get(3), args.get(4), args.len()) {
+            // Usage counts go through the same switch as the settings row: an off reaches the
+            // daemon and deletes what was counted, an on is refused inside a qoop terminal.
+            (Some(key), Some(value), 5) if key == "telemetry" => match value.as_str() {
+                "true" | "false" => {
+                    crate::telemetry::switch(value == "true").map_err(std::io::Error::other)?;
+                    println!("{key} = {value}");
+                    Ok(())
+                }
+                _ => Err(std::io::Error::other("telemetry is true or false")),
+            },
             (Some(key), Some(value), 5) => {
                 config::set(&config::path(), key, value).map_err(std::io::Error::other)?;
                 // The notch reads it when it starts, or at once from its own window.

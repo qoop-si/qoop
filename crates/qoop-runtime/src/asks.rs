@@ -411,6 +411,7 @@ pub(crate) async fn draft_waiting(
         })
         .await;
     if matches!(made, Ok(Some(_))) {
+        crate::telemetry::count(crate::telemetry::Event::DraftAsked);
         connections.asks_changed();
     }
 }
@@ -469,6 +470,7 @@ pub(crate) async fn draft_dialog(
         })
         .await;
     if matches!(made, Ok(Some(_))) {
+        crate::telemetry::count(crate::telemetry::Event::DialogAsked);
         connections.asks_changed();
     }
 }
@@ -587,6 +589,10 @@ pub(crate) async fn write(
                 return failed(id, reason);
             }
             match add(&card, agent, *body, terminals, store).await {
+                Ok(AskResult::Added) => {
+                    crate::telemetry::count(crate::telemetry::Event::QassAsked);
+                    AskResult::Added
+                }
                 Ok(result) => result,
                 Err(reason) => return failed(id, reason),
             }
@@ -596,6 +602,10 @@ pub(crate) async fn write(
                 return failed(id, reason);
             }
             match close(&card, &note, store).await {
+                Ok(AskResult::Closed) => {
+                    crate::telemetry::count(crate::telemetry::Event::ClosedByQass);
+                    AskResult::Closed
+                }
                 Ok(result) => result,
                 Err(reason) => return failed(id, reason),
             }
@@ -605,6 +615,10 @@ pub(crate) async fn write(
                 return failed(id, "a card is put away by the owner, not from a terminal");
             }
             match close(&card, "dismissed", store).await {
+                Ok(AskResult::Closed) => {
+                    crate::telemetry::count(crate::telemetry::Event::Dismissed);
+                    AskResult::Closed
+                }
                 Ok(result) => result,
                 Err(reason) => return failed(id, reason),
             }
@@ -1325,8 +1339,15 @@ async fn flush_card(
     }
     sent.insert(target, Instant::now());
     connections.asks_changed();
-    if let Err(reason) = type_into(terminals, target, &line).await {
-        give_back(reason).await;
+    match type_into(terminals, target, &line).await {
+        Err(reason) => give_back(reason).await,
+        // The owner's answer reached the agent; one passed to qass has not yet.
+        Ok(_) if matches!(route, Route::Worker(_)) => {
+            crate::telemetry::count(crate::telemetry::Event::Answered {
+                waited: now() - row.opened_at,
+            });
+        }
+        Ok(_) => {}
     }
 }
 

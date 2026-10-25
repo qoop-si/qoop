@@ -146,6 +146,19 @@ pub const PHONE: &str = "qoro-mobile";
 /// rather than left hearing nothing.
 pub const MICROPHONE: &str = "microphone";
 
+/// The hello keys an interface names its terminal app and multiplexer under, for the usage
+/// counts (ADR-023). The daemon only compares them with its fixed list.
+pub const TERM: &str = "term";
+pub const MUX: &str = "mux";
+
+/// The terminal app and multiplexer this interface runs in, set once before it connects.
+static RUNS_IN: std::sync::OnceLock<(String, Option<String>)> = std::sync::OnceLock::new();
+
+/// Say which terminal app (one of `telemetry::TERMS`) and multiplexer this interface runs in.
+pub fn set_runs_in(term: &str, mux: Option<&str>) {
+    let _ = RUNS_IN.set((term.to_string(), mux.map(str::to_string)));
+}
+
 fn hello(client_id: &str, observer: bool, replaces: Option<&str>, link: bool) -> ClientHello {
     let mut extra = serde_json::Map::new();
     if link {
@@ -154,6 +167,12 @@ fn hello(client_id: &str, observer: bool, replaces: Option<&str>, link: bool) ->
     }
     if client_id == qoop_proto::INTERFACE_ID {
         extra.insert(MICROPHONE.into(), serde_json::Value::Bool(true));
+        if let Some((term, mux)) = RUNS_IN.get() {
+            extra.insert(TERM.into(), serde_json::Value::String(term.clone()));
+            if let Some(mux) = mux {
+                extra.insert(MUX.into(), serde_json::Value::String(mux.clone()));
+            }
+        }
     }
     if observer {
         extra.insert(OBSERVER.into(), serde_json::Value::Bool(true));

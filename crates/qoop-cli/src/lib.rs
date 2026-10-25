@@ -48,6 +48,7 @@ mod sound;
 mod supervise;
 mod task;
 mod task_verify;
+mod telemetry;
 mod uninstall;
 mod update;
 mod watch;
@@ -147,6 +148,14 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         eprintln!("qoop: {e}");
         std::process::exit(2);
     }
+    // An opt out in the environment is written down before anything else runs; the commands
+    // the daemon and a remote bootstrap run are not a person's.
+    if !matches!(
+        args.get(1).map(String::as_str),
+        Some("daemon" | "--hello" | "--handoff-formats" | "relay" | "attach" | "hook-report")
+    ) {
+        telemetry::honour_env();
+    }
     match args.get(1).map(String::as_str) {
         Some("daemon") => run_daemon(&args),
         // What a daemon about to move onto this binary asks of it: the handover layout it
@@ -209,6 +218,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("config") => config::run(&args),
         Some("sound") => sound::run(&args),
         Some("settings") => settings::run(&args),
+        Some("telemetry") => telemetry::run(&args),
         Some("onboard") => onboard::run(&args, phone),
         Some("skills") => skills::run(&args),
         Some("icons") => icons::run(&args),
@@ -335,6 +345,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop config set <key> <value>  change one, keeping the rest of the file\n\
                   \x20 qoop settings   every setting on one page, with your pet\n\
                   \x20 qoop onboard    the first start: pet, sounds, look, keys, notifications, sleep, qass\n\
+                  \x20 qoop telemetry [status|show|on|off]  the daily usage counts: what is sent, and stopping it\n\
                   \x20 qoop qass [page]  open qass, the assistant over your agents, or its page\n\
                   \x20 qoop qass brief <n> [--json]  what qass must know before it writes to agent n\n\
                   \x20 qoop qass watch [on|off]  whether qass watches your agents, or wakes only when you write;\n\
@@ -490,6 +501,15 @@ fn run_daemon(args: &[String]) -> std::io::Result<()> {
                     if let Some(keeper) = keep::Keeper::for_this(&exe, born) {
                         tokio::spawn(keeper.run());
                     }
+                    // Usage counts (ADR-023) from a release build only; a debug build may be
+                    // pointed at a local hub to try it.
+                    let d = match qoop_runtime::telemetry::debug_url() {
+                        Some(url) => d.sampling_telemetry(url),
+                        None if update::release_built() => {
+                            d.sampling_telemetry(qoop_runtime::telemetry::URL.into())
+                        }
+                        None => d,
+                    };
                     d.leaving_when_idle().restarting_into(exe)
                 }
                 Err(e) => {
@@ -571,6 +591,8 @@ fn run_client() -> std::io::Result<()> {
     // and exits without touching it.
     ensure_daemon(&socket)?;
     supervise::ensure_awake()?;
+    // Before the interface takes the screen, once: what the usage counts are (ADR-023).
+    telemetry::notice_once();
 
     let rt = tokio::runtime::Runtime::new()?;
     // The interface, not the bare attach. `qoop attach` is still there for the one terminal
@@ -3470,6 +3492,12 @@ fn take_session(args: &mut Vec<String>) -> Result<(), paths::PathError> {
         }
     }
     Ok(())
+}
+
+/// What `qoop-app` runs before its own commands, as every command here does first: an opt out
+/// of the usage counts in the environment written down for good.
+pub fn honour_telemetry_env() {
+    telemetry::honour_env();
 }
 
 /// The store as it is on disk: where the daemon keeps it, or beside the socket when no

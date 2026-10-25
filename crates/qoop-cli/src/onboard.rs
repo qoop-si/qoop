@@ -458,6 +458,8 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         }
     }
     drop(session);
+    // What the usage counts are, before anything is counted (ADR-023).
+    crate::telemetry::notice_once();
     if let Some(phone) = phone
         && let Some(hint) = sign_in(phone, ask(SIGN_IN).as_deref())
     {

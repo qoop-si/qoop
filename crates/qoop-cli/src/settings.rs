@@ -186,6 +186,18 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
             config::REPORT_SENDS.map(String::from).to_vec(),
         ),
     ));
+    // A group of its own: the onboarding's notes step shows `report`, and the notice line is
+    // the onboarding's say about usage counts.
+    out.push(row(
+        "usage",
+        "usage counts",
+        on(matches!(
+            qoop_runtime::config::telemetry_from(&config::path()),
+            qoop_runtime::config::TelemetrySetting::On
+        )),
+        "daily numbers only, never content: qoop telemetry show prints them",
+        Kind::Toggle("telemetry"),
+    ));
     for agent in &read.agents {
         out.push(row(
             "agents",
@@ -275,7 +287,7 @@ fn filtered(all: &[Row], query: &str, chip: usize) -> Vec<Row> {
         .filter(|r| match CHIPS[chip] {
             "all" => true,
             "look" => matches!(r.group, "look" | "keys"),
-            "agents" => matches!(r.group, "agents" | "qass" | "report"),
+            "agents" => matches!(r.group, "agents" | "qass" | "report" | "usage"),
             chip => r.group == chip,
         })
         .filter(|r| {
@@ -328,6 +340,8 @@ pub(crate) fn options(row: &Row, macos: bool) -> (Vec<String>, usize) {
 pub(crate) fn write(row: &Row, value: &str) -> Result<(), String> {
     let path = config::path();
     match &row.kind {
+        // Off reaches the daemon at once and deletes what was counted; on waits for the notice.
+        Kind::Toggle("telemetry") => crate::telemetry::switch(value == "on"),
         Kind::Toggle(key) => config::set(&path, key, if value == "on" { "true" } else { "false" }),
         // Choosing a sound is wanting to hear it, as in `qoop sound`.
         Kind::Sound(key, _) => {

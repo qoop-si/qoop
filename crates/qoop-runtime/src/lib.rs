@@ -31,6 +31,7 @@ pub mod spill;
 pub mod state;
 pub mod store;
 mod tasks;
+pub mod telemetry;
 pub mod terminal;
 mod tunnel;
 

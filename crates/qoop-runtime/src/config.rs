@@ -149,6 +149,125 @@ static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 ///
 /// Against another process this is last writer wins on a whole file, as any editor is.
 pub fn edit(path: &Path, edits: &[(&str, toml_edit::Item)]) -> Result<(), String> {
+    edit_doc(path, |doc| {
+        for (key, item) in edits {
+            // Every part but the last is a table, made when missing: `qass.models.best` is the
+            // key `best` of `[qass.models]`.
+            let (tables, leaf) = key.rsplit_once('.').unwrap_or(("", key));
+            let mut at: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+            let parts: Vec<&str> = tables.split('.').filter(|t| !t.is_empty()).collect();
+            for (n, table) in parts.iter().copied().enumerate() {
+                if at.get(table).is_none() {
+                    let mut fresh = toml_edit::Table::new();
+                    // A table that only holds a deeper one gets no header of its own.
+                    fresh.set_implicit(n + 1 < parts.len());
+                    at.insert(table, toml_edit::Item::Table(fresh));
+                }
+                at = match at.get_mut(table).and_then(|t| t.as_table_like_mut()) {
+                    Some(next) => next,
+                    None => return Err(format!("{table} is not a table in {}", path.display())),
+                };
+            }
+            put(at, leaf, item);
+        }
+        Ok(())
+    })
+}
+
+/// Turn usage counts on or off (ADR-023): every `telemetry` key in the file, at any depth, is
+/// taken out and one `telemetry` at the top says `on`. A `telemetry = false` that ended up
+/// under `[daemon]` would otherwise outlive every later "on".
+pub fn set_telemetry(path: &Path, on: bool) -> Result<(), String> {
+    edit_doc(path, |doc| {
+        strip_telemetry(doc.as_table_mut());
+        // A top level key is written above the first table, where a person looks for it.
+        doc["telemetry"] = toml_edit::value(on);
+        Ok(())
+    })
+}
+
+fn strip_telemetry(table: &mut dyn toml_edit::TableLike) {
+    table.remove("telemetry");
+    for (_, item) in table.iter_mut() {
+        strip_item(item);
+    }
+}
+
+fn strip_item(item: &mut toml_edit::Item) {
+    match item {
+        toml_edit::Item::Table(t) => strip_telemetry(t),
+        toml_edit::Item::ArrayOfTables(a) => a.iter_mut().for_each(|t| strip_telemetry(t)),
+        toml_edit::Item::Value(v) => strip_value(v),
+        toml_edit::Item::None => {}
+    }
+}
+
+fn strip_value(value: &mut toml_edit::Value) {
+    match value {
+        toml_edit::Value::InlineTable(t) => strip_telemetry(t),
+        toml_edit::Value::Array(a) => a.iter_mut().for_each(strip_value),
+        _ => {}
+    }
+}
+
+/// What the file says about usage counts (ADR-023).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TelemetrySetting {
+    /// No `telemetry` key anywhere, or every one is `true`.
+    On,
+    /// A `telemetry` that is not `true`; the dotted place it was found.
+    Off(String),
+    /// The file is not TOML or cannot be read: nothing is counted or sent until it is, and
+    /// nothing is deleted either, since this is often an editor halfway through a save.
+    Unreadable(String),
+}
+
+/// The `telemetry` setting in the file at `path`. Every depth is looked at, so a line put
+/// below `[daemon]` (`daemon.telemetry`) counts; any value other than `true`, of any type, is
+/// off. A missing file is on.
+pub fn telemetry_from(path: &Path) -> TelemetrySetting {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TelemetrySetting::On;
+        }
+        Err(error) => return TelemetrySetting::Unreadable(format!("{}: {error}", path.display())),
+    };
+    match text.parse::<toml::Table>() {
+        Ok(table) => match telemetry_off_in(&toml::Value::Table(table), "") {
+            Some(at) => TelemetrySetting::Off(at),
+            None => TelemetrySetting::On,
+        },
+        Err(_) => TelemetrySetting::Unreadable(not_toml(path)),
+    }
+}
+
+/// The first place under `value` where `telemetry` is anything but `true`.
+fn telemetry_off_in(value: &toml::Value, at: &str) -> Option<String> {
+    let place = |key: &str| match at {
+        "" => key.to_string(),
+        _ => format!("{at}.{key}"),
+    };
+    match value {
+        toml::Value::Table(table) => table.iter().find_map(|(key, value)| {
+            if key == "telemetry" && value != &toml::Value::Boolean(true) {
+                Some(place(key))
+            } else {
+                telemetry_off_in(value, &place(key))
+            }
+        }),
+        toml::Value::Array(items) => items.iter().find_map(|v| telemetry_off_in(v, at)),
+        _ => None,
+    }
+}
+
+/// Read the file at `path` as TOML, let `change` edit it, and put it back whole: the one way
+/// this process writes `config.toml`. A file that is not TOML is left alone and said, since
+/// writing over it would lose what a person was typing.
+fn edit_doc(
+    path: &Path,
+    change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(), String> {
     // A panic in one writer must not turn every later write into an error.
     let _one = WRITING
         .lock()
@@ -159,26 +278,7 @@ pub fn edit(path: &Path, edits: &[(&str, toml_edit::Item)]) -> Result<(), String
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|_| not_toml(path))?;
-    for (key, item) in edits {
-        // Every part but the last is a table, made when missing: `qass.models.best` is the key
-        // `best` of `[qass.models]`.
-        let (tables, leaf) = key.rsplit_once('.').unwrap_or(("", key));
-        let mut at: &mut dyn toml_edit::TableLike = doc.as_table_mut();
-        let parts: Vec<&str> = tables.split('.').filter(|t| !t.is_empty()).collect();
-        for (n, table) in parts.iter().copied().enumerate() {
-            if at.get(table).is_none() {
-                let mut fresh = toml_edit::Table::new();
-                // A table that only holds a deeper one gets no header of its own.
-                fresh.set_implicit(n + 1 < parts.len());
-                at.insert(table, toml_edit::Item::Table(fresh));
-            }
-            at = match at.get_mut(table).and_then(|t| t.as_table_like_mut()) {
-                Some(next) => next,
-                None => return Err(format!("{table} is not a table in {}", path.display())),
-            };
-        }
-        put(at, leaf, item);
-    }
+    change(&mut doc)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -604,6 +704,79 @@ mod tests {
 
         let (_d, broken) = file_with("[sleep\nidle_minutes = ");
         let said = read_strict(&broken).expect_err("not TOML is not defaults");
+        assert!(said.contains("is not TOML"), "{said}");
+    }
+
+    #[test]
+    fn telemetry_is_off_for_anything_but_true_at_any_depth_and_paused_when_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let on = TelemetrySetting::On;
+        assert_eq!(telemetry_from(&dir.path().join("none.toml")), on);
+        for (text, expect) in [
+            ("", on.clone()),
+            ("telemetry = true\n", on.clone()),
+            (
+                "telemetry = false\n",
+                TelemetrySetting::Off("telemetry".into()),
+            ),
+            (
+                "telemetry = \"false\"\n",
+                TelemetrySetting::Off("telemetry".into()),
+            ),
+            ("telemetry = 0\n", TelemetrySetting::Off("telemetry".into())),
+            (
+                "[telemetry]\nx = 1\n",
+                TelemetrySetting::Off("telemetry".into()),
+            ),
+            (
+                "[daemon]\nexit_when_asleep = true\ntelemetry = false\n",
+                TelemetrySetting::Off("daemon.telemetry".into()),
+            ),
+            (
+                "[a.b]\ntelemetry = false\n",
+                TelemetrySetting::Off("a.b.telemetry".into()),
+            ),
+            (
+                "[[x]]\ntelemetry = true\n[[x]]\ntelemetry = 1\n",
+                TelemetrySetting::Off("x.telemetry".into()),
+            ),
+            (
+                "items = [{ telemetry = false }]\n",
+                TelemetrySetting::Off("items.telemetry".into()),
+            ),
+        ] {
+            let (_d, path) = file_with(text);
+            assert_eq!(telemetry_from(&path), expect, "{text:?}");
+        }
+        let (_d, broken) = file_with("[sleep\nidle_minutes = ");
+        assert!(matches!(
+            telemetry_from(&broken),
+            TelemetrySetting::Unreadable(said) if said.contains("is not TOML")
+        ));
+    }
+
+    #[test]
+    fn turning_telemetry_on_takes_every_nested_off_away_and_keeps_comments() {
+        let (_d, path) = file_with(
+            "# mine\n[daemon]\nexit_when_asleep = true # stays\ntelemetry = false\n\
+             [[x]]\ntelemetry = false\nitems = [{ telemetry = false, keep = 1 }]\n",
+        );
+        set_telemetry(&path, true).expect("on");
+        assert_eq!(telemetry_from(&path), TelemetrySetting::On);
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.starts_with("telemetry = true\n# mine\n"), "{text}");
+        assert!(text.contains("exit_when_asleep = true # stays"), "{text}");
+        assert!(text.contains("keep = 1"), "{text}");
+        assert_eq!(text.matches("telemetry").count(), 1, "{text}");
+
+        set_telemetry(&path, false).expect("off");
+        assert_eq!(
+            telemetry_from(&path),
+            TelemetrySetting::Off("telemetry".into())
+        );
+
+        let (_d, broken) = file_with("[sleep\nidle_minutes = ");
+        let said = set_telemetry(&broken, true).expect_err("not TOML is left alone");
         assert!(said.contains("is not TOML"), "{said}");
     }
 }

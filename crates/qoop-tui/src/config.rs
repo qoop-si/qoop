@@ -685,6 +685,12 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 "report is a table: [report] then send = \"ask\"".into(),
             ),
             ("sleep" | "daemon", _) => {}
+            // Usage counts (ADR-023), read by the daemon: anything but true is off.
+            ("telemetry", toml::Value::Boolean(_)) => {}
+            ("telemetry", _) => refuse(
+                line,
+                format!("telemetry = {value} is not true or false; usage counts stay off"),
+            ),
             ("agents", toml::Value::Table(table)) => {
                 for (name, value) in table {
                     let line = line_of(&nested.agents, name);
@@ -770,7 +776,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 19] = [
+pub const KEYS: [&str; 20] = [
     "prefix",
     "theme",
     "icons",
@@ -790,6 +796,7 @@ pub const KEYS: [&str; 19] = [
     "qass.models.low",
     "board.cards",
     "report.send",
+    "telemetry",
 ];
 
 /// Write one setting into the file at `path`, leaving every other line as it was:
@@ -797,6 +804,13 @@ pub const KEYS: [&str; 19] = [
 /// the file never holds something the reader would refuse; a file that is not TOML is
 /// left alone and said, since writing over it would lose what a person was typing.
 pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    // Every `telemetry` in the file goes, so a nested one never outlives this line.
+    if key == "telemetry" {
+        return match value {
+            "true" | "false" => qoop_runtime::config::set_telemetry(path, value == "true"),
+            _ => Err(format!("{key} is true or false")),
+        };
+    }
     // An `[agents]` line: a plain name that is not an agent's own, its line as the reader takes it.
     if let Some(name) = key.strip_prefix("agents.") {
         let plain = name
@@ -954,6 +968,7 @@ mod tests {
             ("qass.models.low", "haiku"),
             ("board.cards", "quiet"),
             ("report.send", "always"),
+            ("telemetry", "false"),
         ];
         assert_eq!(values.len(), KEYS.len());
         for (key, value) in values {

@@ -18,6 +18,7 @@ pub mod item;
 pub mod schedule;
 pub mod show;
 pub mod task;
+pub mod telemetry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -504,11 +505,30 @@ impl Store {
                  schedule INTEGER PRIMARY KEY REFERENCES schedule(id) ON DELETE CASCADE,
                  command TEXT NOT NULL,
                  seen TEXT
+             );
+             -- Usage counts per UTC day and the sender's few values (`telemetry.rs`). New
+             -- tables, no version bump: an older binary never reads them.
+             CREATE TABLE IF NOT EXISTS telemetry_day (
+                 day TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 n REAL NOT NULL,
+                 PRIMARY KEY (day, key)
+             );
+             CREATE TABLE IF NOT EXISTS telemetry_kv (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         migrate(&conn, found)?;
         Ok(Self { conn })
+    }
+
+    /// How many workspaces there are, without reading them.
+    pub fn workspace_count(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM workspace", [], |r| r.get(0))?)
     }
 
     pub fn create_workspace(&self, name: &str, now: i64) -> Result<i64, StoreError> {

@@ -168,6 +168,44 @@ pub fn current_env() -> Env {
     }
 }
 
+/// The terminal app this interface runs in, as one of the usage counts' fixed names
+/// (`telemetry::TERMS`), and the multiplexer, if any (ADR-023). A terminal's own variables
+/// first, since inside tmux `TERM_PROGRAM` names tmux.
+pub fn runs_in(env: &Env, zellij: bool, screen: bool) -> (&'static str, Option<&'static str>) {
+    let program = env.term_program.as_deref().unwrap_or("");
+    let term = if env.ghostty || program == "ghostty" {
+        "ghostty"
+    } else if env.kitty {
+        "kitty"
+    } else if env.wezterm || program == "WezTerm" {
+        "wezterm"
+    } else if env.alacritty {
+        "alacritty"
+    } else if env.wt_session {
+        "windows_terminal"
+    } else {
+        match program {
+            "iTerm.app" => "iterm",
+            "Apple_Terminal" => "apple_terminal",
+            "WarpTerminal" => "warp",
+            "vscode" => "vscode",
+            _ if std::env::var_os("KONSOLE_VERSION").is_some() => "konsole",
+            _ if std::env::var_os("VTE_VERSION").is_some() => "gnome",
+            _ => "other",
+        }
+    };
+    let mux = if env.tmux {
+        Some("tmux")
+    } else if zellij {
+        Some("zellij")
+    } else if screen {
+        Some("screen")
+    } else {
+        None
+    };
+    (term, mux)
+}
+
 /// Decide the level from the environment. Pure, so the precedence is tested.
 pub fn detect_from(env: &Env) -> Level {
     if let Some(level) = parse_override(env.qoop_color.as_deref()) {

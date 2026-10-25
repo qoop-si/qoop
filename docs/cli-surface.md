@@ -99,6 +99,7 @@ a claim nobody has to keep.
 | `qoop config [--json]` | the settings in `config.toml` (prefix, theme, copy on select, notifications, the notch), each from the file or its default, where the file is, and what in it could not be used | no |
 | `qoop config set <key> <value>` | write one setting, checked first, keeping every other line of the file; `notch.enabled` is read by the notch when it starts or from its settings window; `agents.<name> '<line>'` writes an `[agents]` line (a name of up to 24 letters, digits, `-` or `_` that is not claude, codex, gemini or opencode, and one line typed to start it) | no |
 | `qoop settings` | every setting on one page with the pet: on a terminal, typing searches, tab moves the chip, up and down walk the rows (up from the first reaches the pet), left and right change a value and write it at once, esc clears the search or leaves; piped, prints what `qoop config` prints | no |
+| `qoop telemetry [status\|show\|on\|off]` | the daily usage counts (ADR-023): whether they are on and why not, every day not yet sent exactly as it would be sent, off (stops at once, deletes every count and the id, writes `telemetry = false`), or on again (shows the notice line; refused inside a qoop terminal and while `DO_NOT_TRACK` is set) | no |
 | `qoop onboard` | the first start, one step a screen: pet, sounds, light or dark, the command key, notifications, sleep, the agent qass runs on; left and right choose, up and down move between rows, enter goes on, esc finishes; then, in the release build, whether to sign in; then, with an agent qass runs on installed, it saves that agent as qass's, starts qass and opens `qoop` on it, where qass sets up projects, servers and settings with the person (a fresh Claude home first waits for enter, after a line on its permission warning); piped, says it needs a terminal | no |
 | `qoop qass` | open qass, the assistant over every agent: the running one is shown, one asleep in the `qass` space is woken, otherwise it starts in its own folder (`qoop paths qass-data`) on `[qass] agent` from `config.toml` (claude, codex, gemini, opencode or an `[agents]` name, typed with its flags), carrying on its own last conversation on that agent while the agent still keeps it (Claude: its newest of qass's; the others: the id their hook last reported from qass's folder, kept in `last-session`), or, with none, told to start its qass skill. It lives in the space `qass`, which the sidebar and `ctrl-a s` leave out: `ctrl-a Q`, or a click on the pet in the sidebar foot, goes there and back. Its tab shows the board above it (`qoop task board --page` in a pane of its own, the tab's first; `ctrl-a z` on it is full screen), put back by `qoop qass` and `ctrl-a Q` when the tab is without it. Closing it is `qoop close` | no |
 | `qoop qass page` | qass's page, built like `qoop settings`: its state (running, asleep, not started or not set up), the agent it runs on, what it is doing, when it last did anything, wake or start, sleep now, open its tab, and its sleep mode (`sleep.qass_idle_minutes`: never, 15, 30 or 60 minutes idle); up and down move, enter does, `w` `s` `o` are wake, sleep, open, left and right change the sleep mode, `q` or esc leaves; piped, says it needs a terminal | no |
@@ -164,10 +165,13 @@ and a bridge reload does nothing.
 The rows that say yes are each the point of their row: `qoop update` reaches qoop.si for the
 releases, and `qoop pair`, `qoop bridge`, `qoop login` and `qoop logout` reach the hub, and
 only once a person has asked for a phone or an account; `qoop report send`, `delete` and
-`inbox` reach the hub this machine signed in to, and only when asked for one note. Nothing else touches the network: no control plane, no
-background version check, and a machine that never pairs a phone never opens a
-connection to a hub. Anything else that ever needs the network is an addition to this
-table with a yes, plus a row in the gate saying what happens when it is unreachable.
+`inbox` reach the hub this machine signed in to, and only when asked for one note. Two
+things a release build's daemon does on its own: it starts `qoop update --auto` every few
+hours (ADR-019), and it sends the day's usage counts to qoop.si (ADR-023, `qoop telemetry off`
+stops it). Nothing else touches the network: no control plane, and a machine that never
+pairs a phone never opens a connection to a hub. Anything else that ever needs the network
+is an addition to this table with a yes, plus a row in the gate saying what happens when it
+is unreachable.
 
 The gate skips the rows that say yes: with the network blackholed `qoop update` fails
 closed with "cannot reach the releases" and `qoop pair` fails naming the hub it could

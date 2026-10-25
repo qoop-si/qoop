@@ -47,6 +47,7 @@ export default {
       children: [
         { title: "Configuration", slug: "configuration" },
         { title: "Update and uninstall", slug: "update" },
+        { title: "Usage counts", slug: "telemetry" },
         { title: "FAQ and troubleshooting", slug: "faq" },
         { title: "How it is built", slug: "built" },
       ],

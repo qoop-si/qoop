@@ -297,6 +297,10 @@ pub struct Connection {
     interface: std::sync::atomic::AtomicBool,
     /// Whether that interface said it lends a microphone (`client::MICROPHONE`).
     microphone: std::sync::atomic::AtomicBool,
+    /// The terminal app and multiplexer that interface runs in, from the fixed lists, and
+    /// whether this is the phone: what a usage sample marks for the day (ADR-023).
+    runs_in: std::sync::OnceLock<(&'static str, Option<&'static str>)>,
+    phone: std::sync::atomic::AtomicBool,
     /// The terminals this connection last said are news for its person (`News`).
     news: std::sync::Mutex<BTreeSet<u32>>,
     /// Whether its hello was answered with a welcome. Until then it is nobody yet.
@@ -431,13 +435,41 @@ impl ConnectionRegistry {
             .count()
     }
 
-    fn mark_interface(&self, client: &ClientId, microphone: bool) {
+    fn mark_interface(
+        &self,
+        client: &ClientId,
+        microphone: bool,
+        runs_in: (&'static str, Option<&'static str>),
+    ) {
         for c in self.inner.lock().unwrap().iter() {
             if &c.client == client {
                 c.interface.store(true, Ordering::Relaxed);
                 c.microphone.store(microphone, Ordering::Relaxed);
+                let _ = c.runs_in.set(runs_in);
             }
         }
+    }
+
+    fn mark_phone(&self, client: &ClientId) {
+        for c in self.inner.lock().unwrap().iter() {
+            if &c.client == client {
+                c.phone.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The terminal apps and multiplexers of the interfaces attached now, and whether a phone
+    /// is, for a usage sample.
+    fn attached_kinds(&self) -> (Vec<&'static str>, Vec<&'static str>, bool) {
+        let (mut terms, mut muxes, mut phone) = (Vec::new(), Vec::new(), false);
+        for c in self.inner.lock().unwrap().iter() {
+            if let Some((term, mux)) = c.runs_in.get() {
+                terms.push(*term);
+                muxes.extend(*mux);
+            }
+            phone |= c.phone.load(Ordering::Relaxed);
+        }
+        (terms, muxes, phone)
     }
 
     /// Whether this connection is an interface that lends a microphone.
@@ -1159,6 +1191,9 @@ pub struct Daemon {
     /// What the last restart brought back, counted by kind. Kept so a gate, a
     /// client, or a startup line can read what survived without reopening tabs.
     restore_report: RestoreReport,
+    /// Where usage counts go when this daemon keeps them (ADR-023): set by the binary for a
+    /// release build only, so a test or a development daemon counts nothing.
+    telemetry_to: Option<String>,
 }
 
 impl Daemon {
@@ -1394,6 +1429,7 @@ impl Daemon {
             leaves: false,
             watched: crate::idle::WatchCounts::default(),
             restore_report: report,
+            telemetry_to: None,
         })
     }
 
@@ -1419,6 +1455,13 @@ impl Daemon {
     /// `leave_when_idle`). Off unless asked for, because leaving is `process::exit`.
     pub fn leaving_when_idle(mut self) -> Self {
         self.leaves = true;
+        self
+    }
+
+    /// Keep usage counts and send them to `url` (ADR-023). Called by `qoop daemon` for a
+    /// release build only.
+    pub fn sampling_telemetry(mut self, url: String) -> Self {
+        self.telemetry_to = Some(url);
         self
     }
 
@@ -1504,6 +1547,16 @@ impl Daemon {
     }
 
     pub async fn serve(self) -> io::Result<()> {
+        if let Some(url) = self.telemetry_to.clone() {
+            let telemetry = crate::telemetry::Telemetry::new(self.store.clone(), url);
+            telemetry.activate();
+            let (terminals, agents, connections) = (
+                self.terminals.clone(),
+                self.agents.clone(),
+                self.connections.clone(),
+            );
+            tokio::spawn(telemetry.run(move || usage_gauges(&terminals, &agents, &connections)));
+        }
         if self.leaves {
             tokio::spawn(leave_when_idle(Leaving {
                 terminals: self.terminals.clone(),
@@ -1769,6 +1822,8 @@ impl Daemon {
                 pid: peer_pid(&stream),
                 interface: std::sync::atomic::AtomicBool::new(false),
                 microphone: std::sync::atomic::AtomicBool::new(false),
+                runs_in: std::sync::OnceLock::new(),
+                phone: std::sync::atomic::AtomicBool::new(false),
                 news: std::sync::Mutex::default(),
                 welcomed: std::sync::atomic::AtomicBool::new(false),
                 observer: std::sync::atomic::AtomicBool::new(false),
@@ -2348,7 +2403,20 @@ async fn serve_client(
     {
         let microphone =
             hello.extra.get(crate::client::MICROPHONE) == Some(&serde_json::Value::Bool(true));
-        connections.mark_interface(&client, microphone);
+        let said = |key: &str| hello.extra.get(key).and_then(serde_json::Value::as_str);
+        // Compared with the fixed lists, never kept as sent.
+        let runs_in = (
+            crate::telemetry::term_name(said(crate::client::TERM).unwrap_or("other")),
+            said(crate::client::MUX).and_then(crate::telemetry::mux_name),
+        );
+        connections.mark_interface(&client, microphone, runs_in);
+        crate::telemetry::attach(Some(runs_in.0), runs_in.1, false);
+    }
+    if hello.client_name == crate::client::PHONE
+        && matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_))
+    {
+        connections.mark_phone(&client);
+        crate::telemetry::attach(None, None, true);
     }
     if matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_)) {
         let observer =
@@ -2725,6 +2793,16 @@ async fn serve_client(
                         ) if !phone => ControlResponse::Failed {
                             id,
                             reason: "only the phone app asks for that".into(),
+                        },
+                        // The owner's switch is on this Mac; the phone does not turn counting
+                        // back on.
+                        Ok(ControlRequest::Telemetry {
+                            id,
+                            action: crate::control::TelemetryOp::On,
+                            ..
+                        }) if phone => ControlResponse::Failed {
+                            id,
+                            reason: "usage counts are turned on on the computer".into(),
                         },
                         // Lives as long as this connection, so it is opened here.
                         Ok(ControlRequest::TunnelOpen { id, show, conn }) => {
@@ -3998,6 +4076,9 @@ async fn handle_control(
                 Some(books.clone()),
             ) {
                 Ok(_) => {
+                    // Here, where a tab is asked for: a restore or a wake opens tabs too and
+                    // is no new terminal.
+                    crate::telemetry::count(crate::telemetry::Event::TerminalOpened);
                     // Subscribed on creation. A client that asked for a terminal wants to
                     // see it, and a separate round trip to say so is a race in which the
                     // first output is lost.
@@ -4727,7 +4808,10 @@ async fn handle_control(
             }
         }
         ControlRequest::CreateWorkspace { name, .. } => match store.create_workspace(name).await {
-            Ok(workspace) => ControlResponse::WorkspaceCreated { id, workspace },
+            Ok(workspace) => {
+                crate::telemetry::count(crate::telemetry::Event::SpaceCreated);
+                ControlResponse::WorkspaceCreated { id, workspace }
+            }
             Err(e) => ControlResponse::Failed {
                 id,
                 reason: format!("the workspace could not be created: {e}"),
@@ -5748,6 +5832,21 @@ async fn handle_control(
             id,
             until: agents.person_until(terminal, crate::agents::now_unix()),
         },
+        // Usage counts (ADR-023): an agent's token does not turn them back on.
+        ControlRequest::Telemetry {
+            id,
+            terminal,
+            action,
+            ..
+        } => {
+            if action == crate::control::TelemetryOp::On && terminal.is_some() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "usage counts are turned on by the owner, not from a terminal".into(),
+                };
+            }
+            crate::telemetry::answer(id, action).await
+        }
         // One small file in qass's folder, like the sleep settings: the watcher reads it, and
         // turned on, qass is told to start its watcher again; a qass asleep is woken first, as
         // the line has no terminal to be typed into otherwise.
@@ -7317,6 +7416,43 @@ async fn hold_state(state: &Path) -> io::Result<crate::lock::StartupLock> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// What is open now, for a usage sample (ADR-023): terminals, the most in one space, the
+/// detected agents and how many work, and what the attached clients run in.
+fn usage_gauges(
+    terminals: &TerminalRegistry,
+    agents: &crate::agents::AgentRegistry,
+    connections: &ConnectionRegistry,
+) -> crate::telemetry::Gauges {
+    let streams = terminals.streams();
+    let mut per_space: BTreeMap<i64, u32> = BTreeMap::new();
+    let mut gauges = crate::telemetry::Gauges {
+        terminals: u32::try_from(streams.len()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    for stream in streams {
+        if let Some(space) = terminals.workspace_of(stream) {
+            *per_space.entry(space).or_default() += 1;
+        }
+        let Some(agent) = agents.agent(stream) else {
+            continue;
+        };
+        if let qoop_domain::identity::AgentIdentity::Known {
+            program,
+            agent: true,
+            ..
+        } = &agent.identity
+        {
+            gauges.agents.push(program.clone());
+            if agent.belief.state == qoop_domain::observation::AgentRuntimeState::Working {
+                gauges.working += 1;
+            }
+        }
+    }
+    gauges.most_in_one_space = per_space.values().copied().max().unwrap_or(0);
+    (gauges.terms, gauges.muxes, gauges.phone) = connections.attached_kinds();
+    gauges
 }
 
 /// Everything bringing a session back needs.
