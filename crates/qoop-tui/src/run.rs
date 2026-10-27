@@ -7533,6 +7533,17 @@ fn chat_id(id: &str) -> Option<(u32, bool)> {
     Some((terminal.parse().ok()?, page == "old"))
 }
 
+/// Forget what the outer terminal shows, so the next frame writes every row and its
+/// pictures go the resized way: what is shown comes down (a kitty delete), then goes up.
+///
+/// For a screen the terminal changed behind the presenter's back: `ctrl-a l`, and every
+/// SIGWINCH, since a shrink and grow back can arrive as one signal at the size of the last
+/// frame while the terminal reflowed what it showed or put back rows it had kept.
+fn forget_screen(presenter: &mut present::Presenter, state: &mut State) {
+    *presenter = present::Presenter::default();
+    state.img_size = (0, 0);
+}
+
 /// Size whatever changed since the last painted frame: tiles a divider moved, however many
 /// nudges or drag motions the frame took in, and a terminal nothing has sized yet, such as
 /// one a script just opened.
@@ -8419,6 +8430,7 @@ where
                     let (cols, lines) = client::outer_size();
                     state.cols = cols;
                     state.lines = lines;
+                    forget_screen(&mut presenter, &mut state);
                     // Every row moved under a held drag; it ends rather than land on
                     // whatever is under the pointer now.
                     drop_carry(&mut state);
@@ -10013,8 +10025,7 @@ where
                                 // A fresh presenter, or the repaint writes only rows that
                                 // differ from its cache, which is none: the key existed
                                 // for a screen the outer terminal mangled, and did nothing.
-                                presenter = present::Presenter::default();
-                                state.shown_images.clear();
+                                forget_screen(&mut presenter, &mut state);
                                 dirty = true;
                             }
                             // With nothing awake in the space the keys move between its
@@ -16814,6 +16825,66 @@ mod tests {
         assert_eq!(s.armed, None);
         assert_eq!(s.message.as_deref(), Some("kept qoop"));
         assert!(s.closing.is_none(), "nothing was sent");
+    }
+
+    #[test]
+    fn a_forgotten_screen_is_written_whole_and_its_kitty_picture_put_back() {
+        use crate::graphics::{GraphicsCap, ImageOp, plan};
+        let mut state = state();
+        let mut presenter = present::Presenter::default();
+        let frame = "\x1b[1;1Htop row\x1b[2;1Hsecond row";
+        let mut out = String::new();
+        presenter.present(frame, state.cols, state.lines, &mut out);
+        let image = StoredImage {
+            terminal: 2,
+            id: 7,
+            protocol: qoop_runtime::daemon::ImageProtocol::Kitty,
+            bytes: b"\x1b_Gf=100,s=8,v=6;eA==\x1b\\".to_vec(),
+        };
+        let cap = GraphicsCap {
+            kitty: true,
+            iterm2: false,
+            sixel: false,
+        };
+        let frame_plan = |state: &State| {
+            let resized = state.img_size != (state.cols, state.lines);
+            plan(
+                2,
+                Some(&image),
+                &state.shown_images,
+                cap,
+                false,
+                resized,
+                Some((1, 1)),
+            )
+            .0
+        };
+        state.img_size = (state.cols, state.lines);
+        state.shown_images.insert(2, (7, image.protocol));
+        // The same frame and picture at the same size write nothing: a SIGWINCH that ends at
+        // the last frame's size would leave whatever the terminal put back.
+        out.clear();
+        presenter.present(frame, state.cols, state.lines, &mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(frame_plan(&state), vec![]);
+
+        forget_screen(&mut presenter, &mut state);
+        presenter.present(frame, state.cols, state.lines, &mut out);
+        assert!(
+            out.contains("top row") && out.contains("second row"),
+            "{out:?}"
+        );
+        assert_eq!(
+            frame_plan(&state),
+            vec![
+                ImageOp::Delete { id: 7 },
+                ImageOp::Place {
+                    row: 1,
+                    col: 1,
+                    bytes: image.bytes.clone(),
+                },
+            ]
+        );
     }
 
     fn state() -> State {
