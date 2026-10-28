@@ -26,7 +26,7 @@ exit_when_asleep = true   # leave when nothing is awake and nobody is attached
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached |
 
 The file is read when the interface starts, and again within two seconds of any change to it,
-so an edit applies without a restart. `qoop settings` (also `ctrl-a space`, then `settings`)
+so an edit applies without a restart. `qoop settings` (also `ctrl-a m`, then `settings`)
 changes it from a page. The page shows every setting with your pet and writes a
 change as you make it; `qoop config` prints the file, the value in force for each key, and any
 problem.
