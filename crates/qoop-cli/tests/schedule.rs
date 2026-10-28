@@ -29,8 +29,11 @@ impl Stack {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_qoop"), bin.join("qoop")).unwrap();
+        // Its words go to the log in one write: two agents started on the same tick append at
+        // once, and the shell's `printf` writes a line at a time, so their lines interleaved
+        // and a prompt of several lines was never found whole.
         let agent = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            "#!/bin/sh\nt=$(/usr/bin/mktemp)\nprintf '%s\\n' \"$@\" > \"$t\"\n/bin/cat \"$t\" >> '{}'\n/bin/rm -f \"$t\"\n",
             dir.path().join("claude.args").display()
         );
         std::fs::write(bin.join("claude"), agent).unwrap();
