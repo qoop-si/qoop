@@ -1307,10 +1307,20 @@ pub fn paint(frame: &Frame) -> String {
     // The lines around split panes, worked out once for the whole frame, and the park mark
     // against the focused corner when it stands there.
     let mut edges = edge_grid(frame, pane_cols as usize, pane_rows as usize);
-    let rule_side = if wide_enough {
+    // qass's lone box draws its own frame: its rows are painted ahead, so the rule can take
+    // their left side over just as it does the split panes'.
+    let mut qass_rows: Vec<String> = match &qass {
+        Some((plan, screen)) if !tiled(frame) => (0..pane_rows as usize)
+            .map(|pane_row| qass_box_row(frame, plan, screen, pane_row))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let rule_side = if !wide_enough {
+        Vec::new()
+    } else if qass_rows.is_empty() {
         take_left_side(&mut edges)
     } else {
-        Vec::new()
+        take_left_cells(&mut qass_rows)
     };
     let park = park_spot(frame);
     if let Some((parked, ParkSpot::Corner(x, y, label))) = &park
@@ -1483,15 +1493,15 @@ pub fn paint(frame: &Frame) -> String {
             // Beside the panes it is also their left side, in the ink of the pane it frames.
             let side = (row + SIDEBAR_TOP - 1)
                 .checked_sub(TABS)
-                .and_then(|pane_row| rule_side.get(pane_row).copied().flatten());
-            let right = side.is_some_and(|(right, _)| right);
+                .and_then(|pane_row| rule_side.get(pane_row).and_then(Option::as_ref));
+            let right = side.is_some_and(|(right, _)| *right);
             // Its ends bend toward the column, the only part of it in ember.
             if row + 1 == column_rows {
                 out.push_str(&theme::fg(theme::Role::Brand));
                 out.push(if right { '\u{2534}' } else { '\u{256f}' });
             } else {
-                if let Some((_, ink)) = side {
-                    out.push_str(&edge_style(ink));
+                if let Some((_, style)) = side {
+                    out.push_str(style);
                 }
                 out.push(match (joins, right) {
                     (true, true) => '\u{253c}',
@@ -1518,29 +1528,8 @@ pub fn paint(frame: &Frame) -> String {
         // Tiled rows for every pane in its frame; the plain path for qass's lone box, which
         // draws its own, and a frame with no tile at all.
         if !tiled(frame) {
-            if let Some((plan, screen)) = &qass {
-                // qass's screen: its header and the frame around its terminal, whose rows
-                // are the box's inside, counted from its first.
-                out.push_str(&screen.row(pane_row, |local| {
-                    let (line, spans) = window_row(
-                        frame.snapshot,
-                        frame.behind,
-                        frame.scroll,
-                        frame.anchor,
-                        local,
-                    );
-                    let selected = frame
-                        .selection
-                        .and_then(|s| s.columns_on(local, plan.inner.cols));
-                    pane_row_paint(
-                        frame,
-                        line,
-                        spans,
-                        links_of(frame.snapshot),
-                        plan.inner.cols,
-                        selected,
-                    )
-                }));
+            if let Some(row) = qass_rows.get(pane_row) {
+                out.push_str(row);
                 continue;
             }
             let (line, spans) = window_row(
@@ -3746,11 +3735,86 @@ fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
     crate::rail::rows(rail.rows, rail.w, &tabs, preview.as_ref(), fade)
 }
 
+/// One row of qass's screen: its header and the frame around its terminal, whose rows are the
+/// box's inside, counted from its first.
+fn qass_box_row(
+    frame: &Frame,
+    plan: &crate::qass_screen::Plan,
+    screen: &crate::qass_screen::Screen,
+    pane_row: usize,
+) -> String {
+    screen.row(pane_row, |local| {
+        let (line, spans) = window_row(
+            frame.snapshot,
+            frame.behind,
+            frame.scroll,
+            frame.anchor,
+            local,
+        );
+        let selected = frame
+            .selection
+            .and_then(|s| s.columns_on(local, plan.inner.cols));
+        pane_row_paint(
+            frame,
+            line,
+            spans,
+            links_of(frame.snapshot),
+            plan.inner.cols,
+            selected,
+        )
+    })
+}
+
+/// [`take_left_side`] for rows already painted, qass's lone box: the first cell after the
+/// row's leading escapes is taken the same way, and the rule wears those escapes.
+fn take_left_cells(rows: &mut [String]) -> Vec<Option<(bool, String)>> {
+    rows.iter_mut()
+        .map(|row| {
+            let at = escapes_len(row);
+            let glyph = row[at..].chars().next()?;
+            let (right, with) = match glyph {
+                '\u{2502}' => (false, ' '),
+                '\u{256d}' | '\u{2570}' | '\u{251c}' | '\u{2500}' => (true, '\u{2500}'),
+                _ => return None,
+            };
+            let style = row[..at].to_string();
+            row.replace_range(at..at + glyph.len_utf8(), with.encode_utf8(&mut [0; 4]));
+            Some((right, style))
+        })
+        .collect()
+}
+
+/// How many bytes of escapes (CSI and OSC) `row` starts with.
+fn escapes_len(row: &str) -> usize {
+    let bytes = row.as_bytes();
+    let mut at = 0;
+    while bytes.get(at) == Some(&0x1b) {
+        match bytes.get(at + 1) {
+            Some(b'[') => {
+                at += 2;
+                while bytes.get(at).is_some_and(|b| !(0x40..=0x7e).contains(b)) {
+                    at += 1;
+                }
+                at += 1;
+            }
+            Some(b']') => {
+                at += 2;
+                while at < bytes.len() && bytes[at] != 0x07 && !bytes[at..].starts_with(b"\x1b\\") {
+                    at += 1;
+                }
+                at += if bytes.get(at) == Some(&0x07) { 1 } else { 2 };
+            }
+            _ => break,
+        }
+    }
+    at.min(row.len())
+}
+
 /// The column's rule stands right beside the pane area's first column, where the panes' left
 /// side would draw a second line next to it. The rule takes that side over: the first column's
 /// side cells go blank and its corners and joints become the start of their line. Per area
-/// row: whether the rule there meets a line going right, and the ink of the side it stands for.
-fn take_left_side(edges: &mut [Vec<Option<(char, EdgeInk)>>]) -> Vec<Option<(bool, EdgeInk)>> {
+/// row: whether the rule there meets a line going right, and the style of the side it stands for.
+fn take_left_side(edges: &mut [Vec<Option<(char, EdgeInk)>>]) -> Vec<Option<(bool, String)>> {
     edges
         .iter_mut()
         .map(|row| {
@@ -3762,7 +3826,7 @@ fn take_left_side(edges: &mut [Vec<Option<(char, EdgeInk)>>]) -> Vec<Option<(boo
                 _ => return None,
             };
             *cell = right.then_some(('\u{2500}', ink));
-            Some((right, ink))
+            Some((right, edge_style(ink)))
         })
         .collect()
 }

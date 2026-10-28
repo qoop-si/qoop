@@ -1039,20 +1039,39 @@ impl Screen {
         if let Some(side) = p.side.filter(|s| s.replaces) {
             return inbox(pane_row - side.rect.y);
         }
-        let left = p
-            .side
-            .map(|s| inbox(pane_row - s.rect.y))
-            .unwrap_or_default();
+        // The questions beside the box: their right side is its left side too, one line where
+        // the two meet, its ends joints.
+        let Some(side) = p.side else {
+            if pane_row == p.frame.y {
+                return format!("{}{beside}", self.top);
+            }
+            if pane_row + 1 == p.frame.y + p.frame.rows {
+                return format!("{}{beside}", self.bottom);
+            }
+            return format!(
+                "{0}{1}{0}{beside}",
+                self.side,
+                terminal(pane_row - p.inner.y)
+            );
+        };
+        let left = inbox(pane_row - side.rect.y);
+        let joined = |edge: &str, (corner, joint): (char, char), own: char| {
+            let left = match left.rfind(corner) {
+                Some(at) => format!("{}{joint}{}", &left[..at], &left[at + corner.len_utf8()..]),
+                None => left.clone(),
+            };
+            format!("{left}{}{beside}", edge.replacen(own, "\u{2500}", 1))
+        };
         if pane_row == p.frame.y {
-            return format!("{left}{}{beside}", self.top);
+            return joined(&self.top, ('\u{256e}', '\u{252c}'), '\u{256d}');
         }
         if pane_row + 1 == p.frame.y + p.frame.rows {
-            return format!("{left}{}{beside}", self.bottom);
+            return joined(&self.bottom, ('\u{256f}', '\u{2534}'), '\u{2570}');
         }
         format!(
-            "{left}{0}{1}{0}{beside}",
-            self.side,
-            terminal(pane_row - p.inner.y)
+            "{left} {}{}{beside}",
+            terminal(pane_row - p.inner.y),
+            self.side
         )
     }
 }
@@ -1863,17 +1882,15 @@ mod tests {
                 }
             }
             if !side.replaces {
-                // Beside: the terminal's frame follows the inbox and its first row is the edge.
-                let top = strip(&screen.row(plan.frame.y, |_| String::new()));
-                assert!(
-                    top[top.find('\u{256d}').unwrap()..].contains("terminal"),
-                    "{top}"
-                );
-                let mid = strip(&screen.row(plan.frame.y + 2, |_| "T".repeat(plan.inner.cols)));
-                assert!(
-                    mid.contains(&format!("\u{2502}{}\u{2502}", "T".repeat(plan.inner.cols))),
-                    "{mid}"
-                );
+                // Beside: the terminal's frame follows the inbox and its first row is the edge,
+                // its left side the inbox's right one, so it starts with no line of its own.
+                let at = |row: &str| row.chars().skip(side.rect.cols).collect::<String>();
+                let top = at(&strip(&screen.row(plan.frame.y, |_| String::new())));
+                assert!(top.starts_with("\u{2500}\u{2500} terminal"), "{top}");
+                let mid = at(&strip(
+                    &screen.row(plan.frame.y + 2, |_| "T".repeat(plan.inner.cols)),
+                ));
+                assert_eq!(mid, format!(" {}\u{2502}", "T".repeat(plan.inner.cols)));
             }
         }
     }

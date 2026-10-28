@@ -25784,6 +25784,66 @@ mod tests {
         }
     }
 
+    /// qass's lone box draws its own frame, and the column's rule is its left side too: the
+    /// box's corners join the rule, its side beside the rule is blank, with or without the
+    /// questions open on its left.
+    #[test]
+    fn the_column_rule_is_the_left_side_of_qass_box() {
+        for inbox in [false, true] {
+            let mut state = qass_window();
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+            assert!(state.on_qass_screen());
+            state.qass_ui.inbox = inbox;
+            // Nothing over the box: the test state opens with the find box up.
+            state.palette = None;
+            let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+            let grid = cells_of(
+                &screen::paint(&state.frame()),
+                state.cols as usize,
+                state.lines as usize,
+            );
+            if std::env::var_os("QOOP_SHOW").is_some() {
+                for row in &grid {
+                    eprintln!("{}", row[left - 4..left + 60].iter().collect::<String>());
+                }
+            }
+            let plan = state.qass_plan().expect("qass's box");
+            let (rule, first) = (left - 1, left);
+            let row = |pane_row: usize| &grid[screen::TABS + pane_row];
+            let (top, bottom) = (plan.frame.y, plan.frame.y + plan.frame.rows - 1);
+            // The line under the header runs into the rule too.
+            assert_eq!(row(plan.header.rows() - 1)[rule], '\u{251c}');
+            assert_eq!(row(top)[rule], '\u{251c}', "the box's top joins the rule");
+            assert_eq!(row(top)[first], '\u{2500}');
+            assert_eq!(row(bottom)[rule], '\u{2534}', "and its bottom");
+            assert_eq!(row(bottom)[first], '\u{2500}');
+            for at in top + 1..bottom {
+                assert_eq!(row(at)[rule], '\u{2502}', "inbox {inbox}, row {at}");
+                assert_eq!(
+                    row(at)[first],
+                    ' ',
+                    "no second line, inbox {inbox}, row {at}"
+                );
+            }
+            // The questions beside it share one line with the box, joined at both ends.
+            if let Some(side) = plan.side.filter(|s| !s.replaces) {
+                let (end, box_left) = (left + side.rect.cols - 1, left + plan.frame.x);
+                assert_eq!(box_left, end + 1);
+                assert_eq!(row(top)[end], '\u{252c}');
+                assert_eq!(row(top)[box_left], '\u{2500}');
+                assert_eq!(row(bottom)[end], '\u{2534}');
+                assert_eq!(row(bottom)[box_left], '\u{2500}');
+                for at in top + 1..bottom {
+                    assert_eq!(row(at)[end], '\u{2502}', "row {at}");
+                    assert_eq!(row(at)[box_left], ' ', "no second line, row {at}");
+                }
+            } else {
+                assert!(!inbox, "the window holds the questions beside the box");
+            }
+        }
+    }
+
     /// The rail and the open pane share one line: the board's frame, with the rail's edge
     /// blank beside it, never two lines side by side.
     #[test]
