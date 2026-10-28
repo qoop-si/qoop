@@ -7169,17 +7169,33 @@ fn spawn_agent_recorder(
         // are announced through the same channel, does not write a row that says what the
         // row already says.
         let mut written: BTreeMap<u32, Option<String>> = BTreeMap::new();
+        // When each tab's agent was first seen gone, while its row still names it.
+        let mut gone_since: BTreeMap<u32, std::time::Instant> = BTreeMap::new();
         loop {
             match changes.recv().await {
                 Ok(stream) => {
-                    record_stream(&agents, &terminals, &books, &mut written, stream).await;
+                    record_stream(
+                        &agents,
+                        &terminals,
+                        &books,
+                        (&mut written, &mut gone_since),
+                        stream,
+                    )
+                    .await;
                 }
                 // Announcements are news, not a ledger, but a reader that fell behind
                 // cannot know which terminals changed: re-read every open one rather
                 // than waiting for the next announcement, which may never come.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for stream in terminals.streams() {
-                        record_stream(&agents, &terminals, &books, &mut written, stream).await;
+                        record_stream(
+                            &agents,
+                            &terminals,
+                            &books,
+                            (&mut written, &mut gone_since),
+                            stream,
+                        )
+                        .await;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -7228,11 +7244,21 @@ async fn forget_answered_parks(
 /// erase the one thing the next start needs: measured, a session with a real
 /// Claude Code in it came back as a bare shell because the row was cleared
 /// between the stop and the exit.
+///
+/// A shutdown that is not `qoop stop` sets no flag: a reboot, a logout or a killed daemon
+/// signals the agents and the daemon alike, and the agents often go first. So an agent's
+/// leaving is written only once it has stayed gone for [`AGENT_GONE_GRACE`]; a daemon
+/// that dies within it leaves the row naming the agent, and the next start resumes it.
+/// Measured on the 27.2 restart: seven tabs whose rows named Claude and its conversation
+/// were cleared between the agents' end and the daemon's, and came back as bare shells.
 async fn record_stream(
     agents: &Arc<crate::agents::AgentRegistry>,
     terminals: &TerminalRegistry,
     books: &Bookkeeping,
-    written: &mut BTreeMap<u32, Option<String>>,
+    (written, gone_since): (
+        &mut BTreeMap<u32, Option<String>>,
+        &mut BTreeMap<u32, std::time::Instant>,
+    ),
     stream: u32,
 ) {
     if books.stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -7243,12 +7269,40 @@ async fn record_stream(
     // still waking, for the same reason.
     if terminals.workspace_of(stream).is_none() {
         written.remove(&stream);
+        gone_since.remove(&stream);
         return;
     }
     if books.is_marked(stream) {
+        // The sleep writes what the tab holds now; a wake starts any grace afresh.
+        gone_since.remove(&stream);
         return;
     }
     let now = agent_program(agents, stream);
+    // Not yet known to be without an agent, and none there now: wait out the grace before
+    // settling the conversation or writing the row. The tab is announced again once it is
+    // over, so the write still happens when nothing else changes.
+    if now.is_none() && written.get(&stream) != Some(&None) {
+        let first = !gone_since.contains_key(&stream);
+        if let Some(left) = gone_wait(gone_since, stream, std::time::Instant::now()) {
+            if first {
+                let agents = agents.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(left).await;
+                    agents.announce(stream);
+                });
+            }
+            return;
+        }
+    }
+    // An agent back within the grace is another start, even of the same program: the
+    // conversation the one before had is not its own, so it goes as an exit would have.
+    if gone_since.remove(&stream).is_some()
+        && now.is_some()
+        && let Some(gone) = terminals.settle_session(stream, None)
+    {
+        let _ = books.store.forget_agent_session(stream as i64, gone).await;
+        agents.announce(stream);
+    }
     // Before the row check below: the same program in a new generation is a new agent,
     // and the conversation of the one before is not its conversation.
     let generation = agents.agent(stream).map(|a| a.belief.generation.0);
@@ -7272,6 +7326,40 @@ async fn record_stream(
         .is_ok()
     {
         written.insert(stream, now);
+    }
+}
+
+/// How long an agent stays gone before its tab's row says so. Longer than a shutdown takes
+/// to end the daemon after its agents; a person who quits an agent and restarts the Mac
+/// within it gets the agent back, which is the cheaper mistake.
+const AGENT_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What is left of the grace for a tab whose agent is gone at `at`, the first sighting
+/// starting it; `None` once it is over.
+fn gone_wait(
+    since: &mut BTreeMap<u32, std::time::Instant>,
+    stream: u32,
+    at: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let first = *since.entry(stream).or_insert(at);
+    let left = AGENT_GONE_GRACE.saturating_sub(at.saturating_duration_since(first));
+    (!left.is_zero()).then_some(left)
+}
+
+#[cfg(test)]
+mod gone_grace_tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_is_written_as_gone_only_after_the_grace() {
+        let mut since = BTreeMap::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(gone_wait(&mut since, 7, t0), Some(AGENT_GONE_GRACE));
+        let mid = t0 + AGENT_GONE_GRACE / 2;
+        assert_eq!(gone_wait(&mut since, 7, mid), Some(AGENT_GONE_GRACE / 2));
+        // Another tab has a clock of its own.
+        assert_eq!(gone_wait(&mut since, 8, mid), Some(AGENT_GONE_GRACE));
+        assert_eq!(gone_wait(&mut since, 7, t0 + AGENT_GONE_GRACE), None);
     }
 }
 
