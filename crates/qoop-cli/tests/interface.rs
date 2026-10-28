@@ -57,6 +57,9 @@ struct Screen {
     style: String,
     /// The start of a sequence or a character a read cut in half, for the next read.
     pending: Vec<u8>,
+    /// Inside a frame: its synchronized update has begun and not yet ended, so its other
+    /// rows are still to come.
+    framing: bool,
 }
 
 impl Screen {
@@ -67,6 +70,7 @@ impl Screen {
             col: 0,
             style: String::new(),
             pending: Vec::new(),
+            framing: false,
         }
     }
 
@@ -105,6 +109,7 @@ impl Screen {
                                         .push_str(&String::from_utf8_lossy(&data[i..=end]));
                                 }
                             }
+                            b'h' | b'l' if params == "?2026" => self.framing = data[end] == b'h',
                             _ => {}
                         }
                         i = end + 1;
@@ -560,7 +565,10 @@ impl Interface {
         };
         let mut buf = [0u8; 64 * 1024];
         while start.elapsed() < within {
-            if self.painted.contains(needle) {
+            // Found, and the frame it came in is read to its end: a read can stop in the
+            // middle of one, and until its other rows are in, the screen here holds the
+            // frame before it in every row the needle is not on.
+            if self.painted.contains(needle) && !self.screen.framing {
                 return Some(start.elapsed());
             }
             match file.read(&mut buf) {

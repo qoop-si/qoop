@@ -13,8 +13,9 @@
 use crate::theme::{self, Role};
 use crate::width;
 
-/// The columns after the tabs: the edge (the line that drags the width) and one blank column, which is
-/// where the focused pane's corner stands (the rail paints the edge and steps over the blank).
+/// The columns after the tabs: the edge, which drags the width, and the column beside it, where the
+/// open pane's frame draws the line. The rail blanks the edge and steps over the frame's column, so
+/// the one line between the tabs and the pane is the frame's.
 pub const EDGE: usize = 2;
 /// The narrowest and widest the tabs are dragged to.
 pub const MIN: usize = 3;
@@ -227,8 +228,8 @@ pub fn wrap(text: &str, w: usize) -> Vec<String> {
     lines
 }
 
-/// The rail's rows, `rows` tall, each `w` cells and the edge line, then the cursor stepped one cell
-/// over: the tabs, a rule, the preview, the edge on every row and a cap rule on the last.
+/// The rail's rows, `rows` tall, each `w` cells and the blank edge, then the cursor stepped one cell
+/// over the pane frame's line: the tabs, a rule, the preview and a cap rule on the last.
 pub fn rows(
     rows: usize,
     w: usize,
@@ -243,11 +244,7 @@ pub fn rows(
             theme::RESET
         )
     };
-    let edge = format!(
-        "{}\u{2502}{}\x1b[C",
-        crate::qass_screen::ink(Role::Rule, fade),
-        theme::RESET
-    );
+    let edge = " \x1b[C";
     let plain = |text: String, role: Role, bold: bool| {
         let text = width::fit(&text, w);
         let pad = " ".repeat(w.saturating_sub(width::width(&text)));

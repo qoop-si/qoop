@@ -201,10 +201,11 @@ pub struct FoldPaint {
     pub path: bool,
 }
 
-/// A pane's name on its top edge: on qass's tab with the board, behind the caret that folds
-/// it (the one a space's fold wears in the column). The click reads the same words.
+/// A pane's name on its top edge, the one its row in the column shows: on qass's tab with the
+/// board, behind the caret that folds it (the one a space's fold wears in the column). The
+/// click reads the same words.
 pub(crate) fn pane_title(agent: &AgentRow, caret: bool) -> String {
-    let name = crate::sidebar::label(agent);
+    let name = crate::sidebar::session_name(agent);
     if caret {
         format!("\u{25be} {name}")
     } else {
@@ -880,12 +881,13 @@ pub(crate) fn park_spot(frame: &Frame) -> Option<(bool, ParkSpot)> {
     let (cols, rows) = (cols as usize, rows as usize);
     let label = park_label(parked);
     let wide = width::width(&label);
-    // Every cell it takes and the blank before it are free: no pane's name or handle there.
+    // Every cell it takes and the blank each side of it are free: no pane's name or handle
+    // there, only the frame's line, which the label stands on.
     if let Some((x, y)) = park_corner(&frame.tiles, cols, rows, wide)
         && edge_grid(frame, cols, rows)
             .get(y)
-            .and_then(|row| row.get(x - 1..x + wide))
-            .is_some_and(|cells| cells.iter().all(Option::is_none))
+            .and_then(|row| row.get(x - 1..=x + wide))
+            .is_some_and(|cells| cells.iter().copied().all(bare_line))
     {
         return Some((parked, ParkSpot::Corner(x, y, label)));
     }
@@ -896,13 +898,36 @@ pub(crate) fn park_spot(frame: &Frame) -> Option<(bool, ParkSpot)> {
     Some((parked, ParkSpot::Notice(col, text)))
 }
 
+/// Whether an edge cell holds nothing, or only a straight run of a pane frame's line: no name,
+/// mark, handle or joint, so what is written over it leaves no line hanging.
+fn bare_line(cell: Option<(char, EdgeInk)>) -> bool {
+    cell.is_none_or(|(c, ink)| {
+        matches!(ink, EdgeInk::Line | EdgeInk::Frame(_)) && matches!(c, '\u{2500}' | '\u{2502}')
+    })
+}
+
+/// The focused pane's space ink: its agent's space, else the tab bar's (a shell runs no
+/// agent), else the brand's ember.
+fn focus_ink(frame: &Frame) -> theme::Role {
+    let focused = frame.tiles.iter().find(|t| t.focused).map(|t| t.terminal);
+    frame
+        .rows
+        .iter()
+        .find(|a| Some(a.terminal) == focused)
+        .map(|a| a.workspace)
+        .or(frame.space)
+        .map_or(theme::Role::Brand, |space| {
+            theme::space_in(frame.spaces, space)
+        })
+}
+
 /// The lines around the panes and what rides them: the folded panes' titles and the
 /// handles. Empty where nothing paints as tiles (qass's lone box).
 fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, EdgeInk)>>> {
     if !tiled(frame) {
         return Vec::new();
     }
-    let mut edges = pane_edges(&frame.tiles, frame.rows, cols, rows);
+    let mut edges = pane_edges(&frame.tiles, frame.rows, focus_ink(frame), cols, rows);
     if let Some(fold) = frame.chrome.fold {
         put_fold_titles(&mut edges, &frame.tiles, frame.rows, fold);
     }
@@ -1287,7 +1312,8 @@ pub fn paint(frame: &Frame) -> String {
         } else {
             EdgeInk::Quiet
         };
-        for (cell, c) in row.iter_mut().skip(*x).zip(label.chars()) {
+        // A blank each side, so the label stands on the frame's line as a name does.
+        for (cell, c) in row.iter_mut().skip(x - 1).zip(format!(" {label} ").chars()) {
             *cell = Some((c, ink));
         }
     }
@@ -3701,8 +3727,12 @@ fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
 /// How a cell of the marks around split panes is painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EdgeInk {
-    /// A corner of the focused pane, in the brand's ember.
+    /// The handle and the fold's caret, in the brand's ember.
     Lit,
+    /// The frame round a pane the keyboard is not in: a quiet line.
+    Line,
+    /// The frame round the focused pane, in its space's ink.
+    Frame(theme::Role),
     /// A pane's name on its top edge.
     Title,
     /// The focused pane's name.
@@ -3715,21 +3745,30 @@ enum EdgeInk {
 
 /// The marks around split panes, as a grid over the pane area.
 ///
-/// The focused pane is a viewfinder: a curve at each of its four corners with one cell of
-/// line beside it, and no other line anywhere. Every pane keeps its name on the edge above
-/// it, the focused one bold. The cells round the tiles stay theirs, so panes keep their
-/// gap and a divider still drags; only the keyboard's pane is outlined, and it is findable
-/// without a frame round every pane competing with it.
+/// Every pane has a quiet frame, one line shared where two panes meet, so panes never run
+/// into each other; the focused pane's frame wears its space's ink (`focus`), the owner's
+/// pick, 2026-10-28. Every pane keeps its name on the edge above it, the focused one bold.
+/// The frame is drawn in the cells round the tiles, so panes keep their gap and a divider
+/// still drags.
 fn pane_edges(
     tiles: &[Tile],
     agents: &[AgentRow],
+    focus: theme::Role,
     cols: usize,
     rows: usize,
 ) -> Vec<Vec<Option<(char, EdgeInk)>>> {
+    const UP: u8 = 1;
+    const DOWN: u8 = 2;
+    const LEFT: u8 = 4;
+    const RIGHT: u8 = 8;
     let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; cols]; rows];
-    for tile in tiles.iter().filter(|t| t.focused) {
+    // The ways a frame's line leaves each cell, from every pane's frame, so a shared side is
+    // one line and its ends are joints; and the cells of the focused pane's frame.
+    let mut ways = vec![vec![0u8; cols]; rows];
+    let mut lit = vec![vec![false; cols]; rows];
+    for tile in tiles.iter().filter(|t| t.rect.cols > 0 && t.rect.rows > 0) {
         let r = tile.rect;
-        // A tile against the area's edge (an area too small for the marks) has no corners.
+        // A tile against the area's edge (an area too small for the frame) has none.
         let (Some(left), Some(top)) = (r.x.checked_sub(1), r.y.checked_sub(1)) else {
             continue;
         };
@@ -3737,14 +3776,47 @@ fn pane_edges(
         if right >= cols || bottom >= rows {
             continue;
         }
-        for (x, y, corner, arm) in [
-            (left, top, '\u{256d}', left + 1),
-            (right, top, '\u{256e}', right - 1),
-            (left, bottom, '\u{2570}', left + 1),
-            (right, bottom, '\u{256f}', right - 1),
-        ] {
-            grid[y][x] = Some((corner, EdgeInk::Lit));
-            grid[y][arm] = Some(('\u{2500}', EdgeInk::Lit));
+        for x in left..=right {
+            let way = if x > left { LEFT } else { 0 } | if x < right { RIGHT } else { 0 };
+            ways[top][x] |= way;
+            ways[bottom][x] |= way;
+            lit[top][x] |= tile.focused;
+            lit[bottom][x] |= tile.focused;
+        }
+        for y in top..=bottom {
+            let way = if y > top { UP } else { 0 } | if y < bottom { DOWN } else { 0 };
+            ways[y][left] |= way;
+            ways[y][right] |= way;
+            lit[y][left] |= tile.focused;
+            lit[y][right] |= tile.focused;
+        }
+    }
+    for (y, row) in ways.iter().enumerate() {
+        for (x, way) in row.iter().enumerate().filter(|(_, w)| **w != 0) {
+            let glyph = match (
+                way & UP != 0,
+                way & DOWN != 0,
+                way & LEFT != 0,
+                way & RIGHT != 0,
+            ) {
+                (true, true, true, true) => '\u{253c}',
+                (false, true, true, true) => '\u{252c}',
+                (true, false, true, true) => '\u{2534}',
+                (true, true, false, true) => '\u{251c}',
+                (true, true, true, false) => '\u{2524}',
+                (false, true, false, true) => '\u{256d}',
+                (false, true, true, false) => '\u{256e}',
+                (true, false, false, true) => '\u{2570}',
+                (true, false, true, false) => '\u{256f}',
+                (_, _, false, false) => '\u{2502}',
+                _ => '\u{2500}',
+            };
+            let ink = if lit[y][x] {
+                EdgeInk::Frame(focus)
+            } else {
+                EdgeInk::Line
+            };
+            grid[y][x] = Some((glyph, ink));
         }
     }
     // Each pane's name on its top edge, two cells in from its corner: one pane alone is
@@ -3761,7 +3833,7 @@ fn pane_edges(
         if room < 3 {
             continue;
         }
-        let name = crate::sidebar::label(row);
+        let name = pane_title(row, false);
         let name = width::fit(&name, width::width(&name).min(room - 2));
         let ink = if tile.focused {
             EdgeInk::TitleLit
@@ -3817,10 +3889,15 @@ fn put_fold_titles(
         let mut x = r.x + 1;
         for c in format!(" {} ", title.trim_end()).chars() {
             let at_ink = if c == '\u{25be}' { EdgeInk::Lit } else { ink };
+            let wide = width::columns(c) == 2;
             if let Some(cell) = grid[top].get_mut(x) {
                 *cell = Some((c, at_ink));
             }
-            x += 1;
+            // The cell a wide character spills into paints nothing of its own.
+            if wide && let Some(cell) = grid[top].get_mut(x + 1) {
+                *cell = Some(('\0', at_ink));
+            }
+            x += if wide { 2 } else { 1 };
         }
         let path = (fold.path && tile.terminal == fold.qass)
             .then(|| crate::tabs::folder(agent, crate::tabs::MAX_PATH))
@@ -3839,8 +3916,8 @@ fn put_fold_titles(
     }
 }
 
-/// The handle's cells in the edge grid, in the same ember as the focused pane's corners; a cell
-/// that already holds a name or a corner is left as it is.
+/// The handle's cells in the edge grid, in the brand's ember over the frame's straight line; a
+/// cell that holds a name or a joint is left as it is.
 fn put_handle(grid: &mut [Vec<Option<(char, EdgeInk)>>], handle: crate::qass_screen::Handle) {
     let glyph = if handle.vertical {
         '\u{2502}'
@@ -3854,24 +3931,29 @@ fn put_handle(grid: &mut [Vec<Option<(char, EdgeInk)>>], handle: crate::qass_scr
             (handle.x + at, handle.y)
         };
         if let Some(cell) = grid.get_mut(y).and_then(|row| row.get_mut(x))
-            && cell.is_none()
+            && bare_line(*cell)
+            && cell.is_none_or(|(c, _)| c == glyph)
         {
             *cell = Some((glyph, EdgeInk::Lit));
         }
     }
 }
 
-/// The escape for one kind of edge cell: the focused pane's corners in ember, its name bold
-/// in the text's ink, every other name quiet. Bold carries the focus without colour, which
-/// is how every other focus on this screen reads in monochrome.
+/// The escape for one kind of edge cell: the focused pane's frame in its space's ink, its name
+/// bold in the text's ink, every other frame and name quiet. Bold carries the focus without
+/// colour, which is how every other focus on this screen reads in monochrome.
 fn edge_style(ink: EdgeInk) -> String {
     let mono = crate::colorlevel::level() == crate::colorlevel::Level::Mono;
     match ink {
         EdgeInk::Title => theme::fg(theme::Role::Detail),
         EdgeInk::Quiet => theme::fg(theme::Role::FaintText),
         EdgeInk::Saved => theme::fg(theme::Role::Saved),
+        EdgeInk::Line => theme::fg(theme::Role::Rule),
         EdgeInk::Lit if !mono => theme::fg(theme::Role::Brand),
-        EdgeInk::Lit | EdgeInk::TitleLit => format!("{}\x1b[1m", theme::fg(theme::Role::Text)),
+        EdgeInk::Frame(role) if !mono => theme::fg(role),
+        EdgeInk::Lit | EdgeInk::Frame(_) | EdgeInk::TitleLit => {
+            format!("{}\x1b[1m", theme::fg(theme::Role::Text))
+        }
     }
 }
 
@@ -8388,10 +8470,16 @@ mod tests {
             (0, bottom, '\u{2570}'),
             (right, bottom, '\u{256f}'),
         ] {
-            assert_eq!(edges[y][x], Some((corner, EdgeInk::Lit)), "{x},{y}");
+            assert!(
+                matches!(edges[y][x], Some((c, EdgeInk::Frame(_))) if c == corner),
+                "{x},{y}: {:?}",
+                edges[y][x]
+            );
         }
         assert!(
-            edges[0][2..right - 1].iter().all(Option::is_none),
+            edges[0][2..right - 1]
+                .iter()
+                .all(|c| matches!(c, Some(('\u{2500}', EdgeInk::Frame(_))))),
             "no name on a lone pane's top edge"
         );
         let left = left_for(80, false, sidebar::WIDTH);
@@ -8467,11 +8555,15 @@ mod tests {
     }
 
     /// A split tab is framed the way the column's boxes are: rounded outer corners, one
-    /// shared line between the panes joined into the frame, and the focused pane's box and
-    /// name lit while the other's stay grey.
+    /// shared line between the panes joined into the frame, and the focused pane's box in its
+    /// space's ink and its name lit while the other's stay grey. Each name is the one its row in
+    /// the column shows.
     #[test]
-    fn only_the_focused_split_is_marked_and_by_its_corners() {
-        let rows = [row(1, "zsh", "idle"), row(2, "claude", "working")];
+    fn every_split_is_framed_and_the_focused_one_in_its_space_ink() {
+        let mut named = row(2, "claude", "working");
+        // The name the column shows for it, the conversation's title, not the program.
+        named.agent_title = Some("fix scroll".to_string());
+        let rows = [row(1, "zsh", "idle"), named];
         let area = crate::layout::Rect {
             x: 0,
             y: 0,
@@ -8491,35 +8583,45 @@ mod tests {
                 focused: terminal == 2,
             })
             .collect();
-        let grid = pane_edges(&tiles, &rows, 40, 10);
+        let ink = theme::Role::Space(2);
+        let grid = pane_edges(&tiles, &rows, ink, 40, 10);
         let text =
             |y: usize| -> String { grid[y].iter().map(|c| c.map_or(' ', |(c, _)| c)).collect() };
         let left = tiles[0].rect;
         let divider = left.x + left.cols;
-        // The focused pane, on the right, is a viewfinder: a curve and one cell of line at
-        // each corner, in ember.
-        assert_eq!(grid[0][divider], Some(('\u{256d}', EdgeInk::Lit)));
-        assert_eq!(grid[0][divider + 1], Some(('\u{2500}', EdgeInk::Lit)));
-        assert_eq!(grid[0][39], Some(('\u{256e}', EdgeInk::Lit)));
-        assert_eq!(grid[0][38], Some(('\u{2500}', EdgeInk::Lit)));
-        assert_eq!(grid[9][divider], Some(('\u{2570}', EdgeInk::Lit)));
-        assert_eq!(grid[9][39], Some(('\u{256f}', EdgeInk::Lit)));
-        // No other line: not round the other pane, not between them, not along the sides.
-        assert!(
-            grid[0][0].is_none() && grid[9][0].is_none(),
+        let lit = EdgeInk::Frame(ink);
+        // The focused pane, on the right: its whole frame in its space's ink, the shared
+        // divider joined to the outer frame at both ends.
+        assert_eq!(grid[0][divider], Some(('\u{252c}', lit)));
+        assert_eq!(grid[9][divider], Some(('\u{2534}', lit)));
+        assert_eq!(grid[4][divider], Some(('\u{2502}', lit)));
+        assert_eq!(grid[0][39], Some(('\u{256e}', lit)));
+        assert_eq!(grid[9][39], Some(('\u{256f}', lit)));
+        assert_eq!(grid[4][39], Some(('\u{2502}', lit)));
+        assert_eq!(grid[9][divider + 3], Some(('\u{2500}', lit)));
+        // The other pane: a quiet frame all round.
+        assert_eq!(
+            grid[0][0],
+            Some(('\u{256d}', EdgeInk::Line)),
             "{:?}",
             text(0)
         );
-        assert!(grid[4][divider].is_none() && grid[4][39].is_none() && grid[4][0].is_none());
-        assert!(grid[9][divider + 3].is_none(), "{:?}", text(9));
+        assert_eq!(grid[9][0], Some(('\u{2570}', EdgeInk::Line)));
+        assert_eq!(grid[4][0], Some(('\u{2502}', EdgeInk::Line)));
+        assert_eq!(
+            grid[9][3],
+            Some(('\u{2500}', EdgeInk::Line)),
+            "{:?}",
+            text(9)
+        );
         // Each pane's name on its top edge, the focused one lit.
         assert!(
-            text(0).contains(" zsh ") && text(0).contains(" claude "),
+            text(0).contains(" zsh ") && text(0).contains(" fix scroll "),
             "{:?}",
             text(0)
         );
         let top = text(0);
-        let at = top[..top.find(" claude ").expect("its name")]
+        let at = top[..top.find(" fix scroll ").expect("its name")]
             .chars()
             .count();
         assert_eq!(grid[0][at + 1].map(|(_, ink)| ink), Some(EdgeInk::TitleLit));
@@ -8637,14 +8739,14 @@ mod tests {
         );
         assert!(painted.contains("top row"), "{painted:?}");
         assert!(painted.contains("bottom row"), "{painted:?}");
-        // The focused pane's corners and no line between the two.
+        // A frame round both, one line between them joined into it at each end.
         assert!(
             painted.contains('\u{256d}') && painted.contains('\u{256f}'),
-            "the focused pane has no corners: {painted:?}"
+            "the frame has no corners: {painted:?}"
         );
         assert!(
-            !painted.contains('\u{251c}') && !painted.contains('\u{253c}'),
-            "a line still runs between the panes: {painted:?}"
+            painted.contains('\u{251c}') && painted.contains('\u{2524}'),
+            "no line runs between the panes: {painted:?}"
         );
     }
     #[test]
@@ -8877,13 +8979,29 @@ mod tests {
         assert_ne!(say(&[shell, in_qass], &qass_spaces, 3).0, START_AGENT);
         assert!(START_AGENT.len() < 50);
     }
+    /// The park label stands only on a straight run of a frame: never on a joint, which
+    /// would leave a divider hanging, nor on a name.
+    #[test]
+    fn the_park_label_stands_only_on_a_straight_line() {
+        assert!(bare_line(None));
+        assert!(bare_line(Some(('\u{2500}', EdgeInk::Line))));
+        assert!(bare_line(Some((
+            '\u{2500}',
+            EdgeInk::Frame(theme::Role::Brand)
+        ))));
+        assert!(!bare_line(Some(('\u{2534}', EdgeInk::Line))));
+        assert!(!bare_line(Some(('x', EdgeInk::Title))));
+    }
+
     /// The handle's cells are ember edge cells over the divider only: a cell that holds a name or
-    /// a corner keeps it, and nothing outside the line is touched.
+    /// a joint keeps it, a straight line of the frame is lit, and nothing outside it is touched.
     #[test]
     fn the_handle_fills_only_free_cells_of_its_line() {
         use crate::qass_screen::Handle;
         let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; 10]; 10];
         grid[4][3] = Some(('x', EdgeInk::Title));
+        grid[5][3] = Some(('\u{2502}', EdgeInk::Line));
+        grid[6][3] = Some(('\u{251c}', EdgeInk::Line));
         put_handle(
             &mut grid,
             Handle {
@@ -8897,7 +9015,12 @@ mod tests {
         assert_eq!(column[2], Some(('\u{2502}', EdgeInk::Lit)));
         assert_eq!(column[3], Some(('\u{2502}', EdgeInk::Lit)));
         assert_eq!(column[4], Some(('x', EdgeInk::Title)), "a name is kept");
-        assert_eq!(column[6], Some(('\u{2502}', EdgeInk::Lit)));
+        assert_eq!(column[5], Some(('\u{2502}', EdgeInk::Lit)), "a line is lit");
+        assert_eq!(
+            column[6],
+            Some(('\u{251c}', EdgeInk::Line)),
+            "a joint is kept"
+        );
         assert_eq!((column[1], column[7]), (None, None), "only its own cells");
         assert!(grid.iter().flatten().filter(|c| c.is_some()).count() == 5);
         // A row of it, off the edge of the grid: clipped, no panic.

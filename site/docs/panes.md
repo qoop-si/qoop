@@ -7,6 +7,11 @@ Move between panes with `ctrl-a H J K L` or a click, cycle with `ctrl-a o`, and 
 the full pane with `ctrl-a z`. `ctrl-a X` takes a pane out of the split and keeps it as a
 tab.
 
+Every pane has a thin quiet frame, one line shared where two panes meet. The focused pane's
+frame wears its space's colour (bold without colour), so the pane the keys go to stands out.
+Each pane's top edge carries the name its row in the agents panel shows: the conversation's
+title, or the name you gave the tab.
+
 ## Resizing
 
 - **Mouse:** drag the divider between two panes.

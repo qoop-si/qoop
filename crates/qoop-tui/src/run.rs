@@ -3482,9 +3482,11 @@ impl State {
     }
 
     /// Whether a pane cell is on the rail's edge line, the one that drags its width.
+    /// The edge and the open pane's frame line beside it, which is the line the rail shows.
     fn on_rail_edge(&self, x: usize, y: usize) -> bool {
-        self.rail_paint()
-            .is_some_and(|r| x == r.x + r.w && y >= r.y && y < r.y + r.rows)
+        self.rail_paint().is_some_and(|r| {
+            (r.x + r.w..=r.x + r.w + 1).contains(&x) && y >= r.y && y < r.y + r.rows
+        })
     }
 
     /// Set the tabs' width from the pane cell the edge was dragged to. True when it moved.
@@ -5403,6 +5405,21 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     let moved = next != state.list_scroll;
     state.list_scroll = next;
     moved
+}
+
+/// Where the wheel leaves the column's list once a click puts the keyboard on `picked`. A row
+/// of the tree was on screen to be clicked, so the list stays where the wheel left it; an
+/// inbox item names an agent whose row may be scrolled out, so the wheel's place is let go
+/// and the list follows it there.
+fn clicked_scroll(
+    scroll: Option<(u32, usize)>,
+    picked: u32,
+    hit: Option<sidebar::Hit>,
+) -> Option<(u32, usize)> {
+    match (scroll, hit) {
+        (Some((_, at)), Some(sidebar::Hit::Terminal(_))) => Some((picked, at)),
+        _ => None,
+    }
 }
 
 fn scroll_focus(state: &mut State, up: bool, step: usize) {
@@ -9409,11 +9426,11 @@ where
                                     // let go where it went down it is a click, moved
                                     // first it is a drag to another space or a pane.
                                     Some(Clicked::Terminal(picked)) if in_column => {
-                                        // The list stays where the wheel left it when the
-                                        // click moves the keyboard to the row it landed on.
-                                        if let Some((_, at)) = state.list_scroll {
-                                            state.list_scroll = Some((picked, at));
-                                        }
+                                        state.list_scroll = clicked_scroll(
+                                            state.list_scroll,
+                                            picked,
+                                            state.column_hit(row).map(|(hit, _)| hit),
+                                        );
                                         let name = matches!(
                                             state.column_hit(row),
                                             Some((sidebar::Hit::Terminal(_), true))
@@ -20948,6 +20965,27 @@ mod tests {
         }
     }
 
+    /// A click on a tree row keeps the wheel's place; a click on an inbox item lets the list
+    /// follow the agent it opens, whose row may be scrolled out of the window.
+    #[test]
+    fn an_inbox_click_lets_the_list_follow_the_agent_it_opens() {
+        let wheeled = Some((1, 12));
+        assert_eq!(
+            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Terminal(7))),
+            Some((7, 12))
+        );
+        // Let go, not kept for the agent it was on: back there, the list follows the keys.
+        assert_eq!(
+            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Next(Some(7)))),
+            None,
+            "the list follows the opened agent"
+        );
+        assert_eq!(
+            clicked_scroll(None, 7, Some(sidebar::Hit::Terminal(7))),
+            None
+        );
+    }
+
     #[test]
     fn the_focus_list_scrolls_with_arrows_and_j_k() {
         let mut state = bare_state();
@@ -25303,7 +25341,9 @@ mod tests {
         let default = rail.w;
         assert_eq!(default, crate::rail::default_width(pane_area(&state).cols));
         assert!(state.on_rail_edge(rail.x + rail.w, rail.y + 3));
-        assert!(!state.on_rail_edge(rail.x + rail.w + 1, rail.y + 3));
+        // The board's frame line beside it is the line the rail shows, and drags it too.
+        assert!(state.on_rail_edge(rail.x + rail.w + 1, rail.y + 3));
+        assert!(!state.on_rail_edge(rail.x + rail.w + 2, rail.y + 3));
         let (col, row) = screen_of(&state, rail.x + rail.w, rail.y + 3);
         assert!(state.split_press(col, row), "the press holds the edge");
         assert_eq!(state.modes.split_drag, Some(Grab::Rail));
@@ -25437,6 +25477,30 @@ mod tests {
             assert_eq!(tile_of(&state, 5), qass);
             assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
         }
+    }
+
+    /// The rail and the open pane share one line: the board's frame, with the rail's edge
+    /// blank beside it, never two lines side by side.
+    #[test]
+    fn the_rail_and_the_open_pane_share_one_line() {
+        let mut state = qass_wide();
+        state.qass_ui.fold = Some(crate::qass_screen::Fold::Qass);
+        let rail = state.rail_paint().expect("the rail");
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let cell = |x: usize| {
+            let (col, row) = screen_of(&state, x, rail.y + 3);
+            grid[row as usize - 1][col as usize - 1]
+        };
+        assert_eq!(cell(rail.x + rail.w), ' ', "the edge is blank");
+        assert_eq!(
+            cell(rail.x + rail.w + 1),
+            '\u{2502}',
+            "the frame draws the line"
+        );
     }
 
     /// What a drawn copy carries (the rail among it) never reaches a tree that is kept, and
