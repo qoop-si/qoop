@@ -86,6 +86,8 @@ struct Key {
     tool_id: Option<String>,
     /// When the agent that serves the page started: a new one reads running work as left behind.
     alive_since: Option<i64>,
+    /// The subagent whose chat it is, `None` for the terminal's own.
+    child: Option<String>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,8 @@ struct Watched {
     next_locate: Option<Instant>,
     /// The last reply, for a read that asks the same while the stamp has not moved.
     memo: Option<Memo>,
+    /// The same for the last read of one of its subagents' chats (its key names the child).
+    child_memo: Option<Memo>,
     /// When the agent the last page was made for started: the stamp of that page folds it in
     /// (`qoop_parsed::revision_with`), so the watch must too.
     alive: Option<i64>,
@@ -209,11 +213,29 @@ impl Watch {
         })
     }
 
-    /// What is known of a terminal's chat, to save a read the work.
-    fn known(&self, terminal: u32, session: &str) -> (Option<Source>, Option<Memo>) {
+    /// What is known of a terminal's chat, to save a read the work: where its file is, and the
+    /// last reply of the terminal's own chat, or of a subagent's for a `child` read.
+    fn known(&self, terminal: u32, session: &str, child: bool) -> (Option<Source>, Option<Memo>) {
         match self.watched.lock().unwrap().get(&terminal) {
-            Some(w) if w.session == session => (w.source.clone(), w.memo.clone()),
+            Some(w) if w.session == session => {
+                let memo = if child { &w.child_memo } else { &w.memo };
+                (w.source.clone(), memo.clone())
+            }
             _ => (None, None),
+        }
+    }
+
+    /// A client read a subagent's chat of `terminal` just now: the watch of the terminal's own
+    /// chat goes on (its stamp folds in the newest subagents), and the reply is kept. Where the
+    /// terminal's file is, its stamp and its own memo are the terminal's chat's, never changed here.
+    fn renew(&self, terminal: u32, session: &str, memo: Option<Memo>) {
+        if let Some(w) = self.watched.lock().unwrap().get_mut(&terminal)
+            && w.session == session
+        {
+            w.asked = Instant::now();
+            if memo.is_some() {
+                w.child_memo = memo;
+            }
         }
     }
 
@@ -238,6 +260,7 @@ impl Watch {
             revision,
             next_locate: None,
             memo: None,
+            child_memo: None,
             alive: None,
             told: None,
         });
@@ -250,6 +273,7 @@ impl Watch {
                 revision,
                 next_locate: None,
                 memo: None,
+                child_memo: None,
                 alive: None,
                 told: None,
             };
@@ -287,6 +311,7 @@ impl Watch {
                         revision: None,
                         next_locate: None,
                         memo: None,
+                        child_memo: None,
                         alive: None,
                         told: None,
                     };
@@ -440,15 +465,25 @@ fn locate(dirs: &Option<qoop_parsed::Dirs>, program: &str, session: &str) -> Opt
 /// What a read asks for.
 enum Ask {
     Page {
+        child: Option<String>,
         skip: usize,
         limit: usize,
         revision: Option<u64>,
         alive_since: Option<i64>,
     },
     Detail {
+        child: Option<String>,
         tool_id: String,
         max_bytes: usize,
     },
+}
+
+impl Ask {
+    fn child(&self) -> Option<&str> {
+        match self {
+            Ask::Page { child, .. } | Ask::Detail { child, .. } => child.as_deref(),
+        }
+    }
 }
 
 /// What a read found, whether or not it could answer.
@@ -482,9 +517,18 @@ fn read(
     memo: Option<Memo>,
     ask: &Ask,
 ) -> Outcome {
-    let Some(source) = known.or_else(|| locate(&agent_dirs(), program, session)) else {
+    let dirs = agent_dirs();
+    let Some(mut source) = known.or_else(|| locate(&dirs, program, session)) else {
         return Outcome::refused(None, None, "no_session");
     };
+    // A subagent's chat: its own file, found from the terminal's and checked to be its child.
+    if let Some(child) = ask.child() {
+        let codex = dirs.as_ref().map(|d| d.codex.as_path());
+        match qoop_parsed::child_source(program, &source, session, child, codex) {
+            Some(found) => source = found,
+            None => return Outcome::refused(None, None, "no_session"),
+        }
+    }
     let revision = match qoop_parsed::revision_of(&source) {
         Ok(revision) => revision,
         // The file went away since it was found: find it again next time.
@@ -498,6 +542,7 @@ fn read(
     };
     match ask {
         Ask::Page {
+            child,
             skip,
             limit,
             revision: client,
@@ -519,12 +564,13 @@ fn read(
                 max_bytes: 0,
                 tool_id: None,
                 alive_since: *alive_since,
+                child: child.clone(),
             };
             let load = |skip| {
                 let opts = Options {
                     skip,
                     limit: *limit,
-                    codex_root: agent_dirs().map(|d| d.codex),
+                    codex_root: dirs.as_ref().map(|d| d.codex.clone()),
                     alive_since: *alive_since,
                     ..Options::default()
                 };
@@ -564,7 +610,11 @@ fn read(
                 result: Ok((reply, reset)),
             }
         }
-        Ask::Detail { tool_id, max_bytes } => {
+        Ask::Detail {
+            child,
+            tool_id,
+            max_bytes,
+        } => {
             let key = Key {
                 revision,
                 skip: 0,
@@ -572,6 +622,7 @@ fn read(
                 max_bytes: *max_bytes,
                 tool_id: Some(tool_id.clone()),
                 alive_since: None,
+                child: child.clone(),
             };
             if let Some(reply) = hit(&key) {
                 return Outcome {
@@ -607,6 +658,22 @@ pub async fn answer(
     agents: &Arc<AgentRegistry>,
     watch: &Watch,
 ) -> ControlResponse {
+    let page = |child, terminal, skip: u32, limit: u32, revision| Ask::Page {
+        child,
+        skip: (skip as usize).min(MAX_SKIP),
+        limit: if limit == 0 {
+            Options::default().limit
+        } else {
+            limit.min(MAX_LIMIT) as usize
+        },
+        revision,
+        alive_since: alive_since(agents, terminal),
+    };
+    let detail = |child, tool_id, max_bytes: Option<u32>| Ask::Detail {
+        child,
+        tool_id,
+        max_bytes: max_bytes.unwrap_or(DETAIL_DEFAULT).min(DETAIL_MAX) as usize,
+    };
     let (id, terminal, ask) = match request {
         ControlRequest::Messages {
             id,
@@ -614,33 +681,32 @@ pub async fn answer(
             skip,
             limit,
             revision,
-        } => {
-            let limit = if limit == 0 {
-                Options::default().limit
-            } else {
-                limit.min(MAX_LIMIT) as usize
-            };
-            let skip = (skip as usize).min(MAX_SKIP);
-            (
-                id,
-                terminal,
-                Ask::Page {
-                    skip,
-                    limit,
-                    revision,
-                    alive_since: alive_since(agents, terminal),
-                },
-            )
-        }
+        } => (id, terminal, page(None, terminal, skip, limit, revision)),
+        ControlRequest::SubagentMessages {
+            id,
+            terminal,
+            child,
+            skip,
+            limit,
+            revision,
+        } => (
+            id,
+            terminal,
+            page(Some(child), terminal, skip, limit, revision),
+        ),
         ControlRequest::MessageDetail {
             id,
             terminal,
             tool_id,
             max_bytes,
-        } => {
-            let max_bytes = max_bytes.unwrap_or(DETAIL_DEFAULT).min(DETAIL_MAX) as usize;
-            (id, terminal, Ask::Detail { tool_id, max_bytes })
-        }
+        } => (id, terminal, detail(None, tool_id, max_bytes)),
+        ControlRequest::SubagentDetail {
+            id,
+            terminal,
+            child,
+            tool_id,
+            max_bytes,
+        } => (id, terminal, detail(Some(child), tool_id, max_bytes)),
         other => return failed(other.request_id().to_string(), "unavailable"),
     };
     let (program, session) = match who(terminals, agents, terminal) {
@@ -657,7 +723,8 @@ pub async fn answer(
         Ask::Page { alive_since, .. } => *alive_since,
         Ask::Detail { .. } => None,
     };
-    let (known, memo) = watch.known(terminal, &session);
+    let child = ask.child().is_some();
+    let (known, memo) = watch.known(terminal, &session, child);
     let outcome = {
         let session = session.clone();
         crate::blocking::chat(DEADLINE, move || {
@@ -669,8 +736,11 @@ pub async fn answer(
         // Busy, degraded, past its deadline or panicked: the chat is not answering now.
         return failed(id, "unavailable");
     };
+    // A subagent's chat keeps the terminal's watch going and nothing else of it.
+    if child {
+        watch.renew(terminal, &session, outcome.memo);
     // Worth hearing about when it changes: a read that answered, or found no file yet.
-    if outcome.result.is_ok() || matches!(outcome.result, Err("no_session")) {
+    } else if outcome.result.is_ok() || matches!(outcome.result, Err("no_session")) {
         watch.mark(
             terminal,
             &session,
@@ -765,6 +835,39 @@ mod tests {
         let held = watch.watched.lock().unwrap();
         assert_eq!(held[&4].revision, Some(12));
         assert_eq!(held[&4].session, "two");
+    }
+
+    #[test]
+    fn a_subagent_read_renews_the_watch_and_keeps_its_reply_apart() {
+        let watch = Watch::default();
+        let memo = |child: Option<&str>| Memo {
+            key: Key {
+                revision: 1,
+                skip: 0,
+                limit: 1,
+                max_bytes: 0,
+                tool_id: None,
+                alive_since: None,
+                child: child.map(String::from),
+            },
+            reply: Arc::new(Reply::Detail(qoop_parsed::Detail {
+                input: String::new(),
+                output: String::new(),
+                truncated: false,
+            })),
+        };
+        let own = Source::File("/p/s.jsonl".into());
+        watch.mark(4, "one", Some(own.clone()), Some(1), Some(memo(None)), None);
+        let before = watch.watched.lock().unwrap()[&4].asked;
+        watch.renew(4, "one", Some(memo(Some("c"))));
+        // Another conversation's read keeps nothing.
+        watch.renew(4, "two", Some(memo(Some("x"))));
+        let (source, parent) = watch.known(4, "one", false);
+        let (_, child) = watch.known(4, "one", true);
+        assert_eq!(source, Some(own));
+        assert_eq!(parent.unwrap().key.child, None);
+        assert_eq!(child.unwrap().key.child.as_deref(), Some("c"));
+        assert!(watch.watched.lock().unwrap()[&4].asked >= before);
     }
 
     #[test]
@@ -936,6 +1039,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let source = Source::File(path.clone());
         let page = Ask::Page {
+            child: None,
             alive_since: None,
             skip: 0,
             limit: 3,
@@ -957,6 +1061,7 @@ mod tests {
         );
         // Another page is another reply.
         let deeper = Ask::Page {
+            child: None,
             alive_since: None,
             skip: 1,
             limit: 3,
@@ -1002,6 +1107,7 @@ mod tests {
         .unwrap();
         let source = Source::File(path);
         let page = |alive_since| Ask::Page {
+            child: None,
             alive_since,
             skip: 0,
             limit: 3,
@@ -1040,6 +1146,7 @@ mod tests {
         assert_ne!(other.revision, first.revision);
         // A client that holds the first agent's revision is told to start over.
         let held = Ask::Page {
+            child: None,
             alive_since: Some(2_000),
             skip: 1,
             limit: 3,
@@ -1059,6 +1166,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gone = Source::File(dir.path().join("missing.jsonl"));
         let page = Ask::Page {
+            child: None,
             alive_since: None,
             skip: 0,
             limit: 3,

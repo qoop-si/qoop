@@ -996,3 +996,124 @@ async fn a_watch_begun_by_a_detail_read_or_a_missing_file_says_nothing_until_som
     let now = page(ask(&mut c, messages(0, 10, None)).await);
     assert_eq!(now.revision, revision);
 }
+
+/// A spawn of a named background agent, the launch result that names its child, and the
+/// child's own transcript beside the parent's, with one command in it.
+fn with_child(id: &str) -> (PathBuf, String) {
+    let path = transcript(id);
+    let child = "ae1-langfuse-14ff6a68";
+    let spawn = record(
+        "assistant",
+        1,
+        id,
+        json!({"id": "msg_1", "role": "assistant", "model": "claude-sonnet-5-5",
+               "content": [{"type": "tool_use", "id": "toolu_spawn", "name": "Agent",
+                            "input": {"description": "Build E1", "prompt": "p", "name": "e1-langfuse",
+                                      "run_in_background": true}}],
+               "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    );
+    let mut launched: Value =
+        serde_json::from_str(&result(2, id, "toolu_spawn", "launched")).unwrap();
+    launched["toolUseResult"] =
+        json!({"status": "async_launched", "agentId": child, "prompt": "p"});
+    std::fs::write(
+        &path,
+        [user(0, id, "build e1"), spawn, format!("{launched}\n")].concat(),
+    )
+    .expect("write");
+    let subagents = path.with_extension("").join("subagents");
+    std::fs::create_dir_all(&subagents).expect("subagents dir");
+    let mut first: Value = serde_json::from_str(&user(0, id, "p")).unwrap();
+    first["isSidechain"] = json!(true);
+    first["agentId"] = json!(child);
+    std::fs::write(
+        subagents.join(format!("agent-{child}.jsonl")),
+        [
+            format!("{first}\n"),
+            call(1, id, "toolu_child", "docker ps"),
+            result(2, id, "toolu_child", "langfuse-web up"),
+            agent(3, id, "E1 is up on staging."),
+        ]
+        .concat(),
+    )
+    .expect("write child");
+    (path, child.to_string())
+}
+
+#[tokio::test]
+async fn a_subagent_row_opens_its_own_chat_and_nothing_outside_it() {
+    let daemon = Daemon::start();
+    let id = fresh_id("child");
+    let (path, child) = with_child(&id);
+    // A transcript of another conversation beside it, which no child id may reach.
+    std::fs::write(path.with_file_name("other.jsonl"), turns("other", 1)).expect("write");
+    daemon.start_agent(Some(&id));
+    let mut c = daemon.client().await;
+
+    let parent = page(ask(&mut c, messages(0, 10, None)).await);
+    let row = parent
+        .items
+        .iter()
+        .find(|i| i["type"] == "subagent")
+        .expect("a subagent row");
+    assert_eq!(row["name"], "e1-langfuse");
+    assert_eq!(row["act"], "spawn");
+    assert_eq!(row["child"], json!(child));
+
+    let sub = |child: &str| ControlRequest::SubagentMessages {
+        id: format!("s-{child}"),
+        terminal: 1,
+        child: child.into(),
+        skip: 0,
+        limit: 10,
+        revision: None,
+    };
+    let opened = page(ask(&mut c, sub(&child)).await);
+    assert_eq!(
+        texts(&opened).last().map(String::as_str),
+        Some("E1 is up on staging.")
+    );
+    let tool = opened
+        .items
+        .iter()
+        .find(|i| i["type"] == "tool")
+        .expect("the child's command");
+    let detail = ask(
+        &mut c,
+        ControlRequest::SubagentDetail {
+            id: "sd".into(),
+            terminal: 1,
+            child: child.clone(),
+            tool_id: tool["id"].as_str().unwrap().into(),
+            max_bytes: None,
+        },
+    )
+    .await;
+    let ControlResponse::MessageDetail { output, .. } = detail else {
+        panic!("a detail was expected: {detail:?}");
+    };
+    assert!(output.contains("langfuse-web up"), "{output}");
+
+    for outside in ["../other", "other", "missing", ""] {
+        assert_eq!(
+            refusal(ask(&mut c, sub(outside)).await),
+            "no_session",
+            "{outside}"
+        );
+    }
+    // The terminal's own chat is as it was, from its memo or a fresh read alike.
+    let again = page(ask(&mut c, messages(0, 10, None)).await);
+    assert_eq!(
+        (again.revision, again.items.len()),
+        (parent.revision, parent.items.len())
+    );
+
+    let (ok, out, err) = daemon.qoop(&["messages", "1"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(&format!("e1-langfuse --child {child}")),
+        "{out}"
+    );
+    let (ok, out, err) = daemon.qoop(&["messages", "1", "--child", &child]);
+    assert!(ok && out.contains("E1 is up on staging."), "{out}{err}");
+}

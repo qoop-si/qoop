@@ -140,6 +140,28 @@ pub enum ControlRequest {
         #[serde(default)]
         max_bytes: Option<u32>,
     },
+    /// A page of the chat of one subagent of a terminal's agent, answered as `Messages`:
+    /// `child` is the id a `subagent` item carries. Same paging, authorization and reason codes
+    /// as `Messages`; `no_session` also when `child` is not a subagent of the terminal's own
+    /// session. An older daemon answers `unknown variant`, never the terminal's own chat.
+    SubagentMessages {
+        id: String,
+        terminal: TerminalStream,
+        child: String,
+        skip: u32,
+        limit: u32,
+        #[serde(default)]
+        revision: Option<u64>,
+    },
+    /// `MessageDetail` for a tool call in a subagent's chat, answered as `MessageDetail`.
+    SubagentDetail {
+        id: String,
+        terminal: TerminalStream,
+        child: String,
+        tool_id: String,
+        #[serde(default)]
+        max_bytes: Option<u32>,
+    },
     /// Look for text in what has scrolled past, one bounded step at a time.
     ///
     /// A step and not a whole search, because a week of history is millions of rows and a
@@ -1603,6 +1625,8 @@ impl ControlRequest {
             | Self::SearchScrollback { id, .. }
             | Self::Messages { id, .. }
             | Self::MessageDetail { id, .. }
+            | Self::SubagentMessages { id, .. }
+            | Self::SubagentDetail { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }

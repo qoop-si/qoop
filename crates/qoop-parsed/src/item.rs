@@ -87,6 +87,18 @@ pub enum Item {
         /// included), `failed`, `interrupted`. An older daemon sends none, which reads as `ok`.
         #[serde(default)]
         status: Status,
+        /// What the call did to the subagent: `spawn`, `message` or `wait`; absent when the
+        /// tool's name does not say (the summary still opens with the verb, for older clients).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<String>,
+        /// The agent's own name (a named Claude agent, the one a message goes to, a Codex agent
+        /// path's last part), else its type when that is not the generic one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The subagent's session id, for `Messages { child }`: the spawned child, or the child a
+        /// message or a wait names. Only where the daemon can open it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<String>,
     },
     Compaction {
         seq: u32,

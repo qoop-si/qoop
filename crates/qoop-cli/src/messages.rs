@@ -10,8 +10,8 @@ use qoop_runtime::control::{ControlRequest, ControlResponse};
 use crate::task::ask;
 use crate::usage;
 
-const USAGE: &str = "usage: qoop messages <terminal> [--skip N] [--limit N] [--json]
-       qoop messages detail <terminal> <tool_id> [--json]";
+const USAGE: &str = "usage: qoop messages <terminal> [--child ID] [--skip N] [--limit N] [--json]
+       qoop messages detail <terminal> <tool_id> [--child ID] [--json]";
 
 /// The longest a row of the text form is, in characters.
 const ROW: usize = 120;
@@ -24,6 +24,13 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
     }
 }
 
+/// The value of `--child`: a word that is not another flag.
+fn id_arg(word: Option<&String>) -> std::io::Result<String> {
+    word.filter(|w| !w.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| usage(USAGE))
+}
+
 fn terminal_of(word: Option<&String>) -> std::io::Result<u32> {
     word.and_then(|v| v.parse().ok())
         .ok_or_else(|| usage(USAGE))
@@ -33,6 +40,7 @@ fn page(args: &[String]) -> std::io::Result<()> {
     let terminal = terminal_of(args.first())?;
     crate::qass_guard(&terminal.to_string())?;
     let (mut skip, mut limit, mut json) = (0u32, 0u32, false);
+    let mut child = None;
     let mut rest = args.iter().skip(1);
     while let Some(arg) = rest.next() {
         let mut number = || -> std::io::Result<u32> {
@@ -44,15 +52,27 @@ fn page(args: &[String]) -> std::io::Result<()> {
             "--skip" => skip = number()?,
             "--limit" => limit = number()?,
             "--json" => json = true,
+            "--child" => child = Some(id_arg(rest.next())?),
             _ => return Err(usage(format!("unknown flag {arg}; {USAGE}"))),
         }
     }
-    let request = ControlRequest::Messages {
-        id: crate::request_id("messages"),
-        terminal,
-        skip,
-        limit,
-        revision: None,
+    let id = crate::request_id("messages");
+    let request = match child {
+        Some(child) => ControlRequest::SubagentMessages {
+            id,
+            terminal,
+            child,
+            skip,
+            limit,
+            revision: None,
+        },
+        None => ControlRequest::Messages {
+            id,
+            terminal,
+            skip,
+            limit,
+            revision: None,
+        },
     };
     match ask(request, Duration::from_secs(15))? {
         ControlResponse::Messages {
@@ -89,18 +109,30 @@ fn detail(args: &[String]) -> std::io::Result<()> {
     let terminal = terminal_of(args.first())?;
     crate::qass_guard(&terminal.to_string())?;
     let tool_id = args.get(1).ok_or_else(|| usage(USAGE))?.clone();
-    let mut json = false;
-    for arg in args.iter().skip(2) {
+    let (mut json, mut child) = (false, None);
+    let mut rest = args.iter().skip(2);
+    while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--json" => json = true,
+            "--child" => child = Some(id_arg(rest.next())?),
             _ => return Err(usage(format!("unknown flag {arg}; {USAGE}"))),
         }
     }
-    let request = ControlRequest::MessageDetail {
-        id: crate::request_id("detail"),
-        terminal,
-        tool_id,
-        max_bytes: None,
+    let id = crate::request_id("detail");
+    let request = match child {
+        Some(child) => ControlRequest::SubagentDetail {
+            id,
+            terminal,
+            child,
+            tool_id,
+            max_bytes: None,
+        },
+        None => ControlRequest::MessageDetail {
+            id,
+            terminal,
+            tool_id,
+            max_bytes: None,
+        },
     };
     match ask(request, Duration::from_secs(15))? {
         ControlResponse::MessageDetail {
@@ -169,11 +201,20 @@ fn row(item: &Item) -> String {
             summary,
             steps,
             status,
+            name,
+            child,
             ..
-        } => (
-            "subagent",
-            format!("[{}] {summary} ({steps} steps)", status_word(*status)),
-        ),
+        } => {
+            let mut line = format!("[{}] {summary} ({steps} steps)", status_word(*status));
+            if let Some(name) = name {
+                line.push_str(&format!(" {name}"));
+            }
+            // What opens its own chat: `qoop messages <terminal> --child <id>`.
+            if let Some(child) = child {
+                line.push_str(&format!(" --child {child}"));
+            }
+            ("subagent", line)
+        }
         Item::Compaction { text, .. } => ("compaction", text.clone().unwrap_or_default()),
         Item::Error { text, .. } => ("error", text.clone()),
         Item::Notice { kind, text, .. } => ("notice", format!("{kind}: {text}")),
@@ -240,6 +281,9 @@ mod tests {
             summary: "spawned: survey".into(),
             steps: 2,
             status: Status::Running,
+            act: Some("spawn".into()),
+            name: Some("e1".into()),
+            child: Some("ae1-14ff".into()),
         };
         // The word is before the summary: a long one is cut at the end of the line.
         let long = Item::Subagent {
@@ -247,11 +291,14 @@ mod tests {
             summary: "x".repeat(200),
             steps: 1,
             status: Status::Failed,
+            act: None,
+            name: None,
+            child: None,
         };
         assert!(row(&long).contains("[failed] xxx"), "{}", row(&long));
         assert_eq!(
             row(&subagent),
-            "    6  subagent   [running] spawned: survey (2 steps)"
+            "    6  subagent   [running] spawned: survey (2 steps) e1 --child ae1-14ff"
         );
         let tool = Item::Tool {
             seq: 4,

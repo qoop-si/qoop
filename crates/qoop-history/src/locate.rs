@@ -322,7 +322,7 @@ fn codex_head_matches(path: &Path, id: &str) -> Result<bool, Error> {
 }
 
 /// The first line of a file as JSON, `None` when it is not one or exceeds the probe bound.
-fn first_line_json(path: &Path) -> Result<Option<serde_json::Value>, Error> {
+pub fn first_line_json(path: &Path) -> Result<Option<serde_json::Value>, Error> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).map_err(|e| Error::Io(e.to_string()))?;
     let len = file.metadata().map_err(|e| Error::Io(e.to_string()))?.len();

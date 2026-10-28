@@ -314,10 +314,11 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 less what qoop or qass typed for you\n\
                   \x20 qoop sessions-index <file>  read every agent session on this computer\n\
                   \x20                 into the index at <file>; the daemon runs it\n\
-                  \x20 qoop messages <terminal> [--skip N] [--limit N] [--json]\n\
-                  \x20                 the chat of an agent, parsed from its own session file:\n\
+                  \x20 qoop messages <terminal> [--child ID] [--skip N] [--limit N] [--json]\n\
+                  \x20                 the chat of an agent (or, with --child, of one of its\n\
+                  \x20                 subagents), parsed from its own session file:\n\
                   \x20                 one row per message, tool call or note, newest last\n\
-                  \x20 qoop messages detail <terminal> <tool_id> [--json]\n\
+                  \x20 qoop messages detail <terminal> <tool_id> [--child ID] [--json]\n\
                   \x20                 the input and output of one tool call of that chat\n\
                   \x20 qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
                   \x20                 understand another agent before writing to it:\n\

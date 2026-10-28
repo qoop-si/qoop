@@ -3844,7 +3844,10 @@ fn dispatch(
         ControlRequest::SaveUpload { .. } => Dispatch::Apart,
         // A read and a parse of the agent's own session file: off the read loop, where it
         // would hold up this connection's typing.
-        ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. } => Dispatch::Apart,
+        ControlRequest::Messages { .. }
+        | ControlRequest::MessageDetail { .. }
+        | ControlRequest::SubagentMessages { .. }
+        | ControlRequest::SubagentDetail { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
@@ -5653,7 +5656,10 @@ async fn handle_control(
             ))
             .await
         }
-        request @ (ControlRequest::Messages { .. } | ControlRequest::MessageDetail { .. }) => {
+        request @ (ControlRequest::Messages { .. }
+        | ControlRequest::MessageDetail { .. }
+        | ControlRequest::SubagentMessages { .. }
+        | ControlRequest::SubagentDetail { .. }) => {
             crate::messages::answer(request, terminals, agents, &connections.messages).await
         }
         ControlRequest::AskRead { id, all } => {

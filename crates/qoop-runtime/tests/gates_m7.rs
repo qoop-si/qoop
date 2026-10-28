@@ -214,6 +214,21 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             tool_id: "t".into(),
             max_bytes: None,
         },
+        ControlRequest::SubagentMessages {
+            id: "x37".into(),
+            terminal,
+            child: "c".into(),
+            skip: 0,
+            limit: 10,
+            revision: None,
+        },
+        ControlRequest::SubagentDetail {
+            id: "x38".into(),
+            terminal,
+            child: "c".into(),
+            tool_id: "t".into(),
+            max_bytes: None,
+        },
         ControlRequest::SetSplit {
             id: "x22".into(),
             tree: qoop_runtime::control::Pane::Leaf { terminal },
@@ -445,6 +460,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SearchScrollback { .. }
             | ControlRequest::Messages { .. }
             | ControlRequest::MessageDetail { .. }
+            | ControlRequest::SubagentMessages { .. }
+            | ControlRequest::SubagentDetail { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }

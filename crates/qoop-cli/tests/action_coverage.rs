@@ -401,6 +401,31 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "read the chat of a subagent, from `qoop messages --child`",
+            method: || {
+                Method::Control(ControlRequest::SubagentMessages {
+                    id: "a".into(),
+                    terminal: 1,
+                    child: "c".into(),
+                    skip: 0,
+                    limit: 60,
+                    revision: None,
+                })
+            },
+        },
+        Action {
+            name: "open one tool call of a subagent's chat, from `qoop messages detail --child`",
+            method: || {
+                Method::Control(ControlRequest::SubagentDetail {
+                    id: "a".into(),
+                    terminal: 1,
+                    child: "c".into(),
+                    tool_id: "t".into(),
+                    max_bytes: None,
+                })
+            },
+        },
+        Action {
             name: "search the history from copy mode",
             method: || {
                 Method::Control(ControlRequest::SearchScrollback {
@@ -879,6 +904,21 @@ fn every_control_method_is_reachable_from_some_action() {
             tool_id: String::new(),
             max_bytes: None,
         },
+        ControlRequest::SubagentMessages {
+            id: String::new(),
+            terminal: 0,
+            child: String::new(),
+            skip: 0,
+            limit: 0,
+            revision: None,
+        },
+        ControlRequest::SubagentDetail {
+            id: String::new(),
+            terminal: 0,
+            child: String::new(),
+            tool_id: String::new(),
+            max_bytes: None,
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -1145,6 +1185,8 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SearchScrollback { .. }
             | ControlRequest::Messages { .. }
             | ControlRequest::MessageDetail { .. }
+            | ControlRequest::SubagentMessages { .. }
+            | ControlRequest::SubagentDetail { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

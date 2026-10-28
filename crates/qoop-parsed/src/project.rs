@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::item::{Chip, Item, Status};
 use crate::subagent::Spawn;
 use crate::text;
+use qoop_history::valid_id;
 
 /// Records the agents write for their own bookkeeping, not for the reader (seen in real
 /// Claude and Codex sessions), and the `attachment.*` records Claude injects. They get no row.
@@ -46,6 +47,7 @@ const BOOKKEEPING: &[&str] = &[
     "SubAgentActivity",
     "task_started",
     "todos",
+    "tools-used",
     "token_count",
     "turn_diff",
     "web_search_end",
@@ -83,6 +85,11 @@ struct Cx {
     newest_turn: Option<usize>,
     /// See `Options::alive_since`.
     since: Option<i64>,
+    /// The subagents spawned so far, by their name and by their child id: (name, child id).
+    agents: HashMap<String, (Option<String>, String)>,
+    /// Rows may link a child session: the daemon opens Claude's at any depth (one directory per
+    /// top session) and the other products' only from a top session.
+    links: bool,
 }
 
 /// Every item of the session, oldest first, each numbered by its distance from the end of
@@ -110,6 +117,8 @@ pub(crate) fn project(
             .iter()
             .rposition(|e| matches!(e.kind, EntryKind::Turn(_))),
         since: alive_since,
+        agents: HashMap::new(),
+        links: session.agent == Agent::Claude || session.parent.is_none(),
     };
     let mut out = Vec::new();
     for (at, entry) in session.entries.iter().enumerate() {
@@ -530,17 +539,23 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
     }
 }
 
-/// What another agent sent: one line, `<sender>: <first line of the payload>`, and nothing at
-/// all for a message with no payload. Text that is not in that shape stays as it came.
+/// What another agent sent: one line per message, `<sender>: <first line of the payload>`, and
+/// nothing for a message with no payload. A Claude teammate block (a team's protocol ping
+/// included) is read by [`text::teammate_messages`], a Codex one by [`text::agent_message`].
+/// Text in neither shape stays as it came.
 fn push_agent_message(body: &str, out: &mut Vec<Item>) {
-    let Some((sender, payload)) = text::agent_message(body) else {
-        return push_notice_text("agent message", body, out);
+    let said = match text::teammate_messages(body) {
+        Some(said) => said,
+        None => match text::agent_message(body) {
+            Some(one) => vec![one],
+            None => return push_notice_text("agent message", body, out),
+        },
     };
-    if !payload.is_empty() {
+    for (sender, payload) in said.iter().filter(|(_, p)| !p.is_empty()) {
         let line = format!(
             "{}: {}",
-            text::short(&sender, 60),
-            text::first_line(&payload, 120)
+            text::short(sender, 60),
+            text::first_line(payload, 120)
         );
         out.push(notice("agent message", &line));
     }
@@ -679,21 +694,28 @@ fn push_call(call: &ToolCall, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>)
     if let Tool::Task {
         description,
         prompt,
-        ..
+        agent_type,
+        name,
     } = &call.tool
     {
         let what = description
             .as_deref()
             .or(prompt.as_deref())
             .unwrap_or("subagent");
-        if let Some(spawn) = Spawn::of(call, cx.agent) {
+        let verb = verb_of(call, cx.agent);
+        let spawn = Spawn::of(call, cx.agent);
+        let (name, child) = agent_of(call, spawn.as_ref(), name, agent_type, cx);
+        if let Some(spawn) = spawn {
             cx.spawns.push((out.len(), spawn));
         }
         out.push(Item::Subagent {
             seq: 0,
-            summary: text::summary(&format!("{}{what}", verb_of(call, cx.agent))),
+            summary: text::summary(&format!("{verb}{what}")),
             steps: 0,
             status: live_status(call, ts, cx.since),
+            act: act_of(verb).map(String::from),
+            name: name.map(|n| text::short(&n, 60)),
+            child: child.filter(|_| cx.links),
         });
         return;
     }
@@ -716,6 +738,64 @@ fn verb_of(call: &ToolCall, agent: Agent) -> &'static str {
 }
 
 const SPAWNED: &str = "spawned: ";
+const SENT: &str = "sent: ";
+const WAITED: &str = "waited for: ";
+
+/// Agent types that say nothing about the agent: no name is better.
+const GENERIC_AGENTS: [&str; 2] = ["general-purpose", "general"];
+
+/// The `act` of a subagent row, from its verb.
+fn act_of(verb: &str) -> Option<&'static str> {
+    match verb {
+        SPAWNED => Some("spawn"),
+        SENT => Some("message"),
+        WAITED => Some("wait"),
+        _ => None,
+    }
+}
+
+/// The name a subagent row shows and the child session it opens. A spawn names its own child
+/// and is remembered under its name and its id; a message or a wait names its agent by name or
+/// id, and the spawn seen before it in the window says which child that is and what it is called.
+fn agent_of(
+    call: &ToolCall,
+    spawn: Option<&Spawn>,
+    name: &Option<String>,
+    agent_type: &Option<String>,
+    cx: &mut Cx,
+) -> (Option<String>, Option<String>) {
+    // A Codex agent path names the agent by its last part.
+    let named = name
+        .as_deref()
+        .map(|n| n.rsplit('/').next().unwrap_or(n))
+        .filter(|n| !n.is_empty());
+    if let Some(spawn) = spawn {
+        let kind = agent_type
+            .as_deref()
+            .filter(|t| !GENERIC_AGENTS.contains(t));
+        let shown = named.or(kind).map(String::from);
+        let child = spawn.child().to_string();
+        let entry = (shown.clone(), child.clone());
+        if let Some(n) = named {
+            cx.agents.insert(n.to_string(), entry.clone());
+        }
+        cx.agents.insert(child.clone(), entry);
+        return (shown, Some(child));
+    }
+    let known = named
+        .and_then(|n| cx.agents.get(n))
+        .or_else(|| call.child_session.as_deref().and_then(|c| cx.agents.get(c)));
+    match known {
+        Some((shown, child)) => (
+            shown.clone().or(named.map(String::from)),
+            Some(child.clone()),
+        ),
+        None => (
+            named.map(String::from),
+            call.child_session.clone().filter(|c| valid_id(c)),
+        ),
+    }
+}
 
 /// What a subagent call did, from the tool's own name: Codex `spawn_agent`, `send_message`,
 /// `followup_task`, `wait_agent`, Claude `Task` / `Agent` / `SendMessage`, OpenCode `task`.
@@ -723,9 +803,9 @@ const SPAWNED: &str = "spawned: ";
 fn task_verb(name: &str) -> &'static str {
     let name = name.to_ascii_lowercase();
     if name.contains("wait") {
-        "waited for: "
+        WAITED
     } else if name.contains("send") || name.contains("followup") {
-        "sent: "
+        SENT
     } else if name.contains("spawn")
         || ["task", "agent", "subagent", "invoke_agent"].contains(&&*name)
     {
@@ -1361,7 +1441,11 @@ mod tests {
 
     #[test]
     fn opencode_todo_snapshots_are_bookkeeping() {
-        assert!(is_bookkeeping("todos") && is_bookkeeping("api-request-shape"));
+        assert!(
+            is_bookkeeping("todos")
+                && is_bookkeeping("api-request-shape")
+                && is_bookkeeping("tools-used")
+        );
         assert!(!is_bookkeeping("continued-in") && !is_bookkeeping("synthetic"));
     }
 
@@ -1652,6 +1736,7 @@ mod tests {
                 description: Some("survey".into()),
                 prompt: None,
                 agent_type: None,
+                name: None,
             };
             let call = call("Agent", tool, serde_json::Value::Null, status);
             if status == ToolStatus::Pending {
@@ -1746,6 +1831,7 @@ mod tests {
                 description: Some("survey".into()),
                 prompt: None,
                 agent_type: None,
+                name: None,
             };
             let mut c = call("Agent", tool, serde_json::Value::Null, ToolStatus::Pending);
             c.started_at = started;
@@ -2203,6 +2289,7 @@ mod tests {
             description: Some("Map the repo".into()),
             prompt: None,
             agent_type: None,
+            name: None,
         };
         let mut c = call(
             "codebase_investigator",
@@ -2221,5 +2308,92 @@ mod tests {
             matches!(&claude.0[0], Item::Subagent { summary, .. } if summary == "Map the repo")
         );
         assert!(claude.1.is_empty());
+    }
+
+    #[test]
+    fn subagent_rows_name_their_agent_and_the_child_they_open() {
+        let task = |name: Option<&str>, kind: Option<&str>, d: &str| Tool::Task {
+            description: Some(d.into()),
+            prompt: None,
+            agent_type: kind.map(String::from),
+            name: name.map(String::from),
+        };
+        let mut spawn = call(
+            "Agent",
+            task(Some("e1-langfuse"), Some("general-purpose"), "Build E1"),
+            serde_json::Value::Null,
+            ToolStatus::Pending,
+        );
+        spawn.child_session = Some("ae1-langfuse-14ff".into());
+        let mut typed = call(
+            "Agent",
+            task(None, Some("code-reviewer"), "Review"),
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        typed.id = "id-typed".into();
+        typed.child_session = Some("a5292fc3".into());
+        let by_name = call(
+            "SendMessage",
+            task(Some("e1-langfuse"), None, "E1 accepted"),
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        let mut by_id = call(
+            "SendMessage",
+            task(Some("a5292fc3"), None, "Go"),
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        by_id.id = "id-by-id".into();
+        let mut unknown = call(
+            "SendMessage",
+            task(Some("nobody"), None, "Hi"),
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        unknown.id = "id-unknown".into();
+        let rows = |agent: Agent, parent: bool| {
+            let mut s = session(
+                agent,
+                [&spawn, &typed, &by_name, &by_id, &unknown]
+                    .into_iter()
+                    .map(|c| call_message(c.clone()))
+                    .collect(),
+            );
+            if parent {
+                s.parent = Some(agentparse::ParentLink {
+                    session_id: "top".into(),
+                    call_id: None,
+                    agent_type: None,
+                });
+            }
+            rows_of(&s)
+                .into_iter()
+                .filter_map(|i| match i {
+                    Item::Subagent {
+                        act, name, child, ..
+                    } => Some((act, name, child)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let o = |s: &str| Some(s.to_string());
+        assert_eq!(
+            rows(Agent::Claude, true),
+            [
+                (o("spawn"), o("e1-langfuse"), o("ae1-langfuse-14ff")),
+                (o("spawn"), o("code-reviewer"), o("a5292fc3")),
+                (o("message"), o("e1-langfuse"), o("ae1-langfuse-14ff")),
+                (o("message"), o("code-reviewer"), o("a5292fc3")),
+                (o("message"), o("nobody"), None),
+            ],
+            "a Claude subagent's rows link at any depth"
+        );
+        let gemini = rows(Agent::Gemini, true);
+        assert!(
+            gemini.iter().all(|(_, _, child)| child.is_none()),
+            "{gemini:?}"
+        );
     }
 }

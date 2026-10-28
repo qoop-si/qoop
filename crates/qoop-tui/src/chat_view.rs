@@ -394,13 +394,31 @@ fn label(name: &str, summary: &str) -> String {
             "" => "Fetched a page".to_string(),
             host => format!("Fetched {host}"),
         },
-        "task" | "agent" | "subagent" => subagent_label(&summary),
+        "task" | "agent" | "subagent" => subagent_label(None, None, &summary),
         _ => said(name),
     }
 }
 
-fn subagent_label(summary: &str) -> String {
-    format!("Ran a subagent: {}", one_line(summary))
+/// A subagent row in words, as the phone says it: what the call did to which agent, then what
+/// it was about (the summary without the verb it opens with). A row from an older daemon has no
+/// `act`, and says `Ran a subagent` with its summary as it came.
+fn subagent_label(act: Option<&str>, name: Option<&str>, summary: &str) -> String {
+    let without = |verb: &str| summary.strip_prefix(verb).unwrap_or(summary);
+    let (head, what) = match (act, name) {
+        (Some("spawn"), Some(n)) => (format!("Started {n}"), without("spawned: ")),
+        (Some("spawn"), None) => ("Started a subagent".into(), without("spawned: ")),
+        (Some("message"), Some(n)) => (format!("Messaged {n}"), without("sent: ")),
+        (Some("message"), None) => ("Sent a message".into(), without("sent: ")),
+        (Some("wait"), Some(n)) => (format!("Waited for {n}"), without("waited for: ")),
+        (Some("wait"), None) => ("Waited for a subagent".into(), without("waited for: ")),
+        _ => ("Ran a subagent".into(), summary),
+    };
+    let what = one_line(what);
+    // A wait names its agent and nothing else: the name once is enough.
+    if name == Some(what.as_str()) {
+        return head;
+    }
+    format!("{head}: {what}")
         .trim_end_matches([':', ' '])
         .to_string()
 }
@@ -769,9 +787,19 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
             lines
         }
         Item::Subagent {
-            summary, status, ..
+            summary,
+            status,
+            act,
+            name,
+            ..
         } => vec![(
-            tool_line(&subagent_label(summary), *status, None, None, cols),
+            tool_line(
+                &subagent_label(act.as_deref(), name.as_deref(), summary),
+                *status,
+                None,
+                None,
+                cols,
+            ),
             None,
         )],
         _ => vec![(StyledRow::default(), None)],
@@ -2526,6 +2554,9 @@ mod tests {
                 summary: "s".into(),
                 steps: 2,
                 status: Status::Ok,
+                act: None,
+                name: None,
+                child: None,
             },
         ];
         assert_eq!(lines(&items, 40), ["3 steps \u{25b8}"]);
@@ -2571,6 +2602,9 @@ mod tests {
             summary: summary.into(),
             steps: 1,
             status,
+            act: None,
+            name: None,
+            child: None,
         }
     }
 
@@ -2591,6 +2625,38 @@ mod tests {
         }
         let rows = layout(&[subagent("s", Status::Running)], 40);
         assert_eq!(style_at(&rows[0], 0).role, Role::Working);
+    }
+
+    #[test]
+    fn a_subagent_row_says_what_it_did_to_which_agent() {
+        let said = |act: Option<&str>, name: Option<&str>, summary: &str| {
+            subagent_label(act, name, summary)
+        };
+        assert_eq!(
+            said(Some("spawn"), Some("e1-langfuse"), "spawned: Build E1"),
+            "Started e1-langfuse: Build E1"
+        );
+        assert_eq!(
+            said(Some("spawn"), None, "spawned: Map"),
+            "Started a subagent: Map"
+        );
+        assert_eq!(
+            said(Some("message"), Some("d2"), "sent: go"),
+            "Messaged d2: go"
+        );
+        assert_eq!(
+            said(Some("message"), None, "sent: go"),
+            "Sent a message: go"
+        );
+        assert_eq!(
+            said(Some("wait"), Some("review"), "waited for: review"),
+            "Waited for review"
+        );
+        assert_eq!(
+            said(Some("wait"), None, "waited for: "),
+            "Waited for a subagent"
+        );
+        assert_eq!(said(None, None, "spawned: x"), "Ran a subagent: spawned: x");
     }
 
     #[test]
@@ -2898,6 +2964,9 @@ mod tests {
                 summary: "review".into(),
                 steps: 7,
                 status: Status::Ok,
+                act: None,
+                name: None,
+                child: None,
             },
         ];
         let rows = layout(&items, 40);
@@ -3017,6 +3086,9 @@ mod tests {
                 summary: "review 世界".into(),
                 steps: 3,
                 status: Status::Ok,
+                act: None,
+                name: None,
+                child: None,
             },
         ]
     }
@@ -3066,6 +3138,9 @@ mod tests {
                 summary: "review 世界 \u{2764}\u{fe0f}".into(),
                 steps: 1,
                 status: Status::Ok,
+                act: None,
+                name: None,
+                child: None,
             },
         ];
         let mut opened = Opened::default();

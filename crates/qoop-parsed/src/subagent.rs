@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use agentparse::{Agent, Session, Source, ToolCall};
 use qoop_history::locate::locate_codex;
-use qoop_history::{BaseDirs, Located, valid_id};
+use qoop_history::{BaseDirs, Located, Product, valid_id};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 
@@ -57,6 +57,11 @@ pub(crate) struct Spawn {
 }
 
 impl Spawn {
+    /// The child session's id.
+    pub(crate) fn child(&self) -> &str {
+        &self.child
+    }
+
     /// The spawn of a call that starts a subagent whose child id is a plain id.
     pub(crate) fn of(call: &ToolCall, agent: Agent) -> Option<Spawn> {
         let child = call.child_session.as_deref().filter(|c| valid_id(c))?;
@@ -234,13 +239,103 @@ fn clamp(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// `<project>/<session>.jsonl` keeps its children in `<project>/<session>/subagents/`. The
-/// child id is a plain id (`valid_id`), so it names a file in that directory and no other.
+/// `<project>/<session>.jsonl` keeps its children in `<project>/<session>/subagents/`, at every
+/// depth: a subagent's own children sit beside it. The child id is a plain id (`valid_id`), so
+/// it names a file in that directory and no other.
 fn claude_file(parent: &Path, child: &str) -> PathBuf {
-    parent
-        .with_extension("")
-        .join("subagents")
-        .join(format!("agent-{child}.jsonl"))
+    let dir = match parent.parent() {
+        Some(dir) if dir.file_name().is_some_and(|n| n == "subagents") => dir.to_path_buf(),
+        _ => parent.with_extension("").join("subagents"),
+    };
+    dir.join(format!("agent-{child}.jsonl"))
+}
+
+/// Where the session of subagent `child` is, for a reader of the session `parent` that `program`
+/// wrote (whose own id is `parent_id`). The id is untrusted: it must be a plain id, and the session it names must be a
+/// child of this one: a Claude or Gemini file in the parent's own directory for children (a link
+/// out of it is not followed), a Codex rollout whose first record names `parent_id` as its parent
+/// thread, an OpenCode session whose `parent_id` is `parent_id`. `None` for anything else, and for
+/// a child not written yet.
+pub fn child_source(
+    program: &str,
+    parent: &crate::locate::Source,
+    parent_id: &str,
+    child: &str,
+    codex_dir: Option<&Path>,
+) -> Option<crate::locate::Source> {
+    use crate::locate::Source as S;
+    if !valid_id(child) || child == parent_id {
+        return None;
+    }
+    let path = match parent {
+        S::Opencode { db, .. } => {
+            return opencode_parent(db, child)
+                .filter(|p| p == parent_id)
+                .map(|_| S::Opencode {
+                    db: db.clone(),
+                    id: child.to_string(),
+                });
+        }
+        S::File(path) => path,
+    };
+    let file = match qoop_history::detect_product(program).ok()? {
+        Product::Claude => inside(path, claude_file(path, child))?,
+        Product::Gemini => inside(path, gemini_file(path, parent_id, child))?,
+        Product::Codex => {
+            let file = find_codex(&codex_root(path, codex_dir)?, child)?;
+            codex_child_of(&file, child, parent_id).then_some(file)?
+        }
+        Product::Opencode => return None,
+    };
+    Some(S::File(file))
+}
+
+/// `file` when it is a regular file reached from the parent session file's own directory with no
+/// link on the way: a linked file, or a linked `subagents` or session directory (one that leads to
+/// another session's children), is refused.
+fn inside(parent: &Path, file: PathBuf) -> Option<PathBuf> {
+    let base = parent.parent()?;
+    let below = file.strip_prefix(base).ok()?;
+    let real = file.canonicalize().ok()?;
+    (real == base.canonicalize().ok()?.join(below) && real.is_file()).then_some(file)
+}
+
+/// A Codex rollout's first record (`session_meta`) is thread `child`'s and names `parent_id` as
+/// its parent thread.
+fn codex_child_of(file: &Path, child: &str, parent_id: &str) -> bool {
+    let Ok(Some(v)) = qoop_history::locate::first_line_json(file) else {
+        return false;
+    };
+    let p = v.get("payload");
+    let at = |ptr: &str| p.and_then(|p| p.pointer(ptr)).and_then(|s| s.as_str());
+    at("/id") == Some(child)
+        && [
+            "/parent_thread_id",
+            "/source/subagent/thread_spawn/parent_thread_id",
+        ]
+        .iter()
+        .any(|ptr| at(ptr) == Some(parent_id))
+}
+
+/// The `parent_id` of OpenCode session `id`.
+fn opencode_parent(db: &Path, id: &str) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_millis(200)).ok()?;
+    // Either layout may hold the session; a table or column that is not there finds nothing.
+    ["session_v2", "session"].iter().find_map(|table| {
+        conn.query_row(
+            &format!("SELECT parent_id FROM {table} WHERE id = ?1"),
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    })
 }
 
 /// `<project>/chats/session-<..>.jsonl` keeps its children in
@@ -584,6 +679,7 @@ mod tests {
                 description: Some("map".into()),
                 prompt: None,
                 agent_type: None,
+                name: None,
             },
             status: agentparse::ToolStatus::Pending,
             status_detail: None,
@@ -720,5 +816,128 @@ mod tests {
         }
         remember(&mut list, 3, 3, 33);
         assert_eq!(list, [(2, 2), (4, 4), (3, 33)]);
+    }
+
+    #[test]
+    fn a_child_opens_only_as_a_session_of_its_own_parent() {
+        use crate::locate::Source as S;
+        let dir = tempfile::tempdir().unwrap();
+        // The real path: lookups resolve links (`/var` is `/private/var` on macOS).
+        let base = dir.path().canonicalize().unwrap();
+        // Claude: one `subagents/` directory per top session, children of children beside them.
+        let top = base.as_path().join("p/s1.jsonl");
+        let subs = base.as_path().join("p/s1/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        std::fs::write(&top, "").unwrap();
+        std::fs::write(subs.join("agent-a1.jsonl"), "").unwrap();
+        std::fs::write(subs.join("agent-a2.jsonl"), "").unwrap();
+        std::fs::write(base.as_path().join("p/secret.jsonl"), "").unwrap();
+        std::os::unix::fs::symlink(
+            base.as_path().join("p/secret.jsonl"),
+            subs.join("agent-out.jsonl"),
+        )
+        .unwrap();
+        let claude = |parent: &Path, child: &str| {
+            child_source("claude", &S::File(parent.to_path_buf()), "s1", child, None)
+        };
+        assert_eq!(
+            claude(&top, "a1"),
+            Some(S::File(subs.join("agent-a1.jsonl")))
+        );
+        assert_eq!(
+            claude(&subs.join("agent-a1.jsonl"), "a2"),
+            Some(S::File(subs.join("agent-a2.jsonl"))),
+            "a subagent's own child sits beside it"
+        );
+        for refused in ["../secret", "a1/../a2", "missing", "out", ""] {
+            assert_eq!(claude(&top, refused), None, "{refused}");
+        }
+        // Another session's `subagents` directory linked in as this one's.
+        let other = base.join("p/s2/subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("agent-b1.jsonl"), "").unwrap();
+        let linked = base.join("p/s3.jsonl");
+        std::fs::write(&linked, "").unwrap();
+        std::fs::create_dir_all(base.join("p/s3")).unwrap();
+        std::os::unix::fs::symlink(&other, base.join("p/s3/subagents")).unwrap();
+        assert_eq!(
+            child_source("claude", &S::File(linked), "s3", "b1", None),
+            None,
+            "a linked subagents directory"
+        );
+
+        // Codex: the rollout must name the parent (or the root) as its own.
+        let day = base.as_path().join("sessions/2026/10/12");
+        std::fs::create_dir_all(&day).unwrap();
+        let meta = |id: &str, parent: &str, root: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{root}\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent}\"}}}}}}}}}}\n"
+            )
+        };
+        let ids = [
+            "019f1a10-0001-7000-8000-000000000001",
+            "019f1a10-0002-7000-8000-000000000002",
+            "019f1a10-0003-7000-8000-000000000003",
+            "019f1a10-0004-7000-8000-000000000004",
+        ];
+        let rollout = |id: &str| day.join(format!("rollout-2026-10-12T09-00-00-{id}.jsonl"));
+        std::fs::write(rollout(ids[0]), meta(ids[0], "", ids[0])).unwrap();
+        std::fs::write(rollout(ids[1]), meta(ids[1], ids[0], ids[0])).unwrap();
+        std::fs::write(rollout(ids[2]), meta(ids[2], ids[1], ids[0])).unwrap();
+        std::fs::write(
+            rollout(ids[3]),
+            meta(ids[3], "someone-else", "someone-else"),
+        )
+        .unwrap();
+        let codex =
+            |child: &str| child_source("codex", &S::File(rollout(ids[0])), ids[0], child, None);
+        assert_eq!(codex(ids[1]), Some(S::File(rollout(ids[1]))));
+        assert_eq!(
+            codex(ids[2]),
+            None,
+            "a grandchild is its parent's child, not the root's"
+        );
+        assert_eq!(codex(ids[3]), None, "another session's child");
+        assert_eq!(codex(ids[0]), None, "the session itself");
+
+        // OpenCode: the row's `parent_id`.
+        let db = fixture_db(base.as_path());
+        let oc = |parent: &str, child: &str| {
+            child_source(
+                "opencode",
+                &S::Opencode {
+                    db: db.clone(),
+                    id: parent.into(),
+                },
+                parent,
+                child,
+                None,
+            )
+        };
+        let (root, kid) = (
+            "ses_ed52a75fff9cZv864nVGS5jPGC",
+            "ses_ed52a633ff93Y7Vatlwl1zyPKr",
+        );
+        assert_eq!(
+            oc(root, kid),
+            Some(S::Opencode {
+                db: db.clone(),
+                id: kid.into()
+            })
+        );
+        assert_eq!(oc("ses_ecd6ad17ff80AEbRxnOg8B21Mn", kid), None);
+
+        // Gemini: `chats/<parent id>/<child>.jsonl`.
+        let chats = base.as_path().join("g/chats");
+        std::fs::create_dir_all(chats.join("gp")).unwrap();
+        std::fs::write(chats.join("gp/agent7.jsonl"), "").unwrap();
+        let gemini = child_source(
+            "gemini",
+            &S::File(chats.join("session-x.jsonl")),
+            "gp",
+            "agent7",
+            None,
+        );
+        assert_eq!(gemini, Some(S::File(chats.join("gp/agent7.jsonl"))));
     }
 }
