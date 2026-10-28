@@ -22092,7 +22092,7 @@ mod tests {
         assert_eq!(state.message.as_deref(), Some("only an agent can be saved"));
     }
 
-    /// One pane alone stands in its frame like a split one: the park label follows its bottom
+    /// One pane alone stands in the split panes' margin: the park label follows its bottom
     /// left corner, under the agent's screen and never on it, is its own click, stands only
     /// while the agent has answered and reads parked once parked.
     #[test]

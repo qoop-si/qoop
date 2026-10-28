@@ -611,7 +611,8 @@ pub fn pane_size_for(
 }
 
 /// Whether the pane area paints as tiles inside their frame: always, but for qass's lone box,
-/// which draws its own. One pane is a tile like any split one, framed, with its corners.
+/// which draws its own. One pane is a tile like any split one, in the same blank margin, with no
+/// line drawn round it.
 fn tiled(frame: &Frame) -> bool {
     frame.tiles.len() >= 2
         || (frame.tiles.len() == 1 && (frame.chrome.qass.is_none() || qass_plan(frame).is_none()))
@@ -3752,7 +3753,8 @@ enum EdgeInk {
 /// into each other; the focused pane's frame wears its space's ink (`focus`), the owner's
 /// pick, 2026-10-28. Every pane keeps its name on the edge above it, the focused one bold.
 /// The frame is drawn in the cells round the tiles, so panes keep their gap and a divider
-/// still drags.
+/// still drags. One pane alone has no frame, only the blank cells round it: nothing
+/// runs into it, so a line there is noise, the owner's word, 2026-10-28.
 fn pane_edges(
     tiles: &[Tile],
     agents: &[AgentRow],
@@ -3769,7 +3771,10 @@ fn pane_edges(
     // one line and its ends are joints; and the cells of the focused pane's frame.
     let mut ways = vec![vec![0u8; cols]; rows];
     let mut lit = vec![vec![false; cols]; rows];
-    for tile in tiles.iter().filter(|t| t.rect.cols > 0 && t.rect.rows > 0) {
+    for tile in tiles
+        .iter()
+        .filter(|t| tiles.len() >= 2 && t.rect.cols > 0 && t.rect.rows > 0)
+    {
         let r = tile.rect;
         // A tile against the area's edge (an area too small for the frame) has none.
         let (Some(left), Some(top)) = (r.x.checked_sub(1), r.y.checked_sub(1)) else {
@@ -8419,11 +8424,11 @@ mod tests {
         })
     }
 
-    /// One pane alone is a tile in its frame, as a split one is: the four ember corners stand
-    /// round it in the frame's cells, it is not named on its top edge (the tab bar names it),
-    /// and its text is painted one cell in.
+    /// One pane alone is a tile in the split panes' margin, with no line drawn round it: a line
+    /// with nothing beside it to part from is noise. It is not named on its top edge (the tab
+    /// bar names it), and its text is painted one cell in.
     #[test]
-    fn a_lone_pane_stands_in_its_frame_with_four_corners() {
+    fn a_lone_pane_stands_in_a_blank_margin_with_no_frame() {
         let rows = [row(1, "zsh", "idle")];
         let spaces = spaces();
         let snap = snapshot(&["hello from the shell"]);
@@ -8475,28 +8480,13 @@ mod tests {
             chrome: Default::default(),
         };
         let edges = edge_grid(&frame, area.cols, area.rows);
-        let (right, bottom) = (area.cols - 1, area.rows - 1);
-        for (x, y, corner) in [
-            (0, 0, '\u{256d}'),
-            (right, 0, '\u{256e}'),
-            (0, bottom, '\u{2570}'),
-            (right, bottom, '\u{256f}'),
-        ] {
-            assert!(
-                matches!(edges[y][x], Some((c, EdgeInk::Frame(_))) if c == corner),
-                "{x},{y}: {:?}",
-                edges[y][x]
-            );
-        }
         assert!(
-            edges[0][2..right - 1]
-                .iter()
-                .all(|c| matches!(c, Some(('\u{2500}', EdgeInk::Frame(_))))),
-            "no name on a lone pane's top edge"
+            edges.iter().flatten().all(Option::is_none),
+            "no line and no name round a lone pane"
         );
         let left = left_for(80, false, sidebar::WIDTH);
         let painted = paint(&frame);
-        // The text's row starts one cell in: the frame's column, then the shell's first letter.
+        // The text's row starts one cell in: the margin's column, then the shell's first letter.
         assert!(
             painted.contains(&at(TABS + 2, left + 2)) && painted.contains("hello"),
             "{painted:?}"
