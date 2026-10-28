@@ -584,22 +584,24 @@ pub const FOCUS_ENV: &str = "QOOP_INTERFACE_FOCUS";
 /// asked it to move, that is the move. Otherwise it is [`DaemonClosed`], for the caller that
 /// knows the socket to tell apart. Either way the window may come back, and `focused` is
 /// where.
-fn daemon_closed(update: &UpdateAsk, focused: u32) -> io::Result<()> {
+fn daemon_closed(update: &UpdateAsk, focused: u32, unsent: Vec<String>) -> io::Result<()> {
     CLOSED_ON.store(focused, std::sync::atomic::Ordering::SeqCst);
     if update.clicked.is_some() {
         RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
         return Ok(());
     }
-    Err(io::Error::other(DaemonClosed))
+    Err(io::Error::other(DaemonClosed(unsent)))
 }
 
 /// What the interface ends with when its daemon closed the stream with no click asking it to
 /// move. A daemon that answers on its socket again moved all the same (`qoop restart` or
 /// `qoop update` from another terminal) or let this window go, and the window comes back
 /// (see `qoop-cli`). One that does not is gone, and this says so once the screen is left: an
-/// interface that vanished without a word reads as qoop crashing for no reason.
+/// interface that vanished without a word reads as qoop crashing for no reason. It carries the
+/// words for the questions that were never sent (an answer held, or words lost), one line
+/// each with whose card, so they outlive the screen.
 #[derive(Debug)]
-pub struct DaemonClosed;
+pub struct DaemonClosed(pub Vec<String>);
 
 impl DaemonClosed {
     /// Whether the interface ended with this.
@@ -610,7 +612,11 @@ impl DaemonClosed {
 
 impl std::fmt::Display for DaemonClosed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the daemon stopped; run qoop to start it again")
+        f.write_str("the daemon stopped; run qoop to start it again")?;
+        for unsent in &self.0 {
+            write!(f, "\n  {unsent}")?;
+        }
+        Ok(())
     }
 }
 
@@ -739,7 +745,7 @@ struct State {
     qass_ui: crate::qass_screen::Ui,
     /// The question inbox beside qass's terminal: its cards, what is typed, the answer held.
     asks: crate::asks::Pane,
-    /// The schedules ("on the clock") on qass's screen: the rows, the pick, the form.
+    /// The schedules on qass's screen: the rows, the pick, the form.
     clock: crate::schedules::Pane,
     /// When this client last forwarded a key or a paste to each terminal, so a talk line is
     /// never pasted over what he is typing there, nor twice.
@@ -949,6 +955,8 @@ struct State {
     palette_pending: Vec<u8>,
     /// What is typed into the keys overlay's search, `None` while nobody is searching.
     keys_query: Option<String>,
+    /// The page of the keys overlay on screen when it is taller than the window.
+    keys_page: usize,
     /// Copy mode, resize mode, a close waiting for its `y`, and what they leave for the
     /// loop to send.
     modes: Modes,
@@ -1289,6 +1297,8 @@ impl State {
                 inbox: self.inbox,
                 nav: self.modes.side.as_ref(),
                 keys_query: self.keys_query.as_deref(),
+                keys_page: self.keys_page,
+                zoomed: self.zoomed(),
                 closing: self
                     .modes
                     .confirm_close
@@ -2841,11 +2851,53 @@ impl State {
             return None;
         }
         let (board, qass) = self.board_leaves(tree)?;
-        match self.qass_ui.fold? {
-            crate::qass_screen::Fold::Board => Some((board, board)),
-            crate::qass_screen::Fold::Qass => Some((qass, board)),
-            crate::qass_screen::Fold::Both => None,
+        match self.qass_ui.fold {
+            Some(crate::qass_screen::Fold::Board) => Some((board, board)),
+            Some(crate::qass_screen::Fold::Qass) => Some((qass, board)),
+            Some(crate::qass_screen::Fold::Both) => None,
+            // Too small for both: the pane with the keyboard stays, the other rests, so a
+            // resize never moves the keyboard.
+            None if self.cramped(tree, board) => Some(if self.focused == qass {
+                (board, board)
+            } else {
+                (qass, board)
+            }),
+            None => None,
         }
+    }
+
+    /// qass's tab with the board too small for both: stacked, and the board's tile under the
+    /// board page's three lanes. qass's pane then rests on its tab while the board is open, and
+    /// the board takes the room (one lane at a time). The left column keeps its fold: only its
+    /// owner folds it (`left-sidebar.md`).
+    fn cramped(&self, tree: &Layout, board: u32) -> bool {
+        let Some(saved) = tree.root_split() else {
+            return false;
+        };
+        let area = self.tree_area(tree);
+        let reserve = self.rail_reserve(area);
+        let (dir, ratio, _) = crate::qass_screen::board_shape(
+            area.cols,
+            saved,
+            false,
+            None,
+            self.board_first(tree),
+            reserve,
+        );
+        if dir == layout::Dir::V {
+            return false;
+        }
+        let mut stacked = tree.clone();
+        stacked.set_root_split(dir, ratio);
+        stacked.rail = reserve;
+        stacked
+            .tile_rects(area)
+            .into_iter()
+            .find(|(t, _)| *t == board)
+            .is_some_and(|(_, tile)| {
+                tile.cols < crate::qass_screen::BOARD_MIN_COLS
+                    || tile.rows < crate::qass_screen::BOARD_MIN_ROWS
+            })
     }
 
     /// Whether both the board and qass are folded away on `tree`, the questions holding the tab.
@@ -3582,6 +3634,14 @@ impl State {
             .flatten()
     }
 
+    /// Whether the tab on screen has a pane zoomed, for the notice row to say so: a zoom
+    /// otherwise hides the other panes without a sign.
+    fn zoomed(&self) -> bool {
+        self.space
+            .and_then(|space| self.layouts.get(&space))
+            .is_some_and(|tree| tree.zoomed.is_some() && tree.leaf_count() > 1)
+    }
+
     /// What the notice row says about the chat when nothing else needs it.
     fn chat_hint(&self) -> Option<&'static str> {
         let terminal = self.focused;
@@ -3696,6 +3756,26 @@ impl State {
     }
 }
 
+/// The row one step from `selected`, down or up, over the blanks between groups; the ends stay.
+fn menu_step(rows: &[(String, String)], selected: usize, down: bool) -> usize {
+    let last = rows.len().saturating_sub(1);
+    let mut at = selected;
+    loop {
+        let next = if down {
+            (at + 1).min(last)
+        } else {
+            at.saturating_sub(1)
+        };
+        if next == at {
+            return selected;
+        }
+        at = next;
+        if !rows[at].0.is_empty() {
+            return at;
+        }
+    }
+}
+
 /// What one read of stdin meant while the menu owns the keyboard.
 enum MenuOutcome {
     Moved,
@@ -3711,7 +3791,7 @@ enum MenuOutcome {
 /// A prefix or a bare detach closes the menu and hands the bytes on, so `ctrl-a d` still
 /// detaches out of it.
 fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
-    let last = menu_rows(&state.menu_kind).len().saturating_sub(1);
+    let rows = menu_rows(&state.menu_kind);
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
@@ -3719,11 +3799,11 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
             // An arrow, or a mouse report to swallow whole.
             match bytes.get(at + 2) {
                 Some(b'A') => {
-                    state.menu = Some(selected.saturating_sub(1));
+                    state.menu = Some(menu_step(&rows, selected, false));
                     return MenuOutcome::Moved;
                 }
                 Some(b'B') => {
-                    state.menu = Some((selected + 1).min(last));
+                    state.menu = Some(menu_step(&rows, selected, true));
                     return MenuOutcome::Moved;
                 }
                 _ => match bytes[at..].iter().position(|b| b.is_ascii_alphabetic()) {
@@ -3750,12 +3830,8 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
                 return MenuOutcome::Passthrough(bytes[at - 1..].to_vec());
             }
             letter => {
-                if letter == b'k' {
-                    state.menu = Some(selected.saturating_sub(1));
-                    return MenuOutcome::Moved;
-                }
-                if letter == b'j' {
-                    state.menu = Some((selected + 1).min(last));
+                if letter == b'k' || letter == b'j' {
+                    state.menu = Some(menu_step(&rows, selected, letter == b'j'));
                     return MenuOutcome::Moved;
                 }
                 // A row's own key first, so `r` means rename tab and never
@@ -3787,8 +3863,10 @@ fn menu_key(state: &mut State, selected: usize, bytes: &[u8]) -> MenuOutcome {
 /// Everything here does something today. A menu row that opened nothing would be the one
 /// place in the interface that lies about what the product can do, and a person who found
 /// one would be right to stop trusting the rest. The key is the `ctrl-a` letter that does
-/// the same thing without the menu; empty when the row has no direct key.
+/// the same thing without the menu; empty when the row has no direct key. A row with no name
+/// is the blank between two groups: it is never picked, and a short window leaves it out.
 pub const MENU: &[(&str, &str, &str)] = &[
+    // The tab and the space.
     ("new tab", "c", "name it, then it opens"),
     ("new space", "w", "name it, then it opens"),
     ("rename tab", "r", "rename what is focused"),
@@ -3797,7 +3875,8 @@ pub const MENU: &[(&str, &str, &str)] = &[
         "R",
         "name and colour of what is on screen",
     ),
-    ("close tab", "x", "close what is focused"),
+    MENU_GAP,
+    // The panes of the tab on screen.
     ("split side by side", "v", "a sub-terminal, not a new tab"),
     ("split stacked", "-", "a sub-terminal, not a new tab"),
     ("zoom pane", "z", "fill the pane with this tile, or go back"),
@@ -3808,6 +3887,8 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ),
     ("resize panes", "e", "h j k l move the nearest divider"),
     ("equalize panes", "=", "every pane the same share"),
+    MENU_GAP,
+    // qoop itself.
     (
         "tree or priority",
         "g",
@@ -3820,17 +3901,23 @@ pub const MENU: &[(&str, &str, &str)] = &[
     ("sleep space", "", "every tab of it sleeps"),
     ("wake space", "", "every sleeping tab of it wakes"),
     (
-        "reload manifests",
-        "",
-        "re-read the agent detection overrides",
-    ),
-    (
         "connect a computer",
         "",
         "another computer's qoop, over ssh",
     ),
+    (
+        "reload agent detection",
+        "",
+        "re-read the agent detection overrides",
+    ),
+    MENU_GAP,
+    // Last, away from the rows used most: the ones that leave or end something, the close last.
     ("detach", "d", "leave, and keep everything running"),
+    ("close tab", "x", "close what is focused"),
 ];
+
+/// The blank between two groups of [`MENU`].
+const MENU_GAP: (&str, &str, &str) = ("", "", "");
 
 /// Which list the menu box is showing. One box, one set of keys and clicks, three lists.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4453,6 +4540,8 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         }
     }
     match MENU[item].0 {
+        // A click on the blank between two groups.
+        "" => MenuSend::Nothing,
         "connect a computer" => {
             state.prompt = ask(Naming::Remote);
             MenuSend::Nothing
@@ -4578,6 +4667,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         "keys" => {
             state.reading = Some(Reading::Keybinds);
             state.keys_query = None;
+            state.keys_page = 0;
             MenuSend::Nothing
         }
         "settings" => {
@@ -4594,9 +4684,9 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
                 Some("settings".to_string()),
             ))
         }
-        "reload manifests" => {
+        "reload agent detection" => {
             *request += 1;
-            state.message = Some("reloading agent manifests".to_string());
+            state.message = Some("reloading agent detection".to_string());
             MenuSend::Control(ControlRequest::ReloadAgentManifests {
                 id: format!("reload-{request}"),
             })
@@ -4678,6 +4768,10 @@ pub struct Prompt {
     /// The start of a sequence the last read ended inside (an arrow, a mouse report), held
     /// for the next read.
     pub(crate) held: Vec<u8>,
+    /// Where the keyboard is in a space's settings box: the name (0), the colour (1, left and
+    /// right move it) or qass's watch (2, space turns it); tab steps between them, so the
+    /// keys a name field reads (the arrows, readline's ctrl-e) stay the field's.
+    pub(crate) stop: u8,
 }
 
 impl Prompt {
@@ -4692,6 +4786,7 @@ impl Prompt {
             skip: None,
             command: None,
             held: Vec::new(),
+            stop: 0,
         }
     }
 }
@@ -4824,7 +4919,8 @@ impl Naming {
     /// The word on the enter button.
     pub fn verb(self) -> &'static str {
         match self {
-            Naming::Space | Naming::Terminal => "make",
+            Naming::Space => "create space",
+            Naming::Terminal => "make",
             Naming::Agent(_) | Naming::AgentName(_) => "start",
             Naming::Remote => "connect",
             Naming::SpaceSettings(_) => "save",
@@ -4857,6 +4953,10 @@ impl Naming {
         }
     }
 }
+
+/// The byte the settings box's qass button stands for: a click turns the watch over. Not a key
+/// anybody types: ctrl-e moves a readline caret in every other name field.
+pub(crate) const SKIP_BUTTON: u8 = 0x05;
 
 /// What one read of stdin meant while the naming box owns the keyboard.
 enum PromptOutcome {
@@ -5029,6 +5129,11 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
         return PromptOutcome::Passthrough(bytes.to_vec());
     };
     let colours = crate::screen::prompt_colours(cols, lines, prompt);
+    // A watch the box has no room to draw is not a stop: tab passes it and space types.
+    let watch = crate::screen::prompt_watch(cols, lines, prompt);
+    if prompt.stop == 2 && !watch {
+        prompt.stop = 0;
+    }
     let input = [std::mem::take(&mut prompt.held).as_slice(), bytes].concat();
     let bytes = input.as_slice();
     let mut at = 0;
@@ -5047,7 +5152,10 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                 // Left and right move a space's colour along its row. Anywhere else, and
                 // in a box too small to show the row, they are nothing.
                 ModeKey::Left | ModeKey::Right => {
-                    if colours && let Some(pick) = prompt.ink.as_mut() {
+                    if colours
+                        && prompt.stop == 1
+                        && let Some(pick) = prompt.ink.as_mut()
+                    {
                         *pick = pick.step(key == ModeKey::Right);
                     }
                     at += len;
@@ -5082,6 +5190,12 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                         Some(crate::screen::BoxClick::Key(0x1b)) => {
                             state.prompt = None;
                             return PromptOutcome::Closed;
+                        }
+                        // qass's watch turns over on its button, which has no key of its own.
+                        Some(crate::screen::BoxClick::Key(SKIP_BUTTON)) => {
+                            if let Some(skip) = prompt.skip.as_mut() {
+                                skip.now = !skip.now;
+                            }
                         }
                         Some(crate::screen::BoxClick::Key(key)) => {
                             return prompt_key(state, &[&[key][..], &bytes[at + len..]].concat());
@@ -5147,14 +5261,31 @@ fn prompt_key(state: &mut State, bytes: &[u8]) -> PromptOutcome {
                 state.prompt = None;
                 return PromptOutcome::Passthrough(bytes[at..].to_vec());
             }
-            // ctrl-u, the line kill every shell knows: start the answer over.
-            0x15 => prompt.text.clear(),
-            // ctrl-e, qass leaving the space alone, or watching it again: saved with the rest.
-            0x05 => {
+            // Tab steps the settings box's stops: the name, the colour, qass's watch.
+            b'\t' if colours && prompt.ink.is_some() => {
+                let last = if prompt.skip.is_some() && watch { 2 } else { 1 };
+                prompt.stop = if prompt.stop >= last {
+                    0
+                } else {
+                    prompt.stop + 1
+                };
+            }
+            // Space on qass's watch: leaving the space alone, or watching it again, saved with
+            // the rest.
+            b' ' if prompt.stop == 2 => {
                 if let Some(skip) = prompt.skip.as_mut() {
                     skip.now = !skip.now;
                 }
             }
+            // Nothing else is typed on the colour or the watch: a letter goes back to the name.
+            _ if prompt.stop != 0
+                && (byte.is_ascii_graphic() || *byte == b' ' || *byte >= 0xc2 || *byte == 0x7f) =>
+            {
+                prompt.stop = 0;
+                return prompt_key(state, &bytes[at..]);
+            }
+            // ctrl-u, the line kill every shell knows: start the answer over.
+            0x15 => prompt.text.clear(),
             // ctrl-r, back to the default name, where the thing has one to go back to.
             0x12 if prompt.what.resets() => {
                 let Some(taken) = state.prompt.take() else {
@@ -5798,14 +5929,14 @@ fn park(state: &mut State, terminal: u32, request: &mut u64) {
         .iter()
         .find(|r| r.terminal == terminal && r.agent)
     else {
-        state.message = Some("only an agent can be saved for later".to_string());
+        state.message = Some("only an agent can be saved".to_string());
         return;
     };
     let on = !row.parked;
     *request += 1;
     state.message = Some(
         if on {
-            "saved for later: at the bottom of the inbox"
+            "saved: at the bottom of the inbox"
         } else {
             "no longer saved"
         }
@@ -7880,6 +8011,7 @@ where
         palette: None,
         palette_pending: Vec::new(),
         keys_query: None,
+        keys_page: 0,
         menu_kind: MenuKind::Main,
         connecting: None,
         probing: None,
@@ -8258,6 +8390,10 @@ where
                     painted.push_str("\x1b[?25h");
                 }
                 written.clear();
+                // Under the interface's floor one line says how big the window must be.
+                if state.cols < screen::FLOOR.0 || state.lines < screen::FLOOR.1 {
+                    painted = screen::too_small(state.cols, state.lines);
+                }
                 presenter.present(&painted, state.cols, state.lines, &mut written);
                 // Pictures, reconciled per frame. Anything placed on the outer
                 // screen and no longer desired comes down; the current picture
@@ -8672,20 +8808,7 @@ where
                         }
                     } else if state.reading.is_some() {
                         dirty = true;
-                        // The keys can be searched: `/` starts it, and while it runs the
-                        // bytes are the search's. What it hands back (a prefix and
-                        // after) goes through the decoder like any key here.
-                        let rest = if state.keys_query.is_some() {
-                            keys_search(&mut state, &bytes)
-                        } else if state.reading == Some(Reading::Keybinds)
-                            && bytes == b"/"
-                            && !keys.prefix_pending()
-                        {
-                            state.keys_query = Some(String::new());
-                            None
-                        } else {
-                            Some(bytes)
-                        };
+                        let rest = reading_key(&mut state, bytes, &keys);
                         // A key or a click closes a thing that is only being read.
                         // Through the one decoder, so half a report carried across
                         // reads is still half a report, not two keys.
@@ -8694,6 +8817,7 @@ where
                         {
                             state.reading = None;
                             state.keys_query = None;
+                            state.keys_page = 0;
                         }
                     } else if state.prompt.is_some() {
                         // The naming box owns the keyboard the same way the palette does,
@@ -10149,6 +10273,7 @@ where
                             }
                             Action::Keybinds => {
                                 state.reading = Some(Reading::Keybinds);
+                                state.keys_page = 0;
                                 state.keys_query = None;
                                 dirty = true;
                             }
@@ -10578,7 +10703,7 @@ where
                 n = rd.read(&mut read) => {
                     let n = n?;
                     if n == 0 {
-                        return daemon_closed(&state.update, state.focused);
+                        return daemon_closed(&state.update, state.focused, state.asks.unsent());
                     }
                     inbuf.extend_from_slice(&read[..n]);
                     let mut refresh = false;
@@ -13556,7 +13681,10 @@ fn questions_fold(state: &mut State) -> bool {
     state.asks.release();
     state.qass_ui.inbox = false;
     state.asks.raised = false;
-    state.qass_next();
+    // The keyboard goes back to the pane it came from (the board or qass), else to qass.
+    if fold_leaves(state).is_none_or(|(board, qass)| ![board, qass].contains(&state.focused)) {
+        state.qass_next();
+    }
     true
 }
 
@@ -13575,10 +13703,19 @@ fn fold_leaves(state: &State) -> Option<(u32, u32)> {
 /// True when the layout changed.
 fn fold_key(state: &mut State) -> bool {
     let Some((board, qass)) = fold_leaves(state) else {
-        state.message = Some("only on qass's screen".to_string());
+        state.message = Some(crate::keys::named(
+            "the board is on qass's screen: ctrl-a Q",
+        ));
         return false;
     };
-    if state.qass_ui.fold.take().is_some() {
+    if let Some(was) = state.qass_ui.fold.take() {
+        // Too small for both, the pane it opens takes the keyboard: the one with it is shown.
+        if state.folded().is_some() {
+            state.pending_focus = Some(match was {
+                crate::qass_screen::Fold::Qass => qass,
+                _ => board,
+            });
+        }
         return true;
     }
     if state.asks_focused() {
@@ -15161,6 +15298,47 @@ fn skip_sequence(buf: &[u8], i: usize) -> Option<usize> {
     } else {
         i + 2 + at
     })
+}
+
+/// One read while a read only overlay is up. The keys can be searched: `/` starts it, on the
+/// first page (a search packs its matches at the top), and while it runs the bytes are the
+/// search's; `j k` turn a keys box taller than the window. What is handed back (a prefix
+/// and after, or any other key) goes through the decoder, to close the overlay.
+fn reading_key(state: &mut State, bytes: Vec<u8>, keys: &Keys) -> Option<Vec<u8>> {
+    if state.keys_query.is_some() {
+        return keys_search(state, &bytes);
+    }
+    if let Some(down) = keys_turn(state, &bytes, keys) {
+        let last = crate::screen::keys_pages(state.cols, state.lines) - 1;
+        state.keys_page = if down {
+            (state.keys_page + 1).min(last)
+        } else {
+            state.keys_page.min(last).saturating_sub(1)
+        };
+        return None;
+    }
+    if state.reading == Some(Reading::Keybinds) && bytes == b"/" && !keys.prefix_pending() {
+        state.keys_query = Some(String::new());
+        state.keys_page = 0;
+        return None;
+    }
+    Some(bytes)
+}
+
+/// `j` or the down arrow (true), `k` or the up arrow (false), on the keys box, outside its search
+/// and a pending prefix.
+fn keys_turn(state: &State, bytes: &[u8], keys: &Keys) -> Option<bool> {
+    if state.reading != Some(Reading::Keybinds) || keys.prefix_pending() {
+        return None;
+    }
+    match bytes {
+        b"\x1b[B" | b"\x1bOB" => Some(true),
+        b"\x1b[A" | b"\x1bOA" => Some(false),
+        // Typed fast or held, the letters come several to a read: still a turn, not a close.
+        [b'j', ..] if bytes.iter().all(|b| *b == b'j') => Some(true),
+        [b'k', ..] if bytes.iter().all(|b| *b == b'k') => Some(false),
+        _ => None,
+    }
 }
 
 /// Typing into the keys overlay's search.
@@ -16959,6 +17137,7 @@ mod tests {
             palette: Some(Palette::open()),
             palette_pending: Vec::new(),
             keys_query: None,
+            keys_page: 0,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
@@ -17923,14 +18102,18 @@ mod tests {
         );
     }
 
-    /// Left and right walk the colours, 1 to 6 then auto and round, in both spellings and
-    /// split across reads; a bare esc still cancels.
+    /// On the colour's stop (tab from the name), left and right walk the colours, 1 to 6 then
+    /// auto and round, in both spellings and split across reads; on the name they are the
+    /// name's. A bare esc still cancels.
     #[test]
     fn the_arrows_walk_the_colours_round_through_auto() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         s.prompt = Some(space_settings(&s, 1));
         assert_eq!(pick(&s), Some(None));
+        prompt_key(&mut s, b"\x1b[C");
+        assert_eq!(pick(&s), Some(None), "the name's arrow");
+        prompt_key(&mut s, b"\t");
         prompt_key(&mut s, b"\x1b[C");
         assert_eq!(pick(&s), Some(Some(0)));
         prompt_key(&mut s, b"\x1bOC\x1bOC");
@@ -17982,7 +18165,7 @@ mod tests {
         (s.cols, s.lines) = (100, 30);
         let mut request = 0;
         s.prompt = Some(space_settings(&s, 1));
-        prompt_key(&mut s, b"\x1b[C\x1b[C");
+        prompt_key(&mut s, b"\t\x1b[C\x1b[C");
         let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
             panic!("a colour picked over an empty name was not saved");
         };
@@ -18510,6 +18693,7 @@ mod tests {
             palette: None,
             palette_pending: Vec::new(),
             keys_query: None,
+            keys_page: 0,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
@@ -18662,6 +18846,7 @@ mod tests {
             palette: None,
             palette_pending: Vec::new(),
             keys_query: None,
+            keys_page: 0,
             menu_kind: MenuKind::Main,
             connecting: None,
             probing: None,
@@ -19795,14 +19980,15 @@ mod tests {
         assert!(matches!(menu_key(&mut state, 5, b"r"), MenuOutcome::Moved));
         assert_eq!(state.menu, Some(2));
         assert!(matches!(menu_key(&mut state, 0, b"?"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(12));
+        let at = |name: &str| MENU.iter().position(|(n, ..)| *n == name);
+        assert_eq!(state.menu, at("keys"));
         // Keyless rows answer to their first letter, the first such row from the top:
         // `s` is still settings, ahead of sleep space.
         assert!(matches!(menu_key(&mut state, 7, b"s"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(13));
-        // `x` jumps straight to close tab.
+        assert_eq!(state.menu, at("settings"));
+        // `x` jumps straight to close tab, the last row.
         assert!(matches!(menu_key(&mut state, 0, b"x"), MenuOutcome::Moved));
-        assert_eq!(state.menu, Some(4));
+        assert_eq!(state.menu, Some(MENU.len() - 1));
         // Enter chooses, esc closes.
         assert!(matches!(
             menu_key(&mut state, 8, b"\r"),
@@ -19817,6 +20003,39 @@ mod tests {
         assert_eq!(state.menu, None);
     }
 
+    /// `j` and `k` turn a cut keys box one page, typed slowly or several to a read; anything
+    /// else is not a turn (it closes the box).
+    #[test]
+    fn the_keys_box_turns_on_j_and_k_however_fast_they_come() {
+        let mut state = bare_state();
+        state.reading = Some(Reading::Keybinds);
+        let keys = Keys::default();
+        assert_eq!(keys_turn(&state, b"j", &keys), Some(true));
+        assert_eq!(keys_turn(&state, b"jjj", &keys), Some(true));
+        assert_eq!(keys_turn(&state, b"kk", &keys), Some(false));
+        assert_eq!(keys_turn(&state, b"\x1b[A", &keys), Some(false));
+        assert_eq!(keys_turn(&state, b"jq", &keys), None);
+        assert_eq!(keys_turn(&state, b"", &keys), None);
+    }
+
+    /// A search started on a later page of the keys box shows its matches: the page goes back
+    /// to the first, where a search puts them (`j`, `/`, `zoom` at 60x24).
+    #[test]
+    fn a_keys_search_from_a_later_page_shows_its_matches() {
+        let mut state = bare_state();
+        (state.cols, state.lines) = (60, 24);
+        state.reading = Some(Reading::Keybinds);
+        let keys = Keys::default();
+        assert_eq!(reading_key(&mut state, b"j".to_vec(), &keys), None);
+        assert_eq!(state.keys_page, 1);
+        for key in [&b"/"[..], b"z", b"o", b"o", b"m"] {
+            assert_eq!(reading_key(&mut state, key.to_vec(), &keys), None);
+        }
+        assert_eq!(state.keys_query.as_deref(), Some("zoom"));
+        let painted = plain(&screen::paint(&state.frame()));
+        assert!(painted.contains("zoom, chat"), "{painted}");
+    }
+
     #[test]
     fn every_menu_row_names_a_dispatched_choice() {
         // The dispatch matches on the same names, so a row added without an
@@ -19829,23 +20048,49 @@ mod tests {
                 "new space",
                 "rename tab",
                 "space settings",
-                "close tab",
+                "",
                 "split side by side",
                 "split stacked",
                 "zoom pane",
                 "copy mode",
                 "resize panes",
                 "equalize panes",
+                "",
                 "tree or priority",
                 "keys",
                 "settings",
                 "sleep space",
                 "wake space",
-                "reload manifests",
                 "connect a computer",
+                "reload agent detection",
+                "",
                 "detach",
+                "close tab",
             ]
         );
+    }
+
+    /// The menu's groups stand apart by a blank that `j k` and the arrows step over, so the pick
+    /// is always a choice; a blank clicked chooses nothing.
+    #[test]
+    fn the_menu_steps_over_the_blanks_between_its_groups() {
+        let mut state = bare_state();
+        let gap = MENU.iter().position(|(n, ..)| n.is_empty()).unwrap();
+        assert!(matches!(
+            menu_key(&mut state, gap - 1, b"j"),
+            MenuOutcome::Moved
+        ));
+        assert_eq!(state.menu, Some(gap + 1));
+        assert!(matches!(
+            menu_key(&mut state, gap + 1, b"\x1b[A"),
+            MenuOutcome::Moved
+        ));
+        assert_eq!(state.menu, Some(gap - 1));
+        let mut request = 0;
+        assert!(matches!(
+            apply_menu_choice(&mut state, gap, &mut request),
+            MenuSend::Nothing
+        ));
     }
 
     #[test]
@@ -19880,13 +20125,13 @@ mod tests {
         let mut request = 0;
         let reload = MENU
             .iter()
-            .position(|(n, _, _)| *n == "reload manifests")
+            .position(|(n, _, _)| *n == "reload agent detection")
             .unwrap();
         assert!(matches!(
             apply_menu_choice(&mut state, reload, &mut request),
             MenuSend::Control(ControlRequest::ReloadAgentManifests { .. })
         ));
-        assert_eq!(state.message.as_deref(), Some("reloading agent manifests"));
+        assert_eq!(state.message.as_deref(), Some("reloading agent detection"));
         let rename = MENU
             .iter()
             .position(|(n, _, _)| *n == "rename tab")
@@ -21522,10 +21767,7 @@ mod tests {
         }
         park(&mut state, 2, &mut request);
         assert!(state.modes.outbox.is_empty(), "a shell is not parked");
-        assert_eq!(
-            state.message.as_deref(),
-            Some("only an agent can be saved for later")
-        );
+        assert_eq!(state.message.as_deref(), Some("only an agent can be saved"));
     }
 
     /// One pane alone stands in its frame like a split one: the park label follows its bottom
@@ -21551,7 +21793,7 @@ mod tests {
             (pane.x + 2, pane.y + pane.rows),
             "after the bottom left corner"
         );
-        assert!(label.contains("save for later"), "{label:?}");
+        assert!(label.contains("save"), "{label:?}");
         let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(3))));
         assert!(
@@ -21570,7 +21812,7 @@ mod tests {
         else {
             panic!("still in the corner once parked");
         };
-        assert!(label.contains("saved for later"), "{label:?}");
+        assert!(label.contains("saved"), "{label:?}");
         s.rows[0].agent = false;
         assert_eq!(
             screen::park_state(&s.rows, 3),
@@ -21595,7 +21837,7 @@ mod tests {
         let (row, col) = ((y + screen::TABS + 1) as u16, (x + left + 1) as u16);
         let wide = crate::width::width(&label) as u16;
         assert!(
-            label.starts_with("[ ") && label.ends_with(" save for later ]"),
+            label.starts_with("[ ") && label.ends_with(" save ]"),
             "{label:?}"
         );
         assert!(matches!(s.clicked(row, col), Some(Clicked::Park(1))));
@@ -21777,15 +22019,30 @@ mod tests {
         );
     }
 
-    /// The space's settings box turns qass's skip over with ctrl-e and saves it with the rest,
-    /// and says nothing of it for qass's own space.
+    /// The space's settings box turns qass's skip over on its own stop (tab, then space), says
+    /// the state it is in, and saves it with the rest; nothing of it for qass's own space.
     #[test]
     fn the_settings_box_turns_the_qass_skip_over() {
         let mut s = state();
         (s.cols, s.lines) = (100, 30);
         let mut request = 0;
         s.prompt = Some(space_settings(&s, 1));
+        // ctrl-e is the name's (readline's end of line), never the watch.
         prompt_key(&mut s, b"\x05");
+        assert!(
+            s.prompt
+                .as_ref()
+                .unwrap()
+                .skip
+                .is_some_and(|k| k.now == k.was)
+        );
+        // Tab to the watch, marked like the colour row, space turns it over; the button says
+        // the state.
+        assert!(plain(&screen::paint(&s.frame())).contains("qass watches"));
+        prompt_key(&mut s, b"\t\t");
+        assert!(plain(&screen::paint(&s.frame())).contains("\u{25b8} qass watches"));
+        prompt_key(&mut s, b" ");
+        assert!(plain(&screen::paint(&s.frame())).contains("qass skips"));
         let PromptOutcome::Confirm(prompt, name, _) = prompt_key(&mut s, b"\r") else {
             panic!("a skip picked over an empty name was not saved");
         };
@@ -21804,10 +22061,19 @@ mod tests {
         );
         // Twice is back where it was: nothing to send.
         s.prompt = Some(space_settings(&s, 1));
-        prompt_key(&mut s, b"\x05\x05");
+        prompt_key(&mut s, b"\t\t  ");
         let PromptOutcome::Passthrough(_) = prompt_key(&mut s, b"\r") else {
             panic!("a skip turned over twice was saved");
         };
+        // A box too narrow to draw the watch (50 columns) has no stop for it: tab passes it and
+        // space types, so nothing turns that the person cannot see.
+        (s.cols, s.lines) = (50, 30);
+        s.prompt = Some(space_settings(&s, 1));
+        assert!(!plain(&screen::paint(&s.frame())).contains("qass watches"));
+        prompt_key(&mut s, b"\t\t ");
+        let prompt = s.prompt.as_ref().expect("open");
+        assert!(prompt.skip.is_some_and(|k| k.now == k.was) && prompt.stop != 2);
+        (s.cols, s.lines) = (100, 30);
         // qass's own space has no skip to turn.
         s.spaces[0].name = "qass".into();
         s.prompt = Some(space_settings(&s, 1));
@@ -24139,10 +24405,10 @@ mod tests {
     }
 
     /// Put away by the owner, the questions stay away while an answer is held or its word is
-    /// up; leaving them, by putting them away or by their last card answered, gives the
-    /// keyboard to qass's terminal and not to the board it may have come from.
+    /// up; putting them away gives the keyboard back to the pane it came from (the board here),
+    /// and their last card answered gives it to qass's terminal.
     #[test]
-    fn leaving_the_questions_hides_them_over_a_sent_answer_and_hands_the_keyboard_to_qass() {
+    fn leaving_the_questions_hides_them_over_a_sent_answer_and_gives_the_keyboard_back() {
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
         state.focused = 4;
@@ -24162,7 +24428,7 @@ mod tests {
             state.questions().is_none(),
             "put away wins over the word on screen"
         );
-        assert_eq!(state.pending_focus, Some(5));
+        assert_eq!((state.pending_focus, state.focused), (None, 4));
         // The last card going while the keyboard is in them does the same.
         let mut state = qass_wide();
         state.asks.take(vec![ask_card(1, "korea")], Vec::new());
@@ -24631,6 +24897,343 @@ mod tests {
         }
     }
 
+    /// The sidebar's cells as a person's terminal shows them: per row, each cell's character after
+    /// the escape in force on it (written only where it changes), columns `0..left`, rows above
+    /// the status rows. Links and other strings are skipped; the version is masked, so a release
+    /// of the same length leaves the bytes alone.
+    fn sidebar_bytes(painted: &str, cols: usize, lines: usize, left: usize) -> Vec<String> {
+        let mut grid = vec![vec![(' ', String::new()); cols]; lines];
+        let (mut r, mut c, mut sgr) = (0usize, 0usize, String::new());
+        let mut chars = painted.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&']') {
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' || (ch == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let mut seq = String::new();
+                for ch in chars.by_ref() {
+                    seq.push(ch);
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                if let Some(at) = seq.strip_prefix('[').and_then(|s| s.strip_suffix('H')) {
+                    let mut it = at.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
+                    r = it.next().unwrap_or(1).saturating_sub(1);
+                    c = it.next().unwrap_or(1).saturating_sub(1);
+                } else if seq.ends_with('m') {
+                    if seq == "[m" || seq.starts_with("[0") {
+                        sgr.clear();
+                    }
+                    sgr.push_str(&seq);
+                }
+                continue;
+            }
+            if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                *cell = (ch, sgr.clone());
+            }
+            c += crate::width::columns(ch).max(1);
+        }
+        let version = sidebar::VERSION;
+        grid.into_iter()
+            .take(lines - screen::STATUS)
+            .map(|row| {
+                let mut out = String::new();
+                let mut was = None;
+                for (ch, sgr) in &row[..left] {
+                    if was != Some(sgr) {
+                        out.push_str(&format!("<{sgr}>"));
+                        was = Some(sgr);
+                    }
+                    out.push(*ch);
+                }
+                out.replace(version, &"#".repeat(version.len()))
+            })
+            .collect()
+    }
+
+    /// FNV-1a: a hash that stays the same across Rust releases, for bytes pinned in a test.
+    fn fnv(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// A zoomed pane says so on the notice row with the key that shows every pane again; the
+    /// note goes with the zoom.
+    #[test]
+    fn a_zoomed_pane_says_so_on_the_notice_row() {
+        let mut state = qass_wide();
+        let notice =
+            |state: &State| written_on(&screen::paint(&state.frame()), state.lines as usize - 1);
+        state.layouts.get_mut(&9).unwrap().zoomed = Some(5);
+        let said = notice(&state);
+        assert!(said.contains("zoomed") && said.contains(" z "), "{said}");
+        state.layouts.get_mut(&9).unwrap().zoomed = None;
+        assert!(!notice(&state).contains("zoomed"));
+    }
+
+    /// qass's page beside the open column of an 80 and a 60 column window. A resize never moves
+    /// the keyboard: qass keeps it and the board rests on its tab. `ctrl-a T` opens the board in
+    /// the room with the keyboard, the questions open over it with every word and option, and
+    /// close back to the board. The column keeps its fold whatever opens, and a resize back
+    /// gives the layout the same keys give at that size.
+    #[test]
+    fn a_narrow_qass_page_opens_the_board_and_the_questions_beside_the_open_column() {
+        const ASKS: &str = "Which PR lands first, and may the agent remove the old branch?";
+        let size = |state: &mut State, cols: u16, lines: u16| {
+            (state.cols, state.lines) = (cols, lines);
+            state.sidebar_width = sidebar::opening_width(cols);
+        };
+        // qass's tab at `cols` x `lines`: the board opened with `ctrl-a T`, then the questions.
+        let opened = |cols: u16, lines: u16| {
+            let mut state = qass_wide();
+            state.palette = None;
+            state.qass_ui.fold = None;
+            assert_eq!(state.focused, 5, "the keyboard in qass");
+            size(&mut state, cols, lines);
+            assert_eq!(state.focused, 5, "a resize leaves the keyboard at {cols}");
+            if cols < 100 {
+                assert_eq!(state.folded(), Some(4), "the board rests at {cols}");
+            }
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            assert!(fold_key(&mut state), "ctrl-a T");
+            if let Some(next) = state.pending_focus.take() {
+                move_focus(&mut state, next, &mut seq, &mut seqs).unwrap();
+            }
+            let mut card = ask_card(1, "korea");
+            card.body.asks = ASKS.into();
+            state.asks.take(vec![card], Vec::new());
+            state
+        };
+        for (cols, lines) in [(80u16, 24u16), (60, 24)] {
+            let mut state = opened(cols, lines);
+            assert_eq!(state.folded(), Some(5), "qass rests on its tab at {cols}");
+            assert_eq!(state.focused, 4, "the keyboard goes with the board");
+            let board = tile_of(&state, 4);
+            assert!(board.cols >= 20 && board.rows >= 8, "{cols}: {board:?}");
+            asks_toggle(&mut state);
+            let painted = cells_of(
+                &screen::paint(&state.frame()),
+                cols as usize,
+                lines as usize,
+            )
+            .iter()
+            .map(|row| row.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(state.questions().is_some(), "{cols}: {:?}", state.message);
+            assert!(!state.collapsed, "the column keeps its fold at {cols}");
+            for word in ASKS.split(' ').chain(["[a]", "[b]"]) {
+                assert!(painted.contains(word), "{word:?} at {cols}:\n{painted}");
+            }
+            // Closed, the keyboard is back on the board it came from.
+            assert!(asks_toggle(&mut state));
+            assert!(
+                state.pending_focus.is_none() && state.focused == 4,
+                "{cols}"
+            );
+            assert_eq!(state.folded(), Some(5));
+            assert!(!state.collapsed);
+            // `ctrl-a T` from the board opens qass with the keyboard at once; again, the board.
+            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+            for (focused, rests) in [(5, 4), (4, 5)] {
+                assert!(fold_key(&mut state));
+                if let Some(next) = state.pending_focus.take() {
+                    move_focus(&mut state, next, &mut seq, &mut seqs).unwrap();
+                }
+                assert_eq!(
+                    (state.focused, state.folded()),
+                    (focused, Some(rests)),
+                    "{cols}"
+                );
+            }
+            // Open again and resized to 120x40: as the same keys leave it at 120x40.
+            asks_toggle(&mut state);
+            size(&mut state, 120, 40);
+            let mut wide = opened(120, 40);
+            asks_toggle(&mut wide);
+            assert_eq!(state.focused, wide.focused, "{cols}");
+            assert_eq!(state.folded(), wide.folded(), "{cols}");
+            assert_eq!(state.questions(), wide.questions(), "{cols}");
+        }
+    }
+
+    /// The left sidebar is the owner's and frozen: its cells, characters and inks both, are
+    /// pinned to the bytes recorded at d4a3518 (origin/main before the 2026-10-27 overhaul) for
+    /// qass's page and a terminal page, open and folded, at four sizes, dark, light and without
+    /// colour. A palette change that reaches the sidebar fails here even when it moves every
+    /// frame alike, which the test above cannot see.
+    #[test]
+    fn the_left_sidebar_keeps_the_bytes_it_had_at_d4a3518() {
+        use crate::colorlevel::{Level, TEST_LEVEL};
+        use crate::theme::TEST_LIGHT;
+        const PINNED: &[(&str, u64)] = &[
+            ("qass 200x60 open dark", 0xd14ae38c4d135e2a),
+            ("qass 200x60 folded dark", 0x7e32e4c0c8764e5a),
+            ("qass 120x40 open dark", 0xd319d0cdffb804fa),
+            ("qass 120x40 folded dark", 0xff5df5cc4d9813ca),
+            ("qass 80x24 open dark", 0xe89464a1f54f8b4e),
+            ("qass 80x24 folded dark", 0xe93091a39416e00a),
+            ("qass 60x24 open dark", 0xb507640aa7643be2),
+            ("qass 60x24 folded dark", 0xe93091a39416e00a),
+            ("terminal 200x60 open dark", 0xe42256f32140ca32),
+            ("terminal 200x60 folded dark", 0x804d87b39324edc3),
+            ("terminal 120x40 open dark", 0xdbabb7307ea37242),
+            ("terminal 120x40 folded dark", 0xcd5dc865d57a4593),
+            ("terminal 80x24 open dark", 0x2fe3fbc39823124e),
+            ("terminal 80x24 folded dark", 0xedf9dd3862d7fa53),
+            ("terminal 60x24 open dark", 0x51f07e74fe960c9a),
+            ("terminal 60x24 folded dark", 0xedf9dd3862d7fa53),
+            ("agent picked 200x60 open dark", 0x51130f8de5bccef8),
+            ("agent picked 200x60 folded dark", 0x0ad6f8f56a8e123f),
+            ("agent picked 120x40 open dark", 0xd159716c0fd92dc8),
+            ("agent picked 120x40 folded dark", 0xdf943b80288c0b2f),
+            ("agent picked 80x24 open dark", 0x25adc1eed78c95a4),
+            ("agent picked 80x24 folded dark", 0x009e4014379c9d6f),
+            ("agent picked 60x24 open dark", 0xad6875748b2beb60),
+            ("agent picked 60x24 folded dark", 0x009e4014379c9d6f),
+            ("space picked 200x60 open dark", 0x2ff7d4c73cfada85),
+            ("space picked 200x60 folded dark", 0x88bd79e56fdb7296),
+            ("space picked 120x40 open dark", 0xc61e8fe5800c8bf5),
+            ("space picked 120x40 folded dark", 0xb3d5847548db9a66),
+            ("space picked 80x24 open dark", 0x9b7bbb2743afb0a0),
+            ("space picked 80x24 folded dark", 0xfe1299c648e81026),
+            ("space picked 60x24 open dark", 0x31c3cff495b1873c),
+            ("space picked 60x24 folded dark", 0xfe1299c648e81026),
+            ("qass 200x60 open light", 0x83709fb737228f32),
+            ("qass 200x60 folded light", 0x91f8a58f31ad8da2),
+            ("qass 120x40 open light", 0xbf23a0ef1fdb4e6a),
+            ("qass 120x40 folded light", 0x707372a3a2959b6a),
+            ("qass 80x24 open light", 0x79b99ab85e40522a),
+            ("qass 80x24 folded light", 0xf54459ff42ce7eca),
+            ("qass 60x24 open light", 0x4011e011cbc45dcf),
+            ("qass 60x24 folded light", 0xf54459ff42ce7eca),
+            ("terminal 200x60 open light", 0x2de42b03a17084ee),
+            ("terminal 200x60 folded light", 0x33031af13d51280d),
+            ("terminal 120x40 open light", 0x2a8510d0e3f9f026),
+            ("terminal 120x40 folded light", 0x2ad03196be1919e5),
+            ("terminal 80x24 open light", 0x83ddf428e03fb92e),
+            ("terminal 80x24 folded light", 0x03bf4295099c1185),
+            ("terminal 60x24 open light", 0xb78b746cae08cca3),
+            ("terminal 60x24 folded light", 0x03bf4295099c1185),
+            ("agent picked 200x60 open light", 0xd91b1b13b85b4f28),
+            ("agent picked 200x60 folded light", 0x06000e9ea0ca4ee1),
+            ("agent picked 120x40 open light", 0x2fbb14af4b919bf0),
+            ("agent picked 120x40 folded light", 0xaa339b4a56d953f9),
+            ("agent picked 80x24 open light", 0x9f184cba0ffa5b37),
+            ("agent picked 80x24 folded light", 0xa3ea6235f7b5a099),
+            ("agent picked 60x24 open light", 0xea3d6a2b0c89e474),
+            ("agent picked 60x24 folded light", 0xa3ea6235f7b5a099),
+            ("space picked 200x60 open light", 0x3aedeb5d0effdd5e),
+            ("space picked 200x60 folded light", 0xb10cfce2c3bef542),
+            ("space picked 120x40 open light", 0x010711225b4c98d6),
+            ("space picked 120x40 folded light", 0x36b143442e2e678a),
+            ("space picked 80x24 open light", 0xa7725fcac60cc2f2),
+            ("space picked 80x24 folded light", 0xdb8536903b37db6a),
+            ("space picked 60x24 open light", 0xdbbd03858a15dbb7),
+            ("space picked 60x24 folded light", 0xdb8536903b37db6a),
+            ("qass 200x60 open mono", 0xe9045e23946320bb),
+            ("qass 200x60 folded mono", 0x03177d21aee2b90c),
+            ("qass 120x40 open mono", 0x21c464b0558703bb),
+            ("qass 120x40 folded mono", 0xc2ae51400e76528c),
+            ("qass 80x24 open mono", 0x063f6bfa34365ad7),
+            ("qass 80x24 folded mono", 0x432bcd5eb399f08c),
+            ("qass 60x24 open mono", 0x36827b86c877bdc7),
+            ("qass 60x24 folded mono", 0x432bcd5eb399f08c),
+            ("terminal 200x60 open mono", 0xfe74b59175d09503),
+            ("terminal 200x60 folded mono", 0x581b29bea2514048),
+            ("terminal 120x40 open mono", 0x0a94e14a71d54283),
+            ("terminal 120x40 folded mono", 0xda4174c73d1b3028),
+            ("terminal 80x24 open mono", 0x674a97fba665a0cf),
+            ("terminal 80x24 folded mono", 0x7fe648bec37cd2a8),
+            ("terminal 60x24 open mono", 0x3a082831528a7c7f),
+            ("terminal 60x24 folded mono", 0x7fe648bec37cd2a8),
+            ("agent picked 200x60 open mono", 0xab921a5d5cdcea58),
+            ("agent picked 200x60 folded mono", 0x8bd8bd8a16dab4c0),
+            ("agent picked 120x40 open mono", 0xb50bf828e246eb58),
+            ("agent picked 120x40 folded mono", 0x7b55ebffc86fa820),
+            ("agent picked 80x24 open mono", 0xb07add0fc8cca643),
+            ("agent picked 80x24 folded mono", 0x66da94b7900d38a0),
+            ("agent picked 60x24 open mono", 0x43ea48ba9c8e4c33),
+            ("agent picked 60x24 folded mono", 0x66da94b7900d38a0),
+            ("space picked 200x60 open mono", 0x3d148362496601f2),
+            ("space picked 200x60 folded mono", 0xe61c31d13aca298e),
+            ("space picked 120x40 open mono", 0x65ddb6996c578912),
+            ("space picked 120x40 folded mono", 0x71295e74e8d1d9ae),
+            ("space picked 80x24 open mono", 0xad4ac5fa96ec9e95),
+            ("space picked 80x24 folded mono", 0xa3379e2a1cda1c2e),
+            ("space picked 60x24 open mono", 0x5f1a817243002965),
+            ("space picked 60x24 folded mono", 0xa3379e2a1cda1c2e),
+        ];
+        let mut got = Vec::new();
+        for (theme, light, level) in [
+            ("dark", false, None),
+            ("light", true, None),
+            ("mono", false, Some(Level::Mono)),
+        ] {
+            TEST_LIGHT.with(|c| c.set(Some(light)));
+            TEST_LEVEL.with(|c| c.set(level));
+            // The column's own pick raises its row with `theme::selected`: on an agent, and
+            // after `k` up to its space's rule.
+            let picked = |ups: usize| {
+                let mut state = qass_state();
+                enter_side(&mut state, false);
+                for _ in 0..ups {
+                    mode_input(&mut state, b"k", 0x01, &mut 0);
+                }
+                state
+            };
+            let pages: [(&str, &dyn Fn() -> State); 4] = [
+                ("qass", &qass_wide),
+                ("terminal", &qass_state),
+                ("agent picked", &|| picked(0)),
+                ("space picked", &|| picked(9)),
+            ];
+            for (page, make) in pages {
+                for (cols, lines) in [(200u16, 60u16), (120, 40), (80, 24), (60, 24)] {
+                    for collapsed in [false, true] {
+                        let mut state = make();
+                        // The palette the test state opens with would cover the column at 80.
+                        (state.palette, state.menu) = (None, None);
+                        (state.cols, state.lines, state.collapsed) = (cols, lines, collapsed);
+                        state.sidebar_width = sidebar::opening_width(cols);
+                        let left = screen::left_for(cols, collapsed, state.sidebar_width);
+                        let rows = sidebar_bytes(
+                            &screen::paint(&state.frame()),
+                            cols as usize,
+                            lines as usize,
+                            left,
+                        );
+                        let fold = if collapsed { "folded" } else { "open" };
+                        let name = format!("{page} {cols}x{lines} {fold} {theme}");
+                        got.push((name, fnv(&rows.join("\n")), rows));
+                    }
+                }
+            }
+        }
+        TEST_LIGHT.with(|c| c.set(None));
+        TEST_LEVEL.with(|c| c.set(None));
+        let recorded: String = got
+            .iter()
+            .map(|(name, hash, _)| format!("            ({name:?}, {hash:#018x}),\n"))
+            .collect();
+        for (name, hash, rows) in &got {
+            let pinned = PINNED.iter().find(|(n, _)| n == name).map(|(_, h)| *h);
+            assert_eq!(
+                pinned,
+                Some(*hash),
+                "the sidebar of {name} moved:\n{}\nnow:\n{recorded}",
+                rows.join("\n")
+            );
+        }
+    }
+
     /// A tab on the rail is a click that opens its pane: the board's and qass's tabs fold away
     /// and come back, the questions' tab is the chip's click; a press anywhere else on the rail's
     /// rows (under the tabs) opens nothing.
@@ -24904,7 +25507,8 @@ mod tests {
 
     /// On qass's split tab, the last waiting card answered (queued) or gone elsewhere while he
     /// types for it: the questions stay up with the keyboard and his words, so no letter of his
-    /// reaches qass's chat, until esc lets them go.
+    /// reaches qass's chat. Esc stops the typing and the words stand as not sent; a second esc
+    /// lets them go.
     #[test]
     fn typing_for_the_last_card_handled_elsewhere_keeps_the_questions_up() {
         for gone in [false, true] {
@@ -24934,6 +25538,9 @@ mod tests {
                 (true, "run it after the".to_string(), true, true, true),
                 "gone={gone}"
             );
+            state.asks.key(b"\x1b", 1);
+            state.asks_settle();
+            assert!(state.asks.raised && !state.asks.typing(), "gone={gone}");
             state.asks.key(b"\x1b", 1);
             state.asks_settle();
             assert!(!state.asks.raised, "gone={gone}");
@@ -24991,7 +25598,7 @@ mod tests {
                 Some(&(inner.cols as u16, inner.rows as u16))
             );
             let painted = screen::paint(&state.frame());
-            assert!(painted.contains("on the clock"), "{cols} columns");
+            assert!(painted.contains("schedules"), "{cols} columns");
             assert!(painted.contains("morning review"), "{cols} columns");
             // Gone from the list: the terminal has the pane back.
             state.clock.take(Vec::new());
@@ -25158,29 +25765,23 @@ mod tests {
 
     #[test]
     fn a_pane_too_narrow_or_too_short_says_so_and_changes_nothing() {
-        // Narrow with the column open: folding it makes the room, so the key is named. Short:
-        // folding makes none.
-        for (cols, lines, says) in [
-            (
-                90u16,
-                50u16,
-                "the pane is too narrow for the questions; ctrl-a b folds the column",
-            ),
-            (160, 15, "the pane is too small for the questions"),
-        ] {
-            let mut state = qass_window();
-            state.cols = cols;
-            state.lines = lines;
-            let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
-            qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
-            assert!(!asks_toggle(&mut state), "{cols}x{lines}");
-            assert!(!state.qass_ui.inbox && !state.collapsed);
-            assert_eq!(state.message.as_deref(), Some(says), "{cols}x{lines}");
-        }
+        // Short: folding the column makes no room. (Any pane wide enough for qass's screen is
+        // wide enough for the questions.)
+        let mut state = qass_window();
+        (state.cols, state.lines) = (160, 15);
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        assert!(!asks_toggle(&mut state));
+        assert!(!state.qass_ui.inbox && !state.collapsed);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("the pane is too small for the questions")
+        );
         // qass's tab with the board, the same rule by where the questions would stand.
         for (cols, lines, says) in [
+            // Narrow with the column open: folding it makes the room, so the key is named.
             (
-                100u16,
+                63u16,
                 40u16,
                 "the pane is too narrow for the questions; ctrl-a b folds the column",
             ),
@@ -26217,11 +26818,19 @@ mod tests {
             }
         );
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
-        let gone = daemon_closed(&UpdateAsk::default(), 7).expect_err("a close said nothing");
+        let gone =
+            daemon_closed(&UpdateAsk::default(), 7, Vec::new()).expect_err("a close said nothing");
         assert!(DaemonClosed::ended(&gone), "{gone}");
         assert_eq!(
             gone.to_string(),
             "the daemon stopped; run qoop to start it again"
+        );
+        // Words never sent outlive the screen, on the exit line, with whose card.
+        let unsent = vec!["not sent to release-build: land 42 then rebase".to_string()];
+        let gone = daemon_closed(&UpdateAsk::default(), 7, unsent).expect_err("closed");
+        assert_eq!(
+            gone.to_string(),
+            "the daemon stopped; run qoop to start it again\n  not sent to release-build: land 42 then rebase"
         );
         assert!(!DaemonClosed::ended(&io::Error::other("another failure")));
         assert!(!restarting(), "a close with no click restarted");
@@ -26231,7 +26840,8 @@ mod tests {
                     clicked: Some(std::time::Instant::now()),
                     ..UpdateAsk::default()
                 },
-                7
+                7,
+                Vec::new()
             )
             .is_ok(),
             "the move was said as the daemon stopping"
@@ -26342,7 +26952,7 @@ mod tests {
         assert!(s.update.clicked.is_none());
         assert_eq!(s.hint.as_deref(), Some(NOT_MOVED));
         RESTARTING.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert!(daemon_closed(&s.update, 7).is_err_and(|e| DaemonClosed::ended(&e)));
+        assert!(daemon_closed(&s.update, 7, Vec::new()).is_err_and(|e| DaemonClosed::ended(&e)));
         assert!(!restarting(), "a close after a given up click restarted");
         // An answer that no longer offers it (the move happened elsewhere) says nothing.
         let mut t = state();

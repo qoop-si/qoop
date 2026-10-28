@@ -34,7 +34,7 @@ pub const WRITE_ID: &str = "asks-write";
 const TEXT_MAX: usize = 400;
 /// What he is told under his words, after the agent's name, when the card they were begun for
 /// was answered, dismissed or closed elsewhere: nothing is sent.
-const HANDLED_ELSEWHERE: &str = "handled elsewhere, enter sends nothing";
+const HANDLED_ELSEWHERE: &str = "handled elsewhere";
 
 /// What a key did, for the loop that owns the keyboard.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,19 +75,42 @@ pub struct Pane {
     text: String,
     /// The card the words in the box were begun for, and its agent's handle.
     typing_for: Option<(String, String)>,
+    /// Words typed for cards not open now, by card: they come back when that card is opened
+    /// again and go when it is answered, put away or ends.
+    drafts: std::collections::BTreeMap<String, String>,
     /// Writes made and not yet sent: the loop sends them on its next tick.
     outbox: Vec<ControlRequest>,
+    /// Writes made so far: each takes its own request id, so two answers to one card in
+    /// flight are told apart.
+    writes: u64,
     /// What the daemon last said about an answer: shown in place of the key line.
     notice: Option<String>,
     /// When the notice is let go.
     notice_until: Option<Instant>,
     /// Answers sent and not yet answered, by request id: the card's handle and his words.
     sent: std::collections::BTreeMap<String, (String, String)>,
+    /// Words on their way, by request id: the card, the words (a typed answer, or the draft an
+    /// option or a dismissal took with it) and whether they were the answer sent; put back in
+    /// the box if the write fails, let go once the daemon took them.
+    pending: std::collections::BTreeMap<String, (String, String, bool)>,
+    /// Words that can no longer be sent, their card ended, with that card's handle: the one
+    /// place they go (a draft, words put back, a box left on an ended card). Added to, never
+    /// replaced; drawn until an esc outside typing and the whole view lets them go.
+    lost: Vec<(String, String)>,
     /// Cards already read again because their terminal left the rows.
     gone: Vec<String>,
     /// The owner brought the questions up while cards waited: they stay until the last card
     /// is answered and its word seen, or he puts them away. A card never sets it.
     pub raised: bool,
+    /// The open card's question read whole (`m`), in place of its answers.
+    whole: bool,
+    /// The answers the last frame drew, so `a` to `d` never send one the person cannot see;
+    /// `None` before a frame.
+    shown: std::cell::Cell<Option<usize>>,
+    /// The first row of the question read whole, scrolled by `j k`, and the last first row the
+    /// last frame could show.
+    whole_at: usize,
+    whole_end: std::cell::Cell<usize>,
 }
 
 impl Pane {
@@ -118,6 +141,11 @@ impl Pane {
     /// Take a fresh read: the open card stays the open card when it is still there.
     pub fn take(&mut self, live: Vec<AskInfo>, ended: Vec<AskInfo>) {
         let keep = self.open_card().map(|c| c.card.clone());
+        let handles: std::collections::BTreeMap<String, String> = self
+            .live
+            .iter()
+            .map(|c| (c.card.clone(), c.body.handle.clone()))
+            .collect();
         self.live = live;
         self.ended = ended;
         self.loaded = true;
@@ -128,13 +156,50 @@ impl Pane {
             .unwrap_or(self.selected)
             .min(self.live.len().saturating_sub(1));
         self.preview = None;
-        // Words kept for a card are not for the one that took its place. While he types they
-        // stay, his card answered, dismissed or closed elsewhere (the phone) or not: the keys
-        // stay in the box, so no letter of his becomes a command (`j` to another card, `x` to
-        // put it away), and enter sends nothing ([`Pane::orphaned`]).
-        if !self.typing && self.open_card().map(|c| &c.card) != keep.as_ref() {
-            self.text.clear();
+        // Words kept for a card are not for the one that took its place: they wait for their
+        // card. While he types they stay, his card answered, dismissed or closed elsewhere (the
+        // phone) or not: the keys stay in the box, so no letter of his becomes a command (`j` to
+        // another card, `x` to put it away), and enter sends nothing ([`Pane::orphaned`]).
+        if !self.typing {
+            self.swap_draft(keep);
         }
+        // Words kept for a card that ended (a retry put back, a draft) are never dropped
+        // unseen: they go to the lost words.
+        let live = &self.live;
+        let (kept, ended): (
+            std::collections::BTreeMap<_, _>,
+            std::collections::BTreeMap<_, _>,
+        ) = std::mem::take(&mut self.drafts)
+            .into_iter()
+            .partition(|(card, _)| live.iter().any(|c| c.card == *card));
+        self.drafts = kept;
+        for (card, words) in ended {
+            let who = handles.get(&card).cloned().unwrap_or_default();
+            self.lost.push((who, words));
+        }
+    }
+
+    /// The lost words as they read: whose card ended, and the words.
+    fn lost_said(&self) -> impl Iterator<Item = String> + '_ {
+        self.lost.iter().map(|(who, words)| match who.is_empty() {
+            true => format!("not sent, a card ended: {words}"),
+            false => format!("not sent, {who}'s card ended: {words}"),
+        })
+    }
+
+    /// The open card is no longer `from`: the words in the box are kept for `from`, and the
+    /// open card's own words come back.
+    fn swap_draft(&mut self, from: Option<String>) {
+        let to = self.open_card().map(|c| c.card.clone());
+        if to == from {
+            return;
+        }
+        self.whole = false;
+        let words = std::mem::take(&mut self.text);
+        if let Some(from) = from.filter(|_| !words.is_empty()) {
+            self.drafts.insert(from, words);
+        }
+        self.text = to.and_then(|c| self.drafts.remove(&c)).unwrap_or_default();
     }
 
     /// The card his words were begun for is no longer the open one waiting for him: it was
@@ -145,11 +210,13 @@ impl Pane {
         })
     }
 
-    /// Typing ends. Words no card can take any more go with it, so a later `t` never sends
-    /// them to another card.
+    /// Typing ends. Words no card can take any more leave the box for the lost words, so a
+    /// later `t` never sends them to another card.
     fn stop_typing(&mut self) {
-        if self.typing && self.orphaned() {
-            self.text.clear();
+        if self.typing && self.orphaned() && !self.text.is_empty() {
+            let who = self.typing_for.as_ref().map(|(_, h)| h.clone());
+            self.lost
+                .push((who.unwrap_or_default(), std::mem::take(&mut self.text)));
         }
         self.typing = false;
     }
@@ -203,6 +270,7 @@ impl Pane {
                 true
             }
             ControlResponse::AskWritten { id, result, .. } if self.is_mine(id) => {
+                self.pending.remove(id);
                 let (handle, words) = self.sent.remove(id).unwrap_or_default();
                 let said = match result {
                     AskResult::Answered => format!("sent to {handle}: {words}"),
@@ -217,8 +285,32 @@ impl Pane {
                 true
             }
             ControlResponse::Failed { id, reason } if self.is_mine(id) => {
-                self.sent.remove(id);
-                self.say(reason.clone());
+                let (handle, _) = self.sent.remove(id).unwrap_or_default();
+                let said = match self.pending.remove(id) {
+                    // Its card ended elsewhere: no box to put them back in.
+                    Some((card, words, _)) if !self.live.iter().any(|c| c.card == card) => {
+                        self.lost.push((handle, words));
+                        format!("not sent: {reason}")
+                    }
+                    // An option or a dismissal failed: the draft it took comes back.
+                    Some((card, words, false)) => {
+                        self.restore(card, words);
+                        format!("not sent: {reason}")
+                    }
+                    Some((card, words, true)) => {
+                        let here = self.open_card().is_some_and(|c| c.card == card);
+                        self.restore(card, words);
+                        if here {
+                            format!("not sent, t and enter retry: {reason}")
+                        } else {
+                            format!("not sent, kept on {handle}'s card: {reason}")
+                        }
+                    }
+                    None => format!("not sent: {reason}"),
+                };
+                // A failure stays until esc or typing: read whole, not missed.
+                self.notice = Some(said);
+                self.notice_until = None;
                 self.stale = true;
                 true
             }
@@ -237,6 +329,21 @@ impl Pane {
 
     fn is_mine(&self, id: &str) -> bool {
         self.sent.contains_key(id)
+    }
+
+    /// Words a failed write took out of the box go back to their card, ahead of any typed since:
+    /// into the box when that card is open, else kept for the card.
+    fn restore(&mut self, card: String, words: String) {
+        let open = self.open_card().is_some_and(|c| c.card == card);
+        let kept = if open {
+            &mut self.text
+        } else {
+            self.drafts.entry(card).or_default()
+        };
+        *kept = match kept.is_empty() {
+            true => words,
+            false => format!("{words} {kept}"),
+        };
     }
 
     /// The moment the inbox next has something to do by itself: a write to send now or a
@@ -273,9 +380,24 @@ impl Pane {
 
     /// Whether an answer is on its way, just answered or being typed: the questions stay up
     /// through all three, so the last answer's word is still seen and no letter of his goes to
+    /// The words not sent when the daemon goes, one line each with whose card: answers on
+    /// their way, then the lost words.
+    pub fn unsent(&self) -> Vec<String> {
+        self.sent
+            .values()
+            .filter(|(_, words)| !words.is_empty())
+            .map(|(handle, words)| format!("not sent to {handle}: {words}"))
+            .chain(self.lost_said())
+            .collect()
+    }
+
     /// qass's chat when his card is handled elsewhere.
     pub fn busy(&self) -> bool {
-        !self.outbox.is_empty() || !self.sent.is_empty() || self.notice.is_some() || self.typing
+        !self.outbox.is_empty()
+            || !self.sent.is_empty()
+            || self.notice.is_some()
+            || self.typing
+            || !self.lost.is_empty()
     }
 
     /// Write now: the one request every answer and every dismissal goes out by.
@@ -284,7 +406,20 @@ impl Pane {
             AskOp::Answer { card, .. } | AskOp::Dismiss { card } => card.clone(),
             _ => return,
         };
-        let id = format!("{WRITE_ID}-{card}");
+        self.writes += 1;
+        let id = format!("{WRITE_ID}-{card}-{}", self.writes);
+        // The words that go with this write: its own text, else the card's draft.
+        let open = self.open_card().is_some_and(|c| c.card == card);
+        let (kept, typed) = match &action {
+            AskOp::Answer {
+                text: Some(text), ..
+            } => (text.clone(), true),
+            _ if open => (self.text.clone(), false),
+            _ => (self.drafts.get(&card).cloned().unwrap_or_default(), false),
+        };
+        if !kept.is_empty() {
+            self.pending.insert(id.clone(), (card.clone(), kept, typed));
+        }
         self.sent.insert(id.clone(), (handle, words));
         self.outbox.push(ControlRequest::AskWrite {
             id,
@@ -296,6 +431,7 @@ impl Pane {
         self.notice_until = None;
         self.typing = false;
         self.text.clear();
+        self.drafts.remove(&card);
     }
 
     fn send_answer(&mut self, option: Option<usize>, text: Option<String>) -> bool {
@@ -347,12 +483,20 @@ impl Pane {
     /// Open card number `at` of the list.
     pub fn select(&mut self, at: usize) {
         if at < self.live.len() {
+            // The words in the box are for the card typed into, else for the open one.
+            let from = match (&self.typing_for, self.typing) {
+                (Some((card, _)), true) => Some(card.clone()),
+                _ => self.open_card().map(|c| c.card.clone()),
+            };
             self.selected = at;
             self.preview = None;
             self.typing = false;
-            self.text.clear();
-            self.notice = None;
-            self.notice_until = None;
+            self.swap_draft(from);
+            // A failure stays over a move between cards: only esc or typing takes it.
+            if self.notice_until.is_some() {
+                self.notice = None;
+                self.notice_until = None;
+            }
         }
     }
 
@@ -361,6 +505,8 @@ impl Pane {
         if let Some(c) = self.open_card().filter(|c| c.status == "open") {
             self.typing_for = Some((c.card.clone(), c.body.handle.clone()));
             self.typing = true;
+            // The box and its caret are on screen while typing.
+            self.whole = false;
             self.notice = None;
             self.notice_until = None;
         }
@@ -412,6 +558,18 @@ impl Pane {
         if bytes.first() == Some(&prefix) || bytes.starts_with(b"\x1b[<") || bytes == b"\x11" {
             return Out::Pass(bytes.to_vec());
         }
+        // A failure said stays until esc (or typing, which takes the line); the lost words go
+        // on an esc of their own. Not in the whole view, where esc goes back to the card, nor
+        // while typing, where it stops the typing first.
+        if bytes == b"\x1b" && !self.whole {
+            if self.notice_until.is_none() {
+                self.notice = None;
+            }
+            if !self.typing && !self.lost.is_empty() {
+                self.lost.clear();
+                return Out::Stay;
+            }
+        }
         if self.typing {
             return self.type_key(bytes);
         }
@@ -445,7 +603,21 @@ impl Pane {
 
     fn act(&mut self, key: Key) -> Out {
         match key {
+            // Esc in the card read whole goes back to the card, as `m` does.
+            Key::Esc if self.whole => {
+                self.whole = false;
+                Out::Stay
+            }
             Key::Esc => Out::Closed,
+            Key::Char(b'j' | b'k') | Key::Down | Key::Up if self.whole => {
+                let down = matches!(key, Key::Char(b'j') | Key::Down);
+                self.whole_at = if down {
+                    (self.whole_at + 1).min(self.whole_end.get())
+                } else {
+                    self.whole_at.saturating_sub(1)
+                };
+                Out::Stay
+            }
             Key::Up => {
                 self.step_option(false);
                 Out::Stay
@@ -464,7 +636,15 @@ impl Pane {
                 Out::Stay
             }
             Key::Char(c @ b'a'..=b'd') => {
-                self.press_option((c - b'a') as usize);
+                let at = (c - b'a') as usize;
+                if self.shown.get().is_none_or(|n| at < n) {
+                    self.press_option(at);
+                }
+                Out::Stay
+            }
+            Key::Char(b'm') => {
+                self.whole = !self.whole;
+                self.whole_at = 0;
                 Out::Stay
             }
             Key::Char(b't') => {
@@ -670,12 +850,12 @@ fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
     (row.state == "working").then(|| "working again".to_string())
 }
 
-/// The most rows the question takes, and each other card text (a reason, what was asked): a text
-/// that needs more ends in `\u{2026}`.
-const ASK_ROWS: usize = 8;
+/// The most rows each card text other than the question takes (a reason, what was asked): a text
+/// that needs more ends in `\u{2026}`. The question takes all it needs while the answers, the
+/// box and the key line still fit; else it is cut, and `m` reads it whole.
 const SIDE_ROWS: usize = 8;
 
-/// The rows each card text needs at its width, as many as `ASK_ROWS` and `SIDE_ROWS` allow.
+/// The rows each card text needs at its width, as many as `SIDE_ROWS` allows.
 /// `reasons` is the rows each option reason takes.
 struct Lens {
     ask: usize,
@@ -685,11 +865,13 @@ struct Lens {
     pick: usize,
     sends: usize,
     reasons: Vec<usize>,
+    /// The card has a tag under its title (`now`, a draft): that row is kept.
+    tag: bool,
 }
 
 /// How the pane is divided between the parts, given its height.
 struct Budget {
-    /// Rows of the question.
+    /// Rows of the question: all it needs.
     ask: usize,
     /// The most rows each side text takes: it falls to 1, a cut row, as the pane gets short.
     side: usize,
@@ -701,6 +883,10 @@ struct Budget {
     pick: bool,
     sends: bool,
     doing: bool,
+    /// The text box, which a short pane drops while it holds no words (`t` brings it back).
+    text_box: bool,
+    /// The blank row under the card's title, where a tag would stand.
+    head_gap: bool,
     handled: usize,
 }
 
@@ -710,6 +896,7 @@ fn budget(
     options: usize,
     has_asked: bool,
     has_pick: bool,
+    words: bool,
     lens: &Lens,
 ) -> Budget {
     let mut b = Budget {
@@ -723,12 +910,15 @@ fn budget(
         pick: has_pick,
         sends: true,
         doing: true,
+        text_box: true,
+        head_gap: true,
         handled: 5,
     };
     let need = |b: &Budget| {
         // tabs, rule, list, rule, hints, and the detail below.
         let more = |on: bool, n: usize| usize::from(on) * (n.min(b.side) - 1);
-        let detail = 2
+        let detail = 1
+            + usize::from(b.head_gap)
             + b.ask
             + more(b.asked, lens.asked)
             + more(b.doing, lens.doing)
@@ -748,9 +938,9 @@ fn budget(
             + usize::from(b.sends)
             + usize::from(b.pick)
             + usize::from(b.gap_box)
-            + 3;
+            + 3 * usize::from(b.text_box);
         let handled = if b.handled > 0 { b.handled + 2 } else { 0 };
-        2 + b.list + 1 + detail + handled + 1
+        2 + b.list + usize::from(b.list > 0) + detail + handled + 1
     };
     while need(&b) > inner_rows {
         if b.handled > 0 {
@@ -774,16 +964,25 @@ fn budget(
             b.pick = false;
         } else if b.list > 1 {
             b.list -= 1;
-        } else if b.ask > 1 {
-            b.ask = 1;
         } else if b.sends {
             b.sends = false;
         } else if b.doing {
             b.doing = false;
+        } else if b.text_box && !words {
+            b.text_box = false;
+        } else if b.list > 0 {
+            // The open card is the one in its head: the list goes before the question is cut.
+            b.list = 0;
+        } else if b.head_gap && !lens.tag {
+            b.head_gap = false;
         } else {
             break;
         }
     }
+    // The answers, the box and the key line keep their rows: the question takes what is left,
+    // cut with `m` to read it whole.
+    let over = need(&b).saturating_sub(inner_rows);
+    b.ask = b.ask.saturating_sub(over).max(1);
     b
 }
 
@@ -795,6 +994,8 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let mut out: Vec<String> = Vec::new();
     let mut targets = Vec::new();
     let mut cursor = None;
+    // The question cut to leave its answers room: the key line names `m`.
+    let mut cut = false;
 
     // One content row: a margin, the pieces padded to `cw`, a margin, between the box's sides.
     let rule = ink(Role::Rule, fade);
@@ -810,6 +1011,94 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let hr = || wrap(&[seg(Role::Rule, "\u{2500}".repeat(cw))]);
 
     out.push(edge(cols, ('\u{256d}', '\u{256e}'), None, None, fade));
+
+    // The card read whole takes every row but the key line, scrolled by `j k`: the words that
+    // could not be sent and a failure, what the card is about, the question, then each answer
+    // with its reason and what it sends, wrapped, never cut.
+    if pane.whole && (pane.open_card().is_some() || !pane.lost.is_empty()) {
+        let content = inner_rows.saturating_sub(1);
+        let mut lines: Vec<(Vec<Seg>, Option<usize>)> = Vec::new();
+        let failed = pane.notice.clone().filter(|_| pane.notice_until.is_none());
+        for said in pane.lost_said().chain(failed) {
+            for row in wrap_dots(&said, cw, usize::MAX) {
+                lines.push((vec![seg(Role::Detail, row)], None));
+            }
+            lines.push((Vec::new(), None));
+        }
+        // A text under its label, its later rows indented to the text.
+        let labelled = |lines: &mut Vec<(Vec<Seg>, Option<usize>)>, what: &str, text: &str| {
+            let indent = width::width(what).min(cw / 2);
+            for (n, row) in wrap_dots(text, cw.saturating_sub(indent), usize::MAX)
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if n == 0 {
+                    width::fit(what, indent)
+                } else {
+                    " ".repeat(indent)
+                };
+                lines.push((
+                    vec![seg(Role::FaintText, lead), seg(Role::Detail, row)],
+                    None,
+                ));
+            }
+        };
+        let card = pane.open_card();
+        if let Some(card) = card {
+            if let Some(asked) = &card.body.asked {
+                labelled(&mut lines, "asked   ", asked);
+            }
+            labelled(&mut lines, "doing   ", &card.body.doing);
+            labelled(&mut lines, "why now ", &card.body.why);
+            lines.push((Vec::new(), None));
+            for row in wrap_dots(&card.body.asks, cw, usize::MAX) {
+                lines.push((vec![bold(Role::Text, row)], None));
+            }
+            lines.push((Vec::new(), None));
+        }
+        let options = card.map_or(&[][..], |c| &c.body.options[..]);
+        for (i, o) in options.iter().enumerate() {
+            let head = format!("[{}] {}", o.key, o.label);
+            for (n, row) in wrap_dots(&head, cw, usize::MAX).into_iter().enumerate() {
+                lines.push((vec![seg(Role::Text, row)], (n == 0).then_some(i)));
+            }
+            for row in wrap_dots(&o.reason, cw.saturating_sub(4), usize::MAX) {
+                lines.push((vec![seg(Role::Detail, format!("    {row}"))], None));
+            }
+            labelled(&mut lines, "    sends: ", &o.words);
+        }
+        let end = lines.len().saturating_sub(content);
+        pane.whole_end.set(end);
+        let first = pane.whole_at.min(end);
+        // The answers whose first row is on screen, in order, are the ones `a` to `d` reach.
+        let seen = |i: usize| {
+            lines
+                .iter()
+                .position(|(_, at)| *at == Some(i))
+                .is_some_and(|row| row >= first && row < first + content)
+        };
+        let reach = (0..options.len()).take_while(|i| seen(*i)).count();
+        for (segs, _) in lines.iter().skip(first).take(content) {
+            out.push(wrap(segs));
+        }
+        while out.len() < 1 + content {
+            out.push(blank());
+        }
+        let keys = if end > 0 {
+            "j k scroll  m back"
+        } else {
+            "m back"
+        };
+        out.push(wrap(&[seg(Role::FaintText, cut_dots(keys, cw))]));
+        out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, fade));
+        out.truncate(rows);
+        pane.shown.set(Some(reach));
+        return View {
+            rows: out,
+            targets: Vec::new(),
+            cursor: None,
+        };
+    }
 
     // The tabs.
     let n = pane.waiting();
@@ -832,7 +1121,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let board_x = width::width("questions") + if n > 0 { 2 + n.to_string().len() } else { 0 } + 2;
     if !ctx.board_above {
         tabs.push(seg(Role::Text, "  "));
-        tabs.push(seg(Role::Faint, "board"));
+        tabs.push(seg(Role::FaintText, "board"));
         targets.push(Target {
             row: out.len(),
             x0: 2 + board_x,
@@ -846,7 +1135,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     if pane.unsupported {
         out.push(wrap(&[seg(Role::Detail, "restart qoop for the questions")]));
     } else if !pane.loaded {
-        out.push(wrap(&[seg(Role::Faint, "reading the questions")]));
+        out.push(wrap(&[seg(Role::FaintText, "reading the questions")]));
     } else if pane.live.is_empty() && !pane.typing {
         out.push(blank());
         out.push(wrap(&[seg(Role::Detail, "Nothing waits for you.")]));
@@ -866,7 +1155,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         let reason_room = cw.saturating_sub(4 + label_w + 2);
         let side_rows = |text: &str, room: usize| wrap_dots(text, room, SIDE_ROWS).len();
         let lens = Lens {
-            ask: wrap_dots(&card.body.asks, cw, ASK_ROWS).len(),
+            ask: wrap_dots(&card.body.asks, cw, usize::MAX).len(),
             asked: card
                 .body
                 .asked
@@ -890,6 +1179,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 .iter()
                 .map(|o| side_rows(&o.reason, reason_room))
                 .collect(),
+            tag: tag_of(card, ctx).is_some(),
         };
         let b = budget(
             inner_rows,
@@ -897,6 +1187,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             card.body.options.len(),
             card.body.asked.is_some(),
             card.body.pick.is_some(),
+            pane.typing || !pane.text.is_empty(),
             &lens,
         );
         let side = b.side;
@@ -907,7 +1198,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         for (at, c) in pane.live.iter().enumerate().skip(first).take(b.list) {
             let old = ctx.now_unix - c.opened_at >= OLD_SECS;
             let calm = old || c.status != "open";
-            let role = if calm { Role::Faint } else { Role::Text };
+            let role = if calm { Role::FaintText } else { Role::Text };
             let age = age_short(ctx.now_unix - c.opened_at);
             let name = sidebar::chip_name(&name_of(c, ctx));
             let name_w = 12usize.min(cw / 4);
@@ -922,9 +1213,9 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             let mut segs = vec![
                 seg(role, head),
                 seg(role, "  "),
-                seg(if calm { Role::Faint } else { Role::Detail }, asks),
+                seg(if calm { Role::FaintText } else { Role::Detail }, asks),
                 seg(Role::Text, " ".repeat(gap)),
-                seg(Role::Faint, age),
+                seg(Role::FaintText, age),
             ];
             if at == sel {
                 for s in &mut segs {
@@ -940,28 +1231,38 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             });
             out.push(wrap(&segs));
         }
-        out.push(hr());
+        if b.list > 0 {
+            out.push(hr());
+        }
 
         // The open card.
-        let waited = age_long(ctx.now_unix - card.opened_at);
-        let space = space_of(card, ctx)
-            .map(|s| format!("{s} \u{b7} "))
-            .unwrap_or_default();
-        let right = format!("{space}waiting {waited}");
+        // Who asks reads first and whole (to 24 columns); then the wait, short when it must be,
+        // and the space in what is left, cut first.
         let name = name_of(card, ctx);
-        // The marker takes two columns of the left side; a narrow column keeps a space before the wait.
-        let left_w = cw.saturating_sub(width::width(&right) + 4);
-        let title_left = format!("\u{25be} {}", cut_dots(&name, left_w.min(24)));
+        let title_left = format!("\u{25be} {}", cut_dots(&name, cw.saturating_sub(2).min(24)));
+        let room = cw.saturating_sub(width::width(&title_left) + 2);
+        let age = ctx.now_unix - card.opened_at;
+        let waited = format!("waiting {}", age_long(age));
+        let right = match space_of(card, ctx) {
+            Some(space) if room >= width::width(&waited) + 3 + 4 => format!(
+                "{} \u{b7} {waited}",
+                cut_dots(&space, room - width::width(&waited) - 3)
+            ),
+            _ if room >= width::width(&waited) => waited,
+            _ if room >= age_short(age).len() => age_short(age),
+            _ => String::new(),
+        };
         let gap = cw.saturating_sub(width::width(&title_left) + width::width(&right));
         out.push(wrap(&[
             bold(Role::Text, title_left),
             seg(Role::Text, " ".repeat(gap)),
-            seg(Role::Faint, right),
+            seg(Role::FaintText, right),
         ]));
-        out.push(match tag_of(card, ctx) {
-            Some(tag) => wrap(&[seg(Role::Blocked, tag)]),
-            None => blank(),
-        });
+        match tag_of(card, ctx) {
+            Some(tag) => out.push(wrap(&[seg(Role::Blocked, tag)])),
+            None if b.head_gap => out.push(blank()),
+            None => {}
+        }
         // A text on rows after its lead (a label, a key), the later rows indented under the text.
         let rows_after = |lead: Vec<Seg>, indent: usize, text: &str| -> Vec<String> {
             let rows = wrap_dots(text, cw.saturating_sub(indent), side);
@@ -977,7 +1278,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 .collect()
         };
         let label = |what: &str, text: &str| {
-            rows_after(vec![seg(Role::Faint, format!("{what:<8}"))], 8, text)
+            rows_after(vec![seg(Role::FaintText, format!("{what:<8}"))], 8, text)
         };
         if b.asked
             && let Some(asked) = &card.body.asked
@@ -993,16 +1294,20 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         if b.gap_top {
             out.push(blank());
         }
+        cut = b.ask < lens.ask;
         for row in wrap_dots(&card.body.asks, cw, b.ask) {
             out.push(wrap(&[bold(Role::Text, row)]));
         }
         let passed = card.status != "open";
         for (i, o) in card.body.options.iter().enumerate() {
-            let key_ink = if passed { Role::Faint } else { Role::Brand };
+            // An answer cut to its room is read whole with `m`, as the question is.
+            cut |= width::width(&o.label) > label_w
+                || wrap_dots(&o.reason, reason_room, usize::MAX).len() > side;
+            let key_ink = if passed { Role::FaintText } else { Role::Brand };
             let lab = width::fit(&cut_dots(&o.label, label_w), label_w);
             let lead = vec![
                 seg(key_ink, format!("[{}] ", o.key)),
-                seg(if passed { Role::Faint } else { Role::Text }, lab),
+                seg(if passed { Role::FaintText } else { Role::Text }, lab),
                 seg(Role::Text, "  "),
             ];
             for row in rows_after(lead, 4 + label_w + 2, &o.reason) {
@@ -1015,7 +1320,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 out.push(row);
             }
             if b.sends && i == shown {
-                let lead = vec![seg(Role::Text, "    "), seg(Role::Faint, "sends: ")];
+                let lead = vec![seg(Role::Text, "    "), seg(Role::FaintText, "sends: ")];
                 out.extend(rows_after(lead, 11, &o.words));
             }
         }
@@ -1023,7 +1328,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             && let Some(p) = &card.body.pick
         {
             let lead = vec![
-                seg(Role::Brand, format!("qass picks {}", p.key)),
+                seg(Role::BrandText, format!("qass picks {}", p.key)),
                 seg(Role::Detail, ": "),
             ];
             out.extend(rows_after(lead, 14, &p.reason));
@@ -1032,21 +1337,23 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             out.push(blank());
         }
         // The one text box.
-        targets.push(Target {
-            row: out.len() + 1,
-            x0: 2,
-            x1: 2 + cw,
-            hit: Hit::Box,
-        });
-        let (rows, caret) = text_box(pane, cw, passed, &wrap);
-        cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
-        out.extend(rows);
+        if b.text_box {
+            targets.push(Target {
+                row: out.len() + 1,
+                x0: 2,
+                x1: 2 + cw,
+                hit: Hit::Box,
+            });
+            let (rows, caret) = text_box(pane, cw, passed, &wrap);
+            cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
+            out.extend(rows);
+        }
 
         // What he already handled.
         if b.handled > 0 && !pane.ended.is_empty() {
             out.push(blank());
             out.push(wrap(&[
-                seg(Role::Faint, "handled for you "),
+                seg(Role::FaintText, "handled for you "),
                 seg(Role::Detail, pane.ended.len().to_string()),
             ]));
             out.push(hr());
@@ -1066,7 +1373,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         }
         if !pane.ended.is_empty() {
             out.push(wrap(&[
-                seg(Role::Faint, "handled for you "),
+                seg(Role::FaintText, "handled for you "),
                 seg(Role::Detail, pane.ended.len().to_string()),
             ]));
             out.push(hr());
@@ -1081,17 +1388,53 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     }
 
     // The key line closes the content: what a held answer is about to do, what the daemon last
-    // said, or the keys.
-    let content = inner_rows.saturating_sub(1);
+    // said, or the keys. Words that could not be sent, then a failure, are wrapped whole in as
+    // many rows as they need, so their words can be read and copied (and `m` reads them whole
+    // when even that is short).
+    let standing: Vec<String> = pane
+        .lost_said()
+        .chain(pane.notice.clone().filter(|_| pane.notice_until.is_none()))
+        .collect();
+    let joined = standing.join("; ");
+    let most = inner_rows.saturating_sub(2).max(1);
+    let mut said = wrap_dots(&joined, cw, usize::MAX);
+    if said.len() > most {
+        // More than the room: as much as fits, and the key that reads it all.
+        said = wrap_dots(&joined, cw, most.saturating_sub(1).max(1));
+        said.push(cut_dots("m reads it whole", cw));
+    }
+    let mut foot: Vec<String> = said
+        .into_iter()
+        .filter(|_| !standing.is_empty())
+        .map(|r| wrap(&[seg(Role::Detail, r)]))
+        .collect();
+    // While he types for a card handled elsewhere, the line that says so closes the foot.
+    if pane.typing && pane.orphaned() {
+        for row in elsewhere_rows(pane, cw) {
+            foot.push(wrap(&[seg(Role::Detail, row)]));
+        }
+    } else if foot.is_empty() {
+        foot.push(wrap(&bottom_line(pane, cw, cut)));
+    }
+    let content = inner_rows.saturating_sub(foot.len());
     out.truncate(1 + content);
     while out.len() < 1 + content {
         out.push(blank());
     }
-    out.push(wrap(&bottom_line(pane, cw)));
+    out.extend(foot);
     out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, fade));
     out.truncate(rows);
-    // A target below the clipped rows is no target.
+    // A target below the clipped rows is no target, and an answer not drawn takes no key.
     targets.retain(|t| t.row <= content);
+    let mut shown: Vec<usize> = targets
+        .iter()
+        .filter_map(|t| match t.hit {
+            Hit::Option(i) => Some(i),
+            _ => None,
+        })
+        .collect();
+    shown.dedup();
+    pane.shown.set(Some(shown.len()));
     View {
         rows: out,
         targets,
@@ -1144,7 +1487,11 @@ fn text_box(
     } else {
         "t to type".to_string()
     };
-    let text_role = if pane.typing { Role::Text } else { Role::Faint };
+    let text_role = if pane.typing {
+        Role::Text
+    } else {
+        Role::FaintText
+    };
     let caret = pane
         .typing
         .then(|| 2 + 2 + width::width(&shown_text).saturating_sub(1));
@@ -1189,11 +1536,11 @@ fn handled_row(c: &AskInfo, ctx: &Ctx, cw: usize, wrap: &impl Fn(&[Seg]) -> Stri
     let gap =
         cw.saturating_sub(width::width(&name) + 2 + width::width(&asks) + width::width(&right));
     wrap(&[
-        seg(Role::Faint, name),
-        seg(Role::Faint, "  "),
-        seg(Role::Faint, asks),
+        seg(Role::FaintText, name),
+        seg(Role::FaintText, "  "),
+        seg(Role::FaintText, asks),
         seg(Role::Text, " ".repeat(gap)),
-        seg(Role::Faint, right),
+        seg(Role::FaintText, right),
     ])
 }
 
@@ -1207,31 +1554,51 @@ pub fn talk_line(card: &AskInfo) -> String {
     )
 }
 
-fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
+/// The rows under a box whose card was handled elsewhere: that first, whose card the words
+/// were for, the keys last, in the longest form that fits one row, else the shortest wrapped
+/// on words, never a word cut.
+fn elsewhere_rows(pane: &Pane, cw: usize) -> Vec<String> {
+    let whose = match pane.typing_for.as_ref().map_or("", |(_, handle)| handle) {
+        "" => String::new(),
+        who => format!(": {who}'s card"),
+    };
+    let short = format!("{HANDLED_ELSEWHERE}{whose}; esc stops typing");
+    [
+        format!("{HANDLED_ELSEWHERE}{whose}; enter sends nothing, esc stops typing"),
+        short.clone(),
+    ]
+    .into_iter()
+    .find(|line| width::width(line) <= cw)
+    .map_or_else(|| wrap_dots(&short, cw, usize::MAX), |line| vec![line])
+}
+
+fn bottom_line(pane: &Pane, cw: usize, cut: bool) -> Vec<Seg> {
     // For as long as the words stay, never back to `enter send`; named, since another card
     // may stand over them.
-    if pane.typing && pane.orphaned() {
-        // The name is cut first, so what enter does always reads whole.
-        let who = pane.typing_for.as_ref().map_or("", |(_, handle)| handle);
-        let room = cw.saturating_sub(width::width(HANDLED_ELSEWHERE) + 2);
-        let say = if who.is_empty() || room < 4 {
-            HANDLED_ELSEWHERE.to_string()
-        } else {
-            format!("{}: {HANDLED_ELSEWHERE}", cut_dots(who, room))
-        };
-        return vec![seg(Role::Detail, cut_dots(&say, cw))];
+    // A failure stands over everything: it is the one thing that cannot be read again.
+    if let Some(n) = pane.notice.as_ref().filter(|_| pane.notice_until.is_none()) {
+        return vec![seg(Role::Detail, cut_dots(n, cw))];
     }
     if let Some(n) = &pane.notice {
         return vec![seg(Role::Detail, cut_dots(n, cw))];
     }
+    // An answer on its way says so until the daemon takes it.
+    if let Some((handle, _)) = pane.sent.values().next() {
+        return vec![seg(
+            Role::Detail,
+            cut_dots(&format!("sending to {handle}\u{2026}"), cw),
+        )];
+    }
     let keys = if pane.typing {
         "enter send  esc stop typing"
+    } else if pane.focus && cut {
+        "m read whole  a-d send  t type  j k cards"
     } else if pane.focus {
         "j k cards  a-d send  t type  o talk  x away  tab chat"
     } else {
         "ctrl-a i focuses this"
     };
-    vec![seg(Role::Faint, cut_dots(keys, cw))]
+    vec![seg(Role::FaintText, cut_dots(keys, cw))]
 }
 
 /// `text` wrapped on words into rows of `cols` columns, at most `max` of them; a word longer than a
@@ -1508,6 +1875,357 @@ mod tests {
         );
     }
 
+    /// Words typed for a card wait for it while another card is open (by key, by click or
+    /// by a fresh read), come back with it, and go only when that card is answered.
+    #[test]
+    fn a_typed_answer_waits_for_its_card_and_goes_when_sent() {
+        let mut p = pane(3);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"run it after the backup", 1);
+        p.key(b"\x1b", 1);
+        p.key(b"j", 1);
+        assert_eq!(p.typed(), "", "the second card has no words of its own");
+        p.key(b"t", 1);
+        p.key(b"skip this one", 1);
+        p.click(Hit::Card(0));
+        assert_eq!(p.typed(), "run it after the backup");
+        // Kept words show in the box however short the pane: the box stays while it holds them.
+        for rows in 14..=20 {
+            let t = text(&view(&p, &ctx(&[], &[]), 64, rows));
+            assert!(t.contains("run it after the backup"), "{rows} rows:\n{t}");
+        }
+        p.take(p.live.clone(), Vec::new());
+        assert_eq!(p.typed(), "run it after the backup", "a read keeps them");
+        p.key(b"t", 1);
+        p.key(b"\r", 1);
+        assert_eq!(p.outbox.len(), 1, "sent");
+        p.key(b"j", 1);
+        assert_eq!(p.typed(), "skip this one");
+        p.key(b"k", 1);
+        assert_eq!(p.typed(), "", "the sent card's words are gone");
+    }
+
+    /// A read that takes away the card words were kept for leaves the next card's box empty
+    /// (nothing of them can be sent to another agent); a read that only moves that card keeps
+    /// them with it.
+    #[test]
+    fn a_read_keeps_words_with_their_card() {
+        let mut p = pane(3);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"for the first", 1);
+        p.key(b"\x1b", 1);
+        let moved = vec![p.live[1].clone(), p.live[0].clone(), p.live[2].clone()];
+        p.take(moved, Vec::new());
+        assert_eq!(
+            p.typed(),
+            "for the first",
+            "moved, the card keeps its words"
+        );
+        let rest = vec![p.live[0].clone(), p.live[2].clone()];
+        p.take(rest, Vec::new());
+        assert_eq!(p.typed(), "", "gone, its words go with it");
+        p.key(b"t", 1);
+        p.key(b"\r", 1);
+        assert!(p.outbox.is_empty(), "nothing sent to the card in its place");
+    }
+
+    /// A write that fails for a card ended elsewhere while the person types: the failure stands
+    /// over the "handled elsewhere" line, holds the lost words, and outlasts the typing keys.
+    #[test]
+    fn a_failure_for_a_card_ended_elsewhere_shows_its_lost_words() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"land 42 first", 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        p.key(b"t", 1);
+        p.key(b"and", 1);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "closed".into(),
+        });
+        p.key(b" more", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 90, 36));
+        assert!(
+            t.contains("not sent, migrations's card ended: land 42 first; not sent: closed"),
+            "{t}"
+        );
+    }
+
+    /// The daemon's own order: the failure first, then the read without the card. The words put
+    /// back for a retry do not stay in the box over the next card, and are not lost unseen:
+    /// they stand in a notice with whose card ended.
+    #[test]
+    fn words_put_back_for_a_card_that_then_ends_stand_in_a_notice() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"land it", 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "busy".into(),
+        });
+        assert_eq!(p.typed(), "land it", "back for a retry");
+        p.take(p.live[1..].to_vec(), Vec::new());
+        assert_eq!(p.typed(), "", "not over the next card");
+        let t = text(&view(&p, &ctx(&[], &[]), 90, 36));
+        assert!(
+            t.contains("not sent, migrations's card ended: land it"),
+            "{t}"
+        );
+    }
+
+    /// The words of every card that ends stay on screen, one card's never in place of
+    /// another's, until an esc outside typing and the whole view; `t`, an answer and the whole
+    /// view keep them. The four orders the final review found losing words.
+    #[test]
+    fn words_that_can_no_longer_be_sent_stay_until_esc() {
+        // The frame's words in one line, so words wrapped over two rows still read as typed.
+        let shown = |p: &Pane| {
+            text(&view(p, &ctx(&[], &[]), 90, 36))
+                .split(|c: char| c == '\u{2502}' || c.is_whitespace())
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let sent = |p: &mut Pane, words: &[u8]| {
+            p.key(b"t", 1);
+            p.key(words, 1);
+            p.key(b"\r", 1);
+            match p.tick(Instant::now()).0.into_iter().next() {
+                Some(ControlRequest::AskWrite { id, .. }) => id,
+                other => panic!("sent: {other:?}"),
+            }
+        };
+        let failed = |p: &mut Pane, id: String| {
+            p.answered(&ControlResponse::Failed {
+                id,
+                reason: "closed".into(),
+            });
+        };
+        // Two cards end in two reads, each with its draft: both stand.
+        let mut p = pane(3);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"draft one", 1);
+        p.key(b"\x1b", 1);
+        p.key(b"j", 1);
+        p.key(b"t", 1);
+        p.key(b"draft two", 1);
+        p.key(b"\x1b", 1);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.take(p.live[1..].to_vec(), Vec::new());
+        let t = shown(&p);
+        assert!(t.contains("draft one") && t.contains("draft two"), "{t}");
+        p.key(b"\x1b", 1);
+        assert!(!shown(&p).contains("draft"), "esc lets them go");
+        // The failure lands in the whole view: shown there, and on the card after esc.
+        let mut p = pane(2);
+        p.focus = true;
+        let id = sent(&mut p, b"first answer");
+        p.key(b"j", 1);
+        p.key(b"m", 1);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        failed(&mut p, id);
+        assert!(
+            p.whole && shown(&p).contains("first answer"),
+            "{}",
+            shown(&p)
+        );
+        p.key(b"\x1b", 1);
+        assert!(!p.whole, "esc goes back to the card");
+        assert!(shown(&p).contains("first answer"), "{}", shown(&p));
+        // Put back into the box while typing, then the card ends and esc stops the typing.
+        let mut p = pane(2);
+        p.focus = true;
+        let id = sent(&mut p, b"first answer");
+        p.key(b"t", 1);
+        p.key(b"second words", 1);
+        failed(&mut p, id);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.key(b"\x1b", 1);
+        let t = shown(&p);
+        assert!(
+            t.contains("first answer") && t.contains("second words"),
+            "{t}"
+        );
+        // `t` and an answer to the next card keep them.
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"draft one", 1);
+        p.key(b"\x1b", 1);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.key(b"t", 1);
+        assert!(shown(&p).contains("draft one"), "{}", shown(&p));
+        p.key(b"go", 1);
+        p.key(b"\r", 1);
+        assert!(shown(&p).contains("draft one"), "{}", shown(&p));
+        p.key(b"\x1b", 1);
+        assert!(!shown(&p).contains("draft one"), "{}", shown(&p));
+    }
+
+    /// At the smallest pane (30x14) a longest answer (400 characters) whose card ended reads
+    /// whole: the foot shows its start and the key, the whole view scrolls through every word
+    /// with `j`, and a later failure stands beside it, never in its place. On its way it said
+    /// "sending".
+    #[test]
+    fn a_longest_lost_answer_reads_whole_in_the_smallest_pane() {
+        let long: String = (1..=80)
+            .map(|n| format!("w{n:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(long.as_bytes(), 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        let t = text(&view(&p, &ctx(&[], &[]), 90, 36));
+        assert!(t.contains("sending to migrations"), "{t}");
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "closed".into(),
+        });
+        // A second failure, for the card still open.
+        p.key(b"t", 1);
+        p.key(b"short", 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "busy".into(),
+        });
+        let t = text(&view(&p, &ctx(&[], &[]), 30, 14));
+        assert!(t.contains("w001") && t.contains("m reads it whole"), "{t}");
+        p.key(b"m", 1);
+        let mut seen = String::new();
+        for _ in 0..120 {
+            seen.push_str(&text(&view(&p, &ctx(&[], &[]), 30, 14)));
+            p.key(b"j", 1);
+        }
+        for n in 1..=80 {
+            assert!(seen.contains(&format!("w{n:03}")), "w{n:03}:\n{seen}");
+        }
+        assert!(seen.contains("busy"), "the later failure beside it");
+    }
+
+    /// The card read whole carries what it is about (asked, doing, why) and what each answer
+    /// sends, scrolled with `j`; the card's head keeps who asks whole at a narrow width.
+    #[test]
+    fn the_whole_view_carries_the_context_and_what_each_answer_sends() {
+        let mut p = pane(1);
+        p.focus = true;
+        let t = text(&view(&p, &ctx(&[], &[]), 26, 17));
+        assert!(t.contains("\u{25be} migrations "), "{t}");
+        p.key(b"m", 1);
+        let mut seen = String::new();
+        for _ in 0..60 {
+            seen.push_str(&text(&view(&p, &ctx(&[], &[]), 30, 17)));
+            p.key(b"j", 1);
+        }
+        for want in [
+            "asked",
+            "doing",
+            "migration",
+            "why now",
+            "staging",
+            "sends:",
+            "owner.",
+        ] {
+            assert!(seen.contains(want), "{want}:\n{seen}");
+        }
+    }
+
+    /// The words the daemon never took, for the exit line when it goes: an answer held and the
+    /// lost words, each with whose card.
+    #[test]
+    fn the_unsent_words_name_whose_card() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(b"draft one", 1);
+        p.key(b"\x1b", 1);
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.key(b"t", 1);
+        p.key(b"land 42 then rebase\r", 1);
+        assert_eq!(
+            p.unsent(),
+            [
+                "not sent to web-app: land 42 then rebase",
+                "not sent, migrations's card ended: draft one"
+            ]
+        );
+    }
+
+    /// Two typed answers to one card in flight are told apart: each fails on its own and both
+    /// sets of words come back.
+    #[test]
+    fn two_answers_in_flight_for_one_card_each_come_back() {
+        let mut p = pane(1);
+        p.focus = true;
+        let mut ids = Vec::new();
+        for words in [&b"first try"[..], b"second try"] {
+            p.key(b"t", 1);
+            p.key(words, 1);
+            p.key(b"\r", 1);
+            match p.tick(Instant::now()).0.into_iter().next() {
+                Some(ControlRequest::AskWrite { id, .. }) => ids.push(id),
+                other => panic!("sent: {other:?}"),
+            }
+        }
+        assert_ne!(ids[0], ids[1]);
+        for id in ids {
+            p.answered(&ControlResponse::Failed {
+                id,
+                reason: "no".into(),
+            });
+        }
+        assert!(
+            p.typed().contains("first try") && p.typed().contains("second try"),
+            "{}",
+            p.typed()
+        );
+    }
+
+    /// Typing leaves the question read whole: the box and its caret are on screen at the 60x24
+    /// and 80x24 sizes, never typing into a box that is not drawn.
+    #[test]
+    fn typing_leaves_the_question_read_whole() {
+        for (cols, rows) in [(22, 17), (34, 17)] {
+            let mut p = long_pane();
+            p.focus = true;
+            p.key(b"m", 1);
+            p.key(b"t", 1);
+            p.key(b"go", 1);
+            let v = view(&p, &ctx(&[], &[]), cols, rows);
+            let t = text(&v);
+            assert!(
+                t.contains("go\u{2588}") && v.cursor.is_some(),
+                "{cols}x{rows}:\n{t}"
+            );
+        }
+    }
+
     /// A long answer in wide letters keeps its caret in the box: the tail is taken by cells.
     #[test]
     fn a_wide_answer_keeps_its_caret() {
@@ -1571,7 +2289,8 @@ mod tests {
     }
 
     /// The last card leaves while he types beside qass's chat: the box with his words stays,
-    /// not "Nothing waits for you.", and the line under it names whose question went.
+    /// not "Nothing waits for you.", and the line under it says so first and the keys last, in
+    /// the longest form that fits, never a word cut.
     #[test]
     fn the_last_card_gone_while_typing_keeps_the_box_and_names_it() {
         let mut p = pane(1);
@@ -1580,22 +2299,30 @@ mod tests {
         p.key(b"run it after the backup", 1);
         p.take(Vec::new(), Vec::new());
         assert!(p.busy(), "the questions stay up while he types");
-        let v = view(&p, &ctx(&[], &[]), 60, 36);
+        let v = view(&p, &ctx(&[], &[]), 90, 36);
         let t = text(&v);
         assert!(
             t.contains("run it after the backup") && !t.contains("Nothing waits for you."),
             "{t}"
         );
         assert!(
-            t.contains(&format!("migrations: {HANDLED_ELSEWHERE}")),
+            t.contains(
+                "handled elsewhere: migrations's card; enter sends nothing, esc stops typing"
+            ),
             "{t}"
         );
         assert!(v.cursor.is_some());
-        // Narrow, the name is cut and what enter does still reads whole.
-        let narrow = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        // Narrower, what enter does goes first; whose card and the esc stay, on rows of their
+        // own where they must.
+        let narrow = text(&view(&p, &ctx(&[], &[]), 60, 36));
         assert!(
-            narrow.contains(&format!("\u{2026}: {HANDLED_ELSEWHERE}")),
+            narrow.contains("handled elsewhere: migrations's card; esc stops typing"),
             "{narrow}"
+        );
+        let tight = text(&view(&p, &ctx(&[], &[]), 30, 36));
+        assert!(
+            tight.contains("migrations's card;") && tight.contains("stops typing"),
+            "{tight}"
         );
     }
 
@@ -1684,11 +2411,12 @@ mod tests {
             .expect("the box");
         assert!(top.contains('\u{256e}'), "{t}");
         // The open card's name and its wait never run together.
-        let head = t.lines().find(|l| l.contains("waiting")).expect("the head");
-        assert!(
-            !head.contains("migrawaiting") && !head.contains("migrationswaiting"),
-            "{t}"
-        );
+        // Who asks is whole even here; the wait is short beside it.
+        let head = t
+            .lines()
+            .find(|l| l.contains("\u{25be} migrations "))
+            .expect("the head");
+        assert!(!head.contains("migrations6") && head.contains("6m"), "{t}");
     }
 
     #[test]
@@ -2054,22 +2782,22 @@ mod tests {
         );
     }
 
+    /// A sent answer's word stands a few seconds; a failure stays until esc.
     #[test]
-    fn a_notice_stands_a_few_seconds_and_the_key_line_comes_back() {
+    fn a_notice_stands_a_few_seconds_and_a_failure_until_esc() {
         let t0 = Instant::now();
-        let mut p = pane(1);
+        let mut p = pane(2);
         p.focus = true;
         p.key(b"a", 1);
         let (sent, _) = p.tick(t0);
         let Some(ControlRequest::AskWrite { id, .. }) = sent.into_iter().next() else {
             panic!("sent")
         };
-        p.answered(&ControlResponse::Failed {
+        p.answered(&ControlResponse::AskWritten {
             id,
-            reason: "taken back".into(),
+            result: AskResult::Answered,
+            card: String::new(),
         });
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("taken back") && !t.contains("j k cards"), "{t}");
         assert!(p.wake_at().is_some(), "a clock to let it go");
         assert!(!p.tick(t0 + Duration::from_secs(1)).1);
         assert!(
@@ -2078,10 +2806,147 @@ mod tests {
         );
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
-            t.contains("t type  o talk") && !t.contains("taken back"),
+            t.contains("t type  o talk") && !t.contains("sent to"),
             "{t}"
         );
         assert_eq!(p.wake_at(), None, "nothing armed again");
+        p.key(b"b", 1);
+        let (sent, _) = p.tick(t0);
+        let Some(ControlRequest::AskWrite { id, .. }) = sent.into_iter().next() else {
+            panic!("sent")
+        };
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "taken back".into(),
+        });
+        assert!(!p.tick(t0 + NOTICE * 10).1, "no clock lets a failure go");
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("taken back") && !t.contains("j k cards"), "{t}");
+        p.key(b"\x1b[B", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("taken back"), "a key in the pane keeps it: {t}");
+        p.key(b"\x1b", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("j k cards") && !t.contains("taken back"), "{t}");
+    }
+
+    /// An option or a dismissal takes the card's draft with it, and a failure brings it back.
+    #[test]
+    fn a_draft_comes_back_when_an_option_or_a_dismissal_fails() {
+        for key in [b"a", b"x"] {
+            let mut p = pane(2);
+            p.focus = true;
+            p.key(b"t", 1);
+            p.key(b"only after the backup", 1);
+            p.key(b"\x1b", 1);
+            p.key(key, 1);
+            assert_eq!(p.typed(), "", "{key:?} takes the draft");
+            let Some(ControlRequest::AskWrite { id, .. }) =
+                p.tick(Instant::now()).0.into_iter().next()
+            else {
+                panic!("sent")
+            };
+            p.answered(&ControlResponse::Failed {
+                id,
+                reason: "no".into(),
+            });
+            assert_eq!(p.typed(), "only after the backup", "{key:?}");
+        }
+    }
+
+    /// The words of a card that ended stand whole, wrapped in as many rows as they need, until
+    /// esc: a key in the pane does not take them away.
+    #[test]
+    fn the_words_of_a_card_that_ended_stand_whole_until_esc() {
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(words(20).as_bytes(), 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "closed".into(),
+        });
+        p.key(b"j", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 30, 36));
+        for word in words(20).split(' ') {
+            assert!(t.contains(word), "{word}:\n{t}");
+        }
+        p.key(b"\x1b", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 30, 36));
+        assert!(!t.contains("word20"), "{t}");
+    }
+
+    /// A typed answer whose write fails comes back in the box with a way to send it again; one
+    /// the daemon took is gone.
+    #[test]
+    fn a_typed_answer_comes_back_when_its_write_fails() {
+        let t0 = Instant::now();
+        let mut p = pane(2);
+        p.focus = true;
+        let send = |p: &mut Pane, words: &[u8]| {
+            p.key(b"t", 1);
+            p.key(words, 1);
+            p.key(b"\r", 1);
+            assert_eq!(p.typed(), "", "the box empties as it goes");
+            match p.tick(t0).0.into_iter().next() {
+                Some(ControlRequest::AskWrite { id, .. }) => id,
+                other => panic!("sent: {other:?}"),
+            }
+        };
+        let id = send(&mut p, b"land 42 first");
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "the daemon is restarting".into(),
+        });
+        assert_eq!(p.typed(), "land 42 first");
+        let t = text(&view(&p, &ctx(&[], &[]), 70, 36));
+        assert!(
+            t.contains("not sent, t and enter retry: the daemon is restarting"),
+            "{t}"
+        );
+        // Sent again and taken: nothing comes back.
+        p.key(b"t", 1);
+        p.key(b"\r", 1);
+        let id = match p.tick(t0).0.into_iter().next() {
+            Some(ControlRequest::AskWrite { id, .. }) => id,
+            other => panic!("sent: {other:?}"),
+        };
+        p.answered(&ControlResponse::AskWritten {
+            id,
+            result: AskResult::Answered,
+            card: String::new(),
+        });
+        assert_eq!(p.typed(), "");
+        // Failed after he moved to another card: kept for its card.
+        let id = send(&mut p, b"wait for me");
+        p.key(b"j", 1);
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "no".into(),
+        });
+        assert_eq!(p.typed(), "");
+        p.key(b"k", 1);
+        assert_eq!(p.typed(), "wait for me");
+        // Failed while new words are in the box: both are kept, the failed ones first.
+        p.key(b"t", 1);
+        p.key(b"\r", 1);
+        let id = match p.tick(t0).0.into_iter().next() {
+            Some(ControlRequest::AskWrite { id, .. }) => id,
+            other => panic!("sent: {other:?}"),
+        };
+        p.key(b"t", 1);
+        p.key(b"and then", 1);
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "no".into(),
+        });
+        assert_eq!(p.typed(), "wait for me and then");
     }
 
     #[test]
@@ -2195,17 +3060,98 @@ mod tests {
         }
     }
 
+    /// A short question with an answer cut to its room (the 60x24 window's 22 columns) names `m`
+    /// on the key line, and `m` reads that answer whole.
     #[test]
-    fn a_short_pane_cuts_the_question_to_one_row_as_before() {
-        let p = long_pane();
-        let t = text(&view(&p, &ctx(&[], &[]), 56, 14));
-        assert!(t.contains("word01"), "{t}");
-        assert!(!t.contains("word24"), "{t}");
-        let question_rows = t
-            .lines()
-            .filter(|l| l.starts_with("\u{2502} word01"))
-            .count();
-        assert_eq!(question_rows, 1, "one question row\n{t}");
+    fn an_answer_cut_to_its_room_is_read_whole_with_m() {
+        let mut p = long_pane();
+        let mut card = p.live[0].clone();
+        card.body.asks = "Which first?".into();
+        card.body.options[0].reason = "smaller, already reviewed by two people".into();
+        p.take(vec![card], Vec::new());
+        p.focus = true;
+        let t = text(&view(&p, &ctx(&[], &[]), 22, 17));
+        assert!(t.contains("m read whole"), "{t}");
+        p.key(b"m", 1);
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&text(&view(&p, &ctx(&[], &[]), 22, 17)));
+            p.key(b"j", 1);
+        }
+        assert!(seen.contains("two") && seen.contains("people"), "{seen}");
+    }
+
+    /// A short pane keeps every answer, the key line and a box with words in it: the question
+    /// takes the rows left, cut with `m` named to read it whole. While it is read whole the
+    /// answers are not on screen and `a` to `d` send nothing.
+    #[test]
+    fn a_short_pane_keeps_every_answer_and_m_reads_the_question_whole() {
+        let mut p = long_pane();
+        let mut card = p.live[0].clone();
+        card.body.asks = words(30);
+        let mut d = card.body.options[0].clone();
+        d.key = "d".into();
+        card.body.options.push(d);
+        p.take(vec![card], Vec::new());
+        p.focus = true;
+        for (cols, rows) in [(34, 17), (22, 17), (34, 14)] {
+            for draft in ["", "keep this"] {
+                p.text = draft.into();
+                let t = text(&view(&p, &ctx(&[], &[]), cols, rows));
+                for key in ["[a]", "[b]", "[c]", "[d]"] {
+                    assert!(t.contains(key), "{key} at {cols}x{rows} {draft:?}:\n{t}");
+                }
+                assert!(
+                    t.contains("word01") && t.contains("m read whole"),
+                    "{cols}x{rows}:\n{t}"
+                );
+                assert!(t.contains(draft), "the box keeps its words:\n{t}");
+                // Cut, the question starts right under the card's title: no blank row is kept.
+                let lines: Vec<&str> = t.lines().collect();
+                let head = lines.iter().position(|l| l.contains("\u{25be} ")).unwrap();
+                assert!(lines[head + 1].contains("word01"), "{cols}x{rows}:\n{t}");
+            }
+        }
+        p.text.clear();
+        // Read whole: every row but the key line, `j k` scroll it, at 34x17 and at 22x17 (the
+        // 60x24 target) with a 210 character question.
+        for (cols, rows) in [(34, 17), (22, 17)] {
+            p.key(b"m", 1);
+            let mut seen = String::new();
+            for _ in 0..80 {
+                let t = text(&view(&p, &ctx(&[], &[]), cols, rows));
+                assert!(!t.contains("questions"), "{t}");
+                seen.push_str(&t);
+                p.key(b"j", 1);
+            }
+            // The question and every answer with its reason, wrapped, none cut.
+            let reasons = words(10);
+            for word in words(30).split(' ').chain(["[a]", "[b]", "[c]", "[d]"]) {
+                assert!(seen.contains(word), "{word} read whole at {cols}x{rows}");
+            }
+            assert!(
+                seen.contains(reasons.split(' ').next_back().unwrap()),
+                "{seen}"
+            );
+            if cols == 22 {
+                assert!(seen.contains("j k scroll  m back"), "{seen}");
+            }
+            assert_eq!(p.selected, 0, "j scrolls, it does not change the card");
+            p.key(b"m", 1);
+        }
+        // Read whole in a short pane the answers are below the fold: `a` sends nothing; esc
+        // goes back to the card, where `a` sends.
+        p.key(b"m", 1);
+        let _ = view(&p, &ctx(&[], &[]), 22, 10);
+        p.key(b"a", 1);
+        assert!(p.outbox.is_empty(), "no answer sent that is not on screen");
+        assert!(
+            matches!(p.key(b"\x1b", 1), Out::Stay),
+            "esc back to the card"
+        );
+        let _ = view(&p, &ctx(&[], &[]), 34, 17);
+        p.key(b"a", 1);
+        assert_eq!(p.outbox.len(), 1, "back on screen, `a` sends");
     }
 
     #[test]

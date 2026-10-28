@@ -82,6 +82,15 @@ pub enum Role {
     AvatarHair(u8),
     /// The body's ink; see [`Role::AvatarHair`].
     AvatarBody(u8),
+    /// The brand, working, failed, faint and idle inks for words a person reads: each at
+    /// least 4.5 to 1 on the page, the status bar and the selected row of its table, where
+    /// the mark inks above are held only to 3 to 1 as glyphs. Painted right of the left
+    /// column only: the column is frozen and keeps the mark inks (`left-sidebar.md`).
+    BrandText,
+    WorkingText,
+    FailedText,
+    FaintText,
+    IdleText,
 }
 
 /// The colour a space is given, from its own number, so it keeps it for as long as it
@@ -222,6 +231,12 @@ const fn dark_ink(role: Role) -> u8 {
         Role::Unobserved => 238,
         Role::AvatarHair(ink) => ink,
         Role::AvatarBody(ink) => ink,
+        // The brand and failed one step lighter, apart from blocked's 208 and the tab's 212:
+        // 202 and 201 are 4.3 and 4.2 to 1 on the selected row.
+        Role::BrandText => 209,
+        Role::WorkingText => dark_ink(Role::Working),
+        Role::FailedText => 207,
+        Role::FaintText | Role::IdleText => 247,
         Role::Shimmer(level) => 244 + if level > 11 { 11 } else { level },
         Role::Space(n) => SPACE_INKS[n % SPACE_INKS.len()],
         Role::SpaceCalm(n) => SPACE_CALM_INKS[n % SPACE_CALM_INKS.len()],
@@ -454,7 +469,17 @@ pub fn set_light(on: bool) {
 
 /// Whether the chrome is drawn for a light background.
 pub fn light() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LIGHT.with(std::cell::Cell::get) {
+        return on;
+    }
     LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own palette, on its own thread: the switch above is the whole process's.
+    pub(crate) static TEST_LIGHT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The background colour the terminal answered with, packed with a presence bit: zero is
@@ -560,6 +585,11 @@ const fn light_ink(role: Role) -> u8 {
         Role::Unobserved => 244,
         Role::AvatarHair(ink) => light_pet(ink),
         Role::AvatarBody(ink) => light_pet(ink),
+        // Amber 94, not blocked's 130: a brand word must not read as a blocked state.
+        Role::BrandText => 94,
+        Role::WorkingText => 25,
+        Role::FailedText => 127,
+        Role::FaintText | Role::IdleText => 241,
         // On white the sweep darkens toward black rather than brightening toward white: the
         // quiet row is a light grey here, and emphasis on a light page is a darker ink.
         Role::Shimmer(level) => 244 - if level > 11 { 11 } else { level },
@@ -979,8 +1009,13 @@ mod tests {
 
     /// WCAG contrast between two palette entries.
     fn contrast(a: u8, b: u8) -> f64 {
-        let luminance = |entry: u8| {
-            let [r, g, b] = rgb(entry).map(|c| {
+        contrast_rgb(rgb(a), rgb(b))
+    }
+
+    /// WCAG contrast between two colours.
+    fn contrast_rgb(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let luminance = |colour: [f64; 3]| {
+            let [r, g, b] = colour.map(|c| {
                 let c = c / 255.0;
                 if c <= 0.03928 {
                     c / 12.92
@@ -992,6 +1027,56 @@ mod tests {
         };
         let (x, y) = (luminance(a), luminance(b));
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// The text roles are read, so each holds 4.5 to 1 on every ground it is painted on: the
+    /// page (black and white, and the common #1d1f21 and #fafafa terminal grounds), the
+    /// status bar and the selected row, in both tables.
+    #[test]
+    fn every_text_role_reads_on_every_ground() {
+        let text = [
+            Role::BrandText,
+            Role::WorkingText,
+            Role::FailedText,
+            Role::FaintText,
+            Role::IdleText,
+        ];
+        let grounds = [
+            (
+                "dark",
+                dark_ink as fn(Role) -> u8,
+                [
+                    rgb(16),
+                    [29.0, 31.0, 33.0],
+                    rgb(SELECTED_BG),
+                    rgb(STATUS_BG),
+                ],
+            ),
+            (
+                "light",
+                light_ink,
+                [
+                    rgb(231),
+                    [250.0; 3],
+                    rgb(LIGHT_SELECTED_BG),
+                    rgb(LIGHT_STATUS_BG),
+                ],
+            ),
+        ];
+        for (table, ink, grounds) in grounds {
+            for role in text {
+                for ground in grounds {
+                    let ratio = contrast_rgb(rgb(ink(role)), ground);
+                    assert!(
+                        ratio >= 4.5,
+                        "{table} {role:?} is {ratio:.2}:1 on {ground:?}"
+                    );
+                }
+            }
+        }
+        // Brand words never wear a state's ink: light blocked is 130, dark blocked 208.
+        assert_ne!(light_ink(Role::BrandText), light_ink(Role::Blocked));
+        assert_ne!(dark_ink(Role::BrandText), dark_ink(Role::Blocked));
     }
 
     /// The light table, measured against white (231): text at least 4.5 to 1, everything

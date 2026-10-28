@@ -64,7 +64,17 @@ static LEVEL: AtomicU8 = AtomicU8::new(TRUE);
 /// The level in effect. True until [`apply`] runs at startup, which preserves
 /// the historical passthrough for anything that paints before detection.
 pub fn level() -> Level {
+    #[cfg(test)]
+    if let Some(level) = TEST_LEVEL.with(std::cell::Cell::get) {
+        return level;
+    }
     Level::loaded(LEVEL.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own level, on its own thread: [`LEVEL`] is the whole process's.
+    pub(crate) static TEST_LEVEL: std::cell::Cell<Option<Level>> = const { std::cell::Cell::new(None) };
 }
 
 fn set(level: Level) {

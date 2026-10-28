@@ -1966,23 +1966,27 @@ fn a_refusal_on_the_status_line_goes_when_the_next_command_runs() {
 }
 
 /// `ctrl-a N` reaches the tab the bar numbers N, a sleeping one too: it wakes, as a click on
-/// it does. Asleep the tab reads `shell` on the bar, awake the program in it.
+/// it does. Asleep the tab reads `shell` on the bar behind the asleep mark, awake the program
+/// in it.
 #[test]
 fn a_tab_number_wakes_the_sleeping_tab_it_reaches() {
+    let asleep = |bar: &str| {
+        bar.contains("2 z shell") || bar.contains(&format!("2 {} shell", qoop_tui::icons::ASLEEP))
+    };
     let mut ui = Interface::start();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.create_terminal("");
     assert!(ui.wait_for_tab(2, Duration::from_secs(15)));
     ui.command(b'Z');
     assert!(
-        ui.wait_for_tabs(|bar| bar.contains("2 shell"), Duration::from_secs(15)),
+        ui.wait_for_tabs(asleep, Duration::from_secs(15)),
         "the second tab did not sleep: {:?}\n{}",
         ui.tab_bar(),
         ui.daemon_log()
     );
     ui.command(b'2');
     assert!(
-        ui.wait_for_tabs(|bar| !bar.contains("2 shell"), Duration::from_secs(15)),
+        ui.wait_for_tabs(|bar| !asleep(bar), Duration::from_secs(15)),
         "ctrl-a 2 did not wake the sleeping tab: {:?}",
         ui.tab_bar()
     );

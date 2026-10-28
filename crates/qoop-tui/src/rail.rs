@@ -42,7 +42,8 @@ impl Pane {
     fn code(self) -> &'static str {
         match self {
             Pane::Board => "brd",
-            Pane::Questions => "qst",
+            // Never shown: the questions keep their word.
+            Pane::Questions => "questions",
             Pane::Qass => "qss",
         }
     }
@@ -104,7 +105,7 @@ type Piece = (String, Role, bool);
 /// and the level (3 word and state, 2 word, 1 code, 0 dot).
 pub fn ladder(tab: &Tab, w: usize) -> (Vec<Piece>, usize) {
     let quiet = if tab.pane == Pane::Questions {
-        Role::Faint
+        Role::FaintText
     } else {
         Role::Detail
     };
@@ -135,13 +136,15 @@ pub fn ladder(tab: &Tab, w: usize) -> (Vec<Piece>, usize) {
         ));
     }
     // A question waiting keeps its count over the whole word: the count is what the tab signals.
-    if !tab.lit() {
+    // The questions keep their word over any code (S9: one word a concept), the count goes first.
+    let questions = tab.pane == Pane::Questions;
+    if !tab.lit() || questions {
         forms.push((
             2,
             vec![caret.clone(), seg(tab.pane.word(), Role::Text, true)],
         ));
     }
-    if let Some(n) = &count {
+    if let Some(n) = count.as_ref().filter(|_| !questions) {
         forms.push((
             1,
             vec![
@@ -152,7 +155,9 @@ pub fn ladder(tab: &Tab, w: usize) -> (Vec<Piece>, usize) {
             ],
         ));
     }
-    forms.push((1, vec![caret, seg(tab.pane.code(), Role::Text, true)]));
+    if !questions {
+        forms.push((1, vec![caret, seg(tab.pane.code(), Role::Text, true)]));
+    }
     if let Some(n) = &count {
         forms.push((
             0,
@@ -271,10 +276,14 @@ pub fn rows(
                 body.push(plain(line, Role::Text, false));
             }
             if let Some(line) = wrap(&p.agent, w).into_iter().next() {
-                body.push(plain(line, Role::Faint, false));
+                body.push(plain(line, Role::FaintText, false));
             }
             if p.count > 1 {
-                body.push(plain(format!("+{} more", p.count - 1), Role::Faint, false));
+                body.push(plain(
+                    format!("+{} more", p.count - 1),
+                    Role::FaintText,
+                    false,
+                ));
             }
             // A card opens nothing by itself: the key to bring it up is said at every width
             // that shows words.
@@ -284,7 +293,7 @@ pub fn rows(
             } else {
                 "ctrl-a i"
             };
-            body.push(plain(hint.to_string(), Role::Faint, false));
+            body.push(plain(hint.to_string(), Role::FaintText, false));
         } else {
             let dots = vec!["\u{25cf}"; p.count.min(w.div_ceil(2))].join(" ");
             body.push(plain(dots, Role::Blocked, true));
@@ -357,9 +366,9 @@ mod tests {
             at(&q),
             [
                 "\u{25cf}2",
-                "\u{25b8} qst",
-                "\u{25b8} qst 2",
-                "\u{25b8} qst 2",
+                "\u{25cf}2",
+                "\u{25cf}2",
+                "\u{25b8} questions",
                 "\u{25b8} questions 2",
                 "\u{25b8} questions 2"
             ]

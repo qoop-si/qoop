@@ -35,9 +35,15 @@ const LEFT_MIN: usize = 16;
 /// Blank cells either side of the pet (the lamp's overhang), and between the pet's block and the lines beside it.
 const PAD: usize = 1;
 const GAP: usize = 3;
-/// The narrowest pane that holds the inbox at all, and the one that holds it beside qass's
-/// terminal rather than in its place.
-pub const INBOX_MIN_COLS: usize = 60;
+/// The fewest cells a cut header line shows: a label and a word or two of its text.
+const SHOWN_MIN: usize = 14;
+/// The narrowest pane the framed header is drawn in: under it qass's lines have no room
+/// beside the counters, and its rows would stand empty over the panes, so it is one line.
+const BOX_MIN_COLS: usize = 2 * (SHOWN_MIN + GAP) + 2;
+/// The narrowest pane that holds the inbox at all (the board's tile beside the open column of a
+/// 60 column window is 22), and the one that holds it beside qass's terminal rather than in its
+/// place.
+pub const INBOX_MIN_COLS: usize = 20;
 pub const INBOX_BESIDE_COLS: usize = 100;
 /// The shortest pane that holds the inbox.
 pub const INBOX_MIN_ROWS: usize = 14;
@@ -52,8 +58,10 @@ const CLOCK_WIDTH: (usize, usize) = (38, 46);
 const CLOCK_SHARE: usize = 30;
 /// The columns qass's terminal keeps beside the panel: with fewer the panel goes under it.
 const CLOCK_BESIDE_LEAVES: usize = 56;
-/// The narrowest the board page draws in (`qoop task board --page` asks for this much).
+/// The smallest the board page draws its three lanes in (`qoop task board --page`); in less it
+/// shows one lane at a time.
 pub const BOARD_MIN_COLS: usize = 60;
+pub const BOARD_MIN_ROWS: usize = 14;
 /// The narrowest qass's terminal gets beside the board.
 pub const QASS_MIN_COLS: usize = 40;
 /// The board's share of qass's tab when it is shown the other way from how it was saved.
@@ -352,7 +360,7 @@ impl Plan {
         };
         let header = if zoomed {
             Header::None
-        } else if rows >= box_rows {
+        } else if rows >= box_rows && cols >= BOX_MIN_COLS {
             Header::Box
         } else {
             Header::Line
@@ -475,7 +483,7 @@ impl Plan {
             return None;
         }
         let room = (3 + 2 * MIN_INSIDE).max(INBOX_BOX_ROWS);
-        let header = if rows >= Header::Box.rows() + room {
+        let header = if rows >= Header::Box.rows() + room && cols >= BOX_MIN_COLS {
             Header::Box
         } else {
             Header::Line
@@ -795,8 +803,8 @@ fn chips(f: &Facts) -> Vec<Vec<Seg>> {
     let one = |n: usize, word: &str, lit: Role| {
         vec![
             seg(Role::Rule, "[ "),
-            bold(if n > 0 { lit } else { Role::Faint }, n.to_string()),
-            seg(Role::Faint, format!(" {word}")),
+            bold(if n > 0 { lit } else { Role::FaintText }, n.to_string()),
+            seg(Role::FaintText, format!(" {word}")),
             seg(Role::Rule, " ]"),
         ]
     };
@@ -858,7 +866,10 @@ pub(crate) fn edge(
     out.push_str(&rule);
     out.push_str(&"\u{2500}".repeat(cols - used));
     if let Some(tag) = tag {
-        out.push_str(&format!(" {}{tag} {rule}\u{2500}", ink(Role::Faint, fade)));
+        out.push_str(&format!(
+            " {}{tag} {rule}\u{2500}",
+            ink(Role::FaintText, fade)
+        ));
     }
     out.push_str(&format!("{corner}{right}{}", theme::RESET));
     out
@@ -1094,7 +1105,7 @@ fn header_rows(
     let w = |segs: &[Seg]| segs.iter().map(|s| width::width(&s.text)).sum::<usize>();
     let label = |what: &str, text: &str| {
         vec![
-            seg(Role::Faint, format!("{what:<6}")),
+            seg(Role::FaintText, format!("{what:<6}")),
             seg(Role::Detail, text.to_string()),
         ]
     };
@@ -1117,9 +1128,12 @@ fn header_rows(
         let at = centred.min(most);
         (at >= 1 + LEFT_MIN + GAP).then_some(at)
     };
+    // qass's lines are read whole: the pet stands right of the longest, or is not drawn.
+    let left_need = left.iter().map(|segs| w(segs)).max().unwrap_or(0);
     let pet = art.and_then(|(pw, rows)| {
         let mid_w = PAD + 1 + pw + 1 + PAD;
-        fit(mid_w).map(|at| (at, pw, rows))
+        let at = fit(mid_w)?.max(1 + left_need + GAP);
+        (at + mid_w + GAP + chips_w < cols).then_some((at, pw, rows))
     });
     let (mid_x, mid_w) = match &pet {
         Some((at, pw, _)) => (*at, PAD + 1 + pw + 1 + PAD),
@@ -1133,17 +1147,30 @@ fn header_rows(
     let right_w = cols.saturating_sub(right_x + 1);
     let chips = fit_chips(f, right_w, 1);
     let span = last_chip(f, &chips).map(|(from, to)| (right_x + from, right_x + to));
-    let right = [chips, vec![seg(Role::Faint, say.sub.clone())]];
+    let right = [chips, vec![seg(Role::FaintText, say.sub.clone())]];
+    // A line that would show only a few cells of itself is left out, not a row of dots.
+    let readable =
+        |full: usize, room: usize| (full <= room || room >= SHOWN_MIN).then_some(full.min(room));
+    // qass's lines stand as one block against the middle, each on the block's first column, cut
+    // at the pane's edge.
+    let room = left_end.saturating_sub(1);
+    let block = left
+        .iter()
+        .filter_map(|segs| readable(w(segs), room))
+        .max()
+        .unwrap_or(0);
     let mut out = Vec::with_capacity(HEAD_ROWS);
     for r in 0..HEAD_ROWS - 1 {
-        // Left of the middle: a line right-aligned against it, cut at the pane's edge.
-        let text = r.checked_sub(1).and_then(|i| left.get(i));
-        let room = left_end.saturating_sub(1);
-        let shown = text.map_or(0, |segs| w(segs).min(room));
-        let mut row = " ".repeat(left_end.saturating_sub(shown));
-        if let Some(segs) = text {
+        let text = r
+            .checked_sub(1)
+            .and_then(|i| left.get(i))
+            .and_then(|segs| Some((segs, readable(w(segs), room)?)));
+        let mut row = " ".repeat(left_end.saturating_sub(block));
+        let shown = text.map_or(0, |(_, shown)| shown);
+        if let Some((segs, shown)) = text {
             row.push_str(&line(segs, shown, ctx.fade));
         }
+        row.push_str(&" ".repeat(block - shown));
         row.push_str(&" ".repeat(mid_x - left_end));
         // The middle: the pet with a cell of air either side, or the gap.
         match &pet {
@@ -1159,7 +1186,10 @@ fn header_rows(
         }
         // Right of the middle: the counters, then the sub line.
         row.push_str(&" ".repeat(right_x.saturating_sub(mid_x + mid_w)));
-        let text = r.checked_sub(1).and_then(|i| right.get(i));
+        let text = r
+            .checked_sub(1)
+            .and_then(|i| right.get(i))
+            .filter(|segs| readable(w(segs), cols - right_x).is_some());
         row.push_str(&line(
             text.map_or(&[][..], |s| &s[..]),
             cols - right_x,
@@ -1461,7 +1491,7 @@ mod tests {
     #[test]
     fn a_cut_line_ends_in_an_ellipsis() {
         let segs = [
-            seg(Role::Faint, "last  "),
+            seg(Role::FaintText, "last  "),
             seg(Role::Detail, "active 1 min ago"),
         ];
         assert_eq!(strip(&line(&segs, 17, false)), "last  active 1 m\u{2026}");
@@ -1534,11 +1564,49 @@ mod tests {
     /// fit whole on its right, moved left only as far as they need (a 120 column window gives
     /// an 81 column pane), with qass's own line still on its left. The one line header has no
     /// rows in the tab bar's.
+    /// qass's lines start on one column (`last` under `next`), and a pane too narrow to show a
+    /// few cells of a line leaves it out rather than drawing a row of dots; one too narrow for
+    /// any of them (qass's beside the open column at 60x24) has the one line header instead.
+    #[test]
+    fn the_header_lines_align_and_a_narrow_pane_leaves_them_out() {
+        let lead = |row: &str| row.len() - row.trim_start().len();
+        for cols in [161, 120, 81] {
+            let plan = Plan::new(cols, 40, false, false).unwrap();
+            let screen = Screen::new(plan, &facts_of("working"), None, ctx(None));
+            let (next, last) = (strip(&screen.header[2]), strip(&screen.header[3]));
+            assert_eq!(lead(&next), lead(&last), "{cols}:\n{next}\n{last}");
+        }
+        for cols in 24..=60 {
+            let Some(plan) = Plan::new(cols, 40, false, false) else {
+                continue;
+            };
+            let screen = Screen::new(plan, &facts_of("working"), None, ctx(None));
+            // Under the framed header's floor, one line and no empty rows over the panes.
+            if cols < BOX_MIN_COLS {
+                assert_eq!(screen.header.len(), 1, "{cols}");
+                continue;
+            }
+            for row in &screen.header[..HEAD_ROWS - 1] {
+                let row = strip(row);
+                for part in row.split("   ").filter(|p| p.ends_with('\u{2026}')) {
+                    // A cut gives back the blank before its dots.
+                    let part = part.trim();
+                    assert!(
+                        width::width(part) + 1 >= SHOWN_MIN,
+                        "{cols}: {part:?} in {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_pet_stands_in_the_middle_and_moves_over_only_for_the_counters() {
         let pet = pet();
         let (pw, _) = sidebar::avatar_overlay(&pet, true);
-        for (cols, centred) in [(161, true), (81, false)] {
+        // Where qass's lines and the counters leave room for it: centred, or as far left as the
+        // counters need, never over qass's lines (at 81 columns it is not drawn).
+        for (cols, centred) in [(161, true), (101, false)] {
             let plan = Plan::new(cols, 40, false, false).unwrap();
             let screen = Screen::new(plan, &facts_of("working"), None, ctx(Some(&pet)));
             let rule: Vec<char> = strip(&screen.header[HEAD_ROWS - 1]).chars().collect();
@@ -1555,7 +1623,10 @@ mod tests {
             if centred {
                 assert!(middle.abs_diff(cols / 2) <= 1, "{cols}: {middle}");
             } else {
-                assert!(middle + 5 < cols / 2, "{cols}: moved left, {middle}");
+                assert!(
+                    middle <= cols / 2,
+                    "{cols}: never right of the middle, {middle}"
+                );
             }
             let first = strip(&screen.header[1]);
             let (left, right) = first.split_at(first.char_indices().nth(lb).unwrap().0);
@@ -1569,6 +1640,11 @@ mod tests {
             );
             assert!(screen.chip().is_some(), "{cols}");
         }
+        let plan = Plan::new(81, 40, false, false).unwrap();
+        let tight = Screen::new(plan, &facts_of("working"), None, ctx(Some(&pet)));
+        assert!(!tight.header.iter().any(|r| r.contains('\u{2501}')));
+        let next = strip(&tight.header[2]);
+        assert!(!next.contains('\u{2026}'), "qass's lines whole: {next:?}");
         // No pet (no colour here): no lamp, the counters still whole on the right.
         let plan = Plan::new(161, 40, false, false).unwrap();
         let bare = Screen::new(plan, &facts_of("working"), None, ctx(None));
@@ -1757,11 +1833,13 @@ mod tests {
         assert_eq!((narrow.frame, narrow.inner), (shut.frame, shut.inner));
         assert_eq!(narrow.side.unwrap().rect, narrow.frame);
         // Too narrow or too short: no inbox at all. Zoom puts it away with the header.
-        assert_eq!(Plan::new(59, 40, false, true).unwrap().side, None);
+        assert!(Plan::new(INBOX_MIN_COLS - 1, 40, false, true).is_none_or(|p| p.side.is_none()));
         assert_eq!(Plan::new(100, 13, false, true).unwrap().side, None);
         assert_eq!(Plan::new(122, 40, true, true).unwrap().side, None);
         assert!(
-            Plan::holds_inbox(60, 14) && !Plan::holds_inbox(59, 14) && !Plan::holds_inbox(60, 13)
+            Plan::holds_inbox(INBOX_MIN_COLS, 14)
+                && !Plan::holds_inbox(INBOX_MIN_COLS - 1, 14)
+                && !Plan::holds_inbox(INBOX_MIN_COLS, 13)
         );
     }
 

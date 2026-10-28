@@ -152,7 +152,7 @@ pub enum Action {
     Qass,
     /// ctrl-a i, the question inbox beside qass's terminal: open and focus it, or put it away.
     Asks,
-    /// ctrl-a C, the schedules ("on the clock") on qass's screen: open and focus the panel, or
+    /// ctrl-a C, the schedules on qass's screen: open and focus the panel, or
     /// put the keyboard back.
     Clock,
     /// ctrl-a T, on qass's tab with the board: fold the pane with the keyboard to its strip,

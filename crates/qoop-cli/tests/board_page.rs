@@ -178,9 +178,9 @@ fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
     daemon.until("the board drawn in its pane", &read, || {
         let screen = read();
         [
-            "TODO",
-            "DOING",
-            "DONE",
+            "todo",
+            "doing",
+            "done",
             "check the board",
             "DEFAULT-1",
             "no agent",

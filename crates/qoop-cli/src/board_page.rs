@@ -31,8 +31,17 @@ use crate::page::{self, Key, Screen, Session, bold, ink, raised, raised_bold};
 use crate::qass::{self, Life};
 use crate::qass_page::ago;
 
-/// The smallest window the page draws in: three lanes of a card each.
-const NEED: (usize, usize) = (qoop_tui::qass_screen::BOARD_MIN_COLS, 14);
+/// The smallest window the page draws its three lanes in, a card each; under it one lane at a
+/// time ([`Page::narrow`]), and the mouse rests.
+const NEED: (usize, usize) = (
+    qoop_tui::qass_screen::BOARD_MIN_COLS,
+    qoop_tui::qass_screen::BOARD_MIN_ROWS,
+);
+/// The smallest it draws in at all: one lane as a list of keys and titles. The board beside the
+/// open column of a 60 column window has about 22 of them.
+const FLOOR: (usize, usize) = (20, 8);
+/// Under this width the one lane is a list, a row a card, with no boxes.
+const LIST_W: usize = 30;
 /// A card's rows: full (A1) is its title, then key, ages and its one word; quiet (A2) is its
 /// title alone, a word only when someone must act.
 const FULL_H: usize = 4;
@@ -43,8 +52,6 @@ const CHECKS: &str = "qass checks";
 /// What a card says while no agent is on it: in Doing, and in Todo or a reopened item.
 const STARTS: &str = "qass will start it";
 const NO_AGENT: &str = "no agent yet";
-/// The fewest cells a card's key keeps when it is cut so that its word shows whole.
-const KEY_MIN: usize = 4;
 /// `[ full · quiet  v ]`, the card switch at the board's top right.
 const SWITCH_W: usize = 19;
 /// Read again after this long with no news, for what changes with time alone (a start that
@@ -176,6 +183,8 @@ struct Anchor {
 
 /// The dialog's columns and body, from its box.
 struct Pane {
+    /// A page too small for the two columns: the details go under the rest, in one column.
+    one: bool,
     lx: usize,
     lw: usize,
     split: usize,
@@ -188,9 +197,11 @@ struct Pane {
 impl Pane {
     fn of((x, y): (usize, usize), (w, h): (usize, usize)) -> Pane {
         let lx = x + 3;
-        let split = x + w * 62 / 100;
+        let one = w + 2 < NEED.0;
+        let split = if one { x + w - 1 } else { x + w * 62 / 100 };
         let dx = split + 3;
         Pane {
+            one,
             lx,
             lw: split.saturating_sub(lx + 2).max(1),
             split,
@@ -356,6 +367,25 @@ fn short(word: &str) -> String {
 
 /// [`short`] with the age left off, for a card with no room for one: the age whole or not at
 /// all, since a cut one reads as another age.
+/// An issue key in at most `room` columns: whole, else cut in the middle keeping the number
+/// (`QOOPP…-1`), and never shorter than its number (`-1`), which tells two keys apart.
+fn cut_key(key: &str, room: usize) -> String {
+    let n = key.chars().count();
+    if n <= room {
+        return key.to_string();
+    }
+    let Some(dash) = key.rfind('-') else {
+        return fit(key, room.max(1));
+    };
+    let number = &key[dash..];
+    if room <= number.chars().count() {
+        return number.to_string();
+    }
+    let keep = room.saturating_sub(number.chars().count() + 1);
+    let lead: String = key[..dash].chars().take(keep).collect();
+    format!("{lead}\u{2026}{number}")
+}
+
 fn bare(word: &str) -> String {
     let base = word.split_once(" · ").map_or(word, |(base, _)| base);
     match base {
@@ -507,12 +537,12 @@ pub(crate) fn status_word(token: &str) -> Option<(&'static str, Role)> {
         "checks" => (CHECKS, Role::Done),
         // Done, one step quieter than qass still checking: the work is over.
         "finished" => ("finished", Role::Detail),
-        "replaced" => ("replaced", Role::Faint),
-        "closed" => ("tab closed", Role::Faint),
-        "asleep" => ("asleep", Role::Faint),
-        "working" => ("working", Role::Working),
-        "error" => ("error", Role::Failed),
-        "idle" => ("idle", Role::Faint),
+        "replaced" => ("replaced", Role::FaintText),
+        "closed" => ("tab closed", Role::FaintText),
+        "asleep" => ("asleep", Role::FaintText),
+        "working" => ("working", Role::WorkingText),
+        "error" => ("error", Role::FailedText),
+        "idle" => ("idle", Role::FaintText),
         _ => return None,
     })
 }
@@ -552,7 +582,7 @@ fn agent_word(a: &qoop_runtime::control::ItemAgentInfo, now: i64) -> (String, Ro
     } else if a.stage == "waiting-human" {
         (WAITS.into(), Role::Blocked, true)
     } else {
-        (a.stage.clone(), Role::Working, false)
+        (a.stage.clone(), Role::WorkingText, false)
     }
 }
 
@@ -577,7 +607,7 @@ fn assignee(item: &ItemInfo, now: i64) -> (String, String, Role, bool) {
             .filter(|a| matches!(a.status.as_str(), "finished" | "replaced" | "closed"))
             .and_then(|a| status_said(&a.status, a.status_at, now));
         return match (item.outcome.as_deref(), ended) {
-            (Some("failed"), _) => (name, aged("failed", at, now), Role::Failed, false),
+            (Some("failed"), _) => (name, aged("failed", at, now), Role::FailedText, false),
             (_, Some((word, role))) => (name, word, role, false),
             _ => (name, "done".into(), Role::Done, false),
         };
@@ -588,8 +618,8 @@ fn assignee(item: &ItemInfo, now: i64) -> (String, String, Role, bool) {
             (a.name.clone(), word, role, acts)
         }
         None => match (item.state.as_str(), item.outcome.as_deref()) {
-            ("doing", _) => (String::new(), STARTS.into(), Role::Brand, false),
-            _ => (String::new(), NO_AGENT.into(), Role::Faint, false),
+            ("doing", _) => (String::new(), STARTS.into(), Role::BrandText, false),
+            _ => (String::new(), NO_AGENT.into(), Role::FaintText, false),
         },
     }
 }
@@ -762,12 +792,21 @@ impl Page {
         self.follow();
     }
 
+    /// A narrow page draws its lane as a list, a row a card: under [`LIST_W`] columns, or when
+    /// the lane's box would hold no card at all.
+    fn listed(&self, (w, h): (usize, usize), n: usize) -> bool {
+        (w < NEED.0 || h < NEED.1) && (w < LIST_W || self.shown(n, 0, h.saturating_sub(4)).1 == 0)
+    }
+
     /// How many cards fit in lane `n`'s rows at the size last drawn; none while the page is too
     /// small to draw lanes at all.
     fn room(&self, n: usize) -> usize {
         let (w, h) = self.size;
-        if w < NEED.0 || h < NEED.1 {
+        if w < FLOOR.0 || h < FLOOR.1 {
             return 0;
+        }
+        if self.listed((w, h), n) {
+            return h - 4;
         }
         self.shown(n, 0, h - 4).1
     }
@@ -828,12 +867,13 @@ impl Page {
     fn loose_cursor(&self) -> Option<usize> {
         self.loose_at
             .filter(|_| self.lane == 1 && self.loose_shown() && self.loose_open)
+            .filter(|_| !self.listed(self.size, 1))
     }
 
     /// The opened row is Doing's last stop: `j` past its last card steps into it and `k` from
     /// its first line steps back out. Whether it took the key.
     fn step_in_loose(&mut self, by: isize) -> bool {
-        if self.lane != 1 || !self.loose_shown() || !self.loose_open {
+        if self.lane != 1 || !self.loose_shown() || !self.loose_open || self.listed(self.size, 1) {
             return false;
         }
         let lines = self.loose_lines().len();
@@ -875,7 +915,8 @@ impl Page {
 
     /// Open or close the folded row (`N`).
     fn turn_loose(&mut self) {
-        if self.loose_shown() {
+        // The row is drawn in Doing's box: a list too narrow for boxes has none to turn.
+        if self.loose_shown() && !self.listed(self.size, 1) {
             self.loose_open = !self.loose_open;
             self.loose_at = None;
             self.follow();
@@ -1381,16 +1422,16 @@ impl Page {
         };
         let sub = "your tasks, run by qass";
         if x + 1 + sub.chars().count() + 2 <= self.switch_at(w) {
-            s.put(x + 1, 0, sub, &ink(Role::Faint));
+            s.put(x + 1, 0, sub, &ink(Role::FaintText));
         }
         let search = self.search();
         let sx = self.search_at(w);
         // The card switch: the view picked in brand ink, the other faint, `v` turns it.
         let pick = |on: bool| {
             if on {
-                bold(Role::Brand)
+                bold(Role::BrandText)
             } else {
-                ink(Role::Faint)
+                ink(Role::FaintText)
             }
         };
         let switch = self.switch_at(w);
@@ -1400,7 +1441,7 @@ impl Page {
             &[
                 ("[ ", ink(Role::Brand)),
                 ("full", pick(!self.quiet)),
-                (" · ", ink(Role::Faint)),
+                (" · ", ink(Role::FaintText)),
                 ("quiet", pick(self.quiet)),
                 ("  v", ink(Role::Detail)),
                 (" ]", ink(Role::Brand)),
@@ -1427,6 +1468,18 @@ impl Page {
             return s;
         };
         let lanes = self.lanes();
+        if w < NEED.0 || h < NEED.1 {
+            self.narrow(&mut s, &lanes);
+            // Every mode the keys act in is drawn: the card over the one lane, at its size.
+            if let Mode::Card(at) = self.mode
+                && let Some(card) = &self.card
+            {
+                let (corner, size) = Self::dialog_box((w, h));
+                self.dialog(&mut s, card, at, corner, size);
+            }
+            self.foot(&mut s);
+            return s;
+        }
         // Three lanes, two columns apart.
         let lw = (w - 2 - 4) / 3;
         let (top, bottom) = (2, h - 2);
@@ -1445,6 +1498,85 @@ impl Page {
         s
     }
 
+    /// A page too small for three lanes: the keyboard's lane alone, `h` and `l` to the next,
+    /// named with the others on the rule's row (the others as arrows when they do not fit). A
+    /// box with its cards while there is room for a card, else a list of keys and titles. A new
+    /// card is made on Todo, so its form shows Todo.
+    fn narrow(&self, s: &mut Screen, lanes: &[Vec<&ItemInfo>; 3]) {
+        let (w, h) = (s.w, s.h);
+        let creating = match &self.mode {
+            Mode::Create { title, space } => Some((title, *space)),
+            _ => None,
+        };
+        let shown = if creating.is_some() { 0 } else { self.lane };
+        s.put(1, 1, &" ".repeat(w - 2), &ink(Role::Text));
+        let names: Vec<String> = (0..3)
+            .map(|n| format!("{} {}", LANES[n], lanes[n].len()))
+            .collect();
+        let all = names.iter().map(|n| n.len() + 2).sum::<usize>() + 3;
+        let mut x = 1;
+        if all <= w - 2 {
+            for (n, name) in names.iter().enumerate() {
+                let esc = if n == shown {
+                    bold(Role::BrandText)
+                } else {
+                    ink(Role::FaintText)
+                };
+                x = s.put(x, 1, name, &esc) + 2;
+            }
+            s.put(x, 1, "h l", &ink(Role::FaintText));
+        } else {
+            let before = if shown > 0 { "\u{2039} " } else { "  " };
+            x = s.put(x, 1, before, &ink(Role::FaintText));
+            x = s.put(x, 1, &names[shown], &bold(Role::BrandText));
+            if shown < 2 {
+                s.put(x, 1, " \u{203a}", &ink(Role::FaintText));
+            }
+        }
+        let lane = &lanes[shown];
+        if !self.listed((w, h), shown) {
+            self.lane_box(s, shown, lane, 1, 2, w - 2, h - 4);
+            // The rule's row above names the lane: its box keeps a plain edge.
+            s.put(1, 2, &format!("┌{}┐", "─".repeat(w - 4)), &ink(Role::Rule));
+            return;
+        }
+        // The form takes the list's first two rows: the title typed, and the space it goes to.
+        let mut top = 2;
+        if let Some((title, space)) = creating {
+            let room = w - 4;
+            let end: String = {
+                let n = title.chars().count();
+                title.chars().skip(n.saturating_sub(room)).collect()
+            };
+            let cx = s.put(1, top, "+ ", &ink(Role::Brand));
+            let cx = s.put(cx, top, &end, &bold(Role::Focused));
+            s.put(cx, top, "\u{258c}", &ink(Role::Brand));
+            let to = self
+                .targets()
+                .get(space)
+                .map_or("no space to add to".to_string(), |t| {
+                    format!("to {}, tab space", t.name)
+                });
+            s.put(3, top + 1, &fit(&to, w - 4), &ink(Role::FaintText));
+            top += 2;
+        }
+        let rows = h - 2 - top;
+        let first = self.top[shown].min(lane.len().saturating_sub(rows));
+        for (row, item) in lane.iter().skip(first).take(rows).enumerate() {
+            let on = Some(item.id) == self.sel;
+            let (lead, esc) = if on {
+                ("\u{25b8} ", bold(Role::Focused))
+            } else {
+                ("  ", ink(Role::Text))
+            };
+            let line = fit(&format!("{lead}{} {}", item.key, item.title), w - 2);
+            s.put(1, top + row, &line, &esc);
+        }
+        if lane.is_empty() && creating.is_none() {
+            s.put(3, top, "nothing here", &ink(Role::FaintText));
+        }
+    }
+
     /// One lane: its box, its name and count, the cards that fit, and its foot.
     #[allow(clippy::too_many_arguments)]
     fn lane_box(
@@ -1458,11 +1590,8 @@ impl Page {
         h: usize,
     ) {
         let rule = ink(Role::Rule);
-        let (name, role) = [
-            ("TODO", Role::Text),
-            ("DOING", Role::Working),
-            ("DONE", Role::Done),
-        ][n];
+        let name = LANES[n];
+        let role = [Role::Text, Role::WorkingText, Role::Done][n];
         s.put(x, y, &format!("┌{}┐", "─".repeat(w - 2)), &rule);
         s.seg(
             x + 2,
@@ -1470,7 +1599,7 @@ impl Page {
             &[
                 (" ", rule.clone()),
                 (name, bold(role)),
-                (&format!(" {} ", lane.len()), ink(Role::Faint)),
+                (&format!(" {} ", lane.len()), ink(Role::FaintText)),
             ],
         );
         for row in y + 1..y + h - 1 {
@@ -1516,7 +1645,7 @@ impl Page {
             .map(|(n, word)| format!("{n} {word}  "))
             .collect::<String>();
         let foot = format!("{marks}{foot}");
-        s.put(x + 2, y + h - 2, &fit(&foot, w - 4), &ink(Role::Faint));
+        s.put(x + 2, y + h - 2, &fit(&foot, w - 4), &ink(Role::FaintText));
     }
 
     /// How many of the folded row's work wait on the owner, need, break, sleep and so on, in the
@@ -1549,9 +1678,9 @@ impl Page {
         let role = if count(&|s| s == "waits") > 0 {
             Role::Blocked
         } else if count(&|s| s == "error") > 0 {
-            Role::Failed
+            Role::FailedText
         } else {
-            Role::Faint
+            Role::FaintText
         };
         (chunks.join(" · "), role)
     }
@@ -1564,7 +1693,7 @@ impl Page {
         let terminal = t.terminal.map(|n| format!("T{n} ")).unwrap_or_default();
         let space = space_name(&self.spaces, t.workspace);
         let (word, role) = status_said(&t.status, t.status_at, self.now)
-            .unwrap_or_else(|| (aged(&t.stage, t.status_at, self.now), Role::Faint));
+            .unwrap_or_else(|| (aged(&t.stage, t.status_at, self.now), Role::FaintText));
         if t.terminal.is_some() {
             return (format!("{terminal}{space} {word}"), role, false);
         }
@@ -1587,7 +1716,7 @@ impl Page {
             &ink(Role::Detail),
         );
         if at + 3 <= x + 2 + inner {
-            s.put(at + 2, top, "N", &ink(Role::Faint));
+            s.put(at + 2, top, "N", &ink(Role::FaintText));
         }
         let (counts, role) = self.loose_counts();
         s.put(x + 2, top + 1, &fit(&counts, inner), &ink(role));
@@ -1605,7 +1734,7 @@ impl Page {
             let goal_w = (x + 2 + inner).saturating_sub(end + 2);
             if goal_w >= 4 {
                 let goal = match (dim, on) {
-                    (true, _) => ink(Role::Faint),
+                    (true, _) => ink(Role::FaintText),
                     (false, true) => bold(Role::Focused),
                     (false, false) => ink(Role::Text),
                 };
@@ -1627,7 +1756,7 @@ impl Page {
             ink(Role::Rule)
         };
         let space = space_name(&self.spaces, item.workspace);
-        let space_ink = item.workspace.map_or(ink(Role::Faint), |id| {
+        let space_ink = item.workspace.map_or(ink(Role::FaintText), |id| {
             ink(theme::space_in(&self.spaces, id))
         });
         s.put(x, y, &format!("┌{}┐", "─".repeat(w - 2)), &edge);
@@ -1640,7 +1769,7 @@ impl Page {
             let cross = if item.hidden {
                 Role::Detail
             } else {
-                Role::Faint
+                Role::FaintText
             };
             s.put(x + w - 2, y, "x", &ink(cross));
         }
@@ -1686,7 +1815,12 @@ impl Page {
                 ages
             };
             if !item.hidden && !ages.trim().is_empty() {
-                s.put(x + w - 4 - width::width(&ages), y, &ages, &ink(Role::Faint));
+                s.put(
+                    x + w - 4 - width::width(&ages),
+                    y,
+                    &ages,
+                    &ink(Role::FaintText),
+                );
             }
             // A narrow card keeps room for its title: the short form of the word, and the age
             // only where there is room for both.
@@ -1705,29 +1839,37 @@ impl Page {
             s.put(x + w - 2 - shown.chars().count(), y + 1, &shown, &ink(role));
             return;
         }
+        // The title keeps its whole row: it is what tells one card from another. The foot: the
+        // key, its age in the lane, then its agent and how long it has worked while there is
+        // room, and the word flush right in the room the whole key leaves: its longest form
+        // that fits, down to its bare one, else none (the card's ink still says the state). A
+        // word that wants the owner (waits, blocked, failed) always shows, and the key gives
+        // way. A key is cut in the middle, never past its number (`QOOPP…-1`).
         s.put(x + 2, y + 1, &fit(&item.title, inner), &title);
-        // The foot: the key, its age in the lane, then its agent and how long it has worked
-        // while there is room, and the word flush right, which always shows: its short form
-        // when the long one does not fit beside the key, and whole while it fits beside
-        // [`KEY_MIN`] cells of the key, the key cut. One space stands between them.
         let (fy, end) = (y + 2, x + w - 2);
-        let key_w = item.key.chars().count() + 1;
-        let word = [word.clone(), short(&word), bare(&word)]
-            .into_iter()
-            .find(|w| w.chars().count() + key_w <= inner)
-            .unwrap_or_else(|| bare(&word));
-        let word = if word.chars().count() + KEY_MIN < inner {
-            word
-        } else {
-            fit(&word, inner.saturating_sub(key_w).max(inner / 3))
+        let urgent = acts || matches!(role, Role::Blocked | Role::Failed | Role::FailedText);
+        let fits = |key: usize| {
+            [word.clone(), short(&word), bare(&word)]
+                .into_iter()
+                .find(|w| w.chars().count() + key <= inner)
         };
+        let key_min = cut_key(&item.key, 0).chars().count() + 1;
+        let word = fits(item.key.chars().count() + 1)
+            .or_else(|| urgent.then(|| fits(key_min).unwrap_or_else(|| bare(&word))))
+            .unwrap_or_default();
         let wx = end - word.chars().count();
         s.put(wx, fy, &word, &ink(role));
         let kx = s.put(
             x + 2,
             fy,
-            &fit(&item.key, wx.saturating_sub(x + 3)),
-            &ink(Role::Faint),
+            &cut_key(
+                &item.key,
+                match word.is_empty() {
+                    true => inner,
+                    false => wx.saturating_sub(x + 3),
+                },
+            ),
+            &ink(Role::FaintText),
         );
         // A Done card says when it closed: `just now`, `3 min ago`.
         let lane_age = if item.state == "done" && item.since != 0 {
@@ -1803,7 +1945,7 @@ impl Page {
                     &fit(&format!(" {} ", target.name), w / 2),
                     &ink(theme::space_in(&self.spaces, target.id)),
                 );
-                s.put(nx + 1, sy, " tab space ", &ink(Role::Faint));
+                s.put(nx + 1, sy, " tab space ", &ink(Role::FaintText));
             }
             None => {
                 s.put(sx, sy, " no space to add to ", &ink(Role::Blocked));
@@ -1833,29 +1975,39 @@ impl Page {
         let item = &card.item;
         let pane = Pane::of((x, y), (w, h));
         let space = space_name(&self.spaces, item.workspace);
-        let space_ink = item.workspace.map_or(ink(Role::Faint), |id| {
+        let space_ink = item.workspace.map_or(ink(Role::FaintText), |id| {
             ink(theme::space_in(&self.spaces, id))
         });
         let key = format!(" / {}", item.key);
-        let space = fit(
-            &space,
-            (x + w - 16).saturating_sub(pane.lx + width::width(&key)),
-        );
-        s.seg(
-            pane.lx,
-            y + 1,
-            &[(&space, space_ink), (&key, ink(Role::Faint))],
-        );
-        s.seg(
-            x + w - 15,
-            y + 1,
-            &[
-                ("[ ", ink(Role::Brand)),
-                ("esc", bold(Role::Text)),
-                (" close ]", ink(Role::Detail)),
-            ],
-        );
-        let (left, right) = (self.rows(card, pane.lw), self.details_rows(card, pane.dw));
+        // One column: the key alone on the head, the way out stays on the foot.
+        if pane.one {
+            s.put(
+                pane.lx,
+                y + 1,
+                &fit(&item.key, pane.lw),
+                &ink(Role::FaintText),
+            );
+        } else {
+            let space = fit(
+                &space,
+                (x + w - 16).saturating_sub(pane.lx + width::width(&key)),
+            );
+            s.seg(
+                pane.lx,
+                y + 1,
+                &[(&space, space_ink), (&key, ink(Role::FaintText))],
+            );
+            s.seg(
+                x + w - 15,
+                y + 1,
+                &[
+                    ("[ ", ink(Role::Brand)),
+                    ("esc", bold(Role::Text)),
+                    (" close ]", ink(Role::Detail)),
+                ],
+            );
+        }
+        let (left, right) = (self.left_rows(card, &pane), self.right_rows(card, &pane));
         let view = pane.view();
         let total = left.len().max(right.len());
         let scroll = self.scroll.min(total.saturating_sub(view));
@@ -1886,10 +2038,32 @@ impl Page {
         );
     }
 
-    /// The dialog's box, as [`Page::draw`] places it over the lanes.
+    /// The dialog's box, as [`Page::draw`] places it over the lanes, or over the one lane of a
+    /// narrow page at its real size.
     fn dialog_box(size: (usize, usize)) -> ((usize, usize), (usize, usize)) {
-        let (w, h) = (size.0.max(NEED.0), size.1.max(NEED.1));
+        let (w, h) = (size.0.max(FLOOR.0), size.1.max(FLOOR.1));
+        if w < NEED.0 || h < NEED.1 {
+            return ((1, 2), (w - 2, h - 4));
+        }
         ((1, 2), (3 * ((w - 2 - 4) / 3) + 4, h - 4))
+    }
+
+    /// The dialog's first column, with the details under it when the pane has one column.
+    fn left_rows(&self, card: &ItemCardInfo, pane: &Pane) -> Vec<Row> {
+        let mut rows = self.rows(card, pane.lw);
+        if pane.one {
+            rows.push(Row::new(Block::Plain, None));
+            rows.extend(self.details_rows(card, pane.lw));
+        }
+        rows
+    }
+
+    /// The details column, none when they stand under the rest.
+    fn right_rows(&self, card: &ItemCardInfo, pane: &Pane) -> Vec<Row> {
+        if pane.one {
+            return Vec::new();
+        }
+        self.details_rows(card, pane.dw)
     }
 
     fn pane(&self) -> Pane {
@@ -1905,9 +2079,14 @@ impl Page {
         let blank = || Row::new(Block::Plain, None);
         let mut out = text_rows(&item.title, lw, 0, Role::Focused, true, Block::Title);
         out.push(blank());
-        out.push(plain("Description", Role::Faint, true));
+        out.push(plain("Description", Role::FaintText, true));
         if card.description.trim().is_empty() {
-            out.push(Row::new(Block::Description, None).with(0, "none yet", Role::Faint, false));
+            out.push(Row::new(Block::Description, None).with(
+                0,
+                "none yet",
+                Role::FaintText,
+                false,
+            ));
         }
         for para in card.description.lines() {
             out.extend(text_rows(
@@ -1922,16 +2101,16 @@ impl Page {
         out.push(blank());
         out.push(
             Row::new(Block::Plain, None)
-                .with(0, "Checklist", Role::Faint, true)
+                .with(0, "Checklist", Role::FaintText, true)
                 .with(
                     9,
                     &format!("  {}/{}", item.steps_done, item.steps_total),
-                    Role::Faint,
+                    Role::FaintText,
                     false,
                 ),
         );
         if card.steps.is_empty() {
-            out.push(plain("no steps yet", Role::Faint, false));
+            out.push(plain("no steps yet", Role::FaintText, false));
         }
         let going = card.steps.iter().position(|st| st.done_at.is_none());
         for (n, step) in card.steps.iter().enumerate() {
@@ -1945,13 +2124,13 @@ impl Page {
                     let mark = if done { "[x] " } else { "[ ] " };
                     row = row.with(0, mark, Role::Detail, false);
                 }
-                let role = if done { Role::Faint } else { Role::Text };
+                let role = if done { Role::FaintText } else { Role::Text };
                 row = row.with(4, line, role, false);
                 if i == 0 && going == Some(n) {
                     row = row.with(
                         4 + width::width(line) + 2,
                         "in progress",
-                        Role::Working,
+                        Role::WorkingText,
                         false,
                     );
                 }
@@ -1959,7 +2138,7 @@ impl Page {
             }
         }
         out.push(blank());
-        out.push(plain("Activity", Role::Faint, true));
+        out.push(plain("Activity", Role::FaintText, true));
         let keys = if self.flipped.is_empty() {
             Vec::new()
         } else {
@@ -1980,7 +2159,12 @@ impl Page {
             for (n, line) in lines.iter().enumerate() {
                 let mut row = Row::new(Block::Entry(i), Some(card.steps.len() + i));
                 if n == 0 {
-                    row = row.with(0, &fit(&ago(Some(e.at), self.now), 11), Role::Faint, false);
+                    row = row.with(
+                        0,
+                        &fit(&ago(Some(e.at), self.now), 11),
+                        Role::FaintText,
+                        false,
+                    );
                 }
                 if cut && n == last {
                     let line = clip(line, tw.saturating_sub(MORE.chars().count()));
@@ -2000,7 +2184,14 @@ impl Page {
                 "older activity is not shown here: qoop task show {}",
                 item.key
             );
-            out.extend(text_rows(&note, lw, 0, Role::Faint, false, Block::Plain));
+            out.extend(text_rows(
+                &note,
+                lw,
+                0,
+                Role::FaintText,
+                false,
+                Block::Plain,
+            ));
         }
         out
     }
@@ -2010,7 +2201,7 @@ impl Page {
         let item = &card.item;
         let vw = dw.saturating_sub(11);
         let mut out = vec![
-            Row::new(Block::Plain, None).with(0, "Details", Role::Faint, true),
+            Row::new(Block::Plain, None).with(0, "Details", Role::FaintText, true),
             Row::new(Block::Plain, None),
         ];
         let kv = |out: &mut Vec<Row>, label: &str, value: &str, role: Role| {
@@ -2019,13 +2210,13 @@ impl Page {
             for (i, line) in lines.iter().enumerate() {
                 let mut row = Row::new(Block::Plain, None);
                 if i == 0 && !label.is_empty() {
-                    row = row.with(0, label, Role::Faint, false);
+                    row = row.with(0, label, Role::FaintText, false);
                 }
                 out.push(row.with(11, line, role, false));
             }
         };
         let state_role = match item.state.as_str() {
-            "doing" => Role::Working,
+            "doing" => Role::WorkingText,
             "done" => Role::Done,
             _ => Role::Text,
         };
@@ -2036,7 +2227,7 @@ impl Page {
         kv(&mut out, "Status", &state, state_role);
         out.push(Row::new(Block::Plain, None));
         if item.agents.is_empty() {
-            kv(&mut out, "Assignees", "none yet", Role::Faint);
+            kv(&mut out, "Assignees", "none yet", Role::FaintText);
         }
         for (n, a) in item.agents.iter().enumerate() {
             kv(
@@ -2054,11 +2245,11 @@ impl Page {
                 let end = 11 + width::width(&place) + 2;
                 out.push(
                     Row::new(Block::Plain, None)
-                        .with(11, &place, Role::Faint, false)
+                        .with(11, &place, Role::FaintText, false)
                         .with(end, &word, role, false),
                 );
             } else {
-                kv(&mut out, "", &place, Role::Faint);
+                kv(&mut out, "", &place, Role::FaintText);
                 kv(&mut out, "", &word, role);
             }
         }
@@ -2066,7 +2257,7 @@ impl Page {
         let space = space_name(&self.spaces, item.workspace);
         let space_role = item
             .workspace
-            .map_or(Role::Faint, |id| theme::space_in(&self.spaces, id));
+            .map_or(Role::FaintText, |id| theme::space_in(&self.spaces, id));
         kv(&mut out, "Space", &space, space_role);
         kv(&mut out, "Key", &item.key, Role::Text);
         kv(
@@ -2101,8 +2292,8 @@ impl Page {
             return 0;
         };
         let pane = self.pane();
-        let rows = self.rows(card, pane.lw).len();
-        rows.max(self.details_rows(card, pane.dw).len())
+        let rows = self.left_rows(card, &pane).len();
+        rows.max(self.right_rows(card, &pane).len())
             .saturating_sub(pane.view())
     }
 
@@ -2169,7 +2360,7 @@ impl Page {
     /// The block of the first row in view and how far into it the view starts.
     fn anchor(&self) -> Option<Anchor> {
         let card = self.card.as_ref()?;
-        let rows = self.rows(card, self.pane().lw);
+        let rows = self.left_rows(card, &self.pane());
         let row = rows.get(self.scroll)?;
         if row.block == Block::Plain {
             return None;
@@ -2196,10 +2387,10 @@ impl Page {
         let stops = card.steps.len() + card.activity.len();
         let pane = self.pane();
         let view = pane.view();
-        let rows = self.rows(card, pane.lw);
+        let rows = self.left_rows(card, &pane);
         let max = rows
             .len()
-            .max(self.details_rows(card, pane.dw).len())
+            .max(self.right_rows(card, &pane).len())
             .saturating_sub(view);
         let scroll = self.scroll.min(max);
         let range = |stop: usize| {
@@ -2257,7 +2448,7 @@ impl Page {
         let steps = card.steps.len();
         let scroll = self.scroll.min(self.max_scroll());
         let stop = self
-            .rows(card, pane.lw)
+            .left_rows(card, &pane)
             .get(scroll + row - pane.top)
             .and_then(|r| r.stop);
         if let Some(stop) = stop {
@@ -2274,7 +2465,7 @@ impl Page {
         let y = s.h - 2;
         let mut x = s.put(1, y, "qass", &bold(Role::Text));
         if let Some(t) = self.qass.0 {
-            x = s.put(x + 1, y, &format!("T{t}"), &ink(Role::Faint));
+            x = s.put(x + 1, y, &format!("T{t}"), &ink(Role::FaintText));
         }
         x = s.put(x + 1, y, &self.qass.1, &ink(Role::Detail)) + 3;
         let room = s.w.saturating_sub(x + 1);
@@ -2286,7 +2477,7 @@ impl Page {
                         .skip(n.saturating_sub(room.saturating_sub(12)))
                         .collect()
                 };
-                let tx = s.put(x, y, "tell qass: ", &ink(Role::Brand));
+                let tx = s.put(x, y, "tell qass: ", &ink(Role::BrandText));
                 let cx = s.put(tx, y, &shown, &bold(Role::Focused));
                 s.put(cx, y, "▌", &ink(Role::Brand));
             }
@@ -2309,6 +2500,16 @@ impl Page {
         ];
         if self.loose_shown() {
             board.insert(6, ("N", "not on the board"));
+        }
+        // One lane at a time: the keys that move in it first, in the room there is.
+        if s.w < NEED.0 || s.h < NEED.1 {
+            board = vec![
+                ("j k", "move"),
+                ("enter", "open"),
+                ("h l", "lane"),
+                ("c", "create"),
+                ("q", "close"),
+            ];
         }
         let keys: &[(&str, &str)] = match &self.mode {
             Mode::Board => &board,
@@ -2361,11 +2562,38 @@ pub(crate) fn activity_words(kind: &str, body: &str) -> String {
 /// others in order while they fit before it.
 fn chips(s: &mut Screen, keys: &[(&str, &str)]) {
     let y = s.h - 1;
-    let mut x = s.put(1, y, " board ", &theme::filled(Role::Brand)) + 2;
     let chip_w =
         |(key, what): &(&str, &str)| 2 + key.chars().count() + what.chars().count() + 3 + 2;
     let Some((last, rest)) = keys.split_last() else {
         return;
+    };
+    // A page narrower than its lanes names its keys plainly, as the questions beside it do:
+    // brackets take the room a key needs. The way out always, the others while they fit.
+    if s.w < NEED.0 {
+        let word_w = |(key, what): &(&str, &str)| key.chars().count() + what.chars().count() + 3;
+        let mut room = s.w.saturating_sub(1 + word_w(last) - 2);
+        let mut x = 1;
+        let shown = rest.iter().take_while(|chip| {
+            let fits = word_w(chip) <= room;
+            room = room.saturating_sub(word_w(chip));
+            fits
+        });
+        for (key, what) in shown.chain([last]) {
+            let what = format!(" {what}");
+            x = s.seg(
+                x,
+                y,
+                &[(key, bold(Role::Text)), (&what, ink(Role::FaintText))],
+            ) + 2;
+        }
+        return;
+    }
+    // The way out is drawn whole: on a narrow page the page's name gives way to it.
+    const NAME: &str = " board ";
+    let mut x = if s.w >= NEED.0 && 1 + NAME.len() + 2 + chip_w(last) - 2 <= s.w {
+        s.put(1, y, NAME, &theme::filled(Role::Brand)) + 2
+    } else {
+        1
     };
     let mut room = s.w.saturating_sub(x + chip_w(last));
     let mut shown: Vec<&(&str, &str)> = rest
@@ -2651,18 +2879,27 @@ pub(crate) fn run() -> std::io::Result<()> {
         if w < NEED.0 || h < NEED.1 {
             page.held = None;
         }
-        let screen = page.draw(w.max(NEED.0), h.max(NEED.1));
+        let screen = page.draw(w.max(FLOOR.0), h.max(FLOOR.1));
         // Written only when it changed: a page that repaints every tick is never idle to the
         // daemon, and its tab would never sleep. Ages are compared to the hour only: "3 min"
         // turning "4 min" on a card is no news, and repainting for it alone would keep the tab
         // awake; a card's "2 h" still turns "3 h" when the hour does.
         let now = page.now;
         page.now -= page.now.rem_euclid(3600);
-        let ageless = page.draw(w.max(NEED.0), h.max(NEED.1)).frame();
+        let ageless = page.draw(w.max(FLOOR.0), h.max(FLOOR.1)).frame();
         page.now = now;
         let frame = format!("{w}x{h}{ageless}");
         if frame != last {
-            page::show(&screen, NEED, "q")?;
+            // Too narrow in a qoop pane: the key that folds the column, which may give it room.
+            // Too short, or outside qoop: how big it must be.
+            if w < FLOOR.0 && h >= FLOOR.1 && qoop_runtime::legacy::var("QOOP_TERMINAL").is_ok() {
+                let key = qoop_tui::keys::name_of(qoop_tui::config::read().config.prefix);
+                let say =
+                    format!("too narrow for the board: if the column is open, {key} b folds it");
+                page::show_said(&screen, FLOOR, &say)?;
+            } else {
+                page::show(&screen, FLOOR, "q")?;
+            }
             last = frame;
         }
         for key in page::next_keys(&session.typed) {
@@ -2827,6 +3064,100 @@ mod tests {
         ]);
         p.settle();
         p
+    }
+
+    /// Beside the open column of a narrow window the board draws one lane at a time: at 80
+    /// columns (34 for the board) the keyboard's lane in its box with its cards, at 60 (22) a list
+    /// of keys and titles; `l` goes to the next lane, and the rule's row names all three.
+    #[test]
+    fn a_narrow_board_shows_one_lane_at_a_time() {
+        let mut p = page();
+        for (w, h) in [(34, 14), (22, 14)] {
+            p.size = (w, h);
+            (p.lane, p.sel) = (0, None);
+            p.settle();
+            let text = drawn(&p, w, h);
+            let named = if w < 30 {
+                vec!["todo 2 \u{203a}"]
+            } else {
+                vec!["todo 2", "doing 3", "done 1"]
+            };
+            for lane in named {
+                assert!(text.contains(lane), "{lane} at {w}: {text}");
+            }
+            assert!(
+                text.contains("QOOP-1"),
+                "the keyboard's lane at {w}: {text}"
+            );
+            assert!(!text.contains("QOOP-3"), "one lane at {w}: {text}");
+            p.key(Key::Char('l'));
+            let text = drawn(&p, w, h);
+            assert!(
+                text.contains("QOOP-3") && !text.contains("QOOP-1"),
+                "{text}"
+            );
+        }
+        // A list at 22, and at 40 when too short for a card in a box: a row a card, the
+        // keyboard's marked, no box.
+        for (w, h) in [(22, 14), (40, 9)] {
+            p.size = (w, h);
+            let text = drawn(&p, w, h);
+            assert!(text.contains("\u{25b8} QOOP-3 board"), "{w}x{h}: {text}");
+            assert!(!text.contains('\u{250c}'), "{w}x{h}: {text}");
+        }
+        // In a box the lane is named once, on the rule's row, and the foot names the keys that
+        // move in one lane and open a card, plainly (qass's tab at 80 x 24 gives the board 34).
+        let text = drawn(&p, 34, 14);
+        assert!(
+            text.contains("j k move  enter open  q close") && !text.contains("[ q"),
+            "{text}"
+        );
+        assert_eq!(text.matches("doing 3").count(), 1, "{text}");
+        // Doing gives rows to the work no item holds: at a height where Todo still holds a card
+        // in its box, Doing holds none, so Doing is a list and its picked card is on screen.
+        with_loose(&mut p);
+        p.size = (40, 11);
+        (p.lane, p.sel) = (1, None);
+        p.settle();
+        let text = drawn(&p, 40, 11);
+        assert!(text.contains("\u{25b8} QOOP-3"), "{text}");
+        assert!(!text.contains('\u{250c}'), "{text}");
+    }
+
+    /// A narrow page draws every mode its keys act in: the card over the one lane at the page's
+    /// size, its title and details in one column, and esc closes it; the new card form on Todo,
+    /// whatever lane was shown, in the box or as the list's first rows.
+    #[test]
+    fn a_narrow_board_draws_the_card_and_the_form_its_keys_act_in() {
+        for (w, h) in [(34, 17), (22, 17)] {
+            let mut p = open_with((w, h), Vec::new(), Vec::new());
+            p.card.as_mut().unwrap().item.title = "board everywhere".into();
+            let text = drawn(&p, w, h);
+            assert!(
+                text.contains("everywhere") && text.contains("esc close"),
+                "{w}: {text}"
+            );
+            assert!(
+                all_seen(&mut p, &["Checklist".into(), "Details".into()]),
+                "the details under it at {w}"
+            );
+            p.key(Key::Esc);
+            assert_eq!(p.mode, Mode::Board, "{w}");
+            let mut p = page();
+            p.size = (w, h);
+            p.key(Key::Char('l'));
+            p.key(Key::Char('c'));
+            for c in "nightly".chars() {
+                p.key(Key::Char(c));
+            }
+            let text = drawn(&p, w, h);
+            assert!(text.contains("nightly\u{258c}"), "the form at {w}: {text}");
+            assert!(
+                text.contains("esc cancel"),
+                "the way out whole at {w}: {text}"
+            );
+            assert!(text.contains("todo 2"), "on Todo at {w}: {text}");
+        }
     }
 
     /// A card pressed on the board is held; let go over qass (the interface says so) a Todo
@@ -3456,7 +3787,12 @@ mod tests {
         i.outcome = Some("failed".into());
         assert_eq!(
             assignee(&i, 999 + 2 * DAY),
-            ("worker".into(), "failed · 2 d".into(), Role::Failed, false)
+            (
+                "worker".into(),
+                "failed · 2 d".into(),
+                Role::FailedText,
+                false
+            )
         );
     }
 
@@ -3487,7 +3823,12 @@ mod tests {
         let i = &p.items.as_ref().unwrap()[2];
         assert_eq!(
             assignee(i, now),
-            ("worker".into(), "asleep · 13 d".into(), Role::Faint, false)
+            (
+                "worker".into(),
+                "asleep · 13 d".into(),
+                Role::FaintText,
+                false
+            )
         );
         assert!(drawn(&p, 200, 50).contains("asleep · 13 d"));
         for (token, ago, said) in [
@@ -3509,7 +3850,7 @@ mod tests {
         for token in ["", "unknown", "remote"] {
             assert_eq!(
                 agent_word(&agent(token, 995), 1_000),
-                ("implementing".into(), Role::Working, false),
+                ("implementing".into(), Role::WorkingText, false),
                 "{token:?}"
             );
         }
@@ -3528,12 +3869,12 @@ mod tests {
             ("waits", "waits on you", Role::Blocked),
             ("checks", "qass checks", Role::Done),
             ("finished", "finished", Role::Detail),
-            ("replaced", "replaced", Role::Faint),
-            ("closed", "tab closed", Role::Faint),
-            ("asleep", "asleep", Role::Faint),
-            ("working", "working", Role::Working),
-            ("error", "error", Role::Failed),
-            ("idle", "idle", Role::Faint),
+            ("replaced", "replaced", Role::FaintText),
+            ("closed", "tab closed", Role::FaintText),
+            ("asleep", "asleep", Role::FaintText),
+            ("working", "working", Role::WorkingText),
+            ("error", "error", Role::FailedText),
+            ("idle", "idle", Role::FaintText),
         ] {
             assert_eq!(status_word(token), Some((word, role)), "{token}");
         }
@@ -3568,7 +3909,12 @@ mod tests {
         i.outcome = Some("failed".into());
         assert_eq!(
             assignee(&i, now),
-            ("worker".into(), "failed · 2 d".into(), Role::Failed, false)
+            (
+                "worker".into(),
+                "failed · 2 d".into(),
+                Role::FailedText,
+                false
+            )
         );
         (i.outcome, i.agents[0].closed) = (Some("verified".into()), false);
         i.agents[0].status = "idle".into();
@@ -3654,16 +4000,16 @@ mod tests {
         assert!(text.contains("Not on the board · 12"), "{text}");
         assert!(text.contains(COUNTS), "{text}");
         // Doing's own count leaves them out.
-        assert!(text.contains("DOING 3 "), "{text}");
+        assert!(text.contains("doing 3 "), "{text}");
         let said = |p: &Page, ink: Role| {
             let frame = p.draw(280, 50).frame();
             frame.contains(&format!("{}{}", super::ink(ink), p.loose_counts().0))
         };
         assert!(said(&p, Role::Blocked));
         p.tasks.retain(|t| t.status != "waits");
-        assert!(said(&p, Role::Failed));
+        assert!(said(&p, Role::FailedText));
         p.tasks.retain(|t| t.status != "error");
-        assert!(said(&p, Role::Faint));
+        assert!(said(&p, Role::FaintText));
         // One with a count cut off says how many it did not list.
         p.loose = Some(p.tasks.len() + 4);
         assert!(p.loose_counts().0.ends_with("· 4 not listed"));
@@ -3725,9 +4071,9 @@ mod tests {
         // A task with no terminal keeps its word and its ink and says no tab after it; one with
         // no word of its own says its stage, quiet.
         let frame = p.draw(280, 50).frame();
-        let dim = format!("{}qoop implementing · 2 d · no tab", ink(Role::Faint));
+        let dim = format!("{}qoop implementing · 2 d · no tab", ink(Role::FaintText));
         assert!(frame.contains(&dim));
-        let quiet = format!("{}T20 qoop implementing · 2 d", ink(Role::Faint));
+        let quiet = format!("{}T20 qoop implementing · 2 d", ink(Role::FaintText));
         assert!(frame.contains(&quiet));
         if let Some(t) = p.tasks.iter_mut().find(|t| t.goal == "third wait") {
             t.terminal = None;
@@ -3839,8 +4185,12 @@ mod tests {
             assert_eq!(p.room(1), 1, "open: {open}");
             let (top, rows) = p.loose_place(2, lane_h).unwrap();
             let text = drawn(&p, NEED.0, NEED.1);
-            // The card, and the label on the row the place says.
-            assert!(text.contains("board every"), "{text}");
+            // The card, its title on its own row and its key whole (no room left for its
+            // word), and the label on the row the place says.
+            assert!(
+                text.contains("board every…") && text.contains("│ QOOP-3 "),
+                "{text}"
+            );
             assert!(row_text(&p, NEED.0, NEED.1, top).contains("Not on the"));
             // The rows end above Doing's foot and its bottom edge.
             assert_eq!(top + rows, 2 + lane_h - 2);
@@ -3902,9 +4252,9 @@ mod tests {
         assert_eq!(keys, ["QOOP-8", "QOOP-9", "QOOP-6", "QOOP-7"]);
     }
 
-    /// On a narrow full card the word stays readable (the short form of one that asks the
-    /// owner to act) and the key is what gets cut; the key bar shows whole chips and always
-    /// the way out.
+    /// On a narrow full card a calm card's key stays whole and its word takes only the room it
+    /// leaves; a word that wants the owner (waits, failed) stays whole and the key gives way,
+    /// keeping its number. The key bar shows whole chips and always the way out.
     #[test]
     fn a_narrow_board_keeps_the_word_and_the_way_out() {
         let mut p = page();
@@ -3928,12 +4278,21 @@ mod tests {
         }
         let narrow = drawn(&p, NEED.0, NEED.1);
         assert!(
-            narrow.contains(" waits │") && !narrow.contains("wai…"),
+            narrow.contains("\u{2026}-2 waits │") && narrow.contains("\u{2026}-6 failed │"),
             "{narrow}"
         );
         assert!(
-            narrow.contains(" failed │") && !narrow.contains("fai…"),
+            !narrow.contains("wai…") && !narrow.contains("fai…"),
             "{narrow}"
+        );
+        assert!(
+            narrow.contains("│ QOOP-1 "),
+            "a calm card's key whole: {narrow}"
+        );
+        let roomy = drawn(&p, 100, NEED.1);
+        assert!(
+            roomy.contains(" waits") && roomy.contains(" failed"),
+            "{roomy}"
         );
         for w in [NEED.0, 120, 200] {
             let bar = drawn(&p, w, NEED.1);
@@ -3979,20 +4338,61 @@ mod tests {
                 "{w}: {text}"
             );
         }
-        // Lanes of (63 - 6) / 3: cards of 13 cells inside, the fewest where `no agent` stands
-        // whole one space from a key cut to `KEY_MIN` (qass's tab at 120 x 40).
+        // Lanes of (63 - 6) / 3: cards of 13 cells inside (qass's tab at 120 x 40). The key
+        // whole, the word gone where it has no room.
         let tight = drawn(&p, 63, NEED.1);
-        assert!(tight.contains("QOO… no agent │"), "{tight}");
+        assert!(
+            tight.contains("│ QOOPPRIVAT-1  │") && !tight.contains("-1 no agent"),
+            "{tight}"
+        );
         let wide = drawn(&p, 200, 30);
         assert!(
             wide.contains("日本") && wide.contains(" verifying │"),
             "{wide}"
         );
-        let mid = drawn(&p, 80, 30);
+        // With the room beside the whole key, the word in the longest form that fits.
+        let mid = drawn(&p, 100, 30);
         assert!(
-            mid.contains(" no agent │") && mid.contains(" starts │"),
+            mid.contains(" no agent yet │") && mid.contains(" starts │"),
             "{mid}"
         );
+    }
+
+    /// Where the board shares qass's tab with the questions (cards of 12 to 14 cells, as at
+    /// 120 x 40 and 200 x 60), every card's title keeps its whole row and every key keeps its
+    /// number: the key is cut in the middle, never the title to a few letters.
+    #[test]
+    fn a_narrow_card_keeps_its_title_and_its_key_number() {
+        let mut p = page();
+        for i in p.items.as_mut().unwrap().iter_mut() {
+            i.key = format!("QOOPPRIVAT-{}", i.id);
+        }
+        for w in 60..=66 {
+            let inner = (w - 6) / 3 - 6;
+            let text = drawn(&p, w, 30);
+            // Each card drawn: its title on its whole row, its key whole.
+            for i in p.items.as_ref().unwrap() {
+                if text.contains(&format!("QOOPPRIVAT-{} ", i.id)) {
+                    assert!(
+                        text.contains(&fit(&i.title, inner)),
+                        "{w}: {}\n{text}",
+                        i.title
+                    );
+                }
+            }
+            assert!(
+                text.contains("│ QOOPPRIVAT-1 ") && text.contains("│ QOOPPRIVAT-3 "),
+                "{w}: {text}"
+            );
+            assert!(
+                !text.contains("\u{2026}-") && !text.contains("boar\u{2026}"),
+                "{w}: {text}"
+            );
+        }
+        // Only a key wider than the card is cut, in the middle, keeping its number.
+        p.items.as_mut().unwrap()[0].key = "QOOPPRIVATEXTRA-1".into();
+        let text = drawn(&p, 60, 30);
+        assert!(text.contains("│ QOOPPRIVA\u{2026}-1 │"), "{text}");
     }
 
     /// A quiet card's top edge places its ages and a wide agent name by cells: no corner is
@@ -4116,10 +4516,11 @@ mod tests {
         let p = page();
         for (w, h) in [NEED, (200, 50)] {
             let text = drawn(&p, w, h);
-            for want in ["TODO", "DOING", "DONE", "QOOP-1", "qass", "select"] {
+            for want in ["todo 2", "doing 3", "done 1", "-1 ", "qass", "select"] {
                 assert!(text.contains(want), "{want} at {w}x{h}: {text}");
             }
         }
+        assert!(drawn(&p, 200, 50).contains("QOOP-1"));
         let text = drawn(&p, 200, 50);
         for want in [
             "board everywhere",
@@ -4129,8 +4530,8 @@ mod tests {
         ] {
             assert!(text.contains(want), "{want}: {text}");
         }
-        // A card's foot stays inside its card in the narrowest lane: the key and the state,
-        // the rest cut.
+        // A card's foot stays inside its card in the narrowest lane: the key whole, the word
+        // left out where it has no room, the title on its own row.
         let mut narrow = page();
         narrow.items.as_mut().unwrap()[0].key = "DEFAULT-12".into();
         let (w, h) = NEED;
@@ -4139,7 +4540,10 @@ mod tests {
         let (right, foot) = (2 + lw - 2 - 1, 2 + 1 + 2);
         assert_eq!(text[foot * w + right], '│');
         let row: String = text[foot * w..foot * w + right].iter().collect();
-        assert!(row.contains("DEFAUL") && row.contains(" no"), "{row}");
+        assert!(
+            row.contains("DEFAULT-12") && !row.contains("no agent"),
+            "{row}"
+        );
         let mut old = page();
         old.items = None;
         assert!(drawn(&old, 80, 20).contains("older than the board"));

@@ -980,25 +980,25 @@ pub struct View {
 /// words for the timing.
 fn next_words(s: &ScheduleInfo, ctx: &Ctx) -> (String, Role) {
     match (s.paused, s.next_at) {
-        (true, _) => ("paused".to_string(), Role::Faint),
-        (false, Some(at)) => (moment(at, ctx.now_unix, ctx.zone), Role::Working),
-        (false, None) => ("done".to_string(), Role::Faint),
+        (true, _) => ("paused".to_string(), Role::FaintText),
+        (false, Some(at)) => (moment(at, ctx.now_unix, ctx.zone), Role::WorkingText),
+        (false, None) => ("done".to_string(), Role::FaintText),
     }
 }
 
 /// How the last run went, `last started 09:00 → tab 12`, in the ink of its result.
 fn last_segs(s: &ScheduleInfo, ctx: &Ctx) -> Vec<Seg> {
-    let mut out = vec![seg(Role::Text, "   "), seg(Role::Faint, "last ")];
+    let mut out = vec![seg(Role::Text, "   "), seg(Role::FaintText, "last ")];
     let Some(result) = s.last_result.as_deref() else {
-        out.push(seg(Role::Faint, "not run yet"));
+        out.push(seg(Role::FaintText, "not run yet"));
         return out;
     };
     let said = result.replacen(": ", ", ", 1);
     let (role, mark) = match result.split(':').next().unwrap_or_default() {
         "started" => (Role::Done, "\u{2713} "),
-        "claimed" => (Role::Working, ""),
+        "claimed" => (Role::WorkingText, ""),
         "skipped" => (Role::Sleeping, ""),
-        "failed" => (Role::Failed, ""),
+        "failed" => (Role::FailedText, ""),
         _ => (Role::Detail, ""),
     };
     let said = if said == "claimed" {
@@ -1064,7 +1064,7 @@ fn block(s: &ScheduleInfo, ctx: &Ctx, cw: usize, cols: &Cols, marked: bool) -> V
         seg(Role::Text, " ")
     };
     let (glyph_role, name_role) = match (s.paused, marked) {
-        (true, _) => (Role::Faint, Role::Faint),
+        (true, _) => (Role::FaintText, Role::FaintText),
         (false, true) => (Role::Working, Role::Focused),
         (false, false) => (Role::Working, Role::Text),
     };
@@ -1096,7 +1096,7 @@ fn block(s: &ScheduleInfo, ctx: &Ctx, cw: usize, cols: &Cols, marked: bool) -> V
 /// refusal, or the keys.
 fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
     if let Some(error) = pane.form.as_ref().and_then(|f| f.error.as_ref()) {
-        return vec![seg(Role::Failed, cut_dots(error, cw))];
+        return vec![seg(Role::FailedText, cut_dots(error, cw))];
     }
     if let Some(id) = pane.confirm
         && let Some(s) = pane.list.iter().find(|s| s.id == id)
@@ -1108,13 +1108,13 @@ fn bottom_line(pane: &Pane, cw: usize) -> Vec<Seg> {
         return vec![seg(Role::Detail, cut_dots(n, cw))];
     }
     let words = if pane.form.is_some() {
-        "tab next  \u{2190}\u{2192} pick  enter save  esc"
+        "tab next  \u{2190}\u{2192} pick  enter save  esc cancel"
     } else if pane.focus {
         "j k move  enter open  space pause  r run  x remove  + new"
     } else {
         "ctrl-a C focuses this"
     };
-    vec![seg(Role::Faint, cut_dots(&keys::named(words), cw))]
+    vec![seg(Role::FaintText, cut_dots(&keys::named(words), cw))]
 }
 
 /// `text` as its last `room` columns behind a `…`, so the letter being typed is on screen.
@@ -1157,7 +1157,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let title = if pane.form.is_some() {
         "new schedule"
     } else {
-        "on the clock"
+        "schedules"
     };
     let tag = (pane.form.is_none()).then_some("+ add");
     // Where the tag is, when the edge keeps it: before the last corner and a rule cell.
@@ -1181,10 +1181,10 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     } else if pane.unsupported {
         body.push(wrap(&[seg(Role::Detail, "restart qoop for schedules")]));
     } else if !pane.loaded {
-        body.push(wrap(&[seg(Role::Faint, "reading the schedules")]));
+        body.push(wrap(&[seg(Role::FaintText, "reading the schedules")]));
     } else if pane.list.is_empty() {
-        body.push(wrap(&[seg(Role::Detail, "Nothing on the clock.")]));
-        body.push(wrap(&[seg(Role::Faint, "+ adds one")]));
+        body.push(wrap(&[seg(Role::Detail, "Nothing scheduled.")]));
+        body.push(wrap(&[seg(Role::FaintText, "+ adds one")]));
     } else {
         let cols = cols_of(&pane.list, ctx, cw);
         let blocks: Vec<Vec<Vec<Seg>>> = pane
@@ -1247,7 +1247,7 @@ fn form_rows(
         let role = if form.field == field {
             Role::Focused
         } else {
-            Role::Faint
+            Role::FaintText
         };
         let text = format!("{text:<LABEL$}");
         if form.field == field {
@@ -1321,7 +1321,7 @@ fn form_rows(
         Field::Time,
     )];
     match (form.preset, form.field == Field::Time) {
-        (Preset::EveryTwoHours, _) => row.push(seg(Role::Faint, "on the hour")),
+        (Preset::EveryTwoHours, _) => row.push(seg(Role::FaintText, "on the hour")),
         (Preset::Custom, on) => {
             row.extend(typed(&form.cron, "m h dom mon dow", room, on, &caret));
         }
@@ -1355,14 +1355,14 @@ fn form_rows(
             0 => {
                 row.push(bold(Role::Text, name.clone()));
                 if on && n > 1 {
-                    row.push(seg(Role::Faint, "  \u{2039}"));
+                    row.push(seg(Role::FaintText, "  \u{2039}"));
                 }
             }
-            _ => row.push(seg(Role::Faint, format!(" {name}"))),
+            _ => row.push(seg(Role::FaintText, format!(" {name}"))),
         }
     }
     if on && n > 1 {
-        row.push(seg(Role::Faint, " \u{203a}"));
+        row.push(seg(Role::FaintText, " \u{203a}"));
     }
     field_row(out, targets, Field::Agent, row);
 
@@ -1390,7 +1390,7 @@ fn form_rows(
     // A watch has no first run: its first check notes what is there.
     let first = if form.preset == Preset::OnChange {
         vec![seg(
-            Role::Faint,
+            Role::FaintText,
             "checked every 5m; new lines start the agent",
         )]
     } else {
@@ -1399,11 +1399,11 @@ fn form_rows(
             .map(|t| first_run(&t, ctx.now_unix, ctx.zone))
         {
             Ok(Some(at)) => vec![
-                seg(Role::Faint, "first run "),
-                seg(Role::Working, moment(at, ctx.now_unix, ctx.zone)),
+                seg(Role::FaintText, "first run "),
+                seg(Role::WorkingText, moment(at, ctx.now_unix, ctx.zone)),
             ],
-            Ok(None) => vec![seg(Role::Faint, "first run never")],
-            Err(_) => vec![seg(Role::Faint, "first run after the time is set")],
+            Ok(None) => vec![seg(Role::FaintText, "first run never")],
+            Err(_) => vec![seg(Role::FaintText, "first run after the time is set")],
         }
     };
     out.push(wrap(&first));
@@ -1414,7 +1414,7 @@ fn form_rows(
 fn typed(text: &str, hint: &str, room: usize, on: bool, caret: &impl Fn(bool) -> Seg) -> Vec<Seg> {
     let room = room.saturating_sub(usize::from(on));
     if text.is_empty() {
-        return vec![caret(on), seg(Role::Faint, cut_dots(hint, room))];
+        return vec![caret(on), seg(Role::FaintText, cut_dots(hint, room))];
     }
     vec![seg(Role::Text, tail(text, room)), caret(on)]
 }
@@ -1759,7 +1759,7 @@ mod tests {
         let rows = painted(&pane(vec![ran, skipped, paused]), 60, 12);
         let text = rows.join("\n");
         assert!(
-            rows[0].contains("on the clock") && rows[0].contains("+ add"),
+            rows[0].contains("schedules") && rows[0].contains("+ add"),
             "{text}"
         );
         assert!(
@@ -1851,7 +1851,7 @@ mod tests {
         assert!(p.shown());
         let text = painted(&p, 40, 6).join("\n");
         assert!(
-            text.contains("Nothing on the clock.") && text.contains("+ adds one"),
+            text.contains("Nothing scheduled.") && text.contains("+ adds one"),
             "{text}"
         );
         // Letting go of the keyboard puts an empty panel away.

@@ -23,7 +23,7 @@ use crate::page::{self, Key, Player, Screen, Session, bold, ink, raised, raised_
 pub const NEED: (usize, usize) = (100, 30);
 /// The smallest window the page is drawn in: below `NEED` the pet column folds away and the
 /// settings take the width (a tab beside the sidebar is often 91 x 34).
-pub const MIN: (usize, usize) = (64, 16);
+pub const MIN: (usize, usize) = (60, 16);
 /// Where the pet column ends and the settings begin.
 const DIV: usize = 40;
 const CHIPS: [&str; 6] = ["all", "sound", "look", "agents", "computers", "phones"];
@@ -631,7 +631,7 @@ impl Page {
             );
             s.put(12, y, &format!("‹ {value} ›"), &value_ink);
         }
-        s.put(4, 23, "ctrl-r a random pet", &ink(Role::Faint));
+        s.put(4, 23, "ctrl-r a random pet", &ink(Role::FaintText));
         for y in 1..h - 2 {
             s.put(DIV, y, "│", &ink(Role::Rule));
         }
@@ -647,7 +647,7 @@ impl Page {
         let mut x = s.put(x0, 1, "/ ", &ink(Role::Title));
         if self.query.is_empty() {
             x = s.put(x, 1, "▏", &ink(Role::Brand));
-            s.put(x, 1, "search", &ink(Role::Faint));
+            s.put(x, 1, "search", &ink(Role::FaintText));
         } else {
             // A search longer than the room before the chips shows its end.
             let room = cx.saturating_sub(x + 3);
@@ -664,7 +664,7 @@ impl Page {
                 &if i == self.chip {
                     bold(Role::Focused)
                 } else {
-                    ink(Role::Faint)
+                    ink(Role::FaintText)
                 },
             ) + 2;
         }
@@ -674,11 +674,11 @@ impl Page {
             x0,
             3,
             &format!("settings on {}", self.host),
-            &ink(Role::Faint),
+            &ink(Role::FaintText),
         );
         self.draw_list(s, x0, 4, h - 3, rw);
         if let Some(said) = &self.said {
-            s.put(x0, h - 2, said, &ink(Role::Faint));
+            s.put(x0, h - 2, said, &ink(Role::FaintText));
         }
         s.status_bar(&[
             ("type", "search"),
@@ -697,7 +697,7 @@ impl Page {
                 x,
                 y,
                 &format!("nothing matches \"{}\"", self.query),
-                &ink(Role::Faint),
+                &ink(Role::FaintText),
             );
             return;
         }
@@ -813,12 +813,12 @@ impl Page {
                                 &format!("{} ", column(&row.value, value_w)),
                                 paint(value_role, true),
                             ),
-                            (&help, paint(Role::Faint, false)),
+                            (&help, paint(Role::FaintText, false)),
                         ],
                     );
                 }
                 Line::Help(text) => {
-                    s.put(x + 4, yy, text, &ink(Role::Faint));
+                    s.put(x + 4, yy, text, &ink(Role::FaintText));
                 }
                 Line::Pick(items) => {
                     let mut xx = x + 4;
@@ -836,7 +836,7 @@ impl Page {
         }
         if lines.len() > room {
             let count = format!("{} of {}", self.sel + 1, rows.len());
-            s.put(x + w - count.len(), bottom, &count, &ink(Role::Faint));
+            s.put(x + w - count.len(), bottom, &count, &ink(Role::FaintText));
         }
     }
 
@@ -1136,7 +1136,7 @@ mod tests {
         out.lines().map(str::to_string).collect()
     }
 
-    /// From 130 x 38 down to 64 x 16 every size draws the settings; the pet only where it fits,
+    /// From 130 x 38 down to 60 x 16 every size draws the settings; the pet only where it fits,
     /// the selected row's long help whole under it, any other long help cut with "…".
     #[test]
     fn the_page_fits_every_size_from_the_smallest() {
@@ -1147,7 +1147,7 @@ mod tests {
             (99, 30),
             (91, 34),
             (70, 20),
-            (64, 16),
+            (60, 16),
         ] {
             let mut page = small_page(1);
             let lines = text(&mut page, w, h);
@@ -1171,9 +1171,9 @@ mod tests {
             );
         }
         assert!(
-            page::too_small(63, 16, MIN)
-                && page::too_small(64, 15, MIN)
-                && !page::too_small(64, 16, MIN)
+            page::too_small(59, 16, MIN)
+                && page::too_small(60, 15, MIN)
+                && !page::too_small(60, 16, MIN)
         );
     }
 
@@ -1182,11 +1182,11 @@ mod tests {
     #[test]
     fn the_selected_row_and_its_picker_stay_in_view() {
         let mut page = small_page(13);
-        let all = text(&mut page, 64, 16).join("\n");
+        let all = text(&mut page, 60, 16).join("\n");
         assert!(all.contains("key 11") && all.contains("ctrl-8"), "{all}");
         let mut page = small_page(5);
         page.all[5].help = "a long help for a row in the middle of the list, long enough to take four lines under it at this width, so the row, its help and its two picker lines are taller than half the room and a centred window would cut the picker off".to_string();
-        let all = text(&mut page, 64, 16).join("\n");
+        let all = text(&mut page, 60, 16).join("\n");
         assert!(all.contains("key 3") && all.contains("ctrl-8"), "{all}");
     }
 
@@ -1267,7 +1267,7 @@ mod tests {
     /// A search longer than its room shows its end and never writes over a chip.
     #[test]
     fn a_long_search_leaves_every_chip_whole() {
-        for (w, h) in [(100, 30), (64, 16)] {
+        for (w, h) in [(100, 30), (60, 16)] {
             let mut page = small_page(0);
             page.query = "a search typed far longer than the room before the chips".to_string();
             let line = text(&mut page, w, h)

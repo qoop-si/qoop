@@ -94,8 +94,8 @@ const STEPS: [Step; 8] = [
         also: &[
             "Notes never carry your files, names or projects:",
             "a fixed form of common words, shown to you first.",
-            "We recommend always: it sends by itself after your first yes.",
-            "ask: asks each time. never: sends nothing.",
+            "ask: asks each time. always: sends after your first yes.",
+            "never: sends nothing.",
             "Sent with your account so it can be limited; the note carries no account.",
         ],
     },
@@ -106,6 +106,8 @@ struct Onboard {
     row: usize,
     pet: Avatar,
     said: Option<String>,
+    /// Ctrl-C, ctrl-d or a lost terminal ended it: nothing more is asked or started.
+    stopped: bool,
 }
 
 impl Onboard {
@@ -147,7 +149,7 @@ impl Onboard {
             let (dot, dot_ink) = match i.cmp(&self.step) {
                 std::cmp::Ordering::Less => ("●", ink(Role::Done)),
                 std::cmp::Ordering::Equal => ("●", ink(Role::Brand)),
-                std::cmp::Ordering::Greater => ("○", ink(Role::Faint)),
+                std::cmp::Ordering::Greater => ("○", ink(Role::FaintText)),
             };
             s.put(x, 6, dot, &dot_ink);
             if i + 1 < STEPS.len() {
@@ -161,7 +163,7 @@ impl Onboard {
             let name_ink = match i.cmp(&self.step) {
                 std::cmp::Ordering::Equal => bold(Role::Focused),
                 std::cmp::Ordering::Less => ink(Role::Detail),
-                std::cmp::Ordering::Greater => ink(Role::Faint),
+                std::cmp::Ordering::Greater => ink(Role::FaintText),
             };
             s.put(x.saturating_sub(t.name.len() / 2), 7, t.name, &name_ink);
         }
@@ -172,11 +174,11 @@ impl Onboard {
         } else {
             let below = self.draw_rows(&mut s, cx, w, top + 3, rows);
             for (y, line) in (below..).zip(step.also) {
-                s.centre(cx, y, line, &ink(Role::Faint));
+                s.centre(cx, y, line, &ink(Role::FaintText));
             }
         }
         if let Some(said) = &self.said {
-            s.centre(cx, h - 2, said, &ink(Role::Faint));
+            s.centre(cx, h - 2, said, &ink(Role::FaintText));
         }
         let last = self.step + 1 == STEPS.len();
         let pet_step = step.groups.is_empty();
@@ -185,21 +187,21 @@ impl Onboard {
             h - 3,
             &[
                 ("←→", bold(Role::Focused)),
-                (" choose   ", ink(Role::Faint)),
+                (" choose   ", ink(Role::FaintText)),
                 (if pet_step { "ctrl-r" } else { "" }, bold(Role::Focused)),
                 (
                     if pet_step { " random pet   " } else { "" },
-                    ink(Role::Faint),
+                    ink(Role::FaintText),
                 ),
                 ("↑↓", bold(Role::Focused)),
-                (" row   ", ink(Role::Faint)),
+                (" row   ", ink(Role::FaintText)),
                 ("enter", bold(Role::Focused)),
                 (
                     if last { " done   " } else { " next step   " },
-                    ink(Role::Faint),
+                    ink(Role::FaintText),
                 ),
                 ("esc", bold(Role::Focused)),
-                (" finish", ink(Role::Faint)),
+                (" finish", ink(Role::FaintText)),
             ],
         );
         s.status_bar(&[
@@ -291,7 +293,7 @@ impl Onboard {
                         } else if current {
                             bold(Role::Focused)
                         } else {
-                            ink(Role::Faint)
+                            ink(Role::FaintText)
                         };
                         (format!(" {o}  "), esc)
                     })
@@ -302,7 +304,7 @@ impl Onboard {
                 y += 1;
             }
             if let Kind::Idle = row.kind {
-                s.centre(cx, y, &row.help, &ink(Role::Faint));
+                s.centre(cx, y, &row.help, &ink(Role::FaintText));
                 y += 1;
             }
             y += 1;
@@ -315,7 +317,11 @@ impl Onboard {
         let macos = cfg!(target_os = "macos");
         let pet_step = STEPS[self.step].groups.is_empty();
         match key {
-            Key::Esc | Key::Stop | Key::Char('q') => return false,
+            Key::Stop => {
+                self.stopped = true;
+                return false;
+            }
+            Key::Esc | Key::Char('q') => return false,
             Key::Enter | Key::Tab => {
                 if self.step + 1 == STEPS.len() {
                     return false;
@@ -435,6 +441,7 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         row: 0,
         pet: settings::the_pet(),
         said: None,
+        stopped: false,
     };
     // A pet chosen here is a pet picked: saved even when only enter is pressed.
     if avatar::load().is_none() {
@@ -458,6 +465,31 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         }
     }
     drop(session);
+    if let Some(code) = after_steps(onboard.stopped, phone, finish)? {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// What follows the steps. A stop (Ctrl-C, ctrl-d, a lost terminal) asks and starts nothing,
+/// says the next step and gives exit code 130; else `finish` signs in with `phone` and starts
+/// qass.
+fn after_steps(
+    stopped: bool,
+    phone: Option<Phone>,
+    finish: impl FnOnce(Option<Phone>) -> std::io::Result<()>,
+) -> std::io::Result<Option<i32>> {
+    if stopped {
+        // Never a panic on a terminal that is gone: the exit code still says it.
+        let _ = writeln!(std::io::stderr(), "{STOPPED}");
+        return Ok(Some(130));
+    }
+    finish(phone)?;
+    Ok(None)
+}
+
+/// The end of a finished onboarding: the usage notice, the sign-in, then qass.
+fn finish(phone: Option<Phone>) -> std::io::Result<()> {
     // What the usage counts are, before anything is counted (ADR-023).
     crate::telemetry::notice_once();
     if let Some(phone) = phone
@@ -526,6 +558,7 @@ fn yes(said: Option<&str>) -> bool {
 
 const SIGN_IN: &str = "Sign in so this computer shows on qoop.si/app and your phone? [Y/n] ";
 const LATER: &str = "later: qoop login";
+const STOPPED: &str = "onboarding stopped; run `qoop onboard` to finish";
 const GO_ON: &str = "Press enter to open qoop with qass. ";
 const NO_AGENT: &str =
     "qass runs on claude, codex, gemini or opencode; install one, then: qoop qass";
@@ -754,6 +787,7 @@ mod tests {
             row: 2,
             pet: settings::first_pet(),
             said: None,
+            stopped: false,
         };
         let mut player = Player::new();
         for step in 1..STEPS.len() {
@@ -763,6 +797,51 @@ mod tests {
         assert!(!o.key(Key::Enter, &mut player));
         o.key(Key::BackTab, &mut player);
         assert_eq!(o.step, STEPS.len() - 2);
+    }
+
+    /// A stop never reaches what follows the steps, with the phone part present too: no
+    /// sign-in, no qass, exit code 130; a finish goes on to them with the phone.
+    #[test]
+    fn a_stop_skips_the_sign_in_and_qass_even_with_the_phone_part() {
+        // The sign-in a finish does with the phone part, answered yes.
+        let finish = |phone: Option<Phone>| {
+            if let Some(phone) = phone {
+                sign_in(phone, Some("\n"));
+            }
+            Ok(())
+        };
+        assert_eq!(
+            after_steps(true, Some(signs_in), finish).unwrap(),
+            Some(130)
+        );
+        assert!(calls().is_empty(), "no sign-in after a stop");
+        assert_eq!(after_steps(false, Some(signs_in), finish).unwrap(), None);
+        assert_eq!(calls().len(), 1, "a finish signs in");
+    }
+
+    /// Ctrl-C (and ctrl-d) stops onboarding where it is: the run then prints the next step and
+    /// exits 130, never walking on into the sign-in and qass. Esc and `q` finish it as before.
+    #[test]
+    fn ctrl_c_stops_onboarding_and_esc_finishes_it() {
+        let mut player = Player::new();
+        let typed = |bytes: &[u8]| page::decode(bytes).0[0];
+        for (key, stopped) in [
+            (typed(b"\x03"), true),
+            (typed(b"\x04"), true),
+            (Key::Esc, false),
+            (typed(b"q"), false),
+        ] {
+            let mut o = Onboard {
+                step: 1,
+                row: 0,
+                pet: settings::first_pet(),
+                said: None,
+                stopped: false,
+            };
+            assert!(!o.key(key, &mut player), "{key:?} ends it");
+            assert_eq!(o.stopped, stopped, "{key:?}");
+        }
+        assert!(STOPPED.contains("`qoop onboard`"));
     }
 
     /// The frame without its escapes, a row a line.
@@ -793,6 +872,7 @@ mod tests {
                     row: 0,
                     pet: settings::first_pet(),
                     said: None,
+                    stopped: false,
                 };
                 let frame = plain(&o.draw(w, h, &o.rows()).frame());
                 assert!(frame.contains(each.what), "{w}x{h} step {step}");
@@ -839,6 +919,7 @@ mod tests {
                         row,
                         pet: settings::first_pet(),
                         said: None,
+                        stopped: false,
                     };
                     let frame = plain(&o.draw(w, h, &rows).frame());
                     let at = format!("{w}x{h} row {row} at {now}:\n{frame}");

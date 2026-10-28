@@ -233,7 +233,7 @@ impl Page {
             Life::Running => ("running", Role::Working),
             Life::Asleep => ("asleep", Role::Sleeping),
             Life::NotStarted if self.facts.blocker.is_some() => ("not set up", Role::Blocked),
-            Life::NotStarted => ("not started", Role::Faint),
+            Life::NotStarted => ("not started", Role::FaintText),
         }
     }
 
@@ -315,7 +315,7 @@ impl Page {
             x0 + 5,
             1,
             "the assistant over your agents",
-            &ink(Role::Faint),
+            &ink(Role::FaintText),
         );
         s.put(x0, 2, &"─".repeat(rw), &ink(Role::Rule));
         let items = self.items();
@@ -397,11 +397,11 @@ impl Page {
         // its own, and qass never wakes by itself.
         y += 2;
         for line in wrap(SLEEP_NOTE, rw - 2) {
-            s.put(x0 + 2, y, &line, &ink(Role::Faint));
+            s.put(x0 + 2, y, &line, &ink(Role::FaintText));
             y += 1;
         }
         if let Some(said) = &self.said {
-            s.put(x0, h - 2, said, &ink(Role::Faint));
+            s.put(x0, h - 2, said, &ink(Role::FaintText));
         }
         s.status_bar(&[
             ("↑↓", "row"),
@@ -462,7 +462,7 @@ fn row(
             (if on { "▸ " } else { "  " }, paint(Role::Brand, false)),
             (&format!("{label:<18}"), paint(Role::Text, on)),
             (&format!("{value:<vw$}"), paint(value_role, true)),
-            (&help, paint(Role::Faint, false)),
+            (&help, paint(Role::FaintText, false)),
         ],
     );
 }

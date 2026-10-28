@@ -26,6 +26,10 @@ const NEW: &str = " + ";
 /// terminal off the bar.
 const MAX_LABEL: usize = 12;
 
+/// The most a label takes when the bar has the room: spare room goes to names before any is
+/// cut, to the widest cap at which every tab of the space still fits.
+const ROOMY_LABEL: usize = 32;
+
 /// Rows the bar takes: the tabs' names, and under each the folder it runs in.
 pub const ROWS: usize = 2;
 
@@ -153,7 +157,22 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
     // on it. Never wider than the bar.
     let margin = cols.min(1);
     let budget = cols.saturating_sub(margin + crate::width::width(NEW));
-    let (first, end, counted) = drawn(terminals, focused, budget);
+    // The spare room goes to the names: the widest cap (to a point) at which every tab still
+    // fits, else the plain cap.
+    let fits = |max: usize| {
+        terminals
+            .iter()
+            .enumerate()
+            .map(|(at, row)| tab(row, at + 1, false, max).wide)
+            .sum::<usize>()
+            .saturating_sub(GAP.len())
+            <= budget
+    };
+    let max = (MAX_LABEL..=ROOMY_LABEL)
+        .rev()
+        .find(|max| fits(*max))
+        .unwrap_or(MAX_LABEL);
+    let (first, end, counted) = drawn(terminals, focused, budget, max);
     let [lead, trail] = if counted {
         counts(terminals.len(), (first, end))
     } else {
@@ -163,7 +182,7 @@ fn segments(terminals: &[AgentRow], focused: u32, cols: usize) -> Vec<Segment> {
     out.push(quiet(" ".repeat(margin)));
     out.extend(lead.map(quiet));
     for (at, row) in terminals.iter().enumerate().take(end).skip(first) {
-        out.push(tab(row, at + 1, row.terminal == focused));
+        out.push(tab(row, at + 1, row.terminal == focused, max));
     }
     // The last tab drawn needs no gap: the new tab button brings its own space.
     if let Some(last) = out.last_mut().filter(|seg| seg.hit.is_some()) {
@@ -210,8 +229,8 @@ fn quiet(text: String) -> Segment {
 /// reads as a space with fewer terminals in it. The counts take their columns from the tabs,
 /// and give them back when the focused tab would no longer fit beside them: which tab has the
 /// keyboard is the one thing the bar never stops saying.
-fn drawn(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize, bool) {
-    let plain = fitting(terminals, focused, budget);
+fn drawn(terminals: &[AgentRow], focused: u32, budget: usize, max: usize) -> (usize, usize, bool) {
+    let plain = fitting(terminals, focused, budget, max);
     if plain == (0, terminals.len()) {
         return (plain.0, plain.1, false);
     }
@@ -227,7 +246,7 @@ fn drawn(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize, 
     // two counts never take more than a few.
     let mut kept = marks(plain);
     let counted = loop {
-        let run = fitting(terminals, focused, budget.saturating_sub(kept));
+        let run = fitting(terminals, focused, budget.saturating_sub(kept), max);
         if marks(run) <= kept {
             break run;
         }
@@ -256,12 +275,12 @@ fn counts(len: usize, (first, end): (usize, usize)) -> [Option<String>; 2] {
 
 /// The run of tabs that fits in `budget` columns, as `first..end`: from where [`scrolled`]
 /// starts it, as many as fit.
-fn fitting(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize) {
-    let first = scrolled(terminals, focused, budget);
+fn fitting(terminals: &[AgentRow], focused: u32, budget: usize, max: usize) -> (usize, usize) {
+    let first = scrolled(terminals, focused, budget, max);
     let mut used = 0;
     let mut end = first;
     for (at, row) in terminals.iter().enumerate().skip(first) {
-        let wide = tab(row, at + 1, false).wide;
+        let wide = tab(row, at + 1, false, max).wide;
         // The gap only counts once another tab follows it.
         if used + wide - GAP.len() > budget {
             break;
@@ -277,7 +296,7 @@ fn fitting(terminals: &[AgentRow], focused: u32, budget: usize) -> (usize, usize
 /// Zero until the focused tab does not fit, then the least it takes to bring it back. Least,
 /// so the bar moves by one tab when the focus moves by one tab rather than jumping the
 /// focused tab to the left edge, which is a whole bar of new labels for one keystroke.
-fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
+fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize, max: usize) -> usize {
     let Some(at) = terminals.iter().position(|r| r.terminal == focused) else {
         return 0;
     };
@@ -286,7 +305,7 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
         let fits = terminals[first..=at]
             .iter()
             .enumerate()
-            .map(|(i, row)| tab(row, first + i + 1, false).wide)
+            .map(|(i, row)| tab(row, first + i + 1, false, max).wide)
             .sum::<usize>()
             - GAP.len()
             <= budget;
@@ -309,10 +328,14 @@ fn scrolled(terminals: &[AgentRow], focused: u32, budget: usize) -> usize {
 /// Only the inks and the close differ between a focused tab and the same tab unfocused,
 /// never a width. The label sets the width and the folder is cut to it: a folder wider than
 /// its name made every tab twenty one columns, and three of eight fitted at 120 columns.
-fn tab(row: &AgentRow, position: usize, focused: bool) -> Segment {
-    let name = format!(" {}", label(row, position));
-    // Two blank columns at least between the name and the close, one after the folder.
-    let inner = crate::width::width(&name) + 3;
+fn tab(row: &AgentRow, position: usize, focused: bool, max: usize) -> Segment {
+    let name = format!(" {}", label(row, position, max));
+    // Two blank columns at least between the name and the close, one after the folder. While
+    // every tab fits with room to spare, the folder takes it too, to the same cap as the name.
+    let mut inner = crate::width::width(&name) + 3;
+    if max > MAX_LABEL {
+        inner = inner.max(crate::width::width(&folder(row, max)) + 2);
+    }
     let path = format!(" {}", folder(row, inner - 2));
     let pad =
         |text: &str, to: usize| format!("{text}{}", " ".repeat(to - crate::width::width(text)));
@@ -396,7 +419,11 @@ fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
         used += wide;
         end.insert(0, c);
     }
-    format!("\u{2026}{end}")
+    // At a separator when the end holds one, so no folder name is cut mid-word.
+    match end.find('/') {
+        Some(at) if at > 0 => format!("\u{2026}{}", &end[at..]),
+        _ => format!("\u{2026}{end}"),
+    }
 }
 
 /// What a tab is called: its place on this bar, and its name ([`called`]) when it has one.
@@ -412,11 +439,17 @@ fn path_of(cwd: Option<&str>, home: Option<&str>, max: usize) -> String {
 /// is labelled with a number nobody typed. Places also stay within one digit, which the
 /// terminal numbers stop doing after the ninth terminal of the day.
 ///
-/// No state mark: the agents panel beside the bar already says what each one is doing.
-fn label(row: &AgentRow, position: usize) -> String {
+/// One state mark only: a sleeping tab says so (the moon, or `z` without icons) besides its
+/// quiet ink, which colour alone would not; the agents panel says the rest.
+fn label(row: &AgentRow, position: usize, max: usize) -> String {
+    let asleep = match (row.state == "sleeping", crate::icons::on()) {
+        (false, _) => String::new(),
+        (true, true) => format!("{} ", crate::icons::ASLEEP),
+        (true, false) => "z ".to_string(),
+    };
     match called(row) {
-        Some(name) => clip(&format!("{position} {name}")),
-        None => clip(&format!("{position}")),
+        Some(name) => clip(&format!("{position} {asleep}{name}"), max),
+        None => clip(format!("{position} {asleep}").trim_end(), max),
     }
 }
 
@@ -446,9 +479,9 @@ pub(crate) fn program(row: &AgentRow) -> Option<&str> {
     )
 }
 
-/// Cut a label to at most [`MAX_LABEL`] columns.
-fn clip(text: &str) -> String {
-    crate::width::fit(text, MAX_LABEL.min(crate::width::width(text)))
+/// Cut a label to at most `max` columns.
+fn clip(text: &str, max: usize) -> String {
+    crate::width::fit(text, max.min(crate::width::width(text)))
 }
 
 #[cfg(test)]
@@ -660,9 +693,9 @@ mod tests {
         assert_eq!(hit(&rows, 3, 60, corner, 1), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 0), Some(Hit::Terminal(3)));
         assert_eq!(hit(&rows, 3, 60, name, 1), Some(Hit::Terminal(3)));
-        // Cut to the name above it, keeping its end.
+        // Under the name above it, whole while every tab fits.
         let folder = under
-            .find("\u{2026}app-feat-x")
+            .find("/srv/app-feat-x")
             .expect("no path under the tab");
         assert_eq!(crate::width::width(&under[..folder]), name, "{under:?}");
         // No other tab carries a close.
@@ -736,12 +769,53 @@ mod tests {
         assert_eq!(crate::width::width(&long), MAX_PATH);
     }
 
+    /// A folder cut to its tab gives way at a separator, never mid-name.
+    #[test]
+    fn a_cut_folder_gives_way_at_a_separator() {
+        let home = Some("/Users/me");
+        let cut = path_of(Some("/Users/me/coding/qoop/qoop-private"), home, 16);
+        assert_eq!(cut, "\u{2026}/qoop-private");
+        // One name longer than the room is cut, there is no separator to give way at.
+        assert_eq!(path_of(Some("/x/abcdefghij"), None, 6), "\u{2026}fghij");
+    }
+
+    /// Spare room goes to names: on a wide bar a long name reads whole, on a narrow one it is
+    /// cut to the plain cap; a sleeping tab carries its mark, not its ink alone.
+    #[test]
+    fn names_take_the_spare_room_and_a_sleeping_tab_says_so() {
+        let long = "mobile-release-build";
+        let rows = vec![agent(1, long), agent(2, "codex")];
+        assert!(render(&rows, 1, 200).text.contains(&format!("1 {long}")));
+        assert!(!render(&rows, 1, 40).text.contains(long));
+        let mut asleep = agent(3, "simulator");
+        asleep.state = "sleeping".into();
+        assert!(render(&[asleep], 0, 80).text.contains("1 z simulator"));
+        // Room for some of it, not all: the names share it before any is cut to the plain cap.
+        let rows = vec![agent(1, "rail-preview-long"), agent(2, "release-build-x")];
+        let bar = render(&rows, 1, 60).text;
+        assert!(
+            bar.contains("1 rail-preview-long") && bar.contains("2 release-build-x"),
+            "{bar}"
+        );
+        // A short name with a long folder: the folder takes the spare room too.
+        let mut short = agent(4, "expo");
+        short.cwd = Some("/work/mobile-app/apps/expo-dock".into());
+        let [_, wide] = rows_of(std::slice::from_ref(&short), 0, 200);
+        assert!(wide.contains("/work/mobile-app/apps/expo-dock"), "{wide}");
+        let crowd = [short, agent(5, &"x".repeat(30)), agent(6, &"y".repeat(30))];
+        let [_, tight] = rows_of(&crowd, 0, 40);
+        assert!(
+            tight.contains("dock") && !tight.contains("expo-dock"),
+            "{tight}"
+        );
+    }
+
     #[test]
     fn a_long_program_name_cannot_push_every_other_tab_off_the_bar() {
         let rows = vec![agent(1, &"z".repeat(40)), agent(2, "codex")];
         let line = render(&rows, 1, 40);
         assert!(line.text.contains("codex"), "{:?}", line.text);
-        assert!(!line.text.contains(&"z".repeat(MAX_LABEL + 1)));
+        assert!(!line.text.contains(&"z".repeat(30)), "{:?}", line.text);
     }
 
     #[test]
@@ -756,7 +830,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter_map(|(at, r)| {
-                    let byte = text.find(&format!("\u{256d} {} ", label(r, at + 1)))?;
+                    let byte = text.find(&format!("\u{256d} {} ", label(r, at + 1, MAX_LABEL)))?;
                     Some((crate::width::width(&text[..byte]), r.terminal))
                 })
                 .collect();

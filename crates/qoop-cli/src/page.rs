@@ -646,18 +646,24 @@ fn notice(say: &str, w: usize, h: usize) -> String {
 /// pane in a qoop terminal, else the window) and the page's own key that leaves it (`leave`).
 pub fn show(screen: &Screen, need: (usize, usize), leave: &str) -> std::io::Result<()> {
     let (w, h) = size();
+    let what = if qoop_runtime::legacy::var("QOOP_TERMINAL").is_ok() {
+        "this pane"
+    } else {
+        "the window"
+    };
+    let say = format!(
+        "make {what} at least {} x {} (it is {w} x {h}), {leave} leaves",
+        need.0, need.1
+    );
+    show_said(screen, need, &say)
+}
+
+/// [`show`] with its own words for a terminal smaller than `need`.
+pub fn show_said(screen: &Screen, need: (usize, usize), say: &str) -> std::io::Result<()> {
+    let (w, h) = size();
     let mut out = std::io::stdout();
     if too_small(w, h, need) {
-        let what = if qoop_runtime::legacy::var("QOOP_TERMINAL").is_ok() {
-            "this pane"
-        } else {
-            "the window"
-        };
-        let say = format!(
-            "make {what} at least {} x {} (it is {w} x {h}), {leave} leaves",
-            need.0, need.1
-        );
-        out.write_all(notice(&say, w, h).as_bytes())?;
+        out.write_all(notice(say, w, h).as_bytes())?;
     } else {
         out.write_all(screen.frame().as_bytes())?;
     }

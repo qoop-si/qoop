@@ -574,6 +574,12 @@ fn log_to_file(session: &std::path::Path) {
 
 /// Start the daemon if there is not one, then attach.
 fn run_client() -> std::io::Result<()> {
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return Err(std::io::Error::other(
+            "this needs a terminal; `qoop agents` and `qoop ls` print plain lists",
+        ));
+    }
     let focus = own_focus();
     let exe = own_path();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
@@ -3805,7 +3811,11 @@ mod tests {
     fn a_closed_interface_comes_back_only_when_a_daemon_answers() {
         let dir = tempfile::tempdir().expect("a directory");
         let socket = dir.path().join("qoop.sock");
-        let closed = || Err(std::io::Error::other(qoop_tui::run::DaemonClosed));
+        let closed = || {
+            Err(std::io::Error::other(qoop_tui::run::DaemonClosed(
+                Vec::new(),
+            )))
+        };
         let within = std::time::Duration::from_millis(300);
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
         assert!(super::moved(&closed(), &socket, within));

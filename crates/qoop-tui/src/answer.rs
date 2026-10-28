@@ -198,7 +198,7 @@ pub fn render(text: &str, width: usize) -> Vec<String> {
 
 fn faint() -> Ink {
     Ink {
-        role: Role::Faint,
+        role: Role::FaintText,
         ..PLAIN
     }
 }
