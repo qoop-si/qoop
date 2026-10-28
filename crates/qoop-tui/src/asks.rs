@@ -1398,7 +1398,11 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let joined = standing.join("; ");
     let most = inner_rows.saturating_sub(2).max(1);
     let mut said = wrap_dots(&joined, cw, usize::MAX);
-    if said.len() > most {
+    if pane.typing {
+        // The box he types in keeps its rows and its caret: what stands yields to one row,
+        // read whole with `m` once esc ends the typing.
+        said = wrap_dots(&joined, cw, 1);
+    } else if said.len() > most {
         // More than the room: as much as fits, and the key that reads it all.
         said = wrap_dots(&joined, cw, most.saturating_sub(1).max(1));
         said.push(cut_dots("m reads it whole", cw));
@@ -2127,6 +2131,37 @@ mod tests {
             assert!(seen.contains(&format!("w{n:03}")), "w{n:03}:\n{seen}");
         }
         assert!(seen.contains("busy"), "the later failure beside it");
+    }
+
+    /// At the smallest pane, a longest answer lost when its card ended yields its rows to the
+    /// box `t` opens on the next card: the box, its words and its caret stay on screen, so
+    /// enter never sends what he cannot see.
+    #[test]
+    fn a_long_lost_answer_never_hides_the_box_being_typed_in() {
+        let long: String = (1..=80)
+            .map(|n| format!("w{n:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut p = pane(2);
+        p.focus = true;
+        p.key(b"t", 1);
+        p.key(long.as_bytes(), 1);
+        p.key(b"\r", 1);
+        let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
+        else {
+            panic!("sent")
+        };
+        p.take(p.live[1..].to_vec(), Vec::new());
+        p.answered(&ControlResponse::Failed {
+            id,
+            reason: "closed".into(),
+        });
+        p.key(b"t", 1);
+        p.key(b"zq", 1);
+        let v = view(&p, &ctx(&[], &[]), 30, 14);
+        let t = text(&v);
+        assert!(v.cursor.is_some(), "the caret: {t}");
+        assert!(t.contains("zq\u{2588}") && t.contains("not sent"), "{t}");
     }
 
     /// The card read whole carries what it is about (asked, doing, why) and what each answer

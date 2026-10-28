@@ -2719,3 +2719,49 @@ fn the_icon_font_a_start_writes_is_drawn_from_the_next_start() {
         second.screen
     );
 }
+
+/// Under the floor the screen shows only how big it must be, so no key acts on what it
+/// hides: the keys that would open the naming box and confirm it make no terminal, and a
+/// detach still leaves.
+#[test]
+fn under_the_floor_keys_act_on_nothing_unseen_and_a_detach_still_leaves() {
+    let mut ui = Interface::start_impl_sized(false, 30, 10);
+    assert!(
+        ui.wait_for("(it is 30 x 10)", Duration::from_secs(20))
+            .is_some(),
+        "the window never said it was too small:\n{}",
+        ui.painted
+    );
+    ui.command(b'c');
+    let _ = ui.wait_for("never", Duration::from_millis(300));
+    ui.type_in(b"unseen");
+    let _ = ui.wait_for("never", Duration::from_millis(300));
+    ui.type_in(b"\r");
+    let _ = ui.wait_for("never", Duration::from_millis(1500));
+    let listed = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
+        .arg("ls")
+        .env("QOOP_RUNTIME_DIR", ui.runtime_dir())
+        .env("XDG_CONFIG_HOME", ui.runtime_dir().join("config"))
+        .env_remove("QOOP_SESSION")
+        .env_remove("QORO_SESSION")
+        .output()
+        .expect("qoop ls");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains(" 1 tab") && !listed.contains(" 2 tab"),
+        "keys under the floor made a terminal: {listed}"
+    );
+
+    ui.type_in(b"\x11");
+    let ended = Instant::now();
+    while ended.elapsed() < Duration::from_secs(20) {
+        if ui.child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        let _ = ui.wait_for("never", Duration::from_millis(100));
+    }
+    assert!(
+        ui.child.try_wait().ok().flatten().is_some(),
+        "ctrl-q under the floor did not detach"
+    );
+}

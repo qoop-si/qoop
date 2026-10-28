@@ -8075,6 +8075,9 @@ where
     // the CLI's `request_id` stays unique.
     let mut request = request_seed();
     let mut keys = Keys::with_prefix(state.config.prefix);
+    // Whether the last key came in under the floor: a prefix pressed there is forgotten on
+    // the way out, so a key typed after the window grows is never a command.
+    let mut under_floor = false;
     let mut connection = Connection::new();
     let mut inbuf = leftover;
     inbuf.reserve(256 * 1024);
@@ -8658,6 +8661,19 @@ where
                     // Ahead of the keystroke itself: a resize behind the input
                     // loses the race with the shell reading it.
                     drain_adopt_resize(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
+                    // Under the floor the screen shows no control, so no key acts on one
+                    // unseen (an enter in a rename would send it): every key is dropped and
+                    // what was typed stays as it was, but a detach still leaves.
+                    if state.cols < screen::FLOOR.0 || state.lines < screen::FLOOR.1 {
+                        if keys.feed(&bytes).contains(&Action::Detach) || bytes.contains(&crate::keys::DETACH) {
+                            return Ok(());
+                        }
+                        under_floor = true;
+                        continue;
+                    }
+                    if std::mem::take(&mut under_floor) {
+                        keys.clear_prefix();
+                    }
                     // Esc while a row is carried puts it back, and goes no further.
                     if bytes == b"\x1b" && state.row_press.is_some_and(|p| p.moved && !p.dead) {
                         drop_carry(&mut state);
