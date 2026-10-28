@@ -25152,7 +25152,8 @@ mod tests {
                 );
                 grid.into_iter()
                     .take(rows)
-                    .map(|row| row[..left].iter().collect::<String>())
+                    // Without the rule, which is also the panes' left side.
+                    .map(|row| row[..left - 1].iter().collect::<String>())
                     .collect::<Vec<_>>()
             };
             let base = sidebar(&state);
@@ -25220,8 +25221,9 @@ mod tests {
     }
 
     /// The sidebar's cells as a person's terminal shows them: per row, each cell's character after
-    /// the escape in force on it (written only where it changes), columns `0..left`, rows above
-    /// the status rows. Links and other strings are skipped; the version is masked, so a release
+    /// the escape in force on it (written only where it changes), columns `0..left - 1`, rows
+    /// above the status rows. The rule in the last column is left out: it is also the panes'
+    /// left side, joined to their lines and in the focused pane's ink. Links and other strings are skipped; the version is masked, so a release
     /// of the same length leaves the bytes alone.
     fn sidebar_bytes(painted: &str, cols: usize, lines: usize, left: usize) -> Vec<String> {
         let mut grid = vec![vec![(' ', String::new()); cols]; lines];
@@ -25267,7 +25269,7 @@ mod tests {
             .map(|row| {
                 let mut out = String::new();
                 let mut was = None;
-                for (ch, sgr) in &row[..left] {
+                for (ch, sgr) in &row[..left.saturating_sub(1)] {
                     if was != Some(sgr) {
                         out.push_str(&format!("<{sgr}>"));
                         was = Some(sgr);
@@ -25390,108 +25392,110 @@ mod tests {
     /// pinned to the bytes recorded at d4a3518 (origin/main before the 2026-10-27 overhaul) for
     /// qass's page and a terminal page, open and folded, at four sizes, dark, light and without
     /// colour. A palette change that reaches the sidebar fails here even when it moves every
-    /// frame alike, which the test above cannot see.
+    /// frame alike, which the test above cannot see. Its rule is left out since 2026-10-28, when
+    /// it became the panes' left side too; the hashes were taken again from the code before that
+    /// change, so they still pin the d4a3518 bytes of every other column.
     #[test]
     fn the_left_sidebar_keeps_the_bytes_it_had_at_d4a3518() {
         use crate::colorlevel::{Level, TEST_LEVEL};
         use crate::theme::TEST_LIGHT;
         const PINNED: &[(&str, u64)] = &[
-            ("qass 200x60 open dark", 0xd14ae38c4d135e2a),
-            ("qass 200x60 folded dark", 0x7e32e4c0c8764e5a),
-            ("qass 120x40 open dark", 0xd319d0cdffb804fa),
-            ("qass 120x40 folded dark", 0xff5df5cc4d9813ca),
-            ("qass 80x24 open dark", 0xe89464a1f54f8b4e),
-            ("qass 80x24 folded dark", 0xe93091a39416e00a),
-            ("qass 60x24 open dark", 0xb507640aa7643be2),
-            ("qass 60x24 folded dark", 0xe93091a39416e00a),
-            ("terminal 200x60 open dark", 0xe42256f32140ca32),
-            ("terminal 200x60 folded dark", 0x804d87b39324edc3),
-            ("terminal 120x40 open dark", 0xdbabb7307ea37242),
-            ("terminal 120x40 folded dark", 0xcd5dc865d57a4593),
-            ("terminal 80x24 open dark", 0x2fe3fbc39823124e),
-            ("terminal 80x24 folded dark", 0xedf9dd3862d7fa53),
-            ("terminal 60x24 open dark", 0x51f07e74fe960c9a),
-            ("terminal 60x24 folded dark", 0xedf9dd3862d7fa53),
-            ("agent picked 200x60 open dark", 0x51130f8de5bccef8),
-            ("agent picked 200x60 folded dark", 0x0ad6f8f56a8e123f),
-            ("agent picked 120x40 open dark", 0xd159716c0fd92dc8),
-            ("agent picked 120x40 folded dark", 0xdf943b80288c0b2f),
-            ("agent picked 80x24 open dark", 0x25adc1eed78c95a4),
-            ("agent picked 80x24 folded dark", 0x009e4014379c9d6f),
-            ("agent picked 60x24 open dark", 0xad6875748b2beb60),
-            ("agent picked 60x24 folded dark", 0x009e4014379c9d6f),
-            ("space picked 200x60 open dark", 0x2ff7d4c73cfada85),
-            ("space picked 200x60 folded dark", 0x88bd79e56fdb7296),
-            ("space picked 120x40 open dark", 0xc61e8fe5800c8bf5),
-            ("space picked 120x40 folded dark", 0xb3d5847548db9a66),
-            ("space picked 80x24 open dark", 0x9b7bbb2743afb0a0),
-            ("space picked 80x24 folded dark", 0xfe1299c648e81026),
-            ("space picked 60x24 open dark", 0x31c3cff495b1873c),
-            ("space picked 60x24 folded dark", 0xfe1299c648e81026),
-            ("qass 200x60 open light", 0x83709fb737228f32),
-            ("qass 200x60 folded light", 0x91f8a58f31ad8da2),
-            ("qass 120x40 open light", 0xbf23a0ef1fdb4e6a),
-            ("qass 120x40 folded light", 0x707372a3a2959b6a),
-            ("qass 80x24 open light", 0x79b99ab85e40522a),
-            ("qass 80x24 folded light", 0xf54459ff42ce7eca),
-            ("qass 60x24 open light", 0x4011e011cbc45dcf),
-            ("qass 60x24 folded light", 0xf54459ff42ce7eca),
-            ("terminal 200x60 open light", 0x2de42b03a17084ee),
-            ("terminal 200x60 folded light", 0x33031af13d51280d),
-            ("terminal 120x40 open light", 0x2a8510d0e3f9f026),
-            ("terminal 120x40 folded light", 0x2ad03196be1919e5),
-            ("terminal 80x24 open light", 0x83ddf428e03fb92e),
-            ("terminal 80x24 folded light", 0x03bf4295099c1185),
-            ("terminal 60x24 open light", 0xb78b746cae08cca3),
-            ("terminal 60x24 folded light", 0x03bf4295099c1185),
-            ("agent picked 200x60 open light", 0xd91b1b13b85b4f28),
-            ("agent picked 200x60 folded light", 0x06000e9ea0ca4ee1),
-            ("agent picked 120x40 open light", 0x2fbb14af4b919bf0),
-            ("agent picked 120x40 folded light", 0xaa339b4a56d953f9),
-            ("agent picked 80x24 open light", 0x9f184cba0ffa5b37),
-            ("agent picked 80x24 folded light", 0xa3ea6235f7b5a099),
-            ("agent picked 60x24 open light", 0xea3d6a2b0c89e474),
-            ("agent picked 60x24 folded light", 0xa3ea6235f7b5a099),
-            ("space picked 200x60 open light", 0x3aedeb5d0effdd5e),
-            ("space picked 200x60 folded light", 0xb10cfce2c3bef542),
-            ("space picked 120x40 open light", 0x010711225b4c98d6),
-            ("space picked 120x40 folded light", 0x36b143442e2e678a),
-            ("space picked 80x24 open light", 0xa7725fcac60cc2f2),
-            ("space picked 80x24 folded light", 0xdb8536903b37db6a),
-            ("space picked 60x24 open light", 0xdbbd03858a15dbb7),
-            ("space picked 60x24 folded light", 0xdb8536903b37db6a),
-            ("qass 200x60 open mono", 0xe9045e23946320bb),
-            ("qass 200x60 folded mono", 0x03177d21aee2b90c),
-            ("qass 120x40 open mono", 0x21c464b0558703bb),
-            ("qass 120x40 folded mono", 0xc2ae51400e76528c),
-            ("qass 80x24 open mono", 0x063f6bfa34365ad7),
-            ("qass 80x24 folded mono", 0x432bcd5eb399f08c),
-            ("qass 60x24 open mono", 0x36827b86c877bdc7),
-            ("qass 60x24 folded mono", 0x432bcd5eb399f08c),
-            ("terminal 200x60 open mono", 0xfe74b59175d09503),
-            ("terminal 200x60 folded mono", 0x581b29bea2514048),
-            ("terminal 120x40 open mono", 0x0a94e14a71d54283),
-            ("terminal 120x40 folded mono", 0xda4174c73d1b3028),
-            ("terminal 80x24 open mono", 0x674a97fba665a0cf),
-            ("terminal 80x24 folded mono", 0x7fe648bec37cd2a8),
-            ("terminal 60x24 open mono", 0x3a082831528a7c7f),
-            ("terminal 60x24 folded mono", 0x7fe648bec37cd2a8),
-            ("agent picked 200x60 open mono", 0xab921a5d5cdcea58),
-            ("agent picked 200x60 folded mono", 0x8bd8bd8a16dab4c0),
-            ("agent picked 120x40 open mono", 0xb50bf828e246eb58),
-            ("agent picked 120x40 folded mono", 0x7b55ebffc86fa820),
-            ("agent picked 80x24 open mono", 0xb07add0fc8cca643),
-            ("agent picked 80x24 folded mono", 0x66da94b7900d38a0),
-            ("agent picked 60x24 open mono", 0x43ea48ba9c8e4c33),
-            ("agent picked 60x24 folded mono", 0x66da94b7900d38a0),
-            ("space picked 200x60 open mono", 0x3d148362496601f2),
-            ("space picked 200x60 folded mono", 0xe61c31d13aca298e),
-            ("space picked 120x40 open mono", 0x65ddb6996c578912),
-            ("space picked 120x40 folded mono", 0x71295e74e8d1d9ae),
-            ("space picked 80x24 open mono", 0xad4ac5fa96ec9e95),
-            ("space picked 80x24 folded mono", 0xa3379e2a1cda1c2e),
-            ("space picked 60x24 open mono", 0x5f1a817243002965),
-            ("space picked 60x24 folded mono", 0xa3379e2a1cda1c2e),
+            ("qass 200x60 open dark", 0xef0ed9d59730da41),
+            ("qass 200x60 folded dark", 0x5c63fce590019b7d),
+            ("qass 120x40 open dark", 0xa7a5a163268efb75),
+            ("qass 120x40 folded dark", 0xb8819bd326634501),
+            ("qass 80x24 open dark", 0x381b86ff4a0ad7c5),
+            ("qass 80x24 folded dark", 0xe7ce5b51b3ba2c11),
+            ("qass 60x24 open dark", 0xa2bd82bd153450f1),
+            ("qass 60x24 folded dark", 0xe7ce5b51b3ba2c11),
+            ("terminal 200x60 open dark", 0x5cc96913a999e88f),
+            ("terminal 200x60 folded dark", 0x8ba592bd24d453b8),
+            ("terminal 120x40 open dark", 0x0474e679e30bd6c3),
+            ("terminal 120x40 folded dark", 0xf5f8876c8e0e6d94),
+            ("terminal 80x24 open dark", 0x5e97f36f930c6c27),
+            ("terminal 80x24 folded dark", 0x6a480b3714ea7124),
+            ("terminal 60x24 open dark", 0x6dcecb730d615eeb),
+            ("terminal 60x24 folded dark", 0x6a480b3714ea7124),
+            ("agent picked 200x60 open dark", 0x64d3c0affcbae5a9),
+            ("agent picked 200x60 folded dark", 0x8d6531bd9fb67418),
+            ("agent picked 120x40 open dark", 0x846868798620f5cd),
+            ("agent picked 120x40 folded dark", 0xecdde9f98d5e0f74),
+            ("agent picked 80x24 open dark", 0x63e7e106de896d69),
+            ("agent picked 80x24 folded dark", 0x91a55b02a39e2c84),
+            ("agent picked 60x24 open dark", 0x12d04c6ef745119d),
+            ("agent picked 60x24 folded dark", 0x91a55b02a39e2c84),
+            ("space picked 200x60 open dark", 0xba56123c813d0b6c),
+            ("space picked 200x60 folded dark", 0xfc99f80d50e88753),
+            ("space picked 120x40 open dark", 0x86d82630439d6768),
+            ("space picked 120x40 folded dark", 0xba166e8e16f56b27),
+            ("space picked 80x24 open dark", 0x8be52046afd82ea9),
+            ("space picked 80x24 folded dark", 0x015cc0c105b41377),
+            ("space picked 60x24 open dark", 0xe0363886cc97e17d),
+            ("space picked 60x24 folded dark", 0x015cc0c105b41377),
+            ("qass 200x60 open light", 0xc652b92b194fbcd1),
+            ("qass 200x60 folded light", 0x1d2020dcc648fc8f),
+            ("qass 120x40 open light", 0x7b1bf5430646086d),
+            ("qass 120x40 folded light", 0xe66c49ccec4ab8db),
+            ("qass 80x24 open light", 0xe82946a2349b8f8d),
+            ("qass 80x24 folded light", 0x00d64a2dea52b3eb),
+            ("qass 60x24 open light", 0x04238403e50d77b2),
+            ("qass 60x24 folded light", 0x00d64a2dea52b3eb),
+            ("terminal 200x60 open light", 0x8be4b1005627e9d7),
+            ("terminal 200x60 folded light", 0x31d4b2babfe93908),
+            ("terminal 120x40 open light", 0x29c8b8b972697a83),
+            ("terminal 120x40 folded light", 0x0ccce3e8da7523d4),
+            ("terminal 80x24 open light", 0x03adc64466b37b43),
+            ("terminal 80x24 folded light", 0x8a0faf03218351e4),
+            ("terminal 60x24 open light", 0x1243bfdd0b5b242c),
+            ("terminal 60x24 folded light", 0x8a0faf03218351e4),
+            ("agent picked 200x60 open light", 0x6f4b20abaf1efc45),
+            ("agent picked 200x60 folded light", 0xc99b486581a8c8cc),
+            ("agent picked 120x40 open light", 0x99b8f645208b0569),
+            ("agent picked 120x40 folded light", 0xbacda406c67c0a68),
+            ("agent picked 80x24 open light", 0xea7025215ac2cfee),
+            ("agent picked 80x24 folded light", 0x700467d267c1fb78),
+            ("agent picked 60x24 open light", 0x629f94721b86a213),
+            ("agent picked 60x24 folded light", 0x700467d267c1fb78),
+            ("space picked 200x60 open light", 0x60b5e2ce53fa8b2b),
+            ("space picked 200x60 folded light", 0x7c7cd2ebecd64a81),
+            ("space picked 120x40 open light", 0xb43a67b6447cb53f),
+            ("space picked 120x40 folded light", 0x096b50c0cb57e43d),
+            ("space picked 80x24 open light", 0xafd5027d21d94427),
+            ("space picked 80x24 folded light", 0x80ba3cc76ac764cd),
+            ("space picked 60x24 open light", 0x0c9c578e969eff50),
+            ("space picked 60x24 folded light", 0x80ba3cc76ac764cd),
+            ("qass 200x60 open mono", 0x7e2703494d301790),
+            ("qass 200x60 folded mono", 0x919634c62394fde7),
+            ("qass 120x40 open mono", 0x33d4306bdec58d20),
+            ("qass 120x40 folded mono", 0x03d75c6ef8ce33d7),
+            ("qass 80x24 open mono", 0x769ae4a7ddcdd520),
+            ("qass 80x24 folded mono", 0x215e5d58874fa097),
+            ("qass 60x24 open mono", 0x00abaa0b9afc0410),
+            ("qass 60x24 folded mono", 0x215e5d58874fa097),
+            ("terminal 200x60 open mono", 0x41678d860fba7df8),
+            ("terminal 200x60 folded mono", 0x7af61d9696861c5b),
+            ("terminal 120x40 open mono", 0x4c69f279d5385e08),
+            ("terminal 120x40 folded mono", 0xb82597383e9999ab),
+            ("terminal 80x24 open mono", 0x4788bc66f5b7dc38),
+            ("terminal 80x24 folded mono", 0xfea98da227c87feb),
+            ("terminal 60x24 open mono", 0xe8068280bdebbc68),
+            ("terminal 60x24 folded mono", 0xfea98da227c87feb),
+            ("agent picked 200x60 open mono", 0x1e32acf53cd88347),
+            ("agent picked 200x60 folded mono", 0x9a9152dd338edf33),
+            ("agent picked 120x40 open mono", 0xf28d15c004959eb7),
+            ("agent picked 120x40 folded mono", 0x9599a6e9f6f94043),
+            ("agent picked 80x24 open mono", 0x9bf1dc64dd9ae6ec),
+            ("agent picked 80x24 folded mono", 0xd9f4c883dea2c183),
+            ("agent picked 60x24 open mono", 0xdd988a848388f49c),
+            ("agent picked 60x24 folded mono", 0xd9f4c883dea2c183),
+            ("space picked 200x60 open mono", 0xf005b42794e4132f),
+            ("space picked 200x60 folded mono", 0xe0b93aaef4109dd7),
+            ("space picked 120x40 open mono", 0xab8111df5ac454df),
+            ("space picked 120x40 folded mono", 0x163f25aa224f5087),
+            ("space picked 80x24 open mono", 0x99a86cae38752d1c),
+            ("space picked 80x24 folded mono", 0x4bd4f41aaa6bae47),
+            ("space picked 60x24 open mono", 0x86f9be4131ddac2c),
+            ("space picked 60x24 folded mono", 0x4bd4f41aaa6bae47),
         ];
         let mut got = Vec::new();
         for (theme, light, level) in [
@@ -25744,6 +25748,39 @@ mod tests {
             assert_eq!(state.drawn(&state.layouts[&9]).root_split().unwrap().0, dir);
             assert_eq!(tile_of(&state, 5), qass);
             assert!(tile_of(&state, 4).cols >= crate::qass_screen::BOARD_MIN_COLS);
+        }
+    }
+
+    /// The column's rule is the left side of the panes beside it: one line, never two side by
+    /// side, joined where a pane's top and bottom lines meet it.
+    #[test]
+    fn the_column_rule_is_the_left_side_of_the_panes() {
+        let state = tiled_state();
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let (rule, first) = (left - 1, left);
+        let rows = screen::pane_size_for(
+            state.cols,
+            state.lines,
+            state.collapsed,
+            0,
+            state.sidebar_width,
+        )
+        .1;
+        let (top, bottom) = (screen::TABS, screen::TABS + rows as usize - 1);
+        assert_eq!(grid[top][rule], '\u{251c}', "the top line joins the rule");
+        assert_eq!(grid[top][first], '\u{2500}');
+        assert_eq!(
+            grid[bottom][rule], '\u{2534}',
+            "the bottom line joins the rule"
+        );
+        for (at, row) in grid.iter().enumerate().take(bottom).skip(top + 1) {
+            assert_eq!(row[rule], '\u{2502}', "row {at}");
+            assert_eq!(row[first], ' ', "no second line on row {at}");
         }
     }
 

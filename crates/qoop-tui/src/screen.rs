@@ -1307,6 +1307,11 @@ pub fn paint(frame: &Frame) -> String {
     // The lines around split panes, worked out once for the whole frame, and the park mark
     // against the focused corner when it stands there.
     let mut edges = edge_grid(frame, pane_cols as usize, pane_rows as usize);
+    let rule_side = if wide_enough {
+        take_left_side(&mut edges)
+    } else {
+        Vec::new()
+    };
     let park = park_spot(frame);
     if let Some((parked, ParkSpot::Corner(x, y, label))) = &park
         && let Some(row) = edges.get_mut(*y)
@@ -1475,12 +1480,25 @@ pub fn paint(frame: &Frame) -> String {
             let joins = panel
                 .get(row)
                 .is_some_and(|(line, _)| line.colour == Some(theme::Role::Rule));
+            // Beside the panes it is also their left side, in the ink of the pane it frames.
+            let side = (row + SIDEBAR_TOP - 1)
+                .checked_sub(TABS)
+                .and_then(|pane_row| rule_side.get(pane_row).copied().flatten());
+            let right = side.is_some_and(|(right, _)| right);
             // Its ends bend toward the column, the only part of it in ember.
             if row + 1 == column_rows {
                 out.push_str(&theme::fg(theme::Role::Brand));
-                out.push('\u{256f}');
+                out.push(if right { '\u{2534}' } else { '\u{256f}' });
             } else {
-                out.push(if joins { '\u{2524}' } else { '\u{2502}' });
+                if let Some((_, ink)) = side {
+                    out.push_str(&edge_style(ink));
+                }
+                out.push(match (joins, right) {
+                    (true, true) => '\u{253c}',
+                    (true, false) => '\u{2524}',
+                    (false, true) => '\u{251c}',
+                    (false, false) => '\u{2502}',
+                });
             }
             out.push_str(theme::RESET);
         }
@@ -3726,6 +3744,27 @@ fn rail_rows_of(frame: &Frame, rail: &RailPaint, fade: bool) -> Vec<String> {
             agent: c.body.handle.clone(),
         });
     crate::rail::rows(rail.rows, rail.w, &tabs, preview.as_ref(), fade)
+}
+
+/// The column's rule stands right beside the pane area's first column, where the panes' left
+/// side would draw a second line next to it. The rule takes that side over: the first column's
+/// side cells go blank and its corners and joints become the start of their line. Per area
+/// row: whether the rule there meets a line going right, and the ink of the side it stands for.
+fn take_left_side(edges: &mut [Vec<Option<(char, EdgeInk)>>]) -> Vec<Option<(bool, EdgeInk)>> {
+    edges
+        .iter_mut()
+        .map(|row| {
+            let cell = row.first_mut()?;
+            let (glyph, ink) = (*cell)?;
+            let right = match glyph {
+                '\u{2502}' => false,
+                '\u{256d}' | '\u{2570}' | '\u{251c}' => true,
+                _ => return None,
+            };
+            *cell = right.then_some(('\u{2500}', ink));
+            Some((right, ink))
+        })
+        .collect()
 }
 
 /// How a cell of the marks around split panes is painted.
