@@ -1204,6 +1204,12 @@ mod tests {
     }
 
     #[tokio::test]
+    // The hub here is plain http, which only a debug build posts to: in release the send fails
+    // before it connects, and the hub would wait on `accept` for ever.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "a release build posts over https only"
+    )]
     async fn only_a_204_deletes_a_sent_day_and_a_400_three_times_drops_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         for (status, kept_after_one) in [(204, false), (500, true), (429, true), (301, true)] {
@@ -1239,6 +1245,12 @@ mod tests {
 
     // Several threads: the test blocks on `accept` while the send runs beside it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The hub here is plain http, which only a debug build posts to: in release the send fails
+    // before it connects, and the hub would wait on `accept` for ever.
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "a release build posts over https only"
+    )]
     async fn an_off_during_a_send_stops_it_and_leaves_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A listener that never answers: the send hangs until it is cancelled.
