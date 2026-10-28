@@ -336,7 +336,11 @@ fn tab(row: &AgentRow, position: usize, focused: bool, max: usize) -> Segment {
     if max > MAX_LABEL {
         inner = inner.max(crate::width::width(&folder(row, max)) + 2);
     }
-    let path = format!(" {}", folder(row, inner - 2));
+    // Someone else at this tab says so where its folder goes, in the same columns.
+    let path = match presence(row, focused, crate::sidebar::now_unix()) {
+        Some(there) => format!(" {}", cut(&there, inner - 2)),
+        None => format!(" {}", folder(row, inner - 2)),
+    };
     let pad =
         |text: &str, to: usize| format!("{text}{}", " ".repeat(to - crate::width::width(text)));
     let (name_ink, mark_ink) = if focused {
@@ -370,6 +374,56 @@ fn tab(row: &AgentRow, position: usize, focused: bool, max: usize) -> Segment {
         close: focused.then_some(inner),
         hit: Some(Hit::Terminal(row.terminal)),
     }
+}
+
+/// How long a kind of client reads as typing after the last key the daemon told of.
+pub(crate) const TYPING_SECS: i64 = 10;
+
+/// Who else has this tab open, for its folder row, or `None` when only this interface does:
+/// every kind of client but this one, with "typing" after the kind a person typed from in the
+/// last [`TYPING_SECS`]. "phone typing", "browser, attach". This interface watches only the tab
+/// it shows (`shown`, the focused one), so only there is one `computer` its own.
+pub(crate) fn presence(row: &AgentRow, shown: bool, now_unix: i64) -> Option<String> {
+    let mut others = row.clients.clone();
+    if shown && let Some(me) = others.iter().position(|kind| kind == "computer") {
+        others.remove(me);
+    }
+    others.dedup();
+    if others.is_empty() {
+        return None;
+    }
+    let typing = row
+        .typed_by
+        .as_ref()
+        .filter(|typed| now_unix - typed.at < TYPING_SECS)
+        .map(|typed| typed.kind.as_str());
+    let words: Vec<String> = others
+        .iter()
+        .map(|kind| match typing {
+            Some(typing) if typing == kind => format!("{kind} typing"),
+            _ => kind.clone(),
+        })
+        .collect();
+    Some(words.join(", "))
+}
+
+/// When the soonest "typing" among these tabs ends, as unix seconds: it ends on its own, with
+/// nothing from the daemon to say so, so the loop wakes to repaint then.
+pub(crate) fn typing_ends(rows: &[AgentRow], now_unix: i64) -> Option<i64> {
+    rows.iter()
+        .filter_map(|r| r.typed_by.as_ref())
+        .map(|typed| typed.at.saturating_add(TYPING_SECS))
+        .filter(|end| *end > now_unix)
+        .min()
+}
+
+/// Words in at most `max` columns, their end given way to an ellipsis when they do not fit.
+fn cut(words: &str, max: usize) -> String {
+    if crate::width::width(words) <= max {
+        return words.to_string();
+    }
+    let kept = crate::width::text(words, max.saturating_sub(1));
+    format!("{}\u{2026}", kept.trim_end())
 }
 
 /// The folder a tab runs in, in at most `max` columns.
@@ -509,8 +563,48 @@ mod tests {
         }
     }
 
+    /// Who else is at a tab replaces its folder in the same columns; this interface is not
+    /// counted, and "typing" lasts ten seconds after the key the daemon told of.
+    #[test]
+    fn someone_else_at_a_tab_shows_where_its_folder_goes() {
+        let mut row = agent(1, "zsh");
+        row.cwd = Some("/tmp/work".into());
+        row.clients = vec!["computer".into()];
+        assert_eq!(presence(&row, true, 100), None, "only this interface");
+        assert_eq!(
+            presence(&row, false, 100).as_deref(),
+            Some("computer"),
+            "a tab this interface does not show is another computer's"
+        );
+        row.clients = vec!["computer".into(), "phone".into(), "attach".into()];
+        assert_eq!(presence(&row, true, 100).as_deref(), Some("phone, attach"));
+        row.typed_by = Some(qoop_runtime::control::TypedBy {
+            kind: "phone".into(),
+            at: 95,
+        });
+        assert_eq!(
+            presence(&row, true, 100).as_deref(),
+            Some("phone typing, attach")
+        );
+        assert_eq!(presence(&row, true, 105).as_deref(), Some("phone, attach"));
+        row.clients = vec!["computer".into(), "computer".into()];
+        assert_eq!(
+            presence(&row, true, 100).as_deref(),
+            Some("computer"),
+            "a second window"
+        );
+        let [_, folder_row] = rows_of(&[row], 1, 80);
+        assert!(folder_row.contains(" computer "), "{folder_row:?}");
+        assert!(!folder_row.contains("/tmp/work"), "{folder_row:?}");
+        assert_eq!(cut("phone typing", 7), "phone\u{2026}", "cut, and said so");
+        assert_eq!(cut("phone", 7), "phone");
+    }
+
     fn agent(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             keep_awake: false,
             qass_skip: false,
             parked: false,
@@ -543,6 +637,9 @@ mod tests {
 
     fn shell(terminal: u32) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             keep_awake: false,
             qass_skip: false,
             parked: false,

@@ -2466,6 +2466,42 @@ pub struct AgentRow {
     /// Absent when there is none, and from a daemon that predates tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskRef>,
+    /// The last command the shell here finished, as its own marks (OSC 133) told it. Absent
+    /// until one has, for a shell that sends none, and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandRow>,
+    /// Who has this terminal open now, one entry per connection: `computer` (an interface,
+    /// here or over a link), `phone`, `browser`, `attach` (`qoop attach`). A repeat is a
+    /// second window. Strings, so a kind a client does not know is shown as given. Empty from
+    /// a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clients: Vec<String>,
+    /// Which kind of client a person last typed from here, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_by: Option<TypedBy>,
+}
+
+/// A command a shell finished. Says nothing of what the command was: any program can print
+/// the marks, so they are trusted for timing only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRow {
+    /// Its exit status, when the shell said one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    pub millis: u64,
+    /// Unix seconds.
+    pub ended_at: i64,
+    /// An agent ran in this terminal while it did: the agent's own state says when it is
+    /// done, so the command's end is no news.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
+}
+
+/// The kind of client a person last typed from, and when (unix seconds).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedBy {
+    pub kind: String,
+    pub at: i64,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -3051,6 +3087,9 @@ mod tests {
         assert_eq!(new.slept_at_unix, Some(1_750_000_000));
         // Skipped on the wire when absent: live rows say nothing new.
         let live = AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             news: false,
             keep_awake: false,

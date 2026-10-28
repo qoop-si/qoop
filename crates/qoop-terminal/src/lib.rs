@@ -9,7 +9,7 @@ pub mod images;
 pub mod keyboard;
 
 pub use alacritty::{AlacrittyEngine, MAX_LINK_BYTES, MAX_LINK_LEN, MAX_LINKS, SCROLLBACK_ROWS};
-pub use control_string::{ControlStringFilter, MAX_CONTROL_STRING};
+pub use control_string::{ControlStringFilter, MAX_CONTROL_STRING, ShellMark};
 pub use engine::{
     Colour, Damage, Discards, LineDamage, Snapshot, Span, Style, TerminalEffect, TerminalEngine,
     TerminalModes,

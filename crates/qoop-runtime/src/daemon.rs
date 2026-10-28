@@ -309,6 +309,12 @@ pub struct Connection {
     observer: std::sync::atomic::AtomicBool,
     /// The link it said it is, so the next connection of that link can end this one.
     replaces: std::sync::OnceLock<String>,
+    /// What kind of client a person sees it as (`AgentRow::clients`), set on its welcome:
+    /// none for a program's connection, which never counts as someone there.
+    kind: std::sync::OnceLock<&'static str>,
+    /// The terminals it asked to watch (the default one only for `qoop attach`, the one
+    /// client that shows it): what presence counts.
+    watching: std::sync::Mutex<BTreeSet<u32>>,
 }
 
 impl ConnectionRegistry {
@@ -529,18 +535,67 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    /// Take a connection out, and say which terminals it held as news: their rows change.
+    /// Take a connection out, and say which terminals it held as news or watched as someone
+    /// there: their rows change.
     fn remove(&self, client: &ClientId) -> Vec<u32> {
         let mut inner = self.inner.lock().unwrap();
         let news = inner
             .iter()
             .filter(|c| &c.client == client)
-            .flat_map(|c| c.news.lock().unwrap().clone())
+            .flat_map(|c| {
+                let mut held = c.news.lock().unwrap().clone();
+                held.extend(c.watching.lock().unwrap().iter());
+                held
+            })
             .collect();
         inner.retain(|c| &c.client != client);
         drop(inner);
         self.changed.notify_one();
         news
+    }
+
+    /// Say what kind of client a connection is, once, on its welcome.
+    fn set_kind(&self, client: &ClientId, kind: &'static str) {
+        for c in self.inner.lock().unwrap().iter() {
+            if &c.client == client {
+                let _ = c.kind.set(kind);
+            }
+        }
+    }
+
+    /// A connection with a kind started (`on`) or stopped watching a terminal: whether that
+    /// changed who is there. A program's connection never counts.
+    fn watch(&self, client: &ClientId, terminal: u32, on: bool) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(connection) = inner
+            .iter()
+            .find(|c| &c.client == client && c.kind.get().is_some())
+        else {
+            return false;
+        };
+        let mut watching = connection.watching.lock().unwrap();
+        if on {
+            watching.insert(terminal)
+        } else {
+            watching.remove(&terminal)
+        }
+    }
+
+    /// The kinds of client watching a terminal, one per connection, sorted. `watchers` is that
+    /// terminal's own set for this life of it: a number handed out again starts with none, so
+    /// a connection that watched the old one and never said it stopped is not counted.
+    pub fn clients_of(&self, terminal: u32, watchers: &BTreeSet<ClientId>) -> Vec<String> {
+        let mut kinds: Vec<String> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| watchers.contains(&c.client))
+            .filter(|c| c.watching.lock().unwrap().contains(&terminal))
+            .filter_map(|c| c.kind.get().map(|kind| kind.to_string()))
+            .collect();
+        kinds.sort();
+        kinds
     }
 
     /// Replace what one connection counts as news, and say which terminals moved.
@@ -1269,6 +1324,11 @@ impl Daemon {
             Ok(None) => {}
             Err(e) => crate::say!("qoopd: no arecord for tabs: {e}"),
         }
+        // Before anything is restored, so a restored zsh or bash tab reports its commands too.
+        match write_shell_integration(dir) {
+            Ok(shell_dir) => *SHELL_INTEGRATION.lock().unwrap() = Some(shell_dir),
+            Err(e) => crate::say!("qoopd: no shell integration for tabs: {e}"),
+        }
 
         let warnings: Arc<std::sync::Mutex<Vec<Warning>>> = Arc::default();
 
@@ -1828,6 +1888,8 @@ impl Daemon {
                 welcomed: std::sync::atomic::AtomicBool::new(false),
                 observer: std::sync::atomic::AtomicBool::new(false),
                 replaces: std::sync::OnceLock::new(),
+                kind: std::sync::OnceLock::new(),
+                watching: std::sync::Mutex::default(),
             });
             let announce = self.agents.clone();
             if !admitted {
@@ -2418,6 +2480,26 @@ async fn serve_client(
         connections.mark_phone(&client);
         crate::telemetry::attach(None, None, true);
     }
+    // The kind of client a person sees: an interface here or over a link, the phone app on a
+    // phone or in a browser, and `qoop attach`. Every other client is a program.
+    let kind = if !matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_)) {
+        None
+    } else if hello.client_id == qoop_proto::INTERFACE_ID {
+        Some("computer")
+    } else if hello.client_name == crate::client::PHONE {
+        Some(if hello.client_id.starts_with("browser-") {
+            "browser"
+        } else {
+            "phone"
+        })
+    } else if hello.client_id == crate::client::ATTACH_ID {
+        Some("attach")
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
+        connections.set_kind(&client, kind);
+    }
     if matches!(outcome, qoop_proto::HandshakeOutcome::Welcome(_)) {
         let observer =
             hello.extra.get(crate::client::OBSERVER) == Some(&serde_json::Value::Bool(true));
@@ -2457,10 +2539,11 @@ async fn serve_client(
     let (blob_tx, mut blob_rx) = mpsc::channel::<BytesMut>(crate::tunnel::LANE);
     let tunnels = crate::tunnel::Tunnels::default();
     let phone = hello.client_name == crate::client::PHONE;
-    // A person's connection, decided once: the interface or the phone. Every `qoop-*` client
-    // (`qoop new` typing an agent's command, `qoop prompt`, `qoop send`) types for a program.
-    // What a person presses is what `qoop prompt` must not type over (`PersonAt`).
-    let person = hello.client_id == qoop_proto::INTERFACE_ID || phone;
+    // A person's connection, decided once: any client with a kind (the interface, the phone
+    // app, `qoop attach`), carrying it for `typed_by`. Every other `qoop-*` client (`qoop new`
+    // typing an agent's command, `qoop prompt`, `qoop send`) types for a program. What a
+    // person presses is what `qoop prompt` must not type over (`PersonAt`).
+    let person = kind;
     // Which history search of this connection may still run. Each one takes the next
     // number and stops at its next chunk once the number has moved on: a newer search from
     // the same person makes the older one moot, and a connection that is gone makes every
@@ -2482,6 +2565,11 @@ async fn serve_client(
             &client,
             first,
         );
+        // `qoop attach` shows the terminal it got by default; every other client asks for
+        // the ones it shows.
+        if kind == Some("attach") && connections.watch(&client, first, true) {
+            agents.announce_soon(first);
+        }
     }
 
     // News for this connection, on its own channel. One task per connection rather than a
@@ -2976,11 +3064,12 @@ async fn serve_client(
                         // another records the wait: the waiter is vetoed
                         // while the target is busy. Verified by
                         // `verify_waiter`; anything unverified is ignored.
-                        if person {
+                        if let Some(kind) = person {
                             agents.note_person(
                                 message.stream,
                                 &bytes,
                                 false,
+                                kind,
                                 crate::agents::now_unix(),
                             );
                         }
@@ -3005,11 +3094,12 @@ async fn serve_client(
                         rows,
                     },
                     ClientWire::Paste { bytes } => {
-                        if person {
+                        if let Some(kind) = person {
                             agents.note_person(
                                 message.stream,
                                 &bytes,
                                 true,
+                                kind,
                                 crate::agents::now_unix(),
                             );
                         }
@@ -5100,6 +5190,13 @@ async fn handle_control(
                         background: u32::try_from(background).unwrap_or(u32::MAX),
                         subagents: u32::try_from(subagents).unwrap_or(u32::MAX),
                         task: task_refs.remove(&terminal),
+                        command: agents.command(terminal),
+                        clients: terminals
+                            .get(terminal)
+                            .map(|handle| handle.watchers.lock().unwrap().clone())
+                            .map(|watchers| connections.clients_of(terminal, &watchers))
+                            .unwrap_or_default(),
+                        typed_by: agents.typed_by(terminal),
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals
@@ -5188,6 +5285,11 @@ async fn handle_control(
                 .into_iter()
                 .filter(|s| subscribe(terminals, subscriptions, renders, watched, client, *s))
                 .collect();
+            for terminal in &subscribed {
+                if connections.watch(client, *terminal, true) {
+                    agents.announce_soon(*terminal);
+                }
+            }
             ControlResponse::Subscribed {
                 id,
                 terminals: subscribed,
@@ -6022,6 +6124,12 @@ async fn handle_control(
                     s
                 })
                 .collect();
+            drop(held);
+            for terminal in &dropped {
+                if connections.watch(client, *terminal, false) {
+                    agents.announce_soon(*terminal);
+                }
+            }
             ControlResponse::Subscribed {
                 id,
                 terminals: dropped,
@@ -10677,6 +10785,63 @@ fn tab_path(bin: &Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsSt
     std::env::join_paths(dirs).ok()
 }
 
+/// The directory the shell integration files were written to (`write_shell_integration`).
+///
+/// Set again by every bind rather than once: one process binds one daemon in production, but a
+/// test binary binds many, each in a temporary directory that goes when its test ends, and a
+/// shell reads these files only as it starts, which for a test's first tab is inside the bind.
+static SHELL_INTEGRATION: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The startup files that make zsh and bash say where each command starts and ends (OSC 133
+/// C and D), embedded so the binary carries them and an update replaces them.
+const ZSH_INTEGRATION: &str = include_str!("../shell/zshenv");
+const BASH_INTEGRATION: &str = include_str!("../shell/qoop.bash");
+
+/// `<dir>/shell`, holding the zsh `.zshenv` and `qoop.bash`. Written again at every start, each
+/// through a rename, so a shell starting while a new daemon writes reads one whole version.
+fn write_shell_integration(dir: &Path) -> io::Result<PathBuf> {
+    let shell = dir.join("shell");
+    std::fs::create_dir_all(&shell)?;
+    for (name, text) in [
+        (".zshenv", ZSH_INTEGRATION),
+        ("qoop.bash", BASH_INTEGRATION),
+    ] {
+        let fresh = shell.join(format!(".{name}.{}", std::process::id()));
+        std::fs::write(&fresh, text)?;
+        std::fs::rename(&fresh, shell.join(name))?;
+    }
+    Ok(shell)
+}
+
+/// The arguments and environment that make a zsh or bash tab load the integration, ending
+/// with `-i`; any other shell gets `-i` alone. No file of the person's is edited.
+///
+/// zsh reads `.zshenv` from `ZDOTDIR`, so that points at ours, and `QOOP_ZDOTDIR` carries what
+/// it was for ours to put back before anything of the person's runs. bash takes `--rcfile`,
+/// which must come before `-i`: bash refuses to start with it after.
+///
+/// Only when the file is there: the runtime directory can sit in a temp folder the system
+/// cleans, and a zsh pointed at a `ZDOTDIR` that has gone would skip the person's `.zshrc`.
+/// Missing marks are the smaller loss.
+fn shell_integration(cmd: &mut std::process::Command, shell: &Path) {
+    let dir = SHELL_INTEGRATION.lock().unwrap().clone();
+    let name = shell.file_name().and_then(|n| n.to_str());
+    match (name, dir) {
+        (Some("zsh"), Some(dir)) if dir.join(".zshenv").is_file() => {
+            match std::env::var_os("ZDOTDIR") {
+                Some(own) => cmd.env("QOOP_ZDOTDIR", own),
+                None => cmd.env_remove("QOOP_ZDOTDIR"),
+            };
+            cmd.env("ZDOTDIR", dir);
+        }
+        (Some("bash"), Some(dir)) if dir.join("qoop.bash").is_file() => {
+            cmd.arg("--rcfile").arg(dir.join("qoop.bash"));
+        }
+        _ => {}
+    }
+    cmd.arg("-i");
+}
+
 /// Start a shell on a new pty: its master, the shell and the device of its slave.
 fn start_shell(
     shell: &Path,
@@ -10689,7 +10854,7 @@ fn start_shell(
     let slave_fd = pty.slave;
 
     let mut cmd = std::process::Command::new(shell);
-    cmd.arg("-i");
+    shell_integration(&mut cmd, shell);
     // SAFETY: the closure runs post-fork and calls only async-signal-safe syscalls, with no
     // allocation. setsid plus TIOCSCTTY is what gives the child its own session with this
     // pty as its controlling terminal, which is the containment identity teardown uses.
@@ -11379,6 +11544,9 @@ async fn terminal_task(
     let mut engine = AlacrittyEngine::new(seed.size.cols, seed.size.rows);
     // The engine's discards as last handed to the index.
     let mut discarded = qoop_terminal::Discards::default();
+    // A shell command is running and whether an agent runs it is not known yet: only then
+    // does a read look (`note_command_output`), so the ordinary read takes no lock for it.
+    let mut command_open = false;
     let mut buf = vec![0u8; 64 * 1024];
     let mut policy = SizePolicy::Unowned;
     // Writable clients refused a size while another owned the terminal, oldest first, with
@@ -11863,6 +12031,18 @@ async fn terminal_task(
                                 if let Some(handle) = terminals.get(stream) {
                                     *handle.discards.lock().unwrap() = now;
                                 }
+                            }
+                            // A shell's command marks, and while a command runs, whether an
+                            // agent is what it runs.
+                            for effect in &effects {
+                                if let qoop_terminal::TerminalEffect::Shell(mark) = effect {
+                                    agents.note_shell(stream, *mark, crate::agents::now_unix());
+                                    command_open =
+                                        matches!(mark, qoop_terminal::ShellMark::Started);
+                                }
+                            }
+                            if command_open {
+                                command_open = agents.note_command_output(stream);
                             }
                             for reply in replies(&effects) {
                                 // Replies have their own reserved budget: an application

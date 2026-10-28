@@ -470,6 +470,9 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -502,6 +505,9 @@ mod tests {
 
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,

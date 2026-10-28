@@ -1737,6 +1737,9 @@ mod tests {
 
     fn agent_row(terminal: u32) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,

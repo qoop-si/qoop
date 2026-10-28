@@ -14,6 +14,24 @@ you are typing in, or the terminal window running qoop has lost focus. It waits 
 again first, so an agent that flickers through a state does not ping you, and several
 agents finishing together make one notification.
 
+## Long commands in a shell tab
+
+A command that runs in a plain shell tab (no agent ran in it) and takes 30 seconds or more
+gets a note when it ends, if you cannot see that tab: it is not on screen in this window, or
+the terminal window running qoop is not focused. The note says `Command finished in <tab>`, or
+`Command failed (exit 3) in <tab>`. It follows the same `[notify]` switches and mute as an
+agent's, and it works for a tab on a remote machine too.
+
+To know where a command starts and ends, qoop makes new zsh and bash (4.4 or newer) tabs
+report it, without editing any of your files: zsh reads a qoop `.zshenv` that hands back your own
+`ZDOTDIR` and sources your `.zshenv` first, and bash starts through a qoop rc file that sources
+`~/.bashrc` first. fish 4 reports it by itself. The macOS `/bin/bash` (3.2) does not, so a
+command there gets no note. Only shells started after the update report it. Nothing but the
+timing and the exit status is read from what they report.
+
+To turn it off, put `export QOOP_SHELL_INTEGRATION=0` in `.zshrc` or `.bashrc`; it is read at
+each prompt.
+
 ## How it reaches the desktop
 
 qoop uses the fastest way the terminal you run it in understands:

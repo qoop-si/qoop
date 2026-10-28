@@ -233,6 +233,13 @@ pub struct AgentRegistry {
     /// nobody, so an index showed a command that had already finished. A registry that
     /// announces its own changes cannot have a path that forgets to.
     changes: tokio::sync::broadcast::Sender<u32>,
+    /// Terminals owed an [`Self::announce_soon`]: one second trailing window for all of them.
+    announce_due: Arc<Mutex<BTreeSet<u32>>>,
+    /// The command each shell is running and the last it finished (OSC 133).
+    commands: Mutex<BTreeMap<u32, ShellCommands>>,
+    /// Which kind of client a person last typed from in each terminal, when, and when that
+    /// was last news (unix seconds).
+    typed_by: Mutex<BTreeMap<u32, (&'static str, i64, i64)>>,
     /// Tasks, board items or a space goal changed: a board reads them again. Its own
     /// channel, because it is not about any terminal's row.
     tasks: tokio::sync::broadcast::Sender<()>,
@@ -308,6 +315,9 @@ pub struct AgentRegistry {
 pub const PERSON_SENT_SECS: i64 = 120;
 /// A person who typed and sent nothing (a draft, or an Esc and a thought) for this long.
 pub const PERSON_DRAFT_SECS: i64 = 180;
+/// How often the same kind of client typing on in a terminal is news again: under the ten
+/// seconds a client shows "typing" after the last news, so it never lapses mid burst.
+pub const TYPING_NEWS_SECS: i64 = 5;
 
 /// Whether input from a person's connection holds a key they pressed, not only what their
 /// terminal sent by itself. A read may hold several keys (an arrow and the text after it), so
@@ -470,20 +480,145 @@ impl AgentRegistry {
             return;
         }
         let (due, tasks) = (self.tasks_due.clone(), self.tasks.clone());
-        let send = move || {
+        after_window(move || {
             // Down first: a change after this send starts the next window.
             due.store(false, Ordering::SeqCst);
             let _ = tasks.send(());
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(async move {
-                    tokio::time::sleep(TASKS_WINDOW).await;
-                    send();
+        });
+    }
+
+    /// [`Self::announce`]'s news on the trailing edge of a one-second window, for changes a
+    /// program can make as fast as it likes (a shell's command marks): a terminal flooding them
+    /// costs every client one listing a second. What rides here moves neither a park nor a
+    /// board, so the window goes straight to the watchers.
+    pub fn announce_soon(&self, stream: u32) {
+        {
+            let mut due = self.announce_due.lock().unwrap();
+            let first = due.is_empty();
+            due.insert(stream);
+            if !first {
+                return;
+            }
+        }
+        let (due, changes) = (self.announce_due.clone(), self.changes.clone());
+        after_window(move || {
+            for stream in std::mem::take(&mut *due.lock().unwrap()) {
+                let _ = changes.send(stream);
+            }
+        });
+    }
+
+    /// A shell's command mark. A command's end is kept only after its start was seen: an
+    /// Enter on an empty line, or a command started before a restart, ends nothing.
+    pub fn note_shell(&self, stream: u32, mark: qoop_terminal::ShellMark, now_unix: i64) {
+        match mark {
+            qoop_terminal::ShellMark::Started => {
+                let generation = self.agent_generation(stream);
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .entry(stream)
+                    .or_default()
+                    .started = Some(Started {
+                    at: std::time::Instant::now(),
+                    generation,
+                    agent: false,
                 });
             }
-            Err(_) => send(),
+            qoop_terminal::ShellMark::Finished(exit) => {
+                let mut commands = self.commands.lock().unwrap();
+                let shell = commands.entry(stream).or_default();
+                let Some(started) = shell.started.take() else {
+                    return;
+                };
+                shell.last = Some(crate::control::CommandRow {
+                    exit,
+                    millis: u64::try_from(started.at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ended_at: now_unix,
+                    agent: started.agent,
+                });
+                drop(commands);
+                self.announce_soon(stream);
+            }
         }
+    }
+
+    /// While a command runs, whether an agent is what it runs: an agent typed into the shell
+    /// is the foreground neither when its command starts nor once it has ended, so this looks
+    /// on the output in between. Only an agent of a generation newer than the one at the
+    /// command's start counts, so one that just ended is not taken for the next command.
+    /// Whether to look again: the read loop calls this only while a command runs and it has
+    /// not yet answered no.
+    pub fn note_command_output(&self, stream: u32) -> bool {
+        let Some(since) = self
+            .commands
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .and_then(|shell| shell.started.as_ref())
+            .filter(|started| !started.agent)
+            .map(|started| started.generation)
+        else {
+            return false;
+        };
+        let agent = self
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .is_some_and(|a| {
+                matches!(
+                    a.identity,
+                    AgentIdentity::Known { agent: true, .. }
+                        | AgentIdentity::Unavailable {
+                            boundary: Boundary::Namespace { .. },
+                            ..
+                        }
+                ) && a.identity.generation() > since
+            });
+        if !agent {
+            return true;
+        }
+        if let Some(started) = self
+            .commands
+            .lock()
+            .unwrap()
+            .get_mut(&stream)
+            .and_then(|shell| shell.started.as_mut())
+        {
+            started.agent = true;
+        }
+        false
+    }
+
+    /// The generation of what runs in this terminal now, if anything was seen there.
+    fn agent_generation(&self, stream: u32) -> Option<GenerationId> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .and_then(|a| a.identity.generation())
+    }
+
+    /// Which kind of client a person last typed from here, and when.
+    pub fn typed_by(&self, stream: u32) -> Option<crate::control::TypedBy> {
+        self.typed_by
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map(|(kind, at, _)| crate::control::TypedBy {
+                kind: kind.to_string(),
+                at: *at,
+            })
+    }
+
+    /// The last command the shell here finished.
+    pub fn command(&self, stream: u32) -> Option<crate::control::CommandRow> {
+        self.commands
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .and_then(|shell| shell.last.clone())
     }
 
     fn unpark_if_answered(&self, stream: u32) {
@@ -657,8 +792,39 @@ fn subagents(agent: &TerminalAgent) -> usize {
     agent.subagents.len().max(agent.background_agents)
 }
 
+/// A shell's command in progress (when it started, and whether an agent was seen running in
+/// it) and the last one it finished.
+#[derive(Default)]
+struct ShellCommands {
+    started: Option<Started>,
+    last: Option<crate::control::CommandRow>,
+}
+
+/// A command running now: when it started, the generation of what ran in its terminal then,
+/// and whether an agent of a newer one has been seen running in it since.
+struct Started {
+    at: std::time::Instant,
+    generation: Option<GenerationId>,
+    agent: bool,
+}
+
 /// How long a board re-read waits for more changes before it goes out.
 pub const TASKS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Run `send` once [`TASKS_WINDOW`] has passed, on the runtime, or now when there is none
+/// (a test without one). The trailing edge of the windows above: what arrives inside one
+/// rides on the send already owed.
+fn after_window(send: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(async move {
+                tokio::time::sleep(TASKS_WINDOW).await;
+                send();
+            });
+        }
+        Err(_) => send(),
+    }
+}
 
 /// What an agent is doing, coarsely: the states a board words differently. A change between
 /// two of them is news to a board; a change inside one is not.
@@ -771,6 +937,9 @@ impl AgentRegistry {
             person_sent: Mutex::new(BTreeMap::new()),
             person_draft: Mutex::new(std::collections::BTreeSet::new()),
             changes: tokio::sync::broadcast::channel(64).0,
+            announce_due: Arc::new(Mutex::new(BTreeSet::new())),
+            commands: Mutex::new(BTreeMap::new()),
+            typed_by: Mutex::new(BTreeMap::new()),
             tasks: tokio::sync::broadcast::channel(16).0,
         })
     }
@@ -962,11 +1131,39 @@ impl AgentRegistry {
 
     /// Input from a person's own connection: a key they pressed stamps the draft clock, a line
     /// with a return the sent one. A paste is typed, never sent: its return waits for theirs.
-    pub fn note_person(&self, stream: u32, bytes: &[u8], paste: bool, now_unix: i64) {
+    ///
+    /// `kind` is the kind of client the keys came from (`AgentRow::typed_by`). A change of
+    /// kind is news at once; the same kind typing on is news again every [`TYPING_NEWS_SECS`],
+    /// so a client's "typing" never runs out while someone types, and keys are never news one
+    /// by one.
+    pub fn note_person(
+        &self,
+        stream: u32,
+        bytes: &[u8],
+        paste: bool,
+        kind: &'static str,
+        now_unix: i64,
+    ) {
         if !paste && !person_key(bytes) {
             return;
         }
         self.person_typed.lock().unwrap().insert(stream, now_unix);
+        let news = {
+            let mut typed = self.typed_by.lock().unwrap();
+            let was = typed.get(&stream).copied();
+            let news = was.is_none_or(|(was_kind, _, told)| {
+                was_kind != kind || now_unix - told >= TYPING_NEWS_SECS
+            });
+            let told = match was {
+                Some((_, _, told)) if !news => told,
+                _ => now_unix,
+            };
+            typed.insert(stream, (kind, now_unix, told));
+            news
+        };
+        if news {
+            self.announce_soon(stream);
+        }
         // A return, or Enter as a kitty key report (`ESC[13u`, `ESC[13;1u`), sends the line and
         // ends the draft; any key after the last one in the same read starts the next draft.
         let (mut sent, mut after) = (false, false);
@@ -1202,6 +1399,8 @@ impl AgentRegistry {
         self.person_typed.lock().unwrap().remove(&stream);
         self.person_sent.lock().unwrap().remove(&stream);
         self.person_draft.lock().unwrap().remove(&stream);
+        self.commands.lock().unwrap().remove(&stream);
+        self.typed_by.lock().unwrap().remove(&stream);
         self.drop_expectations_touching(stream);
         // A terminal that is gone is a change like any other. Closing one answers as soon
         // as the request is accepted, but the terminal itself lives until its teardown
@@ -1871,36 +2070,36 @@ mod tests {
     fn a_person_holds_a_tab_while_they_type_or_just_sent() {
         let r = registry();
         assert_eq!(r.person_until(4, NOW), None);
-        r.note_person(4, b"\x1b[<0;1;1M", false, NOW);
+        r.note_person(4, b"\x1b[<0;1;1M", false, "computer", NOW);
         assert_eq!(r.person_until(4, NOW), None, "a mouse report is nobody");
-        r.note_person(4, b"go on\r", false, NOW);
+        r.note_person(4, b"go on\r", false, "computer", NOW);
         assert_eq!(r.person_until(4, NOW + 10), Some(NOW + PERSON_SENT_SECS));
         assert_eq!(r.person_until(4, NOW + PERSON_SENT_SECS), None);
-        r.note_person(4, b"\x1b", false, NOW + 200);
+        r.note_person(4, b"\x1b", false, "computer", NOW + 200);
         assert_eq!(
             r.person_until(4, NOW + 210),
             Some(NOW + 200 + PERSON_DRAFT_SECS)
         );
-        r.note_person(4, b"ok\r", false, NOW + 230);
-        r.note_person(4, b"and th", false, NOW + 230);
+        r.note_person(4, b"ok\r", false, "computer", NOW + 230);
+        r.note_person(4, b"and th", false, "computer", NOW + 230);
         assert_eq!(
             r.person_until(4, NOW + 231),
             Some(NOW + 230 + PERSON_DRAFT_SECS),
             "a new draft in the second of a line is a draft"
         );
-        r.note_person(4, b"\x1b[13u\x1b[97u", false, NOW + 240);
+        r.note_person(4, b"\x1b[13u\x1b[97u", false, "computer", NOW + 240);
         assert_eq!(
             r.person_until(4, NOW + 241),
             Some(NOW + 240 + PERSON_DRAFT_SECS),
             "a key after a kitty Enter is a new draft"
         );
-        r.note_person(4, b"\x1b[13u", false, NOW + 250);
+        r.note_person(4, b"\x1b[13u", false, "computer", NOW + 250);
         assert_eq!(
             r.person_until(4, NOW + 251),
             Some(NOW + 250 + PERSON_SENT_SECS),
             "a kitty Enter sends"
         );
-        r.note_person(4, b"half a sente", true, NOW + 300);
+        r.note_person(4, b"half a sente", true, "computer", NOW + 300);
         assert_eq!(
             r.person_until(4, NOW + 301),
             Some(NOW + 300 + PERSON_DRAFT_SECS),
@@ -2489,10 +2688,10 @@ mod tests {
     fn input_is_a_persons_key_or_line_and_a_kitty_enter_sends() {
         let r = registry();
         assert_eq!(r.input_at(1), None, "nothing typed: a scheduled wake");
-        r.note_person(1, b"\x1b[I", false, 5);
-        r.note_person(1, b"\x1b[<35;10;5M", false, 5);
+        r.note_person(1, b"\x1b[I", false, "computer", 5);
+        r.note_person(1, b"\x1b[<35;10;5M", false, "computer", 5);
         assert_eq!(r.input_at(1), None, "a focus or mouse report");
-        r.note_person(1, b"2", false, 7);
+        r.note_person(1, b"2", false, "computer", 7);
         assert_eq!(r.input_at(1), Some(7), "one key picks a dialog option");
         r.note_sent(1, b"\x1b[13u", 9);
         assert_eq!(r.input_at(1), Some(9), "a kitty Enter sends the line");
@@ -3232,5 +3431,63 @@ mod tests {
         assert!(r.take_closed(5));
         assert!(!r.take_closed(5), "taken once");
         assert!(!r.is_closed(5));
+    }
+
+    /// A command's end is kept only after its start, and a terminal printing marks in a loop
+    /// costs its watchers one announcement for the window, not one per mark.
+    #[tokio::test]
+    async fn shell_marks_keep_the_last_command_and_announce_once_a_window() {
+        use qoop_terminal::ShellMark::{Finished, Started};
+        let r = registry();
+        let mut changes = r.subscribe();
+        r.note_shell(3, Finished(Some(1)), 100);
+        assert_eq!(r.command(3), None, "an end with no start ends nothing");
+        for _ in 0..500 {
+            r.note_shell(3, Started, 100);
+            r.note_shell(3, Finished(Some(2)), 101);
+        }
+        let last = r.command(3).expect("a command ended");
+        assert_eq!(
+            (last.exit, last.ended_at, last.agent),
+            (Some(2), 101, false)
+        );
+        tokio::time::sleep(TASKS_WINDOW + std::time::Duration::from_millis(200)).await;
+        assert_eq!(changes.try_recv().ok(), Some(3));
+        assert!(
+            changes.try_recv().is_err(),
+            "one announcement for the flood"
+        );
+        r.forget(3);
+        assert_eq!(r.command(3), None);
+    }
+
+    /// The same kind typing on is news once per window, a new kind at once.
+    #[tokio::test]
+    async fn typing_is_news_once_a_window_and_on_a_change_of_kind() {
+        let r = registry();
+        for at in 0..4 {
+            r.note_person(2, b"a", false, "phone", 1_000 + at);
+        }
+        let typed = r.typed_by(2).expect("typed");
+        assert_eq!((typed.kind.as_str(), typed.at), ("phone", 1_003));
+        assert_eq!(
+            r.typed_by.lock().unwrap()[&2].2,
+            1_000,
+            "told once in the window"
+        );
+        r.note_person(2, b"a", false, "phone", 1_000 + TYPING_NEWS_SECS);
+        assert_eq!(r.typed_by.lock().unwrap()[&2].2, 1_000 + TYPING_NEWS_SECS);
+        r.note_person(2, b"a", false, "computer", 1_006);
+        assert_eq!(
+            r.typed_by.lock().unwrap()[&2].2,
+            1_006,
+            "a new kind is news"
+        );
+        r.note_person(2, b"[I", false, "phone", 1_007);
+        assert_eq!(
+            r.typed_by(2).unwrap().kind,
+            "computer",
+            "a focus report is no key"
+        );
     }
 }

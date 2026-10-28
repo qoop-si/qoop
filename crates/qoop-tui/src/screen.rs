@@ -786,6 +786,9 @@ pub fn bar_tabs(
         .filter(|t| t.lead.is_none_or(|lead| lead == t.terminal))
     {
         tabs.push(AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -4384,6 +4387,9 @@ mod tests {
 
     fn row(terminal: u32, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -7271,6 +7277,9 @@ mod tests {
 
     fn blocked_row(terminal: u32, program: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -7929,6 +7938,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, state)| AgentRow {
+                command: None,
+                clients: Vec::new(),
+                typed_by: None,
                 parked: false,
                 keep_awake: false,
                 qass_skip: false,

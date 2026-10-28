@@ -4542,6 +4542,9 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -4574,6 +4577,9 @@ mod tests {
 
     fn shell(terminal: u32, workspace: i64) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -5348,6 +5354,9 @@ mod tests {
 
     fn named(terminal: u32, workspace: i64, name: &str, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -5611,6 +5620,9 @@ mod tests {
     #[test]
     fn a_wrapper_is_shown_as_standing_in_the_way_and_never_as_the_program() {
         let agents = vec![AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -5653,6 +5665,9 @@ mod tests {
     #[test]
     fn an_unknown_state_is_drawn_as_nothing_and_leaves_the_name_the_whole_row() {
         let agents = vec![AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,

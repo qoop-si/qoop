@@ -43,6 +43,19 @@ pub struct ControlStringFilter {
     /// Where each `CSI ? 996 n` passed since the last take ends in what the parser is handed:
     /// the program asking which scheme the person's terminal is in, answered in its place.
     scheme_asked: Vec<usize>,
+    /// The shell's command marks (OSC 133) passed since the last take, in order.
+    shell: Vec<ShellMark>,
+}
+
+/// A command mark a shell sends (OSC 133, FinalTerm's semantic prompt): `C` as the command
+/// starts and `D` with its exit status as it ends. The prompt marks `A` and `B` are not kept.
+///
+/// Any program can print these, so a mark says only that a command started or ended, never
+/// what it was or where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellMark {
+    Started,
+    Finished(Option<i32>),
 }
 
 impl ControlStringFilter {
@@ -69,6 +82,7 @@ impl ControlStringFilter {
             self.staged.push(b);
             if next.is_ground() {
                 self.follow_modes();
+                self.follow_shell();
                 out.extend_from_slice(&self.staged);
                 if self.staged == b"\x1b[?996n" {
                     self.scheme_asked.push(out.len());
@@ -105,6 +119,35 @@ impl ControlStringFilter {
     /// the last take: the end of each ask, in what the parser is handed.
     pub fn take_scheme_asked(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.scheme_asked)
+    }
+
+    /// The shell's command marks passed since the last take, in order.
+    pub fn take_shell(&mut self) -> Vec<ShellMark> {
+        std::mem::take(&mut self.shell)
+    }
+
+    /// `OSC 133 ; C` and `OSC 133 ; D [; status]`, ended by BEL or ST. A status that is not a
+    /// number reads as unknown rather than dropping the mark: the command still ended.
+    fn follow_shell(&mut self) {
+        let Some(body) = self.staged.strip_prefix(b"\x1b]133;") else {
+            return;
+        };
+        let body = body
+            .strip_suffix(b"\x07")
+            .or_else(|| body.strip_suffix(b"\x1b\\"))
+            .unwrap_or(body);
+        let mut parts = body.split(|b| *b == b';');
+        let mark = match parts.next() {
+            Some(b"C") => ShellMark::Started,
+            Some(b"D") => ShellMark::Finished(
+                parts
+                    .next()
+                    .and_then(|code| std::str::from_utf8(code).ok())
+                    .and_then(|code| code.parse().ok()),
+            ),
+            _ => return,
+        };
+        self.shell.push(mark);
     }
 
     /// The colour scheme reports (DEC private mode 2031, which kitty, ghostty and contour
@@ -243,6 +286,29 @@ mod tests {
         assert_eq!(f.take_scheme_reports(), Some(true));
         run(&mut f, b"\x1bc");
         assert_eq!(f.take_scheme_reports(), Some(false));
+    }
+
+    /// C and D, ended by BEL or ST, alone or cut by a read, pass through to the parser and are
+    /// kept in order; A, B, a longer number (`1337`) and other OSCs are not marks.
+    #[test]
+    fn the_shell_command_marks_are_kept_in_order_and_still_passed_on() {
+        let mut f = ControlStringFilter::default();
+        let input = b"\x1b]133;A\x07$ ls\x1b]133;B\x07\x1b]133;C\x07out\x1b]133;D;2\x1b\\";
+        assert_eq!(run(&mut f, input), input);
+        assert_eq!(
+            f.take_shell(),
+            [ShellMark::Started, ShellMark::Finished(Some(2))]
+        );
+        assert!(f.take_shell().is_empty());
+        run(&mut f, b"\x1b]13");
+        run(
+            &mut f,
+            b"3;D\x07\x1b]133;D;x\x07\x1b]1337;File=x\x07\x1b]0;133;C\x07",
+        );
+        assert_eq!(
+            f.take_shell(),
+            [ShellMark::Finished(None), ShellMark::Finished(None)]
+        );
     }
 
     /// The three byte prefix that used to bypass the bound entirely.

@@ -780,7 +780,7 @@ fn run_attach() -> std::io::Result<()> {
 async fn attach(socket: &std::path::Path) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (stream, leftover) = client::connect(socket, "qoop-cli").await?;
+    let (stream, leftover) = client::connect(socket, client::ATTACH_ID).await?;
     let guard = TerminalGuard::enter_raw()?;
     // A panic must not leave the outer terminal raw either.
     let previous_hook = std::panic::take_hook();
@@ -3863,6 +3863,9 @@ mod tests {
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,

@@ -141,6 +141,9 @@ pub const REPLACES: &str = "replaces";
 /// Only such a connection opens a preview tunnel or reads a checkout's changes.
 pub const PHONE: &str = "qoro-mobile";
 
+/// The client id `qoop attach` says: a person at a terminal, not a program typing.
+pub const ATTACH_ID: &str = "qoop-attach";
+
 /// The hello key an interface sets to say it lends a microphone to a tab's program
 /// (`microphone`). An older interface never says it, so a recording is refused at once
 /// rather than left hearing nothing.

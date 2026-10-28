@@ -736,6 +736,12 @@ impl TerminalEngine for AlacrittyEngine {
         for img in self.sniffer.take_images() {
             effects.push(TerminalEffect::Image(img));
         }
+        effects.extend(
+            self.filter
+                .take_shell()
+                .into_iter()
+                .map(TerminalEffect::Shell),
+        );
         (damage, effects)
     }
 
@@ -1056,6 +1062,24 @@ mod tests {
         let mut e = engine();
         let (_, effects) = e.feed(b"\x1b]0;my title\x07");
         assert!(effects.contains(&TerminalEffect::Title("my title".into())));
+    }
+
+    #[test]
+    fn a_shell_command_mark_produces_a_shell_effect_and_draws_nothing() {
+        let mut e = engine();
+        let (_, effects) = e.feed(b"\x1b]133;C\x07ok\x1b]133;D;0\x07");
+        let marks: Vec<_> = effects
+            .into_iter()
+            .filter(|f| matches!(f, TerminalEffect::Shell(_)))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                TerminalEffect::Shell(crate::ShellMark::Started),
+                TerminalEffect::Shell(crate::ShellMark::Finished(Some(0)))
+            ]
+        );
+        assert_eq!(e.snapshot().lines[0], "ok");
     }
 
     #[test]

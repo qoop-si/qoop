@@ -1,0 +1,32 @@
+# qoop's zsh integration. The daemon starts a tab's zsh with ZDOTDIR pointing here, so this
+# file runs first, and no file of the person's is edited for it.
+#
+# ZDOTDIR goes back to what it was before anything of the person's runs, so zsh then reads
+# their .zprofile and .zshrc from where it always would. Unset when it was unset: a ZDOTDIR
+# left pointing here would reach every shell started from this one.
+if [[ -n ${QOOP_ZDOTDIR+x} ]]; then
+  ZDOTDIR=$QOOP_ZDOTDIR
+else
+  unset ZDOTDIR
+fi
+unset QOOP_ZDOTDIR
+if [[ -r ${ZDOTDIR:-$HOME}/.zshenv ]]; then
+  source "${ZDOTDIR:-$HOME}/.zshenv"
+fi
+
+# OSC 133 C as a command starts and D with its status at the next prompt: the daemon times
+# the command from these, and nothing else is read from them. Through add-zsh-hook, so the
+# hooks a person or a prompt theme adds keep running. QOOP_SHELL_INTEGRATION=0, set in a
+# startup file or by hand, turns both off; read when a hook runs, so it can come later.
+autoload -Uz add-zsh-hook
+__qoop_preexec() {
+  [[ ${QOOP_SHELL_INTEGRATION-} == 0 ]] && return
+  printf '\e]133;C\a'
+}
+__qoop_precmd() {
+  local qoop_status=$?
+  [[ ${QOOP_SHELL_INTEGRATION-} == 0 ]] && return
+  printf '\e]133;D;%s\a' "$qoop_status"
+}
+add-zsh-hook preexec __qoop_preexec
+add-zsh-hook precmd __qoop_precmd

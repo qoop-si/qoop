@@ -1014,6 +1014,12 @@ struct State {
     /// of them is due. Empty on a quiet screen, so nothing is armed (ADR-009).
     notes: Vec<crate::notify::Note>,
     notes_due: Option<std::time::Instant>,
+    /// When the last command this interface saw finish in each terminal ended. A terminal
+    /// missing here has not been seen yet: its first sighting is recorded and says nothing.
+    commands_seen: std::collections::BTreeMap<u32, Option<i64>>,
+    /// Command notes `apply` decided on, with whether each failed, said by the event loop,
+    /// which has the writer.
+    command_notes: Vec<(String, bool)>,
     /// What asking the daemon whether it could move onto a newer qoop has come to.
     update: UpdateAsk,
     /// Where a desktop note goes, decided once at start.
@@ -8059,6 +8065,8 @@ where
         news_refused: false,
         notes: Vec::new(),
         notes_due: None,
+        commands_seen: Default::default(),
+        command_notes: Vec::new(),
         update: UpdateAsk::default(),
         route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
         nowhere: false,
@@ -8506,20 +8514,29 @@ where
             } else if motion_at.is_none() {
                 motion_at = Some(tokio::time::Instant::now() + MOTION_TICK * motion_step as u32);
             }
-            let tier_at = if state.collapsed {
-                None
-            } else {
-                let now_wall = sidebar::now_unix();
-                sidebar::wants_tick(&state.rows, now_wall).and_then(|at| {
+            // The column's tiers only while it is open; the tab bar's "typing" whenever, since
+            // the bar is drawn with the column folded too.
+            let now_wall = sidebar::now_unix();
+            let tier_at = (!state.collapsed)
+                .then(|| sidebar::wants_tick(&state.rows, now_wall))
+                .flatten()
+                .into_iter()
+                .chain(tabs::typing_ends(&state.rows, now_wall))
+                .min()
+                .and_then(|at| {
                     let wait = (at - now_wall).max(0) as u64;
                     tokio::time::Instant::now()
                         .checked_add(std::time::Duration::from_secs(wait))
-                })
-            };
+                });
 
             // A held `ESC [` or `ESC ]` waiting to see whether it is a report. `None` on a
             // quiet screen, like the tier boundary, so nothing is armed.
             let hold_at = reports.deadline().map(tokio::time::Instant::from_std);
+            // A command that finished while the person could not see it: said now, here,
+            // where the writer is.
+            if !state.command_notes.is_empty() {
+                fire_command_notes(&mut state, &mut out)?;
+            }
             // Notes waiting out their second. `None` with nothing held, so nothing is armed.
             let notes_at = state.notes_due.map(tokio::time::Instant::from_std);
             // A standing toast goes on its clock, then repaints once to come down. `None`
@@ -11957,7 +11974,14 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
     if due.is_empty() {
         return Ok(());
     }
-    let body = crate::notify::clean(&crate::notify::say(&due));
+    let urgent = due.iter().any(|note| note.urgent);
+    say_note(state, out, &crate::notify::say(&due), urgent)
+}
+
+/// Put one note on the desktop and play its sound, as far as `[notify]` allows: the
+/// caller has already checked the mute.
+fn say_note(state: &State, out: &mut impl Write, text: &str, urgent: bool) -> io::Result<()> {
+    let body = crate::notify::clean(text);
     if state.config.desktop {
         match state.route {
             crate::notify::Route::Escape { escape, tmux } => {
@@ -11974,13 +11998,55 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
     if state.config.sound
         && std::env::var_os("SSH_CONNECTION").is_none()
         && let Some(play) = crate::notify::sound(
-            due.iter().any(|note| note.urgent),
+            urgent,
             cfg!(target_os = "macos"),
             state.config.done_sound,
             state.config.alert_sound,
         )
     {
         crate::notify::spawn(&play);
+    }
+    Ok(())
+}
+
+/// How long a command has to run before its end is worth a note: Warp's default.
+const COMMAND_NOTE_MS: u64 = 30_000;
+
+/// What to tell the desktop about the command that has just finished in `row`, with
+/// whether it failed, or nothing. `before` is when the last command this interface saw
+/// finish there ended, and `None` when the terminal is new to it: a first sighting (a
+/// start, a reconnect) only records, so an old command is never news. A short command, or
+/// one an agent ran in (the agent's own note says that), is no news either, and neither is
+/// one the person can see end: on screen, with the window not known to be elsewhere.
+fn command_note(
+    state: &State,
+    row: &AgentRow,
+    before: Option<Option<i64>>,
+    visible: &[u32],
+) -> Option<(String, bool)> {
+    let command = row.command.as_ref()?;
+    let before = before?;
+    if before == Some(command.ended_at) || command.millis < COMMAND_NOTE_MS || command.agent {
+        return None;
+    }
+    if visible.contains(&row.terminal) && state.outer_focus != Some(false) {
+        return None;
+    }
+    let tab = sidebar::label(row);
+    Some(match command.exit {
+        Some(code) if code != 0 => (format!("Command failed (exit {code}) in {tab}"), true),
+        _ => (format!("Command finished in {tab}"), false),
+    })
+}
+
+/// Say the command notes `apply` held, unless this Mac is muted.
+fn fire_command_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
+    let notes = std::mem::take(&mut state.command_notes);
+    if state.config.mute != qoop_runtime::config::Mute::Off {
+        return Ok(());
+    }
+    for (text, failed) in notes {
+        say_note(state, out, &text, failed)?;
     }
     Ok(())
 }
@@ -14804,6 +14870,17 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                         .remove(&(row.terminal, sidebar::gen_of(row)));
                 }
             }
+            let visible = visible_set(state);
+            for row in &agents {
+                let before = state.commands_seen.get(&row.terminal).copied();
+                if let Some(note) = command_note(state, row, before, &visible) {
+                    state.command_notes.push(note);
+                }
+            }
+            state.commands_seen = agents
+                .iter()
+                .map(|r| (r.terminal, r.command.as_ref().map(|c| c.ended_at)))
+                .collect();
             state.was = agents
                 .iter()
                 .map(|r| (r.terminal, r.state.clone()))
@@ -15553,6 +15630,9 @@ mod tests {
 
     fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow {
         AgentRow {
+            command: None,
+            clients: Vec::new(),
+            typed_by: None,
             parked: false,
             keep_awake: false,
             qass_skip: false,
@@ -17201,6 +17281,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            commands_seen: Default::default(),
+            command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
@@ -18757,6 +18839,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            commands_seen: Default::default(),
+            command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
@@ -18910,6 +18994,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            commands_seen: Default::default(),
+            command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
             nowhere: false,
@@ -20289,6 +20375,188 @@ mod tests {
             note.due = past;
         }
         state.notes_due = Some(past);
+    }
+
+    /// A shell tab, `terminal`, whose last command ended at `ended_at` after `millis`.
+    fn shell(terminal: u32, ended_at: i64, millis: u64, exit: Option<i32>) -> AgentRow {
+        let mut row = agent(terminal, 1, "zsh", "idle");
+        row.command = Some(qoop_runtime::control::CommandRow {
+            exit,
+            millis,
+            ended_at,
+            agent: false,
+        });
+        row
+    }
+
+    /// A state that says its notes as OSC 9, with terminal 1 on screen and terminal 2
+    /// not, both already seen once with a command that ended at 100.
+    fn shell_state() -> State {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        state
+    }
+
+    /// What the desktop is told once the event loop drains the command notes.
+    fn said(state: &mut State) -> String {
+        let mut out = Vec::new();
+        fire_command_notes(state, &mut out).expect("fire");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn a_first_sighting_of_a_command_says_nothing() {
+        let mut state = shell_state();
+        assert_eq!(said(&mut state), "", "the start saw them first");
+        // A tab that arrives with a command already over, off screen: recorded only.
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+                shell(3, 200, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "");
+        // The same end seen again is no news either.
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "");
+    }
+
+    #[test]
+    fn a_long_command_off_screen_is_said() {
+        let mut state = shell_state();
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 200, COMMAND_NOTE_MS, Some(0)),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "\x1b]9;Command finished in zsh\x1b\\");
+        assert_eq!(said(&mut state), "", "said once");
+    }
+
+    #[test]
+    fn a_new_tabs_first_command_is_said() {
+        let mut state = shell_state();
+        let mut fresh = agent(3, 1, "zsh", "idle");
+        index(
+            &mut state,
+            vec![shell(1, 100, COMMAND_NOTE_MS, None), fresh.clone()],
+        );
+        fresh.command = shell(3, 200, COMMAND_NOTE_MS, None).command;
+        index(
+            &mut state,
+            vec![shell(1, 100, COMMAND_NOTE_MS, None), fresh],
+        );
+        assert_eq!(said(&mut state), "\x1b]9;Command finished in zsh\x1b\\");
+    }
+
+    #[test]
+    fn a_failed_command_names_its_exit_code() {
+        let mut state = shell_state();
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 200, COMMAND_NOTE_MS, Some(2)),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(
+            said(&mut state),
+            "\x1b]9;Command failed (exit 2) in zsh\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_short_command_says_nothing() {
+        let mut state = shell_state();
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 200, COMMAND_NOTE_MS - 1, Some(1)),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "");
+    }
+
+    #[test]
+    fn a_command_an_agent_ran_in_says_nothing() {
+        let mut state = shell_state();
+        let mut row = shell(2, 200, COMMAND_NOTE_MS, Some(0));
+        row.command.as_mut().expect("command").agent = true;
+        index(&mut state, vec![shell(1, 100, COMMAND_NOTE_MS, None), row]);
+        assert_eq!(said(&mut state), "");
+    }
+
+    #[test]
+    fn a_command_on_screen_says_nothing_unless_the_window_is_elsewhere() {
+        let mut state = shell_state();
+        state.outer_focus = Some(true);
+        index(
+            &mut state,
+            vec![
+                shell(1, 200, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "", "on screen, window focused");
+        // No focus reports at all (tmux without focus-events): on screen counts as seen.
+        state.outer_focus = None;
+        index(
+            &mut state,
+            vec![
+                shell(1, 300, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "", "on screen, focus unknown");
+        state.outer_focus = Some(false);
+        index(
+            &mut state,
+            vec![
+                shell(1, 400, COMMAND_NOTE_MS, None),
+                shell(2, 100, COMMAND_NOTE_MS, None),
+            ],
+        );
+        assert_eq!(said(&mut state), "\x1b]9;Command finished in zsh\x1b\\");
+    }
+
+    #[test]
+    fn a_muted_mac_says_no_command() {
+        let mut state = shell_state();
+        index(
+            &mut state,
+            vec![
+                shell(1, 100, COMMAND_NOTE_MS, None),
+                shell(2, 200, COMMAND_NOTE_MS, None),
+            ],
+        );
+        state.config.mute = qoop_runtime::config::Mute::Here;
+        assert_eq!(said(&mut state), "");
+        assert!(state.command_notes.is_empty(), "and nothing kept for later");
     }
 
     /// A note that arrived after another waits its own full second: it is not said with

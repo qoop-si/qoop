@@ -45,6 +45,9 @@ pub enum TerminalEffect {
     /// A completed image envelope (Kitty or iTerm2), verbatim. The parser never
     /// saw it: it is a side channel beside the grid, not cells in it.
     Image(crate::images::CapturedImage),
+    /// A shell's command mark (OSC 133). The parser ignores the sequence; this is the only
+    /// place it is seen.
+    Shell(crate::control_string::ShellMark),
 }
 
 /// Authoritative cell state for a client. A client never parses raw bytes; the daemon owns

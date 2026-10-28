@@ -45,7 +45,7 @@ cards = "full"
 | `theme` | `"auto"` | `auto` asks the terminal for its background; `dark` or `light` say it |
 | `icons` | `"auto"` | the few icons qoop draws (asleep, keep awake, sleep and wake, settings, another machine) where they were seen to draw: iTerm2, Terminal, Ghostty and kitty on a Mac with qoop's own font, which the install and `qoop update` put in `~/Library/Fonts` (`qoop icons install`), drawn from the first interface started after the font is there; WezTerm, Alacritty, every other terminal, tmux and an ssh session keep the plain glyphs. `on` or `off` force either; `on` draws them even with no font in place |
 | `copy_on_select` | `true` | a selection made with the mouse goes to the clipboard when the button comes up. `false` leaves it highlighted until the prefix and `y` copy it; a program's own copy and copy mode's `y` are not affected |
-| `notify.desktop` | `true` | tell the desktop when an agent needs you and you are not looking |
+| `notify.desktop` | `true` | tell the desktop when an agent needs you and you are not looking, and when a command of 30 s or more ends in a plain shell tab you cannot see |
 | `notify.sound` | `false` | and play a sound when it does; the install asks |
 | `notify.done_sound` | `"Glass"` | the sound for an agent that finished, one of macOS's own: `Basso Blow Bottle Frog Funk Glass Hero Morse Ping Pop Purr Sosumi Submarine Tink`, or on Linux a freedesktop name (`complete`, `bell`, `message`, ...; Linux default `complete`); `qoop sound` plays them to choose |
 | `notify.alert_sound` | `"Funk"` | the sound for one that waits on you or failed, from the same list (Linux default `dialog-warning`) |
@@ -75,6 +75,10 @@ working, waiting on you or kept awake is passed by.
 Two writers in one daemon take turns, so neither loses the other's change. A second process writing
 at the same moment (`qoop settings` in a tab, `qoop config set`) is last writer wins on the whole file,
 which is replaced atomically, as any editor does.
+
+`QOOP_SHELL_INTEGRATION=0`, exported in `.zshrc` or `.bashrc` and read at each prompt, stops zsh and bash tabs from
+reporting where a command starts and ends (the base of the long-command note); see
+[Notifications](../site/docs/notifications.md).
 
 `QOOP_IDLE_TIMEOUT_MINUTES` is no longer read. It used to close idle tabs for good; a daemon
 that finds it set says so once and points here, where `sleep.idle_minutes` puts idle tabs
