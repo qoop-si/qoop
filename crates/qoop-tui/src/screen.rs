@@ -1307,20 +1307,34 @@ pub fn paint(frame: &Frame) -> String {
     // The lines around split panes, worked out once for the whole frame, and the park mark
     // against the focused corner when it stands there.
     let mut edges = edge_grid(frame, pane_cols as usize, pane_rows as usize);
-    // qass's lone box draws its own frame: its rows are painted ahead, so the rule can take
-    // their left side over just as it does the split panes'.
-    let mut qass_rows: Vec<String> = match &qass {
-        Some((plan, screen)) if !tiled(frame) => (0..pane_rows as usize)
-            .map(|pane_row| qass_box_row(frame, plan, screen, pane_row))
+    // The rows qass paints itself from the pane's first column: its lone box whole, or on its
+    // split tab the header over the panes and the schedules under them. Painted ahead, so the
+    // rule can take their left side over just as it does the split panes'.
+    let mut qass_rows: Vec<Option<String>> = match &qass {
+        Some((plan, screen)) => (0..pane_rows as usize)
+            .map(|pane_row| {
+                if !tiled(frame) {
+                    Some(qass_box_row(frame, plan, screen, pane_row))
+                } else if pane_row < plan.header.rows() {
+                    Some(screen.row(pane_row, |_| String::new()))
+                } else {
+                    screen.clock_row(pane_row)
+                }
+            })
             .collect(),
-        _ => Vec::new(),
+        None => Vec::new(),
     };
-    let rule_side = if !wide_enough {
-        Vec::new()
-    } else if qass_rows.is_empty() {
-        take_left_side(&mut edges)
+    let rule_side = if wide_enough {
+        let panes = take_left_side(&mut edges);
+        let qass = take_left_cells(&mut qass_rows);
+        (0..pane_rows as usize)
+            .map(|at| match qass_rows.get(at) {
+                Some(Some(_)) => qass[at].clone(),
+                _ => panes.get(at).cloned().flatten(),
+            })
+            .collect()
     } else {
-        take_left_cells(&mut qass_rows)
+        Vec::new()
     };
     let park = park_spot(frame);
     if let Some((parked, ParkSpot::Corner(x, y, label))) = &park
@@ -1528,7 +1542,7 @@ pub fn paint(frame: &Frame) -> String {
         // Tiled rows for every pane in its frame; the plain path for qass's lone box, which
         // draws its own, and a frame with no tile at all.
         if !tiled(frame) {
-            if let Some(row) = qass_rows.get(pane_row) {
+            if let Some(Some(row)) = qass_rows.get(pane_row) {
                 out.push_str(row);
                 continue;
             }
@@ -1552,10 +1566,10 @@ pub fn paint(frame: &Frame) -> String {
             ));
         } else {
             // qass's header over its split: the rows above the panes.
-            if let Some((plan, screen)) = &qass
+            if let Some((plan, _)) = &qass
                 && pane_row < plan.header.rows()
             {
-                out.push_str(&screen.row(pane_row, |_| String::new()));
+                out.push_str(qass_rows[pane_row].as_deref().unwrap_or_default());
                 continue;
             }
             // The questions beside the board, or over its tile: the panes paint first, the
@@ -1569,12 +1583,12 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&row);
             }
             // The schedules under the panes, in the rows the tree leaves free.
-            if let Some((plan, screen)) = &qass
+            if let Some((plan, _)) = &qass
                 && let Some(clock) = plan.clock
-                && let Some(row) = screen.clock_row(pane_row)
+                && let Some(Some(row)) = qass_rows.get(pane_row)
             {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + clock.rect.x));
-                out.push_str(&row);
+                out.push_str(row);
             }
             if let (Some(rail), Some(rows)) = (frame.chrome.rail, &rail_rows)
                 && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
@@ -3765,11 +3779,12 @@ fn qass_box_row(
     })
 }
 
-/// [`take_left_side`] for rows already painted, qass's lone box: the first cell after the
-/// row's leading escapes is taken the same way, and the rule wears those escapes.
-fn take_left_cells(rows: &mut [String]) -> Vec<Option<(bool, String)>> {
+/// [`take_left_side`] for rows qass paints itself: the first cell after the row's leading
+/// escapes is taken the same way, and the rule wears those escapes.
+fn take_left_cells(rows: &mut [Option<String>]) -> Vec<Option<(bool, String)>> {
     rows.iter_mut()
         .map(|row| {
+            let row = row.as_mut()?;
             let at = escapes_len(row);
             let glyph = row[at..].chars().next()?;
             let (right, with) = match glyph {

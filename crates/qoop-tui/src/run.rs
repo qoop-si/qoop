@@ -25844,6 +25844,50 @@ mod tests {
         }
     }
 
+    /// On qass's split tab qass paints the header over the panes and the schedules under them
+    /// from the pane's first column too: the rule joins their lines and is their left side.
+    #[test]
+    fn the_column_rule_is_the_left_side_of_qass_schedules_on_its_split_tab() {
+        let mut state = qass_split_window();
+        let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
+        state.palette = None;
+        state.clock.take(vec![clock_row(1, "morning review")]);
+        let plan = state.qass_plan().expect("qass's split tab");
+        assert_eq!(
+            plan.frame, plan.inner,
+            "the split tab, whose panes draw their own edges"
+        );
+        let clock = plan.clock.expect("the schedules under the panes");
+        assert!(clock.under && clock.rect.x == 0);
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let grid = cells_of(
+            &screen::paint(&state.frame()),
+            state.cols as usize,
+            state.lines as usize,
+        );
+        let (rule, first) = (left - 1, left);
+        let row = |pane_row: usize| &grid[screen::TABS + pane_row];
+        assert_eq!(
+            row(plan.header.rows() - 1)[rule],
+            '\u{251c}',
+            "the header's line"
+        );
+        let (top, bottom) = (clock.rect.y, clock.rect.y + clock.rect.rows - 1);
+        assert_eq!(
+            row(top)[rule],
+            '\u{251c}',
+            "the schedules' top joins the rule"
+        );
+        assert_eq!(row(top)[first], '\u{2500}');
+        assert_eq!(row(bottom)[rule], '\u{2534}', "and their bottom");
+        assert_eq!(row(bottom)[first], '\u{2500}');
+        for at in top + 1..bottom {
+            assert_eq!(row(at)[rule], '\u{2502}', "row {at}");
+            assert_eq!(row(at)[first], ' ', "no second line on row {at}");
+        }
+    }
+
     /// The rail and the open pane share one line: the board's frame, with the rail's edge
     /// blank beside it, never two lines side by side.
     #[test]
