@@ -915,7 +915,9 @@ mod tests {
         // work that stops reaches qass in seconds and his go means keep going, the rows that
         // answer a reversible ask, resume an error, a limit and a finished job and push the
         // step a goal still lacks, the ceiling `qoop prompt` keeps, and the agents in a summary.
-        assert!(skill.lines().count() <= 486, "SKILL.md grew past 486 lines");
+        // 495 since 2026-10-29: another agent's turn lasts 15 minutes, then its writer is asked
+        // once and the tab is qass's, so no agent waits on a reply nobody sends.
+        assert!(skill.lines().count() <= 495, "SKILL.md grew past 495 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -1107,7 +1109,8 @@ mod tests {
             "| Failed on an API, network or overload error | one scoped prompt to resume where it stopped; failed again: escalate |",
             "prompt the step the goal still lacks in its words",
             "**What they ask you to do, do in that turn**",
-            "| Stopped while its job still runs (`background` or subagents on its row, `← N agents` on its screen) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on |",
+            "| Stopped while its job still runs (`background` or subagents on its row, a row under `← N agents` on its screen that is not idle) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on; after the 1200 with it still running: prompt it to check the job, and wait on if it still progresses (`hands off until <now + 1200>` again) |",
+            "Still stopped after it (or idle for unknown time), no one is answering.",
             "| Stopped on a usage limit with a reset time, no `cswap` | `hands off until <reset + 120>` (its clock time as unix through `date`); said again and still idle: prompt it to resume |",
         ] {
             assert!(skill.contains(want), "SKILL.md lost: {want}");

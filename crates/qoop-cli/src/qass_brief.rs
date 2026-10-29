@@ -126,19 +126,20 @@ fn peer(text: &str) -> bool {
 }
 
 /// Who typed the agent's newest message, and when: him, qass, another agent through `qoop
-/// prompt`, or a teammate. Not who started its turn: a background job's notice starts one
-/// too and is no message here. `None` with no message read.
+/// prompt` (named by its tab, the one to ask when the agent waits on it), or a teammate. Not
+/// who started its turn: a background job's notice starts one too and is no message here.
+/// `None` with no message read.
 fn last_typed(
     messages: &[Message],
     log: &[Record],
     tab: &str,
     qass: Option<u32>,
-) -> Option<(&'static str, Option<i64>)> {
+) -> Option<(String, Option<i64>)> {
     let m = messages.iter().rev().find(|m| !m.text.trim().is_empty())?;
     let text = m.text.trim();
     let at = m.ts.map(|t| t / 1000);
     if peer(text) || text.starts_with("<teammate-message") {
-        return Some(("a teammate", at));
+        return Some(("a teammate".into(), at));
     }
     let by = at.and_then(|at| {
         log.iter()
@@ -148,10 +149,10 @@ fn last_typed(
     });
     Some((
         match by {
-            Some(from) if Some(from) == qass => "qass",
-            Some(_) => "another agent's prompt",
-            None if text.starts_with('<') => "a notice",
-            None => "him",
+            Some(from) if Some(from) == qass => "qass".into(),
+            Some(from) => format!("T{from}'s prompt"),
+            None if text.starts_with('<') => "a notice".into(),
+            None => "him".into(),
         },
         at,
     ))
@@ -1358,7 +1359,7 @@ mod tests {
         assert!(out.contains("last typed: by a teammate 0 min ago"), "{out}");
         f.typed_here = transcript(&[said(NOW - 900, "build the dashboard")]);
         f.log = parse_log(&format!("{} 77 T52", NOW - 902));
-        assert!(brief(&f).contains("last typed: by another agent's prompt 15 min ago"));
+        assert!(brief(&f).contains("last typed: by T77's prompt 15 min ago"));
         f.log = parse_log(&format!("{} 128 T52", NOW - 902));
         assert!(brief(&f).contains("last typed: by qass 15 min ago"));
         f.log = Vec::new();

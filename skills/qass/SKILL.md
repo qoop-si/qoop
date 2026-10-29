@@ -132,9 +132,19 @@ while `qoop qass watch` reads on or `resumed` and none of yours runs: start it (
      until <ts/1000 + 120>` on its line.
    - **Standing orders:** their go signal ("go", "continue", or the same in their language), or
      a skill that runs to the end on its own, means keep it going to the end, never hands off.
-     You stay out when they are engaged, `qoop prompt` says a person is at that tab, or, for a
-     plain stop (an error or a limit still gets its row), `last typed:` names another agent or a
-     teammate, or their newest words there asked or talked about something this turn answered.
+     You stay out when they are engaged, `qoop prompt` says a person is at that tab, or their
+     newest words there asked or talked about something this turn answered.
+   - **Another agent's turn, 15 minutes:** a plain stop (an error or a limit still gets its row)
+     whose `last typed:` is `T<k>'s prompt` or a teammate is that writer's to answer while the
+     brief's first line says idle under 15 min: `hands off until <now + (15 - those min) × 60>`.
+     Still stopped after it (or idle for unknown time), no one is answering. `T<k>'s prompt`, T<n>'s
+     last words wait on T<k>, T<k> idle or done with nothing running on its row, its brief allowing
+     a write, no `nudged` on T<n>'s line: `qoop prompt <k> --generation <its G> -- 'T<n> has waited
+     since <hh:mm> on your answer to its last message; answer it in T<n> (qoop prompt <n>) or tell
+     it to go on.'` plus the fence, then `nudged T<k>, hands off until <now + 900>` on T<n>'s line.
+     T<k> busy: `hands off until <now + 300>`, for 30 min at most. Else (it waits on no one; a
+     teammate: its own team reported and went quiet; T<k> gone, asleep or not writable; `nudged`
+     already there): it is yours, by the table. A new stop of T<n> drops `nudged`.
 3. Classify: finished, asks a question, blocked on a menu, failed.
 4. Before you write anything to the worker, know where it stands (below); the brief's last line
    says what is allowed now (write, which ending) and what not, with why.
@@ -250,7 +260,7 @@ how important the question feels.
 | Design, UI or marketing pick, copy, naming, pricing, or a requirement with several plausible readings | a card for later; now if the worker sits idle on it. A design or copy pick in a repo their `do it` lesson names: pick it, say which in a two-line note, its ending then `pr`. A requirement they state is no question: into the item's description and to the agent |
 | Failed on an API, network or overload error | one scoped prompt to resume where it stopped; failed again: escalate |
 | Failed otherwise, or the same question twice | escalate |
-| Stopped while its job still runs (`background` or subagents on its row, `← N agents` on its screen) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on |
+| Stopped while its job still runs (`background` or subagents on its row, a row under `← N agents` on its screen that is not idle) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on; after the 1200 with it still running: prompt it to check the job, and wait on if it still progresses (`hands off until <now + 1200>` again) |
 | Stopped on a usage limit with a reset time, no `cswap` | `hands off until <reset + 120>` (its clock time as unix through `date`); said again and still idle: prompt it to resume |
 | `->limited` (its usage limit, this Mac, only with `cswap` installed) | `cswap auto --once >/dev/null 2>&1; echo $?` once per wake, even when you may not write to them (never `cswap switch`, its config or accounts). 0 or 2, or 1 while `pgrep -f "[c]swap auto"` finds its loop: prompt each limited agent you may write to, 5 s apart: `The usage limit that stopped you is cleared; resume the task you were on.` plus the fence. A line ending `again`, exit 3, or exit 1 with no loop: tell the owner once, with its reset time, and how many you could not prompt |
 

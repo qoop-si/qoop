@@ -26,7 +26,8 @@ step's check passes. Add `qoop task evidence \"<check: result>\"` for each accep
 with `qoop task done \"<summary>\"` once every step is ticked, before your tab closes; it is a claim \
 checked outside you, so keep working or stop as usual. If a `qoop task` command fails, carry on. Write rm targets \
 as literal paths or \"${VAR:?}\". Take the next step these rules allow yourself; end a turn on \
-the owner only for his decision, as one question with your pick. Keep a debrief to 12 short \
+the owner only for his decision, as one question with your pick. Never sign a message to \
+another agent with a role (`Lead:`). Keep a debrief to 12 short \
 lines, the result first and his one action last, if any; open a plan or report with a 5-line \
 summary. Run your own \
 browser and simulator tests headless and read the screenshots; open a window only when \
@@ -1190,17 +1191,22 @@ mod tests {
         // ponytail: 1380 holds when to tick, move and finish, the "dangerous rm" sentence, the
         // debrief one, the owner's headless-testing one (+160) and `qoop show` (+100), each a
         // sentence of its own. 1510 since 2026-10-23: the next step is the agent's own, and any
-        // task he gave opens a record (QOOP-55, +143).
+        // task he gave opens a record (QOOP-55, +143). 1580 since 2026-10-29: no role label
+        // on a message to another agent (+67).
         assert!(
-            RULES.len() <= 1510,
+            RULES.len() <= 1580,
             "{} chars in every session",
             RULES.len()
         );
         // ponytail: 2200 is the 1380 above plus the own-repo block (its own cap: 1100 at the
         // longest name, 815 for pat/qoop-tui): what may ship and what always asks,
-        // computed for this repo, said once at session start. 2330 with the 1510 above.
+        // computed for this repo, said once at session start. 2400 with the 1580 above.
         let session = RULES.len() + repo_rules(Some("pat/qoop-tui")).len();
-        assert!(session <= 2330, "{session} chars at session start");
+        assert!(session <= 2400, "{session} chars at session start");
+        assert!(
+            RULES.contains("(`Lead:`)"),
+            "no role label on agent messages"
+        );
         assert!(
             RULES.contains("${VAR:?}"),
             "deletion targets that cannot be empty"
