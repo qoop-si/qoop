@@ -330,7 +330,7 @@ pub(crate) fn asks_owner(line: &str) -> bool {
 /// does qass's `While E7 waits on the owner: ...`, which sets it to the work the question does
 /// not hold up and keeps the question open for his answer.
 pub(crate) fn not_his(prompt: &str) -> bool {
-    let prompt = prompt.trim_start();
+    let prompt = untagged(prompt.trim_start()).trim_start();
     prompt.starts_with("<task-notification")
         || prompt.starts_with("<agent-message")
         || card_after(prompt, "While ").is_some_and(|card| {
@@ -554,7 +554,31 @@ pub(crate) async fn relayed(
 /// `E7` (qass's card) or `W12` (the daemon's draft) from a prompt head that starts `The owner
 /// answered E7`, matched whole so it never reads E70 as E7.
 fn card_in_prompt(head: &str) -> Option<String> {
-    card_after(head, "The owner answered ")
+    card_after(
+        untagged(head.trim_start()).trim_start(),
+        "The owner answered ",
+    )
+}
+
+/// The words `qoop prompt` put before what another tab wrote: `[from <name>, tab <n>]`, so the
+/// agent reading it knows who wrote and where to answer. `name` comes in already plain.
+pub fn sender_tag(name: &str, tab: u32) -> String {
+    format!("[from {name}, tab {tab}]")
+}
+
+/// A prompt head without the [`sender_tag`] in front of it, if one is there: what follows is
+/// matched as the sender wrote it.
+fn untagged(head: &str) -> &str {
+    let Some(rest) = head.strip_prefix("[from ") else {
+        return head;
+    };
+    rest.split_once("] ")
+        .filter(|(inside, _)| {
+            inside
+                .rsplit_once(", tab ")
+                .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map_or(head, |(_, after)| after)
 }
 
 /// The card a head names right after `prefix`, matched whole.
@@ -1467,6 +1491,20 @@ mod tests {
             Some("W12")
         );
         assert_eq!(card_in_prompt("The owner answered X12"), None);
+        // Relayed by qass from its tab, the line carries `qoop prompt`'s sender tag first.
+        let tagged = format!("{} The owner answered E7: \"go\"", sender_tag("qass", 473));
+        assert_eq!(card_in_prompt(&tagged).as_deref(), Some("E7"));
+        assert!(not_his(&format!(
+            "{} While E7 waits on the owner: do the rest",
+            sender_tag("qass", 473)
+        )));
+        assert_eq!(
+            untagged("[from x] The owner answered E7"),
+            "[from x] The owner answered E7"
+        );
+        assert!(not_his(
+            "[from qass, tab 473]  While E7 waits on the owner: go"
+        ));
         assert_eq!(draft_handle("Api-local PR 513", 52), "api52");
         assert_eq!(draft_handle("ödeme", 3), "deme3");
         assert_eq!(draft_handle("***", 4), "agent4");

@@ -2399,6 +2399,16 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
             return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
+        let is_qass = |r: &qoop_runtime::control::AgentRow| {
+            paths::qass_data_dir()
+                .zip(r.cwd.as_deref())
+                .is_some_and(|(f, cwd)| crate::qass::in_folder(cwd, &f))
+        };
+        let from = cli_sender().0;
+        let text = match from.and_then(|f| sender_tag(&rows, f, terminal, &text, is_qass)) {
+            Some(tag) => format!("{tag} {text}"),
+            None => text,
+        };
         let said = text.clone();
         let mut term_seq = 0u32;
         // The Enter carries the sender, which records the wait edge.
@@ -2440,6 +2450,47 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         drop(wr);
         supervise::finish_turn(supervise::wait_for_turn(&before, timeout).await?)
     })
+}
+
+/// What starts a prompt one qoop terminal types into another: `[from <name>, tab <n>]`, so the
+/// agent reading it knows who wrote and where to answer, and he, reading the chat, can tell it
+/// from his own words. The name is `qass` for qass's tab, else the tab's name unless that is
+/// only its program's, else the agent's title, else the program. `None` for a prompt to its own
+/// tab, into anything but an agent (a shell would run the tag as a command), before a `/` or `!`
+/// command the agent must still read as one, or from a terminal the daemon does not list.
+fn sender_tag(
+    rows: &[qoop_runtime::control::AgentRow],
+    from: u32,
+    target: u32,
+    text: &str,
+    is_qass: impl Fn(&qoop_runtime::control::AgentRow) -> bool,
+) -> Option<String> {
+    let agent = rows.iter().any(|r| r.terminal == target && r.agent);
+    let command = text.trim_start().starts_with(['/', '!']);
+    if from == target || !agent || command {
+        return None;
+    }
+    let row = rows.iter().find(|r| r.terminal == from)?;
+    fn field(v: &Option<String>) -> Option<&str> {
+        v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    let name = if is_qass(row) {
+        "qass"
+    } else {
+        field(&row.name)
+            .filter(|n| Some(*n) != field(&row.program))
+            .or_else(|| field(&row.agent_title))
+            .or_else(|| field(&row.program))
+            .unwrap_or("an agent")
+    };
+    // ponytail: 40 characters, plain: a title is the agent's own words, never a second line, and
+    // the daemon reads a prompt's first 120 (`MAX_FOCUS_LABEL_CHARS`) for the card it answers.
+    let name: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '[' | ']'))
+        .take(40)
+        .collect();
+    Some(qoop_runtime::asks::sender_tag(name.trim(), from))
 }
 
 /// Parsed `qoop prompt` arguments, pure so the refusals are testable.
@@ -3893,6 +3944,54 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+        }
+    }
+
+    /// A prompt from another tab says who wrote it by a name he can read, and where to answer.
+    #[test]
+    fn a_prompt_from_another_tab_names_its_sender() {
+        let mut lead = row(519, Some("ui-ux-audit"), Some("claude"));
+        lead.agent_title = Some("player repo analysis".into());
+        let mut plain = row(546, Some("claude"), Some("claude"));
+        plain.agent_title = Some("Fix the qass stall".into());
+        let bare = row(7, None, Some("codex"));
+        let mut qass = row(473, Some("qass"), Some("claude"));
+        qass.cwd = Some("/q".into());
+        let rows = [lead, plain, bare, qass, row(349, None, Some("claude"))];
+        let is_qass = |r: &AgentRow| r.cwd.as_deref() == Some("/q");
+        let tag = |from| super::sender_tag(&rows, from, 349, "go on", is_qass);
+        assert_eq!(tag(519).as_deref(), Some("[from ui-ux-audit, tab 519]"));
+        assert_eq!(
+            tag(546).as_deref(),
+            Some("[from Fix the qass stall, tab 546]")
+        );
+        assert_eq!(tag(7).as_deref(), Some("[from codex, tab 7]"));
+        assert_eq!(tag(473).as_deref(), Some("[from qass, tab 473]"));
+        let mut odd = row(9, None, Some("claude"));
+        odd.agent_title = Some(format!("a]b\n{}", "x".repeat(80)));
+        let rows2 = [odd, row(349, None, Some("claude"))];
+        let long = super::sender_tag(&rows2, 9, 349, "go on", is_qass).unwrap();
+        assert_eq!(long, format!("[from ab{}, tab 9]", "x".repeat(38)));
+        assert_eq!(tag(349), None, "its own tab");
+        assert_eq!(tag(9999), None, "a terminal the daemon does not list");
+        let mut shell = row(8, None, Some("zsh"));
+        shell.agent = false;
+        let rows = [shell, row(519, Some("ui-ux-audit"), Some("claude"))];
+        assert_eq!(
+            super::sender_tag(&rows, 519, 8, "ls", is_qass),
+            None,
+            "a shell runs what it gets"
+        );
+        let rows = [
+            row(519, Some("ui-ux-audit"), Some("claude")),
+            row(8, None, Some("claude")),
+        ];
+        for command in ["/compact", " !ls"] {
+            assert_eq!(
+                super::sender_tag(&rows, 519, 8, command, is_qass),
+                None,
+                "{command}"
+            );
         }
     }
 
