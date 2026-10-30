@@ -94,9 +94,7 @@ fn status(op: TelemetryOp) -> std::io::Result<()> {
             "off because DO_NOT_TRACK or QOOP_TELEMETRY is set: unset it, then qoop telemetry on"
         );
     }
-    println!(
-        "what is sent: qoop telemetry show; about it: https://qoop-si.github.io/qoop/#telemetry"
-    );
+    println!("what is sent: qoop telemetry show; about it: https://qoop.si/privacy#usage");
     Ok(())
 }
 
