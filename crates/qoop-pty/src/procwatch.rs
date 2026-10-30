@@ -220,14 +220,35 @@ mod imp {
     /// The probe. No subscription exists for `exec` on Linux without privileges, so this
     /// records what each watched process was running and reports a change.
     pub struct ProcWatch {
-        watched: Mutex<HashMap<i32, String>>,
+        watched: Mutex<HashMap<i32, Image>>,
     }
 
-    fn program(pid: i32) -> Option<String> {
-        std::fs::read_link(format!("/proc/{pid}/exe"))
+    /// What a process runs: the path (`sys::exe_of`, else its `comm`) and the file's inode.
+    struct Image {
+        path: String,
+        inode: Option<(u64, u64)>,
+    }
+
+    impl Image {
+        /// An exec gives a new path or a new file. An agent updating itself removes its binary
+        /// under it: the path reads the same without ` (deleted)` and the inode is the one still
+        /// open, so that is no exec, while its exec into the new binary at that path is one.
+        /// An inode that could not be read this time (a `stat` on a network mount) says nothing.
+        // ponytail: overlayfs without xino can give a running binary a new inode on copy-up
+        // (a chmod of it); a false exec then, the same as a real one.
+        fn exec_since(&self, was: &Image) -> bool {
+            self.path != was.path || matches!((self.inode, was.inode), (Some(a), Some(b)) if a != b)
+        }
+    }
+
+    fn program(pid: i32) -> Option<Image> {
+        use std::os::unix::fs::MetadataExt;
+        let path = crate::sys::exe_of(Pid(pid))
+            .or_else(|| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())?;
+        let inode = std::fs::metadata(format!("/proc/{pid}/exe"))
             .ok()
-            .map(|p| p.display().to_string())
-            .or_else(|| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+            .map(|m| (m.dev(), m.ino()));
+        Some(Image { path, inode })
     }
 
     impl ProcWatch {
@@ -264,14 +285,47 @@ mod imp {
                     out.push(ProcEvent::Exit(Pid(*pid)));
                     false
                 }
-                Some(now) if now != *was => {
+                Some(now) if now.exec_since(was) => {
                     out.push(ProcEvent::Exec(Pid(*pid)));
                     *was = now;
                     true
                 }
-                Some(_) => true,
+                // An inode read now and not before is kept for the next look.
+                Some(now) => {
+                    if was.inode.is_none() {
+                        *was = now;
+                    }
+                    true
+                }
             });
             out
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Image;
+
+        fn image(path: &str, inode: Option<(u64, u64)>) -> Image {
+            Image {
+                path: path.into(),
+                inode,
+            }
+        }
+
+        #[test]
+        fn an_exec_is_a_new_path_or_a_new_file_and_an_unread_inode_is_neither() {
+            let was = image("/usr/bin/agent", Some((1, 10)));
+            assert!(!image("/usr/bin/agent", Some((1, 10))).exec_since(&was));
+            assert!(
+                image("/usr/bin/agent", Some((1, 11))).exec_since(&was),
+                "new file"
+            );
+            // Hard links of one multi-call binary: the same inode, another program.
+            assert!(image("/bin/cp", Some((1, 10))).exec_since(&was), "new path");
+            // A `stat` that failed this time is no exec, and one that failed before neither.
+            assert!(!image("/usr/bin/agent", None).exec_since(&was));
+            assert!(!was.exec_since(&image("/usr/bin/agent", None)));
         }
     }
 }
@@ -332,6 +386,100 @@ mod tests {
         }
         let _ = child.wait();
         assert!(saw_exec, "an in place exec was not reported");
+    }
+
+    /// Start a binary a test just wrote. A fork in another test can hold the write
+    /// descriptor of the copy until it execs (`ETXTBSY`), so a busy file is tried again.
+    #[cfg(not(target_os = "macos"))]
+    fn spawn_copy(command: &mut std::process::Command) -> std::process::Child {
+        for _ in 0..100 {
+            match command.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other.expect("spawn"),
+            }
+        }
+        panic!("the copied binary stayed busy");
+    }
+
+    /// What an agent's self-update does: the binary it runs is removed under it. Same
+    /// program, same process, so no exec, and the name it reads by keeps its path.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_binary_removed_under_its_process_is_no_exec() {
+        let dir = std::env::temp_dir().join(format!("qoop-deleted-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // `/proc/<pid>/exe` is the resolved path; a temp dir behind a symlink would differ.
+        let dir = std::fs::canonicalize(&dir).expect("canonical");
+        let copy = dir.join("sleep");
+        std::fs::copy("/bin/sleep", &copy).expect("copy");
+        let mut child = spawn_copy(std::process::Command::new(&copy).arg("5"));
+        let pid = Pid(child.id() as i32);
+        let watch = ProcWatch::new().expect("watch");
+        assert!(
+            watch.watch(pid).expect("watch"),
+            "the child was already gone"
+        );
+
+        std::fs::remove_file(&copy).expect("remove");
+        let raw = std::fs::read_link(format!("/proc/{}/exe", pid.0)).expect("exe");
+        let removed = raw.display().to_string().ends_with(" (deleted)");
+        let events = watch.drain();
+        let exe = crate::sys::exe_of(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            removed,
+            "the kernel did not mark the binary removed: {raw:?}"
+        );
+        assert_eq!(exe.as_deref(), copy.to_str(), "the path keeps no suffix");
+        assert!(
+            !events.contains(&ProcEvent::Exec(pid)),
+            "a removed binary read as an exec: {events:?}"
+        );
+    }
+
+    /// The rest of a self-update: the new binary lands at the old path and the process
+    /// execs into it. The path reads the same before and after, and it is still an exec.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_exec_into_a_new_binary_at_the_same_path_is_reported() {
+        let dir = std::env::temp_dir().join(format!("qoop-same-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let agent = dir.join("agent");
+        std::fs::copy("/bin/sh", &agent).expect("copy");
+        let mut child = spawn_copy(
+            std::process::Command::new(&agent).args(["-c", "sleep 3; exec \"$0\" -c 'sleep 2'"]),
+        );
+        let pid = Pid(child.id() as i32);
+        let watch = ProcWatch::new().expect("watch");
+        assert!(
+            watch.watch(pid).expect("watch"),
+            "the child was already gone"
+        );
+        // The update: removed, then a new file (a new inode) at the same path.
+        std::fs::remove_file(&agent).expect("remove");
+        std::fs::copy("/bin/sh", &agent).expect("copy again");
+        let removed_only = watch.drain();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_exec = false;
+        while std::time::Instant::now() < deadline && !saw_exec {
+            saw_exec = watch.drain().contains(&ProcEvent::Exec(pid));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !removed_only.contains(&ProcEvent::Exec(pid)),
+            "the update alone read as an exec: {removed_only:?}"
+        );
+        assert!(saw_exec, "the exec into the new binary was not reported");
     }
 
     /// More pending events than one read holds, and the one that matters queued last.

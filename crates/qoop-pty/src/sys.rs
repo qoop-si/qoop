@@ -476,12 +476,28 @@ pub fn program_of(pid: Pid) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// The executable `/proc/<pid>/exe` names, without the ` (deleted)` the kernel adds once that
+/// file is removed or replaced. An agent that updates itself swaps the binary under the
+/// process still running it, and that process is the same program: read with the suffix, a
+/// claude idle in a tab became `claude (deleted)`, a new program to the exec probe, and no
+/// sleep was ever allowed for it again (measured on a real Linux machine). A name, not a file:
+/// the path may hold a newer binary by now, or nothing.
+// ponytail: a binary really named `x (deleted)` reads as `x`; nothing ships one.
 #[cfg(not(target_os = "macos"))]
-pub fn program_of(pid: Pid) -> Option<String> {
+pub fn exe_of(pid: Pid) -> Option<String> {
     let exe = std::fs::read_link(format!("/proc/{}/exe", pid.0))
         .ok()?
         .display()
         .to_string();
+    Some(match exe.strip_suffix(" (deleted)") {
+        Some(path) => path.to_string(),
+        None => exe,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn program_of(pid: Pid) -> Option<String> {
+    let exe = exe_of(pid)?;
     Some(
         emulated_argv(&exe, &raw_argv_of(pid))
             .and_then(|argv| argv.into_iter().next())
@@ -867,9 +883,8 @@ fn procargs(pid: Pid) -> (usize, Vec<u8>) {
 #[cfg(not(target_os = "macos"))]
 pub fn argv_of(pid: Pid) -> Vec<String> {
     let argv = raw_argv_of(pid);
-    std::fs::read_link(format!("/proc/{}/exe", pid.0))
-        .ok()
-        .and_then(|exe| emulated_argv(&exe.display().to_string(), &argv))
+    exe_of(pid)
+        .and_then(|exe| emulated_argv(&exe, &argv))
         .unwrap_or(argv)
 }
 
