@@ -14,28 +14,16 @@ use crate::qass::{PROMPTED_LOG, json};
 const QASS_SAYS: i64 = 5;
 /// The owner typed into a tab this recently: he is at it.
 const ENGAGED: i64 = 120;
-/// Writes to one agent since the owner last spoke to qass, and to all in an hour.
-const PER_AGENT: usize = 3;
-const PER_HOUR: usize = 10;
 /// Review rounds when the workflow names no limit.
 const ROUNDS: u32 = 8;
 const WORDS: usize = 200;
-/// The words that start qass under each agent program: the program's, never his.
-const LAUNCH: [&str; 3] = ["/qass", "$qass", "Use the qass skill."];
 
-/// Whether a message is the line that started qass, with or without words after it.
-fn launch(text: &str) -> bool {
-    LAUNCH.iter().any(|l| text.starts_with(l))
-}
-
-/// One `prompted.log` record: `<unix> <from terminal> T<n>` (`<remote>/T<n>` from on.sh),
-/// and `build` after it for the go-ahead sent once a plan is approved.
+/// One `prompted.log` record: `<unix> <from terminal> T<n>` (`<remote>/T<n>` from on.sh).
 #[derive(Clone, Debug, PartialEq)]
 struct Record {
     at: i64,
     from: u32,
     to: String,
-    build: bool,
 }
 
 fn parse_log(text: &str) -> Vec<Record> {
@@ -46,7 +34,6 @@ fn parse_log(text: &str) -> Vec<Record> {
                 at: w.next()?.parse().ok()?,
                 from: w.next()?.parse().ok()?,
                 to: w.next()?.to_string(),
-                build: w.next() == Some("build"),
             })
         })
         .collect()
@@ -87,8 +74,6 @@ struct Facts {
     /// What was typed into the agent's tab; `None` when its transcript cannot be read.
     typed_here: Option<Vec<Message>>,
     qass: Option<u32>,
-    /// What was typed into qass's own tab; `None` when it cannot be read.
-    typed_to_qass: Option<Vec<Message>>,
     log: Vec<Record>,
     /// The open task on its row: its facts, or its id when they could not be read.
     task: Option<Result<Task, i64>>,
@@ -103,13 +88,12 @@ struct Facts {
     offset: i64,
 }
 
-/// The newest message the owner typed, in seconds: not a notification, not the line that
-/// started qass, and not one that follows a write `by_other` says came just before it. `Err`
-/// when a message has no time.
+/// The newest message the owner typed, in seconds: not a notification, and not one that
+/// follows a write `by_other` says came just before it. `Err` when a message has no time.
 fn owner_typed(messages: &[Message], by_other: impl Fn(i64) -> bool) -> Result<Option<i64>, ()> {
     for m in messages.iter().rev() {
         let text = m.text.trim();
-        if text.starts_with('<') || launch(text) || peer(text) {
+        if text.starts_with('<') || peer(text) {
             continue;
         }
         let at = m.ts.ok_or(())? / 1000;
@@ -350,64 +334,7 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         lines.push(format!("last typed: by {by}{ago}"));
     }
 
-    // Writes: qass's own records since the owner last wrote to qass, and in the last hour.
-    let mine: Vec<&Record> = f.log.iter().filter(|r| Some(r.from) == f.qass).collect();
-    let to_qass = f.qass.map(|q| format!("T{q}"));
-    // No message of his found (none in the window read, or a new conversation) is as unknown
-    // as no transcript: the last hour stands in, and the line says so.
-    let spoke = f
-        .typed_to_qass
-        .as_deref()
-        .ok_or(())
-        .and_then(|m| {
-            owner_typed(m, |at| {
-                written_before(&f.log, at, |r| Some(&r.to) == to_qass.as_ref())
-            })
-        })
-        .ok()
-        .flatten();
-    let since = spoke.unwrap_or(f.now - 3600);
-    // A step forward gives room too, for that agent only: three pushes with none is a stall.
     let task = f.task.as_ref().and_then(|t| t.as_ref().ok());
-    let moved = task
-        .map(|t| t.forward.max(t.opened))
-        .filter(|at| *at > since);
-    // The go-ahead after a plan approval is not a push: it does not count toward the three.
-    let to_agent = mine
-        .iter()
-        .filter(|r| r.to == tab && !r.build && r.at >= moved.unwrap_or(since))
-        .count();
-    // His word gives room: the hour's count starts again when he speaks.
-    let hour_from = since.max(f.now - 3600);
-    let hour = mine.iter().filter(|r| r.at >= hour_from).count();
-    let since_words = match (moved, spoke) {
-        (Some(_), _) => "since its last step forward",
-        (None, Some(_)) => "since he spoke to you",
-        (None, None) => "in the last hour (when he last spoke to you is unknown)",
-    };
-    let hour_words = if hour_from > f.now - 3600 {
-        "since he spoke to you"
-    } else {
-        "in the last hour"
-    };
-    let qass_known = if f.qass.is_some() {
-        ""
-    } else {
-        " (qass's terminal unknown)"
-    };
-    lines.push(format!(
-        "writes: {to_agent} of {PER_AGENT} to {tab} {since_words}; {hour} of {PER_HOUR} {hour_words}{qass_known}"
-    ));
-    if to_agent >= PER_AGENT {
-        not_now.push(format!("write ({to_agent} of {PER_AGENT} {since_words})"));
-    }
-    if hour >= PER_HOUR {
-        not_now.push(format!("write ({hour} of {PER_HOUR} {hour_words})"));
-    }
-    if f.qass.is_none() {
-        not_now.push("write (qass's terminal unknown)".to_string());
-    }
-
     if let Some(Err(id)) = &f.task {
         lines.push(format!("task: #{id} unreadable"));
         not_now.push("another review round (task unreadable)".to_string());
@@ -493,8 +420,6 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "owner_engaged": engaged,
         "owner_typed_at": typed_at,
         "hands_off_until": typed_at.filter(|_| engaged == Some(true)).map(|a| a + ENGAGED),
-        "writes_to_agent": to_agent,
-        "writes_last_hour": hour,
         "task": f.task.as_ref().map(|t| t.as_ref().map_or_else(|id| *id, |t| t.id)),
         "task_readable": f.task.as_ref().map(Result::is_ok),
         "review_rounds": task.map(|t| t.rounds),
@@ -734,7 +659,6 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         qass: qass_row
             .and_then(|r| r["terminal"].as_u64())
             .and_then(|t| u32::try_from(t).ok()),
-        typed_to_qass: qass_row.and_then(|r| typed(r, dirs.as_ref())),
         log: folder
             .and_then(|f| std::fs::read_to_string(f.join(PROMPTED_LOG)).ok())
             .map(|t| parse_log(&t))
@@ -798,7 +722,6 @@ mod tests {
             generation: Some(3),
             qass: Some(128),
             typed_here: Some(Vec::new()),
-            typed_to_qass: Some(Vec::new()),
             limit: ROUNDS,
             now: NOW,
             ..Facts::default()
@@ -923,43 +846,6 @@ mod tests {
         assert!(typed(&row, BaseDirs::from_home().ok().as_ref()).is_none());
     }
 
-    /// qass's writes to the agent count from when the owner last spoke to qass, never a
-    /// message another terminal typed into qass; all of qass's in the last hour, remotes too.
-    #[test]
-    fn writes_count_since_he_spoke_to_qass() {
-        let mut f = facts();
-        f.typed_to_qass = transcript(&[
-            said(NOW - 1000, "korea B"),
-            said(NOW - 500, "QOOP-9: merged"),
-        ]);
-        let log: String = [
-            format!("{} 128 T52", NOW - 4000),
-            format!("{} 205 T128", NOW - 502),
-            format!("{} 128 T52", NOW - 900),
-            format!("{} 128 T52", NOW - 800),
-            format!("{} 128 T52", NOW - 700),
-            format!("{} 128 ubox/T2", NOW - 600),
-            format!("{} 77 T52", NOW - 600),
-        ]
-        .join("\n");
-        f.log = parse_log(&log);
-        let out = brief(&f);
-        assert!(
-            out.contains(
-                "writes: 3 of 3 to T52 since he spoke to you; 4 of 10 since he spoke to you"
-            ),
-            "{out}"
-        );
-        assert!(
-            out.contains("Not now: write (3 of 3 since he spoke to you)"),
-            "{out}"
-        );
-        assert_eq!(compose(&f).1["writes_to_agent"], 3);
-        // The go-ahead after a plan approval is no push: the agent's count holds.
-        f.log = parse_log(&format!("{log}\n{} 128 T52 build", NOW - 400));
-        assert_eq!(compose(&f).1["writes_to_agent"], 3);
-    }
-
     /// Rounds are changes into reviewing: a stay is none, and neither is the way back from
     /// waiting on the owner.
     #[test]
@@ -1037,6 +923,22 @@ mod tests {
         }
     }
 
+    /// No count of qass's writes is a reason to hold back: thirty in the last hour to one tab
+    /// print no writes line and still allow a write.
+    #[test]
+    fn many_writes_to_one_agent_are_no_reason_to_hold_back() {
+        let mut f = facts();
+        f.log = parse_log(
+            &(0..30)
+                .map(|i| format!("{} 128 T52\n", NOW - 60 - i))
+                .collect::<String>(),
+        );
+        let out = brief(&f);
+        assert!(!out.contains("writes:"), "{out}");
+        assert!(out.ends_with("Allowed now: write (ending none)"), "{out}");
+        assert!(compose(&f).1.get("writes_to_agent").is_none());
+    }
+
     /// A remote agent is read there, as today.
     #[test]
     fn a_remote_is_read_with_on_sh() {
@@ -1045,19 +947,17 @@ mod tests {
         assert!(line.contains("`on.sh ubox`"), "{line}");
         assert!(remote_line("52").is_none());
         assert_eq!(
-            parse_log("100 128 ubox/T2\nbroken\n101 128 T5 build\n"),
+            parse_log("100 128 ubox/T2\nbroken\n101 128 T5\n"),
             [
                 Record {
                     at: 100,
                     from: 128,
                     to: "ubox/T2".into(),
-                    build: false,
                 },
                 Record {
                     at: 101,
                     from: 128,
                     to: "T5".into(),
-                    build: true,
                 },
             ]
         );
@@ -1087,20 +987,6 @@ mod tests {
             "{out}"
         );
     }
-
-    /// With qass's terminal unknown its writes cannot be counted: no write now.
-    #[test]
-    fn an_unknown_qass_terminal_is_no_write() {
-        let mut f = facts();
-        f.qass = None;
-        let out = brief(&f);
-        assert!(
-            out.contains("Not now: write (qass's terminal unknown)"),
-            "{out}"
-        );
-        assert!(out.contains("Allowed now: nothing"), "{out}");
-    }
-
     /// The review limit is read across a line break.
     #[test]
     fn the_review_limit_reads_across_a_line_break() {
@@ -1140,22 +1026,6 @@ mod tests {
         );
         assert_eq!(row(serde_json::json!({})), "T3");
     }
-
-    /// No message of his found in qass's transcript is unknown: the last hour, said so.
-    #[test]
-    fn no_word_to_qass_found_counts_the_last_hour() {
-        let mut f = facts();
-        f.typed_to_qass = transcript(&[said(NOW - 100, "<task-notification>x")]);
-        f.log = parse_log(&format!("{} 128 T52\n{} 128 T52\n", NOW - 7200, NOW - 60));
-        let out = brief(&f);
-        assert!(
-            out.contains(
-                "writes: 1 of 3 to T52 in the last hour (when he last spoke to you is unknown)"
-            ),
-            "{out}"
-        );
-    }
-
     /// A message right after another agent wrote to that tab is that agent's (a lead driving
     /// its child), never his.
     #[test]
@@ -1168,40 +1038,6 @@ mod tests {
             out.contains("owner here: nothing he typed in this tab"),
             "{out}"
         );
-    }
-
-    /// His word gives room: writes from before he spoke do not count toward the hour.
-    #[test]
-    fn the_hour_counts_again_from_his_last_word() {
-        let mut f = facts();
-        f.typed_to_qass = transcript(&[said(NOW - 300, "open an agent for the scroll bug")]);
-        let log: String = (0..10)
-            .map(|i| format!("{} 128 T{}\n", NOW - 3000 + i * 180, 60 + i))
-            .collect();
-        f.log = parse_log(&log);
-        let out = brief(&f);
-        assert!(out.contains("0 of 10 since he spoke to you"), "{out}");
-        assert!(out.ends_with("Allowed now: write (ending none)"), "{out}");
-        // With him silent for longer than the hour, the hour stands.
-        f.typed_to_qass = transcript(&[said(NOW - 4000, "go")]);
-        let out = brief(&f);
-        assert!(out.contains("10 of 10 in the last hour"), "{out}");
-        assert!(out.contains("Allowed now: nothing"), "{out}");
-    }
-
-    /// The line that started qass is the program's, not his word.
-    #[test]
-    fn the_launch_line_is_not_his_word() {
-        let mut f = facts();
-        for launch in LAUNCH {
-            f.typed_to_qass = transcript(&[said(NOW - 100, launch)]);
-            f.log = parse_log(&format!("{} 128 T52\n", NOW - 60));
-            let out = brief(&f);
-            assert!(
-                out.contains("(when he last spoke to you is unknown)"),
-                "{launch}: {out}"
-            );
-        }
     }
 
     /// His message in the tab after the card was written is said beside the card.
@@ -1271,41 +1107,6 @@ mod tests {
             "the same evidence again is no step"
         );
     }
-
-    /// Three pushes with no step forward are the cap; a step forward after them gives room.
-    #[test]
-    fn writes_count_since_its_last_step_forward() {
-        let mut f = facts();
-        f.typed_to_qass = transcript(&[said(NOW - 2000, "go")]);
-        f.log = parse_log(
-            &[NOW - 1500, NOW - 1200, NOW - 900]
-                .iter()
-                .map(|at| format!("{at} 128 T52"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        f.task = Some(Ok(task_at(
-            NOW - 2500,
-            "fix the parser; done when cargo test passes",
-        )));
-        let out = brief(&f);
-        assert!(
-            out.contains("writes: 3 of 3 to T52 since he spoke to you"),
-            "{out}"
-        );
-        assert!(out.contains("Not now: write (3 of 3"), "{out}");
-        f.task = Some(Ok(task_at(
-            NOW - 1000,
-            "fix the parser; done when cargo test passes",
-        )));
-        let out = brief(&f);
-        assert!(
-            out.contains("writes: 1 of 3 to T52 since its last step forward"),
-            "{out}"
-        );
-        assert!(out.contains("Allowed now: write"), "{out}");
-    }
-
     /// The goal is said whole, last before the verdict, so a cut drops it before the ending.
     #[test]
     fn the_goal_is_said_and_cut_before_the_ending() {

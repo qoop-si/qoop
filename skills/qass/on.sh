@@ -64,8 +64,8 @@ for a in "$@"; do
     case "$a" in *\'*) echo "on.sh: an argument holds a quote" >&2; exit 2 ;; esac
     cmd="$cmd '$a'"
 done
-# A write to an agent there is noted where qass counts its writes, as `qoop prompt` notes one
-# here. Before the exec below, so it counts the attempt; a note that fails stops nothing.
+# A write to an agent there is noted where the watcher reads qass's writes, as `qoop prompt`
+# notes one here. Before the exec below, so it notes the attempt; a note that fails stops nothing.
 case "$1" in prompt | send)
     from="${QOOP_TERMINAL:-${QORO_TERMINAL:-}}"
     if [ -d "@QASS_DATA@" ] && [ -n "$from" ]; then

@@ -288,12 +288,9 @@ and the third:
 Write apostrophes as ’, since `'` is the quote. Do not use `--wait`: the next
 state arrives as an event. After writing, confirm with one `qoop context`.
 
-At most 3 writes to one worker since the owner last spoke to you or it last stepped forward (a
-higher stage or new evidence), and 10 in the last hour or since they spoke, the shorter: the
-brief's `writes` line counts them. Their word gives room, never permission. `qoop prompt` itself
-refuses a tab a person is at (write the `hands off until` it names) and past your ceiling (8 to a
-tab in 6 hours, 20 an hour). Keys are not capped (a dialog's answer may be his), but every write counts. Never loop waiting on it:
-a card, or the next wake. A key refused because a person is at the tab: theirs to answer there.
+No count limits your writes to a worker. `qoop prompt` itself refuses a tab a person is at (write
+the `hands off until` it names). Never loop waiting on it: a card, or the next wake. A key refused
+because a person is at the tab: theirs to answer there.
 
 ## Asking first
 

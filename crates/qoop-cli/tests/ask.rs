@@ -178,6 +178,22 @@ impl Stack {
         terminal
     }
 
+    /// A shell tab in qass's folder (as the terminals see it: under the daemon's own home),
+    /// opened from `from`'s shell. Its number.
+    fn qass_tab(&self, from: &str) -> String {
+        self.inside(
+            from,
+            "d=\"$HOME/Library/Application Support/qoop/qass\"; [ \"$(uname)\" = Darwin ] || d=\"$HOME/.local/share/qoop/qass\"; [ -z \"$XDG_DATA_HOME\" ] || d=\"$XDG_DATA_HOME/qoop/qass\"; mkdir -p \"$d\" && (cd \"$d\" && qoop new --space qass --name qtab)",
+        );
+        let (_, list, _) = self.run(&["agents"]);
+        list.lines()
+            .find(|l| l.contains("qtab"))
+            .and_then(|l| l.strip_prefix("term="))
+            .and_then(|l| l.split(' ').next())
+            .unwrap_or_else(|| panic!("no qtab: {list}"))
+            .to_string()
+    }
+
     fn state_of(&self, terminal: &str) -> String {
         let (_, out, _) = self.run(&["agents"]);
         out.lines()
@@ -1230,19 +1246,7 @@ fn a_json_listing_larger_than_one_frame_arrives_whole() {
 fn another_terminal_never_types_into_qasss_tab() {
     let stack = Stack::start();
     let worker = stack.open("work", "worker", &[]);
-    // qass's folder as the terminals see it: under the daemon's own home.
-    stack.inside(
-        &worker,
-        "d=\"$HOME/Library/Application Support/qoop/qass\"; [ \"$(uname)\" = Darwin ] || d=\"$HOME/.local/share/qoop/qass\"; [ -z \"$XDG_DATA_HOME\" ] || d=\"$XDG_DATA_HOME/qoop/qass\"; mkdir -p \"$d\" && cd \"$d\" && qoop new --space qass --name qtab",
-    );
-    let (_, list, _) = stack.run(&["agents"]);
-    let qtab = list
-        .lines()
-        .find(|l| l.contains("qtab"))
-        .and_then(|l| l.strip_prefix("term="))
-        .and_then(|l| l.split(' ').next())
-        .unwrap_or_else(|| panic!("no qtab: {list}"))
-        .to_string();
+    let qtab = stack.qass_tab(&worker);
     let said = stack.inside(
         &worker,
         &format!("{{ qoop prompt {qtab} WORKER_NOTE_1; echo rc=$?; }}"),
@@ -1272,6 +1276,26 @@ fn another_terminal_never_types_into_qasss_tab() {
     assert!(stack.wait(|| stack.run(&["read", &qtab]).1.contains("OWNER_LINE_3")));
     let screen = stack.run(&["read", &qtab]).1;
     assert!(!screen.contains("WORKER_NOTE"), "{screen}");
+}
+
+/// qass is held to no count of writes: nine prompts and a text send in a row to one tab, from
+/// its own tab, all go through. Only a person at the tab holds a write back.
+#[test]
+fn qass_writes_to_one_tab_as_often_as_it_needs() {
+    let stack = Stack::start();
+    let worker = stack.open("work", "worker", &[]);
+    let qtab = stack.qass_tab(&worker);
+    let said = stack.inside(
+        &qtab,
+        &format!(
+            "{{ for n in $(seq 1 9); do qoop prompt {worker} \"true $n\" || echo REFUSED; done; \
+             qoop send {worker} --enter true || echo REFUSED; }}"
+        ),
+    );
+    assert!(
+        !said.contains("REFUSED") && !said.contains("ceiling"),
+        "{said}"
+    );
 }
 
 /// A card qass writes on a worker with `--via-qass` (a plan the owner approves) sits on that

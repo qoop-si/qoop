@@ -56,9 +56,7 @@ qoop prompt <the terminal show printed> --generation <G> -- 'approved, build (<K
 ```
 
 `<ending>` is the one its brief's `ending` picks ("Writing to a worker" in SKILL.md). No `--wait`:
-the build is long. Refused because he is at that tab: send it on your next wake; refused by the
-ceiling on writes: one line to him. A line that starts `approved, build (<KEY>).` does not count
-toward your three writes to that agent; nothing else is exempt.
+the build is long. Refused because he is at that tab: send it on your next wake.
 
 One of them: one card, on the worker, with `--via-qass` so his answer comes to you, and the plan on
 his phone:
