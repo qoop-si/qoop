@@ -123,6 +123,10 @@ pub enum TaskError {
     NoStep(i64, usize),
     #[error("{len} steps, over the {max} limit; merge some")]
     TooManySteps { len: usize, max: usize },
+    #[error("{len} phases, over the {max} limit; merge some")]
+    TooManyPhases { len: usize, max: usize },
+    #[error("line {0} is a phase heading, not a step to tick")]
+    NotAStep(i64),
     #[error("#{0}'s space was removed; add it again in a space that is there")]
     SpaceGone(i64),
     #[error("only a done item can be dismissed; #{0} is open or was dropped")]

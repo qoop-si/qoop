@@ -74,6 +74,8 @@ pub enum PlanState {
     Written,
     /// Linked, not approved, no card open on the item, for longer than [`STALE_SECS`].
     Stale,
+    /// Not approved, and qass's plan card is open on the item: it waits on the owner.
+    Asked,
     /// Approved for the newest file.
     Approved(ApprovedBy),
     /// Approved for an older version of the file.
@@ -86,6 +88,7 @@ impl PlanState {
             Self::None => "none",
             Self::Written => "written",
             Self::Stale => "stale",
+            Self::Asked => "asked",
             Self::Approved(_) => "approved",
             Self::Changed => "changed",
         }
@@ -117,6 +120,8 @@ pub struct PlanInfo {
     pub file: Option<PlanFile>,
     /// The owner asked to see this item's plan before it is built.
     pub show_me: bool,
+    /// When its plan last changed: the newest link or approval.
+    pub at: Option<i64>,
 }
 
 /// A plan that waited too long for qass.
@@ -179,8 +184,16 @@ fn plan_file(tx: &Connection, item: i64) -> rusqlite::Result<Option<PlanFile>> {
     )
 }
 
-/// Cards on an item: of a task linked to it, or of the terminal of an open agent linked to it (a
-/// screen dialog's draft has no task). Open ones are the questions he has not answered; with
+/// A card is on an item: its task is linked to it, or its terminal is the terminal of an open
+/// agent linked to it (a screen dialog's draft has no task). The item is `?1`.
+const ON_ITEM: &str = "(a.task IN (SELECT task FROM task_item WHERE item = ?1) \
+    OR a.terminal IN (SELECT t.terminal FROM task_item l JOIN task t ON t.id = l.task \
+                      WHERE l.item = ?1 AND t.closed_at IS NULL AND t.terminal IS NOT NULL))";
+
+/// A card's handle; none for a body that is not JSON.
+const HANDLE: &str = "CASE WHEN json_valid(a.body) THEN json_extract(a.body, '$.handle') END";
+
+/// Cards on an item, by [`ON_ITEM`]. Open ones are the questions he has not answered; with
 /// `in_flight`, answered ones still on their way (queued, passed) count too.
 pub(crate) fn open_cards(tx: &Connection, item: i64, in_flight: bool) -> rusqlite::Result<usize> {
     let statuses = if in_flight {
@@ -189,16 +202,35 @@ pub(crate) fn open_cards(tx: &Connection, item: i64, in_flight: bool) -> rusqlit
         "('open')"
     };
     tx.query_row(
+        &format!("SELECT COUNT(*) FROM ask a WHERE a.status IN {statuses} AND {ON_ITEM}"),
+        params![item],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n as usize)
+}
+
+/// Open questions on an item: its open cards but qass's plan card, which the plan's own state
+/// (`asked`) already tells.
+pub(crate) fn open_questions(tx: &Connection, item: i64) -> rusqlite::Result<usize> {
+    tx.query_row(
         &format!(
-            "SELECT COUNT(*) FROM ask a WHERE a.status IN {statuses} AND ( \
-           a.task IN (SELECT task FROM task_item WHERE item = ?1) \
-           OR a.terminal IN (SELECT t.terminal FROM task_item l JOIN task t ON t.id = l.task \
-                             WHERE l.item = ?1 AND t.closed_at IS NULL AND t.terminal IS NOT NULL))"
+            "SELECT COUNT(*) FROM ask a WHERE a.status = 'open' AND {HANDLE} IS NOT 'plan' AND {ON_ITEM}"
         ),
         params![item],
         |r| r.get::<_, i64>(0),
     )
     .map(|n| n as usize)
+}
+
+/// qass's plan card (handle `plan`) is open on the item, by [`ON_ITEM`].
+fn plan_card_open(tx: &Connection, item: i64) -> rusqlite::Result<bool> {
+    tx.query_row(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM ask a WHERE a.status = 'open' AND {HANDLE} = 'plan' AND {ON_ITEM})"
+        ),
+        params![item],
+        |r| r.get(0),
+    )
 }
 
 /// An item's plan, read from its events.
@@ -212,9 +244,16 @@ pub(crate) fn plan_info(tx: &Connection, item: i64, now: i64) -> rusqlite::Resul
             state: PlanState::None,
             file: None,
             show_me,
+            at: None,
         });
     };
-    let approved = newest_body(tx, item, &["approved"])?.and_then(|(_, _, _, body)| {
+    let newest = newest_body(tx, item, &["approved"])?;
+    let at = Some(
+        newest
+            .as_ref()
+            .map_or(file.at, |(_, at, _, _)| (*at).max(file.at)),
+    );
+    let approved = newest.and_then(|(_, _, _, body)| {
         let (by, hash) = body.split_once('\t')?;
         Some((ApprovedBy::parse(by)?, hash.to_string()))
     });
@@ -222,6 +261,7 @@ pub(crate) fn plan_info(tx: &Connection, item: i64, now: i64) -> rusqlite::Resul
     let waited = now - file.at >= STALE_SECS;
     let state = match approved {
         Some((by, hash)) if hash == file.hash => PlanState::Approved(by),
+        _ if plan_card_open(tx, item)? => PlanState::Asked,
         _ if waited && open_cards(tx, item, true)? == 0 => PlanState::Stale,
         Some(_) => PlanState::Changed,
         None => PlanState::Written,
@@ -230,6 +270,7 @@ pub(crate) fn plan_info(tx: &Connection, item: i64, now: i64) -> rusqlite::Resul
         state,
         file: Some(file),
         show_me,
+        at,
     })
 }
 
@@ -249,7 +290,38 @@ fn open_item_row(tx: &Connection, item: i64) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The open item a card is about, by the rule `open_cards` counts by: the card's task is linked
+/// to it, or the card's terminal is the terminal of an open agent linked to it.
+pub(crate) fn item_of_card(
+    tx: &Connection,
+    task: Option<i64>,
+    terminal: Option<i64>,
+) -> rusqlite::Result<Option<(i64, String)>> {
+    // An ended card goes by its task only: the caller passes no terminal for one, since a
+    // terminal number is given again to a new tab.
+    let item: Option<i64> = tx
+        .query_row(
+            "SELECT l.item FROM task_item l JOIN task i ON i.id = l.item JOIN task t ON t.id = l.task \
+             WHERE i.closed_at IS NULL AND (l.task = ?1 OR (t.closed_at IS NULL AND t.terminal = ?2)) \
+             ORDER BY l.task = ?1 DESC LIMIT 1",
+            params![task, terminal],
+            |r| r.get(0),
+        )
+        .optional()?;
+    item.map(|i| Ok((i, crate::item::key_of(tx, i)?)))
+        .transpose()
+}
+
 impl Store {
+    /// The open item a card is about: see [`item_of_card`].
+    pub fn item_of_card(
+        &self,
+        task: Option<i64>,
+        terminal: Option<i64>,
+    ) -> Result<Option<(i64, String)>, StoreError> {
+        Ok(item_of_card(&self.conn, task, terminal)?)
+    }
+
     /// Link a plan file to an open item: its path, the hash of what it says now, the terminal
     /// that linked it (0 for qass) and its summary. Answers the hash.
     pub fn set_planfile(
@@ -763,5 +835,85 @@ mod tests {
         let file = card.plan.unwrap();
         assert_eq!(file.summary, "Ship it.");
         assert_eq!(file.terminal, t);
+    }
+
+    #[test]
+    fn a_card_finds_its_item_by_task_or_by_an_open_agents_terminal() {
+        let (s, _, t, item) = setup();
+        let task = s.begin_task(t, "work", None, 11).unwrap().0;
+        s.link_task(task, item, 12).unwrap();
+        let key = crate::item::key_of(&s.conn, item).unwrap();
+        // By its task.
+        assert_eq!(
+            s.item_of_card(Some(task), None).unwrap(),
+            Some((item, key.clone()))
+        );
+        // A screen dialog's draft has no task: by the terminal of the open agent.
+        assert_eq!(s.item_of_card(None, Some(t)).unwrap(), Some((item, key)));
+        // Nothing to go by, or a terminal with no linked agent: none.
+        assert_eq!(s.item_of_card(None, None).unwrap(), None);
+        assert_eq!(s.item_of_card(None, Some(t + 99)).unwrap(), None);
+        // A plan's time is its newest link or approval.
+        let h = s.set_planfile(item, "/p/a.md", b"v1", t, 20).unwrap();
+        assert_eq!(s.plan_info(item, 21).unwrap().at, Some(20));
+        s.approve_plan(item, ApprovedBy::Qass, &h, 30).unwrap();
+        assert_eq!(s.plan_info(item, 31).unwrap().at, Some(30));
+    }
+
+    #[test]
+    fn an_open_plan_card_makes_the_plan_wait_on_the_owner() {
+        let (s, _, t, item) = setup();
+        let task = s.begin_task(t, "work", None, 11).unwrap().0;
+        s.link_task(task, item, 12).unwrap();
+        let h = s.set_planfile(item, "/p/plan.md", b"v1", t, 20).unwrap();
+        let card = |handle: &str, status: &str| {
+            s.conn.execute("DELETE FROM ask", []).unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO ask (card, terminal, task, status, body, opened_at) \
+                     VALUES ('E1', ?1, ?2, ?3, ?4, 21)",
+                    params![t, task, status, format!("{{\"handle\":\"{handle}\"}}")],
+                )
+                .unwrap();
+        };
+        card("plan", "open");
+        assert_eq!(s.plan_info(item, 22).unwrap().state, PlanState::Asked);
+        // The plan says it asked: the card is no question on top of that.
+        let row = s.item_row(item, 22).unwrap();
+        assert_eq!((row.plan, row.open_asks), (PlanState::Asked, 0));
+        // It still holds the plan back from going stale while it is open.
+        assert_eq!(open_cards(&s.conn, item, true).unwrap(), 1);
+        // Another question on the item is no plan card.
+        card("domain", "open");
+        assert_eq!(s.plan_info(item, 22).unwrap().state, PlanState::Written);
+        assert_eq!(s.item_row(item, 22).unwrap().open_asks, 1);
+        // Answered: it no longer waits on him.
+        card("plan", "queued");
+        assert_eq!(s.plan_info(item, 22).unwrap().state, PlanState::Written);
+        // Approved wins over a card still open.
+        card("plan", "open");
+        s.approve_plan(item, ApprovedBy::Owner, &h, 30).unwrap();
+        assert_eq!(
+            s.plan_info(item, 31).unwrap().state,
+            PlanState::Approved(ApprovedBy::Owner)
+        );
+    }
+
+    #[test]
+    fn a_closed_item_waits_on_nobody_with_a_plan_card_left_open() {
+        let (s, _, t, item) = setup();
+        let task = s.begin_task(t, "work", None, 11).unwrap().0;
+        s.link_task(task, item, 12).unwrap();
+        s.set_planfile(item, "/p/plan.md", b"v1", t, 20).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO ask (card, terminal, task, status, body, opened_at) \
+                 VALUES ('E1', ?1, ?2, 'open', '{\"handle\":\"plan\"}', 21)",
+                params![t, task],
+            )
+            .unwrap();
+        s.close_task(item, crate::Outcome::Verified, "done", 30)
+            .unwrap();
+        assert_eq!(s.item_row(item, 31).unwrap().plan, PlanState::Written);
     }
 }

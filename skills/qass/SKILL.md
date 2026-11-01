@@ -333,8 +333,8 @@ inbox needs a restart of qoop`: `qoop restart` once (checked), write it again (i
 counts); not restarted, the card stands in chat and `goals.md` only. Without the `-`, the old form
 (`'A: <option>'` words, no inbox record, number from `escalate.sh next E`) when no block can be
 written. The handle: one word of the agent's sidebar name, lowercase, no accented letters (café as
-`cafe`; they may type either), unused by any open card ("billing"). `doing`, `why`, `asks`, labels
-and reasons are in their language, the words in English.
+`cafe`; they may type either), unused by any open card ("billing"), never `plan` (kept for plan
+cards, plans.md). `doing`, `why`, `asks`, labels and reasons are in their language, the words in English.
 
 `now` when the decision table says escalate (their phone rings, end your turn), unless they typed in
 that agent's tab in the last 10 minutes (never for `escalate, always`); `later` otherwise (it waits
@@ -444,7 +444,7 @@ title, description, steps (`3/7`) and its agents. You run it, and it is the trut
 - They want something: brief.md's "Before you create" and "The deeper version", then `qoop task add
   --space <space> '<title>' --description '<their words>'`. A title names the thing
   in at most 32 characters ("api retry defaults"), never its state or progress: the lane and the
-  card say those. Steps (`qoop task steps --id <n> -`) only from their or a plan's words.
+  card say those. Steps (`qoop task steps --id <n> -`) only from their words or a plan's (its phases as `## ` lines, plans.md).
 - They pick (a design, an option, a name): add a line to the item's description, their words and the
   date (`qoop task describe --id KEY -` replaces it whole: read it first). Read it before asking.
 - On every wake, from the board you just wrote: a Doing item whose agents all sit idle with no

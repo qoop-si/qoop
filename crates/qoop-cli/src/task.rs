@@ -264,7 +264,8 @@ const USAGE: &str = "usage:
                                        put an item on a space's board; prints its key (a title
                                        over 32 characters is cut, the whole kept in the description)
   qoop task describe [--id KEY|N] <text|->  the item's description
-  qoop task steps [--id KEY|N] -       the item's steps, one per line on standard input
+  qoop task steps [--id KEY|N] -       the item's steps, one per line on standard input; a
+                                       line `## <name>` starts a phase (at most 8)
   qoop task check [--id KEY|N] <n> [--undo]  tick step n of the item
   qoop task link [--id N] <KEY|#id>    put this terminal's task (or task N) on an item
   qoop task link <KEY|#id> --remote R --task N --name NAME --stage S
@@ -284,7 +285,7 @@ const USAGE: &str = "usage:
   qoop task board [--json] [--dir DIR] the board's items, then every space's goal and open
                                        tasks as Markdown; --json: the items; --dir writes
                                        README.md and space-<id>.md there
-  qoop task board --page               the board as a page: lanes, cards, moves
+  qoop task board --page               the board as a page: a list or lanes (b), cards, moves
   qoop task show [KEY|id] [--before E] [--json]   no id: this terminal's open task; an
                                        item comes with its card (--json: `item`)
   qoop task begin                      this terminal's open task, opened now if none (hooks)
@@ -766,7 +767,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 return Err(usage(USAGE));
             }
             let steps = text(words)?.lines().map(String::from).collect();
-            write(task, TaskOp::Steps { steps }).map(drop)
+            write(task, steps_op(steps)).map(drop)
         }
         Some("check") => {
             let (task, words) = named(rest)?;
@@ -972,8 +973,14 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             };
             println!("{}", line(t));
             if let Some(card) = &found.item {
+                let phase = card
+                    .item
+                    .phase
+                    .as_ref()
+                    .map(|p| format!(", phase {} of {}: {}", p.n, p.of, p.name))
+                    .unwrap_or_default();
                 println!(
-                    "  {} {}, steps {}/{}",
+                    "  {} {}, steps {}/{}{phase}",
                     card.item.key, card.item.state, card.item.steps_done, card.item.steps_total
                 );
                 if let Some(plan) = &card.plan_file {
@@ -1003,7 +1010,14 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 if card.item.open_asks > 0 {
                     println!("  {} question(s) open for the owner", card.item.open_asks);
                 }
+                // A phase header is a heading over the steps under it, never a box to tick.
+                let mut phase = 0;
                 for step in &card.steps {
+                    if let Some(name) = step.text.strip_prefix("## ") {
+                        phase += 1;
+                        println!("  Phase {phase}: {name}");
+                        continue;
+                    }
                     let mark = if step.done_at.is_some() { "x" } else { " " };
                     println!("  [{mark}] {}. {}", step.n, step.text);
                 }
@@ -1096,9 +1110,22 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     }
 }
 
+/// The op that writes an item's steps. Headers go as their own op: a daemon from before phases
+/// refuses it, and the refusal says it is older, rather than keeping the headers as steps to
+/// tick.
+fn steps_op(steps: Vec<String>) -> TaskOp {
+    if steps
+        .iter()
+        .any(|s| qoop_store::item::is_phase(&qoop_store::task::one_line(s)))
+    {
+        TaskOp::PhasedSteps { steps }
+    } else {
+        TaskOp::Steps { steps }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-
     const OWNER_MD: &str = "# What qass learned\n\n## Everywhere\n- Open what he needs to look at; do not describe it (said 3x: 10-18 gtm, 10-21 acme; learned 10-25, new)\n\n## Repo qoop-si/qoop\n- Commit as qoopsy (said 2x)\n\n## Every prompt\n- Prove done with a real run (said 4x: 10-20 acme)\n\n## Every prompt pat/app\n- Never name search\n\n## Repo pat/app\n- Use app-fast\n";
 
     #[test]
@@ -1154,6 +1181,14 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn steps_with_a_phase_header_go_as_their_own_op() {
+        let plain = vec!["write it".to_string(), "##not a header".to_string()];
+        assert!(matches!(steps_op(plain), TaskOp::Steps { .. }));
+        let phased = vec!["## Plan".to_string(), "write it".to_string()];
+        assert!(matches!(steps_op(phased), TaskOp::PhasedSteps { .. }));
+    }
+
     fn open_task() -> TaskInfo {
         TaskInfo {
             id: 7,
@@ -1179,8 +1214,10 @@ mod tests {
             item: qoop_runtime::control::ItemInfo {
                 plan: String::new(),
                 plan_by: None,
+                plan_at: None,
                 show_me: false,
                 open_asks: 0,
+                phase: None,
                 id: 9,
                 key: "QOOP-3".into(),
                 workspace: None,

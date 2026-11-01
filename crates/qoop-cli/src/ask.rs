@@ -496,4 +496,45 @@ pick: B | a column drop cannot be undone
         );
         assert!(parse("doing: d\nwhy: w\nasks: q\nA: a | r | w", "h", "now").is_err());
     }
+
+    /// The plan card qass copies from its skill must be a card the parser takes: its options
+    /// one a line, approve first, so the phone and qass's screen show A as the main button.
+    /// No option's words hold a slot qass cannot fill when it writes the card (his words come
+    /// with his answer): only the item's key.
+    #[test]
+    fn the_plan_card_in_the_skill_parses_with_approve_first() {
+        let skill = include_str!("../../../skills/qass/plans.md");
+        let start = skill
+            .find("asked: <KEY> plan needs you")
+            .expect("the card example");
+        let block = &skill[start..];
+        let block = &block[..block.find("```").expect("its fence")];
+        let words: Vec<&str> = block
+            .lines()
+            .filter(|l| {
+                l.len() > 2 && l.as_bytes()[1] == b':' && l.as_bytes()[0].is_ascii_uppercase()
+            })
+            .filter_map(|l| l.split('|').nth(2))
+            .collect();
+        assert_eq!(words.len(), 2, "{block}");
+        for w in &words {
+            assert!(
+                !w.replace("<KEY>", "").contains('<'),
+                "a slot in the words: {w}"
+            );
+        }
+        // Its placeholders filled in, as qass writes them.
+        let mut card = String::new();
+        let mut rest = block;
+        while let Some(open) = rest.find('<') {
+            card.push_str(&rest[..open]);
+            let close = rest[open..].find('>').expect("a closed placeholder") + open;
+            card.push_str("QOOP-61");
+            rest = &rest[close + 1..];
+        }
+        card.push_str(rest);
+        let parsed = parse(&card, "plan", "now").unwrap_or_else(|p| panic!("{p:?}\n{card}"));
+        let labels: Vec<&str> = parsed.options.iter().map(|o| o.label.as_str()).collect();
+        assert_eq!(labels, ["Approve, build it", "Stop"]);
+    }
 }

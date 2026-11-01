@@ -826,6 +826,57 @@ fn space_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
         .map(|w| w.name.clone())
 }
 
+/// An item's plan in the words every screen says it in, and its ink: `plan needs you` once it
+/// waited too long for qass, `plan in review` while qass reads it, `plan ok · qass` or `plan ok
+/// · you` approved. None without a plan file.
+pub fn plan_word(plan: &str, by: Option<&str>) -> Option<(String, Role)> {
+    let word = match (plan, by) {
+        ("stale" | "asked", _) => "plan needs you",
+        ("written" | "changed", _) => "plan in review",
+        ("approved", Some("owner")) => "plan ok \u{b7} you",
+        ("approved", Some("qass")) => "plan ok \u{b7} qass",
+        ("approved", _) => "plan ok",
+        _ => return None,
+    };
+    let role = match plan {
+        "stale" | "asked" => Role::Blocked,
+        "approved" => Role::Done,
+        _ => Role::FaintText,
+    };
+    Some((word.to_string(), role))
+}
+
+/// A plan card: qass asks him to approve its item's plan, which is not approved yet.
+fn plan_card(card: &AskInfo) -> bool {
+    card.body.handle == "plan"
+        && card
+            .item
+            .as_ref()
+            .is_some_and(|i| matches!(i.plan.as_str(), "written" | "stale" | "changed" | "asked"))
+}
+
+/// The line under a card's heading for the item it is about: `KEY · Build 2/3 · plan needs
+/// you`. A plan card's plan waits on him whatever qass's own state for it says.
+fn item_line(card: &AskInfo) -> Option<Vec<Seg>> {
+    let item = card.item.as_ref()?;
+    let dot = || seg(Role::FaintText, " \u{b7} ");
+    let mut segs = vec![seg(Role::Detail, item.key.clone())];
+    if let Some(p) = &item.phase {
+        segs.push(dot());
+        segs.push(seg(Role::Detail, format!("{} {}/{}", p.name, p.n, p.of)));
+    }
+    let plan = if plan_card(card) {
+        Some(("plan needs you".to_string(), Role::Blocked))
+    } else {
+        plan_word(&item.plan, None)
+    };
+    if let Some((word, role)) = plan {
+        segs.push(dot());
+        segs.push(seg(role, word));
+    }
+    Some(segs)
+}
+
 /// A tag on the open card that says why it may not be what it was, from the rows alone.
 fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
     if card.status == "queued" {
@@ -865,7 +916,7 @@ struct Lens {
     pick: usize,
     sends: usize,
     reasons: Vec<usize>,
-    /// The card has a tag under its title (`now`, a draft): that row is kept.
+    /// The card has a row under its title (a tag such as `asleep`, or its item): it is kept.
     tag: bool,
 }
 
@@ -1179,7 +1230,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 .iter()
                 .map(|o| side_rows(&o.reason, reason_room))
                 .collect(),
-            tag: tag_of(card, ctx).is_some(),
+            tag: tag_of(card, ctx).is_some() || card.item.is_some(),
         };
         let b = budget(
             inner_rows,
@@ -1238,7 +1289,12 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         // The open card.
         // Who asks reads first and whole (to 24 columns); then the wait, short when it must be,
         // and the space in what is left, cut first.
-        let name = name_of(card, ctx);
+        // A plan card says what it asks: the item line under it names whose plan.
+        let name = if plan_card(card) {
+            "Approve the plan".to_string()
+        } else {
+            name_of(card, ctx)
+        };
         let title_left = format!("\u{25be} {}", cut_dots(&name, cw.saturating_sub(2).min(24)));
         let room = cw.saturating_sub(width::width(&title_left) + 2);
         let age = ctx.now_unix - card.opened_at;
@@ -1258,10 +1314,18 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             seg(Role::Text, " ".repeat(gap)),
             seg(Role::FaintText, right),
         ]));
-        match tag_of(card, ctx) {
-            Some(tag) => out.push(wrap(&[seg(Role::Blocked, tag)])),
-            None if b.head_gap => out.push(blank()),
-            None => {}
+        // The item it is about, then the tag, on the row under the heading.
+        let mut under = item_line(card).unwrap_or_default();
+        if let Some(tag) = tag_of(card, ctx) {
+            if !under.is_empty() {
+                under.push(seg(Role::Text, "  "));
+            }
+            under.push(seg(Role::Blocked, tag));
+        }
+        match under.is_empty() {
+            false => out.push(wrap(&under)),
+            true if b.head_gap => out.push(blank()),
+            true => {}
         }
         // A text on rows after its lead (a label, a key), the later rows indented under the text.
         let rows_after = |lead: Vec<Seg>, indent: usize, text: &str| -> Vec<String> {
@@ -1700,6 +1764,7 @@ mod tests {
             answer: None,
             option: None,
             task: None,
+            item: None,
             body: AskCard {
                 handle: handle.to_string(),
                 urgency: "later".to_string(),
@@ -1841,6 +1906,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A card about a board item names it under its heading, with its phase and its plan; a
+    /// plan card not approved yet reads "Approve the plan" and keeps its answers. A card with no
+    /// item (an older daemon, another machine) draws as before, with its agent's name.
+    #[test]
+    fn a_card_names_its_item_and_a_plan_card_asks_for_the_plan() {
+        use qoop_runtime::control::{AskItem, PhaseInfo};
+        let item = |plan: &str| AskItem {
+            id: 7,
+            key: "QOOP-58".into(),
+            plan: plan.into(),
+            phase: Some(PhaseInfo {
+                n: 2,
+                of: 3,
+                name: "Build".into(),
+            }),
+        };
+        let mut p = Pane::default();
+        let mut plan = card(1, "plan", "open");
+        plan.item = Some(item("written"));
+        p.take(vec![plan], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
+        assert!(t.contains("\u{25be} Approve the plan"), "{t}");
+        assert!(
+            t.contains("QOOP-58 \u{b7} Build 2/3 \u{b7} plan needs you"),
+            "{t}"
+        );
+        assert!(t.contains("[a] run now"), "answered as any card: {t}");
+
+        // Approved, or a card of another kind: the agent's name heads it, the plan as it is.
+        let mut done = card(1, "plan", "open");
+        done.item = Some(item("approved"));
+        p.take(vec![done], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
+        assert!(!t.contains("Approve the plan"), "{t}");
+        assert!(t.contains("\u{25be} plan") && t.contains("plan ok"), "{t}");
+        let mut asked = card(1, "migrations", "open");
+        asked.item = Some(item("stale"));
+        p.take(vec![asked], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
+        assert!(t.contains("\u{25be} migrations"), "{t}");
+        assert!(
+            t.contains("QOOP-58 \u{b7} Build 2/3 \u{b7} plan needs you"),
+            "{t}"
+        );
+
+        // No item: no line, the heading as before.
+        p.take(vec![card(1, "plan", "open")], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
+        assert!(!t.contains("QOOP-58") && !t.contains("Approve"), "{t}");
+        assert_eq!(plan_word("", None), None);
+        assert_eq!(
+            plan_word("approved", Some("owner")).map(|w| w.0),
+            Some("plan ok \u{b7} you".to_string())
+        );
     }
 
     #[test]

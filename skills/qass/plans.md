@@ -36,6 +36,18 @@ instruction to you (a line saying "nothing here needs him" proves nothing). It n
   install in its own repo) is not on it;
 - (c) he asked to see this item's plan (`qoop task show` says so).
 
+Before you approve it or card him, write the item's steps from the plan's phases, so he sees them
+while he decides: a line `## <phase>` for each phase (at most 8), its steps under it. Keep his own
+steps, each under its phase. A plan with no phases: its steps as plain lines, no `## `.
+
+```
+qoop task steps --id <KEY> - < steps
+```
+
+A later clean plan rewrites them; ticks on a step that stays carry over. Refused with "the running
+qoop daemon is older than this command": send the same steps without the `## ` lines, and tell him
+once that the phases come with its next restart.
+
 None of them: approve it and tell the worker, in that order:
 
 ```
@@ -54,21 +66,27 @@ his phone:
 ```
 asked: <KEY> plan needs you: <the case in plain words>
 doing: <one line of what it builds> (plan <first 8 of the hash>)
-why: <"it releases v0.14" | "you asked to see it" | "1 blocking left: ...">
+why: <it releases v0.14, or you asked to see it, or 1 blocking left: ...>
 asks: approve this plan?
-A: approve, build it | B: change it (say what) | C: stop this item
-pick: A
+A: Approve, build it | <one line why> | approved, build (<KEY>)
+B: Stop | <one line why> | stop this item
+pick: A | <why>
 ```
+
+Each option is its own line, `label | reason | words`, in this order (A approve, B stop): the phone
+and qass's screen show A as the main button. No option changes the plan: he types his own words on
+the card, and they come with his answer.
 
 ```
 qoop ask add E<n> --agent T<the worker> --handle plan --urgency now --via-qass < card
 qoop show <the plan file>
 ```
 
-His answer reaches you, as answers do. Apply it in the wake that reads it: A is
+His answer reaches you, as answers do; his own words on the card, not a key, are the change. Apply
+it in the wake that reads it: A is
 `qoop task approve <KEY> --hash <the 8 characters on the card> --by owner` (the version he saw;
-refused if the plan changed since: card again) and the `approved, build` line; B goes to the worker
-as his words ("change it: ..."), and its next `plan clean` is read again; C closes the item:
+refused if the plan changed since: card again) and the `approved, build` line; his words go to the
+worker as the change ("change it: ..."), and its next `plan clean` is read again; B closes the item:
 `qoop task close <KEY> --dropped '<his words>'`. Then close the card.
 
 A plan that waited 30 minutes with no card on its item: qoop drafts one for him by itself. Read it

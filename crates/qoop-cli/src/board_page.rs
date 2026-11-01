@@ -1,6 +1,8 @@
-//! `qoop task board --page`: the board as a Jira board, on one page.
+//! `qoop task board --page`: the board on one page, as a list or as a Jira board.
 //!
-//! Three lanes, Todo, Doing and Done, of issue cards (the space on the card's top edge, the
+//! The list (the first view, `b` turns it) groups the items by what they want: Needs you, In
+//! progress, Not started, then Done folded to one row; a row is the item's mark, key, title and
+//! its plan, questions, phase, steps and agent word. Three lanes, Todo, Doing and Done, of issue cards (the space on the card's top edge, the
 //! title, the key, the steps ticked of all, the agent on it and its stage). `h j k l` and the
 //! arrows move, enter opens the issue (Description, Checklist, Activity on the left, Details
 //! on the right; `x` ticks a step), `c` adds an issue to Todo, `H` and `L` move one a lane
@@ -52,8 +54,23 @@ const CHECKS: &str = "qass checks";
 /// What a card says while no agent is on it: in Doing, and in Todo or a reopened item.
 const STARTS: &str = "qass will start it";
 const NO_AGENT: &str = "no agent yet";
-/// `[ full · quiet  v ]`, the card switch at the board's top right.
+/// `[ full · quiet  v ]`, the card switch at the board's top right; `[ list · board  b ]`, the
+/// view switch right of it, is as wide.
 const SWITCH_W: usize = 19;
+/// The list's groups, in order, and the ink of each one's name.
+const GROUPS: [(&str, Role); 4] = [
+    ("Needs you", Role::Blocked),
+    ("In progress", Role::WorkingText),
+    ("Not started", Role::Text),
+    ("Done", Role::Done),
+];
+/// The Done row's place among the list's stops: no item has id 0 (they count from 1).
+// ponytail: a sentinel id, an enum of stops if the list gains another row to stand on.
+const FOLD: i64 = 0;
+/// A row's title keeps at least this many cells before its parts give way.
+const TITLE_MIN: usize = 12;
+/// What the list says with nothing on the board.
+const EMPTY: &str = "Nothing on the board yet. c adds one, t tells qass.";
 /// Read again after this long with no news, for what changes with time alone (a start that
 /// expired, "3 min ago").
 const POLL: Duration = Duration::from_secs(30);
@@ -72,6 +89,22 @@ const LOOSE: &str = "Not on the board";
 const NO_TAB: &str = "no tab";
 /// The lanes, in order, as the daemon names the states.
 const LANES: [&str; 3] = ["todo", "doing", "done"];
+
+/// The board page's two views: the list, grouped by what the items want, and the lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum View {
+    List,
+    Board,
+}
+
+/// A row of the list view.
+enum Line<'a> {
+    /// A group's rule: which, and how many it holds.
+    Group(usize, usize),
+    Item(&'a ItemInfo),
+    /// Done's rule, which folds its items: how many.
+    Fold(usize),
+}
 
 /// What `H` or `L` does to an item, by the lane it is in (decision 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +149,8 @@ enum Step {
     Tell(String),
     /// Keep the card view picked: quiet or full.
     Cards(bool),
+    /// Keep the view picked: the list or the lanes.
+    View(View),
     /// Show this terminal's tab, as `qoop focus` does.
     Goto(u32),
 }
@@ -314,6 +349,14 @@ struct Page {
     /// The quiet cards (A2): one line, a word only when someone must act. `v` or the switch at
     /// the top right turns it; `board.cards` in config.toml keeps it.
     quiet: bool,
+    /// The list or the lanes: `b` or the switch at the top right turns it; `board.view` in
+    /// config.toml keeps it.
+    view: View,
+    /// The list's first row in view, and whether its Done group is opened.
+    list_top: usize,
+    done_open: bool,
+    /// The list's selected row as last settled: its place among the stops and its group.
+    list_was: (usize, usize),
     /// Each lane's first card in view: the wheel moves it, the keyboard and a click bring the
     /// selected card back into view.
     top: [usize; 3],
@@ -624,6 +667,124 @@ fn assignee(item: &ItemInfo, now: i64) -> (String, String, Role, bool) {
     }
 }
 
+/// Whether an open item waits on the owner: an agent of it waits, a question on it is open, or
+/// its plan waited too long for qass.
+fn needs_you(item: &ItemInfo) -> bool {
+    item.state != "done"
+        && (item.open_asks > 0
+            || matches!(item.plan.as_str(), "stale" | "asked")
+            || item.agents.iter().any(|a| !a.closed && a.status == "waits"))
+}
+
+/// The lanes regrouped for the list: what waits on the owner, the rest of Doing, the rest of Todo
+/// (a plan or not: the owner's pick), then Done. Each group keeps the lanes' newest first.
+fn groups<'a>(lanes: &[Vec<&'a ItemInfo>; 3]) -> [Vec<&'a ItemInfo>; 4] {
+    let mut open: Vec<&ItemInfo> = lanes[0].iter().chain(&lanes[1]).copied().collect();
+    open.sort_by_key(|i| std::cmp::Reverse(lane_stamp(i)));
+    let mut out: [Vec<&ItemInfo>; 4] = Default::default();
+    for item in open {
+        let group = match (needs_you(item), item.state == "doing") {
+            (true, _) => 0,
+            (false, true) => 1,
+            (false, false) => 2,
+        };
+        out[group].push(item);
+    }
+    out[3] = lanes[2].clone();
+    out
+}
+
+/// An item's mark, the sidebar's own picture, and its ink: the ring when it waits on the owner,
+/// full once closed or at its last phase done, else its first live agent's state (breath
+/// working, the middle row asleep, the centre dot idle); the ring in the quiet ink in Todo.
+fn item_mark(item: &ItemInfo) -> (String, Role) {
+    let mark = |role| qoop_tui::sidebar::state_mark(role, false, 0, false);
+    if needs_you(item) {
+        return (mark(Role::Blocked), Role::Blocked);
+    }
+    let last_done = item.phase.as_ref().is_some_and(|p| p.n == p.of)
+        && item.steps_total > 0
+        && item.steps_done == item.steps_total;
+    if item.state == "done" || last_done {
+        return (mark(Role::Done), Role::Done);
+    }
+    if let Some(a) = item.agents.iter().find(|a| !a.closed) {
+        let role = match a.status.as_str() {
+            "working" => Role::Working,
+            "asleep" => Role::Sleeping,
+            "error" => Role::Failed,
+            _ => Role::Idle,
+        };
+        return (mark(role), role);
+    }
+    if item.state == "todo" {
+        let colour = qoop_tui::colorlevel::level() != qoop_tui::colorlevel::Level::Mono;
+        return (
+            todo_ring(qoop_tui::colorlevel::braille(), colour),
+            Role::FaintText,
+        );
+    }
+    (mark(Role::Idle), Role::Idle)
+}
+
+/// Todo's mark: waiting's picture, told apart by its quiet ink. Without braille its `?` would
+/// say it waits, and without colour it would be the needs-you ring: a plain `o` then.
+fn todo_ring(braille: bool, colour: bool) -> String {
+    if braille && colour {
+        qoop_tui::sidebar::state_mark(Role::Blocked, false, 0, false)
+    } else {
+        "o ".to_string()
+    }
+}
+
+/// What a list row says right of its title, in the order it is drawn: the plan, the questions
+/// open, the phase, the steps, the agent's word.
+fn row_parts(item: &ItemInfo, now: i64) -> Vec<(String, Role)> {
+    let mut parts = Vec::new();
+    if let Some(plan) = qoop_tui::asks::plan_word(&item.plan, item.plan_by.as_deref()) {
+        parts.push(plan);
+    }
+    match item.open_asks {
+        0 => {}
+        1 => parts.push(("1 question".to_string(), Role::Blocked)),
+        n => parts.push((format!("{n} questions"), Role::Blocked)),
+    }
+    if let Some(p) = &item.phase {
+        parts.push((
+            format!("{} {}/{}", fit(&p.name, 16), p.n, p.of),
+            Role::Detail,
+        ));
+    }
+    if item.steps_total > 0 {
+        let role = if item.steps_done == item.steps_total {
+            Role::Done
+        } else {
+            Role::Detail
+        };
+        parts.push((format!("{}/{}", item.steps_done, item.steps_total), role));
+    }
+    let (_, word, role, _) = assignee(item, now);
+    if !word.is_empty() {
+        parts.push((word, role));
+    }
+    parts
+}
+
+/// The cells `parts` take flush right, two apart, with the two before the first.
+fn parts_w(parts: &[(String, Role)]) -> usize {
+    parts.iter().map(|(t, _)| width::width(t) + 2).sum()
+}
+
+/// `parts` cut to `room` cells, the rightmost first, a word that wants the owner last.
+fn drop_parts(mut parts: Vec<(String, Role)>, room: usize) -> Vec<(String, Role)> {
+    while parts_w(&parts) > room {
+        let urgent = |r: &Role| matches!(r, Role::Blocked | Role::Failed | Role::FailedText);
+        let at = parts.iter().rposition(|(_, r)| !urgent(r));
+        parts.remove(at.unwrap_or(parts.len() - 1));
+    }
+    parts
+}
+
 impl Page {
     fn new() -> Page {
         Page {
@@ -643,6 +804,10 @@ impl Page {
             wandered: false,
             reveal: false,
             quiet: false,
+            view: View::List,
+            list_top: 0,
+            done_open: false,
+            list_was: (0, 0),
             top: [0; 3],
             scroll: 0,
             all: false,
@@ -667,9 +832,24 @@ impl Page {
         w.saturating_sub(self.search().chars().count() + 6)
     }
 
-    /// Where the card switch starts on the top row at width `w`: left of the search box.
-    fn switch_at(&self, w: usize) -> usize {
+    /// Where the view switch starts on the top row at width `w`: left of the search box.
+    fn view_at(&self, w: usize) -> usize {
         self.search_at(w).saturating_sub(2 + SWITCH_W)
+    }
+
+    /// Where the card switch starts on the top row at width `w`: left of the view switch, or in
+    /// its place when that leaves no room (qass's split; the footer still says `b`). Only the
+    /// lanes have cards.
+    fn switch_at(&self, w: usize) -> usize {
+        let left = self.view_at(w).saturating_sub(2 + SWITCH_W);
+        // " board" ends at column 6.
+        if left > 6 { left } else { self.view_at(w) }
+    }
+
+    /// The view switch is drawn and clicked: always in the list, on the lanes only while the
+    /// card switch has room beside it.
+    fn view_shown(&self, w: usize) -> bool {
+        self.view == View::List || self.switch_at(w) != self.view_at(w)
     }
 
     /// The search box's text.
@@ -686,6 +866,93 @@ impl Page {
         self.quiet = !self.quiet;
         self.follow();
         Step::Cards(self.quiet)
+    }
+
+    /// The list to the lanes or back, on the same item: a Done one opens Done in the list.
+    fn turn_view(&mut self) -> Step {
+        self.view = match self.view {
+            View::List => View::Board,
+            View::Board => View::List,
+        };
+        self.loose_at = None;
+        if self.selected().is_some_and(|i| i.state == "done") {
+            self.done_open = true;
+        }
+        self.settle();
+        self.follow();
+        Step::View(self.view)
+    }
+
+    /// The list's rows: each group with items its rule and its items, then Done's rule, and
+    /// its items while it is opened.
+    fn list_lines<'a>(&self, lanes: &[Vec<&'a ItemInfo>; 3]) -> Vec<Line<'a>> {
+        let groups = groups(lanes);
+        let mut out = Vec::new();
+        for (n, group) in groups[..3].iter().enumerate() {
+            if !group.is_empty() {
+                out.push(Line::Group(n, group.len()));
+                out.extend(group.iter().map(|i| Line::Item(i)));
+            }
+        }
+        if !groups[3].is_empty() {
+            out.push(Line::Fold(groups[3].len()));
+            if self.done_open {
+                out.extend(groups[3].iter().map(|i| Line::Item(i)));
+            }
+        }
+        out
+    }
+
+    /// What the list's keyboard stands on, in order: its items and the Done row ([`FOLD`]).
+    fn stops(&self) -> Vec<i64> {
+        self.list_lines(&self.lanes())
+            .iter()
+            .filter_map(|l| match l {
+                Line::Item(i) => Some(i.id),
+                Line::Fold(_) => Some(FOLD),
+                Line::Group(..) => None,
+            })
+            .collect()
+    }
+
+    /// The list's first row on the page: under the new item's form while one is typed.
+    fn list_y(&self) -> usize {
+        if matches!(self.mode, Mode::Create { .. }) {
+            4
+        } else {
+            2
+        }
+    }
+
+    /// The rows the list has at the size last drawn: above the folded row and the foot.
+    fn list_room(&self) -> usize {
+        let h = self.size.1.max(FLOOR.1);
+        (h - 2)
+            .saturating_sub(self.list_y() + self.sect_rows(1, h - 4))
+            .max(1)
+    }
+
+    /// Scroll the list the least that brings the selected row into view, its group's rule with
+    /// it when it is the group's first.
+    fn list_follow(&mut self) {
+        let lanes = self.lanes();
+        let lines = self.list_lines(&lanes);
+        let Some(at) = lines.iter().position(|l| match l {
+            Line::Item(i) => Some(i.id) == self.sel,
+            Line::Fold(_) => self.sel == Some(FOLD),
+            Line::Group(..) => false,
+        }) else {
+            return;
+        };
+        let head = at.saturating_sub(usize::from(
+            at > 0 && matches!(lines[at - 1], Line::Group(..)),
+        ));
+        let room = self.list_room();
+        if head < self.list_top {
+            self.list_top = head;
+        } else if at >= self.list_top + room {
+            self.list_top = at + 1 - room;
+        }
     }
 
     fn lanes(&self) -> [Vec<&ItemInfo>; 3] {
@@ -743,6 +1010,36 @@ impl Page {
     /// Keep the keyboard on its item wherever the item went (a move takes it to another
     /// lane); an item gone or filtered out leaves it on the first card of its lane.
     fn settle(&mut self) {
+        if self.view == View::List {
+            let stops = self.stops();
+            // An item gone from the stops (`L` folds it into Done) leaves the keyboard on the
+            // row now at its place; one that changed group on a poll is brought into view.
+            let (was, group) = self.list_was;
+            let kept = self.sel.and_then(|s| stops.iter().position(|n| *n == s));
+            let at = kept.unwrap_or(was.min(stops.len().saturating_sub(1)));
+            self.sel = stops.get(at).copied();
+            let now = match self.sel {
+                Some(FOLD) => 3,
+                sel => groups(&self.lanes())
+                    .iter()
+                    .position(|g| g.iter().any(|i| Some(i.id) == sel))
+                    .unwrap_or(0),
+            };
+            if kept.is_none() || now != group {
+                self.list_follow();
+            }
+            self.list_was = (at, now);
+            let lanes = self.lanes();
+            // The lane follows the item, so the lanes open on it and a move knows its way.
+            self.lane = match self.sel {
+                Some(FOLD) => 2,
+                sel => lanes
+                    .iter()
+                    .position(|l| l.iter().any(|i| Some(i.id) == sel))
+                    .unwrap_or(self.lane),
+            };
+            return;
+        }
         let lanes = self.lanes();
         if let Some(lane) = self
             .sel
@@ -764,6 +1061,17 @@ impl Page {
     /// Move the keyboard `by` cards in its lane.
     fn step(&mut self, by: isize) {
         if self.step_in_loose(by) {
+            return;
+        }
+        if self.view == View::List {
+            let stops = self.stops();
+            let at = self
+                .sel
+                .and_then(|sel| stops.iter().position(|s| *s == sel))
+                .unwrap_or(0);
+            let to = (at as isize + by).clamp(0, stops.len().saturating_sub(1) as isize) as usize;
+            self.sel = stops.get(to).copied();
+            self.list_follow();
             return;
         }
         let lanes = self.lanes();
@@ -813,6 +1121,9 @@ impl Page {
 
     /// Scroll the keyboard's lane the least that brings the selected card into view.
     fn follow(&mut self) {
+        if self.view == View::List {
+            return self.list_follow();
+        }
         let room = self.room(self.lane);
         let lanes = self.lanes();
         let Some(at) = self
@@ -863,17 +1174,22 @@ impl Page {
             .min(self.loose_lines().len().saturating_sub(shown))
     }
 
+    /// Whether the folded row is drawn where the keyboard is: at the list's foot, or in the
+    /// lanes' Doing box (a lane too narrow for boxes has none).
+    fn loose_here(&self) -> bool {
+        self.view == View::List || (self.lane == 1 && !self.listed(self.size, 1))
+    }
+
     /// The line of the opened row with the keyboard, while it is there to have it.
     fn loose_cursor(&self) -> Option<usize> {
         self.loose_at
-            .filter(|_| self.lane == 1 && self.loose_shown() && self.loose_open)
-            .filter(|_| !self.listed(self.size, 1))
+            .filter(|_| self.loose_shown() && self.loose_open && self.loose_here())
     }
 
     /// The opened row is Doing's last stop: `j` past its last card steps into it and `k` from
     /// its first line steps back out. Whether it took the key.
     fn step_in_loose(&mut self, by: isize) -> bool {
-        if self.lane != 1 || !self.loose_shown() || !self.loose_open || self.listed(self.size, 1) {
+        if !self.loose_here() || !self.loose_shown() || !self.loose_open {
             return false;
         }
         let lines = self.loose_lines().len();
@@ -883,12 +1199,19 @@ impl Page {
                     .then(|| (i as isize + by).clamp(0, lines as isize - 1) as usize);
             }
             None => {
-                let lanes = self.lanes();
-                let at = self
-                    .sel
-                    .and_then(|sel| lanes[1].iter().position(|i| i.id == sel))
-                    .unwrap_or(0);
-                if by < 0 || lines == 0 || at + 1 < lanes[1].len() {
+                // In the list it is the last stop's next; in the lanes, Doing's last card's.
+                let last = if self.view == View::List {
+                    let stops = self.stops();
+                    stops.is_empty() || self.sel == stops.last().copied()
+                } else {
+                    let lanes = self.lanes();
+                    let at = self
+                        .sel
+                        .and_then(|sel| lanes[1].iter().position(|i| i.id == sel))
+                        .unwrap_or(0);
+                    at + 1 >= lanes[1].len()
+                };
+                if by < 0 || lines == 0 || !last {
                     return false;
                 }
                 self.loose_at = Some(0);
@@ -915,8 +1238,8 @@ impl Page {
 
     /// Open or close the folded row (`N`).
     fn turn_loose(&mut self) {
-        // The row is drawn in Doing's box: a list too narrow for boxes has none to turn.
-        if self.loose_shown() && !self.listed(self.size, 1) {
+        // In the lanes the row is drawn in Doing's box: a lane too narrow for boxes has none.
+        if self.loose_shown() && (self.view == View::List || !self.listed(self.size, 1)) {
             self.loose_open = !self.loose_open;
             self.loose_at = None;
             self.follow();
@@ -994,6 +1317,22 @@ impl Page {
             };
             return;
         }
+        // The list moves a row a notch, never past its last.
+        if self.view == View::List {
+            if self.mode == Mode::Board {
+                let max = self
+                    .list_lines(&self.lanes())
+                    .len()
+                    .saturating_sub(self.list_room());
+                let top = self.list_top.min(max);
+                self.list_top = if up {
+                    top.saturating_sub(1)
+                } else {
+                    (top + 1).min(max)
+                };
+            }
+            return;
+        }
         let (w, h) = self.size;
         if self.mode != Mode::Board || w < NEED.0 || h < NEED.1 || row < 2 || row >= h - 2 {
             return;
@@ -1061,6 +1400,19 @@ impl Page {
             } if self.mode == Mode::Board => {
                 let (col, row) = (col as usize, row as usize);
                 self.wandered = false;
+                let view = self.view_at(self.size.0);
+                if row == 0
+                    && view > 6
+                    && self.view_shown(self.size.0)
+                    && (view..view + SWITCH_W).contains(&col)
+                {
+                    self.held = None;
+                    return self.turn_view();
+                }
+                if self.view == View::List {
+                    self.held = None;
+                    return self.list_click(row);
+                }
                 // A Done card's cross puts it away (or back): never also a press that holds it.
                 if let Some(id) = self.cross_at(col, row) {
                     self.held = None;
@@ -1161,6 +1513,52 @@ impl Page {
             _ => {}
         }
         Step::Stay
+    }
+
+    /// A press on the list: a row opens its item, the Done row opens or folds, the folded row
+    /// at the foot opens, or takes the keyboard to a line of it. A row spans the page's width.
+    fn list_click(&mut self, row: usize) -> Step {
+        let h = self.size.1.max(FLOOR.1);
+        let loose = self.sect_rows(1, h - 4);
+        if loose > 0 && row + 2 + loose >= h && row + 2 < h {
+            match row + 2 + loose - h {
+                0 | 1 => self.turn_loose(),
+                n => {
+                    self.loose_at = Some(self.loose_first(loose - 2) + n - 2);
+                    self.loose_follow();
+                }
+            }
+            return Step::Stay;
+        }
+        let room = self.list_room();
+        let hit = {
+            let lanes = self.lanes();
+            let lines = self.list_lines(&lanes);
+            let first = self.list_top.min(lines.len().saturating_sub(room));
+            row.checked_sub(self.list_y())
+                .filter(|r| *r < room)
+                .and_then(|r| lines.get(first + r))
+                .and_then(|l| match l {
+                    Line::Item(i) => Some(i.id),
+                    Line::Fold(_) => Some(FOLD),
+                    Line::Group(..) => None,
+                })
+        };
+        self.loose_at = None;
+        match hit {
+            Some(FOLD) => {
+                self.sel = Some(FOLD);
+                self.done_open = !self.done_open;
+                self.settle();
+                Step::Stay
+            }
+            Some(id) => {
+                self.sel = Some(id);
+                self.settle();
+                Step::Open(id)
+            }
+            None => Step::Stay,
+        }
     }
 
     /// The card drawn at a cell of the page, with its lane: the lanes and cards as
@@ -1319,15 +1717,18 @@ impl Page {
         match key {
             Key::Char('q') => return Step::Leave,
             Key::Esc => self.filter.clear(),
-            Key::Left | Key::Char('h') => self.side(-1),
-            Key::Right | Key::Char('l') => self.side(1),
+            // The list is one column: only the lanes go sideways.
+            Key::Left | Key::Char('h') if self.view == View::Board => self.side(-1),
+            Key::Right | Key::Char('l') if self.view == View::Board => self.side(1),
             Key::Up | Key::Char('k') => self.step(-1),
             Key::Down | Key::Char('j') => self.step(1),
             Key::Enter => {
                 if let Some(i) = self.loose_cursor() {
                     return self.goto(i);
                 }
-                if let Some(item) = self.selected() {
+                if self.view == View::List && self.sel == Some(FOLD) {
+                    self.done_open = !self.done_open;
+                } else if let Some(item) = self.selected() {
                     return Step::Open(item.id);
                 }
             }
@@ -1345,6 +1746,7 @@ impl Page {
             Key::Char('N') => self.turn_loose(),
             Key::Char('/') => self.mode = Mode::Filter,
             Key::Char('v') => return self.turn_cards(),
+            Key::Char('b') => return self.turn_view(),
             Key::Char('t') => self.mode = Mode::Tell(String::new()),
             Key::Char('c') => {
                 let here = self.selected().and_then(|i| i.workspace);
@@ -1395,7 +1797,8 @@ impl Page {
                 self.flipped.clear();
             }
             Key::Char('x') | Key::Char(' ') => {
-                if let Some(step) = step {
+                // A phase's heading is never a box to tick.
+                if let Some(step) = step.filter(|s| !qoop_store::item::is_phase(&s.text)) {
                     let done = step.done_at.is_none();
                     let said = format!(
                         "{} step {} {}",
@@ -1420,13 +1823,33 @@ impl Page {
         } else {
             s.put(1, 0, "board", &bold(Role::Title)) + 1
         };
+        let list = self.view == View::List;
+        // The heading's words end before the switches: the card switch only on the lanes.
+        let end = if list {
+            self.view_at(w)
+        } else {
+            self.switch_at(w)
+        };
         let sub = "your tasks, run by qass";
-        if x + 1 + sub.chars().count() + 2 <= self.switch_at(w) {
-            s.put(x + 1, 0, sub, &ink(Role::FaintText));
+        // How many wait on him, as the list's first group counts them under the filter: before
+        // the sub line when only one fits.
+        let need = groups(&self.lanes())[0].len();
+        let said = if list && need > 0 {
+            format!("{need} need you")
+        } else {
+            String::new()
+        };
+        let mut x = x;
+        let sub_w = sub.chars().count() + if said.is_empty() { 0 } else { 2 };
+        if x + 1 + sub_w + said.len() + 2 <= end {
+            x = s.put(x + 1, 0, sub, &ink(Role::FaintText)) + 1;
+        }
+        if !said.is_empty() && x + 1 + said.len() + 2 <= end {
+            s.put(x + 1, 0, &said, &bold(Role::Blocked));
         }
         let search = self.search();
         let sx = self.search_at(w);
-        // The card switch: the view picked in brand ink, the other faint, `v` turns it.
+        // A switch: the view picked in brand ink, the other faint, its key after them.
         let pick = |on: bool| {
             if on {
                 bold(Role::BrandText)
@@ -1434,19 +1857,32 @@ impl Page {
                 ink(Role::FaintText)
             }
         };
-        let switch = self.switch_at(w);
-        s.seg(
-            if switch > 6 { switch } else { w },
-            0,
-            &[
-                ("[ ", ink(Role::Brand)),
-                ("full", pick(!self.quiet)),
-                (" · ", ink(Role::FaintText)),
-                ("quiet", pick(self.quiet)),
-                ("  v", ink(Role::Detail)),
-                (" ]", ink(Role::Brand)),
-            ],
-        );
+        let switch = |s: &mut Screen, at: usize, (a, b): (&str, &str), first: bool, key: &str| {
+            s.seg(
+                if at > 6 { at } else { w },
+                0,
+                &[
+                    ("[ ", ink(Role::Brand)),
+                    (a, pick(first)),
+                    (" · ", ink(Role::FaintText)),
+                    (b, pick(!first)),
+                    (key, ink(Role::Detail)),
+                    (" ]", ink(Role::Brand)),
+                ],
+            );
+        };
+        if !list {
+            switch(
+                &mut s,
+                self.switch_at(w),
+                ("full", "quiet"),
+                !self.quiet,
+                "  v",
+            );
+        }
+        if self.view_shown(w) {
+            switch(&mut s, self.view_at(w), ("list", "board"), list, "  b");
+        }
         s.seg(
             sx,
             0,
@@ -1468,26 +1904,22 @@ impl Page {
             return s;
         };
         let lanes = self.lanes();
-        if w < NEED.0 || h < NEED.1 {
+        // The list at every width the page draws; the lanes one at a time under their size.
+        if list {
+            self.list(&mut s, &lanes);
+        } else if w < NEED.0 || h < NEED.1 {
             self.narrow(&mut s, &lanes);
-            // Every mode the keys act in is drawn: the card over the one lane, at its size.
-            if let Mode::Card(at) = self.mode
-                && let Some(card) = &self.card
-            {
-                let (corner, size) = Self::dialog_box((w, h));
-                self.dialog(&mut s, card, at, corner, size);
+        } else {
+            // Three lanes, two columns apart.
+            let lw = (w - 2 - 4) / 3;
+            let (top, bottom) = (2, h - 2);
+            for (n, lane) in lanes.iter().enumerate() {
+                let lx = 1 + n * (lw + 2);
+                self.lane_box(&mut s, n, lane, lx, top, lw, bottom - top);
             }
-            self.foot(&mut s);
-            return s;
         }
-        // Three lanes, two columns apart.
-        let lw = (w - 2 - 4) / 3;
-        let (top, bottom) = (2, h - 2);
-        for (n, lane) in lanes.iter().enumerate() {
-            let lx = 1 + n * (lw + 2);
-            self.lane_box(&mut s, n, lane, lx, top, lw, bottom - top);
-        }
-        // The issue over the lanes, edge on edge with them: one box, no lane border beside it.
+        // The issue over the page, edge on edge with the lanes: one box, no lane border beside
+        // it; over the one lane or the list of a narrow page at its size.
         if let Mode::Card(at) = self.mode
             && let Some(card) = &self.card
         {
@@ -1540,24 +1972,9 @@ impl Page {
             s.put(1, 2, &format!("┌{}┐", "─".repeat(w - 4)), &ink(Role::Rule));
             return;
         }
-        // The form takes the list's first two rows: the title typed, and the space it goes to.
         let mut top = 2;
         if let Some((title, space)) = creating {
-            let room = w - 4;
-            let end: String = {
-                let n = title.chars().count();
-                title.chars().skip(n.saturating_sub(room)).collect()
-            };
-            let cx = s.put(1, top, "+ ", &ink(Role::Brand));
-            let cx = s.put(cx, top, &end, &bold(Role::Focused));
-            s.put(cx, top, "\u{258c}", &ink(Role::Brand));
-            let to = self
-                .targets()
-                .get(space)
-                .map_or("no space to add to".to_string(), |t| {
-                    format!("to {}, tab space", t.name)
-                });
-            s.put(3, top + 1, &fit(&to, w - 4), &ink(Role::FaintText));
+            self.form(s, top, title, space);
             top += 2;
         }
         let rows = h - 2 - top;
@@ -1574,6 +1991,157 @@ impl Page {
         }
         if lane.is_empty() && creating.is_none() {
             s.put(3, top, "nothing here", &ink(Role::FaintText));
+        }
+    }
+
+    /// The new item's form on a list's first two rows from `top`: the title typed, and the space
+    /// it goes to.
+    fn form(&self, s: &mut Screen, top: usize, title: &str, space: usize) {
+        let room = s.w - 4;
+        let end: String = {
+            let n = title.chars().count();
+            title.chars().skip(n.saturating_sub(room)).collect()
+        };
+        let cx = s.put(1, top, "+ ", &ink(Role::Brand));
+        let cx = s.put(cx, top, &end, &bold(Role::Focused));
+        s.put(cx, top, "\u{258c}", &ink(Role::Brand));
+        let to = self
+            .targets()
+            .get(space)
+            .map_or("no space to add to".to_string(), |t| {
+                format!("to {}, tab space", t.name)
+            });
+        s.put(3, top + 1, &fit(&to, s.w - 4), &ink(Role::FaintText));
+    }
+
+    /// The list view: a rule with its count over each group's rows, Done folded to its rule
+    /// until enter opens it, and the work no item holds folded at the foot. Rows out of view
+    /// are counted on the rule under the heading.
+    fn list(&self, s: &mut Screen, lanes: &[Vec<&ItemInfo>; 3]) {
+        let w = s.w;
+        let top = self.list_y();
+        if let Mode::Create { title, space } = &self.mode {
+            self.form(s, 2, title, *space);
+        }
+        let lines = self.list_lines(lanes);
+        if lines.is_empty() && top == 2 {
+            let say = if self.filter.trim().is_empty() {
+                EMPTY
+            } else {
+                "Nothing matches the filter. esc clears it."
+            };
+            s.put(3, top, &fit(say, w - 4), &ink(Role::FaintText));
+        }
+        let room = (s.h - 2)
+            .saturating_sub(top + self.sect_rows(1, s.h - 4))
+            .max(1);
+        let first = self.list_top.min(lines.len().saturating_sub(room));
+        let key_w = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Item(i) => Some(i.key.chars().count()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .min(12)
+            .min(w.saturating_sub(9) / 3);
+        let quiet = self.mode == Mode::Filter || self.loose_cursor().is_some();
+        for (r, line) in lines.iter().skip(first).take(room).enumerate() {
+            let y = top + r;
+            match line {
+                Line::Group(n, count) => self.group_rule(s, y, *n, *count, ""),
+                Line::Fold(count) => {
+                    let mut hint = if self.done_open {
+                        "enter folds".to_string()
+                    } else {
+                        "enter opens".to_string()
+                    };
+                    match (self.hidden(), self.reveal) {
+                        (0, _) => {}
+                        (n, false) => hint = format!("hidden ({n})  X  {hint}"),
+                        (n, true) => hint = format!("hidden ({n}) shown  X  {hint}"),
+                    }
+                    if self.sel == Some(FOLD) && !quiet {
+                        s.put(1, y, "\u{25b8}", &ink(Role::Brand));
+                    }
+                    self.group_rule(s, y, 3, *count, &hint);
+                }
+                Line::Item(item) => {
+                    let on = Some(item.id) == self.sel && !quiet;
+                    self.list_row(s, item, y, key_w, on);
+                }
+            }
+        }
+        let below = lines.len().saturating_sub(first + room);
+        let marks = [(first, "above"), (below, "below")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, word)| format!(" {n} {word} "))
+            .collect::<String>();
+        if !marks.is_empty() {
+            s.put(
+                w.saturating_sub(2 + width::width(&marks)),
+                1,
+                &marks,
+                &ink(Role::FaintText),
+            );
+        }
+        // The work no item holds, at the foot: its label and count line, its lines opened.
+        let rows = self.sect_rows(1, s.h - 4);
+        if rows > 0 {
+            self.loose_row(s, 0, w, (s.h - 2 - rows, rows));
+        }
+    }
+
+    /// A group's rule on row `y`: its name in its ink, its count, the rule to the edge with
+    /// `hint` near its end.
+    fn group_rule(&self, s: &mut Screen, y: usize, n: usize, count: usize, hint: &str) {
+        let (name, role) = GROUPS[n];
+        let x = s.put(3, y, name, &bold(role));
+        let x = s.put(x, y, &format!(" {count} "), &ink(Role::FaintText));
+        let end = s.w - 1;
+        s.put(
+            x,
+            y,
+            &"\u{2500}".repeat(end.saturating_sub(x)),
+            &ink(Role::Rule),
+        );
+        let hint = format!(" {hint} ");
+        if hint.len() > 2 && x + 2 + width::width(&hint) + 2 <= end {
+            s.put(
+                end - 2 - width::width(&hint),
+                y,
+                &hint,
+                &ink(Role::FaintText),
+            );
+        }
+    }
+
+    /// One item's row: the keyboard's arrow, its mark, key and title, then right of it its
+    /// parts as fit, the rightmost given up first and a word that wants the owner last. The
+    /// mark, the key and the title always stay; a title is cut by cells.
+    fn list_row(&self, s: &mut Screen, item: &ItemInfo, y: usize, key_w: usize, on: bool) {
+        let end = s.w - 1;
+        if on {
+            s.put(1, y, "\u{25b8}", &ink(Role::Brand));
+        }
+        let (mark, role) = item_mark(item);
+        s.put(3, y, &mark, &ink(role));
+        s.put(6, y, &cut_key(&item.key, key_w), &ink(Role::FaintText));
+        let tx = 6 + key_w + 2;
+        let room = end.saturating_sub(tx);
+        let keep = width::width(&item.title).min(TITLE_MIN);
+        let parts = drop_parts(row_parts(item, self.now), room.saturating_sub(keep));
+        let title = match (on, item.state == "done") {
+            (true, _) => bold(Role::Focused),
+            (false, true) => ink(Role::Detail),
+            (false, false) => ink(Role::Text),
+        };
+        s.put(tx, y, &fit(&item.title, room - parts_w(&parts)), &title);
+        let mut x = end - parts_w(&parts) + 2;
+        for (text, role) in &parts {
+            x = s.put(x, y, text, &ink(*role)) + 2;
         }
     }
 
@@ -1625,8 +2193,10 @@ impl Page {
                 .min(y + 1 + (room.max(1) - 1) * self.card_h());
             self.new_card(s, title, *space, x + 1, cy, w - 2);
         }
-        if n == 1 {
-            self.loose_row(s, x, y, w, h);
+        if n == 1
+            && let Some(place) = self.loose_place(y, h)
+        {
+            self.loose_row(s, x, w, place);
         }
         let below = lane.len().saturating_sub(first + room);
         let foot = match n {
@@ -1701,12 +2271,10 @@ impl Page {
         (format!("{space} {word} · {NO_TAB}"), role, true)
     }
 
-    /// The folded row at the foot of Doing, in lane `y`..`y + h`: its label with the count of
-    /// all of it, its count line, and while it is open a line per task.
-    fn loose_row(&self, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) {
-        let Some((top, rows)) = self.loose_place(y, h) else {
-            return;
-        };
+    /// The folded row in a box at `x`, `w` wide, at its first row and with its rows (at the
+    /// foot of Doing, or of the list): its label with the count of all of it, its count line,
+    /// and while it is open a line per task.
+    fn loose_row(&self, s: &mut Screen, x: usize, w: usize, (top, rows): (usize, usize)) {
         let inner = w - 4;
         let label = format!("{LOOSE} · {}", self.loose.unwrap_or(0));
         let at = s.put(
@@ -2099,6 +2667,34 @@ impl Page {
             ));
         }
         out.push(blank());
+        // The plan: where it stands, who approved it and when, its file, its summary.
+        if let Some(plan) = &card.plan_file {
+            let (word, role) = qoop_tui::asks::plan_word(&item.plan, item.plan_by.as_deref())
+                .unwrap_or_else(|| ("plan".to_string(), Role::Text));
+            let word = word.trim_start_matches("plan ").to_string();
+            let when = format!(" \u{b7} {}", ago(item.plan_at.or(Some(plan.at)), self.now));
+            out.push(
+                Row::new(Block::Plain, None)
+                    .with(0, "Plan", Role::FaintText, true)
+                    .with(6, &word, role, false)
+                    .with(6 + width::width(&word), &when, Role::FaintText, false),
+            );
+            let file = std::path::Path::new(&plan.path)
+                .file_name()
+                .map_or(plan.path.clone(), |f| f.to_string_lossy().into_owned());
+            out.extend(text_rows(&file, lw, 0, Role::Detail, false, Block::Plain));
+            if !plan.summary.trim().is_empty() {
+                out.extend(text_rows(
+                    &plan.summary,
+                    lw,
+                    0,
+                    Role::Text,
+                    false,
+                    Block::Plain,
+                ));
+            }
+            out.push(blank());
+        }
         out.push(
             Row::new(Block::Plain, None)
                 .with(0, "Checklist", Role::FaintText, true)
@@ -2113,7 +2709,37 @@ impl Page {
             out.push(plain("no steps yet", Role::FaintText, false));
         }
         let going = card.steps.iter().position(|st| st.done_at.is_none());
-        for (n, step) in card.steps.iter().enumerate() {
+        let phases = card
+            .steps
+            .iter()
+            .filter(|st| qoop_store::item::is_phase(&st.text))
+            .count();
+        // Steps above the first heading are the first phase's, as `phase_of` counts them: its
+        // rule goes over them.
+        let mut order: Vec<usize> = (0..card.steps.len()).collect();
+        if let Some(h) = card
+            .steps
+            .iter()
+            .position(|st| qoop_store::item::is_phase(&st.text))
+        {
+            order.remove(h);
+            order.insert(0, h);
+        }
+        let mut phase = 0;
+        for n in order {
+            let step = &card.steps[n];
+            // A phase's heading is a rule over its steps, never a stop the keyboard ticks.
+            if let Some(name) = step.text.strip_prefix("## ") {
+                phase += 1;
+                let head = fit(&format!("Phase {phase} of {phases}: {name}"), lw);
+                let rule = "\u{2500}".repeat(lw.saturating_sub(width::width(&head) + 1));
+                out.push(
+                    Row::new(Block::Step(step.n), None)
+                        .with(0, &head, Role::Detail, true)
+                        .with(width::width(&head) + 1, &rule, Role::Rule, false),
+                );
+                continue;
+            }
             let done = step.done_at.is_some();
             let room = lw.saturating_sub(4 + if going == Some(n) { 13 } else { 0 });
             let mut lines = wrap_cells(&step.text, room, None);
@@ -2313,9 +2939,15 @@ impl Page {
 
     /// The issue opened: at its top, every entry as it comes.
     fn open_card(&mut self, card: ItemCardInfo, older: bool) {
+        // On its first step, past a phase's heading.
+        let first = card
+            .steps
+            .iter()
+            .position(|s| !qoop_store::item::is_phase(&s.text))
+            .unwrap_or(card.steps.len());
+        self.mode = Mode::Card(first);
         self.card = Some(card);
         self.older = older;
-        self.mode = Mode::Card(0);
         self.scroll = 0;
         self.all = false;
         self.flipped.clear();
@@ -2334,7 +2966,16 @@ impl Page {
         let keys = entry_keys(&card);
         if let Mode::Card(at) = self.mode {
             let found = was.and_then(|k| keys.iter().position(|n| *n == k));
-            let at = found.map_or(at, |i| card.steps.len() + i);
+            let mut at = found.map_or(at, |i| card.steps.len() + i);
+            // Steps rewritten with a heading where it stood: on to the next step, as
+            // `open_card` does.
+            while card
+                .steps
+                .get(at)
+                .is_some_and(|s| qoop_store::item::is_phase(&s.text))
+            {
+                at += 1;
+            }
             let stops = card.steps.len() + card.activity.len();
             self.mode = Mode::Card(at.min(stops.saturating_sub(1)));
         }
@@ -2408,7 +3049,10 @@ impl Page {
                 scroll
             }
         };
-        let edge = if down { at + 1 >= stops } else { at == 0 };
+        // A phase's heading is no stop: the keyboard steps over it.
+        let next = (at + 1..stops).find(|s| range(*s).is_some());
+        let prev = (0..at).rev().find(|s| range(*s).is_some());
+        let edge = if down { next.is_none() } else { prev.is_none() };
         let here = range(at);
         let (to, shown) = match here {
             Some((first, last)) if last >= scroll && first < scroll + view => {
@@ -2417,10 +3061,10 @@ impl Page {
                     (at, scroll + 1)
                 } else if tall && !down && first < scroll {
                     (at, scroll - 1)
-                } else if down && at + 1 < stops {
-                    (at + 1, range(at + 1).map_or(scroll, show))
-                } else if !down && at > 0 {
-                    (at - 1, range(at - 1).map_or(scroll, show))
+                } else if let (true, Some(next)) = (down, next) {
+                    (next, range(next).map_or(scroll, show))
+                } else if let (false, Some(prev)) = (down, prev) {
+                    (prev, range(prev).map_or(scroll, show))
                 } else if down {
                     (at, scroll + 1)
                 } else {
@@ -2487,8 +3131,12 @@ impl Page {
                 }
             }
         }
+        // The other view's key early: the room a narrow page has keeps it before the rest.
+        let list = self.view == View::List;
+        let other = if list { ("b", "board") } else { ("b", "list") };
         let mut board = vec![
-            ("h j k l", "select"),
+            (if list { "j k" } else { "h j k l" }, "select"),
+            other,
             ("enter", "open"),
             ("c", "create"),
             ("/", "filter"),
@@ -2499,17 +3147,18 @@ impl Page {
             ("q", "close"),
         ];
         if self.loose_shown() {
-            board.insert(6, ("N", "not on the board"));
+            board.insert(7, ("N", "not on the board"));
+        }
+        if list {
+            board.retain(|(key, _)| *key != "v");
         }
         // One lane at a time: the keys that move in it first, in the room there is.
         if s.w < NEED.0 || s.h < NEED.1 {
-            board = vec![
-                ("j k", "move"),
-                ("enter", "open"),
-                ("h l", "lane"),
-                ("c", "create"),
-                ("q", "close"),
-            ];
+            board = vec![("j k", "move"), ("enter", "open")];
+            if !list {
+                board.push(("h l", "lane"));
+            }
+            board.extend([other, ("c", "create"), ("q", "close")]);
         }
         let keys: &[(&str, &str)] = match &self.mode {
             Mode::Board => &board,
@@ -2842,7 +3491,13 @@ pub(crate) fn run() -> std::io::Result<()> {
     let mut stamp = config_stamp();
     crate::settings::apply_theme();
     let mut page = Page::new();
-    page.quiet = qoop_tui::config::read().config.quiet_cards;
+    let config = qoop_tui::config::read().config;
+    page.quiet = config.quiet_cards;
+    page.view = if config.board_list {
+        View::List
+    } else {
+        View::Board
+    };
     // qass's tab opens the board in qass's folder (`qass::show_board`), and a wake brings it
     // back there.
     let canonical = |p: std::path::PathBuf| p.canonicalize().ok();
@@ -2919,6 +3574,17 @@ pub(crate) fn run() -> std::io::Result<()> {
                     let path = qoop_tui::config::path();
                     page.said = Some(match qoop_tui::config::set(&path, "board.cards", view) {
                         Ok(()) => format!("cards: {view}"),
+                        Err(why) => why,
+                    });
+                }
+                Step::View(view) => {
+                    let view = match view {
+                        View::List => "list",
+                        View::Board => "board",
+                    };
+                    let path = qoop_tui::config::path();
+                    page.said = Some(match qoop_tui::config::set(&path, "board.view", view) {
+                        Ok(()) => format!("view: {view}"),
                         Err(why) => why,
                     });
                 }
@@ -3031,8 +3697,10 @@ mod tests {
         ItemInfo {
             plan: String::new(),
             plan_by: None,
+            plan_at: None,
             show_me: false,
             open_asks: 0,
+            phase: None,
             id,
             key: format!("QOOP-{id}"),
             workspace: Some(workspace),
@@ -3057,8 +3725,10 @@ mod tests {
         .unwrap()
     }
 
+    /// The lanes, which most tests here read; the list's tests turn to it.
     fn page() -> Page {
         let mut p = Page::new();
+        p.view = View::Board;
         p.spaces = vec![space(1, "qoop"), space(2, "app"), space(3, qass::SPACE)];
         p.items = Some(vec![
             item(1, "todo", "never names a task after harness text", 1),
@@ -4881,5 +5551,511 @@ mod tests {
         assert!(wrap_cells("", 5, None).is_empty());
         assert_eq!(fit("中文中文", 5), "中文…");
         assert_eq!(fit("qass will start it", 6), "qass…");
+    }
+
+    /// The list's board: an item in every group. QOOP-1 is in Todo with a plan that waited too
+    /// long, QOOP-4 in Doing has an agent that waits on him: both need him. QOOP-3 works to an
+    /// approved plan in its Build phase; QOOP-2 (Todo) and QOOP-5 (Doing, no plan, no phase)
+    /// have no plan yet; QOOP-6 is done.
+    fn list_page() -> Page {
+        let mut p = page();
+        p.view = View::List;
+        p.now = 10_000;
+        let agent = |status: &str| ItemAgentInfo {
+            task: 9,
+            terminal: Some(4),
+            name: "onyx".into(),
+            machine: "this Mac".into(),
+            stage: "implementing".into(),
+            status: status.into(),
+            status_at: 10_000 - 60,
+            since: 10_000 - 3600,
+            ..Default::default()
+        };
+        {
+            let items = p.items.as_mut().unwrap();
+            items[0].plan = "stale".into();
+            items[2].agents.push(agent("working"));
+            items[2].plan = "approved".into();
+            items[2].plan_by = Some("qass".into());
+            items[2].phase = Some(qoop_runtime::control::PhaseInfo {
+                n: 2,
+                of: 3,
+                name: "Build".into(),
+            });
+            (items[2].steps_done, items[2].steps_total) = (2, 5);
+            items[3].agents.push(agent("waits"));
+        }
+        p.settle();
+        p
+    }
+
+    /// The text of the list's rows from its first, one a line, the escapes left out.
+    fn list_rows(p: &Page, w: usize, h: usize) -> Vec<String> {
+        (2..h - 2)
+            .map(|row| {
+                let text = row_text(p, w, h, row);
+                text.split_once('H')
+                    .map_or(text.clone(), |(_, r)| r.to_string())
+            })
+            .collect()
+    }
+
+    /// The row of the list that names `want`, trimmed.
+    fn row_of(rows: &[String], want: &str) -> String {
+        rows.iter()
+            .find(|r| r.contains(want))
+            .unwrap_or_else(|| panic!("{want} in {rows:#?}"))
+            .trim()
+            .to_string()
+    }
+
+    /// The list is the page's first view. Its groups come in the order of what they want of
+    /// him, each a rule with its count, an empty group not drawn, Done folded to its rule; the
+    /// heading counts what needs him. At 120, 80 and 60 columns alike.
+    #[test]
+    fn the_list_groups_the_items_by_what_they_want_at_every_width() {
+        assert_eq!(Page::new().view, View::List, "the list is the first view");
+        let mut p = list_page();
+        for (w, h) in [(120, 40), (80, 24), (60, 24)] {
+            p.size = (w, h);
+            let rows = list_rows(&p, w, h);
+            let at = |want: &str| rows.iter().position(|r| r.contains(want)).unwrap();
+            let order = [
+                at("Needs you 2"),
+                at("QOOP-1"),
+                at("QOOP-4"),
+                at("In progress 2"),
+                at("QOOP-3"),
+                at("QOOP-5"),
+                at("Not started 1"),
+                at("QOOP-2"),
+                at("Done 1"),
+            ];
+            assert!(order.is_sorted(), "{w}: {rows:#?}");
+            assert!(
+                !rows.iter().any(|r| r.contains("QOOP-6")),
+                "folded: {rows:#?}"
+            );
+            let head = drawn(&p, w, h).chars().take(w).collect::<String>();
+            if w >= 80 {
+                assert!(head.contains("2 need you"), "{head}");
+                assert!(head.contains("[ list · board  b ]"), "{head}");
+            }
+            assert!(
+                !head.contains("full · quiet"),
+                "no cards in the list: {head}"
+            );
+        }
+        // A group with nothing in it is not drawn.
+        p.items.as_mut().unwrap().retain(|i| i.state != "done");
+        let text = drawn(&p, 120, 40);
+        assert!(!text.contains("Done "), "{text}");
+    }
+
+    /// One flat list: `j` and `k` walk it across the groups onto the Done row, enter opens and
+    /// folds Done, `h` and `l` do nothing; the lane follows the item, so `H`, `L` and `x` act on
+    /// it as on the board.
+    #[test]
+    fn the_keyboard_walks_the_list_and_acts_on_its_item() {
+        let mut p = list_page();
+        p.size = (120, 40);
+        assert_eq!(p.sel, Some(1), "the first row has it");
+        let mut walked = vec![p.sel.unwrap()];
+        for _ in 0..6 {
+            p.key(Key::Char('j'));
+            walked.push(p.sel.unwrap());
+        }
+        assert_eq!(walked, [1, 4, 3, 5, 2, FOLD, FOLD]);
+        assert_eq!(p.key(Key::Enter), Step::Stay);
+        assert!(drawn(&p, 120, 40).contains("QOOP-6"), "opened");
+        p.key(Key::Char('j'));
+        assert_eq!((p.sel, p.lane), (Some(6), 2));
+        assert!(matches!(
+            p.key(Key::Char('x')),
+            Step::Write(6, TaskOp::Dismiss { undo: false }, _)
+        ));
+        p.key(Key::Char('k'));
+        p.key(Key::Char('k'));
+        assert_eq!((p.sel, p.lane), (Some(2), 0));
+        p.key(Key::Char('l'));
+        p.key(Key::Char('h'));
+        assert_eq!((p.sel, p.lane), (Some(2), 0), "no sideways in a list");
+        assert_eq!(p.key(Key::Char('L')), Step::Start(2, "QOOP-2".into()));
+        assert_eq!(p.key(Key::Enter), Step::Open(2));
+        p.key(Key::Char('k'));
+        assert_eq!((p.sel, p.lane), (Some(5), 1));
+        assert!(matches!(
+            p.key(Key::Char('L')),
+            Step::Write(5, TaskOp::Close { .. }, _)
+        ));
+        // Enter on the Done row folds it again.
+        while p.sel != Some(FOLD) {
+            p.key(Key::Char('j'));
+        }
+        p.key(Key::Enter);
+        assert!(!drawn(&p, 120, 40).contains("QOOP-6"), "folded again");
+    }
+
+    /// An item that leaves the list's stops on a poll (closed into the folded Done) leaves the
+    /// keyboard on the row now at its place, not the first; one that changes group is brought
+    /// into view.
+    #[test]
+    fn the_list_keeps_its_place_when_the_selected_item_moves() {
+        let mut p = list_page();
+        p.size = (60, 10);
+        for _ in 0..2 {
+            p.key(Key::Char('j'));
+        }
+        assert_eq!(p.sel, Some(3));
+        p.items.as_mut().unwrap()[2] = item(3, "done", "board everywhere", 1);
+        p.settle();
+        assert_eq!(p.sel, Some(5), "the row now at its place");
+        // A poll that moves it to another group out of view brings it back into view.
+        let mut p = list_page();
+        p.size = (60, FLOOR.1);
+        p.settle();
+        assert_eq!((p.sel, p.list_top), (Some(1), 0));
+        p.items.as_mut().unwrap()[0].plan.clear();
+        p.settle();
+        assert_eq!(p.sel, Some(1));
+        let rows = list_rows(&p, 60, FLOOR.1);
+        assert!(rows.iter().any(|r| r.contains("QOOP-1")), "{rows:#?}");
+    }
+
+    /// The mark is qoop's own picture for the item: the ring when it needs him, full once done
+    /// or at its last phase done, its live agent's state, the ring in the quiet ink in Todo,
+    /// the centre dot with no agent in Doing.
+    #[test]
+    fn a_row_wears_the_mark_of_its_items_state() {
+        let mark = |role| qoop_tui::sidebar::state_mark(role, false, 0, false);
+        let p = list_page();
+        let items = p.items.as_ref().unwrap();
+        let of = |id: i64| item_mark(items.iter().find(|i| i.id == id).unwrap());
+        assert_eq!(of(1), (mark(Role::Blocked), Role::Blocked), "a stale plan");
+        assert_eq!(
+            of(4),
+            (mark(Role::Blocked), Role::Blocked),
+            "an agent waits"
+        );
+        assert_eq!(of(3), (mark(Role::Working), Role::Working));
+        assert_eq!(
+            of(2),
+            (mark(Role::Blocked), Role::FaintText),
+            "Todo's quiet ring"
+        );
+        assert_eq!(of(5), (mark(Role::Idle), Role::Idle), "Doing, no agent");
+        // Under NO_COLOR (or without braille) the ink is gone: Todo's mark is not the ring.
+        for (braille, colour) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(todo_ring(braille, colour), "o ");
+            assert_ne!(todo_ring(braille, colour), of(1).0);
+        }
+        assert_eq!(of(6), (mark(Role::Done), Role::Done));
+        let mut it = items[2].clone();
+        it.open_asks = 1;
+        assert_eq!(item_mark(&it).1, Role::Blocked, "a question open");
+        it.open_asks = 0;
+        it.agents[0].status = "asleep".into();
+        assert_eq!(item_mark(&it), (mark(Role::Sleeping), Role::Sleeping));
+        it.agents[0].status = "idle".into();
+        assert_eq!(item_mark(&it), (mark(Role::Idle), Role::Idle));
+        it.phase = Some(qoop_runtime::control::PhaseInfo {
+            n: 3,
+            of: 3,
+            name: "Verify".into(),
+        });
+        it.steps_done = 5;
+        assert_eq!(
+            item_mark(&it),
+            (mark(Role::Done), Role::Done),
+            "its last phase done"
+        );
+        // Every picture is drawn: the row carries the mark before its key.
+        let rows = list_rows(&p, 120, 40);
+        assert!(
+            row_of(&rows, "QOOP-3").starts_with(&mark(Role::Working)),
+            "{rows:#?}"
+        );
+    }
+
+    /// A row says its plan, questions, phase, steps and agent word right of its title; as the
+    /// page narrows they give way from the right, the word that wants him last, while the
+    /// mark, key and title stay. A wide title is cut by cells. Each state is a word, not only
+    /// an ink, so the list reads the same under NO_COLOR.
+    #[test]
+    fn a_row_gives_up_its_parts_from_the_right_and_keeps_what_needs_him() {
+        let mut p = list_page();
+        p.items.as_mut().unwrap()[2].open_asks = 1;
+        let rows = list_rows(&p, 120, 40);
+        let row = row_of(&rows, "QOOP-3");
+        for want in [
+            "board everywhere",
+            "plan ok · qass",
+            "1 question",
+            "Build 2/3",
+            "2/5",
+            "working",
+        ] {
+            assert!(row.contains(want), "{want}: {row}");
+        }
+        assert!(
+            row_of(&rows, "QOOP-1").contains("plan needs you"),
+            "{rows:#?}"
+        );
+        // A plan card open: the store counts it as the plan's ask, not a question too.
+        p.items.as_mut().unwrap()[0].plan = "asked".into();
+        let asked = row_of(&list_rows(&p, 120, 40), "QOOP-1");
+        assert!(
+            asked.contains("plan needs you") && !asked.contains("question"),
+            "{asked}"
+        );
+        assert!(
+            row_of(&rows, "QOOP-4").contains("waits on you"),
+            "{rows:#?}"
+        );
+        assert!(
+            row_of(&rows, "QOOP-2").contains("no agent yet"),
+            "{rows:#?}"
+        );
+        // At 60 columns the parts that do not need him go first.
+        let rows = list_rows(&p, 60, 24);
+        let row = row_of(&rows, "QOOP-3");
+        assert!(
+            row.contains("board everywhere") && row.contains("1 question"),
+            "{row}"
+        );
+        assert!(!row.contains("working") && !row.contains("2/5"), "{row}");
+        assert!(
+            row_of(&rows, "QOOP-4").contains("waits on you"),
+            "{rows:#?}"
+        );
+        // At the narrowest the mark, key and title stay.
+        let rows = list_rows(&p, FLOOR.0 + 20, 24);
+        let row = row_of(&rows, "QOOP-3");
+        assert!(row.contains("board ev"), "{row}");
+        // A title of wide characters is cut by cells, never past the row.
+        p.items.as_mut().unwrap()[1].title =
+            "看板の一覧を作る看板の一覧を作る看板の一覧を作る看板".into();
+        for w in [60, 80] {
+            let row = row_of(&list_rows(&p, w, 24), "QOOP-2");
+            assert!(
+                row.contains('…') && width::width(&row) <= w - 2,
+                "{w}: {row}"
+            );
+        }
+    }
+
+    /// `b` turns the list into the lanes and back on the same item, and asks for the view to be
+    /// kept; so does a click on the switch. An item in Done opens Done when the list comes
+    /// back; the lanes keep their card switch.
+    #[test]
+    fn b_and_the_switch_turn_the_view_on_the_same_item() {
+        let mut p = list_page();
+        p.size = (120, 40);
+        p.key(Key::Char('j'));
+        p.key(Key::Char('j'));
+        assert_eq!(p.sel, Some(3));
+        assert_eq!(p.key(Key::Char('b')), Step::View(View::Board));
+        assert_eq!((p.view, p.sel, p.lane), (View::Board, Some(3), 1));
+        let text = drawn(&p, 120, 40);
+        assert!(
+            text.contains("todo 2") && text.contains("[ full · quiet  v ]"),
+            "{text}"
+        );
+        // A Done card in the lanes, then the list: Done is open on it.
+        p.key(Key::Char('l'));
+        assert_eq!(p.sel, Some(6));
+        let x = p.view_at(120) + 3;
+        let click = Key::Mouse {
+            down: true,
+            held: false,
+            col: x as u16,
+            row: 0,
+        };
+        assert_eq!(p.key(click), Step::View(View::List));
+        assert_eq!((p.view, p.sel), (View::List, Some(6)));
+        assert!(drawn(&p, 120, 40).contains("QOOP-6"), "Done opened on it");
+        // A click on a row opens its item; on the Done row it folds.
+        let rows = list_rows(&p, 120, 40);
+        let row = rows.iter().position(|r| r.contains("QOOP-4")).unwrap() + 2;
+        let press = |row: usize| Key::Mouse {
+            down: true,
+            held: false,
+            col: 30,
+            row: row as u16,
+        };
+        assert_eq!(p.key(press(row)), Step::Open(4));
+        assert_eq!(p.sel, Some(4));
+        let fold = rows.iter().position(|r| r.contains("Done 1")).unwrap() + 2;
+        assert_eq!(p.key(press(fold)), Step::Stay);
+        assert!(!drawn(&p, 120, 40).contains("QOOP-6"), "folded");
+        // The footer names `b` at 60 columns, the other keys giving way first.
+        let foot = drawn(&p, 60, 24).chars().skip(23 * 60).collect::<String>();
+        assert!(
+            foot.contains("b board") && foot.contains("q close"),
+            "{foot}"
+        );
+    }
+
+    /// In qass's split (60 columns) the lanes keep their card switch: it takes the view
+    /// switch's place, and the footer still says `b`.
+    #[test]
+    fn the_lanes_keep_the_card_switch_at_60_columns() {
+        let mut p = list_page();
+        p.size = (60, 24);
+        assert_eq!(p.key(Key::Char('b')), Step::View(View::Board));
+        let text = drawn(&p, 60, 24);
+        let head = text.chars().take(60).collect::<String>();
+        assert!(
+            head.contains("[ full · quiet  v ]") && !head.contains("list · board"),
+            "{head}"
+        );
+        let foot = text.chars().skip(23 * 60).collect::<String>();
+        assert!(foot.contains("b list"), "{foot}");
+        let click = |x: usize| Key::Mouse {
+            down: true,
+            held: false,
+            col: x as u16,
+            row: 0,
+        };
+        assert_eq!(p.switch_at(60), p.view_at(60));
+        assert_eq!(p.key(click(p.switch_at(60) + 3)), Step::Cards(true));
+        // The list keeps its view switch at the same width.
+        assert_eq!(p.key(Key::Char('b')), Step::View(View::List));
+        assert_eq!(p.key(click(p.view_at(60) + 3)), Step::View(View::Board));
+    }
+
+    /// With nothing on the board the list says how to put something there; a filter that hides
+    /// everything says how to clear it.
+    #[test]
+    fn an_empty_list_says_how_to_fill_it() {
+        let mut p = list_page();
+        p.items = Some(Vec::new());
+        p.settle();
+        assert!(drawn(&p, 80, 24).contains(EMPTY));
+        let mut p = list_page();
+        p.filter = "nothing like it".into();
+        p.settle();
+        let text = drawn(&p, 80, 24);
+        assert!(text.contains("Nothing matches the filter"), "{text}");
+        assert!(!text.contains("Needs you"), "{text}");
+        assert!(
+            !text.contains("need you"),
+            "the heading counts the group: {text}"
+        );
+    }
+
+    /// The work no item holds sits folded at the list's foot as on the board: `N` opens it, `j`
+    /// past the last row steps into it, enter goes to its tab.
+    #[test]
+    fn the_folded_row_sits_at_the_foot_of_the_list() {
+        let mut p = list_page();
+        with_loose(&mut p);
+        p.size = (120, 40);
+        assert!(row_text(&p, 120, 40, 36).contains("Not on the board · 12"));
+        assert!(row_text(&p, 120, 40, 37).contains(COUNTS));
+        p.key(Key::Char('N'));
+        // Seven rows and the Done row stand before it: a few more `j` than that must reach it.
+        for _ in 0..10 {
+            if p.loose_cursor().is_some() {
+                break;
+            }
+            p.key(Key::Char('j'));
+        }
+        assert_eq!(p.loose_cursor(), Some(0));
+        assert_eq!(p.key(Key::Enter), Step::Goto(13));
+        assert!(drawn(&p, 120, 40).contains("third wait"), "opened");
+    }
+
+    /// The dialog: the plan above the checklist (where it stands, by whom and when, its file,
+    /// its summary); a phase's heading is a rule over its steps, never a stop or a tick.
+    #[test]
+    fn the_dialog_shows_the_plan_and_the_steps_under_their_phases() {
+        let step = |n: i64, text: &str, done: bool| StepInfo {
+            n,
+            text: text.into(),
+            done_at: done.then_some(5),
+        };
+        let mut p = open_with(
+            (120, 40),
+            vec![
+                step(1, "## Plan", true),
+                step(2, "write it", true),
+                step(3, "## Build", true),
+                step(4, "code it", false),
+            ],
+            Vec::new(),
+        );
+        p.now = 10_000;
+        let card = p.card.take().unwrap();
+        let mut card = card;
+        card.item.plan = "approved".into();
+        card.item.plan_by = Some("owner".into());
+        card.item.plan_at = Some(10_000 - 7200);
+        card.plan_file = Some(qoop_runtime::control::PlanFileInfo {
+            path: "/w/plans/2026-11-01-ship.md".into(),
+            hash: "abc".into(),
+            terminal: 4,
+            summary: "Ship the list view.".into(),
+            at: 1,
+        });
+        p.open_card(card, false);
+        assert_eq!(p.mode, Mode::Card(1), "on the first step, past the heading");
+        let text = drawn(&p, 120, 40);
+        for want in [
+            "Plan  ok · you · 2 h ago",
+            "2026-11-01-ship.md",
+            "Ship the list view.",
+            "Phase 1 of 2: Plan",
+            "Phase 2 of 2: Build",
+            "[ ] code it",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert!(!text.contains("## "), "{text}");
+        assert!(text.find("Plan  ok").unwrap() < text.find("Checklist").unwrap());
+        // `j` steps over the heading; back up, `k` stays on the first step.
+        p.key(Key::Char('j'));
+        assert_eq!(p.mode, Mode::Card(3));
+        assert!(matches!(
+            p.key(Key::Char('x')),
+            Step::Write(1, TaskOp::Check { n: 4, done: true }, _)
+        ));
+        p.key(Key::Char('k'));
+        assert_eq!(p.mode, Mode::Card(1));
+        // A heading is never ticked, even with the keyboard put on it.
+        p.mode = Mode::Card(0);
+        assert_eq!(p.key(Key::Char('x')), Step::Stay);
+        // Steps rewritten with a heading where the keyboard stood: on to the next step.
+        p.mode = Mode::Card(1);
+        let mut card = p.card.clone().unwrap();
+        card.steps.insert(1, step(9, "## Draft", false));
+        p.keep_card(card, false);
+        assert_eq!(p.mode, Mode::Card(2));
+    }
+
+    /// A step written above the first heading is the first phase's, in the dialog as in
+    /// `phase_of`: the first rule goes over it.
+    #[test]
+    fn a_step_above_the_first_heading_sits_under_phase_one() {
+        let step = |n: i64, text: &str| StepInfo {
+            n,
+            text: text.into(),
+            done_at: None,
+        };
+        let p = open_with(
+            (120, 40),
+            vec![
+                step(1, "loose first"),
+                step(2, "## Plan"),
+                step(3, "write it"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(p.mode, Mode::Card(0));
+        let text = drawn(&p, 120, 40);
+        let rule = text.find("Phase 1 of 1: Plan").expect("the rule");
+        assert!(rule < text.find("loose first").unwrap(), "{text}");
+        assert!(text.find("loose first").unwrap() < text.find("write it").unwrap());
     }
 }

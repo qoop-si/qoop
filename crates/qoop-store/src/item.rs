@@ -21,6 +21,17 @@ use crate::{Store, StoreError};
 /// Budgets, in characters and steps. Past one the write is refused with the limit named.
 pub const DESCRIPTION_MAX: usize = 2_500;
 pub const STEPS_MAX: usize = 30;
+/// The most phase headers a step list carries (`## <name>` lines).
+pub const PHASES_MAX: usize = 8;
+
+/// A step line that names a phase: `## <name>`. Stored as a step (one numbering), written done
+/// so an older binary counts it as finished, never ticked, outside every count.
+pub fn is_phase(text: &str) -> bool {
+    text.starts_with("## ")
+}
+
+/// The SQL test for a real step, never a phase header: `LIKE` would read `_` as any character.
+const REAL_STEP: &str = "substr(text, 1, 3) <> '## '";
 pub const STEP_MAX: usize = 200;
 /// The longest title a card shows on one line. A longer one is cut at a word, never refused:
 /// the owner typed it, and its whole text is kept in its event (and the description).
@@ -139,8 +150,13 @@ pub struct ItemRow {
     pub since: i64,
     /// Put away by the owner (`dismiss`): closed, off the board, nothing of it deleted.
     pub hidden: bool,
+    /// The phase its work is in: the header over its first step not done, its place among the
+    /// headers, how many there are, and its name. None without headers or real steps.
+    pub phase: Option<(usize, usize, String)>,
     /// Where its plan is (`plan.rs`).
     pub plan: crate::plan::PlanState,
+    /// When its plan last changed (`plan.rs`).
+    pub plan_at: Option<i64>,
     /// The owner asked to see its plan before it is built.
     pub show_me: bool,
     /// Questions open on it: cards of its agents not answered yet.
@@ -269,7 +285,8 @@ pub(crate) fn follow_last_agent(
     };
     let waiting: i64 = tx.query_row(
         "SELECT (SELECT COUNT(*) FROM task_item_remote WHERE item = ?1) \
-         + (SELECT COUNT(*) FROM task_step WHERE task = ?1 AND done_at IS NULL)",
+         + (SELECT COUNT(*) FROM task_step WHERE task = ?1 AND done_at IS NULL \
+           AND substr(text, 1, 3) <> '## ')",
         params![item],
         |r| r.get(0),
     )?;
@@ -324,6 +341,35 @@ pub(crate) fn abandon_open_items(
         close(tx, item, Outcome::Abandoned, "its space was removed", now)?;
     }
     Ok(())
+}
+
+/// The phase a step list is in: the header over its first real step not done; with every real
+/// step done, the last header; none without a header or a real step. Its place counts from 1.
+pub fn phase_of(steps: &[StepRow]) -> Option<(usize, usize, String)> {
+    let of = steps.iter().filter(|s| is_phase(&s.text)).count();
+    if of == 0 || steps.iter().all(|s| is_phase(&s.text)) {
+        return None;
+    }
+    let mut at = 0;
+    let mut name = String::new();
+    for s in steps {
+        if let Some(n) = s.text.strip_prefix("## ") {
+            at += 1;
+            name = n.chars().take(40).collect();
+        } else if s.done_at.is_none() {
+            // A step above the first header is the first phase's.
+            let first = steps
+                .iter()
+                .find_map(|s| s.text.strip_prefix("## "))
+                .unwrap_or("");
+            return Some(if at == 0 {
+                (1, of, first.chars().take(40).collect())
+            } else {
+                (at, of, name)
+            });
+        }
+    }
+    Some((at, of, name))
 }
 
 fn steps(tx: &Connection, item: i64) -> rusqlite::Result<Vec<StepRow>> {
@@ -453,7 +499,7 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
     let agents = agents(tx, task.id)?;
     let state = state(tx, &task, &agents, now)?;
     let (steps_total, steps_done): (i64, i64) = tx.query_row(
-        "SELECT COUNT(*), COUNT(done_at) FROM task_step WHERE task = ?1",
+        &format!("SELECT COUNT(*), COUNT(done_at) FROM task_step WHERE task = ?1 AND {REAL_STEP}"),
         params![task.id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -475,15 +521,18 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
             .is_some(),
         None => false,
     };
+    let phase = phase_of(&steps(tx, task.id)?);
     let plan = crate::plan::plan_info(tx, task.id, now)?;
     // A closed item waits on nobody.
     let plan_state = match plan.state {
-        crate::plan::PlanState::Stale if task.closed_at.is_some() => {
+        crate::plan::PlanState::Stale | crate::plan::PlanState::Asked
+            if task.closed_at.is_some() =>
+        {
             crate::plan::PlanState::Written
         }
         state => state,
     };
-    let open_asks = crate::plan::open_cards(tx, task.id, false)?;
+    let open_asks = crate::plan::open_questions(tx, task.id)?;
     Ok(ItemRow {
         task,
         key,
@@ -494,10 +543,19 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         updated_at,
         since,
         hidden,
+        phase,
         plan: plan_state,
+        plan_at: plan.at,
         show_me: plan.show_me,
         open_asks,
     })
+}
+
+impl Store {
+    /// An item's board row by id.
+    pub fn item_row(&self, item: i64, now: i64) -> Result<ItemRow, StoreError> {
+        Ok(item_row_of(&self.conn, item, now)?)
+    }
 }
 
 /// An item's board row by id, read in the caller's transaction.
@@ -785,12 +843,23 @@ impl Store {
         let list: Vec<String> = list
             .iter()
             .map(|s| one_line(s))
-            .filter(|s| !s.is_empty())
+            // A bare `##` names no phase: dropped, never kept as a step to tick.
+            .filter(|s| !s.is_empty() && s != "##")
             .collect();
-        if list.len() > STEPS_MAX {
+        // Phase headers sit among the steps and count toward neither cap but their own.
+        let headers = list.iter().filter(|s| is_phase(s)).count();
+        let real = list.len() - headers;
+        if real > STEPS_MAX {
             return Err(TaskError::TooManySteps {
-                len: list.len(),
+                len: real,
                 max: STEPS_MAX,
+            }
+            .into());
+        }
+        if headers > PHASES_MAX {
+            return Err(TaskError::TooManyPhases {
+                len: headers,
+                max: PHASES_MAX,
             }
             .into());
         }
@@ -811,11 +880,22 @@ impl Store {
         for (i, text) in list.iter().enumerate() {
             tx.execute(
                 "INSERT INTO task_step (task, n, text, done_at) VALUES (?1, ?2, ?3, ?4)",
-                params![item, i as i64 + 1, text, ticks.get(text.as_str())],
+                // A header is written done: an older binary then counts it finished and never
+                // holds the item open for it.
+                params![
+                    item,
+                    i as i64 + 1,
+                    text,
+                    if is_phase(text) {
+                        Some(now)
+                    } else {
+                        ticks.get(text.as_str()).copied()
+                    }
+                ],
             )?;
         }
         touch(&tx, item, now)?;
-        event(&tx, item, "steps", &format!("{} steps", list.len()), now)?;
+        event(&tx, item, "steps", &format!("{real} steps"), now)?;
         tx.commit()?;
         Ok(true)
     }
@@ -828,6 +908,9 @@ impl Store {
         let Some(step) = all.iter().find(|s| s.n == n) else {
             return Err(TaskError::NoStep(n, all.len()).into());
         };
+        if is_phase(&step.text) {
+            return Err(TaskError::NotAStep(n).into());
+        }
         if step.done_at.is_some() == done {
             return Ok(false);
         }
@@ -1931,5 +2014,97 @@ mod tests {
         assert!(s.task(kept).unwrap().unwrap().closed_at.is_none());
         let shown: Vec<i64> = s.items(14).unwrap().iter().map(|i| i.task.id).collect();
         assert_eq!(shown, [kept, done]);
+    }
+
+    #[test]
+    fn phase_headers_group_steps_and_stay_out_of_every_count() {
+        let (s, ws, _) = setup();
+        let (item, _) = s.add_item(ws, "ship", "", 1).unwrap();
+        let list: Vec<String> = [
+            "## Plan",
+            "write it",
+            "## Build",
+            "code",
+            "test",
+            "## Verify",
+            "run it",
+        ]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+        assert!(s.set_steps(item, &list, 2).unwrap());
+        let row = |at| {
+            s.items(at)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.task.id == item)
+                .unwrap()
+        };
+        // Four real steps, three headers written done and counted nowhere.
+        assert_eq!((row(3).steps_done, row(3).steps_total), (0, 4));
+        assert_eq!(row(3).phase, Some((1, 3, "Plan".to_string())));
+        // A header is never ticked; real steps keep one numbering with it.
+        assert!(matches!(
+            s.check_step(item, 1, true, 4),
+            Err(StoreError::Task(TaskError::NotAStep(1)))
+        ));
+        s.check_step(item, 2, true, 5).unwrap();
+        assert_eq!(row(6).phase, Some((2, 3, "Build".to_string())));
+        assert_eq!((row(6).steps_done, row(6).steps_total), (1, 4));
+        for n in [4, 5, 7] {
+            s.check_step(item, n, true, 7).unwrap();
+        }
+        // Every real step done: the last phase.
+        assert_eq!(row(8).phase, Some((3, 3, "Verify".to_string())));
+        // A header changed is a change saved.
+        let renamed: Vec<String> = list
+            .iter()
+            .map(|t| t.replace("## Verify", "## Check"))
+            .collect();
+        assert!(s.set_steps(item, &renamed, 9).unwrap());
+        assert_eq!(row(10).phase, Some((3, 3, "Check".to_string())));
+    }
+
+    #[test]
+    fn phase_headers_have_a_cap_of_their_own_and_none_means_no_phase() {
+        let (s, ws, _) = setup();
+        let (item, _) = s.add_item(ws, "ship", "", 1).unwrap();
+        let mut list: Vec<String> = (0..9).map(|i| format!("## P{i}")).collect();
+        list.push("one step".to_string());
+        assert!(matches!(
+            s.set_steps(item, &list, 2),
+            Err(StoreError::Task(TaskError::TooManyPhases { len: 9, .. }))
+        ));
+        // Thirty real steps beside headers still fit.
+        let mut full: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        full.insert(0, "## Build".to_string());
+        assert!(s.set_steps(item, &full, 3).unwrap());
+        let plain: Vec<String> = vec!["a".into(), "b".into()];
+        s.set_steps(item, &plain, 4).unwrap();
+        let row = s
+            .items(5)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.task.id == item)
+            .unwrap();
+        assert_eq!(row.phase, None);
+        assert_eq!(
+            phase_of(&[StepRow {
+                n: 1,
+                text: "## Only".into(),
+                done_at: Some(1)
+            }]),
+            None
+        );
+        // A step above the first header is the first phase's.
+        let at = |n: i64, text: &str| StepRow {
+            n,
+            text: text.into(),
+            done_at: None,
+        };
+        assert_eq!(
+            phase_of(&[at(1, "loose"), at(2, "## Plan"), at(3, "write")]),
+            Some((1, 1, "Plan".to_string()))
+        );
     }
 }

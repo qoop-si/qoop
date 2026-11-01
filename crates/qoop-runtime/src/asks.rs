@@ -180,7 +180,7 @@ fn qass_speaks(agents: &AgentRegistry, caller: &Caller) -> Result<(), String> {
     Ok(())
 }
 
-fn info(row: AskRow) -> Option<AskInfo> {
+fn info((row, item): (AskRow, Option<crate::control::AskItem>)) -> Option<AskInfo> {
     let body: AskCard = serde_json::from_str(&row.body).ok()?;
     Some(AskInfo {
         card: row.card,
@@ -193,6 +193,7 @@ fn info(row: AskRow) -> Option<AskInfo> {
         answer: row.answer,
         option: row.option,
         task: row.task,
+        item,
         body,
     })
 }
@@ -205,10 +206,52 @@ pub(crate) async fn read(
 ) -> ControlResponse {
     match store
         .run(move |s| {
-            Ok((
-                s.live_asks()?,
+            // Each card with the board item it is about, when it is about one here: its plan
+            // state and phase ride along, so no screen needs the board to read the card. Cards
+            // share a few items: each is read once. A failed lookup leaves the card without its
+            // item, never the inbox unread.
+            let at = now();
+            let mut known: HashMap<i64, Option<crate::control::AskItem>> = HashMap::new();
+            let mut with_item = |rows: Vec<AskRow>, live: bool| -> Vec<_> {
+                rows.into_iter()
+                    .map(|r| {
+                        let remote = r.agent.as_deref().is_some_and(|a| a.contains('/'));
+                        let found = if remote {
+                            None
+                        } else {
+                            s.item_of_card(r.task, r.terminal.filter(|_| live))
+                                .ok()
+                                .flatten()
+                        };
+                        let item = found.and_then(|(id, key)| {
+                            known
+                                .entry(id)
+                                .or_insert_with(|| {
+                                    let row = s.item_row(id, at).ok()?;
+                                    Some(crate::control::AskItem {
+                                        id,
+                                        key,
+                                        plan: match row.plan {
+                                            qoop_store::plan::PlanState::None => String::new(),
+                                            state => state.as_str().to_string(),
+                                        },
+                                        phase: row.phase.map(|(n, of, name)| {
+                                            crate::control::PhaseInfo { n, of, name }
+                                        }),
+                                    })
+                                })
+                                .clone()
+                        });
+                        (r, item)
+                    })
+                    .collect()
+            };
+            let live = with_item(s.live_asks()?, true);
+            let ended = with_item(
                 s.ended_asks(if all { ENDED_ALL } else { ENDED_SHOWN })?,
-            ))
+                false,
+            );
+            Ok((live, ended))
         })
         .await
     {
@@ -1862,5 +1905,97 @@ mod tests {
             .unwrap();
         assert!(cards.is_empty(), "no qass, no card: {cards:?}");
         assert_ne!(stage, "waiting-human", "no qass, no stage moved");
+    }
+
+    /// A card read with the board item it is about: its key, its plan state and its phase, so
+    /// a screen reads a plan card without the board.
+    #[tokio::test]
+    async fn a_card_is_read_with_its_items_plan_and_phase() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let at = now() - qoop_store::plan::STALE_SECS - 60;
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_workspace(QASS_SPACE, 2).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let (item, key) = s.add_item(ws, "ship it", "", at).unwrap();
+        let task = s.begin_task(7, "ship it", None, at).unwrap().0;
+        s.link_task(task, item, at).unwrap();
+        let steps: Vec<String> = ["## Plan", "write it", "## Build", "code it"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        s.set_steps(item, &steps, at).unwrap();
+        s.check_step(item, 2, true, at).unwrap();
+        s.set_planfile(item, "/p/plan.md", b"v1", 7, at).unwrap();
+        let store = StoreHandle::new(s);
+        stale_plans_once(&agents, &connections, &store).await;
+        let terminals = Arc::new(TerminalRegistry::default());
+        let ControlResponse::Asks { live, .. } = read("r".into(), false, &terminals, &store).await
+        else {
+            panic!("no asks read");
+        };
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(
+            live[0].item,
+            Some(crate::control::AskItem {
+                id: item,
+                key,
+                // Its card is open now: written, no longer stale.
+                plan: "written".into(),
+                phase: Some(crate::control::PhaseInfo {
+                    n: 2,
+                    of: 2,
+                    name: "Build".into(),
+                }),
+            })
+        );
+    }
+
+    /// An ended card goes by its task only, since a terminal number is given again to a new
+    /// tab; a live one goes by its terminal too. A remote card is never matched to an item here.
+    #[tokio::test]
+    async fn an_ended_card_by_its_terminal_and_a_remote_card_carry_no_item() {
+        let at = now();
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_workspace(QASS_SPACE, 2).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let (item, key) = s.add_item(ws, "ship it", "", at).unwrap();
+        let body = |h: &str| {
+            format!(
+                r#"{{"handle":"{h}","urgency":"later","doing":"d","why":"w","asks":"a","options":[{{"key":"a","label":"A","reason":"r","words":"go"}}]}}"#
+            )
+        };
+        // Filed in terminal 7 before any task there: no task, the terminal only.
+        s.add_ask("E1", None, Some(7), None, &body("old"), at)
+            .unwrap();
+        s.add_ask("E2", None, Some(7), None, &body("live"), at)
+            .unwrap();
+        s.close_ask("E1", "done", at).unwrap();
+        // Terminal 7 now holds an agent linked to the item.
+        let task = s.begin_task(7, "ship it", None, at).unwrap().0;
+        s.link_task(task, item, at).unwrap();
+        // A remote card whose task row is this one's: still no item here.
+        s.add_ask("E3", Some("a/T2"), Some(7), None, &body("far"), at)
+            .unwrap();
+        let store = StoreHandle::new(s);
+        let terminals = Arc::new(TerminalRegistry::default());
+        let ControlResponse::Asks { live, ended, .. } =
+            read("r".into(), true, &terminals, &store).await
+        else {
+            panic!("no asks read");
+        };
+        let of = |cards: &[AskInfo], card: &str| {
+            cards
+                .iter()
+                .find(|c| c.card == card)
+                .unwrap_or_else(|| panic!("{card}: {cards:?}"))
+                .item
+                .clone()
+        };
+        assert_eq!(of(&live, "E2").map(|i| i.key), Some(key));
+        assert_eq!(of(&ended, "E1"), None);
+        assert_eq!(of(&live, "E3"), None);
     }
 }

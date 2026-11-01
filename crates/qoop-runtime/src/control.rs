@@ -1112,6 +1112,10 @@ pub struct AskInfo {
     pub option: Option<String>,
     #[serde(default)]
     pub task: Option<i64>,
+    /// The board item the card is about, by the rule its open questions are counted by: its
+    /// task is linked to the item, or its terminal is an open linked agent's. Local cards only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<AskItem>,
     pub body: AskCard,
 }
 
@@ -1162,6 +1166,11 @@ pub enum TaskOp {
     },
     /// Replace the item's steps; a step whose text is unchanged keeps its tick.
     Steps {
+        steps: Vec<String>,
+    },
+    /// `Steps` with phase headers (`## <name>` lines): its own op, so a daemon from before
+    /// phases refuses it out loud instead of storing the headers as steps to tick.
+    PhasedSteps {
         steps: Vec<String>,
     },
     /// Tick step `n` (from 1), or untick it.
@@ -1259,19 +1268,46 @@ pub struct ItemInfo {
     /// Put away by the owner (`dismiss`): closed, left out of the Done lane by every client.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
-    /// Where its plan is: `written`, `stale`, `approved` or `changed`; empty with no plan file
-    /// and from an older daemon.
+    /// Where its plan is: `written`, `stale`, `asked`, `approved` or `changed`; empty with no
+    /// plan file and from an older daemon.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub plan: String,
     /// Who approved it, `qass` or `owner`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_by: Option<String>,
+    /// When its plan last changed: linked, or approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_at: Option<i64>,
     /// The owner asked to see its plan before it is built.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_me: bool,
-    /// Questions open on it: its agents' cards not answered yet.
+    /// Questions open on it: its agents' cards not answered yet, qass's plan card left to
+    /// `plan` (`asked`).
     #[serde(default, skip_serializing_if = "none_open")]
     pub open_asks: usize,
+    /// The phase its work is in, from its steps' `## ` headers; none without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PhaseInfo>,
+}
+
+/// The item a card is about.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskItem {
+    pub id: i64,
+    pub key: String,
+    /// Its plan state, as `ItemInfo::plan`: empty with no plan file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plan: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PhaseInfo>,
+}
+
+/// Where an item is among its phases: the `n`th of `of`, called `name`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseInfo {
+    pub n: usize,
+    pub of: usize,
+    pub name: String,
 }
 
 fn none_open(n: &usize) -> bool {
@@ -1444,8 +1480,10 @@ pub fn item_info(
             state => state.as_str().to_string(),
         },
         plan_by: row.plan.by().map(|b| b.as_str().to_string()),
+        plan_at: row.plan_at,
         show_me: row.show_me,
         open_asks: row.open_asks,
+        phase: row.phase.map(|(n, of, name)| PhaseInfo { n, of, name }),
     }
 }
 

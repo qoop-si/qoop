@@ -2794,9 +2794,10 @@ fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
     state_mark(role, moving, c.tick, c.icons)
 }
 
-/// A state's mark where the column is not the one drawing it (the qass screen's header): the
-/// zzz where icons are drawn and the state is asleep, else the two cell picture.
-pub(crate) fn state_mark(role: crate::theme::Role, moving: bool, tick: u64, icons: bool) -> String {
+/// A state's mark where the column is not the one drawing it (the qass screen's header, the
+/// board's list): the zzz where icons are drawn and the state is asleep, else the two cell
+/// picture.
+pub fn state_mark(role: crate::theme::Role, moving: bool, tick: u64, icons: bool) -> String {
     if icons && role == crate::theme::Role::Sleeping {
         return asleep_mark();
     }

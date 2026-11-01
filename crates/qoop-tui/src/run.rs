@@ -26152,6 +26152,7 @@ mod tests {
             answer: None,
             option: None,
             task: None,
+            item: None,
             body: AskCard {
                 handle: handle.to_string(),
                 urgency: "later".to_string(),

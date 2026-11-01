@@ -269,6 +269,7 @@ pub(crate) async fn write(
         action,
         TaskOp::Describe { .. }
             | TaskOp::Steps { .. }
+            | TaskOp::PhasedSteps { .. }
             | TaskOp::Check { .. }
             | TaskOp::Link { .. }
             | TaskOp::Unlink
@@ -320,6 +321,7 @@ pub(crate) async fn write(
             | TaskOp::Add { .. }
             | TaskOp::Describe { .. }
             | TaskOp::Steps { .. }
+            | TaskOp::PhasedSteps { .. }
             | TaskOp::Check { .. }
             | TaskOp::Link { .. }
             | TaskOp::Unlink
@@ -424,7 +426,9 @@ async fn item_write(
             let mut key = None;
             let changed = match action {
                 TaskOp::Describe { text } => s.describe_item(target, &text, now)?,
-                TaskOp::Steps { steps } => s.set_steps(target, &steps, now)?,
+                TaskOp::Steps { steps } | TaskOp::PhasedSteps { steps } => {
+                    s.set_steps(target, &steps, now)?
+                }
                 TaskOp::Check { n, done } => s.check_step(target, n, done, now)?,
                 TaskOp::Link { item } => s.link_task(target, item, now)?,
                 TaskOp::Unlink => s.unlink(target, now)?,

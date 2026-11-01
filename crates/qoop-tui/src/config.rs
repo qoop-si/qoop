@@ -96,6 +96,8 @@ pub struct Config {
     pub lifecycle: qoop_runtime::config::Lifecycle,
     /// The board's quiet cards: one line, a word only on a card someone must act on.
     pub quiet_cards: bool,
+    /// The board page opens as the list (the default) rather than the lanes.
+    pub board_list: bool,
     /// A mouse selection goes to the clipboard when the button comes up. Off, it stays
     /// highlighted until the copy key.
     pub copy_on_select: bool,
@@ -122,6 +124,7 @@ impl Default for Config {
             notch: true,
             lifecycle: qoop_runtime::config::Lifecycle::default(),
             quiet_cards: false,
+            board_list: true,
             copy_on_select: true,
         }
     }
@@ -614,6 +617,11 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                                 format!("cards = {value} is not \"full\" or \"quiet\""),
                             );
                         }
+                        ("view", Some("list")) => config.board_list = true,
+                        ("view", Some("board")) => config.board_list = false,
+                        ("view", _) => {
+                            refuse(line, format!("view = {value} is not \"list\" or \"board\""));
+                        }
                         _ => refuse(line, format!("there is no setting board.{key}")),
                     }
                 }
@@ -776,7 +784,7 @@ pub fn prefixes() -> Vec<String> {
 }
 
 /// The keys `set` writes, each as the file spells it.
-pub const KEYS: [&str; 20] = [
+pub const KEYS: [&str; 21] = [
     "prefix",
     "theme",
     "icons",
@@ -795,6 +803,7 @@ pub const KEYS: [&str; 20] = [
     "qass.models.mid",
     "qass.models.low",
     "board.cards",
+    "board.view",
     "report.send",
     "telemetry",
 ];
@@ -834,6 +843,8 @@ pub fn set(path: &Path, key: &str, value: &str) -> Result<(), String> {
         "icons" => return Err("icons is auto, on or off".to_string()),
         "board.cards" if matches!(value, "full" | "quiet") => toml_edit::value(value),
         "board.cards" => return Err("board.cards is full or quiet".to_string()),
+        "board.view" if matches!(value, "list" | "board") => toml_edit::value(value),
+        "board.view" => return Err("board.view is list or board".to_string()),
         "notify.mute" if qoop_runtime::config::Mute::parse(value).is_some() => {
             toml_edit::value(value)
         }
@@ -967,6 +978,7 @@ mod tests {
             ("qass.models.mid", "claude-sonnet-5-5"),
             ("qass.models.low", "haiku"),
             ("board.cards", "quiet"),
+            ("board.view", "board"),
             ("report.send", "always"),
             ("telemetry", "false"),
         ];
@@ -987,6 +999,12 @@ mod tests {
         assert!(!read.config.copy_on_select);
         assert!(set(&path, "copy_on_select", "maybe").is_err());
         assert!(set(&path, "board.cards", "loud").is_err());
+        assert!(!read.config.board_list);
+        assert!(
+            Config::default().board_list,
+            "the list is the board's first view"
+        );
+        assert!(set(&path, "board.view", "grid").is_err());
         assert_eq!(read.config.mute, qoop_runtime::config::Mute::Here);
         assert!(set(&path, "notify.mute", "loud").is_err());
         assert_eq!(read.config.theme, Theme::Light);
