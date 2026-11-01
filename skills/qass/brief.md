@@ -52,7 +52,11 @@ One `qoop prompt` line, in this order:
 1. "First run `qoop task link <KEY>`" (or `qoop task new <goal>` for work on no item) "and keep its
    steps ticked, then follow `qoop task rules` and the repo’s `.qoop/workflow.md` as far as the
    fence allows. Each `qoop task`
-   command alone, one per call, never chained (a chain asks permission)."
+   command alone, one per call, never chained (a chain asks permission). Your plan is a file with a
+   `## Summary`; once its reviews are done (again only when a review changed it, never for a status
+   edit), `qoop task planfile <path>`, then end your turn with
+   `plan clean` or `plan blocked: <finding>`, a statement with no question mark. Build only after
+   `approved, build`, once `qoop task show` says the plan is approved for the hash you linked." (A worker on a remote: no `planfile`; its plan goes to them as a card.)
 2. The goal: their words in double quotes, unchanged, with when it is done (cleared up with them:
    no second round), then
    `Deeper: a top professional would <1>; start from <2>; use <3>; it is right when <4>.`

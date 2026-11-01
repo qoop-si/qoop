@@ -274,6 +274,12 @@ const USAGE: &str = "usage:
   qoop task reopen <KEY|id>            bring a closed item back
   qoop task dismiss <KEY|id> [--undo]  put a closed item away from the board (nothing is
                                        deleted); --undo: back on the board
+  qoop task planfile [--id KEY] <path> link the reviewed plan file to the item; prints its hash
+  qoop task approve <KEY|id> --hash <h> [--by owner]
+                                       approve the plan qass read (qass only)
+  qoop task show-me <KEY|id> [--off]   the owner wants to see this item's plan (qass only)
+  qoop task next [--take] [--json]     the Todo item qass should start now; --take starts it
+                                       (qass only)
   qoop task ls [--json]                open tasks
   qoop task board [--json] [--dir DIR] the board's items, then every space's goal and open
                                        tasks as Markdown; --json: the items; --dir writes
@@ -386,6 +392,45 @@ pub(crate) fn written(task: Option<i64>, action: TaskOp) -> std::io::Result<(i64
             "unexpected answer: {other:?}"
         ))),
     }
+}
+
+/// A plan file read for its hash, bounded as the daemon reads it: a regular file of at most
+/// 200 KB, never a device, a pipe or a link to one.
+fn read_plan(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 200 * 1024;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX {
+        return Err(std::io::Error::other("not a plan file of at most 200 KB"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// A plan write speaks for its terminal even when it names an item: the daemon checks who may
+/// approve, mark or take (qass's tab), and which item an agent links a plan to.
+fn plan_request(task: Option<i64>, action: TaskOp) -> std::io::Result<ControlResponse> {
+    let (terminal, token) = here();
+    let request = ControlRequest::TaskWrite {
+        id: crate::request_id("task"),
+        terminal,
+        token,
+        task,
+        action,
+    };
+    match ask(request, std::time::Duration::from_secs(10))? {
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        answer => Ok(answer),
+    }
+}
+
+fn unexpected(other: ControlResponse) -> std::io::Result<()> {
+    Err(std::io::Error::other(format!(
+        "unexpected answer: {other:?}"
+    )))
 }
 
 struct Found {
@@ -780,6 +825,96 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             }
             _ => Err(usage(USAGE)),
         },
+        Some("planfile") => {
+            let (task, words) = named(rest)?;
+            let [path] = words else {
+                return Err(usage(USAGE));
+            };
+            let path = std::fs::canonicalize(path)
+                .map_err(|e| std::io::Error::other(format!("{path}: {e}")))?;
+            let path = path.to_string_lossy().into_owned();
+            match plan_request(task, TaskOp::PlanFile { path: path.clone() })? {
+                ControlResponse::TaskWritten { task, key, .. } => {
+                    println!("plan {path} on #{task}, hash {}", key.unwrap_or_default());
+                    Ok(())
+                }
+                other => unexpected(other),
+            }
+        }
+        Some("approve") => {
+            let words = without(&["--by", "owner"]);
+            let owner = rest.windows(2).any(|w| w[0] == "--by" && w[1] == "owner");
+            let (key, hash) = match words.as_slice() {
+                [key, flag, hash] if flag == "--hash" => (key, hash),
+                [flag, hash, key] if flag == "--hash" => (key, hash),
+                _ => return Err(usage(USAGE)),
+            };
+            let item = item(key)?;
+            plan_request(
+                Some(item),
+                TaskOp::Approve {
+                    hash: hash.clone(),
+                    owner,
+                },
+            )?;
+            println!(
+                "{key}: plan approved by {}",
+                if owner { "owner" } else { "qass" }
+            );
+            Ok(())
+        }
+        Some("show-me") => match without(&["--off"]).as_slice() {
+            [key] => {
+                let on = !has("--off");
+                plan_request(Some(item(key)?), TaskOp::ShowMe { on })?;
+                if on {
+                    println!("{key}: the owner sees its plan before it is built");
+                } else {
+                    println!("{key}: qass approves its plan as usual");
+                }
+                Ok(())
+            }
+            _ => Err(usage(USAGE)),
+        },
+        Some("next") => {
+            if !without(&["--take", "--json"]).is_empty() {
+                return Err(usage(USAGE));
+            }
+            let take = has("--take");
+            match plan_request(None, TaskOp::Next { take })? {
+                ControlResponse::Next {
+                    item,
+                    key,
+                    title,
+                    at_work,
+                    skipped,
+                    ..
+                } => {
+                    if has("--json") {
+                        return json(&serde_json::json!({
+                            "item": item, "key": key, "title": title,
+                            "at_work": at_work, "skipped": skipped,
+                        }));
+                    }
+                    match (key, title) {
+                        (Some(key), Some(title)) => println!("{key} {title}"),
+                        _ if at_work >= qoop_store::plan::QASS_WORKERS => {
+                            println!("none: {at_work} at work");
+                        }
+                        _ => println!("none: nothing new in Todo"),
+                    }
+                    if !skipped.is_empty() {
+                        println!(
+                            "skipped: {}, {} starts never linked",
+                            skipped.join(", "),
+                            qoop_store::plan::DEAD_STARTS
+                        );
+                    }
+                    Ok(())
+                }
+                other => unexpected(other),
+            }
+        }
         Some("ls") => {
             let found = read(None, None, false, std::time::Duration::from_secs(10))?;
             if has("--json") {
@@ -841,6 +976,33 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     "  {} {}, steps {}/{}",
                     card.item.key, card.item.state, card.item.steps_done, card.item.steps_total
                 );
+                if let Some(plan) = &card.plan_file {
+                    let state = match card.item.plan_by.as_deref() {
+                        Some(by) => format!("{} by {by}", card.item.plan),
+                        None => card.item.plan.clone(),
+                    };
+                    println!("  plan {state}: {} (hash {})", plan.path, plan.hash);
+                    // The file as it is now: an edit after it was linked is not what was read.
+                    match read_plan(&plan.path) {
+                        Ok(bytes) if qoop_store::plan::plan_hash(&bytes) != plan.hash => println!(
+                            "  the file changed since it was linked: qoop task planfile it again"
+                        ),
+                        Err(e) => println!("  the file cannot be read now: {e}"),
+                        Ok(_) => {}
+                    }
+                    if plan.terminal > 0 {
+                        println!("  linked from terminal {}", plan.terminal);
+                    }
+                    if !plan.summary.is_empty() {
+                        println!("  summary: {}", plan.summary);
+                    }
+                }
+                if card.item.show_me {
+                    println!("  the owner wants to see the plan before it is built");
+                }
+                if card.item.open_asks > 0 {
+                    println!("  {} question(s) open for the owner", card.item.open_asks);
+                }
                 for step in &card.steps {
                     let mark = if step.done_at.is_some() { "x" } else { " " };
                     println!("  [{mark}] {}. {}", step.n, step.text);
@@ -1013,7 +1175,12 @@ mod tests {
     fn card(title: &str, steps: &[(&str, bool)]) -> ItemCardInfo {
         let done = steps.iter().filter(|(_, d)| *d).count();
         ItemCardInfo {
+            plan_file: None,
             item: qoop_runtime::control::ItemInfo {
+                plan: String::new(),
+                plan_by: None,
+                show_me: false,
+                open_asks: 0,
                 id: 9,
                 key: "QOOP-3".into(),
                 workspace: None,

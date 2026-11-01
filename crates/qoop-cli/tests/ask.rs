@@ -1273,3 +1273,32 @@ fn another_terminal_never_types_into_qasss_tab() {
     let screen = stack.run(&["read", &qtab]).1;
     assert!(!screen.contains("WORKER_NOTE"), "{screen}");
 }
+
+/// A card qass writes on a worker with `--via-qass` (a plan the owner approves) sits on that
+/// worker, but his answer goes to qass, which records it, never straight to the worker.
+#[test]
+fn a_via_qass_card_on_a_worker_is_answered_through_qass() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "qoop ask add E9 --agent T{korea} --handle plan --urgency later --via-qass < '{}'",
+            stack.path("card.txt").display()
+        ),
+    );
+    assert!(said.contains("Added"), "{said}");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E9", "--option", "a"]);
+    assert!(
+        ok && out.contains("Passed"),
+        "to qass, not the worker: {out} {err}"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !stack.log("korea").contains("The owner answered E9"),
+        "the worker was typed to: {:?}",
+        stack.log("korea")
+    );
+}

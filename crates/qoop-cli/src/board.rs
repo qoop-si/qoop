@@ -306,8 +306,14 @@ fn index(b: &Board) -> String {
                 .outcome
                 .as_deref()
                 .map_or(i.state.clone(), |o| format!("{}, {o}", i.state));
-            // Put away by the owner: off every board he sees, still done.
+            // Put away by the owner: off every board he sees, still done. Its plan, when one is
+            // linked, read where the state is.
             let hidden = if i.hidden { ", hidden" } else { "" };
+            let hidden = match (i.plan.as_str(), i.plan_by.as_deref()) {
+                ("", _) => hidden.to_string(),
+                (plan, Some(by)) => format!("{hidden}, plan {plan} by {by}"),
+                (plan, None) => format!("{hidden}, plan {plan}"),
+            };
             let _ = writeln!(
                 out,
                 "| {} | {} | {state}{hidden} | {}/{} | {} |",

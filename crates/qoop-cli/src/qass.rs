@@ -25,17 +25,52 @@ pub(crate) const PROMPTED_LOG: &str = "prompted.log";
 /// that already exists, and never failing the write it records: a person without qass gets
 /// no file, and a prompt never fails for want of its note.
 pub(crate) fn note_prompted(target: u32) {
+    note_prompted_said(target, "");
+}
+
+/// The line qass sends a worker once its plan is approved: the go-ahead it waits for, not a
+/// push, so it is marked in the log and left out of qass's per-agent count.
+pub(crate) const BUILD_LINE: &str = "approved, build";
+
+/// `approved, build (<KEY>).` at the start of the line and nothing looser: only the go-ahead for
+/// one item is left out of the count, never any line that happens to begin with those words.
+pub(crate) fn is_build_line(said: &str) -> bool {
+    let Some(rest) = said.trim_start().strip_prefix(BUILD_LINE) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(" (") else {
+        return false;
+    };
+    let Some((key, after)) = rest.split_once(')') else {
+        return false;
+    };
+    let Some((prefix, n)) = key.rsplit_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !n.is_empty()
+        && n.chars().all(|c| c.is_ascii_digit())
+        && (after.is_empty() || after.starts_with('.'))
+}
+
+/// [`note_prompted`] for a text write: the go-ahead after a plan approval is marked `build`.
+pub(crate) fn note_prompted_said(target: u32, said: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let from = qoop_runtime::legacy::var("QOOP_TERMINAL").ok();
-    let _ = note_prompted_in(paths::qass_data_dir(), from.as_deref(), target, now);
+    let build = is_build_line(said);
+    let _ = note_prompted_in(paths::qass_data_dir(), from.as_deref(), target, build, now);
 }
 
 fn note_prompted_in(
     folder: Option<PathBuf>,
     from: Option<&str>,
     target: u32,
+    build: bool,
     now: u64,
 ) -> std::io::Result<()> {
     use std::io::Write;
@@ -50,7 +85,13 @@ fn note_prompted_in(
         .append(true)
         .create(true)
         .open(folder.join(PROMPTED_LOG))?
-        .write_all(format!("{now} {from} T{target}\n").as_bytes())
+        .write_all(
+            format!(
+                "{now} {from} T{target}{}\n",
+                if build { " build" } else { "" }
+            )
+            .as_bytes(),
+        )
 }
 
 /// How each agent takes its first message, as each was seen to: Claude and Codex as the
@@ -998,20 +1039,33 @@ mod tests {
     }
 
     #[test]
+    fn only_the_go_ahead_for_one_item_is_a_build_line() {
+        assert!(is_build_line(
+            "approved, build (QOOP-61). Do not commit, push..."
+        ));
+        assert!(is_build_line("approved, build (app2-4)"));
+        assert!(!is_build_line("approved, build everything now"));
+        assert!(!is_build_line("approved, build (qoop-61)."));
+        assert!(!is_build_line("approved, build (QOOP-). go"));
+        assert!(!is_build_line("not approved, build (QOOP-61)."));
+    }
+
+    #[test]
     fn a_write_is_noted_for_the_watcher_only_in_a_qass_folder_that_exists() {
         let home = tempfile::tempdir().expect("a directory");
         let folder = home.path().join("qass");
         let at = || Some(folder.clone());
-        note_prompted_in(at(), Some("128"), 52, 100).expect("no folder is no error");
+        note_prompted_in(at(), Some("128"), 52, false, 100).expect("no folder is no error");
         assert!(!folder.exists(), "a person without qass gets no folder");
         std::fs::create_dir(&folder).expect("folder");
-        note_prompted_in(at(), Some("128"), 52, 100).expect("noted");
-        note_prompted_in(at(), None, 52, 100).expect("outside a terminal, nothing");
-        note_prompted_in(at(), Some("x"), 52, 100).expect("a broken number, nothing");
-        note_prompted_in(None, Some("7"), 52, 100).expect("no home, nothing");
-        note_prompted_in(at(), Some("7"), 52, 101).expect("noted");
+        note_prompted_in(at(), Some("128"), 52, false, 100).expect("noted");
+        note_prompted_in(at(), None, 52, false, 100).expect("outside a terminal, nothing");
+        note_prompted_in(at(), Some("x"), 52, false, 100).expect("a broken number, nothing");
+        note_prompted_in(None, Some("7"), 52, false, 100).expect("no home, nothing");
+        note_prompted_in(at(), Some("7"), 52, true, 101).expect("noted");
         let log = std::fs::read_to_string(folder.join(PROMPTED_LOG)).expect("log");
-        assert_eq!(log, "100 128 T52\n101 7 T52\n");
+        // The go-ahead after a plan approval is marked, so qass's count can leave it out.
+        assert_eq!(log, "100 128 T52\n101 7 T52 build\n");
     }
 
     #[test]

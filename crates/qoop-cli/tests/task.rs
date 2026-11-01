@@ -1435,3 +1435,166 @@ $Q show big.bin > big.out 2>&1; echo $? > big.rc"#,
             .contains("no show 9")
     );
 }
+
+/// The plan loop end to end: an agent on an item links its reviewed plan file; it cannot
+/// approve it, nor can a client outside every terminal, nor an agent on no item link one;
+/// qass approves the version it read and is refused for one it did not; the board says who
+/// approved; a rewritten file reads `changed`; only qass takes work from Todo.
+#[test]
+fn a_plan_is_linked_by_its_agent_and_approved_only_by_qass() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let (ok, out, err) = daemon.run(&["task", "add", "--space", "1", "ship", "it"]);
+    assert!(ok, "add: {err}");
+    let key = out.split_whitespace().next().unwrap().to_string();
+    let plan = dir.path().join("plan.md");
+    std::fs::write(&plan, "# Ship\n\n## Summary\n\nShip it in one phase.\n").unwrap();
+    // The path the CLI records, with every link resolved (/var is /private/var here).
+    let plan = std::fs::canonicalize(&plan).unwrap().display().to_string();
+
+    // The agent on the item links the plan, and is refused when it tries to approve it.
+    let work = daemon.inside(
+        "1",
+        "plan",
+        &format!(
+            r#"$Q task link {key} > link.out 2>&1
+$Q task planfile '{plan}' > planfile.out 2>&1
+$Q task approve {key} --hash x > approve.out 2>&1; echo $? > approve.rc
+$Q task show-me {key} > showme.out 2>&1; echo $? > showme.rc
+$Q task next --take > take.out 2>&1; echo $? > take.rc"#
+        ),
+    );
+    let linked = read(&work, "planfile.out");
+    assert!(linked.contains(&format!("plan {plan} on #")), "{linked}");
+    let hash = linked.trim().rsplit(' ').next().unwrap().to_string();
+    assert_eq!(hash.len(), 16, "{linked}");
+    assert_eq!(read(&work, "approve.rc").trim(), "1");
+    assert!(
+        read(&work, "approve.out").contains("only qass"),
+        "{}",
+        read(&work, "approve.out")
+    );
+    assert_eq!(read(&work, "take.rc").trim(), "1");
+    assert!(
+        read(&work, "take.out").contains("only qass"),
+        "{}",
+        read(&work, "take.out")
+    );
+    assert_eq!(
+        read(&work, "showme.rc").trim(),
+        "1",
+        "an agent marks nothing for the owner"
+    );
+
+    // Outside every terminal is no proof of qass: refused too.
+    let (ok, _, err) = daemon.run(&["task", "approve", &key, "--hash", &hash]);
+    assert!(!ok && err.contains("only qass"), "{err}");
+
+    // An agent on no item cannot link a plan to one.
+    let (ok, out, err) = daemon.run(&["new", "--space", "1"]);
+    assert!(ok, "new: {err}");
+    let other = out.trim().to_string();
+    let work = daemon.inside(
+        &other,
+        "other",
+        &format!(
+            r#"$Q task new "elsewhere" > /dev/null 2>&1
+$Q task planfile --id {key} '{plan}' > planfile.out 2>&1; echo $? > planfile.rc"#
+        ),
+    );
+    assert_eq!(read(&work, "planfile.rc").trim(), "1");
+    assert!(
+        read(&work, "planfile.out").contains("not the item this terminal's task is on"),
+        "{}",
+        read(&work, "planfile.out")
+    );
+
+    // qass: a wrong hash is refused, the one it read is approved, and the board says so.
+    let (ok, out, err) = daemon.run(&["new", "--space", "qass"]);
+    assert!(ok, "new --space qass: {err}");
+    let qass = out.trim().to_string();
+    let work = daemon.inside(
+        &qass,
+        "qass",
+        &format!(
+            r#"$Q task approve {key} --hash 0000000000000000 > wrong.out 2>&1; echo $? > wrong.rc
+$Q task approve {key} --hash {hash} > right.out 2>&1; echo $? > right.rc
+$Q task show-me {key} > showme.out 2>&1"#
+        ),
+    );
+    assert_eq!(read(&work, "wrong.rc").trim(), "1");
+    assert!(
+        read(&work, "wrong.out").contains("changed since it was read"),
+        "{}",
+        read(&work, "wrong.out")
+    );
+    assert_eq!(
+        read(&work, "right.rc").trim(),
+        "0",
+        "{}",
+        read(&work, "right.out")
+    );
+    assert!(
+        read(&work, "right.out").contains("approved by qass"),
+        "{}",
+        read(&work, "right.out")
+    );
+    let item = board_items(&daemon)
+        .into_iter()
+        .find(|i| i["key"] == key.as_str())
+        .expect("the item");
+    assert_eq!(item["plan"], "approved");
+    assert_eq!(item["plan_by"], "qass");
+    assert_eq!(item["show_me"], true);
+    let (ok, out, err) = daemon.run(&["task", "show", &key]);
+    assert!(ok, "show: {err}");
+    assert!(out.contains("plan approved by qass"), "{out}");
+    assert!(out.contains("summary: Ship it in one phase."), "{out}");
+
+    // The file rewritten after the approval: the board reads it as changed, and the old
+    // hash approves nothing.
+    std::fs::write(&plan, "# Ship\n\n## Summary\n\nShip it in two phases.\n").unwrap();
+    let work = daemon.inside(
+        "1",
+        "relink",
+        &format!(r#"$Q task planfile '{plan}' > planfile.out 2>&1"#),
+    );
+    assert!(
+        read(&work, "planfile.out").contains("hash"),
+        "{}",
+        read(&work, "planfile.out")
+    );
+    let item = board_items(&daemon)
+        .into_iter()
+        .find(|i| i["key"] == key.as_str())
+        .unwrap();
+    assert_eq!(item["plan"], "changed");
+    let work = daemon.inside(
+        &qass,
+        "qass-old",
+        &format!(r#"$Q task approve {key} --hash {hash} > old.out 2>&1; echo $? > old.rc"#),
+    );
+    assert_eq!(read(&work, "old.rc").trim(), "1");
+
+    // Reading the next item is anyone's; taking it is qass's, and begins pickup.
+    let (ok, out, err) = daemon.run(&["task", "next"]);
+    assert!(ok, "next: {err}");
+    assert!(out.starts_with("none"), "{out}");
+    let work = daemon.inside(
+        &qass,
+        "qass-take",
+        r#"$Q task next --take > take.out 2>&1; echo $? > take.rc"#,
+    );
+    assert_eq!(
+        read(&work, "take.rc").trim(),
+        "0",
+        "{}",
+        read(&work, "take.out")
+    );
+    // The item opened before pickup began stays the owner's.
+    assert!(
+        read(&work, "take.out").starts_with("none"),
+        "{}",
+        read(&work, "take.out")
+    );
+}

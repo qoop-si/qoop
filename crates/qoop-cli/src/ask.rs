@@ -15,7 +15,9 @@ use crate::task::{ask as ask_daemon_once, here, json};
 use crate::usage;
 
 const USAGE: &str = "usage:
-  qoop ask add E<n> --agent <T52|ubox/T2|-> --handle <word> --urgency now|later   a card on stdin
+  qoop ask add E<n> --agent <T52|ubox/T2|-> --handle <word> --urgency now|later [--via-qass]
+                                         a card on stdin; --via-qass: his answer goes to qass,
+                                         not the agent (a plan he approves)
   qoop ask close E<n> [--note <words>]   end a card that was handled (default note: closed)
   qoop ask answer E<n> [--option a|b|c|d] [--seen <its words>] [--text <words>]   answer as the owner (not from a terminal)
   qoop ask dismiss E<n>                  put a card away unanswered, as the owner
@@ -297,6 +299,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     card: card.clone(),
                     agent,
                     body: Box::new(body),
+                    via_qass: rest.iter().any(|a| a == "--via-qass"),
                 },
                 true,
             );

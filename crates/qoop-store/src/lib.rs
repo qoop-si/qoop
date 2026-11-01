@@ -15,6 +15,7 @@
 pub mod ask;
 pub mod history;
 pub mod item;
+pub mod plan;
 pub mod schedule;
 pub mod show;
 pub mod task;
@@ -329,6 +330,13 @@ impl Store {
              -- The spaces and the panes a person asked qass to leave alone. Cascaded like the
              -- rest, because ids are reused. New tables, no version bump: an older binary
              -- ignores them and qass watches the tab as before.
+             -- When qass first took work from Todo by itself (`plan.rs`): items opened
+             -- before stay for the owner. New table, no version bump: an older binary
+             -- ignores it.
+             CREATE TABLE IF NOT EXISTS pickup (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 since INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS qass_skip_workspace (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE
              );

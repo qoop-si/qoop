@@ -2436,7 +2436,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         )?)
         .await?;
         wr.flush().await?;
-        crate::qass::note_prompted(terminal);
+        crate::qass::note_prompted_said(terminal, &said);
         paths::note_typed(terminal, &typed_by(), &said);
         println!("prompted terminal {terminal}");
         if !wait {

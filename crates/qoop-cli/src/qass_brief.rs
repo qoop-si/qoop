@@ -28,12 +28,14 @@ fn launch(text: &str) -> bool {
     LAUNCH.iter().any(|l| text.starts_with(l))
 }
 
-/// One `prompted.log` record: `<unix> <from terminal> T<n>` (`<remote>/T<n>` from on.sh).
+/// One `prompted.log` record: `<unix> <from terminal> T<n>` (`<remote>/T<n>` from on.sh),
+/// and `build` after it for the go-ahead sent once a plan is approved.
 #[derive(Clone, Debug, PartialEq)]
 struct Record {
     at: i64,
     from: u32,
     to: String,
+    build: bool,
 }
 
 fn parse_log(text: &str) -> Vec<Record> {
@@ -44,6 +46,7 @@ fn parse_log(text: &str) -> Vec<Record> {
                 at: w.next()?.parse().ok()?,
                 from: w.next()?.parse().ok()?,
                 to: w.next()?.to_string(),
+                build: w.next() == Some("build"),
             })
         })
         .collect()
@@ -369,9 +372,10 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
     let moved = task
         .map(|t| t.forward.max(t.opened))
         .filter(|at| *at > since);
+    // The go-ahead after a plan approval is not a push: it does not count toward the three.
     let to_agent = mine
         .iter()
-        .filter(|r| r.to == tab && r.at >= moved.unwrap_or(since))
+        .filter(|r| r.to == tab && !r.build && r.at >= moved.unwrap_or(since))
         .count();
     // His word gives room: the hour's count starts again when he speaks.
     let hour_from = since.max(f.now - 3600);
@@ -951,6 +955,9 @@ mod tests {
             "{out}"
         );
         assert_eq!(compose(&f).1["writes_to_agent"], 3);
+        // The go-ahead after a plan approval is no push: the agent's count holds.
+        f.log = parse_log(&format!("{log}\n{} 128 T52 build", NOW - 400));
+        assert_eq!(compose(&f).1["writes_to_agent"], 3);
     }
 
     /// Rounds are changes into reviewing: a stay is none, and neither is the way back from
@@ -1038,12 +1045,21 @@ mod tests {
         assert!(line.contains("`on.sh ubox`"), "{line}");
         assert!(remote_line("52").is_none());
         assert_eq!(
-            parse_log("100 128 ubox/T2\nbroken\n"),
-            [Record {
-                at: 100,
-                from: 128,
-                to: "ubox/T2".into()
-            }]
+            parse_log("100 128 ubox/T2\nbroken\n101 128 T5 build\n"),
+            [
+                Record {
+                    at: 100,
+                    from: 128,
+                    to: "ubox/T2".into(),
+                    build: false,
+                },
+                Record {
+                    at: 101,
+                    from: 128,
+                    to: "T5".into(),
+                    build: true,
+                },
+            ]
         );
     }
 

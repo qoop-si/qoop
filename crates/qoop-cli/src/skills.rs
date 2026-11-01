@@ -142,6 +142,11 @@ const QASS: &[(&str, &str, bool)] = &[
         false,
     ),
     (
+        "plans.md",
+        include_str!("../../../skills/qass/plans.md"),
+        false,
+    ),
+    (
         "setup.md",
         include_str!("../../../skills/qass/setup.md"),
         false,
@@ -916,8 +921,9 @@ mod tests {
         // answer a reversible ask, resume an error, a limit and a finished job and push the
         // step a goal still lacks, the ceiling `qoop prompt` keeps, and the agents in a summary.
         // 495 since 2026-10-29: another agent's turn lasts 15 minutes, then its writer is asked
-        // once and the tab is qass's, so no agent waits on a reply nobody sends.
-        assert!(skill.lines().count() <= 495, "SKILL.md grew past 495 lines");
+        // once and the tab is qass's, so no agent waits on a reply nobody sends. 496 since
+        // 2026-11-01: every wake reads plans.md (the next new Todo item, a ready plan to approve).
+        assert!(skill.lines().count() <= 496, "SKILL.md grew past 496 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

@@ -2548,6 +2548,8 @@ pub(crate) fn activity_words(kind: &str, body: &str) -> String {
         "done" => "claims done",
         "hidden" => return "hidden from the board".to_string(),
         "unhidden" => return "back on the board".to_string(),
+        // A plan's events come worded by the store ("plan approved by qass"): said as they are.
+        "planfile" | "approved" | "show-me" | "show-me-off" | "stale-card" => return body,
         other => other,
     };
     if body.is_empty() {
@@ -3027,6 +3029,10 @@ mod tests {
 
     fn item(id: i64, state: &str, title: &str, workspace: i64) -> ItemInfo {
         ItemInfo {
+            plan: String::new(),
+            plan_by: None,
+            show_me: false,
+            open_asks: 0,
             id,
             key: format!("QOOP-{id}"),
             workspace: Some(workspace),
@@ -3627,6 +3633,7 @@ mod tests {
         let mut p = page();
         assert_eq!(p.key(Key::Enter), Step::Open(1));
         p.card = Some(ItemCardInfo {
+            plan_file: None,
             item: item(1, "todo", "t", 1),
             description: "why".into(),
             steps: vec![
@@ -3692,6 +3699,7 @@ mod tests {
             body: body.into(),
         };
         p.card = Some(ItemCardInfo {
+            plan_file: None,
             item: item(1, "doing", "t", 1),
             description: String::new(),
             steps: Vec::new(),
@@ -4574,6 +4582,7 @@ mod tests {
         let mut p = page();
         p.size = size;
         p.card = Some(ItemCardInfo {
+            plan_file: None,
             item: item(1, "doing", "t", 1),
             description: String::new(),
             steps,
@@ -4652,6 +4661,7 @@ mod tests {
             ..Default::default()
         });
         p.card = Some(ItemCardInfo {
+            plan_file: None,
             item: it,
             description: words("d", 400),
             steps: vec![StepInfo {
@@ -4836,6 +4846,7 @@ mod tests {
     #[test]
     fn identical_events_are_told_apart_from_the_oldest() {
         let card = ItemCardInfo {
+            plan_file: None,
             item: item(1, "doing", "t", 1),
             description: String::new(),
             steps: Vec::new(),

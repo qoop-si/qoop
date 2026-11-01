@@ -253,6 +253,20 @@ pub(crate) async fn write(
     }
     if matches!(
         action,
+        TaskOp::PlanFile { .. }
+            | TaskOp::Approve { .. }
+            | TaskOp::ShowMe { .. }
+            | TaskOp::Next { .. }
+    ) {
+        // qass is a terminal in qass's own space, its token checked above.
+        let qass = speaker.is_some() && space.as_deref() == Some(QASS_SPACE);
+        return Box::pin(plan_write(
+            id, speaker, qass, task, action, agents, store, now,
+        ))
+        .await;
+    }
+    if matches!(
+        action,
         TaskOp::Describe { .. }
             | TaskOp::Steps { .. }
             | TaskOp::Check { .. }
@@ -312,6 +326,10 @@ pub(crate) async fn write(
             | TaskOp::Start
             | TaskOp::Reopen
             | TaskOp::Dismiss { .. }
+            | TaskOp::PlanFile { .. }
+            | TaskOp::Approve { .. }
+            | TaskOp::ShowMe { .. }
+            | TaskOp::Next { .. }
             | TaskOp::LinkRemote { .. } => unreachable!("handled above"),
             TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
             TaskOp::Goal { goal } => s.set_task_goal(task, &goal, now),
@@ -430,6 +448,202 @@ async fn item_write(
             ControlResponse::TaskWritten { id, task, key }
         }
         Err(e) => store_failed(id, e),
+    }
+}
+
+/// The largest plan file read: a plan, not a log.
+const PLAN_BYTES: u64 = 200 * 1024;
+
+/// A plan file, read off the async threads: a regular file up to [`PLAN_BYTES`].
+async fn read_file(path: String) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let meta = std::fs::metadata(&path)?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other("not a file"));
+        }
+        if meta.len() > PLAN_BYTES {
+            return Err(std::io::Error::other(format!(
+                "over {} KB: a plan, not a log",
+                PLAN_BYTES / 1024
+            )));
+        }
+        std::fs::read(&path)
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+/// A plan write: link a plan file, approve it, mark it for the owner, or name the next item.
+/// Approving, marking and taking are qass's; a plan file comes from an agent on the item, qass,
+/// or a client that speaks for no terminal (the owner's own socket).
+#[allow(clippy::too_many_arguments)]
+async fn plan_write(
+    id: String,
+    speaker: Option<u32>,
+    qass: bool,
+    task: Option<i64>,
+    action: TaskOp,
+    agents: &AgentRegistry,
+    store: &StoreHandle,
+    now: i64,
+) -> ControlResponse {
+    use qoop_store::plan::{ApprovedBy, plan_hash};
+    const QASS_ONLY: &str = "only qass does this: it reads the plan, or carries the owner's word";
+    match action {
+        TaskOp::Next { take } => {
+            if take && !qass {
+                return failed(
+                    id,
+                    "only qass takes work from Todo; qoop task next reads it",
+                );
+            }
+            match store.run(move |s| s.next_item(now, take)).await {
+                Ok(next) => {
+                    if take && next.item.is_some() {
+                        agents.tasks_changed();
+                    }
+                    let (item, key, title) = match next.item {
+                        Some((i, k, t)) => (Some(i), Some(k), Some(t)),
+                        None => (None, None, None),
+                    };
+                    ControlResponse::Next {
+                        id,
+                        item,
+                        key,
+                        title,
+                        at_work: next.at_work,
+                        skipped: next.skipped,
+                    }
+                }
+                Err(e) => store_failed(id, e),
+            }
+        }
+        TaskOp::ShowMe { on } => {
+            if !qass {
+                return failed(id, QASS_ONLY);
+            }
+            let Some(item) = task else {
+                return failed(id, "name the item, by its key or #id");
+            };
+            match store.run(move |s| s.set_show_me(item, on, now)).await {
+                Ok(changed) => {
+                    if changed {
+                        agents.tasks_changed();
+                    }
+                    written(id, item)
+                }
+                Err(e) => store_failed(id, e),
+            }
+        }
+        TaskOp::Approve { hash, owner } => {
+            if !qass {
+                return failed(id, QASS_ONLY);
+            }
+            let Some(item) = task else {
+                return failed(id, "name the item, by its key or #id");
+            };
+            let path = match store.run(move |s| s.plan_info(item, now)).await {
+                Ok(info) => info.file.map(|f| f.path),
+                Err(e) => return store_failed(id, e),
+            };
+            let Some(path) = path else {
+                return failed(
+                    id,
+                    format!("#{item} has no plan file: qoop task planfile <path> links one"),
+                );
+            };
+            // What is approved is what the file says now: never text nobody read.
+            let read = match read_file(path.clone()).await {
+                Ok(bytes) => plan_hash(&bytes),
+                Err(e) => return failed(id, format!("{path}: {e}")),
+            };
+            // The whole hash, or the 8 or more characters of it a card carries.
+            let hash = hash.trim().to_string();
+            if hash.len() < 8 || !read.starts_with(&hash) {
+                return failed(
+                    id,
+                    format!(
+                        "{path} changed since it was read ({read} now, {hash} read): read it again"
+                    ),
+                );
+            }
+            let by = if owner {
+                ApprovedBy::Owner
+            } else {
+                ApprovedBy::Qass
+            };
+            match store
+                .run(move |s| s.approve_plan(item, by, &hash, now))
+                .await
+            {
+                Ok(_) => {
+                    agents.tasks_changed();
+                    written(id, item)
+                }
+                Err(e) => store_failed(id, e),
+            }
+        }
+        TaskOp::PlanFile { path } => {
+            // An agent on the item or qass, each by its terminal's token: a client that speaks for
+            // no terminal links nothing, and has the daemon read no file.
+            if speaker.is_none() {
+                return failed(
+                    id,
+                    "link a plan from the terminal of the agent on the item, or qass",
+                );
+            }
+            if !std::path::Path::new(&path).is_absolute() {
+                return failed(id, "the plan file is an absolute path");
+            }
+            let bytes = match read_file(path.clone()).await {
+                Ok(b) => b,
+                Err(e) => return failed(id, format!("{path}: {e}")),
+            };
+            let wrote = store
+                .run(move |s| {
+                    let open = match speaker {
+                        Some(t) => s.open_task_of(i64::from(t))?,
+                        None => None,
+                    };
+                    let linked = match &open {
+                        Some(o) => s.linked_item(o.id)?,
+                        None => None,
+                    };
+                    let Some(item) = task.or(linked) else {
+                        return Ok(Err(
+                            "this task is not on the board: qoop task link <KEY> puts it there"
+                                .to_string(),
+                        ));
+                    };
+                    // An agent links a plan to the item it works on, nothing else.
+                    if speaker.is_some() && !qass && linked != Some(item) {
+                        return Ok(Err(format!(
+                            "#{item} is not the item this terminal's task is on"
+                        )));
+                    }
+                    let terminal = if qass {
+                        0
+                    } else {
+                        speaker.map_or(0, i64::from)
+                    };
+                    s.set_planfile(item, &path, &bytes, terminal, now)
+                        .map(|hash| Ok((item, hash)))
+                })
+                .await;
+            match wrote {
+                Ok(Ok((item, hash))) => {
+                    agents.tasks_changed();
+                    ControlResponse::TaskWritten {
+                        id,
+                        task: item,
+                        key: Some(hash),
+                    }
+                }
+                Ok(Err(reason)) => failed(id, reason),
+                Err(e) => store_failed(id, e),
+            }
+        }
+        _ => unreachable!("only plan writes come here"),
     }
 }
 
@@ -598,6 +812,13 @@ pub(crate) async fn read(
                 body: e.body,
             })
             .collect(),
+        plan_file: c.plan.map(|p| crate::control::PlanFileInfo {
+            path: p.path,
+            hash: p.hash,
+            terminal: p.terminal,
+            summary: p.summary,
+            at: p.at,
+        }),
     });
     if one && task.is_some() && tasks.is_empty() {
         return failed(id, format!("no task #{}", task.unwrap_or_default()));

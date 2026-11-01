@@ -944,6 +944,10 @@ pub enum AskOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         body: Box<AskCard>,
+        /// Keep the agent's terminal, so the card sits on its item, but no conversation: his
+        /// answer goes to qass, which acts on it (a plan approval), never straight to the agent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        via_qass: bool,
     },
     /// The owner's answer: an option's key, his own words, or both.
     Answer {
@@ -1184,6 +1188,29 @@ pub enum TaskOp {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         undo: bool,
     },
+    /// Link a plan file to an item (by id, or the one the terminal's task is linked to): the
+    /// daemon reads and hashes it. From the terminal of an agent on that item, or qass.
+    PlanFile {
+        path: String,
+    },
+    /// Approve the plan of the item named by id, for the hash the approver read; `owner` when
+    /// it is the owner's word qass carries. qass only.
+    Approve {
+        hash: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        owner: bool,
+    },
+    /// Mark the item named by id as one whose plan the owner wants to see, or unmark it.
+    /// qass only, on his word.
+    ShowMe {
+        on: bool,
+    },
+    /// The Todo item qass should start now, answered as `Next`; `take` writes its start in
+    /// the same transaction, and is qass's only.
+    Next {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        take: bool,
+    },
     /// qass reports an agent on an ssh remote working on `item`, from that machine's
     /// events: its task there, its name and its stage.
     LinkRemote {
@@ -1232,6 +1259,34 @@ pub struct ItemInfo {
     /// Put away by the owner (`dismiss`): closed, left out of the Done lane by every client.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// Where its plan is: `written`, `stale`, `approved` or `changed`; empty with no plan file
+    /// and from an older daemon.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plan: String,
+    /// Who approved it, `qass` or `owner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_by: Option<String>,
+    /// The owner asked to see its plan before it is built.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_me: bool,
+    /// Questions open on it: its agents' cards not answered yet.
+    #[serde(default, skip_serializing_if = "none_open")]
+    pub open_asks: usize,
+}
+
+fn none_open(n: &usize) -> bool {
+    *n == 0
+}
+
+/// An item's plan file, on its card.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanFileInfo {
+    pub path: String,
+    pub hash: String,
+    /// The terminal that linked it, where qass sends "approved, build"; 0 when qass did.
+    pub terminal: i64,
+    pub summary: String,
+    pub at: i64,
 }
 
 /// An agent working on an item.
@@ -1279,6 +1334,10 @@ pub struct ItemCardInfo {
     pub steps: Vec<StepInfo>,
     /// Its own events and its agents', newest first, each with the task it is on.
     pub activity: Vec<ItemEventInfo>,
+    /// Its plan file; none from an older daemon. Not `plan`: the item flattened beside it
+    /// carries its plan state under that key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_file: Option<PlanFileInfo>,
 }
 
 /// One line of an item's activity.
@@ -1380,6 +1439,13 @@ pub fn item_info(
         since: row.since,
         closed_at: row.task.closed_at,
         hidden: row.hidden,
+        plan: match row.plan {
+            qoop_store::plan::PlanState::None => String::new(),
+            state => state.as_str().to_string(),
+        },
+        plan_by: row.plan.by().map(|b| b.as_str().to_string()),
+        show_me: row.show_me,
+        open_asks: row.open_asks,
     }
 }
 
@@ -1896,12 +1962,27 @@ pub enum ControlResponse {
         id: String,
         until: Option<i64>,
     },
-    /// A `TaskWrite` landed on `task`; `key` is an item's, when one was added or started.
+    /// A `TaskWrite` landed on `task`; `key` is an item's, when one was added or started, or
+    /// the hash of the plan file a `PlanFile` linked.
     TaskWritten {
         id: String,
         task: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+    },
+    /// What `TaskOp::Next` found: the item to start (taken, when asked), how many are at
+    /// work, and the keys left in Todo because their starts never got an agent.
+    Next {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        at_work: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
     },
     /// What a `TaskRead` asked for, kept under one frame: `more` says the list or the events
     /// were cut there, and older events come with `before`. `space` is the asking terminal's
@@ -2617,6 +2698,7 @@ impl ControlResponse {
             | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
             | Self::TaskWritten { id, .. }
+            | Self::Next { id, .. }
             | Self::Tasks { id, .. }
             | Self::AskWritten { id, .. }
             | Self::Asks { id, .. }

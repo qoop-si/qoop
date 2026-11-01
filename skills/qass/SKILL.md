@@ -111,6 +111,7 @@ minute; what needs nothing now with a later wake or within 10 minutes (never sai
 `@QASS_DATA@/quiet.log`); a plain rest with no task after 30 minutes if it still holds, a sleep never. Their `routine on` (in any
 language) writes `say` to `@QASS_DATA@/routine`, `routine off` removes it. Write to agents only
 with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wait or block come at once.
+Then, every wake: `<this skill's dir>/plans.md` (take the next new Todo item; read a ready plan).
 
 **Watching, their switch** (the pet's `watch` word, their phone, or "watching off/on" in any language: `qoop qass watch off|on`). A `watch-off: ...` line: run `qoop qass watch`; still off, say and start nothing; on again, start it. `watch-running`: nothing.
 A `watching on: ...` line: one summary of the fleet now, remotes included (`on.sh <name> agents --json`), and start the watcher (Start, step 3) if you have a Monitor; with one, a message of theirs
@@ -421,8 +422,8 @@ qoop prompt <n> --generation <G> -- '<the brief>'      # spawn.sh prints "<n> <G
 Agent: their pick (claude, opencode, an `[agents]` name), else `[qass] agent` with its flags (claude
 if that is neither); the space they name, made when missing (default: the repo's own). Its tier and
 its first brief (no ok needed): follow `<this skill's dir>/brief.md`. Its task id reaches you on its
-event lines (`task:<id>`). Record it in `goals.md`. At most 4 of yours alive, unless their own message
-asks for more (by its count; a scheduled run is not yours). Your own review or research that only reads: a subagent of yours,
+event lines (`task:<id>`). Record it in `goals.md`. At most 3 of yours alive (`qoop task next` counts them), unless their own
+message asks for more (by its count; a scheduled run is not yours). Your own review or research that only reads: a subagent of yours,
 unless they ask for a qoop agent; a worker's: its brief.
 
 ## Schedules

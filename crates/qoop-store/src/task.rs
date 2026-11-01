@@ -127,6 +127,12 @@ pub enum TaskError {
     SpaceGone(i64),
     #[error("only a done item can be dismissed; #{0} is open or was dropped")]
     NotDone(i64),
+    #[error("#{0} has no plan file: qoop task planfile <path> links one")]
+    NoPlan(i64),
+    #[error("the plan file's path has a tab or a line break: rename the file")]
+    PlanPath,
+    #[error("the plan changed since it was read (read {read}, newest {newest}): read it again")]
+    PlanMoved { read: String, newest: String },
 }
 
 /// One line, no control characters: a goal is shown in lists and injected into agents.

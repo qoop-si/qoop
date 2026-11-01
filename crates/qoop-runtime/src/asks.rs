@@ -361,6 +361,93 @@ fn card_value(text: &str) -> String {
         .collect()
 }
 
+/// How often the daemon looks for a plan that waited too long for qass.
+const STALE_LOOK: Duration = Duration::from_secs(60);
+
+/// Plans that waited [`qoop_store::plan::STALE_SECS`] for qass, with no card open on their
+/// item: the owner is told once per version of the plan, with a draft card on the agent that
+/// linked it. The card keeps no conversation, so his answer reaches qass, which records it.
+/// Its own clock: the schedules loop sleeps while none is due.
+pub(crate) fn watch_stale_plans(
+    agents: Arc<AgentRegistry>,
+    connections: Arc<ConnectionRegistry>,
+    store: StoreHandle,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(STALE_LOOK);
+        loop {
+            tick.tick().await;
+            stale_plans_once(&agents, &connections, &store).await;
+        }
+    });
+}
+
+pub(crate) async fn stale_plans_once(
+    agents: &AgentRegistry,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let at = now();
+    // No qass on this Mac: nobody approves here, and the inbox the card would go to is qass's.
+    // A tab or a space the owner keeps from qass is his: no card, no stage moved.
+    let Ok(stale) = store
+        .run(move |s| {
+            if !s.workspaces()?.iter().any(|w| w.name == QASS_SPACE) {
+                return Ok(Vec::new());
+            }
+            let (spaces, tabs) = s.qass_skips()?;
+            let mut out = Vec::new();
+            for plan in s.stale_plans(at)? {
+                let space = s.task(plan.item)?.and_then(|t| t.workspace);
+                if !tabs.contains(&plan.terminal) && space.is_none_or(|w| !spaces.contains(&w)) {
+                    out.push(plan);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    else {
+        return;
+    };
+    for plan in stale {
+        let mut told = false;
+        if let Ok(terminal) = u32::try_from(plan.terminal) {
+            // Waiting first, so the draft and every reader of the stage agree.
+            let t = plan.terminal;
+            if matches!(
+                store.run(move |s| s.wait_on_owner(t, at)).await,
+                Ok(Some(_))
+            ) {
+                agents.tasks_changed();
+            }
+            told = draft_waiting(
+                terminal,
+                None,
+                Some(format!(
+                    "{} plan waits for qass: approve it, or say what to change",
+                    plan.key
+                )),
+                None,
+                connections,
+                store,
+            )
+            .await;
+        }
+        // Marked only once he was told, so a plan whose card could not be made is tried again
+        // on the next look.
+        if !told {
+            continue;
+        }
+        let (item, hash) = (plan.item, plan.hash);
+        if let Err(e) = store
+            .run(move |s| s.mark_stale_carded(item, &hash, at))
+            .await
+        {
+            crate::say!("qoopd: a stale plan's mark: {}", why(e));
+        }
+    }
+}
+
 /// The agent in `terminal` ended its turn waiting on the owner (its task in `waiting-human`):
 /// a draft card, so his inbox shows it even when qass wrote nothing. Only on a Mac with qass's
 /// space (the inbox lives there), never over a live card, once a waiting spell. No options:
@@ -373,7 +460,7 @@ pub(crate) async fn draft_waiting(
     session: Option<String>,
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
-) {
+) -> bool {
     let made = store
         .run(move |s| {
             let Some(task) = s.open_task_of(i64::from(terminal))? else {
@@ -410,10 +497,12 @@ pub(crate) async fn draft_waiting(
             )
         })
         .await;
-    if matches!(made, Ok(Some(_))) {
+    let drafted = matches!(made, Ok(Some(_)));
+    if drafted {
         crate::telemetry::count(crate::telemetry::Event::DraftAsked);
         connections.asks_changed();
     }
+    drafted
 }
 
 /// The agent in `terminal` still shows the question dialog its blocked report of `since`
@@ -608,11 +697,16 @@ pub(crate) async fn write(
         | AskOp::Answer { card, .. } => card.clone(),
     };
     let result = match action {
-        AskOp::Add { card, agent, body } => {
+        AskOp::Add {
+            card,
+            agent,
+            body,
+            via_qass,
+        } => {
             if let Err(reason) = qass_speaks(agents, &caller) {
                 return failed(id, reason);
             }
-            match add(&card, agent, *body, terminals, store).await {
+            match add(&card, agent, *body, via_qass, terminals, store).await {
                 Ok(AskResult::Added) => {
                     crate::telemetry::count(crate::telemetry::Event::QassAsked);
                     AskResult::Added
@@ -682,6 +776,7 @@ async fn add(
     card: &str,
     agent: Option<String>,
     body: AskCard,
+    via_qass: bool,
     terminals: &Arc<TerminalRegistry>,
     store: &StoreHandle,
 ) -> Result<AskResult, String> {
@@ -701,7 +796,10 @@ async fn add(
             return Err("the agent is T<n>, <machine>/T<n>, or - for none".to_string());
         }
     };
-    let session = terminal.and_then(|t| terminals.session_of(t));
+    // With no conversation on the card, his answer routes to qass (`route`), not the agent.
+    let session = terminal
+        .filter(|_| !via_qass)
+        .and_then(|t| terminals.session_of(t));
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let card = card.to_string();
     store
@@ -1704,5 +1802,65 @@ mod tests {
         };
         assert!(rest("idle").at_rest() && rest("done").at_rest());
         assert!(!rest("failed").at_rest() && !rest("starting").at_rest());
+    }
+
+    /// A plan that waited half an hour for qass: one draft card on the agent working on its item
+    /// now, with no conversation (his answer goes to qass), its task waiting on him; told once
+    /// for that version; and nothing at all on a Mac with no qass.
+    #[tokio::test]
+    async fn a_stale_plan_tells_the_owner_once_and_only_where_qass_lives() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let at = now() - qoop_store::plan::STALE_SECS - 60;
+        let setup = |with_qass: bool| {
+            let mut s = qoop_store::Store::in_memory().expect("store");
+            let ws = s.create_workspace("work", 1).unwrap();
+            if with_qass {
+                s.create_workspace(QASS_SPACE, 2).unwrap();
+            }
+            s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+            let (item, _) = s.add_item(ws, "ship it", "", at).unwrap();
+            let task = s.begin_task(7, "ship it", None, at).unwrap().0;
+            s.link_task(task, item, at).unwrap();
+            s.set_planfile(item, "/p/plan.md", b"v1", 7, at).unwrap();
+            (StoreHandle::new(s), task)
+        };
+
+        let (store, task) = setup(true);
+        stale_plans_once(&agents, &connections, &store).await;
+        let (cards, stage) = store
+            .run(move |s| Ok((s.live_asks()?, s.task(task)?.unwrap().stage)))
+            .await
+            .unwrap();
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        assert_eq!(cards[0].terminal, Some(7));
+        assert_eq!(cards[0].session, None, "his answer goes to qass");
+        assert!(
+            cards[0].body.contains("plan waits for qass"),
+            "{}",
+            cards[0].body
+        );
+        assert_eq!(stage, "waiting-human");
+        // Answered and gone, the worker back at work: only the mark keeps a second card away.
+        let card = cards[0].card.clone();
+        store
+            .run(move |s| {
+                s.close_ask(&card, "answered", now())?;
+                s.set_task_stage(task, "implementing", now()).map(drop)
+            })
+            .await
+            .unwrap();
+        stale_plans_once(&agents, &connections, &store).await;
+        let live = store.run(|s| s.live_asks()).await.unwrap();
+        assert!(live.is_empty(), "told again: {live:?}");
+
+        let (store, task) = setup(false);
+        stale_plans_once(&agents, &connections, &store).await;
+        let (cards, stage) = store
+            .run(move |s| Ok((s.live_asks()?, s.task(task)?.unwrap().stage)))
+            .await
+            .unwrap();
+        assert!(cards.is_empty(), "no qass, no card: {cards:?}");
+        assert_ne!(stage, "waiting-human", "no qass, no stage moved");
     }
 }

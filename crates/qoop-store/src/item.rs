@@ -139,6 +139,12 @@ pub struct ItemRow {
     pub since: i64,
     /// Put away by the owner (`dismiss`): closed, off the board, nothing of it deleted.
     pub hidden: bool,
+    /// Where its plan is (`plan.rs`).
+    pub plan: crate::plan::PlanState,
+    /// The owner asked to see its plan before it is built.
+    pub show_me: bool,
+    /// Questions open on it: cards of its agents not answered yet.
+    pub open_asks: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +163,8 @@ pub struct ItemCard {
     /// Its own events and its agents' stages, evidence and done claims, newest first. `task`
     /// says whose; an id of 0 is a line read from the record, not stored.
     pub activity: Vec<TaskEventRow>,
+    /// Its plan file, if one is linked: path, hash, summary, who linked it.
+    pub plan: Option<crate::plan::PlanFile>,
 }
 
 /// The key prefix a space's name gives: its letters and digits, upper case, at most ten
@@ -426,7 +434,7 @@ fn agents(tx: &Connection, item: i64) -> rusqlite::Result<Vec<ItemAgent>> {
 }
 
 /// An item's key, `<PREFIX>-<n>`.
-fn key_of(tx: &Connection, item: i64) -> rusqlite::Result<String> {
+pub(crate) fn key_of(tx: &Connection, item: i64) -> rusqlite::Result<String> {
     tx.query_row(
         "SELECT prefix, n FROM board_item WHERE task = ?1",
         params![item],
@@ -467,6 +475,15 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
             .is_some(),
         None => false,
     };
+    let plan = crate::plan::plan_info(tx, task.id, now)?;
+    // A closed item waits on nobody.
+    let plan_state = match plan.state {
+        crate::plan::PlanState::Stale if task.closed_at.is_some() => {
+            crate::plan::PlanState::Written
+        }
+        state => state,
+    };
+    let open_asks = crate::plan::open_cards(tx, task.id, false)?;
     Ok(ItemRow {
         task,
         key,
@@ -477,7 +494,35 @@ fn item_row(tx: &Connection, task: TaskRow, now: i64) -> rusqlite::Result<ItemRo
         updated_at,
         since,
         hidden,
+        plan: plan_state,
+        show_me: plan.show_me,
+        open_asks,
     })
+}
+
+/// An item's board row by id, read in the caller's transaction.
+pub(crate) fn item_row_of(tx: &Connection, item: i64, now: i64) -> rusqlite::Result<ItemRow> {
+    item_row(tx, row_of(tx, item)?, now)
+}
+
+/// A start still waiting for an agent and younger than [`START_SECS`].
+pub(crate) fn fresh_start(tx: &Connection, item: i64, now: i64) -> rusqlite::Result<bool> {
+    Ok(waiting_start(tx, item)?.is_some_and(|(_, at)| now - at < START_SECS))
+}
+
+/// Starts since the newest link, reopen or unlink: none of them got an agent.
+pub(crate) fn dead_starts(tx: &Connection, item: i64) -> rusqlite::Result<usize> {
+    let mut back = 0;
+    // A link, a reopen or the owner moving it back to Todo (an unlink) starts the count again.
+    for kind in ["linked", "reopened", "unlinked"] {
+        back = back.max(newest(tx, item, kind)?.map_or(0, |(id, _)| id));
+    }
+    tx.query_row(
+        "SELECT COUNT(*) FROM task_event WHERE task = ?1 AND kind = 'start' AND id > ?2",
+        params![item, back],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n as usize)
 }
 
 /// When an item came into its lane: Done when it closed; Doing at the first link or start
@@ -1059,6 +1104,12 @@ impl Store {
             stmt.query_map(params![item, ACTIVITY_MAX as i64], event_row)?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        // A plan's events carry paths and hashes for the record; every client reads words.
+        for e in &mut activity {
+            if let Some(words) = crate::plan::said(&e.kind, &e.body) {
+                e.body = words;
+            }
+        }
         // Every task ever linked, not only the ones linked now, an agent moved off keeping
         // what it did here; and each only while it was linked, its work on another item
         // being that item's.
@@ -1096,6 +1147,7 @@ impl Store {
             description,
             steps: steps(conn, item)?,
             activity,
+            plan: crate::plan::plan_info(conn, item, now)?.file,
         }))
     }
 }

@@ -1805,6 +1805,12 @@ impl Daemon {
         // client is accepted, so one that connects knows what became of them. Parked, and so
         // free, while no schedule is active.
         crate::schedules::start(self.books.clone(), self.connections.clone()).await;
+        // Plans that waited too long for qass reach the owner even with qass down.
+        crate::asks::watch_stale_plans(
+            self.agents.clone(),
+            self.connections.clone(),
+            self.books.store.clone(),
+        );
 
         let mut next_client = 0u64;
         let mut failing = None;
@@ -5668,12 +5674,17 @@ async fn handle_control(
             action,
         } => {
             // A begin, and a goal or a link that begins first, skip qass's own space, so they
-            // need the space's name; nothing else does.
+            // need the space's name; so do the plan writes, which only qass may approve, mark
+            // or take with.
             let space = match (&action, terminal.and_then(|t| terminals.workspace_of(t))) {
                 (
                     crate::control::TaskOp::Begin
                     | crate::control::TaskOp::Goal { .. }
-                    | crate::control::TaskOp::Link { .. },
+                    | crate::control::TaskOp::Link { .. }
+                    | crate::control::TaskOp::PlanFile { .. }
+                    | crate::control::TaskOp::Approve { .. }
+                    | crate::control::TaskOp::ShowMe { .. }
+                    | crate::control::TaskOp::Next { .. },
                     Some(space),
                 ) => space_name(store, space).await,
                 _ => None,
