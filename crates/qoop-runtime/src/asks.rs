@@ -54,7 +54,7 @@ const SETTLE: Duration = Duration::from_secs(3);
 const GIVE_UP_SECS: i64 = 30 * 60;
 
 /// The most characters of his own words one answer carries.
-const TEXT_MAX: usize = 400;
+pub(crate) const TEXT_MAX: usize = 400;
 
 /// How many ended cards a read carries: the last few for the pane, or all of the keep window.
 const ENDED_SHOWN: usize = 5;
@@ -106,7 +106,7 @@ impl Standing {
     }
 }
 
-fn standing(
+pub(crate) fn standing(
     agents: &AgentRegistry,
     terminals: &TerminalRegistry,
     terminal: u32,
@@ -892,7 +892,7 @@ async fn close(card: &str, note: &str, store: &StoreHandle) -> Result<AskResult,
 
 /// His own words as they are sent: one line, no control characters (what qass and the
 /// worker read must be what he typed), `None` when nothing is left.
-fn clean_text(text: &str) -> Option<String> {
+pub(crate) fn clean_text(text: &str) -> Option<String> {
     Some(qoop_store::task::one_line(text)).filter(|t| !t.is_empty())
 }
 
@@ -1199,7 +1199,7 @@ async fn flush_watch(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
 }
 
 /// Type `text`, a pause, then Enter, into a terminal.
-async fn type_into(
+pub(crate) async fn type_into(
     terminals: &Arc<TerminalRegistry>,
     terminal: u32,
     text: &str,

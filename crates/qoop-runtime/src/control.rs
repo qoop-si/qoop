@@ -162,6 +162,25 @@ pub enum ControlRequest {
         #[serde(default)]
         max_bytes: Option<u32>,
     },
+    /// Say something to one subagent or teammate of a terminal's agent. Claude has no input
+    /// path into a subagent, so the words go to its lead, typed as the prompt
+    /// `Tell <name>: <text>` (`<name>` is the child's own, from its `agent-<child>.meta.json`,
+    /// else `subagent <child>`), which the lead passes on with `SendMessage`. `child` is the id
+    /// a `subagent` item carries, `text` is cleaned to one line of at most 400 characters.
+    /// Answered `SubagentSent` once the line and its Enter are typed.
+    ///
+    /// Refused with a short reason code in `Failed`, nothing typed: `unavailable` (no such
+    /// terminal), `not_agent` (a shell or any other program), `no_session` (the agent has said
+    /// no session, or `child` is not a subagent of the terminal's own session), `empty` (no
+    /// text left once cleaned), `too_long` (over 400 characters), `person_typing` (a person is
+    /// at that terminal, as `PersonAt` says: ask again later), and `trust`, `blocked` or
+    /// `sleeping` (the lead cannot take a prompt now). An older daemon answers `unknown variant`.
+    SubagentSend {
+        id: String,
+        terminal: TerminalStream,
+        child: String,
+        text: String,
+    },
     /// Look for text in what has scrolled past, one bounded step at a time.
     ///
     /// A step and not a whole search, because a week of history is millions of rows and a
@@ -1738,6 +1757,7 @@ impl ControlRequest {
             | Self::MessageDetail { id, .. }
             | Self::SubagentMessages { id, .. }
             | Self::SubagentDetail { id, .. }
+            | Self::SubagentSend { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -1888,6 +1908,11 @@ pub enum ControlResponse {
         input: String,
         output: String,
         truncated: bool,
+    },
+    /// A `SubagentSend` was typed into the lead; `to` is the name it was addressed to.
+    SubagentSent {
+        id: String,
+        to: String,
     },
     /// Where a `SearchScrollback` step got to.
     ///
@@ -2721,6 +2746,7 @@ impl ControlResponse {
             | Self::ScrollbackMatch { id, .. }
             | Self::Messages { id, .. }
             | Self::MessageDetail { id, .. }
+            | Self::SubagentSent { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }

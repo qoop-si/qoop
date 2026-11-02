@@ -229,6 +229,14 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             tool_id: "t".into(),
             max_bytes: None,
         },
+        // Types a line into the lead of a subagent, which a shell is not: refused `not_agent`
+        // before any byte moves.
+        ControlRequest::SubagentSend {
+            id: "x39".into(),
+            terminal,
+            child: "c".into(),
+            text: "hello".into(),
+        },
         ControlRequest::SetSplit {
             id: "x22".into(),
             tree: qoop_runtime::control::Pane::Leaf { terminal },
@@ -462,6 +470,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::MessageDetail { .. }
             | ControlRequest::SubagentMessages { .. }
             | ControlRequest::SubagentDetail { .. }
+            | ControlRequest::SubagentSend { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }
@@ -518,7 +527,7 @@ async fn g7_1_no_control_method_writes_to_a_terminal() {
         .wait_for_text_on(victim, "never matches", Duration::from_millis(200))
         .await;
     let screen = owner.screen(victim).expect("a screen").lines.join("\n");
-    for trace in ["x1", "x2", "x4", "x6", "x7", "somebody"] {
+    for trace in ["x1", "x2", "x4", "x6", "x7", "somebody", "Tell c"] {
         assert!(
             !screen.contains(trace),
             "a control request reached the child's terminal: {trace} in\n{screen}"

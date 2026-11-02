@@ -3950,6 +3950,8 @@ fn dispatch(
         | ControlRequest::MessageDetail { .. }
         | ControlRequest::SubagentMessages { .. }
         | ControlRequest::SubagentDetail { .. } => Dispatch::Apart,
+        // The same read, and then a pause between the words and their Enter.
+        ControlRequest::SubagentSend { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
@@ -5780,6 +5782,12 @@ async fn handle_control(
         | ControlRequest::SubagentDetail { .. }) => {
             crate::messages::answer(request, terminals, agents, &connections.messages).await
         }
+        ControlRequest::SubagentSend {
+            id,
+            terminal,
+            child,
+            text,
+        } => crate::messages::send(id, terminal, child, text, terminals, agents).await,
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
         }

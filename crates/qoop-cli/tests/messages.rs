@@ -80,17 +80,27 @@ impl Daemon {
     }
 
     fn start_agent_with(&self, session: Option<&str>, listed: bool) {
+        self.start_agent_logging(session, listed, None);
+    }
+
+    /// The stand in, which also copies every line it is typed to `log` when given one (the
+    /// terminal's line discipline turns the Enter into the newline that ends a line).
+    fn start_agent_logging(&self, session: Option<&str>, listed: bool, log: Option<&Path>) {
         let bin = self.dir.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
         let source = bin.join("claude.rs");
         let report = session.map_or(String::new(), |id| {
             format!("let _ = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--session-id\", {id:?}]).status();")
         });
-        std::fs::write(
-            &source,
-            format!("fn main() {{ {report} std::thread::sleep(std::time::Duration::from_secs(120)); }}\n"),
-        )
-        .expect("write");
+        let body = log.map_or_else(
+            || "std::thread::sleep(std::time::Duration::from_secs(120));".to_string(),
+            |log| {
+                format!(
+                    "use std::io::{{BufRead, Write}}; let mut out = std::fs::OpenOptions::new().create(true).append(true).open({log:?}).unwrap(); for line in std::io::stdin().lock().lines() {{ writeln!(out, \"{{}}\", line.unwrap()).unwrap(); }}"
+                )
+            },
+        );
+        std::fs::write(&source, format!("fn main() {{ {report} {body} }}\n")).expect("write");
         let built = Command::new("rustc")
             .arg(&source)
             .arg("-o")
@@ -1116,4 +1126,148 @@ async fn a_subagent_row_opens_its_own_chat_and_nothing_outside_it() {
     );
     let (ok, out, err) = daemon.qoop(&["messages", "1", "--child", &child]);
     assert!(ok && out.contains("E1 is up on staging."), "{out}{err}");
+}
+
+/// The sandbox file the stand in copies the lines it is typed to.
+fn typed_log(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("{name}-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+fn send_to_child(terminal: u32, child: &str, text: &str) -> ControlRequest {
+    ControlRequest::SubagentSend {
+        id: "ss".into(),
+        terminal,
+        child: child.into(),
+        text: text.into(),
+    }
+}
+
+/// Wait until `log` holds `want` (the stand in reads its lines on its own clock).
+fn wait_for_log(log: &Path, want: &str) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let got = std::fs::read_to_string(log).unwrap_or_default();
+        if got == want || Instant::now() > deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[tokio::test]
+async fn a_line_for_a_teammate_is_typed_into_its_lead_by_name() {
+    let daemon = Daemon::start();
+    let id = fresh_id("tell");
+    let (_, child) = with_child(&id);
+    let meta = transcript(&id)
+        .with_extension("")
+        .join("subagents")
+        .join(format!("agent-{child}.meta.json"));
+    std::fs::write(&meta, r#"{"name":"x","taskKind":"in_process_teammate"}"#).expect("meta");
+    let log = typed_log("tell");
+    daemon.start_agent_logging(Some(&id), true, Some(&log));
+    let mut c = daemon.client().await;
+
+    // The words as the phone sends them: control bytes and line breaks are one line.
+    let request = send_to_child(1, &child, "  use the\nstaging \u{7}db  ");
+    // What the phone writes on the wire, and what it reads back.
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({"op": "SubagentSend", "id": "ss", "terminal": 1, "child": child,
+               "text": "  use the\nstaging \u{7}db  "})
+    );
+    let sent = ask(&mut c, request).await;
+    assert_eq!(
+        serde_json::to_value(&sent).unwrap(),
+        json!({"op": "SubagentSent", "id": "ss", "to": "x"})
+    );
+    eprintln!(
+        "wire: {} -> {}",
+        serde_json::to_string(&send_to_child(1, &child, "hi")).unwrap(),
+        serde_json::to_string(&sent).unwrap()
+    );
+    assert_eq!(
+        wait_for_log(&log, "Tell x: use the staging db\n"),
+        "Tell x: use the staging db\n"
+    );
+
+    // A child with no meta file is named by its id.
+    std::fs::remove_file(&meta).expect("remove meta");
+    let sent = ask(&mut c, send_to_child(1, &child, "again")).await;
+    let ControlResponse::SubagentSent { to, .. } = sent else {
+        panic!("an ack was expected: {sent:?}");
+    };
+    assert_eq!(to, format!("subagent {child}"));
+    let want = format!("Tell x: use the staging db\nTell subagent {child}: again\n");
+    assert_eq!(wait_for_log(&log, &want), want);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn a_line_for_a_subagent_is_refused_with_a_reason_and_types_nothing() {
+    let daemon = Daemon::start();
+    let mut c = daemon.client().await;
+    // A shell is not an agent.
+    assert_eq!(
+        refusal(ask(&mut c, send_to_child(1, "c", "hi")).await),
+        "not_agent"
+    );
+    assert_eq!(
+        refusal(ask(&mut c, send_to_child(99, "c", "hi")).await),
+        "unavailable"
+    );
+
+    let id = fresh_id("refuse");
+    let (_, child) = with_child(&id);
+    let log = typed_log("refuse");
+    daemon.start_agent_logging(Some(&id), true, Some(&log));
+    for (terminal, child, text, reason) in [
+        (1, child.as_str(), "", "empty"),
+        (1, child.as_str(), " \n\u{7} ", "empty"),
+        (1, child.as_str(), &"a".repeat(401), "too_long"),
+        (1, "missing", "hi", "no_session"),
+        (1, "../other", "hi", "no_session"),
+        (1, "", "hi", "no_session"),
+        // The lead's own session id is not a child of itself.
+        (1, id.as_str(), "hi", "no_session"),
+    ] {
+        assert_eq!(
+            refusal(ask(&mut c, send_to_child(terminal, child, text)).await),
+            reason,
+            "{child:?} {text:?}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn a_line_for_a_subagent_waits_for_a_person_at_the_keyboard() {
+    let daemon = Daemon::start();
+    let id = fresh_id("person");
+    let (_, child) = with_child(&id);
+    let log = typed_log("person");
+    daemon.start_agent_logging(Some(&id), true, Some(&log));
+    let mut c = daemon.client().await;
+
+    // A person's own connection, with a draft under their fingers.
+    let socket = qoop_testkit::socket_in(daemon.dir.path());
+    let (stream, inbuf) = client::connect(&socket, qoop_proto::INTERFACE_ID)
+        .await
+        .expect("connect");
+    let mut person = TestClient::from_parts(stream, inbuf, 1);
+    person.input_to(1, b"half a thought").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        refusal(ask(&mut c, send_to_child(1, &child, "hi")).await),
+        "person_typing"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Only the person's own draft reached the terminal, and no newline ended it.
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    let _ = std::fs::remove_file(&log);
 }

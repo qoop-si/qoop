@@ -772,6 +772,86 @@ pub async fn answer(
     }
 }
 
+/// One line at a time into the leads' terminals: the words and their Enter are two writes with
+/// a pause between, and another line landing in the pause would be sent glued to this one.
+/// ponytail: one lock for every terminal, per-terminal locks if sends ever queue behind it.
+static TYPING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The longest name of a child that is put in a line.
+const NAME_MAX: usize = 60;
+
+/// What the lead calls the child: the `name` its `agent-<child>.meta.json` beside the child's
+/// session carries (a teammate's own name), else `subagent <child>`. Cleaned to one line, as it
+/// is typed into a prompt.
+fn child_label(source: &Source, child: &str) -> String {
+    let named = match source {
+        Source::File(path) => std::fs::read(path.with_extension("meta.json"))
+            .ok()
+            .filter(|bytes| bytes.len() <= 64 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|meta| meta["name"].as_str().map(qoop_store::task::one_line)),
+        Source::Opencode { .. } => None,
+    };
+    named
+        .map(|name| name.chars().take(NAME_MAX).collect::<String>())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("subagent {child}"))
+}
+
+/// Answer a `SubagentSend`: type `Tell <name>: <text>` and an Enter into the lead's terminal,
+/// the one way to reach a subagent (the lead passes it on). The reason codes are the ones
+/// `ControlRequest::SubagentSend` lists; nothing is typed when one is given.
+pub async fn send(
+    id: String,
+    terminal: u32,
+    child: String,
+    text: String,
+    terminals: &Arc<TerminalRegistry>,
+    agents: &Arc<AgentRegistry>,
+) -> ControlResponse {
+    let Some(text) = crate::asks::clean_text(&text) else {
+        return failed(id, "empty");
+    };
+    if text.chars().count() > crate::asks::TEXT_MAX {
+        return failed(id, "too_long");
+    }
+    let (program, session) = match who(terminals, agents, terminal) {
+        Ok(who) => who,
+        Err(reason) => return failed(id, reason),
+    };
+    // The child must be one of this terminal's own session, found the way its chat is.
+    let found = crate::blocking::chat(DEADLINE, move || {
+        let dirs = agent_dirs();
+        let source = locate(&dirs, &program, &session)?;
+        let codex = dirs.as_ref().map(|d| d.codex.as_path());
+        let source = qoop_parsed::child_source(&program, &source, &session, &child, codex)?;
+        Some(child_label(&source, &child))
+    })
+    .await;
+    let Ok(Some(to)) = found else {
+        return failed(id, "no_session");
+    };
+    // A person at the keyboard keeps it: their draft would be sent glued to this line.
+    if agents
+        .person_until(terminal, crate::agents::now_unix())
+        .is_some()
+    {
+        return failed(id, "person_typing");
+    }
+    // A working lead takes it as a queued prompt; a dialog or a sleeping tab would not read it.
+    if let Some(reason) = crate::asks::standing(agents, terminals, terminal)
+        .and_then(|s| crate::asks::refusal(&s.state, &s.readiness))
+        .filter(|reason| *reason != "working")
+    {
+        return failed(id, reason);
+    }
+    let _one_at_a_time = TYPING.lock().await;
+    match crate::asks::type_into(terminals, terminal, &format!("Tell {to}: {text}")).await {
+        Ok(()) => ControlResponse::SubagentSent { id, to },
+        Err(_) => failed(id, "unavailable"),
+    }
+}
+
 /// A short reason code for a refusal, the only thing a client branches on.
 fn refusal(e: qoop_parsed::Error) -> &'static str {
     match e {

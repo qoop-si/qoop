@@ -426,6 +426,17 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "send a line to a subagent or teammate through its lead, from the phone",
+            method: || {
+                Method::Control(ControlRequest::SubagentSend {
+                    id: "a".into(),
+                    terminal: 1,
+                    child: "c".into(),
+                    text: "hello".into(),
+                })
+            },
+        },
+        Action {
             name: "search the history from copy mode",
             method: || {
                 Method::Control(ControlRequest::SearchScrollback {
@@ -919,6 +930,12 @@ fn every_control_method_is_reachable_from_some_action() {
             tool_id: String::new(),
             max_bytes: None,
         },
+        ControlRequest::SubagentSend {
+            id: String::new(),
+            terminal: 0,
+            child: String::new(),
+            text: String::new(),
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -1187,6 +1204,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::MessageDetail { .. }
             | ControlRequest::SubagentMessages { .. }
             | ControlRequest::SubagentDetail { .. }
+            | ControlRequest::SubagentSend { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();
