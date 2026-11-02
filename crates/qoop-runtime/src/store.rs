@@ -333,6 +333,17 @@ impl StoreHandle {
             .await
     }
 
+    /// The agent of a conversation has left for good: forget the id and end the open cards
+    /// asked in it. How many cards ended.
+    pub async fn agent_left(
+        &self,
+        id: i64,
+        session: String,
+        now: i64,
+    ) -> Result<usize, HandleError> {
+        self.run(move |s| s.agent_left(id, &session, now)).await
+    }
+
     /// Record where a terminal actually is, so a restart opens it there.
     pub async fn set_cwd(&self, id: i64, cwd: String) -> Result<(), HandleError> {
         self.run(move |s| s.set_cwd(id, &cwd)).await

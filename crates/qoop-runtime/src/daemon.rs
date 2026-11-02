@@ -1440,7 +1440,14 @@ impl Daemon {
         //
         // Armed before anything is restored, so an agent that comes back is recorded the
         // first time it is recognised rather than the first time it changes.
-        spawn_agent_recorder(agents.clone(), terminals.clone(), books.clone());
+        // Made here, not with the daemon below: a card that ends with its agent tells them.
+        let connections = Arc::new(ConnectionRegistry::default());
+        spawn_agent_recorder(
+            agents.clone(),
+            terminals.clone(),
+            books.clone(),
+            connections.clone(),
+        );
         spawn_task_terminals(agents.clone(), books.store.clone());
 
         // What the last daemon was holding when it stopped. A person who closed qoop and
@@ -1466,7 +1473,6 @@ impl Daemon {
         let report = restore_report(&into).await;
         restore_splits(&terminals, &books).await;
         terminals.load_session_titles(books.store.session_titles().await.unwrap_or_default());
-        let connections = Arc::new(ConnectionRegistry::default());
         connections
             .sessions
             .place(state.join("sessions-index.json"));
@@ -5443,8 +5449,7 @@ async fn handle_control(
                         // A worker told "The owner answered E7" in the chat has the answer:
                         // the card is handled, whoever relayed it.
                         if kind == "user" {
-                            crate::asks::relayed(label.as_deref(), terminal, connections, store)
-                                .await;
+                            crate::asks::relayed(label.as_deref(), connections, store).await;
                             // A prompt reached an agent waiting on the owner: its answer. The
                             // stage goes back, so no board still says it waits on him. A notice
                             // the harness typed (its own background work done) is no answer, nor
@@ -7173,6 +7178,7 @@ fn spawn_agent_recorder(
     agents: Arc<crate::agents::AgentRegistry>,
     terminals: Arc<TerminalRegistry>,
     books: Bookkeeping,
+    connections: Arc<ConnectionRegistry>,
 ) {
     let mut changes = agents.subscribe();
     tokio::spawn(async move {
@@ -7186,9 +7192,7 @@ fn spawn_agent_recorder(
             match changes.recv().await {
                 Ok(stream) => {
                     record_stream(
-                        &agents,
-                        &terminals,
-                        &books,
+                        (&agents, &terminals, &books, &connections),
                         (&mut written, &mut gone_since),
                         stream,
                     )
@@ -7200,9 +7204,7 @@ fn spawn_agent_recorder(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for stream in terminals.streams() {
                         record_stream(
-                            &agents,
-                            &terminals,
-                            &books,
+                            (&agents, &terminals, &books, &connections),
                             (&mut written, &mut gone_since),
                             stream,
                         )
@@ -7263,9 +7265,12 @@ async fn forget_answered_parks(
 /// Measured on the 27.2 restart: seven tabs whose rows named Claude and its conversation
 /// were cleared between the agents' end and the daemon's, and came back as bare shells.
 async fn record_stream(
-    agents: &Arc<crate::agents::AgentRegistry>,
-    terminals: &TerminalRegistry,
-    books: &Bookkeeping,
+    (agents, terminals, books, connections): (
+        &Arc<crate::agents::AgentRegistry>,
+        &TerminalRegistry,
+        &Bookkeeping,
+        &Arc<ConnectionRegistry>,
+    ),
     (written, gone_since): (
         &mut BTreeMap<u32, Option<String>>,
         &mut BTreeMap<u32, std::time::Instant>,
@@ -7319,7 +7324,17 @@ async fn record_stream(
     let generation = agents.agent(stream).map(|a| a.belief.generation.0);
     let here = now.as_deref().zip(generation);
     if let Some(gone) = terminals.settle_session(stream, here) {
-        let _ = books.store.forget_agent_session(stream as i64, gone).await;
+        // Past the grace (an agent back inside it was settled above, with no card ended) and
+        // the daemon is not stopping (checked at the top): the agent left, so the cards it
+        // asked in that conversation end with it.
+        if let Ok(ended) = books
+            .store
+            .agent_left(stream as i64, gone, crate::store::now())
+            .await
+            && ended > 0
+        {
+            connections.asks_changed();
+        }
         // The index carries the id, so its readers hear it is gone.
         agents.announce(stream);
     }

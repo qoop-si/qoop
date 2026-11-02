@@ -482,10 +482,10 @@ impl Store {
 
     /// The Todo item qass should start now, or none, and with `take` its start written in
     /// the same transaction. Eligible: Todo, its space not left alone by qass, opened after
-    /// qass first took work by itself and at least [`SETTLE_SECS`] ago, fewer than
-    /// [`DEAD_STARTS`] starts that never got an agent; first in the board's Todo order. None
-    /// while [`QASS_WORKERS`] items are at work. The first `take` sets when pickup began, so
-    /// the owner's older Todo items stay his.
+    /// qass first took work by itself and at least [`SETTLE_SECS`] ago, no agent linked since
+    /// its last reopen or unlink, fewer than [`DEAD_STARTS`] starts that never got an agent;
+    /// first in the board's Todo order. None while [`QASS_WORKERS`] items are at work. The
+    /// first `take` sets when pickup began, so the owner's older Todo items stay his.
     pub fn next_item(&self, now: i64, take: bool) -> Result<Next, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let since: Option<i64> = tx
@@ -554,6 +554,10 @@ impl Store {
                 None => true,
             };
             if left_alone {
+                continue;
+            }
+            // Its agent ended and nobody moved it back: a closed tab must not loop into a restart.
+            if crate::item::had_agent(&tx, id)? {
                 continue;
             }
             if crate::item::dead_starts(&tx, id)? >= DEAD_STARTS {
@@ -768,6 +772,50 @@ mod tests {
         assert_eq!(again.item, None);
         assert_eq!(again.at_work, 1);
         let _ = old;
+    }
+
+    /// An item whose agent was linked and then ended (a closed tab) reads Todo but is not
+    /// offered again, so pickup never loops into a restart. An item the owner moved back to
+    /// Todo (an unlink) or reopened after its last agent is picked as before.
+    #[test]
+    fn next_leaves_an_item_whose_agent_ended_and_picks_a_restarted_one() {
+        let (mut s, ws, _, _) = setup();
+        s.next_item(50, true).unwrap();
+        let (item, _) = s.add_item(ws, "Work", "", 100).unwrap();
+        let at = 100 + SETTLE_SECS + 1;
+        assert_eq!(
+            s.next_item(at, false).unwrap().item.map(|i| i.0),
+            Some(item)
+        );
+        // Its agent ended with nothing claimed: Todo, but not offered again.
+        let u = s.create_terminal(9, ws, "/tmp", "/bin/sh", at).unwrap();
+        let task = s.open_task(u, "work", false, at).unwrap();
+        s.link_task(task, item, at).unwrap();
+        s.close_terminal(u, at + 1).unwrap();
+        assert_eq!(s.item_row(item, at + 2).unwrap().state, ItemState::Todo);
+        assert_eq!(s.next_item(at + 2, true).unwrap().item, None);
+        // The owner moves it back to Todo: picked again.
+        assert!(s.unlink(item, at + 3).unwrap());
+        assert_eq!(
+            s.next_item(at + 4, false).unwrap().item.map(|i| i.0),
+            Some(item)
+        );
+        // A new agent, ended again: left alone until the next unlink or reopen.
+        let v = s
+            .create_terminal(10, ws, "/tmp", "/bin/sh", at + 5)
+            .unwrap();
+        let again = s.open_task(v, "work", false, at + 5).unwrap();
+        s.link_task(again, item, at + 5).unwrap();
+        s.close_terminal(v, at + 6).unwrap();
+        assert_eq!(s.next_item(at + 7, true).unwrap().item, None);
+        // Closed and reopened after its last agent: picked as before.
+        s.close_task(item, crate::task::Outcome::Verified, "", at + 8)
+            .unwrap();
+        assert!(s.reopen_item(item, at + 9).unwrap());
+        assert_eq!(
+            s.next_item(at + 10, false).unwrap().item.map(|i| i.0),
+            Some(item)
+        );
     }
 
     #[test]

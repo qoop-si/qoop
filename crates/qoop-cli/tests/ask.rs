@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 /// line it is sent, and flips its state on `BUSY` and `FREE`. `ASK` shows a question dialog
 /// as the claude hook reports one, `MENU` a permission menu, `TOOL` a tool, `TASK` opens
 /// a task, `WAIT` sets its stage to `waiting-human`, `DONE <words>` ends a turn on those last
-/// words and `SAID <words>` is his prompt.
+/// words, `SAID <words>` is his prompt and `EXIT` ends the agent, leaving its shell.
 const STUB: &str = r#"#!/bin/sh
 if [ -n "$STUB_SESSION" ]; then qoop hook-report --state idle --session-id "$STUB_SESSION"; else qoop hook-report --state idle; fi
 while IFS= read -r line; do
@@ -31,6 +31,7 @@ while IFS= read -r line; do
     DONE*) qoop hook-report --state idle --visible-idle --event done --label "${line#DONE }" ;;
     SAID*) qoop hook-report --state working --event user --label "${line#SAID }" ;;
     WAIT) qoop task stage waiting-human ;;
+    EXIT) exit 0 ;;
   esac
 done
 "#;
@@ -663,12 +664,20 @@ fn an_answer_goes_to_the_worker_when_it_is_the_same_conversation_and_through_qas
     assert_eq!(typed.matches("cv A").count(), 1, "once each: {typed:?}");
     assert_eq!(stack.card_status("E2"), "passed");
     assert_eq!(stack.card_status("E3"), "passed");
+    // qass passes his answer on (`The owner answered E2`), in whichever tab: the card ends.
+    let (ok, _, err) = stack.run(&["send", &korea, "RELAY E2", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(
+        stack.wait(|| stack.card_status("E2") == "closed"),
+        "a passed card relayed by qass stayed {}",
+        stack.card_status("E2")
+    );
 
-    // qass reports it handled: the card ends. A second answer is refused.
-    let said = stack.inside(&shell, "qoop ask close E2 --note 'qass answered'");
+    // qass reports one it handled without a relay: the card ends. A second answer is refused.
+    let said = stack.inside(&shell, "qoop ask close E3 --note 'qass answered'");
     assert!(said.contains("Closed"), "{said}");
-    assert_eq!(stack.card_status("E2"), "closed");
-    let (ok, _, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
+    assert_eq!(stack.card_status("E3"), "closed");
+    let (ok, _, err) = stack.run(&["ask", "answer", "E3", "--option", "a"]);
     assert!(!ok && err.contains("already closed"), "{err}");
 }
 
@@ -707,6 +716,99 @@ fn a_card_ends_when_the_owner_puts_it_away_or_its_worker_is_told_in_the_chat() {
         .find(|c| c["card"] == "E20")
         .expect("E20 is listed");
     assert_ne!(e20["note"], "answered in chat", "{out}");
+}
+
+/// qass relays his chat answer to whichever tab it likes, not only the card's own: the card
+/// about the worker named in the head ends all the same while it is `open` (or `passed`, which
+/// the long route test above shows). An answer he gave that waits to be typed (queued, here) is
+/// not undone by a head that names its card.
+#[test]
+fn a_card_ends_when_its_answer_is_relayed_to_another_tab_but_never_while_queued() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let lead = stack.agent("work", "lead", Some("sess-lead"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
+    // The head lands in the lead's tab; the card is about korea.
+    let (ok, _, err) = stack.run(&["send", &lead, "RELAY E1", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(
+        stack.wait(|| stack.card_status("E1") == "closed"),
+        "a relay to another tab did not end the card"
+    );
+    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
+    assert!(out.contains("answered in chat"), "{out}");
+
+    // His answer to a busy worker is kept (queued): a head naming that card ends nothing.
+    let (ok, _, err) = stack.run(&["send", &korea, "BUSY", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(stack.wait(|| stack.state_of(&korea) == "working"));
+    add(&stack, &shell, "E2", &format!("T{korea}"), "korea");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
+    assert!(ok && out.contains("Answered"), "{out} {err}");
+    assert_eq!(stack.card_status("E2"), "queued");
+    let (ok, _, err) = stack.run(&["send", &lead, "RELAY E2", "--enter"]);
+    assert!(ok, "{err}");
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(stack.card_status("E2"), "queued", "a queued answer stays");
+}
+
+/// An agent that is gone for longer than the grace (10 s, no knob) takes its tab's open cards
+/// with it. Its conversation must be on disk before it starts, or the daemon never records the
+/// id and has nothing to forget. A card of another agent stays, and so does the card of one
+/// that came back to the same conversation inside the grace (a quick resume).
+#[test]
+fn a_card_ends_when_its_agent_has_left_its_tab() {
+    let stack = Stack::start();
+    let id = format!("left-{}-5a1c0de0", std::process::id());
+    let projects = qoop_testkit::sandboxed("true")
+        .get_envs()
+        .find(|(k, _)| *k == "HOME")
+        .and_then(|(_, v)| v.map(PathBuf::from))
+        .expect("the sandbox has a home")
+        .join(".claude/projects/-work-left");
+    std::fs::create_dir_all(&projects).unwrap();
+    let back_id = format!("back-{}-5a1c0de0", std::process::id());
+    for id in [&id, &back_id] {
+        std::fs::write(
+            projects.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"u0\",\"sessionId\":\"{id}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let korea = stack.agent("work", "korea", Some(&id));
+    let back = stack.agent("work", "back", Some(&back_id));
+    let cv = stack.agent("work", "cv", Some("sess-cv"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
+    add(&stack, &shell, "E2", &format!("T{cv}"), "cv");
+    add(&stack, &shell, "E3", &format!("T{back}"), "back");
+    // Quick: still inside the grace, nothing has happened.
+    stack.send(&korea, "EXIT");
+    // `back` quits and is started again on its conversation at once, inside the grace.
+    stack.send(&back, "EXIT");
+    std::thread::sleep(Duration::from_millis(500));
+    let again = format!(
+        "STUB_LOG={} STUB_SESSION={back_id} claude",
+        stack.path("back.log").display()
+    );
+    let (ok, _, err) = stack.run(&["send", &back, &again, "--enter"]);
+    assert!(ok, "{err}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(stack.card_status("E1"), "open", "inside the grace");
+    assert!(
+        stack.wait(|| stack.card_status("E1") == "closed"),
+        "the card of an agent that left stayed open: {}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
+    assert!(out.contains("its agent left"), "{out}");
+    assert_eq!(stack.card_status("E2"), "open", "another agent's card");
+    assert_eq!(stack.card_status("E3"), "open", "back inside the grace");
 }
 
 #[test]
@@ -891,6 +993,84 @@ fn escalate_sh_keeps_a_block_card_and_done_ends_it_while_the_old_form_still_work
     assert_eq!(stack.card_status("E1"), "closed");
     let said = stack.inside(&shell, &format!("'{sh}' done E99"));
     assert!(said.contains("noted E99"), "{said}");
+}
+
+/// A `replaces:` line in the block ends those older cards that are still open E cards, through
+/// the skill's own door, and nothing else: an answer he gave, an ended card, the card's own
+/// number and a number the inbox never had stay as they are. A bad token stores nothing.
+#[test]
+fn a_card_that_replaces_others_ends_only_the_open_ones_it_names() {
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    let script = escalate(&stack);
+    let sh = script.display();
+    let card = stack.path("card.txt");
+    add(&stack, &shell, "E1", "-", "one");
+    add(&stack, &shell, "E3", "-", "three");
+    add(&stack, &shell, "E4", "-", "four");
+    let (ok, _, err) = stack.run(&["send", &korea, "BUSY", "--enter"]);
+    assert!(ok, "{err}");
+    assert!(stack.wait(|| stack.state_of(&korea) == "working"));
+    add(&stack, &shell, "E2", &format!("T{korea}"), "korea");
+    let (ok, out, err) = stack.run(&["ask", "answer", "E2", "--option", "a"]);
+    assert!(ok && out.contains("Answered"), "{out} {err}");
+    stack.inside(&shell, "qoop ask close E4 --note chat");
+    let (status, note) = (stack.card_status("E2"), stack.card_status("E4"));
+    assert_eq!((status.as_str(), note.as_str()), ("queued", "closed"));
+
+    let block = format!(
+        "replaces: E1 E2 E4 E10 E99\n{}",
+        std::fs::read_to_string(&card).unwrap()
+    );
+    std::fs::write(stack.path("replacing.txt"), block).unwrap();
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "'{sh}' E10 - later ten - < '{}'",
+            stack.path("replacing.txt").display()
+        ),
+    );
+    assert!(said.contains("E10 Added"), "{said}");
+    assert!(
+        said.contains("superseded E1 one:") && !said.contains("superseded E2"),
+        "the add names what it ended: {said}"
+    );
+    assert_eq!(stack.card_status("E1"), "closed");
+    assert_eq!(stack.card_status("E2"), "queued", "his answer stays");
+    assert_eq!(stack.card_status("E3"), "open", "not named");
+    assert_eq!(stack.card_status("E10"), "open", "its own number");
+    assert_eq!(stack.card_status("E99"), "", "an unknown number");
+    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
+    assert!(out.contains("superseded by E10"), "{out}");
+    assert!(
+        out.contains("\"note\": \"chat\""),
+        "E4 keeps its note: {out}"
+    );
+
+    // A token that is no card number stores nothing, and the format says why.
+    std::fs::write(
+        stack.path("bad.txt"),
+        format!(
+            "replaces: E3 soon\n{}",
+            std::fs::read_to_string(&card).unwrap()
+        ),
+    )
+    .unwrap();
+    let said = stack.inside(
+        &shell,
+        &format!(
+            "{{ '{sh}' E11 - later eleven - < '{}'; echo rc=$?; }}",
+            stack.path("bad.txt").display()
+        ),
+    );
+    assert!(
+        said.contains("card was not stored") && said.contains("replaces") && said.contains("rc=2"),
+        "{said}"
+    );
+    assert_eq!(stack.card_status("E11"), "");
+    assert_eq!(stack.card_status("E3"), "open", "nothing was ended");
 }
 
 /// `escalate.sh new` takes the number and keeps the card in one call: cards in a row get their

@@ -311,6 +311,41 @@ impl Store {
         )?)
     }
 
+    /// A new card `card` replaces the older ones it names (`replaces:` in its block): one
+    /// UPDATE ends those that are still `open` E cards, never `card` itself. A question he
+    /// answered (`queued`, `passed`), an ended one, a draft and a number the inbox never had
+    /// stay as they are. Answers the cards it ended, in the order they were named.
+    pub fn supersede_asks(
+        &self,
+        card: &str,
+        replaces: &[String],
+        now: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        if replaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; replaces.len()].join(", ");
+        let note = format!("superseded by {card}");
+        let args = [card, note.as_str()]
+            .into_iter()
+            .chain(replaces.iter().map(String::as_str));
+        let mut stmt = self.conn.prepare(&format!(
+            "UPDATE ask SET status = 'closed', note = ?2, closed_at = {now} \
+             WHERE card IN ({marks}) AND status = 'open' AND card LIKE 'E%' AND card <> ?1 \
+             RETURNING card"
+        ))?;
+        let ended: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(args), |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut named: Vec<String> = Vec::new();
+        for c in replaces.iter().filter(|c| ended.contains(*c)) {
+            if !named.contains(c) {
+                named.push(c.clone());
+            }
+        }
+        Ok(named)
+    }
+
     /// One card by its number.
     pub fn ask(&self, card: &str) -> Result<Option<AskRow>, StoreError> {
         Ok(find(&self.conn, card)?)
@@ -788,6 +823,129 @@ mod tests {
             "an unknown card is refused"
         );
         assert_eq!(s.ended_asks(5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_new_card_ends_only_the_open_e_cards_it_names() {
+        let (s, t) = store_with_terminal();
+        for (n, card) in ["E1", "E2", "E3", "E4", "E6"].into_iter().enumerate() {
+            s.add_ask(card, None, None, None, "{}", 10 + n as i64)
+                .unwrap();
+        }
+        s.claim_ask("E2", "queued", Some("a"), "a", "queued", 20)
+            .unwrap();
+        s.claim_ask("E3", "passed", None, "go", "passed to qass", 20)
+            .unwrap();
+        s.close_ask("E4", "chat", 20).unwrap();
+        let w = draft_on(&s, t, "T5", false, 30);
+        let named: Vec<String> = ["E1", "E2", "E3", "E4", "E5", "E6", &w, "E99"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let closed = s.supersede_asks("E5", &named, 40).unwrap();
+        assert_eq!(
+            closed,
+            ["E1", "E6"],
+            "only open E cards, in the order named"
+        );
+        let e1 = s.ask("E1").unwrap().unwrap();
+        assert_eq!(
+            (e1.status.as_str(), e1.note.as_deref(), e1.closed_at),
+            ("closed", Some("superseded by E5"), Some(40))
+        );
+        for (card, status) in [("E2", "queued"), ("E3", "passed"), ("E4", "closed")] {
+            assert_eq!(s.ask(card).unwrap().unwrap().status, status, "{card}");
+        }
+        assert_eq!(s.ask("E4").unwrap().unwrap().note.as_deref(), Some("chat"));
+        assert_eq!(s.ask(&w).unwrap().unwrap().status, "open", "a W card stays");
+        s.add_ask("E5", None, None, None, "{}", 41).unwrap();
+        assert!(
+            s.supersede_asks("E5", &["E5".into()], 42)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.ask("E5").unwrap().unwrap().status, "open", "never itself");
+        assert!(s.supersede_asks("E5", &[], 43).unwrap().is_empty());
+    }
+
+    fn session_of(s: &Store, t: i64) -> Option<String> {
+        s.conn
+            .query_row(
+                "SELECT agent_session FROM terminal WHERE id = ?1",
+                params![t],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The agent left a conversation after the grace: the terminal forgets the id and its open
+    /// cards of that conversation end. An answer he gave (queued, passed), a card of another
+    /// conversation or of none stay.
+    #[test]
+    fn an_agent_that_left_ends_the_open_cards_of_its_conversation_only() {
+        let (s, t) = store_with_terminal();
+        s.set_agent_session(t, "sess").unwrap();
+        s.add_ask("E1", Some("T5"), Some(t), Some("sess"), "{}", 10)
+            .unwrap();
+        s.add_ask("E2", None, Some(t), Some("sess"), "{}", 11)
+            .unwrap();
+        s.add_ask("E3", None, Some(t), Some("sess"), "{}", 12)
+            .unwrap();
+        s.add_ask("E4", None, Some(t), Some("other"), "{}", 13)
+            .unwrap();
+        s.add_ask("E5", None, Some(t), None, "{}", 14).unwrap();
+        s.claim_ask("E2", "queued", Some("a"), "a", "queued", 20)
+            .unwrap();
+        s.claim_ask("E3", "passed", None, "go", "passed to qass", 20)
+            .unwrap();
+        assert_eq!(s.agent_left(t, "sess", 50).unwrap(), 1);
+        let e1 = s.ask("E1").unwrap().unwrap();
+        assert_eq!(
+            (e1.status.as_str(), e1.note.as_deref(), e1.closed_at),
+            ("closed", Some("its agent left"), Some(50))
+        );
+        for (card, status) in [
+            ("E2", "queued"),
+            ("E3", "passed"),
+            ("E4", "open"),
+            ("E5", "open"),
+        ] {
+            assert_eq!(s.ask(card).unwrap().unwrap().status, status, "{card}");
+        }
+        assert_eq!(session_of(&s, t), None);
+    }
+
+    /// Nothing ends unless the forget changed a row: a sleeping tab keeps its id and its
+    /// cards (they still wait on him), and so does a tab whose row holds another id by now.
+    #[test]
+    fn an_agent_that_left_ends_nothing_when_the_forget_changed_no_row() {
+        let mut s = Store::in_memory().expect("open");
+        let ws = s.create_workspace("w", 1).unwrap();
+        let (asleep, moved) = (
+            s.create_terminal(5, ws, "/tmp", "/bin/sh", 2).unwrap(),
+            s.create_terminal(6, ws, "/tmp", "/bin/sh", 2).unwrap(),
+        );
+        for (t, card) in [(asleep, "E1"), (moved, "E2")] {
+            s.set_agent_session(t, "sess").unwrap();
+            s.add_ask(card, None, Some(t), Some("sess"), "{}", 10)
+                .unwrap();
+        }
+        s.sleep_terminals(
+            20,
+            &[crate::Checkpoint {
+                terminal: asleep,
+                agent: Some("claude".into()),
+                agent_session: Some("sess".into()),
+            }],
+        )
+        .unwrap();
+        assert_eq!(s.agent_left(asleep, "sess", 50).unwrap(), 0);
+        assert_eq!(s.ask("E1").unwrap().unwrap().status, "open", "asleep");
+        assert_eq!(session_of(&s, asleep).as_deref(), Some("sess"));
+        s.set_agent_session(moved, "next").unwrap();
+        assert_eq!(s.agent_left(moved, "sess", 50).unwrap(), 0);
+        assert_eq!(s.ask("E2").unwrap().unwrap().status, "open", "new id");
+        assert_eq!(session_of(&s, moved).as_deref(), Some("next"));
     }
 
     /// A waiting spell on terminal `t` with a draft for it, his answer queued when `queue`.

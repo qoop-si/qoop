@@ -660,10 +660,12 @@ pub(crate) async fn dialog_ended(
     }
 }
 
-/// A card closed because the worker it was about was told its answer in the chat.
+/// A card closed because its answer was told in the chat: the head names the card, and the tab
+/// it was typed in is no matter (qass relays to the lead as often as to the worker the card is
+/// about). An `open` card, or a `passed` one (his inbox answer reached qass, and this is qass
+/// passing it on); never a `queued` one, which the daemon still has to type.
 pub(crate) async fn relayed(
     label: Option<&str>,
-    terminal: u32,
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
 ) {
@@ -672,7 +674,7 @@ pub(crate) async fn relayed(
     };
     let closed = store
         .run(move |s| match s.ask(&card)? {
-            Some(row) if row.terminal == Some(i64::from(terminal)) => {
+            Some(row) if matches!(row.status.as_str(), "open" | "passed") => {
                 s.close_ask(&card, "answered in chat", now())
             }
             _ => Ok(false),
@@ -745,11 +747,12 @@ pub(crate) async fn write(
             agent,
             body,
             via_qass,
+            replaces,
         } => {
             if let Err(reason) = qass_speaks(agents, &caller) {
                 return failed(id, reason);
             }
-            match add(&card, agent, *body, via_qass, terminals, store).await {
+            match add(&card, agent, *body, (via_qass, &replaces), terminals, store).await {
                 Ok(AskResult::Added) => {
                     crate::telemetry::count(crate::telemetry::Event::QassAsked);
                     AskResult::Added
@@ -819,7 +822,7 @@ async fn add(
     card: &str,
     agent: Option<String>,
     body: AskCard,
-    via_qass: bool,
+    (via_qass, replaces): (bool, &[String]),
     terminals: &Arc<TerminalRegistry>,
     store: &StoreHandle,
 ) -> Result<AskResult, String> {
@@ -844,17 +847,21 @@ async fn add(
         .filter(|_| !via_qass)
         .and_then(|t| terminals.session_of(t));
     let json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
-    let card = card.to_string();
+    let (card, replaces) = (card.to_string(), replaces.to_vec());
     store
         .run(move |s| {
-            s.add_ask(
+            let at = now();
+            let added = s.add_ask(
                 &card,
                 agent.as_deref(),
                 terminal.map(i64::from),
                 session.as_deref(),
                 &json,
-                now(),
-            )
+                at,
+            )?;
+            // After the add succeeded, so a refused card ends nothing.
+            s.supersede_asks(&card, &replaces, at)?;
+            Ok(added)
         })
         .await
         .map(|added| match added {

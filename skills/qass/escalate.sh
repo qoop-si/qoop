@@ -19,7 +19,11 @@
 #                            breaks the format prints every problem and the format, exits 2 and stores
 #                            nothing. The trailing `-` is what asks for the block: without it
 #                            standard input is never read.
-#   escalate.sh done E<n> [note]  the card is handled (answered in the chat, by you, or gone)
+#                            A `replaces: E<n> E<m>` line in the block ends those older open
+#                            cards as superseded when the new one is stored.
+#   escalate.sh done E<n> [note]  the card is handled where no event shows it (an answer you
+#                            acted on without relaying it); a relay, its agent's prompt, task or
+#                            tab, and a `replaces:` card end it by themselves
 #   escalate.sh show E<n>    the card qass is showing them now: their next message answers it
 #   escalate.sh next E|P     the number for a proposal (P), or a card (E) in the old form: never
 #                            one used before, even when it is long answered and gone from goals.md

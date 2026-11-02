@@ -245,7 +245,7 @@ how important the question feels.
 | Worker situation | You |
 |---|---|
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
-| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal) | "Done, checked" above; unclear: the step its goal still lacks (the rows below), a card only when none is reversible. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
+| Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal, oldest first) | "Done, checked" above; a claim with no terminal has no worker to do a missing step: close it failed with that step (`qoop task close <id> --failed '<missing>'`). An item back in Todo after its only agents were abandoned (tab closed, nothing claimed): name it in the summary when its branch holds commits; pickup never restarts it by itself. Unclear: the step its goal still lacks (the rows below), a card only when none is reversible. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |
 | Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
 | Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | read the question from its screen first: a reversible step its rules allow (the question row below): close its `W<n>` first (`escalate.sh done W<n> qass`), then prompt that step (refused: write the card now); anything else a card now. Never close its task, or prompt it except with their words, that answer or the meanwhile prompt (next row), while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
@@ -319,6 +319,9 @@ pick: B | <why you would pick it>
 END
 ```
 
+The terminal: the agent it is about while its tab is open, asleep too (the card then ends with it,
+and no draft doubles it); `-` only when no tab is. A card that takes over older open ones under
+other handles adds a `replaces: E351 E387` line: they end as superseded (a kept answer stays).
 One `key: value` line each, any order, a value at most 200 characters. `doing`, `why`, `asks` and
 every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:` to
 `D:`, plainly different, no "something else" (the pane has their own box), never one that drops or
@@ -359,15 +362,15 @@ showed that card), and the card stays open until they answer it.
   word as you wrote them in its card:
   `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<their words>". He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.'` (the daemon writes and reads this exact sentence, "He chose" included: keep it as is)
 
-Then move the card out of `Waiting on you` and run `"<this skill's dir>/escalate.sh" done E<n> chat`
-(`qass` when you answered it, `gone` when its agent is gone). Their inbox answer types `<handle> B`
+Then move the card out of `Waiting on you`: the relay ended it, in any tab; acted on without a relay:
+`"<this skill's dir>/escalate.sh" done E<n> chat` (`qass` when you answered it). Their inbox answer types `<handle> B`
 (or `<handle> <their words>`) to you, a clause like any other, or goes straight to the agent. On every
 wake, and before reading `Waiting on you` to them, run `qoop ask ls --json` and drop every card
 `answered` or `closed`; `passed` is their answer you have not passed on yet. A card ends by itself
-once its agent takes a prompt (not the meanwhile prompt), moves its stage, claims done or closes: while
+once its agent takes a prompt (not the meanwhile prompt), moves its stage, claims done, its task or tab
+closes, its agent leaves, you relay their answer, or a newer card replaces it (never by sleeping): while
 yours is open, prompt that agent only with their words for it or that meanwhile prompt. Sweep the rest each wake: `escalate.sh done E<n> stale` for
-one whose agent is gone, whose screen no longer asks it, or whose brief card line says they typed
-there after it and their words settle it (no relay: the agent has them).
+one whose screen no longer asks it, or with no tab whose answer or real-world step settled it.
 
 ## Lessons
 

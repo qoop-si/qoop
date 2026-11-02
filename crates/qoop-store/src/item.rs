@@ -261,6 +261,46 @@ pub(crate) fn carry_link(tx: &Connection, old: i64, new: i64, now: i64) -> rusql
     Ok(())
 }
 
+/// Whether a task was linked to an item after the event `back` (its last reopen). Event ids,
+/// not clocks.
+fn linked_since(tx: &Connection, item: i64, task: i64, back: i64) -> rusqlite::Result<bool> {
+    let linked: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM task_event \
+         WHERE task = ?1 AND kind = 'linked' AND body = ?2",
+        params![item, format!("#{task}")],
+        |r| r.get(0),
+    )?;
+    Ok(linked > back)
+}
+
+/// Nothing finished on an item: no remote agent is on it, and every task linked since its
+/// last reopen closed `abandoned` (a tab closed with nothing claimed). Reads the links
+/// itself, not the card's list of the five newest ended agents.
+fn only_abandoned_since(tx: &Connection, item: i64, reopened: i64) -> rusqlite::Result<bool> {
+    let remote: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM task_item_remote WHERE item = ?1",
+        params![item],
+        |r| r.get(0),
+    )?;
+    if remote > 0 {
+        return Ok(false);
+    }
+    let mut stmt = tx.prepare(
+        "SELECT t.id, t.outcome FROM task_item l JOIN task t ON t.id = l.task WHERE l.item = ?1",
+    )?;
+    let links = stmt
+        .query_map(params![item], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (task, outcome) in links {
+        if outcome.as_deref() != Some("abandoned") && linked_since(tx, item, task, reopened)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// A claimed task just closed verified takes its open item to Done when it was the last work
 /// on it: no linked task still open (from before a reopen too), every task linked since the
 /// item's last reopen closed verified, no remote agent on it, every step ticked (none counts,
@@ -294,15 +334,7 @@ pub(crate) fn follow_last_agent(
         return Ok(());
     }
     let reopened = newest(tx, item, "reopened")?.map_or(0, |(id, _)| id);
-    let since = |t: i64| -> rusqlite::Result<bool> {
-        let linked: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM task_event \
-             WHERE task = ?1 AND kind = 'linked' AND body = ?2",
-            params![item, format!("#{t}")],
-            |r| r.get(0),
-        )?;
-        Ok(linked > reopened)
-    };
+    let since = |t: i64| linked_since(tx, item, t, reopened);
     if !since(task)? {
         return Ok(());
     }
@@ -399,13 +431,15 @@ fn state(
     if agents.iter().any(|a| !a.closed) {
         return Ok(ItemState::Doing);
     }
-    // Every agent on it ended, and linked after its last reopen: the work is finished and
-    // waits for qass's check, never Todo again (an unlink takes the agents off; a reopen with no
-    // agent since is Todo). Event ids, not clocks: a remote's re-sync rewrites its time.
+    // Every agent on it ended, and one linked after its last reopen: the work waits for qass's
+    // check and stays Doing, unless nothing finished. Todo then (the item goes back to the
+    // start, its history kept): no remote agent, and each task linked since the reopen closed
+    // abandoned. A claimed, verified or failed agent keeps Doing. Event ids, not clocks: a
+    // remote's re-sync rewrites its time. A reopen with no agent since is Todo too.
     if !agents.is_empty() {
         let linked = newest(tx, t.id, "linked")?.map_or(0, |(id, _)| id);
         let reopened = newest(tx, t.id, "reopened")?.map_or(0, |(id, _)| id);
-        if linked > reopened {
+        if linked > reopened && !only_abandoned_since(tx, t.id, reopened)? {
             return Ok(ItemState::Doing);
         }
     }
@@ -581,6 +615,13 @@ pub(crate) fn dead_starts(tx: &Connection, item: i64) -> rusqlite::Result<usize>
         |r| r.get::<_, i64>(0),
     )
     .map(|n| n as usize)
+}
+
+/// An agent was linked after the item's last reopen or unlink: it had its try, so pickup does
+/// not start it again by itself (the owner or qass can). Event ids, as [`dead_starts`] counts.
+pub(crate) fn had_agent(tx: &Connection, item: i64) -> rusqlite::Result<bool> {
+    let id = |kind| newest(tx, item, kind).map(|e| e.map_or(0, |(id, _)| id));
+    Ok(id("linked")? > id("reopened")?.max(id("unlinked")?))
 }
 
 /// When an item came into its lane: Done when it closed; Doing at the first link or start
@@ -1735,7 +1776,8 @@ mod tests {
     }
 
     /// A link goes only to an open item, never from one; it moves off another item; it
-    /// follows the task's successor in its terminal, from a begin and from a replace.
+    /// follows the task's successor in its terminal, from a begin and from a replace. An agent
+    /// whose tab closed with nothing claimed was abandoned, so the item reads Todo.
     #[test]
     fn links_refuse_what_is_not_an_open_item_and_follow_a_superseded_task() {
         let (mut s, ws, t) = setup();
@@ -1774,8 +1816,9 @@ mod tests {
         // A task closed with its terminal is not carried: nothing replaced it.
         s.close_terminal(t, 34).unwrap();
         assert_eq!(s.linked_item(third).unwrap(), Some(item), "kept as history");
-        // Its only agent ended: finished, waiting for qass's check, never Todo again.
-        assert_eq!(state_of(&s, item, 35), ItemState::Doing);
+        // Its only agent ended unclaimed (abandoned): nothing finished, so nothing waits for
+        // qass's check and the item is Todo again, with its link kept as history.
+        assert_eq!(state_of(&s, item, 35), ItemState::Todo);
 
         s.close_task(other, Outcome::Verified, "", 36).unwrap();
         let u = s.create_terminal(7, ws, "/tmp", "/bin/sh", 37).unwrap();
@@ -1790,15 +1833,21 @@ mod tests {
         ));
     }
 
-    /// An item whose agents all ended stays in Doing until it is closed; a reopen with no
+    /// An item whose agent finished work stays in Doing until it is closed; a reopen with no
     /// agent linked since is Todo, and a re-sync of an ended remote agent changes nothing.
+    /// Its agent claims done before its tab closes: one that never claimed anything was
+    /// abandoned, and that item reads Todo (`an_item_whose_agents_were_all_abandoned_reads_todo`).
     #[test]
     fn a_finished_item_never_falls_back_to_todo() {
         let (s, ws, t) = setup();
         let (item, _) = s.add_item(ws, "logo", "", 10).unwrap();
         let task = s.open_task(t, "logo", false, 11).unwrap();
         s.link_task(task, item, 12).unwrap();
+        s.claim_task_done(task, "done", 12).unwrap();
         s.close_terminal(t, 13).unwrap();
+        // Failed, not verified: a verified last agent would close the item itself.
+        s.close_task(task, Outcome::Failed, "step missing", 13)
+            .unwrap();
         assert_eq!(state_of(&s, item, 14), ItemState::Doing);
         let card = s.item_card(item, 14).unwrap().unwrap();
         assert!(
@@ -1820,6 +1869,62 @@ mod tests {
             ItemState::Doing,
             "a new agent since, finished"
         );
+    }
+
+    /// Every agent on an item ended: Todo only when each one linked since its last reopen was
+    /// abandoned (never claimed) and no remote agent is on it. A claimed, verified or failed
+    /// agent, or any remote, keeps Doing, and a long history cannot hide one of them.
+    #[test]
+    fn an_item_whose_agents_were_all_abandoned_reads_todo() {
+        let (mut s, ws, _) = setup();
+        let (item, _) = s.add_item(ws, "logo", "", 10).unwrap();
+        fn ended(s: &mut Store, ws: i64, item: i64, n: i64, at: i64, claim: bool) -> i64 {
+            let u = s
+                .create_terminal(100 + n, ws, "/tmp", "/bin/sh", at)
+                .unwrap();
+            let task = s.open_task(u, "work", false, at).unwrap();
+            s.link_task(task, item, at).unwrap();
+            if claim {
+                s.claim_task_done(task, "done", at).unwrap();
+            }
+            s.close_terminal(u, at + 1).unwrap();
+            task
+        }
+        // Abandoned: nothing was claimed, so nothing waits for a check.
+        ended(&mut s, ws, item, 1, 20, false);
+        assert_eq!(state_of(&s, item, 30), ItemState::Todo);
+        // A claimed agent (its tab closed, the claim waits): Doing.
+        let claimed = ended(&mut s, ws, item, 2, 40, true);
+        assert_eq!(state_of(&s, item, 50), ItemState::Doing);
+        // Closed failed or verified: still Doing, for qass to act on.
+        s.close_task(claimed, Outcome::Failed, "no", 51).unwrap();
+        assert_eq!(state_of(&s, item, 52), ItemState::Doing);
+        // Five newer abandoned agents push the failed one out of the card's list, not out of
+        // the reading.
+        for n in 3..8 {
+            ended(&mut s, ws, item, n, 60 + 10 * n, false);
+        }
+        let card = s.item_card(item, 200).unwrap().unwrap();
+        assert!(!card.item.agents.iter().any(|a| a.task == claimed));
+        assert_eq!(state_of(&s, item, 200), ItemState::Doing);
+        // A reopen starts the count again: only the abandoned ones since count.
+        s.close_task(item, Outcome::Verified, "checked", 210)
+            .unwrap();
+        assert!(s.reopen_item(item, 211).unwrap());
+        ended(&mut s, ws, item, 8, 220, false);
+        assert_eq!(state_of(&s, item, 230), ItemState::Todo);
+        // One closed verified without a claim (qass checked it by hand): finished, Doing.
+        let u = s.create_terminal(120, ws, "/tmp", "/bin/sh", 231).unwrap();
+        let checked = s.open_task(u, "work", false, 231).unwrap();
+        s.link_task(checked, item, 231).unwrap();
+        s.close_task(checked, Outcome::Verified, "checked", 232)
+            .unwrap();
+        s.close_terminal(u, 233).unwrap();
+        assert_eq!(state_of(&s, item, 234), ItemState::Doing);
+        // Any remote agent keeps it Doing, ended or not.
+        s.link_remote(item, "box", 7, "T3", "finished", 240)
+            .unwrap();
+        assert_eq!(state_of(&s, item, 250), ItemState::Doing);
     }
 
     /// Todo, Doing on a start for ten minutes or on a live agent, Todo again on an unlink

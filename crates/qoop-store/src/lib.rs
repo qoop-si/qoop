@@ -1416,13 +1416,27 @@ impl Store {
     /// Forget the id of a conversation whose agent has left the terminal, if the row still
     /// holds that one: an id the next agent wrote meanwhile is its own, and stays.
     pub fn forget_agent_session(&self, id: i64, session: &str) -> Result<(), StoreError> {
-        // Not in a sleeping tab, like every write here: its row says what to bring back.
-        self.conn.execute(
-            "UPDATE terminal SET agent_session = NULL WHERE id = ?1 AND agent_session = ?2 \
-             AND id NOT IN (SELECT terminal FROM asleep_terminal)",
-            params![id, session],
-        )?;
+        forget_session(&self.conn, id, session)?;
         Ok(())
+    }
+
+    /// The agent of a conversation has left the terminal for good: forget the id as
+    /// [`Store::forget_agent_session`] does, and only when that changed a row end the
+    /// terminal's `open` cards that were asked in that conversation. A tab asleep, or one whose
+    /// row holds another id by now, changes no row and ends nothing: its cards still wait on
+    /// him. An answer he already gave (`queued`, `passed`) stays. Answers how many cards ended.
+    pub fn agent_left(&self, id: i64, session: &str, now: i64) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if forget_session(&tx, id, session)? == 0 {
+            return Ok(0);
+        }
+        let ended = tx.execute(
+            "UPDATE ask SET status = 'closed', note = 'its agent left', closed_at = ?3 \
+             WHERE terminal = ?1 AND session = ?2 AND status = 'open'",
+            params![id, session, now],
+        )?;
+        tx.commit()?;
+        Ok(ended)
     }
 
     /// Record which agent is in a terminal, and its own id for the conversation when it
@@ -1452,6 +1466,16 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// The write behind `forget_agent_session`: how many rows it changed.
+fn forget_session(conn: &Connection, id: i64, session: &str) -> rusqlite::Result<usize> {
+    // Not in a sleeping tab, like every write here: its row says what to bring back.
+    conn.execute(
+        "UPDATE terminal SET agent_session = NULL WHERE id = ?1 AND agent_session = ?2 \
+         AND id NOT IN (SELECT terminal FROM asleep_terminal)",
+        params![id, session],
+    )
 }
 
 /// What a sleeping terminal's row has to say when it goes to sleep: which agent was in

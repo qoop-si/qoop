@@ -948,6 +948,10 @@ pub enum AskOp {
         /// answer goes to qass, which acts on it (a plan approval), never straight to the agent.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         via_qass: bool,
+        /// Older cards this one replaces (`replaces: E351 E387` in its block): those still
+        /// `open` end as superseded once it is stored.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replaces: Vec<String>,
     },
     /// The owner's answer: an option's key, his own words, or both.
     Answer {
@@ -1606,7 +1610,10 @@ pub fn status(i: StatusInput) -> (Status, i64) {
     }
     let live = i.tab.live;
     let last_active = live.and_then(|l| l.last_active).unwrap_or(i.updated_at);
-    if i.stage == "waiting-human" {
+    // A claimed task with no tab, awake or asleep, has nobody to answer its wait: it falls
+    // through to the claim, which waits for its check.
+    let orphan = i.claimed_at.is_some() && live.is_none() && i.tab.asleep_since.is_none();
+    if i.stage == "waiting-human" && !orphan {
         return (Status::Waits, i.waiting_at.unwrap_or(i.updated_at));
     }
     if live.is_some_and(|l| l.state == "blocked") {
@@ -3707,6 +3714,45 @@ mod tests {
             }),
             asleep_since: None,
         }
+    }
+
+    /// A wait stage on a claimed task whose tab is gone reads Checks: nobody is there to answer
+    /// the wait, and the claim waits for its check. A sleeping tab, a live tab and a task with
+    /// no claim keep Waits.
+    #[test]
+    fn a_wait_on_a_claimed_task_with_no_tab_reads_checks() {
+        let waits = StatusInput {
+            stage: "waiting-human",
+            waiting_at: Some(400),
+            updated_at: 500,
+            ..Default::default()
+        };
+        let claimed = StatusInput {
+            claimed_at: Some(420),
+            ..waits
+        };
+        assert_eq!(status(claimed), (Status::Checks, 420), "claimed, no tab");
+        let asleep = Tab {
+            live: None,
+            asleep_since: Some(100),
+        };
+        assert_eq!(
+            status(StatusInput {
+                tab: asleep,
+                ..claimed
+            }),
+            (Status::Waits, 400),
+            "claimed, asleep"
+        );
+        assert_eq!(
+            status(StatusInput {
+                tab: live("idle", Some(490), 0),
+                ..claimed
+            }),
+            (Status::Waits, 400),
+            "claimed, live"
+        );
+        assert_eq!(status(waits), (Status::Waits, 400), "unclaimed, no tab");
     }
 
     /// One case per row of the status table, in its order: the first that holds wins, and

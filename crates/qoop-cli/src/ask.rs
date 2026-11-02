@@ -33,6 +33,7 @@ const FORMAT: &str = "a card is `key: value` lines, one line each, any order:
   B: <label> | <why this option> | <the words sent to the worker, in English>
   (C and D optional; two to four options, A first, in order)
   pick: <A to D> | <why>                                 (optional)
+  replaces: E<n> E<m>                                    (optional: older open cards this one ends)
 every value is one line of at most 200 characters, and label, reason and words are not empty";
 
 /// How long standard input may stay open with no end: a forgotten heredoc must not hang.
@@ -160,6 +161,37 @@ pub(crate) fn parse(text: &str, handle: &str, urgency: &str) -> Result<AskCard, 
     }
 }
 
+/// The `replaces: E351 E387` line of a card text, taken out of it: the text without the line,
+/// and the numbers. The daemon takes them as a field of the add, not as part of the card.
+fn take_replaces(text: &str) -> Result<(String, Vec<String>), String> {
+    let (mut kept, mut replaces, mut seen) = (String::new(), Vec::new(), false);
+    for line in text.lines() {
+        match line.trim().split_once(':') {
+            Some((key, value)) if key.trim() == "replaces" => {
+                if seen {
+                    return Err("replaces is given twice".to_string());
+                }
+                seen = true;
+                for n in value.split_whitespace() {
+                    let digits = n.strip_prefix('E').unwrap_or_default();
+                    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(format!("replaces names card numbers (E351), not {n:?}"));
+                    }
+                    replaces.push(n.to_string());
+                }
+                if replaces.is_empty() {
+                    return Err("replaces names no card: `replaces: E351 E387`".to_string());
+                }
+            }
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+    }
+    Ok((kept, replaces))
+}
+
 /// Standard input as the card text. A reader thread with a deadline, so a pipe that never
 /// closes ends in a refusal, not a hang.
 fn read_stdin() -> std::io::Result<String> {
@@ -260,6 +292,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             let handle = flag(rest, "--handle").ok_or_else(|| usage(USAGE))?;
             let urgency = flag(rest, "--urgency").ok_or_else(|| usage(USAGE))?;
             let text = read_stdin()?;
+            let (text, replaces) = take_replaces(&text).map_err(|problem| {
+                usage(format!("the card was not stored:\n  - {problem}\n{FORMAT}"))
+            })?;
             let body = parse(&text, handle, urgency).map_err(|problems| {
                 usage(format!(
                     "the card was not stored:\n  - {}\n{FORMAT}",
@@ -275,20 +310,31 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 .as_deref()
                 .and_then(qoop_runtime::asks::agent_key)
                 .map(|(k, _)| k);
-            let replaced: Vec<String> = match &key {
-                Some(a) => read_all(false)
-                    .map(|(live, _)| live)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| {
-                        c.agent.as_deref() == Some(a.as_str())
-                            && c.status == "open"
-                            && &c.card != card
-                    })
-                    .map(|c| format!("replaced {} {}: {}", c.card, c.body.handle, c.body.asks))
-                    .collect(),
-                None => Vec::new(),
+            let live = if key.is_some() || !replaces.is_empty() {
+                read_all(false).map(|(live, _)| live).unwrap_or_default()
+            } else {
+                Vec::new()
             };
+            let line = |verb: &str, c: &AskInfo| {
+                format!("{verb} {} {}: {}", c.card, c.body.handle, c.body.asks)
+            };
+            let replaced: Vec<String> = live
+                .iter()
+                .filter(|c| {
+                    key.as_deref()
+                        .is_some_and(|a| c.agent.as_deref() == Some(a))
+                        && c.status == "open"
+                        && &c.card != card
+                })
+                .map(|c| line("replaced", c))
+                .collect();
+            // The daemon ends exactly the open E cards named; the reply says which.
+            let superseded: Vec<String> = replaces
+                .iter()
+                .filter(|n| *n != card)
+                .filter_map(|n| live.iter().find(|c| &c.card == n && c.status == "open"))
+                .map(|c| line("superseded", c))
+                .collect();
             let options: Vec<String> = body
                 .options
                 .iter()
@@ -300,6 +346,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     agent,
                     body: Box::new(body),
                     via_qass: rest.iter().any(|a| a == "--via-qass"),
+                    replaces,
                 },
                 true,
             );
@@ -319,6 +366,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             options.iter().for_each(|o| println!("{o}"));
             if result == qoop_runtime::control::AskResult::Added {
                 replaced.iter().for_each(|r| println!("{r}"));
+                superseded.iter().for_each(|r| println!("{r}"));
             }
             Ok(())
         }
@@ -403,6 +451,26 @@ B: wait for you | you may want to read the SQL first | Do not run 0042 yet; stay
 C: skip | the old app may still read the column | Skip 0042 and take legacy_id out of this PR.
 pick: B | a column drop cannot be undone
 ";
+
+    #[test]
+    fn a_replaces_line_leaves_the_card_and_names_the_numbers() {
+        let text = format!("replaces: E351 E387\n{GOOD}");
+        let (rest, replaces) = take_replaces(&text).unwrap();
+        assert_eq!(replaces, ["E351", "E387"]);
+        assert_eq!(rest, GOOD);
+        assert!(parse(&rest, "migrations", "now").is_ok());
+        assert_eq!(take_replaces(GOOD).unwrap(), (GOOD.to_string(), vec![]));
+        for bad in [
+            "replaces: soon",
+            "replaces: E1 e2",
+            "replaces:",
+            "replaces: E",
+        ] {
+            assert!(take_replaces(&format!("{bad}\n{GOOD}")).is_err(), "{bad}");
+        }
+        let twice = format!("replaces: E1\nreplaces: E2\n{GOOD}");
+        assert!(take_replaces(&twice).unwrap_err().contains("twice"));
+    }
 
     #[test]
     fn a_good_card_parses_with_its_options_in_order() {
