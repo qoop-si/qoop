@@ -931,3 +931,241 @@ fn a_ride_or_long_put_keeps_a_person_hold() {
         );
     }
 }
+
+/// Terminal 5 at rest on stop `stop` with `n` things running in the background.
+fn resting(stop: &str, n: u32) -> String {
+    let bg = if n > 0 {
+        format!(r#","background":{n}"#)
+    } else {
+        String::new()
+    };
+    row(5, "idle", &format!(r#","stop":"{stop}"{bg}"#))
+}
+
+/// Terminal 5's stop as said, `n` things still running in the background (`bg:<n>` above 0).
+fn rest_line(stop: &str, n: u32) -> String {
+    let bg = if n > 0 {
+        format!(" bg:{n}")
+    } else {
+        String::new()
+    };
+    format!(
+        r#"T5 g1 claude working->idle "w" /tmp/x stop:{stop}{bg} allowed:write:none@1000 task:12:implementing"#
+    )
+}
+
+/// A worker at rest with work in the background wakes nobody; once none runs, the tick lets it
+/// go and it is said once.
+#[test]
+fn a_rest_with_background_work_is_said_once_none_runs() {
+    let w = Watch::new();
+    w.snaps(&[rows(&[row(5, "working", "")]), rows(&[resting("1.1", 2)])]);
+    let (lines, _) = w.run(0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(w.read("data/quiet.log").contains("bg: held 2"));
+    w.snaps(&[rows(&[resting("1.1", 0)])]);
+    let (lines, _) = w.run(11, &[]);
+    assert_eq!(lines, [rest_line("1.1", 0)]);
+    assert!(w.read("data/bghold").is_empty());
+}
+
+/// Fewer running than when the hold began is said too, once.
+#[test]
+fn a_background_count_that_drops_is_said_once() {
+    let w = Watch::new();
+    w.snaps(&[
+        rows(&[row(5, "working", "")]),
+        rows(&[resting("1.1", 2)]),
+        rows(&[resting("1.1", 1)]),
+    ]);
+    let (lines, _) = w.run(11, &[]);
+    assert_eq!(lines, [rest_line("1.1", 1)]);
+    // Held at its stop, so the one line is the drop.
+    assert!(w.read("data/quiet.log").contains("bg: held 2"));
+    assert!(w.read("data/bghold").is_empty());
+}
+
+/// A job that outlasts QASS_BG_LIMIT is said once on the tick, and not again on the next one.
+#[test]
+fn a_background_hold_past_its_limit_is_said_once() {
+    let w = Watch::new();
+    w.snaps(&[rows(&[row(5, "working", "")]), rows(&[resting("1.1", 2)])]);
+    let (lines, _) = w.run(21, &[("QASS_BG_LIMIT", "2")]);
+    assert_eq!(lines, [rest_line("1.1", 2)]);
+    assert!(lines[0].contains(" bg:2 "), "{lines:?}");
+    assert!(w.read("data/quiet.log").contains("bg: limit"));
+    assert!(
+        w.read("data/bghold").starts_with("5 1 2 ") && w.read("data/bghold").ends_with(" spent\n")
+    );
+}
+
+/// A job that never ends (a dev server): past the limit the hold is spent, so each later stop
+/// with as many running takes its usual class at once, with no second hold.
+#[test]
+fn a_spent_hold_holds_no_later_stop() {
+    let w = Watch::new();
+    w.snaps(&[
+        rows(&[row(5, "working", "")]),
+        rows(&[resting("1.1", 1)]),
+        "sleep 11".into(),
+        rows(&[row(5, "working", "")]),
+        rows(&[resting("1.2", 1)]),
+        rows(&[row(5, "working", "")]),
+        rows(&[resting("1.3", 1)]),
+    ]);
+    let (lines, _) = w.run(1, &[("QASS_BG_LIMIT", "2")]);
+    assert_eq!(
+        lines,
+        [
+            rest_line("1.1", 1),
+            rest_line("1.2", 1),
+            rest_line("1.3", 1)
+        ]
+    );
+    assert_eq!(w.read("data/quiet.log").matches("bg: held").count(), 1);
+    assert!(w.read("data/bghold").ends_with(" spent\n"));
+}
+
+/// A job that ends wakes the agent, which works and stops again: with the settle a real watcher
+/// has, the drop the tick let go and that stop are one line, not two.
+#[test]
+fn one_job_end_is_one_line_with_the_settle() {
+    let w = Watch::new();
+    w.snaps(&[
+        rows(&[row(5, "working", "")]),
+        rows(&[resting("1.1", 2)]),
+        rows(&[resting("1.1", 0)]),
+        "sleep 11".into(),
+        rows(&[row(5, "working", "")]),
+        "sleep 1".into(),
+        rows(&[resting("1.2", 0)]),
+    ]);
+    let (lines, _) = w.run(30, &[("QASS_SETTLE", "20")]);
+    assert_eq!(lines, [rest_line("1.2", 0)]);
+    assert!(w.read("data/quiet.log").contains("bg: let go"));
+}
+
+/// Terminal `t` at rest on a task in `stage`, claimed or not, with two jobs running.
+fn task_row(t: u32, stage: &str, claimed: bool) -> String {
+    format!(
+        r#"{{"terminal":{t},"generation":1,"agent":true,"program":"claude","state":"idle","name":"w","cwd":"/tmp/x","task":{{"id":12,"stage":"{stage}","claimed":{claimed}}},"stop":"1.1","background":2}}"#
+    )
+}
+
+/// What is said at once stays so with work in the background (a block, a failure), and a repeat
+/// on a task waiting on the owner or claimed done is never held for it.
+#[test]
+fn urgent_waiting_and_claimed_rows_are_never_background_held() {
+    let w = Watch::new();
+    let bg = r#","stop":"1.1","background":2"#;
+    let at = now() - 60;
+    w.put(
+        "data/said",
+        &format!(
+            "7 1 idle waiting-human {at} 1.0 {at}\n8 1 idle implementing:claimed {at} 1.0 {at}\n"
+        ),
+    );
+    let working: Vec<String> = [5, 6, 7, 8]
+        .iter()
+        .map(|t| row(*t, "working", ""))
+        .collect();
+    w.put("data/last.json", &rows(&working));
+    w.snaps(&[rows(&[
+        row(5, "blocked", bg),
+        row(6, "failed", bg),
+        task_row(7, "waiting-human", false),
+        task_row(8, "implementing", true),
+    ])]);
+    let (lines, _) = w.run(0, &[]);
+    assert_eq!(of(&lines, 5).len(), 1, "{lines:?}");
+    assert_eq!(of(&lines, 6).len(), 1, "{lines:?}");
+    assert!(
+        w.read("data/bghold").is_empty(),
+        "{}",
+        w.read("data/bghold")
+    );
+}
+
+/// The hold and its start outlive a restart of the watcher, and a new stop keeps that start.
+#[test]
+fn a_background_hold_outlives_a_restart() {
+    let w = Watch::new();
+    w.snaps(&[rows(&[row(5, "working", "")]), rows(&[resting("1.1", 2)])]);
+    let (lines, _) = w.run(0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    std::thread::sleep(Duration::from_secs(3));
+    w.snaps(&[rows(&[resting("1.2", 2)])]);
+    let (lines, _) = w.run(11, &[("QASS_BG_LIMIT", "3")]);
+    assert_eq!(lines, [rest_line("1.2", 2)]);
+}
+
+/// A worker another agent drives (routine before this) is held too, and said when its job ends.
+#[test]
+fn a_driven_worker_with_background_work_is_held_and_said() {
+    let w = Watch::new();
+    w.put("data/prompted.log", &format!("{} 8 T5\n", now()));
+    let other = row(8, "working", "");
+    w.snaps(&[
+        rows(&[row(5, "working", ""), other.clone()]),
+        rows(&[resting("1.1", 2), other.clone()]),
+        rows(&[resting("1.1", 0), other]),
+    ]);
+    let (lines, _) = w.run(11, &[]);
+    assert_eq!(of(&lines, 5), [&rest_line("1.1", 0)]);
+    assert!(w.read("data/quiet.log").contains("bg: held 2"));
+}
+
+/// A person hold that runs out while the job runs says nothing: the hold took its line, and its
+/// release meets the brief again.
+#[test]
+fn a_person_hold_gives_way_to_the_background_hold() {
+    let w = Watch::new();
+    let line = r#"T5 g1 claude working->idle "w" /tmp/x stop:1.0 task:12:implementing"#;
+    w.put(
+        "data/held",
+        &format!("5 1 person {} {} {line}\n", now() + 3, now() - 5),
+    );
+    w.put("data/last.json", &rows(&[row(5, "working", "")]));
+    w.snaps(&[rows(&[resting("1.1", 2)])]);
+    let (lines, _) = w.run(11, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(
+        !w.read("data/held").contains("5 1 "),
+        "{}",
+        w.read("data/held")
+    );
+    assert!(w.read("data/bghold").starts_with("5 1 2 "));
+}
+
+/// A remote worker is held in its own file and said with its machine's name; a resume (the
+/// owner turned watching on again) drops every hold.
+#[test]
+fn a_remote_background_hold_and_a_resume() {
+    let w = Watch::new();
+    w.put("stub/remotes", "ubox\n");
+    let remote = |state: &str, extra: &str| row(2, state, extra);
+    w.put(
+        "stub/remote-snaps",
+        &format!(
+            "{}\n{}\nsleep 1\n{}\n",
+            rows(&[remote("working", "")]),
+            rows(&[remote("idle", r#","stop":"1.1","background":2"#)]),
+            rows(&[remote("idle", r#","stop":"1.1""#)])
+        ),
+    );
+    let local = rows(&[row(5, "working", "")]);
+    w.put("data/last.json", &local);
+    w.snaps(std::slice::from_ref(&local));
+    let (lines, _) = w.run(11, &[("REMOTE_HOLD", "20")]);
+    let ubox: Vec<&String> = lines.iter().filter(|l| l.starts_with("ubox/T2 ")).collect();
+    assert_eq!(ubox.len(), 1, "{lines:?}");
+    assert!(w.read("data/quiet.log").contains("bg: held 2"));
+    w.put("data/bghold", &format!("5 1 2 {} working\n", now()));
+    w.put("data/bghold-ubox", &format!("2 1 2 {} working\n", now()));
+    w.put("data/watch", "resume 77\n");
+    w.put("stub/remotes", "");
+    w.snaps(&[local]);
+    let (lines, _) = w.run(0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(!w.path("data/bghold").exists() && !w.path("data/bghold-ubox").exists());
+}

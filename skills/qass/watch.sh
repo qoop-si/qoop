@@ -35,6 +35,7 @@
 # Before the task: `stop:<id>`, the daemon's newest admitted stop of that agent (`?`: none since
 # its last work), and `allowed:<verdict>@<unix>`, what `qoop qass brief` allowed when the line
 # was made (`allowed:?`: no brief, see `facts`).
+# After the stop, `bg:<n>` when the row counts n things still running in the background.
 #
 # Quiet (the default; QASS_QUIET=0 gives everything above and nothing below). Every line wakes
 # qass, and a wake re-reads its whole conversation, so only what needs it now is said now:
@@ -54,6 +55,17 @@
 #   block.
 # - Ride: a repeat of an agent already said waiting on the owner, and a sleep after an idle
 #   already said, only ever go with another block.
+# - Background hold: an agent at rest (idle or done) whose row counts work still running in the
+#   background (`background`: shells, monitors, subagents), on no claim and not waiting on the
+#   owner, is said nothing of while that runs: a wait is not news. That covers a driven agent and,
+#   with routine on, a rest with no task; with routine silent such a rest stays routine. The tick
+#   lets it go, as its row is then (`bg:<n>` with some still running), into the short hold when
+#   fewer run than when the hold began (none included) and it still rests, or once the hold has
+#   lasted QASS_BG_LIMIT seconds (300), whichever comes first. A stop in between keeps the first
+#   count and start (`bghold` in qass's folder); a stop with fewer running ends the hold and is
+#   held as any line. Past its limit the hold is spent: a job that never ends (a dev server)
+#   holds none of the agent's later stops, until fewer run. Said, never stopped.
+#   The lines said at once above are never held so.
 # - A remote whose daemon left with no agent on it, and lines that went stale, go to
 #   quiet.log instead. Held lines and marks outlive a restart of this script.
 # - Routine, silent unless the file `routine` in qass's folder holds `say` (the owner's word:
@@ -86,6 +98,7 @@ qhold="${QASS_QUIET_HOLD:-600}"
 linkdown="${QASS_LINKDOWN:-60}"
 vcheck="${QASS_REMOTE_VERSION_EVERY:-60}"
 rhold="${QASS_ROUTINE_HOLD:-1800}"
+bglimit="${QASS_BG_LIMIT:-300}"
 # A Monitor is killed at 30 minutes and its one notice of that can be lost (2026-10-12: it came
 # in the second an event did, and nothing watched for an hour). So this ends first, by itself.
 watch_for="${QASS_WATCH_FOR:-1740}"
@@ -106,7 +119,9 @@ def line($r; $from):
   # Claude flagged a dangerous rm on this menu: a hint, the screen decides (SKILL.md, Menu row).
   # Before the task, so a line still ends `task:<id>:<stage>[:claimed]`.
   + (if $r.rule == "dangerous_rm_dialog" then " menu:dangerous" else "" end)
-  + " stop:" + ($r.stop // "" | clean | if . == "" then "?" else . end) + ($r | task);
+  + " stop:" + ($r.stop // "" | clean | if . == "" then "?" else . end)
+  # Work still running in the background (shells, monitors, subagents), as the row is now.
+  + (if ($r.background // 0) > 0 then " bg:\($r.background)" else "" end) + ($r | task);
 '
 # Every program below takes $skip, the terminals of one machine the owner asked qass to leave
 # alone, so `rows` drops them: a skipped tab going idle, blocked, failed or away says nothing, and
@@ -143,6 +158,22 @@ settled="$defs"'
 # $b is a row array and $due terminal numbers; prints those that still wait.
 again="$defs"'
 ($b | rows) as $new | $due[] | $new[.] // empty | select(.state | waits) | line(.; "hands-off")'
+
+# $b is a row array; the background hold of terminal $t, generation $g, begun with $n at work:
+# with the agent at rest, its line once fewer run, or `late <line>` once the hold ran out
+# ($late); `keep` while it rests or works, else `drop` (gone, restarted, blocked, or on a claim
+# or the owner: those lines go their own way). A spent hold ($spent: its limit was said) says
+# nothing more and goes once fewer run.
+bgcheck="$defs"'
+($b | rows)[$t] as $r
+| if $r == null or $r.generation != $g or $r.task.claimed == true
+     or ($r.task.stage? // "") == "waiting-human" then "drop"
+  elif ($r.state == "idle" or $r.state == "done") | not then
+    (if $r.state == "working" or $r.state == "starting" then "keep" else "drop" end)
+  elif ($r.background // 0) < $n then (if $spent then "drop" else line($r; $from) end)
+  elif $spent then "keep"
+  elif $late then "late " + line($r; $from)
+  else "keep" end'
 
 # Whether a row array $a holds an agent: a machine that goes away with none says nothing.
 has_agents="$defs"'($a | rows | length) > 0'
@@ -679,6 +710,96 @@ ride_expire() {
     done
 }
 
+# A machine's background holds: "<t> <gen> <count> <since> <from>[ spent]", one per agent;
+# `spent` once its limit was said.
+bghold_file() { if [ -z "$1" ]; then echo "$dir/bghold"; else echo "$dir/bghold-$1"; fi; }
+
+# Holds the agent line $2 just parsed, of machine $1, while its agent rests with work running in
+# the background (see the top of this file). A plain rest with no task stays routine while routine
+# is silent, and a line joins a short hold already there (one just let go). Whatever else was held
+# for the agent is older news and goes, a person hold too: the line let go meets the brief again.
+# A stop with fewer at work than the hold began with ends it, and takes its usual class. Fails for
+# a line it does not hold. Runs under the settle lock.
+bg_hold() { # label line
+    local f h n o_g o_n o_s _
+    BG_DROP=""
+    case "$L_STATE" in idle | done) ;; *) return 1 ;; esac
+    [ "$L_STAGE" != waiting-human ] && [ -z "$L_CLAIMED" ] || return 1
+    f="$(bghold_file "$1")" h="$(held_file "$1")"
+    n="$(jq -r --argjson t "$L_T" '[.[]? | select(.terminal == $t) | .background // 0][0] // 0' \
+        "$(snapshot_file "$1")" 2>/dev/null || echo 0)"
+    read -r _ o_g o_n _ _ o_s _ <<< "$(grep "^$L_T " "$f" 2>/dev/null | tail -1 || true)"
+    [ "${o_g:-}" = "$L_G" ] || o_n=""
+    # A spent hold (a job that never ends, a dev server): each stop takes its usual class at once.
+    [ -z "$o_n" ] || [ "$n" -lt "$o_n" ] || [ -n "${o_s:-}" ] || return 0
+    [ -n "$o_n" ] || [ "$n" -gt 0 ] || return 1
+    ! { routine_quiet && [ "$L_STAGE" = - ] && routine "$2"; } || return 1
+    ! awk -v t="$L_T" '$1 == t && $3 == "short" { f = 1 } END { exit !f }' "$h" 2>/dev/null || return 1
+    # Fewer jobs than at the start: the line takes its own class, and the hold goes only once
+    # that line is held there (`bg_drop`), so a crash between the two loses nothing.
+    [ -z "$o_n" ] || { [ "$n" -ge "$o_n" ] || BG_DROP="$L_T"; return 1; }
+    { grep -v "^$L_T " "$f" 2>/dev/null || true
+      echo "$L_T $L_G $n $(date +%s) $L_FROM"; } > "$f.tmp"
+    mv "$f.tmp" "$f"
+    note "bg: held $n" "$2"
+    [ ! -f "$h" ] || { awk -v t="$L_T" '$1 != t' "$h" > "$h.tmp"; mv "$h.tmp" "$h"; }
+}
+
+# Drops the background hold `bg_hold` left for terminal $BG_DROP of machine $1, once its stop's
+# line is held in its own class.
+bg_drop() {
+    local f
+    f="$(bghold_file "$1")"
+    [ -n "${BG_DROP:-}" ] && [ -f "$f" ] || return 0
+    { grep -v "^$BG_DROP " "$f" || true; } > "$f.tmp"
+    mv "$f.tmp" "$f"
+    BG_DROP=""
+}
+
+# On the tick, lets go each machine's background holds that are over (`bgcheck`): the line goes
+# to the short hold, so it settles and meets the brief as any line, and the hold goes only once
+# that line is held. A hold jq cannot read goes once past QASS_BG_LIMIT. Runs under the settle lock.
+bg_check() {
+    local f label snap skip now t g n since from spent r late kept
+    now="$(date +%s)"
+    for f in "$dir"/bghold "$dir"/bghold-*; do
+        [ -s "$f" ] || continue
+        case "$f" in *.tmp) continue ;; esac
+        label="${f#"$dir"/bghold}"; label="${label#-}"
+        [ ! -e "$(gone_file "$label")" ] || continue
+        snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
+        skip="$(skips_of "$snap")" kept=""
+        while read -r t g n since from spent _; do
+            late=false; [ $((now - since)) -lt "$bglimit" ] || late=true
+            if ! r="$(jq -rn --argjson b "$snap" --arg t "$t" --argjson g "$g" --argjson n "$n" \
+                --argjson late "$late" --arg from "$from" --argjson self "$self" --argjson skip "$skip" \
+                --argjson spent "$([ -n "$spent" ] && echo true || echo false)" --arg at "$(at_of "$label")" \
+                "$bgcheck" 2>/dev/null)"; then
+                r=keep; [ "$late" = false ] || { r=drop; note "bg: unreadable" "$t $g $n $since $from $spent"; }
+            fi
+            # A stop with fewer jobs already went to its own class (`bg_hold`, `bg_drop`): the
+            # hold is over, and handing it on again would say that stop twice. At the limit,
+            # that line stands for it: the hold is spent.
+            if [ "$r" != keep ] && [ -n "$r" ] && [ "$r" != drop ] &&
+                awk -v t="$t" '$1 == t { f = 1 } END { exit !f }' "$(held_file "$label")" 2>/dev/null; then
+                case "$r" in late\ *) r=spent ;; *) r=drop ;; esac
+            fi
+            case "$r" in
+                keep | '') kept="$kept$t $g $n $since $from${spent:+ spent}"$'\n' ;;
+                drop) ;;
+                spent) kept="$kept$t $g $n $since $from spent"$'\n' ;;
+                # The limit: said once, and the hold stays, spent, so a job that never ends
+                # (a dev server) holds none of the agent's later stops.
+                late\ *) hold_put "$label" "$t" "$g" short "${r#late }"; note "bg: limit" "${r#late }"
+                    kept="$kept$t $g $n $since $from spent"$'\n' ;;
+                *) hold_put "$label" "$t" "$g" short "$r"; note "bg: let go" "$r" ;;
+            esac
+        done < "$f"
+        printf '%s' "$kept" > "$f.tmp"
+        mv "$f.tmp" "$f"
+    done
+}
+
 # A Claude agent of this Mac that stopped on its usage limit (its screen shows the limit and the
 # live "continuing automatically" countdown), named when cswap is there to switch the account:
 # the line comes out as ->limited with the reset time on its screen, and
@@ -891,8 +1012,10 @@ follow() {
                     l="$(limit_line "$label" "$l")"
                     [ -n "$l" ] || continue
                     if urgent "$l"; then now_lines="$now_lines$l
-"; elif routine_quiet && routine "$l"; then quiet_routine "$label" "$l"
+"; elif settle_locked bg_hold "$label" "$l"; then :
+                    elif routine_quiet && routine "$l"; then quiet_routine "$label" "$l"
                     else quiet_hold "$label" "$l"; fi
+                    [ -z "${BG_DROP:-}" ] || settle_locked bg_drop "$label"
                 else
                     hold "$label" "$l" || now_lines="$now_lines$l
 "
@@ -1048,7 +1171,7 @@ resume=0
 stamp="$(watch_unseen || true)"
 if [ -n "$stamp" ]; then
     resume=1
-    rm -f "$dir"/held "$dir"/held-* "$dir"/settle "$dir"/settle-*
+    rm -f "$dir"/held "$dir"/held-* "$dir"/bghold "$dir"/bghold-* "$dir"/settle "$dir"/settle-*
     touch "$(base_file "")"
     seen_stamp "$stamp"
 fi
@@ -1104,6 +1227,7 @@ fi
         asks_said
         claims_said
         if [ "$quiet" = 1 ]; then
+            settle_locked bg_check
             settle_locked flush ""
             settle_locked ride_expire
             for f in "$dir"/down-*; do

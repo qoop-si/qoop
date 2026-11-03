@@ -1116,7 +1116,7 @@ mod tests {
             "| Failed on an API, network or overload error | one scoped prompt to resume where it stopped; failed again: escalate |",
             "prompt the step the goal still lacks in its words",
             "**What they ask you to do, do in that turn**",
-            "| Stopped while its job still runs (`background` or subagents on its row, a row under `← N agents` on its screen that is not idle) | `hands off until <now + 300>` on its line, then 600, then 1200 while it runs; said again with nothing running: prompt it to read the job's result and go on; after the 1200 with it still running: prompt it to check the job, and wait on if it still progresses (`hands off until <now + 1200>` again) |",
+            "| Stopped while its job still runs (`background` or subagents on its row, a row under `← N agents` on its screen that is not idle) | the watcher holds it until fewer run or past 5 minutes; said with nothing running: prompt it to read the job's result and go on; a line with `bg:<n>` above 0 means jobs still run: check the job (its output or the process), do not just wait |",
             "Still stopped after it (or idle for unknown time), no one is answering.",
             "| Stopped on a usage limit with a reset time, no `cswap` | `hands off until <reset + 120>` (its clock time as unix through `date`); said again and still idle: prompt it to resume |",
         ] {
