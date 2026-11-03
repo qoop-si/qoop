@@ -458,6 +458,7 @@ fn fire(args: &[String]) -> std::io::Result<()> {
         space: row.space.clone(),
         command,
         typed,
+        spawned: false,
     };
     let mut opened = None;
     // The baseline moves only with an agent that started: lines that reached nobody stay new.

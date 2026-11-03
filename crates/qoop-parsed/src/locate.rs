@@ -11,8 +11,10 @@ pub use qoop_history::BaseDirs as Dirs;
 /// The Claude `projects` directories this process's environment names.
 pub use qoop_history::locate::claude_roots_from_env;
 
-/// Where one session lives.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where one session lives. Kept as `{"file":"<path>"}` or `{"opencode":{"db":..,"id":..}}`
+/// in a done claim's record, so the session is read again with no terminal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Source {
     /// A transcript file (Claude, Codex, Gemini).
     File(PathBuf),

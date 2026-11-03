@@ -246,10 +246,39 @@ fn keep_folder(tx: &Connection, task: i64, terminal: i64, now: i64) -> rusqlite:
     }
 }
 
+/// A task opened in a terminal someone marked as theirs (`Store::mark_spawned`) carries the
+/// mark and the terminal, `spawned_by` `qass T12`: its close can then be told apart as the
+/// worker's own, once the task no longer names its terminal.
+fn spawned_by(tx: &Connection, task: i64, terminal: i64, now: i64) -> rusqlite::Result<()> {
+    let by: Option<String> = tx
+        .query_row(
+            "SELECT by FROM spawned_terminal WHERE terminal = ?1",
+            params![terminal],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match by {
+        Some(by) => event(tx, task, "spawned_by", &format!("{by} T{terminal}"), now),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn close(
     tx: &Connection,
     task: i64,
     outcome: Outcome,
+    reason: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    close_as(tx, task, outcome, None, reason, now)
+}
+
+/// [`close`], its event saying who asked for it (`verified by qass: ...`) when `by` is given.
+pub(crate) fn close_as(
+    tx: &Connection,
+    task: i64,
+    outcome: Outcome,
+    by: Option<&str>,
     reason: &str,
     now: i64,
 ) -> rusqlite::Result<()> {
@@ -269,11 +298,13 @@ pub(crate) fn close(
          WHERE id = ?1",
         params![task, now, outcome.as_str()],
     )?;
-    let body = if reason.is_empty() {
-        outcome.as_str().to_string()
-    } else {
-        format!("{}: {reason}", outcome.as_str())
-    };
+    let mut body = outcome.as_str().to_string();
+    if let Some(by) = by {
+        body.push_str(&format!(" by {by}"));
+    }
+    if !reason.is_empty() {
+        body.push_str(&format!(": {reason}"));
+    }
     event(tx, task, "closed", &body, now)
 }
 
@@ -412,6 +443,7 @@ impl Store {
         )?;
         let id = tx.last_insert_rowid();
         event(&tx, id, "opened", &goal, now)?;
+        spawned_by(&tx, id, terminal, now)?;
         if let Some(old) = replaced {
             crate::item::carry_link(&tx, old, id, now)?;
         }
@@ -492,6 +524,7 @@ impl Store {
         )?;
         let id = tx.last_insert_rowid();
         event(&tx, id, "opened", &format!("opened by {by}: {goal}"), now)?;
+        spawned_by(&tx, id, terminal, now)?;
         // Here and not in `close`, which abandon shares: only a task that has a successor
         // hands its place on the board to it.
         if let Some(old) = replaced {
@@ -676,7 +709,8 @@ impl Store {
     }
 
     /// The agent says it is done. A claim: it is checked outside the agent, and the task
-    /// stays open until a close.
+    /// stays open until a close. Steps of its item still unticked are named in the claim,
+    /// never a reason to refuse it: some steps are the owner's, and agents share an item's.
     pub fn claim_task_done(&self, task: i64, summary: &str, now: i64) -> Result<(), StoreError> {
         let summary = printable(summary);
         within("the summary", &summary, SUMMARY_MAX)?;
@@ -686,11 +720,24 @@ impl Store {
             "UPDATE task SET claimed_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![task, now],
         )?;
-        event(&tx, task, "done", &summary, now)?;
+        let unticked = crate::item::unticked(&tx, task)?;
+        let body = if unticked.is_empty() {
+            summary
+        } else {
+            format!("{summary}\nunticked: {}", unticked.join("; "))
+        };
+        event(&tx, task, "done", &body, now)?;
         if let Some(terminal) = t.terminal {
             crate::ask::close_cards(&tx, terminal, "its task is done", false, now)?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Where a done claim's work can be read again: the daemon's own `record` event, written
+    /// after the claim, never by an agent. Its body is the daemon's compact JSON.
+    pub fn task_record(&self, task: i64, record: &str, now: i64) -> Result<(), StoreError> {
+        event(&self.conn, task, "record", record, now)?;
         Ok(())
     }
 
@@ -700,6 +747,19 @@ impl Store {
         &self,
         task: i64,
         outcome: Outcome,
+        reason: &str,
+        now: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        self.close_task_by(task, outcome, None, reason, now)
+    }
+
+    /// [`Store::close_task`], recording who asked (`qass`, `T12/3` or `unknown`) on its
+    /// `closed` event. Only recorded: who may close is not decided here.
+    pub fn close_task_by(
+        &self,
+        task: i64,
+        outcome: Outcome,
+        by: Option<&str>,
         reason: &str,
         now: i64,
     ) -> Result<Option<i64>, StoreError> {
@@ -714,9 +774,9 @@ impl Store {
             return Ok(done.terminal);
         }
         let t = open_row(&tx, task)?;
-        close(&tx, task, outcome, &reason, now)?;
+        close_as(&tx, task, outcome, by, &reason, now)?;
         if outcome == Outcome::Verified && t.claimed_at.is_some() {
-            crate::item::follow_last_agent(&tx, task, &reason, now)?;
+            crate::item::follow_last_agent(&tx, task, by, &reason, now)?;
         }
         tx.commit()?;
         Ok(t.terminal)
@@ -1334,5 +1394,77 @@ mod tests {
         s.delete_workspace(other).unwrap();
         let again = s.create_workspace("again", 26).unwrap();
         assert_eq!(goal_of(&s, again), None, "a reused id starts with no goal");
+    }
+
+    /// A claim with steps of its item still unticked is taken, the steps named in its `done`
+    /// event (phase headers never); a close records who asked when told, and only then.
+    #[test]
+    fn a_claim_names_its_unticked_steps_and_a_close_who_asked() {
+        let (s, ws, t) = store_with_terminal();
+        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let steps = ["build", "## check", "e2e passes", "deploy"].map(String::from);
+        s.set_steps(item, &steps, 10).unwrap();
+        s.check_step(item, 1, true, 11).unwrap();
+        s.check_step(item, 4, true, 11).unwrap();
+        let id = s.open_task(t, "part", false, 12).unwrap();
+        s.link_task(id, item, 12).unwrap();
+        s.claim_task_done(id, "merged", 13).expect("never refused");
+        let done = &s.task_events_of(id, "done", 1).unwrap()[0];
+        assert_eq!(done.body, "merged\nunticked: 3. e2e passes");
+        s.check_step(item, 3, true, 13).unwrap();
+        s.close_task_by(id, Outcome::Verified, Some("T5/2"), "checked", 14)
+            .unwrap();
+        let closed = &s.task_events_of(id, "closed", 1).unwrap()[0];
+        assert_eq!(closed.body, "verified by T5/2: checked");
+        // The item its close took to Done says the same asker.
+        let item_closed = &s.task_events_of(item, "closed", 1).unwrap()[0];
+        assert_eq!(item_closed.body, "verified by T5/2: checked");
+
+        let loose = s.open_task(t, "other", false, 15).unwrap();
+        s.claim_task_done(loose, "done", 16).unwrap();
+        assert_eq!(s.task_events_of(loose, "done", 1).unwrap()[0].body, "done");
+        s.close_task(loose, Outcome::Failed, "", 17).unwrap();
+        assert_eq!(
+            s.task_events_of(loose, "closed", 1).unwrap()[0].body,
+            "failed"
+        );
+    }
+
+    /// A terminal marked as qass's carries the mark onto every task opened in it, by `new`
+    /// and by a begin, until it closes; a closed one is never marked.
+    #[test]
+    fn a_spawned_terminal_marks_every_task_opened_in_it_for_its_lifetime() {
+        let (mut s, ws, t) = store_with_terminal();
+        let mark = |s: &Store, task: i64| {
+            s.task_events_of(task, "spawned_by", 1)
+                .unwrap()
+                .first()
+                .map(|e| e.body.clone())
+        };
+        let before = s.open_task(t, "first", false, 10).unwrap();
+        assert!(s.mark_spawned(t, "qass").unwrap());
+        assert_eq!(mark(&s, before), None, "only tasks opened after the mark");
+        let new = s.open_task(t, "second", true, 11).unwrap();
+        assert_eq!(
+            mark(&s, new).as_deref(),
+            Some(format!("qass T{t}").as_str())
+        );
+        s.claim_task_done(new, "done", 12).unwrap();
+        let (begun, opened) = s.begin_task(t, "third", Some(13), 13).unwrap();
+        assert!(opened);
+        assert_eq!(
+            mark(&s, begun).as_deref(),
+            Some(format!("qass T{t}").as_str())
+        );
+        s.close_terminal(t, 14).unwrap();
+        let kept: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM spawned_terminal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 0, "cleared when the terminal closes");
+        assert!(!s.mark_spawned(t, "qass").unwrap(), "a closed terminal");
+        let next = s.create_terminal(t + 1, ws, "/tmp", "/bin/sh", 15).unwrap();
+        let other = s.open_task(next, "fourth", false, 16).unwrap();
+        assert_eq!(mark(&s, other), None);
     }
 }

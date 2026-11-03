@@ -353,6 +353,13 @@ impl Store {
                  terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE,
                  at INTEGER NOT NULL
              );
+             -- Who started a terminal, kept for its lifetime: `qass` for one that qass's
+             -- space opened with `qoop worktree new`. Cleared when the terminal closes, and
+             -- cascaded like the rest. New table, no version bump: an older binary ignores it.
+             CREATE TABLE IF NOT EXISTS spawned_terminal (
+                 terminal INTEGER PRIMARY KEY REFERENCES terminal(id) ON DELETE CASCADE,
+                 by TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS space_goal (
                  workspace INTEGER PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE,
                  goal TEXT NOT NULL,
@@ -862,6 +869,16 @@ impl Store {
         Ok(open)
     }
 
+    /// Mark an open terminal as started by `by` for its lifetime. Answers false when there is
+    /// no such open terminal.
+    pub fn mark_spawned(&self, id: i64, by: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "INSERT OR REPLACE INTO spawned_terminal (terminal, by) \
+             SELECT id, ?2 FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+            params![id, by],
+        )? == 1)
+    }
+
     /// Every parked terminal and when it was parked.
     pub fn parked(&self) -> Result<BTreeMap<i64, i64>, StoreError> {
         let mut stmt = self
@@ -1010,6 +1027,10 @@ impl Store {
             "DELETE FROM asleep_terminal WHERE terminal = ?1",
             params![id],
         )?;
+        tx.execute(
+            "DELETE FROM spawned_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
         task::abandon_open_tasks(&tx, &[id], now)?;
         tx.execute(
             "DELETE FROM applied WHERE idempotency_key = ?1 AND outcome = ?2",
@@ -1150,6 +1171,11 @@ impl Store {
         // Nor parked: nobody will answer it.
         tx.execute(
             "DELETE FROM parked_terminal WHERE terminal = ?1",
+            params![id],
+        )?;
+        // Nor anyone's spawn: the mark lasts the terminal's lifetime, no longer.
+        tx.execute(
+            "DELETE FROM spawned_terminal WHERE terminal = ?1",
             params![id],
         )?;
         // Nor working on anything: its id may be handed out again.

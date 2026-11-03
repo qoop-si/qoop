@@ -5689,8 +5689,13 @@ async fn handle_control(
         } => {
             // A begin, and a goal or a link that begins first, skip qass's own space, so they
             // need the space's name; so do the plan writes, which only qass may approve, mark
-            // or take with.
-            let space = match (&action, terminal.and_then(|t| terminals.workspace_of(t))) {
+            // or take with, and a start, which only qass's marks. A close is told the space of
+            // whoever asks for it, which its event records.
+            let asking = match &action {
+                crate::control::TaskOp::Close { actor, .. } => actor.as_ref().map(|a| a.terminal),
+                _ => terminal,
+            };
+            let space = match (&action, asking.and_then(|t| terminals.workspace_of(t))) {
                 (
                     crate::control::TaskOp::Begin
                     | crate::control::TaskOp::Goal { .. }
@@ -5698,9 +5703,42 @@ async fn handle_control(
                     | crate::control::TaskOp::PlanFile { .. }
                     | crate::control::TaskOp::Approve { .. }
                     | crate::control::TaskOp::ShowMe { .. }
-                    | crate::control::TaskOp::Next { .. },
+                    | crate::control::TaskOp::Next { .. }
+                    | crate::control::TaskOp::Spawned { .. }
+                    | crate::control::TaskOp::Close { .. },
                     Some(space),
                 ) => space_name(store, space).await,
+                _ => None,
+            };
+            // A done claim from its own terminal keeps where its work can be read again.
+            let record = match (&action, terminal, token.as_deref()) {
+                (crate::control::TaskOp::Done { .. }, Some(t), Some(k))
+                    if crate::tasks::admitted(agents, t, k) =>
+                {
+                    let program = agent_program(agents, t);
+                    // Read at the claim: once the task closes it no longer names its tab, and the
+                    // owner's word to keep qass off that tab must still hold. Unread counts as kept.
+                    let space = terminals.workspace_of(t);
+                    let skipped =
+                        store
+                            .run(|s| s.qass_skips())
+                            .await
+                            .map_or(true, |(spaces, tabs)| {
+                                tabs.contains(&i64::from(t))
+                                    || space.is_some_and(|w| spaces.contains(&w))
+                            });
+                    Some(
+                        crate::tasks::record(
+                            agent_dirs(),
+                            Some(t),
+                            skipped,
+                            program,
+                            terminals.session_of(t),
+                            terminals.cwd_of(t),
+                        )
+                        .await,
+                    )
+                }
                 _ => None,
             };
             // A link from a terminal keeps what its agent is called, for when it is gone.
@@ -5720,7 +5758,7 @@ async fn handle_control(
                     | crate::control::TaskOp::Close { .. }
             );
             let wrote = Box::pin(crate::tasks::write(
-                id, terminal, token, task, action, space, name, agents, store,
+                id, terminal, token, task, action, space, name, record, agents, store,
             ))
             .await;
             if ends_wait {

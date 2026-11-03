@@ -318,6 +318,9 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 the chat of an agent (or, with --child, of one of its\n\
                   \x20                 subagents), parsed from its own session file:\n\
                   \x20                 one row per message, tool call or note, newest last\n\
+                  \x20 qoop messages --task <id> [--skip N] [--limit N] [--json]\n\
+                  \x20                 the same chat of the session a task's done claim\n\
+                  \x20                 recorded, read with no terminal: its tab may be gone\n\
                   \x20 qoop messages detail <terminal> <tool_id> [--child ID] [--json]\n\
                   \x20                 the input and output of one tool call of that chat\n\
                   \x20 qoop context <target> [--last N] [--role user|assistant] [--lines N] [--json]\n\
@@ -1650,6 +1653,26 @@ pub(crate) fn qass_guard(target: &str) -> std::io::Result<()> {
     Err(std::io::Error::other(format!(
         "terminal {} is one the owner asked qass to leave alone: it is not yours to read or touch",
         row.terminal
+    )))
+}
+
+/// The same for a task whose tab is gone, by its space: refused when qass is the caller and the
+/// owner asked qass to leave that space alone. A store that cannot be read refuses nothing, as a
+/// listing that cannot be read above.
+pub(crate) fn qass_space_guard(space: i64) -> std::io::Result<()> {
+    if !qass::may_be_qass() {
+        return Ok(());
+    }
+    let skipped = paths::runtime_dir()
+        .ok()
+        .and_then(|dir| existing_store(&dir).ok().flatten())
+        .and_then(|store| store.qass_skips().ok())
+        .is_some_and(|(spaces, _)| spaces.contains(&space));
+    if !skipped || !qass::called_by_qass() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "space {space} is one the owner asked qass to leave alone: its tasks are not yours to read"
     )))
 }
 

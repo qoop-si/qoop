@@ -1173,6 +1173,18 @@ pub enum TaskOp {
     Close {
         outcome: TaskOutcome,
         reason: String,
+        /// Who asks: the caller's terminal and token, only recorded on the close (`qass`,
+        /// `T<n>/<generation>`, or `unknown` without them or when the token does not
+        /// match), never used to admit or refuse it. A daemon from before it ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Actor>,
+    },
+    /// The speaker started `terminal` (`qoop worktree new`): from qass's own space it is
+    /// marked `spawned_by` qass for its lifetime, and every task opened in it carries the
+    /// mark. From anywhere else nothing is written. A daemon from before it answers
+    /// `unknown variant`, which the caller ignores.
+    Spawned {
+        terminal: TerminalStream,
     },
     /// Put an item on a space's board: a task with no terminal, answered with its key. From
     /// anywhere, never in qass's own space.
@@ -1252,6 +1264,14 @@ pub enum TaskOp {
         name: String,
         stage: String,
     },
+}
+
+/// A caller named only to be recorded, never admitted by it: its terminal and that
+/// terminal's token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Actor {
+    pub terminal: TerminalStream,
+    pub token: String,
 }
 
 /// How a task is closed by a person or qass. Superseded happens to a task; nobody asks for

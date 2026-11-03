@@ -670,6 +670,7 @@ pub(crate) fn start(board: bool) -> std::io::Result<u64> {
             space: Some(SPACE.into()),
             command,
             typed,
+            spawned: false,
         };
         let mut opened = 0;
         supervise::open_terminal(&opts, |terminal| opened = terminal)?;
@@ -942,6 +943,7 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
         space: Some(SPACE.into()),
         command: page.iter().map(|w| w.to_string()).collect(),
         typed: None,
+        spawned: false,
     };
     let mut board = 0;
     supervise::open_terminal(&opts, |t| board = t)?;

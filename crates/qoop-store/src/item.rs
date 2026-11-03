@@ -305,10 +305,12 @@ fn only_abandoned_since(tx: &Connection, item: i64, reopened: i64) -> rusqlite::
 /// on it: no linked task still open (from before a reopen too), every task linked since the
 /// item's last reopen closed verified, no remote agent on it, every step ticked (none counts,
 /// as qass's rule has it). Anything else leaves the item
-/// for qass or the owner. Runs after the close, in its transaction.
+/// for qass or the owner. Runs after the close, in its transaction, and records the same
+/// asker (`by`) on the item's close.
 pub(crate) fn follow_last_agent(
     tx: &Connection,
     task: i64,
+    by: Option<&str>,
     reason: &str,
     now: i64,
 ) -> rusqlite::Result<()> {
@@ -352,7 +354,7 @@ pub(crate) fn follow_last_agent(
             return Ok(());
         }
     }
-    close(tx, item, Outcome::Verified, reason, now)
+    crate::task::close_as(tx, item, Outcome::Verified, by, reason, now)
 }
 
 /// Close a space's open items as abandoned, inside the transaction that removes it.
@@ -402,6 +404,23 @@ pub fn phase_of(steps: &[StepRow]) -> Option<(usize, usize, String)> {
         }
     }
     Some((at, of, name))
+}
+
+/// The real steps not ticked on the item `task` is linked to, as `<n>. <text>`; none when it
+/// is not linked.
+pub(crate) fn unticked(tx: &Connection, task: i64) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT n, text FROM task_step WHERE done_at IS NULL AND {REAL_STEP} \
+         AND task = (SELECT item FROM task_item WHERE task = ?1) ORDER BY n"
+    ))?;
+    stmt.query_map(params![task], |r| {
+        Ok(format!(
+            "{}. {}",
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?
+        ))
+    })?
+    .collect()
 }
 
 fn steps(tx: &Connection, item: i64) -> rusqlite::Result<Vec<StepRow>> {

@@ -7,7 +7,8 @@
 use std::io::Read;
 
 use qoop_runtime::control::{
-    ControlRequest, ControlResponse, ItemCardInfo, TaskEventInfo, TaskInfo, TaskOp, TaskOutcome,
+    Actor, ControlRequest, ControlResponse, ItemCardInfo, TaskEventInfo, TaskInfo, TaskOp,
+    TaskOutcome,
 };
 use qoop_runtime::paths;
 
@@ -434,15 +435,15 @@ fn unexpected(other: ControlResponse) -> std::io::Result<()> {
     )))
 }
 
-struct Found {
-    tasks: Vec<TaskInfo>,
-    events: Vec<TaskEventInfo>,
-    more: bool,
+pub(crate) struct Found {
+    pub(crate) tasks: Vec<TaskInfo>,
+    pub(crate) events: Vec<TaskEventInfo>,
+    pub(crate) more: bool,
     space: Option<String>,
     item: Option<Box<ItemCardInfo>>,
 }
 
-fn read(
+pub(crate) fn read(
     task: Option<i64>,
     before: Option<i64>,
     mine: bool,
@@ -734,11 +735,18 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 return Err(usage(USAGE));
             };
             let id = item(id)?;
+            // Who asks goes along apart from the task named: recorded on the close, never
+            // what decides which task is meant or whether it may be closed.
+            let actor = match here() {
+                (Some(terminal), Some(token)) => Some(Actor { terminal, token }),
+                _ => None,
+            };
             write(
                 Some(id),
                 TaskOp::Close {
                     outcome,
                     reason: reason.join(" "),
+                    actor,
                 },
             )
             .map(drop)

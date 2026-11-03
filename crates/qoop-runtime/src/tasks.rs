@@ -13,8 +13,8 @@ use qoop_store::{Outcome, TaskEventRow, TaskRow};
 
 use crate::agents::AgentRegistry;
 use crate::control::{
-    ControlResponse, ItemCardInfo, ItemEventInfo, StepInfo, TASK_REF_GOAL, Tab, TaskEventInfo,
-    TaskInfo, TaskOp, TaskOutcome, TaskRef, item_info, tab_of, task_status,
+    Actor, ControlResponse, ItemCardInfo, ItemEventInfo, StepInfo, TASK_REF_GOAL, Tab,
+    TaskEventInfo, TaskInfo, TaskOp, TaskOutcome, TaskRef, item_info, tab_of, task_status,
 };
 use crate::store::{HandleError, StoreHandle, now};
 
@@ -79,6 +79,79 @@ fn speaker(
     }
 }
 
+/// How long a done claim waits for its record: the session found within the first, git within
+/// the second. Their sum stays well under the 10 s a `qoop task` waits for its answer.
+const RECORD_LOCATE: std::time::Duration = std::time::Duration::from_secs(1);
+const RECORD_GIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a done claim's `record` event holds, as compact JSON: the claiming `terminal`, and
+/// `"skipped": true` when the owner had asked qass to leave that terminal or its space alone
+/// (`qoop messages --task` then keeps qass off it, after the tab is gone), the agent's
+/// `program` and its `session` id (what `qoop messages --task` finds the session by again),
+/// where the session was then (`source`, a `qoop_parsed::Source`, kept for the reader's
+/// information), and its checkout's `head` and whether that was `clean`. Each is left out
+/// when it is not known, never guessed, and finding them never fails the claim.
+pub(crate) async fn record(
+    dirs: Option<qoop_parsed::Dirs>,
+    terminal: Option<u32>,
+    skipped: bool,
+    program: Option<String>,
+    session: Option<String>,
+    cwd: Option<String>,
+) -> String {
+    let source = match (dirs, program.clone(), session.clone()) {
+        (Some(dirs), Some(program), Some(session)) => {
+            crate::blocking::chat(RECORD_LOCATE, move || {
+                qoop_parsed::locate_session(&program, &session, &dirs)
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        _ => None,
+    };
+    let (head, clean) = match cwd {
+        Some(cwd) => crate::blocking::probe_asked(
+            &cwd.clone(),
+            RECORD_GIT + std::time::Duration::from_millis(500),
+            move || crate::changes::head_and_clean(&cwd, RECORD_GIT),
+        )
+        .await
+        .unwrap_or((None, None)),
+        None => (None, None),
+    };
+    let mut record = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            record.insert(key.to_string(), value);
+        }
+    };
+    put("terminal", terminal.map(Into::into));
+    put("skipped", skipped.then_some(true.into()));
+    put("program", program.map(Into::into));
+    put("session", session.map(Into::into));
+    put("source", source.and_then(|s| serde_json::to_value(s).ok()));
+    put("head", head.map(Into::into));
+    put("clean", clean.map(Into::into));
+    serde_json::Value::Object(record).to_string()
+}
+
+/// Who asked for a close, as its event records it: `qass` for a terminal in qass's own space,
+/// `T<n>/<generation>` for any other whose token matches, else `unknown`. Never the owner by
+/// default: a caller with no identity is unknown.
+fn actor_label(agents: &AgentRegistry, actor: Option<&Actor>, space: Option<&str>) -> String {
+    let Some(actor) = actor.filter(|a| admitted(agents, a.terminal, &a.token)) else {
+        return "unknown".into();
+    };
+    if space == Some(QASS_SPACE) {
+        return "qass".into();
+    }
+    match agents.agent(actor.terminal) {
+        Some(agent) => format!("T{}/{}", actor.terminal, agent.belief.generation),
+        None => "unknown".into(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write(
     id: String,
@@ -88,6 +161,7 @@ pub(crate) async fn write(
     action: TaskOp,
     space: Option<String>,
     name: Option<String>,
+    record: Option<String>,
     agents: &AgentRegistry,
     store: &StoreHandle,
 ) -> ControlResponse {
@@ -152,6 +226,19 @@ pub(crate) async fn write(
                 }
                 written(id, item)
             }
+            Err(e) => store_failed(id, e),
+        };
+    }
+    // What qass starts is marked as qass's; a start from anywhere else writes nothing.
+    if let TaskOp::Spawned { terminal: started } = action {
+        if speaker.is_none() || space.as_deref() != Some(QASS_SPACE) {
+            return written(id, 0);
+        }
+        return match store
+            .run(move |s| s.mark_spawned(i64::from(started), QASS_SPACE))
+            .await
+        {
+            Ok(_) => written(id, 0),
             Err(e) => store_failed(id, e),
         };
     }
@@ -297,6 +384,11 @@ pub(crate) async fn write(
             (None, None) => Ok(None),
         })
         .await;
+    // Who asks for a close, recorded on it and nothing more.
+    let by = match &action {
+        TaskOp::Close { actor, .. } => Some(actor_label(agents, actor.as_ref(), space.as_deref())),
+        _ => None,
+    };
     let (task, home) = match target {
         Ok(Some(found)) => found,
         Ok(None) => {
@@ -332,13 +424,24 @@ pub(crate) async fn write(
             | TaskOp::Approve { .. }
             | TaskOp::ShowMe { .. }
             | TaskOp::Next { .. }
-            | TaskOp::LinkRemote { .. } => unreachable!("handled above"),
+            | TaskOp::LinkRemote { .. }
+            | TaskOp::Spawned { .. } => unreachable!("handled above"),
             TaskOp::Stage { stage } => s.set_task_stage(task, &stage, now),
             TaskOp::Goal { goal } => s.set_task_goal(task, &goal, now),
             TaskOp::Plan { text } => s.task_plan(task, &text, now).map(|()| false),
             TaskOp::Evidence { text } => s.task_evidence(task, &text, now).map(|()| false),
-            TaskOp::Done { summary } => s.claim_task_done(task, &summary, now).map(|()| true),
-            TaskOp::Close { outcome, reason } => {
+            TaskOp::Done { summary } => {
+                s.claim_task_done(task, &summary, now)?;
+                // After the claim and apart from it: a record that cannot be written never
+                // fails the claim.
+                if let Some(record) = &record {
+                    let _ = s.task_record(task, record, now);
+                }
+                Ok(true)
+            }
+            TaskOp::Close {
+                outcome, reason, ..
+            } => {
                 let outcome = match outcome {
                     TaskOutcome::Verified => Outcome::Verified,
                     TaskOutcome::Failed => Outcome::Failed,
@@ -354,7 +457,7 @@ pub(crate) async fn write(
                 } else {
                     "--verified"
                 };
-                match s.close_task(task, outcome, &reason, now) {
+                match s.close_task_by(task, outcome, by.as_deref(), &reason, now) {
                     Err(qoop_store::StoreError::Task(qoop_store::TaskError::Closed(t))) => {
                         match s.open_item_key(t)? {
                             Some(key) => {
@@ -942,6 +1045,7 @@ mod tests {
                 TaskOp::Link { item },
                 space.map(String::from),
                 Some("worker".to_string()),
+                None,
                 &agents,
                 &store,
             )
@@ -995,6 +1099,7 @@ mod tests {
             TaskOp::Link { item },
             Some("work".into()),
             Some("worker".into()),
+            None,
             &agents,
             &store,
         )
@@ -1143,5 +1248,213 @@ mod tests {
         let (all, cut) = fit(rows.clone(), &mut plenty);
         assert_eq!(all.len(), 10);
         assert!(!cut);
+    }
+
+    /// A done claim's record keeps the program, the session id and where it was, and the
+    /// checkout's `HEAD` and whether it was clean at the claim; what is not known is left out,
+    /// never guessed. Untracked files count though the checkout's config hides them, a
+    /// submodule moved is a change, and a checkout with submodules is never called clean.
+    #[tokio::test]
+    async fn a_record_keeps_the_checkouts_head_and_whether_it_was_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |at: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo = dir.path().join("repo");
+        let sub = dir.path().join("sub");
+        for at in [&repo, &sub] {
+            std::fs::create_dir(at).unwrap();
+            git(at, &["init", "-q"]);
+            std::fs::write(at.join("a"), "a").unwrap();
+            git(at, &["add", "a"]);
+            git(at, &["commit", "-qm", "a"]);
+        }
+        git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        let cwd = Some(repo.display().to_string());
+        let read = |r: String| serde_json::from_str::<serde_json::Value>(&r).unwrap();
+
+        // A Claude transcript under a `projects` directory of the dirs given.
+        let home = dir.path().join("home");
+        let project = home.join(".claude/projects/-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
+        let file = project.join("s1.jsonl").canonicalize().unwrap();
+        let dirs = qoop_parsed::Dirs::under(&home, None, None);
+        let clean = read(
+            record(
+                Some(dirs),
+                Some(4),
+                true,
+                Some("claude".into()),
+                Some("s1".into()),
+                cwd.clone(),
+            )
+            .await,
+        );
+        assert_eq!(
+            clean,
+            serde_json::json!({"terminal": 4, "skipped": true, "program": "claude",
+                "session": "s1", "source": {"file": file}, "head": head, "clean": true})
+        );
+        std::fs::write(repo.join("b"), "untracked").unwrap();
+        let dirty = read(record(None, None, false, None, None, cwd.clone()).await);
+        assert_eq!(dirty, serde_json::json!({"head": head, "clean": false}));
+        std::fs::remove_file(repo.join("b")).unwrap();
+
+        let sub_url = sub.display().to_string();
+        git(&repo, &["submodule", "add", "-q", &sub_url, "sub"]);
+        git(&repo, &["commit", "-qm", "sub"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        let with_sub = read(record(None, None, false, None, None, cwd.clone()).await);
+        assert_eq!(
+            with_sub,
+            serde_json::json!({"head": head}),
+            "not called clean"
+        );
+        let inner = repo.join("sub");
+        std::fs::write(inner.join("c"), "c").unwrap();
+        git(&inner, &["add", "c"]);
+        git(&inner, &["commit", "-qm", "c"]);
+        let moved = read(record(None, None, false, None, None, cwd).await);
+        assert_eq!(moved, serde_json::json!({"head": head, "clean": false}));
+
+        let nowhere = read(
+            record(
+                None,
+                None,
+                false,
+                None,
+                None,
+                Some(dir.path().display().to_string()),
+            )
+            .await,
+        );
+        assert_eq!(nowhere, serde_json::json!({}), "no checkout, nothing said");
+    }
+
+    /// A named close records who asked and nothing else changes: qass's terminal reads `qass`,
+    /// another with its own token `T<n>/<generation>`, and one with no identity or a wrong
+    /// token `unknown`; each still closes the task, whoever's it is.
+    #[tokio::test]
+    async fn a_close_records_who_asked_and_admits_as_before() {
+        let agents = AgentRegistry::new().expect("registry");
+        let mut tokens = Vec::new();
+        for t in [1, 2] {
+            let token = crate::agents::mint_token(t);
+            agents.register(t, TerminalId::new(t.to_string()), token.clone());
+            tokens.push(token.as_str().to_string());
+        }
+        let generation = agents.agent(2).unwrap().belief.generation;
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let store = StoreHandle::new(s);
+        let actor = |terminal: u32, token: &str| {
+            Some(Actor {
+                terminal,
+                token: token.to_string(),
+            })
+        };
+        let cases = [
+            (actor(1, &tokens[0]), Some(QASS_SPACE), "qass".to_string()),
+            (
+                actor(2, &tokens[1]),
+                Some("work"),
+                format!("T2/{generation}"),
+            ),
+            (actor(2, &tokens[0]), Some("work"), "unknown".to_string()),
+            (None, None, "unknown".to_string()),
+        ];
+        for (n, (actor, space, by)) in cases.into_iter().enumerate() {
+            let task = store
+                .run(move |s| s.open_task(1, &format!("part {n}"), true, 2))
+                .await
+                .unwrap();
+            let answer = write(
+                "w".into(),
+                None,
+                None,
+                Some(task),
+                TaskOp::Close {
+                    outcome: crate::control::TaskOutcome::Verified,
+                    reason: "checked".into(),
+                    actor,
+                },
+                space.map(String::from),
+                None,
+                None,
+                &agents,
+                &store,
+            )
+            .await;
+            assert!(
+                matches!(answer, ControlResponse::TaskWritten { .. }),
+                "{answer:?}"
+            );
+            let closed = store
+                .run(move |s| s.task_events_of(task, "closed", 1))
+                .await
+                .unwrap();
+            assert_eq!(closed[0].body, format!("verified by {by}: checked"));
+        }
+    }
+
+    /// `qoop worktree new` from qass's space marks the terminal it opened; from any other
+    /// space it marks nothing, and says nothing wrong either.
+    #[tokio::test]
+    async fn only_qass_marks_the_terminal_it_starts() {
+        let agents = AgentRegistry::new().expect("registry");
+        let token = crate::agents::mint_token(1);
+        agents.register(1, TerminalId::new("1"), token.clone());
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let store = StoreHandle::new(s);
+        let mark = |space: &str| {
+            write(
+                "w".into(),
+                Some(1),
+                Some(token.as_str().to_string()),
+                None,
+                TaskOp::Spawned { terminal: 7 },
+                Some(space.to_string()),
+                None,
+                None,
+                &agents,
+                &store,
+            )
+        };
+        let opened = |goal: &'static str| {
+            store.run(move |s| {
+                let task = s.open_task(7, goal, true, 2)?;
+                s.task_events_of(task, "spawned_by", 1)
+            })
+        };
+        assert!(matches!(
+            mark("work").await,
+            ControlResponse::TaskWritten { .. }
+        ));
+        assert!(opened("a").await.unwrap().is_empty(), "not qass's");
+        assert!(matches!(
+            mark(QASS_SPACE).await,
+            ControlResponse::TaskWritten { .. }
+        ));
+        assert_eq!(opened("b").await.unwrap()[0].body, "qass T7");
     }
 }

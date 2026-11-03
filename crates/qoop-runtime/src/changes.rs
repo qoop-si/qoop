@@ -205,12 +205,12 @@ fn filters_in(config: &[u8]) -> Vec<String> {
     names
 }
 
-/// The checkout `cwd` is in, its config read.
-fn open(cwd: &str) -> Result<Git, String> {
+/// The checkout `cwd` is in, its config read, every command of it done `within`.
+fn open(cwd: &str, within: Duration) -> Result<Git, String> {
     let mut git = Git {
         root: PathBuf::from(cwd),
         filters: Vec::new(),
-        by: Instant::now() + GIT_WITHIN,
+        by: Instant::now() + within,
     };
     // `GIT_CONFIG_COUNT` came in 2.31: an older git ignores it and would run what it turns off.
     let version = git.line(&["--version"]).unwrap_or_default();
@@ -350,7 +350,7 @@ struct Looked {
 }
 
 fn look(cwd: &str) -> Result<Looked, String> {
-    let git = open(cwd)?;
+    let git = open(cwd, GIT_WITHIN)?;
     let branch = git.line(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
     let base = base_of(&git);
     let from = from_of(&git, &base);
@@ -369,6 +369,31 @@ fn look(cwd: &str) -> Result<Looked, String> {
         cut: cut || more,
         repo,
     })
+}
+
+/// The checkout `cwd` is in: its `HEAD` commit, and whether nothing is changed or untracked,
+/// all of it `within`. Each is `None` when git could not say, never guessed. Untracked files
+/// count whatever the checkout's config says. A submodule moved to another commit is a change;
+/// the inside of a submodule is not looked into (git would run in a checkout whose config was
+/// not read), so a checkout with submodules and nothing else changed is not called clean.
+pub(crate) fn head_and_clean(cwd: &str, within: Duration) -> (Option<String>, Option<bool>) {
+    let Ok(git) = open(cwd, within) else {
+        return (None, None);
+    };
+    let head = git.line(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    let args = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=dirty",
+    ];
+    let clean = match git.guarded(&args) {
+        Ok(Some((out, false))) if !out.is_empty() => Some(false),
+        Ok(Some((_, false))) => (!git.root.join(".gitmodules").exists()).then_some(true),
+        _ => None,
+    };
+    (head, clean)
 }
 
 /// `gh` on the daemon's PATH, else where Homebrew puts it: a daemon started by a service may

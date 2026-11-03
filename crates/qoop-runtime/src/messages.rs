@@ -46,7 +46,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 const TICK_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The most items one page may ask for; the page's own byte budget cuts it shorter.
-const MAX_LIMIT: u32 = 200;
+pub const MAX_LIMIT: u32 = 200;
 
 /// The default and the largest cut of one side of a tool call.
 const DETAIL_DEFAULT: u32 = 64 * 1024;

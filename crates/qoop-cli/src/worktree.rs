@@ -433,6 +433,7 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     println!("worktree={} branch={branch}", path.display());
     new.cwd = Some(path);
     new.name = new.name.or_else(|| Some(branch.clone()));
+    new.spawned = true;
     supervise::open_terminal(&new, |terminal| println!("terminal={terminal}"))
 }
 

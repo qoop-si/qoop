@@ -182,6 +182,7 @@ async fn an_index_hears_what_a_row_shows_and_nothing_else() {
         TaskOp::Close {
             outcome: TaskOutcome::Verified,
             reason: String::new(),
+            actor: None,
         },
     )
     .await;
@@ -580,4 +581,192 @@ async fn a_space_removed_and_a_tab_closed_are_board_news() {
         assert!(Instant::now() < deadline, "its agent never read as ended");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A close named by id from qass's terminal records `qass`, the space read by the daemon from
+/// the asker's terminal; the same close with no asker records `unknown`, and both close.
+#[tokio::test]
+async fn a_close_from_qass_space_reads_qass_on_its_event() {
+    let d = TestDaemon::start().await;
+    let worker = d.terminals().streams()[0];
+    let token_of = |t: u32| {
+        d.agents_arc()
+            .token_of(t)
+            .expect("a token")
+            .as_str()
+            .to_string()
+    };
+    let mut c = d.attach("qoop-task").await;
+    let space = match c
+        .control(
+            &ControlRequest::CreateWorkspace {
+                id: "s".into(),
+                name: "qass".into(),
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("an answer")
+    {
+        ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+        other => panic!("no space: {other:?}"),
+    };
+    let qass = match c
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "t".into(),
+                cwd: None,
+                workspace: Some(space),
+                name: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("an answer")
+    {
+        ControlResponse::TerminalCreated { terminal, .. } => terminal,
+        other => panic!("no terminal: {other:?}"),
+    };
+    for (n, actor, by) in [
+        (
+            0,
+            Some(qoop_runtime::control::Actor {
+                terminal: qass,
+                token: token_of(qass),
+            }),
+            "qass",
+        ),
+        (1, None, "unknown"),
+    ] {
+        let opened = write(
+            &mut c,
+            Some(worker),
+            Some(token_of(worker)),
+            None,
+            TaskOp::New {
+                goal: format!("part {n}"),
+                replace: true,
+            },
+        )
+        .await;
+        let ControlResponse::TaskWritten { task, .. } = opened else {
+            panic!("not opened: {opened:?}")
+        };
+        let closed = write(
+            &mut c,
+            None,
+            None,
+            Some(task),
+            TaskOp::Close {
+                outcome: TaskOutcome::Verified,
+                reason: "checked".into(),
+                actor,
+            },
+        )
+        .await;
+        assert!(
+            matches!(closed, ControlResponse::TaskWritten { .. }),
+            "{closed:?}"
+        );
+        let read = c
+            .control(
+                &ControlRequest::TaskRead {
+                    id: "r".into(),
+                    board: false,
+                    task: Some(task),
+                    terminal: None,
+                    token: None,
+                    before: None,
+                },
+                PATIENCE,
+            )
+            .await
+            .expect("an answer");
+        let ControlResponse::Tasks { events, .. } = read else {
+            panic!("not read: {read:?}")
+        };
+        assert_eq!(events[0].kind, "closed");
+        assert_eq!(events[0].body, format!("verified by {by}: checked"));
+    }
+}
+
+/// A claim's record names its terminal, and says `skipped` when the owner had asked qass to
+/// leave that terminal alone at the claim: what keeps qass off its session once the tab is
+/// gone and the task no longer names it.
+#[tokio::test]
+async fn a_claims_record_keeps_what_the_owner_kept_from_qass() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .agents_arc()
+        .token_of(terminal)
+        .expect("a token")
+        .as_str()
+        .to_string();
+    let mut c = d.attach("qoop-task").await;
+    let workspace = match c
+        .control(&ControlRequest::ListWorkspaces { id: "l".into() }, PATIENCE)
+        .await
+        .expect("an answer")
+    {
+        ControlResponse::Workspaces { workspaces, .. } => workspaces[0].id,
+        other => panic!("no spaces: {other:?}"),
+    };
+    let open = claim(&mut c, terminal, &token, 0).await;
+    assert_eq!(open["terminal"], terminal);
+    assert!(open.get("skipped").is_none(), "{open}");
+    let skip = c
+        .control(
+            &ControlRequest::SetQassSkip {
+                id: "k".into(),
+                workspace,
+                terminal: Some(terminal),
+                on: true,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("an answer");
+    assert!(!matches!(skip, ControlResponse::Failed { .. }), "{skip:?}");
+    let kept = claim(&mut c, terminal, &token, 1).await;
+    assert_eq!(kept["skipped"], true, "{kept}");
+}
+
+/// Open a task in `terminal`, claim it done, and answer its `record`.
+async fn claim(c: &mut TestClient, terminal: u32, token: &str, n: usize) -> serde_json::Value {
+    let me = (Some(terminal), Some(token.to_string()));
+    let new = TaskOp::New {
+        goal: format!("part {n}"),
+        replace: true,
+    };
+    let opened = write(c, me.0, me.1.clone(), None, new).await;
+    let ControlResponse::TaskWritten { task, .. } = opened else {
+        panic!("not opened: {opened:?}")
+    };
+    let done = TaskOp::Done {
+        summary: "done".into(),
+    };
+    write(c, me.0, me.1.clone(), None, done).await;
+    let read = c
+        .control(
+            &ControlRequest::TaskRead {
+                id: "r".into(),
+                board: false,
+                task: Some(task),
+                terminal: None,
+                token: None,
+                before: None,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("an answer");
+    let ControlResponse::Tasks { events, .. } = read else {
+        panic!("not read: {read:?}")
+    };
+    let record = events
+        .iter()
+        .find(|e| e.kind == "record")
+        .expect("a record");
+    serde_json::from_str(&record.body).expect("json")
 }

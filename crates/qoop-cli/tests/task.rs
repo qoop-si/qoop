@@ -193,9 +193,20 @@ $Q task show --json > show.json 2>&1"#,
         .iter()
         .map(|e| e["kind"].as_str().unwrap())
         .collect();
-    assert_eq!(kinds, ["done", "evidence", "stage", "plan", "opened"]);
+    // The claim keeps a record of where its work can be read again: here a plain shell, so
+    // no agent and no session are named, never guessed.
+    assert_eq!(
+        kinds,
+        ["record", "done", "evidence", "stage", "plan", "opened"]
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(show["events"][0]["body"].as_str().unwrap()).unwrap();
     assert!(
-        show["events"][1]["body"]
+        record.is_object() && record.get("program").is_none() && record.get("source").is_none(),
+        "{record}"
+    );
+    assert!(
+        show["events"][2]["body"]
             .as_str()
             .unwrap()
             .contains("--workspace"),
@@ -223,6 +234,11 @@ $Q task show --json > show.json 2>&1"#,
     let (ok, out, _) = daemon.run(&["task", "show", "1"]);
     assert!(ok);
     assert!(out.contains("(verified)"), "{out}");
+    // Asked from no qoop terminal: who asked is unknown, never taken for the owner.
+    assert!(
+        out.contains("closed: verified by unknown: checked the test"),
+        "{out}"
+    );
     let (_, out, _) = daemon.run(&["task", "ls"]);
     assert!(out.contains("no open task"), "{out}");
     let (ok, _, err) = daemon.run(&["task", "close", "1", "--failed"]);
@@ -1596,5 +1612,59 @@ $Q task show-me {key} > showme.out 2>&1"#
         read(&work, "take.out").starts_with("none"),
         "{}",
         read(&work, "take.out")
+    );
+}
+
+/// `qoop worktree new` run in a terminal of qass's space marks the terminal it opens before its
+/// command is typed: a command that opens a task at once finds the mark already there.
+#[test]
+fn a_command_qass_starts_carries_the_mark_from_its_first_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(&dir);
+    let (ok, out, err) = daemon.run(&["new", "--space", "qass"]);
+    assert!(ok, "qoop new: {err}");
+    let qass = out.trim().to_string();
+    // Typed once its shell has drawn its prompt, as `qoop new -- cmd` waits for it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while daemon.run(&["read", &qass]).1.trim().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the shell in {qass} drew nothing"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // In a subshell: the script's own `touch finished` runs where it started.
+    let work = daemon.inside(
+        &qass,
+        "spawner",
+        r#"(git init -q repo && cd repo && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m a
+$Q worktree new child -- "$Q" task new 'first thing' > ../new.out 2>&1)"#,
+    );
+    let printed = read(&work, "new.out");
+    let child = printed
+        .lines()
+        .find_map(|l| l.strip_prefix("terminal="))
+        .unwrap_or_else(|| panic!("no terminal: {printed}"))
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let show = loop {
+        let (ok, out, _) = daemon.run(&["task", "show", "1", "--json"]);
+        if ok {
+            break out;
+        }
+        assert!(Instant::now() < deadline, "the child opened no task");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let show: serde_json::Value = serde_json::from_str(&show).expect("json");
+    let marked = show["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "spawned_by")
+        .map(|e| e["body"].clone());
+    assert_eq!(
+        marked,
+        Some(serde_json::Value::from(format!("qass T{child}"))),
+        "{show}"
     );
 }

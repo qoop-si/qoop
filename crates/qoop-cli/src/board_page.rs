@@ -1362,6 +1362,7 @@ impl Page {
                 TaskOp::Close {
                     outcome: TaskOutcome::Verified,
                     reason: "moved to Done on the board".into(),
+                    actor: None,
                 },
                 format!("{key} to done: closed verified"),
             ),

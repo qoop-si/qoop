@@ -1081,6 +1081,10 @@ pub(crate) struct NewOpts {
     /// A command line typed as written, ahead of `command`'s quoted words: a person's own
     /// launcher line from `[agents]`, which may hold quotes or an assignment.
     pub(crate) typed: Option<String>,
+    /// Say, before anything is typed, that the terminal this runs in started it (`qoop worktree
+    /// new`): the daemon marks it as qass's when that is qass's space, so a task its command
+    /// opens at once already carries the mark.
+    pub(crate) spawned: bool,
 }
 
 const NEW_USAGE: &str =
@@ -1637,6 +1641,20 @@ pub(crate) fn open_terminal(opts: &NewOpts, announce: impl FnOnce(u32)) -> std::
             _ => return Err(std::io::Error::other("unexpected answer to a create")),
         };
         announce(terminal);
+        // Never in the way of the start: a daemon that cannot mark it is not asked again.
+        if opts.spawned
+            && let (Some(by), Some(token)) = crate::task::here()
+        {
+            let _ = link
+                .ask(&ControlRequest::TaskWrite {
+                    id: super::request_id("spawned"),
+                    terminal: Some(by),
+                    token: Some(token),
+                    task: None,
+                    action: qoop_runtime::control::TaskOp::Spawned { terminal },
+                })
+                .await;
+        }
         if opts.command.is_empty() && opts.typed.is_none() {
             return Ok(());
         }
