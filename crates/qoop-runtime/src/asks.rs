@@ -368,6 +368,15 @@ pub(crate) fn asks_owner(line: &str) -> bool {
     )
 }
 
+/// Whether the end of a turn waits on the owner: its last paragraph asks him something
+/// ([`asks_owner`]) and none of the agent's sub-agents still runs. One that ends with its
+/// sub-agents at work is woken by them, so a question there was put to them (a reviewer it
+/// briefed), not to him; a question for him is still there at the turn that ends once they are
+/// done. Shells do not count: a dev server never ends, and would keep him from ever being asked.
+pub(crate) fn turn_asks_him(label: Option<&str>, subagents_running: usize) -> bool {
+    subagents_running == 0 && label.is_some_and(asks_owner)
+}
+
 /// Whether a prompt is one nobody typed: the harness's notice that the agent's own background
 /// work ended, or another agent's message. Neither answers a question the agent left him, nor
 /// does qass's `While E7 waits on the owner: ...`, which sets it to the work the question does

@@ -5496,14 +5496,16 @@ async fn handle_control(
                             }
                         }
                         // A turn's end carries its last line; it is the turn's question only when
-                        // it asks him something. Masked and cut like any label: a token in the
+                        // it waits on him (`turn_asks_him`: it asks him something and none of its
+                        // sub-agents still runs). Masked and cut like any label: a token in the
                         // question never reaches the card or the phone.
                         let label = if kind == "done" {
-                            let asks = label.as_deref().is_some_and(crate::asks::asks_owner);
+                            let running = agents.hooked_subagents_of(terminal);
+                            let asks = crate::asks::turn_asks_him(label.as_deref(), running);
                             // The verdict and nothing of the text, for finding a turn the
                             // reader got wrong without keeping what the agent said.
                             crate::say!(
-                                "qoopd: terminal {terminal} ended its turn; its label asks him: {asks}"
+                                "qoopd: terminal {terminal} ended its turn; its label asks him: {asks} (sub-agents running: {running})"
                             );
                             label
                                 .filter(|_| asks)

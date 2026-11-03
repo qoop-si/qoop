@@ -336,6 +336,19 @@ session = str(payload.get("session_id") or "")
 if session and (len(session) > 128 or not all(c.isalnum() or c in "-_." for c in session)):
     session = ""
 
+# The turn is over: a subagent missing from its own list of what still runs has ended, even
+# when its end never came. Before the report: the daemon reads a turn's end as a question for
+# the owner only when none of the agent's sub-agents still runs, so the count it reads must be
+# this turn's own.
+tasks = payload.get("background_tasks")
+if name in ("Stop", "StopFailure") and isinstance(tasks, list):
+    running = [
+        str(t.get("id")) for t in tasks
+        if isinstance(t, dict) and t.get("type") == "subagent"
+        and t.get("status") == "running" and t.get("id")
+    ]
+    subagents("--subagents", ",".join(running))
+
 args = ["qoop", "hook-report", "--agent", "claude", "--state", state]
 if flags:
     args.append(flags)
@@ -350,16 +363,6 @@ if state:
         subprocess.run(args, timeout=5, capture_output=True)
     except Exception:
         pass
-# The turn is over: a subagent missing from its own list of what still runs has ended, even
-# when its end never came. After the report, so the state is never late for it.
-tasks = payload.get("background_tasks")
-if name in ("Stop", "StopFailure") and isinstance(tasks, list):
-    running = [
-        str(t.get("id")) for t in tasks
-        if isinstance(t, dict) and t.get("type") == "subagent"
-        and t.get("status") == "running" and t.get("id")
-    ]
-    subagents("--subagents", ",".join(running))
 # Mark or compare the turn after the report, so the state never waits on its git calls.
 turn(payload, "UserPromptSubmit", "Stop")
 

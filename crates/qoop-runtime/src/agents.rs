@@ -791,6 +791,18 @@ impl AgentRegistry {
                 (a.background_tasks + subagents(a), subagents(a))
             })
     }
+
+    /// The sub-agents the agent's own hooks say still run, without the screen's count as a
+    /// floor: a turn end is judged on this, since Claude's own list at its `Stop` (sent before
+    /// the state) is the truth there, and a screen read from earlier in the turn is not.
+    /// Agents read only from the screen send no question with their turn end.
+    pub fn hooked_subagents_of(&self, stream: u32) -> usize {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .map_or(0, |a| a.subagents.len())
+    }
 }
 
 /// How many sub-agents an agent runs: what its hooks said started and has not ended, or the
@@ -2466,6 +2478,65 @@ mod tests {
         assert!(r.agent(1).unwrap().seen.len() <= SEEN_LEADERS);
         r.terminals.lock().unwrap().get_mut(&1).unwrap().leader = Some(Pid(7));
         assert_eq!(seen(&r), None, "a leader this daemon did not see come");
+    }
+
+    /// The three turns that drafted W692, W702 and W705 on 2026-11-03 ended on a question the
+    /// agent had put to its reviewer sub-agents, each still running: none waits on the owner.
+    /// The same words with no sub-agent at work do.
+    #[test]
+    fn a_turn_ending_while_its_sub_agents_run_asks_him_nothing() {
+        use crate::control::SubagentChange::{Ended, Started};
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
+            program: "claude".into(),
+            generation: GenerationId::FIRST,
+            agent: true,
+        };
+        let turns = [
+            (
+                "W692",
+                "a0000000000000001",
+                "Did who may close a task change? A worker on its own ... do the board, doctor, phone and `report.py` that read it break?",
+            ),
+            (
+                "W702",
+                "a0000000000000002",
+                "1. **The root cause of the rise in wakes:** Is the rise real ... can it create the `play` file and run any code?",
+            ),
+            (
+                "W705",
+                "a0000000000000003",
+                "Two sub-agents are checking the root fix. I asked one to look at ... . Does this undo the \"run the stuck work\" aim of `abc1234`?",
+            ),
+        ];
+        for (card, reviewer, label) in turns {
+            r.note_subagents(1, Started(reviewer.into()));
+            let running = r.hooked_subagents_of(1);
+            assert_eq!(running, 1, "{card}: its reviewer runs");
+            assert!(
+                !crate::asks::turn_asks_him(Some(label), running),
+                "{card}: a question to its own reviewer is not his"
+            );
+            r.note_subagents(1, Ended(reviewer.into()));
+            let running = r.hooked_subagents_of(1);
+            assert!(
+                crate::asks::turn_asks_him(Some(label), running),
+                "{card}: the same question with nothing of its own at work is his"
+            );
+        }
+        // A shell left running (a dev server) never keeps a question from him, nor does a
+        // screen that listed a background agent earlier in the turn once the turn's own list
+        // says none runs.
+        r.note_background(1, 1, 1);
+        assert_eq!(
+            r.background_of(1),
+            (2, 1),
+            "the row still shows what the screen listed"
+        );
+        let running = r.hooked_subagents_of(1);
+        assert_eq!(running, 0);
+        assert!(crate::asks::turn_asks_him(Some("Merge it now?"), running));
     }
 
     /// Sub-agents a hook names are counted by id beside the agent, with what its screen lists

@@ -3043,7 +3043,8 @@ mod tests {
             ),
             "hook-report --subagent-end a1",
         );
-        // Claude's turn ends with its own list: running sub-agents only, shells left out.
+        // Claude's turn ends with its own list: running sub-agents only, shells left out, sent
+        // before the state so the daemon judges the turn's end on this turn's own count.
         let said = calls(
             "claude",
             "",
@@ -3053,8 +3054,8 @@ mod tests {
                 {"id":"b1","type":"shell","status":"running"},
                 {"id":"a4","type":"subagent","status":"running"}]}"#,
         );
-        assert!(said[0].starts_with("hook-report --state idle"), "{said:?}");
-        assert_eq!(said[1], "hook-report --subagents a2,a4", "{said:?}");
+        assert_eq!(said[0], "hook-report --subagents a2,a4", "{said:?}");
+        assert!(said[1].starts_with("hook-report --state idle"), "{said:?}");
         let said = calls("claude", "", r#"{"hook_event_name":"Stop"}"#);
         assert_eq!(
             said.len(),
@@ -3073,7 +3074,7 @@ mod tests {
             "",
             r#"{"hook_event_name":"Stop","background_tasks":[7,{"id":3,"type":"subagent","status":"running"}]}"#,
         );
-        assert_eq!(said[1], "hook-report --subagents 3", "{said:?}");
+        assert_eq!(said[0], "hook-report --subagents 3", "{said:?}");
 
         only(
             calls(
