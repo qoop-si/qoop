@@ -10,9 +10,10 @@
     "allow": [
       "Read", "Glob", "Grep", "TodoWrite",
       "Edit(/@LEARN@/**)", "Edit(/@QASS_CONFIG@/owner.md)", "Edit(/@QASS_DATA@/learn.jsonl)",
-      "Bash(qoop history:*)", "Bash(qoop show:*)", "Bash(qoop close:*)", "Bash(date:*)"
+      "Bash(qoop history:*)", "Bash(qoop show:*)", "Bash(qoop close:*)", "Bash(date:*)", "Bash(./replay)"
     ],
     "deny": [
+      "Edit(/@LEARN@/replay)", "Edit(/@LEARN@/replay.jsonl)",
       "mcp__*", "Agent", "Skill", "Monitor", "WebFetch", "WebSearch", "NotebookEdit", "Artifact", "ArtifactComments",
       "ArtifactData", "Workflow", "CronCreate", "CronDelete", "CronList", "DesignSync", "EnterPlanMode",
       "ExitPlanMode", "EnterWorktree", "ExitWorktree", "PublishPlugin", "PushNotification", "RemoteTrigger",

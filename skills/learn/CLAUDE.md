@@ -9,6 +9,8 @@ Files:
 - `@QASS_CONFIG@/owner.md`: the learned rules every agent is handed by `qoop task rules`.
 - `@QASS_DATA@/learn.jsonl`: one line of counts per run.
 - `last-run` (this folder): unix seconds of the last run; `classes/`, `reports/`, `history/` here.
+- `replay` (this folder, only if he made one; qoop never does): his numbers, one line a night in
+  `replay.jsonl` here. Both are his: run `replay`, read `replay.jsonl`, never write either.
 
 ## 1. Read
 
@@ -16,11 +18,15 @@ Files:
    (the first run sets the baseline).
    `qoop history --since <since> --json --out scratch/said-<cutoff>.jsonl` (a new file), then Read
    it: every message he
-   typed to an agent since then, with time, session, cwd, branch and `repo` (owner/name). Nothing: write
-   the cutoff to `last-run`, `qoop close "$QOOP_TERMINAL"`, stop.
+   typed to an agent since then, with time, session, cwd, branch and `repo` (owner/name). Nothing and
+   no `replay` here: write the cutoff to `last-run`, `qoop close "$QOOP_TERMINAL"`, stop. Nothing with
+   `replay`: do item 3 of this list (`./replay`), then section 5 only.
 2. The rules already written: `owner.md`, `~/.claude/CLAUDE.md`, and for each repository a message
    came from (its cwd's git root): `CLAUDE.md`, `AGENTS.md`, `.claude/CLAUDE.md`, `.claude/rules/*.md`.
    Read only; never edit them.
+3. `replay` here: run exactly `./replay`. It prints one JSON line and adds it to `replay.jsonl`. No
+   line, or it failed: do not read `replay.jsonl`, and send no numbers. Else Read `replay.jsonl`; per
+   date of `at`, only that date's newest line counts.
 
 ## 2. Sort each message (classifier v1)
 
@@ -68,7 +74,7 @@ the instruction it gives or repeats, in English, for `rule` and `repeat`).
   `{"date","classifier":"v1","messages","approve","repeat","rule","state","task","other","added","moved","removed","needs_word","share_approve","share_repeat"}`
   (shares are approve / messages and repeat / messages, two decimals).
 
-## 5. Tell him, only when something changed
+## 5. Tell him, only when something changed or `./replay` printed a line
 
 `reports/<YYYY-MM-DD>.md`, short, in the language most of his messages are in, no headings beyond
 these (the template is English; write it in his language):
@@ -82,10 +88,15 @@ Removed: <removed, with why>
 Needs your word: <n>. <rule> "<quote>": say "learn keep <n>"
 Repeats: approvals <share_approve as %> (first run <baseline>%), written rules said again <share_repeat as %> (first run <baseline>%)
 To remove a rule, tell qass: "learn drop <n>"
+Numbers: <each over_target key: its numbers value tonight (the date before), or none over target>
+Needs a check in code: <each key in over_target on 3 or more of the last 7 dates, or nothing>
 ```
 
+The last two lines only when `./replay` printed one; a night with no messages has the first line and
+them only. A number under "Needs a check in code" is for code to fix: never a rule in `owner.md`.
+
 `qoop show reports/<date>.md --note "qass learned <n> rules"`. Nothing added, moved, removed or
-needing his word: no report.
+needing his word, and no `./replay` line: no report.
 
 ## 6. End
 
