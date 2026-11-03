@@ -222,6 +222,9 @@ const RELOOK: std::time::Duration = std::time::Duration::from_secs(1);
 /// answer that ends a park.
 const ANSWER_WINDOW_SECS: i64 = 30;
 
+/// A terminal's stop count, and its newest stop's time and generation while no work came after it.
+type Stops = (u64, Option<(i64, GenerationId)>);
+
 pub struct AgentRegistry {
     watch: ProcWatch,
     /// Terminals whose agent has moved, for anyone drawing an index.
@@ -266,6 +269,11 @@ pub struct AgentRegistry {
     /// few dozen tool calls push the prompt out of it. What a task opened by qoop is named
     /// after, and how it tells a new request from the one a done claim answered.
     prompts: Mutex<BTreeMap<u32, (String, i64)>>,
+    /// Each terminal's admitted turn ends: how many there were, and when the newest was and in
+    /// which generation, while no work came after it. What tells qass's watcher a new stop from
+    /// the same one said again. The count outlives a clear, so two stops in one second never
+    /// share an id; a stop of an older generation is no stop of the agent there now.
+    stops: Mutex<BTreeMap<u32, Stops>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
@@ -924,6 +932,7 @@ impl AgentRegistry {
             terminals: Mutex::new(BTreeMap::new()),
             focus: Mutex::new(BTreeMap::new()),
             prompts: Mutex::new(BTreeMap::new()),
+            stops: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
             leaders: Mutex::new(HashMap::new()),
             closed: Mutex::new(BTreeSet::new()),
@@ -1415,6 +1424,7 @@ impl AgentRegistry {
         self.masters.lock().unwrap().remove(&stream);
         self.focus.lock().unwrap().remove(&stream);
         self.prompts.lock().unwrap().remove(&stream);
+        self.stops.lock().unwrap().remove(&stream);
         if let Some(agent) = self.terminals.lock().unwrap().remove(&stream)
             && let Some(pid) = agent.leader
         {
@@ -1797,12 +1807,55 @@ impl AgentRegistry {
         visible_idle: bool,
         now_unix: i64,
     ) -> Result<bool, ClaimRefusal> {
+        self.observe_hook_event(
+            stream,
+            terminal,
+            token,
+            state,
+            visible_blocker,
+            visible_idle,
+            now_unix,
+            None,
+        )
+    }
+
+    /// [`Self::observe_hook`] for a report that carries a focus event: an admitted `done` is a
+    /// new stop, and a `user`, `tool` or `blocked` one is work that ends the last stop. Set
+    /// after the token check and before the state is announced, so the first row that shows
+    /// the rest names its stop; a changed stop announces the row even when the state held.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_hook_event(
+        &self,
+        stream: u32,
+        terminal: &TerminalId,
+        token: &CapabilityToken,
+        state: AgentRuntimeState,
+        visible_blocker: bool,
+        visible_idle: bool,
+        now_unix: i64,
+        event: Option<&str>,
+    ) -> Result<bool, ClaimRefusal> {
         let mut terminals = self.terminals.lock().unwrap();
         let Some(agent) = terminals.get_mut(&stream) else {
             return Err(ClaimRefusal::WrongTerminal);
         };
         let generation = agent.belief.generation;
         agent.capability.admit(terminal, Some(token), generation)?;
+        let stopped = match event {
+            Some("done") => {
+                let mut stops = self.stops.lock().unwrap();
+                let entry = stops.entry(stream).or_insert((0, None));
+                *entry = (entry.0 + 1, Some((now_unix, generation)));
+                true
+            }
+            Some("user" | "tool" | "blocked") => {
+                if let Some(entry) = self.stops.lock().unwrap().get_mut(&stream) {
+                    entry.1 = None;
+                }
+                false
+            }
+            _ => false,
+        };
         let observation = qoop_domain::AgentObservation {
             agent_id: qoop_domain::AgentId::new(stream.to_string()),
             terminal_id: agent.capability.terminal.clone(),
@@ -1819,6 +1872,10 @@ impl AgentRegistry {
         let before_blocker = agent.belief.visible_blocker;
         let before_gate = agent.setup_gate;
         let Ok(next) = agent.belief.clone().accept(&observation) else {
+            drop(terminals);
+            if stopped {
+                self.announce(stream);
+            }
             return Ok(false);
         };
         agent.belief = next;
@@ -1837,7 +1894,7 @@ impl AgentRegistry {
             agent.last_io_unix = Some(now_unix);
         }
         drop(terminals);
-        if changed {
+        if changed || stopped {
             self.announce(stream);
         }
         Ok(changed)
@@ -1902,6 +1959,24 @@ impl AgentRegistry {
             }
         }
         None
+    }
+
+    /// The terminal's current stop, `<at>.<seq>`: the newest admitted turn end, while no work
+    /// came after it. `None` before the first, after new work, after a daemon restart, and for a
+    /// new process in the terminal (a new generation) until its own first.
+    pub fn stop_of(&self, stream: u32) -> Option<String> {
+        let generation = self
+            .terminals
+            .lock()
+            .unwrap()
+            .get(&stream)?
+            .belief
+            .generation;
+        let stops = self.stops.lock().unwrap();
+        let (seq, newest) = stops.get(&stream)?;
+        newest
+            .filter(|(_, g)| *g == generation)
+            .map(|(at, _)| format!("{at}.{seq}"))
     }
 
     /// The newest prompt head this terminal's hook reported, and when, if any.
@@ -2584,6 +2659,51 @@ mod tests {
 
     /// B3 end to end: a hook event goes through `admit()` into a state change,
     /// and a forged token never becomes an observation.
+    #[test]
+    fn each_admitted_turn_end_is_a_new_stop_and_work_ends_it() {
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        let mut news = r.subscribe();
+        let report = |token: &CapabilityToken, state, event, at| {
+            r.observe_hook_event(1, &id, token, state, false, false, at, event)
+        };
+        report(&token, AgentRuntimeState::Working, Some("user"), NOW).expect("admitted");
+        assert_eq!(r.stop_of(1), None, "no turn has ended");
+        while news.try_recv().is_ok() {}
+        // The turn's end: the row that shows the rest is announced with its stop.
+        report(&token, AgentRuntimeState::Idle, Some("done"), NOW + 5).expect("admitted");
+        assert_eq!(news.try_recv(), Ok(1));
+        assert_eq!(r.stop_of(1).as_deref(), Some("1750000005.1"));
+        // Another turn end with no state change and no work between: a new stop, announced.
+        report(&token, AgentRuntimeState::Idle, Some("done"), NOW + 5).expect("admitted");
+        assert_eq!(news.try_recv(), Ok(1), "a changed stop is news");
+        assert_eq!(r.stop_of(1).as_deref(), Some("1750000005.2"));
+        // Work ends it; the count goes on, so a stop in the same second is not an old one.
+        report(&token, AgentRuntimeState::Working, Some("tool"), NOW + 5).expect("admitted");
+        assert_eq!(r.stop_of(1), None);
+        report(&token, AgentRuntimeState::Idle, Some("done"), NOW + 5).expect("admitted");
+        assert_eq!(r.stop_of(1).as_deref(), Some("1750000005.3"));
+        // A refused report sets nothing.
+        assert!(
+            report(
+                &CapabilityToken::new("forged"),
+                AgentRuntimeState::Idle,
+                Some("done"),
+                NOW + 9
+            )
+            .is_err()
+        );
+        assert_eq!(r.stop_of(1).as_deref(), Some("1750000005.3"));
+        // A report without an event leaves the stop as it is.
+        report(&token, AgentRuntimeState::Idle, None, NOW + 9).expect("admitted");
+        assert_eq!(r.stop_of(1).as_deref(), Some("1750000005.3"));
+        // A new process in the terminal has no stop until its own first turn end.
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().advance();
+        assert_eq!(r.stop_of(1), None, "a new generation has no old stop");
+    }
+
     #[test]
     fn a_hook_event_drives_a_state_change_through_admit_and_a_forgery_does_not() {
         let r = registry();

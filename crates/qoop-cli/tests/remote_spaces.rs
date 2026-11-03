@@ -935,6 +935,7 @@ async fn pre_feature_daemon(
                                 id,
                                 agents: Vec::new(),
                                 splits: Vec::new(),
+                                qass_checks: None,
                             },
                             _ => {
                                 if op == "RestartWhenSafe" {

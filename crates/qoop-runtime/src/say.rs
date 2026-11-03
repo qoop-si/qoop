@@ -5,7 +5,8 @@
 //! did: on a full disk. `eprintln!` panics when its write fails, and a panic in the daemon took
 //! every tab with it. So the runtime says everything through [`say!`](crate::say), which drops a
 //! line it cannot write, and keeps the log it writes to small while it runs. `eprintln!` is
-//! refused in this crate (`clippy.toml`).
+//! refused in this crate (`clippy.toml`). In the log every line starts with its UTC time, so
+//! what it said can be put next to what else happened then.
 
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -43,7 +44,30 @@ pub fn line(args: std::fmt::Arguments<'_>) {
     if let Some(path) = LOG.get().filter(|_| SERVING.load(Ordering::Relaxed)) {
         keep_small(path);
     }
-    let _ = writeln!(std::io::stderr(), "{args}");
+    // A daemon run in a terminal, a test and the CLI keep plain lines: only the log is stamped.
+    let _ = if LOG.get().is_some() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        std::io::stderr().write_all(stamped(now, &args.to_string()).as_bytes())
+    } else {
+        writeln!(std::io::stderr(), "{args}")
+    };
+}
+
+/// `text` with the time `unix` before each of its lines, `2026-10-28T09:05:07Z a line`, and a
+/// newline after the last.
+fn stamped(unix: i64, text: &str) -> String {
+    let n = crate::schedule::Naive::from_secs(unix);
+    let at = format!(
+        "{:04}-{:02}-{:02}T{}:{:02}Z",
+        n.year,
+        n.month,
+        n.day,
+        n.clock(),
+        unix.rem_euclid(60)
+    );
+    text.split('\n').map(|l| format!("{at} {l}\n")).collect()
 }
 
 /// `log` opened for appending, readable by the person only (it can hold a panic's text), after
@@ -123,7 +147,7 @@ fn same(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::open_log;
+    use super::{open_log, stamped};
     use std::os::unix::fs::PermissionsExt;
 
     /// Run in a child whose stderr cannot be written (a pipe nobody reads): `eprintln!` panics
@@ -151,6 +175,73 @@ mod tests {
         assert!(
             child.wait().unwrap().success(),
             "a failed write ended the process"
+        );
+    }
+
+    #[test]
+    fn every_line_of_a_message_gets_its_time() {
+        assert_eq!(stamped(0, "one"), "1970-01-01T00:00:00Z one\n");
+        assert_eq!(
+            stamped(1_761_642_307, "a\nb"),
+            "2025-10-28T09:05:07Z a\n2025-10-28T09:05:07Z b\n"
+        );
+    }
+
+    /// In a child: with `QOOP_SAY_LOG` its stderr goes nowhere and it points it at that log, as
+    /// an on-demand daemon does; without, it keeps the stderr it was given.
+    fn say_in_child(log: Option<&std::path::Path>) -> String {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "say::tests::the_log_is_stamped_and_stderr_is_not",
+            ])
+            .args(["--nocapture", "--test-threads=1"])
+            .env("QOOP_SAY_CHILD", "1")
+            .stdout(std::process::Stdio::null());
+        match log {
+            Some(log) => child
+                .env("QOOP_SAY_LOG", log)
+                .stderr(std::process::Stdio::null()),
+            None => child.stderr(std::process::Stdio::piped()),
+        };
+        let out = child.output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stderr).unwrap()
+    }
+
+    #[test]
+    fn the_log_is_stamped_and_stderr_is_not() {
+        if std::env::var_os("QOOP_SAY_CHILD").is_some() {
+            if let Some(log) = std::env::var_os("QOOP_SAY_LOG") {
+                assert!(super::to_file(log.into()));
+            }
+            crate::say!("before serving\nsecond line");
+            super::serving();
+            crate::say!("serving");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("qoopd.log");
+        say_in_child(Some(&log));
+        let written = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 3, "{written}");
+        for (line, said) in lines
+            .iter()
+            .zip(["before serving", "second line", "serving"])
+        {
+            let (at, rest) = line.split_once(' ').unwrap();
+            assert_eq!(rest, said);
+            assert!(
+                at.len() == 20 && at.ends_with('Z') && at.as_bytes()[10] == b'T',
+                "{line}"
+            );
+        }
+        let plain = say_in_child(None);
+        assert!(
+            plain.contains("before serving\nsecond line\nserving\n"),
+            "stderr got stamped: {plain}"
         );
     }
 

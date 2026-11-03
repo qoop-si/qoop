@@ -83,6 +83,9 @@ struct Facts {
     /// `owner/name` when the agent works in the owner's own repository
     /// ([`crate::worktree::own_repo`]); `None` for any other, or when its folder is gone.
     own: Option<String>,
+    /// Until when a person is at the tab, from the daemon's live input (`PersonAt`):
+    /// `Some(None)` when nobody is, `None` when that is unknown (no answer, an old daemon).
+    person: Option<Option<i64>>,
     now: i64,
     /// Seconds east of UTC, for a clock time he reads.
     offset: i64,
@@ -143,6 +146,19 @@ fn last_typed(
         },
         at,
     ))
+}
+
+/// `last_typed`'s words as the JSON key the watcher reads: `agent` for another agent or a
+/// teammate, `unknown` for a notice, which drives nothing.
+fn typed_by_key(by: &str) -> &'static str {
+    match by {
+        "him" => "owner",
+        "qass" => "qass",
+        "a teammate" => "agent",
+        // Another agent through `qoop prompt`, named by its tab: `T52's prompt`.
+        _ if by.starts_with('T') && by.ends_with("'s prompt") => "agent",
+        _ => "unknown",
+    }
 }
 
 /// Whether a record in `log` for which `pick` holds was written at most `QASS_SAYS` seconds
@@ -292,17 +308,36 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         .as_deref()
         .ok_or(())
         .and_then(|m| owner_typed(m, |at| written_before(&f.log, at, to_tab)));
-    let (engaged, typed_at) = match here {
-        Err(()) => {
+    // The daemon's live input is the presence verdict when it answers: one clock, the one
+    // the watcher holds a tab's stops by. Only when it cannot say does the transcript decide.
+    let (engaged, typed_at) = match (f.person, here) {
+        (Some(until), here) => {
+            let typed_at = here.ok().flatten();
+            match until.filter(|u| *u > f.now) {
+                Some(u) => {
+                    let at = clock(u, f.offset);
+                    lines.push(format!(
+                        "owner here: at this tab until {at} ({u}) (live input)"
+                    ));
+                    not_now.push(format!("write (a person is at this tab until {at})"));
+                    (Some(true), typed_at)
+                }
+                None => {
+                    lines.push("owner here: not at this tab (live input)".into());
+                    (Some(false), typed_at)
+                }
+            }
+        }
+        (None, Err(())) => {
             lines.push("owner here: unknown: treat as engaged".into());
             not_now.push("write (owner here unknown: treat as engaged)".to_string());
             (None, None)
         }
-        Ok(None) => {
+        (None, Ok(None)) => {
             lines.push("owner here: nothing he typed in this tab".into());
             (Some(false), None)
         }
-        Ok(Some(at)) => {
+        (None, Ok(Some(at))) => {
             let ago = (f.now - at).max(0);
             let until = clock(at + ENGAGED, f.offset);
             if ago < ENGAGED {
@@ -323,11 +358,11 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         }
     };
 
-    if let Some((by, at)) = f
+    let typed_by = f
         .typed_here
         .as_deref()
-        .and_then(|m| last_typed(m, &f.log, &tab, f.qass))
-    {
+        .and_then(|m| last_typed(m, &f.log, &tab, f.qass));
+    if let Some((by, at)) = &typed_by {
         let ago = at.map_or(String::new(), |a| {
             format!(" {} min ago", (f.now - a).max(0) / 60)
         });
@@ -419,7 +454,10 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "lines": lines,
         "owner_engaged": engaged,
         "owner_typed_at": typed_at,
-        "hands_off_until": typed_at.filter(|_| engaged == Some(true)).map(|a| a + ENGAGED),
+        // The transcript's clock only when it decided; under the live one, `person_until`.
+        "hands_off_until": typed_at
+            .filter(|_| f.person.is_none() && engaged == Some(true))
+            .map(|a| a + ENGAGED),
         "task": f.task.as_ref().map(|t| t.as_ref().map_or_else(|id| *id, |t| t.id)),
         "task_readable": f.task.as_ref().map(Result::is_ok),
         "review_rounds": task.map(|t| t.rounds),
@@ -432,6 +470,10 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
         "blocked": blocked,
         "allowed": allowed,
         "not_now": not_now,
+        "at": f.now,
+        "person_until": f.person.flatten(),
+        "person_known": f.person.is_some(),
+        "last_typed_by": typed_by.as_ref().map_or("unknown", |(by, _)| typed_by_key(by)),
     });
     (lines, json)
 }
@@ -669,6 +711,7 @@ fn gather(n: u32) -> std::io::Result<Facts> {
         limit,
         card,
         own: cwd.and_then(crate::worktree::own_repo),
+        person: crate::person_known_now(n),
         now,
         offset: utc_offset(),
     })
@@ -734,6 +777,75 @@ mod tests {
 
     fn words(text: &str) -> usize {
         text.split_whitespace().count()
+    }
+
+    /// The daemon's live input is the presence verdict when it answers, whatever the
+    /// transcript says; unknown, the transcript decides as before.
+    #[test]
+    fn live_input_decides_who_is_at_the_tab_when_the_daemon_knows() {
+        let mut f = facts();
+        f.typed_here = transcript(&[said(NOW - 30, "Run the tests")]);
+        // Typed 30 s ago, but nobody at the tab now: the transcript's verdict is not used.
+        f.person = Some(None);
+        let (lines, json) = compose(&f);
+        let out = lines.join("\n");
+        assert!(
+            out.contains("owner here: not at this tab (live input)"),
+            "{out}"
+        );
+        assert!(!out.contains("engaged"), "{out}");
+        assert_eq!(json["allowed"], "write (ending none)");
+        assert_eq!(json["person_known"], true);
+        assert_eq!(json["person_until"], serde_json::Value::Null);
+        assert_eq!(json["hands_off_until"], serde_json::Value::Null);
+        // Someone at it for 90 s more, though the transcript has nothing.
+        f.typed_here = Some(Vec::new());
+        f.person = Some(Some(NOW + 90));
+        let (lines, json) = compose(&f);
+        let at = clock(NOW + 90, 0);
+        let out = lines.join("\n");
+        assert!(
+            out.contains(&format!(
+                "owner here: at this tab until {at} ({}) (live input)",
+                NOW + 90
+            )),
+            "{out}"
+        );
+        assert_eq!(json["allowed"], serde_json::Value::Null);
+        assert_eq!(json["person_until"], NOW + 90);
+        assert!(
+            json["not_now"][0]
+                .as_str()
+                .is_some_and(|n| n == format!("write (a person is at this tab until {at})")),
+            "{json}"
+        );
+        // A time already past is nobody.
+        f.person = Some(Some(NOW - 1));
+        assert!(brief(&f).contains("not at this tab (live input)"));
+        // Unknown: the transcript rule, as before.
+        f.person = None;
+        f.typed_here = transcript(&[said(NOW - 30, "Run the tests")]);
+        let (lines, json) = compose(&f);
+        assert!(lines.join("\n").contains("typed 30 s ago, engaged"));
+        assert_eq!(json["person_known"], false);
+        assert_eq!(json["hands_off_until"], NOW - 30 + ENGAGED);
+    }
+
+    /// The keys the watcher's line tag reads: the brief's own time and who typed last.
+    #[test]
+    fn the_json_carries_its_time_and_who_typed_last() {
+        let mut f = facts();
+        let json = compose(&f).1;
+        assert_eq!(json["at"], NOW);
+        assert_eq!(json["last_typed_by"], "unknown", "nothing typed");
+        f.typed_here = transcript(&[said(NOW - 600, "fix it")]);
+        assert_eq!(compose(&f).1["last_typed_by"], "owner");
+        f.log = parse_log(&format!("{} 128 T52\n", NOW - 602));
+        assert_eq!(compose(&f).1["last_typed_by"], "qass");
+        f.log = parse_log(&format!("{} 77 T52\n", NOW - 602));
+        assert_eq!(compose(&f).1["last_typed_by"], "agent");
+        assert_eq!(typed_by_key("a teammate"), "agent");
+        assert_eq!(typed_by_key("a notice"), "unknown");
     }
 
     /// His message is his; the one that came 2 s after qass wrote to that tab is qass's.

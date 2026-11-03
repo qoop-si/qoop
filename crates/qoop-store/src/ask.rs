@@ -288,6 +288,55 @@ impl Store {
         Ok(Some(card))
     }
 
+    /// A card the daemon files about qass itself (no watcher came when it was told): card
+    /// `W<n>` like a draft, with no agent, terminal or task, so no tab's prompt, dialog or end
+    /// closes it and his answer goes to qass. None while a live card with the same handle
+    /// stands: one is never filed twice.
+    pub fn add_notice(&self, body: &str, now: i64) -> Result<Option<String>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let handle = handle_of(body);
+        let live: Vec<String> = tx
+            .prepare(
+                "SELECT body FROM ask WHERE terminal IS NULL AND task IS NULL AND card LIKE 'W%' \
+                 AND status IN ('open', 'queued', 'passed')",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if live.iter().any(|b| handle_of(b) == handle) {
+            return Ok(None);
+        }
+        let n: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM ask", [], |r| r.get(0))?;
+        let card = format!("W{n}");
+        tx.execute(
+            "INSERT INTO ask (card, status, body, opened_at) VALUES (?1, 'open', ?2, ?3)",
+            params![card, body, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(card))
+    }
+
+    /// End the open notice with `handle`: what it said is over. An answer he gave to it is
+    /// left to go its way. Answers whether one ended.
+    pub fn close_notice(&self, handle: &str, note: &str, now: i64) -> Result<bool, StoreError> {
+        let open: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT id, body FROM ask WHERE terminal IS NULL AND task IS NULL AND card LIKE 'W%' \
+                 AND status = 'open'")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut ended = false;
+        for (id, body) in open {
+            if handle_of(&body).as_deref() == Some(handle) {
+                self.conn.execute(
+                    "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 WHERE id = ?1",
+                    params![id, note, now],
+                )?;
+                ended = true;
+            }
+        }
+        Ok(ended)
+    }
+
     /// End a terminal's live dialog draft: its agent reported a tool or a prompt, so the
     /// dialog is gone. A waiting draft and qass's cards stay. Answers whether one ended.
     pub fn close_dialog_drafts(&self, terminal: i64, now: i64) -> Result<bool, StoreError> {
@@ -512,6 +561,55 @@ pub(crate) fn close_cards(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A notice stands alone: a second one with its handle is not filed while it is live, one
+    /// with another handle is, and once he ends it the next is filed again. A tab's prompt or
+    /// end never closes it.
+    #[test]
+    fn a_notice_is_filed_once_while_it_is_live() {
+        let (s, t) = store_with_terminal();
+        // qass's own card about no tab, under the same handle, is not a notice: it neither
+        // stops one nor is ended with it.
+        s.add_ask(
+            "E1",
+            None,
+            None,
+            None,
+            r#"{"handle":"qass","asks":"mine"}"#,
+            5,
+        )
+        .unwrap();
+        let body = r#"{"handle":"qass","asks":"qass is not watching since 09:05"}"#;
+        let first = s.add_notice(body, 10).unwrap().expect("filed");
+        assert_eq!(s.add_notice(body, 11).unwrap(), None, "not twice");
+        let other = r#"{"handle":"else"}"#;
+        assert!(s.add_notice(other, 12).unwrap().is_some());
+        s.prompt_taken(t, 20, 21).unwrap();
+        s.close_dialog_drafts(t, 22).unwrap();
+        let tx = s.conn.unchecked_transaction().unwrap();
+        close_for_terminals(&tx, &[t], 23).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(s.ask(&first).unwrap().unwrap().status, "open");
+        assert!(s.close_ask(&first, "seen", 30).unwrap());
+        let second = s
+            .add_notice(body, 31)
+            .unwrap()
+            .expect("a new one once it ended");
+        // The daemon ends it when what it says is over; only that handle's.
+        assert!(s.close_notice("qass", "qass checks again", 40).unwrap());
+        assert!(!s.close_notice("qass", "again", 41).unwrap(), "once");
+        assert_eq!(s.ask(&second).unwrap().unwrap().status, "closed");
+        assert_eq!(
+            s.ask("E1").unwrap().unwrap().status,
+            "open",
+            "qass's card stays"
+        );
+        assert_eq!(
+            s.live_asks().unwrap().len(),
+            2,
+            "the other notice and qass's card stay"
+        );
+    }
 
     fn store_with_terminal() -> (Store, i64) {
         let mut s = Store::in_memory().expect("open");

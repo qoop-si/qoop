@@ -1738,6 +1738,8 @@ impl Daemon {
             &self.connections,
             &self.books.store,
         );
+        // And done claims nobody looked at for a day are listed to qass every few hours.
+        crate::claims::scan_stranded_claims(&self.books.store);
 
         // The chats clients are reading: parked until one is asked about.
         tokio::spawn(crate::messages::Watch::run(
@@ -5197,6 +5199,7 @@ async fn handle_control(
                         agent_session,
                         agent_title,
                         last_active_at_unix,
+                        stop: agents.stop_of(terminal),
                         cwd,
                         slept_at_unix: None,
                         activity,
@@ -5243,6 +5246,7 @@ async fn handle_control(
                 id,
                 agents: rows,
                 splits: terminals.live_splits(&settled),
+                qass_checks: Some(crate::asks::qass_checks()),
             }
         }
         // A tree naming one terminal twice would come back on every index as a tab
@@ -5368,7 +5372,7 @@ async fn handle_control(
             // `open_terminal` registered the capability under.
             let terminal_id = TerminalId::new(terminal.to_string());
             let token = qoop_domain::CapabilityToken::new(token);
-            match agents.observe_hook(
+            match agents.observe_hook_event(
                 terminal,
                 &terminal_id,
                 &token,
@@ -5376,6 +5380,9 @@ async fn handle_control(
                 visible_blocker,
                 visible_idle,
                 crate::agents::now_unix(),
+                event
+                    .as_deref()
+                    .filter(|k| crate::control::parse_focus_event(k)),
             ) {
                 Err(_) => ControlResponse::Failed {
                     id,
@@ -5745,7 +5752,17 @@ async fn handle_control(
                 BTreeMap::new()
             };
             Box::pin(crate::tasks::read(
-                id, board, task, terminal, token, before, space, names, agents, store,
+                id,
+                board,
+                task,
+                terminal,
+                token,
+                before,
+                space,
+                names,
+                qass_checked(terminals, books),
+                agents,
+                store,
             ))
             .await
         }
@@ -5993,6 +6010,16 @@ async fn handle_control(
                         };
                     }
                 };
+                // Off, no claim can be checked: the board is told now, not at the heal's look,
+                // and a card saying qass is not watching says nothing true any more.
+                crate::asks::announce_checks(agents);
+                if !on && turned {
+                    let (connections, store) = (connections.clone(), store.clone());
+                    tokio::spawn(async move {
+                        // A failed close is the heal's to try again at its next look.
+                        let _ = crate::asks::close_unwatched(&connections, &store).await;
+                    });
+                }
                 // Asked again while it still waits for a watcher: told again, so a line that
                 // went unheeded (qass stuck, gone for good) is one more `on` away.
                 if on && crate::paths::qass_watch_resuming() {
@@ -7147,6 +7174,8 @@ async fn set_qass_skip(
                     .filter(|t| terminals.workspace_of(*t) == Some(workspace))
                     .for_each(|t| agents.announce(t)),
             }
+            // A claim in a tab qass leaves alone has nobody to check it: its status moved.
+            agents.tasks_changed();
             ControlResponse::Renamed { id }
         }
         Err(e) => ControlResponse::Failed {
@@ -7754,6 +7783,25 @@ impl QassSkips {
     pub fn covers(&self, space: Option<i64>, pane: u32) -> bool {
         space.is_some_and(|w| self.spaces.contains(&w)) || self.panes.contains(&pane)
     }
+}
+
+/// The terminals qass would check a done claim in now: its snapshot holds
+/// ([`crate::asks::qass_checks`]) and it does not leave them alone. None while it cannot check.
+fn qass_checked(terminals: &TerminalRegistry, books: &Bookkeeping) -> BTreeSet<i64> {
+    if !crate::asks::qass_checks() {
+        return BTreeSet::new();
+    }
+    // The spaces read first, so the registry and the skips are never locked at once.
+    let tabs: Vec<(Option<i64>, u32)> = terminals
+        .streams()
+        .into_iter()
+        .map(|t| (terminals.workspace_of(t), t))
+        .collect();
+    let skip = books.skip.lock().unwrap();
+    tabs.into_iter()
+        .filter(|(space, t)| !skip.covers(*space, *t))
+        .map(|(_, t)| i64::from(t))
+        .collect()
 }
 
 impl KeptAwake {

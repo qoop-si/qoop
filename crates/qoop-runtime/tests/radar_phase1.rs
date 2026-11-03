@@ -251,3 +251,57 @@ async fn a_fast_cd_on_a_quiet_prompt_reaches_the_row() {
     }
     panic!("the row still says {seen:?} after a quiet cd to {wanted}");
 }
+
+/// The listing's row carries the stop the daemon recorded: a turn's end names one, a second
+/// turn end a new one, and work after it takes it away.
+#[tokio::test]
+async fn the_row_names_the_stop_of_each_turn_end() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut client = d.attach("stop").await;
+    let mut report = async |id: &str, state: &str, event: &str| {
+        let r = client
+            .control(
+                &ControlRequest::ReportAgentState {
+                    from: None,
+                    id: id.into(),
+                    terminal,
+                    token: token.clone(),
+                    state: state.into(),
+                    visible_blocker: false,
+                    visible_idle: false,
+                    visible_working: false,
+                    clock: 0,
+                    session: None,
+                    event: Some(event.into()),
+                    label: None,
+                },
+                PATIENCE,
+            )
+            .await;
+        assert!(
+            matches!(r, Some(ControlResponse::AgentStateReported { .. })),
+            "{r:?}"
+        );
+        row_of(&agents_of(&mut client, &format!("{id}-ls")).await, terminal)
+            .stop
+            .clone()
+    };
+    assert_eq!(
+        report("s1", "working", "user").await,
+        None,
+        "no turn has ended"
+    );
+    let first = report("s2", "idle", "done").await.expect("a stop");
+    assert!(first.ends_with(".1"), "{first}");
+    let second = report("s3", "idle", "done").await.expect("a stop");
+    assert_ne!(second, first, "each turn end is a new stop");
+    assert_eq!(report("s4", "working", "tool").await, None, "work ends it");
+}

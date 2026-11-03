@@ -218,6 +218,13 @@ fn a_daemon_started_with_nowhere_to_write_keeps_a_log() {
         text.contains("qoopd") && text.contains("starting") && text.contains("listening on"),
         "{text:?}"
     );
+    assert!(
+        text.lines().all(|l| l
+            .split(' ')
+            .next()
+            .is_some_and(|at| at.len() == 20 && at.ends_with('Z'))),
+        "a log line without its time: {text:?}"
+    );
     let mode = std::fs::metadata(&log).expect("log").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the log is readable by others");
     m.stop(false);

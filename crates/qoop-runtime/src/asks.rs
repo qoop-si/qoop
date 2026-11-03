@@ -1059,13 +1059,52 @@ const HEAL_AFTER: u32 = 2;
 /// The least time between two tells: a qass that does not start its watcher is not typed to
 /// every two minutes.
 const HEAL_GAP: Duration = Duration::from_secs(30 * 60);
+/// How long qass may be away from rest before it counts as stuck, on the heal's own clock of
+/// when it last saw qass at rest. Plain working does not count, or every claim would flip
+/// between checked and waiting on each qass turn. Apart from [`HEAL_GAP`], which only spaces
+/// tells.
+const STUCK_AFTER_SECS: i64 = 30 * 60;
+/// A tell after which no watcher came within this long, in seconds, failed.
+const TELL_FAILS_AFTER: i64 = 10 * 60;
+/// Failed tells in a row that raise the owner's card: about 90 minutes of tells.
+const CARD_AFTER: u32 = 3;
+
+/// qass's watcher alive and qass not stuck, as the heal's last look found them. With the
+/// switch, whether a claim can be checked ([`qass_checks`]).
+static CHECKER_UP: AtomicBool = AtomicBool::new(false);
+/// What [`announce_checks`] last told the board.
+static CHECKS_TOLD: AtomicBool = AtomicBool::new(false);
+
+/// Whether qass can check a done claim on this Mac now: watching on, its watcher alive, and
+/// qass not stuck. The daemon's one snapshot; each tab adds its own skip and liveness.
+pub(crate) fn qass_checks() -> bool {
+    crate::paths::qass_watching() && CHECKER_UP.load(Ordering::SeqCst)
+}
+
+/// A change in [`qass_checks`] changes the status of every claim with no task written, so the
+/// board is told as a task write would tell it.
+pub(crate) fn announce_checks(agents: &AgentRegistry) {
+    announce_change(&CHECKS_TOLD, qass_checks(), agents);
+}
+
+/// Tells the board when `now` is not what `told` holds, and keeps `now` there.
+fn announce_change(told: &AtomicBool, now: bool, agents: &AgentRegistry) {
+    if told.swap(now, Ordering::SeqCst) != now {
+        agents.tasks_changed();
+    }
+}
 
 /// qass's watcher lives in the Monitor of its Claude session. A session that restarts or
 /// resumes takes it down, and with no watcher no event comes to wake qass to start one again
 /// (2026-10-24: 16 hours with none). So every minute: watching on, a qass on Claude here at
-/// rest, and no watcher on [`HEAL_AFTER`] looks in a row: the switch is renewed and qass told,
-/// as `qoop qass watch off` then `on` would. An agent of another kind has no Monitor, so it is
-/// never told: it watches when the owner writes to it (the skill).
+/// rest or stuck, and no watcher on [`HEAL_AFTER`] looks in a row: the switch is renewed and
+/// qass told, as `qoop qass watch off` then `on` would. An agent of another kind has no
+/// Monitor, so it is never told: it watches when the owner writes to it (the skill).
+///
+/// The same look keeps the check snapshot ([`qass_checks`]) and counts tries that brought no
+/// working checker: [`CARD_AFTER`] in a row give the owner one card, since a heal that fails
+/// quietly is as silent as no heal. The card closes once qass can check again or the switch
+/// is off.
 pub(crate) fn heal_qass_watcher(
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
@@ -1079,19 +1118,127 @@ pub(crate) fn heal_qass_watcher(
         store.clone(),
     );
     tokio::spawn(async move {
-        let mut gone = 0;
-        let mut told: Option<Instant> = None;
+        let mut heal = Heal {
+            rested: crate::agents::now_unix(),
+            // A card a past daemon raised is closed at the first look that finds qass fine.
+            unwatched: Unwatched {
+                raised: true,
+                ..Unwatched::default()
+            },
+            ..Heal::default()
+        };
         loop {
-            tokio::time::sleep(HEAL_EVERY).await;
-            let missing = watcher_missing(&terminals, &agents, &store).await;
-            let (looks, tell) = heal_step(gone, missing, told.map(|at| at.elapsed()));
-            gone = looks;
-            if tell && crate::paths::renew_qass_watch().unwrap_or(false) {
-                told = Some(Instant::now());
+            // The snapshot is read from the first look, so a daemon start does not show every
+            // claim waiting for a minute.
+            let look = look_at_qass(&terminals, &agents, &store).await;
+            let step = heal.step(look, crate::agents::now_unix(), || {
+                crate::paths::renew_qass_watch().unwrap_or(false)
+            });
+            CHECKER_UP.store(step.checker_up, Ordering::SeqCst);
+            announce_checks(&agents);
+            if step.told {
+                crate::say!("qoopd: qass has no watcher; told it to start one");
                 tell_qass_watching(&terminals, &agents, &connections, &store, false);
+            } else if step.tried {
+                crate::say!("qoopd: qass is stuck mid-turn with its watcher running");
             }
+            if step.failed {
+                crate::say!(
+                    "qoopd: qass could not check 10 minutes after the try ({} in a row)",
+                    heal.unwatched.failed
+                );
+            }
+            // The old card is closed before a new one is raised, so a new run never lands on
+            // it; each is tried again at the next look until the store takes it.
+            if step.cleared && close_unwatched(&connections, &store).await {
+                heal.close_due = false;
+            }
+            if heal.raise_due
+                && !heal.close_due
+                && let Some(since) = heal.unwatched.since
+                && raise_unwatched(since, &connections, &store).await
+            {
+                heal.raise_due = false;
+            }
+            tokio::time::sleep(HEAL_EVERY).await;
         }
     });
+}
+
+/// What the heal keeps between looks, on the unix clock.
+#[derive(Clone, Copy, Debug, Default)]
+struct Heal {
+    /// Looks in a row that found qass not watching, for the tell; a tell starts it over.
+    gone: u32,
+    /// Looks in a row that found no watcher, for the snapshot; a tell never starts it over.
+    no_watcher: u32,
+    /// The last try: a tell, or the look a stuck qass with a watcher would have been told.
+    tried: Option<i64>,
+    /// When qass was last seen at rest, or not there at all: the clock that says stuck.
+    rested: i64,
+    unwatched: Unwatched,
+    /// A run with a card ended and the card is not closed yet: a store that failed the close
+    /// is tried again at every look until it does.
+    close_due: bool,
+    /// This run's card is due and not written yet; it waits for [`Heal::close_due`], so it
+    /// never lands on the old card, and goes with the run.
+    raise_due: bool,
+}
+
+/// What one look decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Step {
+    /// A watcher alive, or gone for no more than [`HEAL_AFTER`] looks (it ends every 29
+    /// minutes and qass starts the next), and qass not stuck: what [`CHECKER_UP`] keeps.
+    checker_up: bool,
+    /// qass is told to start its watcher.
+    told: bool,
+    /// A try: a tell, or a stuck qass with its watcher running, which no line reaches.
+    tried: bool,
+    /// A try before this look left qass unable to check.
+    failed: bool,
+    /// The owner's card is due and no old card is left to close first.
+    raise: bool,
+    /// A run with a card ended (qass can check again, or the switch is off) and its card is
+    /// not closed yet: close it.
+    cleared: bool,
+}
+
+impl Heal {
+    /// One look at `now`. `renew` renews the switch for a tell and says whether it did: a
+    /// switch turned off since is not told.
+    fn step(&mut self, look: Look, now: i64, renew: impl FnOnce() -> bool) -> Step {
+        if look.rested {
+            self.rested = now;
+        }
+        let stuck = now - self.rested >= STUCK_AFTER_SECS;
+        self.no_watcher = if look.alive { 0 } else { self.no_watcher + 1 };
+        let since_tried = self
+            .tried
+            .map(|at| Duration::from_secs(u64::try_from(now - at).unwrap_or(0)));
+        let due;
+        (self.gone, due) = heal_step(self.gone, not_watching(&look, stuck), since_tried);
+        // A running watcher is not told to start: the try is only counted.
+        let told = due && !look.alive && renew();
+        let tried = told || (due && look.alive);
+        if tried {
+            self.tried = Some(now);
+        }
+        let settled = (look.alive && !stuck) || !look.watching;
+        let was = self.unwatched;
+        let raise;
+        (self.unwatched, raise) = unwatched_step(self.unwatched, settled, tried, now);
+        self.close_due |= settled && was.raised;
+        self.raise_due = (self.raise_due || raise) && self.unwatched.raised;
+        Step {
+            checker_up: (look.alive || self.no_watcher <= HEAL_AFTER) && !stuck,
+            told,
+            tried,
+            failed: self.unwatched.failed > was.failed,
+            raise: self.raise_due && !self.close_due,
+            cleared: self.close_due,
+        }
+    }
 }
 
 /// One look: the looks in a row that found no watcher, and whether qass is to be told now.
@@ -1104,22 +1251,164 @@ fn heal_step(gone: u32, missing: bool, since_told: Option<Duration>) -> (u32, bo
     (if tell { 0 } else { gone }, tell)
 }
 
-/// Watching on, qass a Claude agent here at rest, and no watcher running.
-async fn watcher_missing(
+/// What one heal look finds of qass.
+#[derive(Clone, Copy, Debug, Default)]
+struct Look {
+    /// The owner's switch is on.
+    watching: bool,
+    /// Its watcher runs. Only looked at while watching.
+    alive: bool,
+    /// qass is a Claude agent here: the kind with a Monitor to run a watcher in.
+    claude: bool,
+    /// qass is at rest, or there is no qass here to be stuck.
+    rested: bool,
+}
+
+async fn look_at_qass(
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
     store: &StoreHandle,
-) -> bool {
-    if !crate::paths::qass_watching() || crate::paths::qass_watcher_alive() {
-        return false;
-    }
-    let Some(qass) = qass_terminal(terminals, agents, store).await else {
-        return false;
-    };
-    let claude = agents.agent(qass).is_some_and(|a| {
+) -> Look {
+    let watching = crate::paths::qass_watching();
+    let alive = watching && crate::paths::qass_watcher_alive();
+    let qass = qass_terminal(terminals, agents, store).await;
+    let claude = qass.and_then(|q| agents.agent(q)).is_some_and(|a| {
         matches!(&a.identity, qoop_domain::AgentIdentity::Known { program, .. } if program == "claude")
     });
-    claude && standing(agents, terminals, qass).is_some_and(|s| s.at_rest())
+    let rested = qass.is_none_or(|q| standing(agents, terminals, q).is_some_and(|s| s.at_rest()));
+    Look {
+        watching,
+        alive,
+        claude,
+        rested,
+    }
+}
+
+/// Watching on and qass a Claude agent here that cannot watch: at rest with no watcher, or
+/// stuck, watcher or not. A stuck qass takes no line until it rests, but nothing else would
+/// start its watcher or end its turn either.
+// ponytail: at rest is sampled once a minute, so a qass that only rests between looks reads
+// stuck after 30 minutes; read the agent's own state changes if that shows up.
+fn not_watching(look: &Look, stuck: bool) -> bool {
+    look.watching && look.claude && (stuck || (!look.alive && look.rested))
+}
+
+/// The heal's count of tries that left qass unable to check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Unwatched {
+    /// The last try not judged yet, at its unix time.
+    tried: Option<i64>,
+    /// Tries in a row after which qass still could not check [`TELL_FAILS_AFTER`] later.
+    failed: u32,
+    /// The first try since qass could last check: the time the card names.
+    since: Option<i64>,
+    /// The card was raised for this run, so the end of the run closes it.
+    raised: bool,
+}
+
+/// One look: `settled` (qass can check, or the switch is off) ends the run; a try
+/// [`TELL_FAILS_AFTER`] old with qass still unable failed; `tried` is the next to judge.
+/// True on the [`CARD_AFTER`]th failure in a row, the one that raises the card: later ones
+/// add none.
+fn unwatched_step(u: Unwatched, settled: bool, tried: bool, now: i64) -> (Unwatched, bool) {
+    if settled {
+        return (Unwatched::default(), false);
+    }
+    let mut u = u;
+    let mut raise = false;
+    if u.tried.is_some_and(|at| now - at >= TELL_FAILS_AFTER) {
+        u.tried = None;
+        u.failed += 1;
+        raise = u.failed == CARD_AFTER;
+        u.raised |= raise;
+    }
+    if tried {
+        u.tried = Some(now);
+        u.since.get_or_insert(now);
+    }
+    (u, raise)
+}
+
+/// The owner's card for a qass that could not check after [`CARD_AFTER`] tries. None over one
+/// still live. False when the store failed, so the caller tries again.
+async fn raise_unwatched(
+    since: i64,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) -> bool {
+    let body = serde_json::to_string(&unwatched_card(since, crate::schedule::system_zone()));
+    let Ok(body) = body else {
+        return false;
+    };
+    match store.run(move |s| s.add_notice(&body, now())).await {
+        Ok(card) => {
+            if let Some(card) = card {
+                crate::say!("qoopd: qass is not watching; the owner has card {card}");
+                connections.asks_changed();
+            }
+            true
+        }
+        Err(e) => {
+            crate::say!(
+                "qoopd: the card for qass not watching was not written: {}",
+                why(e)
+            );
+            false
+        }
+    }
+}
+
+/// The handle of the card [`unwatched_card`] writes.
+const UNWATCHED_HANDLE: &str = "qass";
+
+/// qass can check again, or the switch is off: its open card says nothing true any more.
+/// False when the store failed, so the caller tries again.
+pub(crate) async fn close_unwatched(
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) -> bool {
+    match store
+        .run(|s| {
+            s.close_notice(
+                UNWATCHED_HANDLE,
+                "qass checks again, or watching is off",
+                now(),
+            )
+        })
+        .await
+    {
+        Ok(closed) => {
+            if closed {
+                crate::say!("qoopd: qass can check again; its card is closed");
+                connections.asks_changed();
+            }
+            true
+        }
+        Err(e) => {
+            crate::say!(
+                "qoopd: the card for qass not watching was not closed: {}",
+                why(e)
+            );
+            false
+        }
+    }
+}
+
+/// "qass is not watching since 09:05", on the wall clock of `zone`. No options: his words go
+/// to qass, which is what can start its watcher.
+fn unwatched_card(since: i64, zone: crate::schedule::Zone) -> AskCard {
+    AskCard {
+        handle: UNWATCHED_HANDLE.to_string(),
+        urgency: "now".to_string(),
+        asked: None,
+        doing: "watching your agents".to_string(),
+        why: format!(
+            "{CARD_AFTER} tries in a row, 30 minutes apart, found no watcher or qass stuck mid-turn"
+        ),
+        asks: format!("qass is not watching since {}", (zone.local)(since).clock()),
+        options: Vec::new(),
+        pick: None,
+    }
 }
 
 /// Whether a switch under [`WATCH_TELL_MAX_AGE`] old is still untold.
@@ -1538,6 +1827,277 @@ mod tests {
         assert_eq!(heal_step(1, true, soon), (2, false));
         assert_eq!(heal_step(5, true, soon), (6, false));
         assert_eq!(heal_step(5, true, Some(HEAL_GAP)), (0, true));
+    }
+
+    /// qass on Claude here, watching on, at rest or not, its watcher alive or not.
+    fn qass(alive: bool, rested: bool) -> Look {
+        Look {
+            watching: true,
+            alive,
+            claude: true,
+            rested,
+        }
+    }
+
+    /// The heal over `minutes` looks a minute apart, every tell renewed: the minutes that
+    /// raised the owner's card.
+    fn cards(
+        heal: &mut Heal,
+        look: impl Fn(i64) -> Look,
+        minutes: std::ops::Range<i64>,
+    ) -> Vec<i64> {
+        minutes
+            .filter(|m| look_ok(heal, look(*m), m * 60).raise)
+            .collect()
+    }
+
+    /// One look whose card writes go through, as the loop clears them.
+    fn look_ok(heal: &mut Heal, look: Look, now: i64) -> Step {
+        let step = heal.step(look, now, || true);
+        if step.cleared {
+            heal.close_due = false;
+        }
+        if step.raise {
+            heal.raise_due = false;
+        }
+        step
+    }
+
+    /// The five ways a claim has nobody to check it each show `waits`, and each shows `checks`
+    /// again once fixed: watching off, a dead watcher, qass stuck (30 minutes not at rest on
+    /// the heal's clock), a tab qass leaves alone and an asleep tab. A claim with no tab at all
+    /// shows `checks` whatever the watcher does: qass closes it at its Start.
+    #[test]
+    fn qass_checks_a_claim_only_while_a_check_can_happen() {
+        use crate::control::{Live, Status, StatusInput, status, tab_of};
+        // Looks a minute apart from a rest at 0, at least four, to `since_rest`.
+        let up = |alive: bool, since_rest: i64| {
+            let mut heal = Heal::default();
+            (0..=(since_rest / 60).max(3))
+                .map(|m| heal.step(qass(alive, m == 0), m * 60, || false))
+                .last()
+                .is_some_and(|step| step.checker_up)
+        };
+        let claim = |watching: bool, alive: bool, since_rest: i64, skipped: bool, tab: &str| {
+            let live = (tab == "live").then_some(Live {
+                state: "idle",
+                last_active: Some(5),
+                subagents: 0,
+            });
+            let asleep = std::collections::BTreeMap::from_iter((tab == "asleep").then_some((7, 3)));
+            // `qass_checks` is the switch and the heal's snapshot; the daemon adds the skip.
+            let checks = watching && up(alive, since_rest) && !skipped;
+            status(StatusInput {
+                claimed_at: Some(4),
+                stage: "implementing",
+                updated_at: 6,
+                tab: tab_of(live, &asleep, 7, checks),
+                ..StatusInput::default()
+            })
+        };
+        let fine = (true, true, 60, false, "live");
+        assert_eq!(
+            claim(fine.0, fine.1, fine.2, fine.3, fine.4),
+            (Status::Checks, 4)
+        );
+        let broken = [
+            ("watch off", (false, true, 60, false, "live")),
+            ("dead watcher", (true, false, 60, false, "live")),
+            ("qass stuck", (true, true, STUCK_AFTER_SECS, false, "live")),
+            ("skipped", (true, true, 60, true, "live")),
+            ("asleep tab", (true, true, 60, false, "asleep")),
+        ];
+        for (why, (w, a, r, s, t)) in broken {
+            assert_eq!(claim(w, a, r, s, t), (Status::Waits, 4), "{why}");
+        }
+        // No tab at all: qass closes it failed at its Start, watcher or not.
+        assert_eq!(
+            claim(false, false, 60, false, "gone"),
+            (Status::Checks, 4),
+            "no tab"
+        );
+        assert_eq!(
+            claim(true, true, STUCK_AFTER_SECS - 1, false, "live").0,
+            Status::Checks,
+            "working, not stuck yet"
+        );
+        // Fixed again: a qass back at rest resets the stuck clock.
+        let mut heal = Heal::default();
+        assert!(
+            !heal
+                .step(qass(true, false), STUCK_AFTER_SECS, || false)
+                .checker_up
+        );
+        assert!(
+            heal.step(qass(true, true), STUCK_AFTER_SECS + 60, || false)
+                .checker_up
+        );
+    }
+
+    /// The watcher ends every 29 minutes and qass starts the next: a gap of a minute or two,
+    /// seen by up to [`HEAL_AFTER`] looks, keeps every claim checked. A third look with no
+    /// watcher does not.
+    #[test]
+    fn a_minute_or_two_between_watchers_changes_no_claim() {
+        let mut heal = Heal::default();
+        let mut up = |m: i64, alive: bool| heal.step(qass(alive, true), m * 60, || true).checker_up;
+        assert!(up(0, true));
+        assert!(up(1, false), "one look in the gap");
+        assert!(up(2, true));
+        assert!(up(3, false) && up(4, false), "two looks in the gap");
+        assert!(up(5, true));
+        assert!(up(6, false) && up(7, false));
+        assert!(!up(8, false), "gone for three looks");
+        assert!(up(9, true), "back with the next watcher");
+    }
+
+    /// A change in what qass can check tells every client the board changed, with no task
+    /// written; the same snapshot again tells nobody.
+    #[test]
+    fn a_change_in_what_qass_can_check_reaches_clients_with_no_task_write() {
+        let agents = AgentRegistry::new().expect("registry");
+        let mut changed = agents.subscribe_tasks();
+        let told = AtomicBool::new(false);
+        for (now, says) in [(false, false), (true, true), (true, false), (false, true)] {
+            announce_change(&told, now, &agents);
+            assert_eq!(changed.try_recv().is_ok(), says, "{now}");
+        }
+    }
+
+    /// A killed watcher with qass at rest: told every 30 minutes, each tell failed after 10
+    /// with no watcher, and the third failure raises the card, once, in under 90 minutes.
+    /// Failures after it raise none.
+    #[test]
+    fn a_dead_watcher_raises_one_card_after_three_failed_tells() {
+        let mut heal = Heal::default();
+        let raised = cards(&mut heal, |_| qass(false, true), 0..400);
+        assert_eq!(
+            raised,
+            vec![71],
+            "tells at 1, 31 and 61, each failed 10 later"
+        );
+        assert!(heal.unwatched.failed > CARD_AFTER, "it went on failing");
+        assert_eq!(
+            heal.unwatched.since,
+            Some(60),
+            "the card names the first tell"
+        );
+    }
+
+    /// A qass stuck working (30 minutes not at rest) is told like one at rest, though the line
+    /// waits for it to rest, and its failed tells raise the card the same way.
+    #[test]
+    fn a_qass_stuck_working_with_no_watcher_raises_the_card() {
+        let mut heal = Heal::default();
+        let raised = cards(&mut heal, |_| qass(false, false), 0..400);
+        assert_eq!(raised, vec![101], "stuck at 30, tells at 31, 61 and 91");
+        // Working, not stuck, is not missing.
+        let mut heal = Heal::default();
+        assert!(cards(&mut heal, |_| qass(false, false), 0..29).is_empty());
+        assert_eq!(heal.tried, None);
+    }
+
+    /// A qass stuck working with its watcher running cannot check either: each try is
+    /// counted without a tell (its watcher is fine, the line would wait for its rest), the
+    /// third failure raises the card, and its rest closes it.
+    #[test]
+    fn a_qass_stuck_working_with_its_watcher_running_raises_the_card() {
+        let mut heal = Heal::default();
+        let mut told = false;
+        let raised: Vec<i64> = (0..120)
+            .filter(|m| {
+                let step = heal.step(qass(true, false), m * 60, || {
+                    told = true;
+                    true
+                });
+                heal.raise_due &= !step.raise;
+                step.raise
+            })
+            .collect();
+        assert_eq!(raised, vec![101], "stuck at 30, tries at 31, 61 and 91");
+        assert!(!told, "a running watcher is never told to start");
+        let step = heal.step(qass(true, true), 120 * 60, || true);
+        assert!(step.cleared && step.checker_up, "{step:?}");
+        assert_eq!(heal.unwatched, Unwatched::default());
+    }
+
+    /// A watcher seen again starts the count over: two failures, a live watcher, and the card
+    /// needs three more. The switch off starts it over too. A card raised is closed by
+    /// either, and a later run raises a new one.
+    #[test]
+    fn a_watcher_seen_again_resets_the_failed_tells() {
+        let mut heal = Heal::default();
+        assert!(cards(&mut heal, |_| qass(false, true), 0..50).is_empty());
+        assert_eq!(heal.unwatched.failed, 2);
+        assert!(!heal.step(qass(true, true), 50 * 60, || true).raise);
+        assert_eq!(heal.unwatched, Unwatched::default());
+        let raised = cards(&mut heal, |_| qass(false, true), 51..400);
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0] > 51 + 60, "three new failures: {raised:?}");
+        let off = Look {
+            watching: false,
+            ..qass(false, true)
+        };
+        assert!(
+            heal.step(off, 400 * 60, || true).cleared,
+            "off closes the card"
+        );
+        heal.close_due = false;
+        assert_eq!(heal.unwatched, Unwatched::default());
+        assert!(!heal.step(off, 401 * 60, || true).cleared, "closed once");
+        let raised = cards(&mut heal, |_| qass(false, true), 402..600);
+        assert_eq!(raised.len(), 1, "a new run, a new card");
+        assert!(heal.step(qass(true, true), 600 * 60, || true).cleared);
+    }
+
+    /// A close the store failed stays due at every look, through a new run of failures too.
+    /// The new run's card waits for it, so it never lands on the old card, and once the close
+    /// goes through it is raised at that same look. A raise the store failed is tried again.
+    #[test]
+    fn a_card_close_that_failed_is_tried_again() {
+        let mut heal = Heal::default();
+        assert_eq!(cards(&mut heal, |_| qass(false, true), 0..200).len(), 1);
+        // From here every close fails: close_due stays as the step set it.
+        assert!(heal.step(qass(true, true), 200 * 60, || true).cleared);
+        assert!(
+            heal.step(qass(true, true), 201 * 60, || true).cleared,
+            "again"
+        );
+        for m in 202..400 {
+            let step = heal.step(qass(false, true), m * 60, || true);
+            assert!(step.cleared, "still due while a new run fails, minute {m}");
+            assert!(!step.raise, "no card over the old one, minute {m}");
+        }
+        assert!(heal.raise_due, "the new run reached its card");
+        // The close goes through; the card is raised at that look and, failed once, at the next.
+        heal.close_due = false;
+        assert!(heal.step(qass(false, true), 400 * 60, || true).raise);
+        let step = look_ok(&mut heal, qass(false, true), 401 * 60);
+        assert!(step.raise && !step.cleared, "{step:?}");
+        assert!(
+            !look_ok(&mut heal, qass(false, true), 402 * 60).raise,
+            "raised once"
+        );
+        // The run ends: its own card is closed.
+        assert!(look_ok(&mut heal, qass(true, true), 403 * 60).cleared);
+        assert!(!heal.raise_due && !heal.close_due);
+    }
+
+    /// The card says since when, on the wall clock, in values the card format takes.
+    #[test]
+    fn the_card_says_qass_is_not_watching_since_its_first_tell() {
+        let utc = crate::schedule::Zone {
+            local: crate::schedule::Naive::from_secs,
+            unix: crate::schedule::Naive::secs,
+        };
+        let card = unwatched_card(9 * 3600 + 5 * 60, utc);
+        assert_eq!(card.asks, "qass is not watching since 09:05");
+        // Like a draft it has no options; every other rule of the format holds.
+        let problems = card.problems();
+        assert!(
+            problems.iter().all(|p| p.contains("options")),
+            "{problems:?}"
+        );
     }
 
     use super::*;

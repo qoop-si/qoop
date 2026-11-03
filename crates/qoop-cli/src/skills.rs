@@ -923,7 +923,9 @@ mod tests {
         // 495 since 2026-10-29: another agent's turn lasts 15 minutes, then its writer is asked
         // once and the tab is qass's, so no agent waits on a reply nobody sends. 496 since
         // 2026-11-01: every wake reads plans.md (the next new Todo item, a ready plan to approve).
-        assert!(skill.lines().count() <= 496, "SKILL.md grew past 496 lines");
+        // 498 since 2026-11-03: the row for the daemon's `claims` line (the recurring claim scan)
+        // and the dangerous-rm rule.
+        assert!(skill.lines().count() <= 498, "SKILL.md grew past 498 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text
@@ -1094,7 +1096,7 @@ mod tests {
             "`Do not commit, push, merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch and open a PR for it. Do not merge, delete, deploy, or contact anything external in this step; ask first.`",
             "`You may commit only through /commit, push this branch, open a PR for it and rebase-merge that PR; once `gh pr view` shows it merged, as your last step and from the main checkout, remove your own worktree (no --force) and its branch, local and remote. Do not delete anything else, deploy, or contact anything external in this step; ask first.`",
-            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, install only; merge only where its ending is `merge`) |",
+            "| Commit, push, PR, merge, release, tag, version bump, `git reset --hard`, `git clean`, `branch -D`, `rm -rf`, deleting a worktree (in an own repo, not its own worktree and merged branch after the merge), stash, file or repo | escalate, unless the brief says own repo (commit, push, PR, install only; merge only where its ending is `merge`); a dangerous-rm menu: the Menu row |",
             "the step is commit, push, PR, merge or install\n(merge only where its ending is `merge`; never a release, deploy or migration), else a card.",
             "The brief's `ending` picks it: `none`, the one above; `merge`, the third; `pr`, the second",
             "| Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |",

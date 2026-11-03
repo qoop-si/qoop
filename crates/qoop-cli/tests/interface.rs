@@ -2642,6 +2642,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                         id,
                         agents: Vec::new(),
                         splits: Vec::new(),
+                        qass_checks: None,
                     },
                     "RestartWhenSafe" => ControlResponse::RestartArmed {
                         id,

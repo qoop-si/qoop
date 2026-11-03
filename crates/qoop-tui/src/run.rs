@@ -15655,6 +15655,7 @@ mod tests {
             agent_session: None,
             agent_title: None,
             last_active_at_unix: None,
+            stop: None,
             cwd: None,
             slept_at_unix: None,
             activity: None,
@@ -16296,6 +16297,7 @@ mod tests {
                 id: "index".into(),
                 agents: Vec::new(),
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut request,
             &mut dirty,
@@ -16452,6 +16454,7 @@ mod tests {
                     id: "index".into(),
                     agents: Vec::new(),
                     splits: Vec::new(),
+                    qass_checks: None,
                 },
                 &mut request,
                 &mut dirty,
@@ -16518,6 +16521,7 @@ mod tests {
                 id: "index".into(),
                 agents: Vec::new(),
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut request,
             &mut dirty,
@@ -16612,6 +16616,7 @@ mod tests {
                 id: "index".into(),
                 agents: Vec::new(),
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut request,
             &mut false,
@@ -18457,6 +18462,7 @@ mod tests {
                 id: "index-1".into(),
                 agents: rows,
                 splits: Vec::new(),
+                qass_checks: None,
             }
         };
         s.modes.outbox.clear();
@@ -19174,6 +19180,7 @@ mod tests {
                 id: "x".to_string(),
                 agents: vec![agent(1, 1, "zsh", "idle"), agent(3, 1, "sh", "idle")],
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -19420,6 +19427,7 @@ mod tests {
                 agent(3, 1, "claude", "idle"),
             ],
             splits,
+            qass_checks: None,
         }
     }
 
@@ -20362,6 +20370,7 @@ mod tests {
                 id: "index".to_string(),
                 agents,
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -20829,6 +20838,7 @@ mod tests {
                 id: "index".to_string(),
                 splits: Vec::new(),
                 agents: vec![agent(7, 5, "zsh", "working")],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -20850,6 +20860,7 @@ mod tests {
                 id: "index".to_string(),
                 splits: Vec::new(),
                 agents: rows,
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -20873,6 +20884,7 @@ mod tests {
             id: "index".to_string(),
             splits: Vec::new(),
             agents,
+            qass_checks: None,
         };
         let rows = || {
             vec![
@@ -20924,6 +20936,7 @@ mod tests {
                 agent(5, 1, "zsh", "idle"),
                 agent(9, 2, "zsh", "idle"),
             ],
+            qass_checks: None,
         };
         std::fs::write(&file, "9\n").expect("write");
         let (mut request, mut dirty) = (0u64, false);
@@ -20962,6 +20975,7 @@ mod tests {
                 id: "index".to_string(),
                 splits: Vec::new(),
                 agents: vec![agent(3, 2, "zsh", "idle"), agent(4, 2, "zsh", "idle")],
+                qass_checks: None,
             },
             &mut request,
             &mut dirty,
@@ -20982,6 +20996,7 @@ mod tests {
             id: "index".to_string(),
             splits: Vec::new(),
             agents,
+            qass_checks: None,
         };
         let mut state = bare_state();
         state.space = Some(1);
@@ -21060,6 +21075,7 @@ mod tests {
                     id: "index".to_string(),
                     splits: Vec::new(),
                     agents: vec![agent(1, 1, "zsh", state_word)],
+                    qass_checks: None,
                 },
                 &mut 0,
                 &mut dirty,
@@ -21079,6 +21095,7 @@ mod tests {
                     id: "index".to_string(),
                     splits: Vec::new(),
                     agents: vec![agent(1, 1, "claude", word), agent(2, 1, "claude", "idle")],
+                    qass_checks: None,
                 },
                 &mut 0,
                 &mut false,
@@ -21154,6 +21171,7 @@ mod tests {
             id: "index".to_string(),
             agents: rows.clone(),
             splits: vec![tree.clone()],
+            qass_checks: None,
         };
         for spaces_first in [true, false] {
             let mut state = bare_state();
@@ -21195,6 +21213,7 @@ mod tests {
                 id: "index".to_string(),
                 splits: Vec::new(),
                 agents: vec![agent(1, 1, "claude", "working")],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -21420,6 +21439,7 @@ mod tests {
                 id: "mux".into(),
                 splits: Vec::new(),
                 agents: vec![],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -21432,6 +21452,7 @@ mod tests {
                 id: "index".into(),
                 splits: Vec::new(),
                 agents: vec![],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -21461,6 +21482,7 @@ mod tests {
                     agent(1, 1, "zsh", "idle"),
                     agent(remote, R1 | 1, "claude", "idle"),
                 ],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -21478,6 +21500,7 @@ mod tests {
                 id: "mux".into(),
                 splits: Vec::new(),
                 agents: vec![agent(remote, R1 | 1, "claude", "sleeping")],
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -21497,6 +21520,7 @@ mod tests {
             id: "mux".into(),
             splits: Vec::new(),
             agents,
+            qass_checks: None,
         };
         let both = || {
             vec![
@@ -21580,6 +21604,7 @@ mod tests {
             id: "mux".into(),
             splits: Vec::new(),
             agents,
+            qass_checks: None,
         };
         let both = || {
             vec![
@@ -21791,6 +21816,7 @@ mod tests {
                 id: "mux".into(),
                 agents: vec![agent(1, 1, "zsh", "idle"), agent(tab, there, "zsh", "idle")],
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut 0,
             &mut dirty,
@@ -23446,6 +23472,7 @@ mod tests {
                 id: "index".into(),
                 agents: vec![agent(5, 2, "claude", "done"), agent(7, 4, "claude", "idle")],
                 splits: Vec::new(),
+                qass_checks: None,
             },
             &mut request,
             &mut dirty,

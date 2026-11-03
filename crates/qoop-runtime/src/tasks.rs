@@ -716,6 +716,7 @@ pub(crate) async fn read(
     before: Option<i64>,
     space: Option<String>,
     names: std::collections::BTreeMap<i64, String>,
+    checked: std::collections::BTreeSet<i64>,
     agents: &AgentRegistry,
     store: &StoreHandle,
 ) -> ControlResponse {
@@ -788,9 +789,10 @@ pub(crate) async fn read(
     };
     let name = |t: i64| names.get(&t).cloned();
     // A tab's live row is the registry's, a sleep the store's: the same two for every agent.
+    // `checked` is the daemon's: the terminals qass would check a claim in now.
     let tab = |terminal: i64| {
         let live = u32::try_from(terminal).ok().and_then(|t| agents.live(t));
-        tab_of(live, &asleep, terminal)
+        tab_of(live, &asleep, terminal, checked.contains(&terminal))
     };
     let items: Option<Vec<_>> =
         items.map(|v| v.into_iter().map(|r| item_info(r, name, tab)).collect());
@@ -1062,6 +1064,7 @@ mod tests {
             None,
             None,
             std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
             &agents,
             &store,
         )
@@ -1109,6 +1112,7 @@ mod tests {
             None,
             None,
             std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
             &agents,
             &store,
         )

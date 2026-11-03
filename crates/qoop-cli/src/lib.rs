@@ -565,10 +565,7 @@ fn log_to_file(session: &std::path::Path) {
         paths::logs_dir()
     };
     if dir.is_some_and(|d| qoop_runtime::say::to_file(d.join("qoopd.log"))) {
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        qoop_runtime::say!("[{at}] qoopd {} starting", env!("CARGO_PKG_VERSION"));
+        qoop_runtime::say!("qoopd {} starting", env!("CARGO_PKG_VERSION"));
     }
 }
 
@@ -1788,6 +1785,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         )
         .await
         .ok()
+        .flatten()
         .flatten();
         if let Some(reason) = person_refusal(until, terminal, unix_now()) {
             return Err(std::io::Error::other(reason));
@@ -2153,6 +2151,12 @@ fn person_refusal(until: Option<i64>, terminal: u32, now: i64) -> Option<String>
 /// [`person_at`] on a connection of its own, for a caller with no runtime: `None` on any
 /// failure, so a write goes as it always did.
 fn person_until_now(terminal: u32) -> Option<i64> {
+    person_known_now(terminal).flatten()
+}
+
+/// [`person_at`] as the brief reads it: `None` when it is unknown (no daemon answer, or one
+/// from before `PersonAt`), `Some(None)` when nobody is at `terminal`.
+pub(crate) fn person_known_now(terminal: u32) -> Option<Option<i64>> {
     let rt = tokio::runtime::Runtime::new().ok()?;
     rt.block_on(async {
         let dir = paths::runtime_dir().ok()?;
@@ -2181,8 +2185,8 @@ fn unix_now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// Asks the daemon until when a person is at `terminal`; a daemon from before `PersonAt`, or
-/// any other answer, is `None`: the write goes as it always did.
+/// Asks the daemon until when a person is at `terminal`: `Some(None)` when nobody is; a daemon
+/// from before `PersonAt`, or any other answer, is `None`.
 async fn person_at(
     rd: &mut tokio::net::unix::OwnedReadHalf,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
@@ -2190,7 +2194,7 @@ async fn person_at(
     connection: &mut client::Connection,
     seq: &mut u32,
     terminal: u32,
-) -> std::io::Result<Option<i64>> {
+) -> std::io::Result<Option<Option<i64>>> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
     let id = format!("person-{terminal}-{}", unix_now());
     Ok(
@@ -2206,7 +2210,7 @@ async fn person_at(
         .await?
         .0
         {
-            ControlResponse::PersonAt { until, .. } => until,
+            ControlResponse::PersonAt { until, .. } => Some(until),
             _ => None,
         },
     )
@@ -2295,6 +2299,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         )
         .await
         .ok()
+        .flatten()
         .flatten();
         if let Some(reason) = person_refusal(until, row.terminal, unix_now()) {
             return Err(std::io::Error::other(reason));
@@ -3791,6 +3796,7 @@ mod tests {
             agent_session: None,
             agent_title: None,
             last_active_at_unix: None,
+            stop: None,
             cwd: None,
             slept_at_unix: None,
             activity: None,

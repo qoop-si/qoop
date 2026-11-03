@@ -88,32 +88,41 @@ fn local_now() -> String {
 }
 
 /// The live rows of this machine's agents, by terminal: their sidebar names and what each tab
-/// is doing. Empty without a daemon.
-fn live_rows() -> HashMap<i64, AgentRow> {
+/// is doing, and whether qass can check a claim now (the daemon's snapshot, which lives only
+/// in the daemon). An older daemon sends none, and its claims read checked as it shows them;
+/// with no daemon at all nothing can check, so empty and false.
+fn live_rows() -> (HashMap<i64, AgentRow>, bool) {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     else {
-        return HashMap::new();
+        return (HashMap::new(), false);
     };
     rt.block_on(async {
         let Ok(dir) = paths::runtime_dir() else {
-            return HashMap::new();
+            return (HashMap::new(), false);
         };
         let Ok((stream, inbuf)) =
             client::connect_observer(&paths::socket_path(&dir), "qoop-board").await
         else {
-            return HashMap::new();
+            return (HashMap::new(), false);
         };
         let request = ControlRequest::ListAgents {
             id: crate::request_id("board"),
         };
         match crate::ask_over(stream, inbuf, &request, crate::ASK_PATIENCE).await {
-            Ok(ControlResponse::Agents { agents, .. }) => agents
-                .into_iter()
-                .map(|a| (i64::from(a.terminal), a))
-                .collect(),
-            _ => HashMap::new(),
+            Ok(ControlResponse::Agents {
+                agents,
+                qass_checks,
+                ..
+            }) => (
+                agents
+                    .into_iter()
+                    .map(|a| (i64::from(a.terminal), a))
+                    .collect(),
+                qass_checks.unwrap_or(true),
+            ),
+            _ => (HashMap::new(), false),
         }
     })
 }
@@ -137,7 +146,11 @@ struct Hidden {
     tabs: BTreeSet<i64>,
 }
 
-fn read(store: &Store, live: &HashMap<i64, AgentRow>, hidden: &Hidden) -> std::io::Result<Board> {
+fn read(
+    store: &Store,
+    (live, qass_checks): (&HashMap<i64, AgentRow>, bool),
+    hidden: &Hidden,
+) -> std::io::Result<Board> {
     let now = now();
     let stored: HashMap<String, String> = store
         .session_titles()
@@ -172,11 +185,14 @@ fn read(store: &Store, live: &HashMap<i64, AgentRow>, hidden: &Hidden) -> std::i
         .into_iter()
         .map(|(terminal, _, since)| (terminal, since))
         .collect();
+    // A claim is checked only where qass can check now and does not leave the tab alone.
     let tab = |terminal: i64| {
+        let row = live.get(&terminal);
         tab_of(
-            live.get(&terminal).and_then(Live::of_row),
+            row.and_then(Live::of_row),
             &asleep,
             terminal,
+            qass_checks && !row.is_some_and(|r| r.qass_skip),
         )
     };
     let waiting = store.waiting_since().map_err(std::io::Error::other)?;
@@ -522,7 +538,8 @@ pub(crate) fn run(dir: Option<&Path>, json: bool) -> std::io::Result<()> {
         }
         return Ok(());
     };
-    let board = read(&store, &live_rows(), &hidden_from_qass(&store)?)?;
+    let (live, qass_checks) = live_rows();
+    let board = read(&store, (&live, qass_checks), &hidden_from_qass(&store)?)?;
     if json {
         println!(
             "{}",
@@ -578,7 +595,7 @@ mod tests {
             )
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut b = read(&store, &HashMap::new(), &Hidden::default()).unwrap();
+        let mut b = read(&store, (&HashMap::new(), false), &Hidden::default()).unwrap();
         b.asof = "2026-10-10 21:40".into();
         (dir, b)
     }
@@ -617,14 +634,38 @@ mod tests {
         store
             .claim_task_done(tabs[2].1, "ok", now - 8 * day)
             .unwrap();
-        let live = HashMap::from([(6, busy)]);
-        let b = read(&store, &live, &Hidden::default()).unwrap();
+        let claimer = |skip: bool| -> AgentRow {
+            serde_json::from_value(serde_json::json!({
+                "terminal": 7, "workspace": ws, "state": "idle", "readiness": "ready",
+                "agent": true, "qass_skip": skip,
+            }))
+            .unwrap()
+        };
+        let live = HashMap::from([(6, busy.clone()), (7, claimer(false))]);
+        let b = read(&store, (&live, true), &Hidden::default()).unwrap();
         let text = space(&b, &b.spaces[0]);
         for want in [
             "task #1 · investigating since 30 d ago · asleep · 13 d · updated",
             "task #2 · investigating since 30 d ago · working · 3 d · updated",
             "task #3 · investigating since 30 d ago · qass checks · 8 d · updated",
         ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        // A claim nobody can check waits on him: qass cannot check now, or it leaves the tab
+        // alone. The snapshot rides the daemon's agents reply.
+        let skipped = HashMap::from([(6, busy.clone()), (7, claimer(true))]);
+        for (live, checks) in [(&live, false), (&skipped, true)] {
+            let b = read(&store, (live, checks), &Hidden::default()).unwrap();
+            let text = space(&b, &b.spaces[0]);
+            let want = "task #3 · investigating since 30 d ago · waits on you · 8 d";
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        // A claim whose tab is gone is qass's to close failed at its Start, watcher or not.
+        let gone = HashMap::from([(6, busy)]);
+        for checks in [true, false] {
+            let b = read(&store, (&gone, checks), &Hidden::default()).unwrap();
+            let text = space(&b, &b.spaces[0]);
+            let want = "task #3 · investigating since 30 d ago · qass checks · 8 d";
             assert!(text.contains(want), "{want}: {text}");
         }
     }
@@ -654,7 +695,7 @@ mod tests {
         store
             .close_task(alone, qoop_store::Outcome::Verified, "ran", now())
             .unwrap();
-        let b = read(&store, &HashMap::new(), &Hidden::default()).unwrap();
+        let b = read(&store, (&HashMap::new(), false), &Hidden::default()).unwrap();
         let readme = index(&b);
         assert!(
             readme.contains(&format!(
@@ -688,7 +729,11 @@ mod tests {
             .unwrap();
         let text = |hidden: &Hidden| {
             let dir = tempfile::tempdir().unwrap();
-            write_dir(&read(&store, &HashMap::new(), hidden).unwrap(), dir.path()).unwrap();
+            write_dir(
+                &read(&store, (&HashMap::new(), false), hidden).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
             let mut all = String::new();
             for entry in std::fs::read_dir(dir.path()).unwrap() {
                 all += &std::fs::read_to_string(entry.unwrap().path()).unwrap();

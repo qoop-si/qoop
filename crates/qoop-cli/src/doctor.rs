@@ -1,8 +1,8 @@
 //! `qoop doctor`: whether the board, qass's questions and the agents tell one truth.
 //!
-//! Read-only on the store: three reads through the daemon (the agents, the board, the live
-//! cards), checked against the invariants in `plans/2026-10-12-sync-architecture.md`. One line
-//! per finding, nothing when all hold. It never acts: qass, or the owner, does what a line says.
+//! Read-only on the store: four reads through the daemon (the agents, the board, the open
+//! tasks, the live cards), checked against the invariants in
+//! `plans/2026-10-12-sync-architecture.md`. One line per finding, nothing when all hold. It never acts: qass, or the owner, does what a line says.
 //! Exit 0 when clean, 1 with findings, 3 when a read could not be made (a daemon from before
 //! it, or one that did not answer), each skipped check named so silence never means "not
 //! checked". `--new <file>` prints only findings whose id is not in the file and writes the
@@ -12,7 +12,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
 use std::time::Duration;
 
-use qoop_runtime::control::{AgentRow, AskInfo, ControlRequest, ControlResponse, ItemInfo};
+use qoop_runtime::control::{
+    AgentRow, AskInfo, ControlRequest, ControlResponse, ItemInfo, Status, TaskInfo,
+};
 
 /// The space qass and its inbox live in.
 const QASS_SPACE: &str = "qass";
@@ -40,6 +42,10 @@ pub(crate) struct Seen {
     pub agents: Result<Vec<AgentRow>, String>,
     pub spaces: Result<Spaces, String>,
     pub board: Result<Option<Vec<ItemInfo>>, String>,
+    /// Every open task, each with the board's status; `tasks_cut` when they did not fit one
+    /// answer.
+    pub tasks: Result<Vec<TaskInfo>, String>,
+    pub tasks_cut: bool,
     pub asks: Result<Vec<AskInfo>, String>,
 }
 
@@ -83,10 +89,22 @@ pub(crate) fn check(seen: &Seen) -> (Vec<Finding>, Vec<String>) {
         (Err(e), _) => skipped.push(format!("cannot check the board: {e}")),
         (Ok(Some(_)), None) => {}
     }
+    let tasks = match &seen.tasks {
+        Ok(tasks) => Some(tasks),
+        Err(e) => {
+            skipped.push(format!("cannot check the open tasks: {e}"));
+            None
+        }
+    };
+    if seen.tasks_cut {
+        skipped.push("the open tasks did not fit one answer: I4 saw only the oldest".into());
+    }
     // Both need to know qass's space and the sleeping tabs: without them qass's own tab and a
     // sleeping one would read as findings.
     if let (Some(rows), Some(asks), Some(spaces)) = (agents, asks, &spaces) {
-        found.extend(waiting_without_card(rows, asks, spaces.qass));
+        if let Some(tasks) = tasks {
+            found.extend(waiting_without_card(tasks, rows, asks, spaces));
+        }
         found.extend(cards_with_nobody(rows, asks, spaces));
     }
     (found, skipped)
@@ -140,35 +158,68 @@ fn live(a: &AskInfo) -> bool {
     matches!(a.status.as_str(), "open" | "queued" | "passed")
 }
 
-/// I4: an agent whose task waits on the owner has a live card. qass's own tab is skipped: it
-/// asks him through cards it writes itself.
-fn waiting_without_card(rows: &[AgentRow], asks: &[AskInfo], qass: Option<i64>) -> Vec<Finding> {
-    let carded: BTreeSet<u32> = asks
+/// I4: a task that waits on the owner has a live card, wherever its tab is: live (once its
+/// agent is at rest), asleep, or gone. Waiting is the board's own word for it (`waits` from
+/// `control::status`, where `waiting-human` comes before a claim), so a claimed task that
+/// asks is seen too. Only `waiting-human` asks for one: a plain claim is checked by qass (it may
+/// read `waits` when nobody can check it, but a claim never becomes his card by itself), and
+/// a live tab on a menu reads `waits` for a menu qass answers. qass's own space is skipped:
+/// it asks him through cards it writes itself.
+fn waiting_without_card(
+    tasks: &[TaskInfo],
+    rows: &[AgentRow],
+    asks: &[AskInfo],
+    spaces: &Spaces,
+) -> Vec<Finding> {
+    let live_cards: Vec<&AskInfo> = asks.iter().filter(|a| live(a)).collect();
+    tasks
         .iter()
-        .filter(|a| live(a))
-        .filter_map(|a| a.terminal)
-        .collect();
-    rows.iter()
-        .filter(|r| Some(r.workspace) != qass)
-        .filter_map(|r| {
-            let task = r.task.as_ref()?;
-            // At rest: the inbox's draft comes when the turn ends, not when the stage is set.
-            let at_rest = !matches!(r.state.as_str(), "working" | "starting");
-            (task.stage == "waiting-human"
-                && !task.claimed
-                && at_rest
-                && !carded.contains(&r.terminal))
-            .then(|| Finding {
-                id: format!("I4:T{}:{}", r.terminal, task.id),
+        .filter(|t| t.workspace.is_none_or(|w| Some(w) != spaces.qass))
+        .filter(|t| waits_on_owner(t))
+        .filter_map(|t| {
+            let terminal = t.terminal.and_then(|n| u32::try_from(n).ok());
+            let carded = live_cards
+                .iter()
+                .any(|a| a.task == Some(t.id) || (a.terminal.is_some() && a.terminal == terminal));
+            if carded {
+                return None;
+            }
+            let row = terminal.and_then(|n| rows.iter().find(|r| r.terminal == n));
+            let tab = match (row, terminal) {
+                // At rest: the inbox's draft comes when the turn ends, not when the stage is set.
+                (Some(r), _) if matches!(r.state.as_str(), "working" | "starting") => {
+                    return None;
+                }
+                (Some(_), _) => "",
+                (None, Some(n)) if spaces.asleep.contains(&n) => ", its tab asleep,",
+                _ => ", its tab gone,",
+            };
+            let claimed = if t.claimed_at.is_some() {
+                " and claimed done"
+            } else {
+                ""
+            };
+            let (head, who) = match (terminal, row) {
+                (Some(n), Some(r)) => (format!("T{n}"), format!(" {}", name(r))),
+                (Some(n), None) => (format!("T{n}"), String::new()),
+                (None, _) => ("-".to_string(), String::new()),
+            };
+            Some(Finding {
+                id: format!("I4:{head}:{}", t.id),
                 line: format!(
-                    "I4 T{} {}: waits on you (task {}) with no question card; qass writes one",
-                    r.terminal,
-                    name(r),
-                    task.id
+                    "I4 {head}{who}: waits on you (task {}{claimed}){tab} with no question card; \
+                     qass writes one",
+                    t.id
                 ),
             })
         })
         .collect()
+}
+
+/// Whether the board says a task waits on him: `waiting-human` and the board's `waits` (an
+/// older daemon sends no status; its stage alone then).
+fn waits_on_owner(t: &TaskInfo) -> bool {
+    t.stage == "waiting-human" && (t.status.is_empty() || t.status == Status::Waits.as_str())
 }
 
 /// I6: a live card has someone to take its answer: its agent's tab, else qass's.
@@ -206,7 +257,7 @@ fn name(r: &AgentRow) -> String {
         .unwrap_or_else(|| format!("terminal {}", r.terminal))
 }
 
-/// The three reads, each on its own: one that fails does not stop the others.
+/// The four reads, each on its own: one that fails does not stop the others.
 fn read() -> Seen {
     let before = read_spaces();
     let agents = match crate::task::ask(
@@ -246,6 +297,25 @@ fn read() -> Seen {
         Ok(other) => Err(format!("unexpected answer: {other:?}")),
         Err(e) => Err(e.to_string()),
     };
+    // Every open task, wherever its tab is: the agents listing has only the live ones.
+    let open = match crate::task::ask(
+        ControlRequest::TaskRead {
+            id: crate::request_id("doctor"),
+            board: false,
+            task: None,
+            terminal: None,
+            token: None,
+            before: None,
+        },
+        PATIENCE,
+    ) {
+        Ok(ControlResponse::Tasks { tasks, more, .. }) => Ok((tasks, more)),
+        Ok(ControlResponse::Failed { reason, .. }) => Err(reason),
+        Ok(other) => Err(format!("unexpected answer: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    };
+    let tasks_cut = open.as_ref().is_ok_and(|(_, more)| *more);
+    let tasks = open.map(|(tasks, _)| tasks);
     let asks = match crate::task::ask(
         ControlRequest::AskRead {
             id: crate::request_id("doctor"),
@@ -262,6 +332,8 @@ fn read() -> Seen {
         agents,
         spaces,
         board,
+        tasks,
+        tasks_cut,
         asks,
     }
 }
@@ -340,12 +412,13 @@ const HELP: &str = "\
 usage: qoop doctor [--json] [--new <file>]
 
 Whether the board, qass's questions and the agents tell one truth. Read-only: it reads the
-agents, the board and the live cards through the daemon and prints one line per thing that does
-not hold, and nothing when all hold. It never acts.
+agents, the board, the open tasks and the live cards through the daemon and prints one line
+per thing that does not hold, and nothing when all hold. It never acts.
 
   I1  an item closed in the last day still has an open task that is claimed, or whose tab is
       gone or asleep
-  I4  an agent at rest waits on you (its task in waiting-human) and has no question card
+  I4  a task waits on you (waiting-human, claimed done or not; its tab at rest, asleep or
+      gone) and has no question card
   I6  a live card has nobody to take its answer: its tab closed, or no tab and no qass
 
   --json        the findings as JSON: [{\"id\", \"line\"}], skipped checks under \"skipped\"
@@ -354,8 +427,7 @@ not hold, and nothing when all hold. It never acts.
 
 Exit 0 clean, 1 findings, 3 a read could not be made (each skipped check is named).
 Limits: live cards only; this Mac only; items closed in the last day (the board's Done
-lane); a question on an agent's screen it has not ended its turn with is not seen; an agent
-whose task the daemon could not read in time shows no task and is not checked for I4.
+lane); a question on an agent's screen it has not ended its turn with is not seen.
 ";
 
 pub fn run(args: &[String]) -> std::io::Result<()> {
@@ -430,7 +502,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qoop_runtime::control::{AskCard, ItemAgentInfo, TaskRef};
+    use qoop_runtime::control::{AskCard, ItemAgentInfo, Live, StatusInput, Tab, TaskRef, status};
 
     fn row(terminal: u32, workspace: i64, task: Option<(i64, &str, bool)>) -> AgentRow {
         let mut r: AgentRow = serde_json::from_value(serde_json::json!({
@@ -491,8 +563,79 @@ mod tests {
         a
     }
 
+    /// Where a task's tab is, for its status.
+    #[derive(Clone, Copy)]
+    enum At {
+        Live,
+        Asleep,
+        Gone,
+    }
+
+    /// An open task as the daemon sends it, its status made by the board's own `status`.
+    fn task(
+        id: i64,
+        terminal: Option<i64>,
+        workspace: i64,
+        stage: &str,
+        claimed: bool,
+        at: At,
+    ) -> TaskInfo {
+        let tab = match at {
+            At::Live => Tab {
+                live: Some(Live {
+                    state: "idle",
+                    last_active: None,
+                    subagents: 0,
+                }),
+                ..Default::default()
+            },
+            At::Asleep => Tab {
+                asleep_since: Some(0),
+                ..Default::default()
+            },
+            At::Gone => Tab::default(),
+        };
+        let claimed_at = claimed.then_some(100);
+        let (token, at) = status(StatusInput {
+            stage,
+            claimed_at,
+            updated_at: 100,
+            tab,
+            ..Default::default()
+        });
+        let mut t: TaskInfo = serde_json::from_value(serde_json::json!({
+            "id": id, "goal": "g", "stage": stage, "opened_at": 0, "updated_at": 100,
+        }))
+        .expect("a minimal task");
+        t.terminal = terminal;
+        t.workspace = Some(workspace);
+        t.claimed_at = claimed_at;
+        t.status = token.as_str().to_string();
+        t.status_at = at;
+        t
+    }
+
+    /// The open tasks of the live rows, as the daemon would send them beside the listing.
+    fn tasks_of(rows: &[AgentRow]) -> Vec<TaskInfo> {
+        rows.iter()
+            .filter_map(|r| {
+                let t = r.task.as_ref()?;
+                Some(task(
+                    t.id,
+                    Some(i64::from(r.terminal)),
+                    r.workspace,
+                    &t.stage,
+                    t.claimed,
+                    At::Live,
+                ))
+            })
+            .collect()
+    }
+
     fn seen(agents: Vec<AgentRow>, board: Vec<ItemInfo>, asks: Vec<AskInfo>) -> Seen {
         Seen {
+            tasks: Ok(tasks_of(&agents)),
+            tasks_cut: false,
             agents: Ok(agents),
             spaces: Ok(Spaces {
                 qass: Some(9),
@@ -549,13 +692,64 @@ mod tests {
         let rows = vec![
             row(5, 1, Some((50, "waiting-human", false))), // no card: said
             row(6, 1, Some((51, "waiting-human", false))), // queued answer: live
-            row(7, 1, Some((52, "waiting-human", true))),  // claimed: done and asking
+            row(7, 1, Some((52, "waiting-human", true))),  // claimed and asking: said
             row(8, 9, Some((53, "waiting-human", false))), // qass's own tab
         ];
         let asks = vec![card("W1", Some(6), "queued"), card("E2", Some(5), "closed")];
         let (found, _) = check(&seen(rows, Vec::new(), asks));
         let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
-        assert_eq!(ids, ["I4:T5:50"]);
+        assert_eq!(ids, ["I4:T5:50", "I4:T7:52"]);
+    }
+
+    /// F1: a claimed and an unclaimed `waiting-human` task ask for a card, on a live, an
+    /// asleep (T6) and a gone tab alike, except a claim with no tab, which qass closes; a
+    /// plain done claim never does, wherever it is.
+    #[test]
+    fn a_wait_asks_for_a_card_on_every_tab_and_a_plain_claim_never_does() {
+        let rows = vec![row(5, 1, None)];
+        let cases = [
+            ("waiting-human", true, true),
+            ("waiting-human", false, true),
+            ("verifying", true, false),
+        ];
+        for (stage, claimed, asks_him) in cases {
+            for (terminal, at) in [(5, At::Live), (6, At::Asleep), (8, At::Gone)] {
+                let open = vec![task(70, Some(terminal), 1, stage, claimed, at)];
+                let mut s = seen(rows.clone(), Vec::new(), Vec::new());
+                s.tasks = Ok(open.clone());
+                let (found, _) = check(&s);
+                let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
+                let want: &[String] = &[format!("I4:T{terminal}:70")];
+                let case = format!("{stage} claimed={claimed} T{terminal}");
+                if asks_him && !(claimed && terminal == 8) {
+                    assert_eq!(ids, want, "{case}");
+                    let line = &found[0].line;
+                    assert_eq!(line.contains("claimed done"), claimed, "{case}: {line}");
+                    assert_eq!(line.contains("asleep"), terminal == 6, "{case}: {line}");
+                    assert_eq!(line.contains("gone"), terminal == 8, "{case}: {line}");
+                    // A live card about its task, or its tab, settles it.
+                    let mut by_task = card("E5", None, "open");
+                    by_task.task = Some(70);
+                    for c in [by_task, card("E6", Some(terminal as u32), "open")] {
+                        let mut s = seen(rows.clone(), Vec::new(), vec![c]);
+                        s.tasks = Ok(open.clone());
+                        let (found, _) = check(&s);
+                        assert!(
+                            found.iter().all(|f| !f.id.starts_with("I4")),
+                            "{case}: {found:?}"
+                        );
+                    }
+                } else {
+                    assert!(ids.is_empty(), "{case}: {found:?}");
+                }
+            }
+        }
+        // A tab-less wait is said too.
+        let mut s = seen(rows, Vec::new(), Vec::new());
+        s.tasks = Ok(vec![task(71, None, 1, "waiting-human", false, At::Gone)]);
+        let (found, _) = check(&s);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].id, "I4:-:71");
     }
 
     #[test]
@@ -583,17 +777,24 @@ mod tests {
         let (found, skipped) = check(&Seen {
             agents: Err("the daemon did not answer in time".into()),
             spaces: Ok(Spaces::default()),
+            tasks: Err("the daemon did not answer in time".into()),
+            tasks_cut: false,
             board: Ok(None),
             asks: Err("unknown variant `AskRead`".into()),
         });
         assert!(found.is_empty());
-        assert_eq!(skipped.len(), 3, "{skipped:?}");
+        assert_eq!(skipped.len(), 4, "{skipped:?}");
         assert!(
             skipped
                 .iter()
                 .any(|s| s.contains("cannot check the agents"))
         );
         assert!(skipped.iter().any(|s| s.contains("cannot check the board")));
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.contains("cannot check the open tasks"))
+        );
         assert!(
             skipped
                 .iter()
@@ -606,6 +807,8 @@ mod tests {
         let (found, skipped) = check(&Seen {
             agents: Ok(vec![row(5, 1, Some((50, "waiting-human", false)))]),
             spaces: Err("timed out".into()),
+            tasks: Ok(Vec::new()),
+            tasks_cut: false,
             board: Ok(Some(Vec::new())),
             asks: Ok(vec![card("E1", Some(77), "open")]),
         });

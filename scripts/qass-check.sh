@@ -24,6 +24,10 @@ render() { # home -> the skill's dir
     echo "$to"
 }
 skill_w="$(render "$tmp/home")"
+# Every agent line now carries `stop:<id>` and the brief's `allowed:<verdict>@<unix>` (their own
+# cases are crates/qoop-cli/tests/qass_watch_lines.rs); the lines here are compared without them.
+# Line by line, so the timed cases keep their times.
+bare() { perl -pe 'BEGIN { $| = 1 } s/ stop:\S+//; s/ allowed:\S+//'; }
 
 row() { # terminal generation state [agent] [title] [skip: any word marks it qass_skip]
     printf '{"terminal":%s,"generation":%s,"state":"%s","agent":%s,"program":"claude","name":null,"agent_title":"%s","cwd":"/w","activity":"%s"%s}' \
@@ -44,6 +48,7 @@ cat > "$tmp/snapshots" <<EOF
 EOF
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 cat "$tmp/snapshots"
 EOF
@@ -57,7 +62,7 @@ daemon-gone
 T5 g1 claude working->failed "task" /w
 T7 g1 claude blocked->closed "task" /w'
 
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" | bare)"
 if [ "$got" != "$expected" ]; then
     echo "watch.sh printed:"; echo "$got"; echo "expected:"; echo "$expected"; exit 1
 fi
@@ -71,7 +76,7 @@ got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" bash -c "
 # Its own terminal is never reported.
 printf '%s\n' "[$(row 5 1 working)]" "[$(row 5 1 idle)]" > "$tmp/snapshots"
 rm -f "$tmp/home/.qass/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=5 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=5 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" | bare)"
 [ -z "$got" ] || { echo "own terminal printed: $got"; exit 1; }
 
 # A hands-off mark raises its worker once more when it passes, once, and only
@@ -85,12 +90,13 @@ printf -- '- T5 g1 0a1b2c3d "fix x" task:12; hands off until %s\n- T6 g1 y: task
     $((now + 3)) $((now - 1)) $((now + 999)) > "$tmp/home/.qass/goals.md"
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 # The tick reads the inbox: answered at once, not by the snapshots' long wait.
 [ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 22 2>/dev/null
 EOF
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$skill_w/watch.sh" || true)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" perl -e 'alarm 24; exec @ARGV' "$skill_w/watch.sh" | bare || true)"
 [ "$got" = 'T5 g1 claude hands-off->idle "task" /w' ] || { echo "hands-off printed: $got"; exit 1; }
 
 # A tab that slept is not a tab that closed.
@@ -98,11 +104,12 @@ printf '%s\n' "[$(row 5 1 idle)]" "[$(row 6 1 working)]" > "$tmp/snapshots"
 echo '[{"name":"a","sleeping":[5]}]' > "$tmp/ls"
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = ls ] && { cat "$tmp/ls"; exit 0; }
 cat "$tmp/snapshots"
 EOF
 rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/goals.md"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" | bare)"
 [ "$got" = 'T5 g1 claude new->idle "task" /w
 T5 g1 claude idle->sleeping "task" /w' ] || { echo "sleep printed: $got"; exit 1; }
 rm -f "$tmp/ls"
@@ -112,6 +119,7 @@ printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
 printf '%s\n' "[$(row 2 3 working)]" "[$(row 2 3 idle)]" > "$tmp/remote-snapshots"
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = remote ] && { echo "ubox  fake-host"; exit 0; }
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 sleep 2; cat "$tmp/snapshots"
@@ -122,7 +130,7 @@ case "\$*" in *watch*) cat "$tmp/remote-snapshots" ;; *) echo '[]' ;; esac
 EOF
 chmod +x "$tmp/bin/ssh"
 rm -f "$tmp/home/.qass/"*.json "$tmp/home/.qass/goals.md"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | sort)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare | sort)"
 want="$(printf '%s\n' 'T5 g1 claude new->idle "task" /w' 'ubox/T2 g3 claude working->idle "task" /w' 'ubox/link-down' | sort)"
 [ "$got" = "$want" ] || { echo "remote printed: $got"; exit 1; }
 rm -f "$tmp/bin/ssh"
@@ -135,20 +143,21 @@ printf '%s\n' "[$(row 5 1 idle),$(row 6 1 idle)]" "[$(row 5 1 working),$(row 6 1
 : > "$tmp/home/.qass/goals.md"
 cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = ls ] && { echo '[]'; exit 0; }
 [ "\$1" = remote ] && exit 0
 # The tick reads the inbox: answered at once, not by the snapshots' long wait.
 [ "\$1" = ask ] && { echo '{"live":[],"ended":[]}'; exit 0; }
 cat "$tmp/snapshots"; exec sleep 14 2>/dev/null
 EOF
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" || true)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_SETTLE=2 PATH="$tmp/bin:$PATH" perl -e 'alarm 15; exec @ARGV' "$skill_w/watch.sh" | bare || true)"
 [ "$got" = 'T5 g1 claude working->idle "task" /w' ] || { echo "settle printed: $got"; exit 1; }
 
 # A row with a task carries it at the end of its line, claim and all.
 task_row='{"terminal":8,"generation":1,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"verifying","claimed":true}}'
 printf '%s\n' "[$(printf "$task_row" working)]" "[$(printf "$task_row" idle)]" > "$tmp/snapshots"
 rm -f "$tmp/home/.qass/last.json" "$tmp/home/.qass/settle"*
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh")"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" | bare)"
 [ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] \
     || { echo "task line printed: $got"; exit 1; }
 
@@ -164,6 +173,7 @@ quiet_fresh() { rm -rf "$q"; mkdir -p "$q"; }
 stream() { # hold-open-seconds [gap-seconds]
     cat > "$tmp/bin/qoop" <<EOF
 #!/bin/sh
+[ "\$1" = qass ] && exit 1
 [ "\$1" = ls ] && { cat "$tmp/ls" 2>/dev/null || echo '[]'; exit 0; }
 [ "\$1" = remote ] && { cat "$tmp/remotes" 2>/dev/null; exit 0; }
 [ "\$1" = read ] && { cat "$tmp/screen" 2>/dev/null; exit 0; }
@@ -179,7 +189,7 @@ timed() {
     start="$(perl -MTime::HiRes=time -e 'printf "%.2f", time')"
     # Stopped with TERM, the way Monitor stops it, so its own way out takes every child along.
     ( HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null &
-      w=$!; sleep "$1"; kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null || true ) |
+      w=$!; sleep "$1"; kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null || true ) | bare |
         perl -MTime::HiRes=time -ne "\$|=1; printf '%.1f %s', time() - $start, \$_" || true
 }
 lines() { cut -d' ' -f2-; }                      # stamped -> plain
@@ -201,7 +211,7 @@ cat > "$tmp/snapshots" <<EOF
 [$(row 5 1 failed),$(row 7 1 blocked)]
 [$(row 5 1 failed)]
 EOF
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 want='T6 g1 claude new->idle "task" /w
 T6 g2 claude restarted->idle "task" /w
 T5 g1 claude working->idle "task" /w
@@ -218,13 +228,13 @@ grep -q 'long: no record T5 g1' "$q/quiet.log" || { echo "a long line left no re
 fresh; stream 0
 printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
 printf '%s\n' '[]' > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = daemon-gone ] || { echo "gone with an agent printed: $got"; exit 1; }
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] || { echo "a restart said the gone daemon again: $got"; exit 1; }
 fresh
 printf '%s\n' "[$(row 9 1 idle false)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] || { echo "gone with no agent printed: $got"; exit 1; }
 grep -q 'daemon gone, no agent' "$q/quiet.log" || { echo "a silent gone was not logged"; exit 1; }
 
@@ -298,7 +308,7 @@ grep -q 'ride expired T5' "$q/quiet.log" || { echo "a ride did not expire to the
 fresh; stream 0
 echo "5 1 idle implementing $(( $(date +%s) - 100 ))" > "$q/said"
 printf '%s\n' "[$(printf "$wh" working)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g1 claude working->idle "x" /w task:12:waiting-human' ] || { echo "new waiting-human printed: $got"; exit 1; }
 # Still idle, its task only now waiting on him (the daemon moved a question left unanswered):
 # said at once too, on a remote as here.
@@ -337,7 +347,7 @@ rm -f "$tmp/ls"
 fresh; stream 0
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
 printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_QUIET_HOLD=12 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 QASS_QUIET_HOLD=12 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && grep -q '^5 1 long ' "$q/held" || { echo "nothing was held: $got"; exit 1; }
 stream 30
 got="$(QASS_QUIET_HOLD=12 timed 24)"
@@ -348,13 +358,13 @@ got="$(QASS_QUIET_HOLD=12 timed 24)"
 fresh; stream 0
 printf '%s\n' "[$(row 5 1 working),$(row 6 1 working)]" > "$q/last.json"
 printf '%s\n' "[$(row 5 1 idle),$(row 6 1 blocked)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T6 g1 claude working->blocked "task" /w
 T5 g1 claude working->idle "task" /w' ] || { echo "one snapshot, held and said, printed: $got"; exit 1; }
 fresh
 printf '%s\n' "[$(row 5 1 working),$(row 6 1 working)]" > "$q/last.json"
 printf '%s\n' "[$(row 5 2 idle),$(row 6 1 blocked)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g2 claude restarted->idle "task" /w
 T6 g1 claude working->blocked "task" /w' ] && grep -q '^5 2 idle ' "$q/said" \
     || { echo "restart beside blocked printed: $got"; exit 1; }
@@ -424,11 +434,11 @@ fresh; stream 0
 cl='{"terminal":8,"generation":1,"state":"%s","agent":true,"program":"claude","name":null,"agent_title":"fix","cwd":"/w","task":{"id":12,"goal":"x","stage":"verifying","claimed":%s}}'
 printf '%s\n' "[$(printf "$cl" working false)]" > "$q/last.json"
 printf '%s\n' "[$(printf "$cl" idle true)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T8 g1 claude working->idle "fix" /w task:12:verifying:claimed' ] || { echo "a first claim printed: $got"; exit 1; }
 grep -q '^8 1 idle verifying:claimed ' "$q/said" || { echo "the claim was not kept: $(cat "$q/said")"; exit 1; }
 printf '%s\n' "[$(printf "$cl" working true)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && grep -q '^8 1 long ' "$q/held" || { echo "a repeated claim printed: $got"; exit 1; }
 
 # A Claude agent stopped on its usage limit, with cswap there to switch the account, is said at
@@ -443,31 +453,31 @@ fresh; stream 0
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
 printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
 limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" "    Continuing automatically at 7:20am"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a limit printed: $got"; exit 1; }
 # The same stop seen again within seconds (its failure after its idle) is said once.
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && grep -q 'limit already said T5' "$q/quiet.log" || { echo "one stop twice printed: $got"; exit 1; }
 # A second limit two minutes later ends "again"; one past the hold does not.
 echo "5 $(( $(date +%s) - 120 ))" > "$q/limited"
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am again' ] || { echo "a second limit printed: $got"; exit 1; }
 echo "5 $(( $(date +%s) - 700 ))" > "$q/limited"
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a limit past the hold printed: $got"; exit 1; }
 # A turn that ends failed on the limit (StopFailure) is named the same way.
 fresh
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"; printf '%s\n' "[$(row 5 1 failed)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T5 g1 claude working->limited "task" /w resets:7:20am' ] || { echo "a failed limit printed: $got"; exit 1; }
 # Another agent program is not named (cswap switches Claude accounts only).
 fresh
 printf '%s\n' "[$(row 5 1 working | sed 's/"claude"/"codex"/')]" > "$q/last.json"
 printf '%s\n' "[$(row 5 1 idle | sed 's/"claude"/"codex"/')]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && grep -q '^5 1 long ' "$q/held" || { echo "a codex limit was named: $got"; exit 1; }
 printf '%s\n' "[$(row 5 1 idle)]" > "$tmp/snapshots"
 for case in stale talk nocswap; do
@@ -480,7 +490,7 @@ for case in stale talk nocswap; do
         nocswap) limit_screen "  ⚠ Usage limit reached · limit resets 7:20am" "    Continuing automatically at 7:20am"
                  mv "$tmp/bin/cswap" "$tmp/cswap.off"; p="$tmp/bin:/usr/bin:/bin" ;;
     esac
-    got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$p" "$skill_w/watch.sh" 2>/dev/null)"
+    got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$p" "$skill_w/watch.sh" 2>/dev/null | bare)"
     [ -z "$got" ] && grep -q '^5 1 long ' "$q/held" || { echo "a $case limit was named: $got"; exit 1; }
 done
 mv "$tmp/cswap.off" "$tmp/bin/cswap"
@@ -677,11 +687,11 @@ rm -f "$tmp/ls"
 quiet_fresh; stream 0
 printf '%s\n' "[$(row 5 1 idle)]" > "$q/last.json"
 printf '%s\n' '[]' > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && grep -q 'daemon gone, no agent' "$q/quiet.log" || { echo "an idle machine's exit printed: $got"; exit 1; }
 quiet_fresh
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = daemon-gone ] || { echo "a busy machine's exit printed: $got"; exit 1; }
 
 # Its own time up (QASS_WATCH_FOR), it ends by itself with `watch-ends`, at the first tick past
@@ -734,7 +744,7 @@ printf '%s\n' "[$(trow 5 1 working implementing)]" > "$q/last.json"
 printf '%s\n' "[$(trow 5 1 idle implementing)]" "[$(trow 5 1 working implementing)]" > "$tmp/snapshots"
 got="$(QASS_SETTLE=4 QASS_ROUTINE_HOLD=60 timed 14)"
 [ -z "$got" ] || { echo "a work rest that went back to work was said: $got"; exit 1; }
-grep -q 'stale T5 g1' "$q/quiet.log" || { echo "a flapping work rest left no stale"; exit 1; }
+grep -q 'stale [a-z]* T5 g1' "$q/quiet.log" || { echo "a flapping work rest left no stale"; exit 1; }
 
 # A start the switch refuses is on record too.
 quiet_fresh; stream 5
@@ -756,7 +766,7 @@ quiet_fresh; stream 0
 echo off > "$q/watch"
 printf '%s\n' "[$(row 5 1 working)]" > "$q/last.json"
 printf '%s\n' "[$(row 5 1 blocked)]" > "$tmp/snapshots"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = "$off_line" ] || { echo "off at start printed: $got"; exit 1; }
 # Turned off while it runs: a block after the switch is not said, and it ends with the off line.
 quiet_fresh; stream 30 4
@@ -771,7 +781,7 @@ quiet_fresh; stream 0
 printf '#!/bin/sh\nsleep 30\n' > "$tmp/watch.sh"; chmod +x "$tmp/watch.sh"
 "$tmp/watch.sh" & other=$!
 echo "$other" > "$q/watch.pid"
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 kill "$other" 2>/dev/null || true
 [ "$got" = 'watch-running: one already runs' ] || { echo "a second watcher printed: $got"; exit 1; }
 # On again: its first snapshot is the base and the held lines go (qass sums the fleet up);
@@ -800,7 +810,7 @@ cat > "$tmp/snapshots" <<EOF
 [$(row 6 1 working)]
 [$(row 6 1 blocked)]
 EOF
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ "$got" = 'T6 g1 claude working->blocked "task" /w' ] && [ ! -s "$q/held" ] \
     || { echo "a skipped tab was said: $got"; exit 1; }
 # The flag set while the tab works is not a close, and cleared on one that rests is not a new tab.
@@ -812,7 +822,7 @@ cat > "$tmp/snapshots" <<EOF
 [$(row 5 1 idle)]
 [$(row 5 1 working)]
 EOF
-got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null)"
+got="$(HOME="$tmp/home" QOOP_TERMINAL=99 PATH="$tmp/bin:$PATH" "$skill_w/watch.sh" 2>/dev/null | bare)"
 [ -z "$got" ] && [ ! -s "$q/held" ] || { echo "the flag set or cleared was said: $got"; exit 1; }
 # A held idle line of a tab skipped before the flush is dropped, and says why in the log.
 fresh; stream 30 3

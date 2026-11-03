@@ -29,8 +29,12 @@
 # Lines: T52 g3 claude working->idle "fix login" /home/me/src/app      (this Mac)
 #        ubox/T2 g3 claude working->idle "fix login" /home/me/src/app  (remote ubox)
 #        ASK E75 answered a -> T224   (the owner answered a card: nothing to do, see asks_said)
+#        claims 12 40: ...            (done claims a day old nobody checked: see claims_said)
 # A row with an open task (`qoop task`) ends with its id and stage, and `:claimed` once the
 # agent said done: ... /home/me/src/app task:12:verifying:claimed
+# Before the task: `stop:<id>`, the daemon's newest admitted stop of that agent (`?`: none since
+# its last work), and `allowed:<verdict>@<unix>`, what `qoop qass brief` allowed when the line
+# was made (`allowed:?`: no brief, see `facts`).
 #
 # Quiet (the default; QASS_QUIET=0 gives everything above and nothing below). Every line wakes
 # qass, and a wake re-reads its whole conversation, so only what needs it now is said now:
@@ -98,7 +102,11 @@ def task: if .task == null then "" else
   " task:\(.task.id | clean):\(.task.stage | clean)" + (if .task.claimed then ":claimed" else "" end) end;
 def line($r; $from):
   "\($at)T\($r.terminal) g\($r.generation) \($r.program // "-" | clean) \($from)->\($r.state)"
-  + " \"\(($r.name // $r.agent_title // "") | clean)\" \($r.cwd // "-" | place)\($r | task)";
+  + " \"\(($r.name // $r.agent_title // "") | clean)\" \($r.cwd // "-" | place)"
+  # Claude flagged a dangerous rm on this menu: a hint, the screen decides (SKILL.md, Menu row).
+  # Before the task, so a line still ends `task:<id>:<stage>[:claimed]`.
+  + (if $r.rule == "dangerous_rm_dialog" then " menu:dangerous" else "" end)
+  + " stop:" + ($r.stop // "" | clean | if . == "" then "?" else . end) + ($r | task);
 '
 # Every program below takes $skip, the terminals of one machine the owner asked qass to leave
 # alone, so `rows` drops them: a skipped tab going idle, blocked, failed or away says nothing, and
@@ -112,6 +120,9 @@ diff="$defs"'
      elif $o.generation != $r.generation then
        (if ($r.state | waits) then line($r; "restarted") else empty end)
      elif $o.state != $r.state and ($r.state | waits) then line($r; $o.state)
+     # A new stop of an agent still at rest: it worked where no snapshot showed it, so the
+     # line is the one a stop from working makes.
+     elif ($r.state | waits) and $r.stop != null and $r.stop != $o.stop then line($r; "working")
      # Still at rest, its task only now waiting on the owner (the daemon moves a question
      # left unanswered there): news as well.
      elif ($r.state | waits) and ($r.task.stage? // "") == "waiting-human"
@@ -190,10 +201,12 @@ skips_of() {
 # A machine's lines held until they settle: "<terminal> <generation> <from> <state> <due>".
 settle_file() { if [ -z "$1" ]; then echo "$dir/settle"; else echo "$dir/settle-$1"; fi; }
 
-# One writer at a time for the settle files: the streams add, the tick takes.
+# One writer at a time for the settle files: the streams add, the tick takes. A flush holds it
+# for up to about 2.5 s (its briefs) and the lock keeps no order, so 15 s; past that it runs
+# anyway, and says so in watch.log (a lock a killed watcher left is cleared at start).
 settle_locked() {
     local i rc
-    for i in $(seq 50); do
+    for i in $(seq 150); do
         if mkdir "$dir/settle.lock" 2>/dev/null; then
             "$@"; rc=$?
             rmdir "$dir/settle.lock"
@@ -201,6 +214,7 @@ settle_locked() {
         fi
         sleep 0.1
     done
+    wlog "lock: ran unlocked after 15 s"
     "$@"
 }
 
@@ -233,10 +247,77 @@ say() {
     touch "$dir/last-wake"
 }
 
+# Agent lines with the brief's verdict (`facts`), for `say` with QASS_QUIET=0: nothing is held
+# there, so a tab the owner is at goes out as `allowed:nothing:until-<unix>`.
+tagged() {
+    local l
+    while IFS= read -r l; do printf '%s\n' "${l#* }"; done <<< "$(facts "$1")"
+}
+
+# The brief's verdict for each line of $1 about to go out, as `allowed:<verdict>@<unix>` before
+# its task (A1), and until when the owner is at that tab (A2): "<unix|-> <line>" per line. One
+# `qoop qass brief` per agent line, all at once, each cut at 2 s, so a block of any size waits
+# about 2 s; at most 12, in the order given (the urgent first). A remote, closed or asleep line,
+# one past the 12th, and a brief that failed, timed out or gave no `allowed` read `allowed:?`.
+verdict='
+select(type == "object" and has("allowed"))
+| (.person_known == true and (.person_until // 0) > $now) as $here
+| ([(if $here then .person_until else empty end), (.hands_off_until // empty)]
+   | map(select(. > $now)) | max) as $until
+| ((if .allowed != null then "write:\(.ending // "none")"
+    else "nothing" + (if $until == null then "" else ":until-\($until)" end) end)
+   + (if any(.not_now[]?; startswith("another review round")) then ":no-round" else "" end)
+   + (if .last_typed_by == "agent" then ":driven" else "" end)) as $v
+| "\(if $here then .person_until else "-" end) allowed:\($v)@\(.at // $now)"'
+# Always run in a subshell, `$(facts ...)`.
+facts() {
+    local l i=0 n=0 pids="" p tag tmp now
+    if ! tmp="$(mktemp -d "$dir/.facts.XXXXXX")"; then
+        while IFS= read -r l; do
+            if parse_line "$l"; then printf -- '- %s\n' "$(tag_line "$l" "allowed:?")"; else printf -- '- %s\n' "$l"; fi
+        done <<< "$1"
+        return 0
+    fi
+    while IFS= read -r l; do
+        i=$((i + 1))
+        [ -n "$l" ] && parse_line "$l" && [ -z "$L_LABEL" ] && [ "$n" -lt 12 ] || continue
+        case "$L_STATE" in closed | sleeping) continue ;; esac
+        n=$((n + 1))
+        perl -e 'alarm 2; exec @ARGV' qoop qass brief "$L_T" --json < /dev/null > "$tmp/$i.out" 2>/dev/null &
+        pids="$pids $i:$!"
+    done <<< "$1"
+    # By name: a bare `wait` would wait on the tick and the remote streams too. Only a brief that
+    # ended well counts: one that failed or ran past its alarm reads `allowed:?`, whatever it
+    # wrote. Nothing is left to kill: the alarm ends each, and this subshell neither keeps the
+    # watcher's traps nor gets its signals, so no wait is cut short.
+    for p in $pids; do
+        if wait "${p#*:}" 2>/dev/null; then mv "$tmp/${p%%:*}.out" "$tmp/${p%%:*}" 2>/dev/null || true; fi
+    done
+    now="$(date +%s)" i=0
+    while IFS= read -r l; do
+        i=$((i + 1))
+        parse_line "$l" || { printf -- '- %s\n' "$l"; continue; }
+        read -r p tag <<< "$(jq -r --argjson now "$now" "$verdict" "$tmp/$i" 2>/dev/null || true)"
+        [ -n "${tag:-}" ] || { p=-; tag="allowed:?"; }
+        printf '%s %s\n' "$p" "$(tag_line "$l" "$tag")"
+    done <<< "$1"
+    rm -rf "$tmp"
+}
+
+# Puts $2 before the line's task, or before its ` resets:` with no task, or at its end. Names and
+# paths are cleaned of `:`, so ` task:` and ` resets:` are found where `line` and `limit_line` put them.
+tag_line() { # line tag
+    case "$1" in
+        *" task:"*) printf '%s %s task:%s\n' "${1%% task:*}" "$2" "${1#* task:}" ;;
+        *" resets:"*) printf '%s %s resets:%s\n' "${1%% resets:*}" "$2" "${1#* resets:}" ;;
+        *) printf '%s %s\n' "$1" "$2" ;;
+    esac
+}
+
 # A machine's own files: "" is this Mac, any other label a remote.
 snapshot_file() { if [ -z "$1" ]; then echo "$dir/last.json"; else echo "$dir/last-$1.json"; fi; }
-# Quiet: its held lines, "<t> <gen> <short|long|ride> <due> <arrival> <line>", and its said
-# lines, "<t> <gen> <state> <stage> <arrival>". Not the settle files: an older watcher still
+# Quiet: its held lines, "<t> <gen> <short|long|ride|routine|person> <due> <arrival> <line>", and
+# its said lines, "<t> <gen> <state> <stage> <arrival> <stop> <printed>". Not the settle files: an older watcher still
 # running from an older install reads and clears those.
 held_file() { if [ -z "$1" ]; then echo "$dir/held"; else echo "$dir/held-$1"; fi; }
 said_file() { if [ -z "$1" ]; then echo "$dir/said"; else echo "$dir/said-$1"; fi; }
@@ -263,23 +344,35 @@ asks_said() {
     printf '%s\n' "$cur" > "$f"
 }
 
+# The daemon's claim scan (every 4 h while watching is on) leaves one `claims <ids>: ...` line in
+# `claims`: said once. Taken by a rename first, so two looks never say it twice.
+claims_said() {
+    local l
+    mv "$dir/claims" "$dir/claims.said" 2>/dev/null || return 0
+    l="$(cat "$dir/claims.said" 2>/dev/null || true)"
+    [ -z "$l" ] || say "$l"
+}
+
 # Why a line was not said, for whoever wonders what qass did not hear.
 note() { printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$dir/quiet.log" 2>/dev/null || true; }
 
-# A line's parts, in L_LABEL L_T L_G L_FROM L_STATE L_STAGE ("-" with no task). Fails for a
-# line that is not about an agent (daemon-gone, link-down).
+# A line's parts, in L_LABEL L_T L_G L_FROM L_STATE L_STAGE ("-" with no task) L_STOP ("?" with
+# none). Fails for a line that is not about an agent (daemon-gone, link-down).
 parse_line() {
     local re='^(([A-Za-z0-9_-]+)/)?T([0-9]+) g([^ ]+) [^ ]+ ([a-z-]+)->([a-z]+)'
     local task=' task:[^: ]+:([a-z-]+)(:claimed)?( |$)'
-    L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-" L_CLAIMED=""
+    local stop=' stop:([^ ]+)'
+    L_LABEL="" L_T="" L_G="" L_FROM="" L_STATE="" L_STAGE="-" L_CLAIMED="" L_STOP="?"
     [[ "$1" =~ $re ]] || return 1
     L_LABEL="${BASH_REMATCH[2]}" L_T="${BASH_REMATCH[3]}" L_G="${BASH_REMATCH[4]}"
     L_FROM="${BASH_REMATCH[5]}" L_STATE="${BASH_REMATCH[6]}"
     if [[ "$1" =~ $task ]]; then L_STAGE="${BASH_REMATCH[1]}" L_CLAIMED="${BASH_REMATCH[2]}"; fi
+    if [[ "$1" =~ $stop ]]; then L_STOP="${BASH_REMATCH[1]}"; fi
     return 0
 }
 
-# The said line of terminal $2 on machine $1, as "<t> <gen> <state> <stage> <arrival>".
+# The said line of terminal $2 on machine $1, as "<t> <gen> <state> <stage> <arrival> <stop>
+# <printed>" (an older watcher's has the first five).
 said_of() { grep "^$2 " "$(said_file "$1")" 2>/dev/null | tail -1 || true; }
 
 # Whether a line is said at once (see the top of this file). Run parse_line first.
@@ -308,26 +401,24 @@ record_of() {
     tail -n 2000 "$log" | awk -v t="T$1" '$3 == t { last = $1 " " $2 } END { if (last != "") print last }'
 }
 
-# The hold for the agent line just parsed, on machine $1: short, long or ride. A long one says
+# The hold for the agent line $2 just parsed, on machine $1: short, long or ride. A long one says
 # why in quiet.log, so a write qass made that left no record shows up there.
 hold_class() {
-    local s_t s_gen s_state s_stage s_arr r_at r_from
+    local s_t s_gen s_state s_stage s_arr _ r_at r_from
     case "$L_FROM" in new | restarted | starting) echo short; return ;; esac
     [ -z "$1" ] || { echo short; return; }
-    read -r s_t s_gen s_state s_stage s_arr <<< "$(said_of "" "$L_T")"
+    read -r s_t s_gen s_state s_stage s_arr _ <<< "$(said_of "" "$L_T")"
     if [ "$L_STATE" = sleeping ] && [ "${s_gen:-}" = "$L_G" ] &&
         { [ "${s_state:-}" = idle ] || [ "${s_state:-}" = done ]; } &&
         ! grep -q "^$L_T " "$(held_file "")" 2>/dev/null; then
         echo ride; return
     fi
+    # The only ride a waiting-human repeat gets; a new or unknown stop goes on to the classes below.
+    if handled_repeat "$1" "$2"; then echo ride; return; fi
     read -r r_at r_from <<< "$(record_of "$L_T")"
     if [ "${r_at:-}" = unreadable ]; then echo short; return; fi
     if [ -n "${r_at:-}" ] && [ "${r_from:-}" = "$self" ] && [ "$r_at" -ge "${s_arr:-0}" ]; then
         echo short; return
-    fi
-    if [ "$L_STAGE" = waiting-human ] && [ "${s_stage%:claimed}" = waiting-human ] &&
-        [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ]; then
-        echo ride; return
     fi
     # Work in progress that came to rest, not driven by another agent (`work_rest`).
     if work_rest; then
@@ -337,15 +428,26 @@ hold_class() {
 }
 
 # Holds a line, one entry per agent: a newer line takes the text, the earlier due time and the
-# first arrival stand, a short or long hold outranks a ride. Runs under the settle lock.
-hold_put() { # label terminal generation class line
+# first arrival stand, a short or long hold outranks a ride. A `person` hold (the owner at that
+# tab, A2) comes with its due ($6) and sets it outright; while it is ahead, no other hold moves
+# it. Runs under the settle lock.
+hold_put() { # label terminal generation class line [due]
     local f now due class o_t o_g o_class o_due o_arr _ arr
     f="$(held_file "$1")"
     now="$(date +%s)"
     class="$4" arr="$now"
-    case "$class" in short) due=$((now + settle)) ;; routine) due=$((now + rhold)) ;; *) due=$((now + qhold)) ;; esac
+    case "$class" in
+        short) due=$((now + settle)) ;;
+        routine) due=$((now + rhold)) ;;
+        person) due="$6" ;;
+        *) due=$((now + qhold)) ;;
+    esac
     read -r o_t o_g o_class o_due o_arr _ <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
-    if [ -n "${o_t:-}" ]; then
+    if [ -n "${o_t:-}" ] && [ "$class" = person ]; then
+        arr="$o_arr"
+    elif [ -n "${o_t:-}" ] && [ "$o_class" = person ] && [ "$o_due" -gt "$now" ]; then
+        class=person due="$o_due" arr="$o_arr"
+    elif [ -n "${o_t:-}" ]; then
         [ "$o_due" -ge "$due" ] || due="$o_due"
         arr="$o_arr"
         # A routine line is the agent's newest word: it never inherits an earlier class.
@@ -364,35 +466,97 @@ hold_put() { # label terminal generation class line
     mv "$f.tmp" "$f"
 }
 
-# Notes each said line as its agent's last, with when it first came: a record from qass newer
-# than that makes the agent's next line short. A closed agent is forgotten.
-said_put() { # line arrival
+# Whether the agent line $2 just parsed, of this Mac, is the same stop again, once qass had its
+# line and finished a turn after it, and nobody wrote to the agent since (A3): it rides. Noted
+# then, with the print and rest times the replay reads.
+handled_repeat() { # label line
+    local s_t s_gen s_state s_stage s_arr s_stop s_printed h rested _
+    [ -z "$1" ] && [ "$L_STOP" != "?" ] || return 1
+    case "$L_STATE" in idle | done) ;; *) return 1 ;; esac
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "" "$L_T")"
+    [ "${s_gen:-}" = "$L_G" ] && [ "${s_stop:-}" = "$L_STOP" ] && [ -n "${s_printed:-}" ] || return 1
+    read -r h rested _ <<< "$(handled_of "$L_T" "$s_printed")"
+    [ "$h" = yes ] || return 1
+    note "ride: stop handled T$L_T g$L_G $L_STOP printed $s_printed rested $rested" "$2"
+}
+
+# Notes each said line as its agent's last, with when it first came (a record from qass newer
+# than that makes the agent's next line short), its stop and when it went out (A3's handled
+# rule). A closed agent is forgotten.
+said_put() { # line arrival printed
     local f
     parse_line "$1" || return 0
     f="$(said_file "$L_LABEL")"
     { grep -v "^$L_T " "$f" 2>/dev/null || true
-      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE${L_CLAIMED} $2"; } > "$f.tmp"
+      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE${L_CLAIMED} $2 $L_STOP $3"; } > "$f.tmp"
     mv "$f.tmp" "$f"
+}
+
+# Whether the stop of terminal $1 printed at $2 was handled: qass's own row (this Mac's last
+# snapshot) is at rest with its last activity after that print, and nothing was written to the
+# agent since. "<yes|no> <rested|-> <wrote yes|no>". An equal second is not after.
+handled_of() { # terminal printed
+    local rested r_at r_from wrote=no h=no
+    rested="$(jq -r --argjson self "$self" '[.[]? | select(.terminal == $self
+        and (.state == "idle" or .state == "done")) | .last_active_at_unix // empty][0] // empty' \
+        "$dir/last.json" 2>/dev/null || true)"
+    read -r r_at r_from <<< "$(record_of "$1")"
+    if [ "${r_at:-}" = unreadable ] || { [ -n "${r_at:-}" ] && [ "$r_at" -ge "$2" ]; }; then wrote=yes; fi
+    if [ -n "$rested" ] && [ "$rested" -gt "$2" ] && [ "$wrote" = no ]; then h=yes; fi
+    echo "$h ${rested:--} $wrote"
+}
+
+# One `print:` note per agent line a block puts out, before its said record is replaced: whether
+# it repeats the stop said before, whether that earlier print was handled, when it was printed,
+# when qass last rested and whether the agent was written to since. The replay reads these.
+print_note() { # line
+    local s_t s_gen s_state s_stage s_arr s_stop s_printed _ rep=no h=no was=- rested=- wrote=no
+    parse_line "$1" || return 0
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "$L_LABEL" "$L_T")"
+    if [ -n "$L_LABEL" ] || [ "$L_STOP" = "?" ]; then
+        h="?"
+    elif [ "${s_gen:-}" = "$L_G" ] && [ "${s_stop:-}" = "$L_STOP" ] && [ -n "${s_printed:-}" ]; then
+        rep=yes was="$s_printed"
+        read -r h rested wrote <<< "$(handled_of "$L_T" "$s_printed")"
+    fi
+    note "print: ${L_LABEL:+$L_LABEL/}T$L_T g$L_G $L_STOP repeat:$rep handled:$h printed $was rested $rested wrote $wrote" ""
 }
 
 # Says lines in one block, so Monitor brings them as one wake: $1 (lines said at once, maybe
 # none) first, then every held line that goes with them, each checked against the latest
-# snapshot. With no $1 it says nothing until a held line is due. Runs under the settle lock;
-# the held entries go only after the block is out, so a kill in between says twice, not never.
+# snapshot. With no $1 it says nothing until a held line is due. Each agent line gets the brief's
+# verdict (`facts`); a line of a tab the owner is at (A2) is held instead, as `person`, until his
+# clock runs out, and is not said. The block goes only when a line that wakes survives that: one
+# of $1, or a held line that was due and is no ride; else the rides and longs stay held. Runs
+# under the settle lock; the held entries go only after the block is out, so a kill in between
+# says twice, not never.
 flush() {
-    local now f label snap sel out l go="" block="" said="" picked=""
+    local now f label snap sel out l go="" wake="" block="" outs="" picked="" kept="" info printed
+    local p t e wp i n=0 drop="" ts o_t o_g o_class o_due _
+    local -a c_arr c_wp c_go c_file c_line f_p f_line o_line
     # Off: everything stays held, and is dropped when the owner turns it on again.
     ! watch_off || return 0
     now="$(date +%s)"
     [ -z "$1" ] || go=1
     while IFS= read -r l; do
-        [ -n "$l" ] && parse_line "$l" || continue
-        # A line said at once is newer than whatever was held for its agent.
-        f="$(held_file "$L_LABEL")"
-        if grep -q "^$L_T " "$f" 2>/dev/null; then
-            { grep -v "^$L_T " "$f" || true; } > "$f.tmp"
-            mv "$f.tmp" "$f"
+        [ -n "$l" ] || continue
+        wp=0
+        # A line said at once is newer than whatever was held for its agent; a person hold still
+        # ahead stays its floor, should its brief fail now. A line that is no agent's (daemon-gone,
+        # link-down, link-up) goes as it is.
+        if parse_line "$l"; then
+            f="$(held_file "$L_LABEL")"
+            read -r o_t o_g o_class o_due _ <<< "$(grep "^$L_T " "$f" 2>/dev/null | tail -1 || true)"
+            if [ -n "${o_t:-}" ]; then
+                if [ "$o_class" = person ]; then
+                    wp=1
+                    [ -n "$L_LABEL" ] || [ "$o_due" -le "$now" ] || kept="$kept $L_T:$o_due"
+                fi
+                { grep -v "^$L_T " "$f" || true; } > "$f.tmp"
+                mv "$f.tmp" "$f"
+            fi
         fi
+        c_arr[n]="$now" c_wp[n]="$wp" c_go[n]=1 c_file[n]="" c_line[n]="$l"; n=$((n + 1))
     done <<< "$1"
     for f in "$dir"/held "$dir"/held-*; do
         [ -s "$f" ] || continue
@@ -407,9 +571,10 @@ flush() {
         # With that machine's daemon away its rows are stale: keep its lines for later.
         [ ! -e "$(gone_file "$label")" ] || continue
         snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
-        # Short lines first, then long, then ride: the most urgent first in the block.
-        sel="$(awk -v now="$now" -v b="$batch" '($3 == "routine" ? $4 <= now : $3 != "short" || $4 <= now + b) {
-            print ($3 == "short" ? 0 : $3 == "long" ? 1 : $3 == "routine" ? 2 : 3) " " NR " " $0 }' "$f" |
+        # Short and person lines first, then long, then ride: the most urgent first in the block.
+        # A routine or person line goes only once due.
+        sel="$(awk -v now="$now" -v b="$batch" '(($3 == "routine" || $3 == "person") ? $4 <= now : $3 != "short" || $4 <= now + b) {
+            print ($3 == "short" || $3 == "person" ? 0 : $3 == "long" ? 1 : $3 == "routine" ? 2 : 3) " " NR " " $0 }' "$f" |
             sort -n -k1,1 -k2,2 | cut -d' ' -f3-)"
         [ -n "$sel" ] || continue
         # Taken only once checked: a failed check keeps them held for the next round.
@@ -417,27 +582,85 @@ flush() {
             --argjson skip "$(skips_of "$snap")" --arg at "$(at_of "$label")" "$recheck" 2>/dev/null)" || continue
         picked="$picked$f
 "
+        # Each selected entry's class and due, " <t>:<class>:<due>", for what it was held as.
+        info=" $(printf '%s\n' "$sel" | awk '{ printf "%s:%s:%s ", $1, $3, $4 }')"
         while IFS= read -r l; do
+            case "$l" in "P "* | "D "*) ;; *) continue ;; esac
+            t="${l#? }"; [ "${l%% *}" = D ] || t="${t#* }"
+            parse_line "$t" || continue
+            e=""
+            for e in $info; do [ "${e%%:*}" != "$L_T" ] || break; e=""; done
+            e="${e#*:}"
             case "$l" in
-                "P "*) l="${l#P }"; block="$block${l#* }
-"; said="$said${l%% *} ${l#* }
+                "P "*) l="${l#P }"
+                    wp=0; [ "${e%%:*}" != person ] || wp=1
+                    c_go[n]=0
+                    [ "${e%%:*}" = ride ] || [ "${e#*:}" -gt "$now" ] || c_go[n]=1
+                    c_arr[n]="${l%% *}" c_wp[n]="$wp" c_file[n]="$f" c_line[n]="${l#* }"; n=$((n + 1)) ;;
+                "D "*) l="${l#D }"
+                    if [ "${e%%:*}" = person ]; then note "person: stale" "$l"; else note "stale ${e%%:*}" "$l"; fi
+                    drop="$drop$L_T $f
 " ;;
-                "D "*) note stale "${l#D }" ;;
             esac
         done <<< "$out"
     done
-    block="$(printf '%s' "$1${1:+
-}$block")"
-    if [ -n "$block" ]; then
-        ! watch_off || return 0
-        printf '%s\n' "$block"
-        touch "$dir/last-wake"
+    # The verdicts, then the three sets: printed, held again for a person at the tab, stale.
+    i=0
+    if [ "$n" -gt 0 ]; then
+        while IFS= read -r l; do
+            f_p[i]="${l%% *}" f_line[i]="${l#* }"; i=$((i + 1))
+        done <<< "$(facts "$(printf '%s\n' "${c_line[@]}")")"
     fi
-    while IFS= read -r l; do [ -z "$l" ] || said_put "$l" "$now"; done <<< "$1"
-    while IFS= read -r l; do [ -z "$l" ] || said_put "${l#* }" "${l%% *}"; done <<< "$said"
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        l="${f_line[i]:-}" p="${f_p[i]:--}"
+        # A verdict missing (facts cut short): the line as it came, `allowed:?` on an agent's.
+        if [ -z "$l" ]; then
+            l="${c_line[i]}"
+            ! parse_line "$l" || l="$(tag_line "$l" "allowed:?")"
+        fi
+        if parse_line "$l" && [ -z "$L_LABEL" ]; then
+            case "$l" in
+                *" allowed:?"*) for t in $kept; do [ "${t%%:*}" != "$L_T" ] || p="${t#*:}"; done ;;
+            esac
+            case "$L_STATE" in idle | done | blocked | failed) ;; *) p=- ;; esac
+            if [ "$p" != - ] && [ "$p" -gt "$(date +%s)" ]; then
+                hold_put "" "$L_T" "$L_G" person "$l" "$p"
+                note "person: T$L_T until $p" "$l"
+                i=$((i + 1)); continue
+            fi
+        fi
+        [ "${c_go[i]}" = 0 ] || wake=1
+        block="$block$l
+"
+        o_line[i]="$l" outs="$outs $i"
+        i=$((i + 1))
+    done
+    # Nothing that wakes is left: no block; the selected rides and longs stay held.
+    if [ -n "$wake" ]; then
+        ! watch_off || return 0
+        printf '%s' "$block"
+        touch "$dir/last-wake"
+        printed="$(date +%s)"
+        for i in $outs; do
+            l="${o_line[i]}"
+            # A held line's entry goes once it is out.
+            if [ -n "${c_file[i]}" ] && parse_line "$l"; then drop="$drop$L_T ${c_file[i]}
+"; fi
+            [ "${c_wp[i]}" = 0 ] || note "person: said" "$l"
+            print_note "$l"
+            said_put "$l" "${c_arr[i]}" "$printed"
+        done
+    fi
+    # Only the entries that went out or went stale leave the held files.
     while IFS= read -r f; do
         [ -n "$f" ] || continue
-        awk -v now="$now" -v b="$batch" '!($3 == "routine" ? $4 <= now : $3 != "short" || $4 <= now + b)' "$f" > "$f.tmp"
+        ts=" "
+        while IFS= read -r e; do
+            [ "${e#* }" != "$f" ] || ts="$ts${e%% *} "
+        done <<< "$drop"
+        [ "$ts" != " " ] || continue
+        awk -v ts="$ts" '!index(ts, " " $1 " ")' "$f" > "$f.tmp"
         mv "$f.tmp" "$f"
     done <<< "$picked"
 }
@@ -497,7 +720,7 @@ limit_note() {
 quiet_hold() { # label line
     local class
     parse_line "$2" || return 0
-    class="$(hold_class "$1")"
+    class="$(hold_class "$1" "$2")"
     case "$class" in
         long) if [ -z "$(record_of "$L_T" 2>/dev/null)" ]; then note "long: no record" "$2"; else note "long: written by another" "$2"; fi ;;
     esac
@@ -540,7 +763,8 @@ routine() {
 }
 
 # A routine line: a sleep is only logged, unless a line that is not routine is held for its
-# agent (a question it left): then it goes as any held line; a rest is held for the routine hold.
+# agent (a question it left): then it goes as any held line; a stop qass already handled rides
+# (`handled_repeat`); any other rest is held for the routine hold.
 quiet_routine() { # label line
     if [ "$L_STATE" = sleeping ]; then
         if awk -v t="$L_T" '$1 == t && $3 != "routine" { f = 1 } END { exit !f }' \
@@ -549,6 +773,8 @@ quiet_routine() { # label line
         else
             note "routine: asleep" "$2"
         fi
+    elif handled_repeat "$1" "$2"; then
+        settle_locked hold_put "$1" "$L_T" "$L_G" ride "$2"
     else
         settle_locked hold_put "$1" "$L_T" "$L_G" routine "$2"
     fi
@@ -676,7 +902,7 @@ follow() {
                 if [ "$quiet" = 1 ]; then
                     settle_locked flush "${now_lines%?}"
                 else
-                    say "${now_lines%?}"
+                    say "$(tagged "${now_lines%?}")"
                 fi
             fi
         fi
@@ -807,7 +1033,11 @@ drop_pid() {
     [ "$(cat "$pidf" 2>/dev/null)" != "$$" ] || rm -f "$pidf"
 }
 trap drop_pid EXIT
-[ -f "$dir/watch.log" ] && tail -n 2000 "$dir/watch.log" > "$dir/watch.log.tmp" && mv "$dir/watch.log.tmp" "$dir/watch.log"
+# The logs keep 30 days, by the time each line starts with, so a week of watching that spans
+# days off stays whole for the replay.
+month=$(( $(date +%s) - 2592000 ))
+cut_old() { awk -v c="$month" '$1 !~ /^[0-9]+$/ || $1 >= c' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
+[ ! -f "$dir/watch.log" ] || cut_old "$dir/watch.log"
 wlog "start $$"
 # Its own time is up: said, so qass starts it again (Start, step 3). Or the owner turned it off.
 # Set before the tick and the remotes start, so a stop asked for while they do is never lost.
@@ -824,11 +1054,11 @@ if [ -n "$stamp" ]; then
 fi
 
 rmdir "$dir/settle.lock" 2>/dev/null || true
+# The briefs' folders a killed watcher left.
+rm -rf "$dir"/.facts.*
 if [ "$quiet" = 1 ]; then
     # Held lines and marks carry over; the logs are cut, the said lines of a week ago go.
-    if [ -f "$dir/quiet.log" ]; then
-        tail -n 2000 "$dir/quiet.log" > "$dir/quiet.log.tmp" && mv "$dir/quiet.log.tmp" "$dir/quiet.log"
-    fi
+    [ ! -f "$dir/quiet.log" ] || cut_old "$dir/quiet.log"
     # ponytail: cut only past 1 MB, months of writes, so an append racing the cut is rare.
     if [ -f "$dir/prompted.log" ] && [ "$(wc -c < "$dir/prompted.log")" -gt 1048576 ]; then
         tail -n 2000 "$dir/prompted.log" > "$dir/prompted.log.tmp" && mv "$dir/prompted.log.tmp" "$dir/prompted.log"
@@ -872,6 +1102,7 @@ fi
             exit 0
         fi
         asks_said
+        claims_said
         if [ "$quiet" = 1 ]; then
             settle_locked flush ""
             settle_locked ride_expire
@@ -893,7 +1124,7 @@ fi
                     --arg state "$state" --argjson self "$self" --argjson skip "$(skips_of "$snap")" \
                     --arg at "$(at_of "$label")" "$settled" 2>/dev/null)" || continue
                 if [ -n "$out" ]; then
-                    say "$out"
+                    say "$(tagged "$out")"
                 fi
             done
         done
@@ -905,7 +1136,7 @@ fi
             out="$(jq -rn --argjson b "$snap" --argjson due "[\"$t\"]" --argjson self "$self" \
                 --argjson skip "$(skips_of "$snap")" --arg at "$(at_of "$label")" "$again" 2>/dev/null)" || continue
             if [ -n "$out" ]; then
-                if [ "$quiet" = 1 ]; then settle_locked flush "$out"; else say "$out"; fi
+                if [ "$quiet" = 1 ]; then settle_locked flush "$out"; else say "$(tagged "$out")"; fi
             fi
         done
     done

@@ -501,6 +501,7 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
             id: id.to_string(),
             agents,
             splits,
+            qass_checks: None,
         })
         .await
     }
@@ -3811,6 +3812,7 @@ mod tests {
                 id: "list-2".into(),
                 agents: vec![tab(5, 1), tab(6, 2)],
                 splits: vec![leaf(5), leaf(6)],
+                qass_checks: None,
             },
         )
         .await
@@ -3822,6 +3824,7 @@ mod tests {
                 id: "list-2".into(),
                 agents: vec![tab(6, 2)],
                 splits: vec![leaf(6)],
+                qass_checks: None,
             }
         );
 

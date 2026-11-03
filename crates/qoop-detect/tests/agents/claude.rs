@@ -86,6 +86,57 @@ fn a_permission_quoted_in_an_answer_is_not_a_blocker() {
     assert_no_blocker("claude", &screen);
 }
 
+/// Claude's own warning on a Bash permission, as it draws it: the command box, the warning in
+/// it, often only two options.
+const DANGEROUS_RM_DIALOG: &[&str] = &[
+    " Bash command",
+    " Run shell command",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " │ rm -f \"$OUT\"/snapshots/*.png",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    " │ Dangerous rm operation on possibly-empty variable path: \"$OUT\"/snapshots/*.png",
+    "",
+    " Do you want to proceed?",
+    " ❯ 1. Yes",
+    "   2. No",
+    "",
+    " Esc to cancel · Tab to amend",
+];
+
+#[test]
+fn a_dangerous_rm_claude_flagged_is_its_own_blocker() {
+    assert_rule(
+        "claude",
+        &dialog(DANGEROUS_RM_DIALOG),
+        "dangerous_rm_dialog",
+        Blocked,
+    );
+    let rmdir: Vec<&str> = DANGEROUS_RM_DIALOG
+        .iter()
+        .map(|l| {
+            if l.contains("Dangerous") {
+                " │ Dangerous rmdir operation on statically-unresolvable target"
+            } else {
+                l
+            }
+        })
+        .collect();
+    assert_rule("claude", &dialog(&rmdir), "dangerous_rm_dialog", Blocked);
+}
+
+#[test]
+fn a_plain_rm_permission_and_a_quoted_warning_are_not_dangerous_rm() {
+    assert_not_rule("claude", &dialog(BASH_DIALOG), "dangerous_rm_dialog");
+    let quoted = idle_under(&[
+        "● Claude showed: Dangerous rm operation on possibly-empty variable path",
+        "  ❯ 1. Yes",
+        "    2. No",
+        "",
+    ]);
+    assert_not_rule("claude", &quoted, "dangerous_rm_dialog");
+    assert_no_blocker("claude", &quoted);
+}
+
 #[test]
 fn plan_approval_is_a_blocker() {
     let screen = dialog(&[

@@ -1583,6 +1583,7 @@ async fn daemon_before_restart(
                                         row(2, "zsh", false, "unknown"),
                                     ],
                                     splits: Vec::new(),
+                                    qass_checks: None,
                                 }
                             }
                             op => {

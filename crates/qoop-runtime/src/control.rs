@@ -1515,9 +1515,9 @@ pub fn item_info(
 /// age beside it. `Remote` is an agent on another machine, which keeps the stage it reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// Closed checked or failed, or replaced after it was claimed.
+    /// Closed checked or failed.
     Finished,
-    /// Closed because a newer request took its place, with nothing claimed.
+    /// Closed because a newer request took its place, claimed or not: nobody checked it.
     Replaced,
     /// Closed with its tab or its space.
     Closed,
@@ -1580,18 +1580,26 @@ impl Live {
 pub struct Tab {
     pub live: Option<Live>,
     pub asleep_since: Option<i64>,
+    /// qass would check a claim made here: the daemon's snapshot holds (watching on, its
+    /// watcher alive, qass not stuck) and qass does not leave this tab alone. A claim is
+    /// shown as checked only when this holds and the tab is live, so a switch that is on is
+    /// never taken for a working checker.
+    pub checks: bool,
 }
 
-/// A terminal's tab: its live row, if any, and its sleep from `asleep` (terminal to since).
-/// The one way every reader of a board makes a [`Tab`].
+/// A terminal's tab: its live row, if any, its sleep from `asleep` (terminal to since), and
+/// whether qass would check a claim in it (`checks`, see [`Tab::checks`]). The one way every
+/// reader of a board makes a [`Tab`].
 pub fn tab_of(
     live: Option<Live>,
     asleep: &std::collections::BTreeMap<i64, i64>,
     terminal: i64,
+    checks: bool,
 ) -> Tab {
     Tab {
         live,
         asleep_since: asleep.get(&terminal).copied(),
+        checks,
     }
 }
 
@@ -1620,9 +1628,8 @@ pub fn status(i: StatusInput) -> (Status, i64) {
         let at = i.closed_at.unwrap_or(i.updated_at);
         return match i.outcome {
             Some("verified" | "failed") => (Status::Finished, at),
-            // A new request after a done claim ends the claimed work; one with no claim
-            // replaced work nobody said was done.
-            Some("superseded") if i.claimed_at.is_some() => (Status::Finished, at),
+            // A new request took its place. A done claim it ended was never checked, so it
+            // is not finished either (75 of 208 claims ended this way by 2026-10-28).
             Some("superseded") => (Status::Replaced, at),
             _ => (Status::Closed, at),
         };
@@ -1638,8 +1645,19 @@ pub fn status(i: StatusInput) -> (Status, i64) {
     if live.is_some_and(|l| l.state == "blocked") {
         return (Status::Waits, last_active);
     }
+    // A claim nobody can check now (watching off, no watcher, qass stuck, its tab left alone or
+    // asleep) waits on the owner, at the claim all the same. One with no tab at all is qass's to
+    // close failed at its Start, whatever its watcher does: it reads Checks.
     if let Some(at) = i.claimed_at {
-        return (Status::Checks, at);
+        let checked = orphan || i.tab.checks && live.is_some();
+        return (
+            if checked {
+                Status::Checks
+            } else {
+                Status::Waits
+            },
+            at,
+        );
     }
     if let Some(since) = i.tab.asleep_since {
         return (Status::Asleep, since);
@@ -1836,6 +1854,13 @@ pub enum ControlResponse {
         /// never disagree. Defaulted, so an older daemon reads as "no splits".
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         splits: Vec<Pane>,
+        /// qass can check a done claim on this machine now: watching on, its watcher alive,
+        /// qass not stuck. A reader that decides statuses itself (the CLI board) needs it
+        /// beside the rows; each row's `qass_skip` and liveness are added per tab. Always
+        /// sent by a daemon; `None` from one that predates it (whose claims read checked)
+        /// and from a list merged across machines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qass_checks: Option<bool>,
     },
     Workspaces {
         id: String,
@@ -2542,6 +2567,12 @@ pub struct AgentRow {
     /// client's idle tiers are computed from.
     #[serde(default)]
     pub last_active_at_unix: Option<i64>,
+    /// The agent's current stop, `<at>.<seq>`: its newest admitted turn end while no work came
+    /// after it (`AgentRegistry::stop_of`). What qass's watcher tells a new stop from the same
+    /// one said again by. Absent before the first, after new work, after a daemon restart, and
+    /// on rows from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
     /// When this terminal was slept by the idle reaper, as unix seconds on
     /// the daemon's own clock. Present only on rows with `state:
     /// "sleeping"`: a tombstone kept so a slept tab stays visible instead
@@ -3024,6 +3055,7 @@ mod tests {
                 id: "i".into(),
                 agents: Vec::new(),
                 splits: Vec::new(),
+                qass_checks: None,
             }
         );
         // And an index with none says nothing about them, for an older client.
@@ -3265,6 +3297,7 @@ mod tests {
             rule: None,
             manifest: None,
             last_active_at_unix: None,
+            stop: None,
             cwd: None,
             slept_at_unix: None,
             activity: None,
@@ -3314,6 +3347,25 @@ mod tests {
                 stage: "planning".into(),
                 claimed: true
             })
+        );
+    }
+
+    /// A row's stop crosses old daemons both ways, as the task does.
+    #[test]
+    fn the_stop_field_parses_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"idle"}"#).expect("decode");
+        assert_eq!(old.stop, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("\"stop\""));
+        let new: AgentRow = serde_json::from_str(
+            r#"{"terminal":1,"workspace":1,"state":"idle","stop":"1750000005.2"}"#,
+        )
+        .expect("decode");
+        assert_eq!(new.stop.as_deref(), Some("1750000005.2"));
+        assert!(
+            serde_json::to_string(&new)
+                .unwrap()
+                .contains(r#""stop":"1750000005.2""#)
         );
     }
 
@@ -3739,6 +3791,8 @@ mod tests {
                 subagents,
             }),
             asleep_since: None,
+            // qass would check a claim here: the case a claim reads `checks` in.
+            checks: true,
         }
     }
 
@@ -3761,6 +3815,7 @@ mod tests {
         let asleep = Tab {
             live: None,
             asleep_since: Some(100),
+            checks: true,
         };
         assert_eq!(
             status(StatusInput {
@@ -3800,7 +3855,7 @@ mod tests {
         assert_eq!(status(closed("failed", None)), (Status::Finished, 300));
         assert_eq!(
             status(closed("superseded", Some(200))),
-            (Status::Finished, 300)
+            (Status::Replaced, 300)
         );
         assert_eq!(status(closed("superseded", None)), (Status::Replaced, 300));
         assert_eq!(status(closed("abandoned", None)), (Status::Closed, 300));
@@ -3824,13 +3879,25 @@ mod tests {
             ..open
         };
         assert_eq!(status(blocked), (Status::Waits, 450));
-        // Claimed beats asleep and a live tab; a wait beats a claim.
+        // Claimed beats asleep and a live tab; a wait beats a claim. A claim nobody can check
+        // waits on him (`qass_checks_*` in asks.rs takes each way it cannot).
         let claimed = StatusInput {
             claimed_at: Some(420),
             tab: live("working", Some(490), 0),
             ..open
         };
         assert_eq!(status(claimed), (Status::Checks, 420));
+        let unchecked = Tab {
+            checks: false,
+            ..claimed.tab
+        };
+        assert_eq!(
+            status(StatusInput {
+                tab: unchecked,
+                ..claimed
+            }),
+            (Status::Waits, 420)
+        );
         assert_eq!(
             status(StatusInput {
                 tab: live("blocked", Some(1), 0),
@@ -3843,6 +3910,7 @@ mod tests {
             tab: Tab {
                 live: None,
                 asleep_since: Some(100),
+                checks: true,
             },
             ..open
         };

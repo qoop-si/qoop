@@ -118,6 +118,60 @@ async fn heard(
     }
 }
 
+/// Read an index's event lane until it hears the board changed.
+async fn heard_tasks(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    inbuf: &mut bytes::BytesMut,
+) -> bool {
+    let mut connection = client::Connection::new();
+    let deadline = Instant::now() + PATIENCE;
+    let mut read = [0u8; 64 * 1024];
+    loop {
+        if connection
+            .drain(inbuf)
+            .expect("decode")
+            .into_iter()
+            .any(|i| matches!(i, Incoming::Event(EventMessage::TasksChanged)))
+        {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rd.read(&mut read)).await {
+            Ok(Ok(n)) if n > 0 => inbuf.extend_from_slice(&read[..n]),
+            _ => return false,
+        }
+    }
+}
+
+/// A skip moves the status of a claim in its tabs (checked or waiting), with no task written:
+/// each change, of a tab or of a space, on or off, tells every client the board changed.
+#[tokio::test]
+async fn a_skip_change_tells_clients_the_board_changed() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("qoop-agents").await;
+    let work = new_space(&mut c, "work").await;
+    let tab = new_tab(&mut c, work, "t-a").await;
+    let (index, mut index_in) = client::connect(d.socket(), "qoop-watch")
+        .await
+        .expect("connect");
+    let (mut index_rd, _index_wr) = index.into_split();
+    for (terminal, on) in [
+        (Some(tab), true),
+        (Some(tab), false),
+        (None, true),
+        (None, false),
+    ] {
+        assert!(matches!(
+            skip(&mut c, work, terminal, on).await,
+            ControlResponse::Renamed { .. }
+        ));
+        assert!(
+            Box::pin(heard_tasks(&mut index_rd, &mut index_in)).await,
+            "no board change heard for {terminal:?} {on}"
+        );
+    }
+}
+
 /// A space turned on marks every tab in it, on the tab's own row, and tells every index; the
 /// space's row carries its own flag. Turned off, all of it goes. A tab of another space is
 /// never touched.

@@ -185,6 +185,22 @@ region = "after_last_horizontal_rule"
 visible_blocker = true
 line_regex = '^\s*Enter to select · (.* · )?Esc to cancel\s*$'
 
+# A Bash permission Claude itself flagged: `Dangerous rm operation on possibly-empty variable
+# path`, `... on statically-unresolvable target`, `Dangerous rmdir operation ...`, in the dialog
+# above its options. Its own rule, so the line qass reads can say so (`menu:dangerous`); who may
+# answer it is the qass skill's rule, never this one's.
+[[rules]]
+id = "dangerous_rm_dialog"
+state = "blocked"
+priority = 310
+region = "after_last_horizontal_rule"
+visible_blocker = true
+all = [
+  { line_regex = '^\s*(│\s*)?Dangerous rm(dir)? operation\b' },
+  { line_regex = '^\s*[❯>]\s+\d+\. ' },
+  { line_regex = '^\s*([❯>]\s+)?\d+\. No\b' },
+]
+
 # Every other permission dialog (Bash, edits, fetch, network, skills, MCP tools): a numbered
 # list with the pointer `❯` (`>` without the glyph) on the selected row and a `No` row
 # (`No`, `No, and tell Claude what to do differently (esc)`, `No (recommended)`).
