@@ -49,7 +49,15 @@
 #   progress that came to rest: an agent on an open task, not claimed, not waiting on the owner,
 #   that no other agent drives (`work_rest`, `driven`: another running terminal, not qass, wrote
 #   to it in the last hour; such an agent stays routine or long, as before). Work that stops is qass's to
-#   move on in seconds, not after he did it himself.
+#   move on in seconds, not after he did it himself. Only its first stop there, though: a stop
+#   with the generation, state and stage of the agent's line said last, printed under an hour
+#   ago, and no write from qass since, is the same rest again (it woke for its own background
+#   notice or a teammate's message and stopped where it was): held `again`, below.
+# - Again: the same rest again is held QASS_QUIET_HOLD seconds (600) and said only if the agent is
+#   still there then, never riding along with another block; a snapshot with that agent working
+#   drops it (`again: dropped at work` in quiet.log), and a new stop of it starts the hold over.
+#   A real stall reaches qass in 10 minutes; an agent that keeps waking for its own notices and
+#   stopping is said at least once an hour, when a stop finds its last line over an hour old.
 # - Long hold (QASS_QUIET_HOLD, 600 s from its first line): everything else, an agent woken
 #   by its own background work, or one another agent drives. It rides along with any earlier
 #   block.
@@ -59,7 +67,8 @@
 #   background (`background`: shells, monitors, subagents), on no claim and not waiting on the
 #   owner, is said nothing of while that runs: a wait is not news. That covers a driven agent and,
 #   with routine on, a rest with no task; with routine silent such a rest stays routine. The tick
-#   lets it go, as its row is then (`bg:<n>` with some still running), into the short hold when
+#   lets it go, as its row is then (`bg:<n>` with some still running), into the short hold (or
+#   `again` for work in progress that is the rest said last again) when
 #   fewer run than when the hold began (none included) and it still rests, or once the hold has
 #   lasted QASS_BG_LIMIT seconds (300), whichever comes first. A stop in between keeps the first
 #   count and start (`bghold` in qass's folder); a stop with fewer running ends the hold and is
@@ -432,8 +441,9 @@ record_of() {
     tail -n 2000 "$log" | awk -v t="T$1" '$3 == t { last = $1 " " $2 } END { if (last != "") print last }'
 }
 
-# The hold for the agent line $2 just parsed, on machine $1: short, long or ride. A long one says
-# why in quiet.log, so a write qass made that left no record shows up there.
+# The hold for the agent line $2 just parsed, on machine $1: short, long, again (a rest said
+# before) or ride. A long one says why in quiet.log, so a write qass made that left no record
+# shows up there.
 hold_class() {
     local s_t s_gen s_state s_stage s_arr _ r_at r_from
     case "$L_FROM" in new | restarted | starting) echo short; return ;; esac
@@ -451,11 +461,41 @@ hold_class() {
     if [ -n "${r_at:-}" ] && [ "${r_from:-}" = "$self" ] && [ "$r_at" -ge "${s_arr:-0}" ]; then
         echo short; return
     fi
-    # Work in progress that came to rest, not driven by another agent (`work_rest`).
+    # Work in progress that came to rest, not driven by another agent (`work_rest`): short, or
+    # `again` when it is the rest said last again (`same_rest`).
     if work_rest; then
-        echo short; return
+        rest_class "$2"; return
     fi
     echo long
+}
+
+# Whether the line just parsed, of this Mac, is the rest said last again: the generation, state
+# and stage of its agent's line said last, printed under an hour ago, and no write from qass since
+# that line came. The agent woke without qass, for its own background notice or a teammate, and
+# stopped where it was. Past the hour its stop is short again, so a worker that loops so is said
+# at least once an hour.
+same_rest() {
+    local s_t s_gen s_state s_stage s_arr s_stop s_printed _ r_at r_from
+    [ -z "$L_LABEL" ] || return 1
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "" "$L_T")"
+    [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ] && [ "${s_stage:-}" = "$L_STAGE" ] ||
+        return 1
+    # An older watcher's record has no print time: its arrival stands in.
+    [ $(($(date +%s) - ${s_printed:-$s_arr})) -lt 3600 ] || return 1
+    read -r r_at r_from <<< "$(record_of "$L_T")"
+    [ "${r_at:-}" != unreadable ] || return 1
+    [ -z "${r_at:-}" ] || [ "${r_from:-}" != "$self" ] || [ "$r_at" -lt "$s_arr" ]
+}
+
+# The class of work in progress that came to rest (`work_rest`), the line $1 just parsed: `again` for
+# the rest said last again (`same_rest`, noted), else short.
+rest_class() { # line
+    if same_rest; then
+        note "again: held" "$1"
+        echo again
+    else
+        echo short
+    fi
 }
 
 # Holds a line, one entry per agent: a newer line takes the text, the earlier due time and the
@@ -463,7 +503,7 @@ hold_class() {
 # tab, A2) comes with its due ($6) and sets it outright; while it is ahead, no other hold moves
 # it. Runs under the settle lock.
 hold_put() { # label terminal generation class line [due]
-    local f now due class o_t o_g o_class o_due o_arr _ arr
+    local f now due class o_t o_g o_class o_due o_arr o_line _ arr
     f="$(held_file "$1")"
     now="$(date +%s)"
     class="$4" arr="$now"
@@ -473,7 +513,7 @@ hold_put() { # label terminal generation class line [due]
         person) due="$6" ;;
         *) due=$((now + qhold)) ;;
     esac
-    read -r o_t o_g o_class o_due o_arr _ <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
+    read -r o_t o_g o_class o_due o_arr o_line <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
     if [ -n "${o_t:-}" ] && [ "$class" = person ]; then
         arr="$o_arr"
     elif [ -n "${o_t:-}" ] && [ "$o_class" = person ] && [ "$o_due" -gt "$now" ]; then
@@ -486,15 +526,26 @@ hold_put() { # label terminal generation class line [due]
         # A short line again: the agent stopped anew, so it settles anew from now. An agent that
         # stops more often than the settle is said once it stays stopped, not before.
         [ "$class.$o_class" != short.short ] || due=$((now + settle))
+        # The same rest again on a new stop: the agent worked in between, seen or not, so its
+        # hold starts over from now.
+        [ "$class.$o_class" != again.again ] || [ "$(stop_of "$5")" = "$(stop_of "${o_line:-}")" ] ||
+            due=$((now + qhold))
         case "$class.$o_class" in
             routine.*) ;;
             short.* | *.short) class=short ;;
             long.* | *.long) class=long ;;
+            again.* | *.again) class=again ;;
         esac
     fi
     { grep -v "^$2 " "$f" 2>/dev/null || true
       echo "$2 $3 $class $due $arr $5"; } > "$f.tmp"
     mv "$f.tmp" "$f"
+}
+
+# The stop of an agent line, its `stop:` tag ("" with none).
+stop_of() {
+    local s
+    case "$1" in *" stop:"*) s="${1##* stop:}"; echo "${s%% *}" ;; esac
 }
 
 # Whether the agent line $2 just parsed, of this Mac, is the same stop again, once qass had its
@@ -602,10 +653,10 @@ flush() {
         # With that machine's daemon away its rows are stale: keep its lines for later.
         [ ! -e "$(gone_file "$label")" ] || continue
         snap="$(cat "$(snapshot_file "$label")" 2>/dev/null)" || continue
-        # Short and person lines first, then long, then ride: the most urgent first in the block.
-        # A routine or person line goes only once due.
-        sel="$(awk -v now="$now" -v b="$batch" '(($3 == "routine" || $3 == "person") ? $4 <= now : $3 != "short" || $4 <= now + b) {
-            print ($3 == "short" || $3 == "person" ? 0 : $3 == "long" ? 1 : $3 == "routine" ? 2 : 3) " " NR " " $0 }' "$f" |
+        # Short and person lines first, then long and again, then ride: the most urgent first in
+        # the block. A routine, person or again line goes only once due.
+        sel="$(awk -v now="$now" -v b="$batch" '(($3 == "routine" || $3 == "person" || $3 == "again") ? $4 <= now : $3 != "short" || $4 <= now + b) {
+            print ($3 == "short" || $3 == "person" ? 0 : $3 == "long" || $3 == "again" ? 1 : $3 == "routine" ? 2 : 3) " " NR " " $0 }' "$f" |
             sort -n -k1,1 -k2,2 | cut -d' ' -f3-)"
         [ -n "$sel" ] || continue
         # Taken only once checked: a failed check keeps them held for the next round.
@@ -696,6 +747,20 @@ flush() {
     done <<< "$picked"
 }
 
+# Drops each `again` line of machine $1 whose agent works in the row array $2: it woke and went on,
+# so the rest it stopped in is over. Runs under the settle lock.
+again_drop() { # label snapshot
+    local f ts
+    f="$(held_file "$1")"
+    ts=" $(jq -r '[.[]? | select(.state == "working") | .terminal] | map(tostring) | join(" ")' <<< "$2" 2>/dev/null) "
+    [ "$ts" != "  " ] || return 0
+    awk -v ts="$ts" '$3 == "again" && index(ts, " " $1 " ")' "$f" | while IFS= read -r l; do
+        note "again: dropped at work" "${l#* * * * * }"
+    done
+    awk -v ts="$ts" '!($3 == "again" && index(ts, " " $1 " "))' "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
+}
+
 # A ride line nothing carried for QASS_QUIET_HOLD seconds: a repeat or a sleep, not worth a
 # wake of its own. Runs under the settle lock.
 ride_expire() {
@@ -757,7 +822,8 @@ bg_drop() {
 }
 
 # On the tick, lets go each machine's background holds that are over (`bgcheck`): the line goes
-# to the short hold, so it settles and meets the brief as any line, and the hold goes only once
+# to the short hold (`again` for the rest said last again, `bg_class`), so it settles and meets
+# the brief as any line, and the hold goes only once
 # that line is held. A hold jq cannot read goes once past QASS_BG_LIMIT. Runs under the settle lock.
 bg_check() {
     local f label snap skip now t g n since from spent r late kept
@@ -790,14 +856,21 @@ bg_check() {
                 spent) kept="$kept$t $g $n $since $from spent"$'\n' ;;
                 # The limit: said once, and the hold stays, spent, so a job that never ends
                 # (a dev server) holds none of the agent's later stops.
-                late\ *) hold_put "$label" "$t" "$g" short "${r#late }"; note "bg: limit" "${r#late }"
+                late\ *) note "bg: limit" "${r#late }"
+                    hold_put "$label" "$t" "$g" "$(bg_class "${r#late }")" "${r#late }"
                     kept="$kept$t $g $n $since $from spent"$'\n' ;;
-                *) hold_put "$label" "$t" "$g" short "$r"; note "bg: let go" "$r" ;;
+                *) note "bg: let go" "$r"; hold_put "$label" "$t" "$g" "$(bg_class "$r")" "$r" ;;
             esac
         done < "$f"
         printf '%s' "$kept" > "$f.tmp"
         mv "$f.tmp" "$f"
     done
+}
+
+# The class of a line a background hold let go: work in progress at rest takes the class its stop
+# would have (`rest_class`: the rest said last again is `again`), anything else short.
+bg_class() { # line
+    if parse_line "$1" && work_rest; then rest_class "$1"; else echo short; fi
 }
 
 # A Claude agent of this Mac that stopped on its usage limit (its screen shows the limit and the
@@ -1005,6 +1078,10 @@ follow() {
             # Quiet checks held lines against the saved snapshot: save this one first, so a
             # line held from it is checked against the rows it came from.
             [ "$quiet" != 1 ] || { printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"; }
+            # An agent held `again` that works now: that rest is over (see the top of this file).
+            if [ "$quiet" = 1 ] && grep -q '^[0-9]* [^ ]* again ' "$(held_file "$label")" 2>/dev/null; then
+                settle_locked again_drop "$label" "$snap"
+            fi
             now_lines=""
             while IFS= read -r l; do
                 [ -n "$l" ] || continue

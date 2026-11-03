@@ -107,7 +107,7 @@ A line `ASK E75 answered a -> T224` (or `ASK E3 passed text -> qass`) says the o
 from the inbox and it went out: it needs nothing, `qoop ask ls` still shows the card.
 One wake may bring several lines, most urgent first: handle each. Work in progress that stopped
 (an open task, no claim, not waiting on them, nobody else writing to it) comes within half a
-minute; what needs nothing now with a later wake or within 10 minutes (never said:
+minute (stopped again in the same stage, no write of yours since: after 10 minutes if still at rest, and at least hourly); what needs nothing now with a later wake or within 10 minutes (never said:
 `@QASS_DATA@/quiet.log`); a plain rest with no task after 30 minutes if it still holds, a sleep never. Their `routine on` (in any
 language) writes `say` to `@QASS_DATA@/routine`, `routine off` removes it. Write to agents only
 with `qoop prompt`, `qoop send` or `on.sh`: only then does their next claim, wait or block come at once.
