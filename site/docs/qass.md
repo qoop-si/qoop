@@ -17,9 +17,10 @@ Close it as any tab: `ctrl-a x` in it, or `qoop close`.
 Its rules live in the skill itself: what it answers alone, what it asks you, and what it
 never does. It writes to an agent within those rules without asking you first; tell it "ask me
 first" and it keeps that until you say otherwise. Work that stops is its to move on: an agent on
-an open task that comes to rest reaches it within half a minute, and it answers a question the
-agent's rules already settle, resumes after an error or a usage limit, and pushes the step the
-task's goal still lacks. A question left to you for 5 minutes stays open while the agent does the
+an open task that comes to rest reaches it within about half a minute; stopped again in the same
+stage with nothing from qass in between, it reaches qass after 10 minutes at rest, and not
+if it works again first, though at least once an hour while it keeps stopping. qass answers a question the agent's rules already settle, resumes
+after an error or a usage limit, and pushes the step the task's goal still lacks. A question left to you for 5 minutes stays open while the agent does the
 parts of its task that do not depend on it; your answer reaches it once it is at rest. It never types into a tab while you are at it (your keys there in the last
 minutes), and stops after a few writes to one agent that do not move it, asking you instead.
 Agents themselves are told to take the next step their rules allow and to end a turn on you only

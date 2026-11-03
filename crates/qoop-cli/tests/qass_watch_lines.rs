@@ -532,9 +532,9 @@ fn repeat(r: Repeat) -> (Vec<String>, String, String) {
     (lines, w.read("data/quiet.log"), w.read("data/held"))
 }
 
-/// A handled stop's repeat rides, noted with its print and rest times; every other case is
-/// said: a qass turn that ended before the print, a write after it, qass still working, another
-/// generation, a new stop, and no stop at all.
+/// A handled stop's repeat rides, noted with its print and rest times; no other case does. A
+/// write after the print and another generation are said; a qass turn that ended before the
+/// print, qass still working, a new stop and no stop at all are the same rest again, held `again`.
 #[test]
 fn only_a_handled_stop_rides() {
     let (lines, quiet, held) = repeat(Repeat::default());
@@ -546,9 +546,10 @@ fn only_a_handled_stop_rides() {
     );
     assert!(held.starts_with("5 1 ride "), "{held}");
 
-    for (case, r) in [
+    for (case, said, r) in [
         (
             "rested before the print",
+            false,
             Repeat {
                 printed: 100,
                 ..Repeat::default()
@@ -556,6 +557,7 @@ fn only_a_handled_stop_rides() {
         ),
         (
             "written since",
+            true,
             Repeat {
                 write_at: Some(700),
                 ..Repeat::default()
@@ -563,6 +565,7 @@ fn only_a_handled_stop_rides() {
         ),
         (
             "qass working",
+            false,
             Repeat {
                 qass: ("working", 500),
                 ..Repeat::default()
@@ -570,6 +573,7 @@ fn only_a_handled_stop_rides() {
         ),
         (
             "another generation",
+            true,
             Repeat {
                 said_gen: 0,
                 ..Repeat::default()
@@ -577,6 +581,7 @@ fn only_a_handled_stop_rides() {
         ),
         (
             "a new stop",
+            false,
             Repeat {
                 said_stop: "90.1",
                 ..Repeat::default()
@@ -584,6 +589,7 @@ fn only_a_handled_stop_rides() {
         ),
         (
             "no stop",
+            false,
             Repeat {
                 stop: "?",
                 said_stop: "?",
@@ -591,9 +597,14 @@ fn only_a_handled_stop_rides() {
             },
         ),
     ] {
-        let (lines, quiet, _) = repeat(r);
-        assert_eq!(of(&lines, 5).len(), 1, "{case}: {lines:?}");
+        let (lines, quiet, held) = repeat(r);
         assert!(!quiet.contains("ride: stop handled"), "{case}: {quiet}");
+        if said {
+            assert_eq!(of(&lines, 5).len(), 1, "{case}: {lines:?}");
+        } else {
+            assert!(of(&lines, 5).is_empty(), "{case}: {lines:?}");
+            assert!(held.starts_with("5 1 again "), "{case}: {held}");
+        }
     }
 }
 
@@ -616,8 +627,9 @@ fn a_blocked_line_is_said_whatever_its_stop() {
     assert_eq!(of(&lines, 5).len(), 1, "{lines:?}");
 }
 
-/// Two Stops in a row with the agent at rest all along each make a line from `working`: short on
-/// an open task (said now), routine with none (held).
+/// Two Stops in a row with the agent at rest all along each make a line from `working`: on an open
+/// task the first is short (said now) and the second, the same rest again, `again`; with none,
+/// routine (held).
 #[test]
 fn a_new_stop_at_rest_is_a_line() {
     let w = Watch::new();
@@ -631,9 +643,15 @@ fn a_new_stop_at_rest_is_a_line() {
     ]);
     let (lines, _) = w.run(0, &[]);
     let l = of(&lines, 5);
-    assert_eq!(l.len(), 2, "{lines:?}");
+    assert_eq!(l.len(), 1, "{lines:?}");
     assert!(l[0].starts_with("T5 g1 claude working->idle ") && l[0].contains(" stop:2.2 "));
-    assert!(l[1].contains(" stop:3.3 "), "{lines:?}");
+    let held = w.read("data/held");
+    assert!(
+        held.starts_with("5 1 again ")
+            && held.contains(" working->idle ")
+            && held.contains(" stop:3.3 "),
+        "{held}"
+    );
 
     let w = Watch::new();
     let no_task = |stop: &str| {
@@ -873,7 +891,8 @@ fn a_held_delivery_records_its_print_time() {
         rows(&[row(5, "working", r#","stop":"100.1""#), qass.clone()]),
         rows(&[row(5, "idle", r#","stop":"100.1""#), qass]),
     ]);
-    let (lines, _) = w.run(1, &[]);
+    // The repeat is the same rest again: held, and said on the tick once that hold is over.
+    let (lines, _) = w.run(11, &[("QASS_QUIET_HOLD", "0")]);
     assert_eq!(of(&lines, 5).len(), 2, "{lines:?}");
     let quiet = w.read("data/quiet.log");
     assert!(!quiet.contains("ride: stop handled"), "{quiet}");
@@ -1000,10 +1019,15 @@ fn a_background_hold_past_its_limit_is_said_once() {
 }
 
 /// A job that never ends (a dev server): past the limit the hold is spent, so each later stop
-/// with as many running takes its usual class at once, with no second hold.
+/// with as many running takes its usual class at once, with no second hold. qass wrote to the
+/// agent, so that class is short for each.
 #[test]
 fn a_spent_hold_holds_no_later_stop() {
     let w = Watch::new();
+    w.put(
+        "data/prompted.log",
+        &format!("{} {QASS} T5\n", now() + 3600),
+    );
     w.snaps(&[
         rows(&[row(5, "working", "")]),
         rows(&[resting("1.1", 1)]),
@@ -1168,4 +1192,299 @@ fn a_remote_background_hold_and_a_resume() {
     let (lines, _) = w.run(0, &[]);
     assert!(lines.is_empty(), "{lines:?}");
     assert!(!w.path("data/bghold").exists() && !w.path("data/bghold-ubox").exists());
+}
+
+/// Terminal 5 said last at rest in `said_stage` (none: never said), qass's write to it `write_ago`
+/// seconds ago (none: no record), then a stream of `snaps`. Its lines and its data folder.
+fn rest_again(
+    said_stage: Option<&str>,
+    write_ago: Option<i64>,
+    snaps: &[String],
+    hold: u32,
+    env: &[(&str, &str)],
+) -> (Vec<String>, Watch) {
+    let w = Watch::new();
+    let now = now();
+    if let Some(stage) = said_stage {
+        w.put(
+            "data/said",
+            &format!("5 1 idle {stage} {} 90.1 {}\n", now - 2000, now - 1000),
+        );
+    }
+    if let Some(ago) = write_ago {
+        w.put("data/prompted.log", &format!("{} {QASS} T5\n", now - ago));
+    }
+    w.put(
+        "data/last.json",
+        &rows(&[staged("working", "implementing", "?")]),
+    );
+    w.snaps(snaps);
+    let (lines, _) = w.run(hold, env);
+    (lines, w)
+}
+
+/// The rest of terminal 5 on stop `stop`, task stage `stage`, as said.
+fn staged_line(stage: &str, stop: &str) -> String {
+    format!(
+        r#"T5 g1 claude working->idle "w" /tmp/x stop:{stop} allowed:write:none@1000 task:12:{stage}"#
+    )
+}
+
+/// A first stop on an open task, one in another stage than the line said last, and one after a
+/// write from qass since that line, take the short hold: due with the settle, then one line.
+#[test]
+fn a_first_or_new_rest_on_a_task_is_short() {
+    let idle = [staged("idle", "implementing", "100.1")];
+    for (case, said, write) in [
+        ("first", None, None),
+        ("another stage", Some("investigating"), None),
+        ("written since", Some("implementing"), Some(700)),
+    ] {
+        let snaps = [rows(&idle)];
+        let (lines, w) = rest_again(said, write, &snaps, 0, &[("QASS_SETTLE", "20")]);
+        assert!(lines.is_empty(), "{case}: {lines:?}");
+        let held = w.read("data/held");
+        assert!(held.starts_with("5 1 short "), "{case}: {held}");
+        let quiet = w.read("data/quiet.log");
+        assert!(
+            !quiet.contains("long: ") && !quiet.contains("again: "),
+            "{case}: {quiet}"
+        );
+        let (lines, _) = rest_again(said, write, &snaps, 11, &[("QASS_SETTLE", "1")]);
+        assert_eq!(lines, [staged_line("implementing", "100.1")], "{case}");
+    }
+}
+
+/// The same rest again (generation, state and stage of the line said last, nothing from qass
+/// since) is held `again`, and dropped on the snapshot that shows the agent working, long before
+/// its hold is over: no recheck, no stale note.
+#[test]
+fn the_same_rest_again_is_held_and_dropped_when_the_agent_works() {
+    let snaps = [rows(&[staged("idle", "implementing", "100.1")])];
+    let (lines, w) = rest_again(Some("implementing"), None, &snaps, 0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(w.read("data/held").starts_with("5 1 again "));
+    assert!(w.read("data/quiet.log").contains(" again: held T5 g1 "));
+
+    let snaps = [
+        rows(&[staged("idle", "implementing", "100.1")]),
+        rows(&[staged("working", "implementing", "?")]),
+    ];
+    let (lines, w) = rest_again(Some("implementing"), None, &snaps, 0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    let quiet = w.read("data/quiet.log");
+    assert!(
+        quiet.contains(" again: dropped at work T5 g1 claude working->idle "),
+        "{quiet}"
+    );
+    assert!(!quiet.contains(" stale "), "{quiet}");
+    assert!(w.read("data/held").is_empty());
+}
+
+/// An `again` line never rides along: another agent's line said at once (a block) or short (a
+/// first stop on its task) goes out alone, and the rest stays held.
+#[test]
+fn a_same_rest_again_never_rides_along() {
+    for (case, other) in [("blocked", "blocked"), ("short", "idle")] {
+        let w = Watch::new();
+        let now = now();
+        w.put(
+            "data/said",
+            &format!("5 1 idle implementing {} 90.1 {}\n", now - 2000, now - 1000),
+        );
+        w.put(
+            "data/last.json",
+            &rows(&[
+                staged("working", "implementing", "?"),
+                row(6, "working", ""),
+            ]),
+        );
+        w.snaps(&[
+            rows(&[
+                staged("idle", "implementing", "100.1"),
+                row(6, "working", ""),
+            ]),
+            rows(&[staged("idle", "implementing", "100.1"), row(6, other, "")]),
+        ]);
+        let (lines, _) = w.run(0, &[]);
+        assert_eq!(of(&lines, 6).len(), 1, "{case}: {lines:?}");
+        assert!(of(&lines, 5).is_empty(), "{case}: {lines:?}");
+        assert!(w.read("data/held").starts_with("5 1 again "), "{case}");
+    }
+}
+
+/// The same rest again with the agent still at rest once the long hold is over: one line then.
+#[test]
+fn the_same_rest_again_is_said_once_the_long_hold_ends() {
+    let snaps = [rows(&[staged("idle", "implementing", "100.1")])];
+    let (lines, w) = rest_again(
+        Some("implementing"),
+        None,
+        &snaps,
+        11,
+        &[("QASS_QUIET_HOLD", "5")],
+    );
+    assert_eq!(lines, [staged_line("implementing", "100.1")]);
+    assert!(w.read("data/held").is_empty());
+}
+
+/// The rest said last printed over an hour ago: a stop in the same stage is short again, so a
+/// worker that keeps waking and stopping is said at least once an hour.
+#[test]
+fn the_same_rest_an_hour_on_is_short() {
+    let w = Watch::new();
+    let now = now();
+    w.put(
+        "data/said",
+        &format!("5 1 idle implementing {} 90.1 {}\n", now - 5000, now - 4000),
+    );
+    w.put(
+        "data/last.json",
+        &rows(&[staged("working", "implementing", "?")]),
+    );
+    w.snaps(&[rows(&[staged("idle", "implementing", "100.1")])]);
+    let (lines, _) = w.run(0, &[]);
+    assert_eq!(lines, [staged_line("implementing", "100.1")]);
+    assert!(!w.read("data/quiet.log").contains("again: "));
+}
+
+/// Terminal 5's `again` entry in the held file: "<due> <arrival> <line>".
+fn again_entry(w: &Watch) -> (i64, i64, String) {
+    let held = w.read("data/held");
+    let mut f = held.trim_end().splitn(6, ' ');
+    assert_eq!(
+        (f.next(), f.next(), f.next()),
+        (Some("5"), Some("1"), Some("again")),
+        "{held}"
+    );
+    let due = f.next().and_then(|x| x.parse().ok()).expect("a due");
+    let arr = f.next().and_then(|x| x.parse().ok()).expect("an arrival");
+    (due, arr, f.next().unwrap_or_default().to_string())
+}
+
+/// A new stop of the same rest again, idle to idle with no working snapshot seen, starts its hold
+/// over from now (the first arrival stands), within one run and across a restart of the watcher.
+#[test]
+fn a_new_stop_starts_the_again_hold_over() {
+    let snaps = [
+        rows(&[staged("idle", "implementing", "100.1")]),
+        "sleep 3".into(),
+        rows(&[staged("idle", "implementing", "100.2")]),
+    ];
+    let (lines, w) = rest_again(Some("implementing"), None, &snaps, 0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    let (due, arr, line) = again_entry(&w);
+    assert!(line.contains(" stop:100.2 "), "{line}");
+    assert!(due - arr >= 602, "due {due}, first arrival {arr}");
+
+    // A watcher that starts on a held `again` line near its due, and a new stop.
+    let w = Watch::new();
+    let now = now();
+    w.put(
+        "data/said",
+        &format!("5 1 idle implementing {} 90.1 {}\n", now - 2000, now - 1000),
+    );
+    let old = r#"T5 g1 claude working->idle "w" /tmp/x stop:100.1 task:12:implementing"#;
+    w.put(
+        "data/held",
+        &format!("5 1 again {} {} {old}\n", now + 5, now - 595),
+    );
+    w.put(
+        "data/last.json",
+        &rows(&[staged("idle", "implementing", "100.1")]),
+    );
+    w.snaps(&[rows(&[staged("idle", "implementing", "100.2")])]);
+    let (lines, _) = w.run(0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    let (due, arr, line) = again_entry(&w);
+    assert!(line.contains(" stop:100.2 "), "{line}");
+    assert_eq!(arr, now - 595);
+    assert!(due >= now + 599, "due {due}, now {now}");
+}
+
+/// A background hold let go, on its job's end or at its limit, of the rest said last again is
+/// held `again`, not said; with no said record it is said as before.
+#[test]
+fn a_background_hold_let_go_on_the_same_rest_is_held_again() {
+    for (case, snaps, env) in [
+        (
+            "job end",
+            vec![
+                rows(&[row(5, "working", "")]),
+                rows(&[resting("1.1", 2)]),
+                rows(&[resting("1.1", 0)]),
+            ],
+            vec![],
+        ),
+        (
+            "limit",
+            vec![rows(&[row(5, "working", "")]), rows(&[resting("1.1", 2)])],
+            vec![("QASS_BG_LIMIT", "2")],
+        ),
+    ] {
+        for said in [true, false] {
+            let w = Watch::new();
+            let now = now();
+            if said {
+                w.put(
+                    "data/said",
+                    &format!("5 1 idle implementing {} 90.1 {}\n", now - 2000, now - 1000),
+                );
+            }
+            w.snaps(&snaps);
+            let (lines, _) = w.run(11, &env);
+            let quiet = w.read("data/quiet.log");
+            assert!(
+                quiet.contains(if case == "limit" {
+                    "bg: limit"
+                } else {
+                    "bg: let go"
+                }),
+                "{case}: {quiet}"
+            );
+            if said {
+                assert!(lines.is_empty(), "{case}: {lines:?}");
+                assert!(quiet.contains(" again: held T5 g1 "), "{case}: {quiet}");
+                let (_, _, line) = again_entry(&w);
+                assert!(line.contains(" stop:1.1"), "{case}: {line}");
+            } else {
+                assert_eq!(of(&lines, 5).len(), 1, "{case}: {lines:?}");
+                assert!(!quiet.contains("again: "), "{case}: {quiet}");
+            }
+        }
+    }
+}
+
+/// One block where the first held line is said and the second goes to a person hold: putting the
+/// person hold leaves the said line as it was, so the said record names the first agent, its held
+/// entry goes, and the second keeps its person entry.
+#[test]
+fn a_person_hold_in_a_block_keeps_the_line_said_before_it() {
+    let w = Watch::new();
+    let now = now();
+    let until = now + 300;
+    at_the_tab_once(&w, 6, until);
+    let line =
+        |t: u32| format!(r#"T{t} g1 claude working->idle "w" /tmp/x stop:? task:12:implementing"#);
+    w.put(
+        "data/held",
+        &format!(
+            "5 1 short {p} {p} {}\n6 1 short {p} {p} {}\n",
+            line(5),
+            line(6),
+            p = now - 1
+        ),
+    );
+    let idle = rows(&[row(5, "idle", ""), row(6, "idle", "")]);
+    w.put("data/last.json", &idle);
+    w.snaps(&[idle]);
+    let (lines, _) = w.run(12, &[]);
+    assert_eq!(of(&lines, 5).len(), 1, "{lines:?}");
+    assert!(of(&lines, 6).is_empty(), "{lines:?}");
+    let said = w.read("data/said");
+    assert!(said.starts_with("5 1 idle implementing "), "{said}");
+    assert!(!said.contains("\n6 ") && !said.starts_with("6 "), "{said}");
+    let held = w.read("data/held");
+    assert!(held.starts_with(&format!("6 1 person {until} ")), "{held}");
+    assert!(!held.lines().any(|l| l.starts_with("5 ")), "{held}");
 }
