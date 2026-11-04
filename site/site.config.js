@@ -1,9 +1,9 @@
 export default {
   name: "qoop",
   description: "a portable runtime for human and coding-agent workspaces",
+  // No `url` while the repository is private: the footer's GitHub link would be a 404.
   author: {
     name: "qoop",
-    url: "https://github.com/qoop-si/qoop",
   },
   navLinks: [
     { label: "Docs", href: "#introduction" },

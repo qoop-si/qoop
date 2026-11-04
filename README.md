@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <a href="https://qoop-si.github.io/qoop/">Docs</a> ·
-  <a href="https://qoop-si.github.io/qoop/#quick-start">Quick start</a> ·
-  <a href="https://qoop-si.github.io/qoop/#keys">Keys</a>
+  <a href="https://qoop.si/docs/">Docs</a> ·
+  <a href="https://qoop.si/docs/#quick-start">Quick start</a> ·
+  <a href="https://qoop.si/docs/#keys">Keys</a>
 </p>
 
 ## Get started
@@ -52,7 +52,7 @@ Type `claude` or `codex` in there. macOS and Linux.
 
 ## Docs
 
-Everything else lives in the [docs](https://qoop-si.github.io/qoop/): keys, spaces and
+Everything else lives in the [docs](https://qoop.si/docs/): keys, spaces and
 splits, servers, the phone, qass, hooks, settings, building from source.
 
 ## Licence
