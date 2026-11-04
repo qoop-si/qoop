@@ -1181,17 +1181,18 @@ body[data-page="introduction"] .footer {
     margin-top: 40px;
   }
 
-  /* Wrapped rather than scrolled sideways: nothing on a phone scrolls horizontally. */
+  /* The page never scrolls sideways; a long line scrolls inside its own block, so a command
+     and its note stay on one row. Copy sits above the code, clear of the Keys button. */
   #article pre {
-    padding: 14px 16px 50px;
+    padding: 52px 16px 14px;
     font-size: 13px;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    overflow-x: hidden;
   }
 
-  #article pre .copy-btn {
-    top: auto;
-    bottom: 10px;
+  /* The code scrolls, not the block, so Copy stays in place. */
+  #article pre code {
+    display: block;
+    overflow-x: auto;
   }
 
   /* A table reads as one block per row: the key, then what it does. */
