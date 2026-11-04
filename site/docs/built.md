@@ -19,19 +19,19 @@ That last row was the hard one, and for most of this project it read 38 to 99 mi
 None of that was the code. The measurement started whatever shell the person running it
 used, so it was timing an interactive prompt redraw, and it delivered its megabyte in one
 burst a second, so the percentile came down to which keystrokes happened to land in a burst.
-[docs/latency.md](https://github.com/qoop-si/qoop/blob/main/docs/latency.md) has both mistakes, the numbers before and after, and the
+`docs/latency.md` has both mistakes, the numbers before and after, and the
 one change the corrected measurement then argued for.
 
 ## Decisions and gates
 
 Every decision that was hard is written down as a decision record in
-[docs/adr](https://github.com/qoop-si/qoop/blob/main/docs/adr), with what was measured and what the first version got wrong. Several of
+`docs/adr`, with what was measured and what the first version got wrong. Several of
 them are corrections: the containment identity read from the wrong end of a pty, teardown
 that ended when the child was reaped, a parser bound that a three byte prefix walked past.
 
 The keyboard corpus gate G1.3 checks key encodings against, and where each row came from:
-[docs/keyboard-corpus.md](https://github.com/qoop-si/qoop/blob/main/docs/keyboard-corpus.md). Every benchmark run so far:
-[docs/benchmarks.md](https://github.com/qoop-si/qoop/blob/main/docs/benchmarks.md).
+`docs/keyboard-corpus.md`. Every benchmark run so far:
+`docs/benchmarks.md`.
 
 Every claim about this program is a gate, and a gate is a command that exits zero. They live
 in the tests next to the code they are about, and each one names itself in the test's own

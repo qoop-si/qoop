@@ -343,8 +343,8 @@ function renderHome(slug) {
         <div class="phone-links">${phone}</div>
       </div>
       <div class="hero-art">
-        <img class="hero-img hero-dark" src="${h.hero.dark}" alt="${esc(h.hero.alt)}" onerror="this.remove()">
-        <img class="hero-img hero-light" src="${h.hero.light}" alt="${esc(h.hero.alt)}" onerror="this.remove()">
+        <img class="hero-img hero-dark" src="${h.hero.dark}" alt="${esc(h.hero.alt)}">
+        <img class="hero-img hero-light" src="${h.hero.light}" alt="${esc(h.hero.alt)}">
       </div>
     </section>
     <section class="cards">${cards}</section>
