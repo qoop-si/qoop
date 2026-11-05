@@ -123,6 +123,8 @@ pub struct Chrome<'a> {
     pub chat_refused: bool,
     /// The spaces folded away under their rule.
     pub shut: &'a sidebar::Shut,
+    /// The awake spaces whose sleeping agents are listed rather than folded to one row.
+    pub doze_open: &'a sidebar::Shut,
     /// Where the keyboard's attention is, for the key row.
     pub keys: KeyContext,
     /// What each local agent costs, sampled while `QOOP_USAGE=1`.
@@ -242,6 +244,7 @@ impl Default for Chrome<'_> {
         Chrome {
             chat_refused: false,
             shut: &NO_SHUT,
+            doze_open: &NO_SHUT,
             keys: KeyContext::default(),
             usage: &NO_USAGE,
             answer: false,
@@ -304,6 +307,7 @@ impl Frame<'_> {
             now_unix: self.now_unix,
             width: self.sidebar_width,
             shut: self.chrome.shut,
+            doze_open: self.chrome.doze_open,
             usage: Some(self.chrome.usage),
             scroll: self.chrome.list_scroll,
             inbox: self.chrome.inbox,
@@ -1423,6 +1427,7 @@ pub fn paint(frame: &Frame) -> String {
                 // The keyboard's agent is marked by its ember line, and raised only when the
                 // column's own pick stands on it.
                 Some(sidebar::Hit::Terminal(t)) => stood == Some(sidebar::Pick::Terminal(*t)),
+                Some(sidebar::Hit::Doze(space)) => stood == Some(sidebar::Pick::Doze(*space)),
                 Some(
                     sidebar::Hit::Title
                     | sidebar::Hit::Search
@@ -8117,6 +8122,7 @@ mod tests {
                 now_unix: 0,
                 width: sidebar::WIDTH,
                 shut: &shut,
+                doze_open: &shut,
                 usage: None,
                 scroll: None,
                 icons: false,

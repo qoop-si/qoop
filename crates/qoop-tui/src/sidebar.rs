@@ -312,6 +312,8 @@ const UNNAMED: &str = "agent";
 pub enum Hit {
     Space(i64),
     Terminal(u32),
+    /// The one row a space's sleeping agents fold to: it lists them, or folds them again.
+    Doze(i64),
     /// A row of the inbox's list: the agent it names, which a click reaches like its row in
     /// the tree, or nobody on a row with nobody on it. Never raised, so the keyboard's row is
     /// only ever drawn in one place.
@@ -342,6 +344,8 @@ pub enum Act {
     Space(i64),
     /// Fold a space's agents away under its rule, or open them again.
     Fold(i64),
+    /// List a space's sleeping agents under their row, or fold them to it again.
+    Doze(i64),
     /// Put a space to sleep: the `sleep` on its rule, which reads the space from the row
     /// it was on rather than from whatever is on screen.
     Sleep(i64),
@@ -755,6 +759,9 @@ pub struct Column<'a> {
     /// The live column width, at or above [`SIDEBAR_MIN`] on the live path.
     pub width: usize,
     pub shut: &'a Shut,
+    /// The awake spaces whose sleeping agents are listed; every other one folds them to one
+    /// row.
+    pub doze_open: &'a Shut,
     /// The space whose rule is asking whether it should close, or `None` while no rule is.
     /// The rule paints the question and answers only the question; every other click falls
     /// through to what the row does ordinarily.
@@ -781,6 +788,8 @@ pub struct Column<'a> {
 pub enum Pick {
     Space(i64),
     Terminal(u32),
+    /// The row a space's sleeping agents fold to.
+    Doze(i64),
 }
 
 /// The column while the keyboard has it: what is typed in the search chip, whether typing is
@@ -1917,9 +1926,20 @@ fn content(c: &Column) -> Vec<Row> {
                     out.push((boxed(line, c.width), hit));
                 }
                 // A sleeping space has no terminals, only the tabs a wake brings back: one
-                // faint row each, under the same fold as live tabs.
+                // faint row each, under the same fold as live tabs. In an awake space two or
+                // more of them fold to one row of their own, so the agents at work stay in
+                // view; a search lists the ones it found.
+                let dozing = asleep.iter().filter(|t| one_per_tab(t)).count();
+                let dozes = open && !space.asleep && query.is_empty() && dozing > 1;
+                let listed = !dozes || c.doze_open.contains(&space.id);
+                if dozes {
+                    out.push((
+                        boxed(doze_line(&inside, space, dozing, listed), c.width),
+                        Some(Hit::Doze(space.id)),
+                    ));
+                }
                 for tab in asleep {
-                    if open || tab.terminal == c.focused_terminal {
+                    if (open && listed) || tab.terminal == c.focused_terminal {
                         out.push((
                             boxed(sleeping_line(&inside, tab, space), c.width),
                             Some(Hit::Terminal(tab.terminal)),
@@ -2015,6 +2035,7 @@ fn pick_list(content: &[Row]) -> Vec<Pick> {
         let pick = match hit {
             Some(Hit::Space(id)) => Pick::Space(*id),
             Some(Hit::Terminal(t)) => Pick::Terminal(*t),
+            Some(Hit::Doze(id)) => Pick::Doze(*id),
             _ => continue,
         };
         if out.last() != Some(&pick) {
@@ -2043,6 +2064,7 @@ fn pick_hit(pick: Pick) -> Hit {
     match pick {
         Pick::Space(id) => Hit::Space(id),
         Pick::Terminal(t) => Hit::Terminal(t),
+        Pick::Doze(id) => Hit::Doze(id),
     }
 }
 
@@ -2092,7 +2114,7 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
     let dozing = space
         .sleeping
         .iter()
-        .filter(|t| t.agent.is_some() && t.lead.is_none_or(|lead| lead == t.terminal))
+        .filter(|t| t.agent.is_some() && one_per_tab(t))
         .count();
     let held = if space.asleep { dozing } else { kids.len() };
     // A search shows the agents that matched, and the count says how many there are: `1/2`.
@@ -3086,6 +3108,28 @@ fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
     }
 }
 
+/// Whether a sleeping pane stands for its tab: a tab alone, or the lead of its split. A count
+/// of sleeping tabs counts these, so the rule and the fold row say the same number.
+fn one_per_tab(tab: &SleepingTab) -> bool {
+    tab.lead.is_none_or(|lead| lead == tab.terminal)
+}
+
+/// The row an awake space's sleeping agents fold to: the fold and how many sleep, in the
+/// sleepers' own calm ink.
+///
+/// ```text
+/// ▸ 7 asleep
+/// ```
+fn doze_line(c: &Column, space: &WorkspaceRow, count: usize, listed: bool) -> Line {
+    let fold = if listed { '\u{25be}' } else { '\u{25b8}' };
+    Line {
+        text: fit(&format!("{fold} {count} asleep"), c.width),
+        colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
+        runs: vec![(0, 1, crate::theme::Role::Faint)],
+        ..Line::default()
+    }
+}
+
 /// An agent in a flat list, the priority view or a space the client has not heard of:
 /// the dot, the session, and the space it lives in on the right, in the space's own colour.
 fn flat_line(c: &Column, agent: &AgentRow) -> Line {
@@ -3190,6 +3234,7 @@ pub fn act(hit: Hit, col: usize, c: &Column, collapsed: bool) -> Option<Act> {
     match hit {
         Hit::Terminal(terminal) | Hit::Next(Some(terminal)) => Some(Act::Terminal(terminal)),
         Hit::Next(None) => None,
+        Hit::Doze(id) => Some(Act::Doze(id)),
         Hit::Tabs => {
             let at = col.saturating_sub(1);
             let cell = tab_cells(c, &tab_counts(c))
@@ -4278,6 +4323,7 @@ mod tests {
             now_unix,
             width,
             shut,
+            doze_open: &NOTHING_LISTED,
             usage: None,
             scroll: None,
             icons: false,
@@ -4285,6 +4331,9 @@ mod tests {
             drawer: None,
         }
     }
+
+    /// No space lists its sleeping agents: each awake space folds two or more to one row.
+    static NOTHING_LISTED: Shut = Shut::new();
 
     /// The open column at the default width in the tree, nothing seen and nothing folded.
     fn render(
@@ -10328,6 +10377,77 @@ mod tests {
         c.drawer = Some((1, DRAWER));
         let open = first_rule(&c).text;
         assert!(open.contains(" (3) ") && !open.contains("2z"), "{open:?}");
+    }
+
+    /// An awake space folds two or more sleeping agents to one row, so the agents at work stay
+    /// in view; the row lists them when opened, one sleeper keeps its own row, and a search
+    /// lists the sleepers it found.
+    #[test]
+    fn sleeping_agents_in_an_awake_space_fold_to_one_row() {
+        let (mut spaces, agents) = space_in_state("app", 1, false, true);
+        let sleeper = |terminal| SleepingTab {
+            lead: None,
+            terminal,
+            session: None,
+            title: None,
+            agent: Some("claude".into()),
+            cwd: "/tmp".into(),
+        };
+        spaces[0].sleeping = (10..13).map(sleeper).collect();
+        let none = (Seen::new(), Unseen::new(), Shut::new());
+        let sleepers = |rows: &[Row]| {
+            rows.iter()
+                .filter(|(_, h)| matches!(h, Some(Hit::Terminal(10..))))
+                .count()
+        };
+        let doze = |rows: &[Row]| {
+            rows.iter()
+                .find(|(_, h)| *h == Some(Hit::Doze(1)))
+                .map(|(l, _)| l.text.clone())
+        };
+        let c = clicks(&spaces, &agents, View::Tree, WIDTH, &none);
+        let rows = content(&c);
+        assert_eq!(sleepers(&rows), 0, "folded by default");
+        let folded = doze(&rows).expect("the fold row");
+        assert!(folded.contains("\u{25b8} 3 asleep"), "{folded:?}");
+        assert!(
+            items(&c).contains(&Pick::Doze(1)),
+            "the keyboard reaches it"
+        );
+        assert_eq!(act(Hit::Doze(1), 3, &c, false), Some(Act::Doze(1)));
+        // Opened, the row stays and every sleeper is under it.
+        let listed: Shut = [1].into();
+        let open = Column {
+            doze_open: &listed,
+            ..c
+        };
+        let rows = content(&open);
+        assert_eq!(sleepers(&rows), 3);
+        assert!(doze(&rows).is_some_and(|t| t.contains("\u{25be} 3 asleep")));
+        // A search lists the sleepers it found, with no fold in the way.
+        let nav = Nav {
+            query: "claude".into(),
+            ..Nav::default()
+        };
+        let searched = Column {
+            nav: Some(&nav),
+            ..c
+        };
+        let rows = content(&searched);
+        assert_eq!((sleepers(&rows), doze(&rows)), (3, None));
+        // One sleeper is one row either way, so it keeps its own.
+        spaces[0].sleeping.truncate(1);
+        let rows = content(&clicks(&spaces, &agents, View::Tree, WIDTH, &none));
+        assert_eq!((sleepers(&rows), doze(&rows)), (1, None));
+        // Two panes of one slept split are one tab, as the rule counts them: no fold.
+        spaces[0].sleeping = (10..12)
+            .map(|t| SleepingTab {
+                lead: Some(10),
+                ..sleeper(t)
+            })
+            .collect();
+        let rows = content(&clicks(&spaces, &agents, View::Tree, WIDTH, &none));
+        assert_eq!((sleepers(&rows), doze(&rows)), (2, None));
     }
 
     /// The session's own default carries no close, because the daemon refuses to close it

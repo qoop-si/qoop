@@ -4,7 +4,10 @@ A tab you are not using can sleep: it ends, nothing of it takes CPU or memory, a
 it brings back the same number, name, split, directory and scrollback, the last screen
 included, with its agent resumed into its own conversation. The rest of its space is left
 as it is. A sleeping tab stays in its space, dimmed, on the bar and in the column, and keeps
-the name its conversation had. A click on it wakes that tab alone and opens it. Reaching
+the name its conversation had. In a space that is awake, two or more sleeping agents fold to
+one `▸ N asleep` row under the ones at work; a click on it, or Enter on it from `ctrl-a a`,
+lists them, and a search lists the ones it finds. A click on a sleeping tab wakes that tab
+alone and opens it. Reaching
 for it from the palette shows the last screen it drew, dimmed, without waking anything:
 Enter or `ctrl-a Z` wakes it once you have seen where it was. A program on the alternate
 screen leaves no last screen behind, and its tab says so.

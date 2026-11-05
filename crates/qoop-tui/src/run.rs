@@ -853,6 +853,9 @@ struct State {
     /// The spaces folded away under their rule. Client-local like `view`: the daemon
     /// never knows, and a space that goes away leaves this set with the next index.
     shut: sidebar::Shut,
+    /// The awake spaces whose sleeping agents are listed rather than folded to one row.
+    /// Client-local and pruned the same way as `shut`.
+    doze_open: sidebar::Shut,
     /// The last press landed in the left column, and no key has gone to the pane since:
     /// the key row names what the column answers to.
     in_column: bool,
@@ -1295,6 +1298,7 @@ impl State {
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
+                doze_open: &self.doze_open,
                 drag: None,
                 usage: &self.usage,
                 answer: self.answer.is_some(),
@@ -1811,6 +1815,7 @@ impl State {
         match sidebar::act(hit, col as usize, &column, self.collapsed)? {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
+            sidebar::Act::Doze(space) => Some(Clicked::Doze(space)),
             sidebar::Act::Sleep(space) => Some(Clicked::Sleep(space)),
             sidebar::Act::Wake(space) => Some(Clicked::Wake(space)),
             sidebar::Act::Settings(space) => Some(Clicked::Settings(space)),
@@ -1898,7 +1903,7 @@ impl State {
     /// The space a column row belongs to: its rule's, or its tab's, asleep or not.
     fn space_of_hit(&self, hit: sidebar::Hit) -> Option<i64> {
         match hit {
-            sidebar::Hit::Space(space) => Some(space),
+            sidebar::Hit::Space(space) | sidebar::Hit::Doze(space) => Some(space),
             sidebar::Hit::Terminal(t) => self
                 .rows
                 .iter()
@@ -2254,6 +2259,7 @@ impl State {
         let above_sleepers = |mut at: usize| {
             while at > 0
                 && matches!(hit_of(at - 1), Some(sidebar::Hit::Terminal(u)) if self.is_asleep(u))
+                    | matches!(hit_of(at - 1), Some(sidebar::Hit::Doze(_)))
             {
                 at -= 1;
             }
@@ -2278,6 +2284,7 @@ impl State {
             Some(sidebar::Hit::Terminal(t)) if self.is_asleep(t) => {
                 (Place::End, above_sleepers(within))
             }
+            Some(sidebar::Hit::Doze(_)) => (Place::End, above_sleepers(within)),
             Some(sidebar::Hit::Terminal(t)) => {
                 let group = self.group_of(t);
                 // An agent's name row carries its mark; the row under it does not. Read off the
@@ -2540,6 +2547,7 @@ impl State {
             now_unix,
             width: self.sidebar_width,
             shut: &self.shut,
+            doze_open: &self.doze_open,
             armed: self.armed,
             drawer: self.drawer_view(),
             usage: Some(&self.usage),
@@ -6488,7 +6496,7 @@ fn side_ask_sleep(state: &mut State) {
         .into_iter()
         .filter_map(|pick| match pick {
             sidebar::Pick::Space(id) => Some(id),
-            sidebar::Pick::Terminal(_) => None,
+            sidebar::Pick::Terminal(_) | sidebar::Pick::Doze(_) => None,
         })
         .collect();
     let awake = |s: &&qoop_runtime::control::WorkspaceRow| !s.asleep && s.terminals > 0;
@@ -6601,10 +6609,22 @@ fn side_refilter(state: &mut State, keep: bool) {
     side_stand(state, &items, kept.or(items.first().copied()));
 }
 
+/// List a space's sleeping agents under their row, or fold them to it again.
+fn toggle_doze(state: &mut State, space: i64) {
+    if !state.doze_open.remove(&space) {
+        state.doze_open.insert(space);
+    }
+    // A keyboard pick on a sleeper the fold just hid stands on the fold row, not on whatever
+    // row took its place.
+    if state.modes.side.is_some() {
+        side_stand(state, &side_items(state), Some(sidebar::Pick::Doze(space)));
+    }
+}
+
 /// The space a row of the column belongs to.
 fn side_space(state: &State, pick: sidebar::Pick) -> Option<i64> {
     match pick {
-        sidebar::Pick::Space(id) => Some(id),
+        sidebar::Pick::Space(id) | sidebar::Pick::Doze(id) => Some(id),
         sidebar::Pick::Terminal(t) => state
             .rows
             .iter()
@@ -6792,10 +6812,16 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
             }
         }
         // Open it, and the keyboard goes with it.
+        // On the row sleeping agents fold to, it lists them or folds them, and the column
+        // keeps the keyboard.
+        ModeKey::Byte(b'\r' | b'\n' | b'f' | b' ') if let Some(sidebar::Pick::Doze(id)) = pick => {
+            toggle_doze(state, id);
+        }
         ModeKey::Byte(b'\r' | b'\n') => {
-            state.modes.side_go = pick.map(|p| match p {
-                sidebar::Pick::Terminal(t) => Go::Terminal(t),
-                sidebar::Pick::Space(id) => Go::Space(id),
+            state.modes.side_go = pick.and_then(|p| match p {
+                sidebar::Pick::Terminal(t) => Some(Go::Terminal(t)),
+                sidebar::Pick::Space(id) => Some(Go::Space(id)),
+                sidebar::Pick::Doze(_) => None,
             });
             state.modes.side = None;
         }
@@ -6809,13 +6835,18 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
                 }
             }
             Some(sidebar::Pick::Space(id)) => sleep_space(state, id, request),
+            Some(sidebar::Pick::Doze(_)) => {
+                state.message = Some("already asleep, enter lists them".to_string());
+            }
             None => {}
         },
         ModeKey::Byte(b'w') => match (pick, space) {
             (Some(sidebar::Pick::Terminal(t)), Some(space)) if state.is_asleep(t) => {
                 wake(state, space, t, request);
             }
-            (Some(sidebar::Pick::Space(id)), _) => wake_space(state, id, request),
+            (Some(sidebar::Pick::Space(id) | sidebar::Pick::Doze(id)), _) => {
+                wake_space(state, id, request)
+            }
             _ => state.message = Some("awake already".to_string()),
         },
         ModeKey::Byte(b'S') => side_ask_sleep(state),
@@ -6862,7 +6893,7 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         ModeKey::Byte(b'x') => match pick {
             Some(sidebar::Pick::Terminal(t)) => close_terminal(state, t, request),
             Some(sidebar::Pick::Space(id)) => arm_close(state, id),
-            None => {}
+            Some(sidebar::Pick::Doze(_)) | None => {}
         },
         _ => {}
     }
@@ -7742,6 +7773,8 @@ enum Clicked {
     /// The inbox's caret.
     InboxFold,
     Fold(i64),
+    /// The row a space's sleeping agents fold to: list them, or fold them again.
+    Doze(i64),
     View,
     Collapse,
     /// The pet in the foot: qass, or back, as `ctrl-a Q` does.
@@ -8007,6 +8040,7 @@ where
         inbox_drag: None,
 
         shut: sidebar::Shut::new(),
+        doze_open: sidebar::Shut::new(),
 
         in_column: false,
 
@@ -9641,6 +9675,10 @@ where
                                         if !fold_refused(&mut state) && !state.shut.remove(&space) {
                                             state.shut.insert(space);
                                         }
+                                        dirty = true;
+                                    }
+                                    Some(Clicked::Doze(space)) => {
+                                        toggle_doze(&mut state, space);
                                         dirty = true;
                                     }
                                     Some(Clicked::Sleep(space)) => {
@@ -14402,6 +14440,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // with it, so a later space reusing the id does not start folded.
             let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
             state.shut.retain(|id| live.contains(id));
+            state.doze_open.retain(|id| live.contains(id));
             // The space on screen went to sleep: the screen moves on to the next awake
             // space and the keyboard to its first tab. With none awake anywhere there is
             // nothing to move to, and the interface detaches instead.
@@ -17232,6 +17271,7 @@ mod tests {
             inbox_drag: None,
 
             shut: sidebar::Shut::new(),
+            doze_open: sidebar::Shut::new(),
 
             in_column: false,
 
@@ -18791,6 +18831,7 @@ mod tests {
             inbox_drag: None,
 
             shut: sidebar::Shut::new(),
+            doze_open: sidebar::Shut::new(),
 
             in_column: false,
 
@@ -18946,6 +18987,7 @@ mod tests {
             inbox_drag: None,
 
             shut: sidebar::Shut::new(),
+            doze_open: sidebar::Shut::new(),
 
             in_column: false,
 
@@ -26922,6 +26964,34 @@ mod tests {
         mode_input(&mut s, b"j\r", 0x01, &mut request);
         assert_eq!(s.modes.side_go, Some(Go::Terminal(2)));
         assert!(s.modes.side.is_none(), "enter hands the keyboard back");
+    }
+
+    /// Enter on the row a space's sleeping agents fold to lists them and keeps the keyboard in
+    /// the column; a second one folds them again.
+    #[test]
+    fn enter_on_the_sleepers_row_lists_them_and_stays() {
+        let mut s = state();
+        let mut request = 0;
+        let sleeper = |terminal| qoop_runtime::control::SleepingTab {
+            lead: None,
+            terminal,
+            session: None,
+            title: None,
+            agent: Some("claude".into()),
+            cwd: "/tmp".into(),
+        };
+        s.spaces[0].sleeping = vec![sleeper(10), sleeper(11)];
+        enter_side(&mut s, false);
+        let items = side_items(&s);
+        assert!(!items.contains(&sidebar::Pick::Terminal(10)), "{items:?}");
+        side_stand(&mut s, &items, Some(sidebar::Pick::Doze(1)));
+        mode_input(&mut s, b"\r", 0x01, &mut request);
+        assert!(s.doze_open.contains(&1));
+        assert!(s.modes.side.is_some(), "the column keeps the keyboard");
+        assert_eq!(s.modes.side_go, None);
+        assert!(side_items(&s).contains(&sidebar::Pick::Terminal(11)));
+        mode_input(&mut s, b"\r", 0x01, &mut request);
+        assert!(!s.doze_open.contains(&1));
     }
 
     /// Esc clears a search first and leaves second; `q` leaves at once; the prefix leaves and
