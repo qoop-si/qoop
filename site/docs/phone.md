@@ -11,8 +11,9 @@ The qoop app on Android: download
 [qoop-android-arm64.apk](https://qoop.si/releases/latest/qoop-android-arm64.apk) on the phone
 and open it; Android asks once to let your browser install apps. If Play Protect says it has not
 seen an app from this developer, tap More details, then Install anyway: qoop is not on Google Play yet. Each new release then shows up
-in the app's Settings as Update to qoop and the version: tap it, and Android installs it over
-the one you have, keeping your sign-in. The iPhone app is not public yet; use
+in the app's Settings as Update to qoop and the version: tap it, and the app downloads it and
+installs it over itself, keeping your sign-in. The first time, Android asks you to let qoop
+install apps; allow it, go back, and tap Update again. The iPhone app is not public yet; use
 [qoop.si/app](https://qoop.si/app) there.
 
 A phone can also be paired with one computer without an account: run `qoop pair` there,
