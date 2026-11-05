@@ -46,7 +46,7 @@ Type `claude` or `codex` in there. macOS and Linux.
 | **agent** | Claude Code, Codex and the like, running in a qoop tab. Its dot says what it is doing: breathing while it works, an empty ring when it wants you. |
 | **space** | one project: a group of tabs named after it, in its own colour. |
 | **server** | another computer over ssh. Its spaces sit beside yours and keep working while your laptop sleeps. |
-| **phone** | the same agents on iOS and Android. It buzzes when one asks, finishes or fails; answer from there. |
+| **phone** | the same agents on Android ([APK](https://qoop.si/releases/latest/qoop-android-arm64.apk)) and in any browser ([qoop.si/app](https://qoop.si/app)). It buzzes when one asks, finishes or fails; answer from there. |
 
 `ctrl-a tab` jumps to the agent that needs you. `ctrl-q` leaves; everything keeps running.
 
@@ -57,4 +57,4 @@ splits, servers, the phone, qass, hooks, settings, building from source.
 
 ## Licence
 
-AGPL-3.0-or-later.
+[AGPL-3.0-or-later](LICENSE).
