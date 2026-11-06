@@ -52,7 +52,8 @@
 #   move on in seconds, not after he did it himself. Only its first stop there, though: a stop
 #   with the generation, state and stage of the agent's line said last, printed under an hour
 #   ago, and no write from qass since, is the same rest again (it woke for its own background
-#   notice or a teammate's message and stopped where it was): held `again`, below.
+#   notice or a teammate's message and stopped where it was): held `again`, below, a remote
+#   agent's too.
 # - Again: the same rest again is held QASS_QUIET_HOLD seconds (600) and said only if the agent is
 #   still there then, never riding along with another block; a snapshot with that agent working
 #   drops it (`again: dropped at work` in quiet.log), and a new stop of it starts the hold over.
@@ -432,13 +433,14 @@ urgent() {
     return 1
 }
 
-# The newest prompted.log record for terminal $1 of this Mac, as "<unix> <sender>": who wrote
-# to it last through `qoop prompt` or `qoop send`. "unreadable" when the log cannot be read.
-record_of() {
+# The newest prompted.log record for terminal $1 of machine $2 (none: this Mac), as "<unix>
+# <sender>": who wrote to it last through `qoop prompt`, `qoop send` or on.sh. "unreadable" when
+# the log cannot be read.
+record_of() { # terminal [label]
     local log="$dir/prompted.log"
     [ -e "$log" ] || return 0
     [ -r "$log" ] || { echo unreadable; return 0; }
-    tail -n 2000 "$log" | awk -v t="T$1" '$3 == t { last = $1 " " $2 } END { if (last != "") print last }'
+    tail -n 2000 "$log" | awk -v t="${2:+$2/}T$1" '$3 == t { last = $1 " " $2 } END { if (last != "") print last }'
 }
 
 # The hold for the agent line $2 just parsed, on machine $1: short, long, again (a rest said
@@ -447,7 +449,11 @@ record_of() {
 hold_class() {
     local s_t s_gen s_state s_stage s_arr _ r_at r_from
     case "$L_FROM" in new | restarted | starting) echo short; return ;; esac
-    [ -z "$1" ] || { echo short; return; }
+    # A remote agent: short, or `again` when it is work in progress at the rest said last again.
+    if [ -n "$1" ]; then
+        if work_rest; then rest_class "$2"; else echo short; fi
+        return
+    fi
     read -r s_t s_gen s_state s_stage s_arr _ <<< "$(said_of "" "$L_T")"
     if [ "$L_STATE" = sleeping ] && [ "${s_gen:-}" = "$L_G" ] &&
         { [ "${s_state:-}" = idle ] || [ "${s_state:-}" = done ]; } &&
@@ -469,20 +475,19 @@ hold_class() {
     echo long
 }
 
-# Whether the line just parsed, of this Mac, is the rest said last again: the generation, state
+# Whether the line just parsed, of any machine, is the rest said last again: the generation, state
 # and stage of its agent's line said last, printed under an hour ago, and no write from qass since
 # that line came. The agent woke without qass, for its own background notice or a teammate, and
 # stopped where it was. Past the hour its stop is short again, so a worker that loops so is said
 # at least once an hour.
 same_rest() {
     local s_t s_gen s_state s_stage s_arr s_stop s_printed _ r_at r_from
-    [ -z "$L_LABEL" ] || return 1
-    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "" "$L_T")"
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "$L_LABEL" "$L_T")"
     [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ] && [ "${s_stage:-}" = "$L_STAGE" ] ||
         return 1
     # An older watcher's record has no print time: its arrival stands in.
     [ $(($(date +%s) - ${s_printed:-$s_arr})) -lt 3600 ] || return 1
-    read -r r_at r_from <<< "$(record_of "$L_T")"
+    read -r r_at r_from <<< "$(record_of "$L_T" "$L_LABEL")"
     [ "${r_at:-}" != unreadable ] || return 1
     [ -z "${r_at:-}" ] || [ "${r_from:-}" != "$self" ] || [ "$r_at" -lt "$s_arr" ]
 }

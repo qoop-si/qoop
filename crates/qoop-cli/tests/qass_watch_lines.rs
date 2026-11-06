@@ -1488,3 +1488,48 @@ fn a_person_hold_in_a_block_keeps_the_line_said_before_it() {
     assert!(held.starts_with(&format!("6 1 person {until} ")), "{held}");
     assert!(!held.lines().any(|l| l.starts_with("5 ")), "{held}");
 }
+
+/// A remote worker's same rest again is held `again` in its machine's file, as on this Mac; one
+/// after a write from qass to it (on.sh's `ubox/T5` record) is short.
+#[test]
+fn a_remote_same_rest_again_is_held_again() {
+    for (case, write, class) in [
+        ("same rest", false, "again"),
+        ("written since", true, "short"),
+    ] {
+        let w = Watch::new();
+        let now = now();
+        w.put("stub/remotes", "ubox\n");
+        w.put(
+            "data/said-ubox",
+            &format!("5 1 idle implementing {} 90.1 {}\n", now - 2000, now - 1000),
+        );
+        if write {
+            w.put(
+                "data/prompted.log",
+                &format!("{} {QASS} ubox/T5\n", now - 700),
+            );
+        }
+        w.put(
+            "data/last-ubox.json",
+            &rows(&[staged("working", "implementing", "?")]),
+        );
+        w.put(
+            "stub/remote-snaps",
+            &format!("{}\n", rows(&[staged("idle", "implementing", "100.1")])),
+        );
+        let local = rows(&[row(7, "working", "")]);
+        w.put("data/last.json", &local);
+        w.snaps(&[local]);
+        let (lines, _) = w.run(3, &[("REMOTE_HOLD", "5"), ("QASS_SETTLE", "60")]);
+        assert!(lines.is_empty(), "{case}: {lines:?}");
+        let held = w.read("data/held-ubox");
+        assert!(held.starts_with(&format!("5 1 {class} ")), "{case}: {held}");
+        let quiet = w.read("data/quiet.log");
+        assert_eq!(
+            quiet.contains(" again: held ubox/T5 g1 "),
+            class == "again",
+            "{case}: {quiet}"
+        );
+    }
+}
