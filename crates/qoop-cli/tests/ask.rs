@@ -31,6 +31,7 @@ while IFS= read -r line; do
     DONE*) qoop hook-report --state idle --visible-idle --event done --label "${line#DONE }" ;;
     SAID*) qoop hook-report --state working --event user --label "${line#SAID }" ;;
     WAIT) qoop task stage waiting-human ;;
+    EDIT) qoop task begin ;;
     EXIT) exit 0 ;;
   esac
 done
@@ -1389,6 +1390,41 @@ fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
         stack.drafts(&link)[1]["body"]["asks"],
         "link waits on you: ship the login fix"
     );
+}
+
+/// A task opened by an edit has the owner's own prompt for a goal: the draft of its wait shows
+/// neither as the question nor as what it does, and a prompt that reaches the agent after the
+/// wait began closes the draft and keeps the next turn end from filing another.
+#[test]
+fn a_draft_never_shows_the_owners_prompt_and_closes_when_the_agent_works_again() {
+    let stack = Stack::start();
+    let link = stack.agent("work", "link", None);
+    let _qass = stack.agent("qass", "qass", None);
+    let words = "this is not the average you idiot follow the real rate";
+    stack.send(&link, &format!("SAID {words}"));
+    stack.send(&link, "EDIT");
+    assert!(stack.wait(|| !stage(&stack, &link).is_empty()));
+    stack.send(&link, "WAIT");
+    stack.send(&link, "DONE Merged and deployed.");
+    assert!(
+        stack.wait(|| stack.drafts(&link).len() == 1),
+        "no draft: {:?}",
+        stack.run(&["ask", "ls", "--json"]).1
+    );
+    let draft = stack.drafts(&link).remove(0);
+    assert!(!draft["body"].to_string().contains("idiot"), "{draft}");
+    assert_eq!(draft["body"]["asks"], "link waits on you");
+    let card = draft["card"].as_str().unwrap().to_string();
+
+    // A tool: the agent works again, the draft ends.
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(&link, "TOOL");
+    assert!(stack.wait(|| stack.card_status(&card) == "closed"));
+    // A prompt after the wait began, then a turn end asking nothing: no second draft.
+    stack.send(&link, "SAID keep going");
+    stack.send(&link, "DONE Still on it.");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(stack.drafts(&link).len(), 1, "no new draft");
 }
 
 /// A listing larger than one frame (64 KB) still arrives: 60 cards with long fields are over

@@ -5418,6 +5418,8 @@ async fn handle_control(
                             let (connections, store) = (connections.clone(), store.clone());
                             tokio::spawn(async move {
                                 crate::asks::dialog_ended(terminal, &connections, &store).await;
+                                crate::asks::working_again(terminal, at_unix, &connections, &store)
+                                    .await;
                             });
                         } else if kind == "user" || kind == "done" {
                             crate::asks::dialog_ended(terminal, connections, store).await;
@@ -5494,6 +5496,12 @@ async fn handle_control(
                                     connections.asks_changed();
                                 }
                             }
+                            // Last, so his answer's own note ("answered in its tab") stands on a
+                            // card it ended; a draft left open is stale, the agent works again.
+                            if !label.as_deref().is_some_and(crate::asks::not_his) {
+                                crate::asks::working_again(terminal, at_unix, connections, store)
+                                    .await;
+                            }
                         }
                         // A turn's end carries its last line; it is the turn's question only when
                         // it waits on him (`turn_asks_him`: it asks him something and none of its
@@ -5524,8 +5532,7 @@ async fn handle_control(
                                 name.clone(),
                                 label.clone(),
                                 terminals.session_of(terminal),
-                                connections,
-                                store,
+                                (agents, connections, store),
                             )
                             .await;
                             // It asked him and set no stage: still unanswered after the wait

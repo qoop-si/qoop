@@ -17,6 +17,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Store, StoreError};
 
+/// The note of a draft that waits for qass on a plan, not on the agent.
+pub const PLAN_NOTE: &str = "plan waits for qass";
+
+/// The note of a waiting draft closed because its agent worked again.
+const WORKS_AGAIN: &str = "it works again";
+
 /// How long an ended card is kept.
 pub const KEEP_SECS: i64 = 14 * 24 * 3600;
 
@@ -209,6 +215,32 @@ impl Store {
         body: &str,
         now: i64,
     ) -> Result<Option<String>, StoreError> {
+        self.file_draft(agent, terminal, session, body, None, now)
+    }
+
+    /// [`Store::add_draft`] for a plan that waits for qass: the card is marked [`PLAN_NOTE`], so
+    /// an agent that goes on working does not end it ([`Store::close_waiting_drafts`]); the plan
+    /// is what waits, not the agent.
+    pub fn add_plan_draft(
+        &self,
+        agent: &str,
+        terminal: i64,
+        session: Option<&str>,
+        body: &str,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
+        self.file_draft(agent, terminal, session, body, Some(PLAN_NOTE), now)
+    }
+
+    fn file_draft(
+        &self,
+        agent: &str,
+        terminal: i64,
+        session: Option<&str>,
+        body: &str,
+        note: Option<&str>,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let live: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM ask WHERE terminal = ?1 AND status IN ('open', 'queued', 'passed'))",
@@ -230,11 +262,13 @@ impl Store {
         };
         // One draft a waiting spell: a card opened since it last began waiting (answered,
         // dismissed or closed) stands for this spell, so a stage nobody moved never re-asks.
+        // One that closed because its agent worked again does not: it asks again when it waits.
         let asked: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ask WHERE task = ?1 AND opened_at >= COALESCE( \
+            "SELECT EXISTS(SELECT 1 FROM ask WHERE task = ?1 AND COALESCE(note, '') != ?2 \
+             AND opened_at >= COALESCE( \
              (SELECT MAX(at) FROM task_event WHERE task = ?1 AND kind = 'stage' \
               AND body = 'waiting-human'), 0))",
-            params![task],
+            params![task, WORKS_AGAIN],
             |r| r.get(0),
         )?;
         if asked {
@@ -243,9 +277,9 @@ impl Store {
         let n: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM ask", [], |r| r.get(0))?;
         let card = format!("W{n}");
         tx.execute(
-            "INSERT INTO ask (card, agent, terminal, session, task, status, body, opened_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
-            params![card, agent, terminal, session, task, body, now],
+            "INSERT INTO ask (card, agent, terminal, session, task, status, note, body, opened_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8)",
+            params![card, agent, terminal, session, task, note, body, now],
         )?;
         tx.commit()?;
         Ok(Some(card))
@@ -335,6 +369,20 @@ impl Store {
             }
         }
         Ok(ended)
+    }
+
+    /// End a terminal's open waiting draft (a `W` card with a task) written before `since`: its
+    /// agent worked at `since`, so the question it left is stale. A card written at or after
+    /// that second is the turn end that followed and stands. A dialog draft has no task and
+    /// closes on [`Store::close_dialog_drafts`]; a plan's card, an answer he already gave
+    /// (`queued`, `passed`) and qass's cards stay. Answers whether one ended.
+    pub fn close_waiting_drafts(&self, terminal: i64, since: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.execute(
+            "UPDATE ask SET status = 'closed', note = ?3, closed_at = ?2 \
+             WHERE terminal = ?1 AND card LIKE 'W%' AND task IS NOT NULL AND status = 'open' \
+             AND opened_at < ?2 AND COALESCE(note, '') != ?4",
+            params![terminal, since, WORKS_AGAIN, PLAN_NOTE],
+        )? > 0)
     }
 
     /// End a terminal's live dialog draft: its agent reported a tool or a prompt, so the
@@ -1044,6 +1092,83 @@ mod tests {
         assert_eq!(s.agent_left(moved, "sess", 50).unwrap(), 0);
         assert_eq!(s.ask("E2").unwrap().unwrap().status, "open", "new id");
         assert_eq!(session_of(&s, moved).as_deref(), Some("next"));
+    }
+
+    /// A draft never goes over qass's card for the same terminal, open or already answered,
+    /// and never closes it.
+    #[test]
+    fn a_draft_never_replaces_a_live_card_of_qass() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        s.add_ask("E1", Some("T5"), Some(t), None, "{e}", 12)
+            .unwrap();
+        assert_eq!(s.add_draft("T5", t, None, "{d}", 13).unwrap(), None, "open");
+        s.claim_ask("E1", "answered", None, "go", "owner, inbox", 14)
+            .unwrap();
+        assert_eq!(
+            s.add_draft("T5", t, None, "{d}", 15).unwrap(),
+            None,
+            "answered"
+        );
+        assert_eq!(s.ask("E1").unwrap().unwrap().status, "answered");
+    }
+
+    /// A waiting draft ends when its agent works again; an answer he gave and qass's own card
+    /// are not its to end.
+    #[test]
+    fn a_working_agent_closes_its_waiting_draft_only() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        let draft = s.add_draft("T5", t, None, "{d}", 12).unwrap().unwrap();
+        assert!(s.close_waiting_drafts(t, 13).unwrap());
+        let row = s.ask(&draft).unwrap().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.note.as_deref()),
+            ("closed", Some("it works again"))
+        );
+        assert!(!s.close_waiting_drafts(t, 14).unwrap(), "once");
+        // It waits again with no stage moved: a card closed that way does not stand for the
+        // spell. One written in the second of the event is the turn end after it, and stays.
+        let next = s
+            .add_draft("T5", t, None, "{d}", 30)
+            .unwrap()
+            .expect("asks again");
+        assert!(!s.close_waiting_drafts(t, 30).unwrap(), "same second");
+        assert!(s.close_waiting_drafts(t, 31).unwrap());
+        assert_eq!(s.ask(&next).unwrap().unwrap().status, "closed");
+        s.add_ask("E2", Some("T5"), Some(t), None, "{e}", 23)
+            .unwrap();
+        assert!(!s.close_waiting_drafts(t, 24).unwrap());
+        assert_eq!(s.ask("E2").unwrap().unwrap().status, "open");
+    }
+
+    /// A plan's card waits on qass, not on the agent: its work does not end the card.
+    #[test]
+    fn an_agent_going_on_keeps_the_card_of_its_plan() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        let card = s.add_plan_draft("T5", t, None, "{d}", 12).unwrap().unwrap();
+        assert!(!s.close_waiting_drafts(t, 20).unwrap());
+        assert_eq!(s.ask(&card).unwrap().unwrap().status, "open");
+    }
+
+    /// The goal of a task qoop opened when the agent changed files is the owner's cut prompt,
+    /// until someone writes a goal.
+    #[test]
+    fn an_auto_opened_goal_is_the_owners_prompt_until_a_goal_is_written() {
+        let (s, t) = store_with_terminal();
+        let (auto, _) = s
+            .begin_task(t, "fix the rate, you idiot", Some(9), 10)
+            .unwrap();
+        assert!(s.goal_is_prompt(auto).unwrap());
+        s.set_task_goal(auto, "Use the live rate; done when tests pass", 11)
+            .unwrap();
+        assert!(!s.goal_is_prompt(auto).unwrap());
+        let own = s.open_task(t, "ship the login fix", true, 12).unwrap();
+        assert!(!s.goal_is_prompt(own).unwrap(), "the agent's own words");
     }
 
     /// A waiting spell on terminal `t` with a draft for it, his answer queued when `queue`.

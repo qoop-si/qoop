@@ -472,7 +472,7 @@ pub(crate) async fn stale_plans_once(
             ) {
                 agents.tasks_changed();
             }
-            told = draft_waiting(
+            told = file_waiting(
                 terminal,
                 None,
                 Some(format!(
@@ -480,8 +480,8 @@ pub(crate) async fn stale_plans_once(
                     plan.key
                 )),
                 None,
-                connections,
-                store,
+                true,
+                (agents, connections, store),
             )
             .await;
         }
@@ -505,14 +505,42 @@ pub(crate) async fn stale_plans_once(
 /// space (the inbox lives there), never over a live card, once a waiting spell. No options:
 /// he answers in his own words, which the worker route types to the agent. Never in the way of
 /// the report that called it: a failure is dropped.
+///
+/// The card carries the agent's own words, never the owner's: a task qoop opened when the
+/// agent changed files has his cut prompt for a goal, so that goal is neither the question nor
+/// the "doing" line. With no question, a prompt that reached the agent since its wait began
+/// means it works again (the stage lagged behind), so there is nothing to ask.
 pub(crate) async fn draft_waiting(
     terminal: u32,
     name: Option<String>,
     question: Option<String>,
     session: Option<String>,
-    connections: &Arc<ConnectionRegistry>,
-    store: &StoreHandle,
+    hands: (&AgentRegistry, &Arc<ConnectionRegistry>, &StoreHandle),
 ) -> bool {
+    file_waiting(terminal, name, question, session, false, hands).await
+}
+
+/// [`draft_waiting`], for a plan that waits for qass when `plan`: the agent goes on with its
+/// item, so its work does not end the card.
+async fn file_waiting(
+    terminal: u32,
+    name: Option<String>,
+    question: Option<String>,
+    session: Option<String>,
+    plan: bool,
+    (agents, connections, store): (&AgentRegistry, &Arc<ConnectionRegistry>, &StoreHandle),
+) -> bool {
+    let question = question.filter(|q| !q.trim().is_empty());
+    let prompts: Vec<i64> = if question.is_none() {
+        agents
+            .focus_events(terminal)
+            .iter()
+            .filter(|e| e.kind == "user" && !not_his(&e.label))
+            .map(|e| e.at_unix)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let made = store
         .run(move |s| {
             let Some(task) = s.open_task_of(i64::from(terminal))? else {
@@ -523,15 +551,31 @@ pub(crate) async fn draft_waiting(
             {
                 return Ok(None);
             }
+            // No stage event at all: nothing says when the wait began, so no prompt is later.
+            if let Some(waiting) = s.task_waiting_since(task.id)?
+                && prompts.iter().any(|&at| at > waiting)
+            {
+                return Ok(None);
+            }
             let name = name.unwrap_or_else(|| format!("terminal {terminal}"));
-            let asks = question
-                .filter(|q| !q.trim().is_empty())
-                .unwrap_or_else(|| format!("{name} waits on you: {}", task.goal));
+            let owner_words = s.goal_is_prompt(task.id)?;
+            let asks = question.unwrap_or_else(|| {
+                if owner_words {
+                    format!("{name} waits on you")
+                } else {
+                    format!("{name} waits on you: {}", task.goal)
+                }
+            });
+            let doing = if owner_words {
+                format!("task #{}", task.id)
+            } else {
+                task.goal.clone()
+            };
             let card = AskCard {
                 handle: draft_handle(&name, task.id),
                 urgency: "now".to_string(),
                 asked: None,
-                doing: card_value(&task.goal),
+                doing: card_value(&doing),
                 why: DRAFT_WHY.to_string(),
                 asks: card_value(&asks),
                 options: Vec::new(),
@@ -540,7 +584,13 @@ pub(crate) async fn draft_waiting(
             let Ok(body) = serde_json::to_string(&card) else {
                 return Ok(None);
             };
-            s.add_draft(
+            let file = if plan {
+                qoop_store::Store::add_plan_draft
+            } else {
+                qoop_store::Store::add_draft
+            };
+            file(
+                s,
                 &format!("T{terminal}"),
                 i64::from(terminal),
                 session.as_deref(),
@@ -648,8 +698,7 @@ pub(crate) async fn wait_on_question(
         name,
         Some(question),
         terminals.session_of(terminal),
-        connections,
-        store,
+        (agents, connections, store),
     )
     .await;
 }
@@ -663,6 +712,23 @@ pub(crate) async fn dialog_ended(
 ) {
     let closed = store
         .run(move |s| s.close_dialog_drafts(i64::from(terminal), now()))
+        .await;
+    if matches!(closed, Ok(true)) {
+        connections.asks_changed();
+    }
+}
+
+/// The agent in `terminal` ran a tool, or took a prompt somebody typed: it works again, so the
+/// waiting draft its last turn left is stale. A stage that lagged behind (his input came
+/// before the wait began) cannot keep it open.
+pub(crate) async fn working_again(
+    terminal: u32,
+    at: i64,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let closed = store
+        .run(move |s| s.close_waiting_drafts(i64::from(terminal), at))
         .await;
     if matches!(closed, Ok(true)) {
         connections.asks_changed();
@@ -2421,6 +2487,119 @@ mod tests {
         };
         assert!(rest("idle").at_rest() && rest("done").at_rest());
         assert!(!rest("failed").at_rest() && !rest("starting").at_rest());
+    }
+
+    /// A terminal 7 on a Mac with qass, its task opened as an edit opens one (the owner's cut
+    /// prompt for a goal) and waiting on him since `waiting`.
+    fn waiting_stack(goal: &str, waiting: i64) -> StoreHandle {
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_workspace(QASS_SPACE, 2).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        s.begin_task(7, goal, None, waiting - 5).unwrap();
+        assert!(s.wait_on_owner(7, waiting).unwrap().is_some());
+        StoreHandle::new(s)
+    }
+
+    async fn live_cards(store: &StoreHandle) -> Vec<AskRow> {
+        store.run(|s| s.live_asks()).await.unwrap()
+    }
+
+    /// The owner's own angry prompt is the goal of a task qoop opened when the agent changed
+    /// files: the draft shows neither as the question nor as what it does. The agent's last
+    /// question is the question; a goal somebody wrote stays the fallback.
+    #[tokio::test]
+    async fn a_draft_never_shows_the_owners_prompt_back_to_him() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let words = "this is not the average, you idiot, follow the real rate";
+        let hands = (&agents, &connections);
+        for question in [None, Some("Which rate table do I use?".to_string())] {
+            let store = waiting_stack(words, 100);
+            let made = draft_waiting(
+                7,
+                Some("gtm516".into()),
+                question.clone(),
+                None,
+                (hands.0, hands.1, &store),
+            )
+            .await;
+            assert!(made);
+            let body = live_cards(&store).await.remove(0).body;
+            assert!(!body.contains("idiot"), "{body}");
+            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                card["asks"].as_str().unwrap(),
+                question.as_deref().unwrap_or("gtm516 waits on you")
+            );
+        }
+        let store = waiting_stack(words, 100);
+        store
+            .run(|s| {
+                let task = s.open_task_of(7)?.unwrap().id;
+                s.set_task_goal(task, "Use the live rate; done when tests pass", 101)
+                    .map(drop)
+            })
+            .await
+            .unwrap();
+        assert!(
+            draft_waiting(
+                7,
+                Some("gtm516".into()),
+                None,
+                None,
+                (&agents, &connections, &store)
+            )
+            .await
+        );
+        let body = live_cards(&store).await.remove(0).body;
+        assert!(
+            body.contains("gtm516 waits on you: Use the live rate"),
+            "{body}"
+        );
+    }
+
+    /// A prompt somebody typed reached the agent after its wait began, and its turn then ended
+    /// with no question: it works again, so no draft. A notice the harness typed is no prompt.
+    /// A tool or a prompt then closes a draft that stands.
+    #[tokio::test]
+    async fn an_agent_that_works_again_has_no_waiting_draft() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let event = |label: &str, at| crate::control::FocusEvent {
+            kind: "user".into(),
+            label: label.into(),
+            at_unix: at,
+        };
+        let store = waiting_stack("fix the rate", 100);
+        agents.push_focus_event(7, event("go on, use the live rate", 90));
+        agents.push_focus_event(
+            7,
+            event("<task-notification>build done</task-notification>", 120),
+        );
+        let hands = (&agents, &connections, &store);
+        assert!(
+            draft_waiting(7, None, None, None, hands).await,
+            "a prompt from before the wait"
+        );
+        working_again(7, now() + 5, &connections, &store).await;
+        assert!(live_cards(&store).await.is_empty(), "it works again");
+
+        let store = waiting_stack("fix the rate", 100);
+        agents.push_focus_event(7, event("keep going", 130));
+        assert!(!draft_waiting(7, None, None, None, (&agents, &connections, &store)).await);
+        assert!(live_cards(&store).await.is_empty());
+        // The question it ended its turn with is real whatever came before it.
+        assert!(
+            draft_waiting(
+                7,
+                None,
+                Some("Merge it?".into()),
+                None,
+                (&agents, &connections, &store)
+            )
+            .await
+        );
     }
 
     /// A plan that waited half an hour for qass: one draft card on the agent working on its item

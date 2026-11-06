@@ -191,6 +191,9 @@ pub(crate) const COLUMNS: &str = "id, workspace, terminal, goal, stage, opened_a
      (SELECT e.body FROM task_event e WHERE e.task = task.id AND e.kind = 'folder' \
      ORDER BY e.id DESC LIMIT 1))";
 
+/// Who a task says opened it when qoop opens it for an agent that changed files.
+const AUTO_OPENED_BY: &str = "qoop when the agent changed files";
+
 /// A subquery for when the task row named `alias` was last put to `waiting-human`: the time
 /// of its newest such stage event, `NULL` when it never was.
 pub(crate) fn waiting_at(alias: &str) -> String {
@@ -463,13 +466,29 @@ impl Store {
         asked_at: Option<i64>,
         now: i64,
     ) -> Result<(i64, bool), StoreError> {
-        self.begin(
-            terminal,
-            goal,
-            asked_at,
-            "qoop when the agent changed files",
-            now,
-        )
+        self.begin(terminal, goal, asked_at, AUTO_OPENED_BY, now)
+    }
+
+    /// Whether the task's goal is still the owner's own prompt: the task was opened by qoop
+    /// when the agent changed files (its goal is his cut request) and nobody wrote a goal
+    /// since. Such words are his, not a title to show back to him.
+    pub fn goal_is_prompt(&self, task: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_event WHERE task = ?1 AND kind = 'opened' \
+             AND body LIKE ?2) AND NOT EXISTS(SELECT 1 FROM task_event WHERE task = ?1 \
+             AND kind = 'goal')",
+            params![task, format!("opened by {AUTO_OPENED_BY}:%")],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When the task was last put to `waiting-human`, `None` when it never was.
+    pub fn task_waiting_since(&self, task: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self.conn.query_row(
+            &format!("SELECT {} FROM task WHERE id = ?1", waiting_at("task")),
+            params![task],
+            |r| r.get(0),
+        )?)
     }
 
     /// [`Store::begin_task`], its `opened` event saying who opened it (`by`).
