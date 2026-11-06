@@ -49,6 +49,8 @@ pub enum Out {
     Jump(u32),
     /// The keyboard goes to qass's chat with this line to talk the card through.
     ToQass(String),
+    /// Talk this card through: with the agent it is about (`talk_target`), else in qass's chat.
+    Talk(Box<AskInfo>),
     /// Not the inbox's: the prefix, a mouse report or a detach, for the ordinary path.
     Pass(Vec<u8>),
 }
@@ -659,14 +661,8 @@ impl Pane {
                 Some(terminal) => Out::Jump(terminal),
                 None => Out::Stay,
             },
-            // A draft's question is already on its agent's screen, so its tab; else qass.
             Key::Char(b'o') => match self.open_card() {
-                Some(AskInfo {
-                    card,
-                    terminal: Some(terminal),
-                    ..
-                }) if card.starts_with('W') => Out::Jump(*terminal),
-                Some(card) => Out::ToQass(talk_line(card)),
+                Some(card) => Out::Talk(Box::new(card.clone())),
                 None => Out::Stay,
             },
             Key::Char(_) => Out::Stay,
@@ -1620,6 +1616,184 @@ pub fn talk_line(card: &AskInfo) -> String {
         "About {} ({}): {} ",
         card.card, card.body.handle, card.body.asks
     )
+}
+
+/// Too short or too common to name an agent.
+const COMMON: &[&str] = &[
+    "about", "also", "been", "claude", "codex", "coding", "could", "from", "have", "into", "just",
+    "need", "shall", "should", "some", "than", "that", "their", "them", "then", "there", "these",
+    "they", "this", "what", "when", "which", "will", "with", "would", "your",
+];
+
+/// `T5` is a tab on this machine, `build1/T5` a tab on the remote called build1.
+fn parse_ref(token: &str) -> Option<(Option<&str>, u32)> {
+    let (remote, tab) = match token.rsplit_once('/') {
+        Some((remote, tab)) => (Some(remote), tab),
+        None => (None, token),
+    };
+    let n = tab.strip_prefix('T')?;
+    n.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| n.parse().ok())
+        .flatten()
+        .map(|n| (remote, n))
+}
+
+/// The tab of that reference among `rows`: a remote tab is told by its number in its own
+/// daemon and by the remote's name, which starts its space's name (`build1:<space>`).
+fn tab_of(
+    (remote, n): (Option<&str>, u32),
+    rows: &[AgentRow],
+    spaces: &[WorkspaceRow],
+    qass: Option<i64>,
+) -> Option<u32> {
+    rows.iter()
+        .find(|r| {
+            r.agent
+                && match remote {
+                    None => {
+                        !crate::mux::is_remote_terminal(r.terminal)
+                            && r.terminal == n
+                            && Some(r.workspace) != qass
+                    }
+                    Some(name) => {
+                        crate::mux::is_remote_terminal(r.terminal)
+                            && crate::mux::daemon_terminal(r.terminal) == n
+                            && spaces
+                                .iter()
+                                .find(|s| s.id == r.workspace)
+                                .is_some_and(|s| {
+                                    s.name
+                                        .split(':')
+                                        .next()
+                                        .is_some_and(|p| p.eq_ignore_ascii_case(name))
+                                })
+                    }
+                }
+        })
+        .map(|r| r.terminal)
+}
+
+fn words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in text.split(|c: char| !c.is_alphanumeric()) {
+        let w = w.to_lowercase();
+        if w.chars().count() >= 4 && !COMMON.contains(&w.as_str()) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// The one agent whose name or folder shares a word with `said` (one starts the other, so a
+/// handle like `shoppay` finds the `shop` folder). Names and folders are taken whole: a
+/// branch-like name must not match on its everyday words, and titles and goals are left out
+/// for the same reason. A word that fits more than three agents names none of them; the agent
+/// with most shared words wins, then the one active last.
+fn named(said: &str, rows: &[&AgentRow]) -> Option<u32> {
+    let ids: Vec<(&AgentRow, Vec<String>)> = rows
+        .iter()
+        .map(|r| {
+            let folder = r
+                .cwd
+                .as_deref()
+                .and_then(|c| c.rsplit('/').find(|s| !s.is_empty()));
+            let ids = [r.name.as_deref(), folder]
+                .into_iter()
+                .flatten()
+                .map(str::to_lowercase)
+                .filter(|x| x.chars().count() >= 4 && !COMMON.contains(&x.as_str()))
+                .collect();
+            (*r, ids)
+        })
+        .collect();
+    let mut score: Vec<(&AgentRow, usize)> = Vec::new();
+    for a in words(said) {
+        let fits: Vec<&AgentRow> = ids
+            .iter()
+            .filter(|(_, w)| {
+                w.iter()
+                    .any(|b| a.starts_with(b.as_str()) || b.starts_with(&a))
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        if fits.len() > 3 {
+            continue;
+        }
+        for r in fits {
+            match score.iter_mut().find(|(s, _)| std::ptr::eq(*s, r)) {
+                Some(hit) => hit.1 += 1,
+                None => score.push((r, 1)),
+            }
+        }
+    }
+    // A full tie goes to the first row, as on the phone.
+    score
+        .into_iter()
+        .enumerate()
+        .max_by_key(|(i, (r, n))| {
+            (
+                *n,
+                r.last_active_at_unix.unwrap_or(0),
+                std::cmp::Reverse(*i),
+            )
+        })
+        .map(|(_, (r, _))| r.terminal)
+}
+
+/// The tab Talk it through opens for `card`: the agent it is about, `None` for a card about
+/// nothing, which goes to qass. The first hit wins: the card's terminal; its `T5` or
+/// `build1/T5` agent; such a reference in its words; the one agent whose name or folder its
+/// words name. The phone's `talkRoute` (mobile/src/ui/asks.ts) follows the same order.
+pub fn talk_target(card: &AskInfo, rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Option<u32> {
+    let b = &card.body;
+    let said = [
+        b.handle.as_str(),
+        b.asked.as_deref().unwrap_or(""),
+        &b.doing,
+        &b.why,
+        &b.asks,
+    ]
+    .join(" ");
+    let qass = sidebar::qass_space(spaces);
+    let workers: Vec<&AgentRow> = rows
+        .iter()
+        .filter(|r| {
+            r.agent && !crate::mux::is_remote_terminal(r.terminal) && Some(r.workspace) != qass
+        })
+        .collect();
+    let by_agent = || {
+        card.agent
+            .as_deref()
+            .and_then(parse_ref)
+            .and_then(|r| tab_of(r, rows, spaces, qass))
+    };
+    let by_task = || {
+        let id = card.task?;
+        let hit = workers
+            .iter()
+            .find(|r| r.task.as_ref().is_some_and(|t| t.id == id));
+        hit.map(|r| r.terminal)
+    };
+    let by_words = || {
+        let tokens =
+            said.split(|c: char| !(c.is_alphanumeric() || c == '/' || c == '-' || c == '_'));
+        // `T24-worker` holds T24: a token that is no reference is tried by its `-` pieces.
+        let mut refs = tokens.flat_map(|t| {
+            parse_ref(t)
+                .into_iter()
+                .chain(t.split('-').filter_map(parse_ref))
+        });
+        refs.find_map(|r| tab_of(r, rows, spaces, qass))
+    };
+    // A terminal that is gone (a stale card) is not a tab to open; a draft keeps its tab.
+    let own = card
+        .terminal
+        .filter(|t| card.card.starts_with('W') || workers.iter().any(|r| r.terminal == *t));
+    own.or_else(by_agent)
+        .or_else(by_task)
+        .or_else(by_words)
+        .or_else(|| named(&said, &workers))
 }
 
 /// The rows under a box whose card was handled elsewhere: that first, whose card the words
@@ -2713,34 +2887,118 @@ mod tests {
         assert_eq!(p.key(b"z", 1), Out::Stay);
     }
 
-    /// `o` on qass's card talks it through in qass's chat; on a draft for an agent with a tab it
-    /// goes to that tab, where the question already is; a draft with no tab left goes to qass.
+    /// `o` asks to talk the open card through; with no card it does nothing.
     #[test]
-    fn o_talks_to_qass_for_its_card_and_to_the_tab_for_a_draft() {
-        let mut talk = card(1, "korea", "open");
-        talk.body.asks = "Question 1?".to_string();
+    fn o_talks_the_open_card_through() {
+        let talk = card(1, "korea", "open");
         let mut p = Pane {
             focus: true,
             ..Default::default()
         };
         p.take(vec![talk.clone()], Vec::new());
-        assert_eq!(
-            p.key(b"o", 1),
-            Out::ToQass("About E1 (korea): Question 1? ".to_string())
-        );
-        talk.card = "W1".to_string();
-        talk.terminal = Some(5);
-        p.take(vec![talk.clone()], Vec::new());
-        assert_eq!(p.key(b"o", 1), Out::Jump(5));
-        talk.terminal = None;
-        p.take(vec![talk], Vec::new());
-        assert_eq!(
-            p.key(b"o", 1),
-            Out::ToQass("About W1 (korea): Question 1? ".to_string())
-        );
+        assert_eq!(p.key(b"o", 1), Out::Talk(Box::new(talk)));
         p.take(Vec::new(), Vec::new());
         assert_eq!(p.key(b"o", 1), Out::Stay);
         assert!(!p.busy(), "nothing was answered");
+    }
+
+    fn row_at(terminal: u32, workspace: i64, name: Option<&str>, cwd: Option<&str>) -> AgentRow {
+        AgentRow {
+            workspace,
+            name: name.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            ..agent_row(terminal)
+        }
+    }
+
+    fn space_row(id: i64, name: &str) -> WorkspaceRow {
+        WorkspaceRow {
+            dir: None,
+            keep_awake: false,
+            qass_skip: false,
+            id,
+            name: name.to_string(),
+            terminals: 1,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+            goal: None,
+        }
+    }
+
+    /// Talk it through goes to the agent the card is about, in the phone's order: its terminal,
+    /// its `T5` or `build1/T5` agent, such a reference in its words, the agent its words name.
+    #[test]
+    fn talk_it_through_goes_to_the_agent_the_card_is_about() {
+        let mut c = card(1, "limitless", "open");
+        c.agent = None;
+        c.terminal = None;
+        let qass_space = 9;
+        let spaces = vec![
+            space_row(qass_space, sidebar::QASS_SPACE),
+            space_row((1 << 40) | 2, "build1:main"),
+        ];
+        let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 25;
+        let mut rows = vec![
+            row_at(3, qass_space, Some("qass"), None),
+            row_at(8, 1, None, Some("/Users/pat/coding/app")),
+            row_at(639, 1, None, Some("/Users/pat/coding/shop")),
+            row_at(644, 1, None, Some("/Users/pat/coding/shop")),
+            row_at(remote, (1 << 40) | 2, None, None),
+        ];
+        rows[2].last_active_at_unix = Some(100);
+        rows[3].last_active_at_unix = Some(200);
+        // About nothing: qass.
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
+        // Its terminal, whatever the card's number says (E600 and T639 live).
+        c.terminal = Some(639);
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(639));
+        c.terminal = None;
+        // A remote agent, told by its remote's name and its number there (E581 live).
+        c.agent = Some("build1/T25".to_string());
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(remote));
+        c.agent = Some("build2/T25".to_string());
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
+        // A terminal that is gone is no tab: the card's agent, else qass.
+        c.terminal = Some(77);
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
+        c.card = "W1".to_string();
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(77));
+        c.card = "E1".to_string();
+        c.terminal = None;
+        // qass's own tab is no agent a card names.
+        c.agent = Some("T3".to_string());
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
+        // A reference in its words.
+        c.agent = None;
+        c.body.doing = "T8 is waiting on the build".to_string();
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(8));
+        c.body.doing = "T8-worker is stuck".to_string();
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(8));
+        c.body.doing = "wrote migration 0042".to_string();
+        // E601: nothing but "shop" in its words and two agents in the shop folder, the last active wins.
+        c.body.handle = "shoppay".to_string();
+        c.body.asks = "Stripe account and mail sender for shop?".to_string();
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(644));
+        // The card's task is an agent's task.
+        c.body.asks = "Which one?".to_string();
+        c.body.handle = "x".to_string();
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
+        c.task = Some(510);
+        rows[1].task = Some(qoop_runtime::control::TaskRef {
+            id: 510,
+            goal: "g".to_string(),
+            stage: "implementing".to_string(),
+            claimed: false,
+        });
+        assert_eq!(talk_target(&c, &rows, &spaces), Some(8));
+        // qass is never the agent a card names, and a branch-like name matches on no everyday word.
+        c.task = None;
+        c.body.asks = "Ask qass to wake it, in his words?".to_string();
+        rows[1].name = Some("fix/draft-card-owner-words".to_string());
+        assert_eq!(talk_target(&c, &rows, &spaces), None);
     }
 
     #[test]

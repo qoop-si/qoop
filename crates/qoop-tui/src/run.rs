@@ -13478,7 +13478,14 @@ struct AskKeys {
 fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     use crate::asks::Out;
     let mut taken = AskKeys::default();
-    match state.asks.key(bytes, prefix) {
+    let out = match state.asks.key(bytes, prefix) {
+        Out::Talk(card) => match crate::asks::talk_target(&card, &state.rows, &state.spaces) {
+            Some(tab) => Out::Jump(tab),
+            None => Out::ToQass(crate::asks::talk_line(&card)),
+        },
+        out => out,
+    };
+    match out {
         Out::Stay => {}
         Out::ToQass(_) if state.qass_chat().is_none() => state.asks.say("qass is not running"),
         out @ (Out::ToChat | Out::ToQass(_)) => {
@@ -13520,6 +13527,7 @@ fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
             state.asks.release();
             taken.jump = Some(terminal);
         }
+        Out::Talk(_) => {}
         Out::Pass(rest) => taken.feed = Some(rest),
     }
     taken
@@ -26208,6 +26216,15 @@ mod tests {
         assert!(!state.clock_focused());
     }
 
+    /// A card about nothing: no agent, no terminal, so Talk it through goes to qass.
+    fn ask_about_nothing(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
+        qoop_runtime::control::AskInfo {
+            agent: None,
+            terminal: None,
+            ..ask_card(n, handle)
+        }
+    }
+
     fn ask_card(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
         use qoop_runtime::control::{AskCard, AskInfo, AskOption};
         AskInfo {
@@ -26533,8 +26550,15 @@ mod tests {
         let taken = asks_keys(&mut state, b"\r", 1);
         assert_eq!(taken.jump, Some(1));
         assert!(!state.asks.focus);
-        // `o` talks the card through: the line waits on qass's input while qass is at rest,
-        // and nothing is answered.
+        // `o` on a card about an agent goes to that agent's tab, not to qass.
+        asks_toggle(&mut state);
+        let taken = asks_keys(&mut state, b"o", 1);
+        assert_eq!((taken.jump, taken.paste), (Some(1), None));
+        // A card about nothing is talked through in qass: the line waits on qass's input while
+        // qass is at rest, and nothing is answered.
+        state
+            .asks
+            .take(vec![ask_about_nothing(1, "korea")], Vec::new());
         let line = "About E1 (korea): Question 1? ".to_string();
         let busy = state.asks.busy();
         asks_toggle(&mut state);
@@ -26588,7 +26612,9 @@ mod tests {
         let mut state = qass_window();
         let (mut seq, mut seqs) = (0, std::collections::BTreeMap::new());
         qass_toggle(&mut state, &mut seq, &mut seqs).unwrap();
-        state.asks.take(vec![ask_card(1, "korea")], Vec::new());
+        state
+            .asks
+            .take(vec![ask_about_nothing(1, "korea")], Vec::new());
         state.chat.toggle(5, Some("claude"));
         asks_toggle(&mut state);
         let Some((terminal, line)) = asks_keys(&mut state, b"o", 1).paste else {

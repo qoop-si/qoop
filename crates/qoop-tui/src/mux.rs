@@ -88,6 +88,11 @@ fn terminal_in(terminal: u32) -> (usize, u32) {
     }
 }
 
+/// A remote terminal's number in its own daemon.
+pub fn daemon_terminal(terminal: u32) -> u32 {
+    terminal_in(terminal).1
+}
+
 fn workspace_out(link: usize, id: i64) -> Option<i64> {
     let fits = (0..1i64 << WORKSPACE_SHIFT).contains(&id);
     match link {
