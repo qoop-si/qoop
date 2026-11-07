@@ -1369,6 +1369,60 @@ mod tests {
         assert_eq!(nowhere, serde_json::json!({}), "no checkout, nothing said");
     }
 
+    /// An item added from a coding agent's tab in a work space waits for the owner's start
+    /// (`added_by`); one qass adds for him, or one he adds from a shell tab, does not.
+    #[tokio::test]
+    async fn only_an_agent_marks_the_item_it_adds_for_later() {
+        let agents = AgentRegistry::new().expect("registry");
+        let mut tokens = Vec::new();
+        for t in [1, 2, 3] {
+            let token = crate::agents::mint_token(t);
+            agents.register(t, TerminalId::new(t.to_string()), token.clone());
+            tokens.push(token.as_str().to_string());
+        }
+        agents.test_set_foreground(1, Some("claude"), false);
+        agents.test_set_foreground(2, Some("claude"), false);
+        agents.test_set_foreground(3, Some("zsh"), false);
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let work = s.create_workspace("work", 1).unwrap();
+        let qass = s.create_workspace(QASS_SPACE, 1).unwrap();
+        s.create_terminal(1, work, "/tmp", "/bin/sh", 1).unwrap();
+        s.create_terminal(2, qass, "/tmp", "/bin/sh", 1).unwrap();
+        s.create_terminal(3, work, "/tmp", "/bin/sh", 1).unwrap();
+        let store = StoreHandle::new(s);
+        for (terminal, by) in [(1u32, Some("T1")), (2, None), (3, None)] {
+            let answer = write(
+                "w".into(),
+                Some(terminal),
+                Some(tokens[terminal as usize - 1].clone()),
+                None,
+                TaskOp::Add {
+                    workspace: Some(work),
+                    goal: format!("later {terminal}"),
+                    description: None,
+                },
+                None,
+                None,
+                None,
+                &agents,
+                &store,
+            )
+            .await;
+            let ControlResponse::TaskWritten { task, .. } = answer else {
+                panic!("{answer:?}")
+            };
+            let marks = store
+                .run(move |s| s.task_events_of(task, "added_by", 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                marks.first().map(|e| e.body.as_str()),
+                by,
+                "terminal {terminal}"
+            );
+        }
+    }
+
     /// A named close records who asked and nothing else changes: qass's terminal reads `qass`,
     /// another with its own token `T<n>/<generation>`, and one with no identity or a wrong
     /// token `unknown`; each still closes the task, whoever's it is.

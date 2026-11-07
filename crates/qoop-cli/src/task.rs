@@ -377,8 +377,9 @@ pub(crate) fn written(task: Option<i64>, action: TaskOp) -> std::io::Result<(i64
     // terminal says which one, when there is one: its space is the default, and an agent's
     // own find waits for the owner's start.
     let nobody = task.is_some() || matches!(action, TaskOp::LinkRemote { .. });
+    let anywhere = matches!(action, TaskOp::Add { .. });
     let (terminal, token) = if nobody { (None, None) } else { here() };
-    if !nobody && terminal.is_none() {
+    if !nobody && !anywhere && terminal.is_none() {
         return Err(std::io::Error::other(
             "QOOP_TERMINAL and QOOP_TOKEN are not set: run this in a qoop terminal, or name the task",
         ));

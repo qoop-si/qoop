@@ -743,6 +743,7 @@ pub(crate) async fn working_again(
 /// so no board says it waits on him after he answered.
 pub(crate) async fn relayed(
     label: Option<&str>,
+    typed_in: u32,
     agents: &AgentRegistry,
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
@@ -752,7 +753,7 @@ pub(crate) async fn relayed(
     };
     let ended = store
         .run(move |s| {
-            let moved = s.relay_answered(&card, now())?;
+            let moved = s.relay_answered(&card, i64::from(typed_in), now())?;
             let closed = match s.ask(&card)? {
                 Some(row) if matches!(row.status.as_str(), "open" | "passed") => {
                     s.close_ask(&card, "answered in chat", now())?
