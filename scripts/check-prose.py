@@ -48,10 +48,15 @@ for f in files:
     # marker leaves every line inside a block looking like prose, and a shell command in a
     # block legitimately contains a double hyphen.
     in_fence = False
+    # An inline code span wraps onto the next line in a long markdown paragraph; it ends at
+    # its closing backtick or at the paragraph's end, as markdown reads it.
+    in_span = False
     for n, line in enumerate(f.read_text(errors="ignore").splitlines(), 1):
         if f.suffix == ".md" and line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
+        if not line.strip():
+            in_span = False
         if EM in line or EN in line:
             fail.append(f"{f}:{n}: em or en dash: {line.strip()[:90]}")
         if f.parts[0] in {"skills", "hooks"} and TURKISH.search(line):
@@ -67,7 +72,10 @@ for f in files:
             or f.suffix != ".md"
             or line.lstrip().startswith(("#", "//", "$", "|"))
         )
-        prose = re.sub(r"`[^`]*`", "", line)
+        spans = ("`" if in_span else "") + line
+        if f.suffix == ".md" and not in_fence:
+            in_span = spans.count("`") % 2 == 1
+        prose = re.sub(r"`[^`]*(`|$)", "", spans)
         if not is_code and re.search(r"\S\s+--\s+\S", prose):
             fail.append(f"{f}:{n}: double hyphen as a dash: {line.strip()[:90]}")
         # A lone hyphen between clauses, which the docstring bans and an earlier version
