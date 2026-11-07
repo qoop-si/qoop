@@ -1961,6 +1961,69 @@ mod tests {
         }
     }
 
+    /// A qoop older than the hook refuses `--said` and with it the whole report: the hook
+    /// sends the turn's end again without it, so the state still arrives. Any other failure
+    /// (a daemon slow to answer a report it took) is not sent twice.
+    #[test]
+    fn the_claude_hook_still_reports_a_turns_end_to_an_older_qoop() {
+        use std::os::unix::fs::PermissionsExt;
+        // The reports one Stop makes against a fake qoop whose `hook-report` runs `refuse`.
+        let reports_with = |refuse: &str| -> Vec<String> {
+            let dir = tempfile::tempdir().expect("a directory");
+            let log = dir.path().join("reports");
+            let fake = dir.path().join("qoop");
+            std::fs::write(
+                &fake,
+                format!(
+                    "#!/bin/sh\nprintf '%s|' \"$@\" >> '{}'\n{refuse}\nexit 0\n",
+                    log.display()
+                ),
+            )
+            .expect("write");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let script = dir.path().join("qoop-hook.sh");
+            std::fs::write(&script, target("claude").body).expect("write");
+            let payload = serde_json::json!({
+                "session_id": "f339fcc3-ddfe-4fe2-8dc0-e4b6ddbf18f9",
+                "transcript_path": dir.path().join("none.jsonl"), "cwd": dir.path(),
+                "hook_event_name": "Stop", "stop_hook_active": false, "background_tasks": [],
+                "last_assistant_message": "Built it.\n\nMerge now?"});
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("QOOP_TERMINAL", "1")
+                .env("QOOP_TOKEN", "t")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(payload.to_string().as_bytes())
+                .expect("payload");
+            assert!(child.wait().expect("wait").success());
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .split("hook-report|")
+                .filter(|r| r.contains("--state|idle"))
+                .map(str::to_string)
+                .collect()
+        };
+        let older = reports_with(
+            "for a in \"$@\"; do [ \"$a\" = --said ] && echo 'qoop: unknown flag --said' >&2 && exit 2; done",
+        );
+        assert_eq!(older.len(), 2, "{older:?}");
+        assert!(older[0].contains("--said|Built it."), "{older:?}");
+        assert!(
+            !older[1].contains("--said") && older[1].contains("--event|done|--label|Merge now?|"),
+            "{older:?}"
+        );
+        let slow = reports_with("echo 'qoop: no answer from the daemon' >&2; exit 1");
+        assert_eq!(slow.len(), 1, "never twice: {slow:?}");
+    }
+
     /// A turn's end carries its last paragraph as one line, markdown off, read from the
     /// payload's own message, else the transcript, so the daemon can tell whether it asks the
     /// owner and put it in his inbox; a long one keeps both ends within the label's 120
@@ -2064,6 +2127,14 @@ mod tests {
         // The card's own words: what it did and the whole question, a blank line between,
         // markdown off; the label stays the cut line the question reading judges.
         assert!(said.contains("--said|Built it.\n\nMerge now?|"), "{said}");
+        let said = stop(
+            "",
+            Some("I rebuilt the **rate table** in `rates.rs`.\n\nMerge now?"),
+        );
+        assert!(
+            said.contains("--said|I rebuilt the rate table in rates.rs.\n\nMerge now?|"),
+            "plain words: {said}"
+        );
         let said = stop("", Some(&format!("Done.\n\n{long}")));
         let whole = said
             .split("--said|")

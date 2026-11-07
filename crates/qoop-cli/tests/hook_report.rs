@@ -524,3 +524,30 @@ fn opencodes_footer_count_reaches_its_row() {
     assert!(row.contains("program=opencode"), "{row}");
     assert!(row.contains(" background=3 subagents=3"), "{row}");
 }
+
+/// A turn's closing words ride the report as `--said`: parsed and sent, never a usage error
+/// (an older qoop refusing it is what the Claude hook's resend is for).
+#[test]
+fn the_closing_words_are_a_flag_the_report_takes() {
+    let daemon = Daemon::start();
+    let (ok, err) = daemon.report(
+        &[
+            "--state",
+            "idle",
+            "--event",
+            "done",
+            "--label",
+            "Merge now?",
+            "--said",
+            "Built it.\n\nMerge now?",
+            "--terminal",
+            "1",
+            "--token",
+            "forged",
+        ],
+        false,
+    );
+    assert!(!ok, "a forged token is still refused");
+    assert!(!err.contains("unknown flag"), "{err}");
+    assert!(err.contains("refused"), "it reached the daemon: {err}");
+}

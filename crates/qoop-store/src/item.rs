@@ -734,14 +734,16 @@ fn said(stage: &str) -> &str {
 }
 
 impl Store {
-    /// The space an open terminal is in.
-    pub fn terminal_workspace(&self, terminal: i64) -> Result<Option<i64>, StoreError> {
+    /// The space an open terminal is in, and whether a coding agent runs there now (its hook
+    /// named one, and it has not ended).
+    pub fn terminal_workspace(&self, terminal: i64) -> Result<Option<(i64, bool)>, StoreError> {
         Ok(self
             .conn
             .query_row(
-                "SELECT workspace FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                "SELECT workspace, agent IS NOT NULL FROM terminal WHERE id = ?1 \
+                 AND closed_at IS NULL",
                 params![terminal],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }

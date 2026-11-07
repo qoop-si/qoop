@@ -1438,6 +1438,7 @@ impl AgentRegistry {
 
     /// Drop the live record without touching shields or edges.
     fn remove_live(&self, stream: u32) {
+        self.said.lock().unwrap().remove(&stream);
         self.masters.lock().unwrap().remove(&stream);
         self.focus.lock().unwrap().remove(&stream);
         self.prompts.lock().unwrap().remove(&stream);
@@ -1935,7 +1936,10 @@ impl AgentRegistry {
     /// Keep a turn end's closing words for `stream`, masked; none forgets the last ones.
     pub fn set_said(&self, stream: u32, said: Option<&str>) {
         let mut all = self.said.lock().unwrap();
-        match said
+        // Cut before masking, as a label is: the hook sends at most 800 characters.
+        let cut = said.map(|s| s.chars().take(1200).collect::<String>());
+        match cut
+            .as_deref()
             .map(qoop_parsed::redact)
             .filter(|s| !s.trim().is_empty())
         {

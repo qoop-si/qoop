@@ -148,13 +148,15 @@ def paragraph_of(text):
 
 def said_of(text):
     """The turn's closing words for the owner's card: the paragraph before the last (what it
-    just did, at most 300 characters) and the last (its question, at most 600), a blank line
+    just did, at most 200 characters) and the last (its question, at most 600), a blank line
     between. Cut at a word, never in the middle."""
     parts = paragraphs_of(text, 2)
     if not parts:
         return ""
-    limits = [300, 600][-len(parts):]
-    return "\n\n".join(cut_at_word(p, n) for p, n in zip(parts, limits))
+    limits = [200, 600][-len(parts):]
+    # Bold, italics and code marks off inside the line too: the card shows plain words.
+    plain = [p.replace("**", "").replace("__", "").replace(chr(96), "") for p in parts]
+    return "\n\n".join(cut_at_word(p, n) for p, n in zip(plain, limits))
 
 
 def cut_at_word(text, limit):
@@ -396,7 +398,12 @@ if session:
     args += ["--session-id", session]
 if state:
     try:
-        subprocess.run(args, timeout=5, capture_output=True)
+        sent = subprocess.run(args, timeout=5, capture_output=True)
+        # A qoop older than this hook refuses the card's words as an unknown flag, and with
+        # them the whole report: the turn's end must still arrive, so it goes again without.
+        if sent.returncode != 0 and said and b"--said" in sent.stderr:
+            at = args.index("--said")
+            subprocess.run(args[:at] + args[at + 2:], timeout=5, capture_output=True)
     except Exception:
         pass
 # Mark or compare the turn after the report, so the state never waits on its git calls.

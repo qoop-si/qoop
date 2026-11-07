@@ -177,23 +177,16 @@ pub(crate) async fn write(
         description,
     } = action
     {
-        // An agent's own find waits for the owner's start: a coding agent in a tab outside
-        // qass's space. qass adds what he asked for, and a person in a shell tab is him.
-        let agent_tab = speaker.filter(|&t| {
-            agents.agent(t).is_some_and(|a| {
-                matches!(
-                    a.identity,
-                    qoop_domain::AgentIdentity::Known { agent: true, .. }
-                )
-            })
-        });
         return match store
             .run(move |s| {
                 let spaces = s.workspaces()?;
                 let space_of = |id: i64| spaces.iter().find(|w| w.id == id).map(|w| w.name.clone());
-                let here = match speaker {
-                    Some(t) => s.terminal_workspace(i64::from(t))?,
-                    None => None,
+                // The asking terminal's space, and whether a coding agent asks from it.
+                let (here, agent_tab) = match speaker {
+                    Some(t) => s
+                        .terminal_workspace(i64::from(t))?
+                        .map_or((None, false), |(w, agent)| (Some(w), agent)),
+                    None => (None, false),
                 };
                 let Some(workspace) = workspace.or(here) else {
                     return Ok(Err(
@@ -205,8 +198,10 @@ pub(crate) async fn write(
                         "qass's own space has no board: add the item to the space the work is in",
                     ));
                 }
-                // An agent's own find waits for the owner; qass adds what he asked for.
-                let by = agent_tab
+                // An agent's own find waits for the owner's start; qass adds what he asked
+                // for, and a person in a shell tab is him.
+                let by = speaker
+                    .filter(|_| agent_tab)
                     .filter(|_| here.and_then(space_of).as_deref() != Some(QASS_SPACE))
                     .map(|t| format!("T{t}"));
                 let description = description.unwrap_or_default();
@@ -1371,6 +1366,26 @@ mod tests {
         assert_eq!(nowhere, serde_json::json!({}), "no checkout, nothing said");
     }
 
+    /// A task in a sleeping tab says since when, waiting or not, so a list can fold it apart:
+    /// its status alone reads `waits` asleep or awake.
+    #[test]
+    fn a_task_in_a_sleeping_tab_says_since_when() {
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let id = s.open_task(7, "x", false, 10).unwrap();
+        s.set_task_stage(id, "waiting-human", 11).unwrap();
+        let row = s.task(id).unwrap().unwrap();
+        let asleep = Tab {
+            asleep_since: Some(500),
+            ..Default::default()
+        };
+        let t = info(row.clone(), asleep, Some(11));
+        assert_eq!((t.status.as_str(), t.asleep_since), ("waits", Some(500)));
+        let t = info(row, Tab::default(), Some(11));
+        assert_eq!(t.asleep_since, None, "awake");
+    }
+
     /// An item added from a coding agent's tab in a work space waits for the owner's start
     /// (`added_by`); one qass adds for him, or one he adds from a shell tab, does not.
     #[tokio::test]
@@ -1382,15 +1397,15 @@ mod tests {
             agents.register(t, TerminalId::new(t.to_string()), token.clone());
             tokens.push(token.as_str().to_string());
         }
-        agents.test_set_foreground(1, Some("claude"), false);
-        agents.test_set_foreground(2, Some("claude"), false);
-        agents.test_set_foreground(3, Some("zsh"), false);
         let mut s = qoop_store::Store::in_memory().expect("store");
         let work = s.create_workspace("work", 1).unwrap();
         let qass = s.create_workspace(QASS_SPACE, 1).unwrap();
         s.create_terminal(1, work, "/tmp", "/bin/sh", 1).unwrap();
         s.create_terminal(2, qass, "/tmp", "/bin/sh", 1).unwrap();
         s.create_terminal(3, work, "/tmp", "/bin/sh", 1).unwrap();
+        // Its hook named the agent (the foreground at the moment of the add is `qoop` itself).
+        s.set_agent(1, Some("claude"), None).unwrap();
+        s.set_agent(2, Some("claude"), None).unwrap();
         let store = StoreHandle::new(s);
         for (terminal, by) in [(1u32, Some("T1")), (2, None), (3, None)] {
             let answer = write(
