@@ -689,18 +689,25 @@ impl Store {
     /// means the question was answered or left behind, and a later wait is another
     /// question). The card may predate the wait: qass writes a text question's card before
     /// the daemon's own wait begins. An inbox answer still waiting to be typed stays queued.
+    /// Typed into the card's own tab (`typed_in`), it is that tab's answer: left to
+    /// [`Store::answer_waiting`], which also drops an inbox answer that waited to be typed.
     /// Answers the terminal whose task moved, `None` when nothing did.
-    pub fn relay_answered(&self, card: &str, now: i64) -> Result<Option<i64>, StoreError> {
+    pub fn relay_answered(
+        &self,
+        card: &str,
+        typed_in: i64,
+        now: i64,
+    ) -> Result<Option<i64>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let found: Option<(i64, i64, i64)> = tx
             .query_row(
                 "SELECT a.task, a.terminal, a.opened_at FROM ask a JOIN task t ON t.id = a.task \
-                 WHERE a.card = ?1 AND a.status IN ('open', 'passed') \
+                 WHERE a.card = ?1 AND a.status IN ('open', 'passed') AND a.terminal != ?2 \
                  AND t.terminal = a.terminal AND t.closed_at IS NULL \
                  AND t.stage = 'waiting-human' AND NOT EXISTS (SELECT 1 FROM task_event e \
                  WHERE e.task = t.id AND e.kind = 'stage' AND e.body != 'waiting-human' \
                  AND e.at > a.opened_at)",
-                params![card],
+                params![card, typed_in],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1334,7 +1341,7 @@ mod tests {
         s.add_ask("E7", Some("T5"), Some(t), None, r#"{"handle":"a"}"#, 30)
             .unwrap();
         assert_eq!(s.wait_on_owner(t, 130).unwrap(), Some(id));
-        assert_eq!(s.relay_answered("E7", 200).unwrap(), Some(t));
+        assert_eq!(s.relay_answered("E7", 99, 200).unwrap(), Some(t));
         assert_ne!(s.task(id).unwrap().unwrap().stage, "waiting-human");
         let stages = |s: &Store| {
             s.conn
@@ -1347,7 +1354,7 @@ mod tests {
         };
         // The backfill, the wait, the way back: one stage event for the answer.
         assert_eq!(stages(&s), 3);
-        assert_eq!(s.relay_answered("E7", 201).unwrap(), None, "said once");
+        assert_eq!(s.relay_answered("E7", 99, 201).unwrap(), None, "said once");
 
         // A W card answered from the inbox, waiting to be typed, is never dropped.
         let (s, _, t) = store_with_terminal();
@@ -1369,16 +1376,37 @@ mod tests {
         s.conn
             .execute("UPDATE ask SET status = 'answered' WHERE card = 'E8'", [])
             .unwrap();
-        assert_eq!(s.relay_answered("E8", 19).unwrap(), None);
+        assert_eq!(s.relay_answered("E8", 99, 19).unwrap(), None);
         s.conn
             .execute("UPDATE ask SET status = 'open' WHERE card = 'E8'", [])
             .unwrap();
-        assert_eq!(s.relay_answered("E8", 20).unwrap(), Some(t));
+        assert_eq!(s.relay_answered("E8", 99, 20).unwrap(), Some(t));
         assert_eq!(
             s.ask(&w).unwrap().unwrap().status,
             "queued",
             "kept for delivery"
         );
+
+        // Typed into the worker's own tab, the relay is that tab's answer: left to
+        // answer_waiting, which drops the queued inbox answer as before.
+        let (s, _, t) = store_with_terminal();
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        s.set_task_stage(id, "waiting-human", 11).unwrap();
+        let w = s
+            .add_draft("T5", t, None, r#"{"handle":"w"}"#, 12)
+            .unwrap()
+            .expect("filed");
+        s.conn
+            .execute(
+                "UPDATE ask SET status = 'queued' WHERE card = ?1",
+                params![w],
+            )
+            .unwrap();
+        s.add_ask("E9", Some("T5"), Some(t), None, r#"{"handle":"c"}"#, 13)
+            .unwrap();
+        assert_eq!(s.relay_answered("E9", t, 20).unwrap(), None);
+        assert!(s.answer_waiting(t, 20, 20).unwrap().is_some());
+        assert_eq!(s.ask(&w).unwrap().unwrap().status, "closed");
     }
 
     /// A card from a spell he already answered never ends the next question's wait.
@@ -1394,13 +1422,13 @@ mod tests {
         assert!(s.answer_waiting(t, 40, 40).unwrap().is_some());
         // A second question, a new wait.
         s.set_task_stage(id, "waiting-human", 60).unwrap();
-        assert_eq!(s.relay_answered("E7", 90).unwrap(), None);
+        assert_eq!(s.relay_answered("E7", 99, 90).unwrap(), None);
         assert_eq!(s.task(id).unwrap().unwrap().stage, "waiting-human");
         // A card about no terminal, or an unknown card, ends nothing.
         s.add_ask("E8", None, None, None, r#"{"handle":"b"}"#, 61)
             .unwrap();
-        assert_eq!(s.relay_answered("E8", 91).unwrap(), None);
-        assert_eq!(s.relay_answered("E99", 92).unwrap(), None);
+        assert_eq!(s.relay_answered("E8", 99, 91).unwrap(), None);
+        assert_eq!(s.relay_answered("E99", 99, 92).unwrap(), None);
     }
 
     /// A question left unanswered puts the task on waiting with its claim kept, once, and his

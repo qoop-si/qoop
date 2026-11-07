@@ -5460,8 +5460,14 @@ async fn handle_control(
                         // A worker told "The owner answered E7" in the chat has the answer:
                         // the card is handled, whoever relayed it.
                         if kind == "user" {
-                            crate::asks::relayed(label.as_deref(), agents, connections, store)
-                                .await;
+                            crate::asks::relayed(
+                                label.as_deref(),
+                                terminal,
+                                agents,
+                                connections,
+                                store,
+                            )
+                            .await;
                             // A prompt reached an agent waiting on the owner: its answer. The
                             // stage goes back, so no board still says it waits on him. A notice
                             // the harness typed (its own background work done) is no answer, nor
