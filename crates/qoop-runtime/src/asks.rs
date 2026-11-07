@@ -547,7 +547,11 @@ async fn file_waiting(
     (agents, connections, store): (&AgentRegistry, &Arc<ConnectionRegistry>, &StoreHandle),
 ) -> bool {
     let question = question.filter(|q| !q.trim().is_empty());
-    let said = question.as_ref().and_then(|_| agents.said(terminal));
+    // The turn's own words belong to the card of the turn that ended: a plan's card says its
+    // own line, never whatever the agent last asked.
+    let said = (!plan)
+        .then(|| question.as_ref().and_then(|_| agents.said(terminal)))
+        .flatten();
     let prompts: Vec<i64> = if question.is_none() {
         agents
             .focus_events(terminal)
@@ -589,9 +593,11 @@ async fn file_waiting(
                     format!("{name} waits on you: {}", task.goal)
                 }
             });
+            // With no paragraph before the question, the goal is already "what he asked" (or
+            // his own words, never shown): the task's number names the work.
             let doing = match before {
                 Some(before) => before,
-                None if owner_words => format!("task #{}", task.id),
+                None if owner_words || said.is_some() => format!("task #{}", task.id),
                 None => task.goal.clone(),
             };
             let card = AskCard {
@@ -2730,6 +2736,8 @@ mod tests {
         };
 
         let (store, task) = setup(true);
+        // The agent's last turn asked something else: the plan's card keeps its own line.
+        agents.set_said(7, Some("Tests pass.\n\nShall I also bump the lockfile?"));
         stale_plans_once(&agents, &connections, &store).await;
         let (cards, stage) = store
             .run(move |s| Ok((s.live_asks()?, s.task(task)?.unwrap().stage)))
@@ -2739,7 +2747,7 @@ mod tests {
         assert_eq!(cards[0].terminal, Some(7));
         assert_eq!(cards[0].session, None, "his answer goes to qass");
         assert!(
-            cards[0].body.contains("plan waits for qass"),
+            cards[0].body.contains("plan waits for qass") && !cards[0].body.contains("lockfile"),
             "{}",
             cards[0].body
         );

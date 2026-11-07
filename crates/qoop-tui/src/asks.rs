@@ -1792,6 +1792,14 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         })
         .collect();
     shown.dedup();
+    // On a folded card, the answers still in sight after the clip, in order: a number key
+    // never sends one the pane had no room to draw.
+    let sel = pane.selected.min(pane.live.len().saturating_sub(1));
+    let reach = reach.map(|_| {
+        (0..)
+            .take_while(|i| targets.iter().any(|t| t.hit == Hit::Answer(sel, *i)))
+            .count()
+    });
     pane.shown.set(Some(reach.unwrap_or(shown.len())));
     View {
         rows: out,
@@ -2522,6 +2530,29 @@ mod tests {
                 && at("Sends: Do not run") < at("reply in your own words"),
             "{t}"
         );
+    }
+
+    /// A long question alone in a short pane pushes answers past its foot: a number key sends
+    /// only an answer the pane drew.
+    #[test]
+    fn a_number_key_never_sends_an_answer_cut_off_the_pane() {
+        let mut long = card(1, "migrations", "open");
+        long.body.asks = "Shall I run this migration now? "
+            .repeat(18)
+            .trim()
+            .to_string();
+        let mut p = Pane::default();
+        p.take(vec![long], Vec::new());
+        p.focus = true;
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 14));
+        assert!(!t.contains("[3]"), "the third answer is off the pane:\n{t}");
+        p.key(b"3", 1);
+        assert!(p.outbox.is_empty(), "no key for an answer not drawn");
+        let drawn = (1..=3).filter(|n| t.contains(&format!("[{n}]"))).count();
+        if drawn > 0 {
+            p.key(format!("{drawn}").as_bytes(), 1);
+            assert_eq!(p.outbox.len(), 1, "a drawn answer still takes its key");
+        }
     }
 
     /// Folded, a card is its question and its numbered answers on two rows, the suggested one
