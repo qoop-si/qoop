@@ -2480,8 +2480,8 @@ mod tests {
         assert_eq!(seen(&r), None, "a leader this daemon did not see come");
     }
 
-    /// The three turns that drafted W692, W702 and W705 on 2026-11-03 ended on a question the
-    /// agent had put to its reviewer sub-agents, each still running: none waits on the owner.
+    /// Three turns that drafted cards ended on a question the agent had put to its own
+    /// sub-agents, each still running: none waits on the owner.
     /// The same words with no sub-agent at work do.
     #[test]
     fn a_turn_ending_while_its_sub_agents_run_asks_him_nothing() {
@@ -2510,15 +2510,15 @@ mod tests {
                 "Two sub-agents are checking the root fix. I asked one to look at ... . Does this undo the \"run the stuck work\" aim of `abc1234`?",
             ),
         ];
-        for (card, reviewer, label) in turns {
-            r.note_subagents(1, Started(reviewer.into()));
+        for (card, sub, label) in turns {
+            r.note_subagents(1, Started(sub.into()));
             let running = r.hooked_subagents_of(1);
-            assert_eq!(running, 1, "{card}: its reviewer runs");
+            assert_eq!(running, 1, "{card}: its sub-agent runs");
             assert!(
                 !crate::asks::turn_asks_him(Some(label), running),
-                "{card}: a question to its own reviewer is not his"
+                "{card}: a question to its own sub-agent is not his"
             );
-            r.note_subagents(1, Ended(reviewer.into()));
+            r.note_subagents(1, Ended(sub.into()));
             let running = r.hooked_subagents_of(1);
             assert!(
                 crate::asks::turn_asks_him(Some(label), running),

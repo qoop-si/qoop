@@ -4154,7 +4154,7 @@ mod tests {
             [vec![1, 2], vec![3, 4, 5], vec![6]]
         );
         assert_eq!(
-            ids(&lanes(&items, &p.spaces, "app", false)),
+            ids(&lanes(&items, &p.spaces, "APP", false)),
             [vec![], vec![4, 5], vec![]]
         );
         assert_eq!(

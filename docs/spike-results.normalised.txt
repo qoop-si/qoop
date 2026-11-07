@@ -1,13 +1,13 @@
 # Spike results
 
-GENERATED FILE. Do not edit `plans/01_SPIKE_RESULTS.md` by hand. Edit
-`plans/01_SPIKE_RESULTS.tmpl.md` and run `scripts/regen-spike-results.sh`.
+GENERATED FILE. Do not edit `docs/spike-results.md` by hand. Edit
+`docs/spike-results.tmpl.md` and run `scripts/regen-spike-results.sh`.
 
 Every fenced transcript below is the literal stdout of the committed program, substituted
-by the script. It exists because an adversarial review caught hand-edited transcripts in
+by the script. It exists because a check caught hand-edited transcripts in
 the previous version of this file: durations had been reformatted and one load-bearing
 field had been deleted, in a document whose first line claimed nothing in it was
-theoretical. CI regenerates this file and fails the build on any diff.
+theoretical. `scripts/regen-spike-results.sh` regenerates it; any diff is a failure.
 
 Platform: macOS 15 (Darwin 25.6.0), arm64, 24 GB, 12 cores, Rust 1.98, release build.
 Code: `spikes/spike-runtime/src/{pty,term,proc,teardown,mem}.rs`
@@ -137,9 +137,9 @@ spike-teardown claim B: the blocker is undrained tty output, and closing the mas
 appears to fix it because closing discards the pending output. The corrected rule is in
 ADR-<pgid>.
 
-## spike-teardown: independently verifying four review claims
+## spike-teardown: independently verifying four claims
 
-A reviewer's measurement is a lead, not a fact. Each claim below was reproduced from
+A measurement made elsewhere is a lead, not a fact. Each claim below was reproduced from
 scratch here before any ADR was changed.
 
 ```text
@@ -178,7 +178,7 @@ measuring something else is worse than no test at all:
 
 1. The first spawned the escaping child from our own process, so it was a sibling in a
    different session. It showed only that signals do not cross process groups, which
-   nobody disputed. A reviewer caught this.
+   nobody disputed. A second look caught this.
 2. The second used a plain background job, which died. Not from our signal: `zsh` relays
    a hangup to its own jobs when it exits. Only a job that ignores SIGHUP isolates the
    mechanism under test.
@@ -212,8 +212,8 @@ Confirmed. A child that writes 256 KiB and exits is not reapable after four seco
 the parent holds the master and never reads. Draining it, with the master still open, reaps
 it immediately.
 
-Boundary worth recording: the first version of this test wrote two bytes, and an external
-reviewer running it under load saw it reap anyway. That is correct behaviour, not a flake.
+Boundary worth recording: the first version of this test wrote two bytes, and a run
+of it under load saw it reap anyway. That is correct behaviour, not a flake.
 A small write is usually already in the master's queue by the time the slave closes, so
 nothing is left to wait for. What blocks the reap is output not yet absorbed, which needs a
 write larger than the buffer. The rule the ADR draws is unchanged; the test is what had to

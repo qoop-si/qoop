@@ -1280,18 +1280,18 @@ contains = "esc to interrupt"
     }
 
     /// A question menu is a person being asked to choose, even when the options
-    /// are not yes or no. Copied off a real session where the model asked what
-    /// to do next and the panel kept saying working.
+    /// are not yes or no. Shaped like a session where the model asked what to do
+    /// next and the panel kept saying working.
     #[test]
     fn the_claude_manifest_reads_a_question_menu_as_a_visible_blocker() {
         let v = verdict(
             "claude",
             &[
-                "Elde ~1700 satir commit edilmemis isi var. Bununla ne yapalim?",
-                "  1. Once durumu oku ve anlat",
-                "  2. Kontrolleri calistir",
-                "❯ 3. Palette isini bitir",
-                "  4. Bu is degil, baska konu",
+                "There are ~1700 lines of uncommitted work. What should we do with it?",
+                "  1. Read the state first and explain it",
+                "  2. Run the checks",
+                "❯ 3. Finish the palette work",
+                "  4. Not this, something else",
                 "Enter to select · ↑/↓ to navigate · Esc to cancel",
             ],
         )
@@ -1353,8 +1353,8 @@ contains = "esc to interrupt"
         assert!(v.visible_working);
     }
 
-    /// The composer, which is on screen only while Codex is waiting for a person, copied
-    /// off a real session that had just finished starting up.
+    /// The composer, which is on screen only while Codex is waiting for a person, as a
+    /// session draws it just after starting up.
     #[test]
     fn the_codex_manifest_reads_its_composer_as_idle() {
         for composer in ["› Ask Codex to do anything", "› write me a test"] {
@@ -1380,7 +1380,7 @@ contains = "esc to interrupt"
         assert_eq!(v.state, AgentRuntimeState::Working);
     }
 
-    /// Copied off a real session: Codex draws its update notice as a numbered menu, over
+    /// Codex draws its update notice as a numbered menu, over
     /// the row the composer normally has and with the same marker on it. Read as a composer
     /// it reports idle, which is a person being asked a question and told nobody is waiting.
     #[test]
@@ -1452,7 +1452,7 @@ contains = "esc to interrupt"
         );
     }
 
-    /// Copied off a real session, bottom rows and all: Codex draws its status line and then
+    /// Bottom rows and all: Codex draws its status line and then
     /// keeps drawing under it, so the line that says the turn is happening is the fourth
     /// non empty row from the bottom and not the first.
     #[test]
@@ -1723,7 +1723,7 @@ contains = "esc to interrupt"
                 "\u{273B} Crunched for 16m 31s \u{00B7} done 6:31 PM",
                 "                              You've used 75% of your weekly limit",
                 RULE,
-                "\u{276F} evet kapat hepsini",
+                "\u{276F} yes close them all",
                 RULE,
                 "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7} \u{2190} 5 agents",
             ],

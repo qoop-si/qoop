@@ -374,7 +374,7 @@ impl Palette {
                     space_len: 0,
                     state: None,
                     // Its place by the last two parts, as drawn: the whole path would match
-                    // every conversation under a home directory on `us` or `coding`.
+                    // every conversation under a home directory on `pat` or `coding`.
                     program: Some(format!("{} {place}", row.agent)),
                 });
             }

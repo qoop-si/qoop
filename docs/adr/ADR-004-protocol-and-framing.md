@@ -262,9 +262,8 @@ envelope is not reversible, which is the point of freezing it.
 
 `crates/qoop-proto` is the definition; this ADR is the reasoning and the rejected
 alternatives. Where the two disagree, the code and its tests are right and this document is
-a bug. That is not a dodge: three review rounds each found another decision an implementer
-would have had to invent while reading this ADR, which is evidence about prose rather than
-about the reviewers.
+a bug. That is not a dodge: each pass over this ADR found another decision an implementer
+would have had to invent while reading it, which is evidence about prose as a medium.
 
 Writing it settled several things this document had left open or wrong. The header is ten
 bytes, so the maximum payload is 65526. `stream` has a defined meaning on every channel
@@ -273,8 +272,8 @@ protocol violation rather than an undefined case. A single-frame message sets `E
 acknowledgement is a `u64` little-endian prefix before the codec body, on the first frame of
 a sequence only, and it counts against that frame's payload budget. Interleaving is detected
 by requiring a continuation's `seq` to be exactly the previous plus one, which is what makes
-a chunk sequence atomic without adding a message id to a frozen header. Prose at this level of detail has been
-through three review rounds and each one found another decision an implementer would have
-had to invent, which is evidence about the medium rather than about the reviewers. The
+a chunk sequence atomic without adding a message id to a frozen header. Prose at this level of detail kept
+leaving another decision an implementer would have had to invent, which is evidence about
+the medium. The
 grammar is frozen when two independent implementations of it agree on the corpus, and the
 frozen fixtures are generated from that decoder, not typed.

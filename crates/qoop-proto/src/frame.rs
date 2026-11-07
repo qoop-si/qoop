@@ -1,10 +1,10 @@
 //! The wire frame: encode, decode, and the bounds that make a decoder safe against a
 //! hostile peer.
 //!
-//! This module is the normative artifact for ADR-004. The ADR is the rationale; three
-//! review rounds each found another decision an implementer would have had to invent while
-//! reading it, which is evidence about prose rather than about the reviewers. Where this
-//! code and the ADR disagree, this code and its tests are right and the ADR is a bug.
+//! This module is the normative artifact for ADR-004. The ADR is the rationale; each pass
+//! over it found another decision an implementer would have had to invent while reading it,
+//! which is evidence about prose as a medium. Where this code and the ADR disagree, this
+//! code and its tests are right and the ADR is a bug.
 //!
 //! ```text
 //! frame  := len:u32le  header  payload

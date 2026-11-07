@@ -1,8 +1,7 @@
 # Releases and updates
 
-No build ever runs on GitHub here, because private Actions minutes are gone.
-GitHub only hosts the tarballs. Every build runs on this Mac, and the update runs
-wherever the person reading it sits.
+Release builds do not run on GitHub: it only hosts the tarballs, and CI here only checks
+format, lints and tests. The update runs wherever the person reading it sits.
 
 ## Shipping a release
 

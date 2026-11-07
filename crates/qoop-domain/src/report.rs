@@ -483,7 +483,7 @@ mod tests {
         )
     }
 
-    /// The plan's example, written within the rules by the adversarial reviewer.
+    /// The plan's example, written within the rules.
     #[test]
     fn the_plans_example_passes_and_round_trips() {
         let n = note(
@@ -642,7 +642,7 @@ mod tests {
     fn own_names_fail_with_separators_taken_out() {
         let names = vec![
             "qoop-tui".to_string(),
-            "us".into(),
+            "pat".into(),
             "Pat's laptop".into(),
             "main".into(),
             "harbor".into(),
@@ -651,7 +651,7 @@ mod tests {
         let p = |what: &str| own_name_problems(&ok(what), &names);
         assert!(!p("the watcher in the harbor tab slept").is_empty());
         // A glossary word or a short common word inside another is not a name match.
-        assert!(p("the space slept, then the menu came back for us").len() == 1);
+        assert!(p("the space slept, then the menu came back for pat").len() == 1);
         assert!(p("the main space slept").is_empty());
         assert!(!p("the web one remote slept").is_empty());
         let one = vec!["one".to_string()];

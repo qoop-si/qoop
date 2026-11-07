@@ -46,11 +46,11 @@ the instruction it gives or repeats, in English, for `rule` and `repeat`).
 - Group the `rule` messages by meaning, together with the `rule` lines of `classes/*.jsonl` from
   the last 30 days (something said on two nights counts twice). A group said in 2 or more
   distinct sessions is a rule. One
-  said in a single session is a rule only when he said always or never (her zaman, asla, hep,
-  hiçbir zaman, ever), and then for that repository only.
+  said in a single session is a rule only when he said always or never, in any language
+  (`always`, `never`, `ever`, `her zaman`, `asla`), and then for that repository only.
 - Write it in English as an instruction to an agent, at most 160 characters, his intent rather
   than his words, with its evidence:
-  `- <rule> (said 3x: 10-18 acme, 10-20 qoop; learned 10-25, new)`.
+  `- <rule> (said 3x: 10-18 shop, 10-20 blog; learned 10-25, new)`.
   Under `## Repo <owner/name>` (the messages' `repo`) when every session was in one repository, else
   under `## Everywhere`.
 - A written rule (in `owner.md` or a `CLAUDE.md`) with `repeat` messages from 2 or more sessions

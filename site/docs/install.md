@@ -89,3 +89,20 @@ terminal to ask on, the script skips the setup and prints the next command, `qoo
 
 qoop also sends a few numbers a day about how it is used, never content, once it has told you
 so; [Usage counts](#telemetry) shows exactly what and how to stop it.
+
+## Source
+
+The open part's source is at [github.com/qoop-si/qoop](https://github.com/qoop-si/qoop),
+under AGPL-3.0-or-later: the terminal, the daemon, the interface, agent detection, hooks and
+skills. The phone bridge, the hub and the account features (sign in, your phone,
+qoop.si/app) ship only in the released binary.
+
+To build the open part, install Rust with [rustup](https://rustup.rs): the repository selects
+the stable channel, and Rust 1.98 or newer is needed. Then run:
+
+```
+cargo build --release -p qoop-cli
+```
+
+The binary is `target/release/qoop`. It has no phone part: on a machine paired with your
+phone, keep the released binary, or the phone bridge stops.

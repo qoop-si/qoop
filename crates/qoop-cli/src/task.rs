@@ -1134,25 +1134,25 @@ fn steps_op(steps: Vec<String>) -> TaskOp {
 
 #[cfg(test)]
 mod tests {
-    const OWNER_MD: &str = "# What qass learned\n\n## Everywhere\n- Open what he needs to look at; do not describe it (said 3x: 10-18 gtm, 10-21 acme; learned 10-25, new)\n\n## Repo qoop-si/qoop\n- Commit as qoopsy (said 2x)\n\n## Every prompt\n- Prove done with a real run (said 4x: 10-20 acme)\n\n## Every prompt pat/app\n- Never name search\n\n## Repo pat/app\n- Use app-fast\n";
+    const OWNER_MD: &str = "# What qass learned\n\n## Everywhere\n- Keep recaps short (said 3x: 10-18 blog, 10-21 shop; learned 10-25, new)\n\n## Repo qoop-si/qoop\n- Use the project formatter (said 2x)\n\n## Every prompt\n- Prove done with a real run (said 4x: 10-20 shop)\n\n## Every prompt acme/shop\n- Never name the vendor\n\n## Repo acme/shop\n- Use the fast tier\n";
 
     #[test]
     fn learned_rules_are_the_sections_for_here() {
         let session = learned_lines(OWNER_MD, Some("qoop-si/qoop"), false);
         assert_eq!(session.len(), 2);
-        assert!(session[0].starts_with("Open what he needs"));
-        assert_eq!(session[1], "Commit as qoopsy (said 2x)");
+        assert!(session[0].starts_with("Keep recaps short"));
+        assert_eq!(session[1], "Use the project formatter (said 2x)");
         assert_eq!(learned_lines(OWNER_MD, None, false).len(), 1);
         assert_eq!(
             learned_lines(OWNER_MD, Some("QOOP-SI/qoop"), false).len(),
             2
         );
-        let turn = learned_lines(OWNER_MD, Some("pat/app"), true);
+        let turn = learned_lines(OWNER_MD, Some("acme/shop"), true);
         assert_eq!(
             turn,
             [
-                "Prove done with a real run (said 4x: 10-20 acme)",
-                "Never name search"
+                "Prove done with a real run (said 4x: 10-20 shop)",
+                "Never name the vendor"
             ]
         );
         assert_eq!(learned_lines(OWNER_MD, Some("qoop-si/qoop"), true).len(), 1);
@@ -1161,10 +1161,10 @@ mod tests {
 
     #[test]
     fn the_line_beside_a_request_is_the_rules_alone_in_one_sentence() {
-        let lines = learned_lines(OWNER_MD, Some("pat/app"), true);
+        let lines = learned_lines(OWNER_MD, Some("acme/shop"), true);
         assert_eq!(
             turn_text(&lines),
-            "The owner keeps saying: Prove done with a real run; Never name search."
+            "The owner keeps saying: Prove done with a real run; Never name the vendor."
         );
         let dotted = [
             "Open it yourself.".to_string(),
@@ -1395,7 +1395,7 @@ mod tests {
         // ponytail: +35 on 2026-10-23 for "take reversible steps yourself", the words agents
         // act on beside each request (QOOP-55: 9 of 10 probe runs handed a doable step back).
         assert!(repo_turn(Some(&longest)).len() <= 325);
-        assert!(repo_turn(Some("pat/qoop-tui")).len() <= 190);
+        assert!(repo_turn(Some("qoop-si/qoop")).len() <= 190);
     }
 
     #[test]
@@ -1411,9 +1411,9 @@ mod tests {
             RULES.len()
         );
         // ponytail: 2200 is the 1380 above plus the own-repo block (its own cap: 1100 at the
-        // longest name, 815 for pat/qoop-tui): what may ship and what always asks,
+        // longest name, 817 for qoop-si/qoop): what may ship and what always asks,
         // computed for this repo, said once at session start. 2400 with the 1580 above.
-        let session = RULES.len() + repo_rules(Some("pat/qoop-tui")).len();
+        let session = RULES.len() + repo_rules(Some("qoop-si/qoop")).len();
         assert!(session <= 2400, "{session} chars at session start");
         assert!(
             RULES.contains("(`Lead:`)"),

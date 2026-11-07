@@ -7708,7 +7708,7 @@ mod tests {
         // The fold mark before the name and the name itself both fold.
         let rows = tree_rows(&spaces, &agents, 1, 16, &Seen::new(), &Shut::new());
         let head: String = rule_row(&rows, 1).text.chars().take(NAME_AT + 1).collect();
-        assert_eq!(head, "\u{25be}c");
+        assert_eq!(head, "\u{25be}a");
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let c = column(
             &spaces,
@@ -7980,7 +7980,7 @@ mod tests {
             ("WebFetch https://example.com", "web"),
             ("TodoWrite", "planning"),
             ("thinking", "thinking"),
-            ("mcp__crw__scrape https://x", "mcp__crw__scrape https://x"),
+            ("mcp__web__scrape https://x", "mcp__web__scrape https://x"),
             ("Bash", "running"),
             ("shell bash -lc 'git status'", "git status"),
             ("list /x/src", "searching /x/src"),
@@ -9620,7 +9620,7 @@ mod tests {
             "   \u{2514} claude \u{b7} app-feat-x"
         );
         // Same name in any case: the bare tab.
-        assert_eq!(row(Some("/home/u/app")), "   \u{2514} claude");
+        assert_eq!(row(Some("/home/u/APP")), "   \u{2514} claude");
         assert_eq!(row(Some("/home/u/app")), "   \u{2514} claude");
         // Root, empty, blank: no basename, the bare tab.
         assert_eq!(row(Some("/")), "   \u{2514} claude");
@@ -11315,7 +11315,7 @@ mod tests {
                     assert_eq!(col_of(&text(Hit::Title), &|ch| ch == 'a'), left, "{why}");
                     // A query that finds nobody leaves no space to compare with.
                     if at(Hit::Space(1)).is_some() {
-                        assert_eq!(col_of(&text(Hit::Space(1)), &|ch| ch == 'c'), left, "{why}");
+                        assert_eq!(col_of(&text(Hit::Space(1)), &|ch| ch == 'a'), left, "{why}");
                     }
                 }
             }

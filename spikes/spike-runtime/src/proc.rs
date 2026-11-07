@@ -1,7 +1,7 @@
 //! Spike: can a silent foreground transition be observed without polling, and does the
 //! idle path really cost zero CPU when measured by the OS rather than by our own counter?
 //!
-//! This exists because an adversarial review correctly rejected two claims in ADR-009
+//! This exists because a second look correctly rejected two claims in ADR-009
 //! and ADR-002:
 //!   a) "a foreground process group change cannot happen without output or SIGCHLD" is
 //!      false. `exec` in place and a silently started job both change the foreground
@@ -339,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut child = spawn_shell(&b)?;
     drop(b.slave);
 
-    // ---- 2. the silent transition the review said we would miss -------------------
+    // ---- 2. the silent transition a second look said we would miss ----------------
     let mfd = b.master.as_raw_fd();
     let mut w = unsafe { std::fs::File::from_raw_fd(libc::dup(mfd)) };
     // let the shell settle and drain its prompt

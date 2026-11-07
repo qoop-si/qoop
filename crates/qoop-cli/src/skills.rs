@@ -908,7 +908,7 @@ mod tests {
         // routine words and the doctor step;
         // `qoop qass brief` does the sums of "On every event line" for an
         // agent of this Mac; a remote agent keeps the sum by hand through on.sh; goals.md's rules
-        // keep the file small (no log, ended cards out, under 8 KB). 448 since the review of
+        // keep the file small (no log, ended cards out, under 8 KB). 448 since
         // 2026-10-13: the cap counted from his word, the merge ending's own cleanup, a replaced
         // card carried over, the stale-card sweep, design picks under his lesson, no parked bug
         // and his ask for a qoop agent. 452 since 2026-10-14: his watching switch (Start's check

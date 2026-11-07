@@ -2177,7 +2177,7 @@ mod tests {
 
     use super::*;
 
-    /// The three turn ends the devbox agent left him on 2026-10-12, two with no "?", ask him;
+    /// The three turn ends an agent left him, two with no "?", ask him;
     /// a report, a cut courtesy and a word that only starts like an offer do not.
     #[test]
     fn a_turn_end_asks_him_by_its_mark_or_its_offer() {

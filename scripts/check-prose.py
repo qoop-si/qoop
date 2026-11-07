@@ -23,7 +23,7 @@ TURKISH = re.compile("[\u011f\u0131\u015f\u0130\u011e\u015e]")
 # rule that is enforced over the documentation and not over the code is enforced over the
 # smaller half. `skills` and `hooks` are copied into people's own agent directories, so
 # they ship as surely as the binary does.
-roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "site", "README.md", ".github", ".qoop"]
+roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "site", "README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md", "CLA.md", ".github", ".qoop"]
 skip = ("ref/", "target/", "node_modules/")
 
 fail = []

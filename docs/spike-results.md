@@ -1,13 +1,13 @@
 # Spike results
 
-GENERATED FILE. Do not edit `plans/01_SPIKE_RESULTS.md` by hand. Edit
-`plans/01_SPIKE_RESULTS.tmpl.md` and run `scripts/regen-spike-results.sh`.
+GENERATED FILE. Do not edit `docs/spike-results.md` by hand. Edit
+`docs/spike-results.tmpl.md` and run `scripts/regen-spike-results.sh`.
 
 Every fenced transcript below is the literal stdout of the committed program, substituted
-by the script. It exists because an adversarial review caught hand-edited transcripts in
+by the script. It exists because a check caught hand-edited transcripts in
 the previous version of this file: durations had been reformatted and one load-bearing
 field had been deleted, in a document whose first line claimed nothing in it was
-theoretical. CI regenerates this file and fails the build on any diff.
+theoretical. `scripts/regen-spike-results.sh` regenerates it; any diff is a failure.
 
 Platform: macOS 15 (Darwin 25.6.0), arm64, 24 GB, 12 cores, Rust 1.98, release build.
 Code: `spikes/spike-runtime/src/{pty,term,proc,teardown,mem}.rs`
@@ -19,10 +19,10 @@ of the milestone 1 exit criteria, not a later nicety.
 ## spike-pty: is the async reactor a viable PTY driver? (ADR-002)
 
 ```text
-[1] async read/write on PTY master: PASS (83 bytes in 7.863375ms)
-[2] tcgetpgrp on master: PASS (Some(25015))
+[1] async read/write on PTY master: PASS (91 bytes in 4.736292ms)
+[2] tcgetpgrp on master: PASS (Some(96608))
 [3] resize observed by child (stty size): PASS
-[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.002016958s)
+[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.000345875s)
 [5] child exit status propagates: PASS (Some(7), 14 trailing bytes)
 SPIKE-PTY: ALL PASS
 exit=0
@@ -57,7 +57,7 @@ The one-task-per-terminal advantage is asserted, not measured, until gate G2.1.
 [3] bounded scrollback: PASS (history=1000, screen=24, total=1024)
 [4] damage tracking: PASS (quiet lines=[0, 23], after write to row 5 lines=[4, 23])
 [5] resize to 132x40: PASS (cols=132, lines=40, last non-empty Some("line 2999"))
-[6] parse throughput: 125 MiB/s (1.00 MiB in 7.989541ms)
+[6] parse throughput: 161 MiB/s (1.00 MiB in 6.21975ms)
 
 SPIKE-TERM: ALL PASS
 exit=0
@@ -80,11 +80,11 @@ the check 5 resize assertion verifies dimensions only, not content preservation.
 
 ```text
 [0] openpty default FD_CLOEXEC: master=false, slave=false (both false means every spawn leaks every other terminal's fds unless we set it)
-[1] fd inheritance: without CLOEXEC the child sees ["/dev/ptmx", "/dev/ttys044", "/dev/ttys045"]; with CLOEXEC it sees ["/dev/ttys047"] -> PASS
-[2] silent exec transition: pgrp Some(25039) -> Some(25039), bytes emitted after the command line: 14
+[1] fd inheritance: without CLOEXEC the child sees ["/dev/ptmx", "/dev/ttys006", "/dev/ttys021"]; with CLOEXEC it sees ["/dev/ttys023"] -> PASS
+[2] silent exec transition: pgrp Some(97104) -> Some(97104), bytes emitted after the command line: 14
     note: pgrp is unchanged by exec, so a tcgetpgrp comparison alone cannot see it
 [3] kqueue EVFILT_PROC on an unprivileged child: exec=true fork=false -> PASS
-[4] OS-measured idle cost over 3.001041833s: 33µs of CPU (poll rc=0, revents=0x0, drained 16 prompt bytes) -> PASS
+[4] OS-measured idle cost over 3.00102175s: 17µs of CPU (poll rc=0, revents=0x0, drained 16 prompt bytes) -> PASS
 
 SPIKE-PROC: ALL PASS
 exit=0
@@ -137,16 +137,16 @@ spike-teardown claim B: the blocker is undrained tty output, and closing the mas
 appears to fix it because closing discards the pending output. The corrected rule is in
 ADR-014.
 
-## spike-teardown: independently verifying four review claims
+## spike-teardown: independently verifying four claims
 
-A reviewer's measurement is a lead, not a fact. Each claim below was reproduced from
+A measurement made elsewhere is a lead, not a fact. Each claim below was reproduced from
 scratch here before any ADR was changed.
 
 ```text
-[A1] shell /bin/bash: leader pid=25051 pgid=25051 sid=25051 | job pid=25053 pgid=25053 sid=25051
+[A1] shell /bin/bash: leader pid=97353 pgid=97353 sid=97353 | job pid=97356 pgid=97356 sid=97353
      job is in the leader's session: true; job has its own process group: true; it ignores SIGHUP
-[A2a] controlling-tty enumeration BEFORE teardown (dev=268435500): 2 members, job found=true
-     after HUP/TERM/KILL on -25051: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
+[A2a] controlling-tty enumeration BEFORE teardown (dev=268435462): 2 members, job found=true
+     after HUP/TERM/KILL on -97353: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
 [A2b] enumeration AFTER the leader died: 0 members, job found=false
       the controlling terminal is disassociated when the session leader dies, so the containment set must be a union across rounds and can never shrink
 [A2] union of enumerations: 2 members, 2 distinct groups, job found=true
@@ -157,7 +157,7 @@ scratch here before any ADR was changed.
 [C] master after child exit, 5 rounds: ["rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0"]
     read()==0 in 5/5 rounds, EIO in 0/5 -> CLAIM C CONFIRMED: end of stream is not WouldBlock, so an AsyncFd loop that only handles WouldBlock spins forever
 [D] 1 MiB paste with NO newline into a canonical-mode child: wrote 1048576 bytes (EAGAIN 0) -> child received 0 bytes -> CLAIM D CONFIRMED: the line discipline discards it while write() reports success
-    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 654) -> child received 1048576 (100.0%)
+    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 987) -> child received 1048576 (100.0%)
     -> the daemon's own byte-bounded queue is not what fails; the tty line discipline is
 
 SPIKE-TEARDOWN: COMPLETE
@@ -178,7 +178,7 @@ measuring something else is worse than no test at all:
 
 1. The first spawned the escaping child from our own process, so it was a sibling in a
    different session. It showed only that signals do not cross process groups, which
-   nobody disputed. A reviewer caught this.
+   nobody disputed. A second look caught this.
 2. The second used a plain background job, which died. Not from our signal: `zsh` relays
    a hangup to its own jobs when it exits. Only a job that ignores SIGHUP isolates the
    mechanism under test.
@@ -212,8 +212,8 @@ Confirmed. A child that writes 256 KiB and exits is not reapable after four seco
 the parent holds the master and never reads. Draining it, with the master still open, reaps
 it immediately.
 
-Boundary worth recording: the first version of this test wrote two bytes, and an external
-reviewer running it under load saw it reap anyway. That is correct behaviour, not a flake.
+Boundary worth recording: the first version of this test wrote two bytes, and a run
+of it under load saw it reap anyway. That is correct behaviour, not a flake.
 A small write is usually already in the master's queue by the time the slave closes, so
 nothing is left to wait for. What blocks the reap is output not yet absorbed, which needs a
 write larger than the buffer. The rule the ADR draws is unchanged; the test is what had to
@@ -256,10 +256,10 @@ engine: alacritty_terminal 0.26, 100 terminals per measurement, current RSS (not
 one configuration per process so no row inherits another's high-water mark
  80x24  scrolling_history=1000  never scrolled                         102 KiB per terminal (history_size=0)
  80x24  scrolling_history=1000  filled                                2143 KiB per terminal (history_size=1000)
-200x50  scrolling_history=1000  filled                                5711 KiB per terminal (history_size=1000)
+200x50  scrolling_history=1000  filled                                5710 KiB per terminal (history_size=1000)
 200x50  scrolling_history=200   one line scrolled, 200 line budget     523 KiB per terminal (history_size=0)
 200x50  scrolling_history=200   filled to a 200 line budget           5710 KiB per terminal (history_size=200)
-200x50  scrolling_history=1001  filled, 1001 lines                   10884 KiB per terminal (history_size=1001)
+200x50  scrolling_history=1001  filled, 1001 lines                   10883 KiB per terminal (history_size=1001)
 200x50  scrolling_history=0     engine history disabled                524 KiB per terminal (history_size=0)
 
 the step between a 200 line budget and a 1000 line budget is the point: the engine

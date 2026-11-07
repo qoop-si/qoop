@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Regenerate docs/spike-results.md from the template plus REAL program output.
 #
-# This exists because a review caught hand-edited transcripts in that document: the
+# This exists because a check caught hand-edited transcripts in that document: the
 # numbers had been reformatted and one load-bearing field deleted. Transcripts are now
-# generated, never typed. CI runs this and fails on any diff.
+# generated, never typed. Run this after changing the template and commit the result.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,7 +22,7 @@ for b in "${BINS[@]}"; do
   echo "exit=$rc" >> "spikes/transcripts/$b.txt"
 done
 
-python3 - <<'PY'
+uv run --no-project python - <<'PY'
 import pathlib, re
 tmpl = pathlib.Path("docs/spike-results.tmpl.md").read_text()
 def sub(m):

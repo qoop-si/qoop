@@ -15,8 +15,8 @@ would make unrelated sessions appear to exit together.
 
 The first draft of this ADR replaced enumeration with "containment identity is the
 session, so signalling `-pgid` is sufficient and there is nothing to race against". A
-second review said that was wrong and measured it. It was reproduced here from scratch
-before this ADR was changed, because a reviewer's measurement is a lead, not a fact.
+later measurement said that was wrong. It was reproduced here from scratch before this
+ADR was changed, because a measurement made elsewhere is a lead, not a fact.
 
 ## What was measured
 
@@ -42,8 +42,8 @@ reapable is undrained tty output, not the parent holding the master open. A chil
 writes 256 KiB and exits is still unreaped after four seconds while the parent holds the
 master and never reads; draining it, with the master still open, reaps it immediately.
 
-The boundary: the first version of this test wrote two bytes, and an external reviewer
-running it under load saw it reap anyway. That is correct kernel behaviour rather than a
+The boundary: the first version of this test wrote two bytes, and a run of it under
+load saw it reap anyway. That is correct kernel behaviour rather than a
 flake. A small write is usually already sitting in the master's queue by the time the slave
 closes, so there is nothing left to wait for. What blocks the reap is output that has not
 yet been absorbed, which needs a write larger than the buffer. The design rule is unchanged
@@ -97,7 +97,7 @@ seen, because leaving is exactly what the kernel makes it do.
 **The enumeration API is not the obvious one, and its return value is not what it looks
 like.** `sysctl` with `KERN_PROC_SESSION`, which is the correct constant name
 (`KERN_PROC_SID` does not exist), returns `kinfo_proc`, which the `libc` crate does not
-expose on Apple platforms; a reviewer also measured that selector returning `ENOENT` on
+expose on Apple platforms; that selector was also measured returning `ENOENT` on
 macOS 15, so the binding is not the only obstacle. The implementable route is
 `proc_listallpids` followed by `proc_pidinfo(PROC_PIDTBSDINFO)`, filtering on `e_tdev`.
 

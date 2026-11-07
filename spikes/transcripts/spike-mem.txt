@@ -6,7 +6,7 @@ one configuration per process so no row inherits another's high-water mark
 200x50  scrolling_history=200   one line scrolled, 200 line budget     523 KiB per terminal (history_size=0)
 200x50  scrolling_history=200   filled to a 200 line budget           5710 KiB per terminal (history_size=200)
 200x50  scrolling_history=1001  filled, 1001 lines                   10883 KiB per terminal (history_size=1001)
-200x50  scrolling_history=0     engine history disabled                523 KiB per terminal (history_size=0)
+200x50  scrolling_history=0     engine history disabled                524 KiB per terminal (history_size=0)
 
 the step between a 200 line budget and a 1000 line budget is the point: the engine
 allocates in 1000 row chunks, so a line count below 1000 buys no memory back

@@ -141,9 +141,9 @@ while `qoop qass watch` reads on or `resumed` and none of yours runs: start it (
      brief's first line says idle under 15 min: `hands off until <now + (15 - those min) × 60>`.
      Still stopped after it (or idle for unknown time), no one is answering. `T<k>'s prompt`, T<n>'s
      last words wait on T<k>, T<k> idle or done with nothing running on its row, its brief allowing
-     a write, no `nudged` on T<n>'s line: `qoop prompt <k> --generation <its G> -- 'T<n> has waited
-     since <hh:mm> on your answer to its last message; answer it in T<n> (qoop prompt <n>) or tell
-     it to go on.'` plus the fence, then `nudged T<k>, hands off until <now + 900>` on T<n>'s line.
+     a write, no `nudged` on T<n>'s line: `qoop prompt <k> --generation <its G>
+     -- 'T<n> has waited since <hh:mm> on your answer to its last message; answer it in T<n>
+     (qoop prompt <n>) or tell it to go on.'` plus the fence, then `nudged T<k>, hands off until <now + 900>` on T<n>'s line.
      T<k> busy: `hands off until <now + 300>`, for 30 min at most. Else (it waits on no one; a
      teammate: its own team reported and went quiet; T<k> gone, asleep or not writable; `nudged`
      already there): it is yours, by the table. A new stop of T<n> drops `nudged`.

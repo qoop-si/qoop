@@ -24,7 +24,7 @@ VT correctness at the cost of a Zig toolchain in the build, an FFI surface with 
 `spike-term`, `alacritty_terminal` 0.26:
 
 The transcript is in `docs/spike-results.md`, generated from the program's stdout
-rather than typed, and deliberately not copied here: a review found hand-edited numbers in
+rather than typed, and deliberately not copied here: a check found hand-edited numbers in
 exactly this kind of inline copy, so the repository keeps one generated copy of every
 transcript and ADRs cite it by section.
 

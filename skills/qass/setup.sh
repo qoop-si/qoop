@@ -719,7 +719,7 @@ status() {
     if [ -z "$next" ]; then echo "setup done"; exit 0; fi
     [ "$s2" = yes ] || echo "Repos somewhere else? Type: /qass setup <folder>"
     echo 'Not for you: `skip <n>`. Pause: `later` (`/qass setup` brings it back). Take back what I wrote: `undo`.'
-    # Measured in the isolated run of plans/2026-10-11-qass-setup/; what was not timed gets none.
+    # Measured in an isolated setup run; what was not timed gets none.
     case $next in
     1) took=" (under a minute)" ;; 2) took=" (about 2 to 3 minutes a project)" ;;
     3) took=" (about a minute)" ;; 6) took=" (about 2 minutes)" ;;

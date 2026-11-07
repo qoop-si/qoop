@@ -1359,7 +1359,7 @@ fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
     assert_eq!(stage(&stack, &link), "waiting-human");
 
     // His prompt in the tab answers it: the stage goes back and the draft closes.
-    stack.send(&link, "SAID evet yap");
+    stack.send(&link, "SAID yes do it");
     assert!(stack.wait(|| stack.card_status(&card) == "closed"));
     assert_eq!(stage(&stack, &link), began);
 

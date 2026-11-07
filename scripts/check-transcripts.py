@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Gate G0.4: the spike transcripts are generated, and they still say what they said.
 
-The first version of this gate diffed the generated document byte for byte. Two reviewers
-independently measured that it can never pass: the transcripts embed pids, wall-clock
+The first version of this gate diffed the generated document byte for byte. Two separate
+measurements showed that it can never pass: the transcripts embed pids, wall-clock
 durations, throughput, byte counts and RSS figures, all of which change on every run. A
 gate that is red on every green pull request gets deleted, and the hand-typed transcript
 comes straight back, which is the exact failure this file exists to prevent.
@@ -95,7 +95,7 @@ def main() -> int:
     # 0. Read and normalise the COMMITTED document before regenerating anything.
     #
     # The first version of this checker regenerated first and then normalised, so what it
-    # examined was always the fresh output and never what a human had committed. A reviewer
+    # examined was always the fresh output and never what a human had committed. A test
     # edited "CLAIM A CONFIRMED" to "CLAIM A REFUTED" in the committed file and the gate
     # still printed OK. Comparing before against after is what actually proves the committed
     # document came from a real run, and it is the property the byte-diff version had.
@@ -160,7 +160,7 @@ def main() -> int:
             f"{baseline.relative_to(root)} is missing. It is a committed artefact, not "
             "something this gate creates: a self-seeding baseline makes the gate green "
             "against any content. Regenerate it deliberately with "
-            "QOOP_WRITE_BASELINE=1 python3 scripts/check-transcripts.py"
+            "QOOP_WRITE_BASELINE=1 uv run --no-project python scripts/check-transcripts.py"
         )
         if __import__("os").environ.get("QOOP_WRITE_BASELINE") == "1":
             baseline.write_text(current)

@@ -3884,7 +3884,7 @@ mod tests {
     #[test]
     fn a_prompt_from_another_tab_names_its_sender() {
         let mut lead = row(519, Some("ui-ux-audit"), Some("claude"));
-        lead.agent_title = Some("player repo analysis".into());
+        lead.agent_title = Some("Billing repo analysis".into());
         let mut plain = row(546, Some("claude"), Some("claude"));
         plain.agent_title = Some("Fix the qass stall".into());
         let bare = row(7, None, Some("codex"));

@@ -1,7 +1,7 @@
-[A1] shell /bin/bash: leader pid=96282 pgid=96282 sid=96282 | job pid=96283 pgid=96283 sid=96282
+[A1] shell /bin/bash: leader pid=97353 pgid=97353 sid=97353 | job pid=97356 pgid=97356 sid=97353
      job is in the leader's session: true; job has its own process group: true; it ignores SIGHUP
-[A2a] controlling-tty enumeration BEFORE teardown (dev=268435479): 2 members, job found=true
-     after HUP/TERM/KILL on -96282: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
+[A2a] controlling-tty enumeration BEFORE teardown (dev=268435462): 2 members, job found=true
+     after HUP/TERM/KILL on -97353: leader_alive=false job_alive=true -> CLAIM A CONFIRMED: process-group teardown leaves the job running
 [A2b] enumeration AFTER the leader died: 0 members, job found=false
       the controlling terminal is disassociated when the session leader dies, so the containment set must be a union across rounds and can never shrink
 [A2] union of enumerations: 2 members, 2 distinct groups, job found=true
@@ -12,7 +12,7 @@
 [C] master after child exit, 5 rounds: ["rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0", "rc=1 revents=0x11 read=0 errno=0"]
     read()==0 in 5/5 rounds, EIO in 0/5 -> CLAIM C CONFIRMED: end of stream is not WouldBlock, so an AsyncFd loop that only handles WouldBlock spins forever
 [D] 1 MiB paste with NO newline into a canonical-mode child: wrote 1048576 bytes (EAGAIN 0) -> child received 0 bytes -> CLAIM D CONFIRMED: the line discipline discards it while write() reports success
-    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 628) -> child received 1048576 (100.0%)
+    control, newline-terminated 1 KiB lines: wrote 1048576 (EAGAIN 987) -> child received 1048576 (100.0%)
     -> the daemon's own byte-bounded queue is not what fails; the tty line discipline is
 
 SPIKE-TEARDOWN: COMPLETE

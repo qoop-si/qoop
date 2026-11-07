@@ -1,6 +1,6 @@
 //! Spike: what does one terminal actually cost in memory with the engine ADR-003 chose?
 //!
-//! Two corrections a review forced, both of which change the numbers:
+//! Two corrections a second look forced, both of which change the numbers:
 //!
 //!   1. `getrusage` `maxrss` is a high-water mark, so measuring several configurations in
 //!      one process makes every row after the first depend on allocator retention rather

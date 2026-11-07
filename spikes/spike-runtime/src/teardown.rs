@@ -1,6 +1,6 @@
-//! Spike: independently verify five claims made by an adversarial review that
-//! contradict what ADR-014, ADR-002 and the plan currently say. A reviewer's measurement
-//! is a lead, not a fact, so each is reproduced here from scratch.
+//! Spike: independently verify five claims that contradict what ADR-014, ADR-002 and
+//! the plan currently say. A measurement made elsewhere is a lead, not a fact, so each is
+//! reproduced here from scratch.
 //!
 //! Claims under test:
 //!   A. `kill(-pgid)` of a session leader does not reach a job that called
@@ -130,7 +130,7 @@ fn drain(fd: RawFd) -> usize {
 /// Enumerate every process whose controlling terminal is this PTY, which is what
 /// ADR-014's containment needs.
 ///
-/// Two corrections a review forced. First, the constant is `KERN_PROC_SESSION`, not
+/// Two corrections a second look forced. First, the constant is `KERN_PROC_SESSION`, not
 /// `KERN_PROC_SID`, which does not exist. Second, `sysctl` with either selector returns
 /// `kinfo_proc`, and the libc crate does not expose that type on Apple platforms, so the
 /// sysctl route is not implementable from safe Rust without hand-declaring a large and
@@ -149,8 +149,8 @@ fn tty_members(tty_dev: u64) -> Vec<(i32, i32)> {
     if n <= 0 {
         return Vec::new();
     }
-    // `proc_listallpids` returns the number of PIDS, not a number of bytes. A review
-    // caught this being divided by four, which silently discarded three quarters of the
+    // `proc_listallpids` returns the number of PIDS, not a number of bytes. A second
+    // look caught this being divided by four, which silently discarded three quarters of the
     // table, and because the list comes back newest first the discarded quarter was the
     // oldest processes, which is exactly what containment needs. Verified directly: the
     // return value equals the index after the last non-zero entry and equals `ps -ax`.
@@ -272,7 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The first version of this test spawned the "escapee" from our own process, so it
         // was a sibling in our session rather than a member of the leader's. It still
         // showed that a pgid-scoped signal does not cross process groups, but it did not
-        // model the case the ADR is about. A reviewer caught that and was right.
+        // model the case the ADR is about. A second look caught that.
         let (master, slave) = open_pty(80, 24)?;
         set_nonblocking(master.as_raw_fd());
         let tty_dev = tty_dev_of(slave.as_raw_fd());
@@ -461,7 +461,7 @@ so the containment set must be a union across rounds and can never shrink"
         // The child writes more than the master's buffer can absorb and then exits
         // cleanly. The parent holds the master and never reads.
         //
-        // An earlier version wrote two bytes, and an external reviewer running under load
+        // An earlier version wrote two bytes, and a run of it under load
         // saw it reap anyway. That is correct behaviour, not a flake in the kernel: a
         // small write is usually already sitting in the master's queue by the time the
         // slave closes, so there is nothing left to wait for. The blocking condition is

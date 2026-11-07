@@ -1783,13 +1783,13 @@ mod tests {
 
     #[test]
     fn a_watch_is_drawn_from_the_daemons_words_and_its_form_asks_for_the_command() {
-        let mut watch = info(1, "app-errors");
+        let mut watch = info(1, "shop-errors");
         (watch.cron, watch.watch) = (None, Some("tail log | grep ERROR".to_string()));
         watch.when = "on change, every 5m".to_string();
         watch.next_at = Some(at(8, 5));
         let rows = painted(&pane(vec![watch]), 60, 8).join("\n");
         assert!(
-            rows.contains("app-errors") && rows.contains("on change, every 5m"),
+            rows.contains("shop-errors") && rows.contains("on change, every 5m"),
             "{rows}"
         );
         let mut open = pane(Vec::new());

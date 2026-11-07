@@ -1,8 +1,8 @@
 //! `qoop doctor`: whether the board, qass's questions and the agents tell one truth.
 //!
 //! Read-only on the store: four reads through the daemon (the agents, the board, the open
-//! tasks, the live cards), checked against the invariants in
-//! `plans/2026-10-12-sync-architecture.md`. One line per finding, nothing when all hold. It never acts: qass, or the owner, does what a line says.
+//! tasks, the live cards), checked against the sync invariants. One line per finding,
+//! nothing when all hold. It never acts: qass, or the owner, does what a line says.
 //! Exit 0 when clean, 1 with findings, 3 when a read could not be made (a daemon from before
 //! it, or one that did not answer), each skipped check named so silence never means "not
 //! checked". `--new <file>` prints only findings whose id is not in the file and writes the

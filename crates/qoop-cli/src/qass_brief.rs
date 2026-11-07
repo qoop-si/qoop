@@ -411,7 +411,7 @@ fn compose(f: &Facts) -> (Vec<String>, serde_json::Value) {
 
     // Which of the skill's three prompt endings: merge in the owner's own repository, else the
     // strict one; the middle one (`pr`) where that repository's files ask before merging.
-    // Work a stranger's note started (`report:`, as it was opened) stops at the PR: its AGENTS.md.
+    // Work a stranger's note started (`report:`, as it was opened) stops at the PR.
     // An unreadable task may be a report: it gets the PR too.
     let report = task.is_some_and(|t| reported(&t.first_goal)) || matches!(f.task, Some(Err(_)));
     let end = match (f.own.is_some(), report) {

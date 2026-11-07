@@ -409,8 +409,8 @@ mod tests {
         assert!(!is_github(&base_of(None)));
         assert_eq!(base_of(Some("file:///tmp/rel/".into())), "file:///tmp/rel");
         assert!(!is_github("file:///tmp/rel"));
-        let github = base_of(Some("https://api.github.com/repos/pat/qoop/releases".into()));
-        assert_eq!(github, "https://api.github.com/repos/pat/qoop/releases");
+        let github = base_of(Some("https://api.github.com/repos/pat/app/releases".into()));
+        assert_eq!(github, "https://api.github.com/repos/pat/app/releases");
         assert!(is_github(&github));
     }
 
@@ -431,8 +431,8 @@ mod tests {
         ));
         assert!(!within_base(base, "http://qoop.si/releases/x"));
         assert!(within_base(
-            "https://api.github.com/repos/pat/qoop/releases",
-            "https://api.github.com/repos/pat/qoop/releases/assets/1"
+            "https://api.github.com/repos/pat/app/releases",
+            "https://api.github.com/repos/pat/app/releases/assets/1"
         ));
         assert!(within_base("file:///tmp/rel", "file:///elsewhere/qoop.tgz"));
     }
@@ -474,10 +474,10 @@ mod tests {
             "tag_name": "v0.4.0",
             "assets": [
                 {"name": "qoop-aarch64-apple-darwin.tar.gz",
-                 "url": "https://api.github.com/repos/pat/qoop/releases/assets/1",
+                 "url": "https://api.github.com/repos/pat/app/releases/assets/1",
                  "browser_download_url": "https://example.invalid/qoop.tgz"},
                 {"name": "qoop-aarch64-apple-darwin.tar.gz.sha256",
-                 "url": "https://api.github.com/repos/pat/qoop/releases/assets/2",
+                 "url": "https://api.github.com/repos/pat/app/releases/assets/2",
                  "browser_download_url": "https://example.invalid/qoop.tgz.sha256"},
             ],
         });
@@ -487,11 +487,11 @@ mod tests {
         // with a token.
         assert_eq!(
             release.asset_url,
-            "https://api.github.com/repos/pat/qoop/releases/assets/1"
+            "https://api.github.com/repos/pat/app/releases/assets/1"
         );
         assert_eq!(
             release.checksum_url.as_deref(),
-            Some("https://api.github.com/repos/pat/qoop/releases/assets/2")
+            Some("https://api.github.com/repos/pat/app/releases/assets/2")
         );
     }
 

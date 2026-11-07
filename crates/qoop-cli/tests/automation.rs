@@ -231,7 +231,7 @@ fn verbs_refuse_without_a_daemon_and_start_none() {
 
 #[test]
 fn prompt_wait_ends_when_a_prompt_folded_into_the_running_turn_settles() {
-    // The reviewer's case: the agent is working when the prompt lands, reports one
+    // The folded case: the agent is working when the prompt lands, reports one
     // `done` and nothing busy after it. One foreground process for the whole run, so the
     // hook's belief holds instead of being reset by a new generation.
     let daemon = Daemon::start();

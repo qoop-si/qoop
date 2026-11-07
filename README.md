@@ -53,7 +53,8 @@ Type `claude` or `codex` in there. macOS and Linux.
 ## Docs
 
 Everything else lives in the [docs](https://qoop.si/docs/): keys, spaces and
-splits, servers, the phone, qass, hooks, settings, building from source.
+splits, servers, the phone, qass, hooks, settings. To build the open part from source, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 

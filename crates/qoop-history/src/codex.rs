@@ -337,12 +337,12 @@ mod tests {
                 "event_msg",
                 serde_json::json!({"type": "item_completed",
                     "item": {"type": "McpToolCall", "id": "m1", "server": "app",
-                        "tool": "app_search", "arguments": {"query": "x"}}})
+                        "tool": "web_search", "arguments": {"query": "x"}}})
             ),
         );
         let (msgs, _) = read_all(&data);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, Role::Assistant);
-        assert!(msgs[0].text.contains("app_search"));
+        assert!(msgs[0].text.contains("web_search"));
     }
 }

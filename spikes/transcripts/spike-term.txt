@@ -3,7 +3,7 @@
 [3] bounded scrollback: PASS (history=1000, screen=24, total=1024)
 [4] damage tracking: PASS (quiet lines=[0, 23], after write to row 5 lines=[4, 23])
 [5] resize to 132x40: PASS (cols=132, lines=40, last non-empty Some("line 2999"))
-[6] parse throughput: 125 MiB/s (1.00 MiB in 8.011959ms)
+[6] parse throughput: 161 MiB/s (1.00 MiB in 6.21975ms)
 
 SPIKE-TERM: ALL PASS
 exit=0

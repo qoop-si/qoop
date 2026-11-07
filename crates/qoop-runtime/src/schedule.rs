@@ -119,7 +119,8 @@ pub struct Zone {
 /// The machine's own zone: `tzset`, `localtime_r` and `mktime`, read at every call so a
 /// zone changed while the daemon runs is seen at the next look.
 pub fn system_zone() -> Zone {
-    // POSIX, in every libc, though the `libc` crate does not declare it.
+    // SAFETY: `tzset` is POSIX, in every libc, with this signature, though the `libc` crate
+    // does not declare it.
     unsafe extern "C" {
         fn tzset();
     }

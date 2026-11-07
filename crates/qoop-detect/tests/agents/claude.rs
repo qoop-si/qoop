@@ -574,7 +574,7 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
         Idle,
     );
     // Claude compacts an idle session before its prompt cache expires and says so; its
-    // suggested next prompt sits in the composer (tab 456, 2026-10-25).
+    // suggested next prompt sits in the composer.
     assert_rule(
         "claude",
         &[
@@ -583,14 +583,14 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
             "⏺ Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json",
             "",
             RULE,
-            "❯ deploy, then try it live",
+            "❯ deploy it, then try it live",
             RULE,
             footer,
         ],
         "draft_after_turn",
         Idle,
     );
-    // A narrower pane wraps that note, its tail indented two columns (tab 644, 2026-11-07).
+    // A narrower pane wraps that note, its tail indented two columns.
     assert_rule(
         "claude",
         &[

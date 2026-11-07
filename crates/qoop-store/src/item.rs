@@ -1685,8 +1685,7 @@ mod tests {
     #[test]
     fn titles_are_cut_to_fit_a_card_and_nothing_is_lost() {
         let (s, ws, t) = setup();
-        let long =
-            "Fix app #614: config only_main_content honored as scrape default (PR #615 live)";
+        let long = "Fix app #614: config show_hidden_files honored as list default (PR #615 live)";
         let (item, _) = s.add_item(ws, long, "", 10).unwrap();
         let card = s.item_card(item, 11).unwrap().unwrap();
         assert_eq!(card.item.task.goal, "Fix app #614: config");

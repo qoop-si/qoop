@@ -1625,7 +1625,7 @@ const COMMON: &[&str] = &[
     "they", "this", "what", "when", "which", "will", "with", "would", "your",
 ];
 
-/// `T5` is a tab on this machine, `build1/T5` a tab on the remote called build1.
+/// `T5` is a tab on this machine, `devbox/T5` a tab on the remote called devbox.
 fn parse_ref(token: &str) -> Option<(Option<&str>, u32)> {
     let (remote, tab) = match token.rsplit_once('/') {
         Some((remote, tab)) => (Some(remote), tab),
@@ -1640,7 +1640,7 @@ fn parse_ref(token: &str) -> Option<(Option<&str>, u32)> {
 }
 
 /// The tab of that reference among `rows`: a remote tab is told by its number in its own
-/// daemon and by the remote's name, which starts its space's name (`build1:<space>`).
+/// daemon and by the remote's name, which starts its space's name (`devbox:<space>`).
 fn tab_of(
     (remote, n): (Option<&str>, u32),
     rows: &[AgentRow],
@@ -1743,7 +1743,7 @@ fn named(said: &str, rows: &[&AgentRow]) -> Option<u32> {
 
 /// The tab Talk it through opens for `card`: the agent it is about, `None` for a card about
 /// nothing, which goes to qass. The first hit wins: the card's terminal; its `T5` or
-/// `build1/T5` agent; such a reference in its words; the one agent whose name or folder its
+/// `devbox/T5` agent; such a reference in its words; the one agent whose name or folder its
 /// words name. The phone's `talkRoute` (mobile/src/ui/asks.ts) follows the same order.
 pub fn talk_target(card: &AskInfo, rows: &[AgentRow], spaces: &[WorkspaceRow]) -> Option<u32> {
     let b = &card.body;
@@ -2292,7 +2292,7 @@ mod tests {
 
     /// The words of every card that ends stay on screen, one card's never in place of
     /// another's, until an esc outside typing and the whole view; `t`, an answer and the whole
-    /// view keep them. The four orders the final review found losing words.
+    /// view keep them. The four orders once found losing words.
     #[test]
     fn words_that_can_no_longer_be_sent_stay_until_esc() {
         // The frame's words in one line, so words wrapped over two rows still read as typed.
@@ -2929,21 +2929,21 @@ mod tests {
     }
 
     /// Talk it through goes to the agent the card is about, in the phone's order: its terminal,
-    /// its `T5` or `build1/T5` agent, such a reference in its words, the agent its words name.
+    /// its `T5` or `devbox/T5` agent, such a reference in its words, the agent its words name.
     #[test]
     fn talk_it_through_goes_to_the_agent_the_card_is_about() {
-        let mut c = card(1, "limitless", "open");
+        let mut c = card(1, "websearch", "open");
         c.agent = None;
         c.terminal = None;
         let qass_space = 9;
         let spaces = vec![
             space_row(qass_space, sidebar::QASS_SPACE),
-            space_row((1 << 40) | 2, "build1:main"),
+            space_row((1 << 40) | 2, "devbox:main"),
         ];
         let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 25;
         let mut rows = vec![
             row_at(3, qass_space, Some("qass"), None),
-            row_at(8, 1, None, Some("/Users/pat/coding/app")),
+            row_at(8, 1, None, Some("/Users/pat/coding/blog")),
             row_at(639, 1, None, Some("/Users/pat/coding/shop")),
             row_at(644, 1, None, Some("/Users/pat/coding/shop")),
             row_at(remote, (1 << 40) | 2, None, None),
@@ -2957,9 +2957,9 @@ mod tests {
         assert_eq!(talk_target(&c, &rows, &spaces), Some(639));
         c.terminal = None;
         // A remote agent, told by its remote's name and its number there (E581 live).
-        c.agent = Some("build1/T25".to_string());
+        c.agent = Some("devbox/T25".to_string());
         assert_eq!(talk_target(&c, &rows, &spaces), Some(remote));
-        c.agent = Some("build2/T25".to_string());
+        c.agent = Some("build1/T25".to_string());
         assert_eq!(talk_target(&c, &rows, &spaces), None);
         // A terminal that is gone is no tab: the card's agent, else qass.
         c.terminal = Some(77);
@@ -2978,9 +2978,9 @@ mod tests {
         c.body.doing = "T8-worker is stuck".to_string();
         assert_eq!(talk_target(&c, &rows, &spaces), Some(8));
         c.body.doing = "wrote migration 0042".to_string();
-        // E601: nothing but "shop" in its words and two agents in the shop folder, the last active wins.
+        // E601: nothing but "Shop" in its words and two agents in the shop folder, the last active wins.
         c.body.handle = "shoppay".to_string();
-        c.body.asks = "Stripe account and mail sender for shop?".to_string();
+        c.body.asks = "Stripe account and mail sender for Shop?".to_string();
         assert_eq!(talk_target(&c, &rows, &spaces), Some(644));
         // The card's task is an agent's task.
         c.body.asks = "Which one?".to_string();

@@ -750,43 +750,43 @@ mod tests {
     #[test]
     fn an_own_repo_is_an_origin_on_github_whose_owner_is_the_login() {
         for url in [
-            "git@github.com:pat/qoop-tui.git",
-            "git@github.com:pat/qoop-tui",
-            "ssh://git@github.com/pat/qoop-tui.git",
-            "ssh://git@github.com:22/pat/qoop-tui/",
-            "https://github.com/pat/qoop-tui",
-            "https://github.com/pat/qoop-tui.git/",
-            "https://us:token@github.com/pat/qoop-tui.git",
-            "https://GitHub.com/PAT/qoop-tui",
+            "git@github.com:pat/app.git",
+            "git@github.com:pat/app",
+            "ssh://git@github.com/pat/app.git",
+            "ssh://git@github.com:22/pat/app/",
+            "https://github.com/pat/app",
+            "https://github.com/pat/app.git/",
+            "https://pat:token@github.com/pat/app.git",
+            "https://GitHub.com/PAT/app",
         ] {
             assert!(
-                owned(url, "Us").is_some_and(|r| r.eq_ignore_ascii_case("pat/qoop-tui")),
+                owned(url, "Pat").is_some_and(|r| r.eq_ignore_ascii_case("pat/app")),
                 "{url}"
             );
         }
         assert_eq!(
-            owned("git@github.com:pat/qoop.si.git", "us").as_deref(),
-            Some("pat/qoop.si")
+            owned("git@github.com:pat/my.site.git", "pat").as_deref(),
+            Some("pat/my.site")
         );
         for (url, login) in [
-            ("git@github.com:bigco/app.git", "us"),
-            ("git@github.example.com:pat/x.git", "us"),
-            ("https://github.com.evil.io/pat/x", "us"),
-            ("https://gitlab.com/pat/x", "us"),
+            ("git@github.com:bigco/app.git", "pat"),
+            ("git@github.example.com:pat/x.git", "pat"),
+            ("https://github.com.evil.io/pat/x", "pat"),
+            ("https://gitlab.com/pat/x", "pat"),
             ("git@github.com:pat/x.git", ""),
-            ("git@github.com:pat/x/y.git", "us"),
-            ("git@github.com:pat/.git", "us"),
-            ("/src/pat/x", "us"),
-            ("./a/b:pat/x", "us"),
-            ("https://evil.com#@github.com/pat/x", "us"),
-            ("https://evil.com?@github.com/pat/x", "us"),
-            ("https://evil.com#/@github.com/pat/x", "us"),
-            ("https://evil.com\\@github.com/pat/x", "us"),
-            ("https://evil.com @github.com/pat/x", "us"),
-            ("https://evil.com\t@github.com/pat/x", "us"),
-            ("https://github.com/pat/x?y=1", "us"),
-            ("https://github.com/pat/x#frag", "us"),
-            ("", "us"),
+            ("git@github.com:pat/x/y.git", "pat"),
+            ("git@github.com:pat/.git", "pat"),
+            ("/src/pat/x", "pat"),
+            ("./a/b:pat/x", "pat"),
+            ("https://evil.com#@github.com/pat/x", "pat"),
+            ("https://evil.com?@github.com/pat/x", "pat"),
+            ("https://evil.com#/@github.com/pat/x", "pat"),
+            ("https://evil.com\\@github.com/pat/x", "pat"),
+            ("https://evil.com @github.com/pat/x", "pat"),
+            ("https://evil.com\t@github.com/pat/x", "pat"),
+            ("https://github.com/pat/x?y=1", "pat"),
+            ("https://github.com/pat/x#frag", "pat"),
+            ("", "pat"),
         ] {
             assert_eq!(owned(url, login), None, "{url} as {login:?}");
         }
@@ -816,7 +816,7 @@ mod tests {
             assert!(ok, "git {args:?}");
         };
         let gh = at("gh");
-        std::fs::write(&gh, "#!/bin/sh\necho Us\n").expect("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho Pat\n").expect("gh");
         std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         for (name, origin) in [
@@ -905,7 +905,7 @@ mod tests {
         );
         std::fs::write(&gh, "#!/bin/sh\necho\n").expect("gh");
         assert_eq!(own(&at("own")), None, "no login");
-        std::fs::write(&gh, "#!/bin/sh\necho us\nexit 1\n").expect("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho pat\nexit 1\n").expect("gh");
         assert_eq!(own(&at("own")), None, "gh failed");
     }
 
@@ -929,7 +929,7 @@ mod tests {
             assert!(ok, "git {args:?}");
         };
         let gh = at("gh");
-        std::fs::write(&gh, "#!/bin/sh\necho us\n").expect("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho pat\n").expect("gh");
         std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         for name in ["named/qoop", "elsewhere/qoop"] {

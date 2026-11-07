@@ -2426,7 +2426,7 @@ mod tests {
         // Nothing to say it with: the name and the summary.
         assert_eq!(said("TodoWrite", "3 items"), "TodoWrite 3 items");
         assert_eq!(said("Skill", "ship"), "Skill ship");
-        assert_eq!(said("mcp__crw__search", "q"), "mcp__crw__search q");
+        assert_eq!(said("mcp__web__search", "q"), "mcp__web__search q");
         assert_eq!(said("Mystery", ""), "Mystery");
         // A tool that only mentions a word is not that tool.
         assert_eq!(said("KillShell", "12345"), "KillShell 12345");

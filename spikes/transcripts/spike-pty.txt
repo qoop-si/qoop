@@ -1,7 +1,7 @@
-[1] async read/write on PTY master: PASS (83 bytes in 9.089167ms)
-[2] tcgetpgrp on master: PASS (Some(96254))
+[1] async read/write on PTY master: PASS (91 bytes in 4.736292ms)
+[2] tcgetpgrp on master: PASS (Some(96608))
 [3] resize observed by child (stty size): PASS
-[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.00103475s)
+[4] idle 3s with no output: PASS (settled after 4 rounds / 8 bytes; no readiness for 3.000345875s)
 [5] child exit status propagates: PASS (Some(7), 14 trailing bytes)
 SPIKE-PTY: ALL PASS
 exit=0

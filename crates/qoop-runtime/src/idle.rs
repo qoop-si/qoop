@@ -1081,7 +1081,7 @@ mod tests {
             row(20, 10, 20, Some(5), "codex"),
             row(21, 20, 21, Some(5), "npm"),
             row(22, 21, 21, Some(5), "node"),
-            row(23, 20, 23, Some(5), "app-mcp"),
+            row(23, 20, 23, Some(5), "shop-mcp"),
             row(24, 23, 24, Some(5), "Google Chrome"),
         ];
         assert!(sleep_blockers(&t, 10, Some(20), 5, &|_| false).is_empty());
