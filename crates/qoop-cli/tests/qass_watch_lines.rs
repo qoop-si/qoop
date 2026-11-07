@@ -1533,3 +1533,122 @@ fn a_remote_same_rest_again_is_held_again() {
         );
     }
 }
+
+/// The `again` hold doubles for each time the rest was said in a row (the said line's run), at
+/// most an hour: none or 0 gives 600 s, then 1200, 2400, 3600, and 3600 past that.
+#[test]
+fn the_again_hold_doubles_with_the_run_up_to_an_hour() {
+    for (run, hold) in [
+        ("", 600),
+        (" 0", 600),
+        (" 1", 1200),
+        (" 2", 2400),
+        (" 3", 3600),
+        (" 7", 3600),
+    ] {
+        let w = Watch::new();
+        let now = now();
+        w.put(
+            "data/said",
+            &format!(
+                "5 1 idle implementing {} 90.1 {}{run}\n",
+                now - 2000,
+                now - 1000
+            ),
+        );
+        w.put(
+            "data/last.json",
+            &rows(&[staged("working", "implementing", "?")]),
+        );
+        w.snaps(&[rows(&[staged("idle", "implementing", "100.1")])]);
+        let (lines, _) = w.run(0, &[]);
+        assert!(lines.is_empty(), "run{run}: {lines:?}");
+        let (due, arr, _) = again_entry(&w);
+        assert!(
+            (hold..hold + 3).contains(&(due - arr)),
+            "run{run}: due {due}, arrival {arr}"
+        );
+    }
+}
+
+/// Saying the rest said last again counts one more in its run; after a write from qass, or for
+/// another rest, the run is 0.
+#[test]
+fn saying_the_same_rest_again_counts_its_run() {
+    let snaps = [rows(&[staged("idle", "implementing", "100.1")])];
+    let env = [("QASS_QUIET_HOLD", "5")];
+    let (lines, w) = rest_again(Some("implementing"), None, &snaps, 11, &env);
+    assert_eq!(lines, [staged_line("implementing", "100.1")]);
+    assert!(
+        w.read("data/said").trim_end().ends_with(" 1"),
+        "{}",
+        w.read("data/said")
+    );
+
+    let (lines, w) = rest_again(Some("implementing"), Some(1500), &snaps, 0, &[]);
+    assert_eq!(lines, [staged_line("implementing", "100.1")]);
+    assert!(
+        w.read("data/said").trim_end().ends_with(" 0"),
+        "{}",
+        w.read("data/said")
+    );
+
+    let (lines, w) = rest_again(Some("investigating"), None, &snaps, 0, &[]);
+    assert_eq!(lines, [staged_line("implementing", "100.1")]);
+    assert!(
+        w.read("data/said").trim_end().ends_with(" 0"),
+        "{}",
+        w.read("data/said")
+    );
+}
+
+/// The backoff caps at an hour whatever QASS_QUIET_HOLD is under it, and at QASS_QUIET_HOLD over
+/// it; an `again` line over a held ride keeps its own backoff, not the ride's earlier due.
+#[test]
+fn the_again_backoff_caps_and_outlasts_a_held_ride() {
+    let w = Watch::new();
+    let now = now();
+    w.put(
+        "data/said",
+        &format!(
+            "5 1 idle implementing {} 90.1 {} 3\n",
+            now - 2000,
+            now - 1000
+        ),
+    );
+    w.put(
+        "data/last.json",
+        &rows(&[staged("working", "implementing", "?")]),
+    );
+    w.snaps(&[rows(&[staged("idle", "implementing", "100.1")])]);
+    let (_, _) = w.run(0, &[("QASS_QUIET_HOLD", "4000")]);
+    let (due, arr, _) = again_entry(&w);
+    assert!(
+        (4000..4003).contains(&(due - arr)),
+        "due {due}, arrival {arr}"
+    );
+
+    let w = Watch::new();
+    w.put(
+        "data/said",
+        &format!(
+            "5 1 idle implementing {} 90.1 {} 3\n",
+            now - 2000,
+            now - 1000
+        ),
+    );
+    let ride = r#"T5 g1 claude idle->sleeping "w" /tmp/x stop:? task:12:implementing"#;
+    w.put(
+        "data/held",
+        &format!("5 1 ride {} {} {ride}\n", now + 500, now - 100),
+    );
+    w.put(
+        "data/last.json",
+        &rows(&[staged("working", "implementing", "?")]),
+    );
+    w.snaps(&[rows(&[staged("idle", "implementing", "100.1")])]);
+    let (lines, _) = w.run(0, &[]);
+    assert!(lines.is_empty(), "{lines:?}");
+    let (due, _, _) = again_entry(&w);
+    assert!(due >= now + 3600, "due {due}, now {now}");
+}

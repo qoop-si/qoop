@@ -54,11 +54,13 @@
 #   ago, and no write from qass since, is the same rest again (it woke for its own background
 #   notice or a teammate's message and stopped where it was): held `again`, below, a remote
 #   agent's too.
-# - Again: the same rest again is held QASS_QUIET_HOLD seconds (600) and said only if the agent is
-#   still there then, never riding along with another block; a snapshot with that agent working
-#   drops it (`again: dropped at work` in quiet.log), and a new stop of it starts the hold over.
-#   A real stall reaches qass in 10 minutes; an agent that keeps waking for its own notices and
-#   stopping is said at least once an hour, when a stop finds its last line over an hour old.
+# - Again: the same rest again is held QASS_QUIET_HOLD seconds (600), doubled for each time that
+#   rest was said in a row with no write from qass since (`again_hold`, the said line's run: 10, 20,
+#   40, then 60 minutes), and said only if the agent is still there then, never riding along with
+#   another block; a snapshot with that agent working drops it (`again: dropped at work` in
+#   quiet.log), and a new stop of it starts the hold over. A write from qass starts the run over.
+#   An agent that keeps waking for its own notices and stopping where it was is said at most about
+#   once an hour, and at least once an hour, when a stop finds its last line over an hour old.
 # - Long hold (QASS_QUIET_HOLD, 600 s from its first line): everything else, an agent woken
 #   by its own background work, or one another agent drives. It rides along with any earlier
 #   block.
@@ -358,7 +360,7 @@ tag_line() { # line tag
 # A machine's own files: "" is this Mac, any other label a remote.
 snapshot_file() { if [ -z "$1" ]; then echo "$dir/last.json"; else echo "$dir/last-$1.json"; fi; }
 # Quiet: its held lines, "<t> <gen> <short|long|ride|routine|person> <due> <arrival> <line>", and
-# its said lines, "<t> <gen> <state> <stage> <arrival> <stop> <printed>". Not the settle files: an older watcher still
+# its said lines, "<t> <gen> <state> <stage> <arrival> <stop> <printed> <run>". Not the settle files: an older watcher still
 # running from an older install reads and clears those.
 held_file() { if [ -z "$1" ]; then echo "$dir/held"; else echo "$dir/held-$1"; fi; }
 said_file() { if [ -z "$1" ]; then echo "$dir/said"; else echo "$dir/said-$1"; fi; }
@@ -413,7 +415,7 @@ parse_line() {
 }
 
 # The said line of terminal $2 on machine $1, as "<t> <gen> <state> <stage> <arrival> <stop>
-# <printed>" (an older watcher's has the first five).
+# <printed> <run>" (an older watcher's has the first five or seven).
 said_of() { grep "^$2 " "$(said_file "$1")" 2>/dev/null | tail -1 || true; }
 
 # Whether a line is said at once (see the top of this file). Run parse_line first.
@@ -516,6 +518,7 @@ hold_put() { # label terminal generation class line [due]
         short) due=$((now + settle)) ;;
         routine) due=$((now + rhold)) ;;
         person) due="$6" ;;
+        again) due=$((now + $(again_hold "$1" "$2"))) ;;
         *) due=$((now + qhold)) ;;
     esac
     read -r o_t o_g o_class o_due o_arr o_line <<< "$(grep "^$2 " "$f" 2>/dev/null | tail -1 || true)"
@@ -524,7 +527,8 @@ hold_put() { # label terminal generation class line [due]
     elif [ -n "${o_t:-}" ] && [ "$o_class" = person ] && [ "$o_due" -gt "$now" ]; then
         class=person due="$o_due" arr="$o_arr"
     elif [ -n "${o_t:-}" ]; then
-        [ "$o_due" -ge "$due" ] || due="$o_due"
+        # An `again` line over a ride (a sleep, a repeat) keeps its own backoff, not the ride's due.
+        [ "$class.$o_class" = again.ride ] || [ "$o_due" -ge "$due" ] || due="$o_due"
         arr="$o_arr"
         # A routine line is the agent's newest word: it never inherits an earlier class.
         [ "$class" != routine ] || { due=$((now + rhold)); arr="$now"; }
@@ -534,7 +538,7 @@ hold_put() { # label terminal generation class line [due]
         # The same rest again on a new stop: the agent worked in between, seen or not, so its
         # hold starts over from now.
         [ "$class.$o_class" != again.again ] || [ "$(stop_of "$5")" = "$(stop_of "${o_line:-}")" ] ||
-            due=$((now + qhold))
+            due=$((now + $(again_hold "$1" "$2")))
         case "$class.$o_class" in
             routine.*) ;;
             short.* | *.short) class=short ;;
@@ -571,12 +575,30 @@ handled_repeat() { # label line
 # than that makes the agent's next line short), its stop and when it went out (A3's handled
 # rule). A closed agent is forgotten.
 said_put() { # line arrival printed
-    local f
+    local f s_t s_gen s_state s_stage s_arr s_stop s_printed s_run r_at r_from run=0 _
     parse_line "$1" || return 0
     f="$(said_file "$L_LABEL")"
+    # The run: how many times in a row this rest was said before, with no write from qass since.
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed s_run _ <<< "$(said_of "$L_LABEL" "$L_T")"
+    read -r r_at r_from <<< "$(record_of "$L_T" "$L_LABEL")"
+    if [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ] && [ "${s_stage:-}" = "$L_STAGE$L_CLAIMED" ] &&
+        [ "${r_at:-}" != unreadable ] && { [ -z "${r_at:-}" ] || [ "${r_from:-}" != "$self" ] || [ "$r_at" -lt "$s_arr" ]; }; then
+        run=$((${s_run:-0} + 1))
+        # The same stop said again (it rode along with a block): the agent did not stop anew.
+        [ "$L_STOP" = "?" ] || [ "${s_stop:-}" != "$L_STOP" ] || run="${s_run:-0}"
+    fi
     { grep -v "^$L_T " "$f" 2>/dev/null || true
-      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE${L_CLAIMED} $2 $L_STOP $3"; } > "$f.tmp"
+      [ "$L_STATE" = closed ] || echo "$L_T $L_G $L_STATE $L_STAGE${L_CLAIMED} $2 $L_STOP $3 $run"; } > "$f.tmp"
     mv "$f.tmp" "$f"
+}
+
+# The `again` hold of terminal $2 on machine $1: QASS_QUIET_HOLD doubled for each time its rest was
+# said in a row (the said line's run), at most an hour: 10, 20, 40, then 60 minutes.
+again_hold() { # label terminal
+    local s_t s_gen s_state s_stage s_arr s_stop s_printed s_run h _
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed s_run _ <<< "$(said_of "$1" "$2")"
+    h=$((qhold << (${s_run:-0} > 3 ? 3 : ${s_run:-0})))
+    echo $((h < (qhold > 3600 ? qhold : 3600) ? h : (qhold > 3600 ? qhold : 3600)))
 }
 
 # Whether the stop of terminal $1 printed at $2 was handled: qass's own row (this Mac's last
