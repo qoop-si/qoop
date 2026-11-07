@@ -775,6 +775,7 @@ async fn plan_write(
 }
 
 fn info(t: TaskRow, tab: Tab, waiting_at: Option<i64>) -> TaskInfo {
+    let asleep_since = tab.asleep_since;
     let (state, status_at) = task_status(&t, waiting_at, tab);
     TaskInfo {
         id: t.id,
@@ -790,6 +791,7 @@ fn info(t: TaskRow, tab: Tab, waiting_at: Option<i64>) -> TaskInfo {
         folder: t.folder,
         status: state.as_str().to_string(),
         status_at,
+        asleep_since,
     }
 }
 

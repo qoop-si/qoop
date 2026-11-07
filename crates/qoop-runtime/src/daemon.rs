@@ -5351,6 +5351,7 @@ async fn handle_control(
             session,
             event,
             label,
+            said,
             from,
             ..
         } => {
@@ -5531,6 +5532,9 @@ async fn handle_control(
                         // The agent ended its turn waiting on the owner: his inbox shows it,
                         // with the question the hook read from the turn's last words.
                         if kind == "done" {
+                            // Its closing words, whole, for the card a question gets; only when
+                            // the turn asks him, like the label.
+                            agents.set_said(terminal, said.as_deref().filter(|_| label.is_some()));
                             let name = agent_names(terminals, vec![terminal])
                                 .await
                                 .remove(&i64::from(terminal));

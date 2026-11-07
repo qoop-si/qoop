@@ -120,39 +120,69 @@ def one_line(text, limit=120):
     return single[:limit]
 
 
-def paragraph_of(text):
-    """The last paragraph of a message as one line. Its last paragraph, whatever it says: the
-    daemon decides whether it asks them (a "?", or an offer such as "if you like, I can ...").
-    Each line's markdown off. (A backtick is chr(96): one written out would end the shell's
+def paragraphs_of(text, count):
+    """The last `count` paragraphs of a message, oldest first, each as one line with each
+    line's markdown off. (A backtick is chr(96): one written out would end the shell's
     command substitution.)"""
-    paragraph = []
+    paragraphs, paragraph = [], []
     for text_line in reversed(text.splitlines()):
         bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
         if bare:
             paragraph.insert(0, bare)
         elif paragraph:
-            break
-    return ends_kept(" ".join(paragraph))
+            paragraphs.insert(0, " ".join(paragraph))
+            paragraph = []
+            if len(paragraphs) == count:
+                break
+    if paragraph and len(paragraphs) < count:
+        paragraphs.insert(0, " ".join(paragraph))
+    return paragraphs
+
+
+def paragraph_of(text):
+    """The last paragraph of a message as one line. Its last paragraph, whatever it says: the
+    daemon decides whether it asks them (a "?", or an offer such as "if you like, I can ...")."""
+    last = paragraphs_of(text, 1)
+    return ends_kept(last[0]) if last else ""
+
+
+def said_of(text):
+    """The turn's closing words for the owner's card: the paragraph before the last (what it
+    just did, at most 300 characters) and the last (its question, at most 600), a blank line
+    between. Cut at a word, never in the middle."""
+    parts = paragraphs_of(text, 2)
+    if not parts:
+        return ""
+    limits = [300, 600][-len(parts):]
+    return "\n\n".join(cut_at_word(p, n) for p, n in zip(parts, limits))
+
+
+def cut_at_word(text, limit):
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]
+    at = head.rfind(" ")
+    return (head[:at] if at > limit // 2 else head).rstrip() + "\u2026"
 
 
 def last_paragraph(payload):
-    """The last paragraph of the turn's last message as one line: the Stop payload's own
-    "last_assistant_message" (the transcript is written after the hook can run, so it may
-    not hold the turn yet), else read from the end of the transcript; "" when the turn has
-    none or it cannot be read."""
+    """The last paragraph of the turn's last message as one line, and the turn's closing words
+    for the card (`said_of`): the Stop payload's own "last_assistant_message" (the transcript
+    is written after the hook can run, so it may not hold the turn yet), else read from the end
+    of the transcript; "" for both when the turn has none or it cannot be read."""
     said = payload.get("last_assistant_message")
     if isinstance(said, str) and said.strip():
-        return paragraph_of(said)
+        return paragraph_of(said), said_of(said)
     path = payload.get("transcript_path")
     if not isinstance(path, str) or not path:
-        return ""
+        return "", ""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             f.seek(max(0, f.tell() - 262144))
             lines = f.read().decode("utf-8", "replace").splitlines()
     except Exception:
-        return ""
+        return "", ""
     for line in reversed(lines):
         try:
             entry = json.loads(line)
@@ -167,15 +197,16 @@ def last_paragraph(payload):
             results = isinstance(content, list) and any(
                 isinstance(c, dict) and c.get("type") == "tool_result" for c in content)
             if not results:
-                return ""
+                return "", ""
             continue
         if message.get("role") != "assistant":
             continue
         texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
         if not texts:
             continue
-        return paragraph_of("\n".join(texts))
-    return ""
+        joined = "\n".join(texts)
+        return paragraph_of(joined), said_of(joined)
+    return "", ""
 
 
 def ends_kept(text, limit=120):
@@ -276,6 +307,8 @@ if agent and flag:
 # and the screen's idle composer took it away again a moment later.
 if agent:
     raise SystemExit(0)
+# The closing words a turn end carries for the owner's card; only `Stop` has any.
+said = ""
 if name == "SessionStart":
     # A session opening, resuming or clearing is not a turn: `starting`, so an
     # agent the screen then reads as idle is not news that it finished. A
@@ -320,7 +353,8 @@ elif name == "Notification":
     label = kind if kind in ("elicitation_dialog", "elicitation_url_dialog") else ""
     state, flags, event = "blocked", "--visible-blocker", "blocked"
 elif name == "Stop":
-    state, flags, event, label = "idle", "--visible-idle", "done", last_paragraph(payload)
+    state, flags, event = "idle", "--visible-idle", "done"
+    label, said = last_paragraph(payload)
 elif name == "SessionEnd":
     state, flags, event, label = "idle", "--visible-idle", "done", ""
 elif name == "StopFailure":
@@ -356,6 +390,8 @@ if event:
     args += ["--event", event]
 if label:
     args += ["--label", label]
+if said:
+    args += ["--said", said]
 if session:
     args += ["--session-id", session]
 if state:

@@ -2061,6 +2061,31 @@ mod tests {
         // yet (it is written after the hook runs): the payload's message is the label.
         let said = stop("", Some("Built it.\n\nMerge now?"));
         assert!(said.contains("--event|done|--label|Merge now?|"), "{said}");
+        // The card's own words: what it did and the whole question, a blank line between,
+        // markdown off; the label stays the cut line the question reading judges.
+        assert!(said.contains("--said|Built it.\n\nMerge now?|"), "{said}");
+        let said = stop("", Some(&format!("Done.\n\n{long}")));
+        let whole = said
+            .split("--said|")
+            .nth(1)
+            .and_then(|l| l.split('|').next())
+            .unwrap_or_default();
+        assert!(whole.starts_with("Done.\n\nIstersen "), "{whole}");
+        assert!(
+            whole.ends_with("mi?"),
+            "whole, never cut in the middle: {whole}"
+        );
+        let cut = format!("{}?", "word ".repeat(200));
+        let said = stop("", Some(&cut));
+        let whole = said
+            .split("--said|")
+            .nth(1)
+            .and_then(|l| l.split('|').next())
+            .unwrap_or_default();
+        assert!(
+            whole.chars().count() <= 600 && whole.ends_with("word\u{2026}"),
+            "cut at a word: {whole}"
+        );
     }
 
     /// What a subagent fires describes the subagent: its tool calls and its end would

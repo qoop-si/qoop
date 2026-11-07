@@ -421,6 +421,13 @@ pub enum ControlRequest {
         /// words; a label without an event is refused by the CLI.
         #[serde(default)]
         label: Option<String>,
+        /// A turn end's closing words, for the owner's card only: the paragraph before the
+        /// last and the last, a blank line between, each whole up to the hook's cut. The
+        /// question reading still judges `label`. Masked before a card holds it; never
+        /// journalled or pushed. Absent from older hooks.
+        /// Boxed: a report is the commonest request, and the field must not grow every one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        said: Option<Box<str>>,
         /// The agent whose hook sent this (`claude`, `codex`, ...). A report from another
         /// agent than the terminal's own is refused: an agent the terminal's agent started (Claude
         /// running `codex exec` as a reviewer) inherits the terminal and its token, and would
@@ -1014,6 +1021,10 @@ pub enum AskResult {
 /// The longest one value of a card may be, in characters.
 pub const ASK_FIELD_MAX: usize = 200;
 
+/// The longest a card's question may be: the whole question an agent closed its turn with,
+/// which the card shows folded to three lines and whole when opened.
+pub const ASK_QUESTION_MAX: usize = 600;
+
 /// One option of a card: what a tap sends and why it is offered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskOption {
@@ -1059,7 +1070,7 @@ impl AskCard {
         let mut out = Vec::new();
         check_value(&mut out, "doing", &self.doing);
         check_value(&mut out, "why", &self.why);
-        check_value(&mut out, "asks", &self.asks);
+        check_value_within(&mut out, "asks", &self.asks, ASK_QUESTION_MAX);
         if let Some(asked) = &self.asked {
             check_value(&mut out, "asked", asked);
         }
@@ -1099,6 +1110,11 @@ impl AskCard {
 
 /// One value of a card: not empty, one line, within `ASK_FIELD_MAX`.
 fn check_value(out: &mut Vec<String>, what: &str, text: &str) {
+    check_value_within(out, what, text, ASK_FIELD_MAX);
+}
+
+/// [`check_value`] within `max` characters.
+fn check_value_within(out: &mut Vec<String>, what: &str, text: &str, max: usize) {
     if text.chars().any(char::is_control) {
         out.push(format!("{what} holds a control character or a newline"));
     }
@@ -1106,9 +1122,9 @@ fn check_value(out: &mut Vec<String>, what: &str, text: &str) {
         out.push(format!("{what} is empty"));
     }
     let len = text.chars().count();
-    if len > ASK_FIELD_MAX {
+    if len > max {
         out.push(format!(
-            "{what} is {len} characters, over the {ASK_FIELD_MAX} limit; shorten it"
+            "{what} is {len} characters, over the {max} limit; shorten it"
         ));
     }
 }
@@ -1754,6 +1770,10 @@ pub struct TaskInfo {
     pub status: String,
     #[serde(default)]
     pub status_at: i64,
+    /// Since when its tab sleeps, when it does: a waiting task reads `waits` asleep or not, and
+    /// a list folds the asleep ones apart. `None` awake and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<i64>,
 }
 
 /// One thing recorded on a task.
@@ -3437,6 +3457,7 @@ mod tests {
                 session: None,
                 event: Some("tool".into()),
                 label: Some("Read foo.rs".into()),
+                said: None,
             },
             ControlRequest::ReloadAgentManifests { id: "e".into() },
         ] {
@@ -3468,6 +3489,7 @@ mod tests {
                 session: None,
                 event: None,
                 label: None,
+                said: None,
             }
         );
     }

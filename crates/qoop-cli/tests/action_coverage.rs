@@ -339,6 +339,7 @@ fn actions() -> Vec<Action> {
                     session: None,
                     event: None,
                     label: None,
+                    said: None,
                 })
             },
         },
@@ -872,6 +873,7 @@ fn every_control_method_is_reachable_from_some_action() {
             session: None,
             event: None,
             label: None,
+            said: None,
         },
         ControlRequest::ReportAgentSession {
             from: None,

@@ -56,6 +56,7 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
                 session: None,
                 event: None,
                 label: None,
+                said: None,
             },
             PATIENCE,
         )
@@ -121,6 +122,7 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
                 session: None,
                 event: None,
                 label: None,
+                said: None,
             },
             PATIENCE,
         )
@@ -282,6 +284,7 @@ async fn the_row_names_the_stop_of_each_turn_end() {
                     session: None,
                     event: Some(event.into()),
                     label: None,
+                    said: None,
                 },
                 PATIENCE,
             )

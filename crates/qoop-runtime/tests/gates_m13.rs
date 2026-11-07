@@ -637,6 +637,7 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
                 session: Some("stolen-id".into()),
                 event: Some("tool".into()),
                 label: Some("Read foo.rs".into()),
+                said: None,
             },
             qoop_testkit::PATIENCE,
         )
@@ -662,6 +663,7 @@ async fn g13_9_a_reported_session_id_is_recorded_and_a_forged_report_is_not() {
                 session: Some("abc-123".into()),
                 event: None,
                 label: None,
+                said: None,
             },
             qoop_testkit::PATIENCE,
         )

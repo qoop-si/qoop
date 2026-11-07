@@ -25430,7 +25430,7 @@ mod tests {
             .join("\n");
             assert!(state.questions().is_some(), "{cols}: {:?}", state.message);
             assert!(!state.collapsed, "the column keeps its fold at {cols}");
-            for word in ASKS.split(' ').chain(["[a]", "[b]"]) {
+            for word in ASKS.split(' ').chain(["[1]", "[2]"]) {
                 assert!(painted.contains(word), "{word:?} at {cols}:\n{painted}");
             }
             // Closed, the keyboard is back on the board it came from.
@@ -26463,20 +26463,28 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{needle} not painted"))
         };
-        let (row, col) = at(find("2 cv"), side.x + 8);
+        // Where a word stands in its painted row, in cells.
+        let col_of = |row: usize, needle: &str| {
+            let line = strip(&painted[row]);
+            let at = line.find(needle).expect("painted");
+            line[..at].chars().count()
+        };
+        // A folded card: its head row opens it, each answer and its reply are a click.
+        let (row, col) = at(find(" cv "), side.x + 4);
         assert_eq!(
             state.ask_click(row, col),
             Some(AskClick::Inbox(crate::asks::Hit::Card(1)))
         );
-        let (row, col) = at(find("[b] pick b"), side.x + 8);
+        let answers = find("[2] pick b");
+        let (row, col) = at(answers, col_of(answers, "[2] pick b") + 1);
         assert_eq!(
             state.ask_click(row, col),
-            Some(AskClick::Inbox(crate::asks::Hit::Option(1)))
+            Some(AskClick::Inbox(crate::asks::Hit::Answer(0, 1)))
         );
-        let (row, col) = at(find("t to type"), side.x + 8);
+        let (row, col) = at(answers, col_of(answers, "[r] Reply") + 1);
         assert_eq!(
             state.ask_click(row, col),
-            Some(AskClick::Inbox(crate::asks::Hit::Box))
+            Some(AskClick::Inbox(crate::asks::Hit::Reply(0)))
         );
         // A cell of the inbox with nothing to press, and the chat.
         let (row, col) = at(find("questions"), side.x + side.cols - 3);
@@ -26545,9 +26553,9 @@ mod tests {
         state.asks.focus = true;
         let taken = asks_keys(&mut state, b"\x1b", 1);
         assert!(taken.resize && !state.qass_ui.inbox && !state.asks.focus);
-        // Enter on a card goes to its agent's tab.
+        // `g` on a card goes to its agent's tab (enter opens the card in place).
         asks_toggle(&mut state);
-        let taken = asks_keys(&mut state, b"\r", 1);
+        let taken = asks_keys(&mut state, b"g", 1);
         assert_eq!(taken.jump, Some(1));
         assert!(!state.asks.focus);
         // `o` on a card about an agent goes to that agent's tab, not to qass.

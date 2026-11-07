@@ -1,7 +1,10 @@
-//! The question inbox pane: the cards qass keeps for the owner, as a list over the open card.
+//! The question inbox pane: the cards qass keeps for the owner, each folded to its question and
+//! its numbered answers, one of them opened in place.
 //!
-//! Beside qass's terminal (or in its place, in a narrow pane) the owner reads one card in full
-//! and answers it with one key or tap, or in his own words in the one text box. Everything
+//! Beside qass's terminal (or in its place, in a narrow pane) the owner answers a card with one
+//! key or click (`1` to `9`), opens it (enter) to read what he asked, what the agent did, why it
+//! needs him, the whole question and what each answer sends, or replies in his own words (`r`)
+//! in the one text box. Everything
 //! here is a pure function of the cards the daemon sent and of what this client remembers (which
 //! card is open, what is typed, the answer being held), so a test reads the pane instead of
 //! looking at one.
@@ -71,8 +74,8 @@ pub struct Pane {
     /// The read is owed: a change event came, or the first read has not been asked.
     pub stale: bool,
     selected: usize,
-    /// The option whose words show under it, by position in the open card.
-    preview: Option<usize>,
+    /// The selected card is opened in place (enter); the others stay folded.
+    expanded: bool,
     typing: bool,
     text: String,
     /// The card the words in the box were begun for, and its agent's handle.
@@ -134,7 +137,12 @@ impl Pane {
         (self.loaded && !self.unsupported).then(|| self.waiting())
     }
 
-    /// The open card, if any.
+    /// Whether the selected card shows in full: opened with enter, or holding his words.
+    pub fn is_open(&self) -> bool {
+        self.expanded || self.typing || !self.text.is_empty()
+    }
+
+    /// The selected card, the one a key answers.
     pub fn open_card(&self) -> Option<&AskInfo> {
         self.live
             .get(self.selected.min(self.live.len().saturating_sub(1)))
@@ -157,7 +165,13 @@ impl Pane {
             .and_then(|k| self.live.iter().position(|c| c.card == *k))
             .unwrap_or(self.selected)
             .min(self.live.len().saturating_sub(1));
-        self.preview = None;
+        // A card that took the open one's place is read folded first.
+        if keep
+            .as_ref()
+            .is_none_or(|k| self.open_card().is_none_or(|c| c.card != *k))
+        {
+            self.expanded = false;
+        }
         // Words kept for a card are not for the one that took its place: they wait for their
         // card. While he types they stay, his card answered, dismissed or closed elsewhere (the
         // phone) or not: the keys stay in the box, so no letter of his becomes a command (`j` to
@@ -491,7 +505,7 @@ impl Pane {
                 _ => self.open_card().map(|c| c.card.clone()),
             };
             self.selected = at;
-            self.preview = None;
+            self.expanded = false;
             self.typing = false;
             self.swap_draft(from);
             // A failure stays over a move between cards: only esc or typing takes it.
@@ -508,6 +522,7 @@ impl Pane {
             self.typing_for = Some((c.card.clone(), c.body.handle.clone()));
             self.typing = true;
             // The box and its caret are on screen while typing.
+            self.expanded = true;
             self.whole = false;
             self.notice = None;
             self.notice_until = None;
@@ -524,34 +539,6 @@ impl Pane {
             at.saturating_sub(1)
         };
         self.select(to);
-    }
-
-    /// Move the previewed option by one.
-    fn step_option(&mut self, down: bool) {
-        let Some(card) = self.open_card() else {
-            return;
-        };
-        let n = card.body.options.len();
-        if n == 0 {
-            return;
-        }
-        let now = self.preview_at(card);
-        self.preview = Some(if down {
-            (now + 1) % n
-        } else {
-            (now + n - 1) % n
-        });
-    }
-
-    /// The option whose words show: the one he moved to, else qass's pick, else the first.
-    fn preview_at(&self, card: &AskInfo) -> usize {
-        self.preview
-            .filter(|i| *i < card.body.options.len())
-            .or_else(|| {
-                let pick = card.body.pick.as_ref()?;
-                card.body.options.iter().position(|o| o.key == pick.key)
-            })
-            .unwrap_or(0)
     }
 
     /// A key, or the bytes of several. `prefix` is the interface's prefix byte, which with a
@@ -620,25 +607,23 @@ impl Pane {
                 };
                 Out::Stay
             }
-            Key::Up => {
-                self.step_option(false);
-                Out::Stay
-            }
-            Key::Down => {
-                self.step_option(true);
-                Out::Stay
-            }
             Key::Char(b'\t') => Out::ToChat,
-            Key::Char(b'j') => {
+            Key::Char(b'j') | Key::Down => {
                 self.step(true);
                 Out::Stay
             }
-            Key::Char(b'k') => {
+            Key::Char(b'k') | Key::Up => {
                 self.step(false);
                 Out::Stay
             }
-            Key::Char(c @ b'a'..=b'd') => {
-                let at = (c - b'a') as usize;
+            // `1` to `9`, or `a` to `d` as before: the answer drawn with that number. One not
+            // drawn (cut to the room) takes no key.
+            Key::Char(c @ (b'1'..=b'9' | b'a'..=b'd')) => {
+                let at = (if c.is_ascii_digit() {
+                    c - b'1'
+                } else {
+                    c - b'a'
+                }) as usize;
                 if self.shown.get().is_none_or(|n| at < n) {
                     self.press_option(at);
                 }
@@ -649,7 +634,8 @@ impl Pane {
                 self.whole_at = 0;
                 Out::Stay
             }
-            Key::Char(b't') => {
+            // `t` types as it always did; `r` (reply) is the same.
+            Key::Char(b't' | b'r') => {
                 self.start_typing();
                 Out::Stay
             }
@@ -657,7 +643,16 @@ impl Pane {
                 self.dismiss();
                 Out::Stay
             }
-            Key::Char(b'\r' | b'\n') => match self.open_card().and_then(|c| c.terminal) {
+            // Enter opens the card in place, and folds it again.
+            Key::Char(b'\r' | b'\n') if self.whole => Out::Stay,
+            Key::Char(b'\r' | b'\n') => {
+                if self.open_card().is_some() {
+                    self.expanded = !self.expanded;
+                }
+                Out::Stay
+            }
+            // `g` goes to the card's tab, which enter did before it opened the card.
+            Key::Char(b'g') => match self.open_card().and_then(|c| c.terminal) {
                 Some(terminal) => Out::Jump(terminal),
                 None => Out::Stay,
             },
@@ -709,9 +704,27 @@ impl Pane {
     /// A click on something the view drew.
     pub fn click(&mut self, hit: Hit) -> Out {
         match hit {
-            Hit::Card(at) => self.select(at),
+            Hit::Card(at) if at == self.selected && self.open_card().is_some() => {
+                self.expanded = !self.expanded;
+            }
+            Hit::Card(at) => {
+                self.select(at);
+                self.expanded = true;
+            }
             Hit::Option(at) => {
                 self.press_option(at);
+            }
+            Hit::Answer(card, at) => {
+                if card != self.selected {
+                    self.select(card);
+                }
+                self.press_option(at);
+            }
+            Hit::Reply(card) => {
+                if card != self.selected {
+                    self.select(card);
+                }
+                self.start_typing();
             }
             Hit::Box => self.start_typing(),
             Hit::Board => {
@@ -743,10 +756,14 @@ enum Key {
 /// What a click in the inbox landed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
-    /// A card in the list, by position.
+    /// A card's heading, by position: opens it in place, or folds it when it is the open one.
     Card(usize),
     /// An option of the open card, by position.
     Option(usize),
+    /// An answer on a folded card's row: the card by position, then the option.
+    Answer(usize, usize),
+    /// `[r] Reply` on a folded card's row, by position.
+    Reply(usize),
     /// The text box.
     Box,
     /// The second tab.
@@ -902,18 +919,21 @@ fn tag_of(card: &AskInfo, ctx: &Ctx) -> Option<String> {
 /// box and the key line still fit; else it is cut, and `m` reads it whole.
 const SIDE_ROWS: usize = 8;
 
-/// The rows each card text needs at its width, as many as `SIDE_ROWS` allows.
-/// `reasons` is the rows each option reason takes.
+/// The rows each card text needs at its width, as many as `SIDE_ROWS` allows; none for a part
+/// the card has not got (no `asked`, a generic `why`).
 struct Lens {
     ask: usize,
     asked: usize,
     doing: usize,
     why: usize,
-    pick: usize,
-    sends: usize,
+    /// Per option: the rows its reason, its `suggested because` and the words it sends take.
     reasons: Vec<usize>,
+    becauses: Vec<usize>,
+    sends: Vec<usize>,
     /// The card has a row under its title (a tag such as `asleep`, or its item): it is kept.
     tag: bool,
+    /// A label takes a row of its own over its text: a narrow pane.
+    stacked: bool,
 }
 
 /// How the pane is divided between the parts, given its height.
@@ -922,72 +942,66 @@ struct Budget {
     ask: usize,
     /// The most rows each side text takes: it falls to 1, a cut row, as the pane gets short.
     side: usize,
-    list: usize,
+    /// How many other cards stay folded around the open one.
+    others: usize,
     asked: bool,
     why: bool,
     gap_top: bool,
     gap_box: bool,
-    pick: bool,
+    because: bool,
     sends: bool,
     doing: bool,
-    /// The text box, which a short pane drops while it holds no words (`t` brings it back).
+    /// The text box, which a short pane drops while it holds no words (`r` brings it back).
     text_box: bool,
     /// The blank row under the card's title, where a tag would stand.
     head_gap: bool,
     handled: usize,
 }
 
-fn budget(
-    inner_rows: usize,
-    cards: usize,
-    options: usize,
-    has_asked: bool,
-    has_pick: bool,
-    words: bool,
-    lens: &Lens,
-) -> Budget {
+/// `others` is how many other cards could stay folded, each `folded` rows tall.
+fn budget(inner_rows: usize, others: usize, folded: usize, words: bool, lens: &Lens) -> Budget {
     let mut b = Budget {
         ask: lens.ask,
         side: SIDE_ROWS,
-        list: cards.clamp(1, 5),
-        asked: has_asked,
-        why: true,
+        others: others.min(4),
+        asked: lens.asked > 0,
+        why: lens.why > 0,
         gap_top: true,
         gap_box: true,
-        pick: has_pick,
+        because: lens.becauses.iter().any(|&n| n > 0),
         sends: true,
-        doing: true,
+        doing: lens.doing > 0,
         text_box: true,
         head_gap: true,
         handled: 5,
     };
     let need = |b: &Budget| {
-        // tabs, rule, list, rule, hints, and the detail below.
-        let more = |on: bool, n: usize| usize::from(on) * (n.min(b.side) - 1);
+        let label = usize::from(lens.stacked);
+        let part = |on: bool, n: usize| if on { label + n.min(b.side) } else { 0 };
+        let rows = |on: bool, v: &[usize]| {
+            if on {
+                v.iter().map(|&n| n.min(b.side)).sum::<usize>()
+            } else {
+                0
+            }
+        };
+        // The title, the row under it, the thread, the question, every answer with its parts,
+        // and the box.
         let detail = 1
             + usize::from(b.head_gap)
-            + b.ask
-            + more(b.asked, lens.asked)
-            + more(b.doing, lens.doing)
-            + more(b.why, lens.why)
-            + more(b.pick, lens.pick)
-            + more(b.sends, lens.sends)
-            + lens
-                .reasons
-                .iter()
-                .map(|&n| n.min(b.side) - 1)
-                .sum::<usize>()
-            + usize::from(b.asked)
-            + usize::from(b.doing)
-            + usize::from(b.why)
+            + part(b.asked, lens.asked)
+            + part(b.doing, lens.doing)
+            + part(b.why, lens.why)
             + usize::from(b.gap_top)
-            + options
-            + usize::from(b.sends)
-            + usize::from(b.pick)
+            + b.ask
+            + rows(true, &lens.reasons)
+            + rows(b.because, &lens.becauses)
+            + rows(b.sends, &lens.sends)
             + usize::from(b.gap_box)
             + 3 * usize::from(b.text_box);
         let handled = if b.handled > 0 { b.handled + 2 } else { 0 };
-        2 + b.list + usize::from(b.list > 0) + detail + handled + 1
+        // tabs, rule, the other cards, the open one, what was handled, the key line.
+        2 + b.others * folded + detail + handled + 1
     };
     while need(&b) > inner_rows {
         if b.handled > 0 {
@@ -997,8 +1011,8 @@ fn budget(
             }
         } else if b.side > 1 {
             b.side -= 1;
-        } else if b.list > 3 {
-            b.list -= 1;
+        } else if b.others > 2 {
+            b.others -= 1;
         } else if b.gap_top {
             b.gap_top = false;
         } else if b.asked {
@@ -1007,19 +1021,17 @@ fn budget(
             b.gap_box = false;
         } else if b.why {
             b.why = false;
-        } else if b.pick {
-            b.pick = false;
-        } else if b.list > 1 {
-            b.list -= 1;
+        } else if b.because {
+            b.because = false;
+        } else if b.others > 0 {
+            // The open card is the one in its head: the others go before the question is cut.
+            b.others -= 1;
         } else if b.sends {
             b.sends = false;
         } else if b.doing {
             b.doing = false;
         } else if b.text_box && !words {
             b.text_box = false;
-        } else if b.list > 0 {
-            // The open card is the one in its head: the list goes before the question is cut.
-            b.list = 0;
         } else if b.head_gap && !lens.tag {
             b.head_gap = false;
         } else {
@@ -1033,6 +1045,219 @@ fn budget(
     b
 }
 
+/// A folded card's question shares its row with who asks from this width; narrower it has a row
+/// of its own.
+const INLINE_W: usize = 56;
+/// The `space:tab` of a folded card shows from this width.
+const WHERE_W: usize = 72;
+/// A thread's labels share a row with their text from this width; narrower they stack.
+const LABEL_W: usize = 56;
+/// The width of a thread's label column when they share a row.
+const LABEL_COL: usize = 18;
+
+/// The most rows a folded card's question wraps to under its head, in a narrow pane.
+const QUESTION_ROWS: usize = 3;
+
+/// Rows a folded card takes at most: its head with the question beside it when there is room,
+/// else under it on up to [`QUESTION_ROWS`] rows, then its numbered answers.
+fn folded_h(cw: usize) -> usize {
+    if cw >= INLINE_W { 2 } else { 2 + QUESTION_ROWS }
+}
+
+/// A card's question as one row of words.
+fn question_line(card: &AskInfo) -> String {
+    card.body
+        .asks
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One folded card: its head row (the marker, who asks, where, now or later and how long, the
+/// question), then its answers on a row of their own, `[1] Enable both (suggested)  [2] ...
+/// [r] Reply`, each a click that sends it. Returns how many answers were drawn whole in
+/// order, which the number keys reach.
+#[allow(clippy::too_many_arguments)]
+fn folded(
+    card: &AskInfo,
+    at: usize,
+    on: bool,
+    ctx: &Ctx,
+    cw: usize,
+    alone: Option<usize>,
+    wrap: &impl Fn(&[Seg]) -> String,
+    out: &mut Vec<String>,
+    targets: &mut Vec<Target>,
+) -> usize {
+    let calm = ctx.now_unix - card.opened_at >= OLD_SECS || card.status != "open";
+    let ask_ink = if calm { Role::FaintText } else { Role::Text };
+    let name_w = 12usize.min(cw / 4);
+    let name = width::fit(
+        &cut_dots(&sidebar::chip_name(&name_of(card, ctx)), name_w),
+        name_w,
+    );
+    let name_ink = match (on, calm) {
+        (true, true) => Role::Detail,
+        (true, false) => Role::Focused,
+        (false, _) => ask_ink,
+    };
+    let age = age_short(ctx.now_unix - card.opened_at);
+    let when = format!("{:<5} {:>4}", card.body.urgency, age);
+    let when_ink = if card.body.urgency == "now" && !calm {
+        Role::Blocked
+    } else {
+        Role::FaintText
+    };
+    let inline = cw >= INLINE_W;
+    let mut head = vec![
+        if on {
+            bold(Role::Brand, "\u{203a} ")
+        } else {
+            seg(Role::Text, "  ")
+        },
+        Seg {
+            bold: on,
+            ..seg(name_ink, name)
+        },
+        seg(Role::Text, "  "),
+    ];
+    let mut used = 2 + name_w + 2;
+    if inline && cw >= WHERE_W {
+        let tab = card.terminal.map(|t| t.to_string()).unwrap_or_default();
+        let place = match space_of(card, ctx) {
+            Some(space) => format!("{space}:{tab}"),
+            None => format!("T{tab}"),
+        };
+        head.push(seg(Role::FaintText, width::fit(&cut_dots(&place, 14), 14)));
+        head.push(seg(Role::Text, "  "));
+        used += 16;
+    }
+    let asks = question_line(card);
+    if inline {
+        head.push(seg(when_ink, when.clone()));
+        head.push(seg(Role::Text, "  "));
+        used += width::width(&when) + 2;
+        head.push(seg(ask_ink, cut_dots(&asks, cw.saturating_sub(used))));
+    } else {
+        let gap = cw.saturating_sub(used + width::width(&when));
+        head.push(seg(Role::Text, " ".repeat(gap)));
+        head.push(seg(when_ink, when));
+    }
+    let mut rows = vec![head];
+    if !inline {
+        // Alone in the pane, the whole question wraps into the rows there are.
+        let q_rows = alone.map_or(QUESTION_ROWS, |rows| {
+            rows.saturating_sub(2).max(QUESTION_ROWS)
+        });
+        for line in wrap_dots(&asks, cw.saturating_sub(2), q_rows) {
+            rows.push(vec![seg(Role::Text, "  "), seg(ask_ink, line)]);
+        }
+    }
+    for segs in &rows {
+        targets.push(Target {
+            row: out.len(),
+            x0: 2,
+            x1: 2 + cw,
+            hit: Hit::Card(at),
+        });
+        out.push(wrap(segs));
+    }
+    // The answers, as many whole as the row holds.
+    const INDENT: usize = 4;
+    let live = card.status == "open";
+    // A card that is not his to answer (passed to qass, queued) says so where the answers would
+    // stand.
+    if !live {
+        let tag = tag_of(card, ctx).unwrap_or_default();
+        out.push(wrap(&[
+            seg(Role::Text, " ".repeat(INDENT)),
+            seg(Role::Blocked, cut_dots(&tag, cw.saturating_sub(INDENT))),
+        ]));
+        return 0;
+    }
+    let mut segs = vec![seg(Role::Text, " ".repeat(INDENT))];
+    let mut x = INDENT;
+    let mut shown = 0;
+    let mut cut = false;
+    for (i, o) in card.body.options.iter().enumerate() {
+        let suggested = card.body.pick.as_ref().is_some_and(|p| p.key == o.key);
+        let num = format!("[{}] ", i + 1);
+        let mark = if suggested { " (suggested)" } else { "" };
+        let mut sep = if x > INDENT { 2 } else { 0 };
+        let full = width::width(&num) + width::width(&o.label) + width::width(mark);
+        if x + sep + full > cw && x > INDENT {
+            // Alone in the pane, an answer that does not fit goes on the next row: every
+            // answer stays in sight. Among other cards the row ends in dots.
+            if alone.is_none() {
+                cut = true;
+                break;
+            }
+            out.push(wrap(&segs));
+            segs = vec![seg(Role::Text, " ".repeat(INDENT))];
+            (x, sep) = (INDENT, 0);
+        }
+        let room = cw.saturating_sub(x + sep);
+        let (label, mark) = if full <= room {
+            (o.label.clone(), mark)
+        } else {
+            (
+                cut_dots(&o.label, room.saturating_sub(width::width(&num))),
+                "",
+            )
+        };
+        let end = x + sep + width::width(&num) + width::width(&label) + width::width(mark);
+        if sep > 0 {
+            segs.push(seg(Role::Text, "  "));
+        }
+        segs.push(seg(if live { Role::Brand } else { Role::FaintText }, num));
+        segs.push(seg(if live { ask_ink } else { Role::FaintText }, label));
+        segs.push(seg(if live { Role::Done } else { Role::FaintText }, mark));
+        targets.push(Target {
+            row: out.len(),
+            x0: 2 + x + sep,
+            x1: 2 + end,
+            hit: Hit::Answer(at, i),
+        });
+        (x, shown) = (end, shown + 1);
+        if x >= cw {
+            break;
+        }
+    }
+    if cut && x + 1 < cw {
+        segs.push(seg(Role::FaintText, "\u{2026}"));
+        x += 1;
+    }
+    if live && !cut {
+        let reply = "[r] Reply";
+        let mut sep = if x > INDENT { 2 } else { 0 };
+        if x + sep + width::width(reply) > cw && alone.is_some() && x > INDENT {
+            out.push(wrap(&segs));
+            segs = vec![seg(Role::Text, " ".repeat(INDENT))];
+            (x, sep) = (INDENT, 0);
+        }
+        if x + sep + width::width(reply) <= cw {
+            segs.push(seg(Role::Text, " ".repeat(sep)));
+            segs.push(seg(Role::FaintText, reply));
+            targets.push(Target {
+                row: out.len(),
+                x0: 2 + x + sep,
+                x1: 2 + x + sep + width::width(reply),
+                hit: Hit::Reply(at),
+            });
+            x += sep + width::width(reply);
+        }
+    }
+    if let Some(tag) = tag_of(card, ctx) {
+        let room = cw.saturating_sub(x + 2);
+        if room >= 8 {
+            segs.push(seg(Role::Text, "  "));
+            segs.push(seg(Role::Blocked, cut_dots(&tag, room)));
+        }
+    }
+    out.push(wrap(&segs));
+    shown
+}
+
 /// The inbox's rows for a box `cols x rows` (border included).
 pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let fade = ctx.fade;
@@ -1043,6 +1268,8 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let mut cursor = None;
     // The question cut to leave its answers room: the key line names `m`.
     let mut cut = false;
+    // The answers of the selected card drawn on its folded row, which the number keys reach.
+    let mut reach: Option<usize> = None;
 
     // One content row: a margin, the pieces padded to `cw`, a margin, between the box's sides.
     let rule = ink(Role::Rule, fade);
@@ -1072,31 +1299,28 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             }
             lines.push((Vec::new(), None));
         }
-        // A text under its label, its later rows indented to the text.
+        // A text under its label, its rows indented to the label's start.
         let labelled = |lines: &mut Vec<(Vec<Seg>, Option<usize>)>, what: &str, text: &str| {
-            let indent = width::width(what).min(cw / 2);
-            for (n, row) in wrap_dots(text, cw.saturating_sub(indent), usize::MAX)
-                .into_iter()
-                .enumerate()
-            {
-                let lead = if n == 0 {
-                    width::fit(what, indent)
-                } else {
-                    " ".repeat(indent)
-                };
-                lines.push((
-                    vec![seg(Role::FaintText, lead), seg(Role::Detail, row)],
-                    None,
-                ));
+            lines.push((vec![seg(Role::FaintText, cut_dots(what, cw))], None));
+            for row in wrap_dots(text, cw.saturating_sub(2), usize::MAX) {
+                lines.push((vec![seg(Role::Detail, format!("  {row}"))], None));
             }
         };
         let card = pane.open_card();
         if let Some(card) = card {
-            if let Some(asked) = &card.body.asked {
-                labelled(&mut lines, "asked   ", asked);
+            if let Some(asked) = card.body.asked.as_deref().filter(|t| !t.trim().is_empty()) {
+                labelled(&mut lines, "You asked", asked);
             }
-            labelled(&mut lines, "doing   ", &card.body.doing);
-            labelled(&mut lines, "why now ", &card.body.why);
+            if !card.body.doing.trim().is_empty() {
+                labelled(
+                    &mut lines,
+                    &format!("{} did", card.body.handle),
+                    &card.body.doing,
+                );
+            }
+            if show_why(card) {
+                labelled(&mut lines, "Why it needs you", &card.body.why);
+            }
             lines.push((Vec::new(), None));
             for row in wrap_dots(&card.body.asks, cw, usize::MAX) {
                 lines.push((vec![bold(Role::Text, row)], None));
@@ -1105,14 +1329,29 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         }
         let options = card.map_or(&[][..], |c| &c.body.options[..]);
         for (i, o) in options.iter().enumerate() {
-            let head = format!("[{}] {}", o.key, o.label);
+            let head = format!("[{}] {}", i + 1, o.label);
             for (n, row) in wrap_dots(&head, cw, usize::MAX).into_iter().enumerate() {
                 lines.push((vec![seg(Role::Text, row)], (n == 0).then_some(i)));
             }
             for row in wrap_dots(&o.reason, cw.saturating_sub(4), usize::MAX) {
                 lines.push((vec![seg(Role::Detail, format!("    {row}"))], None));
             }
-            labelled(&mut lines, "    sends: ", &o.words);
+            if let Some(text) = card.and_then(|c| because(c, &o.key)) {
+                for row in wrap_dots(
+                    &format!("suggested {text}"),
+                    cw.saturating_sub(4),
+                    usize::MAX,
+                ) {
+                    lines.push((vec![seg(Role::Done, format!("    {row}"))], None));
+                }
+            }
+            for (n, row) in wrap_dots(&o.words, cw.saturating_sub(11), usize::MAX)
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if n == 0 { "    Sends: " } else { "           " };
+                lines.push((vec![seg(Role::Detail, format!("{lead}{row}"))], None));
+            }
         }
         let end = lines.len().saturating_sub(content);
         pane.whole_end.set(end);
@@ -1190,235 +1429,290 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
 
     if let Some(card) = pane.open_card() {
         let sel = pane.selected.min(pane.live.len() - 1);
-        let shown = pane.preview_at(card);
-        let label_w = card
-            .body
-            .options
-            .iter()
-            .map(|o| width::width(&o.label))
-            .max()
-            .unwrap_or(0)
-            .min(cw / 3);
-        let reason_room = cw.saturating_sub(4 + label_w + 2);
-        let side_rows = |text: &str, room: usize| wrap_dots(text, room, SIDE_ROWS).len();
-        let lens = Lens {
-            ask: wrap_dots(&card.body.asks, cw, usize::MAX).len(),
-            asked: card
-                .body
-                .asked
-                .as_deref()
-                .map_or(1, |t| side_rows(t, cw.saturating_sub(8))),
-            doing: side_rows(&card.body.doing, cw.saturating_sub(8)),
-            why: side_rows(&card.body.why, cw.saturating_sub(8)),
-            pick: card
-                .body
-                .pick
-                .as_ref()
-                .map_or(1, |p| side_rows(&p.reason, cw.saturating_sub(14))),
-            sends: card
-                .body
-                .options
-                .get(shown)
-                .map_or(1, |o| side_rows(&o.words, cw.saturating_sub(11))),
-            reasons: card
+        let h = folded_h(cw);
+        if !pane.is_open() {
+            // Every card folded: as many as the rows hold around the selected one, then what he
+            // already handled in the rows left.
+            let room = inner_rows.saturating_sub(3);
+            let n = (room / h).clamp(1, pane.live.len());
+            let first = sel
+                .saturating_sub((n - 1) / 2)
+                .min(pane.live.len().saturating_sub(n));
+            for (at, c) in pane.live.iter().enumerate().skip(first).take(n) {
+                // A card alone in the pane shows its whole question and every answer.
+                let alone = (n == 1).then_some(room);
+                let drawn = folded(
+                    c,
+                    at,
+                    at == sel,
+                    ctx,
+                    cw,
+                    alone,
+                    &wrap,
+                    &mut out,
+                    &mut targets,
+                );
+                if at == sel {
+                    reach = Some(drawn);
+                }
+            }
+            let left = room.saturating_sub(n * h);
+            if left >= 4 && !pane.ended.is_empty() {
+                out.push(blank());
+                out.push(wrap(&[
+                    seg(Role::FaintText, "handled for you "),
+                    seg(Role::Detail, pane.ended.len().to_string()),
+                ]));
+                out.push(hr());
+                for c in pane.ended.iter().take(left - 3) {
+                    out.push(handled_row(c, ctx, cw, &wrap));
+                }
+            }
+        } else {
+            let label_w = card
                 .body
                 .options
                 .iter()
-                .map(|o| side_rows(&o.reason, reason_room))
-                .collect(),
-            tag: tag_of(card, ctx).is_some() || card.item.is_some(),
-        };
-        let b = budget(
-            inner_rows,
-            pane.live.len(),
-            card.body.options.len(),
-            card.body.asked.is_some(),
-            card.body.pick.is_some(),
-            pane.typing || !pane.text.is_empty(),
-            &lens,
-        );
-        let side = b.side;
-        // The list: a window of it that holds the open card.
-        let first = sel
-            .saturating_sub(b.list.saturating_sub(1))
-            .min(pane.live.len().saturating_sub(b.list));
-        for (at, c) in pane.live.iter().enumerate().skip(first).take(b.list) {
-            let old = ctx.now_unix - c.opened_at >= OLD_SECS;
-            let calm = old || c.status != "open";
-            let role = if calm { Role::FaintText } else { Role::Text };
-            let age = age_short(ctx.now_unix - c.opened_at);
-            let name = sidebar::chip_name(&name_of(c, ctx));
-            let name_w = 12usize.min(cw / 4);
-            let head = format!(
-                "{} {}",
-                at + 1,
-                width::fit(&cut_dots(&name, name_w), name_w)
+                .map(|o| width::width(&o.label))
+                .max()
+                .unwrap_or(0)
+                .min(cw / 3);
+            let reason_room = cw.saturating_sub(4 + label_w + 2);
+            let stacked = cw < LABEL_W;
+            let text_room = if stacked { cw - 2 } else { cw - LABEL_COL };
+            let side_rows = |text: &str, room: usize| wrap_dots(text, room, SIDE_ROWS).len();
+            let asked = card.body.asked.as_deref().filter(|t| !t.trim().is_empty());
+            let doing = Some(card.body.doing.as_str()).filter(|t| !t.trim().is_empty());
+            let why = show_why(card).then_some(card.body.why.as_str());
+            let lens = Lens {
+                ask: wrap_dots(&card.body.asks, cw, usize::MAX).len(),
+                asked: asked.map_or(0, |t| side_rows(t, text_room)),
+                doing: doing.map_or(0, |t| side_rows(t, text_room)),
+                why: why.map_or(0, |t| side_rows(t, text_room)),
+                reasons: card
+                    .body
+                    .options
+                    .iter()
+                    .map(|o| side_rows(&o.reason, reason_room))
+                    .collect(),
+                becauses: card
+                    .body
+                    .options
+                    .iter()
+                    .map(|o| {
+                        because(card, &o.key).map_or(0, |t| side_rows(&t, cw.saturating_sub(14)))
+                    })
+                    .collect(),
+                sends: card
+                    .body
+                    .options
+                    .iter()
+                    .map(|o| side_rows(&o.words, cw.saturating_sub(11)))
+                    .collect(),
+                tag: tag_of(card, ctx).is_some() || card.item.is_some(),
+                stacked,
+            };
+            let b = budget(
+                inner_rows,
+                pane.live.len() - 1,
+                h,
+                pane.typing || !pane.text.is_empty(),
+                &lens,
             );
-            let room = cw.saturating_sub(width::width(&head) + 2 + age.len() + 1);
-            let asks = cut_dots(&c.body.asks, room);
-            let gap = cw.saturating_sub(width::width(&head) + 2 + width::width(&asks) + age.len());
-            let mut segs = vec![
-                seg(role, head),
-                seg(role, "  "),
-                seg(if calm { Role::FaintText } else { Role::Detail }, asks),
-                seg(Role::Text, " ".repeat(gap)),
-                seg(Role::FaintText, age),
-            ];
-            if at == sel {
-                for s in &mut segs {
-                    s.role = if calm { Role::Detail } else { Role::Focused };
-                }
-                segs[0].bold = true;
+            let side = b.side;
+            // The other cards stay folded around the open one: before it first.
+            let below_all = pane.live.len() - 1 - sel;
+            let mut above = sel.min(b.others.div_ceil(2));
+            let below = below_all.min(b.others - above);
+            above = sel.min(b.others - below);
+            let folded_at = |at: usize, out: &mut Vec<String>, targets: &mut Vec<Target>| {
+                folded(
+                    &pane.live[at],
+                    at,
+                    false,
+                    ctx,
+                    cw,
+                    None,
+                    &wrap,
+                    out,
+                    targets,
+                );
+            };
+            for at in sel - above..sel {
+                folded_at(at, &mut out, &mut targets);
             }
+
+            // The open card.
+            // Who asks reads first and whole (to 24 columns); then the wait, short when it must
+            // be, and the space in what is left, cut first.
+            // A plan card says what it asks: the item line under it names whose plan.
+            let name = if plan_card(card) {
+                "Approve the plan".to_string()
+            } else {
+                name_of(card, ctx)
+            };
+            let title_left = format!("\u{25be} {}", cut_dots(&name, cw.saturating_sub(2).min(24)));
+            let room = cw.saturating_sub(width::width(&title_left) + 2);
+            let age = ctx.now_unix - card.opened_at;
+            let waited = format!("waiting {}", age_long(age));
+            let right = match space_of(card, ctx) {
+                Some(space) if room >= width::width(&waited) + 3 + 4 => format!(
+                    "{} \u{b7} {waited}",
+                    cut_dots(&space, room - width::width(&waited) - 3)
+                ),
+                _ if room >= width::width(&waited) => waited,
+                _ if room >= age_short(age).len() => age_short(age),
+                _ => String::new(),
+            };
+            let gap = cw.saturating_sub(width::width(&title_left) + width::width(&right));
             targets.push(Target {
                 row: out.len(),
                 x0: 2,
                 x1: 2 + cw,
-                hit: Hit::Card(at),
+                hit: Hit::Card(sel),
             });
-            out.push(wrap(&segs));
-        }
-        if b.list > 0 {
-            out.push(hr());
-        }
-
-        // The open card.
-        // Who asks reads first and whole (to 24 columns); then the wait, short when it must be,
-        // and the space in what is left, cut first.
-        // A plan card says what it asks: the item line under it names whose plan.
-        let name = if plan_card(card) {
-            "Approve the plan".to_string()
-        } else {
-            name_of(card, ctx)
-        };
-        let title_left = format!("\u{25be} {}", cut_dots(&name, cw.saturating_sub(2).min(24)));
-        let room = cw.saturating_sub(width::width(&title_left) + 2);
-        let age = ctx.now_unix - card.opened_at;
-        let waited = format!("waiting {}", age_long(age));
-        let right = match space_of(card, ctx) {
-            Some(space) if room >= width::width(&waited) + 3 + 4 => format!(
-                "{} \u{b7} {waited}",
-                cut_dots(&space, room - width::width(&waited) - 3)
-            ),
-            _ if room >= width::width(&waited) => waited,
-            _ if room >= age_short(age).len() => age_short(age),
-            _ => String::new(),
-        };
-        let gap = cw.saturating_sub(width::width(&title_left) + width::width(&right));
-        out.push(wrap(&[
-            bold(Role::Text, title_left),
-            seg(Role::Text, " ".repeat(gap)),
-            seg(Role::FaintText, right),
-        ]));
-        // The item it is about, then the tag, on the row under the heading.
-        let mut under = item_line(card).unwrap_or_default();
-        if let Some(tag) = tag_of(card, ctx) {
-            if !under.is_empty() {
-                under.push(seg(Role::Text, "  "));
+            out.push(wrap(&[
+                bold(Role::Text, title_left),
+                seg(Role::Text, " ".repeat(gap)),
+                seg(Role::FaintText, right),
+            ]));
+            // The item it is about, then the tag, on the row under the heading.
+            let mut under = item_line(card).unwrap_or_default();
+            if let Some(tag) = tag_of(card, ctx) {
+                if !under.is_empty() {
+                    under.push(seg(Role::Text, "  "));
+                }
+                under.push(seg(Role::Blocked, tag));
             }
-            under.push(seg(Role::Blocked, tag));
-        }
-        match under.is_empty() {
-            false => out.push(wrap(&under)),
-            true if b.head_gap => out.push(blank()),
-            true => {}
-        }
-        // A text on rows after its lead (a label, a key), the later rows indented under the text.
-        let rows_after = |lead: Vec<Seg>, indent: usize, text: &str| -> Vec<String> {
-            let rows = wrap_dots(text, cw.saturating_sub(indent), side);
-            let mut lead = Some(lead);
-            rows.into_iter()
-                .map(|t| {
-                    let mut segs = lead
-                        .take()
-                        .unwrap_or_else(|| vec![seg(Role::Text, " ".repeat(indent))]);
-                    segs.push(seg(Role::Detail, t));
-                    wrap(&segs)
-                })
-                .collect()
-        };
-        let label = |what: &str, text: &str| {
-            rows_after(vec![seg(Role::FaintText, format!("{what:<8}"))], 8, text)
-        };
-        if b.asked
-            && let Some(asked) = &card.body.asked
-        {
-            out.extend(label("asked", asked));
-        }
-        if b.doing {
-            out.extend(label("doing", &card.body.doing));
-        }
-        if b.why {
-            out.extend(label("why now", &card.body.why));
-        }
-        if b.gap_top {
-            out.push(blank());
-        }
-        cut = b.ask < lens.ask;
-        for row in wrap_dots(&card.body.asks, cw, b.ask) {
-            out.push(wrap(&[bold(Role::Text, row)]));
-        }
-        let passed = card.status != "open";
-        for (i, o) in card.body.options.iter().enumerate() {
-            // An answer cut to its room is read whole with `m`, as the question is.
-            cut |= width::width(&o.label) > label_w
-                || wrap_dots(&o.reason, reason_room, usize::MAX).len() > side;
-            let key_ink = if passed { Role::FaintText } else { Role::Brand };
-            let lab = width::fit(&cut_dots(&o.label, label_w), label_w);
-            let lead = vec![
-                seg(key_ink, format!("[{}] ", o.key)),
-                seg(if passed { Role::FaintText } else { Role::Text }, lab),
-                seg(Role::Text, "  "),
-            ];
-            for row in rows_after(lead, 4 + label_w + 2, &o.reason) {
+            match under.is_empty() {
+                false => out.push(wrap(&under)),
+                true if b.head_gap => out.push(blank()),
+                true => {}
+            }
+            // A text that did not fit its rows is cut: the key line names `m`.
+            let clipped = std::cell::Cell::new(false);
+            // A text on rows after its lead (a label, a key), the later rows indented under the
+            // text.
+            let rows_after = |lead: Vec<Seg>, indent: usize, text: &str| -> Vec<String> {
+                let room = cw.saturating_sub(indent);
+                if wrap_dots(text, room, usize::MAX).len() > side {
+                    clipped.set(true);
+                }
+                let mut lead = Some(lead);
+                wrap_dots(text, room, side)
+                    .into_iter()
+                    .map(|t| {
+                        let mut segs = lead
+                            .take()
+                            .unwrap_or_else(|| vec![seg(Role::Text, " ".repeat(indent))]);
+                        segs.push(seg(Role::Detail, t));
+                        wrap(&segs)
+                    })
+                    .collect()
+            };
+            // The thread's parts: its label, in a column left of the text, or over it in a
+            // narrow pane.
+            let said = |what: &str, text: &str| -> Vec<String> {
+                if stacked {
+                    let mut rows = vec![wrap(&[seg(Role::FaintText, cut_dots(what, cw))])];
+                    rows.extend(rows_after(vec![seg(Role::Text, "  ")], 2, text));
+                    rows
+                } else {
+                    let lead = width::fit(&cut_dots(what, LABEL_COL - 2), LABEL_COL);
+                    rows_after(vec![seg(Role::FaintText, lead)], LABEL_COL, text)
+                }
+            };
+            if b.asked
+                && let Some(text) = asked
+            {
+                out.extend(said("You asked", text));
+            }
+            if b.doing
+                && let Some(text) = doing
+            {
+                out.extend(said(&format!("{} did", card.body.handle), text));
+            }
+            if b.why
+                && let Some(text) = why
+            {
+                out.extend(said("Why it needs you", text));
+            }
+            if b.gap_top {
+                out.push(blank());
+            }
+            cut = b.ask < lens.ask;
+            for row in wrap_dots(&card.body.asks, cw, b.ask) {
+                out.push(wrap(&[bold(Role::Text, row)]));
+            }
+            let passed = card.status != "open";
+            for (i, o) in card.body.options.iter().enumerate() {
+                let first = out.len();
+                // An answer cut to its room is read whole with `m`, as the question is.
+                cut |= width::width(&o.label) > label_w;
+                let key_ink = if passed { Role::FaintText } else { Role::Brand };
+                let lab = width::fit(&cut_dots(&o.label, label_w), label_w);
+                let lead = vec![
+                    seg(key_ink, format!("[{}] ", i + 1)),
+                    seg(if passed { Role::FaintText } else { Role::Text }, lab),
+                    seg(Role::Text, "  "),
+                ];
+                out.extend(rows_after(lead, 4 + label_w + 2, &o.reason));
+                if b.because
+                    && let Some(text) = because(card, &o.key)
+                {
+                    let lead = vec![
+                        seg(Role::Text, "    "),
+                        seg(
+                            if passed { Role::FaintText } else { Role::Done },
+                            "suggested ",
+                        ),
+                    ];
+                    out.extend(rows_after(lead, 14, &text));
+                }
+                if b.sends {
+                    let lead = vec![seg(Role::Text, "    "), seg(Role::FaintText, "Sends: ")];
+                    out.extend(rows_after(lead, 11, &o.words));
+                }
+                for row in first..out.len() {
+                    targets.push(Target {
+                        row,
+                        x0: 2,
+                        x1: 2 + cw,
+                        hit: Hit::Option(i),
+                    });
+                }
+            }
+            cut |= clipped.get() || !b.sends || !b.because && lens.becauses.iter().any(|&n| n > 0);
+            if b.gap_box {
+                out.push(blank());
+            }
+            // The one text box.
+            if b.text_box {
                 targets.push(Target {
-                    row: out.len(),
+                    row: out.len() + 1,
                     x0: 2,
                     x1: 2 + cw,
-                    hit: Hit::Option(i),
+                    hit: Hit::Box,
                 });
-                out.push(row);
+                let (rows, caret) = text_box(pane, cw, passed, &wrap);
+                cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
+                out.extend(rows);
             }
-            if b.sends && i == shown {
-                let lead = vec![seg(Role::Text, "    "), seg(Role::FaintText, "sends: ")];
-                out.extend(rows_after(lead, 11, &o.words));
+            for at in sel + 1..sel + 1 + below {
+                folded_at(at, &mut out, &mut targets);
             }
-        }
-        if b.pick
-            && let Some(p) = &card.body.pick
-        {
-            let lead = vec![
-                seg(Role::BrandText, format!("qass picks {}", p.key)),
-                seg(Role::Detail, ": "),
-            ];
-            out.extend(rows_after(lead, 14, &p.reason));
-        }
-        if b.gap_box {
-            out.push(blank());
-        }
-        // The one text box.
-        if b.text_box {
-            targets.push(Target {
-                row: out.len() + 1,
-                x0: 2,
-                x1: 2 + cw,
-                hit: Hit::Box,
-            });
-            let (rows, caret) = text_box(pane, cw, passed, &wrap);
-            cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
-            out.extend(rows);
-        }
 
-        // What he already handled.
-        if b.handled > 0 && !pane.ended.is_empty() {
-            out.push(blank());
-            out.push(wrap(&[
-                seg(Role::FaintText, "handled for you "),
-                seg(Role::Detail, pane.ended.len().to_string()),
-            ]));
-            out.push(hr());
-            for c in pane.ended.iter().take(b.handled.saturating_sub(2)) {
-                out.push(handled_row(c, ctx, cw, &wrap));
+            // What he already handled.
+            if b.handled > 0 && !pane.ended.is_empty() {
+                out.push(blank());
+                out.push(wrap(&[
+                    seg(Role::FaintText, "handled for you "),
+                    seg(Role::Detail, pane.ended.len().to_string()),
+                ]));
+                out.push(hr());
+                for c in pane.ended.iter().take(b.handled.saturating_sub(2)) {
+                    out.push(handled_row(c, ctx, cw, &wrap));
+                }
             }
         }
     } else if pane.loaded && !pane.unsupported {
@@ -1498,12 +1792,36 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         })
         .collect();
     shown.dedup();
-    pane.shown.set(Some(shown.len()));
+    pane.shown.set(Some(reach.unwrap_or(shown.len())));
     View {
         rows: out,
         targets,
         cursor: cursor.filter(|(r, _)| *r <= content),
     }
+}
+
+/// The line a W card carries when the daemon knew nothing of why: the card says who waits
+/// instead, so the label is left out.
+const GENERIC_WHY: &str = "it stopped and waits for your answer";
+
+/// Whether "Why it needs you" is worth a row: not for an empty one, and not for the generic line
+/// a W card (the agent's own question, drafted by the daemon) carries.
+fn show_why(card: &AskInfo) -> bool {
+    let why = card.body.why.trim();
+    !why.is_empty()
+        && !(card.card.starts_with('W')
+            && why.trim_end_matches('.').eq_ignore_ascii_case(GENERIC_WHY))
+}
+
+/// Why option `key` is the suggested one, as `because ...`; none when it is not the pick.
+fn because(card: &AskInfo, key: &str) -> Option<String> {
+    let pick = card.body.pick.as_ref().filter(|p| p.key == key)?;
+    let reason = pick.reason.trim();
+    let reason = reason
+        .get(..8)
+        .filter(|head| head.eq_ignore_ascii_case("because "))
+        .map_or(reason, |_| reason[8..].trim_start());
+    Some(format!("because {reason}"))
 }
 
 /// The one text box, as its three rows, and the caret's column in its middle row while he
@@ -1516,7 +1834,7 @@ fn text_box(
 ) -> ([String; 3], Option<usize>) {
     let box_w = cw;
     // Cut to the box: the column may be dragged as narrow as the questions go.
-    let title = cut_dots(" type a different answer ", box_w.saturating_sub(4));
+    let title = cut_dots(" reply in your own words ", box_w.saturating_sub(4));
     let mut top = format!("\u{256d}\u{2500}{title}");
     top.push_str(&"\u{2500}".repeat(box_w.saturating_sub(width::width(&top) + 1)));
     top.push('\u{256e}');
@@ -1546,10 +1864,10 @@ fn text_box(
     } else if passed {
         "waiting for qass".to_string()
     } else if !pane.text.is_empty() {
-        // The answer typed and kept, faint until `t` takes it up again.
+        // The answer typed and kept, faint until `r` takes it up again.
         cut_dots(&pane.text, inside)
     } else {
-        "t to type".to_string()
+        "r to reply".to_string()
     };
     let text_role = if pane.typing {
         Role::Text
@@ -1814,6 +2132,13 @@ fn elsewhere_rows(pane: &Pane, cw: usize) -> Vec<String> {
     .map_or_else(|| wrap_dots(&short, cw, usize::MAX), |line| vec![line])
 }
 
+/// The longest of `lines` that fits `cw` columns, else the last.
+fn pick_keys(cw: usize, lines: &[&str]) -> String {
+    let fits = lines.iter().find(|l| width::width(l) <= cw);
+    fits.or(lines.last())
+        .map_or_else(String::new, |l| l.to_string())
+}
+
 fn bottom_line(pane: &Pane, cw: usize, cut: bool) -> Vec<Seg> {
     // For as long as the words stay, never back to `enter send`; named, since another card
     // may stand over them.
@@ -1832,15 +2157,35 @@ fn bottom_line(pane: &Pane, cw: usize, cut: bool) -> Vec<Seg> {
         )];
     }
     let keys = if pane.typing {
-        "enter send  esc stop typing"
-    } else if pane.focus && cut {
-        "m read whole  a-d send  t type  j k cards"
-    } else if pane.focus {
-        "j k cards  a-d send  t type  o talk  x away  tab chat"
+        "enter send  esc stop typing".to_string()
+    } else if !pane.focus {
+        "ctrl-a i focuses this".to_string()
+    } else if cut {
+        pick_keys(
+            cw,
+            &[
+                "m read whole  1-9 answer  r reply  j k cards",
+                "m read whole  1-9 answer  r reply",
+            ],
+        )
     } else {
-        "ctrl-a i focuses this"
+        let enter = if pane.is_open() {
+            "enter fold"
+        } else {
+            "enter open"
+        };
+        pick_keys(
+            cw,
+            &[
+                &format!(
+                    "1-9 answer  {enter}  r reply  g go to tab  o talk it through  x put away  j k move"
+                ),
+                &format!("1-9 answer  {enter}  r reply  g tab  o talk  x away  j k move"),
+                &format!("1-9 answer  {enter}  r reply  j k move"),
+            ],
+        )
     };
-    vec![seg(Role::FaintText, cut_dots(keys, cw))]
+    vec![seg(Role::FaintText, cut_dots(&keys, cw))]
 }
 
 /// `text` wrapped on words into rows of `cols` columns, at most `max` of them; a word longer than a
@@ -2019,6 +2364,8 @@ mod tests {
                 .collect(),
             Vec::new(),
         );
+        // Most tests read the card in full: they open it first (a folded one has its own).
+        p.expanded = true;
         p
     }
 
@@ -2103,24 +2450,27 @@ mod tests {
         let mut plan = card(1, "plan", "open");
         plan.item = Some(item("written"));
         p.take(vec![plan], Vec::new());
+        p.expanded = true;
         let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
         assert!(t.contains("\u{25be} Approve the plan"), "{t}");
         assert!(
             t.contains("QOOP-58 \u{b7} Build 2/3 \u{b7} plan needs you"),
             "{t}"
         );
-        assert!(t.contains("[a] run now"), "answered as any card: {t}");
+        assert!(t.contains("[1] run now"), "answered as any card: {t}");
 
         // Approved, or a card of another kind: the agent's name heads it, the plan as it is.
         let mut done = card(1, "plan", "open");
         done.item = Some(item("approved"));
         p.take(vec![done], Vec::new());
+        p.expanded = true;
         let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
         assert!(!t.contains("Approve the plan"), "{t}");
         assert!(t.contains("\u{25be} plan") && t.contains("plan ok"), "{t}");
         let mut asked = card(1, "migrations", "open");
         asked.item = Some(item("stale"));
         p.take(vec![asked], Vec::new());
+        p.expanded = true;
         let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
         assert!(t.contains("\u{25be} migrations"), "{t}");
         assert!(
@@ -2130,6 +2480,7 @@ mod tests {
 
         // No item: no line, the heading as before.
         p.take(vec![card(1, "plan", "open")], Vec::new());
+        p.expanded = true;
         let t = text(&view(&p, &ctx(&[], &[]), 64, 36));
         assert!(!t.contains("QOOP-58") && !t.contains("Approve"), "{t}");
         assert_eq!(plan_word("", None), None);
@@ -2140,26 +2491,138 @@ mod tests {
     }
 
     #[test]
-    fn three_cards_show_the_list_the_open_card_and_the_text_box() {
+    fn three_cards_show_the_folded_cards_the_open_card_and_the_text_box() {
         let p = pane(3);
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 40));
         for want in [
             "questions  3  board",
-            "1 migrations",
-            "2 web-app",
-            "3 api-server",
+            "web-app",
+            "api-server",
             "Run 0042 on staging now?",
-            "[a] run now",
-            "[b] wait for you",
-            "sends: Do not run 0042 yet",
-            "qass picks b: a column drop cannot be undone",
-            "type a different answer",
-            "t to type",
+            "[1] run now",
+            "[2] wait for you (suggested)",
+            "Sends: Do not run 0042 yet",
+            "suggested because a column drop",
+            "reply in your own words",
+            "r to reply",
             "waiting 6 min",
-            "why now",
+            "You asked",
+            "migrations did",
+            "Why it needs you",
         ] {
             assert!(t.contains(want), "{want:?} in\n{t}");
         }
+        // Each option with its reason and what it sends, in this order after the question.
+        let at = |w: &str| t.find(w).unwrap_or_else(|| panic!("{w} in {t}"));
+        assert!(
+            at("You asked") < at("migrations did")
+                && at("migrations did") < at("Why it needs you")
+                && at("Why it needs you") < at("Run 0042 on staging now?")
+                && at("no rollback exists") < at("Sends: Run 0042")
+                && at("Sends: Do not run") < at("reply in your own words"),
+            "{t}"
+        );
+    }
+
+    /// Folded, a card is its question and its numbered answers on two rows, the suggested one
+    /// marked, with the keys named; enter opens the selected one in place and folds it again.
+    #[test]
+    fn folded_cards_show_the_question_and_numbered_answers_and_enter_opens() {
+        let mut p = Pane::default();
+        p.take(
+            vec![
+                card(1, "migrations", "open"),
+                card(2, "web-app", "open"),
+                card(3, "api-server", "open"),
+            ],
+            Vec::new(),
+        );
+        p.focus = true;
+        for cols in [120, 100, 64] {
+            let t = text(&view(&p, &ctx(&[], &[]), cols, 40));
+            let answers = if cols > 70 {
+                "[1] run now  [2] wait for you (suggested)  [3] skip  [r] Reply"
+            } else {
+                "[1] run now  [2] wait for you (suggested)  [3] skip"
+            };
+            for want in [
+                "migrations",
+                "web-app",
+                "api-server",
+                "later",
+                "Run 0042 on staging now?",
+                answers,
+                "1-9 answer  enter open  r reply",
+            ] {
+                assert!(t.contains(want), "{want:?} at {cols}:\n{t}");
+            }
+            assert!(
+                !t.contains("Sends:") && !t.contains("You asked"),
+                "folded at {cols}:\n{t}"
+            );
+        }
+        // At 120 columns the question and the place share the head row.
+        let t = text(&view(&p, &ctx(&[], &[]), 120, 40));
+        assert!(
+            t.contains("migrations") && t.contains("later   6m  Run 0042 on staging now?"),
+            "{t}"
+        );
+        // A one-key answer on a folded card sends the option it names.
+        p.key(b"2", 1);
+        assert_eq!(p.outbox.len(), 1, "digit answers the numbered option");
+        p.outbox.clear();
+        p.sent.clear();
+        // Enter opens, enter folds.
+        assert!(!p.is_open());
+        p.key(b"\r", 1);
+        assert!(p.is_open());
+        let t = text(&view(&p, &ctx(&[], &[]), 100, 40));
+        assert!(t.contains("Sends:") && t.contains("enter fold"), "{t}");
+        p.key(b"\r", 1);
+        assert!(!p.is_open());
+        // Moving to another card leaves it folded.
+        p.key(b"\r", 1);
+        p.key(b"j", 1);
+        assert!(!p.is_open());
+    }
+
+    /// A W card with no options, a generic `why` and nothing asked: no empty label, `Reply` is its
+    /// only action, and the open card does not say the generic line.
+    #[test]
+    fn a_card_without_options_or_a_real_why_hides_what_it_has_not_got() {
+        let mut w = card(7, "dub52", "open");
+        w.card = "W7".into();
+        w.body.options.clear();
+        w.body.pick = None;
+        w.body.asked = None;
+        w.body.why = "it stopped and waits for your answer".into();
+        let mut p = Pane::default();
+        p.take(vec![w.clone()], Vec::new());
+        let t = text(&view(&p, &ctx(&[], &[]), 80, 30));
+        assert!(t.contains("[r] Reply") && !t.contains("[1]"), "{t}");
+        p.key(b"\r", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 80, 30));
+        assert!(
+            t.contains("dub52 did") && t.contains("Run 0042 on staging now?"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("Why it needs you")
+                && !t.contains("You asked")
+                && !t.contains("waits for your answer"),
+            "{t}"
+        );
+        // The same line on an E card is qass's own words: shown. A real why on a W card too.
+        let mut e = w.clone();
+        e.card = "E7".into();
+        p.take(vec![e], Vec::new());
+        p.expanded = true;
+        assert!(text(&view(&p, &ctx(&[], &[]), 80, 30)).contains("Why it needs you"));
+        let mut real = w;
+        real.body.why = "the deploy waits on his word".into();
+        p.take(vec![real], Vec::new());
+        p.expanded = true;
+        assert!(text(&view(&p, &ctx(&[], &[]), 80, 30)).contains("the deploy waits on his word"));
     }
 
     /// An answer typed and left with `esc` stays in the box, faint, until `t` takes it up.
@@ -2167,13 +2630,13 @@ mod tests {
     fn a_kept_answer_shows_in_the_box_when_not_typing() {
         let mut p = pane(3);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"run it after the backup", 1);
         p.key(b"\x1b", 1);
         assert!(!p.typing());
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
-            t.contains("run it after the backup") && !t.contains("t to type"),
+            t.contains("run it after the backup") && !t.contains("r to reply"),
             "{t}"
         );
     }
@@ -2184,12 +2647,12 @@ mod tests {
     fn a_typed_answer_waits_for_its_card_and_goes_when_sent() {
         let mut p = pane(3);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"run it after the backup", 1);
         p.key(b"\x1b", 1);
         p.key(b"j", 1);
         assert_eq!(p.typed(), "", "the second card has no words of its own");
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"skip this one", 1);
         p.click(Hit::Card(0));
         assert_eq!(p.typed(), "run it after the backup");
@@ -2200,7 +2663,7 @@ mod tests {
         }
         p.take(p.live.clone(), Vec::new());
         assert_eq!(p.typed(), "run it after the backup", "a read keeps them");
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\r", 1);
         assert_eq!(p.outbox.len(), 1, "sent");
         p.key(b"j", 1);
@@ -2216,7 +2679,7 @@ mod tests {
     fn a_read_keeps_words_with_their_card() {
         let mut p = pane(3);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"for the first", 1);
         p.key(b"\x1b", 1);
         let moved = vec![p.live[1].clone(), p.live[0].clone(), p.live[2].clone()];
@@ -2229,7 +2692,7 @@ mod tests {
         let rest = vec![p.live[0].clone(), p.live[2].clone()];
         p.take(rest, Vec::new());
         assert_eq!(p.typed(), "", "gone, its words go with it");
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\r", 1);
         assert!(p.outbox.is_empty(), "nothing sent to the card in its place");
     }
@@ -2240,14 +2703,14 @@ mod tests {
     fn a_failure_for_a_card_ended_elsewhere_shows_its_lost_words() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"land 42 first", 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
         else {
             panic!("sent")
         };
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"and", 1);
         p.take(p.live[1..].to_vec(), Vec::new());
         p.answered(&ControlResponse::Failed {
@@ -2269,7 +2732,7 @@ mod tests {
     fn words_put_back_for_a_card_that_then_ends_stand_in_a_notice() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"land it", 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
@@ -2304,7 +2767,7 @@ mod tests {
                 .join(" ")
         };
         let sent = |p: &mut Pane, words: &[u8]| {
-            p.key(b"t", 1);
+            p.key(b"r", 1);
             p.key(words, 1);
             p.key(b"\r", 1);
             match p.tick(Instant::now()).0.into_iter().next() {
@@ -2321,11 +2784,11 @@ mod tests {
         // Two cards end in two reads, each with its draft: both stand.
         let mut p = pane(3);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"draft one", 1);
         p.key(b"\x1b", 1);
         p.key(b"j", 1);
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"draft two", 1);
         p.key(b"\x1b", 1);
         p.take(p.live[1..].to_vec(), Vec::new());
@@ -2354,7 +2817,7 @@ mod tests {
         let mut p = pane(2);
         p.focus = true;
         let id = sent(&mut p, b"first answer");
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"second words", 1);
         failed(&mut p, id);
         p.take(p.live[1..].to_vec(), Vec::new());
@@ -2367,11 +2830,11 @@ mod tests {
         // `t` and an answer to the next card keep them.
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"draft one", 1);
         p.key(b"\x1b", 1);
         p.take(p.live[1..].to_vec(), Vec::new());
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         assert!(shown(&p).contains("draft one"), "{}", shown(&p));
         p.key(b"go", 1);
         p.key(b"\r", 1);
@@ -2392,7 +2855,7 @@ mod tests {
             .join(" ");
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(long.as_bytes(), 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
@@ -2407,7 +2870,7 @@ mod tests {
             reason: "closed".into(),
         });
         // A second failure, for the card still open.
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"short", 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
@@ -2443,7 +2906,7 @@ mod tests {
             .join(" ");
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(long.as_bytes(), 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
@@ -2455,7 +2918,7 @@ mod tests {
             id,
             reason: "closed".into(),
         });
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"zq", 1);
         let v = view(&p, &ctx(&[], &[]), 30, 14);
         let t = text(&v);
@@ -2478,12 +2941,12 @@ mod tests {
             p.key(b"j", 1);
         }
         for want in [
-            "asked",
-            "doing",
+            "You asked",
+            "migrations did",
             "migration",
-            "why now",
+            "Why it needs you",
             "staging",
-            "sends:",
+            "Sends:",
             "owner.",
         ] {
             assert!(seen.contains(want), "{want}:\n{seen}");
@@ -2496,11 +2959,11 @@ mod tests {
     fn the_unsent_words_name_whose_card() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"draft one", 1);
         p.key(b"\x1b", 1);
         p.take(p.live[1..].to_vec(), Vec::new());
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"land 42 then rebase\r", 1);
         assert_eq!(
             p.unsent(),
@@ -2519,7 +2982,7 @@ mod tests {
         p.focus = true;
         let mut ids = Vec::new();
         for words in [&b"first try"[..], b"second try"] {
-            p.key(b"t", 1);
+            p.key(b"r", 1);
             p.key(words, 1);
             p.key(b"\r", 1);
             match p.tick(Instant::now()).0.into_iter().next() {
@@ -2549,7 +3012,7 @@ mod tests {
             let mut p = long_pane();
             p.focus = true;
             p.key(b"m", 1);
-            p.key(b"t", 1);
+            p.key(b"r", 1);
             p.key(b"go", 1);
             let v = view(&p, &ctx(&[], &[]), cols, rows);
             let t = text(&v);
@@ -2565,7 +3028,7 @@ mod tests {
     fn a_wide_answer_keeps_its_caret() {
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key("日本語の答えです".repeat(6).as_bytes(), 1);
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("です\u{2588}"), "{t}");
@@ -2577,7 +3040,7 @@ mod tests {
     fn a_card_answered_elsewhere_while_typing_keeps_the_words_and_says_so() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"just do", 1);
         let mut live = p.live.clone();
         live[0].status = "passed".into();
@@ -2601,7 +3064,7 @@ mod tests {
     fn a_card_gone_elsewhere_while_typing_keeps_the_words_and_sends_nothing() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"just do", 1);
         let rest = p.live[1..].to_vec();
         p.take(rest, Vec::new());
@@ -2617,7 +3080,7 @@ mod tests {
         );
         p.key(b"\x1b", 1);
         assert!(!p.typing() && p.typed().is_empty());
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"ok\r", 1);
         assert_eq!(p.outbox.len(), 1, "the card now open takes its own words");
     }
@@ -2629,7 +3092,7 @@ mod tests {
     fn the_last_card_gone_while_typing_keeps_the_box_and_names_it() {
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"run it after the backup", 1);
         p.take(Vec::new(), Vec::new());
         assert!(p.busy(), "the questions stay up while he types");
@@ -2676,7 +3139,9 @@ mod tests {
             Vec::new(),
         );
         let t = text(&view(&p, &ctx(&[], &[]), 60, 36));
-        assert!(t.contains("1 release-bui\u{2026} "), "{t}");
+        assert!(t.contains("release-bui\u{2026} "), "{t}");
+        p.expanded = true;
+        let t = text(&view(&p, &ctx(&[], &[]), 60, 36));
         assert!(
             t.contains("\u{25be} release-build-and-notar\u{2026} "),
             "{t}"
@@ -2697,14 +3162,14 @@ mod tests {
         p.take(vec![draft], Vec::new());
         p.focus = true;
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        for want in ["Merge PR #513 now or deploy first?", "t to type"] {
+        for want in ["Merge PR #513 now or deploy first?", "[r] Reply"] {
             assert!(t.contains(want), "{want:?} in\n{t}");
         }
-        assert!(!t.contains("[a]"), "{t}");
+        assert!(!t.contains("[1]") && !t.contains("[a]"), "{t}");
         p.key(b"j", 1);
         p.key(b"a", 1);
         assert!(p.tick(t0).0.is_empty(), "no option to send");
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"merge it", 1);
         p.key(b"\r", 1);
         let (sent, _) = p.tick(t0);
@@ -2741,7 +3206,7 @@ mod tests {
         let t = text(&view(&p, &ctx(&[], &[]), 24, 36));
         let top = t
             .lines()
-            .find(|l| l.contains("\u{256d}\u{2500} type"))
+            .find(|l| l.contains("\u{256d}\u{2500} reply"))
             .expect("the box");
         assert!(top.contains('\u{256e}'), "{t}");
         // The open card's name and its wait never run together.
@@ -2765,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_move_the_open_card_and_the_previewed_option() {
+    fn keys_move_the_selected_card_and_enter_opens_and_folds_it() {
         let mut p = pane(3);
         p.focus = true;
         assert_eq!(p.open_card().unwrap().card, "E1");
@@ -2775,15 +3240,18 @@ mod tests {
         assert_eq!(p.open_card().unwrap().card, "E3", "stops at the last");
         p.key(b"k", 1);
         assert_eq!(p.open_card().unwrap().card, "E2");
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("sends: Do not run"), "the pick previews first");
+        // The arrows move cards as j and k do.
         p.key(b"\x1b[B", 1);
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("sends: Skip 0042"), "{t}");
+        assert_eq!(p.open_card().unwrap().card, "E3");
         p.key(b"\x1b[A", 1);
         p.key(b"\x1b[A", 1);
-        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("sends: Run 0042 on staging now"), "{t}");
+        assert_eq!(p.open_card().unwrap().card, "E1");
+        // Every option shows what it sends once the card is open: no preview to move.
+        p.key(b"\r", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 40));
+        for sends in ["Sends: Run 0042", "Sends: Do not run", "Sends: Skip 0042"] {
+            assert!(t.contains(sends), "{sends}:\n{t}");
+        }
     }
 
     #[test]
@@ -2837,7 +3305,7 @@ mod tests {
         let t0 = Instant::now();
         let mut p = pane(1);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         assert!(p.typing());
         p.key(b"run it", 1);
         p.key(b"\x7f", 1);
@@ -2860,7 +3328,7 @@ mod tests {
         };
         assert_eq!((option, text.as_deref()), (&None, Some("run twice")));
         // An empty box sends nothing, and esc stops typing.
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\r", 1);
         assert!(p.tick(t0).0.is_empty());
         p.key(b"\x1b", 1);
@@ -2873,7 +3341,7 @@ mod tests {
         p.focus = true;
         assert_eq!(p.key(b"\x01", 1), Out::Pass(b"\x01".to_vec()));
         assert!(matches!(p.key(b"\x1b[<0;5;5M", 1), Out::Pass(_)));
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         assert_eq!(
             p.key(b"\x01", 1),
             Out::Pass(b"\x01".to_vec()),
@@ -2882,7 +3350,7 @@ mod tests {
         p.key(b"\x1b", 1);
         assert_eq!(p.key(b"\t", 1), Out::ToChat);
         assert_eq!(p.key(b"\x1b", 1), Out::Closed);
-        assert_eq!(p.key(b"\r", 1), Out::Jump(1));
+        assert_eq!(p.key(b"g", 1), Out::Jump(1));
         // Letters that mean nothing are swallowed, never typed into the chat behind.
         assert_eq!(p.key(b"z", 1), Out::Stay);
     }
@@ -3010,13 +3478,16 @@ mod tests {
         p.take(vec![c], Vec::new());
         p.focus = true;
         p.key(b"a", 1);
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         assert!(p.tick(t0).0.is_empty() && !p.typing());
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
-            t.contains("passed to qass, 1 min ago") && t.contains("waiting for qass"),
-            "{t}"
+            t.contains("passed to qass, 1 min ago") && !t.contains("[1]"),
+            "no answers on a card that is not his: {t}"
         );
+        p.key(b"\r", 1);
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("waiting for qass"), "{t}");
         assert_eq!(p.waiting(), 0, "a passed card is not waiting for him");
     }
 
@@ -3120,16 +3591,16 @@ mod tests {
         let mut p = pane(1);
         p.live[0].opened_at = 1_000 - 26 * 3600;
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(
-            t.contains("waiting 26 h") && t.contains("1 migrations"),
-            "{t}"
-        );
-        // The old card's list row is painted in the calm ink, a fresh one's in the focused ink.
+        assert!(t.contains("waiting 26 h"), "{t}");
+        p.expanded = false;
+        let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
+        assert!(t.contains("migrations") && t.contains("26h"), "{t}");
+        // The old card's folded row is painted in the calm ink, a fresh one's in the focused ink.
         let row_of = |p: &Pane| {
             view(p, &ctx(&[], &[]), 50, 36)
                 .rows
                 .into_iter()
-                .find(|r| strip(r).contains("1 migrations"))
+                .find(|r| strip(r).contains("migrations"))
                 .unwrap()
         };
         let old = row_of(&p);
@@ -3161,15 +3632,15 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            hit_at(&v, rect, 7 + row_of("2 web-app"), 10),
+            hit_at(&v, rect, 7 + row_of("web-app"), 10),
             Some(Hit::Card(1))
         );
         assert_eq!(
-            hit_at(&v, rect, 7 + row_of("[b] wait"), 10),
+            hit_at(&v, rect, 7 + row_of("[2] wait"), 10),
             Some(Hit::Option(1))
         );
         assert_eq!(
-            hit_at(&v, rect, 7 + row_of("t to type"), 10),
+            hit_at(&v, rect, 7 + row_of("r to reply"), 10),
             Some(Hit::Box)
         );
         let tabs = row_of("questions");
@@ -3179,11 +3650,53 @@ mod tests {
         let mut p = pane(3);
         p.click(Hit::Card(2));
         assert_eq!(p.open_card().unwrap().card, "E3");
+        assert!(p.is_open(), "a click on a card opens it");
+        p.click(Hit::Card(2));
+        assert!(!p.is_open(), "and a click on the open one folds it");
         p.click(Hit::Option(0));
         assert_eq!(p.tick(Instant::now()).0.len(), 1);
         let mut q = pane(1);
         q.click(Hit::Box);
         assert!(q.typing());
+    }
+
+    /// On a folded card each answer and `[r] Reply` is a click of its own, on any card: it
+    /// selects that card first.
+    #[test]
+    fn a_click_on_a_folded_answer_sends_it_from_that_card() {
+        let mut p = Pane::default();
+        p.take(
+            vec![card(1, "migrations", "open"), card(2, "web-app", "open")],
+            Vec::new(),
+        );
+        let v = view(&p, &ctx(&[], &[]), 90, 20);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 90,
+            rows: 20,
+        };
+        let rows: Vec<usize> = v
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| strip(r).contains("[1] run now"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(rows.len(), 2, "{}", text(&v));
+        // `[1] run now` starts at column 4 of the card's rows: 2 for the box and 4 indent.
+        assert_eq!(hit_at(&v, rect, rows[1], 7), Some(Hit::Answer(1, 0)));
+        let row = strip(&v.rows[rows[1]]);
+        let reply = row.find("[r] Reply").unwrap();
+        let col = row[..reply].chars().count() + 2;
+        assert_eq!(hit_at(&v, rect, rows[1], col), Some(Hit::Reply(1)));
+        assert_eq!(hit_at(&v, rect, rows[1] - 1, 10), Some(Hit::Card(1)));
+        p.click(Hit::Answer(1, 2));
+        assert_eq!(p.open_card().unwrap().card, "E2");
+        assert_eq!(p.outbox.len(), 1);
+        p.outbox.clear();
+        p.click(Hit::Reply(0));
+        assert!(p.typing() && p.open_card().unwrap().card == "E1");
     }
 
     #[test]
@@ -3195,7 +3708,7 @@ mod tests {
         let short = text(&view(&p, &ctx(&[], &[]), 50, 22));
         assert!(!short.contains("handled for you"), "{short}");
         assert!(
-            short.contains("[a] run now") && short.contains("type a different answer"),
+            short.contains("[1] run now") && short.contains("reply in your own words"),
             "{short}"
         );
     }
@@ -3224,7 +3737,7 @@ mod tests {
         );
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(
-            t.contains("t type  o talk") && !t.contains("sent to"),
+            t.contains("1-9 answer") && t.contains("r reply") && !t.contains("sent to"),
             "{t}"
         );
         assert_eq!(p.wake_at(), None, "nothing armed again");
@@ -3239,13 +3752,13 @@ mod tests {
         });
         assert!(!p.tick(t0 + NOTICE * 10).1, "no clock lets a failure go");
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("taken back") && !t.contains("j k cards"), "{t}");
+        assert!(t.contains("taken back") && !t.contains("j k move"), "{t}");
         p.key(b"\x1b[B", 1);
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
         assert!(t.contains("taken back"), "a key in the pane keeps it: {t}");
         p.key(b"\x1b", 1);
         let t = text(&view(&p, &ctx(&[], &[]), 50, 36));
-        assert!(t.contains("j k cards") && !t.contains("taken back"), "{t}");
+        assert!(t.contains("j k move") && !t.contains("taken back"), "{t}");
     }
 
     /// An option or a dismissal takes the card's draft with it, and a failure brings it back.
@@ -3254,7 +3767,7 @@ mod tests {
         for key in [b"a", b"x"] {
             let mut p = pane(2);
             p.focus = true;
-            p.key(b"t", 1);
+            p.key(b"r", 1);
             p.key(b"only after the backup", 1);
             p.key(b"\x1b", 1);
             p.key(key, 1);
@@ -3278,7 +3791,7 @@ mod tests {
     fn the_words_of_a_card_that_ended_stand_whole_until_esc() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(words(20).as_bytes(), 1);
         p.key(b"\r", 1);
         let Some(ControlRequest::AskWrite { id, .. }) = p.tick(Instant::now()).0.into_iter().next()
@@ -3308,7 +3821,7 @@ mod tests {
         let mut p = pane(2);
         p.focus = true;
         let send = |p: &mut Pane, words: &[u8]| {
-            p.key(b"t", 1);
+            p.key(b"r", 1);
             p.key(words, 1);
             p.key(b"\r", 1);
             assert_eq!(p.typed(), "", "the box empties as it goes");
@@ -3329,7 +3842,7 @@ mod tests {
             "{t}"
         );
         // Sent again and taken: nothing comes back.
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\r", 1);
         let id = match p.tick(t0).0.into_iter().next() {
             Some(ControlRequest::AskWrite { id, .. }) => id,
@@ -3352,13 +3865,13 @@ mod tests {
         p.key(b"k", 1);
         assert_eq!(p.typed(), "wait for me");
         // Failed while new words are in the box: both are kept, the failed ones first.
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\r", 1);
         let id = match p.tick(t0).0.into_iter().next() {
             Some(ControlRequest::AskWrite { id, .. }) => id,
             other => panic!("sent: {other:?}"),
         };
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"and then", 1);
         p.answered(&ControlResponse::Failed {
             id,
@@ -3393,7 +3906,7 @@ mod tests {
     fn words_typed_for_a_card_are_not_kept_for_the_one_that_replaced_it() {
         let mut p = pane(2);
         p.focus = true;
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"for the first", 1);
         // The card he types for is gone: his words stay while he types and go with esc, never
         // to the next one.
@@ -3402,7 +3915,7 @@ mod tests {
         p.key(b"\x1b", 1);
         assert!(!p.typing() && p.typed().is_empty());
         // Typed text changes with a move to another card, and escapes are not letters.
-        p.key(b"t", 1);
+        p.key(b"r", 1);
         p.key(b"\x1b[D", 1);
         p.key(b"\x1b[200~", 1);
         assert_eq!(p.typed(), "");
@@ -3443,6 +3956,7 @@ mod tests {
         c.body.options[1].reason = format!("{} {}", "x".repeat(70), "\u{4e2d}".repeat(30));
         let mut p = Pane::default();
         p.take(vec![c], Vec::new());
+        p.expanded = true;
         p
     }
 
@@ -3516,7 +4030,7 @@ mod tests {
             for draft in ["", "keep this"] {
                 p.text = draft.into();
                 let t = text(&view(&p, &ctx(&[], &[]), cols, rows));
-                for key in ["[a]", "[b]", "[c]", "[d]"] {
+                for key in ["[1]", "[2]", "[3]", "[4]"] {
                     assert!(t.contains(key), "{key} at {cols}x{rows} {draft:?}:\n{t}");
                 }
                 assert!(
@@ -3544,7 +4058,7 @@ mod tests {
             }
             // The question and every answer with its reason, wrapped, none cut.
             let reasons = words(10);
-            for word in words(30).split(' ').chain(["[a]", "[b]", "[c]", "[d]"]) {
+            for word in words(30).split(' ').chain(["[1]", "[2]", "[3]", "[4]"]) {
                 assert!(seen.contains(word), "{word} read whole at {cols}x{rows}");
             }
             assert!(
@@ -3608,7 +4122,7 @@ mod tests {
         let first = v
             .rows
             .iter()
-            .position(|r| strip(r).contains("[a] "))
+            .position(|r| strip(r).contains("[1] "))
             .unwrap();
         assert_eq!(hit_at(&v, rect, first, 10), Some(Hit::Option(0)));
         assert_eq!(hit_at(&v, rect, first + 1, 10), Some(Hit::Option(0)));

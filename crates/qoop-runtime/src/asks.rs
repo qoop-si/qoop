@@ -413,6 +413,22 @@ fn card_value(text: &str) -> String {
         .collect()
 }
 
+/// A card's question: one line of at most [`crate::control::ASK_QUESTION_MAX`] characters, cut
+/// at a word with an ellipsis when longer.
+fn question_value(text: &str) -> String {
+    let line = qoop_store::task::one_line(text);
+    let max = crate::control::ASK_QUESTION_MAX;
+    if line.chars().count() <= max {
+        return line;
+    }
+    let head: String = line.chars().take(max - 1).collect();
+    let cut = head
+        .rfind(' ')
+        .filter(|&at| at > max / 2)
+        .unwrap_or(head.len());
+    format!("{}\u{2026}", head[..cut].trim_end())
+}
+
 /// How often the daemon looks for a plan that waited too long for qass.
 const STALE_LOOK: Duration = Duration::from_secs(60);
 
@@ -531,6 +547,7 @@ async fn file_waiting(
     (agents, connections, store): (&AgentRegistry, &Arc<ConnectionRegistry>, &StoreHandle),
 ) -> bool {
     let question = question.filter(|q| !q.trim().is_empty());
+    let said = question.as_ref().and_then(|_| agents.said(terminal));
     let prompts: Vec<i64> = if question.is_none() {
         agents
             .focus_events(terminal)
@@ -559,25 +576,33 @@ async fn file_waiting(
             }
             let name = name.unwrap_or_else(|| format!("terminal {terminal}"));
             let owner_words = s.goal_is_prompt(task.id)?;
-            let asks = question.unwrap_or_else(|| {
+            // The turn's own words when the hook sent them: the whole question, and what it
+            // did just before. The cut label stands in when it did not (an older hook).
+            let (before, whole) = match &said {
+                Some((before, last)) => (before.clone(), Some(last.clone())),
+                None => (None, None),
+            };
+            let asks = whole.or(question).unwrap_or_else(|| {
                 if owner_words {
                     format!("{name} waits on you")
                 } else {
                     format!("{name} waits on you: {}", task.goal)
                 }
             });
-            let doing = if owner_words {
-                format!("task #{}", task.id)
-            } else {
-                task.goal.clone()
+            let doing = match before {
+                Some(before) => before,
+                None if owner_words => format!("task #{}", task.id),
+                None => task.goal.clone(),
             };
             let card = AskCard {
                 handle: draft_handle(&name, task.id),
                 urgency: "now".to_string(),
-                asked: None,
+                // What he asked, in the agent's words once it rewrote the goal: never his own
+                // cut prompt shown back to him.
+                asked: (!owner_words).then(|| card_value(&task.goal)),
                 doing: card_value(&doing),
                 why: DRAFT_WHY.to_string(),
-                asks: card_value(&asks),
+                asks: question_value(&asks),
                 options: Vec::new(),
                 pick: None,
             };
@@ -2572,6 +2597,71 @@ mod tests {
             body.contains("gtm516 waits on you: Use the live rate"),
             "{body}"
         );
+    }
+
+    /// The turn's closing words make the card: the whole question, what it did just before,
+    /// and what he asked in the goal the agent wrote; his own prompt never.
+    #[tokio::test]
+    async fn a_draft_carries_the_turns_own_words() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let store = waiting_stack("you idiot, fix the rate", 100);
+        let long = format!("Shall I {}use the live rate?", "really ".repeat(30));
+        agents.set_said(
+            7,
+            Some(&format!("Built the table and ran 208 tests.\n\n{long}")),
+        );
+        assert!(
+            draft_waiting(
+                7,
+                Some("gtm516".into()),
+                Some("Shall I ... rate?".into()),
+                None,
+                (&agents, &connections, &store)
+            )
+            .await
+        );
+        let body = live_cards(&store).await.remove(0).body;
+        let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(card["asks"].as_str().unwrap(), long, "whole, past 200");
+        assert_eq!(
+            card["doing"].as_str().unwrap(),
+            "Built the table and ran 208 tests."
+        );
+        assert!(card.get("asked").is_none_or(|a| a.is_null()), "{body}");
+        assert!(!body.contains("idiot"), "{body}");
+
+        let store = waiting_stack("you idiot, fix the rate", 100);
+        store
+            .run(|s| {
+                let task = s.open_task_of(7)?.unwrap().id;
+                s.set_task_goal(task, "Use the live rate; done when tests pass", 101)
+                    .map(drop)
+            })
+            .await
+            .unwrap();
+        assert!(
+            draft_waiting(
+                7,
+                Some("gtm516".into()),
+                Some("Merge?".into()),
+                None,
+                (&agents, &connections, &store)
+            )
+            .await
+        );
+        let card: serde_json::Value =
+            serde_json::from_str(&live_cards(&store).await.remove(0).body).unwrap();
+        assert_eq!(
+            card["asked"].as_str().unwrap(),
+            "Use the live rate; done when tests pass"
+        );
+        // A token in its words never reaches the card.
+        agents.set_said(
+            7,
+            Some("Set ghp_0123456789abcdef0123456789abcdef0123 in env.\n\nOK?"),
+        );
+        assert!(!agents.said(7).unwrap().0.unwrap().contains("ghp_0123"));
     }
 
     /// A prompt somebody typed reached the agent after its wait began, and its turn then ended
