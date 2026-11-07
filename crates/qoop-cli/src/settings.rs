@@ -51,6 +51,8 @@ pub(crate) struct Row {
     pub value: String,
     pub help: String,
     pub kind: Kind,
+    /// The onboarding shows `help` under the open row's choices.
+    pub hint: bool,
 }
 
 /// Every row, from the file as it is now and the lists read once at the start.
@@ -65,6 +67,7 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         value,
         help: help.to_string(),
         kind,
+        hint: false,
     };
     let mut out = vec![
         row(
@@ -151,17 +154,20 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         ));
     }
     let idle = c.lifecycle.idle_minutes;
-    out.push(row(
-        "sleep",
-        "idle tabs sleep",
-        if idle == 0 {
-            "never".to_string()
-        } else {
-            format!("{idle} min")
-        },
-        "the daemon takes it up on its next check",
-        Kind::Idle,
-    ));
+    out.push(Row {
+        hint: true,
+        ..row(
+            "sleep",
+            "idle tabs sleep",
+            if idle == 0 {
+                "never".to_string()
+            } else {
+                format!("{idle} min")
+            },
+            "the daemon takes it up on its next check",
+            Kind::Idle,
+        )
+    });
     out.push(row(
         "sleep",
         "daemon leaves",
@@ -169,13 +175,24 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
         "when everything sleeps",
         Kind::Toggle("daemon.exit_when_asleep"),
     ));
-    out.push(row(
+    // With nothing qass can start on here, an `[agents]` line of the person's own included,
+    // the row says so, where the onboarding shows it too.
+    let none_here = crate::onboard::qass_agent(&read, crate::onboard::here_now).is_none();
+    let qass = row(
         "qass",
         "qass runs on",
         read.qass_agent.clone(),
-        "the agent `qoop qass` opens: yours from [agents] too",
+        if none_here {
+            "none of these is installed here yet: install one, then qoop qass"
+        } else {
+            "the agent `qoop qass` opens: yours from [agents] too"
+        },
         Kind::Choice("qass.agent", qass_agents(&read)),
-    ));
+    );
+    out.push(Row {
+        hint: none_here,
+        ..qass
+    });
     out.push(row(
         "report",
         "notes to qoop's maker",
@@ -211,12 +228,11 @@ pub(crate) fn rows(lists: &[Row]) -> Vec<Row> {
     out
 }
 
-/// What qass may run on here: the agents it starts on that are on `PATH`, the
-/// `[agents]` names, and whatever the file names now.
+/// What qass may run on: every agent it starts on, installed here or not yet, so a choice
+/// never disappears from the row, the `[agents]` names, and whatever the file names now.
 pub(crate) fn qass_agents(read: &config::Read) -> Vec<String> {
     let mut out: Vec<String> = config::QASS_AGENTS
         .iter()
-        .filter(|a| crate::hooks::on_path(a))
         .map(|a| a.to_string())
         .chain(read.agents.iter().map(|a| a.name.clone()))
         .collect();
@@ -265,6 +281,7 @@ pub(crate) fn listed(group: &'static str, args: &[&str], by_two_spaces: bool) ->
                     String::new()
                 },
                 help: help.trim().to_string(),
+                hint: false,
                 kind: Kind::Info,
             }
         })
@@ -980,6 +997,34 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The qass row starts from the agent the file names and its arrows reach every agent qass
+    /// starts on, installed here or not: none is left out, none is snapped back from.
+    #[test]
+    fn the_qass_row_reaches_every_agent_from_the_one_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[qass]\nagent = \"claude\"\n").unwrap();
+        let read = config::read_from(&file);
+        let list = qass_agents(&read);
+        assert_eq!(list, config::QASS_AGENTS.map(String::from).to_vec());
+        let mut now = read.qass_agent.clone();
+        let mut seen = Vec::new();
+        for _ in 0..list.len() {
+            let row = Row {
+                value: now.clone(),
+                ..row(
+                    "qass",
+                    "qass runs on",
+                    Kind::Choice("qass.agent", list.clone()),
+                )
+            };
+            let (choices, at) = options(&row, false);
+            now = choices[(at + 1) % choices.len()].clone();
+            seen.push(now.clone());
+        }
+        assert_eq!(seen, ["codex", "gemini", "opencode", "claude"]);
+    }
+
     fn row(group: &'static str, label: &str, kind: Kind) -> Row {
         Row {
             group,
@@ -987,6 +1032,7 @@ mod tests {
             value: "on".to_string(),
             help: "some help".to_string(),
             kind,
+            hint: false,
         }
     }
 

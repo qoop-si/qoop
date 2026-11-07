@@ -64,9 +64,31 @@ fn shell() -> PathBuf {
     // here because the daemon runs as the user and the user's own SHELL is exactly the
     // right answer for a terminal multiplexer; ADR-015's rules apply to a Setup artifact,
     // which is a different and untrusted input.
-    std::env::var("SHELL")
+    shell_from(
+        std::env::var_os("SHELL"),
+        qoop_runtime::paths::current_user_shell,
+    )
+}
+
+/// `$SHELL` when set, else the login shell the password database names (a `docker exec` sets
+/// no `SHELL`, and its tabs started dash where the person's shell is bash), else `/bin/sh`.
+/// That one only when it is a shell to type in: a service user's `nologin` or `false` would
+/// give tabs that end at once.
+fn shell_from(env: Option<std::ffi::OsString>, login: impl FnOnce() -> Option<String>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let usable = |p: &PathBuf| {
+        p.is_absolute()
+            && !matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("nologin" | "false")
+            )
+            && std::fs::metadata(p)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    env.filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/bin/sh"))
+        .or_else(|| login().map(PathBuf::from).filter(usable))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
 /// What runs `qoop pair`, `qoop devices` and `qoop bridge`: the phone app's part, in the
@@ -3691,6 +3713,36 @@ fn run_stop(args: &[String]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::person_refusal;
+
+    /// `$SHELL` first; unset or empty, the password database's shell when it is one to type
+    /// in; else `/bin/sh`.
+    #[test]
+    fn a_tab_starts_the_login_shell_when_shell_is_unset() {
+        use std::path::Path;
+        // An absolute, executable file that is not /bin/sh: this test's own binary.
+        let exe = std::env::current_exe().unwrap();
+        let login = || Some(exe.display().to_string());
+        let zsh = Some("/bin/zsh".into());
+        assert_eq!(super::shell_from(zsh, login), Path::new("/bin/zsh"));
+        assert_eq!(super::shell_from(None, login), exe);
+        assert_eq!(super::shell_from(Some("".into()), login), exe);
+        assert_eq!(super::shell_from(None, || None), Path::new("/bin/sh"));
+        for refused in [
+            "/usr/sbin/nologin",
+            "/sbin/nologin",
+            "/bin/false",
+            "/usr/bin/false",
+            "bash",
+            "/no/such/shell",
+            "/etc/hosts",
+        ] {
+            assert_eq!(
+                super::shell_from(None, || Some(refused.to_string())),
+                Path::new("/bin/sh"),
+                "{refused}"
+            );
+        }
+    }
 
     /// A person at the tab refuses a write until the second the daemon names, then it passes.
     #[test]

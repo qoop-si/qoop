@@ -93,16 +93,33 @@ grep -q "extra" "$T/tar-calls" && fail "tar was asked for more than the qoop mem
 # PATH hint since that directory is not on PATH here.
 out="$(env -u QOOP_DEST sh <scripts/install.sh)" || fail "default destination exited nonzero"
 [ -x "$HOME/.local/bin/qoop" ] || fail "default install did not land in ~/.local/bin/qoop"
-case "$out" in *"add $HOME/.local/bin to PATH"*) ;; *) fail "no PATH hint: $out" ;; esac
-# The next step, by full path since the name does not resolve yet.
-case "$out" in *"next: $HOME/.local/bin/qoop login"*) ;; *) fail "no next step by full path: $out" ;; esac
+case "$out" in *"1. add $HOME/.local/bin to PATH"*) ;; *) fail "no PATH hint: $out" ;; esac
+# The steps after it, numbered: this terminal's PATH, the first start, the sign-in.
+case "$out" in *'2. and in this terminal: export PATH='*) ;; *) fail "no PATH for this terminal: $out" ;; esac
+case "$out" in *"3. start it in a project: cd your-project && qoop"*) ;; *) fail "no first start: $out" ;; esac
+case "$out" in *"4. show this computer on qoop.si/app and your phone: qoop login"*) ;; *) fail "no sign-in step: $out" ;; esac
+# Signed in already (the account in hub.json): no sign-in step.
+mkdir -p "$HOME/.config/qoop"
+echo '{"url":"https://qoop.si","account":"a@b.c"}' > "$HOME/.config/qoop/hub.json"
+out="$(QOOP_DEST="$T/signed/qoop" sh scripts/install.sh)" || fail "signed-in install exited nonzero"
+case "$out" in *"qoop login"*) fail "a sign-in step for a computer signed in: $out" ;; esac
+# hub.json as `qoop login` writes it (pretty), with no account in it, or mid-leave: not signed in.
+for hub in '{\n  "url": "https://qoop.si",\n  "account": null\n}' \
+    '{\n  "url": "https://qoop.si",\n  "account": "a@b.c",\n  "unlinking": true\n}' \
+    '{\n  "url": "https://qoop.si"\n}'; do
+    # shellcheck disable=SC2059 # the pattern is the file, its \n the newlines
+    printf "$hub\n" > "$HOME/.config/qoop/hub.json"
+    rm -rf "$T/signed"
+    out="$(QOOP_DEST="$T/signed/qoop" sh scripts/install.sh)" || fail "not-signed-in install exited nonzero"
+    case "$out" in *"qoop login"*) ;; *) fail "no sign-in step for: $(cat "$HOME/.config/qoop/hub.json")" ;; esac
+done
+rm -rf "$HOME/.config"
 # Not a terminal: no onboarding wizard asked for.
 grep -q "^onboard" "$T/calls" && fail "the wizard ran with no terminal answering"
 [ -z "$(ls -A "$T/tmp")" ] || fail "the default install left its temp dir behind"
 
-# A first install on a terminal (`script` gives it one): the PATH line comes before the
-# onboarding, so a ctrl-c in its sign-in leaves it said, and no "next: qoop login" follows,
-# since the onboarding asks to sign in itself.
+# A first install on a terminal (`script` gives it one): the next steps come after the
+# onboarding, the last thing on the screen, with the sign-in while this computer is not signed in.
 command -v script >/dev/null 2>&1 || fail "no script(1) to give install.sh a terminal"
 rm -rf "$T/dest9"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -116,8 +133,8 @@ tr -d '\r' <"$T/out9" >"$T/out9.txt"
 grep -q "^onboarding" "$T/out9.txt" || fail "no onboarding on a first install with a terminal: $(cat "$T/out9.txt")"
 path_at="$(grep -n "to PATH" "$T/out9.txt" | head -n 1 | cut -d: -f1)"
 onboard_at="$(grep -n "^onboarding" "$T/out9.txt" | head -n 1 | cut -d: -f1)"
-[ -n "$path_at" ] && [ "$path_at" -lt "$onboard_at" ] || fail "the PATH line is not said before the onboarding: $(cat "$T/out9.txt")"
-grep -q "next: .*login" "$T/out9.txt" && fail "a login hint after an onboarding that asks itself: $(cat "$T/out9.txt")"
+[ -n "$path_at" ] && [ "$path_at" -gt "$onboard_at" ] || fail "the PATH line is not said after the onboarding: $(cat "$T/out9.txt")"
+grep -q "qoop login$" "$T/out9.txt" || fail "no sign-in step for a computer not signed in: $(cat "$T/out9.txt")"
 
 # The qoop.si layout: asset urls under releases/v<version>/, keys in the other order. The
 # latest file is named hub-latest, so it is laid out as the base's own `latest`.
@@ -141,6 +158,12 @@ case "$out" in *'export PATH'*) fail "a bash line was given to fish: $out" ;; es
 out="$(SHELL=/bin/bash QOOP_DEST="$T/bash/qoop" sh scripts/install.sh)" || fail "bash install exited nonzero"
 if [ "$(uname -s)" = "Darwin" ]; then rc=.bash_profile; else rc=.bashrc; fi
 case "$out" in *">> ~/$rc"*) ;; *) fail "wrong profile for bash: $out" ;; esac
+# No SHELL (a container): the passwd entry's shell picks the file, not .profile.
+printf '#!/bin/sh\necho "me:x:1000:1000::/home/me:/bin/zsh"\n' > "$T/shim/getent"
+chmod 0755 "$T/shim/getent"
+out="$(env -u SHELL QOOP_DEST="$T/noshell/qoop" sh scripts/install.sh)" || fail "install without SHELL exited nonzero"
+case "$out" in *">> ~/.zshrc"*) ;; *) fail "the passwd shell did not pick the profile: $out" ;; esac
+rm "$T/shim/getent"
 
 # A file of the person's beside the destination is never staged over or removed, and nothing
 # but the binary is left there.

@@ -70,7 +70,13 @@ const STEPS: [Step; 8] = [
         title: "notifications",
         what: "how qoop tells you when you are not looking",
         groups: &["notifications"],
-        also: &[],
+        // The notch row is a Mac's only, and on by default: what it is, and that it is a
+        // login item, said where it is chosen.
+        also: if cfg!(target_os = "macos") {
+            &["notch: your agents at the top of the screen; it starts at login"]
+        } else {
+            &[]
+        },
     },
     Step {
         name: "sleep",
@@ -108,6 +114,9 @@ struct Onboard {
     said: Option<String>,
     /// Ctrl-C, ctrl-d or a lost terminal ended it: nothing more is asked or started.
     stopped: bool,
+    /// The qass step was reached: its agent is preselected once, so a pick made there and
+    /// stepped back over is kept.
+    qass_seen: bool,
 }
 
 impl Onboard {
@@ -280,7 +289,7 @@ impl Onboard {
             // own lines with the blank before them.
             let also = STEPS[self.step].also.len();
             let under = 2 * (rows.len() - i - 1)
-                + usize::from(matches!(row.kind, Kind::Idle))
+                + usize::from(row.hint)
                 + if also > 0 { also + 1 } else { 0 };
             let room = (s.h - 4).saturating_sub(y + under);
             let (list, at) = settings::options(row, macos);
@@ -303,7 +312,7 @@ impl Onboard {
                 s.centre_seg(cx, y, &parts);
                 y += 1;
             }
-            if let Kind::Idle = row.kind {
+            if row.hint {
                 s.centre(cx, y, &row.help, &ink(Role::FaintText));
                 y += 1;
             }
@@ -329,6 +338,10 @@ impl Onboard {
                 self.step += 1;
                 self.row = 0;
                 self.said = None;
+                if STEPS[self.step].name == "qass" && !self.qass_seen {
+                    self.qass_seen = true;
+                    self.said = preselect_qass().err();
+                }
             }
             Key::BackTab if self.step > 0 => {
                 self.step -= 1;
@@ -442,6 +455,7 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         pet: settings::the_pet(),
         said: None,
         stopped: false,
+        qass_seen: false,
     };
     // A pet chosen here is a pet picked: saved even when only enter is pressed.
     if avatar::load().is_none() {
@@ -465,6 +479,11 @@ pub fn run(args: &[String], phone: Option<Phone>) -> std::io::Result<()> {
         }
     }
     drop(session);
+    // Finished before the qass step: the agent it would have preselected is chosen now, as
+    // finish keeps whatever the file names.
+    if !onboard.stopped && !onboard.qass_seen {
+        let _ = preselect_qass();
+    }
     if let Some(code) = after_steps(onboard.stopped, phone, finish)? {
         std::process::exit(code);
     }
@@ -488,22 +507,28 @@ fn after_steps(
     Ok(None)
 }
 
-/// The end of a finished onboarding: the usage notice, the sign-in, then qass.
+/// The end of a finished onboarding: the sign-in, the usage notice, then qass.
 fn finish(phone: Option<Phone>) -> std::io::Result<()> {
-    // What the usage counts are, before anything is counted (ADR-023).
-    crate::telemetry::notice_once();
+    // Asked the moment the steps close, before the notice and its pause: a question that came
+    // seconds later took the next command a person typed as its answer. Nothing counts before
+    // the notice is seen (its mark), so a sign-in first counts nothing.
     if let Some(phone) = phone
-        && let Some(hint) = sign_in(phone, ask(SIGN_IN).as_deref())
+        && let Some(hint) = sign_in(phone, ask_yes(SIGN_IN, ask))
     {
         println!("{hint}");
     }
+    // What the usage counts are, before anything is counted (ADR-023).
+    crate::telemetry::notice_once();
     let key = command_key(config::read().config.prefix);
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
-    let Some(agent) = qass_agent(&config::read(), |a| here(a, home.as_deref())) else {
-        println!("{NO_AGENT}");
-        return Ok(());
+    let agent = match qass_start(&config::read(), |a| here(a, home.as_deref())) {
+        Ok(agent) => agent,
+        Err(line) => {
+            println!("{line}");
+            return Ok(());
+        }
     };
     // Claude's own settings: under CLAUDE_CONFIG_DIR, else `~/.claude.json` and `~/.claude/`.
     let (json, settings) = match std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
@@ -551,9 +576,27 @@ fn ask(question: &str) -> Option<String> {
         .map(|_| said)
 }
 
-/// A yes: enter alone is one; no answer is not.
-fn yes(said: Option<&str>) -> bool {
-    said.is_some_and(|a| matches!(a.trim(), "" | "y" | "Y" | "yes" | "Yes"))
+/// `question` until it gets a yes or a no, through `ask`. No answer at all (end of input) is a
+/// no, and so are three answers that are neither, so input piped in never loops.
+fn ask_yes(question: &str, mut ask: impl FnMut(&str) -> Option<String>) -> bool {
+    for _ in 0..3 {
+        match ask(question).map(|said| yes_no(&said)) {
+            None => return false,
+            Some(Some(yes)) => return yes,
+            Some(None) => println!("answer y or n"),
+        }
+    }
+    false
+}
+
+/// A typed answer: enter alone, y or yes is a yes, n or no a no, anything else neither (a
+/// command typed for the shell, which must not be read as a no).
+fn yes_no(said: &str) -> Option<bool> {
+    match said.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 const SIGN_IN: &str = "Sign in so this computer shows on qoop.si/app and your phone? [Y/n] ";
@@ -566,8 +609,8 @@ const NO_AGENT: &str =
 /// After a yes, `qoop login`; the line to print after it, if any. Asked first because a login
 /// waits up to ten minutes for the browser. Nothing here fails onboarding: a no, no answer, no
 /// network or a code nobody confirmed all end on the hint.
-fn sign_in(phone: Phone, said: Option<&str>) -> Option<String> {
-    if !yes(said) {
+fn sign_in(phone: Phone, yes: bool) -> Option<String> {
+    if !yes {
         return Some(LATER.into());
     }
     match phone(&["qoop".into(), "login".into()]) {
@@ -589,24 +632,62 @@ fn last_line(key: &str) -> String {
     )
 }
 
-/// The agent qass starts on: the one the file names when it is here (a person's own `[agents]`
-/// line always is: its shell may know names this process does not), else the first one here.
-fn qass_agent(read: &config::Read, here: impl Fn(&str) -> bool) -> Option<String> {
+/// The agent qass starts on, and the one its settings row shows chosen: the one the file names
+/// when it is here (a person's own `[agents]` line always is: its shell may know names this
+/// process does not), else the first one here.
+pub(crate) fn qass_agent(read: &config::Read, here: impl Fn(&str) -> bool) -> Option<String> {
     let named = &read.qass_agent;
     if read.agents.iter().any(|a| &a.name == named) || here(named) {
         return Some(named.clone());
     }
-    ["claude", "codex", "opencode", "gemini"]
+    config::QASS_AGENTS
         .into_iter()
         .find(|a| here(a))
         .map(String::from)
 }
 
+/// The agent qass starts on after the steps: the one the file names, kept, as the qass step
+/// preselected it once and a pick made there is the person's; else the line to say instead.
+fn qass_start(read: &config::Read, here: impl Fn(&str) -> bool) -> Result<String, String> {
+    let named = &read.qass_agent;
+    if read.agents.iter().any(|a| &a.name == named) || here(named) {
+        return Ok(named.clone());
+    }
+    if qass_agent(read, &here).is_none() {
+        return Err(NO_AGENT.into());
+    }
+    Err(format!(
+        "qass runs on {named}, which is not installed here: install it, then qoop qass"
+    ))
+}
+
+/// On reaching the qass step: an agent the file names that is not here (the default, claude,
+/// on a machine without it) gives way to the first one that is, written, so the row shows it
+/// and its arrows start from it. The settings page always shows what the file says.
+fn preselect_qass() -> Result<(), String> {
+    let read = config::read();
+    match qass_agent(&read, here_now) {
+        Some(agent) if agent != read.qass_agent => {
+            config::set(&config::path(), "qass.agent", &agent)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Whether an agent qass runs on by name is installed: on `PATH`, or Claude's own local
-/// install, which its installer reaches through a shell alias.
+/// install, which its installer reaches through a shell alias. Not an install folder off
+/// `PATH`: qass's tab starts the agent by its bare name.
 fn here(agent: &str, home: Option<&Path>) -> bool {
     crate::hooks::on_path(agent)
         || (agent == "claude" && home.is_some_and(|h| h.join(".claude/local/claude").exists()))
+}
+
+/// [`here`], with this process's home.
+pub(crate) fn here_now(agent: &str) -> bool {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    here(agent, home.as_deref())
 }
 
 /// Whether Claude shows a screen before qass can start on it: its first start not finished
@@ -690,25 +771,61 @@ mod tests {
     }
 
     #[test]
-    fn a_yes_or_enter_runs_qoop_login_and_anything_else_leaves_it_for_later() {
+    fn a_yes_runs_qoop_login_and_a_no_leaves_it_for_later() {
         let login = vec![vec!["qoop".to_string(), "login".to_string()]];
-        for yes in ["\n", "y\n", "Y\n", "yes\n"] {
-            assert_eq!(sign_in(signs_in, Some(yes)), None, "{yes:?}");
-            assert_eq!(calls(), login, "{yes:?}");
-        }
-        for no in [Some("n\n"), Some("no\n"), Some("later\n"), None] {
-            assert_eq!(
-                sign_in(signs_in, no).as_deref(),
-                Some("later: qoop login"),
-                "{no:?}"
-            );
-            assert!(calls().is_empty(), "{no:?}");
-        }
+        assert_eq!(sign_in(signs_in, true), None);
+        assert_eq!(calls(), login);
         assert_eq!(
-            sign_in(cannot_reach, Some("y\n")).as_deref(),
+            sign_in(signs_in, false).as_deref(),
+            Some("later: qoop login")
+        );
+        assert!(calls().is_empty());
+        assert_eq!(
+            sign_in(cannot_reach, true).as_deref(),
             Some("not signed in: the hub did not answer. later: qoop login")
         );
         assert_eq!(calls(), login);
+    }
+
+    /// Enter, y and yes are a yes, n and no a no, and a command typed for the shell (two Mac
+    /// users' next `clear`) is neither, so it is asked again rather than taken as a no.
+    #[test]
+    fn only_a_yes_or_a_no_answers_the_sign_in() {
+        for yes in ["\n", "y\n", "Y\n", "yes\n", " YES \n"] {
+            assert_eq!(yes_no(yes), Some(true), "{yes:?}");
+        }
+        for no in ["n\n", "No\n", "no"] {
+            assert_eq!(yes_no(no), Some(false), "{no:?}");
+        }
+        for other in [
+            "clear\n",
+            "later\n",
+            "ls -la\n",
+            "yess\n",
+            "cd ~/repo && qoop\n",
+        ] {
+            assert_eq!(yes_no(other), None, "{other:?}");
+        }
+    }
+
+    /// An answer that is neither is asked again, up to three times, then taken as a no; the end
+    /// of input is a no at once.
+    #[test]
+    fn the_sign_in_asks_again_three_times_at_most() {
+        let answers = |said: &'static [&'static str]| {
+            let mut said = said.iter();
+            move |_: &str| said.next().map(|s| s.to_string())
+        };
+        assert!(ask_yes(SIGN_IN, answers(&["clear\n", "ls\n", "y\n"])));
+        assert!(!ask_yes(SIGN_IN, answers(&["clear\n", "n\n"])));
+        assert!(!ask_yes(SIGN_IN, answers(&["a\n", "b\n", "c\n", "y\n"])));
+        assert!(!ask_yes(SIGN_IN, answers(&["clear\n"])));
+        let mut asked = 0;
+        ask_yes(SIGN_IN, |_| {
+            asked += 1;
+            Some("garbage\n".into())
+        });
+        assert_eq!(asked, 3, "piped garbage never loops");
     }
 
     #[test]
@@ -733,13 +850,35 @@ mod tests {
             Some("codex")
         );
         assert_eq!(
-            qass_agent(&codex, only(&["gemini", "opencode"])).as_deref(),
-            Some("opencode")
+            qass_agent(&codex, only(&["opencode", "gemini"])).as_deref(),
+            Some("gemini")
         );
         assert_eq!(qass_agent(&codex, only(&[])), None);
         // A person's own line is theirs, whatever this process finds on its PATH.
         let own = read_naming("mine", "[agents]\nmine = \"FOO=1 ~/bin/claude\"\n");
         assert_eq!(qass_agent(&own, only(&[])).as_deref(), Some("mine"));
+    }
+
+    /// After the steps the named agent is kept even when another one is here: a pick of one not
+    /// installed is said, never replaced.
+    #[test]
+    fn qass_starts_on_the_named_agent_or_says_why_not() {
+        let only = |have: &'static [&'static str]| move |a: &str| have.contains(&a);
+        let gemini = read_naming("gemini", "");
+        assert_eq!(
+            qass_start(&gemini, only(&["gemini", "codex"])),
+            Ok("gemini".into())
+        );
+        assert_eq!(
+            qass_start(&gemini, only(&["codex"])),
+            Err(
+                "qass runs on gemini, which is not installed here: install it, then qoop qass"
+                    .into()
+            )
+        );
+        assert_eq!(qass_start(&gemini, only(&[])), Err(NO_AGENT.into()));
+        let own = read_naming("mine", "[agents]\nmine = \"FOO=1 ~/bin/claude\"\n");
+        assert_eq!(qass_start(&own, only(&[])), Ok("mine".into()));
     }
 
     #[test]
@@ -768,18 +907,32 @@ mod tests {
         assert!(line.ends_with("ctrl-b Q starts qass again."), "{line}");
     }
 
+    /// Claude's local install counts; an agent in an install folder off `PATH` does not, as the
+    /// tab qass starts runs it by its bare name.
     #[test]
-    fn claude_s_local_install_counts_as_claude_being_here() {
+    fn only_an_agent_its_tab_can_start_by_name_is_here() {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let on_path = crate::hooks::on_path("claude");
         assert_eq!(here("claude", Some(home.path())), on_path);
         std::fs::create_dir_all(home.path().join(".claude/local")).unwrap();
         std::fs::write(home.path().join(".claude/local/claude"), "").unwrap();
         assert!(here("claude", Some(home.path())));
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gemini"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join("gemini"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            here("gemini", Some(home.path())),
+            crate::hooks::on_path("gemini")
+        );
         assert!(!here("no-such-agent-here", Some(home.path())));
         assert!(!here("no-such-agent-here", None));
     }
 
+    /// Seen once, the qass step is walked into again with nothing preselected (and here, with
+    /// no write to this machine's own config file).
     #[test]
     fn enter_walks_the_steps_and_ends_after_the_last() {
         let mut o = Onboard {
@@ -788,11 +941,13 @@ mod tests {
             pet: settings::first_pet(),
             said: None,
             stopped: false,
+            qass_seen: true,
         };
         let mut player = Player::new();
         for step in 1..STEPS.len() {
             assert!(o.key(Key::Enter, &mut player));
             assert_eq!((o.step, o.row), (step, 0));
+            assert!(o.qass_seen && o.said.is_none(), "step {step}");
         }
         assert!(!o.key(Key::Enter, &mut player));
         o.key(Key::BackTab, &mut player);
@@ -806,7 +961,7 @@ mod tests {
         // The sign-in a finish does with the phone part, answered yes.
         let finish = |phone: Option<Phone>| {
             if let Some(phone) = phone {
-                sign_in(phone, Some("\n"));
+                sign_in(phone, true);
             }
             Ok(())
         };
@@ -837,6 +992,7 @@ mod tests {
                 pet: settings::first_pet(),
                 said: None,
                 stopped: false,
+                qass_seen: false,
             };
             assert!(!o.key(key, &mut player), "{key:?} ends it");
             assert_eq!(o.stopped, stopped, "{key:?}");
@@ -873,6 +1029,7 @@ mod tests {
                     pet: settings::first_pet(),
                     said: None,
                     stopped: false,
+                    qass_seen: false,
                 };
                 let frame = plain(&o.draw(w, h, &o.rows()).frame());
                 assert!(frame.contains(each.what), "{w}x{h} step {step}");
@@ -920,6 +1077,7 @@ mod tests {
                         pet: settings::first_pet(),
                         said: None,
                         stopped: false,
+                        qass_seen: false,
                     };
                     let frame = plain(&o.draw(w, h, &rows).frame());
                     let at = format!("{w}x{h} row {row} at {now}:\n{frame}");

@@ -691,6 +691,8 @@ fn install(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other("no home directory to install into"));
     };
     let wanted = wanted(args)?;
+    // Headed, as `hooks install` is: the two lists come back to back.
+    println!("skills, which show each agent how to work with qoop:");
     // qass is one folder for every agent it may run on.
     let dirs = QassDirs::here()?;
     if install_qass(&home, &dirs)? {

@@ -613,6 +613,9 @@ fn install(args: &[String]) -> std::io::Result<()> {
         let names: Vec<&str> = wanted.iter().map(|t| t.agent).collect();
         set_off(&config_dir, "hooks", &names, false)?;
     }
+    // Headed: the install script and an update print this list and the skills' one back to
+    // back, the same agents in each.
+    println!("hooks, which tell qoop what each agent is doing:");
     let mut any = false;
     for target in wanted {
         // Asked for every agent, only the ones on this machine: an agent named on the

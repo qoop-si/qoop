@@ -97,14 +97,15 @@ screen only, not the scrollback; with `--until` both must hold.
 ## Start and end terminals
 
 ```bash
-t=$(qoop new --name worker --cwd ~/repo -- claude)   # prints the number
-qoop new --space review -- claude                      # a space by id or name
+t=$(qoop new --name worker --cwd ~/repo -- <agent>)  # prints the number
+qoop new --space review -- <agent>                     # a space by id or name
 qoop close <terminal>                                  # never your own
-qoop worktree new <branch> [--base REF] [-- claude]    # a worktree and a terminal in it
+qoop worktree new <branch> [--base REF] [-- <agent>]   # a worktree and a terminal in it
 qoop worktree ls [--json]
 qoop worktree rm <branch|path> [--force]
 ```
 
+`<agent>` is the command that starts one: `claude`, `codex`, `gemini`, `opencode`.
 `new` never starts qoop; a new `--space` name is made once. `worktree new`
 adds `<repo>-wt-<slug>` beside the repository (the branch lowercased, other
 characters as dashes) with a terminal named after the branch; a branch only
@@ -134,9 +135,10 @@ When you supervise for a person:
 * Never `stop` qoop or `sleep` a space, and `close` a worker only when
   asked. Sit in a space of your own, so putting the workers' to sleep
   cannot end you.
-* This skill pre-approves `qoop` for one turn only; a supervisor runs for
-  many. Start it with `claude --allowedTools "Bash(qoop *)"` and run each
-  `qoop` command on its own, without pipes, so that rule covers it.
+* In Claude Code this skill pre-approves `qoop` for one turn only; a
+  supervisor runs for many. Start it with
+  `claude --allowedTools "Bash(qoop *)"` and run each `qoop` command on its
+  own, without pipes, so that rule covers it.
 
 ## Spaces and sleep
 

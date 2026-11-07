@@ -45,6 +45,16 @@ pub enum PathError {
     WrongOwner { path: PathBuf, owner: u32, us: u32 },
     #[error("{path} has mode {mode:o}; it must not be accessible to group or other")]
     TooPermissive { path: PathBuf, mode: u32 },
+    #[error(
+        "the socket path {path} is {len} bytes, and a socket path holds at most {max}: {fix}",
+        path = .path.display()
+    )]
+    SocketTooLong {
+        path: PathBuf,
+        len: usize,
+        max: usize,
+        fix: &'static str,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -55,6 +65,9 @@ pub enum PathError {
 /// failure on a misconfigured machine, which is the correct trade against silently running
 /// with a world-writable socket.
 pub fn runtime_dir() -> Result<PathBuf, PathError> {
+    // Before anything is created: a path too long to bind leaves no directories behind.
+    let socket = socket_path(&session_dir(&base_location(), DEFAULT_SESSION));
+    fits_socket(&socket, SOCKET_PATH_MAX, shorter_base())?;
     let base = runtime_base()?;
     if let Ok(name) = crate::legacy::var(SESSION_ENV) {
         only_default(&name, &base)?;
@@ -65,6 +78,46 @@ pub fn runtime_dir() -> Result<PathBuf, PathError> {
         crate::legacy::reach_old_daemon(&dir);
     }
     Ok(dir)
+}
+
+/// Where the runtime base is: `QOOP_RUNTIME_DIR`, else [`default_runtime_base`]. Nothing is
+/// created or checked.
+fn base_location() -> PathBuf {
+    match crate::legacy::var(RUNTIME_DIR_ENV) {
+        Ok(explicit) => PathBuf::from(explicit),
+        Err(_) => default_runtime_base(),
+    }
+}
+
+/// The longest path a socket address holds, its closing NUL left out: `sun_path` is 108 bytes
+/// on Linux and 104 on macOS.
+const SOCKET_PATH_MAX: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+
+/// How to shorten the runtime directory: the variable it came from, as `default_runtime_base`
+/// reads them.
+fn shorter_base() -> &'static str {
+    if crate::legacy::var(RUNTIME_DIR_ENV).is_ok() {
+        "set QOOP_RUNTIME_DIR to a shorter folder"
+    } else if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+        "set XDG_RUNTIME_DIR to a shorter folder"
+    } else {
+        "set TMPDIR to a shorter folder for every qoop command, for example: export TMPDIR=/tmp"
+    }
+}
+
+/// Refused here with the path and the way out, rather than by the bind as "path must be
+/// shorter than SUN_LEN": a long `TMPDIR` (a sandbox, a nix shell) gave every first start that.
+fn fits_socket(socket: &Path, max: usize, fix: &'static str) -> Result<(), PathError> {
+    let len = socket.as_os_str().len();
+    if len > max {
+        return Err(PathError::SocketTooLong {
+            path: socket.to_path_buf(),
+            len,
+            max,
+            fix,
+        });
+    }
+    Ok(())
 }
 
 /// Where the runtime directory is when `QOOP_RUNTIME_DIR` does not name one:
@@ -83,12 +136,9 @@ pub fn default_runtime_base() -> PathBuf {
 /// Verified the same way the daemon's directory is, because a world writable parent is a
 /// parent somebody else can put a directory into.
 pub fn runtime_base() -> Result<PathBuf, PathError> {
-    let dir = match crate::legacy::var(RUNTIME_DIR_ENV) {
-        Ok(explicit) => PathBuf::from(explicit),
-        // The verification below matters most for the temp directory fallback: a shared temp
-        // directory is exactly where another user could have created the path first.
-        Err(_) => default_runtime_base(),
-    };
+    // The verification below matters most for the temp directory fallback: a shared temp
+    // directory is exactly where another user could have created the path first.
+    let dir = base_location();
     ensure_private_dir(&dir)?;
     ensure_private_dir(&sessions_dir(&dir))?;
     if crate::legacy::migrating() {
@@ -735,6 +785,17 @@ pub fn current_uid() -> u32 {
 /// The login name of the user this process runs as, from the password database (what `id -un`
 /// prints) and not from `$USER`, which any parent may set to anything.
 pub fn current_user_name() -> Option<String> {
+    from_passwd(|entry| entry.pw_name)
+}
+
+/// The login shell of the user this process runs as, from the password database: what a tab
+/// starts when `$SHELL` is not set (a `docker exec`, some cron and systemd contexts).
+pub fn current_user_shell() -> Option<String> {
+    from_passwd(|entry| entry.pw_shell)
+}
+
+/// One string field of this user's password database entry, `None` when it is missing or empty.
+fn from_passwd(field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     // SAFETY: `passwd` is plain data (integers and pointers) for which all zeroes is valid.
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
@@ -753,11 +814,14 @@ pub fn current_user_name() -> Option<String> {
     if rc != 0 || found.is_null() {
         return None;
     }
-    // SAFETY: on success `pw_name` is a NUL terminated string inside `buf`, which is alive.
-    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
-        .to_str()
-        .ok()?;
-    (!name.is_empty()).then(|| name.to_string())
+    let value = field(&entry);
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: on success a non-null field is a NUL terminated string inside `buf`, which is
+    // alive.
+    let value = unsafe { std::ffi::CStr::from_ptr(value) }.to_str().ok()?;
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Create the directory if absent, then verify it. Verification happens after creation
@@ -886,6 +950,31 @@ pub fn wait_for_socket(dir: &std::path::Path, socket: &std::path::Path) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A socket path that cannot be bound is refused by name, with its length and the fix,
+    /// and one that fits passes.
+    #[test]
+    fn a_socket_path_too_long_to_bind_says_its_length_and_the_fix() {
+        let fix = "set TMPDIR to a shorter folder";
+        assert!(
+            fits_socket(
+                Path::new("/tmp/qoop-501/sessions/default/qoopd.sock"),
+                103,
+                fix
+            )
+            .is_ok()
+        );
+        let long = PathBuf::from(format!("/{}/qoopd.sock", "x".repeat(92)));
+        assert_eq!(long.as_os_str().len(), 104);
+        let said = fits_socket(&long, 103, fix).unwrap_err().to_string();
+        assert!(said.contains(&long.display().to_string()), "{said}");
+        assert!(
+            said.contains("is 104 bytes") && said.contains("at most 103"),
+            "{said}"
+        );
+        assert!(said.ends_with(fix), "{said}");
+        assert!(fits_socket(&long, 104, fix).is_ok());
+    }
 
     #[test]
     fn the_user_name_is_the_one_id_prints() {

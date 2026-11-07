@@ -46,16 +46,16 @@ main() {
         "Linux x86_64") TRIPLE="x86_64-unknown-linux-gnu" ;;
         "Linux aarch64" | "Linux arm64") TRIPLE="aarch64-unknown-linux-gnu" ;;
         *)
-            echo "qoop install: no prebuilt binary for $(uname -s) $(uname -m);" \
-                "build from source: cargo build --release -p qoop-cli" >&2
+            echo "qoop install: $(uname -s) $(uname -m) is not supported yet;" \
+                "qoop runs on macOS and on Linux with glibc, x86_64 or arm64 (on Windows: in WSL)" >&2
             exit 1
             ;;
     esac
     # The Linux binaries link glibc. On musl (Alpine) they cannot start at all, so say that
     # here rather than after a download that could never run.
     if [ "$(uname -s)" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
-        echo "qoop install: this is a musl system; the prebuilt Linux binary needs glibc." \
-            "Build from source: cargo build --release -p qoop-cli" >&2
+        echo "qoop install: musl systems such as Alpine are not supported yet; the Linux binary" \
+            "needs glibc: use a glibc distribution or container, such as Debian or Ubuntu" >&2
         exit 1
     fi
     ASSET="qoop-$TRIPLE.tar.gz"
@@ -75,7 +75,7 @@ main() {
         exit 0
     fi
 
-    for tool in curl tar awk sed; do
+    for tool in curl tar gzip awk sed; do
         command -v "$tool" >/dev/null 2>&1 || {
             echo "qoop install: missing required tool: $tool" >&2
             exit 1
@@ -258,13 +258,38 @@ main() {
     # will not start an agent whose file was replaced, and a running one is the old build.
     "$DEST" bridge reload || echo "qoop install: the bridge service was not reloaded; run: qoop bridge reload" >&2
 
-    # The hooks call `qoop` by name, so it has to be on PATH. Said, not done: an rc
-    # file is the person's own. Said before the onboarding, so a ctrl-c in its sign-in, which
-    # ends this script too, leaves it on the screen.
-    cmd="qoop"
+    # On a first install, and only when there is a terminal to answer on, the onboarding
+    # steps: the pet, the sounds, light or dark, the command key, notifications, sleep, then
+    # signing in. A piped run (`curl | sh`) has no stdin to ask on but usually has the
+    # terminal, so the answers are read from it; CI has neither and stays non-interactive by
+    # construction. Quitting keeps the install just done, and a ctrl-c in its sign-in ends the
+    # onboarding but not this script (a caught signal is the default again in the child), so
+    # the next steps below are still said.
+    if [ -n "$first" ] && [ -z "${QOOP_NONINTERACTIVE:-}" ] && ( : </dev/tty ) 2>/dev/null; then
+        trap ':' INT
+        "$DEST" onboard </dev/tty || true
+        trap 'exit 1' INT
+    else
+        echo "the pet, the sounds and every other setting: qoop settings"
+    fi
+    next_steps
+}
+
+# The last thing said, numbered: PATH for new terminals and for this one, then the first start,
+# then the sign-in when this computer is not signed in. The hooks call `qoop` by name, so it has
+# to be on PATH. Said, not done: an rc file is the person's own.
+next_steps() {
+    echo
+    echo "next:"
+    n=0
     if ! command -v qoop >/dev/null 2>&1; then
         bindir="$(dirname "$DEST")"
-        case "${SHELL:-}" in
+        # The person's shell: SHELL, or where none is set (a container), the passwd entry's.
+        login_shell="${SHELL:-}"
+        if [ -z "$login_shell" ] && command -v getent >/dev/null 2>&1; then
+            login_shell="$(getent passwd "$(id -un)" | awk -F: '{ print $7 }')" || login_shell=""
+        fi
+        case "$login_shell" in
             */zsh) rc=.zshrc ;;
             */bash)
                 # Terminal on a Mac starts a login shell, which reads .bash_profile and not .bashrc.
@@ -274,25 +299,30 @@ main() {
             *) rc=.profile ;;
         esac
         if [ -z "$rc" ]; then
-            echo "add $bindir to PATH, e.g. fish_add_path \"$bindir\""
+            n=$((n + 1))
+            echo "  $n. add $bindir to PATH, in this terminal too: fish_add_path \"$bindir\""
         else
-            echo "add $bindir to PATH, e.g. echo 'export PATH=\"$bindir:\$PATH\"' >> ~/$rc"
+            n=$((n + 1))
+            echo "  $n. add $bindir to PATH for new terminals: echo 'export PATH=\"$bindir:\$PATH\"' >> ~/$rc"
+            n=$((n + 1))
+            echo "  $n. and in this terminal: export PATH=\"$bindir:\$PATH\" (or open a new terminal)"
         fi
-        cmd="$DEST"
     fi
-
-    # On a first install, and only when there is a terminal to answer on, the onboarding
-    # steps: the pet, the sounds, light or dark, the command key, notifications, sleep, then
-    # signing in. A piped run (`curl | sh`) has no stdin to ask on but usually has the
-    # terminal, so the answers are read from it; CI has neither and stays non-interactive by
-    # construction. Quitting keeps the install just done.
-    if [ -n "$first" ] && [ -z "${QOOP_NONINTERACTIVE:-}" ] && ( : </dev/tty ) 2>/dev/null; then
-        "$DEST" onboard </dev/tty || true
-    else
-        echo "the pet, the sounds and every other setting: qoop settings"
-        # The onboarding asks to sign in itself; without it, the one command to run next, by
-        # full path while the name does not resolve yet.
-        echo "next: $cmd login"
+    n=$((n + 1))
+    echo "  $n. start it in a project: cd your-project && qoop"
+    # Signed in when `qoop login` wrote the account into hub.json, in qoop's config folder
+    # (pretty JSON, a key and its value on one line): an account that is a string, and no
+    # leave under way (`"unlinking": true`).
+    config="${XDG_CONFIG_HOME:-}"
+    case "$config" in
+        /*) ;;
+        *) config="$HOME/.config" ;;
+    esac
+    hub="$config/qoop/hub.json"
+    if ! grep -qs '"account"[[:space:]]*:[[:space:]]*"[^"]' "$hub" ||
+        grep -qs '"unlinking"[[:space:]]*:[[:space:]]*true' "$hub"; then
+        n=$((n + 1))
+        echo "  $n. show this computer on qoop.si/app and your phone: qoop login"
     fi
 }
 
