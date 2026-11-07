@@ -177,16 +177,10 @@ fn qoop_qass_puts_the_board_beside_qass_and_the_tab_still_sleeps() {
     let read = || daemon.run(&["read", &board.to_string()]).1;
     daemon.until("the board drawn in its pane", &read, || {
         let screen = read();
-        [
-            "todo",
-            "doing",
-            "done",
-            "check the board",
-            "DEFAULT-1",
-            "no agent",
-        ]
-        .iter()
-        .all(|w| screen.contains(w))
+        // The page opens as the list; the lanes are one `b` away.
+        ["Not started", "check the board", "DEFAULT-1", "no agent"]
+            .iter()
+            .all(|w| screen.contains(w))
     });
 
     // The tab sleeps whole, board page and all: qoop's own page is no work a sleep loses.
