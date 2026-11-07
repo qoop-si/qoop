@@ -22,13 +22,13 @@ rules or the hook carry the state.
 | OpenCode | yes | full (plugin) | its open source, plus screens from real sessions |
 | Gemini CLI | yes | full | its open source |
 | Cursor agent | yes | partial | its package |
-| Amp | resume only | by hand | its package (no screen layout in it) |
+| Amp | resume only | not set up by `qoop hooks install` | its package (no screen layout in it) |
 | Qwen Code, Kilo, Cline, Kimi, Maki, Pi, Hermes, Grok | yes | none or conversation id | their open source |
 | GitHub Copilot CLI, Factory Droid, Qoder CLI, Kiro | yes | none or conversation id | their packages |
 | Devin | working and idle only | none | its binary and documentation |
 | Muse | startup gates only | none | its binary and documentation |
 | Antigravity | resume only | none | its binary and documentation |
-| Aider, Goose | generic | Goose by hand | generic rules |
+| Aider, Goose | generic | not set up by `qoop hooks install` | generic rules |
 
 Anything else is read by the generic rules, and a shell reads as a shell.
 

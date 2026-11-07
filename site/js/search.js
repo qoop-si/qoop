@@ -6,6 +6,8 @@ class SearchEngine {
     this.results = document.getElementById("search-results");
     this.trigger = document.getElementById("search-trigger");
     this.selectedIndex = -1;
+    // Where the keyboard was before the search opened, so closing puts it back.
+    this.opener = null;
 
     this.bindEvents();
   }
@@ -14,12 +16,24 @@ class SearchEngine {
     this.trigger.addEventListener("click", () => this.open());
 
     document.addEventListener("keydown", (e) => {
+      const isOpen = this.modal.classList.contains("active");
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
         this.open();
       }
-      if (e.key === "Escape" && this.modal.classList.contains("active")) {
+      // `/` opens it too, as the sidebar's label says, unless it is being typed somewhere.
+      if (e.key === "/" && !isOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typing(e.target)) {
+        e.preventDefault();
+        this.open();
+      }
+      if (e.key === "Escape" && isOpen) {
+        e.preventDefault();
         this.close();
+      }
+      // The dialog holds the keyboard: its one control is the field, so Tab stays there.
+      if (e.key === "Tab" && isOpen) {
+        e.preventDefault();
+        this.input.focus();
       }
     });
 
@@ -43,7 +57,7 @@ class SearchEngine {
         this.updateSelection(items);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        this.selectedIndex = Math.max(this.selectedIndex - 1, 0);
+        this.selectedIndex = Math.max(this.selectedIndex - 1, items.length ? 0 : -1);
         this.updateSelection(items);
       } else if (e.key === "Enter" && this.selectedIndex >= 0) {
         e.preventDefault();
@@ -54,23 +68,40 @@ class SearchEngine {
 
   updateSelection(items) {
     items.forEach((item, i) => {
-      item.classList.toggle("selected", i === this.selectedIndex);
+      const on = i === this.selectedIndex;
+      item.classList.toggle("selected", on);
+      item.setAttribute("aria-selected", on);
     });
-    items[this.selectedIndex]?.scrollIntoView({ block: "nearest" });
+    const current = items[this.selectedIndex];
+    if (current) {
+      this.input.setAttribute("aria-activedescendant", current.id);
+      current.scrollIntoView({ block: "nearest" });
+    } else {
+      this.input.removeAttribute("aria-activedescendant");
+    }
   }
 
   open() {
+    if (this.modal.classList.contains("active")) return;
+    this.opener = document.activeElement;
     this.modal.classList.add("active");
-    this.input.value = "";
-    this.results.innerHTML = "";
-    this.selectedIndex = -1;
+    this.clear();
     setTimeout(() => this.input.focus(), 50);
   }
 
   close() {
     this.modal.classList.remove("active");
+    this.clear();
+    this.opener?.focus?.();
+    this.opener = null;
+  }
+
+  clear() {
     this.input.value = "";
     this.results.innerHTML = "";
+    this.selectedIndex = -1;
+    this.input.removeAttribute("aria-activedescendant");
+    this.input.setAttribute("aria-expanded", "false");
   }
 
   buildIndex(pages) {
@@ -83,8 +114,10 @@ class SearchEngine {
   }
 
   search(query) {
+    this.input.removeAttribute("aria-activedescendant");
     if (!query.trim()) {
       this.results.innerHTML = "";
+      this.input.setAttribute("aria-expanded", "false");
       return;
     }
 
@@ -121,29 +154,28 @@ class SearchEngine {
     return snippet;
   }
 
+  // The text escaped, with every term marked; split first so a term never lands in an entity.
   highlightTerms(text, terms) {
-    let result = text;
-    for (const term of terms) {
-      const regex = new RegExp(
-        `(${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`,
-        "gi"
-      );
-      result = result.replace(regex, "<mark>$1</mark>");
-    }
-    return result;
+    const pattern = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    return text
+      .split(new RegExp(`(${pattern})`, "gi"))
+      .map((part, i) => (i % 2 ? `<mark>${esc(part)}</mark>` : esc(part)))
+      .join("");
   }
 
   renderResults(matches, terms) {
     if (matches.length === 0) {
       this.results.innerHTML =
-        '<div class="search-empty">No results found.</div>';
+        '<div class="search-empty" role="status">No results found.</div>';
+      this.input.setAttribute("aria-expanded", "false");
       return;
     }
 
+    this.input.setAttribute("aria-expanded", "true");
     this.results.innerHTML = matches
       .map(
-        (match) => `
-      <div class="search-result-item" data-slug="${match.slug}">
+        (match, i) => `
+      <div class="search-result-item" id="search-option-${i}" role="option" aria-selected="false" data-slug="${esc(match.slug)}">
         <div class="search-result-title">${this.highlightTerms(match.title, terms)}</div>
         <div class="search-result-snippet">${this.highlightTerms(match.snippet, terms)}</div>
       </div>
@@ -152,13 +184,33 @@ class SearchEngine {
       .join("");
 
     this.results.querySelectorAll(".search-result-item").forEach((item) => {
-      item.addEventListener("click", () => {
-        window.location.hash = item.dataset.slug;
-        this.close();
-      });
+      item.addEventListener("click", () => this.pick(item.dataset.slug));
     });
   }
+
+  // A picked result moves the keyboard to the page it opens, not back to the opener.
+  pick(slug) {
+    this.opener = null;
+    this.close();
+    const focusHeading = () => {
+      const h = [...document.querySelectorAll("#home h1, #article h1")].find((el) => el.offsetParent);
+      if (!h) return;
+      h.tabIndex = -1;
+      h.focus();
+    };
+    if (window.location.hash.slice(1) === slug) {
+      focusHeading();
+      return;
+    }
+    document.addEventListener("docs:page", focusHeading, { once: true });
+    window.location.hash = slug;
+  }
 }
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+// A key pressed in a field types there; it is not a shortcut.
+const typing = (el) => el?.closest?.("input, textarea, select, [contenteditable='true']");
 
 const searchEngine = new SearchEngine();
 export { searchEngine };

@@ -1,3 +1,9 @@
+/* The hub's own font files: nothing is fetched from another host. */
+@font-face { font-family: "DM Sans"; src: url(/fonts/dm-sans-latin-wght.woff2) format("woff2"); font-weight: 100 1000; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url(/fonts/jetbrains-mono-400.woff2) format("woff2"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url(/fonts/jetbrains-mono-500.woff2) format("woff2"); font-weight: 500; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url(/fonts/jetbrains-mono-700.woff2) format("woff2"); font-weight: 700; font-display: swap; }
+
 /* qoop docs. Colours from docs/brand.md; the sidebar is drawn like the TUI's agents column. */
 
 :root {
@@ -433,13 +439,15 @@ body[data-page="keys"] .keys-fab {
 
 #article p,
 #article ul,
+#article ol,
 #article pre,
 #article table,
 #article blockquote {
   margin-bottom: 18px;
 }
 
-#article ul {
+#article ul,
+#article ol {
   padding-left: 1.25em;
 }
 
@@ -650,7 +658,7 @@ body[data-page="introduction"] #article > h1:first-child + p {
 
 .phone-links {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -1280,4 +1288,17 @@ body[data-page="introduction"] .footer {
 .hero > *,
 .install {
   min-width: 0;
+}
+
+/* Read by screen readers, not shown. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

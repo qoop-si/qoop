@@ -7,7 +7,7 @@ qoop update --check     note what the newest release is, change nothing
 qoop update             install it and move every machine onto it
 ```
 
-`--check` leaves a note the interface reads, so the index signs itself `0.3.0>0.4.0` while
+`--check` leaves a note the interface reads, so the index signs itself `0.13.3>0.14.0` while
 an update is waiting; the interface itself never touches the network. `ctrl-a U` says how it
 installs. A release build's daemon also runs `qoop update --auto` a few minutes after it
 starts and every six hours after that; a file named `no-auto-update` in `$(qoop paths config)`

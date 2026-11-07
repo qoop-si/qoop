@@ -46,6 +46,8 @@ Run `qoop reset`: it puts the terminal back from raw mode.
 
 ## Which systems does it run on?
 
-macOS (Apple silicon and Intel) and Linux with glibc 2.17 or newer (x86_64 and arm64), so
-CentOS 7 and newer, Debian, Ubuntu and Fedora. Linux with musl (Alpine) is not supported
-yet: the install script says so rather than installing a binary that cannot run.
+macOS (Apple silicon or Intel) and Linux with glibc 2.17 or newer (x86_64 or arm64), so
+CentOS 7 and newer, Debian, Ubuntu and Fedora. Linux needs `curl` and CA certificates, which a
+minimal image may lack: [Install](#install) has the line for each. Linux with musl, such as
+Alpine, is not supported yet: the install script says so and stops. Use a glibc distribution or
+a glibc container.

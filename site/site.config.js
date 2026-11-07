@@ -9,6 +9,7 @@ export default {
     { label: "Docs", href: "#introduction" },
     { label: "Keys", href: "#keys" },
     { label: "Automation", href: "#automation" },
+    { label: "qoop.si", href: "/" },
   ],
   sidebar: [
     {
@@ -59,7 +60,7 @@ export default {
     right: "qoop",
   },
   // The top of the introduction page. A phone link with an empty url shows as "soon" and
-  // links nowhere; give it the store url and it turns into a live button.
+  // links nowhere; give it a url and it turns into a live button. `download` opens it in place.
   home: {
     tagline: "Your coding agents in one terminal, and in your pocket.",
     lede: "It tells you when one needs you. Close the lid; they keep working.",
@@ -70,9 +71,19 @@ export default {
       alt: "qoop in a terminal, on an iPhone and on an Android phone",
     },
     phone: [
-      { label: "Browser", detail: "qoop.si/app", url: "https://qoop.si/app", icon: "browser" },
-      { label: "App Store", detail: "iPhone", url: "", icon: "apple" },
-      { label: "Google Play", detail: "Android", url: "", icon: "play" },
+      {
+        label: "Android",
+        detail: "download the app (APK, about 56 MB); Google Play soon",
+        url: "/releases/latest/qoop-android-arm64.apk",
+        download: true,
+        icon: "download",
+      },
+      {
+        label: "iPhone",
+        detail: "qoop.si/app in the browser, no push notifications yet; App Store soon",
+        url: "https://qoop.si/app",
+        icon: "apple",
+      },
     ],
   },
 };

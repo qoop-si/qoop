@@ -39,7 +39,7 @@ is left out and the rest of the file is still read.
 
 | Variable | What it does |
 |---|---|
-| `QOOP_RELEASE_BASE` | where `qoop update` and the install script look for releases (a mirror, GitHub's API, or `file:///path`; default `https://qoop.si/releases`) |
+| `QOOP_RELEASE_BASE` | where `qoop update` and the install script look for releases (a mirror, GitHub's API, or `file:///path`; default `https://qoop.si/releases`, under which they read `latest`) |
 | `DO_NOT_TRACK`, `QOOP_TELEMETRY=0` | no usage counts; written into `config.toml` as `telemetry = false` the first time qoop sees it (see [Usage counts](#telemetry)) |
 
 `QOOP_IDLE_TIMEOUT_MINUTES` is no longer read: `idle_minutes` under `[sleep]` puts idle tabs to

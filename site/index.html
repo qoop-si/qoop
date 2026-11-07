@@ -5,19 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>qoop docs</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <div class="reading-progress" id="reading-progress"></div>
 
   <header class="navbar">
-    <button class="icon-btn hamburger" id="hamburger" aria-label="Toggle sidebar">
+    <button class="icon-btn hamburger" id="hamburger" aria-label="Pages" aria-controls="sidebar" aria-expanded="false">
       <svg class="i" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
     </button>
-    <a href="#introduction" class="logo" aria-label="qoop">
+    <a href="/" class="logo" aria-label="qoop.si home">
       <svg viewBox="112 75 919 233" aria-hidden="true"><circle cx="134.4" cy="97.6" r="22.4" fill="currentColor"/><circle cx="196.8" cy="97.6" r="22.4" fill="currentColor"/><circle cx="259.2" cy="97.6" r="22.4" fill="currentColor"/><circle cx="134.4" cy="160.0" r="22.4" fill="currentColor"/><circle cx="259.2" cy="160.0" r="22.4" fill="currentColor"/><circle cx="134.4" cy="222.4" r="22.4" fill="currentColor"/><circle cx="196.8" cy="222.4" r="22.4" fill="currentColor"/><circle cx="259.2" cy="222.4" r="22.4" fill="currentColor"/><circle cx="259.2" cy="284.8" r="22.4" fill="#FD4B03"/><circle cx="384.0" cy="97.6" r="22.4" fill="currentColor"/><circle cx="446.4" cy="97.6" r="22.4" fill="currentColor"/><circle cx="508.8" cy="97.6" r="22.4" fill="currentColor"/><circle cx="384.0" cy="160.0" r="22.4" fill="currentColor"/><circle cx="508.8" cy="160.0" r="22.4" fill="currentColor"/><circle cx="384.0" cy="222.4" r="22.4" fill="currentColor"/><circle cx="446.4" cy="222.4" r="22.4" fill="currentColor"/><circle cx="508.8" cy="222.4" r="22.4" fill="currentColor"/><circle cx="633.6" cy="97.6" r="22.4" fill="currentColor"/><circle cx="696.0" cy="97.6" r="22.4" fill="currentColor"/><circle cx="758.4" cy="97.6" r="22.4" fill="currentColor"/><circle cx="633.6" cy="160.0" r="22.4" fill="currentColor"/><circle cx="758.4" cy="160.0" r="22.4" fill="currentColor"/><circle cx="633.6" cy="222.4" r="22.4" fill="currentColor"/><circle cx="696.0" cy="222.4" r="22.4" fill="currentColor"/><circle cx="758.4" cy="222.4" r="22.4" fill="currentColor"/><circle cx="883.2" cy="97.6" r="22.4" fill="currentColor"/><circle cx="945.6" cy="97.6" r="22.4" fill="currentColor"/><circle cx="1008.0" cy="97.6" r="22.4" fill="currentColor"/><circle cx="883.2" cy="160.0" r="22.4" fill="currentColor"/><circle cx="1008.0" cy="160.0" r="22.4" fill="currentColor"/><circle cx="883.2" cy="222.4" r="22.4" fill="currentColor"/><circle cx="945.6" cy="222.4" r="22.4" fill="currentColor"/><circle cx="1008.0" cy="222.4" r="22.4" fill="currentColor"/><circle cx="883.2" cy="284.8" r="22.4" fill="#FD4B03"/></svg>
     </a>
     <nav class="navbar-links"></nav>
@@ -71,15 +68,17 @@
   </button>
 
   <div class="search-modal" id="search-modal">
-    <div class="search-modal-content">
+    <div class="search-modal-content" role="dialog" aria-modal="true" aria-label="Search the docs">
       <div class="search-input-wrapper">
         <svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input type="text" id="search-input" placeholder="Search the docs" autocomplete="off">
+        <input type="text" id="search-input" placeholder="Search the docs" autocomplete="off" aria-label="Search the docs" role="combobox" aria-controls="search-results" aria-autocomplete="list" aria-expanded="false">
         <kbd>esc</kbd>
       </div>
-      <div class="search-results" id="search-results"></div>
+      <div class="search-results" id="search-results" role="listbox" aria-label="Results"></div>
     </div>
   </div>
+
+  <div class="sr-only" id="status" role="status"></div>
 
   <script type="module" src="js/theme.js"></script>
   <script type="module" src="js/search.js"></script>

@@ -20,6 +20,7 @@ const ICONS = {
   browser: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3c-2.5 2.6-3.8 5.6-3.8 9s1.3 6.4 3.8 9"/>',
   apple: '<path d="M12 7.5c-1.4-1-4.2-1.2-5.6.9-1.5 2.2-.9 6.2 1.2 9 .9 1.3 1.9 2 2.8 1.7.6-.2 1-.5 1.6-.5s1 .3 1.6.5c.9.3 1.9-.4 2.8-1.7 2.1-2.8 2.7-6.8 1.2-9-1.4-2.1-4.2-1.9-5.6-.9z"/><path d="M12 7.5c0-2 1-3.4 2.8-4"/>',
   play: '<path d="M6.5 4.2v15.6a.6.6 0 0 0 .9.5l12.6-7.8a.6.6 0 0 0 0-1L7.4 3.7a.6.6 0 0 0-.9.5z"/>',
+  download: '<path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/>',
 };
 const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -53,19 +54,33 @@ function inlineMarkdown(s) {
   return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${esc(codes[i])}</code>`);
 }
 
-function copyButton(text, label = "Copy") {
-  return `<button class="copy-btn" data-copy="${esc(text)}" aria-label="${label}">${icon("copy")}<span>${label}</span></button>`;
+function copyButton(text) {
+  return `<button class="copy-btn" data-copy="${esc(text)}">${icon("copy")}<span>Copy</span></button>`;
 }
 
-document.addEventListener("click", (e) => {
+// What a screen reader hears after an action with no other visible outcome, such as Copy.
+function announce(text) {
+  const status = document.getElementById("status");
+  status.textContent = "";
+  setTimeout(() => (status.textContent = text), 50);
+}
+
+document.addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-copy]");
   if (!btn) return;
-  navigator.clipboard.writeText(btn.dataset.copy);
-  btn.classList.add("copied");
-  btn.querySelector("span").textContent = "Copied";
+  const label = btn.querySelector("span");
+  try {
+    await navigator.clipboard.writeText(btn.dataset.copy);
+    btn.classList.add("copied");
+    label.textContent = "Copied";
+    announce("Copied");
+  } catch {
+    label.textContent = "Copy failed";
+    announce("Copy failed: select the text and copy it");
+  }
   setTimeout(() => {
     btn.classList.remove("copied");
-    btn.querySelector("span").textContent = "Copy";
+    label.textContent = "Copy";
   }, 2000);
 });
 
@@ -94,10 +109,6 @@ function renderNavbar() {
 
 // ========== Minimal Markdown Parser ==========
 function parseMarkdown(md) {
-  if (/^\s*</.test(md)) {
-    return md;
-  }
-
   let html = md;
 
   // Extract code blocks and inline code FIRST to protect from further parsing
@@ -108,13 +119,10 @@ function parseMarkdown(md) {
   html = html.replace(
     /```(\w*)\n([\s\S]*?)```/g,
     (_, lang, code) => {
-      const escaped = code.trim()
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+      const escaped = esc(code.trim());
       const langAttr = lang ? ` class="language-${lang}"` : "";
       const dataLang = lang ? ` data-lang="${lang}"` : "";
-      const placeholder = `\x00CODEBLOCK${codeBlocks.length}\x00`;
+      const placeholder = `\n\n\x00CODEBLOCK${codeBlocks.length}\x00\n\n`;
       codeBlocks.push(`<pre${dataLang}><code${langAttr}>${escaped}</code></pre>`);
       return placeholder;
     }
@@ -123,20 +131,23 @@ function parseMarkdown(md) {
   // Inline code · extract and replace with placeholders
   html = html.replace(/`([^`]+)`/g, (_, code) => {
     const placeholder = `\x00INLINECODE${inlineCodes.length}\x00`;
-    inlineCodes.push(`<code>${code}</code>`);
+    inlineCodes.push(`<code>${esc(code)}</code>`);
     return placeholder;
   });
 
-  // Now safe to parse markdown · code content is protected
+  // The docs are plain markdown, never HTML: a placeholder such as <agent> in prose is text.
+  // Everything below turns markdown into tags on top of this escaped text.
+  html = esc(html);
 
-  // Headings
-  html = html.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
-  html = html.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+  // Headings. Every block below stands between blank lines, so the paragraph pass never
+  // leaves a line of text glued to one.
+  html = html.replace(/^#### (.+)$/gm, "\n\n<h4>$1</h4>\n\n");
+  html = html.replace(/^### (.+)$/gm, "\n\n<h3>$1</h3>\n\n");
+  html = html.replace(/^## (.+)$/gm, "\n\n<h2>$1</h2>\n\n");
+  html = html.replace(/^# (.+)$/gm, "\n\n<h1>$1</h1>\n\n");
 
   // Horizontal rules
-  html = html.replace(/^---$/gm, "<hr>");
+  html = html.replace(/^---$/gm, "\n\n<hr>\n\n");
 
   // Bold and italic
   html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
@@ -156,21 +167,26 @@ function parseMarkdown(md) {
   );
 
   // Blockquotes
-  html = html.replace(/^&gt; (.+)$/gm, "<blockquote><p>$1</p></blockquote>");
+  html = html.replace(/^&gt; (.+)$/gm, "\n\n<blockquote><p>$1</p></blockquote>\n\n");
 
   // Unordered lists · an indented line under an item continues that item
   while (/^([-*] .*)\n[ \t]+(\S.*)$/m.test(html)) {
     html = html.replace(/^([-*] .*)\n[ \t]+(\S.*)$/m, "$1 $2");
   }
   html = html.replace(/^(\s*)[-*] (.+)$/gm, "$1<li>$2</li>");
-  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, "\n\n<ul>$1</ul>\n\n");
 
-  // Ordered lists
-  html = html.replace(/^\d+\. (.+)$/gm, "<li>$1</li>");
+  // Ordered lists: an indented line under an item continues it, as in unordered ones
+  while (/^(\d+\. .*)\n[ \t]+(\S.*)$/m.test(html)) {
+    html = html.replace(/^(\d+\. .*)\n[ \t]+(\S.*)$/m, "$1 $2");
+  }
+  html = html.replace(/((?:^\d+\. .+\n?)+)/gm, (list) =>
+    `\n\n<ol>${list.trim().split("\n").map((l) => `<li>${l.replace(/^\d+\. /, "")}</li>`).join("")}</ol>\n\n`
+  );
 
-  // Tables
+  // Tables: a blank line ends one, so two tables in a row stay two
   html = html.replace(
-    /^\|(.+)\|\s*\n\|[-| :]+\|\s*\n((?:\|.+\|\s*\n?)*)/gm,
+    /^\|(.+)\|[ \t]*\n\|[-| :]+\|[ \t]*\n((?:\|.+\|[ \t]*\n?)*)/gm,
     (_, header, body) => {
       const headers = header
         .split("|")
@@ -195,7 +211,7 @@ function parseMarkdown(md) {
         table += "</tr>";
       });
       table += "</tbody></table>";
-      return table;
+      return `\n\n${table}\n\n`;
     }
   );
 
@@ -253,7 +269,7 @@ function renderSidebar() {
         const open = !folded.has(section.title);
         return `
         <div class="space space-${si % SPACE_COUNT}${open ? "" : " folded"}">
-          <button class="space-rule" data-section="${esc(section.title)}">
+          <button class="space-rule" data-section="${esc(section.title)}" aria-expanded="${open}">
             <span class="fold">${open ? "&#9662;" : "&#9656;"}</span><span class="space-name">${section.title}</span><span class="space-count">(${section.children.length})</span>
           </button>
           <div class="space-pages">
@@ -279,6 +295,8 @@ function renderSidebar() {
       const t = btn.dataset.section;
       folded.has(t) ? folded.delete(t) : folded.add(t);
       renderSidebar();
+      // The sidebar is drawn again; the keyboard stays on the group it just folded.
+      [...nav.querySelectorAll(".space-rule")].find((b) => b.dataset.section === t)?.focus();
     });
   });
 
@@ -312,8 +330,9 @@ function renderHome(slug) {
     .map((p) => {
       const soon = p.url ? "" : "<em>soon</em>";
       const inner = `${icon(p.icon)}<span class="phone-text"><b>${p.label}</b><small>${p.detail}${soon}</small></span>`;
+      const opens = p.download ? "" : ' target="_blank" rel="noopener"';
       return p.url
-        ? `<a class="phone-link" href="${p.url}" target="_blank" rel="noopener">${inner}${icon("chev")}</a>`
+        ? `<a class="phone-link" href="${p.url}"${opens}>${inner}${icon("chev")}</a>`
         : `<span class="phone-link soon" aria-disabled="true">${inner}</span>`;
     })
     .join("");
@@ -512,6 +531,7 @@ async function loadPage(slug) {
   document.title = `${getPageTitle(slug)} · ${config.name}`;
   renderSidebar();
   window.scrollTo(0, 0);
+  document.dispatchEvent(new CustomEvent("docs:page"));
 }
 
 // ========== Mobile Sidebar ==========
@@ -522,11 +542,13 @@ const overlay = document.getElementById("overlay");
 function openSidebar() {
   sidebar.classList.add("open");
   overlay.classList.add("active");
+  hamburger.setAttribute("aria-expanded", "true");
 }
 
 function closeSidebar() {
   sidebar.classList.remove("open");
   overlay.classList.remove("active");
+  hamburger.setAttribute("aria-expanded", "false");
 }
 
 hamburger.addEventListener("click", () => {

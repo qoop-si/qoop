@@ -74,4 +74,4 @@ It never closes tabs for you: close them first.
 Every command exits 0 on success, 1 when it failed, and 2 when it was called wrong. Errors
 are one line on stderr.
 
-`qoop --help` lists every command; so does `docs/cli-surface.md` in the repository.
+`qoop --help` lists every command.

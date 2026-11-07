@@ -36,10 +36,3 @@ The keyboard corpus gate G1.3 checks key encodings against, and where each row c
 Every claim about this program is a gate, and a gate is a command that exits zero. They live
 in the tests next to the code they are about, and each one names itself in the test's own
 doc comment.
-
-```
-cargo test --workspace     # the gates that do not need a wall clock
-
-# what a person does, driven through tmux, against the release binary
-cargo build --release -p qoop-cli && ./scripts/acceptance-m1.sh
-```
