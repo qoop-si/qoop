@@ -1,8 +1,10 @@
 //! `qoop task board --page`: the board on one page, as a list or as a Jira board.
 //!
-//! The list (the first view, `b` turns it) groups the items by what they want: Needs you, In
-//! progress, Not started, then Done folded to one row; a row is the item's mark, key, title and
-//! its plan, questions, phase, steps and agent word. Three lanes, Todo, Doing and Done, of issue cards (the space on the card's top edge, the
+//! The list (the first view, `b` turns it) is a work list: In progress, Not started, then Done
+//! folded to one row; a row is the item's mark, key, title and its plan, questions, phase, steps
+//! and agent word. What waits on the owner keeps its group and says so in its row. Work an agent
+//! took with no item is a row of its own in In progress (`#542`, `space  no item`), the asleep
+//! ones folded into one `Asleep` row at its foot. Three lanes, Todo, Doing and Done, of issue cards (the space on the card's top edge, the
 //! title, the key, the steps ticked of all, the agent on it and its stage). `h j k l` and the
 //! arrows move, enter opens the issue (Description, Checklist, Activity on the left, Details
 //! on the right; `x` ticks a step), `c` adds an issue to Todo, `H` and `L` move one a lane
@@ -12,9 +14,10 @@
 //! daemon says a task changed, and every half minute besides.
 //!
 //! An agent's word on a card is the daemon's status token (`waits`, `checks`, `asleep`...) with
-//! its age. Open work that no item holds is one folded row at the foot of Doing, `Not on the
-//! board · N`, its count line always in view; `N` opens it to a line per task, `j` and `k`
-//! step down into it past the last card, enter (or a click) on a line shows that task's tab.
+//! its age. On the lanes, open work that no item holds is one folded row at the foot of Doing,
+//! `Not on the board · N`, its count line always in view; `N` opens it to a line per task, `j`
+//! and `k` step down into it past the last card, enter (or a click) on a line shows that task's
+//! tab. On the list the same tasks are rows, and enter on one shows its tab.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
@@ -58,8 +61,7 @@ const NO_AGENT: &str = "no agent yet";
 /// view switch right of it, is as wide.
 const SWITCH_W: usize = 19;
 /// The list's groups, in order, and the ink of each one's name.
-const GROUPS: [(&str, Role); 4] = [
-    ("Needs you", Role::Blocked),
+const GROUPS: [(&str, Role); 3] = [
     ("In progress", Role::WorkingText),
     ("Not started", Role::Text),
     ("Done", Role::Done),
@@ -67,6 +69,10 @@ const GROUPS: [(&str, Role); 4] = [
 /// The Done row's place among the list's stops: no item has id 0 (they count from 1).
 // ponytail: a sentinel id, an enum of stops if the list gains another row to stand on.
 const FOLD: i64 = 0;
+/// The Asleep row's place among the list's stops. A loose task's stop is its number negated
+/// (item ids are positive), so every stop under zero is on the loose work.
+// ponytail: sentinel ids again, an enum of stops if the list gains another kind of row.
+const ASLEEP: i64 = i64::MIN;
 /// A row's title keeps at least this many cells before its parts give way.
 const TITLE_MIN: usize = 12;
 /// What the list says with nothing on the board.
@@ -85,6 +91,8 @@ const ACTIVITY_SENT: usize = 200;
 const NEED_ORDER: [&str; 6] = ["waits", "checks", "error", "asleep", "idle", "working"];
 /// The folded row's label, its count after it.
 const LOOSE: &str = "Not on the board";
+/// What a loose task's row says of the item it has not got.
+const NO_ITEM: &str = "no item";
 /// What a line of the opened row adds after its word when its task has no tab to go to.
 const NO_TAB: &str = "no tab";
 /// The lanes, in order, as the daemon names the states.
@@ -102,6 +110,12 @@ enum Line<'a> {
     /// A group's rule: which, and how many it holds.
     Group(usize, usize),
     Item(&'a ItemInfo),
+    /// Work an agent took with no item; `true` when it sits under the open Asleep row.
+    Task(&'a TaskInfo, bool),
+    /// In progress's foot: how many tasks sleep, and how many of them wait on the owner.
+    Asleep(usize, usize),
+    /// What the daemon counted and did not send.
+    Unlisted(usize),
     /// Done's rule, which folds its items: how many.
     Fold(usize),
 }
@@ -379,6 +393,8 @@ struct Page {
     loose_open: bool,
     loose_at: Option<usize>,
     loose_top: usize,
+    /// The list's Asleep row is opened.
+    asleep_open: bool,
 }
 
 fn now_unix() -> i64 {
@@ -676,22 +692,11 @@ fn needs_you(item: &ItemInfo) -> bool {
             || item.agents.iter().any(|a| !a.closed && a.status == "waits"))
 }
 
-/// The lanes regrouped for the list: what waits on the owner, the rest of Doing, the rest of Todo
-/// (a plan or not: the owner's pick), then Done. Each group keeps the lanes' newest first.
-fn groups<'a>(lanes: &[Vec<&'a ItemInfo>; 3]) -> [Vec<&'a ItemInfo>; 4] {
-    let mut open: Vec<&ItemInfo> = lanes[0].iter().chain(&lanes[1]).copied().collect();
-    open.sort_by_key(|i| std::cmp::Reverse(lane_stamp(i)));
-    let mut out: [Vec<&ItemInfo>; 4] = Default::default();
-    for item in open {
-        let group = match (needs_you(item), item.state == "doing") {
-            (true, _) => 0,
-            (false, true) => 1,
-            (false, false) => 2,
-        };
-        out[group].push(item);
-    }
-    out[3] = lanes[2].clone();
-    out
+/// The lanes as the list groups them: Doing is In progress, Todo is Not started (a plan or not:
+/// the owner's pick), then Done. What waits on the owner stays in its group. Each keeps the
+/// lanes' newest first.
+fn groups<'a>(lanes: &[Vec<&'a ItemInfo>; 3]) -> [Vec<&'a ItemInfo>; 3] {
+    [lanes[1].clone(), lanes[0].clone(), lanes[2].clone()]
 }
 
 /// An item's mark, the sidebar's own picture, and its ink: the ring when it waits on the owner,
@@ -770,6 +775,48 @@ fn row_parts(item: &ItemInfo, now: i64) -> Vec<(String, Role)> {
     parts
 }
 
+/// Whether a task's tab sleeps: the daemon says since when, or its status says so.
+fn task_asleep(t: &TaskInfo) -> bool {
+    t.asleep_since.is_some() || t.status == "asleep"
+}
+
+/// A loose task's stop on the list: its number negated, since item ids are positive.
+fn task_stop(t: &TaskInfo) -> i64 {
+    -t.id
+}
+
+/// A loose task's mark and ink, from its status token as an item's is from its agent's: orange
+/// when it waits on the owner (asleep or not), the sleeping ink asleep, and a task whose token
+/// says nothing reads its stage.
+fn task_mark(t: &TaskInfo) -> (String, Role) {
+    let role = match t.status.as_str() {
+        "waits" => Role::Blocked,
+        "working" => Role::Working,
+        "asleep" => Role::Sleeping,
+        "error" => Role::Failed,
+        "checks" => Role::Done,
+        "idle" => Role::Idle,
+        _ if t.stage == "waiting-human" => Role::Blocked,
+        _ => Role::Working,
+    };
+    (qoop_tui::sidebar::state_mark(role, false, 0, false), role)
+}
+
+/// What a loose task's row says right of its goal: its space and that no item holds it, then its
+/// status word with its age (`waits on you · 2 min` in the owner's ink); a token with no word
+/// of its own says the stage.
+fn task_parts(t: &TaskInfo, spaces: &[WorkspaceRow], now: i64) -> Vec<(String, Role)> {
+    let (word, role) = status_said(&t.status, t.status_at, now)
+        .unwrap_or_else(|| (aged(&t.stage, t.status_at, now), Role::FaintText));
+    vec![
+        (
+            format!("{}  {NO_ITEM}", space_name(spaces, t.workspace)),
+            Role::Detail,
+        ),
+        (word, role),
+    ]
+}
+
 /// The cells `parts` take flush right, two apart, with the two before the first.
 fn parts_w(parts: &[(String, Role)]) -> usize {
     parts.iter().map(|(t, _)| width::width(t) + 2).sum()
@@ -819,6 +866,7 @@ impl Page {
             loose_open: false,
             loose_at: None,
             loose_top: 0,
+            asleep_open: false,
         }
     }
 
@@ -883,34 +931,73 @@ impl Page {
         Step::View(self.view)
     }
 
-    /// The list's rows: each group with items its rule and its items, then Done's rule, and
-    /// its items while it is opened.
-    fn list_lines<'a>(&self, lanes: &[Vec<&'a ItemInfo>; 3]) -> Vec<Line<'a>> {
+    /// The work no item holds, as the list shows it: the awake tasks and the asleep ones; none
+    /// while a filter is typed (it reads items) or from a daemon that does not count them.
+    fn list_tasks(&self) -> (Vec<&TaskInfo>, Vec<&TaskInfo>) {
+        if !self.loose_shown() {
+            return Default::default();
+        }
+        let mut tasks: Vec<&TaskInfo> = self.tasks.iter().collect();
+        tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+        tasks.into_iter().partition(|t| !task_asleep(t))
+    }
+
+    /// The list's rows: In progress holds the Doing items and the awake tasks, newest first
+    /// together, then the Asleep row (its tasks while it is opened) and a line for tasks the
+    /// daemon did not send; then Not started; then Done's rule, and its items while it is opened.
+    fn list_lines<'a>(&'a self, lanes: &[Vec<&'a ItemInfo>; 3]) -> Vec<Line<'a>> {
         let groups = groups(lanes);
+        let (awake, asleep) = self.list_tasks();
+        let unlisted = match self.loose_shown() {
+            true => self.loose.unwrap_or(0).saturating_sub(self.tasks.len()),
+            false => 0,
+        };
+        let mut progress: Vec<(i64, Line<'a>)> = groups[0]
+            .iter()
+            .map(|i| (lane_stamp(i), Line::Item(i)))
+            .chain(awake.iter().map(|t| (t.updated_at, Line::Task(t, false))))
+            .collect();
+        progress.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         let mut out = Vec::new();
-        for (n, group) in groups[..3].iter().enumerate() {
-            if !group.is_empty() {
-                out.push(Line::Group(n, group.len()));
-                out.extend(group.iter().map(|i| Line::Item(i)));
+        let (rows, foot) = (progress.len(), asleep.len() + unlisted);
+        if rows + foot > 0 {
+            out.push(Line::Group(0, rows));
+            out.extend(progress.into_iter().map(|(_, l)| l));
+            if !asleep.is_empty() {
+                let waits = asleep.iter().filter(|t| t.status == "waits").count();
+                out.push(Line::Asleep(asleep.len(), waits));
+                if self.asleep_open {
+                    out.extend(asleep.iter().map(|t| Line::Task(t, true)));
+                }
+            }
+            if unlisted > 0 {
+                out.push(Line::Unlisted(unlisted));
             }
         }
-        if !groups[3].is_empty() {
-            out.push(Line::Fold(groups[3].len()));
+        if !groups[1].is_empty() {
+            out.push(Line::Group(1, groups[1].len()));
+            out.extend(groups[1].iter().map(|i| Line::Item(i)));
+        }
+        if !groups[2].is_empty() {
+            out.push(Line::Fold(groups[2].len()));
             if self.done_open {
-                out.extend(groups[3].iter().map(|i| Line::Item(i)));
+                out.extend(groups[2].iter().map(|i| Line::Item(i)));
             }
         }
         out
     }
 
-    /// What the list's keyboard stands on, in order: its items and the Done row ([`FOLD`]).
+    /// What the list's keyboard stands on, in order: its items, its loose tasks
+    /// ([`task_stop`]), the Asleep row ([`ASLEEP`]) and the Done row ([`FOLD`]).
     fn stops(&self) -> Vec<i64> {
         self.list_lines(&self.lanes())
             .iter()
             .filter_map(|l| match l {
                 Line::Item(i) => Some(i.id),
+                Line::Task(t, _) => Some(task_stop(t)),
+                Line::Asleep(..) => Some(ASLEEP),
                 Line::Fold(_) => Some(FOLD),
-                Line::Group(..) => None,
+                Line::Group(..) | Line::Unlisted(_) => None,
             })
             .collect()
     }
@@ -939,8 +1026,10 @@ impl Page {
         let lines = self.list_lines(&lanes);
         let Some(at) = lines.iter().position(|l| match l {
             Line::Item(i) => Some(i.id) == self.sel,
+            Line::Task(t, _) => Some(task_stop(t)) == self.sel,
+            Line::Asleep(..) => self.sel == Some(ASLEEP),
             Line::Fold(_) => self.sel == Some(FOLD),
-            Line::Group(..) => false,
+            Line::Group(..) | Line::Unlisted(_) => false,
         }) else {
             return;
         };
@@ -1019,7 +1108,8 @@ impl Page {
             let at = kept.unwrap_or(was.min(stops.len().saturating_sub(1)));
             self.sel = stops.get(at).copied();
             let now = match self.sel {
-                Some(FOLD) => 3,
+                Some(FOLD) => 2,
+                Some(s) if s < 0 => 0,
                 sel => groups(&self.lanes())
                     .iter()
                     .position(|g| g.iter().any(|i| Some(i.id) == sel))
@@ -1033,6 +1123,7 @@ impl Page {
             // The lane follows the item, so the lanes open on it and a move knows its way.
             self.lane = match self.sel {
                 Some(FOLD) => 2,
+                Some(s) if s < 0 => 1,
                 sel => lanes
                     .iter()
                     .position(|l| l.iter().any(|i| Some(i.id) == sel))
@@ -1157,7 +1248,7 @@ impl Page {
     /// The rows the folded row takes from lane `n` of `lane_h` rows: its label and count line,
     /// and while it is open a line per task, as many as leave Doing one card's height.
     fn sect_rows(&self, n: usize, lane_h: usize) -> usize {
-        if n != 1 || !self.loose_shown() {
+        if n != 1 || !self.loose_shown() || self.view == View::List {
             return 0;
         }
         if !self.loose_open {
@@ -1174,10 +1265,10 @@ impl Page {
             .min(self.loose_lines().len().saturating_sub(shown))
     }
 
-    /// Whether the folded row is drawn where the keyboard is: at the list's foot, or in the
-    /// lanes' Doing box (a lane too narrow for boxes has none).
+    /// Whether the folded row is drawn where the keyboard is: in the lanes' Doing box (a lane
+    /// too narrow for boxes has none). The list has no folded row: its tasks are rows.
     fn loose_here(&self) -> bool {
-        self.view == View::List || (self.lane == 1 && !self.listed(self.size, 1))
+        self.view == View::Board && self.lane == 1 && !self.listed(self.size, 1)
     }
 
     /// The line of the opened row with the keyboard, while it is there to have it.
@@ -1199,11 +1290,8 @@ impl Page {
                     .then(|| (i as isize + by).clamp(0, lines as isize - 1) as usize);
             }
             None => {
-                // In the list it is the last stop's next; in the lanes, Doing's last card's.
-                let last = if self.view == View::List {
-                    let stops = self.stops();
-                    stops.is_empty() || self.sel == stops.last().copied()
-                } else {
+                // Doing's last card's next.
+                let last = {
                     let lanes = self.lanes();
                     let at = self
                         .sel
@@ -1238,8 +1326,8 @@ impl Page {
 
     /// Open or close the folded row (`N`).
     fn turn_loose(&mut self) {
-        // In the lanes the row is drawn in Doing's box: a lane too narrow for boxes has none.
-        if self.loose_shown() && (self.view == View::List || !self.listed(self.size, 1)) {
+        // The row is drawn in the lanes' Doing box: a lane too narrow for boxes has none.
+        if self.loose_shown() && self.view == View::Board && !self.listed(self.size, 1) {
             self.loose_open = !self.loose_open;
             self.loose_at = None;
             self.follow();
@@ -1249,10 +1337,19 @@ impl Page {
     /// Show the tab of the line at `i`; a task with no terminal, or one that runs on another
     /// machine (its number is that machine's), says so.
     fn goto(&mut self, i: usize) -> Step {
-        let Some((terminal, id, remote)) = self
-            .loose_lines()
-            .get(i)
-            .map(|t| (t.terminal, t.id, t.status == "remote"))
+        match self.loose_lines().get(i).map(|t| t.id) {
+            Some(id) => self.goto_task(id),
+            None => Step::Stay,
+        }
+    }
+
+    /// Show the tab of task `id`, as [`Page::goto`].
+    fn goto_task(&mut self, id: i64) -> Step {
+        let Some((terminal, remote)) = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| (t.terminal, t.status == "remote"))
         else {
             return Step::Stay;
         };
@@ -1516,21 +1613,9 @@ impl Page {
         Step::Stay
     }
 
-    /// A press on the list: a row opens its item, the Done row opens or folds, the folded row
-    /// at the foot opens, or takes the keyboard to a line of it. A row spans the page's width.
+    /// A press on the list: a row opens its item, the Done and Asleep rows open or fold, a
+    /// task's row takes the keyboard. A row spans the page's width.
     fn list_click(&mut self, row: usize) -> Step {
-        let h = self.size.1.max(FLOOR.1);
-        let loose = self.sect_rows(1, h - 4);
-        if loose > 0 && row + 2 + loose >= h && row + 2 < h {
-            match row + 2 + loose - h {
-                0 | 1 => self.turn_loose(),
-                n => {
-                    self.loose_at = Some(self.loose_first(loose - 2) + n - 2);
-                    self.loose_follow();
-                }
-            }
-            return Step::Stay;
-        }
         let room = self.list_room();
         let hit = {
             let lanes = self.lanes();
@@ -1541,8 +1626,10 @@ impl Page {
                 .and_then(|r| lines.get(first + r))
                 .and_then(|l| match l {
                     Line::Item(i) => Some(i.id),
+                    Line::Task(t, _) => Some(task_stop(t)),
+                    Line::Asleep(..) => Some(ASLEEP),
                     Line::Fold(_) => Some(FOLD),
-                    Line::Group(..) => None,
+                    Line::Group(..) | Line::Unlisted(_) => None,
                 })
         };
         self.loose_at = None;
@@ -1550,6 +1637,19 @@ impl Page {
             Some(FOLD) => {
                 self.sel = Some(FOLD);
                 self.done_open = !self.done_open;
+                self.settle();
+                Step::Stay
+            }
+            Some(ASLEEP) => {
+                self.sel = Some(ASLEEP);
+                self.asleep_open = !self.asleep_open;
+                self.settle();
+                Step::Stay
+            }
+            // A task row is selected, as a click on a line of the lanes' folded row is: enter
+            // goes to its tab.
+            Some(stop) if stop < 0 => {
+                self.sel = Some(stop);
                 self.settle();
                 Step::Stay
             }
@@ -1727,10 +1827,16 @@ impl Page {
                 if let Some(i) = self.loose_cursor() {
                     return self.goto(i);
                 }
-                if self.view == View::List && self.sel == Some(FOLD) {
-                    self.done_open = !self.done_open;
-                } else if let Some(item) = self.selected() {
-                    return Step::Open(item.id);
+                let list = self.view == View::List;
+                match self.sel {
+                    Some(ASLEEP) if list => self.asleep_open = !self.asleep_open,
+                    Some(FOLD) if list => self.done_open = !self.done_open,
+                    Some(stop) if list && stop < 0 => return self.goto_task(-stop),
+                    _ => {
+                        if let Some(item) = self.selected() {
+                            return Step::Open(item.id);
+                        }
+                    }
                 }
             }
             Key::Char(c @ ('H' | 'L')) => {
@@ -1832,21 +1938,8 @@ impl Page {
             self.switch_at(w)
         };
         let sub = "your tasks, run by qass";
-        // How many wait on him, as the list's first group counts them under the filter: before
-        // the sub line when only one fits.
-        let need = groups(&self.lanes())[0].len();
-        let said = if list && need > 0 {
-            format!("{need} need you")
-        } else {
-            String::new()
-        };
-        let mut x = x;
-        let sub_w = sub.chars().count() + if said.is_empty() { 0 } else { 2 };
-        if x + 1 + sub_w + said.len() + 2 <= end {
-            x = s.put(x + 1, 0, sub, &ink(Role::FaintText)) + 1;
-        }
-        if !said.is_empty() && x + 1 + said.len() + 2 <= end {
-            s.put(x + 1, 0, &said, &bold(Role::Blocked));
+        if x + 1 + sub.chars().count() + 2 <= end {
+            s.put(x + 1, 0, sub, &ink(Role::FaintText));
         }
         let search = self.search();
         let sx = self.search_at(w);
@@ -2033,14 +2126,13 @@ impl Page {
             };
             s.put(3, top, &fit(say, w - 4), &ink(Role::FaintText));
         }
-        let room = (s.h - 2)
-            .saturating_sub(top + self.sect_rows(1, s.h - 4))
-            .max(1);
+        let room = self.list_room();
         let first = self.list_top.min(lines.len().saturating_sub(room));
         let key_w = lines
             .iter()
             .filter_map(|l| match l {
                 Line::Item(i) => Some(i.key.chars().count()),
+                Line::Task(t, _) => Some(t.id.to_string().len() + 1),
                 _ => None,
             })
             .max()
@@ -2051,7 +2143,34 @@ impl Page {
         for (r, line) in lines.iter().skip(first).take(room).enumerate() {
             let y = top + r;
             match line {
-                Line::Group(n, count) => self.group_rule(s, y, *n, *count, ""),
+                Line::Group(n, count) => self.group_rule(s, y, GROUPS[*n], *count, ("", None)),
+                Line::Asleep(count, waits) => {
+                    if self.sel == Some(ASLEEP) && !quiet {
+                        s.put(1, y, "\u{25b8}", &ink(Role::Brand));
+                    }
+                    let waits =
+                        (*waits > 0).then(|| (format!("{waits} waits on you"), Role::Blocked));
+                    let hint = if self.asleep_open {
+                        "enter folds"
+                    } else {
+                        "enter opens"
+                    };
+                    self.group_rule(s, y, ("Asleep", Role::Text), *count, (hint, waits));
+                }
+                Line::Unlisted(n) => {
+                    let word = if *n == 1 { "task" } else { "tasks" };
+                    let said = format!("{n} more {word} not listed");
+                    s.put(
+                        6,
+                        y,
+                        &fit(&said, w.saturating_sub(8)),
+                        &ink(Role::FaintText),
+                    );
+                }
+                Line::Task(t, nested) => {
+                    let on = self.sel == Some(task_stop(t)) && !quiet;
+                    self.task_row(s, t, y, (key_w, usize::from(*nested) * 2), on);
+                }
                 Line::Fold(count) => {
                     let mut hint = if self.done_open {
                         "enter folds".to_string()
@@ -2066,7 +2185,7 @@ impl Page {
                     if self.sel == Some(FOLD) && !quiet {
                         s.put(1, y, "\u{25b8}", &ink(Role::Brand));
                     }
-                    self.group_rule(s, y, 3, *count, &hint);
+                    self.group_rule(s, y, GROUPS[2], *count, (&hint, None));
                 }
                 Line::Item(item) => {
                     let on = Some(item.id) == self.sel && !quiet;
@@ -2088,19 +2207,23 @@ impl Page {
                 &ink(Role::FaintText),
             );
         }
-        // The work no item holds, at the foot: its label and count line, its lines opened.
-        let rows = self.sect_rows(1, s.h - 4);
-        if rows > 0 {
-            self.loose_row(s, 0, w, (s.h - 2 - rows, rows));
-        }
     }
 
-    /// A group's rule on row `y`: its name in its ink, its count, the rule to the edge with
-    /// `hint` near its end.
-    fn group_rule(&self, s: &mut Screen, y: usize, n: usize, count: usize, hint: &str) {
-        let (name, role) = GROUPS[n];
+    /// A group's rule on row `y`: its name in its ink, its count, `extra` (a word in its own
+    /// ink) after it, the rule to the edge with the hint near its end.
+    fn group_rule(
+        &self,
+        s: &mut Screen,
+        y: usize,
+        (name, role): (&str, Role),
+        count: usize,
+        (hint, extra): (&str, Option<(String, Role)>),
+    ) {
         let x = s.put(3, y, name, &bold(role));
-        let x = s.put(x, y, &format!(" {count} "), &ink(Role::FaintText));
+        let mut x = s.put(x, y, &format!(" {count} "), &ink(Role::FaintText));
+        if let Some((word, role)) = extra {
+            x = s.put(x + 1, y, &word, &ink(role)) + 1;
+        }
         let end = s.w - 1;
         s.put(
             x,
@@ -2141,6 +2264,55 @@ impl Page {
         };
         s.put(tx, y, &fit(&item.title, room - parts_w(&parts)), &title);
         let mut x = end - parts_w(&parts) + 2;
+        for (text, role) in &parts {
+            x = s.put(x, y, text, &ink(*role)) + 2;
+        }
+    }
+
+    /// One loose task's row, an item's anatomy: the keyboard's arrow, its mark, `#<id>` and its
+    /// goal, then right of it `space  no item` and its status word as fit, the rightmost given
+    /// up first and a word that wants the owner last. `(key_w, indent)`: the key column's width
+    /// and how far an Asleep row's tasks sit in.
+    fn task_row(
+        &self,
+        s: &mut Screen,
+        t: &TaskInfo,
+        y: usize,
+        (key_w, indent): (usize, usize),
+        on: bool,
+    ) {
+        let end = s.w - 1;
+        if on {
+            s.put(1, y, "\u{25b8}", &ink(Role::Brand));
+        }
+        let (mark, role) = task_mark(t);
+        s.put(3 + indent, y, &mark, &ink(role));
+        s.put(
+            6 + indent,
+            y,
+            &cut_key(&format!("#{}", t.id), key_w),
+            &ink(Role::FaintText),
+        );
+        let goal = qoop_store::task::one_line(&t.goal);
+        let tx = 6 + indent + key_w + 2;
+        let room = end.saturating_sub(tx);
+        let keep = width::width(&goal).min(TITLE_MIN);
+        let parts = drop_parts(
+            task_parts(t, &self.spaces, self.now),
+            room.saturating_sub(keep),
+        );
+        let title = if on {
+            bold(Role::Focused)
+        } else {
+            ink(Role::Text)
+        };
+        s.put(
+            tx,
+            y,
+            &fit(&goal, room.saturating_sub(parts_w(&parts))),
+            &title,
+        );
+        let mut x = end.saturating_sub(parts_w(&parts)) + 2;
         for (text, role) in &parts {
             x = s.put(x, y, text, &ink(*role)) + 2;
         }
@@ -3147,7 +3319,7 @@ impl Page {
             ("t", "tell qass"),
             ("q", "close"),
         ];
-        if self.loose_shown() {
+        if self.loose_shown() && !list {
             board.insert(7, ("N", "not on the board"));
         }
         if list {
@@ -4639,6 +4811,7 @@ mod tests {
             folder: None,
             status: status.into(),
             status_at: at,
+            asleep_since: None,
         }
     }
 
@@ -5587,6 +5760,7 @@ mod tests {
             (items[2].steps_done, items[2].steps_total) = (2, 5);
             items[3].agents.push(agent("waits"));
         }
+        p.sel = None;
         p.settle();
         p
     }
@@ -5611,11 +5785,12 @@ mod tests {
             .to_string()
     }
 
-    /// The list is the page's first view. Its groups come in the order of what they want of
-    /// him, each a rule with its count, an empty group not drawn, Done folded to its rule; the
-    /// heading counts what needs him. At 120, 80 and 60 columns alike.
+    /// The list is the page's first view, a work list: In progress, Not started, then Done
+    /// folded to its rule, each a rule with its count and an empty group not drawn. What waits on
+    /// him is no group and no count in the heading: a waiting row keeps its group and says why in
+    /// place. At 120, 80 and 60 columns alike.
     #[test]
-    fn the_list_groups_the_items_by_what_they_want_at_every_width() {
+    fn the_list_groups_the_items_by_their_lane_at_every_width() {
         assert_eq!(Page::new().view, View::List, "the list is the first view");
         let mut p = list_page();
         for (w, h) in [(120, 40), (80, 24), (60, 24)] {
@@ -5623,13 +5798,12 @@ mod tests {
             let rows = list_rows(&p, w, h);
             let at = |want: &str| rows.iter().position(|r| r.contains(want)).unwrap();
             let order = [
-                at("Needs you 2"),
-                at("QOOP-1"),
-                at("QOOP-4"),
-                at("In progress 2"),
+                at("In progress 3"),
                 at("QOOP-3"),
+                at("QOOP-4"),
                 at("QOOP-5"),
-                at("Not started 1"),
+                at("Not started 2"),
+                at("QOOP-1"),
                 at("QOOP-2"),
                 at("Done 1"),
             ];
@@ -5638,9 +5812,11 @@ mod tests {
                 !rows.iter().any(|r| r.contains("QOOP-6")),
                 "folded: {rows:#?}"
             );
-            let head = drawn(&p, w, h).chars().take(w).collect::<String>();
+            let text = drawn(&p, w, h);
+            assert!(!text.contains("Needs you"), "no Needs you group: {text}");
+            assert!(!text.contains("need you"), "no count of them: {text}");
+            let head = text.chars().take(w).collect::<String>();
             if w >= 80 {
-                assert!(head.contains("2 need you"), "{head}");
                 assert!(head.contains("[ list · board  b ]"), "{head}");
             }
             assert!(
@@ -5648,6 +5824,16 @@ mod tests {
                 "no cards in the list: {head}"
             );
         }
+        // A waiting row stays in its group with its reason in place.
+        let rows = list_rows(&p, 120, 40);
+        assert!(
+            row_of(&rows, "QOOP-4").contains("waits on you"),
+            "in In progress: {rows:#?}"
+        );
+        assert!(
+            row_of(&rows, "QOOP-1").contains("plan needs you"),
+            "in Not started: {rows:#?}"
+        );
         // A group with nothing in it is not drawn.
         p.items.as_mut().unwrap().retain(|i| i.state != "done");
         let text = drawn(&p, 120, 40);
@@ -5661,13 +5847,13 @@ mod tests {
     fn the_keyboard_walks_the_list_and_acts_on_its_item() {
         let mut p = list_page();
         p.size = (120, 40);
-        assert_eq!(p.sel, Some(1), "the first row has it");
+        assert_eq!(p.sel, Some(3), "the first row has it");
         let mut walked = vec![p.sel.unwrap()];
         for _ in 0..6 {
             p.key(Key::Char('j'));
             walked.push(p.sel.unwrap());
         }
-        assert_eq!(walked, [1, 4, 3, 5, 2, FOLD, FOLD]);
+        assert_eq!(walked, [3, 4, 5, 1, 2, FOLD, FOLD]);
         assert_eq!(p.key(Key::Enter), Step::Stay);
         assert!(drawn(&p, 120, 40).contains("QOOP-6"), "opened");
         p.key(Key::Char('j'));
@@ -5684,6 +5870,7 @@ mod tests {
         assert_eq!((p.sel, p.lane), (Some(2), 0), "no sideways in a list");
         assert_eq!(p.key(Key::Char('L')), Step::Start(2, "QOOP-2".into()));
         assert_eq!(p.key(Key::Enter), Step::Open(2));
+        p.key(Key::Char('k'));
         p.key(Key::Char('k'));
         assert_eq!((p.sel, p.lane), (Some(5), 1));
         assert!(matches!(
@@ -5708,18 +5895,19 @@ mod tests {
         for _ in 0..2 {
             p.key(Key::Char('j'));
         }
-        assert_eq!(p.sel, Some(3));
-        p.items.as_mut().unwrap()[2] = item(3, "done", "board everywhere", 1);
+        assert_eq!(p.sel, Some(5));
+        p.items.as_mut().unwrap()[4] = item(5, "done", "contacts", 2);
         p.settle();
-        assert_eq!(p.sel, Some(5), "the row now at its place");
+        assert_eq!(p.sel, Some(1), "the row now at its place");
         // A poll that moves it to another group out of view brings it back into view.
         let mut p = list_page();
         p.size = (60, FLOOR.1);
+        p.sel = Some(1);
+        p.settle();
+        assert!(p.list_top > 0, "Not started is below the first rows");
+        p.items.as_mut().unwrap()[0].state = "doing".into();
         p.settle();
         assert_eq!((p.sel, p.list_top), (Some(1), 0));
-        p.items.as_mut().unwrap()[0].plan.clear();
-        p.settle();
-        assert_eq!(p.sel, Some(1));
         let rows = list_rows(&p, 60, FLOOR.1);
         assert!(rows.iter().any(|r| r.contains("QOOP-1")), "{rows:#?}");
     }
@@ -5774,7 +5962,10 @@ mod tests {
         // Every picture is drawn: the row carries the mark before its key.
         let rows = list_rows(&p, 120, 40);
         assert!(
-            row_of(&rows, "QOOP-3").starts_with(&mark(Role::Working)),
+            row_of(&rows, "QOOP-3")
+                .trim_start_matches('▸')
+                .trim_start()
+                .starts_with(&mark(Role::Working)),
             "{rows:#?}"
         );
     }
@@ -5855,9 +6046,9 @@ mod tests {
         p.size = (120, 40);
         p.key(Key::Char('j'));
         p.key(Key::Char('j'));
-        assert_eq!(p.sel, Some(3));
+        assert_eq!(p.sel, Some(5));
         assert_eq!(p.key(Key::Char('b')), Step::View(View::Board));
-        assert_eq!((p.view, p.sel, p.lane), (View::Board, Some(3), 1));
+        assert_eq!((p.view, p.sel, p.lane), (View::Board, Some(5), 1));
         let text = drawn(&p, 120, 40);
         assert!(
             text.contains("todo 2") && text.contains("[ full · quiet  v ]"),
@@ -5946,26 +6137,186 @@ mod tests {
         );
     }
 
-    /// The work no item holds sits folded at the list's foot as on the board: `N` opens it, `j`
-    /// past the last row steps into it, enter goes to its tab.
+    /// The list's In progress rows and the Asleep row, as the text of the page.
+    fn progress_rows(p: &Page, w: usize, h: usize) -> Vec<String> {
+        let rows = list_rows(p, w, h);
+        let from = rows.iter().position(|r| r.contains("In progress")).unwrap();
+        let to = rows
+            .iter()
+            .position(|r| r.contains("Not started"))
+            .unwrap_or(rows.len());
+        rows[from..to].to_vec()
+    }
+
+    /// A request an agent took with no item is a row of In progress, newest first with the items:
+    /// its mark, `#<id>`, its goal, `<space>  no item`, its status word and age. One that waits on
+    /// him says so in the owner's word. Not started holds the Todo items and no task.
     #[test]
-    fn the_folded_row_sits_at_the_foot_of_the_list() {
+    fn a_loose_task_is_a_row_of_in_progress_and_a_waiting_one_says_so() {
         let mut p = list_page();
         with_loose(&mut p);
+        p.tasks.truncate(2);
+        p.tasks[1].status = "working".into();
+        p.loose = Some(2);
         p.size = (120, 40);
-        assert!(row_text(&p, 120, 40, 36).contains("Not on the board · 12"));
-        assert!(row_text(&p, 120, 40, 37).contains(COUNTS));
-        p.key(Key::Char('N'));
-        // Seven rows and the Done row stand before it: a few more `j` than that must reach it.
-        for _ in 0..10 {
-            if p.loose_cursor().is_some() {
-                break;
-            }
-            p.key(Key::Char('j'));
+        let rows = list_rows(&p, 120, 40);
+        let progress = progress_rows(&p, 120, 40);
+        // Two tasks and three Doing items, the tasks newer: first.
+        assert!(progress[0].contains("In progress 5"), "{progress:#?}");
+        let wait = row_of(&progress, "third wait");
+        for want in ["#3", "qoop  no item", "waits on you · 1 d"] {
+            assert!(wait.contains(want), "{want}: {wait}");
         }
-        assert_eq!(p.loose_cursor(), Some(0));
-        assert_eq!(p.key(Key::Enter), Step::Goto(13));
-        assert!(drawn(&p, 120, 40).contains("third wait"), "opened");
+        let blocked = qoop_tui::sidebar::state_mark(Role::Blocked, false, 0, false);
+        assert!(wait.starts_with(&blocked), "orange mark: {wait}");
+        let busy = row_of(&progress, "second wait");
+        assert!(busy.contains("#2") && busy.contains("working"), "{busy}");
+        assert!(!busy.contains("waits"), "{busy}");
+        let order = ["third wait", "second wait", "QOOP-3"]
+            .map(|w| progress.iter().position(|r| r.contains(w)).unwrap());
+        assert!(order.is_sorted(), "tasks and items together: {progress:#?}");
+        // Not started holds the Todo items only.
+        let todo = rows
+            .iter()
+            .position(|r| r.contains("Not started 2"))
+            .unwrap();
+        let done = rows.iter().position(|r| r.contains("Done 1")).unwrap();
+        assert_eq!((todo, done), (todo, todo + 3), "{rows:#?}");
+        assert!(rows[todo + 1].contains("QOOP-1") && rows[todo + 2].contains("QOOP-2"));
+        assert!(
+            !rows[todo..].iter().any(|r| r.contains("no item")),
+            "{rows:#?}"
+        );
+        // The Needs you group is gone and the foot has no folded row on the list.
+        let text = drawn(&p, 120, 40);
+        assert!(
+            !text.contains("Needs you") && !text.contains("Not on the board"),
+            "{text}"
+        );
+        assert!(!text.contains("N  not on the board"), "{text}");
+        // Narrow: the goal and the word that wants him stay.
+        let narrow = row_of(&progress_rows(&p, 60, 24), "third wait");
+        assert!(narrow.contains("waits on you"), "{narrow}");
+        // A filter reads items: the tasks leave with it.
+        p.filter = "contacts".into();
+        p.settle();
+        assert!(!drawn(&p, 120, 40).contains("third wait"));
+    }
+
+    /// Tasks whose tab sleeps fold into one `Asleep` row at the foot of In progress, with how many
+    /// of them wait on him; enter opens it to their rows, enter on one shows its agent's tab.
+    #[test]
+    fn the_asleep_tasks_fold_into_one_row_that_enter_opens() {
+        let mut p = list_page();
+        with_loose(&mut p);
+        // Task 1 waits and sleeps; task 7 says asleep; task 3 waits awake.
+        p.tasks[2].asleep_since = Some(p.now - 3 * DAY);
+        p.tasks.retain(|t| matches!(t.id, 1 | 3 | 7));
+        p.loose = Some(3);
+        p.size = (120, 40);
+        p.sel = None;
+        p.settle();
+        let progress = progress_rows(&p, 120, 40);
+        assert!(
+            progress[0].contains("In progress 4"),
+            "awake rows only: {progress:#?}"
+        );
+        let fold = row_of(&progress, "Asleep");
+        assert!(
+            fold.contains("Asleep 2") && fold.contains("1 waits on you"),
+            "{fold}"
+        );
+        assert!(fold.contains("enter opens"), "{fold}");
+        assert!(!drawn(&p, 120, 40).contains("first wait"), "folded");
+        assert!(!drawn(&p, 120, 40).contains("slept"), "folded");
+        // The fold is In progress's last row.
+        assert!(progress.last().unwrap().contains("Asleep"), "{progress:#?}");
+        // Walk down to it: it is a stop; enter opens it.
+        while p.sel != Some(ASLEEP) {
+            let before = p.sel;
+            p.key(Key::Char('j'));
+            assert_ne!(p.sel, before, "{progress:#?}");
+        }
+        assert_eq!(p.key(Key::Enter), Step::Stay);
+        let progress = progress_rows(&p, 120, 40);
+        assert!(progress[0].contains("In progress 4"), "{progress:#?}");
+        assert!(row_of(&progress, "Asleep").contains("enter folds"));
+        let first = row_of(&progress, "first wait");
+        assert!(
+            first.contains("waits on you · 3 d") && first.contains("#1"),
+            "{first}"
+        );
+        assert!(row_of(&progress, "slept").contains("asleep · 13 d"));
+        // Its rows are stops: j steps onto the first (newest first: task 1 slept 3 days).
+        p.key(Key::Char('j'));
+        assert_eq!(p.sel, Some(-1));
+        assert_eq!(p.key(Key::Enter), Step::Goto(11));
+        // A task with no tab says so.
+        p.tasks[0].terminal = None;
+        p.tasks[0].updated_at = p.now;
+        p.sel = Some(-p.tasks[0].id);
+        assert_eq!(p.key(Key::Enter), Step::Stay);
+        assert!(
+            p.said.as_deref().unwrap().contains("no tab"),
+            "{:?}",
+            p.said
+        );
+        // Enter on the fold folds it.
+        p.sel = Some(ASLEEP);
+        p.key(Key::Enter);
+        assert!(!drawn(&p, 120, 40).contains("first wait"), "folded again");
+        // Without `asleep_since` or an asleep status there is no fold (an older daemon).
+        p.tasks
+            .retain(|t| t.status != "asleep" && t.asleep_since.is_none());
+        let text = drawn(&p, 120, 40);
+        assert!(!text.contains("Asleep"), "{text}");
+        // A click on the fold opens it; a click on a task's row only selects it.
+        with_loose(&mut p);
+        p.size = (120, 40);
+        let rows = list_rows(&p, 120, 40);
+        let at = rows.iter().position(|r| r.contains("Asleep")).unwrap() + 2;
+        let press = |row: usize| Key::Mouse {
+            down: true,
+            held: false,
+            col: 30,
+            row: row as u16,
+        };
+        assert_eq!(p.key(press(at)), Step::Stay);
+        assert!(drawn(&p, 120, 40).contains("slept"), "opened by a click");
+        let at = list_rows(&p, 120, 40)
+            .iter()
+            .position(|r| r.contains("slept"))
+            .unwrap()
+            + 2;
+        assert_eq!(p.key(press(at)), Step::Stay);
+        assert_eq!(p.sel, Some(-7));
+    }
+
+    /// Tasks the daemon counted and did not send are said under In progress, not lost.
+    #[test]
+    fn tasks_the_daemon_did_not_send_are_counted_under_in_progress() {
+        let mut p = list_page();
+        with_loose(&mut p);
+        p.loose = Some(p.tasks.len() + 1);
+        p.size = (120, 40);
+        let progress = progress_rows(&p, 120, 40);
+        assert!(
+            progress.last().unwrap().contains("1 more task not listed"),
+            "{progress:#?}"
+        );
+        p.loose = Some(p.tasks.len() + 4);
+        let progress = progress_rows(&p, 120, 40);
+        assert!(
+            progress.last().unwrap().contains("4 more tasks not listed"),
+            "{progress:#?}"
+        );
+        // An older daemon counts none: no rows, no fold, no line.
+        p.loose = None;
+        let text = drawn(&p, 120, 40);
+        assert!(
+            !text.contains("third wait") && !text.contains("not listed"),
+            "{text}"
+        );
     }
 
     /// The dialog: the plan above the checklist (where it stands, by whom and when, its file,

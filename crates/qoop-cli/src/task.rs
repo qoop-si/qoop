@@ -1221,6 +1221,7 @@ mod tests {
             folder: None,
             status: String::new(),
             status_at: 0,
+            asleep_since: None,
         }
     }
 

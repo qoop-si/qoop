@@ -45,6 +45,7 @@ async fn admitted_events_are_listed_and_nothing_else_is() {
                     session: None,
                     event: event.map(str::to_string),
                     label: label.map(str::to_string),
+                    said: None,
                 },
                 qoop_testkit::PATIENCE,
             )

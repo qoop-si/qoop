@@ -256,6 +256,10 @@ pub struct AgentRegistry {
     tasks_due: Arc<AtomicBool>,
     /// Which terminal a watched pid belongs to.
     by_pid: Mutex<HashMap<i32, u32>>,
+    /// Each terminal's last turn end in its own words, masked: the paragraph before the last
+    /// and the last (see `ReportAgentState::said`), for the card a question gets. Memory
+    /// only, replaced at every turn end.
+    said: Mutex<HashMap<u32, String>>,
     terminals: Mutex<BTreeMap<u32, TerminalAgent>>,
     /// Focus events per terminal, oldest first, capped at
     /// [`crate::control::MAX_FOCUS_EVENTS`].
@@ -941,6 +945,7 @@ impl AgentRegistry {
             task_terminals: Mutex::new(BTreeSet::new()),
             tasks_due: Arc::new(AtomicBool::new(false)),
             by_pid: Mutex::new(HashMap::new()),
+            said: Mutex::new(HashMap::new()),
             terminals: Mutex::new(BTreeMap::new()),
             focus: Mutex::new(BTreeMap::new()),
             prompts: Mutex::new(BTreeMap::new()),
@@ -1927,6 +1932,32 @@ impl AgentRegistry {
     /// `at_unix` is daemon time at admission (see the call site), never
     /// the hook's advisory wire clock, so a skewed hook cannot stretch
     /// the shield.
+    /// Keep a turn end's closing words for `stream`, masked; none forgets the last ones.
+    pub fn set_said(&self, stream: u32, said: Option<&str>) {
+        let mut all = self.said.lock().unwrap();
+        match said
+            .map(qoop_parsed::redact)
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(text) => {
+                all.insert(stream, text);
+            }
+            None => {
+                all.remove(&stream);
+            }
+        }
+    }
+
+    /// The closing words of `stream`'s last turn end: what it just did, and its question.
+    pub fn said(&self, stream: u32) -> Option<(Option<String>, String)> {
+        let all = self.said.lock().unwrap();
+        let text = all.get(&stream)?;
+        Some(match text.rsplit_once("\n\n") {
+            Some((before, last)) => (Some(before.trim().to_string()), last.trim().to_string()),
+            None => (None, text.trim().to_string()),
+        })
+    }
+
     pub fn push_focus_event(&self, stream: u32, event: crate::control::FocusEvent) {
         self.note_shield(stream, event.at_unix);
         // A harness message in the prompt's place (a task notification, pasted content, a

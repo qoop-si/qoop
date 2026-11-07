@@ -83,6 +83,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             session: None,
             event: None,
             label: None,
+            said: None,
         },
         ControlRequest::ReloadAgentManifests { id: "x12".into() },
         // Session identity without a state claim: an id for the store, never

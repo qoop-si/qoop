@@ -80,6 +80,7 @@ async fn report_session(d: &TestDaemon, c: &mut qoop_testkit::TestClient, tab: u
                 session: Some(SESSION.into()),
                 event: None,
                 label: None,
+                said: None,
             },
             qoop_testkit::PATIENCE,
         )

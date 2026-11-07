@@ -1041,6 +1041,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
     let mut from: Option<String> = None;
     let mut event: Option<String> = None;
     let mut label: Option<String> = None;
+    let mut said: Option<Box<str>> = None;
     let mut subagent: Option<qoop_runtime::control::SubagentChange> = None;
     let mut rest = args.iter().skip(2);
     while let Some(arg) = rest.next() {
@@ -1065,6 +1066,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                     }
                 }
             }
+            "--said" => said = rest.next().map(|s| s.as_str().into()),
             "--label" => {
                 label = match rest.next() {
                     Some(v) => Some(v.clone()),
@@ -1244,6 +1246,7 @@ fn run_hook_report(args: &[String]) -> std::io::Result<()> {
                 session,
                 event,
                 label,
+                said,
             }
         }
     };
