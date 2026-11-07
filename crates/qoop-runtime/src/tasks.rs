@@ -177,22 +177,45 @@ pub(crate) async fn write(
         description,
     } = action
     {
+        // An agent's own find waits for the owner's start: a coding agent in a tab outside
+        // qass's space. qass adds what he asked for, and a person in a shell tab is him.
+        let agent_tab = speaker.filter(|&t| {
+            agents.agent(t).is_some_and(|a| {
+                matches!(
+                    a.identity,
+                    qoop_domain::AgentIdentity::Known { agent: true, .. }
+                )
+            })
+        });
         return match store
             .run(move |s| {
-                let name = s
-                    .workspaces()?
-                    .into_iter()
-                    .find(|w| w.id == workspace)
-                    .map(|w| w.name);
-                if name.as_deref() == Some(QASS_SPACE) {
-                    return Ok(None);
+                let spaces = s.workspaces()?;
+                let space_of = |id: i64| spaces.iter().find(|w| w.id == id).map(|w| w.name.clone());
+                let here = match speaker {
+                    Some(t) => s.terminal_workspace(i64::from(t))?,
+                    None => None,
+                };
+                let Some(workspace) = workspace.or(here) else {
+                    return Ok(Err(
+                        "no space named, and not inside a qoop terminal: add --space <space>",
+                    ));
+                };
+                if space_of(workspace).as_deref() == Some(QASS_SPACE) {
+                    return Ok(Err(
+                        "qass's own space has no board: add the item to the space the work is in",
+                    ));
                 }
+                // An agent's own find waits for the owner; qass adds what he asked for.
+                let by = agent_tab
+                    .filter(|_| here.and_then(space_of).as_deref() != Some(QASS_SPACE))
+                    .map(|t| format!("T{t}"));
                 let description = description.unwrap_or_default();
-                s.add_item(workspace, &goal, &description, now).map(Some)
+                s.add_item(workspace, &goal, &description, by.as_deref(), now)
+                    .map(Ok)
             })
             .await
         {
-            Ok(Some((task, key))) => {
+            Ok(Ok((task, key))) => {
                 agents.tasks_changed();
                 ControlResponse::TaskWritten {
                     id,
@@ -200,10 +223,7 @@ pub(crate) async fn write(
                     key: Some(key),
                 }
             }
-            Ok(None) => failed(
-                id,
-                "qass's own space has no board: add the item to the space the work is in",
-            ),
+            Ok(Err(reason)) => failed(id, reason),
             Err(e) => store_failed(id, e),
         };
     }
@@ -1034,7 +1054,7 @@ mod tests {
         let mut s = qoop_store::Store::in_memory().expect("store");
         let ws = s.create_workspace("work", 1).unwrap();
         s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
-        let (item, _) = s.add_item(ws, "the item", "", 1).unwrap();
+        let (item, _) = s.add_item(ws, "the item", "", None, 1).unwrap();
         let store = StoreHandle::new(s);
         let link = |space: Option<&str>| {
             write(
@@ -1089,7 +1109,9 @@ mod tests {
         let mut s = qoop_store::Store::in_memory().expect("store");
         let ws = s.create_workspace("work", 1).unwrap();
         s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
-        let (item, key) = s.add_item(ws, "login keeps the session", "", 1).unwrap();
+        let (item, key) = s
+            .add_item(ws, "login keeps the session", "", None, 1)
+            .unwrap();
         let store = StoreHandle::new(s);
         let answer = write(
             "w".into(),
@@ -1145,7 +1167,7 @@ mod tests {
         let mut s = qoop_store::Store::in_memory().expect("store");
         let ws = s.create_workspace("work", 1).unwrap();
         let qass = s.create_workspace(QASS_SPACE, 1).unwrap();
-        let (item, _) = s.add_item(ws, "the item", "", 1).unwrap();
+        let (item, _) = s.add_item(ws, "the item", "", None, 1).unwrap();
         let t = s.create_terminal(1, ws, "/tmp", "/bin/sh", 2).unwrap();
         let linked = s.open_task(t, "on the item", false, 3).unwrap();
         s.link_task(linked, item, 4).unwrap();

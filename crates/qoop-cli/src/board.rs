@@ -677,7 +677,7 @@ mod tests {
         let mut store = Store::in_memory().expect("store");
         let ws = store.create_workspace("web", 1).unwrap();
         let t = store.create_terminal(5, ws, "/w", "/bin/sh", 2).unwrap();
-        let (item, key) = store.add_item(ws, "checkout", "", 2).unwrap();
+        let (item, key) = store.add_item(ws, "checkout", "", None, 2).unwrap();
         let task = store.open_task(t, "fix checkout", false, 3).unwrap();
         store.link_task(task, item, 4).unwrap();
         store.set_task_stage(task, "waiting-human", 5).unwrap();

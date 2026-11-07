@@ -192,7 +192,8 @@ fn turn_line(open: Option<&TaskInfo>, item: Option<&ItemCardInfo>) -> String {
     let Some(card) = item else {
         return format!(
             "qoop: this terminal's task #{} is open (stage {}). Prove each check with `qoop task \
-             evidence`, finish with `qoop task done`; the owner's item: `qoop task link <KEY>`.",
+             evidence`, finish with `qoop task done`; the owner's item: `qoop task link <KEY>`. \
+             Work you will not do now: `qoop task add \"<title>\"`.",
             t.id, t.stage
         );
     };
@@ -261,7 +262,7 @@ const USAGE: &str = "usage:
   qoop task verify <KEY|id> [--repo <path>] [--json]
                                        the closing facts of a finished task (an item: every
                                        linked task's) and what is missing; never closes
-  qoop task add --space S <short title> [--description <text|->]
+  qoop task add [--space S] <short title> [--description <text|->]
                                        put an item on a space's board; prints its key (a title
                                        over 32 characters is cut, the whole kept in the description)
   qoop task describe [--id KEY|N] <text|->  the item's description
@@ -372,8 +373,10 @@ pub(crate) fn written(task: Option<i64>, action: TaskOp) -> std::io::Result<(i64
     guard_named(task)?;
     // A task named by id is spoken for by nobody: qass closes a worker's task from its own
     // terminal, and sending that terminal along would make the daemon ask whether the task
-    // is qass's. Nor is an item added, or a remote agent reported: they name no task here.
-    let nobody = task.is_some() || matches!(action, TaskOp::Add { .. } | TaskOp::LinkRemote { .. });
+    // is qass's. Nor is a remote agent reported: it names no task here. An item added from a
+    // terminal says which one, when there is one: its space is the default, and an agent's
+    // own find waits for the owner's start.
+    let nobody = task.is_some() || matches!(action, TaskOp::LinkRemote { .. });
     let (terminal, token) = if nobody { (None, None) } else { here() };
     if !nobody && terminal.is_none() {
         return Err(std::io::Error::other(
@@ -553,7 +556,7 @@ fn space(wanted: &str) -> std::io::Result<i64> {
     }
 }
 
-/// `qoop task add --space S <title> [--description <text|->]`.
+/// `qoop task add [--space S] <title> [--description <text|->]`: no space, this terminal's.
 fn add(rest: &[String]) -> std::io::Result<()> {
     let (mut wanted, mut description, mut title) = (None, None, Vec::new());
     let mut it = rest.iter();
@@ -568,10 +571,15 @@ fn add(rest: &[String]) -> std::io::Result<()> {
             _ => title.push(word.clone()),
         }
     }
-    let (Some(wanted), false) = (wanted, title.is_empty()) else {
+    if title.is_empty() {
         return Err(usage(USAGE));
+    }
+    // No space named: the asking terminal's own, which the daemon knows.
+    let workspace = match wanted {
+        Some(wanted) => Some(space(wanted)?),
+        None if here().0.is_some() => None,
+        None => return Err(usage(USAGE)),
     };
-    let workspace = space(wanted)?;
     let (id, key) = written(
         None,
         TaskOp::Add {
@@ -1272,6 +1280,11 @@ mod tests {
             !open.contains(CLARIFY),
             "not repeated on every turn of a task"
         );
+        assert!(
+            open.contains("`qoop task add \"<title>\"`"),
+            "work for later goes on the board"
+        );
+        assert!(open.chars().count() <= 300, "short beside every request");
     }
 
     #[test]

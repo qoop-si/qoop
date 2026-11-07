@@ -3620,7 +3620,7 @@ pub(crate) fn run() -> std::io::Result<()> {
                         match write(
                             None,
                             TaskOp::Add {
-                                workspace,
+                                workspace: Some(workspace),
                                 goal,
                                 description: None,
                             },

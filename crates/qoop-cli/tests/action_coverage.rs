@@ -609,7 +609,7 @@ fn actions() -> Vec<Action> {
                     token: None,
                     task: None,
                     action: qoop_runtime::control::TaskOp::Add {
-                        workspace: 1,
+                        workspace: Some(1),
                         goal: "g".into(),
                         description: None,
                     },

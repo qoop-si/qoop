@@ -738,24 +738,38 @@ pub(crate) async fn working_again(
 /// A card closed because its answer was told in the chat: the head names the card, and the tab
 /// it was typed in is no matter (qass relays to the lead as often as to the worker the card is
 /// about). An `open` card, or a `passed` one (his inbox answer reached qass, and this is qass
-/// passing it on); never a `queued` one, which the daemon still has to type.
+/// passing it on); never a `queued` one, which the daemon still has to type. The card's agent
+/// stops waiting too when it still waits on that question ([`qoop_store::Store::relay_answered`]),
+/// so no board says it waits on him after he answered.
 pub(crate) async fn relayed(
     label: Option<&str>,
+    agents: &AgentRegistry,
     connections: &Arc<ConnectionRegistry>,
     store: &StoreHandle,
 ) {
     let Some(card) = label.and_then(card_in_prompt) else {
         return;
     };
-    let closed = store
-        .run(move |s| match s.ask(&card)? {
-            Some(row) if matches!(row.status.as_str(), "open" | "passed") => {
-                s.close_ask(&card, "answered in chat", now())
-            }
-            _ => Ok(false),
+    let ended = store
+        .run(move |s| {
+            let moved = s.relay_answered(&card, now())?;
+            let closed = match s.ask(&card)? {
+                Some(row) if matches!(row.status.as_str(), "open" | "passed") => {
+                    s.close_ask(&card, "answered in chat", now())?
+                }
+                _ => false,
+            };
+            Ok::<_, qoop_store::StoreError>((moved, closed))
         })
         .await;
-    if matches!(closed, Ok(true)) {
+    let Ok((moved, closed)) = ended else {
+        return;
+    };
+    if let Some(terminal) = moved.and_then(|t| u32::try_from(t).ok()) {
+        agents.tasks_changed();
+        agents.announce(terminal);
+    }
+    if moved.is_some() || closed {
         connections.asks_changed();
     }
 }
@@ -2617,7 +2631,7 @@ mod tests {
                 s.create_workspace(QASS_SPACE, 2).unwrap();
             }
             s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
-            let (item, _) = s.add_item(ws, "ship it", "", at).unwrap();
+            let (item, _) = s.add_item(ws, "ship it", "", None, at).unwrap();
             let task = s.begin_task(7, "ship it", None, at).unwrap().0;
             s.link_task(task, item, at).unwrap();
             s.set_planfile(item, "/p/plan.md", b"v1", 7, at).unwrap();
@@ -2673,7 +2687,7 @@ mod tests {
         let ws = s.create_workspace("work", 1).unwrap();
         s.create_workspace(QASS_SPACE, 2).unwrap();
         s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
-        let (item, key) = s.add_item(ws, "ship it", "", at).unwrap();
+        let (item, key) = s.add_item(ws, "ship it", "", None, at).unwrap();
         let task = s.begin_task(7, "ship it", None, at).unwrap().0;
         s.link_task(task, item, at).unwrap();
         let steps: Vec<String> = ["## Plan", "write it", "## Build", "code it"]
@@ -2716,7 +2730,7 @@ mod tests {
         let ws = s.create_workspace("work", 1).unwrap();
         s.create_workspace(QASS_SPACE, 2).unwrap();
         s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
-        let (item, key) = s.add_item(ws, "ship it", "", at).unwrap();
+        let (item, key) = s.add_item(ws, "ship it", "", None, at).unwrap();
         let body = |h: &str| {
             format!(
                 r#"{{"handle":"{h}","urgency":"later","doing":"d","why":"w","asks":"a","options":[{{"key":"a","label":"A","reason":"r","words":"go"}}]}}"#
