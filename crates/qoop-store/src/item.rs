@@ -734,13 +734,28 @@ fn said(stage: &str) -> &str {
 }
 
 impl Store {
+    /// The space an open terminal is in.
+    pub fn terminal_workspace(&self, terminal: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT workspace FROM terminal WHERE id = ?1 AND closed_at IS NULL",
+                params![terminal],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Add an item to a space's board: a task with no terminal, keyed by the space's prefix
-    /// and the next number for it, counted in this transaction.
+    /// and the next number for it, counted in this transaction. `by` names the agent that
+    /// added it (`T12`): such an item waits for the owner's start, never qass's
+    /// ([`Store::next_item`]).
     pub fn add_item(
         &self,
         workspace: i64,
         title: &str,
         description: &str,
+        by: Option<&str>,
         now: i64,
     ) -> Result<(i64, String), StoreError> {
         let full = goal_text(title)?;
@@ -790,6 +805,9 @@ impl Store {
             params![id, prefix, n, description],
         )?;
         event(&tx, id, "opened", &full, now)?;
+        if let Some(by) = by {
+            event(&tx, id, "added_by", by, now)?;
+        }
         if !description.is_empty() {
             event(&tx, id, "description", &description, now)?;
         }
@@ -1323,7 +1341,7 @@ mod tests {
     #[test]
     fn a_closed_item_is_dismissed_and_shown_again_and_nothing_is_lost() {
         let (s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "ship it", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship it", "", None, 10).unwrap();
         assert!(matches!(
             task_err(s.dismiss_item(item, false, 15).unwrap_err()),
             TaskError::NotDone(_)
@@ -1386,7 +1404,7 @@ mod tests {
             .unwrap();
         assert_eq!(hidden(70), Some(false));
         // A dropped item is on no board: nothing to put away.
-        let (dropped, _) = s.add_item(ws, "never mind", "", 80).unwrap();
+        let (dropped, _) = s.add_item(ws, "never mind", "", None, 80).unwrap();
         s.close_task(dropped, Outcome::Abandoned, "dropped", 81)
             .unwrap();
         assert!(matches!(
@@ -1404,7 +1422,7 @@ mod tests {
     #[test]
     fn a_reopened_item_waits_for_a_new_start() {
         let (s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "ship it", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship it", "", None, 10).unwrap();
         s.start_item(item, 20).unwrap();
         assert_eq!(state_of(&s, item, 21), ItemState::Doing);
         s.close_task(item, Outcome::Verified, "moved on the board", 30)
@@ -1426,16 +1444,16 @@ mod tests {
         assert_eq!(prefix_of("qoop-tui"), "QOOPTUI");
         assert_eq!(prefix_of("default"), "DEFAULT");
         assert_eq!(prefix_of("frontend-dashboard"), "FRONTENDDA");
-        let (a, ka) = s.add_item(ws, "first", "", 10).unwrap();
-        let (_, kb) = s.add_item(ws, "second", "", 11).unwrap();
-        let (_, kc) = s.add_item(other, "third", "", 12).unwrap();
-        let (_, kd) = s.add_item(blank, "fourth", "", 13).unwrap();
+        let (a, ka) = s.add_item(ws, "first", "", None, 10).unwrap();
+        let (_, kb) = s.add_item(ws, "second", "", None, 11).unwrap();
+        let (_, kc) = s.add_item(other, "third", "", None, 12).unwrap();
+        let (_, kd) = s.add_item(blank, "fourth", "", None, 13).unwrap();
         assert_eq!(
             [ka.as_str(), &kb, &kc, &kd],
             ["QOOPTUI-1", "QOOPTUI-2", "QOOPTUI-3", "ITEM-1"]
         );
         s.rename_workspace(ws, "web").unwrap();
-        let (_, ke) = s.add_item(ws, "fifth", "", 14).unwrap();
+        let (_, ke) = s.add_item(ws, "fifth", "", None, 14).unwrap();
         assert_eq!(ke, "WEB-1");
         assert_eq!(s.item_card(a, 15).unwrap().unwrap().item.key, "QOOPTUI-1");
         assert_eq!(s.item_id("qooptui-1").unwrap(), Some(a));
@@ -1446,12 +1464,12 @@ mod tests {
         );
         assert_eq!(s.item_id("QOOPTUI-9").unwrap(), None);
         assert!(matches!(
-            s.add_item(999, "x", "", 16).unwrap_err(),
+            s.add_item(999, "x", "", None, 16).unwrap_err(),
             StoreError::NoWorkspace(999)
         ));
-        assert!(s.add_item(ws, "  ", "", 16).is_err());
+        assert!(s.add_item(ws, "  ", "", None, 16).is_err());
         assert!(
-            s.add_item(ws, "x", &"d".repeat(DESCRIPTION_MAX + 1), 16)
+            s.add_item(ws, "x", &"d".repeat(DESCRIPTION_MAX + 1), None, 16)
                 .is_err()
         );
     }
@@ -1462,7 +1480,7 @@ mod tests {
     fn an_item_says_since_when_it_is_in_its_lane() {
         let (mut s, ws, t) = setup();
         let other = s.create_terminal(9, ws, "/tmp", "/bin/sh", 2).unwrap();
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let since = |at| s.item_card(item, at).unwrap().unwrap().item.since;
         assert_eq!(since(11), 10);
         let task = s.open_task(t, "ship it", false, 20).unwrap();
@@ -1486,7 +1504,7 @@ mod tests {
     #[test]
     fn an_agent_carries_the_times_a_status_reads() {
         let (s, ws, t) = setup();
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let task = s.open_task(t, "ship it", false, 20).unwrap();
         s.link_task(task, item, 30).unwrap();
         let agent = |s: &Store, at| {
@@ -1527,7 +1545,7 @@ mod tests {
         let other = s.create_terminal(9, ws, "/tmp", "/bin/sh", 4).unwrap();
         let third = s.create_terminal(10, ws, "/tmp", "/bin/sh", 5).unwrap();
         let inside = s.create_terminal(11, qass, "/tmp", "/bin/sh", 6).unwrap();
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let linked = s.open_task(t, "linked", false, 20).unwrap();
         s.link_task(linked, item, 21).unwrap();
         let first = s.open_task(other, "first", false, 22).unwrap();
@@ -1571,7 +1589,7 @@ mod tests {
     #[test]
     fn an_ended_task_names_the_open_item_left_to_close() {
         let (s, ws, t) = setup();
-        let (item, key) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, key) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let task = s.open_task(t, "ship it", false, 11).unwrap();
         assert_eq!(s.open_item_key(task).unwrap(), None);
         s.link_task(task, item, 12).unwrap();
@@ -1593,7 +1611,7 @@ mod tests {
         // claimed or not; answers the item and its agents' tasks.
         let mut item_with = |s: &mut Store, steps: &[bool], agents: &[bool]| {
             n += 10;
-            let (item, _) = s.add_item(ws, "ship", "", n).unwrap();
+            let (item, _) = s.add_item(ws, "ship", "", None, n).unwrap();
             let list: Vec<String> = (1..=steps.len()).map(|i| format!("s{i}")).collect();
             s.set_steps(item, &list, n).unwrap();
             for (i, done) in steps.iter().enumerate() {
@@ -1686,21 +1704,23 @@ mod tests {
     fn titles_are_cut_to_fit_a_card_and_nothing_is_lost() {
         let (s, ws, t) = setup();
         let long = "Fix app #614: config show_hidden_files honored as list default (PR #615 live)";
-        let (item, _) = s.add_item(ws, long, "", 10).unwrap();
+        let (item, _) = s.add_item(ws, long, "", None, 10).unwrap();
         let card = s.item_card(item, 11).unwrap().unwrap();
         assert_eq!(card.item.task.goal, "Fix app #614: config");
         assert_eq!(card.description, long);
         let opened = s.task_events(item, None, 10).unwrap();
         assert!(opened.iter().any(|e| e.kind == "opened" && e.body == long));
 
-        let (item, _) = s.add_item(ws, long, "his notes", 10).unwrap();
+        let (item, _) = s.add_item(ws, long, "his notes", None, 10).unwrap();
         let card = s.item_card(item, 11).unwrap().unwrap();
         assert_eq!(card.description, format!("{long}\n\nhis notes"));
-        let (item, _) = s.add_item(ws, long, &format!("asked: {long}"), 10).unwrap();
+        let (item, _) = s
+            .add_item(ws, long, &format!("asked: {long}"), None, 10)
+            .unwrap();
         let card = s.item_card(item, 11).unwrap().unwrap();
         assert_eq!(card.description, format!("asked: {long}"), "never twice");
         let full = "d".repeat(DESCRIPTION_MAX - 10);
-        let (item, _) = s.add_item(ws, long, &full, 10).unwrap();
+        let (item, _) = s.add_item(ws, long, &full, None, 10).unwrap();
         let card = s.item_card(item, 11).unwrap().unwrap();
         assert_eq!(card.description, full, "no room: the event keeps it");
         assert!(s.describe_item(item, &card.description, 12).is_ok());
@@ -1719,11 +1739,11 @@ mod tests {
             "Phone board: build P3-1"
         );
         assert!(
-            s.add_item(ws, &"y".repeat(crate::task::GOAL_MAX + 1), "", 10)
+            s.add_item(ws, &"y".repeat(crate::task::GOAL_MAX + 1), "", None, 10)
                 .is_err()
         );
 
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         assert!(s.set_task_goal(item, long, 12).unwrap());
         let card = s.item_card(item, 13).unwrap().unwrap();
         assert_eq!(card.item.task.goal, "Fix app #614: config");
@@ -1741,7 +1761,7 @@ mod tests {
     #[test]
     fn steps_keep_their_ticks_and_their_limits() {
         let (s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(
             s.set_steps(item, &list(&["read", "fix", "", "test"]), 11)
@@ -1799,8 +1819,8 @@ mod tests {
     #[test]
     fn links_refuse_what_is_not_an_open_item_and_follow_a_superseded_task() {
         let (mut s, ws, t) = setup();
-        let (item, _) = s.add_item(ws, "login", "", 10).unwrap();
-        let (other, _) = s.add_item(ws, "signup", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "login", "", None, 10).unwrap();
+        let (other, _) = s.add_item(ws, "signup", "", None, 10).unwrap();
         let (task, _) = s.begin_task(t, "fix login", Some(9), 11).unwrap();
         let plain = {
             let u = s.create_terminal(6, ws, "/tmp", "/bin/sh", 2).unwrap();
@@ -1858,7 +1878,7 @@ mod tests {
     #[test]
     fn a_finished_item_never_falls_back_to_todo() {
         let (s, ws, t) = setup();
-        let (item, _) = s.add_item(ws, "logo", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "logo", "", None, 10).unwrap();
         let task = s.open_task(t, "logo", false, 11).unwrap();
         s.link_task(task, item, 12).unwrap();
         s.claim_task_done(task, "done", 12).unwrap();
@@ -1895,7 +1915,7 @@ mod tests {
     #[test]
     fn an_item_whose_agents_were_all_abandoned_reads_todo() {
         let (mut s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "logo", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "logo", "", None, 10).unwrap();
         fn ended(s: &mut Store, ws: i64, item: i64, n: i64, at: i64, claim: bool) -> i64 {
             let u = s
                 .create_terminal(100 + n, ws, "/tmp", "/bin/sh", at)
@@ -1951,7 +1971,7 @@ mod tests {
     #[test]
     fn the_state_is_read_from_what_happened() {
         let (s, ws, t) = setup();
-        let (item, _) = s.add_item(ws, "search", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "search", "", None, 10).unwrap();
         s.set_steps(item, &["a".to_string(), "b".to_string()], 10)
             .unwrap();
         s.check_step(item, 1, true, 10).unwrap();
@@ -2047,8 +2067,8 @@ mod tests {
     #[test]
     fn a_card_shows_an_agents_work_only_while_it_was_linked_there() {
         let (s, ws, t) = setup();
-        let (a, _) = s.add_item(ws, "login", "", 10).unwrap();
-        let (b, _) = s.add_item(ws, "signup", "", 10).unwrap();
+        let (a, _) = s.add_item(ws, "login", "", None, 10).unwrap();
+        let (b, _) = s.add_item(ws, "signup", "", None, 10).unwrap();
         let task = s.open_task(t, "work", false, 11).unwrap();
         s.task_evidence(task, "before any link", 12).unwrap();
         s.link_task(task, a, 13).unwrap();
@@ -2076,7 +2096,7 @@ mod tests {
     fn a_reopen_is_refused_once_the_space_is_gone() {
         let (s, _, _) = setup();
         let gone = s.create_workspace("gone", 1).unwrap();
-        let (item, _) = s.add_item(gone, "orphan", "", 10).unwrap();
+        let (item, _) = s.add_item(gone, "orphan", "", None, 10).unwrap();
         s.delete_workspace(gone).unwrap();
         assert!(matches!(
             task_err(s.reopen_item(item, 20).unwrap_err()),
@@ -2090,7 +2110,7 @@ mod tests {
     #[test]
     fn an_item_keeps_its_open_agents_and_the_newest_ended_ones() {
         let (mut s, ws, _) = setup();
-        let (item, key) = s.add_item(ws, "long one", "", 10).unwrap();
+        let (item, key) = s.add_item(ws, "long one", "", None, 10).unwrap();
         let mut ended = Vec::new();
         for n in 0..7 {
             let t = s
@@ -2118,15 +2138,15 @@ mod tests {
     #[test]
     fn readers_skip_items_and_a_removed_space_drops_its_own() {
         let (s, ws, t) = setup();
-        let (item, _) = s.add_item(ws, "board work", "", 10).unwrap();
-        let (done, _) = s.add_item(ws, "finished", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "board work", "", None, 10).unwrap();
+        let (done, _) = s.add_item(ws, "finished", "", None, 10).unwrap();
         let task = s.open_task(t, "real work", false, 11).unwrap();
         s.close_task(done, Outcome::Verified, "", 12).unwrap();
         let open: Vec<i64> = s.open_tasks().unwrap().iter().map(|t| t.id).collect();
         assert_eq!(open, [task]);
         assert!(s.closed_tasks_since(0, 10).unwrap().is_empty());
         let keep = s.create_workspace("keep", 13).unwrap();
-        let (kept, _) = s.add_item(keep, "elsewhere", "", 13).unwrap();
+        let (kept, _) = s.add_item(keep, "elsewhere", "", None, 13).unwrap();
         s.delete_workspace(ws).unwrap();
         let row = s.task(item).unwrap().unwrap();
         assert_eq!(row.outcome.as_deref(), Some("abandoned"));
@@ -2142,7 +2162,7 @@ mod tests {
     #[test]
     fn phase_headers_group_steps_and_stay_out_of_every_count() {
         let (s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "ship", "", 1).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 1).unwrap();
         let list: Vec<String> = [
             "## Plan",
             "write it",
@@ -2191,7 +2211,7 @@ mod tests {
     #[test]
     fn phase_headers_have_a_cap_of_their_own_and_none_means_no_phase() {
         let (s, ws, _) = setup();
-        let (item, _) = s.add_item(ws, "ship", "", 1).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 1).unwrap();
         let mut list: Vec<String> = (0..9).map(|i| format!("## P{i}")).collect();
         list.push("one step".to_string());
         assert!(matches!(

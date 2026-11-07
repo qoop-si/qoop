@@ -203,6 +203,41 @@ pub(crate) fn waiting_at(alias: &str) -> String {
     )
 }
 
+/// A task waiting on the owner took his answer: its stage goes back to the one before
+/// `waiting-human`, else `implementing`, and its terminal's cards close with `note`
+/// (`keep_queued`: an inbox answer still waiting to be typed stays). Answers the stage it went
+/// back to, `None` when it no longer waited.
+fn end_wait(
+    tx: &Connection,
+    task: i64,
+    terminal: i64,
+    note: &str,
+    keep_queued: bool,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let before: Option<String> = tx
+        .query_row(
+            "SELECT body FROM task_event WHERE task = ?1 AND kind = 'stage' \
+             AND body != 'waiting-human' ORDER BY id DESC LIMIT 1",
+            params![task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let back = before
+        .filter(|b| STAGES.contains(&b.as_str()))
+        .unwrap_or_else(|| "implementing".to_string());
+    let moved = tx.execute(
+        "UPDATE task SET stage = ?2, updated_at = ?3 WHERE id = ?1 AND stage = 'waiting-human'",
+        params![task, back, now],
+    )?;
+    if moved == 0 {
+        return Ok(None);
+    }
+    event(tx, task, "stage", &back, now)?;
+    crate::ask::close_cards(tx, terminal, note, keep_queued, now)?;
+    Ok(Some(back))
+}
+
 pub(crate) fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
     Ok(TaskRow {
         id: r.get(0)?,
@@ -583,15 +618,15 @@ impl Store {
     /// task id, `None` when there is no open task or it already waits.
     pub fn wait_on_owner(&self, terminal: i64, now: i64) -> Result<Option<i64>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let task: Option<(i64, String)> = tx
+        let task: Option<(i64, String, i64)> = tx
             .query_row(
-                "SELECT id, stage FROM task WHERE terminal = ?1 AND closed_at IS NULL \
+                "SELECT id, stage, opened_at FROM task WHERE terminal = ?1 AND closed_at IS NULL \
                  AND stage != 'waiting-human' ORDER BY id DESC LIMIT 1",
                 params![terminal],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((task, stage)) = task else {
+        let Some((task, stage, opened_at)) = task else {
             return Ok(None);
         };
         // The stage it leaves, on record when it began there with no stage written (a new
@@ -601,8 +636,10 @@ impl Store {
             params![task],
             |r| r.get(0),
         )?;
+        // Dated when it began there, not now: a card qass wrote about this question before
+        // the wait must not read as written before the task moved on.
         if !recorded {
-            event(&tx, task, "stage", &stage, now)?;
+            event(&tx, task, "stage", &stage, opened_at)?;
         }
         tx.execute(
             "UPDATE task SET stage = 'waiting-human', updated_at = ?2 WHERE id = ?1",
@@ -640,28 +677,39 @@ impl Store {
         let Some(task) = waiting else {
             return Ok(None);
         };
-        let before: Option<String> = tx
+        let back = end_wait(&tx, task, terminal, "answered in its tab", false, now)?;
+        tx.commit()?;
+        Ok(back)
+    }
+
+    /// qass relayed the owner's answer to `card` ("The owner answered E7"), typed into any tab,
+    /// often the lead's rather than the worker's: the card's task stops waiting when it still
+    /// waits on what the card asked. That is: open, on the card's terminal, at
+    /// `waiting-human`, and no other stage written since the card opened (a stage after it
+    /// means the question was answered or left behind, and a later wait is another
+    /// question). The card may predate the wait: qass writes a text question's card before
+    /// the daemon's own wait begins. An inbox answer still waiting to be typed stays queued.
+    /// Answers the terminal whose task moved, `None` when nothing did.
+    pub fn relay_answered(&self, card: &str, now: i64) -> Result<Option<i64>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found: Option<(i64, i64, i64)> = tx
             .query_row(
-                "SELECT body FROM task_event WHERE task = ?1 AND kind = 'stage' \
-                 AND body != 'waiting-human' ORDER BY id DESC LIMIT 1",
-                params![task],
-                |r| r.get(0),
+                "SELECT a.task, a.terminal, a.opened_at FROM ask a JOIN task t ON t.id = a.task \
+                 WHERE a.card = ?1 AND a.status IN ('open', 'passed') \
+                 AND t.terminal = a.terminal AND t.closed_at IS NULL \
+                 AND t.stage = 'waiting-human' AND NOT EXISTS (SELECT 1 FROM task_event e \
+                 WHERE e.task = t.id AND e.kind = 'stage' AND e.body != 'waiting-human' \
+                 AND e.at > a.opened_at)",
+                params![card],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let back = before
-            .filter(|b| STAGES.contains(&b.as_str()))
-            .unwrap_or_else(|| "implementing".to_string());
-        let moved = tx.execute(
-            "UPDATE task SET stage = ?2, updated_at = ?3 WHERE id = ?1 AND stage = 'waiting-human'",
-            params![task, back, now],
-        )?;
-        if moved == 0 {
+        let Some((task, terminal, _)) = found else {
             return Ok(None);
-        }
-        event(&tx, task, "stage", &back, now)?;
-        crate::ask::close_cards(&tx, terminal, "answered in its tab", false, now)?;
+        };
+        let back = end_wait(&tx, task, terminal, "answered in chat", true, now)?;
         tx.commit()?;
-        Ok(Some(back))
+        Ok(back.map(|_| terminal))
     }
 
     /// Rewrite an open task's goal: what the owner wants, in plain words, with its done bar.
@@ -1274,6 +1322,87 @@ mod tests {
         );
     }
 
+    /// qass relays his answer to a card into another tab (the lead's): the worker's wait ends
+    /// when it still waits on that card's question, even one qass wrote before the daemon's
+    /// own wait began; an inbox answer still to be typed stays queued.
+    #[test]
+    fn a_relayed_answer_ends_the_wait_it_answers() {
+        let (s, _, t) = store_with_terminal();
+        // A task with no stage written: the daemon's wait backfills the one it leaves, and
+        // qass wrote its card before that wait began.
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        s.add_ask("E7", Some("T5"), Some(t), None, r#"{"handle":"a"}"#, 30)
+            .unwrap();
+        assert_eq!(s.wait_on_owner(t, 130).unwrap(), Some(id));
+        assert_eq!(s.relay_answered("E7", 200).unwrap(), Some(t));
+        assert_ne!(s.task(id).unwrap().unwrap().stage, "waiting-human");
+        let stages = |s: &Store| {
+            s.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_event WHERE task = ?1 AND kind = 'stage'",
+                    params![id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        // The backfill, the wait, the way back: one stage event for the answer.
+        assert_eq!(stages(&s), 3);
+        assert_eq!(s.relay_answered("E7", 201).unwrap(), None, "said once");
+
+        // A W card answered from the inbox, waiting to be typed, is never dropped.
+        let (s, _, t) = store_with_terminal();
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        s.set_task_stage(id, "waiting-human", 11).unwrap();
+        let w = s
+            .add_draft("T5", t, None, r#"{"handle":"w"}"#, 12)
+            .unwrap()
+            .expect("filed");
+        s.conn
+            .execute(
+                "UPDATE ask SET status = 'queued' WHERE card = ?1",
+                params![w],
+            )
+            .unwrap();
+        s.add_ask("E8", Some("T5"), Some(t), None, r#"{"handle":"b"}"#, 13)
+            .unwrap();
+        // A card answered and being typed (no longer open or passed) is the tab's own answer.
+        s.conn
+            .execute("UPDATE ask SET status = 'answered' WHERE card = 'E8'", [])
+            .unwrap();
+        assert_eq!(s.relay_answered("E8", 19).unwrap(), None);
+        s.conn
+            .execute("UPDATE ask SET status = 'open' WHERE card = 'E8'", [])
+            .unwrap();
+        assert_eq!(s.relay_answered("E8", 20).unwrap(), Some(t));
+        assert_eq!(
+            s.ask(&w).unwrap().unwrap().status,
+            "queued",
+            "kept for delivery"
+        );
+    }
+
+    /// A card from a spell he already answered never ends the next question's wait.
+    #[test]
+    fn a_relay_of_an_answered_card_leaves_a_new_wait_alone() {
+        let (s, _, t) = store_with_terminal();
+        let id = s.open_task(t, "x", false, 10).unwrap();
+        s.set_task_stage(id, "implementing", 11).unwrap();
+        s.add_ask("E7", Some("T5"), Some(t), None, r#"{"handle":"a"}"#, 20)
+            .unwrap();
+        s.set_task_stage(id, "waiting-human", 21).unwrap();
+        // Answered at the desk: the stage moved on after the card.
+        assert!(s.answer_waiting(t, 40, 40).unwrap().is_some());
+        // A second question, a new wait.
+        s.set_task_stage(id, "waiting-human", 60).unwrap();
+        assert_eq!(s.relay_answered("E7", 90).unwrap(), None);
+        assert_eq!(s.task(id).unwrap().unwrap().stage, "waiting-human");
+        // A card about no terminal, or an unknown card, ends nothing.
+        s.add_ask("E8", None, None, None, r#"{"handle":"b"}"#, 61)
+            .unwrap();
+        assert_eq!(s.relay_answered("E8", 91).unwrap(), None);
+        assert_eq!(s.relay_answered("E99", 92).unwrap(), None);
+    }
+
     /// A question left unanswered puts the task on waiting with its claim kept, once, and his
     /// answer takes it back to the stage it had.
     #[test]
@@ -1420,7 +1549,7 @@ mod tests {
     #[test]
     fn a_claim_names_its_unticked_steps_and_a_close_who_asked() {
         let (s, ws, t) = store_with_terminal();
-        let (item, _) = s.add_item(ws, "ship", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 10).unwrap();
         let steps = ["build", "## check", "e2e passes", "deploy"].map(String::from);
         s.set_steps(item, &steps, 10).unwrap();
         s.check_step(item, 1, true, 11).unwrap();

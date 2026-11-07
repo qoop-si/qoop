@@ -1187,9 +1187,12 @@ pub enum TaskOp {
         terminal: TerminalStream,
     },
     /// Put an item on a space's board: a task with no terminal, answered with its key. From
-    /// anywhere, never in qass's own space.
+    /// anywhere, never in qass's own space. No `workspace`: the asking terminal's own space.
+    /// Added from an agent's terminal, it waits for the owner's start: qass never takes it by
+    /// itself.
     Add {
-        workspace: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<i64>,
         goal: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
@@ -3991,7 +3994,7 @@ mod tests {
     fn an_abandoned_agent_reads_closed_and_a_verified_one_finished() {
         let mut s = qoop_store::Store::in_memory().expect("store");
         let ws = s.create_workspace("work", 1).unwrap();
-        let (item, _) = s.add_item(ws, "ship", "", 2).unwrap();
+        let (item, _) = s.add_item(ws, "ship", "", None, 2).unwrap();
         let mut tasks = Vec::new();
         for terminal in [1, 2, 3] {
             let t = s

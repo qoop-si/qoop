@@ -345,7 +345,7 @@ async fn the_board_is_read_on_request_and_its_changes_are_heard() {
         None,
         None,
         TaskOp::Add {
-            workspace,
+            workspace: Some(workspace),
             goal: "search works".into(),
             description: Some("why".into()),
         },
@@ -368,6 +368,50 @@ async fn the_board_is_read_on_request_and_its_changes_are_heard() {
     let items = board(&mut c, true).await.expect("asked for, sent");
     assert_eq!(items.len(), 1);
     assert_eq!((items[0].id, items[0].state.as_str()), (item, "todo"));
+
+    // No space named, from a terminal: that terminal's own space, the next key in it.
+    let here = write(
+        &mut c,
+        Some(terminal),
+        Some(token.clone()),
+        None,
+        TaskOp::Add {
+            workspace: None,
+            goal: "later work".into(),
+            description: None,
+        },
+    )
+    .await;
+    let ControlResponse::TaskWritten {
+        key: Some(here_key),
+        ..
+    } = here
+    else {
+        panic!("not added from the terminal: {here:?}")
+    };
+    assert_eq!(
+        here_key.rsplit_once('-').map(|(p, _)| p),
+        key.rsplit_once('-').map(|(p, _)| p),
+        "the terminal's own space"
+    );
+    assert!(here_key.ends_with("-2"), "{here_key}");
+    // No space and no terminal: nothing to put it in.
+    let nowhere = write(
+        &mut c,
+        None,
+        None,
+        None,
+        TaskOp::Add {
+            workspace: None,
+            goal: "nowhere".into(),
+            description: None,
+        },
+    )
+    .await;
+    assert!(
+        !matches!(nowhere, ControlResponse::TaskWritten { .. }),
+        "{nowhere:?}"
+    );
 
     let opened = write(
         &mut c,
@@ -458,7 +502,7 @@ async fn add(c: &mut TestClient, workspace: i64, goal: &str) -> i64 {
         None,
         None,
         TaskOp::Add {
-            workspace,
+            workspace: Some(workspace),
             goal: goal.into(),
             description: None,
         },

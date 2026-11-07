@@ -542,6 +542,15 @@ impl Store {
             if opened < since || now - opened < SETTLE_SECS {
                 continue;
             }
+            // An agent put it there for later: it waits for the owner's start.
+            let by_agent: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_event WHERE task = ?1 AND kind = 'added_by')",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if by_agent {
+                continue;
+            }
             let left_alone: bool = match workspace {
                 Some(ws) => tx
                     .query_row(
@@ -633,7 +642,7 @@ mod tests {
         let mut s = Store::in_memory().expect("open");
         let ws = s.create_workspace("app", 1).unwrap();
         let t = s.create_terminal(5, ws, "/tmp", "/bin/sh", 2).unwrap();
-        let (item, _) = s.add_item(ws, "Ship the thing", "", 10).unwrap();
+        let (item, _) = s.add_item(ws, "Ship the thing", "", None, 10).unwrap();
         (s, ws, t, item)
     }
 
@@ -760,7 +769,7 @@ mod tests {
         assert_eq!(s.next_item(now, false).unwrap().item, None);
         // The first take begins it now: the item opened at 10 is the owner's.
         assert_eq!(s.next_item(now, true).unwrap().item, None);
-        let (new, key) = s.add_item(ws, "New work", "", now + 1).unwrap();
+        let (new, key) = s.add_item(ws, "New work", "", None, now + 1).unwrap();
         // Too fresh to take.
         assert_eq!(s.next_item(now + 2, true).unwrap().item, None);
         let at = now + 1 + SETTLE_SECS;
@@ -774,6 +783,27 @@ mod tests {
         let _ = old;
     }
 
+    /// An item an agent added for later waits for the owner's start: pickup never takes it,
+    /// while one he (or qass for him) added is taken as before.
+    #[test]
+    fn next_leaves_an_item_an_agent_added() {
+        let (s, ws, _, _) = setup();
+        let now = 10 + SETTLE_SECS + 1;
+        assert_eq!(s.next_item(now, true).unwrap().item, None);
+        let (_, _) = s
+            .add_item(ws, "Refactor the parser", "", Some("T5"), now + 1)
+            .unwrap();
+        let at = now + 1 + SETTLE_SECS;
+        assert_eq!(
+            s.next_item(at, true).unwrap().item,
+            None,
+            "the agent's find waits"
+        );
+        let (his, _) = s.add_item(ws, "Ship it", "", None, at + 1).unwrap();
+        let got = s.next_item(at + 1 + SETTLE_SECS, true).unwrap();
+        assert_eq!(got.item.map(|i| i.0), Some(his));
+    }
+
     /// An item whose agent was linked and then ended (a closed tab) reads Todo but is not
     /// offered again, so pickup never loops into a restart. An item the owner moved back to
     /// Todo (an unlink) or reopened after its last agent is picked as before.
@@ -781,7 +811,7 @@ mod tests {
     fn next_leaves_an_item_whose_agent_ended_and_picks_a_restarted_one() {
         let (mut s, ws, _, _) = setup();
         s.next_item(50, true).unwrap();
-        let (item, _) = s.add_item(ws, "Work", "", 100).unwrap();
+        let (item, _) = s.add_item(ws, "Work", "", None, 100).unwrap();
         let at = 100 + SETTLE_SECS + 1;
         assert_eq!(
             s.next_item(at, false).unwrap().item.map(|i| i.0),
@@ -825,7 +855,11 @@ mod tests {
         s.next_item(50, true).unwrap();
         let mut keys = Vec::new();
         for i in 0..4 {
-            keys.push(s.add_item(ws, &format!("Work {i}"), "", 100 + i).unwrap().0);
+            keys.push(
+                s.add_item(ws, &format!("Work {i}"), "", None, 100 + i)
+                    .unwrap()
+                    .0,
+            );
         }
         let at = 200 + SETTLE_SECS;
         // An open agent (asleep or not) on one item holds a slot.
@@ -844,9 +878,9 @@ mod tests {
         // Pickup begins after the setup item (opened at 10), which stays the owner's.
         s.next_item(50, true).unwrap();
         let other = s.create_workspace("quiet", 3).unwrap();
-        s.add_item(other, "Leave me", "", 100).unwrap();
+        s.add_item(other, "Leave me", "", None, 100).unwrap();
         s.set_qass_skip_workspace(other, true).unwrap();
-        let (dead, dead_key) = s.add_item(ws, "Never linked", "", 101).unwrap();
+        let (dead, dead_key) = s.add_item(ws, "Never linked", "", None, 101).unwrap();
         s.start_item(dead, 102).unwrap();
         s.start_item(dead, 103 + START_SECS).unwrap();
         let at = 104 + 2 * START_SECS + SETTLE_SECS;
