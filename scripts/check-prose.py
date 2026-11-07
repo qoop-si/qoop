@@ -7,7 +7,10 @@ examples are English and qass answers in the person's own language by its own ru
 A hyphen inside a compound word or a CLI flag is fine. A hyphen standing in for a dash is
 not. This runs over documents we ship, not over vendored reference material.
 """
-import pathlib, re, sys
+
+import pathlib
+import re
+import sys
 
 # Written as escapes so this checker does not trip over itself.
 EM = "\u2014"
@@ -23,7 +26,22 @@ TURKISH = re.compile("[\u011f\u0131\u015f\u0130\u011e\u015e]")
 # rule that is enforced over the documentation and not over the code is enforced over the
 # smaller half. `skills` and `hooks` are copied into people's own agent directories, so
 # they ship as surely as the binary does.
-roots = ["crates", "docs", "plans", "scripts", "skills", "hooks", "site", "README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md", "CLA.md", ".github", ".qoop"]
+roots = [
+    "crates",
+    "docs",
+    "plans",
+    "scripts",
+    "skills",
+    "hooks",
+    "site",
+    "README.md",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CLA.md",
+    ".github",
+    ".qoop",
+]
 skip = ("ref/", "target/", "node_modules/")
 
 fail = []
@@ -60,13 +78,17 @@ for f in files:
         if EM in line or EN in line:
             fail.append(f"{f}:{n}: em or en dash: {line.strip()[:90]}")
         if f.parts[0] in {"skills", "hooks"} and TURKISH.search(line):
-            fail.append(f"{f}:{n}: Turkish letter in a shipped skill or hook: {line.strip()[:90]}")
+            fail.append(
+                f"{f}:{n}: Turkish letter in a shipped skill or hook: {line.strip()[:90]}"
+            )
         # A CLI invocation legitimately contains " -- ", so strip inline code spans and
         # skip code blocks and tables before looking for a dash used as punctuation.
         # A Rust doc comment is prose and is checked; the code around it is not. Everywhere
         # else a comment marker means a shell or python line, where a double hyphen is a
         # flag rather than a dash.
-        is_rust_prose = f.suffix in {".rs", ".ts", ".tsx"} and line.lstrip().startswith(("///", "//!", "//"))
+        is_rust_prose = f.suffix in {".rs", ".ts", ".tsx"} and line.lstrip().startswith(
+            ("///", "//!", "//")
+        )
         is_code = not is_rust_prose and (
             in_fence
             or f.suffix != ".md"
@@ -88,4 +110,6 @@ if fail:
     for x in fail:
         print("FAIL " + x)
     sys.exit(1)
-print(f"OK  {len(files)} files, no dash violations, no Turkish letters in skills/ or hooks/")
+print(
+    f"OK  {len(files)} files, no dash violations, no Turkish letters in skills/ or hooks/"
+)
