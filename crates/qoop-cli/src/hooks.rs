@@ -1423,6 +1423,15 @@ fn array<'a>(
 mod tests {
     use super::*;
 
+    /// Hand a hook its input. A hook with nothing to do may end before it reads any, and the
+    /// pipe closing under the write is that, not a failure.
+    fn feed(child: &mut std::process::Child, payload: &[u8]) {
+        use std::io::Write;
+        if let Err(e) = child.stdin.take().expect("stdin").write_all(payload) {
+            assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "payload: {e}");
+        }
+    }
+
     /// A configuration with somebody's own hook already in it.
     fn existing() -> serde_json::Value {
         serde_json::json!({
@@ -1733,13 +1742,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -1805,15 +1808,10 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            // A hook that has nothing to report ends without reading its input: the pipe
-            // closing under the write is that, not a failure.
-            let wrote = child.stdin.take().expect("stdin").write_all(
+            feed(
+                &mut child,
                 br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}"#,
             );
-            if let Err(e) = wrote {
-                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "payload: {e}");
-            }
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -1859,13 +1857,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -1945,13 +1937,7 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.to_string().as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.to_string().as_bytes());
             let out = child.wait_with_output().expect("wait");
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
@@ -1996,13 +1982,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.to_string().as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.to_string().as_bytes());
             assert!(child.wait().expect("wait").success());
             std::fs::read_to_string(&log)
                 .unwrap_or_default()
@@ -2066,13 +2046,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.to_string().as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.to_string().as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -2185,13 +2159,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -2477,7 +2445,6 @@ mod tests {
         std::fs::write(&hook, SESSION_HOOK).expect("write");
 
         let run = |payload: &str| {
-            use std::io::Write;
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&hook)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -2486,12 +2453,7 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn");
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(
                 child.wait().expect("wait").success(),
                 "the hook must exit zero"
@@ -2905,13 +2867,7 @@ mod tests {
                 cmd.env("QOOP_TERMINAL", "1").env("QOOP_TOKEN", "t");
             }
             let mut child = cmd.spawn().expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             let out = child.wait_with_output().expect("wait");
             assert!(out.status.success(), "a hook must exit 0");
             String::from_utf8_lossy(&out.stdout).into_owned()
@@ -3104,13 +3060,7 @@ mod tests {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log)
                 .unwrap_or_default()
@@ -3264,13 +3214,7 @@ mod tests {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
@@ -3413,13 +3357,7 @@ mod tests {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .expect("run the hook");
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(payload.as_bytes())
-                .expect("payload");
+            feed(&mut child, payload.as_bytes());
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };

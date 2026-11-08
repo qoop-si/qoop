@@ -30,6 +30,9 @@ fn home_with(files: &[(&str, &str)], zdotdir: Option<&Path>) -> tempfile::TempDi
     // this returns; nothing else in this binary reads or writes the environment meanwhile.
     unsafe {
         std::env::set_var("HOME", home.path());
+        // Debian's and Ubuntu's /etc/zsh/zshrc run compinit, which stops at a question about
+        // the runner's own directories; the person's files are what is under test here.
+        std::env::set_var("skip_global_compinit", "1");
         std::env::remove_var("QOOP_ZDOTDIR");
         std::env::remove_var("QOOP_SHELL_INTEGRATION");
         match zdotdir {
@@ -83,8 +86,7 @@ async fn sleep_then_fail(c: &mut TestClient, before: &str) {
 #[tokio::test]
 async fn zsh_reports_a_finished_command_with_its_status_and_time() {
     let _turn = SERIAL.lock().await;
-    if !Path::new(ZSH).exists() {
-        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+    if !has_zsh() {
         return;
     }
     let _home = home_with(&[(".zshrc", "PROMPT='home> '\n")], None);
@@ -109,8 +111,7 @@ async fn zsh_reports_a_finished_command_with_its_status_and_time() {
 #[tokio::test]
 async fn zsh_with_its_own_zdotdir_keeps_its_prompt_and_still_reports() {
     let _turn = SERIAL.lock().await;
-    if !Path::new(ZSH).exists() {
-        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+    if !has_zsh() {
         return;
     }
     let zdotdir = tempfile::tempdir().expect("tempdir");
@@ -172,8 +173,7 @@ async fn new_bash_reports_a_finished_command_and_keeps_the_persons_prompt_comman
 #[tokio::test]
 async fn an_oversized_mark_is_dropped_and_the_real_ones_still_count() {
     let _turn = SERIAL.lock().await;
-    if !Path::new(ZSH).exists() {
-        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+    if !has_zsh() {
         return;
     }
     let _home = home_with(&[(".zshrc", "PROMPT='home> '\n")], None);
@@ -183,6 +183,15 @@ async fn an_oversized_mark_is_dropped_and_the_real_ones_still_count() {
     // A D with status 7 padded past 4 KiB, printed while the command runs. Taken, it would
     // end the command at once with 7 and leave the real D nothing to end.
     sleep_then_fail(&mut c, "printf '\\033]133;D;7%4200s\\007' x; ").await;
+}
+
+/// Whether there is a zsh to test, said when there is none: a Linux runner may lack it.
+fn has_zsh() -> bool {
+    let there = Path::new(ZSH).exists();
+    if !there {
+        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+    }
+    there
 }
 
 fn bash_has_ps0(bash: &Path) -> bool {
