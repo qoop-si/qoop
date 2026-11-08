@@ -888,6 +888,15 @@ impl TerminalRegistry {
         }
     }
 
+    /// Whether the id held was said by this agent, `program` in `generation`: its own, not
+    /// one an agent before it left behind.
+    fn said_by(&self, stream: u32, program: &str, generation: u64) -> bool {
+        matches!(
+            self.inner.lock().unwrap().get(&stream).and_then(|h| h.session_said.as_ref()),
+            Some(Said::By(p, g)) if p == program && *g == generation
+        )
+    }
+
     /// Keep a conversation id only while the agent that has it is in the terminal (see
     /// `Said::settle`): a conversation is not in a tab its agent left. An id reported from
     /// a program qoop does not know as an agent has no agent to go with, and stays. The id
@@ -7425,8 +7434,13 @@ async fn record_stream(
     }
     // An agent back within the grace is another start, even of the same program: the
     // conversation the one before had is not its own, so it goes as an exit would have.
+    // One this agent already said itself stays: a new tab starts in the grace (nothing was
+    // written for it yet), and an agent whose hook reported before it was seen here would
+    // otherwise lose its first report.
+    let generation = agents.agent(stream).map(|a| a.belief.generation.0);
     if gone_since.remove(&stream).is_some()
-        && now.is_some()
+        && let Some(program) = now.as_deref()
+        && !generation.is_some_and(|g| terminals.said_by(stream, program, g))
         && let Some(gone) = terminals.settle_session(stream, None)
     {
         let _ = books.store.forget_agent_session(stream as i64, gone).await;
@@ -7434,7 +7448,6 @@ async fn record_stream(
     }
     // Before the row check below: the same program in a new generation is a new agent,
     // and the conversation of the one before is not its conversation.
-    let generation = agents.agent(stream).map(|a| a.belief.generation.0);
     let here = now.as_deref().zip(generation);
     if let Some(gone) = terminals.settle_session(stream, here) {
         // Past the grace (an agent back inside it was settled above, with no card ended) and
