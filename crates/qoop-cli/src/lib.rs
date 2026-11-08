@@ -3810,8 +3810,16 @@ mod tests {
             !super::moved(&Err(std::io::Error::other("other")), &socket, within),
             "another failure came back"
         );
-        // Gone, its socket file left behind, as a daemon killed leaves it.
+        // Gone, its socket file left behind, as a daemon killed leaves it. Gone for good once
+        // a connect is refused: a child another test forked meanwhile holds the listener
+        // until its exec, and answers for it that long.
         drop(listener);
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::os::unix::net::UnixStream::connect(&socket).is_ok()
+            && std::time::Instant::now() < gone
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let at = std::time::Instant::now();
         assert!(!super::moved(&closed(), &socket, within));
         assert!(

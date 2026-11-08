@@ -816,10 +816,15 @@ mod argv_tests {
             .spawn()
             .expect("spawn");
         let pid = Pid(child.id() as i32);
-        let (found, missing) = (
-            env_of(pid, "QOOP_ENV_MARKER"),
-            env_of(pid, "QOOP_ENV_MARKE"),
-        );
+        // Read until it is there: Linux shows an empty environment between the spawn's return
+        // and the exec finishing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = env_of(pid, "QOOP_ENV_MARKER");
+        while found.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            found = env_of(pid, "QOOP_ENV_MARKER");
+        }
+        let missing = env_of(pid, "QOOP_ENV_MARKE");
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(found.as_deref(), Some("qoop-env-value"));
