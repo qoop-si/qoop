@@ -5355,9 +5355,12 @@ async fn handle_control(
             from,
             ..
         } => {
-            // Before the identity check: a report applied to the shell's generation is lost
-            // when the agent is noticed a moment later.
-            agents.refresh_for_report(terminal, crate::agents::now_unix());
+            // The hook runs in the foreground job, so its report is news the foreground
+            // changed, and on Linux no exec event says so. Looked at at once, before the
+            // identity check: the fork's settle often read the leader before its exec, and a
+            // look held back for that would leave the report on the shell's generation. Free
+            // once the leader reads as an agent.
+            agents.refresh_foreground(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }
@@ -5628,9 +5631,12 @@ async fn handle_control(
             from,
             ..
         } => {
-            // Before the identity check: a report applied to the shell's generation is lost
-            // when the agent is noticed a moment later.
-            agents.refresh_for_report(terminal, crate::agents::now_unix());
+            // The hook runs in the foreground job, so its report is news the foreground
+            // changed, and on Linux no exec event says so. Looked at at once, before the
+            // identity check: the fork's settle often read the leader before its exec, and a
+            // look held back for that would leave the report on the shell's generation. Free
+            // once the leader reads as an agent.
+            agents.refresh_foreground(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }
@@ -5682,9 +5688,12 @@ async fn handle_control(
             from,
             ..
         } => {
-            // Before the identity check: a report applied to the shell's generation is lost
-            // when the agent is noticed a moment later.
-            agents.refresh_for_report(terminal, crate::agents::now_unix());
+            // The hook runs in the foreground job, so its report is news the foreground
+            // changed, and on Linux no exec event says so. Looked at at once, before the
+            // identity check: the fork's settle often read the leader before its exec, and a
+            // look held back for that would leave the report on the shell's generation. Free
+            // once the leader reads as an agent.
+            agents.refresh_foreground(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }
