@@ -40,14 +40,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Linux runs and reports, but does not block yet: its suite has never passed on a
-    # GitHub runner, and the fixes are their own piece of work.
-    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The shell tests run against zsh and fish too; a Linux runner has bash and dash only.
+      - name: Shells
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
       # The idle CPU gates measure a quiet machine; a shared runner is not one.
       - name: Test
         env:
