@@ -121,8 +121,17 @@ impl Daemon {
         ]);
         assert!(ok, "{err}");
         let deadline = Instant::now() + PATIENCE;
+        // Every change of the row on the way, for a failure to show how it went.
+        let mut seen: Vec<String> = Vec::new();
         while Instant::now() < deadline {
             let row = self.row();
+            let step = format!(
+                "gen {} {} {} session {}",
+                row["generation"], row["program"], row["agent"], row["agent_session"]
+            );
+            if seen.last() != Some(&step) {
+                seen.push(step);
+            }
             let agent = row["agent"] == json!(true);
             let said = !listed || session.is_none_or(|id| row["agent_session"] == json!(id));
             if agent && said {
@@ -131,7 +140,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!(
-            "the stand in never showed as an agent: {}\nits report: {:?}",
+            "the stand in never showed as an agent: {}\nits report: {:?}\non the way: {seen:#?}",
             self.row(),
             std::fs::read_to_string(bin.join("report.out"))
         );
