@@ -75,6 +75,19 @@ pub enum Item {
         /// never bytes. Absent from the wire when there are none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Chip>,
+        /// What the call is, whatever its name: the parser's tool kind (`shell`, `edit`,
+        /// `question`, `plan`, `todo`, ...). Absent on an earlier result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// The agent's own words for the row where it gave some: a command's description (the
+        /// `summary` stays the command), a question's answer or `Declined`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Lines the call added and removed, where its result records them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dels: Option<u64>,
     },
     Subagent {
         seq: u32,
@@ -99,6 +112,22 @@ pub enum Item {
         /// message or a wait names. Only where the daemon can open it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child: Option<String>,
+        /// The call's id, for [`detail`](crate::detail): the prompt and the report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// [`detail`](crate::detail) has a prompt or a report to show.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        has_detail: bool,
+        /// Why the call could not start, on one line (an agent type that does not exist): only on a
+        /// failed call that named no child and no run, since one that did started and failed later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// A workflow's run id. A workflow row has no `act` and no `child`: its lanes do.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
+        /// A workflow's agents, in the order they started.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lanes: Vec<Lane>,
     },
     Compaction {
         seq: u32,
@@ -115,6 +144,9 @@ pub enum Item {
         seq: u32,
         kind: String,
         text: String,
+        /// Who sent an `agent message`. `text` still opens with `<sender>: ` for older clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// A row of a kind this build does not know. Never produced by the parser: it is what a
     /// client reads from a newer daemon. It carries nothing, not even a `seq`.
@@ -144,7 +176,33 @@ pub enum Status {
     Interrupted,
     /// Denied by the user or a permission rule.
     Rejected,
+    /// No result yet, and the call waits: a Claude teammate that went idle until its next message
+    /// (agentparse status detail `idle`). Not running. An older client reads it as `unknown`.
+    Idle,
     /// A status this build does not know (a newer daemon's); draw it as no status at all.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One agent of a workflow run. `child` opens its own chat (`Messages { child }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    pub label: String,
+    pub status: LaneStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneStatus {
+    Running,
+    Done,
+    /// The run ended before this agent reported.
+    Stopped,
+    /// The run recorded this agent as failed.
+    Failed,
+    /// A status this build does not know (a newer daemon's).
     #[serde(other)]
     Unknown,
 }

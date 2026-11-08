@@ -362,7 +362,7 @@ impl Watch {
                     let revision = source
                         .as_ref()
                         .and_then(|s| qoop_parsed::revision_of(s).ok())
-                        .map(|r| qoop_parsed::revision_with(r, job.alive));
+                        .map(|r| qoop_parsed::revision_with(r, job.alive, None));
                     Seen {
                         terminal: job.terminal,
                         session: job.session,
@@ -522,10 +522,17 @@ fn read(
         return Outcome::refused(None, None, "no_session");
     };
     // A subagent's chat: its own file, found from the terminal's and checked to be its child.
+    // A page of it also asks the terminal's whether the spawn still runs.
+    let mut spawn_ended = None;
     if let Some(child) = ask.child() {
         let codex = dirs.as_ref().map(|d| d.codex.as_path());
         match qoop_parsed::child_source(program, &source, session, child, codex) {
-            Some(found) => source = found,
+            Some(found) => {
+                if let Ask::Page { alive_since, .. } = ask {
+                    spawn_ended = qoop_parsed::spawn_ended(&source, child, *alive_since);
+                }
+                source = found;
+            }
             None => return Outcome::refused(None, None, "no_session"),
         }
     }
@@ -550,7 +557,7 @@ fn read(
         } => {
             // The page is made for the agent that runs now: a new agent in the terminal is
             // another revision of the same file.
-            let revision = qoop_parsed::revision_with(revision, *alive_since);
+            let revision = qoop_parsed::revision_with(revision, *alive_since, spawn_ended);
             // A client whose stamp is not the file's is told to start over: no `skip`.
             let mut skip = if client.is_some_and(|r| r != revision) {
                 0
@@ -572,10 +579,11 @@ fn read(
                     limit: *limit,
                     codex_root: dirs.as_ref().map(|d| d.codex.clone()),
                     alive_since: *alive_since,
+                    spawn_ended,
                     ..Options::default()
                 };
                 qoop_parsed::load(&source, &opts).map(|mut d| {
-                    d.revision = qoop_parsed::revision_with(d.revision, *alive_since);
+                    d.revision = qoop_parsed::revision_with(d.revision, *alive_since, spawn_ended);
                     Arc::new(Reply::Page(d))
                 })
             };
@@ -1239,6 +1247,246 @@ mod tests {
             Reply::Detail(_) => 0,
         };
         assert_eq!(digest(&again), digest(&other), "served at the new revision");
+    }
+
+    /// The real shape (crw-saas `72d85121`, call `toolu_017C5gbi2h42T9bmxBZFuQgk`): a subagent
+    /// launches a background Bash, and Claude writes its end to the parent file only. While the
+    /// spawn runs the call runs; once the spawn has ended, the call that has its launch text
+    /// reads ok and one with no result interrupted, and the page is another revision though the
+    /// subagent's file did not change.
+    /// One Claude record of session `s1` at minute `n`, with `extra` merged in.
+    fn rec(kind: &str, n: usize, message: serde_json::Value, extra: serde_json::Value) -> String {
+        let mut v = serde_json::json!({"type": kind, "uuid": format!("u{n}"),
+            "sessionId": "s1", "timestamp": format!("2026-08-07T01:{n:02}:00.000Z"),
+            "message": message});
+        if let (Some(v), serde_json::Value::Object(extra)) = (v.as_object_mut(), extra) {
+            v.extend(extra);
+        }
+        format!("{v}\n")
+    }
+
+    /// The tool rows of a page: summary and status.
+    fn tool_statuses(o: &Outcome) -> Vec<(String, qoop_parsed::Status)> {
+        match &*o.result.as_ref().expect("a page").0 {
+            Reply::Page(d) => d
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    qoop_parsed::Item::Tool {
+                        summary, status, ..
+                    } => Some((summary.clone(), *status)),
+                    _ => None,
+                })
+                .collect(),
+            Reply::Detail(_) => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_subagents_rows_end_with_its_spawn() {
+        let child_id = "afactchecker-fe8b007d8456da6b";
+        let none = serde_json::Value::Null;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("s1.jsonl");
+        let spawned = [
+            rec("user", 1, serde_json::json!({"role": "user", "content": "check the site"}), none.clone()),
+            rec("assistant", 2, serde_json::json!({"id": "m1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_spawn", "name": "Agent", "input": {
+                    "description": "Fact check", "prompt": "check", "run_in_background": true}}]}), none.clone()),
+            rec("user", 3, serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_spawn", "content":
+                    format!("Async agent launched successfully.\nagentId: {child_id} (internal ID - do not mention to user.)")}]}),
+                serde_json::json!({"toolUseResult": {"isAsync": true, "status": "async_launched", "agentId": child_id}})),
+        ]
+        .concat();
+        std::fs::write(&parent, &spawned).unwrap();
+        let subagents = dir.path().join("s1/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join(format!("agent-{child_id}.jsonl")),
+            [
+                rec("assistant", 4, serde_json::json!({"id": "m2", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_017C5gbi2h42T9bmxBZFuQgk", "name": "Bash", "input": {
+                        "command": "./rc/crawl.sh", "description": "Crawl all sitemap pages",
+                        "run_in_background": true}}]}), serde_json::json!({"isSidechain": true, "agentId": child_id})),
+                rec("user", 5, serde_json::json!({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_017C5gbi2h42T9bmxBZFuQgk", "is_error": false, "content":
+                        "Command running in background with ID: bdkljd5e7. Output is being written to: /x/tasks/bdkljd5e7.output. You will be notified when it completes. To check interim output, use Read on that file path."}]}),
+                    serde_json::json!({"isSidechain": true, "agentId": child_id})),
+                rec("assistant", 6, serde_json::json!({"id": "m3", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_noresult", "name": "Bash", "input": {"command": "sleep 600"}}]}),
+                    serde_json::json!({"isSidechain": true, "agentId": child_id})),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let page = Ask::Page {
+            child: Some(child_id.into()),
+            alive_since: None,
+            skip: 0,
+            limit: 10,
+            revision: None,
+        };
+        let statuses = tool_statuses;
+        use qoop_parsed::Status::{Interrupted, Ok, Running};
+        let source = Source::File(parent.clone());
+        let running = read("claude", "s1", Some(source.clone()), None, &page);
+        assert_eq!(
+            statuses(&running),
+            [
+                ("./rc/crawl.sh".to_string(), Running),
+                ("sleep 600".to_string(), Running)
+            ],
+            "the spawn still runs"
+        );
+        // The parent hears the agent finish; the subagent's file does not change.
+        std::fs::write(
+            &parent,
+            format!(
+                "{spawned}{}",
+                rec("user", 7, serde_json::json!({"role": "user", "content":
+                    "<task-notification>\n<task-id>afact</task-id>\n<tool-use-id>toolu_spawn</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Fact check\" completed</summary>\n<result>done</result>\n</task-notification>"}),
+                    none.clone())
+            ),
+        )
+        .unwrap();
+        let ended = read("claude", "s1", Some(source), running.memo.clone(), &page);
+        assert_eq!(
+            statuses(&ended),
+            [
+                ("./rc/crawl.sh".to_string(), Ok),
+                ("sleep 600".to_string(), Interrupted)
+            ],
+            "the spawn has ended"
+        );
+        assert_ne!(ended.revision, running.revision);
+        // The parent goes on past the newest 1 MiB: the spawn's end is still found.
+        let filler: String = (10..30)
+            .map(|n| {
+                rec(
+                    "user",
+                    n,
+                    serde_json::json!({"role": "user", "content": "x".repeat(64 * 1024)}),
+                    none.clone(),
+                )
+            })
+            .collect();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent)
+            .unwrap();
+        std::io::Write::write_all(&mut file, filler.as_bytes()).unwrap();
+        let older = read(
+            "claude",
+            "s1",
+            Some(Source::File(parent.clone())),
+            ended.memo,
+            &page,
+        );
+        assert_eq!(
+            statuses(&older),
+            [
+                ("./rc/crawl.sh".to_string(), Ok),
+                ("sleep 600".to_string(), Interrupted)
+            ],
+            "the spawn has ended, older than the newest 1 MiB of the parent"
+        );
+    }
+
+    /// Claude resumes a stopped subagent with `SendMessage`, and the resumed run writes to the
+    /// same file: a call it makes after the spawn ended runs, one from before it does not.
+    #[test]
+    fn a_resumed_subagents_new_calls_still_run() {
+        let child_id = "a6659747624983776";
+        let none = serde_json::Value::Null;
+        let side = serde_json::json!({"isSidechain": true, "agentId": child_id});
+        let call = |n, id: &str, name: &str, input: serde_json::Value, extra: serde_json::Value| {
+            rec(
+                "assistant",
+                n,
+                serde_json::json!({"id": format!("m{n}"), "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}),
+                extra,
+            )
+        };
+        let result = |n, id: &str, text: &str, extra: serde_json::Value| {
+            rec(
+                "user",
+                n,
+                serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": text}]}),
+                extra,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("s1.jsonl");
+        std::fs::write(&parent, [
+            rec("user", 1, serde_json::json!({"role": "user", "content": "fix it"}), none.clone()),
+            call(2, "toolu_spawn", "Agent", serde_json::json!({"description": "fix",
+                "prompt": "fix", "subagent_type": "general-purpose", "run_in_background": true}),
+                none.clone()),
+            result(3, "toolu_spawn", &format!("Async agent launched successfully.\nagentId: {child_id} (internal ID - do not mention to user.)"),
+                serde_json::json!({"toolUseResult": {"isAsync": true, "status": "async_launched", "agentId": child_id}})),
+            rec("user", 7, serde_json::json!({"role": "user", "content": format!(
+                "<task-notification>\n<task-id>{child_id}</task-id>\n<tool-use-id>toolu_spawn</tool-use-id>\n<status>failed</status>\n<summary>Agent \"fix\" failed</summary>\n</task-notification>")}),
+                none.clone()),
+            call(20, "toolu_send", "SendMessage", serde_json::json!({"to": child_id,
+                "summary": "Resume", "message": "continue"}), none.clone()),
+            result(21, "toolu_send", &format!("{{\"success\":true,\"message\":\"Resuming agent a665974\",\"resumedAgentId\":\"{child_id}\"}}"),
+                none.clone()),
+        ].concat()).unwrap();
+        let subagents = dir.path().join("s1/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            subagents.join(format!("agent-{child_id}.jsonl")),
+            [
+                rec(
+                    "user",
+                    2,
+                    serde_json::json!({"role": "user", "content": "fix"}),
+                    side.clone(),
+                ),
+                call(
+                    4,
+                    "toolu_old",
+                    "Bash",
+                    serde_json::json!({"command": "cargo build"}),
+                    side.clone(),
+                ),
+                result(5, "toolu_old", "ok", side.clone()),
+                rec(
+                    "user",
+                    21,
+                    serde_json::json!({"role": "user", "content": "continue"}),
+                    side.clone(),
+                ),
+                call(
+                    22,
+                    "toolu_now",
+                    "Bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    side.clone(),
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let page = Ask::Page {
+            child: Some(child_id.into()),
+            alive_since: None,
+            skip: 0,
+            limit: 10,
+            revision: None,
+        };
+        let out = read("claude", "s1", Some(Source::File(parent)), None, &page);
+        use qoop_parsed::Status::{Ok, Running};
+        assert_eq!(
+            tool_statuses(&out),
+            [
+                ("cargo build".to_string(), Ok),
+                ("cargo test".to_string(), Running)
+            ]
+        );
     }
 
     #[test]

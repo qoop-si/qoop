@@ -67,7 +67,8 @@
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 #   Stop, StopFailure with a `background_tasks` list -> also `--subagents` with
-#     the ids of its running subagents: any other it was counting has ended
+#     the ids of its running subagents and workflows: any other it was counting has
+#     ended; each running workflow also `--subagent-start`, as it fires no hook itself
 
 set -eu
 
@@ -93,11 +94,14 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # The payload is read first and the program travels in argv, because a
 # heredoc would otherwise take python's stdin for itself and the hook JSON
 # would never arrive: every event would decode nothing and report nothing.
+# A single-quoted string, not a heredoc: a heredoc needs a temporary file, and on a full disk
+# the hook reported nothing at all. So the program holds no apostrophe.
 input=$(cat)
-prog=$(cat <<'PY'
+prog='
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -106,7 +110,7 @@ import tempfile
 def first_fileish(tool_input):
     if not isinstance(tool_input, dict):
         return ""
-    # A command's own description comes before the command: it is what the agent
+    # The description of a command comes before the command: it is what the agent
     # says it is doing, in its words, the line its own interface shows.
     for key in ("file_path", "path", "description", "command", "pattern"):
         value = tool_input.get(key)
@@ -121,12 +125,16 @@ def one_line(text, limit=120):
 
 
 def paragraphs_of(text, count):
-    """The last `count` paragraphs of a message, oldest first, each as one line with each
-    line's markdown off. (A backtick is chr(96): one written out would end the shell's
-    command substitution.)"""
+    """The last `count` paragraphs of a message, oldest first, each as one line. The markdown
+    of each line off: inline emphasis, then the marks at its ends. Code spans stay as written,
+    ticks included: the daemon reads a quoted answer by them ("`sil` de.")."""
     paragraphs, paragraph = [], []
     for text_line in reversed(text.splitlines()):
-        bare = text_line.strip().strip("*_#> -" + chr(96)).strip()
+        line = text_line.strip()
+        # A fence line loses its ticks ("```sh" reads "sh"); any other keeps the code span it
+        # starts or ends with.
+        ends = "*_#> -" + ("`" if line.startswith("```") else "")
+        bare = MARKS.sub(lambda m: m.group(0) if m.group(1) else m.group(3), line).strip(ends).strip()
         if bare:
             paragraph.insert(0, bare)
         elif paragraph:
@@ -147,15 +155,16 @@ def paragraph_of(text):
 
 
 def said_of(text):
-    """The turn's closing words for the owner's card: the paragraph before the last (what it
-    just did, at most 200 characters) and the last (its question, at most 600), a blank line
-    between. Cut at a word, never in the middle."""
+    """The closing words of the turn for the card of the owner: the paragraph before the last
+    (what it just did, at most 200 characters) and the last (its question, at most 600), a
+    blank line between. Cut at a word, never in the middle."""
     parts = paragraphs_of(text, 2)
     if not parts:
         return ""
     limits = [200, 600][-len(parts):]
-    # Bold, italics and code marks off inside the line too: the card shows plain words.
-    plain = [p.replace("**", "").replace("__", "").replace(chr(96), "") for p in parts]
+    # Code ticks off too, emphasis is already: the card shows plain words, and a file name
+    # such as __init__.py keeps its marks.
+    plain = [p.replace(chr(96), "") for p in parts]
     return "\n\n".join(cut_at_word(p, n) for p, n in zip(plain, limits))
 
 
@@ -167,11 +176,26 @@ def cut_at_word(text, limit):
     return (head[:at] if at > limit // 2 else head).rstrip() + "\u2026"
 
 
+# A code span of any tick run, kept as written; else "**bold**", "__bold__", "*it*", "_it_" or
+# "~~gone~~", whose marks never open or close against a word, a "/" or a file extension, so
+# snake_case, path/_build_/x, src/*.rs, **/*.rs and __init__.py keep theirs ("*it*." does not).
+# Emphasis steps over a code span it wraps as one unit and never closes inside it; the
+# lookahead with a back reference makes that step atomic (python3 before 3.11 has no "(?>"), so
+# a line of many spans does not backtrack without end.
+# ponytail: quadratic on a line of unclosed openers (20,000 characters of "**a " take about 7 s),
+# read on the last paragraph only, inside the Stop hook timeout; cap the line length if a real
+# transcript gets near it.
+MARKS = re.compile(
+    r"(`+).*?\1|(?<![\w/])(\*\*|__|~~|\*|_)(?=\S)((?:(?=((`+).*?\5))\4|[^`])+?)(?<=\S)\2(?![\w/]|\.\w)"
+)
+
+
 def last_paragraph(payload):
-    """The last paragraph of the turn's last message as one line, and the turn's closing words
-    for the card (`said_of`): the Stop payload's own "last_assistant_message" (the transcript
-    is written after the hook can run, so it may not hold the turn yet), else read from the end
-    of the transcript; "" for both when the turn has none or it cannot be read."""
+    """The last paragraph of the last message of the turn as one line, and the closing words of
+    the turn for the card (`said_of`): the "last_assistant_message" field of the Stop payload
+    (the transcript is written after the hook can run, so it may not hold the turn yet), else
+    read from the end of the transcript; "" for both when the turn has none or it cannot be
+    read."""
     said = payload.get("last_assistant_message")
     if isinstance(said, str) and said.strip():
         return paragraph_of(said), said_of(said)
@@ -293,7 +317,7 @@ if name == "PreToolUse" and payload.get("tool_name") in ("Edit", "Write", "Multi
 
 
 def subagents(*flag):
-    # The agent's sub-agents, counted beside the tab: never a state.
+    # The sub-agents of the agent, counted beside the tab: never a state.
     try:
         subprocess.run(["qoop", "hook-report", "--agent", "claude", *flag], capture_output=True, timeout=5)
     except Exception:
@@ -304,12 +328,12 @@ agent = str(payload.get("agent_id") or "")
 flag = {"SubagentStart": "--subagent-start", "SubagentStop": "--subagent-end"}.get(name)
 if agent and flag:
     subagents(flag, agent)
-# A subagent's tool calls and its end are not this terminal's turn. Reported, a
+# The tool calls of a subagent and its end are not the turn of this terminal. Reported, a
 # background agent finishing after the turn ended put the tab back to working,
-# and the screen's idle composer took it away again a moment later.
+# and the idle composer on the screen took it away again a moment later.
 if agent:
     raise SystemExit(0)
-# The closing words a turn end carries for the owner's card; only `Stop` has any.
+# The closing words a turn end carries for the card of the owner; only `Stop` has any.
 said = ""
 if name == "SessionStart":
     # A session opening, resuming or clearing is not a turn: `starting`, so an
@@ -373,17 +397,23 @@ if session and (len(session) > 128 or not all(c.isalnum() or c in "-_." for c in
     session = ""
 
 # The turn is over: a subagent missing from its own list of what still runs has ended, even
-# when its end never came. Before the report: the daemon reads a turn's end as a question for
-# the owner only when none of the agent's sub-agents still runs, so the count it reads must be
-# this turn's own.
+# when its end never came. Before the report: the daemon reads the end of a turn as a question
+# for the owner only when none of the sub-agents of the agent still runs, so the count it reads
+# must be the count at this turn end.
+# A running workflow counts too, and is sent as a start besides, since it fires no hook of its
+# own. A teammate stays out: an idle one is still listed as running, and would keep every
+# question at the end of the turn of its lead from the inbox.
 tasks = payload.get("background_tasks")
 if name in ("Stop", "StopFailure") and isinstance(tasks, list):
     running = [
-        str(t.get("id")) for t in tasks
-        if isinstance(t, dict) and t.get("type") == "subagent"
+        (str(t.get("id")), t.get("type")) for t in tasks
+        if isinstance(t, dict) and t.get("type") in ("subagent", "workflow")
         and t.get("status") == "running" and t.get("id")
     ]
-    subagents("--subagents", ",".join(running))
+    subagents("--subagents", ",".join(task for task, _ in running))
+    for task, kind in running:
+        if kind == "workflow":
+            subagents("--subagent-start", task)
 
 args = ["qoop", "hook-report", "--agent", "claude", "--state", state]
 if flags:
@@ -399,8 +429,8 @@ if session:
 if state:
     try:
         sent = subprocess.run(args, timeout=5, capture_output=True)
-        # A qoop older than this hook refuses the card's words as an unknown flag, and with
-        # them the whole report: the turn's end must still arrive, so it goes again without.
+        # A qoop older than this hook refuses the words for the card as an unknown flag, and
+        # with them the whole report: the turn end must still arrive, so it goes again without.
         if sent.returncode != 0 and said and b"--said" in sent.stderr:
             at = args.index("--said")
             subprocess.run(args[:at] + args[at + 2:], timeout=5, capture_output=True)
@@ -412,7 +442,7 @@ turn(payload, "UserPromptSubmit", "Stop")
 # A session starting, resuming, clearing or compacting: tell the agent the short rules for
 # recording its task, and the task it has open, so they survive a compaction too. After the
 # report, so the state is never late for it; quiet on any failure, and qoop itself prints
-# nothing in qass's own space.
+# nothing in the space qass owns.
 # With every request, one line about the task: given once, the rules were read and then not
 # followed.
 if name in ("SessionStart", "UserPromptSubmit"):
@@ -428,8 +458,7 @@ if name in ("SessionStart", "UserPromptSubmit"):
             sys.stdout.write(rules + "\n")
     except Exception:
         pass
-PY
-)
+'
 # Standard output is the agent's context on SessionStart and nothing anywhere else: the
 # program prints only the rules, only then.
 printf '%s' "$input" | python3 -c "$prog" 2>/dev/null || true

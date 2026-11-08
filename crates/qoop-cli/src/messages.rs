@@ -315,9 +315,16 @@ fn row(item: &Item) -> String {
             summary,
             status,
             exit_code,
+            kind,
+            label,
             ..
         } => {
-            let mut line = format!("{name} {summary} [{}", status_word(*status));
+            let mut line = format!("{name} {summary}");
+            // A question's summary is what was asked; its label is the answer.
+            if let (Some("question"), Some(answer)) = (kind.as_deref(), label) {
+                line.push_str(&format!(" {answer}"));
+            }
+            line.push_str(&format!(" [{}", status_word(*status)));
             if let Some(code) = exit_code {
                 line.push_str(&format!(", exit {code}"));
             }
@@ -359,6 +366,7 @@ fn status_word(status: Status) -> &'static str {
         Status::Failed => "failed",
         Status::Interrupted => "interrupted",
         Status::Rejected => "rejected",
+        Status::Idle => "idle",
         Status::Unknown => "unknown",
     }
 }
@@ -411,6 +419,11 @@ mod tests {
             act: Some("spawn".into()),
             name: Some("e1".into()),
             child: Some("ae1-14ff".into()),
+            id: None,
+            has_detail: false,
+            error: None,
+            run: None,
+            lanes: Vec::new(),
         };
         // The word is before the summary: a long one is cut at the end of the line.
         let long = Item::Subagent {
@@ -421,6 +434,11 @@ mod tests {
             act: None,
             name: None,
             child: None,
+            id: None,
+            has_detail: false,
+            error: None,
+            run: None,
+            lanes: Vec::new(),
         };
         assert!(row(&long).contains("[failed] xxx"), "{}", row(&long));
         assert_eq!(
@@ -439,6 +457,10 @@ mod tests {
             output_bytes: 0,
             has_detail: true,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         };
         assert_eq!(
             row(&tool),
@@ -494,11 +516,16 @@ mod tests {
                 output_bytes: 0,
                 has_detail: false,
                 attachments: Vec::new(),
+                kind: None,
+                label: None,
+                adds: None,
+                dels: None,
             },
             Item::Notice {
                 seq: 3,
                 kind: format!("k{}[H", char::from(0x1b)),
                 text: hostile.clone(),
+                from: None,
             },
         ];
         for item in &rows {
@@ -510,6 +537,31 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_question_row_says_the_answer_after_the_question() {
+        let question = Item::Tool {
+            seq: 2,
+            id: "q".into(),
+            name: "AskUserQuestion".into(),
+            summary: "Which database?".into(),
+            status: Status::Ok,
+            exit_code: None,
+            duration_ms: None,
+            ts: None,
+            output_bytes: 0,
+            has_detail: true,
+            attachments: Vec::new(),
+            kind: Some("question".into()),
+            label: Some("Postgres".into()),
+            adds: None,
+            dels: None,
+        };
+        assert_eq!(
+            row(&question),
+            "    2  tool       AskUserQuestion Which database? Postgres [ok]"
+        );
     }
 
     #[test]

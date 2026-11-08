@@ -355,6 +355,7 @@ fn state_of(status: Status) -> (Role, &'static str) {
         Status::Failed => (Role::Failed, "failed"),
         Status::Interrupted => (Role::Detail, "interrupted"),
         Status::Rejected => (Role::Detail, "rejected"),
+        Status::Idle => (Role::Detail, "idle"),
         Status::Ok | Status::Unknown => (Role::Detail, ""),
     }
 }
@@ -394,15 +395,16 @@ fn label(name: &str, summary: &str) -> String {
             "" => "Fetched a page".to_string(),
             host => format!("Fetched {host}"),
         },
-        "task" | "agent" | "subagent" => subagent_label(None, None, &summary),
+        "task" | "agent" | "subagent" => subagent_label(None, None, &summary, false),
         _ => said(name),
     }
 }
 
 /// A subagent row in words, as the phone says it: what the call did to which agent, then what
 /// it was about (the summary without the verb it opens with). A row from an older daemon has no
-/// `act`, and says `Ran a subagent` with its summary as it came.
-fn subagent_label(act: Option<&str>, name: Option<&str>, summary: &str) -> String {
+/// `act`, and says `Ran a subagent` with its summary as it came; a workflow (a run id, no `act`)
+/// says `Ran a workflow`.
+fn subagent_label(act: Option<&str>, name: Option<&str>, summary: &str, workflow: bool) -> String {
     let without = |verb: &str| summary.strip_prefix(verb).unwrap_or(summary);
     let (head, what) = match (act, name) {
         (Some("spawn"), Some(n)) => (format!("Started {n}"), without("spawned: ")),
@@ -411,6 +413,7 @@ fn subagent_label(act: Option<&str>, name: Option<&str>, summary: &str) -> Strin
         (Some("message"), None) => ("Sent a message".into(), without("sent: ")),
         (Some("wait"), Some(n)) => (format!("Waited for {n}"), without("waited for: ")),
         (Some("wait"), None) => ("Waited for a subagent".into(), without("waited for: ")),
+        _ if workflow => ("Ran a workflow".into(), summary),
         _ => ("Ran a subagent".into(), summary),
     };
     let what = one_line(what);
@@ -476,6 +479,7 @@ fn trouble(run: &[&Item]) -> (Role, String) {
     for (n, status) in [
         (count(Status::Failed), Status::Failed),
         (count(Status::Running), Status::Running),
+        (count(Status::Idle), Status::Idle),
         (count(Status::Interrupted), Status::Interrupted),
         (count(Status::Rejected), Status::Rejected),
     ] {
@@ -774,11 +778,18 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
             status,
             exit_code,
             has_detail,
+            kind,
+            label: said,
             ..
         } => {
             let key = tool_key(id);
             let open = has_detail.then(|| opened.keys.contains(&key));
-            let row = tool_line(&label(name, summary), *status, *exit_code, open, cols);
+            // A question's summary is what was asked; its label is the answer.
+            let summary = match (kind.as_deref(), said) {
+                (Some("question"), Some(answer)) => format!("{summary} {answer}"),
+                _ => summary.clone(),
+            };
+            let row = tool_line(&label(name, &summary), *status, *exit_code, open, cols);
             let mut lines = vec![(row, open.map(|_| key))];
             if open == Some(true) {
                 let body = detail_rows(opened.details.get(id), opened.off, cols);
@@ -791,10 +802,11 @@ fn step_lines(item: &Item, opened: &Opened, cols: usize) -> Vec<Line> {
             status,
             act,
             name,
+            run,
             ..
         } => vec![(
             tool_line(
-                &subagent_label(act.as_deref(), name.as_deref(), summary),
+                &subagent_label(act.as_deref(), name.as_deref(), summary, run.is_some()),
                 *status,
                 None,
                 None,
@@ -2151,6 +2163,10 @@ mod tests {
             output_bytes: 0,
             has_detail: false,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         }
     }
 
@@ -2180,6 +2196,10 @@ mod tests {
             output_bytes: 0,
             has_detail: detail,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         }
     }
 
@@ -2482,6 +2502,10 @@ mod tests {
             output_bytes: 9,
             has_detail: true,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         };
         let got = lines(&[item], 36);
         assert_eq!(
@@ -2489,6 +2513,24 @@ mod tests {
             ["\u{25cf} Ran cargo tes\u{2026}  failed, exit 101 \u{25b8}"]
         );
         assert_eq!(width::width(&got[0]), 36);
+    }
+
+    #[test]
+    fn a_question_row_says_the_answer_after_the_question() {
+        let mut item = tool("AskUserQuestion", "Which database?", Status::Ok, None);
+        if let Item::Tool { kind, label, .. } = &mut item {
+            *kind = Some("question".into());
+            *label = Some("Postgres".into());
+        }
+        let got = lines(&[item], 60);
+        assert!(got[0].contains("Which database? Postgres"), "{got:?}");
+        // A Bash label is the description, not part of the row here.
+        let mut bash = tool("Bash", "git status", Status::Ok, None);
+        if let Item::Tool { kind, label, .. } = &mut bash {
+            *kind = Some("shell".into());
+            *label = Some("Show status".into());
+        }
+        assert_eq!(lines(&[bash], 60), ["\u{25cf} Ran git status"]);
     }
 
     #[test]
@@ -2557,6 +2599,11 @@ mod tests {
                 act: None,
                 name: None,
                 child: None,
+                id: None,
+                has_detail: false,
+                error: None,
+                run: None,
+                lanes: Vec::new(),
             },
         ];
         assert_eq!(lines(&items, 40), ["3 steps \u{25b8}"]);
@@ -2605,6 +2652,11 @@ mod tests {
             act: None,
             name: None,
             child: None,
+            id: None,
+            has_detail: false,
+            error: None,
+            run: None,
+            lanes: Vec::new(),
         }
     }
 
@@ -2613,6 +2665,7 @@ mod tests {
         for (status, tail) in [
             (Status::Running, "  running"),
             (Status::Failed, "  failed"),
+            (Status::Idle, "  idle"),
             (Status::Interrupted, "  interrupted"),
             (Status::Ok, ""),
         ] {
@@ -2625,12 +2678,15 @@ mod tests {
         }
         let rows = layout(&[subagent("s", Status::Running)], 40);
         assert_eq!(style_at(&rows[0], 0).role, Role::Working);
+        // M2: an idle teammate is not drawn in the running ink.
+        let rows = layout(&[subagent("s", Status::Idle)], 40);
+        assert_eq!(style_at(&rows[0], 0).role, Role::Detail);
     }
 
     #[test]
     fn a_subagent_row_says_what_it_did_to_which_agent() {
         let said = |act: Option<&str>, name: Option<&str>, summary: &str| {
-            subagent_label(act, name, summary)
+            subagent_label(act, name, summary, false)
         };
         assert_eq!(
             said(Some("spawn"), Some("e1-langfuse"), "spawned: Build E1"),
@@ -2657,6 +2713,10 @@ mod tests {
             "Waited for a subagent"
         );
         assert_eq!(said(None, None, "spawned: x"), "Ran a subagent: spawned: x");
+        assert_eq!(
+            subagent_label(None, None, "Two agents: map, review", true),
+            "Ran a workflow: Two agents: map, review"
+        );
     }
 
     #[test]
@@ -2699,6 +2759,7 @@ mod tests {
             seq: 0,
             kind: kind.into(),
             text: text.into(),
+            from: None,
         };
         let items = [
             notice("background", "2 background agents still running"),
@@ -2957,6 +3018,7 @@ mod tests {
                 seq: 0,
                 kind: "hook".into(),
                 text: "ran".into(),
+                from: None,
             },
             Item::Compaction { seq: 0, text: None },
             Item::Subagent {
@@ -2967,6 +3029,11 @@ mod tests {
                 act: None,
                 name: None,
                 child: None,
+                id: None,
+                has_detail: false,
+                error: None,
+                run: None,
+                lanes: Vec::new(),
             },
         ];
         let rows = layout(&items, 40);
@@ -3080,6 +3147,7 @@ mod tests {
                 seq: 0,
                 kind: "hook世界".into(),
                 text: "🌍".into(),
+                from: None,
             },
             Item::Subagent {
                 seq: 0,
@@ -3089,6 +3157,11 @@ mod tests {
                 act: None,
                 name: None,
                 child: None,
+                id: None,
+                has_detail: false,
+                error: None,
+                run: None,
+                lanes: Vec::new(),
             },
         ]
     }
@@ -3141,6 +3214,11 @@ mod tests {
                 act: None,
                 name: None,
                 child: None,
+                id: None,
+                has_detail: false,
+                error: None,
+                run: None,
+                lanes: Vec::new(),
             },
         ];
         let mut opened = Opened::default();
@@ -3968,6 +4046,10 @@ mod tests {
             output_bytes: 1,
             has_detail: true,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         };
         let mut chat = ChatState::default();
         on(&mut chat, 4);
@@ -4070,6 +4152,10 @@ mod tests {
                 output_bytes: 0,
                 has_detail: false,
                 attachments: Vec::new(),
+                kind: None,
+                label: None,
+                adds: None,
+                dels: None,
             },
         ];
         let mut chat = ChatState::default();
@@ -4732,6 +4818,7 @@ mod tests {
             seq: 0,
             kind: "summary".into(),
             text: text.into(),
+            from: None,
         }
     }
 
@@ -4837,11 +4924,13 @@ mod tests {
                 seq: 0,
                 kind: "hook".into(),
                 text: long,
+                from: None,
             },
             Item::Notice {
                 seq: 0,
                 kind: "interrupted".into(),
                 text: "Interrupted".into(),
+                from: None,
             },
         ];
         let rows = layout(&items, 24);

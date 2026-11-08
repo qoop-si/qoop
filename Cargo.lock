@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "agentparse"
 version = "0.1.0"
-source = "git+https://github.com/qoop-si/agentparse?rev=14117df69f8947658729cf657a062211c69d0ae3#14117df69f8947658729cf657a062211c69d0ae3"
+source = "git+https://github.com/qoop-si/agentparse?rev=76670fbae830aa137f0c757fde97ee460908b0dc#76670fbae830aa137f0c757fde97ee460908b0dc"
 dependencies = [
  "rusqlite",
  "ruzstd",

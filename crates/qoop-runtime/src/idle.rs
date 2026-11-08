@@ -279,13 +279,17 @@ pub fn sleep_blockers(
 /// A subagent lives in Claude's own process, so `sleep_blockers` never sees it, and with the
 /// main turn over the tab reads idle: a sleep would end the agent's work with it. Claude
 /// draws a panel below the prompt box while any exist: a footer line that ends
-/// `↓ to manage`, then the lead's own row (`⏺ main`), then one `◯` row per agent. A running
-/// agent's row ends in its counter (`4s · ↓ 35.8k tokens`); a finished teammate that stays
-/// listed says `idle` instead and holds nothing. The shell and monitor counts in the footer
-/// are left out on purpose: they are processes, judged by `sleep_blockers`, which lets a
-/// `QOOP_SLEEP_SAFE` watcher go. The footer, the lead row and the glyph are all required,
-/// so a panel quoted in an answer (a `qoop read` of another tab) is not mistaken for one.
-/// Measured on Claude Code 2.1.284. Pure, so the measured screens are its tests.
+/// `↓ to manage`, then the lead's own row (`⏺ main`), then one `◯` row per agent. With only
+/// a workflow running the lead row is left out. A running agent's row has its counter
+/// (`4s · ↓ 35.8k tokens`), last or followed by a note (`· ⚠ Large workflow`); a finished
+/// teammate that stays listed says `idle` instead and holds nothing. A workflow row may have
+/// no counter at all: the hook counts that one (see `TerminalAgent::subagents`). The shell
+/// and monitor counts in the footer are left out on purpose: they are processes, judged by
+/// `sleep_blockers`, which lets a `QOOP_SLEEP_SAFE` watcher go. The footer and the glyph are
+/// required, and the lead row unless every row below the footer is a `◯` row, so a panel
+/// quoted in an answer (a `qoop read` of another tab, with the real prompt and footer below
+/// it) is not mistaken for one. Measured on Claude Code 2.1.284. Pure, so the measured
+/// screens are its tests.
 pub fn running_background_agents(screen: &[String]) -> usize {
     let Some(footer) = screen
         .iter()
@@ -293,19 +297,22 @@ pub fn running_background_agents(screen: &[String]) -> usize {
     else {
         return 0;
     };
-    let mut rows = screen[footer + 1..]
+    let rows: Vec<&str> = screen[footer + 1..]
         .iter()
         .map(|row| row.trim())
-        .filter(|row| !row.is_empty());
-    if !rows.next().is_some_and(|lead| lead.starts_with('⏺')) {
+        .filter(|row| !row.is_empty())
+        .collect();
+    let lead = rows.first().is_some_and(|lead| lead.starts_with('⏺'));
+    if !lead && !rows.iter().all(|row| row.starts_with('◯')) {
         return 0;
     }
-    rows.filter(|row| {
-        row.starts_with('◯')
-            && row.ends_with(" tokens")
-            && (row.contains(" · ↑ ") || row.contains(" · ↓ "))
-    })
-    .count()
+    rows.iter()
+        .filter(|row| {
+            row.starts_with('◯')
+                && row.split(" · ").any(|segment| segment.ends_with(" tokens"))
+                && (row.contains(" · ↑ ") || row.contains(" · ↓ "))
+        })
+        .count()
 }
 
 /// How many sub-agents opencode says it is running in this tab: its prompt footer, the last
@@ -985,6 +992,40 @@ mod tests {
             "  ◯ x  y    4s · ↓ 1k tokens",
         ]);
         assert_eq!(running_background_agents(&mid), 0);
+    }
+
+    #[test]
+    fn a_workflow_row_with_no_lead_row_is_counted() {
+        // Measured: Claude Code with only a workflow in the background, main turn over. The
+        // panel has no `⏺ main` row and the counter is not the row's last segment.
+        let s = screen(&[
+            "───────────────────────────────────────",
+            "❯",
+            "───────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on · 2 shells · ← 5 agents · ↓ to manage",
+            "",
+            "  ◯ chat-audit  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/15 · 6m53s · ↓ 1.4m tokens · ⚠ Large workflow",
+        ]);
+        assert_eq!(running_background_agents(&s), 1);
+    }
+
+    #[test]
+    fn a_workflow_row_with_no_counter_is_not_counted_by_the_screen() {
+        // Measured: the lead and four agents, then a workflow row with no token segment. The
+        // hook counts that one for the sleep guard; the screen reads the four.
+        let s = screen(&[
+            "❯ ",
+            "───────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 5 agents · ↓ to manage",
+            "",
+            "  ⏺ main",
+            "  ◯ live-web-2   Live web chat audit, signed in              3m 26s · ↓ 69.1k tokens",
+            "  ◯ sched-var-1  Schedules variants: dock changes           2m 37s · ↓ 107.9k tokens",
+            "  ◯ sched-var-2  Schedules variants: inside existing tabs   2m 30s · ↓ 115.3k tokens",
+            "  ◯ sched-var-3  Schedules variants: timeline and desk      2m 23s · ↓ 94.0k tokens",
+            "  ◯ chat-audit   ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱  15/16 · 0s",
+        ]);
+        assert_eq!(running_background_agents(&s), 4);
     }
 
     #[test]

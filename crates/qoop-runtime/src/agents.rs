@@ -203,7 +203,8 @@ pub struct ReapSnapshot {
     /// through): reads as no program, but must veto, never close.
     pub boundary: bool,
     pub setup_gate: bool,
-    /// Background agents the screen showed running, see `TerminalAgent::background_agents`.
+    /// Sub-agents running, the count the status shows: what the hooks said started and has
+    /// not ended, or what the screen lists, whichever is more (see `subagents`).
     pub background_agents: usize,
     pub idle_since: Option<i64>,
 }
@@ -1285,7 +1286,7 @@ impl AgentRegistry {
             agent: is_agent,
             boundary,
             setup_gate: agent.setup_gate,
-            background_agents: agent.background_agents,
+            background_agents: subagents(agent),
             idle_since,
         })
     }
@@ -2447,6 +2448,23 @@ mod tests {
         let me = Pid(std::process::id() as i32);
         r.note_foreground(1, Some(me), NOW).expect("a change");
         assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 0);
+    }
+
+    /// The sleep guard reads the same sub-agent count as the status: a workflow the hook
+    /// started counts though the screen lists no running row for it (status-flow#1).
+    #[test]
+    fn a_hooked_subagent_reaches_the_snapshot_with_no_screen_row() {
+        use crate::control::SubagentChange::Started;
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        r.terminals.lock().unwrap().get_mut(&1).unwrap().identity = AgentIdentity::Known {
+            program: "claude".into(),
+            generation: GenerationId::FIRST,
+            agent: true,
+        };
+        r.note_subagents(1, Started("w1".into()));
+        r.note_background(1, 0, 0);
+        assert_eq!(r.reap_snapshot(1).expect("snapshot").background_agents, 1);
     }
 
     /// Background work the footer shows is told to the index when the total moves and not

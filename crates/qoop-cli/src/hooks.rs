@@ -1443,6 +1443,14 @@ mod tests {
             .expect("a target")
     }
 
+    /// The Claude hook holds its program in a quoted string: a heredoc needs a temporary file,
+    /// and on a full disk the hook then reported nothing at all.
+    #[test]
+    fn the_claude_hook_holds_its_program_without_a_heredoc() {
+        let body = target("claude").body;
+        assert!(!body.contains("<<"), "a heredoc in the Claude hook");
+    }
+
     /// A dropped hook lands in the agent's own directory: install used to
     /// write the script to qoop's directory and then fail editing the plugin
     /// directory as a file, so opencode never got its hook at all.
@@ -2157,6 +2165,79 @@ mod tests {
             whole.chars().count() <= 600 && whole.ends_with("word\u{2026}"),
             "cut at a word: {whole}"
         );
+        // A 300 character question keeps the file it names on the card, with no markdown.
+        let named = format!(
+            "**Senin isin:** siteye bak. \"evet\" dersen `design/site/index.html` {}acarim mi?",
+            "x ".repeat(120)
+        );
+        let said = stop("", Some(&named));
+        let expected = named.replace("**", "").replace('`', "");
+        assert!(
+            said.contains(&format!("--said|{}|", expected.trim_end())),
+            "{said}"
+        );
+        // Code ticks keep what they quote in the label (the daemon reads a quoted answer by
+        // them); the card drops the ticks, and a file name keeps its own marks.
+        let said = stop(
+            "",
+            Some("**Sil** `__init__.py` mi? `src/*.rs` ve `tests/*.rs`, `__name__`?"),
+        );
+        assert!(
+            said.contains("--label|Sil `__init__.py` mi? `src/*.rs` ve `tests/*.rs`, `__name__`?|"),
+            "{said}"
+        );
+        assert!(
+            said.contains("--said|Sil __init__.py mi? src/*.rs ve tests/*.rs, __name__?|"),
+            "{said}"
+        );
+        // A bare path keeps its marks too: a "/" before them is no emphasis.
+        let said = stop("", Some("Sil path/_build_/x ve src/*.rs/tests/*.rs mi?"));
+        assert!(
+            said.contains("--label|Sil path/_build_/x ve src/*.rs/tests/*.rs mi?|"),
+            "{said}"
+        );
+        // A file name stays whole in a code span of any tick run, at either end of the line,
+        // and bare: a mark never closes before an extension or a "/".
+        for kept in [
+            "Use ``__init__.py`` here?",
+            "Choose __init__.py or __main__.py?",
+            "Delete **/*.rs and **/*.ts?",
+            "`__init__.py` silinsin mi?",
+            "Silinsin mi `__pycache__`",
+        ] {
+            let said = stop("", Some(kept));
+            assert!(said.contains(&format!("--label|{kept}|")), "{said}");
+        }
+        // Emphasis around a code span comes off as a whole; a fence line still loses its ticks.
+        let said = stop("", Some("Should I **delete `foo.rs`** too?"));
+        assert!(
+            said.contains("--label|Should I delete `foo.rs` too?|"),
+            "{said}"
+        );
+        // Emphasis never closes inside a code span it wraps: the span stays whole, and an
+        // opener with no close outside the span keeps its marks.
+        let said = stop("", Some("Should I **run `git diff -- \"**\"`**?"));
+        assert!(
+            said.contains("--label|Should I run `git diff -- \"**\"`?|"),
+            "{said}"
+        );
+        let said = stop("", Some("Should I **run `a \"**\"` now?"));
+        assert!(
+            said.contains("--label|Should I **run `a \"**\"` now?|"),
+            "{said}"
+        );
+        // Many spans behind unclosed openers: each span is stepped over once, not split every
+        // way it could be, so the hook ends at once (30 of them backtracked for minutes).
+        let spans = "**a `b` ".repeat(30);
+        let started = std::time::Instant::now();
+        let said = stop("", Some(&spans));
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+        // The line kept, then cut to 120 with both ends, as any label.
+        let line = &spans.trim_end()[2..];
+        let kept = format!("{} ... {}", &line[..57], &line[line.len() - 57..]);
+        assert!(said.contains(&format!("--label|{kept}|")), "{said}");
+        let said = stop("", Some("Run this?\n```sh\nls -la\n```"));
+        assert!(said.contains("--label|Run this? sh ls -la|"), "{said}");
     }
 
     /// What a subagent fires describes the subagent: its tool calls and its end would
@@ -3155,6 +3236,21 @@ mod tests {
         );
         assert_eq!(said[0], "hook-report --subagents a2,a4", "{said:?}");
         assert!(said[1].starts_with("hook-report --state idle"), "{said:?}");
+        // A running workflow counts too, sent as a start since it fires no hook of its own; a
+        // teammate stays out: an idle one is listed as running, and would hold every
+        // question at the end of its lead's turn.
+        let said = calls(
+            "claude",
+            "",
+            r#"{"hook_event_name":"Stop","background_tasks":[
+                {"id":"a2","type":"subagent","status":"running"},
+                {"id":"w1","type":"workflow","status":"running"},
+                {"id":"t1","type":"teammate","status":"running"}]}"#,
+        );
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert_eq!(said[0], "hook-report --subagents a2,w1", "{said:?}");
+        assert_eq!(said[1], "hook-report --subagent-start w1", "{said:?}");
+        assert!(said[2].starts_with("hook-report --state idle"), "{said:?}");
         let said = calls("claude", "", r#"{"hook_event_name":"Stop"}"#);
         assert_eq!(
             said.len(),

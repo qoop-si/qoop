@@ -4,6 +4,7 @@ mod common;
 
 use common::*;
 use qoop_parsed::{Error, Item, Options, Source, Status, load};
+use serde_json::json;
 
 fn seqs(items: &[Item]) -> Vec<u32> {
     items.iter().map(Item::seq).collect()
@@ -81,6 +82,104 @@ fn a_call_without_a_result_is_never_ok() {
         Status::Running,
         "the newest call may still be running"
     );
+}
+
+/// The esim 51749b4d `ios-teardown` lines up to its idle ping, and the message it sent when it
+/// worked again.
+fn idle_teammate() -> (Vec<String>, String) {
+    let spawn = {
+        let mut v = base("assistant", 2);
+        v["message"] = json!({
+            "id": "msg_2", "role": "assistant", "model": "claude-opus-5-5", "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "content": [{"type": "tool_use", "id": "toolu_teardown", "name": "Agent", "input": {
+                "description": "iOS app teardown on iPhone", "name": "ios-teardown", "model": "sonnet",
+                "prompt": "Goal: competitor UI/UX teardown", "run_in_background": "true"}}],
+        });
+        line(v)
+    };
+    let spawned = {
+        let mut v = base("user", 3);
+        v["message"] = json!({"role": "user", "content": [{"tool_use_id": "toolu_teardown", "type": "tool_result",
+            "content": [{"type": "text", "text": "Spawned successfully.\nagent_id: aios-teardown-200273f453d69348\nname: ios-teardown\nThe agent is now running and will receive instructions via mailbox."}]}]});
+        v["toolUseResult"] = json!({"status": "teammate_spawned", "agentId": "aios-teardown-200273f453d69348",
+            "teammate_id": "ios-teardown@session-51749b4d", "name": "ios-teardown", "team_name": "session-51749b4d",
+            "tmux_pane_id": "in-process"});
+        line(v)
+    };
+    let from_teammate = |n: usize, body: &str| {
+        let mut v = base("user", n);
+        v["message"] = json!({"role": "user", "content": format!(
+            "Another Claude session sent a message:\n<teammate-message teammate_id=\"ios-teardown\" color=\"blue\"{body}</teammate-message>")});
+        line(v)
+    };
+    let idle = from_teammate(
+        5,
+        ">\n{\"type\":\"idle_notification\",\"from\":\"ios-teardown\",\"timestamp\":\"2026-11-07T11:51:31.163Z\",\"result\":\"Waiting on the code screen.\"}\n",
+    );
+    let worked = from_teammate(
+        6,
+        " summary=\"Landed walkthrough done\">\nLanded walkthrough finished, 47 screenshots.\n",
+    );
+    let head = vec![
+        user_line(1, "tear down the iOS apps"),
+        spawn,
+        spawned,
+        agent_line(4, "ios-teardown is on it."),
+        idle,
+    ];
+    (head, worked)
+}
+
+/// The spawn row's status, and whether a page of the teammate's own chat reads it as ended.
+fn teammate_status(lines: &[String], alive_since: Option<i64>) -> (Status, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write(dir.path(), "s.jsonl", lines);
+    let opts = Options {
+        alive_since,
+        ..Options::default()
+    };
+    let row = load(&source, &opts)
+        .expect("load")
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Subagent { act, status, .. } if act.as_deref() == Some("spawn") => Some(*status),
+            _ => None,
+        })
+        .expect("a spawn row");
+    let ended =
+        qoop_parsed::spawn_ended(&source, "aios-teardown-200273f453d69348", alive_since).is_some();
+    (row, ended)
+}
+
+/// M2 (owner, 2026-11-08): a teammate that sent an idle ping waits for its next message, so its
+/// spawn row reads idle, not running; the next real message from it makes it running again.
+/// Shapes from esim 51749b4d: the `ios-teardown` spawn (lines 238, 239), its idle ping (line
+/// 2865) and the message it sent when it worked again (line 3027).
+#[test]
+fn a_teammate_that_went_idle_reads_idle_until_it_speaks_again() {
+    let (head, worked) = idle_teammate();
+    assert_eq!(
+        teammate_status(&head, None),
+        (Status::Idle, false),
+        "after its idle ping"
+    );
+    assert_eq!(
+        teammate_status(&[&head[..], &[worked]].concat(), None),
+        (Status::Running, false),
+        "after it spoke again"
+    );
+}
+
+/// M2 code review r1: an idle teammate spawned before the agent process that now runs the
+/// session started was left behind by the lead that is gone, so it reads interrupted, never idle.
+#[test]
+fn an_idle_teammate_of_a_lead_that_restarted_reads_interrupted() {
+    let (head, _) = idle_teammate();
+    // The spawn is at 09:00:02 (`base`, n = 2); the lead's new process started at 09:00:10.
+    let alive_since = Some(1_791_795_610_000);
+    assert_eq!(teammate_status(&head, alive_since).0, Status::Interrupted);
 }
 
 #[test]
@@ -449,9 +548,9 @@ fn a_page_far_back_in_a_big_file_widens_the_window_itself() {
 }
 
 #[test]
-fn text_is_clamped_to_4096_bytes_and_summaries_to_200_chars() {
+fn replies_and_prompts_are_clamped_to_64_kib_and_summaries_to_200_chars() {
     let dir = tempfile::tempdir().unwrap();
-    let long = "\u{e9}".repeat(10_000);
+    let long = "\u{e9}".repeat(40_000);
     let source = write(
         dir.path(),
         "s.jsonl",
@@ -465,7 +564,7 @@ fn text_is_clamped_to_4096_bytes_and_summaries_to_200_chars() {
     for item in &d.items {
         match item {
             Item::User { text, .. } | Item::Agent { text, .. } => {
-                assert!(text.len() <= 4096, "{} bytes", text.len());
+                assert!(text.len() <= 64 * 1024, "{} bytes", text.len());
                 assert!(text.ends_with("[truncated]"));
             }
             Item::Tool { summary, .. } => assert_eq!(summary.chars().count(), 200),
@@ -843,4 +942,36 @@ fn the_overflow_chip_of_a_big_upload_has_no_path_and_the_first_eight_keep_theirs
     assert_eq!(paths.len(), 9);
     assert_eq!(paths[7], Some("/up/7.png"));
     assert_eq!((attachments[8].name.as_str(), paths[8]), ("+3", None));
+}
+
+#[test]
+fn a_long_reply_and_a_long_prompt_arrive_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let words = |n: usize| {
+        (0..n)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (short, long) = (words(800), words(1500));
+    assert!(short.len() > 4096 && long.len() > 4096);
+    let source = write(
+        dir.path(),
+        "s.jsonl",
+        &[
+            user_line(1, &long),
+            agent_line(2, &short),
+            agent_line(3, &long),
+        ],
+    );
+    let d = digest(&source);
+    let texts: Vec<&str> = d
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::User { text, .. } | Item::Agent { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, [long.as_str(), short.as_str(), long.as_str()]);
 }

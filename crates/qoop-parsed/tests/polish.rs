@@ -218,7 +218,10 @@ fn a_message_from_another_agent_is_one_notice_and_an_empty_one_is_none() {
         .collect();
     assert_eq!(
         notices,
-        [("agent message", "/root/review: VERDICT: APPROVE token=***")]
+        [(
+            "agent message",
+            "/root/review: VERDICT: APPROVE token=***\nsecond line"
+        )]
     );
 }
 
@@ -254,7 +257,7 @@ fn a_subagent_call_says_whether_it_spawned_sent_or_waited() {
 }
 
 #[test]
-fn an_edit_shows_its_path_in_the_list_and_a_short_old_and_new_in_detail() {
+fn an_edit_shows_its_path_in_the_list_and_its_recorded_diff_in_detail() {
     let dir = tempfile::tempdir().unwrap();
     let db = opencode_db(dir.path());
     let source = Source::Opencode {
@@ -274,9 +277,11 @@ fn an_edit_shows_its_path_in_the_list_and_a_short_old_and_new_in_detail() {
         .expect("an edit row");
     assert_eq!(summary, "/work/demo/src/net.ts");
     let full = detail(&source, &id, 4096).unwrap();
-    assert_eq!(
-        full.input,
-        "/work/demo/src/net.ts\n- export async function get\n+ export async function retry<T>() {}\nexport async function get"
+    assert!(
+        full.input
+            .starts_with("@@ -1,3 +1,8 @@\n+export async function retry<T>("),
+        "{}",
+        full.input
     );
 }
 
