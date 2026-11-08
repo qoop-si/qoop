@@ -2538,7 +2538,7 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     std::fs::write(
         ssh_bin.join("ssh"),
         format!(
-            "#!/bin/sh\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_TEST_SANDBOX=1; HOME=\"$(dirname \"$0\")/home\"; export QOOP_TEST_SANDBOX HOME; mkdir -p \"$HOME\"\n\
+            "#!/bin/sh\nwhile [ ! -e \"$(dirname \"$0\")/go\" ]; do sleep 0.05; done\nfor a; do last=$a; done\nunset QOOP_SESSION\nQOOP_TEST_SANDBOX=1; HOME=\"$(dirname \"$0\")/home\"; export QOOP_TEST_SANDBOX HOME; mkdir -p \"$HOME\"\n\
              HOME={} PATH=/usr/bin:/bin QOOP_RUNTIME_DIR={} exec /bin/sh -c \"$last\"\n",
             old.display(),
             run.display()
@@ -2564,6 +2564,11 @@ fn a_remote_waiting_to_move_keeps_its_line_while_the_screen_changes() {
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     // A terminal in front of the person that draws all the time, as an agent at work does.
     ui.type_in(b"i=0; while :; do i=$((i+1)); echo tick$i; sleep 0.1; done\n");
+    // Typing clears the line by design, so the remote answers only once the keys are in and
+    // the terminal draws: on a slow machine it would otherwise come first and be typed over.
+    assert!(ui.wait_for("tick1", Duration::from_secs(20)).is_some());
+    std::fs::write(ssh_bin.join("go"), "").expect("go");
+    ui.painted.clear();
     // The played daemon welcomes as 0.0.1, which predates the promises of a move nobody asked
     // for by hand, so it is not asked and the Mac says so instead.
     let waiting = "old runs qoop 0.0.1, which moves onto the new one when you run `qoop update`";
