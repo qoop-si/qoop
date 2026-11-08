@@ -128,7 +128,6 @@ fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String,
             || name.ends_with(".lock")
             || name.ends_with("qoopd.log")
             || name == "bin"
-            || name.starts_with("bin/")
         {
             continue;
         }

@@ -344,18 +344,21 @@ async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
         .await
         .unwrap();
     // dash (Linux's sh) runs a trap only once it reads its next command: after the shrink
-    // and its restore (30 ms), an empty command lets it run, as bash runs it at once.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    wr.write_all(
-        &client::encode_command(&ClientWire::Input {
-            bytes: b":\n".to_vec(),
-            from_terminal: None,
-            from_token: None,
-        })
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+    // and its restore (30 ms), empty commands let it run, as bash runs it at once. A few, a
+    // beat apart, so a nudge late on a loaded machine still finds one after it.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        wr.write_all(
+            &client::encode_command(&ClientWire::Input {
+                bytes: b":\n".to_vec(),
+                from_terminal: None,
+                from_token: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
 
     let got = wait_for_screen(
         &mut rd,

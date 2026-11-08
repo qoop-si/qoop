@@ -60,6 +60,8 @@ fn sandbox_root() -> &'static Path {
 /// and the descriptor dies with that child. Never write into `dest` in place: it may be
 /// `built` itself.
 pub fn place_binary(built: &Path, dest: &Path) {
+    // Gone first: `cp` over a file already there would write into it in place.
+    let _ = std::fs::remove_file(dest);
     if std::fs::hard_link(built, dest).is_ok() {
         return;
     }
