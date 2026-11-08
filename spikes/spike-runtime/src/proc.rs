@@ -172,13 +172,11 @@ fn child_pty_devices(pid: i32) -> Option<Vec<String>> {
 #[cfg(not(target_os = "macos"))]
 fn child_pty_devices(pid: i32) -> Option<Vec<String>> {
     let mut v = Vec::new();
-    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).ok()? {
-        if let Ok(e) = e {
-            if let Ok(t) = std::fs::read_link(e.path()) {
-                let t = t.to_string_lossy().to_string();
-                if t.contains("/dev/pts") || t.contains("ptmx") {
-                    v.push(t);
-                }
+    for e in std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
+        if let Ok(t) = std::fs::read_link(e.path()) {
+            let t = t.to_string_lossy().to_string();
+            if t.contains("/dev/pts") || t.contains("ptmx") {
+                v.push(t);
             }
         }
     }
@@ -236,10 +234,6 @@ fn watch_proc_exec(pid: i32, wait: Duration) -> std::io::Result<(bool, bool)> {
         }
     }
     Ok((saw_exec, saw_fork))
-}
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-fn watch_proc_exec(_pid: i32, _wait: Duration) -> std::io::Result<(bool, bool)> {
-    Ok((false, false))
 }
 
 /// Bounded, non-blocking reap that keeps draining the master.
