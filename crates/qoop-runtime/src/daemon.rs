@@ -10179,12 +10179,24 @@ fn daemon_command(exe: &Path, args: &[String]) -> std::process::Command {
 /// starts expects, and leaves it there when the exec fails. A daemon that carries on after
 /// that dies of the first write to a closed client, and every tab with it, so it is ignored
 /// again as it was at start.
+///
+/// A binary something still holds open for writing (a copy or a package manager not done
+/// with it) is refused on Linux as "text file busy" for as long as that lasts, so that is
+/// waited out for a second before the move gives up.
 fn run_exec(command: &mut std::process::Command) -> io::Error {
     use std::os::unix::process::CommandExt;
-    let e = command.exec();
-    // SAFETY: signal with SIG_IGN is always a valid disposition for SIGPIPE.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    e
+    let mut tries = 0;
+    loop {
+        let e = command.exec();
+        // SAFETY: signal with SIG_IGN is always a valid disposition for SIGPIPE. Again after
+        // every failed try, before the wait: the other threads write to clients meanwhile.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        tries += 1;
+        if e.kind() != io::ErrorKind::ExecutableFileBusy || tries == 50 {
+            return e;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.
