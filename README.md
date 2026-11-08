@@ -27,13 +27,7 @@ curl -fsSL https://qoop.si/install.sh | sh
 ```
 
 It installs `qoop`, hooks up the agents it finds (Claude Code, Codex and others), lets you
-pick a pet and signs you in. Then:
-
-```sh
-cd my-project && qoop
-```
-
-Type `claude` or `codex` in there. macOS and Linux.
+pick a pet and signs you in. Then type `claude` or `codex` in it. macOS and Linux.
 
 <p align="center">
   <img src="docs/readme/demo.gif" alt="Set up in one command, create spaces and agents for your projects, connect remote servers as spaces, see who needs you, let qass answer, answer from your phone" width="100%">
