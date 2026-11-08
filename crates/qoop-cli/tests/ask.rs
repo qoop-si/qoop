@@ -443,8 +443,9 @@ fn watching_turned_on_wakes_a_sleeping_qass_and_tells_it_once() {
     };
     assert!(
         stack.wait(told) || stack.wait(told),
-        "a sleeping qass was never woken and told: {:?}",
-        stack.log("qass")
+        "a sleeping qass was never woken and told: {:?} {:?}",
+        stack.log("qass"),
+        stack.run(&["agents"]).1
     );
     std::thread::sleep(Duration::from_secs(4));
     assert_eq!(stack.log("qass").matches("watching on:").count(), 1);
@@ -531,7 +532,9 @@ fn watching_turned_on_leaves_a_parked_tab_asleep_beside_an_awake_qass() {
     let parked = stack.agent("qass", "parked", Some("sess-parked"));
     assert!(
         stack.wait(|| stack.run(&["sleep", "--tab", &parked]).0),
-        "the parked tab never went to sleep"
+        "the parked tab never went to sleep: {:?} {:?}",
+        stack.run(&["sleep", "--tab", &parked]).2,
+        stack.run(&["agents"]).1
     );
     stack.run(&["qass", "watch", "off"]);
     let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
