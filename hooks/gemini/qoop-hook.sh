@@ -79,7 +79,7 @@ def worktree_mark(cwd):
     try:
         parts = []
         for git in (["status", "--porcelain=v1", "-uall"], ["diff", "HEAD"], ["rev-parse", "HEAD"]):
-            got = subprocess.run(["git", "--no-optional-locks", "-C", cwd] + git, capture_output=True, timeout=2)
+            got = subprocess.run(["git", "--no-optional-locks", "-C", cwd] + git, capture_output=True, timeout=5)
             if got.returncode != 0 and git[0] == "status":
                 return None
             parts.append(got.stdout if got.returncode == 0 else b"")
@@ -121,7 +121,7 @@ def turn(payload, starts, ends):
         os.remove(path)
         mark = worktree_mark(cwd)
         if mark and was and was_cwd == cwd and mark != was:
-            subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=2)
+            subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -185,7 +185,7 @@ if name == "SessionStart":
 # the record never waits on the agent to open it.
 if name == "BeforeTool" and payload.get("tool_name") in ("write_file", "replace"):
     try:
-        subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=2)
+        subprocess.run(["qoop", "task", "begin"], capture_output=True, timeout=5)
     except Exception:
         pass
 args = ["qoop", "hook-report", "--agent", "gemini", "--state", state]
