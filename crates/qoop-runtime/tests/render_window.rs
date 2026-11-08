@@ -84,8 +84,9 @@ async fn a_paced_client_holds_one_screen_until_it_acks() {
     );
 
     // Acknowledge as the client does, and the screens come again, one per ack, the newest
-    // each time: the last one names the end of the flood.
-    let until = Instant::now() + Duration::from_secs(20);
+    // each time: the last one names the end of the flood. The flood forks 400 sleeps, which
+    // a shared CI runner takes well over 20 seconds to get through; the loop ends at DONE.
+    let until = Instant::now() + Duration::from_secs(60);
     let mut last = String::new();
     while Instant::now() < until && !last.contains("DONE_42") {
         phone.drain_incoming(Duration::from_millis(100)).await;
