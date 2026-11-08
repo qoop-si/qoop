@@ -726,6 +726,11 @@ impl Said {
     // ponytail: a resume cancelled by hand, then the same program started fresh, takes
     // the old id until its first report; an argv check of the agent closes that if it
     // ever matters.
+    /// Said by `program` in `generation` itself, not by a resume or an agent before it.
+    fn is_by(&self, program: &str, generation: u64) -> bool {
+        matches!(self, Said::By(p, g) if p == program && *g == generation)
+    }
+
     fn settle(&self, agent: Option<(&str, u64)>) -> Option<Said> {
         match (self, agent) {
             (Said::Resumed(program), Some((now, generation))) if program == now => {
@@ -891,10 +896,12 @@ impl TerminalRegistry {
     /// Whether the id held was said by this agent, `program` in `generation`: its own, not
     /// one an agent before it left behind.
     fn said_by(&self, stream: u32, program: &str, generation: u64) -> bool {
-        matches!(
-            self.inner.lock().unwrap().get(&stream).and_then(|h| h.session_said.as_ref()),
-            Some(Said::By(p, g)) if p == program && *g == generation
-        )
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&stream)
+            .and_then(|h| h.session_said.as_ref())
+            .is_some_and(|said| said.is_by(program, generation))
     }
 
     /// Keep a conversation id only while the agent that has it is in the terminal (see
@@ -13172,6 +13179,16 @@ mod said_tests {
 
     fn by(generation: u64) -> Option<Said> {
         Some(Said::By("opencode".into(), generation))
+    }
+
+    /// Only the agent that said an id, in the generation it said it in, has said it.
+    #[test]
+    fn an_id_is_said_by_one_agent_in_one_generation() {
+        let said = Said::By("claude".into(), 3);
+        assert!(said.is_by("claude", 3));
+        assert!(!said.is_by("claude", 4));
+        assert!(!said.is_by("opencode", 3));
+        assert!(!Said::Resumed("claude".into()).is_by("claude", 3));
     }
 
     /// An id lives as long as the agent that has it: taken by the agent a resume started,
