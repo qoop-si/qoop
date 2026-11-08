@@ -50,4 +50,4 @@ jobs:
         env:
           # Full debug info for every test binary fills the Linux runner's disk.
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
-        run: cargo test --workspace --locked -- --skip costs_almost_nothing
+        run: cargo test --workspace --locked --no-fail-fast -- --skip costs_almost_nothing
