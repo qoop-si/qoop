@@ -318,7 +318,7 @@ async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
 
     wr.write_all(
         &client::encode_command(&ClientWire::Input {
-            bytes: b"trap 'echo W$((6*7))' WINCH\n".to_vec(),
+            bytes: b"trap 'echo W$((6*7))' WINCH; echo ARMED_$((6*8))\n".to_vec(),
             from_terminal: None,
             from_token: None,
         })
@@ -326,11 +326,36 @@ async fn an_equal_size_resize_nudges_a_repaint_and_restores_canonical() {
     )
     .await
     .unwrap();
+    // The trap is set before the resize goes: a signal that lands first is ignored.
+    assert!(
+        wait_for_screen(
+            &mut rd,
+            &mut inbuf,
+            |s| screen(s).contains("ARMED_48"),
+            Duration::from_secs(10),
+        )
+        .await
+        .is_some(),
+        "the shell never armed its trap"
+    );
     // First resize claims ownership; 80x24 equals the initial size, so this
     // is the nudge path rather than a real change.
     wr.write_all(&client::encode_command(&ClientWire::Resize { cols: 80, rows: 24 }).unwrap())
         .await
         .unwrap();
+    // dash (Linux's sh) runs a trap only once it reads its next command: after the shrink
+    // and its restore (30 ms), an empty command lets it run, as bash runs it at once.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    wr.write_all(
+        &client::encode_command(&ClientWire::Input {
+            bytes: b":\n".to_vec(),
+            from_terminal: None,
+            from_token: None,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
 
     let got = wait_for_screen(
         &mut rd,

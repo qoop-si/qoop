@@ -85,7 +85,8 @@ async fn a_paste_wears_the_markers_only_when_the_program_asked() {
     );
 
     // Off again: the same paste arrives bare.
-    c.input(b"\x03").await;
+    // End of input, not ctrl-c: a SIGINT lets the dying `cat` read the next line first.
+    c.input(b"\x04").await;
     c.input(b"printf '\\033[?2004l'; echo OFF_$((6*7)); cat -v\n")
         .await;
     assert!(c.wait_for_text("OFF_42", PATIENCE).await);

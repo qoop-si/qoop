@@ -733,12 +733,21 @@ mod argv_tests {
         // A real process with arguments nobody could guess, read back through the same
         // path the daemon uses. A unit test with a fixture would prove the parser and not
         // the syscall, and the syscall is the part that differs by platform.
+        // `sleep` not last: dash (Linux's sh) execs a `-c` string's last command in place of
+        // itself, and the shell's own argv would be gone.
         let marker = "qoop-argv-marker";
         let child = std::process::Command::new("/bin/sh")
-            .args(["-c", &format!("sleep 5 # {marker}")])
+            .args(["-c", &format!("sleep 5; : {marker}")])
             .spawn()
             .expect("spawn");
-        let argv = argv_of(Pid(child.id() as i32));
+        // Read until it is there: Linux shows an empty command line between the spawn's
+        // return and the exec finishing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut argv = argv_of(Pid(child.id() as i32));
+        while !argv.iter().any(|a| a.contains(marker)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            argv = argv_of(Pid(child.id() as i32));
+        }
         let mut child = child;
         let _ = child.kill();
         let _ = child.wait();

@@ -13,8 +13,9 @@ use qoop_testkit::{PATIENCE, TestClient, TestDaemon};
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const ZSH: &str = "/bin/zsh";
-/// A bash with `PS0` (4.4 or newer); macOS's own `/bin/bash` is 3.2 and gets no marks.
-const NEW_BASH: &str = "/opt/homebrew/bin/bash";
+/// Where a bash with `PS0` (4.4 or newer) lives: Homebrew's on a Mac, whose own `/bin/bash`
+/// is 3.2 and gets no marks, and the system's on Linux.
+const NEW_BASHES: [&str; 2] = ["/opt/homebrew/bin/bash", "/bin/bash"];
 
 /// A home with the given startup files, and `ZDOTDIR` set to `zdotdir` or unset. The caller
 /// holds `SERIAL`, and no daemon of this binary is running.
@@ -82,6 +83,10 @@ async fn sleep_then_fail(c: &mut TestClient, before: &str) {
 #[tokio::test]
 async fn zsh_reports_a_finished_command_with_its_status_and_time() {
     let _turn = SERIAL.lock().await;
+    if !Path::new(ZSH).exists() {
+        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+        return;
+    }
     let _home = home_with(&[(".zshrc", "PROMPT='home> '\n")], None);
     let d = TestDaemon::start_with_shell(Path::new(ZSH)).await;
     let mut c = d.attach("zsh").await;
@@ -104,6 +109,10 @@ async fn zsh_reports_a_finished_command_with_its_status_and_time() {
 #[tokio::test]
 async fn zsh_with_its_own_zdotdir_keeps_its_prompt_and_still_reports() {
     let _turn = SERIAL.lock().await;
+    if !Path::new(ZSH).exists() {
+        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+        return;
+    }
     let zdotdir = tempfile::tempdir().expect("tempdir");
     std::fs::write(zdotdir.path().join(".zshrc"), "PROMPT='custom> '\n").expect("write");
     std::fs::write(zdotdir.path().join(".zshenv"), "export SAW_ZSHENV=yes\n").expect("write");
@@ -130,10 +139,14 @@ async fn new_bash_reports_a_finished_command_and_keeps_the_persons_prompt_comman
     // The turn first: the probe starts a process, which reads the environment another test
     // may be writing.
     let _turn = SERIAL.lock().await;
-    if !bash_has_ps0(Path::new(NEW_BASH)) {
-        qoop_runtime::say!("skipped: no bash 4.4 or newer at {NEW_BASH}");
+    let Some(new_bash) = NEW_BASHES
+        .into_iter()
+        .map(Path::new)
+        .find(|bash| bash_has_ps0(bash))
+    else {
+        qoop_runtime::say!("skipped: no bash 4.4 or newer at {NEW_BASHES:?}");
         return;
-    }
+    };
     let _home = home_with(
         &[(
             ".bashrc",
@@ -141,7 +154,7 @@ async fn new_bash_reports_a_finished_command_and_keeps_the_persons_prompt_comman
         )],
         None,
     );
-    let d = TestDaemon::start_with_shell(Path::new(NEW_BASH)).await;
+    let d = TestDaemon::start_with_shell(new_bash).await;
     let mut c = d.attach("bash").await;
     assert!(
         c.wait_for_text("bash>", PATIENCE).await,
@@ -159,6 +172,10 @@ async fn new_bash_reports_a_finished_command_and_keeps_the_persons_prompt_comman
 #[tokio::test]
 async fn an_oversized_mark_is_dropped_and_the_real_ones_still_count() {
     let _turn = SERIAL.lock().await;
+    if !Path::new(ZSH).exists() {
+        qoop_runtime::say!("skipped: no zsh at {ZSH}");
+        return;
+    }
     let _home = home_with(&[(".zshrc", "PROMPT='home> '\n")], None);
     let d = TestDaemon::start_with_shell(Path::new(ZSH)).await;
     let mut c = d.attach("zsh").await;

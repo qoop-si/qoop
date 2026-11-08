@@ -22,11 +22,10 @@ impl Machine {
         for dir in [root.path().to_path_buf(), root.path().join("rt")] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         }
-        std::fs::copy(
-            env!("CARGO_BIN_EXE_qoop"),
-            root.path().join("h/.local/bin/qoop"),
-        )
-        .expect("copy the binary");
+        qoop_testkit::place_binary(
+            Path::new(env!("CARGO_BIN_EXE_qoop")),
+            &root.path().join("h/.local/bin/qoop"),
+        );
         std::fs::write(
             root.path().join("h/.claude/skills/neighbour/SKILL.md"),
             "mine",

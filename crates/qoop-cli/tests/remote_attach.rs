@@ -70,14 +70,17 @@ impl Machine {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         collect(self.dir.path(), self.dir.path(), &mut entries);
         entries.sort();
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        // One line per file, so a machine that keeps writing can be told by name.
+        let mut lines = String::new();
         for (name, bytes) in entries {
-            for byte in name.as_bytes().iter().chain(bytes.iter()) {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in &bytes {
                 hash ^= *byte as u64;
                 hash = hash.wrapping_mul(0x1000_0000_01b3);
             }
+            lines += &format!("{name} {hash:016x}\n");
         }
-        format!("{hash:016x}")
+        lines
     }
 }
 
@@ -97,7 +100,13 @@ fn quiet(machines: &[Machine]) -> Vec<String> {
         }
         last = now;
     }
-    panic!("a machine kept writing to its runtime directory after it was up");
+    let now: Vec<String> = machines.iter().map(Machine::state_hash).collect();
+    let moved: Vec<&str> = now
+        .iter()
+        .zip(&last)
+        .flat_map(|(a, b)| a.lines().filter(|l| !b.lines().any(|m| m == *l)))
+        .collect();
+    panic!("a machine kept writing to its runtime directory after it was up: {moved:?}");
 }
 
 fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
@@ -112,8 +121,15 @@ fn collect(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String,
             .display()
             .to_string();
         // The socket and the lock are runtime state, not workspace state: a socket's inode
-        // changes on every daemon start and comparing it would make this hash useless.
-        if name.ends_with(".sock") || name.ends_with(".lock") {
+        // changes on every daemon start and comparing it would make this hash useless. The
+        // daemon's log goes on as long as it runs, and `bin/` holds the stand-ins a Linux
+        // daemon links for its tabs (a link to the whole qoop binary).
+        if name.ends_with(".sock")
+            || name.ends_with(".lock")
+            || name.ends_with("qoopd.log")
+            || name == "bin"
+            || name.starts_with("bin/")
+        {
             continue;
         }
         if path.is_dir() {

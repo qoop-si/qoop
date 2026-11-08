@@ -268,7 +268,7 @@ fn the_version_line_follows_the_name_the_binary_is_run_by() {
     ] {
         let copy = bin.join(format!("run-as-{name}")).join(name);
         std::fs::create_dir_all(copy.parent().unwrap()).expect("dir");
-        std::fs::copy(env!("CARGO_BIN_EXE_qoop"), &copy).expect("copy");
+        qoop_testkit::place_binary(Path::new(env!("CARGO_BIN_EXE_qoop")), &copy);
         // Run from the machine's own environment: any command moves the home's old
         // directories first, and that must never be the person's.
         let mut c = Command::new(&copy);
