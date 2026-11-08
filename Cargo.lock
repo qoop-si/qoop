@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-attention"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "serde",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-bench"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "libc",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-cli"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "libc",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-collab"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "serde",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-detect"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "regex",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-domain"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "proptest",
  "serde",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-events"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "rusqlite",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-history"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-detect",
  "rusqlite",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-move"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-parsed"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "agentparse",
  "qoop-history",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-plugin"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "serde",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-proto"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-pty"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "libc",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-remote"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-proto",
  "serde",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-runtime"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "base64",
  "bytes",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-setup"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "serde",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-store"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-domain",
  "rusqlite",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-support"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "qoop-events",
  "serde",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-terminal"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "alacritty_terminal",
  "bytes",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-testkit"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "libc",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "qoop-tui"
-version = "0.13.4"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "qoop-attention",
