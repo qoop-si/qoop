@@ -70,7 +70,8 @@ fn open_pty(cols: u16, rows: u16) -> std::io::Result<Pty> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut ws,
+            // Linux takes a const pointer, macOS a mutable one: a raw pointer fits both.
+            &raw mut ws,
         )
     };
     if rc != 0 {
