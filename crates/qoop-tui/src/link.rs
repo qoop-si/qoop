@@ -450,13 +450,15 @@ const SWAPPED_MEANWHILE: i32 = 6;
 /// Swap: find the qoop `remote_command` runs, as the real file behind any link; stage stdin
 /// beside it, so the rename is on one filesystem; check the size against `$3` and that the
 /// copy says it is `$2`; then rename it over the original, but only while the original
-/// still says it is `$1`. The check and the rename hold a lock beside the file, a
-/// directory made or not in one step, so two swaps never both pass the check. Exits 3
+/// still says it is `$1`. The check and the rename hold a lock beside the file, made only
+/// when it is not there by the shell itself (`set -C`, one exclusive create), so two swaps
+/// never both pass the check: Ubuntu's Rust `mkdir` let two racers both through. Exits 3
 /// when the place is not this user's to write, 4 when the file there is not qoop at all,
 /// 5 when the copy is wrong, 6 only when another version of qoop is there now, 7 when
 /// another swap holds the lock (said, not quiet: a lock left by a swap that was killed
 /// would otherwise hide every update), and leaves nothing staged and no lock of its own
-/// behind. A lock older than half an hour is from a swap that was killed, and is swept.
+/// behind. A lock older than half an hour is from a swap that was killed, and is swept: the
+/// file says when it was taken, and an older qoop's lock, a directory, goes by its age.
 /// Once swapped, the new qoop refreshes its hooks, skills and icon font there (it skips an
 /// agent that is not on that machine); what fails is said after the marker and never fails
 /// the swap.
@@ -480,11 +482,18 @@ done
 d=$(dirname "$r")
 [ -O "$d" ] && [ -w "$d" ] || { echo "$d is not this user's to write" >&2; exit 3; }
 l="$d/.qoop-swap.lock"
-find "$d" -maxdepth 1 -name .qoop-swap.lock -mmin +30 -exec rmdir {} + 2>/dev/null || true
+find "$d" -maxdepth 1 -name .qoop-swap.lock -type d -mmin +30 -exec rmdir {} + 2>/dev/null || true
+now=$(date +%s)
+if [ -f "$l" ]; then
+  at=
+  read -r at < "$l" 2>/dev/null || true
+  case $at in ''|*[!0-9]*) at=$now ;; esac
+  [ $((now - at)) -le 1800 ] || rm -f "$l"
+fi
 t=
 h=
-trap '[ -z "$t" ] || rm -f "$t"; [ -z "$h" ] || rmdir "$l"' EXIT
-mkdir "$l" 2>/dev/null || { echo "another update of qoop is in progress there; try again later" >&2; exit 7; }
+trap '[ -z "$t" ] || rm -f "$t"; [ -z "$h" ] || rm -f "$l"' EXIT
+( set -C; echo "$now" > "$l" ) 2>/dev/null || { echo "another update of qoop is in progress there; try again later" >&2; exit 7; }
 h=1
 v=$("$r" --version 2>/dev/null) || v=
 case $v in "qoop $1"|"qoro $1") ;; "qoop "*|"qoro "*) echo "qoop changed meanwhile" >&2; exit 6;; *) echo "$r is not qoop" >&2; exit 4;; esac
@@ -496,7 +505,7 @@ chmod 755 "$t"
 mv -f "$t" "$r"
 t=
 h=
-rmdir "$l" || true
+rm -f "$l" || true
 printf '%s\n' MARKER
 for w in hooks skills icons; do
   "$r" "$w" install </dev/null >/dev/null 2>&1 || echo "the $w there were not refreshed: run qoop $w install on it"
@@ -1175,7 +1184,7 @@ mod tests {
         // Notes, each time it is asked for hooks, skills, icons or the bridge, whether the lock
         // directory beside the file is still there.
         let probing = "#!/bin/sh\ncase \"$1\" in\n--version) echo 'qoop 0.0.2';;\n\
-             hooks|skills|icons|bridge) [ -d \"$HOME/.local/bin/.qoop-swap.lock\" ] \
+             hooks|skills|icons|bridge) [ -e \"$HOME/.local/bin/.qoop-swap.lock\" ] \
              && echo \"held during $1\" >> \"$HOME/held\"; exit 0;;\nesac\n";
         let out = swap(home.path(), "0.0.1", "0.0.2", probing.as_bytes());
         assert!(out.status.success());
@@ -1324,6 +1333,28 @@ mod tests {
             .status()
             .expect("touch");
         assert!(touched.success());
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
+        assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);
+
+        // The same with this qoop's own lock, a file that says when it was taken.
+        let home = tempfile::tempdir().expect("home");
+        let qoop = installed(home.path(), &says("0.0.1"));
+        let lock = home.path().join(".local/bin/.qoop-swap.lock");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        std::fs::write(&lock, format!("{now}\n")).expect("lock");
+        let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
+        assert_eq!(out.status.code(), Some(7));
+        assert!(lock.is_file(), "another swap's lock was taken away");
+        std::fs::write(&lock, format!("{}\n", now - 3600)).expect("old lock");
         let out = swap(home.path(), "0.0.1", "0.0.2", &says("0.0.2"));
         assert!(
             out.status.success(),
