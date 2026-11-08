@@ -154,9 +154,22 @@ fn wait_wakes_on_a_state_change() {
         "wait did not match: {stdout} {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(stdout.contains("term=1 state=unknown "), "{stdout}");
+    // The wake can come in the moment between the shell's fork and its exec, when the job
+    // is still the shell's copy (Linux's probe sees it): the program is `sleep` once the
+    // exec is seen, within a beat.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut now = String::new();
+    while Instant::now() < deadline {
+        now = daemon.run(&["agents"]).1;
+        if now.contains("term=1 state=unknown program=sleep") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(
-        stdout.contains("term=1 state=unknown program=sleep"),
-        "{stdout}"
+        now.contains("term=1 state=unknown program=sleep"),
+        "{stdout} then {now}"
     );
 }
 
