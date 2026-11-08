@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-<p align="center"><a href="https://qoop.si"><sub>qoop.si</sub></a></p>
-
 <h1 align="center">qoop</h1>
 
 <p align="center">
@@ -15,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://qoop.si"><b>qoop.si</b></a> ·
   <a href="https://qoop.si/docs/">Docs</a> ·
   <a href="https://qoop.si/docs/#quick-start">Quick start</a> ·
   <a href="https://qoop.si/docs/#keys">Keys</a>
