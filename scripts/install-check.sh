@@ -65,6 +65,8 @@ chmod 0755 "$T/shim/tar"
 export PATH="$T/shim:/usr/bin:/bin:/usr/sbin:/sbin"
 export QOOP_DEST="$T/dest/qoop"
 export HOME="$T/home"
+# A runner's own XDG folders (GitHub's Linux runners set them) must not stand in for this HOME.
+unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME
 mkdir -p "$T/home"
 
 # Happy path: installs, gates the version, delegates hooks + skills.
