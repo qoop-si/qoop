@@ -90,7 +90,8 @@ impl Daemon {
         std::fs::create_dir_all(&bin).expect("bin");
         let source = bin.join("claude.rs");
         let report = session.map_or(String::new(), |id| {
-            format!("let _ = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--session-id\", {id:?}]).status();")
+            let said = bin.join("report.out");
+            format!("if let Ok(o) = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--session-id\", {id:?}]).output() {{ let _ = std::fs::write({said:?}, format!(\"{{}} {{}}\", o.status, String::from_utf8_lossy(&o.stderr))); }}")
         });
         let body = log.map_or_else(
             || "std::thread::sleep(std::time::Duration::from_secs(120));".to_string(),
@@ -129,7 +130,11 @@ impl Daemon {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("the stand in never showed as an agent: {}", self.row());
+        panic!(
+            "the stand in never showed as an agent: {}\nits report: {:?}",
+            self.row(),
+            std::fs::read_to_string(bin.join("report.out"))
+        );
     }
 
     /// The same, for a conversation id the daemon may well refuse to keep: waits for the
