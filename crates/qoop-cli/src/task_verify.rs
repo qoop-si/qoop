@@ -913,8 +913,10 @@ mod tests {
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
+        /// Only the stub's folder: a `gh` installed on the machine (CI runners have one) must
+        /// never answer for the stub.
         fn path(&self) -> std::ffi::OsString {
-            format!("{}:/usr/bin:/bin", self.at("bin").display()).into()
+            self.at("bin").into_os_string()
         }
 
         /// The approved copy naming an install at `bin/qoop`, its mtime `at`.
