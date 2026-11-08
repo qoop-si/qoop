@@ -10,7 +10,7 @@ use crate::text::redacted_cut;
 
 /// Tail windows tried in turn: the call is usually in the newest, and an older one costs more.
 /// A source that is read whole (Gemini, OpenCode, a small file) is parsed once.
-const WINDOWS: [u64; 3] = [1024 * 1024, 8 * 1024 * 1024, MAX_TAIL_BYTES];
+pub(crate) const WINDOWS: [u64; 3] = [1024 * 1024, 8 * 1024 * 1024, MAX_TAIL_BYTES];
 
 /// Input and output of the call `tool_id`, redacted and cut at `max_bytes` each (a limit of
 /// 64 KiB is the usual one). `Error::NotFound` when no window of the session holds the call.

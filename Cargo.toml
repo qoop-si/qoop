@@ -41,7 +41,7 @@ tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 toml_edit = "0.22"
-agentparse = { git = "https://github.com/qoop-si/agentparse", rev = "14117df69f8947658729cf657a062211c69d0ae3" }
+agentparse = { git = "https://github.com/qoop-si/agentparse", rev = "76670fbae830aa137f0c757fde97ee460908b0dc" }
 
 [profile.release]
 debug = 1

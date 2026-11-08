@@ -20,8 +20,10 @@ mod subagent;
 mod text;
 
 pub use detail::detail;
-pub use item::{Chip, Detail, Digest, Item, Status};
-pub use load::{Error, MAX_SKIP, Options, REVISION_MASK, load, revision_of, revision_with};
+pub use item::{Chip, Detail, Digest, Item, Lane, LaneStatus, Status};
+pub use load::{
+    Error, MAX_SKIP, Options, REVISION_MASK, load, revision_of, revision_with, spawn_ended,
+};
 pub use locate::{Dirs, Source, claude_roots_from_env, claude_transcript, locate_session};
 pub use redact::{redact, strip_ansi};
 pub use subagent::child_source;

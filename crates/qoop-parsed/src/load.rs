@@ -1,11 +1,12 @@
 //! Reading a session into a [`Digest`]: stat, parse, project, page.
 
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use agentparse::{Agent, Session};
 
-use crate::item::{Digest, Item};
+use crate::item::{Digest, Item, Status};
 use crate::locate::Source;
 use crate::project;
 use crate::subagent;
@@ -40,8 +41,8 @@ pub struct Options {
     pub skip: usize,
     /// Response budget in bytes (default 256 KiB); the oldest items of the page go first.
     /// The newest item of the page is always kept, even when it alone is over the budget, so
-    /// a page is never empty because of it. Text is clamped to 4 KiB per item, so that item
-    /// is small.
+    /// a page is never empty because of it. A reply or a prompt is clamped to 64 KiB and any other
+    /// text to 4 KiB, so that item stays bounded.
     pub max_total_bytes: usize,
     /// The directory Codex keeps its rollouts under, where the caller found the session. A
     /// subagent's rollout is looked for there. Without it the root is read off a
@@ -52,6 +53,12 @@ pub struct Options {
     /// reads `interrupted`, not `running`; so does the "agents still running" count of a turn
     /// that ended before it. `None` when the caller does not know: nothing is changed.
     pub alive_since: Option<i64>,
+    /// For a subagent's page, when its spawn in the parent stopped running ([`spawn_ended`]).
+    /// Claude writes the end of a background call a subagent launched to the parent file only,
+    /// so in the subagent's own file it never ends: a call still running that started at or
+    /// before this time reads `ok` when it has a result (its launch text) and `interrupted`
+    /// when it has none. A later call belongs to a run Claude resumed and is left as it is.
+    pub spawn_ended: Option<i64>,
 }
 
 impl Default for Options {
@@ -63,6 +70,7 @@ impl Default for Options {
             max_total_bytes: 256 * 1024,
             codex_root: None,
             alive_since: None,
+            spawn_ended: None,
         }
     }
 }
@@ -112,7 +120,7 @@ pub fn load(source: &Source, opts: &Options) -> Result<Digest, Error> {
     let mut window = opts.max_tail_bytes;
     loop {
         let (session, cut) = read(source, stamp.len, window)?;
-        let (all, spawns) = project::project(&session, opts.alive_since);
+        let (all, spawns) = project::project(&session, opts.alive_since, opts.spawn_ended);
         let items = if cut { drop_leading_orphans(all) } else { all };
         // The newest `WATCH_ITEMS` are always in the window, so the spawn rows the revision
         // watches are the same whatever the page asked for.
@@ -286,13 +294,84 @@ pub(crate) fn len_and_mtime(path: &Path) -> Result<(u64, u64), Error> {
 pub const REVISION_MASK: u64 = (1 << 53) - 1;
 
 /// `revision` as a client holding a page must see it when the page was made for an agent that
-/// started at `alive_since` (see [`Options::alive_since`]): the same file read for another
-/// agent has other status words and rows, so it is another revision. `None` leaves it alone.
-pub fn revision_with(revision: u64, alive_since: Option<i64>) -> u64 {
-    match alive_since {
+/// started at `alive_since` (see [`Options::alive_since`]), or for a subagent whose spawn has
+/// ended ([`Options::spawn_ended`]): the same file read for another agent, or once the spawn
+/// ended, has other status words, so it is another revision. `None` leaves it alone.
+pub fn revision_with(revision: u64, alive_since: Option<i64>, spawn_ended: Option<i64>) -> u64 {
+    let revision = match alive_since {
         Some(at) => fnv(&[revision, at as u64]),
         None => revision,
+    };
+    match spawn_ended {
+        Some(end) => fnv(&[revision, 1, end as u64]),
+        None => revision,
     }
+}
+
+/// Ends of spawns already looked up: by parent, child and `alive_since`, the parent's stamp
+/// and the end.
+type Ends = Vec<((Source, String, Option<i64>), (u64, Option<i64>))>;
+static ENDS: Mutex<Ends> = Mutex::new(Vec::new());
+
+/// When the spawn of subagent `child` in the session `parent` stopped running, in unix ms:
+/// its row is there and no longer running. The spawn call's end, else `alive_since` (the
+/// agent that ran it is gone), else `i64::MAX` (every call of the child is before it). `None`
+/// while it runs, and when it cannot tell. The 1 MiB, 8 MiB and 64 MiB tail windows are
+/// tried in turn until the row is found. The answer is kept for the parent's stamp: a resume
+/// rewrites nothing, but a spawn that runs again may end again.
+// ponytail: a child with no spawn row in the terminal's file (a workflow lane, a grandchild)
+// parses the parent up to 64 MiB once per parent change. A resumed run's own background calls
+// are not ended by its later notification (it lands on the SendMessage), as before this rule.
+pub fn spawn_ended(parent: &Source, child: &str, alive_since: Option<i64>) -> Option<i64> {
+    let stamp = stamp(parent).ok()?;
+    let key = (parent.clone(), child.to_string(), alive_since);
+    let ends = || ENDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, (_, end))) = ends()
+        .iter()
+        .find(|(k, (revision, _))| *k == key && *revision == stamp.revision)
+    {
+        return *end;
+    }
+    let end = find_spawn_end(parent, stamp.len, child, alive_since);
+    crate::subagent::remember(&mut ends(), 64, key, (stamp.revision, end));
+    end
+}
+
+fn find_spawn_end(parent: &Source, len: u64, child: &str, alive_since: Option<i64>) -> Option<i64> {
+    for window in crate::detail::WINDOWS {
+        let (session, cut) = read(parent, len, window).ok()?;
+        let (items, _) = project::project(&session, alive_since, None);
+        let spawn = items.iter().rev().find_map(|i| match i {
+            Item::Subagent {
+                act,
+                child: Some(c),
+                status,
+                id,
+                ..
+            } if act.as_deref() == Some("spawn") && c == child => Some((*status, id.clone())),
+            _ => None,
+        });
+        if let Some((status, id)) = spawn {
+            // An idle teammate waits for its next message: it has not ended.
+            if matches!(status, Status::Running | Status::Idle) {
+                return None;
+            }
+            let ended_at = session
+                .messages()
+                .flat_map(|m| &m.parts)
+                .filter_map(|p| match p {
+                    agentparse::Part::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .find(|call| Some(project::item_id(&call.id)) == id)
+                .and_then(|call| call.ended_at);
+            return Some(ended_at.or(alive_since).unwrap_or(i64::MAX));
+        }
+        if !cut {
+            break;
+        }
+    }
+    None
 }
 
 /// FNV-1a over the little-endian bytes: stable across runs and Rust versions, unlike `Hasher`.
@@ -351,12 +430,20 @@ mod tests {
     #[test]
     fn a_page_made_for_another_agent_is_another_revision() {
         let file = 123_456_789;
-        assert_eq!(revision_with(file, None), file);
-        let first = revision_with(file, Some(1_000));
+        assert_eq!(revision_with(file, None, None), file);
+        let first = revision_with(file, Some(1_000), None);
         assert_ne!(first, file);
-        assert_ne!(first, revision_with(file, Some(2_000)));
-        assert_eq!(first, revision_with(file, Some(1_000)));
+        assert_ne!(first, revision_with(file, Some(2_000), None));
+        assert_eq!(first, revision_with(file, Some(1_000), None));
         assert!(first <= REVISION_MASK);
+        // A subagent's page once its spawn ended reads other status words, and so does one
+        // whose spawn ended again after a resume.
+        let ended = revision_with(file, Some(1_000), Some(5_000));
+        assert_ne!(ended, first);
+        assert_ne!(ended, revision_with(file, Some(1_000), Some(9_000)));
+        assert_ne!(revision_with(file, None, Some(1_000)), first);
+        assert_ne!(revision_with(file, None, Some(5_000)), file);
+        assert!(ended <= REVISION_MASK);
     }
 
     #[test]

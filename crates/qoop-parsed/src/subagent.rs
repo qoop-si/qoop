@@ -27,7 +27,7 @@ use qoop_history::{BaseDirs, Located, Product, valid_id};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 
-use crate::item::Item;
+use crate::item::{Item, Lane, LaneStatus, Status};
 use crate::load::{fnv, len_and_mtime};
 use crate::project;
 
@@ -49,15 +49,17 @@ const MAX_WATCHED: usize = 64;
 /// How long a child rollout that was not found is not looked for again under the same root.
 const MISSING_FOR: Duration = Duration::from_secs(30);
 
-/// A spawn row's child: the id of its session, and the step count the harness reported.
+/// A spawn row's child: the id of its session, and the step count the harness reported. Or a
+/// workflow row's run: its id in `child`, and lanes read from its journal instead of steps.
 #[derive(Debug, Clone)]
 pub(crate) struct Spawn {
     child: String,
     reported: Option<u64>,
+    run: bool,
 }
 
 impl Spawn {
-    /// The child session's id.
+    /// The child session's id, or the workflow's run id.
     pub(crate) fn child(&self) -> &str {
         &self.child
     }
@@ -74,6 +76,18 @@ impl Spawn {
                 .and_then(|o| o.data.as_ref())
                 .and_then(|d| d.get("totalToolUseCount"))
                 .and_then(serde_json::Value::as_u64),
+            run: false,
+        })
+    }
+
+    /// The run of a call that launched a workflow, when its run id is a plain id.
+    pub(crate) fn run(call: &ToolCall) -> Option<Spawn> {
+        let data = call.output.as_ref()?.data.as_ref()?;
+        let run = data.get("runId")?.as_str().filter(|r| valid_id(r))?;
+        Some(Spawn {
+            child: run.to_string(),
+            reported: None,
+            run: true,
         })
     }
 }
@@ -109,7 +123,7 @@ fn memo() -> std::sync::MutexGuard<'static, Memo> {
 }
 
 /// Put `value` under `key`, dropping the oldest entry at `cap`.
-fn remember<K: PartialEq, V>(list: &mut Vec<(K, V)>, cap: usize, key: K, value: V) {
+pub(crate) fn remember<K: PartialEq, V>(list: &mut Vec<(K, V)>, cap: usize, key: K, value: V) {
     list.retain(|(k, _)| *k != key);
     if list.len() >= cap {
         list.remove(0);
@@ -139,9 +153,13 @@ pub(crate) fn annotate(
                 .filter(|(seq, _)| **seq < WATCH_ITEMS)
                 .collect();
             near.sort_by_key(|(seq, _)| **seq);
-            let files: Vec<PathBuf> = near
+            // A lane's result in its run's journal is the only write that changes its status, so
+            // each workflow's journal is watched too, outside the spawns' budget.
+            let (runs, children): (Vec<_>, Vec<_>) = near.into_iter().partition(|(_, s)| s.run);
+            let files: Vec<PathBuf> = children
                 .into_iter()
                 .take(MAX_SPAWNS)
+                .chain(runs)
                 .filter_map(|(_, spawn)| ctx.file(spawn))
                 .collect();
             let revision = combine(base, &stamps(&files));
@@ -152,19 +170,117 @@ pub(crate) fn annotate(
     };
     let mut left = MAX_SPAWNS;
     for item in page.iter_mut().rev() {
-        let Item::Subagent { seq, steps, .. } = item else {
+        let Item::Subagent {
+            seq,
+            steps,
+            status,
+            lanes,
+            ..
+        } = item
+        else {
             continue;
         };
         let Some(spawn) = spawns.get(seq) else {
             continue;
         };
-        if left == 0 {
-            break;
+        if spawn.run {
+            let journal = ctx.file(spawn);
+            *lanes = journal.map_or_else(Vec::new, |j| read_lanes(&j, *status == Status::Running));
+        } else if left > 0 {
+            left -= 1;
+            *steps = ctx.steps(spawn, source);
         }
-        left -= 1;
-        *steps = ctx.steps(spawn, source);
     }
     revision
+}
+
+/// A workflow's lanes from its run's journal: a `started` record is a lane (its agent, label
+/// and phase) keyed by its `key`, so a retry under a new agent takes the lane over. A `result`
+/// record for the lane's agent makes it done, a `failed` one failed. A lane with no end runs
+/// while the workflow does, and was stopped once it ended. No lane's own file is read: its steps show
+/// on its own page. A journal that is missing or over [`MAX_CHILD_BYTES`] gives none.
+// ponytail: read again on every page that shows the row, no memo; journals are small. A memo by
+// length and modification time, as `file_calls` keeps, is the upgrade if a page shows many runs.
+fn read_lanes(journal: &Path, running: bool) -> Vec<Lane> {
+    #[derive(Deserialize)]
+    struct Record {
+        #[serde(rename = "type")]
+        kind: String,
+        key: Option<String>,
+        #[serde(rename = "agentId")]
+        agent: Option<String>,
+        label: Option<String>,
+        phase: Option<String>,
+    }
+    let Ok((len, _)) = len_and_mtime(journal) else {
+        return Vec::new();
+    };
+    let Ok(file) = std::fs::File::open(journal) else {
+        return Vec::new();
+    };
+    if len > MAX_CHILD_BYTES {
+        return Vec::new();
+    }
+    let open = if running {
+        LaneStatus::Running
+    } else {
+        LaneStatus::Stopped
+    };
+    // (key, agent now on it, lane)
+    let mut lanes: Vec<(String, String, Lane)> = Vec::new();
+    for line in BufReader::new(file.take(len))
+        .split(b'\n')
+        .map_while(Result::ok)
+    {
+        let text = String::from_utf8_lossy(&line);
+        if ![
+            r#""type":"started""#,
+            r#""type":"result""#,
+            r#""type":"failed""#,
+        ]
+        .iter()
+        .any(|k| text.contains(k))
+        {
+            continue;
+        }
+        let Ok(Record {
+            kind,
+            key,
+            agent: Some(agent),
+            label,
+            phase,
+        }) = serde_json::from_str::<Record>(&text)
+        else {
+            continue;
+        };
+        // A lane is its key: a retry starts the same key under a new agent.
+        let key = key.unwrap_or_else(|| agent.clone());
+        let known = lanes.iter_mut().find(|(k, _, _)| *k == key);
+        match (kind.as_str(), known) {
+            ("started", known) => {
+                let label = label.or(phase).unwrap_or_else(|| "agent".into());
+                let lane = Lane {
+                    label: crate::text::summary(&label),
+                    status: open,
+                    child: valid_id(&agent).then(|| agent.clone()),
+                };
+                match known {
+                    Some(known) => *known = (key, agent, lane),
+                    None => lanes.push((key, agent, lane)),
+                }
+            }
+            // Only the agent now on the lane ends it, not one a retry replaced.
+            (end, Some((_, now, lane))) if *now == agent => {
+                lane.status = if end == "result" {
+                    LaneStatus::Done
+                } else {
+                    LaneStatus::Failed
+                };
+            }
+            _ => {}
+        }
+    }
+    lanes.into_iter().map(|(_, _, lane)| lane).collect()
 }
 
 /// The revision of `source` as [`annotate`] last left its children: `base` and a stat of each.
@@ -209,6 +325,13 @@ impl Ctx<'_> {
             return None;
         };
         match self.session.agent {
+            Agent::Claude if spawn.run => Some(
+                claude_dir(path)
+                    .join("workflows")
+                    .join(&spawn.child)
+                    .join("journal.jsonl"),
+            ),
+            _ if spawn.run => None,
             Agent::Claude => Some(claude_file(path, &spawn.child)),
             Agent::Codex => find_codex(&codex_root(path, self.codex_root)?, &spawn.child),
             Agent::Gemini => Some(gemini_file(path, &self.session.id, &spawn.child)),
@@ -241,13 +364,30 @@ fn clamp(n: usize) -> u32 {
 
 /// `<project>/<session>.jsonl` keeps its children in `<project>/<session>/subagents/`, at every
 /// depth: a subagent's own children sit beside it. The child id is a plain id (`valid_id`), so
-/// it names a file in that directory and no other.
+/// it names a file in that directory and no other. A workflow's agents sit one folder down, in
+/// `subagents/workflows/<run>/`: that is looked in when the flat file is not there, and only a
+/// file [`inside`] the parent's directory is taken.
 fn claude_file(parent: &Path, child: &str) -> PathBuf {
-    let dir = match parent.parent() {
+    let dir = claude_dir(parent);
+    let name = format!("agent-{child}.jsonl");
+    let flat = dir.join(&name);
+    if flat.is_file() {
+        return flat;
+    }
+    let runs = std::fs::read_dir(dir.join("workflows"))
+        .into_iter()
+        .flatten();
+    runs.flatten()
+        .find_map(|run| inside(parent, run.path().join(&name)))
+        .unwrap_or(flat)
+}
+
+/// The `subagents` directory of a Claude session file: its own, or the one it sits in.
+fn claude_dir(parent: &Path) -> PathBuf {
+    match parent.parent() {
         Some(dir) if dir.file_name().is_some_and(|n| n == "subagents") => dir.to_path_buf(),
         _ => parent.with_extension("").join("subagents"),
-    };
-    dir.join(format!("agent-{child}.jsonl"))
+    }
 }
 
 /// Where the session of subagent `child` is, for a reader of the session `parent` that `program`
@@ -788,7 +928,7 @@ mod tests {
     fn only_the_spawn_rows_of_the_returned_page_are_read() {
         let dir = tempfile::tempdir().unwrap();
         let (session, children) = claude_spawns(dir.path(), 40);
-        let (mut items, spawns) = project::project(&session, None);
+        let (mut items, spawns) = project::project(&session, None, None);
         let from = items.len() - 3;
         let mut page = items.split_off(from);
         let source = crate::locate::Source::File(dir.path().join("p/x.jsonl"));
@@ -939,5 +1079,181 @@ mod tests {
             None,
         );
         assert_eq!(gemini, Some(S::File(chats.join("gp/agent7.jsonl"))));
+    }
+
+    /// A Claude parent file with one Workflow launch (its result text names the run, as about
+    /// 40% of launches do with no `toolUseResult`), ended by a notification when `ended`, and the
+    /// run's journal: three lanes started, the first two with a result. Returns the parent and
+    /// the journal.
+    fn claude_workflow(dir: &Path, ended: bool) -> (PathBuf, PathBuf) {
+        let sid = "7a1c0de0-1111-4222-8333-444455556666";
+        let run = "wf_af368794-257";
+        let project = dir.join("p");
+        let runs = project.join(sid).join("subagents/workflows").join(run);
+        std::fs::create_dir_all(&runs).unwrap();
+        let rec = |kind: &str, uuid: &str, ts: &str, message: &str| {
+            format!(
+                "{{\"type\":\"{kind}\",\"uuid\":\"{uuid}\",\"sessionId\":\"{sid}\",\"timestamp\":\"2026-11-07T14:{ts}.000Z\",\"message\":{message}}}\n"
+            )
+        };
+        let mut lines = vec![
+            rec("user", "u0", "34:00", r#"{"role":"user","content":"count"}"#),
+            rec(
+                "assistant",
+                "a1",
+                "34:41",
+                r#"{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"toolu_wf","name":"Workflow","input":{"script":"x"}}]}"#,
+            ),
+            rec(
+                "user",
+                "r1",
+                "34:42",
+                &serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_wf", "content": format!("Workflow launched in background. Task ID: wc5135q8d\nSummary: Two read-only agents\nRun ID: {run}\n\nYou will be notified when it completes.")}]}).to_string(),
+            ),
+        ];
+        if ended {
+            lines.push(rec(
+                "user",
+                "n1",
+                "35:10",
+                &serde_json::json!({"role": "user", "content": "<task-notification>\n<task-id>wc5135q8d</task-id>\n<tool-use-id>toolu_wf</tool-use-id>\n<status>killed</status>\n<summary>Workflow stopped</summary>\n</task-notification>"}).to_string(),
+            ));
+        }
+        let parent = project.join(format!("{sid}.jsonl"));
+        std::fs::write(&parent, lines.concat()).unwrap();
+        let journal = runs.join("journal.jsonl");
+        std::fs::write(
+            &journal,
+            [
+                r#"{"type":"launched"}"#,
+                r#"{"type":"started","key":"k1","agentId":"ac5a2df1d68b53059","label":"readme-words","phase":"Count"}"#,
+                r#"{"type":"started","key":"k2","agentId":"a3e50f9194212a07a","label":"calc-functions","phase":"Count"}"#,
+                r#"{"type":"started","key":"k3","agentId":"a77e0000000000003","phase":"Count"}"#,
+                r#"{"type":"result","key":"k1","agentId":"ac5a2df1d68b53059","result":{"count":8}}"#,
+                r#"{"type":"result","key":"k2","agentId":"a3e50f9194212a07a","result":{"count":2}}"#,
+            ]
+            .map(|l| format!("{l}\n"))
+            .concat(),
+        )
+        .unwrap();
+        std::fs::write(runs.join("agent-a3e50f9194212a07a.jsonl"), "").unwrap();
+        (parent, journal)
+    }
+
+    fn workflow_page(parent: &Path) -> (Vec<Item>, u64) {
+        let session = agentparse::parse_file(parent).unwrap();
+        let (mut items, spawns) = project::project(&session, None, None);
+        let source = crate::locate::Source::File(parent.to_path_buf());
+        let revision = annotate(&source, &session, &spawns, None, &mut items, 7);
+        (items, revision)
+    }
+
+    fn lanes_of(items: &[Item]) -> Vec<(String, crate::item::LaneStatus, Option<String>)> {
+        items
+            .iter()
+            .find_map(|i| match i {
+                Item::Subagent {
+                    run: Some(_),
+                    lanes,
+                    ..
+                } => Some(
+                    lanes
+                        .iter()
+                        .map(|l| (l.label.clone(), l.status, l.child.clone()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("a workflow row")
+    }
+
+    #[test]
+    fn a_workflow_row_lists_its_lanes_from_the_runs_journal() {
+        use crate::item::LaneStatus::{Done, Running, Stopped};
+        let o = |s: &str| Some(s.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, _) = claude_workflow(dir.path(), false);
+        assert_eq!(
+            lanes_of(&workflow_page(&parent).0),
+            [
+                ("readme-words".to_string(), Done, o("ac5a2df1d68b53059")),
+                ("calc-functions".to_string(), Done, o("a3e50f9194212a07a")),
+                ("Count".to_string(), Running, o("a77e0000000000003")),
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, _) = claude_workflow(dir.path(), true);
+        assert_eq!(
+            lanes_of(&workflow_page(&parent).0)[2],
+            ("Count".to_string(), Stopped, o("a77e0000000000003")),
+            "a lane with no result under an ended run"
+        );
+    }
+
+    #[test]
+    fn a_restarted_lane_is_one_lane_and_a_failed_one_ends() {
+        use crate::item::LaneStatus::{Done, Failed};
+        let o = |s: &str| Some(s.to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, journal) = claude_workflow(dir.path(), false);
+        // The real shapes: a key started again under a new agent (a retry), and a top-level
+        // `failed` record for a lane that gave up.
+        std::fs::write(
+            &journal,
+            [
+                r#"{"type":"started","key":"k1","agentId":"a1000000000000001","label":"first"}"#,
+                r#"{"type":"started","key":"k1","agentId":"a1000000000000002","label":"first"}"#,
+                r#"{"type":"result","key":"k1","agentId":"a1000000000000002","result":{}}"#,
+                r#"{"type":"started","key":"k2","agentId":"a1000000000000003","label":"second"}"#,
+                r#"{"type":"failed","key":"k2","agentId":"a1000000000000003"}"#,
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes_of(&workflow_page(&parent).0),
+            [
+                ("first".to_string(), Done, o("a1000000000000002")),
+                ("second".to_string(), Failed, o("a1000000000000003")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lanes_agent_opens_from_the_runs_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (parent, journal) = claude_workflow(&base, false);
+        let lane = journal.with_file_name("agent-a3e50f9194212a07a.jsonl");
+        assert_eq!(
+            child_source(
+                "claude",
+                &crate::locate::Source::File(parent),
+                "7a1c0de0-1111-4222-8333-444455556666",
+                "a3e50f9194212a07a",
+                None
+            ),
+            Some(crate::locate::Source::File(lane))
+        );
+    }
+
+    #[test]
+    fn a_lanes_result_in_the_journal_changes_the_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, journal) = claude_workflow(dir.path(), false);
+        let (_, before) = workflow_page(&parent);
+        let source = crate::locate::Source::File(parent.clone());
+        assert_eq!(with_children(&source, 7), before);
+        let mut text = std::fs::read_to_string(&journal).unwrap();
+        text.push_str(
+            "{\"type\":\"result\",\"key\":\"k3\",\"agentId\":\"a77e0000000000003\",\"result\":{}}\n",
+        );
+        std::fs::write(&journal, text).unwrap();
+        assert_ne!(
+            with_children(&source, 7),
+            before,
+            "only the journal changed: the lane went from running to done"
+        );
     }
 }

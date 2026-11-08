@@ -1,8 +1,9 @@
 //! Turning parsed entries into chat items.
 
 use agentparse::{
-    Agent, Entry, EntryKind, ErrorInfo, Hook, Media, Message, Origin, Part, ProcessAction, Role,
-    Session, TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus, Turn,
+    Agent, Asked, Entry, EntryKind, ErrorInfo, FileChange, Hook, Media, Message, Origin, Part,
+    ProcessAction, Role, Session, TodoItem, Tool, ToolCall, ToolOutput, ToolResult, ToolStatus,
+    Turn,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ const BOOKKEEPING: &[&str] = &[
     "pr-link",
     "queue-operation",
     "relocated",
+    "session-owner",
     "step-finish",
     "step-start",
     "SubAgentActivity",
@@ -85,11 +87,18 @@ struct Cx {
     newest_turn: Option<usize>,
     /// See `Options::alive_since`.
     since: Option<i64>,
+    /// See `Options::spawn_ended`.
+    spawn_ended: Option<i64>,
     /// The subagents spawned so far, by their name and by their child id: (name, child id).
     agents: HashMap<String, (Option<String>, String)>,
     /// Rows may link a child session: the daemon opens Claude's at any depth (one directory per
     /// top session) and the other products' only from a top session.
     links: bool,
+    /// Teammates that sent a message since their last idle ping (see
+    /// [`text::teammate_messages`]).
+    // ponytail: a window that starts between a report and its ping shows the ping's result
+    // once; a wider window hides it. Rare, and only moves older seqs by one.
+    spoke: HashSet<String>,
 }
 
 /// Every item of the session, oldest first, each numbered by its distance from the end of
@@ -99,6 +108,7 @@ struct Cx {
 pub(crate) fn project(
     session: &Session,
     alive_since: Option<i64>,
+    spawn_ended: Option<i64>,
 ) -> (Vec<Item>, HashMap<u32, Spawn>) {
     let mut cx = Cx {
         agent: session.agent,
@@ -117,12 +127,28 @@ pub(crate) fn project(
             .iter()
             .rposition(|e| matches!(e.kind, EntryKind::Turn(_))),
         since: alive_since,
+        spawn_ended,
         agents: HashMap::new(),
         links: session.agent == Agent::Claude || session.parent.is_none(),
+        spoke: HashSet::new(),
     };
     let mut out = Vec::new();
-    for (at, entry) in session.entries.iter().enumerate() {
-        entry_items(entry, at, &mut cx, &mut out);
+    for entry in &session.entries {
+        entry_items(entry, &mut cx, &mut out);
+    }
+    // Said last: it is about now, not about when the turn ended.
+    if let Some(at) = cx.newest_turn {
+        let entry = &session.entries[at];
+        let rolled_back = entry
+            .id
+            .as_ref()
+            .is_some_and(|id| cx.rolled_back.contains(id));
+        if let EntryKind::Turn(t) = &entry.kind
+            && !rolled_back
+            && !before(entry.ts, cx.since)
+        {
+            out.extend(background_notice(t, entry.ts, session));
+        }
     }
     let last = out.len().saturating_sub(1);
     for (i, item) in out.iter_mut().enumerate() {
@@ -144,7 +170,7 @@ fn seq_of(last: usize, index: usize) -> u32 {
     u32::try_from(last - index).unwrap_or(u32::MAX)
 }
 
-fn entry_items(entry: &Entry, at: usize, cx: &mut Cx, out: &mut Vec<Item>) {
+fn entry_items(entry: &Entry, cx: &mut Cx, out: &mut Vec<Item>) {
     let ts = entry.ts;
     // What a rewind rolled back is no longer part of the conversation.
     if entry
@@ -167,12 +193,7 @@ fn entry_items(entry: &Entry, at: usize, cx: &mut Cx, out: &mut Vec<Item>) {
             seq: 0,
             text: text::text(&error_text(e)),
         }),
-        EntryKind::Turn(t) => {
-            turn_item(t.status.as_deref(), t.error.as_deref(), out);
-            if cx.newest_turn == Some(at) && !before(ts, cx.since) {
-                out.extend(background_notice(t));
-            }
-        }
+        EntryKind::Turn(t) => turn_item(t.status.as_deref(), t.error.as_deref(), out),
         // A record with no text and no kind says nothing (Gemini writes an empty `info` for a
         // compression); the level names the kind where the record has none.
         EntryKind::Notice(n) if n.text.trim().is_empty() && n.kind.is_none() => {}
@@ -208,11 +229,33 @@ fn own_text(data: &serde_json::Value) -> Option<String> {
         .find(|s| !s.is_empty())
 }
 
-/// The one quiet row that says background work is still going: from the newest turn record,
-/// and only while it counts any.
-fn background_notice(turn: &Turn) -> Option<Item> {
+/// The one quiet row that says background work is still going: what the newest turn record
+/// (written at `at`) counts, less the agents and workflows whose call ended after it (their
+/// finish notifications came later), and only while any is left.
+// ponytail: a call that started before the parsed window is not seen ending, so a deep tail can
+// still count it; reading the whole file is the upgrade if that shows.
+fn background_notice(turn: &Turn, at: Option<i64>, session: &Session) -> Option<Item> {
+    let ended = |workflow: bool| {
+        let calls = session.messages().flat_map(|m| &m.parts);
+        let ended = calls.filter(|p| {
+            let Part::ToolCall(c) = p else { return false };
+            // A launch the record could count: started by then, ended after it. Sends and waits
+            // are Task calls too, and launch nothing.
+            let launch = if workflow {
+                c.name == "Workflow" && matches!(c.tool, Tool::Task { .. })
+            } else {
+                is_spawn(c, session.agent)
+            };
+            launch
+                && matches!((c.started_at, c.ended_at, at),
+                    (Some(start), Some(end), Some(at)) if start <= at && end > at)
+        });
+        u32::try_from(ended.count()).unwrap_or(u32::MAX)
+    };
     let count = |n: Option<u32>, what: &str| {
-        let n = n.filter(|n| *n > 0)?;
+        let n = n
+            .map(|n| n.saturating_sub(ended(what == "workflow")))
+            .filter(|n| *n > 0)?;
         Some(format!(
             "{n} background {what}{}",
             if n == 1 { "" } else { "s" }
@@ -407,6 +450,7 @@ fn notice(kind: &str, body: &str) -> Item {
         seq: 0,
         kind: text::summary(kind),
         text: text::text(&body),
+        from: None,
     }
 }
 
@@ -445,7 +489,7 @@ fn message_items(m: &Message, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>)
     }
     thinking.flush(out);
     if !user_text.is_empty() || !chips.is_empty() {
-        push_user_side(m, ts, &user_text.join("\n\n"), chips, out);
+        push_user_side(m, ts, &user_text.join("\n\n"), chips, &mut cx.spoke, out);
     }
 }
 
@@ -500,7 +544,7 @@ fn push_agent(m: &Message, ts: Option<i64>, body: &str, out: &mut Vec<Item>) {
         out.push(Item::Agent {
             seq: 0,
             ts,
-            text: text::text(body),
+            text: text::message(body),
             model: m.model.as_deref().map(text::summary),
         });
     }
@@ -508,7 +552,14 @@ fn push_agent(m: &Message, ts: Option<i64>, body: &str, out: &mut Vec<Item>) {
 
 /// Text on the user's side of the line: what a human typed, a slash command, or what the
 /// harness handed the agent as input (command output, notifications, summaries).
-fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, out: &mut Vec<Item>) {
+fn push_user_side(
+    m: &Message,
+    ts: Option<i64>,
+    body: &str,
+    chips: Vec<Chip>,
+    spoke: &mut HashSet<String>,
+    out: &mut Vec<Item>,
+) {
     let kind = m.kind.as_deref().unwrap_or("");
     let shown = match (m.origin, kind) {
         (Origin::Command, "local-command-stdout") => {
@@ -525,39 +576,42 @@ fn push_user_side(m: &Message, ts: Option<i64>, body: &str, chips: Vec<Chip>, ou
             return push_notice_text(what, &text::notification_text(body), out);
         }
         (Origin::Summary, _) => return push_notice_text("summary", body, out),
-        (Origin::Agent, _) => return push_agent_message(body, out),
+        (Origin::Agent, _) => return push_agent_message(m, body, spoke, out),
         (_, _) => return push_notice_text("agent message", body, out),
     };
     if !shown.is_empty() || !chips.is_empty() {
         out.push(Item::User {
             seq: 0,
             ts,
-            text: text::text(&shown),
+            text: text::message(&shown),
             attachments: chips,
             queued: m.phase.as_deref() == Some("queued"),
         });
     }
 }
 
-/// What another agent sent: one line per message, `<sender>: <first line of the payload>`, and
-/// nothing for a message with no payload. A Claude teammate block (a team's protocol ping
-/// included) is read by [`text::teammate_messages`], a Codex one by [`text::agent_message`].
-/// Text in neither shape stays as it came.
-fn push_agent_message(body: &str, out: &mut Vec<Item>) {
-    let said = match text::teammate_messages(body) {
-        Some(said) => said,
+/// What another agent sent: one notice per message, `<sender>: <payload>` (the whole payload, so
+/// a report keeps its lines after the first), with the sender in `from` too, and nothing for a
+/// message with no payload. A Claude teammate block (a team's protocol ping included) is read by
+/// [`text::teammate_messages`], a Codex or Claude agent message by [`text::agent_message`]. The
+/// record's author names the sender of an agent message (Claude lifts `origin.name` into it),
+/// never of teammate blocks: one record holds blocks from several senders, and it names only the
+/// first. Text in neither shape stays as it came, with no sender.
+fn push_agent_message(m: &Message, body: &str, spoke: &mut HashSet<String>, out: &mut Vec<Item>) {
+    let (said, author) = match text::teammate_messages(body, spoke) {
+        Some(said) => (said, None),
         None => match text::agent_message(body) {
-            Some(one) => vec![one],
+            Some(one) => (vec![one], m.author.as_deref()),
             None => return push_notice_text("agent message", body, out),
         },
     };
     for (sender, payload) in said.iter().filter(|(_, p)| !p.is_empty()) {
-        let line = format!(
-            "{}: {}",
-            text::short(sender, 60),
-            text::first_line(payload, 120)
-        );
-        out.push(notice("agent message", &line));
+        let sender = text::short(author.unwrap_or(sender), 60);
+        let mut item = notice("agent message", &format!("{sender}: {payload}"));
+        if let Item::Notice { from, .. } = &mut item {
+            *from = Some(sender);
+        }
+        out.push(item);
     }
 }
 
@@ -705,21 +759,39 @@ fn push_call(call: &ToolCall, ts: Option<i64>, cx: &mut Cx, out: &mut Vec<Item>)
         let verb = verb_of(call, cx.agent);
         let spawn = Spawn::of(call, cx.agent);
         let (name, child) = agent_of(call, spawn.as_ref(), name, agent_type, cx);
-        if let Some(spawn) = spawn {
+        // A workflow's lanes are read from its run's journal, found by its run id.
+        let workflow = Spawn::run(call);
+        let run = workflow.as_ref().map(|w| w.child().to_string());
+        // A call that named a child or a run started one, so a later failure is not why it could not start.
+        let launched = spawn.is_some() || workflow.is_some();
+        if let Some(spawn) = spawn.or(workflow) {
             cx.spawns.push((out.len(), spawn));
         }
+        let status = live_status(call, ts, cx.since, cx.spawn_ended);
+        let error = (status == Status::Failed && !launched)
+            .then(|| text::summary(&output_text(call)))
+            .filter(|e| !e.is_empty());
         out.push(Item::Subagent {
             seq: 0,
             summary: text::summary(&format!("{verb}{what}")),
             steps: 0,
-            status: live_status(call, ts, cx.since),
+            status,
             act: act_of(verb).map(String::from),
             name: name.map(|n| text::short(&n, 60)),
             child: child.filter(|_| cx.links),
+            id: Some(item_id(&call.id)),
+            has_detail: !input_text(call).is_empty() || !output_text(call).is_empty(),
+            error,
+            run,
+            lanes: Vec::new(),
         });
         return;
     }
-    out.extend(rows(call).iter().map(|row| tool_item(row, ts, cx.since)));
+    out.extend(
+        rows(call)
+            .iter()
+            .map(|row| tool_item(row, ts, cx.since, cx.spawn_ended)),
+    );
 }
 
 /// A call that starts a subagent (its child session has the steps).
@@ -854,7 +926,12 @@ pub(crate) fn rows(call: &ToolCall) -> Vec<Row<'_>> {
     rows
 }
 
-fn tool_item(row: &Row, entry_ts: Option<i64>, since: Option<i64>) -> Item {
+fn tool_item(
+    row: &Row,
+    entry_ts: Option<i64>,
+    since: Option<i64>,
+    spawn_ended: Option<i64>,
+) -> Item {
     let call = row.call;
     let shell = call.output.as_ref().and_then(|o| o.shell.as_ref());
     let output = output_text(call);
@@ -863,7 +940,7 @@ fn tool_item(row: &Row, entry_ts: Option<i64>, since: Option<i64>) -> Item {
         id: row.id.clone(),
         name: tool_name(call, row.child),
         summary: summary(call),
-        status: live_status(call, entry_ts, since),
+        status: live_status(call, entry_ts, since, spawn_ended),
         exit_code: shell.and_then(|s| s.exit_code),
         duration_ms: shell.and_then(|s| s.duration_ms).or_else(|| elapsed(call)),
         ts: call.started_at,
@@ -873,7 +950,60 @@ fn tool_item(row: &Row, entry_ts: Option<i64>, since: Option<i64>) -> Item {
             .output
             .as_ref()
             .map_or_else(Vec::new, |o| chips(&o.attachments)),
+        kind: Some(tool_kind(&call.tool).into()),
+        label: label(call),
+        adds: lines(call, |f| f.additions),
+        dels: lines(call, |f| f.deletions),
     }
+}
+
+/// The parser's own name for the kind of a call, the tag its JSON carries.
+fn tool_kind(tool: &Tool) -> &'static str {
+    match tool {
+        Tool::Shell(_) => "shell",
+        Tool::Process { .. } => "process",
+        Tool::Read { .. } => "read",
+        Tool::Write { .. } => "write",
+        Tool::Edit { .. } => "edit",
+        Tool::Patch { .. } => "patch",
+        Tool::Search { .. } => "search",
+        Tool::Glob { .. } => "glob",
+        Tool::List { .. } => "list",
+        Tool::WebFetch { .. } => "web_fetch",
+        Tool::WebSearch { .. } => "web_search",
+        Tool::Todo { .. } => "todo",
+        Tool::Task { .. } => "task",
+        Tool::Mcp { .. } => "mcp",
+        Tool::Code { .. } => "code",
+        Tool::Question { .. } => "question",
+        Tool::Plan => "plan",
+        Tool::Skill { .. } => "skill",
+        Tool::Other => "other",
+    }
+}
+
+/// The agent's own words for a row: a command's description, a question's answer, or what the
+/// user did instead of answering.
+fn label(call: &ToolCall) -> Option<String> {
+    let said = match &call.tool {
+        Tool::Shell(s) => s.description.clone(),
+        Tool::Question { declined: true, .. } => Some(DECLINED.into()),
+        Tool::Question { .. } if call.status_detail.as_deref() == Some("clarify") => {
+            Some(CLARIFY.into())
+        }
+        Tool::Question { .. } => question(call).1,
+        _ => None,
+    };
+    said.map(|s| text::summary(&s)).filter(|s| !s.is_empty())
+}
+
+const DECLINED: &str = "Declined";
+const CLARIFY: &str = "Asked to clarify";
+
+/// Lines the call's file changes added (or removed), summed; `None` when none records a count.
+fn lines(call: &ToolCall, count: fn(&FileChange) -> Option<u64>) -> Option<u64> {
+    let files = call.output.iter().flat_map(|o| &o.files);
+    files.filter_map(count).reduce(u64::saturating_add)
 }
 
 /// A call made inside a code cell is named by what it is (`shell`, `process`, `patch`); the
@@ -920,6 +1050,10 @@ fn orphan(result: &ToolResult) -> Option<Item> {
         output_bytes: output.len() as u64,
         has_detail: !output.is_empty(),
         attachments: chips(&result.output.attachments),
+        kind: None,
+        label: None,
+        adds: None,
+        dels: None,
     })
 }
 
@@ -1026,6 +1160,12 @@ fn push_line(out: &mut String, piece: &str) {
 /// What was asked: the command, the process action, the script, the patch, the file written,
 /// an edit's old and new text (each cut short), else the call's arguments.
 pub(crate) fn input_text(call: &ToolCall) -> String {
+    // The diff the result recorded says more than an edit's old and new text.
+    if matches!(call.tool, Tool::Write { .. } | Tool::Edit { .. })
+        && let Some(diff) = diff_of(call)
+    {
+        return diff;
+    }
     match &call.tool {
         Tool::Shell(s) => s.command.clone(),
         Tool::Process { input, .. } => match input.as_deref().filter(|i| !i.is_empty()) {
@@ -1043,6 +1183,24 @@ pub(crate) fn input_text(call: &ToolCall) -> String {
                 text::preview(&e.new, EDIT_PREVIEW)
             )
         }),
+        Tool::Question { questions, .. } if !questions.is_empty() => {
+            let mut blocks: Vec<String> = questions.iter().map(asked).collect();
+            blocks.extend(label(call).filter(|l| l == DECLINED || l == CLARIFY));
+            blocks.join("\n\n")
+        }
+        Tool::Plan if call.input.get("plan").is_some_and(|p| p.is_string()) => {
+            call.input["plan"].as_str().unwrap_or_default().to_string()
+        }
+        // What the subagent was asked; its report is the output. A call that asks nothing (a
+        // workflow, a Codex wait) shows its input.
+        Tool::Task {
+            prompt,
+            description,
+            ..
+        } if prompt.is_some() || description.is_some() => prompt
+            .clone()
+            .or_else(|| description.clone())
+            .unwrap_or_default(),
         _ if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => patched_files(call),
         _ => match &call.input {
             serde_json::Value::String(s) => s.clone(),
@@ -1050,6 +1208,28 @@ pub(crate) fn input_text(call: &ToolCall) -> String {
             other => serde_json::to_string_pretty(other).unwrap_or_default(),
         },
     }
+}
+
+/// The unified diffs the result recorded for the call's files, when it has any.
+fn diff_of(call: &ToolCall) -> Option<String> {
+    let files = call.output.iter().flat_map(|o| &o.files);
+    let diffs: Vec<&str> = files
+        .filter_map(|f| f.diff.as_deref())
+        .filter(|d| !d.trim().is_empty())
+        .collect();
+    (!diffs.is_empty()).then(|| diffs.join("\n"))
+}
+
+/// One question as text: its header, the question, the options one per line, and the answer.
+fn asked(q: &Asked) -> String {
+    let mut lines: Vec<String> = q.header.iter().cloned().collect();
+    lines.push(q.question.clone());
+    lines.extend(q.options.iter().map(|o| match &o.description {
+        Some(d) => format!("- {}: {d}", o.label),
+        None => format!("- {}", o.label),
+    }));
+    lines.extend(q.answer.as_ref().map(|a| format!("Answer: {a}")));
+    lines.join("\n")
 }
 
 /// Characters of an edit's old and of its new text that `detail` shows.
@@ -1063,9 +1243,26 @@ fn before(at: Option<i64>, since: Option<i64>) -> bool {
 /// [`status`], except that a call still running which began before the agent process that now
 /// runs the session started was left behind by one that is gone: it is `interrupted`. The call's
 /// own start counts, else the time of the message that made it.
-fn live_status(call: &ToolCall, entry_ts: Option<i64>, since: Option<i64>) -> Status {
+fn live_status(
+    call: &ToolCall,
+    entry_ts: Option<i64>,
+    since: Option<i64>,
+    spawn_ended: Option<i64>,
+) -> Status {
+    let at = call.started_at.or(entry_ts);
+    // See `Options::spawn_ended`: a call with no time counts as before the end.
+    let ended = spawn_ended.is_some_and(|end| at.is_none_or(|at| at <= end));
     match status(call) {
-        Status::Running if before(call.started_at.or(entry_ts), since) => Status::Interrupted,
+        Status::Running if before(at, since) => Status::Interrupted,
+        Status::Running if ended && call.output.is_some() => Status::Ok,
+        Status::Running if ended => Status::Interrupted,
+        // A Claude teammate that went idle waits for its next message (agentparse AP-2).
+        Status::Running
+            if call.status == ToolStatus::Pending
+                && call.status_detail.as_deref() == Some("idle") =>
+        {
+            Status::Idle
+        }
         status => status,
     }
 }
@@ -1119,7 +1316,7 @@ fn summary_raw(call: &ToolCall) -> String {
         Tool::List { path: p } => path(p),
         Tool::WebFetch { url, .. } => path(url),
         Tool::WebSearch { query } => path(query),
-        Tool::Todo { items } => todo_line(items),
+        Tool::Todo { items } => todo_line(&call.name, items),
         Tool::Mcp { server, tool } => format!("{server}.{tool}"),
         // A cell that recorded no calls: the first line of its program, short.
         Tool::Code { source } => text::first_line(source, CODE_SUMMARY),
@@ -1127,7 +1324,7 @@ fn summary_raw(call: &ToolCall) -> String {
         Tool::Other if call.output.as_ref().is_some_and(|o| !o.files.is_empty()) => {
             patched_files(call)
         }
-        Tool::Question => question_line(call),
+        Tool::Question { .. } => question(call).0,
         Tool::Plan => plan_line(call),
         Tool::Other => first_field(&call.input, OTHER_FIELDS),
         Tool::Task { .. } => String::new(),
@@ -1154,25 +1351,28 @@ fn first_field(input: &serde_json::Value, keys: &[&str]) -> String {
         .to_string()
 }
 
-/// The first question asked, and the answer the result gives to it (`User has answered your
-/// questions: "<question>"="<answer>"`) once there is one.
-fn question_line(call: &ToolCall) -> String {
+/// The first question asked (the row's summary) and its answer (the row's label) once there is
+/// one: the typed ones, else read off the input and the result's `"<question>"="<answer>"` text
+/// (an agent whose question the parser does not type).
+fn question(call: &ToolCall) -> (String, Option<String>) {
+    if let Tool::Question { questions, .. } = &call.tool
+        && let Some(q) = questions.first()
+    {
+        return (q.question.trim().to_string(), q.answer.clone());
+    }
     let asked = call.input.pointer("/questions/0/question");
     let asked = asked.or_else(|| call.input.get("question"));
     let Some(question) = asked.and_then(|q| q.as_str()).map(str::trim) else {
-        return String::new();
+        return (String::new(), None);
     };
     let answer = call
         .output
         .as_ref()
         .and_then(|o| o.text.split_once(&format!("\"{question}\"=\"")))
         .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(answer, _)| answer.trim())
+        .map(|(answer, _)| answer.trim().to_string())
         .filter(|a| !a.is_empty());
-    match answer {
-        Some(answer) => format!("{question} {answer}"),
-        None => question.to_string(),
-    }
+    (question.to_string(), answer)
 }
 
 /// The title of the plan put up for approval: its first heading, else its first line.
@@ -1191,11 +1391,25 @@ fn plan_line(call: &ToolCall) -> String {
     })
 }
 
-/// `2 of 5 done: <the item in progress>`; the item's own text for a list of one with no state
-/// (a created task), the count for a list that keeps no state at all.
-fn todo_line(items: &[TodoItem]) -> String {
+/// What a Claude task call changed (`Added: <task>`, `Done: <task>`, `Started: <task>`), else
+/// `2 of 5 done: <the item in progress>`; the item's own text for a list of one with no state,
+/// the count for a list that keeps no state at all.
+fn todo_line(name: &str, items: &[TodoItem]) -> String {
     fn state(item: &TodoItem) -> &str {
         item.status.as_deref().unwrap_or("")
+    }
+    if let [one] = items {
+        let did = match (name, state(one)) {
+            ("TaskCreate", _) => Some("Added"),
+            ("TaskUpdate", "completed" | "done") => Some("Done"),
+            ("TaskUpdate", "in_progress") => Some("Started"),
+            ("TaskUpdate", "deleted") => Some("Removed"),
+            ("TaskUpdate", _) => Some("Updated"),
+            _ => None,
+        };
+        if let Some(did) = did {
+            return format!("{did}: {}", one.content);
+        }
     }
     if items.iter().all(|i| state(i).is_empty()) {
         return match items {
@@ -1293,7 +1507,7 @@ mod tests {
         let from_result = text.len() - (text[..at].rfind('\n').unwrap() + 1);
         let session = agentparse::parse_file_tail(&path, from_result as u64).unwrap();
         assert!(!session.warnings.is_empty(), "the parser counts it");
-        let rows = project(&session, None).0;
+        let rows = project(&session, None, None).0;
         let Item::Tool {
             id,
             name,
@@ -1708,7 +1922,7 @@ mod tests {
     }
 
     fn rows_of(session: &Session) -> Vec<Item> {
-        project(session, None).0
+        project(session, None, None).0
     }
 
     fn notices(items: &[Item]) -> Vec<(&str, &str)> {
@@ -1840,7 +2054,7 @@ mod tests {
         let statuses = |since: Option<i64>, calls: Vec<ToolCall>, ts: Option<i64>| {
             let mut s = session(Agent::Claude, calls.into_iter().map(call_message).collect());
             s.entries.iter_mut().for_each(|e| e.ts = ts);
-            project(&s, since)
+            project(&s, since, None)
                 .0
                 .iter()
                 .map(|i| match i {
@@ -1882,7 +2096,7 @@ mod tests {
         let at = |since: Option<i64>, ts: i64| {
             let mut s = session(Agent::Claude, vec![turn(Some(2), None)]);
             s.entries[0].ts = Some(ts);
-            notices(&project(&s, since).0).len()
+            notices(&project(&s, since, None).0).len()
         };
         assert_eq!(at(Some(2000), 1000), 0, "a turn from before it started");
         assert_eq!(at(Some(2000), 3000), 1);
@@ -2125,14 +2339,17 @@ mod tests {
     }
 
     #[test]
-    fn a_question_row_says_what_was_asked_and_the_answer_once_there_is_one() {
+    fn a_question_row_says_what_was_asked_and_labels_the_answer_once_there_is_one() {
         let input = serde_json::json!({"questions": [
             {"question": "Which database?", "options": []},
             {"question": "Which cache?"}
         ]});
         let asked = call(
             "AskUserQuestion",
-            Tool::Question,
+            Tool::Question {
+                questions: Vec::new(),
+                declined: false,
+            },
             input,
             ToolStatus::Pending,
         );
@@ -2141,7 +2358,9 @@ mod tests {
             asked,
             "User has answered your questions: \"Which database?\"=\"Postgres\", \"Which cache?\"=\"None\". You can now continue.",
         );
-        assert_eq!(summary_of(answered), "Which database? Postgres");
+        // No typed fields (a Gemini or OpenCode question): read off the input and the text.
+        assert_eq!(summary_of(answered.clone()), "Which database?");
+        assert!(matches!(tool_row(answered), Item::Tool { label: Some(l), .. } if l == "Postgres"));
     }
 
     #[test]
@@ -2170,10 +2389,16 @@ mod tests {
             item("fix chat", Some("in_progress")),
             item("ship", Some("pending")),
         ];
-        assert_eq!(todo_line(&items), "1 of 3 done: fix chat");
-        assert_eq!(todo_line(&items[..1]), "1 of 1 done");
-        assert_eq!(todo_line(&[item("only one", None)]), "only one");
-        assert_eq!(todo_line(&[item("a", None), item("b", None)]), "2 items");
+        assert_eq!(todo_line("TodoWrite", &items), "1 of 3 done: fix chat");
+        assert_eq!(todo_line("TodoWrite", &items[..1]), "1 of 1 done");
+        assert_eq!(
+            todo_line("TodoWrite", &[item("only one", None)]),
+            "only one"
+        );
+        assert_eq!(
+            todo_line("TodoWrite", &[item("a", None), item("b", None)]),
+            "2 items"
+        );
         assert_eq!(checklist(&items), "[x] write test\n[~] fix chat\n[ ] ship");
         let c = call(
             "TodoWrite",
@@ -2298,12 +2523,16 @@ mod tests {
             ToolStatus::Pending,
         );
         c.child_session = Some("agent7".into());
-        let items = project(&session(Agent::Gemini, vec![call_message(c.clone())]), None);
+        let items = project(
+            &session(Agent::Gemini, vec![call_message(c.clone())]),
+            None,
+            None,
+        );
         assert!(
             matches!(&items.0[0], Item::Subagent { summary, .. } if summary == "spawned: Map the repo")
         );
         assert_eq!(items.1.len(), 1, "its child is looked up for the steps");
-        let claude = project(&session(Agent::Claude, vec![call_message(c)]), None);
+        let claude = project(&session(Agent::Claude, vec![call_message(c)]), None, None);
         assert!(
             matches!(&claude.0[0], Item::Subagent { summary, .. } if summary == "Map the repo")
         );
@@ -2395,5 +2624,490 @@ mod tests {
             gemini.iter().all(|(_, _, child)| child.is_none()),
             "{gemini:?}"
         );
+    }
+
+    #[test]
+    fn a_ping_in_the_record_after_its_senders_message_is_not_a_second_row() {
+        let from = |body: &str| EntryKind::Message(message(Role::User, Origin::Agent, None, body));
+        let items = rows_of(&session(
+            Agent::Claude,
+            vec![
+                from(
+                    "<teammate-message teammate_id=\"a\" summary=\"Review A: 7/10\">\nb\n</teammate-message>",
+                ),
+                from(
+                    "<teammate-message teammate_id=\"a\">\n{\"type\":\"idle_notification\",\"result\":\"Review is done: 7/10\"}\n</teammate-message>",
+                ),
+                from(
+                    "<teammate-message teammate_id=\"a\">\n{\"type\":\"idle_notification\",\"result\":\"Rebased, waiting\"}\n</teammate-message>",
+                ),
+            ],
+        ));
+        assert_eq!(
+            notices(&items),
+            [
+                ("agent message", "a: Review A: 7/10\nb"),
+                ("agent message", "a: Rebased, waiting")
+            ]
+        );
+    }
+
+    // QP-2: rows carry what the parser knows.
+
+    fn task(description: &str, prompt: Option<&str>, agent_type: Option<&str>) -> Tool {
+        Tool::Task {
+            description: Some(description.into()),
+            prompt: prompt.map(String::from),
+            agent_type: agent_type.map(String::from),
+            name: None,
+        }
+    }
+
+    fn tool_row(c: ToolCall) -> Item {
+        rows_of(&session(Agent::Claude, vec![call_message(c)])).remove(0)
+    }
+
+    #[test]
+    fn the_session_owner_record_is_bookkeeping() {
+        let items = rows_of(&session(
+            Agent::Claude,
+            vec![other("session-owner", serde_json::json!({"owner": "x"}))],
+        ));
+        assert_eq!(notices(&items), []);
+    }
+
+    #[test]
+    fn a_plan_and_a_question_open_as_text_not_json() {
+        let plan = call(
+            "ExitPlanMode",
+            Tool::Plan,
+            serde_json::json!({"plan": "# Fix the chat\n\n- step one"}),
+            ToolStatus::Ok,
+        );
+        assert_eq!(input_text(&plan), "# Fix the chat\n\n- step one");
+        let asked = |q: &str, answer: Option<&str>| agentparse::Asked {
+            header: Some(format!("H {q}")),
+            question: q.into(),
+            options: vec![
+                agentparse::AskedOption {
+                    label: "Yes".into(),
+                    description: Some("do it".into()),
+                },
+                agentparse::AskedOption {
+                    label: "No".into(),
+                    description: None,
+                },
+            ],
+            answer: answer.map(String::from),
+        };
+        let three = call(
+            "AskUserQuestion",
+            Tool::Question {
+                questions: vec![
+                    asked("Ship?", Some("Yes")),
+                    asked("Tag?", Some("No")),
+                    asked("Tweet?", None),
+                ],
+                declined: false,
+            },
+            serde_json::json!({"questions": []}),
+            ToolStatus::Ok,
+        );
+        assert_eq!(
+            input_text(&three),
+            "H Ship?\nShip?\n- Yes: do it\n- No\nAnswer: Yes\n\n\
+             H Tag?\nTag?\n- Yes: do it\n- No\nAnswer: No\n\n\
+             H Tweet?\nTweet?\n- Yes: do it\n- No"
+        );
+        let Item::Tool {
+            kind,
+            summary,
+            label,
+            ..
+        } = tool_row(three)
+        else {
+            panic!("a tool row")
+        };
+        assert_eq!(
+            (kind.as_deref(), summary.as_str(), label.as_deref()),
+            (Some("question"), "Ship?", Some("Yes"))
+        );
+        let declined = call(
+            "AskUserQuestion",
+            Tool::Question {
+                questions: vec![asked("Ship?", None)],
+                declined: true,
+            },
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        assert!(input_text(&declined).ends_with("\n\nDeclined"));
+        assert!(matches!(tool_row(declined), Item::Tool { label: Some(l), .. } if l == "Declined"));
+    }
+
+    #[test]
+    fn a_task_row_says_what_changed() {
+        let todo = |name: &str, content: &str, status: Option<&str>| {
+            let items = vec![TodoItem {
+                content: content.into(),
+                status: status.map(String::from),
+                priority: None,
+            }];
+            summary_of(call(
+                name,
+                Tool::Todo { items },
+                serde_json::Value::Null,
+                ToolStatus::Ok,
+            ))
+        };
+        assert_eq!(
+            todo("TaskUpdate", "Write tests", Some("completed")),
+            "Done: Write tests"
+        );
+        assert_eq!(
+            todo("TaskUpdate", "Write tests", Some("in_progress")),
+            "Started: Write tests"
+        );
+        assert_eq!(
+            todo("TaskCreate", "Write tests", Some("pending")),
+            "Added: Write tests"
+        );
+    }
+
+    #[test]
+    fn agents_that_reported_after_the_turn_are_not_still_running() {
+        let spawn = |n: u32, ended: Option<i64>| {
+            let mut c = with_text(
+                call(
+                    "Agent",
+                    task("x", None, None),
+                    serde_json::Value::Null,
+                    ToolStatus::Ok,
+                ),
+                "report",
+            );
+            c.id = format!("id-{n}");
+            c.started_at = Some(500);
+            c.ended_at = ended;
+            call_message(c)
+        };
+        let at = |ended: [Option<i64>; 3]| {
+            let mut s = session(
+                Agent::Claude,
+                vec![
+                    spawn(1, ended[0]),
+                    spawn(2, ended[1]),
+                    spawn(3, ended[2]),
+                    turn(Some(3), None),
+                    EntryKind::Message(message(
+                        Role::User,
+                        Origin::Notification,
+                        Some("task-notification"),
+                        "<task-notification><status>completed</status></task-notification>",
+                    )),
+                ],
+            );
+            s.entries[3].ts = Some(1_000);
+            rows_of(&s)
+        };
+        let after = Some(2_000);
+        assert_eq!(
+            notices(&at([after, after, after]))
+                .iter()
+                .filter(|(k, _)| *k == "background")
+                .count(),
+            0,
+            "all three reported after the turn"
+        );
+        let one_left = at([after, after, None]);
+        assert!(
+            matches!(one_left.last(), Some(Item::Notice { kind, text, .. })
+                if kind == "background" && text == "1 background agent still running"),
+            "{one_left:?}"
+        );
+    }
+
+    #[test]
+    fn only_spawns_running_at_the_turn_record_lower_its_count() {
+        // One background agent still runs at the turn record (ts 1000). A foreground Agent the
+        // next turn starts, and a message sent before the record and answered after it, both
+        // end after the record; neither is an agent the record counted.
+        let later = |name: &str, started: i64| {
+            let mut c = with_text(
+                call(
+                    name,
+                    task("x", None, None),
+                    serde_json::Value::Null,
+                    ToolStatus::Ok,
+                ),
+                "report",
+            );
+            c.started_at = Some(started);
+            c.ended_at = Some(2_000);
+            call_message(c)
+        };
+        for (what, extra) in [
+            ("a foreground spawn after the turn", later("Agent", 1_500)),
+            (
+                "a message answered after the turn",
+                later("SendMessage", 900),
+            ),
+        ] {
+            let mut background = call(
+                "Agent",
+                task("bg", None, None),
+                serde_json::Value::Null,
+                ToolStatus::Pending,
+            );
+            background.id = "id-bg".into();
+            background.started_at = Some(500);
+            let mut s = session(
+                Agent::Claude,
+                vec![
+                    call_message(background),
+                    turn(Some(1), None),
+                    EntryKind::Message(human("next")),
+                    extra,
+                ],
+            );
+            s.entries[1].ts = Some(1_000);
+            let items = rows_of(&s);
+            assert!(
+                matches!(items.last(), Some(Item::Notice { kind, text, .. })
+                    if kind == "background" && text == "1 background agent still running"),
+                "{what}: {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subagent_that_could_not_start_says_why() {
+        let c = with_text(
+            call(
+                "Agent",
+                task("Invalid agent type test", None, Some("no-such-agent-type")),
+                serde_json::Value::Null,
+                ToolStatus::Error,
+            ),
+            "Agent type 'no-such-agent-type' not found. Available agents: general-purpose, Explore",
+        );
+        let Item::Subagent { status, error, .. } = tool_row(c) else {
+            panic!("a subagent row")
+        };
+        assert_eq!(status, Status::Failed);
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "Agent type 'no-such-agent-type' not found. Available agents: general-purpose, Explore"
+            )
+        );
+    }
+
+    #[test]
+    fn a_subagent_that_started_and_then_failed_has_no_reason_it_could_not_start() {
+        // A background agent: the launch result names its child, a later notification failed it.
+        let mut c = with_text(
+            call(
+                "Agent",
+                task("Map the parser", None, None),
+                serde_json::Value::Null,
+                ToolStatus::Error,
+            ),
+            "Async agent launched successfully. agentId: a05f3c2d1",
+        );
+        c.child_session = Some("a05f3c2d1".into());
+        let Item::Subagent { status, error, .. } = tool_row(c) else {
+            panic!("a subagent row")
+        };
+        assert_eq!((status, error), (Status::Failed, None));
+    }
+
+    #[test]
+    fn a_tool_row_carries_its_kind_label_and_line_counts() {
+        let bash = call(
+            "Bash",
+            Tool::Shell(agentparse::Shell {
+                command: "git status --short".into(),
+                description: Some("Show working tree status".into()),
+                ..Default::default()
+            }),
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        let Item::Tool {
+            kind,
+            summary,
+            label,
+            ..
+        } = tool_row(with_text(bash, "M a.rs"))
+        else {
+            panic!("a tool row")
+        };
+        assert_eq!(
+            (kind.as_deref(), summary.as_str(), label.as_deref()),
+            (
+                Some("shell"),
+                "git status --short",
+                Some("Show working tree status")
+            )
+        );
+        let mut edit = call(
+            "Edit",
+            Tool::Edit {
+                path: "/w/a.rs".into(),
+                edits: vec![agentparse::TextEdit {
+                    old: "a".into(),
+                    new: "b".into(),
+                    replace_all: false,
+                }],
+            },
+            serde_json::Value::Null,
+            ToolStatus::Ok,
+        );
+        edit.output = Some(ToolOutput {
+            text: "updated".into(),
+            files: vec![agentparse::FileChange {
+                path: "/w/a.rs".into(),
+                op: agentparse::FileOp::Update,
+                move_to: None,
+                diff: Some("@@ -1,2 +1,4 @@\n-a\n+b\n+c\n+d\n e".into()),
+                additions: Some(3),
+                deletions: Some(1),
+            }],
+            ..ToolOutput::default()
+        });
+        assert!(input_text(&edit).starts_with("@@ -1,2 +1,4 @@\n-a\n+b"));
+        let Item::Tool {
+            kind, adds, dels, ..
+        } = tool_row(edit)
+        else {
+            panic!("a tool row")
+        };
+        assert_eq!(
+            (kind.as_deref(), adds, dels),
+            (Some("edit"), Some(3), Some(1))
+        );
+        // The kind is the tag the parser's own JSON carries.
+        for tool in [
+            Tool::WebFetch {
+                url: None,
+                prompt: None,
+            },
+            Tool::Plan,
+            Tool::Question {
+                questions: Vec::new(),
+                declined: false,
+            },
+            Tool::Other,
+        ] {
+            let tag = serde_json::to_value(&tool).unwrap()["kind"].clone();
+            assert_eq!(tag, tool_kind(&tool), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn an_agent_message_names_its_sender_once() {
+        let from_agent = |author: Option<&str>, body: &str| {
+            let mut m = message(Role::User, Origin::Agent, None, body);
+            m.author = author.map(String::from);
+            let items = rows_of(&session(Agent::Claude, vec![EntryKind::Message(m)]));
+            items
+                .into_iter()
+                .filter_map(|i| match i {
+                    Item::Notice { text, from, .. } => Some((text, from)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let o = |s: &str| Some(s.to_string());
+        assert_eq!(
+            from_agent(
+                Some("general-purpose"),
+                "<agent-message from=\"a5ea2808c35ea93f7\">5</agent-message>"
+            ),
+            [("general-purpose: 5".to_string(), o("general-purpose"))]
+        );
+        assert_eq!(
+            from_agent(None, "Context: do x"),
+            [("Context: do x".to_string(), None)]
+        );
+        // A teammate block names its own sender, never the record's author, and keeps its body
+        // after the summary line.
+        assert_eq!(
+            from_agent(
+                Some("lead"),
+                "<teammate-message teammate_id=\"web-perf\" summary=\"Perf done\">\nLCP 1.2 s\nCLS 0\n</teammate-message>"
+            ),
+            [(
+                "web-perf: Perf done\nLCP 1.2 s\nCLS 0".to_string(),
+                o("web-perf")
+            )]
+        );
+    }
+
+    #[test]
+    fn a_subagent_row_opens_its_prompt_and_report() {
+        let c = with_text(
+            call(
+                "Agent",
+                task("Survey", Some("Survey the tests and report"), None),
+                serde_json::Value::Null,
+                ToolStatus::Ok,
+            ),
+            "Report: 12 tests, 2 flaky",
+        );
+        assert_eq!(input_text(&c), "Survey the tests and report");
+        assert!(output_text(&c).starts_with("Report: 12 tests"));
+        let Item::Subagent { id, has_detail, .. } = tool_row(c) else {
+            panic!("a subagent row")
+        };
+        assert_eq!((id.as_deref(), has_detail), (Some("id-Agent"), true));
+    }
+
+    #[test]
+    fn a_task_call_with_no_prompt_opens_its_input() {
+        let wait = call(
+            "wait",
+            Tool::Task {
+                description: None,
+                prompt: None,
+                agent_type: None,
+                name: None,
+            },
+            serde_json::json!({"ids": ["agent-1"]}),
+            ToolStatus::Ok,
+        );
+        assert_eq!(
+            input_text(&wait),
+            "{\n  \"ids\": [\n    \"agent-1\"\n  ]\n}"
+        );
+    }
+
+    #[test]
+    fn a_workflow_row_has_its_run_and_no_child() {
+        let workflow = |run: &str| {
+            let mut c = call(
+                "Workflow",
+                task("Two read-only agents", None, Some("workflow")),
+                serde_json::Value::Null,
+                ToolStatus::Pending,
+            );
+            c.output = Some(ToolOutput {
+                text: "Workflow launched in background.".into(),
+                data: Some(serde_json::json!({"runId": run, "taskId": "wc5135q8d"})),
+                ..ToolOutput::default()
+            });
+            match tool_row(c) {
+                Item::Subagent {
+                    act, child, run, ..
+                } => (act, child, run),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            workflow("wf_af368794-257"),
+            (None, None, Some("wf_af368794-257".to_string()))
+        );
+        assert_eq!(workflow("../wf"), (None, None, None), "not a plain id");
     }
 }

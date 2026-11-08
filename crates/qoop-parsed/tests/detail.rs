@@ -138,3 +138,52 @@ fn detail_reads_gemini_and_opencode_calls() {
     assert_eq!(found.input, "bun test");
     assert!(matches!(detail(&source, "nope", 1), Err(Error::NotFound)));
 }
+
+#[test]
+fn a_subagent_row_opens_its_prompt_and_its_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&call_line(1, "toolu_agent", "x")).unwrap();
+    v["message"]["content"][0]["name"] = "Agent".into();
+    v["message"]["content"][0]["input"] = serde_json::json!({
+        "description": "Count README lines",
+        "prompt": "Count the lines of README.md and report the number.",
+        "subagent_type": "general-purpose",
+        "run_in_background": true,
+    });
+    let mut note: serde_json::Value = serde_json::from_str(&user_line(3, "x")).unwrap();
+    note["message"]["content"] = "<task-notification>\n<task-id>a5ea2808c35ea93f7</task-id>\n<tool-use-id>toolu_agent</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Count README lines\" finished</summary>\n<result>README.md has 5 lines.</result>\n</task-notification>".into();
+    note.as_object_mut().unwrap().remove("origin");
+    let source = write(
+        dir.path(),
+        "s.jsonl",
+        &[
+            line(v),
+            result_line(
+                2,
+                "toolu_agent",
+                "Async agent launched successfully.\nagentId: a5ea2808c35ea93f7 (internal ID - do not mention to user.)",
+            ),
+            line(note),
+        ],
+    );
+    let d = digest(&source);
+    let (id, has_detail) = d
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Subagent { id, has_detail, .. } => Some((id.clone(), *has_detail)),
+            _ => None,
+        })
+        .expect("a subagent row");
+    assert_eq!((id.as_deref(), has_detail), (Some("toolu_agent"), true));
+    let full = detail(&source, "toolu_agent", 64 * 1024).unwrap();
+    assert_eq!(
+        full.input,
+        "Count the lines of README.md and report the number."
+    );
+    assert!(
+        full.output.starts_with("README.md has 5 lines."),
+        "{}",
+        full.output
+    );
+}

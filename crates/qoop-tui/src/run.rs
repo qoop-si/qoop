@@ -28127,6 +28127,10 @@ mod tests {
             output_bytes: 4,
             has_detail: true,
             attachments: Vec::new(),
+            kind: None,
+            label: None,
+            adds: None,
+            dels: None,
         }
     }
 

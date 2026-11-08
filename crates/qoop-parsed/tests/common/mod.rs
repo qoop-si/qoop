@@ -44,7 +44,7 @@ pub fn line(value: Value) -> String {
     format!("{value}\n")
 }
 
-fn base(kind: &str, n: usize) -> Value {
+pub fn base(kind: &str, n: usize) -> Value {
     json!({
         "type": kind, "uuid": format!("u{n:05}"), "isSidechain": false, "sessionId": CLAUDE_ID,
         "timestamp": format!("2026-10-12T09:{:02}:{:02}.000Z", n / 60 % 60, n % 60),

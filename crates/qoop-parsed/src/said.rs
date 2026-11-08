@@ -169,20 +169,7 @@ fn norm(text: &str) -> String {
 /// The message less the blocks he pasted in (logs, documents, other people's words): what is
 /// left is what he said himself.
 fn unpasted(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("<pasted_content") {
-        out.push_str(&rest[..open]);
-        match rest[open..].find("</pasted_content>") {
-            Some(close) => rest = &rest[open + close + "</pasted_content>".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    crate::text::pastes(text, false)
 }
 
 #[cfg(test)]
@@ -296,5 +283,16 @@ mod tests {
             "cut "
         );
         assert_eq!(unpasted("plain words"), "plain words");
+    }
+
+    #[test]
+    fn every_paste_ends_at_its_own_closing_tag() {
+        // As Claude writes it: the closing tag carries the id too.
+        assert_eq!(
+            unpasted(
+                "a <pasted_content id=\"1\">x</pasted_content id=\"1\"> b <pasted_content id=\"2\">y</pasted_content id=\"2\"> c"
+            ),
+            "a  b  c"
+        );
     }
 }
