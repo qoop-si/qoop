@@ -281,6 +281,9 @@ pub struct AgentRegistry {
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
+    /// Rung by any terminal's traffic, typed or printed, for the probe platform: what is typed
+    /// is often a command about to start, which prints nothing once it runs.
+    io: tokio::sync::Notify,
     /// Each terminal's leader pid and its terminal, keyed like the process table, so a
     /// sleep can walk what the leader started.
     leaders: Mutex<HashMap<u32, (i32, u64)>>,
@@ -951,6 +954,7 @@ impl AgentRegistry {
             prompts: Mutex::new(BTreeMap::new()),
             stops: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
+            io: tokio::sync::Notify::new(),
             leaders: Mutex::new(HashMap::new()),
             closed: Mutex::new(BTreeSet::new()),
             expectations: Mutex::new(BTreeMap::new()),
@@ -1128,6 +1132,34 @@ impl AgentRegistry {
         if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
             agent.last_io_unix = Some(now_unix);
         }
+        self.io.notify_one();
+    }
+
+    /// Wait for any terminal's traffic since the last wait.
+    pub async fn io_seen(&self) {
+        self.io.notified().await;
+    }
+
+    /// The terminals whose foreground group is not the one last read: one ioctl each, for the
+    /// probe platform, which has no event to say which terminal moved. The ioctls run before
+    /// the lock is taken, so a hundred terminals never hold it for their reads.
+    pub fn moved(&self) -> Vec<u32> {
+        let masters: Vec<(u32, std::os::fd::RawFd)> = self
+            .masters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(stream, master)| (*stream, *master))
+            .collect();
+        let now: Vec<(u32, Option<Pid>)> = masters
+            .into_iter()
+            .map(|(stream, master)| (stream, qoop_pty::sys::foreground_leader(master)))
+            .collect();
+        let terminals = self.terminals.lock().unwrap();
+        now.into_iter()
+            .filter(|(stream, leader)| terminals.get(stream).is_some_and(|a| a.leader != *leader))
+            .map(|(stream, _)| stream)
+            .collect()
     }
 
     /// Record that a person typed into this terminal. The focus reports an interface sends

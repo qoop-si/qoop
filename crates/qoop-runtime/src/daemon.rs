@@ -1787,15 +1787,31 @@ impl Daemon {
                     settle_queue.mark(touched);
                 }
             } else {
-                let mut interval = qoop_pty::procwatch::PROBE_FAST;
+                use qoop_pty::procwatch::{PROBE_FAST, next_probe};
+                let mut interval = PROBE_FAST;
                 loop {
-                    tokio::time::sleep(interval).await;
-                    let touched = watched_agents.apply_events(crate::agents::now_unix());
+                    let due = tokio::time::Instant::now() + interval;
+                    tokio::select! {
+                        () = tokio::time::sleep_until(due) => {}
+                        // Traffic resets the interval to the fast end (ADR-009): a typed
+                        // command starts a moment after its echo and prints nothing then.
+                        // The look is pulled forward, never pushed back, so a terminal that
+                        // prints all the time cannot hold it off.
+                        () = watched_agents.io_seen() => {
+                            interval = PROBE_FAST;
+                            tokio::time::sleep_until(due.min(tokio::time::Instant::now() + PROBE_FAST)).await;
+                        }
+                    }
+                    let mut touched = watched_agents.apply_events(crate::agents::now_unix());
+                    // The probe platform has no event to say which terminal moved: those
+                    // whose foreground group changed are settled, one ioctl each, rather
+                    // than every terminal re-read from the process table on every tick.
+                    touched.extend(watched_agents.moved());
+                    touched.sort_unstable();
+                    touched.dedup();
                     let changed = !touched.is_empty();
-                    // The probe platform re-reads every terminal, because it has no event
-                    // to tell it which one moved.
-                    settle_queue.mark(watched_agents.streams());
-                    interval = qoop_pty::procwatch::next_probe(interval, changed);
+                    settle_queue.mark(touched);
+                    interval = next_probe(interval, changed);
                 }
             }
         });
