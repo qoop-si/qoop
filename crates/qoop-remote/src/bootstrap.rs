@@ -62,6 +62,38 @@ pub fn marker_command(command: &str) -> String {
     format!("echo {MARKER_BEGIN}; {command}; echo {MARKER_END}")
 }
 
+/// The shell that answered `echo "$0"; echo "fish:$FISH_VERSION"`.
+///
+/// Only fish sets `FISH_VERSION`, so a version on the tagged line is fish: fish has no `$0`,
+/// and its name line is empty. `$0` is the shell's own name in every posix-like shell. A
+/// shell that names neither is unknown.
+fn shell_from(answer: &str) -> RemoteShell {
+    let tagged = |line: &&str| line.trim_start().starts_with("fish:");
+    if answer
+        .lines()
+        .filter(tagged)
+        .any(|line| !line.trim_start()["fish:".len()..].trim().is_empty())
+    {
+        return RemoteShell::Fish;
+    }
+    let names = answer
+        .lines()
+        .filter(|line| !tagged(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if names.contains("fish") {
+        return RemoteShell::Fish;
+    }
+    if ["bash", "zsh", "ksh", "dash", "sh"]
+        .iter()
+        .any(|name| names.contains(name))
+    {
+        return RemoteShell::PosixLike;
+    }
+    RemoteShell::Unknown
+}
+
 /// What was between the markers, or nothing if they were not both there.
 pub fn between_markers(text: &str) -> Option<String> {
     let start = text.find(MARKER_BEGIN)? + MARKER_BEGIN.len();
@@ -110,24 +142,13 @@ impl<'a, T: RemoteTransport> Bootstrap<'a, T> {
     /// Asked of the shell itself rather than read from `/etc/passwd`, because what matters
     /// is the shell that will run the bootstrap commands, and that is the one ssh starts.
     pub fn detect_shell(&self) -> Result<RemoteShell, BootstrapError> {
-        // `$0` is the shell's own name in every posix-like shell, and in fish it is the
-        // shell's name too. A shell that does not answer at all is unknown.
         let out = self
             .transport
-            .run(&marker_command("echo \"$0\"; echo $FISH_VERSION"))?;
+            .run(&marker_command("echo \"$0\"; echo \"fish:$FISH_VERSION\""))?;
         let Some(answer) = between_markers(&out.stdout) else {
             return Err(BootstrapError::NoMarkedOutput);
         };
-        let lowered = answer.to_lowercase();
-        if lowered.contains("fish") {
-            return Ok(RemoteShell::Fish);
-        }
-        for name in ["bash", "zsh", "ksh", "dash", "sh"] {
-            if lowered.contains(name) {
-                return Ok(RemoteShell::PosixLike);
-            }
-        }
-        Ok(RemoteShell::Unknown)
+        Ok(shell_from(&answer))
     }
 
     /// Ask the remote daemon what it is.
@@ -162,6 +183,18 @@ impl<'a, T: RemoteTransport> Bootstrap<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    /// fish answers with its version and no name, the posix shells with their name and an
+    /// empty version: each is told apart, and a stranger is unknown.
+    #[test]
+    fn a_shell_is_told_by_its_answer() {
+        assert_eq!(shell_from("\nfish:4.0.2"), RemoteShell::Fish);
+        assert_eq!(shell_from("fish\nfish:3.7.1"), RemoteShell::Fish);
+        assert_eq!(shell_from("-bash\nfish:"), RemoteShell::PosixLike);
+        assert_eq!(shell_from("/bin/zsh\nfish:"), RemoteShell::PosixLike);
+        assert_eq!(shell_from("dash\nfish:"), RemoteShell::PosixLike);
+        assert_eq!(shell_from("nu\nfish:"), RemoteShell::Unknown);
+    }
+
     use super::*;
 
     #[test]
