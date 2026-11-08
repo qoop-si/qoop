@@ -282,9 +282,11 @@ pub struct AgentRegistry {
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
-    /// Rung by any terminal's traffic, typed or printed, for the probe platform: what is typed
-    /// is often a command about to start, which prints nothing once it runs.
-    io: tokio::sync::Notify,
+    /// Rung by live input to any terminal, for the probe platform: what is typed is often a
+    /// command about to start, which prints nothing once it runs. Output does not ring it: a
+    /// terminal that prints is looked at by its own read loop, and one drawing a spinner all
+    /// day would otherwise hold the probe at its fast end.
+    input: tokio::sync::Notify,
     /// Each terminal's leader pid and its terminal, keyed like the process table, so a
     /// sleep can walk what the leader started.
     leaders: Mutex<HashMap<u32, (i32, u64)>>,
@@ -955,7 +957,7 @@ impl AgentRegistry {
             prompts: Mutex::new(BTreeMap::new()),
             stops: Mutex::new(BTreeMap::new()),
             masters: Mutex::new(HashMap::new()),
-            io: tokio::sync::Notify::new(),
+            input: tokio::sync::Notify::new(),
             leaders: Mutex::new(HashMap::new()),
             closed: Mutex::new(BTreeSet::new()),
             expectations: Mutex::new(BTreeMap::new()),
@@ -1133,12 +1135,16 @@ impl AgentRegistry {
         if let Some(agent) = self.terminals.lock().unwrap().get_mut(&stream) {
             agent.last_io_unix = Some(now_unix);
         }
-        self.io.notify_one();
     }
 
-    /// Wait for any terminal's traffic since the last wait.
-    pub async fn io_seen(&self) {
-        self.io.notified().await;
+    /// Live input reached a terminal.
+    pub fn note_input(&self) {
+        self.input.notify_one();
+    }
+
+    /// Wait for live input to any terminal since the last wait.
+    pub async fn input_seen(&self) {
+        self.input.notified().await;
     }
 
     /// The terminals whose foreground group is not the one last read: one ioctl each, for the

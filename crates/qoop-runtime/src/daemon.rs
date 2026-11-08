@@ -1793,11 +1793,12 @@ impl Daemon {
                     let due = tokio::time::Instant::now() + interval;
                     tokio::select! {
                         () = tokio::time::sleep_until(due) => {}
-                        // Traffic resets the interval to the fast end (ADR-009): a typed
+                        // Input resets the interval to the fast end (ADR-009): a typed
                         // command starts a moment after its echo and prints nothing then.
-                        // The look is pulled forward, never pushed back, so a terminal that
-                        // prints all the time cannot hold it off.
-                        () = watched_agents.io_seen() => {
+                        // The look is pulled forward, never pushed back. A wrapper that
+                        // starts its agent later and prints nothing is left to the next
+                        // backed-off probe or the read loop's look at its first output.
+                        () = watched_agents.input_seen() => {
                             interval = PROBE_FAST;
                             tokio::time::sleep_until(due.min(tokio::time::Instant::now() + PROBE_FAST)).await;
                         }
@@ -1807,8 +1808,6 @@ impl Daemon {
                     // whose foreground group changed are settled, one ioctl each, rather
                     // than every terminal re-read from the process table on every tick.
                     touched.extend(watched_agents.moved());
-                    touched.sort_unstable();
-                    touched.dedup();
                     let changed = !touched.is_empty();
                     settle_queue.mark(touched);
                     interval = next_probe(interval, changed);
@@ -10161,10 +10160,23 @@ fn exec_daemon(exe: &Path) -> ! {
 }
 
 /// `exe daemon <args>` in place of this process. Returns the error when it did not happen.
+///
+/// A binary something still holds open for writing (a copy or a package manager not done
+/// with it) is refused on Linux as "text file busy" for as long as that lasts, so that is
+/// waited out for a second. Here only, where every descriptor stays close-on-exec: a handover
+/// clears that flag on the tabs' masters, and a wait there would let a child carry them.
 fn exec_into(exe: &Path, args: &[String]) -> io::Error {
     let mut command = daemon_command(exe, args);
     crate::say!("qoopd: moving onto {}", exe.display());
-    run_exec(&mut command)
+    let mut tries = 0;
+    loop {
+        let e = run_exec(&mut command);
+        tries += 1;
+        if e.kind() != io::ErrorKind::ExecutableFileBusy || tries == 50 {
+            return e;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn daemon_command(exe: &Path, args: &[String]) -> std::process::Command {
@@ -10179,24 +10191,12 @@ fn daemon_command(exe: &Path, args: &[String]) -> std::process::Command {
 /// starts expects, and leaves it there when the exec fails. A daemon that carries on after
 /// that dies of the first write to a closed client, and every tab with it, so it is ignored
 /// again as it was at start.
-///
-/// A binary something still holds open for writing (a copy or a package manager not done
-/// with it) is refused on Linux as "text file busy" for as long as that lasts, so that is
-/// waited out for a second before the move gives up.
 fn run_exec(command: &mut std::process::Command) -> io::Error {
     use std::os::unix::process::CommandExt;
-    let mut tries = 0;
-    loop {
-        let e = command.exec();
-        // SAFETY: signal with SIG_IGN is always a valid disposition for SIGPIPE. Again after
-        // every failed try, before the wait: the other threads write to clients meanwhile.
-        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-        tries += 1;
-        if e.kind() != io::ErrorKind::ExecutableFileBusy || tries == 50 {
-            return e;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let e = command.exec();
+    // SAFETY: signal with SIG_IGN is always a valid disposition for SIGPIPE.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    e
 }
 
 /// Remove every terminal's history directory under `dir` whose id is not in `open`.
@@ -12008,6 +12008,7 @@ async fn terminal_task(
                             // of a tab that has been quiet for hours.
                             if crate::idle::is_live_input(from.as_str()) {
                                 agents.note_io(stream, crate::agents::now_unix());
+                                agents.note_input();
                                 // The inbox's answers are a person's too: they end a park.
                                 agents.note_sent(stream, &bytes, crate::agents::now_unix());
                                 if from.as_str() != crate::asks::SENDER {
