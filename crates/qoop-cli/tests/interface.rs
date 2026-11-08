@@ -2081,15 +2081,17 @@ fn g12_15_a_shell_that_exits_takes_its_tab_and_hands_the_keyboard_on() {
 fn g12_16_ctrl_c_interrupts_a_foreground_process_for_a_backgrounded_daemon() {
     let mut ui = Interface::start_backgrounded();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
-    // The marker is computed by the shell, so the typed echo cannot match it: waiting
-    // for the echoed command line would pass without anything being interrupted.
-    ui.type_in(b"sleep 30; echo CTRL_C_WOKE_$((40 + 2))\n");
+    ui.type_in(b"sleep 30\n");
     assert!(
         ui.wait_for_tabs(|bar| bar.contains("sleep"), Duration::from_secs(15)),
         "sleep never came to the foreground: {:?}",
         ui.tab_bar()
     );
     ui.type_in(&[0x03]);
+    // The marker is its own command, computed by the shell: it runs only once the sleep is
+    // gone, and the typed echo cannot match it. Not `sleep 30; echo`, since dash (Linux's
+    // /bin/sh) drops the rest of a line whose job died of ctrl-c.
+    ui.type_in(b"echo CTRL_C_WOKE_$((40 + 2))\n");
     assert!(
         ui.wait_for("CTRL_C_WOKE_42", Duration::from_secs(15))
             .is_some(),
