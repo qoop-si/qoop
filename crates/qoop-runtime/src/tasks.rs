@@ -31,12 +31,7 @@ const EVENTS_READ: usize = 200;
 pub(crate) fn admitted(agents: &AgentRegistry, terminal: u32, token: &str) -> bool {
     let id = TerminalId::new(terminal.to_string());
     let token = CapabilityToken::new(token.to_string());
-    let Some(generation) = agents.agent(terminal).map(|a| a.belief.generation) else {
-        return false;
-    };
-    agents
-        .admit(terminal, &id, Some(&token), generation)
-        .is_ok()
+    agents.holds(terminal, &id, &token)
 }
 
 fn failed(id: String, reason: impl Into<String>) -> ControlResponse {

@@ -1827,6 +1827,20 @@ impl AgentRegistry {
         changed
     }
 
+    /// Whether `token` is the one this terminal's children carry, checked under one lock
+    /// against the terminal's own generation: a write that asks who is calling has no
+    /// generation of its own, and one read before a separate check goes stale whenever the
+    /// foreground moves in between (the caller's own command starting is such a move).
+    pub fn holds(&self, stream: u32, terminal: &TerminalId, token: &CapabilityToken) -> bool {
+        let terminals = self.terminals.lock().unwrap();
+        terminals.get(&stream).is_some_and(|agent| {
+            agent
+                .capability
+                .admit(terminal, Some(token), agent.capability.generation)
+                .is_ok()
+        })
+    }
+
     pub fn admit(
         &self,
         stream: u32,
