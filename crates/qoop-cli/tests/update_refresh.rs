@@ -61,7 +61,7 @@ fn an_update_leaves_hooks_and_skills_current() {
 
     // The installed build, and the "newer release": says 9.9.9, then is this build.
     let exe = root.join("bin/qoop");
-    std::fs::copy(env!("CARGO_BIN_EXE_qoop"), &exe).expect("install");
+    qoop_testkit::place_binary(Path::new(env!("CARGO_BIN_EXE_qoop")), &exe);
     let fresh = root.join("pack/qoop");
     std::fs::write(
         &fresh,

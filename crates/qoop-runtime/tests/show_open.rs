@@ -12,12 +12,14 @@ const PATIENCE: Duration = Duration::from_secs(10);
 
 /// A home (`h`) and a `$TMPDIR` (`t`) of this test binary's own, so `~` and the roots of a
 /// load nobody tapped are known places, and nothing under the real home is touched. A static
-/// is never dropped, so its two empty folders stay in the system's temp folder.
+/// is never dropped, so its two empty folders stay in cargo's temp folder.
 fn sandbox() -> &'static Path {
     static SANDBOX: OnceLock<tempfile::TempDir> = OnceLock::new();
     SANDBOX
         .get_or_init(|| {
-            let dir = tempfile::tempdir().expect("tempdir");
+            // Under cargo's own temp folder, not the system's: on Linux that is /tmp, and a home
+            // inside it takes /tmp off the places agents put results.
+            let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
             for sub in ["h", "t"] {
                 std::fs::create_dir(dir.path().join(sub)).expect("mkdir");
             }

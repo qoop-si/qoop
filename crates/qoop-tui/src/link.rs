@@ -1382,14 +1382,27 @@ mod tests {
                 std::thread::spawn(move || swap(&home, "0.0.1", "0.0.2", &says("0.0.2")))
             })
             .collect();
-        let mut codes: Vec<Option<i32>> = racers
+        let outs: Vec<_> = racers
             .into_iter()
-            .map(|racer| racer.join().expect("racer").status.code())
+            .map(|racer| racer.join().expect("racer"))
             .collect();
+        let mut codes: Vec<Option<i32>> = outs.iter().map(|out| out.status.code()).collect();
         codes.sort();
+        // What each racer said, so a run that lets both through shows which way it went.
+        let said: Vec<String> = outs
+            .iter()
+            .map(|out| {
+                format!(
+                    "{:?} out {:?} err {:?}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .collect();
         assert!(
             matches!(codes.as_slice(), [Some(0), Some(SWAPPED_MEANWHILE | 7)]),
-            "{codes:?}"
+            "{codes:?}: {said:#?}"
         );
         assert_eq!(std::fs::read(&qoop).expect("qoop"), says("0.0.2"));
         assert_eq!(leftovers(home.path()), vec!["qoop".to_string()]);

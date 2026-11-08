@@ -54,6 +54,23 @@ fn sandbox_root() -> &'static Path {
     })
 }
 
+/// Put the binary `built` at `dest`, to be run from there. A hard link, so no descriptor
+/// open for writing exists for another test thread's fork to inherit, which Linux answers
+/// with "text file busy" when the copy is run. Across file systems a `cp` child writes it,
+/// and the descriptor dies with that child. Never write into `dest` in place: it may be
+/// `built` itself.
+pub fn place_binary(built: &Path, dest: &Path) {
+    if std::fs::hard_link(built, dest).is_ok() {
+        return;
+    }
+    let copied = std::process::Command::new("cp")
+        .arg(built)
+        .arg(dest)
+        .status()
+        .expect("run cp");
+    assert!(copied.success(), "cp {built:?} {dest:?} failed");
+}
+
 /// `program` as a test may start it: a home, a temp directory and no `XDG_*` or
 /// `CLAUDE_CONFIG_DIR` of its own, no tab or runtime variables of whoever runs the suite, and
 /// the mark that says it is a test.

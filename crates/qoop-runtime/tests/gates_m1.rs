@@ -312,7 +312,8 @@ async fn g1_16_a_snapshot_larger_than_one_frame_reassembles_exactly() {
 /// hang, which is the failure this gate exists for.
 #[tokio::test]
 async fn g1_17_a_cursor_position_request_is_answered() {
-    let d = TestDaemon::start().await;
+    // bash, not /bin/sh: dash (Linux's sh) has no `read -t` or `-d`.
+    let d = TestDaemon::start_with_shell(std::path::Path::new("/bin/bash")).await;
     let mut c = d.attach("dsr").await;
     // `read -d R` stops at the R that terminates the report. Its exit status is the
     // assertion: non-zero means the reply never came.
@@ -1101,7 +1102,8 @@ async fn g1_14_a_job_that_handles_sigterm_gets_its_grace_window() {
 async fn output_produced_during_teardown_reaches_the_screen() {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
 
-    let d = TestDaemon::start().await;
+    // bash, not /bin/sh: dash (Linux's sh) runs no EXIT trap when a signal ends it.
+    let d = TestDaemon::start_with_shell(std::path::Path::new("/bin/bash")).await;
     let mut c = d.attach("farewell-on-close").await;
     let terminal = d.terminals().streams()[0];
 

@@ -1739,7 +1739,8 @@ fn an_update_moves_an_idle_daemon_onto_the_new_binary() {
         said.contains(&format!(
             "this machine: closed the connection and runs {VERSION}, not {NEXT}"
         )),
-        "{said}"
+        "{said}\nthe daemon's log: {}",
+        std::fs::read_to_string(&d.log).unwrap_or_default()
     );
     assert!(
         !out.status.success(),
@@ -1836,10 +1837,7 @@ fn install_script(exe: &Path, version: &str, extra: &str) {
 
 /// The test binary at `exe`, linked when the filesystem allows and copied when it does not.
 fn stage(exe: &Path) {
-    let built = Path::new(env!("CARGO_BIN_EXE_qoop"));
-    if std::fs::hard_link(built, exe).is_err() {
-        std::fs::copy(built, exe).expect("copy the binary");
-    }
+    qoop_testkit::place_binary(Path::new(env!("CARGO_BIN_EXE_qoop")), exe);
 }
 
 // A move nobody asked for by hand: it ends no tab and waits for every window to close.

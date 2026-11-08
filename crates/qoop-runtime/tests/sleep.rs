@@ -819,9 +819,13 @@ async fn named_tab(c: &mut TestClient, workspace: i64, name: &str) -> u32 {
 #[tokio::test]
 async fn a_program_posing_as_the_board_page_keeps_its_tab_awake() {
     let scratch = tempfile::tempdir().expect("tempdir");
-    // A real binary that blocks on its words: `yes`, under the name `qoop`.
+    // A real program under the name `qoop` that blocks: bash, running a script named `task`
+    // that waits on its input. Not `yes`: Linux's coreutils are one binary that picks its
+    // tool by its name, and as `qoop` it finds none and ends. Not sh: a dash tab exec'ing
+    // into dash keeps its path and inode, which Linux's probe cannot tell from no change.
     let posing = scratch.path().join("qoop");
-    std::os::unix::fs::symlink("/usr/bin/yes", &posing).expect("yes as qoop");
+    std::os::unix::fs::symlink("/bin/bash", &posing).expect("bash as qoop");
+    std::fs::write(scratch.path().join("task"), "while read -r l; do :; done\n").expect("task");
     let d = TestDaemon::start().await;
     let mut c = d.attach("posing").await;
     let space = new_space(&mut c, "qass").await;
@@ -829,8 +833,8 @@ async fn a_program_posing_as_the_board_page_keeps_its_tab_awake() {
     c.input_to(
         tab,
         format!(
-            "exec '{}' task board --page > /dev/null\n",
-            posing.display()
+            "cd '{}' && exec ./qoop task board --page > /dev/null\n",
+            scratch.path().display()
         )
         .as_bytes(),
     )
