@@ -5355,6 +5355,9 @@ async fn handle_control(
             from,
             ..
         } => {
+            // Before the identity check: a report applied to the shell's generation is lost
+            // when the agent is noticed a moment later.
+            agents.refresh_for_report(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }
@@ -5625,6 +5628,9 @@ async fn handle_control(
             from,
             ..
         } => {
+            // Before the identity check: a report applied to the shell's generation is lost
+            // when the agent is noticed a moment later.
+            agents.refresh_for_report(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }
@@ -5676,6 +5682,9 @@ async fn handle_control(
             from,
             ..
         } => {
+            // Before the identity check: a report applied to the shell's generation is lost
+            // when the agent is noticed a moment later.
+            agents.refresh_for_report(terminal, crate::agents::now_unix());
             if let Some(refusal) = foreign(agents, terminal, from.as_deref(), &id) {
                 return refusal;
             }

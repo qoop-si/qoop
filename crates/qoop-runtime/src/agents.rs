@@ -1017,6 +1017,20 @@ impl AgentRegistry {
         )
     }
 
+    /// The foreground looked at because an agent's hook reported: the hook runs in the
+    /// foreground job, so its report is news the foreground changed, and on Linux no exec
+    /// event says so. A new leader is looked at at once; a same leader still not an agent
+    /// at most once per `RELOOK`, since every tool event of an unknown wrapper reports.
+    pub fn refresh_for_report(&self, stream: u32, now_unix: i64) -> Option<GenerationId> {
+        let master = self.masters.lock().unwrap().get(&stream).copied()?;
+        self.look(
+            stream,
+            qoop_pty::sys::foreground_leader(master),
+            true,
+            now_unix,
+        )
+    }
+
     /// Start tracking a terminal, and mint the token its child will carry.
     pub fn register(&self, stream: u32, terminal: TerminalId, token: CapabilityToken) {
         let generation = GenerationId::FIRST;
