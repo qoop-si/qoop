@@ -643,8 +643,43 @@ pub fn group_members(pgid: Pgid) -> Vec<Pid> {
 }
 
 /// Every process in one process group, read from `/proc`.
+///
+/// One scan of `/proc` reads every process on the machine, and a settle asks for a hundred
+/// terminals' groups back to back: a scan younger than [`GROUP_SCAN_FRESH`] answers them all.
+// ponytail: one shared snapshot; a group that changed inside the window is seen on the next ask.
 #[cfg(not(target_os = "macos"))]
 pub fn group_members(pgid: Pgid) -> Vec<Pid> {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, GroupTable)>> =
+        std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !last
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < GROUP_SCAN_FRESH)
+    {
+        *last = Some((std::time::Instant::now(), process_groups()));
+    }
+    last.as_ref()
+        .map(|(_, table)| {
+            table
+                .iter()
+                .filter(|(_, group)| *group == pgid.0)
+                .map(|(pid, _)| Pid(*pid))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every process on the machine, as (pid, process group).
+#[cfg(not(target_os = "macos"))]
+type GroupTable = Vec<(i32, i32)>;
+
+/// How long one scan of `/proc` answers [`group_members`].
+#[cfg(not(target_os = "macos"))]
+const GROUP_SCAN_FRESH: std::time::Duration = std::time::Duration::from_millis(15);
+
+/// Every process and its group, read from `/proc`.
+#[cfg(not(target_os = "macos"))]
+fn process_groups() -> GroupTable {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -661,13 +696,12 @@ pub fn group_members(pgid: Pgid) -> Vec<Pid> {
         let Some((_, rest)) = stat.rsplit_once(')') else {
             continue;
         };
-        if rest
+        if let Some(group) = rest
             .split_whitespace()
             .nth(2)
             .and_then(|f| f.parse::<i32>().ok())
-            == Some(pgid.0)
         {
-            out.push(Pid(pid));
+            out.push((pid, group));
         }
     }
     out
