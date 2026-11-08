@@ -1806,14 +1806,14 @@ mod tests {
                 .spawn()
                 .expect("run the hook");
             use std::io::Write;
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(
-                    br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}"#,
-                )
-                .expect("payload");
+            // A hook that has nothing to report ends without reading its input: the pipe
+            // closing under the write is that, not a failure.
+            let wrote = child.stdin.take().expect("stdin").write_all(
+                br#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}"#,
+            );
+            if let Err(e) = wrote {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "payload: {e}");
+            }
             assert!(child.wait().expect("wait").success(), "a hook must exit 0");
             std::fs::read_to_string(&log).unwrap_or_default()
         };
