@@ -1175,7 +1175,7 @@ fn edit(config: &Path, target: &Target, script: &Path, at_root: bool) -> std::io
 /// rules its hook gives it ask for several per task. Every subcommand an agent uses on its
 /// own task and on the board item it works on, and not `close`, `add` or `start`, which end
 /// somebody's task or put new work on the board and stay a question.
-const ALLOW: [&str; 13] = [
+const ALLOW: [&str; 14] = [
     "Bash(qoop task new:*)",
     "Bash(qoop task stage:*)",
     "Bash(qoop task plan:*)",
@@ -1189,6 +1189,7 @@ const ALLOW: [&str; 13] = [
     "Bash(qoop task check:*)",
     "Bash(qoop task steps:*)",
     "Bash(qoop task describe:*)",
+    "Bash(qoop task ask:*)",
 ];
 
 /// Rules the person may already have that cover all of `ALLOW`.
@@ -2953,7 +2954,8 @@ mod tests {
             assert!(out.status.success(), "a hook must exit 0");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        set_fake("echo \"RULES LINE $3\"; exit 0");
+        // Its arguments after `task rules`, and the request it was given on standard input.
+        set_fake("echo \"RULES LINE $3 $4 $5 $(cat)\"; exit 0");
         let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
         for agent in ["claude", "codex"] {
             assert_eq!(run(agent, start, true).trim(), "RULES LINE", "{agent}");
@@ -2965,8 +2967,8 @@ mod tests {
                     true
                 )
                 .trim(),
-                "RULES LINE --turn",
-                "{agent} gets the line with each request"
+                "RULES LINE --turn --prompt - hi",
+                "{agent} gets the line with each request, and passes the request on"
             );
             assert_eq!(
                 run(agent, r#"{"hook_event_name":"Stop"}"#, true),
@@ -3003,13 +3005,16 @@ mod tests {
             json["hookSpecificOutput"]["additionalContext"],
             "RULES LINE"
         );
-        let turn: serde_json::Value =
-            serde_json::from_str(&run("gemini", r#"{"hook_event_name":"BeforeAgent"}"#, true))
-                .expect("Gemini gets JSON with each request too");
+        let turn: serde_json::Value = serde_json::from_str(&run(
+            "gemini",
+            r#"{"hook_event_name":"BeforeAgent","prompt":"hi"}"#,
+            true,
+        ))
+        .expect("Gemini gets JSON with each request too");
         assert_eq!(turn["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
         assert_eq!(
             turn["hookSpecificOutput"]["additionalContext"],
-            "RULES LINE --turn"
+            "RULES LINE --turn --prompt - hi"
         );
         assert_eq!(
             run("gemini", r#"{"hook_event_name":"AfterAgent"}"#, true),

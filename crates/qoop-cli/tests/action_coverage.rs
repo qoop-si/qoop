@@ -651,6 +651,31 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "an agent asks the owner a question with options",
+            method: || {
+                Method::Control(ControlRequest::AskWrite {
+                    id: "a".into(),
+                    terminal: Some(1),
+                    token: Some("t".into()),
+                    action: qoop_runtime::control::AskOp::Ask {
+                        asks: "Ship it?".into(),
+                        options: Vec::new(),
+                        pick: None,
+                    },
+                })
+            },
+        },
+        Action {
+            name: "tell an agent of the question it left unanswered",
+            method: || {
+                Method::Control(ControlRequest::AskLeft {
+                    id: "a".into(),
+                    terminal: 1,
+                    token: "t".into(),
+                })
+            },
+        },
+        Action {
             name: "put a result on the owner's phone",
             method: || {
                 Method::Control(ControlRequest::ShowWrite {
@@ -1086,6 +1111,11 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             all: false,
         },
+        ControlRequest::AskLeft {
+            id: String::new(),
+            terminal: 0,
+            token: String::new(),
+        },
         ControlRequest::ShowWrite {
             id: String::new(),
             terminal: 0,
@@ -1188,6 +1218,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }
             | ControlRequest::AskRead { .. }
+            | ControlRequest::AskLeft { .. }
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
             | ControlRequest::AgentSessions { .. }

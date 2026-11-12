@@ -197,6 +197,7 @@ qoop task plan -                       # stdin: acceptance, plan, how it is veri
 qoop task stage <stage>                # investigating planning implementing reviewing verifying waiting-human
 qoop task evidence "<check: result>"   # a check that proves an acceptance point
 qoop task done "<summary>"             # a claim; checked outside the agent
+qoop task ask "<question>" "<label>" "<label | why>" [--pick a]   # ask the owner (2 to 4 options)
 qoop task close <id> --verified|--failed [reason]   # qass or the person ends it
 qoop task ls [--json]                  # open tasks, every terminal
 qoop task show [id] [--before E] [--json]           # one task and what was recorded
@@ -208,6 +209,13 @@ a compaction. An agent inside qoop gets the short rules at session start
 stage, claimed}`. A task named by id needs no terminal; without one the
 command speaks for its own terminal (`QOOP_TERMINAL`, `QOOP_TOKEN`). What
 an agent wrote there is its own account: check it before acting on it.
+
+`qoop task ask` puts a card `Q<n>` with one-tap options in the owner's
+inbox and on his phone, and returns at once: the agent goes on with what
+does not depend on the answer, which is typed into its tab at its next
+rest. A card he leaves unanswered for a day is set aside as `left`; the
+next time he prompts that conversation, its turn line tells the agent once,
+and it asks again if the question still matters.
 
 ## Schedules
 

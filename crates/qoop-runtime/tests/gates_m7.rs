@@ -404,6 +404,11 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             token: None,
             before: None,
         },
+        ControlRequest::AskLeft {
+            id: "x30".into(),
+            terminal,
+            token: "not-its-token".into(),
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -453,6 +458,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::TaskRead { .. }
             | ControlRequest::AskWrite { .. }
             | ControlRequest::AskRead { .. }
+            | ControlRequest::AskLeft { .. }
             | ControlRequest::ShowWrite { .. }
             | ControlRequest::ShowRead { .. }
             | ControlRequest::ScheduleWrite { .. }

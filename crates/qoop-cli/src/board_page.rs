@@ -692,6 +692,11 @@ fn needs_you(item: &ItemInfo) -> bool {
             || item.agents.iter().any(|a| !a.closed && a.status == "waits"))
 }
 
+/// Whether a task with no item waits on the owner: it waits, or a question about it is open.
+fn task_needs_you(t: &TaskInfo) -> bool {
+    t.status == "waits" || t.open_asks > 0
+}
+
 /// The lanes as the list groups them: Doing is In progress, Todo is Not started (a plan or not:
 /// the owner's pick), then Done. What waits on the owner stays in its group. Each keeps the
 /// lanes' newest first.
@@ -808,13 +813,18 @@ fn task_mark(t: &TaskInfo) -> (String, Role) {
 fn task_parts(t: &TaskInfo, spaces: &[WorkspaceRow], now: i64) -> Vec<(String, Role)> {
     let (word, role) = status_said(&t.status, t.status_at, now)
         .unwrap_or_else(|| (aged(&t.stage, t.status_at, now), Role::FaintText));
-    vec![
-        (
-            format!("{}  {NO_ITEM}", space_name(spaces, t.workspace)),
-            Role::Detail,
-        ),
-        (word, role),
-    ]
+    let mut parts = vec![(
+        format!("{}  {NO_ITEM}", space_name(spaces, t.workspace)),
+        Role::Detail,
+    )];
+    // A question its agent asked while it goes on working: said as an item row says it.
+    match t.open_asks {
+        0 => {}
+        1 => parts.push(("1 question".to_string(), Role::Blocked)),
+        n => parts.push((format!("{n} questions"), Role::Blocked)),
+    }
+    parts.push((word, role));
+    parts
 }
 
 /// The cells `parts` take flush right, two apart, with the two before the first.
@@ -942,8 +952,8 @@ impl Page {
         tasks.into_iter().partition(|t| !task_asleep(t))
     }
 
-    /// The list's rows: In progress holds the Doing items and the awake tasks, newest first
-    /// together, then the Asleep row (its tasks while it is opened) and a line for tasks the
+    /// The list's rows: In progress holds the Doing items and the awake tasks, what waits on the
+    /// owner first and newest first within that, then the Asleep row (its tasks while it is opened) and a line for tasks the
     /// daemon did not send; then Not started; then Done's rule, and its items while it is opened.
     fn list_lines<'a>(&'a self, lanes: &[Vec<&'a ItemInfo>; 3]) -> Vec<Line<'a>> {
         let groups = groups(lanes);
@@ -952,17 +962,23 @@ impl Page {
             true => self.loose.unwrap_or(0).saturating_sub(self.tasks.len()),
             false => 0,
         };
-        let mut progress: Vec<(i64, Line<'a>)> = groups[0]
+        // What waits on the owner first (an open question, an agent waiting on him), then the
+        // rest; newest first within each.
+        let mut progress: Vec<(bool, i64, Line<'a>)> = groups[0]
             .iter()
-            .map(|i| (lane_stamp(i), Line::Item(i)))
-            .chain(awake.iter().map(|t| (t.updated_at, Line::Task(t, false))))
+            .map(|i| (needs_you(i), lane_stamp(i), Line::Item(i)))
+            .chain(
+                awake
+                    .iter()
+                    .map(|t| (task_needs_you(t), t.updated_at, Line::Task(t, false))),
+            )
             .collect();
-        progress.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        progress.sort_by_key(|(need, at, _)| (!*need, std::cmp::Reverse(*at)));
         let mut out = Vec::new();
         let (rows, foot) = (progress.len(), asleep.len() + unlisted);
         if rows + foot > 0 {
             out.push(Line::Group(0, rows));
-            out.extend(progress.into_iter().map(|(_, l)| l));
+            out.extend(progress.into_iter().map(|(_, _, l)| l));
             if !asleep.is_empty() {
                 let waits = asleep.iter().filter(|t| t.status == "waits").count();
                 out.push(Line::Asleep(asleep.len(), waits));
@@ -4812,6 +4828,7 @@ mod tests {
             status: status.into(),
             status_at: at,
             asleep_since: None,
+            open_asks: 0,
         }
     }
 
@@ -5797,10 +5814,11 @@ mod tests {
             p.size = (w, h);
             let rows = list_rows(&p, w, h);
             let at = |want: &str| rows.iter().position(|r| r.contains(want)).unwrap();
+            // QOOP-4 waits on him: first in its group.
             let order = [
                 at("In progress 3"),
-                at("QOOP-3"),
                 at("QOOP-4"),
+                at("QOOP-3"),
                 at("QOOP-5"),
                 at("Not started 2"),
                 at("QOOP-1"),
@@ -5847,13 +5865,13 @@ mod tests {
     fn the_keyboard_walks_the_list_and_acts_on_its_item() {
         let mut p = list_page();
         p.size = (120, 40);
-        assert_eq!(p.sel, Some(3), "the first row has it");
+        assert_eq!(p.sel, Some(4), "the first row has it: QOOP-4 waits on him");
         let mut walked = vec![p.sel.unwrap()];
         for _ in 0..6 {
             p.key(Key::Char('j'));
             walked.push(p.sel.unwrap());
         }
-        assert_eq!(walked, [3, 4, 5, 1, 2, FOLD, FOLD]);
+        assert_eq!(walked, [4, 3, 5, 1, 2, FOLD, FOLD]);
         assert_eq!(p.key(Key::Enter), Step::Stay);
         assert!(drawn(&p, 120, 40).contains("QOOP-6"), "opened");
         p.key(Key::Char('j'));
@@ -6201,6 +6219,45 @@ mod tests {
         p.filter = "contacts".into();
         p.settle();
         assert!(!drawn(&p, 120, 40).contains("third wait"));
+    }
+
+    /// In progress lists what waits on the owner first, however old, then the rest newest
+    /// first: a question he left a day ago is not buried under fresh work.
+    #[test]
+    fn rows_that_need_him_come_first() {
+        let mut p = list_page();
+        with_loose(&mut p);
+        p.tasks.truncate(2);
+        p.tasks[1].status = "working".into();
+        p.tasks[0].updated_at = p.now - 10 * DAY;
+        p.loose = Some(2);
+        p.size = (120, 40);
+        p.settle();
+        let progress = progress_rows(&p, 120, 40);
+        let order = ["third wait", "second wait"]
+            .map(|w| progress.iter().position(|r| r.contains(w)).unwrap());
+        assert!(order.is_sorted(), "the waiting one first: {progress:#?}");
+        let busy = progress
+            .iter()
+            .position(|r| r.contains("second wait"))
+            .unwrap();
+        assert_eq!(order[0], 1, "right under the group line: {progress:#?}");
+        assert!(busy > order[0]);
+        // A working agent that asked with `qoop task ask` needs him too, and says so.
+        p.tasks[0].status = "working".into();
+        p.tasks[0].open_asks = 1;
+        p.settle();
+        let progress = progress_rows(&p, 120, 40);
+        let asked = row_of(&progress, "third wait");
+        assert!(
+            asked.contains("1 question") && asked.contains("working"),
+            "{asked}"
+        );
+        assert_eq!(
+            progress.iter().position(|r| r.contains("third wait")),
+            Some(1),
+            "{progress:#?}"
+        );
     }
 
     /// Tasks whose tab sleeps fold into one `Asleep` row at the foot of In progress, with how many
