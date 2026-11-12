@@ -26,8 +26,10 @@ reviewing, verifying, waiting-human (leave it once answered). Tick `qoop task ch
 step's check passes. Add `qoop task evidence \"<check: result>\"` for each acceptance point. Finish \
 with `qoop task done \"<summary>\"` once every step is ticked, before your tab closes; it is a claim \
 checked outside you, so keep working or stop as usual. If a `qoop task` command fails, carry on. Write rm targets \
-as literal paths or \"${VAR:?}\". Take the next step these rules allow yourself; end a turn on \
-the owner only for his decision, as one question with your pick. Never sign a message to \
+as literal paths or \"${VAR:?}\". Take the next step these rules allow yourself; ask the owner \
+only for his decision, as soon as you need it, with `qoop task ask \"<q>\" \"<option>\" \"<option>\" --pick <x>`, and go on \
+with what does not depend on it; end your turn on it only when nothing else is left. Never \
+sign a message to \
 another agent with a role (`Lead:`). Keep a debrief to 12 short \
 lines, the result first and his one action last, if any; open a plan or report with a 5-line \
 summary. Run your own \
@@ -68,11 +70,14 @@ fn repo_turn(own: Option<&str>) -> String {
         Some(repo) => {
             format!(
                 "own repo {repo}: take reversible steps yourself; merge only PRs you opened, \
-                 unless a repo file asks first; ask: delete (not your own worktree), release, \
-                 prod, money, external."
+                 unless a repo file asks first; ask (`qoop task ask`): delete (not your own \
+                 worktree), release, prod, money, external."
             )
         }
-        None => "not your repo: take reversible steps yourself; ask before commit.".to_string(),
+        None => {
+            "not your repo: take reversible steps yourself; ask (`qoop task ask`) before commit."
+                .to_string()
+        }
     }
 }
 
@@ -283,6 +288,10 @@ const USAGE: &str = "usage:
   qoop task show-me <KEY|id> [--off]   the owner wants to see this item's plan (qass only)
   qoop task next [--take] [--json]     the Todo item qass should start now; --take starts it
                                        (qass only)
+  qoop task ask <question> <option> <option> [<option> <option>] [--pick <letter>]
+                                       ask the owner: a card with two to four one-tap options
+                                       (`label` or `label | why`); his answer is typed here at
+                                       your next rest, so go on with what does not depend on it
   qoop task ls [--json]                open tasks
   qoop task board [--json] [--dir DIR] the board's items, then every space's goal and open
                                        tasks as Markdown; --json: the items; --dir writes
@@ -291,12 +300,13 @@ const USAGE: &str = "usage:
   qoop task show [KEY|id] [--before E] [--json]   no id: this terminal's open task; an
                                        item comes with its card (--json: `item`)
   qoop task begin                      this terminal's open task, opened now if none (hooks)
-  qoop task rules [--turn]             what an agent in qoop is told at session start, with
+  qoop task rules [--turn [--prompt -]]  what an agent in qoop is told at session start, with
                                        its repo's block: the standing way in your own repo
                                        (its GitHub origin's owner is your gh login or a
                                        `qoop.owner` in the global git config), else
                                        ask first (--turn: the line it is given with each
-                                       request)
+                                       request; --prompt -: that request on standard input,
+                                       to tell it once of a question it left unanswered)
   <text> may be `-` to read it from standard input; without --id, describe, steps and check
   write to the item this terminal's task is linked to";
 
@@ -656,6 +666,128 @@ fn start(key: &str) -> std::io::Result<()> {
     }
 }
 
+/// `qoop task ask <question> <option>... [--pick <letter>]`: the agent's own question to the
+/// owner, card `Q<n>` with two to four options. An option is `label` or `label | why`; the
+/// label is what the agent is told he chose.
+fn ask_owner(rest: &[String]) -> std::io::Result<()> {
+    let mut words = Vec::new();
+    let mut pick = None;
+    let mut args = rest.iter();
+    while let Some(a) = args.next() {
+        if a == "--pick" {
+            pick = Some(args.next().ok_or_else(|| usage(USAGE))?.as_str());
+        } else {
+            words.push(a.as_str());
+        }
+    }
+    let Some((asks, labels)) = words.split_first() else {
+        return Err(usage(USAGE));
+    };
+    let pick = pick.map(|p| qoop_runtime::control::AskPick {
+        key: pick_key(p, labels),
+        reason: "its own pick".to_string(),
+    });
+    let options = labels
+        .iter()
+        .zip('a'..)
+        .map(|(option, key)| {
+            let (label, reason) = option.split_once(" | ").unwrap_or((option, ""));
+            qoop_runtime::control::AskOption {
+                key: key.to_string(),
+                label: label.trim().to_string(),
+                reason: reason.trim().to_string(),
+                words: label.trim().to_string(),
+            }
+        })
+        .collect();
+    let (terminal, token) = here();
+    if terminal.is_none() {
+        return Err(std::io::Error::other(
+            "QOOP_TERMINAL and QOOP_TOKEN are not set: qoop task ask runs in the agent's qoop terminal",
+        ));
+    }
+    let request = ControlRequest::AskWrite {
+        id: crate::request_id("ask"),
+        terminal,
+        token,
+        action: qoop_runtime::control::AskOp::Ask {
+            asks: asks.to_string(),
+            options,
+            pick,
+        },
+    };
+    match ask(request, std::time::Duration::from_secs(10))? {
+        ControlResponse::AskWritten { card, .. } => {
+            println!(
+                "{card} waits on the owner; his answer is typed here at your next rest. Go on with what does not depend on it."
+            );
+            Ok(())
+        }
+        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected answer: {other:?}"
+        ))),
+    }
+}
+
+/// The key `--pick` names: a letter (`b`, `B`), a number from 1 (`2`), or an option's label as
+/// written (case aside): agents name their pick each of these ways. Anything else is passed on
+/// as written, for the daemon to refuse with the options it has.
+fn pick_key(pick: &str, labels: &[&str]) -> String {
+    let pick = pick.trim();
+    let key = |n: usize| ((b'a' + n as u8) as char).to_string();
+    let label = |o: &str| {
+        o.split_once(" | ")
+            .map_or(o, |(l, _)| l)
+            .trim()
+            .to_lowercase()
+    };
+    let lower = pick.to_lowercase();
+    if lower.len() == 1 && lower.as_bytes()[0].is_ascii_lowercase() {
+        return lower;
+    }
+    if let Ok(n) = pick.parse::<usize>()
+        && (1..=labels.len()).contains(&n)
+    {
+        return key(n - 1);
+    }
+    labels
+        .iter()
+        .position(|o| label(o) == lower)
+        .map_or(lower, key)
+}
+
+/// The line that tells the agent, once, of each question its conversation left unanswered,
+/// when `prompt` is the owner's own ([`qoop_runtime::asks::his_own`]). Nothing on any failure:
+/// it rides a hook that must stay quiet.
+fn left_lines(prompt: &str) -> Vec<String> {
+    let (Some(terminal), Some(token)) = here() else {
+        return Vec::new();
+    };
+    if !qoop_runtime::asks::his_own(prompt) {
+        return Vec::new();
+    }
+    let request = ControlRequest::AskLeft {
+        id: crate::request_id("ask"),
+        terminal,
+        token,
+    };
+    let Ok(ControlResponse::Asks { ended, .. }) = ask(request, RULES_PATIENCE) else {
+        return Vec::new();
+    };
+    ended
+        .iter()
+        .map(|card| {
+            format!(
+                "The owner left your question unanswered ({}, asked {}): \"{}\". If his message does not settle it, ask it again at the end of this turn with qoop task ask.",
+                card.card,
+                ago(card.opened_at),
+                card.body.asks
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn json(value: &impl serde::Serialize) -> std::io::Result<()> {
     println!(
         "{}",
@@ -725,6 +857,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         Some("begin") => write(None, TaskOp::Begin).map(drop),
         Some("plan") => write(None, TaskOp::Plan { text: text(&raw)? }).map(drop),
         Some("evidence") => write(None, TaskOp::Evidence { text: text(&raw)? }).map(drop),
+        Some("ask") => ask_owner(rest),
         Some("done") => write(
             None,
             TaskOp::Done {
@@ -1092,6 +1225,15 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     turn_line(open, found.as_ref().and_then(|f| f.item.as_deref())),
                     repo_turn(own.as_deref())
                 );
+                // The request itself, when the hook passes it: a question this conversation
+                // left him comes back once, at his own next prompt.
+                // Only when the daemon answered the read in time: two waits must fit the hook.
+                if has("--prompt") && found.is_some() {
+                    let prompt = text(&["-".to_string()]).unwrap_or_default();
+                    for line in left_lines(&prompt) {
+                        println!("{line}");
+                    }
+                }
                 if let Some(line) = learned(here.as_deref(), true) {
                     println!("{line}");
                 }
@@ -1222,6 +1364,7 @@ mod tests {
             status: String::new(),
             status_at: 0,
             asleep_since: None,
+            open_asks: 0,
         }
     }
 
@@ -1391,12 +1534,12 @@ mod tests {
         }
         assert_eq!(
             repo_turn(Some("pat/x")),
-            "own repo pat/x: take reversible steps yourself; merge only PRs you opened, unless a repo file asks first; ask: \
-             delete (not your own worktree), release, prod, money, external."
+            "own repo pat/x: take reversible steps yourself; merge only PRs you opened, unless a repo file asks first; ask \
+             (`qoop task ask`): delete (not your own worktree), release, prod, money, external."
         );
         assert_eq!(
             repo_turn(None),
-            "not your repo: take reversible steps yourself; ask before commit."
+            "not your repo: take reversible steps yourself; ask (`qoop task ask`) before commit."
         );
     }
 
@@ -1409,8 +1552,27 @@ mod tests {
         assert!(block.len() <= 1100, "{} chars", block.len());
         // ponytail: +35 on 2026-10-23 for "take reversible steps yourself", the words agents
         // act on beside each request (QOOP-55: 9 of 10 probe runs handed a doable step back).
-        assert!(repo_turn(Some(&longest)).len() <= 325);
-        assert!(repo_turn(Some("qoop-si/qoop")).len() <= 190);
+        // +18 on 2026-11-12: the command the ask goes through, `qoop task ask`, named where
+        // the agent decides to ask (0 of 239 turn-end questions carried options).
+        assert!(repo_turn(Some(&longest)).len() <= 343);
+        assert!(repo_turn(Some("qoop-si/qoop")).len() <= 208);
+    }
+
+    /// Agents name their pick by letter, by number or by the label itself: each is the key.
+    #[test]
+    fn a_pick_is_a_letter_a_number_or_a_label() {
+        let labels = ["Public", "Private | only you see it"];
+        assert_eq!(pick_key("b", &labels), "b");
+        assert_eq!(pick_key("B", &labels), "b");
+        assert_eq!(pick_key("2", &labels), "b");
+        assert_eq!(pick_key("private", &labels), "b");
+        assert_eq!(pick_key(" Public ", &labels), "a");
+        assert_eq!(
+            pick_key("3", &labels),
+            "3",
+            "no third option: the daemon refuses it"
+        );
+        assert_eq!(pick_key("maybe", &labels), "maybe");
     }
 
     #[test]
@@ -1419,17 +1581,20 @@ mod tests {
         // debrief one, the owner's headless-testing one (+160) and `qoop show` (+100), each a
         // sentence of its own. 1510 since 2026-10-23: the next step is the agent's own, and any
         // task he gave opens a record (QOOP-55, +143). 1580 since 2026-10-29: no role label
-        // on a message to another agent (+67).
+        // on a message to another agent (+67). 1705 since 2026-11-12: how to ask him, with
+        // options, as soon as it is known (5 of 5 real runs asked only after the rest), and to
+        // go on with the rest meanwhile (+125, the owner's own ask).
         assert!(
-            RULES.len() <= 1580,
+            RULES.len() <= 1705,
             "{} chars in every session",
             RULES.len()
         );
         // ponytail: 2200 is the 1380 above plus the own-repo block (its own cap: 1100 at the
         // longest name, 817 for qoop-si/qoop): what may ship and what always asks,
-        // computed for this repo, said once at session start. 2400 with the 1580 above.
+        // computed for this repo, said once at session start. 2400 with the 1580 above, 2525
+        // with the 1705.
         let session = RULES.len() + repo_rules(Some("qoop-si/qoop")).len();
-        assert!(session <= 2400, "{session} chars at session start");
+        assert!(session <= 2525, "{session} chars at session start");
         assert!(
             RULES.contains("(`Lead:`)"),
             "no role label on agent messages"

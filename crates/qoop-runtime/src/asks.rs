@@ -390,6 +390,17 @@ pub(crate) fn not_his(prompt: &str) -> bool {
         })
 }
 
+/// Whether a prompt is the owner's own, typed to this agent: none of [`not_his`], no
+/// [`sender_tag`] of another tab in front of it, and not the line that carries his inbox
+/// answer (`The owner answered Q12`). What brings back a question he left.
+pub fn his_own(prompt: &str) -> bool {
+    let head = prompt.trim_start();
+    !head.is_empty()
+        && !not_his(head)
+        && untagged(head).len() == head.len()
+        && card_in_prompt(head).is_none()
+}
+
 /// A handle for a draft: the first word of the agent's name in lowercase ASCII letters and
 /// digits, then `tail`: its task id, so no two drafts share one ("api52"), or for an agent
 /// with no task `-t` and its terminal, which no task's handle can be ("api-t3").
@@ -446,8 +457,45 @@ pub(crate) fn watch_stale_plans(
         loop {
             tick.tick().await;
             stale_plans_once(&agents, &connections, &store).await;
+            leave_once(&agents, &connections, &store).await;
         }
     });
+}
+
+/// How long an open card waits for him before it is set aside as left: 96% of his answers
+/// come within a day.
+const LEAVE_SECS: u64 = 24 * 3600;
+
+/// Overrides [`LEAVE_SECS`], read once: for a test or a real run that cannot wait a day.
+const LEAVE_ENV: &str = "QOOP_LEAVE_SECS";
+
+fn leave_after() -> i64 {
+    static AFTER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let secs = crate::legacy::var(LEAVE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(LEAVE_SECS);
+        i64::try_from(secs).unwrap_or(i64::MAX)
+    })
+}
+
+/// Set aside every card he left unanswered for [`leave_after`] ([`qoop_store::Store::leave_asks`]),
+/// on the same look as stale plans. A failure waits for the next look.
+pub(crate) async fn leave_once(
+    agents: &AgentRegistry,
+    connections: &Arc<ConnectionRegistry>,
+    store: &StoreHandle,
+) {
+    let after = leave_after();
+    if let Ok(left) = store.run(move |s| s.leave_asks(now(), after)).await
+        && left > 0
+    {
+        crate::say!("qoopd: {left} question(s) unanswered for {after} s set aside as left");
+        connections.asks_changed();
+        // A task that waited on him may have gone back to its stage before the wait.
+        agents.tasks_changed();
+    }
 }
 
 pub(crate) async fn stale_plans_once(
@@ -806,7 +854,7 @@ pub(crate) async fn relayed(
     }
 }
 
-/// `E7` (qass's card) or `W12` (the daemon's draft) from a prompt head that starts `The owner
+/// `E7` (qass's card), `W12` (the daemon's draft) or `Q3` (the agent's own) from a prompt head that starts `The owner
 /// answered E7`, matched whole so it never reads E70 as E7.
 fn card_in_prompt(head: &str) -> Option<String> {
     card_after(
@@ -839,7 +887,10 @@ fn untagged(head: &str) -> &str {
 /// The card a head names right after `prefix`, matched whole.
 fn card_after(head: &str, prefix: &str) -> Option<String> {
     let rest = head.strip_prefix(prefix)?;
-    let kind = rest.chars().next().filter(|c| matches!(c, 'E' | 'W'))?;
+    let kind = rest
+        .chars()
+        .next()
+        .filter(|c| matches!(c, 'E' | 'W' | 'Q'))?;
     let rest = &rest[1..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let after = rest[digits.len()..].chars().next();
@@ -847,9 +898,12 @@ fn card_after(head: &str, prefix: &str) -> Option<String> {
         .then(|| format!("{kind}{digits}"))
 }
 
+/// `name` is the asking agent's name, read for an `Ask` only: its card's handle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write(
     id: String,
     caller: Caller,
+    name: Option<String>,
     action: AskOp,
     terminals: &Arc<TerminalRegistry>,
     agents: &Arc<AgentRegistry>,
@@ -861,6 +915,7 @@ pub(crate) async fn write(
         | AskOp::Close { card, .. }
         | AskOp::Dismiss { card }
         | AskOp::Answer { card, .. } => card.clone(),
+        AskOp::Ask { .. } => String::new(),
     };
     let result = match action {
         AskOp::Add {
@@ -905,6 +960,31 @@ pub(crate) async fn write(
                     AskResult::Closed
                 }
                 Ok(result) => result,
+                Err(reason) => return failed(id, reason),
+            }
+        }
+        AskOp::Ask {
+            asks,
+            options,
+            pick,
+        } => {
+            match agent_ask(
+                asks,
+                options,
+                pick,
+                (&caller, name),
+                (terminals, agents, store),
+            )
+            .await
+            {
+                Ok(card) => {
+                    connections.asks_changed();
+                    return ControlResponse::AskWritten {
+                        id,
+                        card,
+                        result: AskResult::Added,
+                    };
+                }
                 Err(reason) => return failed(id, reason),
             }
         }
@@ -991,6 +1071,114 @@ async fn add(
             Added::Replaced => AskResult::Replaced,
         })
         .map_err(why)
+}
+
+/// The why of the agent's own card: what makes it his.
+const AGENT_WHY: &str = "only you can decide this";
+
+/// A refusal of the card check that an agent's card does not get: an option may come without
+/// a reason, which the clients then draw as no line.
+fn reason_missing(problem: &str) -> bool {
+    problem.starts_with("option ") && problem.ends_with(" reason is empty")
+}
+
+/// File the agent's own question (`AskOp::Ask`) as card `Q<n>` on its open task, with the
+/// conversation it was asked in, so his answer is typed to it at its next rest. Only from the
+/// agent's terminal with its token, never from qass's space (qass writes `E` cards). Answers
+/// the card's number.
+async fn agent_ask(
+    asks: String,
+    options: Vec<crate::control::AskOption>,
+    pick: Option<crate::control::AskPick>,
+    (caller, name): (&Caller, Option<String>),
+    (terminals, agents, store): (&TerminalRegistry, &AgentRegistry, &StoreHandle),
+) -> Result<String, String> {
+    let (Some(terminal), Some(token)) = (caller.terminal, caller.token.as_deref()) else {
+        return Err("a question is asked from the agent's own terminal: qoop task ask".into());
+    };
+    if !crate::tasks::admitted(agents, terminal, token) {
+        return Err(format!(
+            "the ask request for terminal {terminal} was refused"
+        ));
+    }
+    if caller.space.as_deref() == Some(QASS_SPACE) {
+        return Err("qass writes its cards with escalate.sh, not qoop task ask".into());
+    }
+    let session = terminals.session_of(terminal);
+    let name = name.unwrap_or_else(|| format!("terminal {terminal}"));
+    store
+        .run(move |s| {
+            let Some(task) = s.open_task_of(i64::from(terminal))? else {
+                return Err(qoop_store::AskError::NoTask.into());
+            };
+            let owner_words = s.goal_is_prompt(task.id)?;
+            let card = AskCard {
+                handle: draft_handle(&name, task.id),
+                urgency: "now".to_string(),
+                asked: (!owner_words).then(|| card_value(&task.goal)),
+                doing: format!("task #{}", task.id),
+                why: AGENT_WHY.to_string(),
+                asks: qoop_store::task::one_line(&asks),
+                options,
+                pick,
+            };
+            let problems: Vec<String> = card
+                .problems()
+                .into_iter()
+                .filter(|p| !reason_missing(p))
+                .collect();
+            if !problems.is_empty() {
+                return Ok(Err(problems.join("; ")));
+            }
+            let body = serde_json::to_string(&card).unwrap_or_default();
+            s.add_agent_ask(
+                &format!("T{terminal}"),
+                i64::from(terminal),
+                session.as_deref(),
+                &body,
+                now(),
+            )
+            .map(Ok)
+        })
+        .await
+        .map_err(why)?
+}
+
+/// What the conversation in `terminal` left him (`AskLeft`): its own questions set aside,
+/// raised once ([`qoop_store::Store::raise_left`]), as `Asks` with them in `ended`. Nothing
+/// for a refused token or in qass's own space.
+pub(crate) async fn left(
+    id: String,
+    terminal: u32,
+    token: &str,
+    space: Option<String>,
+    (terminals, agents, store): (&TerminalRegistry, &AgentRegistry, &StoreHandle),
+) -> ControlResponse {
+    if !crate::tasks::admitted(agents, terminal, token) {
+        return failed(
+            id,
+            format!("the ask request for terminal {terminal} was refused"),
+        );
+    }
+    let mut ended = Vec::new();
+    if space.as_deref() != Some(QASS_SPACE) {
+        let session = terminals.session_of(terminal);
+        let rows = store
+            .run(move |s| {
+                let task = s.open_task_of(i64::from(terminal))?.map(|t| t.id);
+                s.raise_left(session.as_deref(), task)
+            })
+            .await;
+        match rows {
+            Ok(rows) => ended = rows.into_iter().filter_map(|r| info((r, None))).collect(),
+            Err(e) => return failed(id, why(e)),
+        }
+    }
+    ControlResponse::Asks {
+        id,
+        live: Vec::new(),
+        ended,
+    }
 }
 
 async fn close(card: &str, note: &str, store: &StoreHandle) -> Result<AskResult, String> {
@@ -2320,6 +2508,27 @@ mod tests {
             Some("W12")
         );
         assert_eq!(card_in_prompt("The owner answered X12"), None);
+        // The agent's own question, relayed by qass, is read the same way.
+        assert_eq!(
+            card_in_prompt("The owner answered Q31: \"wait\"").as_deref(),
+            Some("Q31")
+        );
+        assert!(not_his("While Q31 waits on the owner: go on."));
+        // Only his own words bring back a question he left: not qass's or another tab's.
+        assert!(his_own("where were we"));
+        assert!(!his_own(&format!(
+            "{} where were we",
+            sender_tag("qass", 473)
+        )));
+        assert!(!his_own("<task-notification>done</task-notification>"));
+        assert!(!his_own("While E7 waits on the owner: do the rest"));
+        assert!(!his_own("   "));
+        assert!(!his_own(
+            "The owner answered Q31: \"wait\". He chose B: Wait."
+        ));
+        // An agent's card may leave out an option's reason; every other problem stands.
+        assert!(reason_missing("option b reason is empty"));
+        assert!(!reason_missing("option b label is empty"));
         // Relayed by qass from its tab, the line carries `qoop prompt`'s sender tag first.
         let tagged = format!("{} The owner answered E7: \"go\"", sender_tag("qass", 473));
         assert_eq!(card_in_prompt(&tagged).as_deref(), Some("E7"));

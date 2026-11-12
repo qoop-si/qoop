@@ -228,12 +228,18 @@ turn(payload, "BeforeAgent", "AfterAgent")
 # not followed.
 if name in ("SessionStart", "BeforeAgent"):
     ask = ["qoop", "task", "rules"] + (["--turn"] if name == "BeforeAgent" else [])
+    # The request itself goes along on standard input: a question this conversation left the
+    # owner comes back once, at his own next prompt.
+    prompt = payload.get("prompt") if name == "BeforeAgent" else None
+    prompt = prompt if isinstance(prompt, str) else ""
+    if prompt:
+        ask += ["--prompt", "-"]
     try:
         # Run where the agent works (the payload cwd), as the other calls do: the repo
         # block follows it.
         here = str(payload.get("cwd") or "")
         here = here if os.path.isdir(here) else None
-        got = subprocess.run(ask, capture_output=True, timeout=2, text=True, cwd=here)
+        got = subprocess.run(ask, input=prompt, capture_output=True, timeout=2, text=True, cwd=here)
         rules = got.stdout.strip()
         if got.returncode == 0 and rules:
             sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": name, "additionalContext": rules}}))

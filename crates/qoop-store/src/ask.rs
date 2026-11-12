@@ -26,6 +26,13 @@ const WORKS_AGAIN: &str = "it works again";
 /// How long an ended card is kept.
 pub const KEEP_SECS: i64 = 14 * 24 * 3600;
 
+/// The note of a card he left unanswered ([`Store::leave_asks`]), or whose tab or agent ended
+/// while it waited: its agent's conversation is told of it once, at his next prompt.
+pub const LEFT: &str = "left";
+
+/// The note of a left card once its conversation was told of it ([`Store::raise_left`]).
+pub const LEFT_RAISED: &str = "left, raised";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AskRow {
     pub id: i64,
@@ -70,6 +77,12 @@ pub enum AskError {
     NoCard(String),
     #[error("{0} is already {1}")]
     NotOpen(String, String),
+    #[error(
+        "{0} is still live for this agent (open, or his answer is on its way): one question at a time"
+    )]
+    Waiting(String),
+    #[error("no open task here: open one with qoop task new")]
+    NoTask,
 }
 
 const COLUMNS: &str = "id, card, agent, terminal, session, task, status, note, body, answer, \
@@ -111,8 +124,19 @@ fn find(conn: &Connection, card: &str) -> rusqlite::Result<Option<AskRow>> {
 /// The note on an answer of his still queued for a tab that ended.
 pub const TAB_CLOSED: &str = "its tab closed: qass gets the answer";
 
+/// The start of a `CASE` that notes [`LEFT`] on a card about the agent's own question, still
+/// open, that is not a plan's: what a closing tab or a leaving agent leaves for its
+/// conversation to raise when it comes back. Ends with the other note and `END`.
+pub(crate) fn left_or() -> String {
+    format!(
+        "CASE WHEN status = 'open' AND task IS NOT NULL AND (card LIKE 'Q%' OR card LIKE 'W%') \
+         AND COALESCE(note, '') != '{PLAN_NOTE}' THEN '{LEFT}' ELSE"
+    )
+}
+
 /// End these terminals' cards. An open card closes, a draft or qass's: the agent it asks about
-/// is gone, and a question left in his inbox for it is stale; so does a passed card: his words
+/// is gone, and a question left in his inbox for it is stale (the agent's own question is
+/// noted [`LEFT`], so a resumed conversation is told of it); so does a passed card: his words
 /// already reached qass. A queued answer stays live with terminal and agent cleared, so a
 /// reused terminal id or agent label never matches it and his answer goes to qass. Called
 /// inside the transaction that ends the terminals, and at start for those that ended unseen.
@@ -123,8 +147,11 @@ pub(crate) fn close_for_terminals(
 ) -> rusqlite::Result<()> {
     for terminal in terminals {
         tx.execute(
-            "UPDATE ask SET status = 'closed', note = 'agent closed', closed_at = ?2 \
-             WHERE terminal = ?1 AND status IN ('open', 'passed')",
+            &format!(
+                "UPDATE ask SET status = 'closed', note = {} 'agent closed' END, \
+                 closed_at = ?2 WHERE terminal = ?1 AND status IN ('open', 'passed')",
+                left_or()
+            ),
             params![terminal, now],
         )?;
         tx.execute(
@@ -141,7 +168,7 @@ impl Store {
     /// (qass fixing a typo), an identical one is left alone (a retry), an ended one or one
     /// about another handle (two questions given one number) is refused. Every other open card
     /// of the same agent is closed as superseded, but only when the card names an agent: an
-    /// answer he already gave is never dropped.
+    /// answer he already gave is never dropped, nor the agent's own question (`Q<n>`).
     pub fn add_ask(
         &self,
         card: &str,
@@ -181,7 +208,7 @@ impl Store {
         if let Some(agent) = agent {
             tx.execute(
                 "UPDATE ask SET status = 'closed', note = 'superseded', closed_at = ?2 \
-                 WHERE agent = ?1 AND status = 'open'",
+                 WHERE agent = ?1 AND status = 'open' AND card NOT LIKE 'Q%'",
                 params![agent, now],
             )?;
         }
@@ -262,10 +289,11 @@ impl Store {
         };
         // One draft a waiting spell: a card opened since it last began waiting (answered,
         // dismissed or closed) stands for this spell, so a stage nobody moved never re-asks.
-        // One that closed because its agent worked again does not: it asks again when it waits.
+        // One that closed because its agent worked again does not: it asks again when it waits;
+        // nor one he left unanswered, which the agent was told of and asks again.
         let asked: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM ask WHERE task = ?1 AND COALESCE(note, '') != ?2 \
-             AND opened_at >= COALESCE( \
+             AND COALESCE(note, '') NOT LIKE 'left%' AND opened_at >= COALESCE( \
              (SELECT MAX(at) FROM task_event WHERE task = ?1 AND kind = 'stage' \
               AND body = 'waiting-human'), 0))",
             params![task, WORKS_AGAIN],
@@ -544,6 +572,18 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// How many open cards each task has, by task id: what a board row of a task says.
+    pub fn open_asks_by_task(&self) -> Result<std::collections::BTreeMap<i64, usize>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task, COUNT(*) FROM ask WHERE status = 'open' AND task IS NOT NULL GROUP BY task",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Whether a terminal has a live draft (`W<n>`), the daemon's card for its agent.
     pub fn has_draft(&self, terminal: i64) -> Result<bool, StoreError> {
         Ok(self.conn.query_row(
@@ -552,6 +592,114 @@ impl Store {
             params![terminal],
             |r| r.get(0),
         )?)
+    }
+
+    /// The agent's own question (`qoop task ask`): card `Q<n>`, `n` the next row id, tied to
+    /// the terminal's open task and conversation. Refused with no open task, and while a live
+    /// card names the terminal: one question at a time, and a draft or qass's card stands.
+    pub fn add_agent_ask(
+        &self,
+        agent: &str,
+        terminal: i64,
+        session: Option<&str>,
+        body: &str,
+        now: i64,
+    ) -> Result<String, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let live: Option<String> = tx
+            .query_row(
+                "SELECT card FROM ask WHERE terminal = ?1 \
+                 AND status IN ('open', 'queued', 'passed') ORDER BY id LIMIT 1",
+                params![terminal],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(card) = live {
+            return Err(AskError::Waiting(card).into());
+        }
+        let task: i64 = tx
+            .query_row(
+                "SELECT id FROM task WHERE terminal = ?1 AND closed_at IS NULL",
+                params![terminal],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(AskError::NoTask)?;
+        let n: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM ask", [], |r| r.get(0))?;
+        let card = format!("Q{n}");
+        tx.execute(
+            "INSERT INTO ask (card, agent, terminal, session, task, status, body, opened_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+            params![card, agent, terminal, session, task, body, now],
+        )?;
+        tx.commit()?;
+        Ok(card)
+    }
+
+    /// Set aside what he left unanswered: every `open` card (not a notice, not a plan's) opened
+    /// `after` seconds ago or more ends noted [`LEFT`], kept as
+    /// every ended card is. A task that waited on him with nothing live left on its terminal
+    /// goes back to its stage before the wait ([`crate::task::stage_back`]), and no other card
+    /// is touched. Answers how many cards were left.
+    pub fn leave_asks(&self, now: i64, after: i64) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // A notice is the daemon's `W` card about qass itself (no tab, no task): it is filed
+        // again while what it says holds, so it never leaves. qass's card about nobody does.
+        let due = "status = 'open' AND NOT (card LIKE 'W%' AND terminal IS NULL AND task IS NULL) \
+                   AND COALESCE(note, '') != ?1 AND opened_at <= ?2";
+        let tasks: Vec<i64> = tx
+            .prepare(&format!(
+                "SELECT DISTINCT task FROM ask WHERE {due} AND task IS NOT NULL"
+            ))?
+            .query_map(params![PLAN_NOTE, now - after], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let left = tx.execute(
+            &format!("UPDATE ask SET status = 'closed', note = ?3, closed_at = ?4 WHERE {due}"),
+            params![PLAN_NOTE, now - after, LEFT, now],
+        )?;
+        for task in tasks {
+            let still: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ask a JOIN task t ON t.id = ?1 \
+                 WHERE (a.task = t.id OR a.terminal = t.terminal) \
+                 AND a.status IN ('open', 'queued', 'passed'))",
+                params![task],
+                |r| r.get(0),
+            )?;
+            if !still {
+                crate::task::stage_back(&tx, task, now)?;
+            }
+        }
+        tx.commit()?;
+        Ok(left)
+    }
+
+    /// The questions a conversation left, to tell it of them once: the agent's own (`W`, `Q`)
+    /// noted [`LEFT`], asked in `session`, or, for a card that has no conversation, about
+    /// `task`. They are noted [`LEFT_RAISED`] in the same transaction, so a second read finds
+    /// none. Oldest first.
+    pub fn raise_left(
+        &self,
+        session: Option<&str>,
+        task: Option<i64>,
+    ) -> Result<Vec<AskRow>, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let pick = "status = 'closed' AND note = ?3 AND task IS NOT NULL \
+                    AND (card LIKE 'W%' OR card LIKE 'Q%') \
+                    AND ((?1 IS NOT NULL AND session = ?1) OR (session IS NULL AND task = ?2))";
+        let rows: Vec<AskRow> = tx
+            .prepare(&format!(
+                "SELECT {COLUMNS} FROM ask WHERE {pick} ORDER BY opened_at, id"
+            ))?
+            .query_map(params![session, task, LEFT], row)?
+            .collect::<rusqlite::Result<_>>()?;
+        if !rows.is_empty() {
+            tx.execute(
+                &format!("UPDATE ask SET note = ?4 WHERE {pick}"),
+                params![session, task, LEFT, LEFT_RAISED],
+            )?;
+            tx.commit()?;
+        }
+        Ok(rows)
     }
 
     /// At daemon start: cards of a terminal that is no longer open are ended as its tab's end
@@ -590,19 +738,25 @@ impl Store {
 /// Drafts end whatever their state; qass's own cards only while open and written before now,
 /// so one written in the same second as the move stands. With `keep_queued` an answer he
 /// already gave stays queued for delivery.
+///
+/// The agent's own card (`Q<n>`, `qoop task ask`) asks about work it goes on with: its own
+/// stage moves (`stage_move`) leave it alone, and an answer of his that waits to be typed to it
+/// is never dropped here; anything else ends it while open or passed to qass.
 pub(crate) fn close_cards(
     tx: &Connection,
     terminal: i64,
     note: &str,
     keep_queued: bool,
+    stage_move: bool,
     now: i64,
 ) -> rusqlite::Result<usize> {
     tx.execute(
         "UPDATE ask SET status = 'closed', note = ?2, closed_at = ?3 \
          WHERE terminal = ?1 AND ((card LIKE 'W%' AND status IN ('open', 'queued', 'passed') \
          AND NOT (?4 AND status = 'queued')) \
-         OR (card NOT LIKE 'W%' AND status = 'open' AND opened_at < ?3))",
-        params![terminal, note, now, keep_queued],
+         OR (card LIKE 'E%' AND status = 'open' AND opened_at < ?3) \
+         OR (card LIKE 'Q%' AND NOT ?5 AND status IN ('open', 'passed')))",
+        params![terminal, note, now, keep_queued, stage_move],
     )
 }
 
@@ -1217,10 +1371,11 @@ mod tests {
         );
         assert!(s.close_terminal(t5, 50).unwrap());
         assert!(s.close_terminal(t6, 50).unwrap());
+        // The agent's own open question is left for its conversation to raise if resumed.
         let closed = s.ask(&w5).unwrap().unwrap();
         assert_eq!(
             (closed.status.as_str(), closed.note.as_deref()),
-            ("closed", Some("agent closed"))
+            ("closed", Some(LEFT))
         );
         assert_eq!(
             s.ask("E3").unwrap().unwrap().status,
@@ -1336,5 +1491,202 @@ mod tests {
             .unwrap();
         let a = s.ask(&card).unwrap().unwrap();
         assert_eq!((a.status.as_str(), a.terminal), ("queued", Some(t)));
+    }
+
+    fn status_note(s: &Store, card: &str) -> (String, Option<String>) {
+        let a = s.ask(card).unwrap().unwrap();
+        (a.status, a.note)
+    }
+
+    fn stage(s: &Store, task: i64) -> String {
+        s.task(task).unwrap().unwrap().stage
+    }
+
+    /// The agent's own question asks about work it goes on with: its stage moves, its tool
+    /// calls and qass's card for it leave the card open, one question at a time, and only with
+    /// an open task.
+    #[test]
+    fn an_agent_ask_survives_its_stage_moves_and_work() {
+        let (s, t) = store_with_terminal();
+        assert!(matches!(
+            s.add_agent_ask("T5", t, Some("sess"), "{q}", 9),
+            Err(StoreError::Ask(AskError::NoTask))
+        ));
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        let card = s.add_agent_ask("T5", t, Some("sess"), "{q}", 11).unwrap();
+        assert!(card.starts_with('Q'));
+        assert!(matches!(
+            s.add_agent_ask("T5", t, Some("sess"), "{q2}", 12),
+            Err(StoreError::Ask(AskError::Waiting(c))) if c == card
+        ));
+        s.set_task_stage(task, "reviewing", 13).unwrap();
+        s.set_task_stage(task, "verifying", 14).unwrap();
+        s.close_waiting_drafts(t, 15).unwrap();
+        s.add_ask("E9", Some("T5"), Some(t), None, r#"{"handle":"x"}"#, 16)
+            .unwrap();
+        assert_eq!(status_note(&s, &card).0, "open");
+        assert_eq!(
+            s.add_draft("T5", t, None, "{d}", 17).unwrap(),
+            None,
+            "no turn-end draft over it"
+        );
+    }
+
+    /// His answer to the agent's question still reaches it when the agent claims its task
+    /// done; one qass is relaying ends with the task, as an open one does.
+    #[test]
+    fn an_answer_to_an_agent_ask_survives_done() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        let card = s.add_agent_ask("T5", t, Some("sess"), "{q}", 11).unwrap();
+        s.claim_ask(&card, "queued", Some("a"), "go", "owner, inbox", 12)
+            .unwrap();
+        s.claim_task_done(task, "shipped", 13).unwrap();
+        assert_eq!(status_note(&s, &card).0, "queued");
+        s.deliver_ask(&card, "passed", "qass", 14).unwrap();
+        s.close_task(task, crate::Outcome::Verified, "ok", 15)
+            .unwrap();
+        assert_eq!(status_note(&s, &card).0, "closed");
+    }
+
+    /// An open card he did not answer in a day is set aside as left, kept; its task stops
+    /// waiting on him. A plan's card, a notice and a younger card stay open.
+    #[test]
+    fn an_open_card_leaves_after_a_day_and_its_task_stops_waiting() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "reviewing", 11).unwrap();
+        s.set_task_stage(task, "waiting-human", 12).unwrap();
+        let card = s
+            .add_draft("T5", t, Some("sess"), "{d}", 100)
+            .unwrap()
+            .unwrap();
+        let notice = s.add_notice(r#"{"handle":"qass"}"#, 100).unwrap().unwrap();
+        assert_eq!(s.leave_asks(150, 100).unwrap(), 0, "younger than a day");
+        assert_eq!(s.leave_asks(200, 100).unwrap(), 1);
+        assert_eq!(status_note(&s, &card), ("closed".into(), Some(LEFT.into())));
+        assert_eq!(status_note(&s, &notice).0, "open");
+        assert_eq!(stage(&s, task), "reviewing");
+        let plan = {
+            let (s2, t2) = (&s, t);
+            s2.set_task_stage(task, "waiting-human", 300).unwrap();
+            s2.add_plan_draft("T5", t2, None, "{p}", 300)
+                .unwrap()
+                .unwrap()
+        };
+        s.leave_asks(1000, 100).unwrap();
+        assert_eq!(status_note(&s, &plan).0, "open");
+    }
+
+    /// Leaving one card touches no other: a younger card on the same tab stays open, and the
+    /// task keeps waiting while it does.
+    #[test]
+    fn leave_touches_no_other_card() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        let old = s.add_draft("T5", t, None, "{d}", 100).unwrap().unwrap();
+        s.add_ask("E3", None, Some(t), None, r#"{"handle":"y"}"#, 190)
+            .unwrap();
+        s.leave_asks(200, 100).unwrap();
+        assert_eq!(status_note(&s, &old).1.as_deref(), Some(LEFT));
+        assert_eq!(status_note(&s, "E3").0, "open");
+        assert_eq!(stage(&s, task), "waiting-human");
+    }
+
+    /// A tab closing over the agent's own open question leaves it for a resumed conversation;
+    /// qass's card closes as before.
+    #[test]
+    fn a_closed_tab_leaves_its_question() {
+        let (s, t) = store_with_terminal();
+        s.open_task(t, "ship", false, 10).unwrap();
+        let card = s.add_agent_ask("T5", t, Some("sess"), "{q}", 11).unwrap();
+        let tx = s.conn.unchecked_transaction().unwrap();
+        close_for_terminals(&tx, &[t], 12).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(status_note(&s, &card), ("closed".into(), Some(LEFT.into())));
+        let (s, t) = store_with_terminal();
+        s.add_ask("E4", Some("T5"), Some(t), None, r#"{"handle":"z"}"#, 11)
+            .unwrap();
+        let tx = s.conn.unchecked_transaction().unwrap();
+        close_for_terminals(&tx, &[t], 12).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(status_note(&s, "E4").1.as_deref(), Some("agent closed"));
+    }
+
+    /// A question he left does not count as asked for the wait: the agent's re-ask gets a card.
+    #[test]
+    fn a_left_card_does_not_block_the_re_ask() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        s.add_draft("T5", t, None, "{d}", 100).unwrap().unwrap();
+        s.leave_asks(200, 100).unwrap();
+        s.set_task_stage(task, "waiting-human", 201).unwrap();
+        assert!(s.add_draft("T5", t, None, "{d}", 202).unwrap().is_some());
+    }
+
+    /// A left question is raised once, to its own conversation: another conversation in the
+    /// same tab never sees it, and a card with no conversation is matched by its task.
+    #[test]
+    fn a_left_question_is_raised_once_for_its_session_only() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        let card = s.add_agent_ask("T5", t, Some("sess"), "{q}", 11).unwrap();
+        s.leave_asks(200, 100).unwrap();
+        assert!(
+            s.raise_left(Some("other"), Some(task + 1))
+                .unwrap()
+                .is_empty()
+        );
+        let raised = s.raise_left(Some("sess"), Some(task)).unwrap();
+        assert_eq!(
+            raised.iter().map(|r| r.card.as_str()).collect::<Vec<_>>(),
+            [card.as_str()]
+        );
+        assert!(
+            s.raise_left(Some("sess"), Some(task)).unwrap().is_empty(),
+            "once"
+        );
+        assert_eq!(status_note(&s, &card).1.as_deref(), Some(LEFT_RAISED));
+        let none = s.add_agent_ask("T5", t, None, "{q}", 300).unwrap();
+        s.leave_asks(500, 100).unwrap();
+        let raised = s.raise_left(Some("sess"), Some(task)).unwrap();
+        assert_eq!(
+            raised.iter().map(|r| r.card.as_str()).collect::<Vec<_>>(),
+            [none.as_str()]
+        );
+    }
+
+    /// A closing tab leaves the agent's own question, never a plan's card; an agent leaving
+    /// its conversation leaves its question the same way.
+    #[test]
+    fn a_plans_card_is_never_left_and_an_agent_leaving_leaves_its_question() {
+        let (s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        let plan = s.add_plan_draft("T5", t, None, "{p}", 12).unwrap().unwrap();
+        let tx = s.conn.unchecked_transaction().unwrap();
+        close_for_terminals(&tx, &[t], 13).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(status_note(&s, &plan).1.as_deref(), Some("agent closed"));
+        let (s, t) = store_with_terminal();
+        s.set_agent(t, Some("claude"), Some("sess")).unwrap();
+        s.open_task(t, "ship", false, 10).unwrap();
+        let card = s.add_agent_ask("T5", t, Some("sess"), "{q}", 11).unwrap();
+        assert_eq!(s.agent_left(t, "sess", 12).unwrap(), 1);
+        assert_eq!(status_note(&s, &card).1.as_deref(), Some(LEFT));
+    }
+
+    /// qass's card about nobody leaves after a day too; a notice about qass itself does not.
+    #[test]
+    fn a_card_about_nobody_leaves_but_a_notice_stays() {
+        let (s, _) = store_with_terminal();
+        s.add_ask("E7", None, None, None, r#"{"handle":"elster"}"#, 100)
+            .unwrap();
+        let notice = s.add_notice(r#"{"handle":"qass"}"#, 100).unwrap().unwrap();
+        assert_eq!(s.leave_asks(300, 100).unwrap(), 1);
+        assert_eq!(status_note(&s, "E7").1.as_deref(), Some(LEFT));
+        assert_eq!(status_note(&s, &notice).0, "open");
     }
 }

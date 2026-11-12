@@ -2112,10 +2112,13 @@ pub fn talk_target(card: &AskInfo, rows: &[AgentRow], spaces: &[WorkspaceRow]) -
         });
         refs.find_map(|r| tab_of(r, rows, spaces, qass))
     };
-    // A terminal that is gone (a stale card) is not a tab to open; a draft keeps its tab.
-    let own = card
-        .terminal
-        .filter(|t| card.card.starts_with('W') || workers.iter().any(|r| r.terminal == *t));
+    // A terminal that is gone (a stale card) is not a tab to open; a draft, or the agent's own
+    // question, keeps its tab.
+    let own = card.terminal.filter(|t| {
+        card.card.starts_with('W')
+            || card.card.starts_with('Q')
+            || workers.iter().any(|r| r.terminal == *t)
+    });
     own.or_else(by_agent)
         .or_else(by_task)
         .or_else(by_words)

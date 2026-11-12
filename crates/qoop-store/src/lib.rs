@@ -1457,8 +1457,11 @@ impl Store {
             return Ok(0);
         }
         let ended = tx.execute(
-            "UPDATE ask SET status = 'closed', note = 'its agent left', closed_at = ?3 \
-             WHERE terminal = ?1 AND session = ?2 AND status = 'open'",
+            &format!(
+                "UPDATE ask SET status = 'closed', note = {} 'its agent left' END, \
+                 closed_at = ?3 WHERE terminal = ?1 AND session = ?2 AND status = 'open'",
+                crate::ask::left_or()
+            ),
             params![id, session, now],
         )?;
         tx.commit()?;

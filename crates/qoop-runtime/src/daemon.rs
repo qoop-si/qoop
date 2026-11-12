@@ -5885,6 +5885,13 @@ async fn handle_control(
                 Some(space) => space_name(store, space).await,
                 None => None,
             };
+            // The agent's own question carries its name as its handle, read as a board reads it.
+            let name = match (&action, terminal) {
+                (crate::control::AskOp::Ask { .. }, Some(t)) => {
+                    agent_names(terminals, vec![t]).await.remove(&i64::from(t))
+                }
+                _ => None,
+            };
             Box::pin(crate::asks::write(
                 id,
                 crate::asks::Caller {
@@ -5892,6 +5899,7 @@ async fn handle_control(
                     token,
                     space,
                 },
+                name,
                 action,
                 terminals,
                 agents,
@@ -5914,6 +5922,17 @@ async fn handle_control(
         } => crate::messages::send(id, terminal, child, text, terminals, agents).await,
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
+        }
+        ControlRequest::AskLeft {
+            id,
+            terminal,
+            token,
+        } => {
+            let space = match terminals.workspace_of(terminal) {
+                Some(space) => space_name(store, space).await,
+                None => None,
+            };
+            crate::asks::left(id, terminal, &token, space, (terminals, agents, store)).await
         }
         ControlRequest::ShowWrite {
             terminal,

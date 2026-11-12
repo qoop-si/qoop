@@ -203,18 +203,9 @@ pub(crate) fn waiting_at(alias: &str) -> String {
     )
 }
 
-/// A task waiting on the owner took his answer: its stage goes back to the one before
-/// `waiting-human`, else `implementing`, and its terminal's cards close with `note`
-/// (`keep_queued`: an inbox answer still waiting to be typed stays). Answers the stage it went
-/// back to, `None` when it no longer waited.
-fn end_wait(
-    tx: &Connection,
-    task: i64,
-    terminal: i64,
-    note: &str,
-    keep_queued: bool,
-    now: i64,
-) -> rusqlite::Result<Option<String>> {
+/// A task at `waiting-human` goes back to the stage before it, else `implementing`, with its
+/// stage event; no card is touched. Answers the stage, `None` when it was not waiting.
+pub(crate) fn stage_back(tx: &Connection, task: i64, now: i64) -> rusqlite::Result<Option<String>> {
     let before: Option<String> = tx
         .query_row(
             "SELECT body FROM task_event WHERE task = ?1 AND kind = 'stage' \
@@ -234,7 +225,25 @@ fn end_wait(
         return Ok(None);
     }
     event(tx, task, "stage", &back, now)?;
-    crate::ask::close_cards(tx, terminal, note, keep_queued, now)?;
+    Ok(Some(back))
+}
+
+/// A task waiting on the owner took his answer: its stage goes back to the one before
+/// `waiting-human` ([`stage_back`]), and its terminal's cards close with `note`
+/// (`keep_queued`: an inbox answer still waiting to be typed stays). Answers the stage it went
+/// back to, `None` when it no longer waited.
+fn end_wait(
+    tx: &Connection,
+    task: i64,
+    terminal: i64,
+    note: &str,
+    keep_queued: bool,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let Some(back) = stage_back(tx, task, now)? else {
+        return Ok(None);
+    };
+    crate::ask::close_cards(tx, terminal, note, keep_queued, false, now)?;
     Ok(Some(back))
 }
 
@@ -329,7 +338,7 @@ pub(crate) fn close_as(
         .optional()?
         .flatten();
     if let Some(terminal) = terminal {
-        crate::ask::close_cards(tx, terminal, "its task ended", true, now)?;
+        crate::ask::close_cards(tx, terminal, "its task ended", true, false, now)?;
     }
     tx.execute(
         "UPDATE task SET closed_at = ?2, updated_at = ?2, outcome = ?3, terminal = NULL \
@@ -606,7 +615,7 @@ impl Store {
             && stage != t.stage
             && let Some(terminal) = t.terminal
         {
-            crate::ask::close_cards(&tx, terminal, "no longer waits", false, now)?;
+            crate::ask::close_cards(&tx, terminal, "no longer waits", false, true, now)?;
         }
         tx.commit()?;
         Ok(t.stage != stage || t.claimed_at.is_some())
@@ -802,7 +811,7 @@ impl Store {
         };
         event(&tx, task, "done", &body, now)?;
         if let Some(terminal) = t.terminal {
-            crate::ask::close_cards(&tx, terminal, "its task is done", false, now)?;
+            crate::ask::close_cards(&tx, terminal, "its task is done", false, false, now)?;
         }
         tx.commit()?;
         Ok(())

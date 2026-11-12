@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 /// line it is sent, and flips its state on `BUSY` and `FREE`. `ASK` shows a question dialog
 /// as the claude hook reports one, `MENU` a permission menu, `TOOL` a tool, `TASK` opens
 /// a task, `WAIT` sets its stage to `waiting-human`, `DONE <words>` ends a turn on those last
-/// words, `SAID <words>` is his prompt and `EXIT` ends the agent, leaving its shell.
+/// words, `SAID <words>` is his prompt and `EXIT` ends the agent, leaving its shell. `QASK`
+/// asks him with `qoop task ask`, `STAGE <s>` moves its stage, and `PROMPT <words>` runs the
+/// per-request hook line with those words as the request, all into its log.
 const STUB: &str = r#"#!/bin/sh
 if [ -n "$STUB_SESSION" ]; then qoop hook-report --state idle --session-id "$STUB_SESSION"; else qoop hook-report --state idle; fi
 while IFS= read -r line; do
@@ -31,6 +33,9 @@ while IFS= read -r line; do
     DONE*) qoop hook-report --state idle --visible-idle --event done --label "${line#DONE }" ;;
     SAID*) qoop hook-report --state working --event user --label "${line#SAID }" ;;
     WAIT) qoop task stage waiting-human ;;
+    QASK) qoop task ask "Ship it to staging now?" "Ship" "Wait | the review is not in" --pick a >> "$STUB_LOG" 2>&1 ;;
+    STAGE*) qoop task stage "${line#STAGE }" ;;
+    PROMPT*) printf '%s' "${line#PROMPT }" | qoop task rules --turn --prompt - >> "$STUB_LOG" 2>&1 ;;
     EDIT) qoop task begin ;;
     EXIT) exit 0 ;;
   esac
@@ -1543,5 +1548,131 @@ fn a_via_qass_card_on_a_worker_is_answered_through_qass() {
         !stack.log("korea").contains("The owner answered E9"),
         "the worker was typed to: {:?}",
         stack.log("korea")
+    );
+}
+
+/// The card number `qoop task ask` printed into `log`.
+fn asked_card(log: &str) -> Option<String> {
+    log.split_whitespace()
+        .find(|w| w.starts_with('Q') && w.len() > 1 && w[1..].bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+/// The agent asks him with `qoop task ask` while it works: the card carries its options and
+/// pick, survives the agent's stage moves, and his answer waits for its next rest, then is
+/// typed to it. No qass on this Mac: the agent's own question needs none.
+#[test]
+fn a_worker_asks_keeps_working_and_gets_the_answer_at_rest() {
+    let stack = Stack::start();
+    let api = stack.agent("work", "api", Some("sess-api"));
+    stack.send(&api, "TASK");
+    assert!(stack.wait(|| !stage(&stack, &api).is_empty()));
+    stack.send(&api, "BUSY");
+    assert!(stack.wait(|| stack.state_of(&api) == "working"));
+    stack.send(&api, "QASK");
+    assert!(
+        stack.wait(|| asked_card(&stack.log("api")).is_some()),
+        "{:?}",
+        stack.log("api")
+    );
+    let card = asked_card(&stack.log("api")).unwrap();
+    let (_, out, _) = stack.run(&["ask", "ls", "--json"]);
+    let all: serde_json::Value = serde_json::from_str(&out).expect("json");
+    let live = all["live"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["card"] == card.as_str())
+        .cloned()
+        .expect("the card is live");
+    assert_eq!(live["body"]["options"][1]["label"], "Wait");
+    assert_eq!(live["body"]["options"][1]["reason"], "the review is not in");
+    assert_eq!(live["body"]["pick"]["key"], "a");
+
+    // It goes on working: a stage move and a tool keep the question.
+    stack.send(&api, "STAGE reviewing");
+    stack.send(&api, "TOOL");
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(stack.card_status(&card), "open");
+
+    let (ok, out, err) = stack.run(&["ask", "answer", &card, "--option", "b"]);
+    assert!(ok && out.contains("Answered"), "{out} {err}");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !stack
+            .log("api")
+            .contains(&format!("The owner answered {card}")),
+        "typed into a running turn: {:?}",
+        stack.log("api")
+    );
+    stack.send(&api, "FREE");
+    assert!(
+        stack.wait(|| stack.log("api").contains("He chose B: Wait")),
+        "{:?}",
+        stack.log("api")
+    );
+    assert_eq!(stack.card_status(&card), "answered");
+}
+
+/// A question whose tab closed comes back to its conversation once, at the owner's own next
+/// prompt in a tab that resumed it: a prompt qass sent never spends it.
+#[test]
+fn a_left_question_comes_back_once_at_his_own_prompt() {
+    let stack = Stack::start();
+    let api = stack.agent("work", "api", Some("sess-left"));
+    stack.send(&api, "TASK");
+    assert!(stack.wait(|| !stage(&stack, &api).is_empty()));
+    stack.send(&api, "QASK");
+    assert!(stack.wait(|| asked_card(&stack.log("api")).is_some()));
+    let card = asked_card(&stack.log("api")).unwrap();
+    let (ok, _, err) = stack.run(&["close", &api]);
+    assert!(ok, "{err}");
+    assert!(stack.wait(|| stack.card_status(&card) == "closed"));
+
+    let again = stack.agent("work", "again", Some("sess-left"));
+    stack.send(&again, "TASK");
+    assert!(stack.wait(|| !stage(&stack, &again).is_empty()));
+    let told = format!("The owner left your question unanswered ({card}");
+    stack.send(&again, "PROMPT [from qass, tab 3] look at the logs");
+    assert!(
+        stack.wait(|| stack.log("again").contains("qoop: ")),
+        "the turn line ran"
+    );
+    assert!(
+        !stack.log("again").contains(&told),
+        "qass's prompt spent it"
+    );
+    stack.send(&again, "PROMPT where were we");
+    assert!(
+        stack.wait(|| stack.log("again").contains(&told)),
+        "{:?}",
+        stack.log("again")
+    );
+    assert!(stack.log("again").contains("Ship it to staging now?"));
+    stack.send(&again, "PROMPT and now");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(stack.log("again").matches(&told).count(), 1, "once");
+}
+
+/// qass writes `E` cards with `escalate.sh`; `qoop task ask` from its space is refused, and an
+/// agent with no open task is told how to open one.
+#[test]
+fn an_agent_ask_needs_a_worker_with_a_task() {
+    let stack = Stack::start();
+    let qass = stack.agent("qass", "qass", None);
+    stack.send(&qass, "QASK");
+    assert!(
+        stack.wait(|| stack
+            .log("qass")
+            .contains("qass writes its cards with escalate.sh")),
+        "{:?}",
+        stack.log("qass")
+    );
+    let api = stack.agent("work", "api", None);
+    stack.send(&api, "QASK");
+    assert!(
+        stack.wait(|| stack.log("api").contains("open one with qoop task new")),
+        "{:?}",
+        stack.log("api")
     );
 }

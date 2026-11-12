@@ -782,6 +782,7 @@ fn info(t: TaskRow, tab: Tab, waiting_at: Option<i64>) -> TaskInfo {
         status: state.as_str().to_string(),
         status_at,
         asleep_since,
+        open_asks: 0,
     }
 }
 
@@ -894,11 +895,11 @@ pub(crate) async fn read(
                 .into_iter()
                 .map(|(terminal, _, since)| (terminal, since))
                 .collect();
-            let waiting = s.waiting_since()?;
+            let waiting = (s.waiting_since()?, s.open_asks_by_task()?);
             Ok((items, card, tasks, events, one, loose, asleep, waiting))
         })
         .await;
-    let (items, card, tasks, events, one, loose, asleep, waiting) = match found {
+    let (items, card, tasks, events, one, loose, asleep, (waiting, asking)) = match found {
         Ok(found) => found,
         Err(e) => return store_failed(id, e),
     };
@@ -982,7 +983,11 @@ pub(crate) async fn read(
         .map(|t| {
             let tab = t.terminal.map(tab).unwrap_or_default();
             let waiting_at = waiting.get(&t.id).copied();
-            info(t, tab, waiting_at)
+            let open_asks = asking.get(&t.id).copied().unwrap_or(0);
+            TaskInfo {
+                open_asks,
+                ..info(t, tab, waiting_at)
+            }
         })
         .collect();
     if loose.is_some() {

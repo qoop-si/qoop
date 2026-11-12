@@ -674,6 +674,15 @@ pub enum ControlRequest {
         token: Option<String>,
         action: AskOp,
     },
+    /// What the conversation in `terminal` left him unanswered (the agent's own questions
+    /// set aside after a day, or when its tab or agent ended), told once: answered as `Asks`
+    /// with them in `ended`, oldest first, and never again. From the terminal, with its token;
+    /// nothing in qass's own space. A daemon from before it answers `unknown variant`.
+    AskLeft {
+        id: String,
+        terminal: TerminalStream,
+        token: String,
+    },
     /// The cards waiting for the owner and the last few that ended, answered as `Asks`.
     AskRead {
         id: String,
@@ -995,6 +1004,15 @@ pub enum AskOp {
     Close { card: String, note: String },
     /// The owner puts a card away unanswered.
     Dismiss { card: String },
+    /// The agent in the asking terminal asks him (`qoop task ask`): card `Q<n>` on its open
+    /// task, two to four options keyed `a` to `d`, while it goes on with the rest. With the
+    /// terminal's token; never from qass's own space. The daemon writes the rest of the card.
+    Ask {
+        asks: String,
+        options: Vec<AskOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pick: Option<AskPick>,
+    },
 }
 
 /// What an `AskWrite` came to.
@@ -1774,6 +1792,10 @@ pub struct TaskInfo {
     /// a list folds the asleep ones apart. `None` awake and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asleep_since: Option<i64>,
+    /// Questions about this task that wait on the owner: a board row says so, and lists it
+    /// first. 0 from an older daemon.
+    #[serde(default)]
+    pub open_asks: usize,
 }
 
 /// One thing recorded on a task.
@@ -1850,6 +1872,7 @@ impl ControlRequest {
             | Self::TaskRead { id, .. }
             | Self::AskWrite { id, .. }
             | Self::AskRead { id, .. }
+            | Self::AskLeft { id, .. }
             | Self::ShowWrite { id, .. }
             | Self::ShowRead { id }
             | Self::AgentSessions { id, .. }
