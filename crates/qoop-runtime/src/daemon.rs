@@ -2665,16 +2665,22 @@ async fn serve_client(
                 _ = look.tick(), if rows.is_some() && !due.is_empty() => {
                     let asked: Vec<u32> = std::mem::take(&mut due).into_iter().collect();
                     let Some(rows) = &rows else { continue };
-                    for event in rows.changed(Some(asked)).await {
-                        if !send_event(&event_tx, &event).await {
-                            return;
+                    match rows.changed(Some(asked)).await {
+                        Ok(events) => {
+                            for event in events {
+                                if !send_event(&event_tx, &event).await {
+                                    return;
+                                }
+                            }
                         }
+                        Err(again) => due.extend(again),
                     }
                     continue;
                 }
                 _ = sweep.tick(), if rows.is_some() => {
                     let Some(rows) = &rows else { continue };
-                    for event in rows.changed(None).await {
+                    // A sweep raced by a listing waits for the next: that listing is fresh.
+                    for event in rows.changed(None).await.unwrap_or_default() {
                         if !send_event(&event_tx, &event).await {
                             return;
                         }
@@ -7774,6 +7780,9 @@ const QUIET_FIELDS: &[&str] = &[
 #[derive(Default)]
 pub(crate) struct SeenRows {
     listed: bool,
+    /// Bumped by every listing noted: a look that saw it move compared against a `seen` that
+    /// changed under it, so its rows are looked at again.
+    notes: u64,
     order: Vec<u32>,
     rows: BTreeMap<u32, serde_json::Value>,
 }
@@ -7784,6 +7793,7 @@ impl SeenRows {
         let ControlResponse::Agents { agents, .. } = response else {
             return;
         };
+        self.notes += 1;
         match only {
             None => {
                 self.listed = true;
@@ -7852,22 +7862,20 @@ fn quiet_view(row: &crate::control::AgentRow, watching: &BTreeSet<u32>) -> serde
     view
 }
 
-/// Whether a row moved. A title or a task missing where one was held is a read that timed out
-/// (a slow disk, a busy probe pool), not news: the next look has it again.
+/// Whether a row moved. A title missing where one was held is a read that timed out (a slow
+/// disk, a busy probe pool), not news: the next look has it again. A task missing is news: a
+/// closed one leaves the row that way.
 fn quiet_differs(was: Option<&serde_json::Value>, now: Option<&serde_json::Value>) -> bool {
     match (was, now) {
         (None, None) => false,
         (Some(_), None) | (None, Some(_)) => true,
         (Some(was), Some(now)) => {
             let mut now = now.clone();
-            if let (serde_json::Value::Object(n), serde_json::Value::Object(w)) = (&mut now, was) {
-                for key in ["agent_title", "task"] {
-                    if n.get(key).is_none_or(serde_json::Value::is_null)
-                        && let Some(held) = w.get(key)
-                    {
-                        n.insert(key.to_string(), held.clone());
-                    }
-                }
+            if let (serde_json::Value::Object(n), serde_json::Value::Object(w)) = (&mut now, was)
+                && n.get("agent_title").is_none_or(serde_json::Value::is_null)
+                && let Some(held) = w.get("agent_title")
+            {
+                n.insert("agent_title".to_string(), held.clone());
             }
             now != *was
         }
@@ -7925,11 +7933,20 @@ struct RowsAsker {
 impl RowsAsker {
     /// The news a quiet connection is owed: `AgentChanged` for each of the rows (`asked`, or
     /// every row) that moved against what it holds, and `Resync` when the order did. Nothing
-    /// before its first listing, which reads them all anyway.
-    async fn changed(&self, asked: Option<Vec<u32>>) -> Vec<crate::control::EventMessage> {
-        if !self.seen.lock().unwrap().listed {
-            return Vec::new();
-        }
+    /// before its first listing, which reads them all anyway. `Err` with the rows to look at
+    /// again when a listing it was answered landed meanwhile: compared against that, a row
+    /// that moved and moved back would read as unchanged and be lost.
+    async fn changed(
+        &self,
+        asked: Option<Vec<u32>>,
+    ) -> Result<Vec<crate::control::EventMessage>, Vec<u32>> {
+        let notes = {
+            let seen = self.seen.lock().unwrap();
+            if !seen.listed {
+                return Ok(Vec::new());
+            }
+            seen.notes
+        };
         let whole = asked.is_none();
         let request = match &asked {
             Some(terminals) => ControlRequest::AgentRows {
@@ -7958,22 +7975,26 @@ impl RowsAsker {
         )
         .await;
         let ControlResponse::Agents { agents: rows, .. } = response else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let watching = watching(&self.subscriptions);
-        let (moved, reordered) = self.seen.lock().unwrap().changed(
+        let seen = self.seen.lock().unwrap();
+        if seen.notes != notes {
+            return Err(asked.unwrap_or_default());
+        }
+        let (moved, reordered) = seen.changed(
             asked.as_deref().unwrap_or_default(),
             &rows,
             &watching,
             whole,
         );
         if reordered {
-            return vec![crate::control::EventMessage::Resync];
+            return Ok(vec![crate::control::EventMessage::Resync]);
         }
-        moved
+        Ok(moved
             .into_iter()
             .map(|terminal| crate::control::EventMessage::AgentChanged { terminal })
-            .collect()
+            .collect())
     }
 }
 
