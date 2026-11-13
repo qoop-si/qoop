@@ -714,30 +714,6 @@ impl AgentRegistry {
         std::mem::take(&mut *self.unparked.lock().unwrap())
     }
 
-    /// Re-announce a terminal without touching its belief.
-    ///
-    /// The slow-tick recovery for a missed index refresh (Phase D1): a panel
-    /// that missed one `AgentChanged` event converges on the next one. This
-    /// goes around `accept()` on purpose, so it cannot change the belief and
-    /// cannot be filtered by the changed-state gate: it is a repeat, not news.
-    /// The daemon arms it only while a `visible_blocker` holds.
-    pub fn reannounce(&self, stream: u32) {
-        self.announce(stream);
-    }
-
-    /// Whether this terminal's belief currently holds a visible blocker.
-    ///
-    /// A copied bool rather than a cloned record: the detect loop asks on
-    /// every evaluation and cloning the whole record for one flag is the kind
-    /// of cost that only shows up at a hundred terminals.
-    pub fn belief_visible_blocker(&self, stream: u32) -> bool {
-        self.terminals
-            .lock()
-            .unwrap()
-            .get(&stream)
-            .is_some_and(|a| a.belief.visible_blocker)
-    }
-
     /// Record what the screen shows running in the background: subagents, and the shells
     /// and monitors the footer counts. Changes no state. The sleep check reads the agents;
     /// the index shows both, so a changed total is announced and a repeat is not.
@@ -2931,44 +2907,6 @@ mod tests {
             Err(ClaimRefusal::WrongTerminal)
         );
         // The forgery changed nothing.
-        assert_eq!(
-            r.agent(1).expect("agent").belief.state,
-            AgentRuntimeState::Blocked
-        );
-    }
-
-    /// D1: a held blocker survives re-announces unchanged, and each tick emits
-    /// so a panel that missed one refresh still converges.
-    #[test]
-    fn a_blocker_held_across_reannounce_ticks_stays_blocked() {
-        let r = registry();
-        let token = mint_token(1);
-        r.register(1, TerminalId::new("1"), token.clone());
-        r.observe_hook(
-            1,
-            &TerminalId::new("1"),
-            &token,
-            AgentRuntimeState::Blocked,
-            true,
-            false,
-            NOW,
-        )
-        .expect("applies");
-        let mut rx = r.subscribe();
-        // The observe above announced; drain it so the count below is ticks only.
-        let _ = rx.try_recv();
-
-        let before = r.agent(1).expect("agent").belief.clone();
-        assert!(before.visible_blocker);
-        for _ in 0..3 {
-            r.reannounce(1);
-            assert_eq!(
-                r.agent(1).expect("agent").belief,
-                before,
-                "a repeat is not news"
-            );
-            rx.try_recv().expect("each tick re-announces");
-        }
         assert_eq!(
             r.agent(1).expect("agent").belief.state,
             AgentRuntimeState::Blocked
