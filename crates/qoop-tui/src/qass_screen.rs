@@ -581,19 +581,19 @@ pub fn facts(
         // task waiting on him. A finish nobody read is the sidebar's to show, not a wait.
         waiting: mine()
             .filter(|r| {
-                matches!(crate::sidebar::shown(r), "blocked" | "failed")
+                matches!(crate::sidebar::shown_state(r), "blocked" | "failed")
                     || r.task
                         .as_ref()
                         .is_some_and(|t| t.stage == "waiting-human" && !t.claimed)
             })
             .count(),
         working: mine()
-            .filter(|r| crate::sidebar::shown(r) == "working")
+            .filter(|r| crate::sidebar::shown_state(r) == "working")
             .count(),
         // The cards waiting in his inbox once it can be read; the blocked agents before.
         asks: cards.unwrap_or_else(|| {
             mine()
-                .filter(|r| crate::sidebar::shown(r) == "blocked")
+                .filter(|r| crate::sidebar::shown_state(r) == "blocked")
                 .count()
         }),
         watching: sidebar::watching().unwrap_or(true),

@@ -5,7 +5,9 @@
 use std::time::{Duration, Instant};
 
 use qoop_runtime::client::{self, Incoming};
-use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage, TaskOp};
+use qoop_runtime::control::{
+    AgentRow, ControlRequest, ControlResponse, EventMessage, SubagentChange, TaskOp,
+};
 use qoop_testkit::{TestClient, TestDaemon};
 use tokio::io::AsyncReadExt;
 
@@ -78,8 +80,18 @@ async fn changed(
     inbuf: &mut bytes::BytesMut,
     terminal: u32,
 ) -> bool {
+    changed_within(rd, inbuf, terminal, PATIENCE).await
+}
+
+/// [`changed`] within `patience`.
+async fn changed_within(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    inbuf: &mut bytes::BytesMut,
+    terminal: u32,
+    patience: Duration,
+) -> bool {
     let mut connection = client::Connection::new();
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + patience;
     let mut read = [0u8; 64 * 1024];
     loop {
         for incoming in connection.drain(inbuf).expect("decode") {
@@ -177,6 +189,16 @@ async fn a_task_waiting_on_the_owner_needs_you_at_once_on_every_row() {
         .await
         .expect("connect");
     let (mut index_rd, _index_wr) = index.into_split();
+    // Whatever the task's opening announced is heard and done with first.
+    while changed_within(
+        &mut index_rd,
+        &mut index_in,
+        terminal,
+        Duration::from_millis(500),
+    )
+    .await
+    {}
+    assert_eq!(status(&mut asker, terminal).await, "done");
     let stage = TaskOp::Stage {
         stage: "waiting-human".into(),
     };
@@ -190,4 +212,71 @@ async fn a_task_waiting_on_the_owner_needs_you_at_once_on_every_row() {
     let waiting = row(&mut asker, terminal).await;
     assert_eq!(waiting.status.as_deref(), Some("blocked"));
     assert_eq!(waiting.state, "idle");
+}
+
+async fn subagent(hook: &mut TestClient, terminal: u32, token: &str, change: SubagentChange) {
+    let answer = hook
+        .control(
+            &ControlRequest::ReportSubagents {
+                id: "sub".into(),
+                terminal,
+                token: token.into(),
+                change,
+                from: None,
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        !matches!(answer, Some(ControlResponse::Failed { .. }) | None),
+        "the report was refused: {answer:?}"
+    );
+}
+
+/// A turn that ends while its sub-agents run is still working on what was asked (Claude reads
+/// "Waiting for 2 background agents to finish"); once they end with no new turn, it is a finish.
+#[tokio::test]
+async fn a_turn_waiting_on_its_sub_agents_is_working_until_they_end() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut hook = d.attach("hook").await;
+    let mut asker = d.attach("qoop-agents").await;
+    report(&mut hook, terminal, &token, "working", "user").await;
+    subagent(
+        &mut hook,
+        terminal,
+        &token,
+        SubagentChange::Started("a1".into()),
+    )
+    .await;
+    report(&mut hook, terminal, &token, "idle", "done").await;
+    let waiting = row(&mut asker, terminal).await;
+    assert_eq!(waiting.state, "idle");
+    assert_eq!(waiting.status.as_deref(), Some("working"));
+    subagent(
+        &mut hook,
+        terminal,
+        &token,
+        SubagentChange::Ended("a1".into()),
+    )
+    .await;
+    assert_eq!(status(&mut asker, terminal).await, "done");
+}
+
+/// qass finishes a turn on every event it handles: its own tab never reads done.
+#[tokio::test]
+async fn qass_own_turns_are_never_done() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    d.store()
+        .rename_workspace(d.workspace(), "qass".into())
+        .await
+        .expect("qass's space");
+    let mut hook = d.attach("hook").await;
+    let mut asker = d.attach("qoop-agents").await;
+    report(&mut hook, terminal, &token, "working", "user").await;
+    report(&mut hook, terminal, &token, "idle", "done").await;
+    assert_eq!(status(&mut asker, terminal).await, "idle");
 }

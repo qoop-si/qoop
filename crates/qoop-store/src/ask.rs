@@ -584,13 +584,15 @@ impl Store {
             .collect::<Result<_, _>>()?)
     }
 
-    /// The terminals with an open card: an agent whose question waits on the owner.
+    /// The terminals with an open card that waits on the owner. A plan draft waits on qass, and
+    /// its agent goes on working (`add_plan_draft`): not one.
     pub fn open_ask_terminals(&self) -> Result<std::collections::BTreeSet<i64>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT terminal FROM ask WHERE status = 'open' AND terminal IS NOT NULL",
+            "SELECT DISTINCT terminal FROM ask WHERE status = 'open' AND terminal IS NOT NULL \
+             AND COALESCE(note, '') != ?1",
         )?;
         Ok(stmt
-            .query_map([], |r| r.get::<_, i64>(0))?
+            .query_map(params![PLAN_NOTE], |r| r.get::<_, i64>(0))?
             .collect::<Result<_, _>>()?)
     }
 
@@ -1317,6 +1319,34 @@ mod tests {
         let card = s.add_plan_draft("T5", t, None, "{d}", 12).unwrap().unwrap();
         assert!(!s.close_waiting_drafts(t, 20).unwrap());
         assert_eq!(s.ask(&card).unwrap().unwrap().status, "open");
+    }
+
+    /// A card waiting on the owner names its terminal as one that needs him; a plan's card,
+    /// which waits on qass while its agent works, does not.
+    #[test]
+    fn only_a_card_waiting_on_the_owner_marks_its_terminal() {
+        let (mut s, t) = store_with_terminal();
+        let task = s.open_task(t, "ship", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        s.add_plan_draft("T5", t, None, "{p}", 12).unwrap().unwrap();
+        assert!(
+            s.open_ask_terminals().unwrap().is_empty(),
+            "a plan waits on qass"
+        );
+        let ws = s.create_workspace("v", 2).unwrap();
+        let other = s.create_terminal(6, ws, "/tmp", "/bin/sh", 3).unwrap();
+        let task = s.open_task(other, "ask", false, 10).unwrap();
+        s.set_task_stage(task, "waiting-human", 11).unwrap();
+        s.add_draft("T6", other, None, "{d}", 12)
+            .unwrap()
+            .expect("a draft");
+        assert_eq!(
+            s.open_ask_terminals()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [other]
+        );
     }
 
     /// The goal of a task qoop opened when the agent changed files is the owner's cut prompt,
