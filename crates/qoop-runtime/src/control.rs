@@ -354,6 +354,14 @@ pub enum ControlRequest {
     ListAgents {
         id: String,
     },
+    /// The rows of these terminals only, written as `ListAgents` writes them and answered as
+    /// `Agents` (no splits): what a client that keeps the index reads on `AgentChanged`, one
+    /// row rather than every row, over a metered link. A terminal gone is left out. An older
+    /// daemon refuses it as an unknown variant, and the client lists them all instead.
+    AgentRows {
+        id: String,
+        terminals: Vec<TerminalStream>,
+    },
     /// Show this terminal in every attached interface, the way a click on its row does.
     /// What a notch or another launcher sends so that picking an agent there lands on it.
     Focus {
@@ -1873,6 +1881,7 @@ impl ControlRequest {
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
+            | Self::AgentRows { id, .. }
             | Self::Focus { id, .. }
             | Self::News { id, .. }
             | Self::Seen { id, .. }

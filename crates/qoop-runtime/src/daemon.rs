@@ -5052,7 +5052,13 @@ async fn handle_control(
             },
             Err(reason) => ControlResponse::Failed { id, reason },
         },
-        ControlRequest::ListAgents { .. } => {
+        ControlRequest::ListAgents { .. } | ControlRequest::AgentRows { .. } => {
+            // `AgentRows` names the rows it wants; `ListAgents` wants every one.
+            let only = match &request {
+                ControlRequest::AgentRows { terminals, .. } => Some(terminals.clone()),
+                _ => None,
+            };
+            let wanted = |t: &u32| only.as_ref().is_none_or(|o| o.contains(t));
             // A menu is screen text: only a person's connection is shown one.
             let person = connections.kind_of(client).is_some();
             // Titles come out of the agents' own storage: a directory walk, a megabyte of
@@ -5065,6 +5071,7 @@ async fn handle_control(
             let sessions: Vec<(u32, Option<String>)> = terminals
                 .streams()
                 .into_iter()
+                .filter(wanted)
                 .map(|t| (t, terminals.session_of(t)))
                 .collect();
             let titles = crate::blocking::try_probe(PROBE_DEADLINE, move || {
@@ -5121,6 +5128,7 @@ async fn handle_control(
             // space in the list's order, each space's tabs in theirs, which is how every
             // interface shows them.
             let mut live = terminals.streams();
+            live.retain(wanted);
             live.sort_by_cached_key(|t| {
                 let space = terminals.workspace_of(*t).unwrap_or(i64::MAX);
                 let place = listed.get(&space).copied().unwrap_or(usize::MAX);
@@ -5307,7 +5315,12 @@ async fn handle_control(
             ControlResponse::Agents {
                 id,
                 agents: rows,
-                splits: terminals.live_splits(&settled),
+                // A tree is about every tab of a split: none for some rows.
+                splits: if only.is_some() {
+                    Vec::new()
+                } else {
+                    terminals.live_splits(&settled)
+                },
                 qass_checks: Some(crate::asks::qass_checks()),
             }
         }
