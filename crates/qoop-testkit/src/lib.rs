@@ -362,6 +362,14 @@ impl TestDaemon {
     /// A connection that says it is the phone app, the way the bridge carries the phone's own
     /// hello, and the bytes read past the welcome.
     pub async fn connect_phone(&self) -> (tokio::net::UnixStream, BytesMut) {
+        self.connect_phone_with(serde_json::json!({})).await
+    }
+
+    /// [`TestDaemon::connect_phone`] with more hello keys, as a newer phone says them.
+    pub async fn connect_phone_with(
+        &self,
+        extra: serde_json::Value,
+    ) -> (tokio::net::UnixStream, BytesMut) {
         use tokio::io::AsyncReadExt;
         let mut stream = tokio::net::UnixStream::connect(&self.socket)
             .await
@@ -380,6 +388,10 @@ impl TestDaemon {
                 "blob": codec("blob.raw.v1"),
             },
         });
+        let mut hello = hello;
+        if let (Some(hello), Some(extra)) = (hello.as_object_mut(), extra.as_object()) {
+            hello.extend(extra.clone());
+        }
         let body = bytes::Bytes::from(serde_json::to_vec(&hello).expect("hello"));
         let mut out = BytesMut::new();
         qoop_proto::Frame::new(qoop_proto::Channel::Handshake, 0, body)
@@ -397,6 +409,13 @@ impl TestDaemon {
             inbuf.extend_from_slice(&read[..n]);
         }
         (stream, inbuf)
+    }
+
+    /// [`TestDaemon::attach_phone`] with more hello keys.
+    pub async fn attach_phone_with(&self, extra: serde_json::Value) -> TestClient {
+        let (stream, inbuf) = self.connect_phone_with(extra).await;
+        let default_stream = self.connections_terminals().first().copied().unwrap_or(1);
+        TestClient::from_parts(stream, inbuf, default_stream)
     }
 
     /// [`TestDaemon::attach`] as the phone app.

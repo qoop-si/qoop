@@ -2895,6 +2895,11 @@ pub const SAME_VERSION_RESTART: &str = "restart-same-version";
 /// guessing one from where the space's tabs are.
 pub const SPACE_HOMES: &str = "space-homes";
 
+/// What a daemon that honours the `quiet_rows` hello key says among the welcome's capabilities:
+/// it says a row changed only when what a phone shows of it did, and compares every row now and
+/// then itself, so such a client needs no whole listing of its own on a timer.
+pub const QUIET_ROWS: &str = "quiet-rows";
+
 /// The welcome's key for the tabs a daemon took over running when it became its binary.
 pub const ADOPTED: &str = "adopted";
 
