@@ -2481,6 +2481,7 @@ async fn serve_client(
         w.capabilities
             .push(crate::control::SAME_VERSION_RESTART.into());
         w.capabilities.push(crate::control::SPACE_HOMES.into());
+        w.capabilities.push(crate::control::QUIET_ROWS.into());
         if let Some(ids) = ADOPTED.get() {
             w.extra
                 .insert(crate::control::ADOPTED.into(), serde_json::json!(ids));
@@ -2571,6 +2572,9 @@ async fn serve_client(
         .and_then(serde_json::Value::as_u64)
         .map(|w| w.clamp(1, 16));
     let deltas = hello.extra.get(crate::client::ROW_DELTAS) == Some(&serde_json::Value::Bool(true));
+    // Told of a row only when what it shows moved, against what it was last given (`SeenRows`).
+    let quiet = hello.extra.get(crate::client::QUIET_ROWS) == Some(&serde_json::Value::Bool(true));
+    let seen: Arc<std::sync::Mutex<SeenRows>> = Arc::default();
     stream.write_all(&out).await?;
     if matches!(outcome, qoop_proto::HandshakeOutcome::Refuse(_)) {
         return Ok(());
@@ -2621,13 +2625,62 @@ async fn serve_client(
     // branch inside the writer: the writer's loop is the render hot path, and a lagging
     // broadcast receiver there would make a slow client's problem into everyone's.
     let event_tx = control_tx.clone();
+    let rows = quiet.then(|| RowsAsker {
+        terminals: terminals.clone(),
+        subscriptions: subscriptions.clone(),
+        renders: renders.clone(),
+        shell: shell.clone(),
+        warnings: warnings.clone(),
+        workspace,
+        history_dir: history_dir.clone(),
+        uploads_dir: uploads_dir.clone(),
+        client: client.clone(),
+        scanner: scanner.clone(),
+        agents: agents.clone(),
+        watched: watched.clone(),
+        connections: connections.clone(),
+        books: books.clone(),
+        seen: seen.clone(),
+    });
     let mut changes = agents.subscribe();
     let mut tasks = agents.subscribe_tasks();
     let mut chats = connections.messages.subscribe();
     let events_task = tokio::spawn(async move {
+        // A quiet connection's changed rows, looked at together once a second, and every row
+        // once a minute (a title or a folder moves with no news of its own).
+        let mut due = BTreeSet::new();
+        let mut look = tokio::time::interval(QUIET_LOOK);
+        let mut sweep = tokio::time::interval(QUIET_SWEEP);
+        look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let event = tokio::select! {
-                event = pump_agent_event(&mut changes) => event,
+                event = pump_agent_event(&mut changes) => match (&rows, event) {
+                    (Some(_), Some(crate::control::EventMessage::AgentChanged { terminal })) => {
+                        due.insert(terminal);
+                        continue;
+                    }
+                    (_, event) => event,
+                },
+                _ = look.tick(), if rows.is_some() && !due.is_empty() => {
+                    let asked: Vec<u32> = std::mem::take(&mut due).into_iter().collect();
+                    let Some(rows) = &rows else { continue };
+                    for event in rows.changed(Some(asked)).await {
+                        if !send_event(&event_tx, &event).await {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                _ = sweep.tick(), if rows.is_some() => {
+                    let Some(rows) = &rows else { continue };
+                    for event in rows.changed(None).await {
+                        if !send_event(&event_tx, &event).await {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 // Missed ones say the same as the next: read the board again.
                 changed = tasks.recv() => match changed {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -2681,18 +2734,7 @@ async fn serve_client(
             let Some(event) = event else {
                 return;
             };
-            let body = match serde_json::to_vec(&event) {
-                Ok(body) => body,
-                Err(_) => return,
-            };
-            let mut out = BytesMut::new();
-            if Frame::new(Channel::Event, 0, Bytes::from(body))
-                .encode(&mut out)
-                .is_err()
-            {
-                return;
-            }
-            if event_tx.send(out).await.is_err() {
+            if !send_event(&event_tx, &event).await {
                 return;
             }
         }
@@ -3032,7 +3074,10 @@ async fn serve_client(
                                 continue;
                             }
                             Dispatch::Inline(held) => {
-                                handle_control(
+                                // A listing this quiet connection is given is what its rows are
+                                // compared with from now on.
+                                let listing = quiet.then(|| rows_asked(&request)).flatten();
+                                let response = handle_control(
                                     request,
                                     &terminals,
                                     &subscriptions,
@@ -3050,7 +3095,16 @@ async fn serve_client(
                                     &books,
                                     held,
                                 )
-                                .await
+                                .await;
+                                if let Some(only) = listing {
+                                    let watching = watching(&subscriptions);
+                                    seen.lock().unwrap().note(
+                                        only.as_deref(),
+                                        &response,
+                                        &watching,
+                                    );
+                                }
+                                response
                             }
                         },
                         Err(e) => ControlResponse::Failed {
@@ -7699,6 +7753,227 @@ mod gone_grace_tests {
         // Another tab has a clock of its own.
         assert_eq!(gone_wait(&mut since, 8, mid), Some(AGENT_GONE_GRACE));
         assert_eq!(gone_wait(&mut since, 7, t0 + AGENT_GONE_GRACE), None);
+    }
+}
+
+/// How often a quiet connection's changed rows are looked at together.
+const QUIET_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+/// How often every row of a quiet connection is compared, for what moves with no news.
+const QUIET_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The fields of a row a phone does not need to hear about as they move: what a tool is doing
+/// right now, who is watching, the explanation fields `qoop agents explain` reads. Stripped from
+/// a fixed list, so a field added later is compared, never hidden by accident.
+const QUIET_FIELDS: &[&str] = &[
+    "activity", "clients", "command", "pgid", "source", "rule", "manifest", "menu", "discards",
+    "news",
+];
+
+/// What a quiet connection was last given of each row, as compared: written by every listing it
+/// is answered, so a change is told against what the client holds, not against what was told.
+#[derive(Default)]
+pub(crate) struct SeenRows {
+    listed: bool,
+    order: Vec<u32>,
+    rows: BTreeMap<u32, serde_json::Value>,
+}
+
+impl SeenRows {
+    /// A listing answered: every row (`only` none) or the named ones.
+    fn note(&mut self, only: Option<&[u32]>, response: &ControlResponse, watching: &BTreeSet<u32>) {
+        let ControlResponse::Agents { agents, .. } = response else {
+            return;
+        };
+        match only {
+            None => {
+                self.listed = true;
+                self.order = agents.iter().map(|r| r.terminal).collect();
+                self.rows = agents
+                    .iter()
+                    .map(|r| (r.terminal, quiet_view(r, watching)))
+                    .collect();
+            }
+            Some(asked) => {
+                for t in asked {
+                    self.rows.remove(t);
+                }
+                for r in agents {
+                    self.rows.insert(r.terminal, quiet_view(r, watching));
+                }
+            }
+        }
+    }
+
+    /// The terminals among `asked` whose row differs from what the client holds (a gone one
+    /// and a new one too), and whether the order moved when every row was read.
+    fn changed(
+        &self,
+        asked: &[u32],
+        rows: &[crate::control::AgentRow],
+        watching: &BTreeSet<u32>,
+        whole: bool,
+    ) -> (Vec<u32>, bool) {
+        let terminals: BTreeSet<u32> = if whole {
+            self.rows
+                .keys()
+                .copied()
+                .chain(rows.iter().map(|r| r.terminal))
+                .collect()
+        } else {
+            asked.iter().copied().collect()
+        };
+        let moved = terminals
+            .into_iter()
+            .filter(|t| {
+                let now = rows
+                    .iter()
+                    .find(|r| r.terminal == *t)
+                    .map(|r| quiet_view(r, watching));
+                quiet_differs(self.rows.get(t), now.as_ref())
+            })
+            .collect();
+        let order: Vec<u32> = rows.iter().map(|r| r.terminal).collect();
+        (moved, whole && order != self.order)
+    }
+}
+
+/// A row as a quiet connection compares it: without the fields it is not told of, and without
+/// `typed_by` unless it watches the terminal (the open page's "typing on the computer").
+fn quiet_view(row: &crate::control::AgentRow, watching: &BTreeSet<u32>) -> serde_json::Value {
+    let mut view = serde_json::to_value(row).unwrap_or_default();
+    if let serde_json::Value::Object(fields) = &mut view {
+        for key in QUIET_FIELDS {
+            fields.remove(*key);
+        }
+        if !watching.contains(&row.terminal) {
+            fields.remove("typed_by");
+        }
+    }
+    view
+}
+
+/// Whether a row moved. A title or a task missing where one was held is a read that timed out
+/// (a slow disk, a busy probe pool), not news: the next look has it again.
+fn quiet_differs(was: Option<&serde_json::Value>, now: Option<&serde_json::Value>) -> bool {
+    match (was, now) {
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(was), Some(now)) => {
+            let mut now = now.clone();
+            if let (serde_json::Value::Object(n), serde_json::Value::Object(w)) = (&mut now, was) {
+                for key in ["agent_title", "task"] {
+                    if n.get(key).is_none_or(serde_json::Value::is_null)
+                        && let Some(held) = w.get(key)
+                    {
+                        n.insert(key.to_string(), held.clone());
+                    }
+                }
+            }
+            now != *was
+        }
+    }
+}
+
+/// Which rows a request lists: every one (`Some(None)`), the named ones, or none of them.
+fn rows_asked(request: &ControlRequest) -> Option<Option<Vec<u32>>> {
+    match request {
+        ControlRequest::ListAgents { .. } => Some(None),
+        ControlRequest::AgentRows { terminals, .. } => Some(Some(terminals.clone())),
+        _ => None,
+    }
+}
+
+/// The terminals this connection is subscribed to.
+fn watching(subscriptions: &Subscriptions) -> BTreeSet<u32> {
+    subscriptions.lock().unwrap().keys().copied().collect()
+}
+
+/// One event onto the connection's control lane; false once the connection is gone.
+async fn send_event(tx: &mpsc::Sender<BytesMut>, event: &crate::control::EventMessage) -> bool {
+    let Ok(body) = serde_json::to_vec(event) else {
+        return false;
+    };
+    let mut out = BytesMut::new();
+    if Frame::new(Channel::Event, 0, Bytes::from(body))
+        .encode(&mut out)
+        .is_err()
+    {
+        return false;
+    }
+    tx.send(out).await.is_ok()
+}
+
+/// What a quiet connection's news task needs to read rows the way its own listings are read.
+struct RowsAsker {
+    terminals: Arc<TerminalRegistry>,
+    subscriptions: Subscriptions,
+    renders: Arc<RenderQueue>,
+    shell: PathBuf,
+    warnings: Arc<std::sync::Mutex<Vec<Warning>>>,
+    workspace: i64,
+    history_dir: Option<PathBuf>,
+    uploads_dir: Option<PathBuf>,
+    client: ClientId,
+    scanner: Arc<ContainmentScanner>,
+    agents: Arc<crate::agents::AgentRegistry>,
+    watched: crate::idle::WatchCounts,
+    connections: Arc<ConnectionRegistry>,
+    books: Bookkeeping,
+    seen: Arc<std::sync::Mutex<SeenRows>>,
+}
+
+impl RowsAsker {
+    /// The news a quiet connection is owed: `AgentChanged` for each of the rows (`asked`, or
+    /// every row) that moved against what it holds, and `Resync` when the order did. Nothing
+    /// before its first listing, which reads them all anyway.
+    async fn changed(&self, asked: Option<Vec<u32>>) -> Vec<crate::control::EventMessage> {
+        if !self.seen.lock().unwrap().listed {
+            return Vec::new();
+        }
+        let whole = asked.is_none();
+        let request = match &asked {
+            Some(terminals) => ControlRequest::AgentRows {
+                id: String::new(),
+                terminals: terminals.clone(),
+            },
+            None => ControlRequest::ListAgents { id: String::new() },
+        };
+        let response = handle_control(
+            request,
+            &self.terminals,
+            &self.subscriptions,
+            &self.renders,
+            &self.shell,
+            &self.warnings,
+            self.workspace,
+            self.history_dir.clone(),
+            self.uploads_dir.clone(),
+            &self.client,
+            &self.scanner,
+            &self.agents,
+            &self.watched,
+            &self.connections,
+            &self.books,
+            None,
+        )
+        .await;
+        let ControlResponse::Agents { agents: rows, .. } = response else {
+            return Vec::new();
+        };
+        let watching = watching(&self.subscriptions);
+        let (moved, reordered) = self.seen.lock().unwrap().changed(
+            asked.as_deref().unwrap_or_default(),
+            &rows,
+            &watching,
+            whole,
+        );
+        if reordered {
+            return vec![crate::control::EventMessage::Resync];
+        }
+        moved
+            .into_iter()
+            .map(|terminal| crate::control::EventMessage::AgentChanged { terminal })
+            .collect()
     }
 }
 

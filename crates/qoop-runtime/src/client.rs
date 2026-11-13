@@ -132,6 +132,11 @@ pub const LINK_WINDOW: u64 = 4;
 /// screens, which such a client reads as before.
 pub const ROW_DELTAS: &str = "row_deltas";
 
+/// The hello key a client sets to hear `AgentChanged` only when the part of a row it shows
+/// moved (`crate::daemon::SeenRows`): a phone over a metered link, which reads the row on each.
+/// An older daemon ignores it and says every change, which such a client reads as before.
+pub const QUIET_ROWS: &str = "quiet_rows";
+
 /// The hello key a link sets to a random value it keeps across its reconnects (at most 64
 /// bytes). The daemon ends the connections that link made before, which a dropped ssh can
 /// leave open on the far side, holding the size of every terminal they showed (ADR-007).
