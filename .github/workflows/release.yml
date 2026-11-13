@@ -1,0 +1,283 @@
+name: release
+
+# On every push to main, release-please keeps the Release PR up to date (version in every crate and
+# Cargo.lock, CHANGELOG.md). Merging that PR makes a draft release and its tag; the jobs below build
+# every platform of the app build (these crates with the phone part from qoop-si/private) and the
+# Android app, attach them, publish the draft, then ask deploq on the hub host to copy the release
+# to qoop.si, where clients read it. Started by hand, it is a dry run: main is built with its current
+# version and nothing is published.
+#
+# Secrets, environment `release` (deployment branch main only):
+#   PRIVATE_READ_KEY      read-only deploy key of qoop-si/private
+#   ANDROID_KEYSTORE_B64  the release keystore, base64; every APK must be signed by it
+#   ANDROID_KEY_ALIAS     its key alias
+#   ANDROID_KEY_PASSWORD  its password
+#   DEPLOQ_TOKEN          token of deploq's qoop-releases project on the hub host
+#
+# No cache anywhere here: a pull request's run can read main's caches, and these jobs compile
+# private code. A failed run is finished with "Re-run failed jobs" on the same run.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+
+  prep:
+    needs: please
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.please.outputs.released == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.refs.outputs.version }}
+      qoop_ref: ${{ steps.refs.outputs.qoop_ref }}
+      private_ref: ${{ steps.refs.outputs.private_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'push' && needs.please.outputs.tag || github.sha }}
+          path: qoop
+          persist-credentials: false
+      # Every job builds the same private commit, whatever lands on its main meanwhile.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qoop-si/private
+          ssh-key: ${{ secrets.PRIVATE_READ_KEY }}
+          path: private
+          persist-credentials: false
+      - id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ needs.please.outputs.tag }}
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' qoop/crates/qoop-runtime/Cargo.toml | head -n 1)"
+          if [ "$EVENT" = push ]; then
+            printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a release tag: '$TAG'"; exit 1; }
+            [ "$crate" = "${TAG#v}" ] || { echo "the tag says $TAG, qoop-runtime says $crate"; exit 1; }
+          fi
+          {
+            echo "version=$crate"
+            echo "qoop_ref=$(git -C qoop rev-parse HEAD)"
+            echo "private_ref=$(git -C private rev-parse HEAD)"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: prep
+    if: ${{ !cancelled() && needs.prep.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, triple: aarch64-apple-darwin }
+          # Native, so its binary is started for real; this runner ends in August 2027.
+          - { os: macos-15-intel, triple: x86_64-apple-darwin }
+          - { os: ubuntu-24.04, triple: x86_64-unknown-linux-gnu, zig: x86_64 }
+          - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu, zig: aarch64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prep.outputs.qoop_ref }}
+          path: qoop
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qoop-si/private
+          ref: ${{ needs.prep.outputs.private_ref }}
+          ssh-key: ${{ secrets.PRIVATE_READ_KEY }}
+          path: private
+          persist-credentials: false
+      # Linux builds against glibc 2.17 through zig, the arm one too, so one binary starts on every
+      # glibc distribution from the last decade. Both tools from their own releases, checksummed.
+      - name: zig and cargo-zigbuild
+        if: runner.os == 'Linux'
+        env:
+          ARCH: ${{ matrix.zig }}
+        run: |
+          case "$ARCH" in
+            x86_64)
+              zig_sum=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+              czb_sum=6b69963040818ca1ef573d8135a95aa902e17cf7f873c32c6426642dadfe7f59 ;;
+            aarch64)
+              zig_sum=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
+              czb_sum=25cf2cdc6cde848b33a761ff2cf46d1efe6ba7e1adfc4b6f3ee2d570cacb5419 ;;
+          esac
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          cd "$tools"
+          curl -fsSLo zig.tar.xz "https://ziglang.org/download/0.15.2/zig-$ARCH-linux-0.15.2.tar.xz"
+          echo "$zig_sum  zig.tar.xz" | sha256sum -c
+          curl -fsSLo czb.tar.xz "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.4/cargo-zigbuild-$ARCH-unknown-linux-gnu.tar.xz"
+          echo "$czb_sum  czb.tar.xz" | sha256sum -c
+          tar -xJf zig.tar.xz
+          tar -xJf czb.tar.xz
+          echo "$tools/zig-$ARCH-linux-0.15.2" >> "$GITHUB_PATH"
+          echo "$tools/cargo-zigbuild-$ARCH-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - name: Target
+        working-directory: private
+        run: rustup target add "${{ matrix.triple }}"
+      - name: Build, start and pack
+        working-directory: private
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          TRIPLE: ${{ matrix.triple }}
+        run: ./scripts/release-build.sh "$VERSION" "$TRIPLE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.triple }}
+          path: private/dist/*.tar.gz*
+          retention-days: 1
+          if-no-files-found: error
+
+  apk:
+    needs: prep
+    if: ${{ !cancelled() && needs.prep.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: qoop-si/private
+          ref: ${{ needs.prep.outputs.private_ref }}
+          ssh-key: ${{ secrets.PRIVATE_READ_KEY }}
+          path: private
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+      # The NDK and cmake the app's gradle build names; the runner image carries other versions.
+      - name: Android SDK
+        run: |
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses > /dev/null
+          "$sdk" --install "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
+      - name: Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+      - name: Build and check
+        working-directory: private
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          QOOP_ANDROID_KEYSTORE: ${{ runner.temp }}/release.keystore
+          QOOP_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          QOOP_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: JAVA_HOME="$JAVA_HOME_17_X64" ./scripts/release-apk-build.sh "$VERSION"
+      - name: Forget the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
+      # A dry run's APK carries the versionCode of a shipped one, so it never leaves the runner.
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apk
+          path: private/dist/qoop-android-arm64.apk
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [please, prep, build, apk]
+    if: ${{ github.event_name == 'push' && needs.please.outputs.released == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TAG: ${{ needs.please.outputs.tag }}
+      VERSION: ${{ needs.prep.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Every file, every checksum
+        working-directory: dist
+        run: |
+          for triple in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            for name in "qoop-$triple.tar.gz" "qoro-$triple.tar.gz"; do
+              [ -s "$name" ] && [ -s "$name.sha256" ] || { echo "missing $name"; exit 1; }
+            done
+          done
+          [ -s qoop-android-arm64.apk ] || { echo "missing the APK"; exit 1; }
+          sha256sum --quiet -c ./*.sha256
+          ls -l
+      - name: Notes
+        run: |
+          gh release view "$TAG" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/changes.md"
+          {
+            echo 'Install on macOS or Linux:'
+            echo
+            echo '```'
+            echo 'curl -fsSL https://qoop.si/install.sh | sh'
+            echo '```'
+            echo
+            echo 'Already installed: `qoop update`, which moves every computer you added along with it.'
+            echo
+            echo '- Android: `qoop-android-arm64.apk` below. Installed once, the app offers each new version in Settings.'
+            echo '- iPhone and any browser: https://qoop.si/app'
+            echo '- Docs: https://qoop.si/docs/'
+            echo
+            cat "$RUNNER_TEMP/changes.md"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/notes.md"
+      - name: Upload and publish
+        run: |
+          gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/qoop-android-arm64.apk --repo "$REPO" --clobber
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+      # deploq on the hub host copies the release from GitHub; the token POST starts it, and it is
+      # sent again until qoop.si names the version. A random sha each time, so deploq never takes it
+      # for the commit it deployed last.
+      - name: Onto qoop.si
+        env:
+          DEPLOQ_TOKEN: ${{ secrets.DEPLOQ_TOKEN }}
+        run: |
+          for _try in 1 2 3 4 5; do
+            sha="$(openssl rand -hex 20)"
+            said="$(curl -sS -m 30 -X POST https://qoop.si/webhook/qoop-releases \
+              -H "X-Deploq-Token: $DEPLOQ_TOKEN" -H 'Content-Type: application/json' \
+              -d "{\"ref\":\"refs/heads/main\",\"sha\":\"$sha\"}" || true)"
+            echo "deploq: $said"
+            for _poll in 1 2 3 4 5 6 7 8; do
+              sleep 15
+              if curl -fsS -m 20 https://qoop.si/releases/latest | grep -q "\"tag_name\":\"$TAG\""; then
+                echo "qoop.si serves $TAG"
+                exit 0
+              fi
+            done
+          done
+          echo "qoop.si does not serve $TAG after 10 minutes: see journalctl -u deploq on the hub host"
+          exit 1
