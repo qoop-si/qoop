@@ -11931,10 +11931,6 @@ async fn terminal_task(
     let mut trust_tries = 0;
     // When the job a Claude agent view has open was last looked up (`note_agent_view`).
     let mut agent_view_at: Option<(String, std::time::Instant)> = None;
-    // When to re-announce a held blocker so a panel that missed one refresh
-    // still converges. `None` unless a blocker holds, for the same reason:
-    // the tick is recovery, not polling.
-    let mut blocker_at: Option<tokio::time::Instant> = None;
     let mut pending_input: Option<std::time::Instant> = None;
     // A pending nudge restore: the canonical size to return to, and when.
     // `None` while no nudge is in flight, so a terminal that never needed one
@@ -12659,29 +12655,6 @@ async fn terminal_task(
                             );
                         }
                     }
-                    // Armed only while a blocker holds. A re-announce is a
-                    // repeat, not news: it goes around the acceptance rule, so
-                    // it can neither change the belief nor be filtered by the
-                    // no-change gate, and anything but a blocker keeps using
-                    // that gate alone.
-                    blocker_at = agents
-                        .belief_visible_blocker(stream)
-                        .then(|| tokio::time::Instant::now() + BLOCKER_REANNOUNCE);
-                }
-                _ = async {
-                    match blocker_at {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        // Disabled like the detect arm: no blocker, no wakeups.
-                        None => std::future::pending().await,
-                    }
-                }, if blocker_at.is_some() => {
-                    if agents.belief_visible_blocker(stream) {
-                        agents.reannounce(stream);
-                        blocker_at =
-                            Some(tokio::time::Instant::now() + BLOCKER_REANNOUNCE);
-                    } else {
-                        blocker_at = None;
-                    }
                 }
                 writable = afd.writable(), if want_write => {
                     let mut guard = writable?;
@@ -12879,13 +12852,6 @@ pub const DETECT_SETTLE: std::time::Duration = std::time::Duration::from_millis(
 /// change and far above the cost of reading one screen: a handful of regex passes over the
 /// visible rows, on a terminal that is already spending real work on the output itself.
 pub const DETECT_CEILING: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// How often a held blocker is re-announced while it holds.
-///
-/// Recovery, not polling: a panel that missed one index refresh converges on
-/// the next repeat. Armed only while a `visible_blocker` holds and disarmed
-/// the moment it clears, so terminals without a blocker schedule nothing.
-pub const BLOCKER_REANNOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Where user agent-detection overrides live: `<config>/qoop/agent-detection/`.
 ///
