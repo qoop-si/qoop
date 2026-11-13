@@ -62,6 +62,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         activity: None,
         pgid: None,
         discards: None,
+        status: None,
     }
 }
 

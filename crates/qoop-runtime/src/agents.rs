@@ -85,6 +85,10 @@ pub struct TerminalAgent {
     /// The sub-agents the agent's hooks said started and have not said ended, by the agent's
     /// own id for each. With the same reset as `background_agents`.
     pub subagents: std::collections::BTreeSet<String>,
+    /// A hook said a turn ended (`--event done`) in this generation. An agent that never
+    /// says so (amp, goose and cursor report states only; the screen-only agents) has its
+    /// turn end read off an accepted working to idle instead. Cleared with the counts.
+    pub turn_end_reported: bool,
     /// The rule the screen last matched in this generation, if any.
     ///
     /// What `qoop agents explain` reports. Recorded on every evaluation,
@@ -135,6 +139,16 @@ pub struct AgentCarry {
     /// Absent from a daemon that predates it.
     #[serde(default)]
     pub subagents: std::collections::BTreeSet<String>,
+    /// Absent from a daemon that predates it, as are the two below.
+    #[serde(default)]
+    pub turn_end_reported: bool,
+    /// The terminal's current stop, as its count and time: a turn end not yet followed by
+    /// work, so a handover keeps both its id and whether it was seen.
+    #[serde(default)]
+    pub stop: Option<(u64, i64)>,
+    /// The stop a person has looked at.
+    #[serde(default)]
+    pub seen: Option<String>,
     pub screen_rule: Option<String>,
     pub screen_manifest: Option<String>,
 }
@@ -279,6 +293,10 @@ pub struct AgentRegistry {
     /// the same one said again. The count outlives a clear, so two stops in one second never
     /// share an id; a stop of an older generation is no stop of the agent there now.
     stops: Mutex<BTreeMap<u32, Stops>>,
+    /// The stop (`stop_of`) a person has looked at in each terminal: a `Seen` from the client
+    /// in front of them, or a key they pressed there. A current stop that is not this one is
+    /// a finish nobody has seen yet, which every surface shows as done.
+    seen: Mutex<BTreeMap<u32, String>>,
     /// Each terminal's master, so the foreground group can be re-read without asking the
     /// terminal's own task, which may be parked waiting for output that is not coming.
     masters: Mutex<HashMap<u32, std::os::fd::RawFd>>,
@@ -850,8 +868,8 @@ fn coarse(agent: &TerminalAgent) -> Coarse {
     match agent.belief.state {
         S::Blocked => Coarse::Blocked,
         S::Working | S::Starting => Coarse::Working,
-        _ if subagents(agent) > 0 => Coarse::Working,
         S::Failed => Coarse::Failed,
+        _ if subagents(agent) > 0 => Coarse::Working,
         S::Idle | S::Done => Coarse::Idle,
         S::Uncertain | S::Unknown => Coarse::Unknown,
     }
@@ -899,6 +917,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
     agent.background_agents = 0;
     agent.background_tasks = 0;
     agent.subagents.clear();
+    agent.turn_end_reported = false;
     agent.screen_manifest = None;
     let idle = qoop_domain::AgentObservation {
         agent_id: qoop_domain::AgentId::new(stream.to_string()),
@@ -943,6 +962,7 @@ impl AgentRegistry {
             unparked: Mutex::new(Vec::new()),
             sent_at_unix: Mutex::new(BTreeMap::new()),
             person_typed: Mutex::new(BTreeMap::new()),
+            seen: Mutex::new(BTreeMap::new()),
             person_sent: Mutex::new(BTreeMap::new()),
             person_draft: Mutex::new(std::collections::BTreeSet::new()),
             changes: tokio::sync::broadcast::channel(64).0,
@@ -1019,6 +1039,7 @@ impl AgentRegistry {
                 background_agents: 0,
                 background_tasks: 0,
                 subagents: Default::default(),
+                turn_end_reported: false,
                 screen_rule: None,
                 screen_manifest: None,
                 leader: None,
@@ -1046,6 +1067,18 @@ impl AgentRegistry {
             background_agents: agent.background_agents,
             background_tasks: agent.background_tasks,
             subagents: agent.subagents.clone(),
+            turn_end_reported: agent.turn_end_reported,
+            stop: self
+                .stops
+                .lock()
+                .unwrap()
+                .get(&stream)
+                .and_then(|(count, newest)| {
+                    newest
+                        .filter(|(_, g)| *g == agent.belief.generation)
+                        .map(|(at, _)| (*count, at))
+                }),
+            seen: self.seen.lock().unwrap().get(&stream).cloned(),
             screen_rule: agent.screen_rule.clone(),
             screen_manifest: agent.screen_manifest.clone(),
         })
@@ -1070,6 +1103,16 @@ impl AgentRegistry {
         agent.background_agents = carry.background_agents;
         agent.background_tasks = carry.background_tasks;
         agent.subagents = carry.subagents;
+        agent.turn_end_reported = carry.turn_end_reported;
+        if let Some((count, at)) = carry.stop {
+            self.stops
+                .lock()
+                .unwrap()
+                .insert(stream, (count, Some((at, carry.generation))));
+        }
+        if let Some(seen) = carry.seen {
+            self.seen.lock().unwrap().insert(stream, seen);
+        }
         agent.screen_rule = carry.screen_rule;
         agent.screen_manifest = carry.screen_manifest;
         agent.born = None;
@@ -1189,6 +1232,8 @@ impl AgentRegistry {
             return;
         }
         self.person_typed.lock().unwrap().insert(stream, now_unix);
+        // A person typing here has the finish in front of them.
+        self.mark_seen(stream, None);
         let news = {
             let mut typed = self.typed_by.lock().unwrap();
             let was = typed.get(&stream).copied();
@@ -1438,6 +1483,7 @@ impl AgentRegistry {
         self.typed_at_unix.lock().unwrap().remove(&stream);
         self.sent_at_unix.lock().unwrap().remove(&stream);
         self.person_typed.lock().unwrap().remove(&stream);
+        self.seen.lock().unwrap().remove(&stream);
         self.person_sent.lock().unwrap().remove(&stream);
         self.person_draft.lock().unwrap().remove(&stream);
         self.commands.lock().unwrap().remove(&stream);
@@ -1617,6 +1663,7 @@ impl AgentRegistry {
             agent.background_agents = 0;
             agent.background_tasks = 0;
             agent.subagents.clear();
+            agent.turn_end_reported = false;
             agent.screen_manifest = None;
             agent.identity = AgentIdentity::Known {
                 program,
@@ -1644,6 +1691,7 @@ impl AgentRegistry {
         agent.background_agents = 0;
         agent.background_tasks = 0;
         agent.subagents.clear();
+        agent.turn_end_reported = false;
         agent.screen_manifest = None;
         agent.identity = match leader {
             None => AgentIdentity::None,
@@ -1711,6 +1759,7 @@ impl AgentRegistry {
             agent.background_agents = 0;
             agent.background_tasks = 0;
             agent.subagents.clear();
+            agent.turn_end_reported = false;
             agent.screen_manifest = None;
             if exited {
                 self.by_pid.lock().unwrap().remove(&pid.0);
@@ -1780,6 +1829,7 @@ impl AgentRegistry {
             return false;
         };
         agent.belief = next;
+        let stopped = self.note_turn(stream, agent, before, now_unix);
         // The gate rides with the accepted reading, not beside it: a refused
         // observation changes nothing, and a later reading without a gate
         // clears one, because the dialog is gone when the screen no longer
@@ -1797,6 +1847,56 @@ impl AgentRegistry {
             agent.last_io_unix = Some(now_unix);
         }
         drop(terminals);
+        if changed || stopped {
+            self.announce(stream);
+        }
+        changed
+    }
+
+    /// What an accepted belief change does to the terminal's stop: work ends it, as a hook's
+    /// `user`, `tool` or `blocked` does; and for an agent no hook has told of a turn end in
+    /// this generation, a turn read going from working to idle is one (never from
+    /// `starting`: a session opening did nothing). Called under the terminals lock, which is
+    /// taken before the stops one everywhere. Answers whether the stop changed.
+    fn note_turn(
+        &self,
+        stream: u32,
+        agent: &TerminalAgent,
+        before: AgentRuntimeState,
+        now_unix: i64,
+    ) -> bool {
+        use AgentRuntimeState as S;
+        let after = agent.belief.state;
+        let mut stops = self.stops.lock().unwrap();
+        if after == S::Working && before != S::Working {
+            return stops
+                .get_mut(&stream)
+                .is_some_and(|entry| entry.1.take().is_some());
+        }
+        if before == S::Working && matches!(after, S::Idle | S::Done) && !agent.turn_end_reported {
+            let entry = stops.entry(stream).or_insert((0, None));
+            *entry = (entry.0 + 1, Some((now_unix, agent.belief.generation)));
+            return true;
+        }
+        false
+    }
+
+    /// Whether the terminal's current stop is one nobody has looked at yet.
+    pub fn unseen_stop(&self, stream: u32) -> bool {
+        self.stop_of(stream)
+            .is_some_and(|stop| self.seen.lock().unwrap().get(&stream) != Some(&stop))
+    }
+
+    /// A person has looked at `stream`'s finish: its current stop, or only `stop` when one is
+    /// named, so a look at an older finish never clears a newer one. Announces a change.
+    pub fn mark_seen(&self, stream: u32, stop: Option<&str>) -> bool {
+        let Some(current) = self.stop_of(stream) else {
+            return false;
+        };
+        if stop.is_some_and(|s| s != current) {
+            return false;
+        }
+        let changed = self.seen.lock().unwrap().insert(stream, current.clone()) != Some(current);
         if changed {
             self.announce(stream);
         }
@@ -1890,6 +1990,7 @@ impl AgentRegistry {
         agent.capability.admit(terminal, Some(token), generation)?;
         let stopped = match event {
             Some("done") => {
+                agent.turn_end_reported = true;
                 let mut stops = self.stops.lock().unwrap();
                 let entry = stops.entry(stream).or_insert((0, None));
                 *entry = (entry.0 + 1, Some((now_unix, generation)));
@@ -1926,6 +2027,7 @@ impl AgentRegistry {
             return Ok(false);
         };
         agent.belief = next;
+        let stopped = self.note_turn(stream, agent, before, now_unix) || stopped;
         // A hook report comes from inside a live session, so the session
         // exists no matter what the screen last showed: accepting it clears
         // a startup gate a refused screen reading would otherwise hold
@@ -2037,8 +2139,8 @@ impl AgentRegistry {
         None
     }
 
-    /// The terminal's current stop, `<at>.<seq>`: the newest admitted turn end, while no work
-    /// came after it. `None` before the first, after new work, after a daemon restart, and for a
+    /// The terminal's current stop, `<at>.<seq>`: the newest admitted turn end (or, for an agent
+    /// no hook tells of one, its working to idle), while no work came after it. `None` before the first, after new work, after a daemon restart, and for a
     /// new process in the terminal (a new generation) until its own first.
     pub fn stop_of(&self, stream: u32) -> Option<String> {
         let generation = self
@@ -2854,6 +2956,107 @@ mod tests {
         // A new process in the terminal has no stop until its own first turn end.
         r.terminals.lock().unwrap().get_mut(&1).unwrap().advance();
         assert_eq!(r.stop_of(1), None, "a new generation has no old stop");
+    }
+
+    fn screen_reading(state: AgentRuntimeState) -> qoop_detect::Verdict {
+        qoop_detect::Verdict {
+            visible_working: state == AgentRuntimeState::Working,
+            ..screen_verdict(state, false)
+        }
+    }
+
+    /// An agent no hook tells of a turn end (amp, goose, cursor, the screen-only ones) has its
+    /// finish read off the screen: working to idle is one, a session opening is not, the next
+    /// work ends it, and a look clears it as done, never a look at an older one.
+    #[test]
+    fn a_screen_only_agent_finishes_from_working_to_idle_and_a_look_sees_it() {
+        use AgentRuntimeState as S;
+        let r = registry();
+        r.register(1, TerminalId::new("1"), mint_token(1));
+        let screen = |state, at| r.observe_screen(1, "m", &screen_reading(state), at);
+        screen(S::Starting, NOW);
+        screen(S::Idle, NOW + 1);
+        assert_eq!(r.stop_of(1), None, "a session opening did nothing");
+        screen(S::Working, NOW + 2);
+        screen(S::Idle, NOW + 3);
+        let stop = r.stop_of(1).expect("a turn end read off the screen");
+        assert!(r.unseen_stop(1));
+        let mut news = r.subscribe();
+        assert!(!r.mark_seen(1, Some("1.1")), "a look at another finish");
+        assert!(r.unseen_stop(1));
+        assert!(r.mark_seen(1, Some(&stop)));
+        assert_eq!(news.try_recv(), Ok(1), "a look changes the row");
+        assert!(!r.unseen_stop(1));
+        assert!(!r.mark_seen(1, None), "seen twice is no change");
+        screen(S::Working, NOW + 4);
+        assert_eq!(r.stop_of(1), None, "work ends the stop");
+        screen(S::Idle, NOW + 5);
+        assert!(r.unseen_stop(1), "the next end is a new finish");
+    }
+
+    /// An agent whose hook says when its turn ends finishes only then: an Esc that leaves the
+    /// composer on screen is no finish, and a person typing there has seen the last one.
+    #[test]
+    fn a_hooked_agent_finishes_by_its_turn_end_and_a_key_sees_it() {
+        use AgentRuntimeState as S;
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        let report = |state, event, at| {
+            r.observe_hook_event(1, &id, &token, state, false, false, at, event)
+                .expect("admitted")
+        };
+        report(S::Working, Some("user"), NOW);
+        report(S::Idle, Some("done"), NOW + 1);
+        assert!(r.unseen_stop(1));
+        r.note_person(1, b"a", false, "computer", NOW + 2);
+        assert!(!r.unseen_stop(1), "a person typing there has seen it");
+        report(S::Working, Some("user"), NOW + 3);
+        let composer = qoop_detect::Verdict {
+            visible_idle: true,
+            ..screen_verdict(S::Idle, false)
+        };
+        assert!(
+            r.observe_screen(1, "m", &composer, NOW + 4),
+            "the Esc reads idle"
+        );
+        assert_eq!(r.stop_of(1), None, "an interrupted turn is no finish");
+    }
+
+    /// A daemon that becomes another binary keeps a terminal's finish and whether it was seen.
+    #[test]
+    fn a_handover_keeps_the_finish_and_its_look() {
+        use AgentRuntimeState as S;
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        r.observe_hook_event(1, &id, &token, S::Working, false, false, NOW, Some("user"))
+            .expect("admitted");
+        r.observe_hook_event(1, &id, &token, S::Idle, false, false, NOW, Some("done"))
+            .expect("admitted");
+        let stop = r.stop_of(1).expect("a stop");
+        let carry = r.export(1).expect("a record");
+        let next = registry();
+        next.register(1, id.clone(), token.clone());
+        next.adopt(1, carry.clone());
+        assert_eq!(next.stop_of(1), Some(stop.clone()));
+        assert!(next.unseen_stop(1));
+        assert!(next.agent(1).expect("agent").turn_end_reported);
+        r.mark_seen(1, None);
+        let seen = registry();
+        seen.register(1, id, token);
+        seen.adopt(1, r.export(1).expect("a record"));
+        assert_eq!(seen.stop_of(1), Some(stop));
+        assert!(!seen.unseen_stop(1));
+        // A record from a daemon that predates these fields still reads.
+        let mut old = serde_json::to_value(&carry).expect("json");
+        for key in ["turn_end_reported", "stop", "seen"] {
+            old.as_object_mut().expect("object").remove(key);
+        }
+        let old: AgentCarry = serde_json::from_value(old).expect("an older record");
+        assert_eq!(old.stop, None);
     }
 
     #[test]

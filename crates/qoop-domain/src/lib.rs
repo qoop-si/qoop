@@ -17,6 +17,7 @@ pub mod observation;
 pub mod program;
 pub mod report;
 pub mod sizing;
+pub mod status;
 pub mod terminal;
 pub mod viewport;
 
@@ -29,5 +30,6 @@ pub use observation::{
     ObservationVerdict,
 };
 pub use sizing::{OwnershipEvent, PtySize, SizePolicy, SizeRequest, SizeVerdict};
+pub use status::{Status, StatusFacts};
 pub use terminal::{TerminalPaths, TerminalPhase};
 pub use viewport::Viewport;

@@ -301,8 +301,6 @@ pub struct Connection {
     /// whether this is the phone: what a usage sample marks for the day (ADR-023).
     runs_in: std::sync::OnceLock<(&'static str, Option<&'static str>)>,
     phone: std::sync::atomic::AtomicBool,
-    /// The terminals this connection last said are news for its person (`News`).
-    news: std::sync::Mutex<BTreeSet<u32>>,
     /// Whether its hello was answered with a welcome. Until then it is nobody yet.
     welcomed: std::sync::atomic::AtomicBool,
     /// Whether it said it only watches: a daemon with nothing awake leaves with it open.
@@ -501,6 +499,11 @@ impl ConnectionRegistry {
         let _ = self.asks.send(());
     }
 
+    /// The daemon's own ear on [`ConnectionRegistry::asks_changed`].
+    pub(crate) fn subscribe_asks(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.asks.subscribe()
+    }
+
     /// Tell every connection a result was shown.
     pub fn shows_changed(&self) {
         let _ = self.shows.send(());
@@ -535,23 +538,19 @@ impl ConnectionRegistry {
             .collect()
     }
 
-    /// Take a connection out, and say which terminals it held as news or watched as someone
-    /// there: their rows change.
+    /// Take a connection out, and say which terminals it watched as someone there: their rows
+    /// change.
     fn remove(&self, client: &ClientId) -> Vec<u32> {
         let mut inner = self.inner.lock().unwrap();
-        let news = inner
+        let watched = inner
             .iter()
             .filter(|c| &c.client == client)
-            .flat_map(|c| {
-                let mut held = c.news.lock().unwrap().clone();
-                held.extend(c.watching.lock().unwrap().iter());
-                held
-            })
+            .flat_map(|c| c.watching.lock().unwrap().clone())
             .collect();
         inner.retain(|c| &c.client != client);
         drop(inner);
         self.changed.notify_one();
-        news
+        watched
     }
 
     /// Say what kind of client a connection is, once, on its welcome.
@@ -561,6 +560,17 @@ impl ConnectionRegistry {
                 let _ = c.kind.set(kind);
             }
         }
+    }
+
+    /// The kind of client a connection said it is on its welcome (`computer`, `phone`,
+    /// `browser`, `attach`); `None` for a program, which never says one.
+    fn kind_of(&self, client: &ClientId) -> Option<&'static str> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| &c.client == client)
+            .and_then(|c| c.kind.get().copied())
     }
 
     /// A connection with a kind started (`on`) or stopped watching a terminal: whether that
@@ -596,29 +606,6 @@ impl ConnectionRegistry {
             .collect();
         kinds.sort();
         kinds
-    }
-
-    /// Replace what one connection counts as news, and say which terminals moved.
-    fn set_news(&self, client: &ClientId, terminals: Vec<u32>) -> Vec<u32> {
-        let wanted: BTreeSet<u32> = terminals.into_iter().collect();
-        let inner = self.inner.lock().unwrap();
-        let Some(connection) = inner.iter().find(|c| &c.client == client) else {
-            return Vec::new();
-        };
-        let mut held = connection.news.lock().unwrap();
-        let moved = held.symmetric_difference(&wanted).copied().collect();
-        *held = wanted;
-        moved
-    }
-
-    /// Every terminal some connection counts as news.
-    pub fn news(&self) -> BTreeSet<u32> {
-        self.inner
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|c| c.news.lock().unwrap().clone())
-            .collect()
     }
 
     fn contains(&self, client: &ClientId) -> bool {
@@ -1465,6 +1452,7 @@ impl Daemon {
             connections.clone(),
         );
         spawn_task_terminals(agents.clone(), books.store.clone());
+        spawn_ask_terminals(agents.clone(), books.store.clone(), &connections);
 
         // What the last daemon was holding when it stopped. A person who closed qoop and
         // opened it again asked for their work back, not for an empty screen.
@@ -1737,7 +1725,6 @@ impl Daemon {
                 agents: self.agents.clone(),
             },
             self.watched.clone(),
-            self.connections.clone(),
         ));
 
         // qass's eye turned on before this process, and the line not typed yet.
@@ -1929,7 +1916,6 @@ impl Daemon {
                 microphone: std::sync::atomic::AtomicBool::new(false),
                 runs_in: std::sync::OnceLock::new(),
                 phone: std::sync::atomic::AtomicBool::new(false),
-                news: std::sync::Mutex::default(),
                 welcomed: std::sync::atomic::AtomicBool::new(false),
                 observer: std::sync::atomic::AtomicBool::new(false),
                 replaces: std::sync::OnceLock::new(),
@@ -1969,7 +1955,7 @@ impl Daemon {
                 if let Err(e) = result {
                     crate::say!("qoopd: client ended: {e}");
                 }
-                // What it held as news is news no more: every index looks again.
+                // Whom it watched has one person fewer there: every index looks again.
                 for terminal in registry.remove(&registered) {
                     announce.announce(terminal);
                 }
@@ -3676,11 +3662,7 @@ mod park_tests {
 /// Each pass snapshots eligibility for every terminal, applies waiter-edge
 /// vetoes against that snapshot (never pass order), then puts to sleep each
 /// space all of whose tabs are ready, the way a person would ask for it.
-async fn idle_sleep_loop(
-    into: Restore,
-    watched: crate::idle::WatchCounts,
-    connections: Arc<ConnectionRegistry>,
-) {
+async fn idle_sleep_loop(into: Restore, watched: crate::idle::WatchCounts) {
     let mut changes = into.agents.subscribe();
     let mut timeouts = IdleTimeouts::read();
     let mut read_at = std::time::Instant::now();
@@ -3743,7 +3725,7 @@ async fn idle_sleep_loop(
         timeouts = IdleTimeouts::read();
         read_at = std::time::Instant::now();
         if timeouts.shortest() > 0 {
-            idle_sleep_pass(&into, &watched, &connections, timeouts).await;
+            idle_sleep_pass(&into, &watched, timeouts).await;
         }
     }
 }
@@ -3753,7 +3735,6 @@ async fn idle_sleep_loop(
 async fn idle_sleep_pass(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
-    connections: &ConnectionRegistry,
     timeouts: IdleTimeouts,
 ) {
     // Edges older than a day are over by definition; swept over all edges,
@@ -3763,21 +3744,19 @@ async fn idle_sleep_pass(
     // rename, and no id is kept for it anywhere.
     // Only when qass has a number of its own; a store that does not answer skips the pass,
     // so a qass kept awake is never put to sleep on the general number by a failed look.
+    let Ok(space_of_qass) = qass_space(into).await else {
+        return;
+    };
     let qass = if timeouts.general == timeouts.qass {
         None
     } else {
-        match qass_space(into).await {
-            Ok(space) => space,
-            Err(()) => return,
-        }
+        space_of_qass
     };
-    for ((space, tab), all) in idle_tabs(into, watched, connections, timeouts, qass) {
+    let tabs = |into: &Restore| idle_tabs(into, watched, timeouts, qass, space_of_qass);
+    for ((space, tab), all) in tabs(into) {
         // Asked again for this tab alone, just before it sleeps: the tabs before it took
         // seconds each, and in them a person may have come back to this one.
-        if !all
-            || idle_tabs(into, watched, connections, timeouts, qass).get(&(space, tab))
-                != Some(&true)
-        {
+        if !all || tabs(into).get(&(space, tab)) != Some(&true) {
             continue;
         }
         match sleep_space(into, space, Some(tab)).await {
@@ -3794,19 +3773,20 @@ async fn idle_sleep_pass(
 
 /// Every live tab, by its space and first pane, and whether all of its panes are idle past
 /// the timeout, unwatched, not news to a person and not held by a wait.
+/// `qass` is the space whose timeout is qass's own, when it has one; `space_of_qass` the space
+/// qass lives in, whose turns are never a finish to hold awake for.
 fn idle_tabs(
     into: &Restore,
     watched: &crate::idle::WatchCounts,
-    connections: &ConnectionRegistry,
     timeouts: IdleTimeouts,
     qass: Option<i64>,
+    space_of_qass: Option<i64>,
 ) -> BTreeMap<(i64, u32), bool> {
     let agents = &into.agents;
     let now = crate::agents::now_unix();
     let streams = agents.streams();
-    // What an interface shows as news (finished while nobody looked) stays awake until a
-    // person looks: asleep, it would leave the list before anyone saw what it finished.
-    let news = connections.news();
+    // A finish nobody has looked at yet stays awake until a person looks: asleep, it would
+    // leave the list before anyone saw what it finished. qass's own turns are never one.
     // Snapshot eligibility for every live terminal at pass start. Edge
     // vetoes evaluate against this map, so the outcome never depends on
     // the order the pass happens to visit terminals in.
@@ -3829,7 +3809,9 @@ fn idle_tabs(
         // Held for a day at most, from its last activity, so an interface that never looks
         // cannot keep a tab awake for ever.
         // A parked agent the same: its last screen is what the person comes back to read.
-        if (news.contains(stream) || agents.is_parked(*stream))
+        let unseen = agents.unseen_stop(*stream)
+            && space_of_qass.is_none_or(|q| into.terminals.workspace_of(*stream) != Some(q));
+        if (unseen || agents.is_parked(*stream))
             && now.saturating_sub(since) < crate::idle::NEWS_HOLD_SECS
         {
             eligible.insert(*stream, false);
@@ -5055,8 +5037,6 @@ async fn handle_control(
             Err(reason) => ControlResponse::Failed { id, reason },
         },
         ControlRequest::ListAgents { .. } => {
-            // What the attached interfaces count as news, read once for every row.
-            let news = connections.news();
             // Titles come out of the agents' own storage: a directory walk, a megabyte of
             // transcript per Claude tab, a database for opencode, on a disk the user
             // chose. All of them at once on the probe pool with a deadline (ADR-011),
@@ -5084,21 +5064,33 @@ async fn handle_control(
                 tokio::join!(
                     store.layout_order(),
                     store.workspaces(),
-                    store.run(|s| s.open_tasks())
+                    store.run(|s| s.open_tasks()),
+                    store.run(|s| s.open_ask_terminals())
                 )
             }));
             let (titles, places) = tokio::join!(titles, places);
             let titles = titles.unwrap_or_default();
-            let (order, spaces, open_tasks) =
-                places.unwrap_or((Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())));
+            let (order, spaces, open_tasks, asking) = places.unwrap_or((
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(BTreeSet::new()),
+            ));
             let mut task_refs = crate::tasks::refs(open_tasks.unwrap_or_default());
+            // The terminals with a question card open: what waits on the owner.
+            let asking = asking.unwrap_or_default();
+            let spaces = spaces.unwrap_or_default();
+            // qass finishes a turn on every event it handles: never a finish to show as done.
+            let qass_space = spaces
+                .iter()
+                .find(|w| w.name == crate::asks::QASS_SPACE)
+                .map(|w| w.id);
             let order: BTreeMap<u32, i64> = order
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|(t, at)| Some((u32::try_from(t).ok()?, at)))
                 .collect();
             let listed: BTreeMap<i64, usize> = spaces
-                .unwrap_or_default()
                 .iter()
                 .enumerate()
                 .map(|(at, w)| (w.id, at))
@@ -5196,11 +5188,27 @@ async fn handle_control(
                     let space = terminals.workspace_of(terminal);
                     let qass_skip = books.skip.lock().unwrap().covers(space, terminal);
                     let (background, subagents) = agents.background_of(terminal);
+                    let parked = agents.is_parked(terminal);
+                    let task = task_refs.remove(&terminal);
+                    // What every surface shows, decided here once (`qoop_domain::status`).
+                    let status = agent.as_ref().map(|a| {
+                        qoop_domain::status::of(qoop_domain::StatusFacts {
+                            state: a.belief.state,
+                            subagents,
+                            background_tasks: background.saturating_sub(subagents),
+                            needs_you: asking.contains(&i64::from(terminal))
+                                || task.as_ref().is_some_and(|t| t.stage == "waiting-human"),
+                            unseen_stop: agents.unseen_stop(terminal)
+                                && (qass_space.is_none() || space != qass_space),
+                            parked,
+                        })
+                    });
                     crate::control::AgentRow {
-                        news: news.contains(&terminal),
+                        news: status == Some(qoop_domain::Status::Done),
+                        status: status.map(|s| s.token().to_string()),
                         keep_awake,
                         qass_skip,
-                        parked: agents.is_parked(terminal),
+                        parked,
                         terminal,
                         name: terminals.name_of(terminal),
                         workspace: terminals.workspace_of(terminal).unwrap_or(workspace),
@@ -5237,7 +5245,7 @@ async fn handle_control(
                         pgid,
                         background: u32::try_from(background).unwrap_or(u32::MAX),
                         subagents: u32::try_from(subagents).unwrap_or(u32::MAX),
-                        task: task_refs.remove(&terminal),
+                        task,
                         command: agents.command(terminal),
                         clients: terminals
                             .get(terminal)
@@ -5319,12 +5327,19 @@ async fn handle_control(
                 reason: format!("no terminal {terminal}"),
             },
         },
-        ControlRequest::News {
-            terminals: news, ..
-        } => {
-            for terminal in connections.set_news(client, news) {
-                agents.announce(terminal);
+        // What a released interface still sends: the daemon decides done itself now (the
+        // row's `status`, a stop nobody has seen), so the answer is all there is to it.
+        ControlRequest::News { .. } => ControlResponse::NewsNoted { id },
+        // A program cannot look: only a person's interface says a finish was seen. A repeat
+        // changes nothing and announces nothing, so no limit is needed against a flood.
+        ControlRequest::Seen { terminal, stop, .. } => {
+            if connections.kind_of(client).is_none() {
+                return ControlResponse::Failed {
+                    id,
+                    reason: "only a person's interface says what was seen".into(),
+                };
             }
+            agents.mark_seen(terminal, stop.as_deref());
             ControlResponse::NewsNoted { id }
         }
         ControlRequest::Subscribe {
@@ -7321,10 +7336,60 @@ fn spawn_task_terminals(
     // Subscribed before the first read, so a write in between is not lost.
     let mut changed = agents.subscribe_tasks();
     tokio::spawn(async move {
+        // Each task terminal's task as its row carries it: a stage or a claim that moves with
+        // no change of the agent's own (a question waiting, an answer) changes what every
+        // surface shows, so that terminal's row is announced from here, the one place every
+        // task write passes.
+        let mut held: BTreeMap<u32, crate::control::TaskRef> = BTreeMap::new();
         loop {
-            match store.run(|s| s.open_task_terminals()).await {
-                Ok(held) => agents.set_task_terminals(held.into_iter().map(|t| t as u32).collect()),
+            match store.run(|s| s.open_tasks()).await {
+                Ok(open) => {
+                    let now = crate::tasks::refs(open);
+                    agents.set_task_terminals(now.keys().copied().collect());
+                    let moved: BTreeSet<u32> = held
+                        .keys()
+                        .chain(now.keys())
+                        .filter(|t| held.get(t) != now.get(t))
+                        .copied()
+                        .collect();
+                    held = now;
+                    for terminal in moved {
+                        agents.announce(terminal);
+                    }
+                }
                 Err(e) => crate::say!("qoopd: the terminals holding a task could not be read: {e}"),
+            }
+            if let Err(tokio::sync::broadcast::error::RecvError::Closed) = changed.recv().await {
+                return;
+            }
+        }
+    });
+}
+
+/// Announce the row of each terminal whose question cards opened or all closed: an open card
+/// is what makes a row read "needs you", and `asks_changed` names no terminal.
+fn spawn_ask_terminals(
+    agents: Arc<crate::agents::AgentRegistry>,
+    store: crate::store::StoreHandle,
+    connections: &ConnectionRegistry,
+) {
+    // Subscribed before the first read, so a change in between is not lost.
+    let mut changed = connections.subscribe_asks();
+    tokio::spawn(async move {
+        let mut held: BTreeSet<i64> = BTreeSet::new();
+        loop {
+            match store.run(|s| s.open_ask_terminals()).await {
+                Ok(now) => {
+                    for terminal in held.symmetric_difference(&now) {
+                        if let Ok(terminal) = u32::try_from(*terminal) {
+                            agents.announce(terminal);
+                        }
+                    }
+                    held = now;
+                }
+                Err(e) => {
+                    crate::say!("qoopd: the terminals with a question could not be read: {e}")
+                }
             }
             if let Err(tokio::sync::broadcast::error::RecvError::Closed) = changed.recv().await {
                 return;

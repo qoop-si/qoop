@@ -823,6 +823,7 @@ pub fn bar_tabs(
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         });
     }
     tabs
@@ -4547,6 +4548,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -7438,6 +7440,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -8100,6 +8103,7 @@ mod tests {
                 activity: None,
                 pgid: None,
                 discards: None,
+                status: None,
             })
             .collect();
         // Nothing scrolls: all nine agents draw their row under the space's rule, and

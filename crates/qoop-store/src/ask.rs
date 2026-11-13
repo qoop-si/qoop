@@ -584,6 +584,16 @@ impl Store {
             .collect::<Result<_, _>>()?)
     }
 
+    /// The terminals with an open card: an agent whose question waits on the owner.
+    pub fn open_ask_terminals(&self) -> Result<std::collections::BTreeSet<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT terminal FROM ask WHERE status = 'open' AND terminal IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Whether a terminal has a live draft (`W<n>`), the daemon's card for its agent.
     pub fn has_draft(&self, terminal: i64) -> Result<bool, StoreError> {
         Ok(self.conn.query_row(

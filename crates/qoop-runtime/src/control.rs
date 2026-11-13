@@ -344,11 +344,22 @@ pub enum ControlRequest {
         id: String,
         terminal: TerminalStream,
     },
-    /// The terminals this interface counts as news right now, replacing what it said
-    /// before. Held for the connection's life; see `AgentRow::news`.
+    /// What an interface before `Seen` sent: the terminals it counted as news. Taken and
+    /// ignored, since the daemon decides done itself (`AgentRow::status`).
     News {
         id: String,
         terminals: Vec<TerminalStream>,
+    },
+    /// A person has looked at this terminal's finish: the client in front of them showed it
+    /// (seen rule: the terminal on screen, the window or app in front, their input in the
+    /// last minute, held a moment). `stop` names the finish they saw (`AgentRow::stop`), so a
+    /// look at an older one never clears a newer; without it, the current one. Only from a
+    /// person's interface. Answered `NewsNoted`.
+    Seen {
+        id: String,
+        terminal: TerminalStream,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<String>,
     },
     /// Receive renders for these terminals. Subscribing to a terminal twice is not an
     /// error and does not double the traffic: the set is a set.
@@ -1616,7 +1627,8 @@ pub struct Live {
     pub state: &'static str,
     /// When the agent last did something, on the daemon's clock.
     pub last_active: Option<i64>,
-    /// Sub-agents and background agents running.
+    /// Sub-agents running: work the agent waits on. A shell or monitor left running after
+    /// its turn is not one (`qoop_domain::Status::Background`).
     pub subagents: usize,
 }
 
@@ -1627,7 +1639,7 @@ impl Live {
         (row.state != "sleeping").then(|| Live {
             state: state_name(state_from_name(&row.state)),
             last_active: row.last_active_at_unix,
-            subagents: row.subagents.max(row.background) as usize,
+            subagents: row.subagents as usize,
         })
     }
 }
@@ -1724,8 +1736,8 @@ pub fn status(i: StatusInput) -> (Status, i64) {
     };
     match live.state {
         "working" | "starting" => (Status::Working, last_active),
-        _ if live.subagents > 0 => (Status::Working, last_active),
         "failed" => (Status::Error, last_active),
+        _ if live.subagents > 0 => (Status::Working, last_active),
         "idle" | "done" => (Status::Idle, last_active),
         _ => (Status::Unknown, i.updated_at),
     }
@@ -1846,6 +1858,7 @@ impl ControlRequest {
             | Self::ListAgents { id }
             | Self::Focus { id, .. }
             | Self::News { id, .. }
+            | Self::Seen { id, .. }
             | Self::ListWorkspaces { id }
             | Self::CreateWorkspace { id, .. }
             | Self::CloseWorkspace { id, .. }
@@ -2294,7 +2307,7 @@ pub enum ControlResponse {
         id: String,
         data: String,
     },
-    /// `News` was taken: the rows say it from now on.
+    /// `News` or `Seen` was taken: the rows say it from now on.
     NewsNoted {
         id: String,
     },
@@ -2639,6 +2652,12 @@ pub struct AgentRow {
     /// on rows from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<String>,
+    /// What every surface shows for this row, as a `qoop_domain::Status` token (`blocked`,
+    /// `failed`, `working`, `starting`, `parked`, `background`, `done`, `idle`, `unknown`):
+    /// decided once here so no client works it out from `state` on its own. Absent on rows
+    /// from a daemon that predates it, where a client keeps its own reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// When this terminal was slept by the idle reaper, as unix seconds on
     /// the daemon's own clock. Present only on rows with `state:
     /// "sleeping"`: a tombstone kept so a slept tab stays visible instead
@@ -3369,6 +3388,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");
