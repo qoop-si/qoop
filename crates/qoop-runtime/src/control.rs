@@ -1732,7 +1732,9 @@ pub fn status(i: StatusInput) -> (Status, i64) {
     // A claimed task with no tab, awake or asleep, has nobody to answer its wait: it falls
     // through to the claim, which waits for its check.
     let orphan = i.claimed_at.is_some() && live.is_none() && i.tab.asleep_since.is_none();
-    if i.stage == "waiting-human" && !orphan {
+    // A turn that runs is no wait, whatever the stage still says (the row's status reads it so).
+    let running = live.is_some_and(|l| matches!(l.state, "working" | "starting"));
+    if i.stage == "waiting-human" && !orphan && !running {
         return (Status::Waits, i.waiting_at.unwrap_or(i.updated_at));
     }
     if live.is_some_and(|l| l.state == "blocked") {
@@ -4069,6 +4071,21 @@ mod tests {
                 ..waits
             }),
             (Status::Waits, 500)
+        );
+        // Its turn running is no wait (tab 752): the board says working, as the row does.
+        assert_eq!(
+            status(StatusInput {
+                tab: live("working", Some(480), 0),
+                ..waits
+            }),
+            (Status::Working, 480)
+        );
+        assert_eq!(
+            status(StatusInput {
+                tab: live("idle", Some(480), 0),
+                ..waits
+            }),
+            (Status::Waits, 400)
         );
         // A blocked tab: the live row's time.
         let blocked = StatusInput {
