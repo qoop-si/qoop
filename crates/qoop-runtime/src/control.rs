@@ -1733,7 +1733,8 @@ pub fn status(i: StatusInput) -> (Status, i64) {
     // through to the claim, which waits for its check.
     let orphan = i.claimed_at.is_some() && live.is_none() && i.tab.asleep_since.is_none();
     // A turn that runs is no wait, whatever the stage still says (the row's status reads it so).
-    let running = live.is_some_and(|l| matches!(l.state, "working" | "starting"));
+    let running =
+        live.is_some_and(|l| matches!(l.state, "working" | "starting") || l.subagents > 0);
     if i.stage == "waiting-human" && !orphan && !running {
         return (Status::Waits, i.waiting_at.unwrap_or(i.updated_at));
     }
@@ -4079,6 +4080,14 @@ mod tests {
                 ..waits
             }),
             (Status::Working, 480)
+        );
+        assert_eq!(
+            status(StatusInput {
+                tab: live("idle", Some(480), 2),
+                ..waits
+            }),
+            (Status::Working, 480),
+            "its turn over, its sub-agents still running"
         );
         assert_eq!(
             status(StatusInput {
