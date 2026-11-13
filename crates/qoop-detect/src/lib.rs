@@ -1243,6 +1243,37 @@ contains = "esc to interrupt"
             .evaluate_with_osc(&screen(lines), &OscContext { title })
     }
 
+    /// The agent's own turn line is on the screen; a busy window title is not one. Screens as
+    /// read live on 2026-11-13: a turn begun from a queued message (T748), and a turn over
+    /// waiting on its sub-agents (T730), whose title stays busy.
+    #[test]
+    fn a_turn_line_is_drawn_on_the_screen_never_only_in_the_title() {
+        let queued = [
+            "⏺ Correction to my last message: use the other branch.",
+            "",
+            "✽ Hatching… (3s · ↓ 120 tokens)",
+            "",
+            "────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on · esc to interrupt",
+        ];
+        let v = verdict_with_title("claude", &queued, "◐ Fix the branch").expect("a reading");
+        assert_eq!(v.state, AgentRuntimeState::Working);
+        assert!(v.turn_line, "{v:?}");
+        let waiting = [
+            "✻ Waiting for 3 background agents to finish",
+            "",
+            "────────────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on · 3 shells · ← 5 agents · ↓ to manage",
+        ];
+        let v = verdict_with_title("claude", &waiting, "◐ Research").expect("a reading");
+        assert_eq!(v.rule, "title_busy", "{v:?}");
+        assert!(v.visible_working && !v.turn_line, "{v:?}");
+    }
+
     #[test]
     fn the_claude_manifest_reads_the_esc_to_interrupt_spinner_as_working() {
         let v = verdict("claude", &["⏵ Cogitating… (12s · esc to interrupt)", ""])

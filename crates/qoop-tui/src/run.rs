@@ -1021,6 +1021,8 @@ struct State {
     /// they last pressed a key here: what tells the daemon a finish was seen.
     look: Option<crate::seen::Look>,
     keyed_at: Option<std::time::Instant>,
+    /// The finish each terminal last rang for, by its stop: one finish rings once.
+    rung: std::collections::BTreeMap<u32, String>,
     /// When the last command this interface saw finish in each terminal ended. A terminal
     /// missing here has not been seen yet: its first sighting is recorded and says nothing.
     commands_seen: std::collections::BTreeMap<u32, Option<i64>>,
@@ -8105,6 +8107,7 @@ where
         notes_due: None,
         look: None,
         keyed_at: None,
+        rung: Default::default(),
         commands_seen: Default::default(),
         command_notes: Vec::new(),
         update: UpdateAsk::default(),
@@ -11958,7 +11961,9 @@ fn seen_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> 
         .iter()
         .find(|r| r.terminal == state.focused && r.status.as_deref() == Some("done"))
         .and_then(|r| Some((r.terminal, r.stop.clone()?)));
+    // A box open over the screen (the palette, a menu) takes the keys and hides the pane.
     let present = finish.is_some()
+        && !state.overlay_open()
         && crate::seen::present(state.outer_focus, state.keyed_at, now, false)
         && !crate::seen::locked();
     let tell = crate::seen::step(
@@ -14905,14 +14910,29 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 let is_qass = Some(row.workspace) == qass;
                 // What the row shows: the daemon's status when it sends one.
                 let shown = sidebar::shown_state(row);
-                // A finish under the keyboard of a window in front is in front of the person:
-                // no bell for it (the look tells the daemon a moment later).
-                let looking = row.terminal == state.focused && state.outer_focus != Some(false);
+                // A finish under the keyboard of a person in front of it (the seen rule) is no news
+                // to them: no bell (the look tells the daemon a moment later). And one finish rings
+                // once, whatever comes and goes around it (a sub-agent ending, a card closing).
+                let looking = row.terminal == state.focused
+                    && crate::seen::present(
+                        state.outer_focus,
+                        state.keyed_at,
+                        std::time::Instant::now(),
+                        false,
+                    );
+                let rung_before = row.status.is_some()
+                    && row.stop.is_some()
+                    && state.rung.get(&row.terminal) == row.stop.as_ref();
                 let wants_someone = match shown {
                     "blocked" | "failed" => true,
-                    "done" => !is_qass && !(row.status.is_some() && looking),
+                    "done" => !is_qass && !(row.status.is_some() && (looking || rung_before)),
                     _ => false,
                 };
+                if shown == "done"
+                    && let Some(stop) = row.stop.clone()
+                {
+                    state.rung.insert(row.terminal, stop);
+                }
                 if wants_someone && before.as_deref().is_some_and(|b| b != shown) {
                     let runtime = match shown {
                         "blocked" => AgentRuntimeState::Blocked,
@@ -17396,6 +17416,7 @@ mod tests {
             notes_due: None,
             look: None,
             keyed_at: None,
+            rung: Default::default(),
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
@@ -18958,6 +18979,7 @@ mod tests {
             notes_due: None,
             look: None,
             keyed_at: None,
+            rung: Default::default(),
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
@@ -19116,6 +19138,7 @@ mod tests {
             notes_due: None,
             look: None,
             keyed_at: None,
+            rung: Default::default(),
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),

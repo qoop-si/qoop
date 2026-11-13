@@ -429,10 +429,10 @@ fn terminal_entry(agent: &AgentRow, spaces: &[WorkspaceRow], section: &'static s
         item: Item::Terminal(agent.terminal),
         section,
         text: format!("{space} {}", label(agent)),
-        sub: agent.state.clone(),
+        sub: crate::sidebar::shown_state(agent).to_string(),
         space: Some(agent.workspace),
         space_len: crate::width::width(&space),
-        state: Some(agent.state.clone()),
+        state: Some(crate::sidebar::shown_state(agent).to_string()),
         program: crate::tabs::program(agent).map(str::to_string),
     }
 }

@@ -1184,7 +1184,7 @@ pub fn queue<'a>(
 /// anything not blocked or failed finished.
 fn wait_role(agent: &AgentRow) -> crate::theme::Role {
     use crate::theme::Role;
-    match agent.state.as_str() {
+    match shown_state(agent) {
         "blocked" => Role::Blocked,
         "failed" => Role::Failed,
         _ => crate::theme::of("done"),
@@ -7107,6 +7107,40 @@ mod tests {
     /// Frame zero is the still column, every mark its dot. Past it only a working agent
     /// moves: its dot turns the spinner, in the working colour, while every calm row is
     /// byte for byte what it was. No state word is ever drawn.
+    /// A row that carries the daemon's status is drawn by it alone: a turn waiting on its
+    /// sub-agents spins, a shell left running orbits with the idle, a task waiting on the owner
+    /// wants him, and done is the daemon's finish, focused or not, until a look clears it.
+    #[test]
+    fn a_row_with_a_status_is_drawn_by_it() {
+        use crate::theme::Role;
+        let with = |state: &str, status: &str| AgentRow {
+            status: Some(status.into()),
+            ..agent(1, 1, "claude", state)
+        };
+        let (seen, unseen) = (Seen::new(), Unseen::new());
+        assert_eq!(role_of(&with("idle", "working")), Role::Working);
+        assert!(spins(&with("idle", "working")));
+        assert_eq!(role_of(&with("idle", "background")), Role::Background);
+        assert!(!spins(&with("working", "background")));
+        assert_eq!(role_of(&with("idle", "blocked")), Role::Blocked);
+        assert_eq!(role_of(&with("idle", "parked")), Role::Saved);
+        assert_eq!(role_of(&with("starting", "starting")), Role::Working);
+        assert!(
+            is_new(&with("idle", "done"), 1, &seen, &unseen),
+            "focused too"
+        );
+        assert!(!is_new(&with("idle", "idle"), 0, &seen, &unseen));
+        assert!(!is_new(&with("idle", "background"), 0, &seen, &unseen));
+        assert_eq!(priority_of(&with("idle", "done"), 0, &seen, &unseen), 2);
+        assert_eq!(priority_of(&with("idle", "blocked"), 0, &seen, &unseen), 0);
+        assert!(needs_person(&with("idle", "blocked"), 0, &seen, &unseen));
+        assert_eq!(wait_role(&with("idle", "blocked")), Role::Blocked);
+        assert_eq!(shown_state(&with("idle", "parked")), "idle");
+        assert_eq!(shown_state(&with("working", "newer")), "unknown");
+        // A daemon that sends no status is read as before.
+        assert_eq!(shown_state(&agent(1, 1, "claude", "working")), "working");
+    }
+
     #[test]
     fn only_a_working_agent_moves_and_frame_zero_is_still() {
         let (spaces, agents) = many_agents();
