@@ -834,7 +834,7 @@ pub fn bar_tabs(
 /// works, waits on a question, or is not an agent.
 pub(crate) fn park_state(rows: &[AgentRow], focused: u32) -> Option<bool> {
     let agent = rows.iter().find(|r| r.terminal == focused && r.agent)?;
-    matches!(agent.state.as_str(), "idle" | "done").then(|| sidebar::is_parked(agent))
+    matches!(crate::sidebar::shown(agent), "idle" | "done").then(|| sidebar::is_parked(agent))
 }
 
 /// The park control, as the owner picked it (2026-10-20): `[ ⚑ park ]` in a quiet ink,
@@ -1948,7 +1948,7 @@ fn triage(
     let word = if sidebar::is_new(row, focused, seen, unseen) {
         "done"
     } else {
-        row.state.as_str()
+        crate::sidebar::shown(row)
     };
     Some(crate::keys::named(&format!(
         "next: {space}/{} is {word}  ctrl-a tab",

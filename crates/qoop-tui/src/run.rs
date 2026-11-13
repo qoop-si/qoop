@@ -1017,6 +1017,10 @@ struct State {
     /// of them is due. Empty on a quiet screen, so nothing is armed (ADR-009).
     notes: Vec<crate::notify::Note>,
     notes_due: Option<std::time::Instant>,
+    /// The finish under the keyboard while a person is in front of it (`seen`), and when
+    /// they last pressed a key here: what tells the daemon a finish was seen.
+    look: Option<crate::seen::Look>,
+    keyed_at: Option<std::time::Instant>,
     /// When the last command this interface saw finish in each terminal ended. A terminal
     /// missing here has not been seen yet: its first sighting is recorded and says nothing.
     commands_seen: std::collections::BTreeMap<u32, Option<i64>>,
@@ -8099,6 +8103,8 @@ where
         news_refused: false,
         notes: Vec::new(),
         notes_due: None,
+        look: None,
+        keyed_at: None,
         commands_seen: Default::default(),
         command_notes: Vec::new(),
         update: UpdateAsk::default(),
@@ -8361,6 +8367,10 @@ where
                 wr.write_all(&client::encode_control_seq(&tell, &mut control_seq)?)
                     .await?;
             }
+            if let Some(tell) = seen_request(&mut state, &mut request) {
+                wr.write_all(&client::encode_control_seq(&tell, &mut control_seq)?)
+                    .await?;
+            }
             // At most one frame per `FRAME`. The first render after a quiet spell goes out
             // at once, so a keystroke echoes with no added wait; renders arriving closer
             // together than that wait for the timer arm below and go out as one frame.
@@ -8573,6 +8583,12 @@ where
             }
             // Notes waiting out their second. `None` with nothing held, so nothing is armed.
             let notes_at = state.notes_due.map(tokio::time::Instant::from_std);
+            // A look at a finish that will have held: the loop comes round then to say it.
+            let look_at = state
+                .look
+                .as_ref()
+                .filter(|l| !l.told)
+                .map(|l| tokio::time::Instant::from_std(l.since + crate::seen::HOLD));
             // A standing toast goes on its clock, then repaints once to come down. `None`
             // with no toast, so nothing is armed.
             let toast_at = state.toast.as_ref().map(|toast| {
@@ -8670,6 +8686,9 @@ where
                     // Reports first, before any overlay or the key decoder sees the bytes:
                     // each of those reads an escape as a cancel.
                     let (bytes, said) = reports.strip(&raw);
+                    if qoop_runtime::agents::person_key(&bytes) {
+                        state.keyed_at = Some(std::time::Instant::now());
+                    }
                     let reported = !said.is_empty();
                     let mut window_focus = None;
                     let mut ask_again = false;
@@ -11170,6 +11189,13 @@ where
                 } => {
                     fire_notes(&mut state, &mut out)?;
                 }
+                // Nothing to do here: the pass at the top of the loop says the look.
+                _ = async {
+                    match look_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 _ = async {
                     match chat_at {
                         Some(at) => tokio::time::sleep_until(at).await,
@@ -11920,6 +11946,33 @@ fn news_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> 
     Some(ControlRequest::News {
         id: format!("news-{request}"),
         terminals: news,
+    })
+}
+
+/// A `Seen` for the finish under the keyboard once a person has had it in front of them
+/// (`seen`): the daemon's done clears on every surface. Only a row the daemon calls done.
+fn seen_request(state: &mut State, request: &mut u64) -> Option<ControlRequest> {
+    let now = std::time::Instant::now();
+    let finish = state
+        .rows
+        .iter()
+        .find(|r| r.terminal == state.focused && r.status.as_deref() == Some("done"))
+        .and_then(|r| Some((r.terminal, r.stop.clone()?)));
+    let present = finish.is_some()
+        && crate::seen::present(state.outer_focus, state.keyed_at, now, false)
+        && !crate::seen::locked();
+    let tell = crate::seen::step(
+        &mut state.look,
+        finish.as_ref().map(|(t, stop)| (*t, stop.as_str())),
+        present,
+        now,
+    );
+    let (terminal, stop) = finish.filter(|_| tell)?;
+    *request += 1;
+    Some(ControlRequest::Seen {
+        id: format!("seen-{request}"),
+        terminal,
+        stop: Some(stop),
     })
 }
 
@@ -14850,13 +14903,18 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             for row in &agents {
                 let before = state.was.get(&row.terminal).cloned();
                 let is_qass = Some(row.workspace) == qass;
-                let wants_someone = match row.state.as_str() {
+                // What the row shows: the daemon's status when it sends one.
+                let shown = sidebar::shown(row);
+                // A finish under the keyboard of a window in front is in front of the person:
+                // no bell for it (the look tells the daemon a moment later).
+                let looking = row.terminal == state.focused && state.outer_focus != Some(false);
+                let wants_someone = match shown {
                     "blocked" | "failed" => true,
-                    "done" => !is_qass,
+                    "done" => !is_qass && !(row.status.is_some() && looking),
                     _ => false,
                 };
-                if wants_someone && before.as_ref().is_some_and(|b| *b != row.state) {
-                    let runtime = match row.state.as_str() {
+                if wants_someone && before.as_deref().is_some_and(|b| b != shown) {
+                    let runtime = match shown {
                         "blocked" => AgentRuntimeState::Blocked,
                         "failed" => AgentRuntimeState::Failed,
                         _ => AgentRuntimeState::Done,
@@ -14866,12 +14924,12 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                     if !note(state, row, runtime) {
                         state.ring = true;
                     }
-                    state.message = Some(format!("{} is {}", sidebar::label(row), row.state));
+                    state.message = Some(format!("{} is {shown}", sidebar::label(row)));
                 }
                 // The agent moved on, answered or not: the line that said it needed a
                 // person has nothing left to say, and nothing else would take it down
                 // while the keyboard rests on a quiet pane.
-                if let Some(was) = before.as_deref().filter(|b| *b != row.state)
+                if let Some(was) = before.as_deref().filter(|b| *b != shown)
                     && state.message.as_deref()
                         == Some(format!("{} is {was}", sidebar::label(row)).as_str())
                 {
@@ -14882,7 +14940,8 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 // Same news as a daemon done, same bell, same `new` row.
                 // Working only: `starting` is a session opening (a new tab, a
                 // restore, `/clear`), and one that settles to idle did nothing.
-                let was_working = before.as_deref() == Some("working");
+                // Only from a daemon that sends no status: one that does says done itself.
+                let was_working = row.status.is_none() && before.as_deref() == Some("working");
                 if was_working
                     && !is_qass
                     && matches!(row.state.as_str(), "idle" | "done")
@@ -14930,7 +14989,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .collect();
             state.was = agents
                 .iter()
-                .map(|r| (r.terminal, r.state.clone()))
+                .map(|r| (r.terminal, sidebar::shown(r).to_string()))
                 .collect();
             state.rows = agents;
             sidebar::qass_last(&mut state.spaces, &mut state.rows);
@@ -17335,6 +17394,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            look: None,
+            keyed_at: None,
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
@@ -18895,6 +18956,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            look: None,
+            keyed_at: None,
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
@@ -19051,6 +19114,8 @@ mod tests {
             news_refused: false,
             notes: Vec::new(),
             notes_due: None,
+            look: None,
+            keyed_at: None,
             commands_seen: Default::default(),
             command_notes: Vec::new(),
             update: UpdateAsk::default(),

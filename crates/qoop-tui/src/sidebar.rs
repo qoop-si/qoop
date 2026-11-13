@@ -591,7 +591,7 @@ pub fn gen_of(agent: &AgentRow) -> u64 {
 /// Whether this done row is news: finished, and the keyboard has not been
 /// here since. The focused row is never unread: standing on it is reading it.
 pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
-    agent.state == "done"
+    shown(agent) == "done"
         && !agent.parked
         && agent.terminal != focused
         && !seen.contains(&(agent.terminal, gen_of(agent)))
@@ -607,6 +607,10 @@ pub fn is_unread(agent: &AgentRow, focused: u32, seen: &Seen) -> bool {
 /// news yet: not in the done list, not in the queue, no sage. Its unseen entry stays, and
 /// the moment the job ends the row is plain idle and becomes the news it is.
 pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
+    // The daemon says it: a finish nobody has looked at yet, the same on every client.
+    if let Some(status) = agent.status.as_deref() {
+        return status == "done";
+    }
     if agent.terminal == focused
         || role_of(agent) == crate::theme::Role::Background
         || is_parked(agent)
@@ -616,15 +620,14 @@ pub fn is_new(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> b
     if is_unread(agent, focused, seen) {
         return true;
     }
-    matches!(agent.state.as_str(), "idle" | "done")
-        && unseen.contains(&(agent.terminal, gen_of(agent)))
+    matches!(shown(agent), "idle" | "done") && unseen.contains(&(agent.terminal, gen_of(agent)))
 }
 
 /// Whether a person parked this agent to answer later and it is settled: idle or done. A
 /// parked agent that is blocked or failed shows as that, so a park never hides a question;
 /// one that works again shows working.
 pub fn is_parked(agent: &AgentRow) -> bool {
-    agent.parked && matches!(agent.state.as_str(), "idle" | "done")
+    agent.parked && matches!(shown(agent), "idle" | "done")
 }
 
 /// Where a row sorts in the priority view: what wants a person first, then
@@ -636,6 +639,13 @@ pub fn is_parked(agent: &AgentRow) -> bool {
 /// everywhere. Urgency ranks never see a stamp, so recency cannot promote
 /// a calm row above one that needs a person.
 fn priority_of(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> u8 {
+    if let Some(status) = agent
+        .status
+        .as_deref()
+        .and_then(qoop_domain::Status::from_token)
+    {
+        return status.rank();
+    }
     match agent.state.as_str() {
         "blocked" => 0,
         "failed" => 1,
@@ -722,7 +732,7 @@ pub fn now_unix() -> i64 {
 pub fn wants_tick(rows: &[AgentRow], now_unix: i64) -> Option<i64> {
     const MINUTE: i64 = 60;
     rows.iter()
-        .filter(|r| r.agent && r.state == "idle")
+        .filter(|r| r.agent && shown(r) == "idle")
         .filter_map(|r| r.last_active_at_unix)
         .filter_map(|ts| {
             let next = if ts.saturating_add(ACTIVITY_FRESH_SECS) > now_unix {
@@ -813,7 +823,7 @@ type Row = (Line, Option<Hit>);
 /// One answer for every place that asks: the queue behind the next row, the colour of a
 /// folded space's count, and the status line's triage.
 pub fn needs_person(agent: &AgentRow, focused: u32, seen: &Seen, unseen: &Unseen) -> bool {
-    matches!(agent.state.as_str(), "blocked" | "failed") || is_new(agent, focused, seen, unseen)
+    matches!(shown(agent), "blocked" | "failed") || is_new(agent, focused, seen, unseen)
 }
 
 /// The most urgent row among `rows` that wants a person, the first one on a tie: blocked,
@@ -851,7 +861,7 @@ pub fn urgency_ink<'a>(
         if is_new(a, focused, seen, unseen) {
             crate::theme::of("done")
         } else {
-            crate::theme::of(&a.state)
+            crate::theme::of(shown(a))
         }
     })
 }
@@ -1151,7 +1161,7 @@ pub fn queue<'a>(
     // one it just read still counts as the finish it was; anything else starts the walk
     // over from the top, where what wants a person is.
     let here = rows.iter().enumerate().find_map(|(at, a)| {
-        let rank = match a.state.as_str() {
+        let rank = match shown(a) {
             "blocked" => 0,
             "failed" => 1,
             "done" => 2,
@@ -1180,10 +1190,44 @@ fn wait_role(agent: &AgentRow) -> crate::theme::Role {
     }
 }
 
+/// The state word a row is drawn by: the daemon's status (`qoop_domain::Status`) said in the
+/// state words this column reads, or the raw state from a daemon that sends none. Background
+/// and parked read idle here, and draw by their own roles (`role_of`).
+pub fn shown(agent: &AgentRow) -> &str {
+    match agent.status.as_deref() {
+        None => &agent.state,
+        Some(s @ ("blocked" | "failed" | "working" | "starting" | "done" | "idle")) => s,
+        Some("background" | "parked") => "idle",
+        Some(_) => "unknown",
+    }
+}
+
+/// Whether an agent's row spins: its turn is going, or sub-agents it waits on are.
+fn spins(agent: &AgentRow) -> bool {
+    match agent.status.as_deref() {
+        Some(status) => status == "working",
+        None => agent.state == "working",
+    }
+}
+
 /// An agent's state as a role. An idle agent with work still running in the background is
 /// its own state here, derived from the row's count: the daemon's word stays `idle`, which
 /// scripts wait on.
 fn role_of(agent: &AgentRow) -> crate::theme::Role {
+    use crate::theme::Role;
+    // The daemon's status, decided once for every surface; an older daemon sends none.
+    if let Some(status) = agent.status.as_deref() {
+        return match status {
+            "blocked" => Role::Blocked,
+            "failed" => Role::Failed,
+            "working" | "starting" => Role::Working,
+            "parked" => Role::Saved,
+            "background" => Role::Background,
+            "done" => Role::Done,
+            "idle" => Role::Idle,
+            _ => Role::Unobserved,
+        };
+    }
     if is_parked(agent) {
         crate::theme::Role::Saved
     } else if agent.state == "idle" && agent.background > 0 {
@@ -1220,7 +1264,7 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
         name: session_name(a),
         space: a.workspace,
         waited: if timed { waited(c, a) } else { None },
-        background: if matches!(a.state.as_str(), "idle" | "done") {
+        background: if matches!(shown(a), "idle" | "done") {
             a.background
         } else {
             0
@@ -1230,7 +1274,7 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
         InboxTab::Working => c
             .agents
             .iter()
-            .filter(|a| a.agent && matches!(a.state.as_str(), "working" | "starting"))
+            .filter(|a| a.agent && matches!(shown(a), "working" | "starting"))
             .map(|a| agent_item(a, crate::theme::Role::Working))
             .collect(),
         // Parked by a person, whatever they do now, unless they want a person or failed:
@@ -1238,7 +1282,7 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
         InboxTab::Parked => c
             .agents
             .iter()
-            .filter(|a| a.agent && a.parked && !matches!(a.state.as_str(), "blocked" | "failed"))
+            .filter(|a| a.agent && a.parked && !matches!(shown(a), "blocked" | "failed"))
             .map(|a| agent_item(a, role_of(a)))
             .collect(),
         // Sleeping tabs are the space's, not the daemon's agents: the ones with an agent in
@@ -1261,9 +1305,9 @@ fn inbox_items(c: &Column, tab: InboxTab) -> Vec<Item> {
             .into_iter()
             .map(|(_, a)| a)
             .filter(|a| match tab {
-                InboxTab::Wants => a.state == "blocked",
-                InboxTab::Failed => a.state == "failed",
-                InboxTab::Done => !matches!(a.state.as_str(), "blocked" | "failed"),
+                InboxTab::Wants => shown(a) == "blocked",
+                InboxTab::Failed => shown(a) == "failed",
+                InboxTab::Done => !matches!(shown(a), "blocked" | "failed"),
                 _ => true,
             })
             .map(|a| agent_item(a, wait_role(a)))
@@ -2564,7 +2608,7 @@ fn second_row(c: &Column, agent: &AgentRow, at: usize, place: Option<String>) ->
     let text = match said(agent) {
         Some((what, ink)) => {
             let what = shorten_middle(&what, room);
-            if agent.state == "working" && c.tick > 0 {
+            if spins(agent) && c.tick > 0 {
                 // While it works and the column moves, a band of brighter greys crosses
                 // what it is doing, left to right: the row says "alive" without a word
                 // for it.
@@ -2615,7 +2659,7 @@ fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
         .as_deref()
         .map(str::trim)
         .filter(|a| !a.is_empty());
-    match (agent.state.as_str(), raw) {
+    match (shown(agent), raw) {
         ("blocked", Some(raw)) if raw != "thinking" => {
             return Some((format!("wants: {}", humanize(raw)), Role::Blocked));
         }
@@ -2623,10 +2667,10 @@ fn said(agent: &AgentRow) -> Option<(String, crate::theme::Role)> {
         _ => {}
     }
     let doing = match raw {
-        Some(raw) if matches!(agent.state.as_str(), "working" | "starting") => Some(humanize(raw)),
+        Some(raw) if matches!(shown(agent), "working" | "starting") => Some(humanize(raw)),
         // Its turn is over and it reads idle, but its footer says something still runs: said
         // quietly, so a person does not take a busy agent for a free one.
-        _ if agent.state == "idle" => {
+        _ if shown(agent) == "idle" => {
             let n = agent.background.saturating_sub(agent.subagents) as usize;
             (n > 0).then(|| format!("{n} background task{}", if n == 1 { "" } else { "s" }))
         }
@@ -2791,7 +2835,7 @@ pub fn moves(c: &Column, strip: bool) -> Option<Motion> {
         if !a.agent || !drawn(a) {
             return None;
         }
-        if a.state == "working" {
+        if spins(a) {
             return Some(Motion::Spin);
         }
         (role_of(a) == crate::theme::Role::Background && !strip).then_some(Motion::Orbit)
@@ -2812,7 +2856,7 @@ pub fn moves(c: &Column, strip: bool) -> Option<Motion> {
 /// Frame zero is the still column: hit testing, `QOOP_MOTION=0` and a column with
 /// nothing working all paint at zero, where every mark is its dot.
 fn mark_of(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> String {
-    let moving = agent.state == "working" || role == crate::theme::Role::Background;
+    let moving = spins(agent) || role == crate::theme::Role::Background;
     state_mark(role, moving, c.tick, c.icons)
 }
 
@@ -2835,7 +2879,7 @@ fn asleep_mark() -> String {
 /// The folded strip's one-cell mark: the spinner while it works and the column moves, the
 /// state dot otherwise. The strip is three columns wide, too narrow for the two-cell grid.
 fn strip_mark(c: &Column, agent: &AgentRow, role: crate::theme::Role) -> char {
-    if c.tick > 0 && agent.state == "working" {
+    if c.tick > 0 && spins(agent) {
         SPIN[(c.tick % SPIN.len() as u64) as usize]
     } else {
         dot_glyph(role)
@@ -2904,7 +2948,7 @@ fn dot_of(c: &Column, agent: &AgentRow) -> (crate::theme::Role, bool) {
     let stale = !fresh
         && agent.terminal != c.focused_terminal
         && role_of(agent) != crate::theme::Role::Background
-        && tier_of(&agent.state, agent.last_active_at_unix, c.now_unix) == Some(Tier::Stale);
+        && tier_of(shown(agent), agent.last_active_at_unix, c.now_unix) == Some(Tier::Stale);
     let role = if stale {
         crate::theme::Role::Faint
     } else if fresh {
@@ -2943,7 +2987,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     let mut text = format!("{}{name}", mark_of(c, agent, role));
     let focused = agent.terminal == c.focused_terminal;
     let calm = !focused
-        && !matches!(agent.state.as_str(), "working" | "starting")
+        && !matches!(shown(agent), "working" | "starting")
         && !needs_person(agent, c.focused_terminal, c.seen, c.unseen);
     // One step quieter again for a tab qass leaves alone.
     let ink = match (calm, agent.qass_skip) {
@@ -3448,7 +3492,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
         return Vec::new();
     }
     let strip_row = |agent: &AgentRow| {
-        let colour = colour_for(&agent.state)
+        let colour = colour_for(shown(agent))
             .or((role_of(agent) == crate::theme::Role::Background)
                 .then_some(crate::theme::Role::Background));
         let role = colour.unwrap_or(crate::theme::Role::Idle);
@@ -7089,7 +7133,7 @@ mod tests {
         for agent in agents.iter().filter(|a| a.agent) {
             let still = tree_row(&zero, agent.terminal).clone();
             let role = crate::theme::of(&agent.state);
-            let still_mark = cell_mark(role, agent.state == "working", 0);
+            let still_mark = cell_mark(role, spins(agent), 0);
             assert!(
                 still.text.contains(&still_mark),
                 "frame zero moved: {still:?}"

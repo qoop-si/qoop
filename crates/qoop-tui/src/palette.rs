@@ -199,7 +199,7 @@ impl Palette {
         let listed: Vec<&AgentRow> = rows.iter().collect();
         for agent in listed
             .iter()
-            .filter(|a| matches!(a.state.as_str(), "blocked" | "failed"))
+            .filter(|a| matches!(crate::sidebar::shown(a), "blocked" | "failed"))
         {
             out.push(terminal_entry(agent, spaces, "needs you"));
         }
@@ -211,19 +211,18 @@ impl Palette {
         }
         for agent in listed
             .iter()
-            .filter(|a| matches!(a.state.as_str(), "working" | "starting"))
+            .filter(|a| matches!(crate::sidebar::shown(a), "working" | "starting"))
         {
             out.push(terminal_entry(agent, spaces, "running"));
         }
-        for agent in listed
-            .iter()
-            .filter(|a| a.state == "done" && !crate::sidebar::is_new(a, focused, seen, unseen))
-        {
+        for agent in listed.iter().filter(|a| {
+            crate::sidebar::shown(a) == "done" && !crate::sidebar::is_new(a, focused, seen, unseen)
+        }) {
             out.push(terminal_entry(agent, spaces, "finished"));
         }
         for agent in listed.iter().filter(|a| {
             !matches!(
-                a.state.as_str(),
+                crate::sidebar::shown(a),
                 "blocked" | "failed" | "working" | "starting" | "done"
             ) && !crate::sidebar::is_new(a, focused, seen, unseen)
         }) {

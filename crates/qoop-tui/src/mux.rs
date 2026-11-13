@@ -1215,6 +1215,11 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 let (link, terminal) = terminal_in(terminal);
                 self.send_one(link, R::SetParked { id, terminal, on }).await
             }
+            // A look at a finish goes to the machine whose stop it is.
+            R::Seen { id, terminal, stop } => {
+                let (link, terminal) = terminal_in(terminal);
+                self.send_one(link, R::Seen { id, terminal, stop }).await
+            }
             // The machine whose idle sleep it is: the space's, a pane going with its space.
             R::SetKeepAwake {
                 id,
@@ -3261,6 +3266,30 @@ mod tests {
                 id: "park-1".into(),
                 terminal: 7,
                 on: true,
+            }
+        );
+    }
+
+    /// A look at a remote agent's finish reaches that machine, in its own numbering: sent home,
+    /// the home daemon would clear a finish of whatever its own terminal of that number is.
+    #[tokio::test]
+    async fn a_remote_look_goes_to_its_machine_in_its_own_numbering() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        mux.control(ControlRequest::Seen {
+            id: "seen-1".into(),
+            terminal: terminal_out(1, 7).expect("fits"),
+            stop: Some("1.1".into()),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(
+            asked,
+            ControlRequest::Seen {
+                id: "seen-1".into(),
+                terminal: 7,
+                stop: Some("1.1".into()),
             }
         );
     }
