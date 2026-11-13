@@ -9,6 +9,15 @@ States: `starting`, `working`, `blocked` (waiting for you), `done`, `failed`, `i
 `uncertain` (two sources disagree, which never pages you) and `sleeping` (put to sleep by
 hand or after it sat idle, conversation kept; see [Sleep](#sleep)).
 
+What you see is one status per agent, decided by qoop and the same in the interface, the
+notch, the phone and the web app (`status` in `qoop agents --json`): `blocked` (needs you: a
+dialog, an open question, or its task waiting on you), `failed`, `working` (its turn, or
+sub-agents it waits on), `starting`, `background` (its turn is over and a shell or monitor it
+started still runs), `done` (a finish nobody has looked at yet), `parked`, `idle` and
+`unknown`. A `done` clears everywhere at once when you look at it: its tab on screen in a
+window in front, with a key or a touch there in the last minute, for a moment; typing in it;
+or putting it away on the phone.
+
 ## Detected agents
 
 Every agent's rules are written from its own sources, and the table says which. Where those
