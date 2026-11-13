@@ -4045,8 +4045,8 @@ mod tests {
                 "{state}"
             );
         }
-        // Running sub-agents keep a settled or failed tab working.
-        for state in ["idle", "done", "failed", "unknown"] {
+        // Running sub-agents keep a settled tab working; a failure is a failure whatever runs.
+        for state in ["idle", "done", "unknown"] {
             let tab = live(state, Some(480), 2);
             assert_eq!(
                 status(StatusInput { tab, ..open }),
@@ -4054,6 +4054,8 @@ mod tests {
                 "{state}"
             );
         }
+        let tab = live("failed", Some(480), 2);
+        assert_eq!(status(StatusInput { tab, ..open }), (Status::Error, 480));
         let failed = StatusInput {
             tab: live("failed", Some(470), 0),
             ..open
