@@ -24,8 +24,9 @@ on:
 
 permissions: {}
 
+# A dry run publishes nothing, so it never holds up a release run.
 concurrency:
-  group: release
+  group: release-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -143,7 +144,9 @@ jobs:
           echo "$tools/cargo-zigbuild-$ARCH-unknown-linux-gnu" >> "$GITHUB_PATH"
       - name: Target
         working-directory: private
-        run: rustup target add "${{ matrix.triple }}"
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: rustup target add "$TRIPLE"
       - name: Build, start and pack
         working-directory: private
         env:
@@ -154,7 +157,7 @@ jobs:
         with:
           name: dist-${{ matrix.triple }}
           path: private/dist/*.tar.gz*
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
   apk:
@@ -203,7 +206,7 @@ jobs:
         with:
           name: apk
           path: private/dist/qoop-android-arm64.apk
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
   publish:
@@ -218,7 +221,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       TAG: ${{ needs.please.outputs.tag }}
-      VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -238,6 +240,8 @@ jobs:
       - name: Notes
         run: |
           gh release view "$TAG" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/changes.md"
+          # A re-run finds the block already there.
+          if grep -q 'qoop.si/install.sh' "$RUNNER_TEMP/changes.md"; then exit 0; fi
           {
             echo 'Install on macOS or Linux:'
             echo
@@ -258,9 +262,21 @@ jobs:
         run: |
           gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/qoop-android-arm64.apk --repo "$REPO" --clobber
           gh release edit "$TAG" --repo "$REPO" --draft=false --latest
-      # deploq on the hub host copies the release from GitHub; the token POST starts it, and it is
-      # sent again until qoop.si names the version. A random sha each time, so deploq never takes it
-      # for the commit it deployed last.
+
+  # A job of its own, so "Re-run failed jobs" after a hub problem leaves the published release alone.
+  # deploq on the hub host copies the release from GitHub; the token POST starts it, and it is sent
+  # again until qoop.si names the version. A random sha each time, so deploq never takes it for the
+  # commit it deployed last.
+  hub:
+    needs: [please, publish]
+    if: ${{ github.event_name == 'push' && needs.please.outputs.released == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions: {}
+    env:
+      TAG: ${{ needs.please.outputs.tag }}
+    steps:
       - name: Onto qoop.si
         env:
           DEPLOQ_TOKEN: ${{ secrets.DEPLOQ_TOKEN }}
@@ -271,6 +287,12 @@ jobs:
               -H "X-Deploq-Token: $DEPLOQ_TOKEN" -H 'Content-Type: application/json' \
               -d "{\"ref\":\"refs/heads/main\",\"sha\":\"$sha\"}" || true)"
             echo "deploq: $said"
+            case "$said" in
+              *'"status":"accepted"'* | *'"status":"coalesced"'*) ;;
+              # No answer (the network): try again. Any other answer is a refusal (token, payload).
+              "") ;;
+              *) echo "deploq did not take it"; exit 1 ;;
+            esac
             for _poll in 1 2 3 4 5 6 7 8; do
               sleep 15
               if curl -fsS -m 20 https://qoop.si/releases/latest | grep -q "\"tag_name\":\"$TAG\""; then
