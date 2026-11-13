@@ -92,6 +92,15 @@ fn actions() -> Vec<Action> {
             method: || Method::Control(ControlRequest::ListAgents { id: "a".into() }),
         },
         Action {
+            name: "read again only the rows the daemon said changed",
+            method: || {
+                Method::Control(ControlRequest::AgentRows {
+                    id: "a".into(),
+                    terminals: vec![1],
+                })
+            },
+        },
+        Action {
             name: "show a terminal in every interface, from a notch or a launcher",
             method: || {
                 Method::Control(ControlRequest::Focus {
@@ -868,6 +877,10 @@ fn every_control_method_is_reachable_from_some_action() {
         },
         ControlRequest::ListTerminals { id: String::new() },
         ControlRequest::ListAgents { id: String::new() },
+        ControlRequest::AgentRows {
+            id: String::new(),
+            terminals: Vec::new(),
+        },
         ControlRequest::Focus {
             id: String::new(),
             terminal: 0,
@@ -1211,6 +1224,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::CloseTerminal { .. }
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
+            | ControlRequest::AgentRows { .. }
             | ControlRequest::Focus { .. }
             | ControlRequest::News { .. }
             | ControlRequest::Seen { .. }

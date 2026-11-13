@@ -48,6 +48,10 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             to: "somebody".into(),
         },
         ControlRequest::ListAgents { id: "x8".into() },
+        ControlRequest::AgentRows {
+            id: "x8b".into(),
+            terminals: vec![terminal],
+        },
         ControlRequest::ListWorkspaces { id: "x9".into() },
         ControlRequest::CreateWorkspace {
             id: "x10".into(),
@@ -432,6 +436,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::CloseTerminal { .. }
             | ControlRequest::ListTerminals { .. }
             | ControlRequest::ListAgents { .. }
+            | ControlRequest::AgentRows { .. }
             | ControlRequest::Focus { .. }
             | ControlRequest::News { .. }
             | ControlRequest::Seen { .. }
