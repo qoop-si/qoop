@@ -579,12 +579,15 @@ pub fn facts(
         agents: mine().count(),
         // What waits on him, the way a card says "waits on you": blocked or failed, or its
         // task waiting on him. A finish nobody read is the sidebar's to show, not a wait.
+        // A daemon with a status says it (a waiting task of a turn that runs is no wait);
+        // an older one is read by its task.
         waiting: mine()
             .filter(|r| {
                 matches!(crate::sidebar::shown_state(r), "blocked" | "failed")
-                    || r.task
-                        .as_ref()
-                        .is_some_and(|t| t.stage == "waiting-human" && !t.claimed)
+                    || r.status.is_none()
+                        && r.task
+                            .as_ref()
+                            .is_some_and(|t| t.stage == "waiting-human" && !t.claimed)
             })
             .count(),
         working: mine()

@@ -11,7 +11,8 @@ use crate::AgentRuntimeState;
 /// The statuses, in the order the first one that holds wins (see [`of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Status {
-    /// Waits on a person: a dialog on screen, an open question card, or its task waiting.
+    /// Waits on a person: a dialog on screen, or, with no turn running, an open question
+    /// card or its task waiting.
     Blocked,
     Failed,
     /// Its turn is going, or sub-agents it waits on are: Claude reads "Waiting for 3
@@ -66,13 +67,16 @@ pub struct StatusFacts {
 /// The status of a row: the first case that holds.
 pub fn of(f: StatusFacts) -> Status {
     use AgentRuntimeState as S;
+    // A turn that runs is work, whatever card or stage is still open: the agent is not
+    // waiting on anyone while its spinner turns (a question it asked earlier, or one qass
+    // opened about it, waits in the Inbox on its own). Only a dialog on screen stops a turn.
     match f.state {
         S::Blocked => return Status::Blocked,
-        _ if f.needs_you => return Status::Blocked,
         S::Failed => return Status::Failed,
         S::Working => return Status::Working,
         _ if f.subagents > 0 => return Status::Working,
         S::Starting => return Status::Starting,
+        _ if f.needs_you => return Status::Blocked,
         S::Uncertain | S::Unknown => return Status::Unknown,
         S::Idle | S::Done => {}
     }
@@ -190,10 +194,47 @@ mod tests {
         };
         assert_eq!(of(card), Status::Blocked);
         assert_eq!(of(facts(S::Blocked)), Status::Blocked);
+    }
+
+    /// Tab 752, 2026-11-14 01:47: its spinner turning ("Gesticulating… 9m 40s", two shell
+    /// commands running) while a question card for it was still open. Every surface showed
+    /// it orange, "wants", with its running command under it. A turn that runs is work.
+    #[test]
+    fn a_running_turn_is_working_whatever_card_or_stage_is_open() {
+        let card = StatusFacts {
+            needs_you: true,
+            ..facts(S::Working)
+        };
+        assert_eq!(of(card), Status::Working);
+        assert_eq!(
+            of(StatusFacts {
+                subagents: 2,
+                ..card
+            }),
+            Status::Working
+        );
+        assert_eq!(of(facts(S::Starting)), Status::Starting);
         assert_eq!(
             of(StatusFacts {
                 needs_you: true,
-                ..facts(S::Working)
+                ..facts(S::Starting)
+            }),
+            Status::Starting
+        );
+        // The card is what waits once the turn ends.
+        assert_eq!(of(facts(S::Idle)), Status::Idle);
+        assert_eq!(
+            of(StatusFacts {
+                needs_you: true,
+                ..facts(S::Idle)
+            }),
+            Status::Blocked
+        );
+        // A dialog on screen still stops a turn.
+        assert_eq!(
+            of(StatusFacts {
+                needs_you: true,
+                ..facts(S::Blocked)
             }),
             Status::Blocked
         );
