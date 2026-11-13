@@ -793,6 +793,7 @@ pub fn bar_tabs(
         tabs.push(AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,
@@ -4520,6 +4521,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,
@@ -4557,6 +4559,7 @@ mod tests {
         SnapshotWire {
             modes: Default::default(),
             behind: 0,
+            title: String::new(),
             cols: 40,
             rows: lines.len(),
             cursor: (0, 0),
@@ -7412,6 +7415,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,
@@ -8075,6 +8079,7 @@ mod tests {
             .map(|(i, state)| AgentRow {
                 command: None,
                 clients: Vec::new(),
+                menu: None,
                 typed_by: None,
                 parked: false,
                 keep_awake: false,

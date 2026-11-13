@@ -201,9 +201,12 @@ impl Link {
     /// Update `on_screen` from a render of the `screen_text` terminal; true if it was one.
     fn note_screen(&mut self, incoming: &client::Incoming) -> bool {
         match (incoming, &self.screen_text) {
-            (client::Incoming::Render { terminal, snapshot }, Some((watched, text)))
-                if terminal == watched =>
-            {
+            (
+                client::Incoming::Render {
+                    terminal, snapshot, ..
+                },
+                Some((watched, text)),
+            ) if terminal == watched => {
                 self.on_screen = snapshot.lines.iter().any(|l| l.contains(text.as_str()));
                 true
             }
@@ -547,6 +550,7 @@ pub(crate) fn run_read_watch(
             if let client::Incoming::Render {
                 terminal: t,
                 snapshot,
+                ..
             } = incoming
                 && t == terminal
             {
@@ -634,6 +638,7 @@ fn note(
         client::Incoming::Render {
             terminal: t,
             snapshot,
+            ..
         } if t == terminal => {
             *pending = Some(snapshot);
             false
@@ -2210,6 +2215,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,

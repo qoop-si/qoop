@@ -12,11 +12,19 @@
 //!   `notify-send` elsewhere. Never over ssh, where the system is the far machine's.
 //!
 //! What is said is a tab's name or program, what happened, and the space: names this
-//! machine gave, never anything read from a pane. It still passes one choke point,
-//! [`clean`], because a tab name is typed by a person and ends up inside an escape sequence
-//! or another program's arguments. The system path hands it over as data (an argument after
-//! `--`, or the program's input), never as AppleScript source, shell text or an option, so
-//! no name can become code.
+//! machine gave. One thing more comes from the agent: for an agent waiting on a person, the
+//! first line of its question, from its question card, else from its own menu as the daemon
+//! read it off its screen ([`question_line`]). This note is local only, on this machine's
+//! own desktop; the push to a phone never carries question text. Everything passes one
+//! choke point, [`clean`], because a tab name is typed by a person and a question is written
+//! by an agent, and both end up inside an escape sequence or another program's arguments.
+//! The system path hands it over as data (an argument after `--`, or the program's input),
+//! never as AppleScript source, shell text or an option, so no name can become code.
+//!
+//! A click on a note from `terminal-notifier` shows the agent: it runs `qoop focus` for the
+//! terminal and brings the host terminal forward ([`Click`]). A terminal on the escape route
+//! notifies by itself and keeps no click action, and a note about another machine's agent
+//! has none: its number is this window's own, which no daemon knows.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -229,13 +237,34 @@ pub struct Note {
     pub space: String,
     /// Waiting on a person (blocked, failed) rather than only done.
     pub urgent: bool,
+    /// The first line of what the agent asks, when it asks something ([`question_line`]).
+    pub question: Option<String>,
     /// When it has waited its full [`DELAY`].
     pub due: std::time::Instant,
 }
 
+/// The first line of a question, as a note shows it: the first line with words in it, ended
+/// by any line or paragraph break (`\r` and U+2028 too, which a banner would draw as a second
+/// line), a tab read as a space, and nothing [`crate::width::drawn`] refuses. `None` when it
+/// has none. [`clean`] cuts it to the note's width.
+pub fn question_line(text: &str) -> Option<String> {
+    text.split([
+        '\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
+    ])
+    .map(|line| {
+        line.chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| crate::width::drawn(*c))
+            .collect::<String>()
+    })
+    .map(|line| line.trim().to_string())
+    .find(|line| !line.is_empty())
+}
+
 /// One sentence for everything that came due together: what happened to each, by name.
 /// Two terminals with one name are told apart by their space, the way the agents panel
-/// tells them apart (`app - claude`).
+/// tells them apart (`app - claude`). One agent that asks something is its name and its
+/// question.
 pub fn say(notes: &[Note]) -> String {
     let name = |note: &Note| {
         let shared = notes
@@ -248,6 +277,13 @@ pub fn say(notes: &[Note]) -> String {
         }
     };
     match notes {
+        [one] if one.question.is_some() => {
+            format!(
+                "{}: {}",
+                name(one),
+                one.question.as_deref().unwrap_or_default()
+            )
+        }
         [one] if !one.space.is_empty() => format!("{} {} in {}", name(one), one.what, one.space),
         many => many
             .iter()
@@ -275,23 +311,46 @@ pub fn nowhere_hint(why: Why, config: &Path) -> String {
 
 /// A note, safe to put inside an escape sequence or hand to another program.
 ///
-/// Control characters (C0, C1, DEL) are dropped: any of them could end the escape early and
-/// hand the rest to the terminal as a sequence of its own. `;` becomes `,`, because
+/// What [`crate::width::drawn`] refuses is dropped: a control character (C0, C1, DEL) could
+/// end the escape early and hand the rest to the terminal as a sequence of its own, and a
+/// bidi override or isolate would turn an agent's words around in the banner. `;` becomes `,`, because
 /// `OSC 777` splits its fields on it and `OSC 9 ; 4` is a progress bar, not a note: with no
-/// `;` left, a note can never start with a number and a `;`. Cut to 120 columns.
+/// `;` left, a note can never start with a number and a `;`. Cut to 120 columns, the cut
+/// marked with an ellipsis, never inside a joined emoji or a flag.
 pub fn clean(body: &str) -> String {
     let mut out = String::with_capacity(body.len().min(MAX_COLUMNS * 4));
+    // Each kept character with the columns used before it, so a cut can make room for the `…`.
+    let mut kept: Vec<usize> = Vec::new();
     let mut used = 0;
     for c in body.chars() {
         let c = match c {
-            '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => continue,
             ';' => ',',
+            c if !crate::width::drawn(c) => continue,
             c => c,
         };
         let w = crate::width::columns(c);
         if used + w > MAX_COLUMNS {
-            break;
+            while used + 1 > MAX_COLUMNS {
+                let Some(before) = kept.pop() else { break };
+                out.pop();
+                used = before;
+            }
+            // Not half an emoji: no joiner or variation selector last, no lone half of a flag.
+            while out.ends_with(['\u{200d}', '\u{fe0f}', '\u{fe0e}']) {
+                out.pop();
+            }
+            let flags = out
+                .chars()
+                .rev()
+                .take_while(|c| ('\u{1f1e6}'..='\u{1f1ff}').contains(c))
+                .count();
+            if flags % 2 == 1 {
+                out.pop();
+            }
+            out.push('…');
+            return out;
         }
+        kept.push(used);
         out.push(c);
         used += w;
     }
@@ -329,6 +388,78 @@ pub struct Call {
     pub stdin: Option<String>,
 }
 
+/// What a click on a `terminal-notifier` note does: run `qoop focus <terminal>` with this
+/// session's daemon, and bring the host terminal forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Click {
+    /// This `qoop`, by its absolute path: the note outlives the shell it came from.
+    pub qoop: PathBuf,
+    /// This session's runtime base, absolute, resolved as every client resolves it, so the
+    /// click reaches this daemon from terminal-notifier's own environment.
+    pub runtime_dir: Option<String>,
+    /// The bundle id of the terminal app this runs in, for `-activate`.
+    pub bundle: Option<String>,
+}
+
+/// The click a note gets here, from the environment: none off macOS, and none for a terminal
+/// on the escape route (iTerm2, WezTerm, Ghostty, kitty), which shows its own notes and keeps
+/// no click action. Inside tmux the terminal names itself `tmux`, so a note sent through the
+/// system there does get a click, and `-activate` names whatever app started the tmux server.
+pub fn click(
+    env: &Env,
+    qoop: Option<PathBuf>,
+    runtime_dir: Option<String>,
+    bundle: Option<String>,
+) -> Option<Click> {
+    if !env.macos || escape_for(env).is_some() {
+        return None;
+    }
+    // Apple's Terminal says who it is in `TERM_PROGRAM` when the bundle id was not handed down.
+    let bundle = bundle.or_else(|| {
+        (env.term_program.as_deref() == Some("Apple_Terminal")).then(|| "com.apple.Terminal".into())
+    });
+    Some(Click {
+        qoop: qoop?,
+        runtime_dir,
+        bundle,
+    })
+}
+
+impl Click {
+    /// This process's own: `current_exe`, the runtime base as the client finds its daemon
+    /// (`QOOP_RUNTIME_DIR`, its old name, else the default), made absolute, and the app's
+    /// bundle id as macOS hands it to what the app starts (`__CFBundleIdentifier`).
+    pub fn read(env: &Env) -> Option<Click> {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let runtime_dir = std::path::absolute(qoop_runtime::paths::base_location())
+            .ok()
+            .map(|dir| dir.to_string_lossy().into_owned());
+        click(
+            env,
+            std::env::current_exe().ok(),
+            runtime_dir,
+            var("__CFBundleIdentifier"),
+        )
+    }
+
+    /// The `terminal-notifier` arguments for a note about `terminal`. `-execute` is shell text
+    /// to the notifier, so each path is quoted whole.
+    fn args(&self, terminal: u32) -> Vec<String> {
+        let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+        let dir = self
+            .runtime_dir
+            .as_deref()
+            .map(|dir| format!("QOOP_RUNTIME_DIR={} ", quote(dir)))
+            .unwrap_or_default();
+        let qoop = quote(&self.qoop.to_string_lossy());
+        let mut args = vec!["-execute".into(), format!("{dir}{qoop} focus {terminal}")];
+        if let Some(bundle) = &self.bundle {
+            args.extend(["-activate".into(), bundle.clone()]);
+        }
+        args
+    }
+}
+
 /// How `body` reaches a system program. `body` must have come through [`clean`], and it is
 /// never where a program looks for an option or for code, whatever it starts with:
 ///
@@ -338,13 +469,18 @@ pub struct Call {
 /// - `osascript` runs a fixed script that reads it from `argv`, after a `--`: without it,
 ///   a body starting with `-` is read as an option, and `-e` is an option that runs code.
 /// - `notify-send` gets it after a `--` for the same reason.
-pub fn call(program: Program, body: &str) -> Call {
+///
+/// `click` is the terminal the note is about and what a click on it does: only
+/// `terminal-notifier` acts on a click.
+pub fn call(program: Program, body: &str, click: Option<(&Click, u32)>) -> Call {
     let (program, args, stdin) = match program {
-        Program::TerminalNotifier => (
-            "terminal-notifier",
-            vec!["-title".into(), "qoop".into()],
-            Some(body.to_string()),
-        ),
+        Program::TerminalNotifier => {
+            let mut args = vec!["-title".to_string(), "qoop".into()];
+            if let Some((click, terminal)) = click {
+                args.extend(click.args(terminal));
+            }
+            ("terminal-notifier", args, Some(body.to_string()))
+        }
         Program::Osascript => (
             "osascript",
             vec![
@@ -602,7 +738,7 @@ mod tests {
     #[test]
     fn an_applescript_injection_stays_one_argument() {
         let body = clean(r#"x" & do shell script "touch /tmp/pwned" & ""#);
-        let osa = call(Program::Osascript, &body);
+        let osa = call(Program::Osascript, &body, None);
         assert_eq!(osa.program, "osascript");
         assert_eq!(osa.args.iter().filter(|a| a.contains("pwned")).count(), 1);
         assert_eq!(osa.args[7], body);
@@ -616,19 +752,19 @@ mod tests {
     fn a_note_starting_with_a_dash_stays_data_for_every_sink() {
         let body = clean("-e do shell script \"touch pwned\" -x");
         assert!(body.starts_with('-'));
-        let osa = call(Program::Osascript, &body);
+        let osa = call(Program::Osascript, &body, None);
         let at = osa
             .args
             .iter()
             .position(|a| *a == body)
             .expect("the note is there");
         assert_eq!(osa.args[at - 1], "--", "{:?}", osa.args);
-        let send = call(Program::NotifySend, &body);
+        let send = call(Program::NotifySend, &body, None);
         assert_eq!(
             send.args,
             vec!["--".to_string(), "qoop".into(), body.clone()]
         );
-        let tn = call(Program::TerminalNotifier, &body);
+        let tn = call(Program::TerminalNotifier, &body, None);
         assert!(
             tn.args.iter().all(|a| *a != body),
             "no argument to misparse"
@@ -642,8 +778,12 @@ mod tests {
         assert_eq!(clean("4;50"), "4,50", "OSC 9;4 is a progress bar");
         assert!(!clean("9;4;1;50").contains(';'));
         let long = "\u{4e2d}".repeat(100);
-        assert_eq!(crate::width::width(&clean(&long)), MAX_COLUMNS);
+        let cut = clean(&long);
+        assert!(crate::width::width(&cut) <= MAX_COLUMNS);
+        assert!(cut.ends_with('…'), "{cut}");
         assert_eq!(clean("claude finished in api"), "claude finished in api");
+        // Bidi overrides and isolates go too.
+        assert_eq!(clean("a\u{202e}b\u{2067}c\u{2069}"), "abc");
     }
 
     #[test]
@@ -656,6 +796,7 @@ mod tests {
             what,
             space: "api".into(),
             urgent: false,
+            question: None,
             due: std::time::Instant::now(),
         };
         assert_eq!(
@@ -702,5 +843,197 @@ mod tests {
         assert_eq!(playable("bell", false, false), "bell");
         assert_eq!(playable("Glass", false, false), "complete");
         assert_eq!(playable("Funk", true, false), "dialog-warning");
+    }
+
+    /// The question an agent asks, as its note shows it: the first line with words, nothing
+    /// that could end an escape, and a long one cut to the note's width with an ellipsis.
+    #[test]
+    fn a_note_says_the_first_line_of_the_question_cut_to_its_width() {
+        assert_eq!(
+            question_line("\n  \n  Do you want to proceed?\n  > 1. Yes"),
+            Some("Do you want to proceed?".into())
+        );
+        assert_eq!(
+            question_line("Run\x1b]9;4;1;50\x07 this?\u{9c}"),
+            Some("Run]9;4;1;50 this?".into()),
+            "control characters go, the rest is for clean"
+        );
+        assert_eq!(question_line(""), None);
+        // Every line break ends the first line; a tab is a space.
+        assert_eq!(question_line("Proceed?\rsecret"), Some("Proceed?".into()));
+        assert_eq!(
+            question_line("Proceed?\u{2028}secret"),
+            Some("Proceed?".into())
+        );
+        assert_eq!(
+            question_line("Proceed?\u{2029}secret"),
+            Some("Proceed?".into())
+        );
+        assert_eq!(question_line("Run\tthis?"), Some("Run this?".into()));
+        // An agent's text cannot turn itself around in the banner.
+        assert_eq!(
+            question_line("Allow \u{202e}exe.txt\u{2067}?"),
+            Some("Allow exe.txt?".into())
+        );
+        assert_eq!(question_line(" \n\t\n\x1b"), None);
+        let long = format!("Which of these {}?", "very ".repeat(40));
+        let body = clean(&format!(
+            "claude: {}",
+            question_line(&long).expect("a line")
+        ));
+        assert_eq!(body.chars().count(), MAX_COLUMNS, "{body}");
+        assert!(body.starts_with("claude: Which of these very"), "{body}");
+        assert!(body.ends_with('…'), "{body}");
+        // Short enough: no ellipsis.
+        assert_eq!(clean("claude: Proceed?"), "claude: Proceed?");
+    }
+
+    /// One agent that asks is its name and its question; one that asks nothing, or several
+    /// at once, are said as before.
+    #[test]
+    fn a_note_with_a_question_names_the_agent_and_asks_it() {
+        let note = |terminal: u32, label: &str, question: Option<&str>| Note {
+            terminal,
+            state: "blocked".into(),
+            generation: 0,
+            label: label.into(),
+            what: "is blocked",
+            space: "api".into(),
+            urgent: true,
+            question: question.map(str::to_string),
+            due: std::time::Instant::now(),
+        };
+        assert_eq!(
+            say(&[note(1, "claude", Some("Do you want to proceed?"))]),
+            "claude: Do you want to proceed?"
+        );
+        assert_eq!(say(&[note(1, "claude", None)]), "claude is blocked in api");
+        assert_eq!(
+            say(&[note(1, "claude", Some("Proceed?")), note(2, "codex", None)]),
+            "claude is blocked, codex is blocked"
+        );
+    }
+
+    /// A click on a `terminal-notifier` note runs this `qoop` against this session's daemon,
+    /// paths quoted whole, and brings the host terminal forward. Terminals on the escape route
+    /// and other systems get none.
+    #[test]
+    fn a_click_focuses_the_agent_through_this_sessions_qoop() {
+        let apple = Env {
+            term_program: Some("Apple_Terminal".into()),
+            macos: true,
+            has: |_| true,
+            ..env()
+        };
+        let qoop = || Some(PathBuf::from("/Users/me/.local/bin/qoop"));
+        let click = click(&apple, qoop(), Some("/tmp/qv it's".into()), None).expect("a click");
+        assert_eq!(click.bundle.as_deref(), Some("com.apple.Terminal"));
+        let tn = call(
+            Program::TerminalNotifier,
+            "claude: Proceed?",
+            Some((&click, 7)),
+        );
+        assert_eq!(
+            tn.args,
+            vec![
+                "-title".to_string(),
+                "qoop".into(),
+                "-execute".into(),
+                r"QOOP_RUNTIME_DIR='/tmp/qv it'\''s' '/Users/me/.local/bin/qoop' focus 7".into(),
+                "-activate".into(),
+                "com.apple.Terminal".into(),
+            ]
+        );
+        assert_eq!(tn.stdin.as_deref(), Some("claude: Proceed?"));
+        // The bundle id macOS handed down wins; no runtime directory, no variable.
+        let handed = super::click(&apple, qoop(), None, Some("com.googlecode.iterm2".into()));
+        let args = handed.expect("a click").args(3);
+        assert_eq!(args[1], "'/Users/me/.local/bin/qoop' focus 3");
+        assert_eq!(args[3], "com.googlecode.iterm2");
+        // The escape route keeps no click.
+        for term in ["iTerm.app", "WezTerm", "ghostty"] {
+            let escaping = Env {
+                term_program: Some(term.into()),
+                ..apple.clone()
+            };
+            assert_eq!(super::click(&escaping, qoop(), None, None), None, "{term}");
+        }
+        let kitty = Env {
+            kitty: true,
+            ..apple.clone()
+        };
+        assert_eq!(super::click(&kitty, qoop(), None, None), None);
+        let linux = Env {
+            macos: false,
+            ..apple.clone()
+        };
+        assert_eq!(super::click(&linux, qoop(), None, None), None);
+        // Other programs never act on a click.
+        let osa = call(Program::Osascript, "x", Some((&click, 7)));
+        assert!(osa.args.iter().all(|a| !a.contains("focus")));
+    }
+
+    /// A cut never leaves half an emoji: no joiner or variation selector right before the
+    /// ellipsis, and never one half of a flag.
+    #[test]
+    fn a_cut_note_ends_on_a_whole_character() {
+        // 118 columns of words, then a family joined with a joiner: the cut lands inside it.
+        let family = format!(
+            "{}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+            "a".repeat(118)
+        );
+        let cut = clean(&family);
+        assert!(cut.ends_with('…'), "{cut:?}");
+        assert!(!cut.contains('\u{200d}'), "{cut:?}");
+        // A flag is two regional indicators: 117 columns, then flags, cut after an odd one.
+        let flags = format!("{}\u{1f1f9}\u{1f1f7}\u{1f1e9}\u{1f1ea}", "a".repeat(117));
+        let cut = clean(&flags);
+        let halves = cut
+            .chars()
+            .filter(|c| ('\u{1f1e6}'..='\u{1f1ff}').contains(c))
+            .count();
+        assert_eq!(halves % 2, 0, "{cut:?}");
+        assert!(cut.ends_with('…'), "{cut:?}");
+        assert!(crate::width::width(&cut) <= MAX_COLUMNS);
+    }
+
+    /// The `-execute` text through a real `/bin/sh -c`, as terminal-notifier runs it: paths
+    /// with spaces, quotes, `$( )` and a backtick reach the program whole, and nothing in
+    /// them runs.
+    #[test]
+    fn the_click_runs_through_a_real_shell_with_its_paths_whole() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("tempdir");
+        let odd = "it's a \"dir\" $(touch pwned) `touch pwned2`";
+        let dir = root.path().join(odd);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let qoop = dir.join("qoop");
+        std::fs::write(
+            &qoop,
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$QOOP_RUNTIME_DIR\" \"$1\" \"$2\"\n",
+        )
+        .expect("script");
+        std::fs::set_permissions(&qoop, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let runtime = dir.join("run time");
+        let click = Click {
+            qoop,
+            runtime_dir: Some(runtime.to_string_lossy().into_owned()),
+            bundle: None,
+        };
+        let args = click.args(7);
+        assert_eq!(args[0], "-execute");
+        assert_eq!(args.len(), 2, "no -activate without a bundle id");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &args[1]])
+            .current_dir(root.path())
+            .output()
+            .expect("sh");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}|focus|7", runtime.display())
+        );
+        assert!(!root.path().join("pwned").exists());
+        assert!(!root.path().join("pwned2").exists());
     }
 }

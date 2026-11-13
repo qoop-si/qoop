@@ -238,6 +238,15 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             child: "c".into(),
             text: "hello".into(),
         },
+        // Types an answer into an agent blocked on its own menu, for a person's connection only:
+        // this program is refused before any byte moves.
+        ControlRequest::AnswerMenu {
+            id: "x40".into(),
+            terminal,
+            generation: None,
+            seal: 0,
+            key: "1".into(),
+        },
         ControlRequest::SetSplit {
             id: "x22".into(),
             tree: qoop_runtime::control::Pane::Leaf { terminal },
@@ -485,6 +494,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SubagentMessages { .. }
             | ControlRequest::SubagentDetail { .. }
             | ControlRequest::SubagentSend { .. }
+            | ControlRequest::AnswerMenu { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }

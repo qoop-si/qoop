@@ -1055,6 +1055,7 @@ pub fn snapshot(rows: &[StyledRow], cols: usize) -> SnapshotWire {
             ..ModesWire::default()
         },
         behind: 0,
+        title: String::new(),
     }
 }
 

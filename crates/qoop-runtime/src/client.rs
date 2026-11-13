@@ -162,14 +162,34 @@ pub fn set_runs_in(term: &str, mux: Option<&str>) {
     let _ = RUNS_IN.set((term.to_string(), mux.map(str::to_string)));
 }
 
-fn hello(client_id: &str, observer: bool, replaces: Option<&str>, link: bool) -> ClientHello {
+/// Whether this interface lends its microphone ([`MICROPHONE`]): yes unless it said
+/// otherwise. A window that has none (the desktop window, for now) says so before it
+/// connects, or a recording in a tab is told it is listening and hears nothing.
+static LENDS_MICROPHONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Say whether this interface lends a microphone; set once before it connects.
+pub fn set_lends_microphone(lends: bool) {
+    LENDS_MICROPHONE.store(lends, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn hello(
+    client_id: &str,
+    observer: bool,
+    replaces: Option<&str>,
+    link: bool,
+    deltas: bool,
+) -> ClientHello {
     let mut extra = serde_json::Map::new();
     if link {
         extra.insert(RENDER_WINDOW.into(), LINK_WINDOW.into());
+    }
+    if deltas {
         extra.insert(ROW_DELTAS.into(), serde_json::Value::Bool(true));
     }
     if client_id == qoop_proto::INTERFACE_ID {
-        extra.insert(MICROPHONE.into(), serde_json::Value::Bool(true));
+        if LENDS_MICROPHONE.load(std::sync::atomic::Ordering::Relaxed) {
+            extra.insert(MICROPHONE.into(), serde_json::Value::Bool(true));
+        }
         if let Some((term, mux)) = RUNS_IN.get() {
             extra.insert(TERM.into(), serde_json::Value::String(term.clone()));
             if let Some(mux) = mux {
@@ -207,7 +227,7 @@ fn hello(client_id: &str, observer: bool, replaces: Option<&str>, link: bool) ->
 /// blank screen until something else happened to change. It passed every unit test and
 /// failed the first time a person ran it.
 pub async fn connect(socket: &Path, client_id: &str) -> io::Result<(UnixStream, BytesMut)> {
-    connect_as(socket, client_id, false).await
+    connect_as(socket, client_id, false, false).await
 }
 
 /// Connect as one that only watches (`agents --watch`, a phone bridge's watcher): the same
@@ -216,20 +236,30 @@ pub async fn connect_observer(
     socket: &Path,
     client_id: &str,
 ) -> io::Result<(UnixStream, BytesMut)> {
-    connect_as(socket, client_id, true).await
+    connect_as(socket, client_id, true, false).await
+}
+
+/// Connect asking for only the rows that changed ([`ROW_DELTAS`]), for an interface that
+/// redraws a row only when it changed (the desktop window). Read it with
+/// [`Connection::deltas`], which hands each screen on whole with the rows it changed. An
+/// older daemon ignores the key and sends whole screens, which read as every row changed.
+pub async fn connect_deltas(socket: &Path, client_id: &str) -> io::Result<(UnixStream, BytesMut)> {
+    connect_as(socket, client_id, false, true).await
 }
 
 async fn connect_as(
     socket: &Path,
     client_id: &str,
     observer: bool,
+    deltas: bool,
 ) -> io::Result<(UnixStream, BytesMut)> {
     // Bounded: a daemon that accepts and never answers (wedged, or a stale socket held by
     // something else) otherwise hangs every caller, a hook inside an agent's turn included.
     // Here and not in `handshake`: over an ssh relay the first seconds may be a password.
     tokio::time::timeout(qoop_proto::reassembly::SEQUENCE_DEADLINE, async {
         let stream = UnixStream::connect(socket).await.map_err(not_running)?;
-        let (stream, leftover, _) = handshake_as(stream, client_id, observer, None, false).await?;
+        let (stream, leftover, _) =
+            handshake_as(stream, client_id, observer, None, false, deltas).await?;
         Ok((stream, leftover))
     })
     .await
@@ -268,7 +298,7 @@ pub async fn handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, false, replaces, false).await
+    handshake_as(stream, client_id, false, replaces, false, false).await
 }
 
 /// [`handshake`] for a link to another machine's daemon: paced, so screens never queue in
@@ -282,7 +312,7 @@ pub async fn handshake_link<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, false, Some(replaces), true).await
+    handshake_as(stream, client_id, false, Some(replaces), true, true).await
 }
 
 /// [`handshake`] as one that only watches, over any byte stream: the asker of a move that
@@ -294,7 +324,7 @@ pub async fn handshake_observer<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    handshake_as(stream, client_id, true, None, false).await
+    handshake_as(stream, client_id, true, None, false, false).await
 }
 
 async fn handshake_as<S>(
@@ -303,11 +333,12 @@ async fn handshake_as<S>(
     observer: bool,
     replaces: Option<&str>,
     link: bool,
+    deltas: bool,
 ) -> io::Result<(S, BytesMut, qoop_proto::ServerWelcome)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let body = serde_json::to_vec(&hello(client_id, observer, replaces, link))
+    let body = serde_json::to_vec(&hello(client_id, observer, replaces, link, deltas))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = BytesMut::new();
     Frame::new(Channel::Handshake, 0, Bytes::from(body))
@@ -653,6 +684,14 @@ pub enum Incoming {
     Render {
         terminal: u32,
         snapshot: SnapshotWire,
+        /// The rows that differ from the previous `Render` of this terminal that `drain`
+        /// returned on this connection, ascending, when the daemon sent only those
+        /// ([`Connection::deltas`]). A reader that skips a render (draws only the newest of a
+        /// batch) must merge its rows into the next one's, or redraw whole. `None` is a whole
+        /// screen: any row may have changed, which is all a connection that did not ask for
+        /// deltas, or an older daemon, ever says. The cursor, modes, `behind` and title may
+        /// change with no row listed.
+        changed: Option<Vec<usize>>,
     },
     /// A picture the terminal's child emitted. Separate from the render because it
     /// is not grid cells: the client draws it as an overlay or a placeholder.
@@ -717,21 +756,30 @@ impl Connection {
         self
     }
 
-    /// For a connection made with [`handshake_link`]: deltas are rebuilt into whole screens.
+    /// For a connection made with [`handshake_link`] or [`connect_deltas`]: deltas are
+    /// rebuilt into whole screens. Each `Render`'s `changed` is relative to the previous
+    /// `Render` of that terminal, not to the last one a reader drew: a reader that coalesces
+    /// renders unions their `changed` rows or redraws whole.
     pub fn deltas(mut self) -> Self {
         self.screens = Some(Default::default());
         self
     }
 
-    /// A delta put into its terminal's last screen and given back whole, a whole screen kept
-    /// as the next base, anything else as it came.
+    /// On a connection that asked for deltas: a delta put into its terminal's last screen
+    /// and given back whole with the rows it changed, a whole screen kept as the next base
+    /// and given back with none. `None` for anything else (a picture, a copy) and on a
+    /// connection that did not ask.
     ///
     /// A delta that does not fit is an error, not a dropped screen: the daemon's base has
     /// moved on, so every later delta would patch a stale screen. Ending the connection
     /// starts both ends again without one.
-    fn whole(&mut self, terminal: u32, body: Bytes) -> io::Result<Bytes> {
+    fn whole(
+        &mut self,
+        terminal: u32,
+        body: &[u8],
+    ) -> io::Result<Option<(SnapshotWire, Option<Vec<usize>>)>> {
         let Some(screens) = &mut self.screens else {
-            return Ok(body);
+            return Ok(None);
         };
         if body.starts_with(DELTA_PREFIX) {
             let unfit = || {
@@ -740,18 +788,19 @@ impl Connection {
                     format!("a delta for terminal {terminal} does not fit its last screen"),
                 )
             };
-            let delta: DeltaWire = serde_json::from_slice(&body).map_err(|_| unfit())?;
+            let delta: DeltaWire = serde_json::from_slice(body).map_err(|_| unfit())?;
+            let changed = delta.delta.clone();
             let screen = delta
                 .apply(screens.get(&terminal).ok_or_else(unfit)?)
                 .ok_or_else(unfit)?;
-            let body = serde_json::to_vec(&screen).map_err(|_| unfit())?;
-            screens.insert(terminal, screen);
-            return Ok(Bytes::from(body));
+            screens.insert(terminal, screen.clone());
+            return Ok(Some((screen, Some(changed))));
         }
-        if let Ok(screen) = serde_json::from_slice::<SnapshotWire>(&body) {
-            screens.insert(terminal, screen);
-        }
-        Ok(body)
+        let Ok(screen) = serde_json::from_slice::<SnapshotWire>(body) else {
+            return Ok(None);
+        };
+        screens.insert(terminal, screen.clone());
+        Ok(Some((screen, None)))
     }
 
     /// How many renders have arrived, which is what an acknowledgement reports.
@@ -778,8 +827,15 @@ impl Connection {
             let Some(mut message) = message else { continue };
             match channel {
                 Channel::Terminal => {
-                    message.body = self.whole(terminal, message.body)?;
+                    let screen = self.whole(terminal, &message.body)?;
                     if self.raw {
+                        // A delta goes on as the whole screen it rebuilt.
+                        if let Some((screen, Some(_))) = &screen {
+                            message.body = Bytes::from(
+                                serde_json::to_vec(screen)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                            );
+                        }
                         // Counted like a decoded one: the acknowledgement reports messages
                         // taken off the lane, whatever the reader then does with them.
                         self.renders.received += 1;
@@ -789,9 +845,19 @@ impl Connection {
                         });
                         continue;
                     }
-                    if let Ok(snapshot) = serde_json::from_slice::<SnapshotWire>(&message.body) {
+                    let screen = match screen {
+                        Some(screen) => Some(screen),
+                        None => serde_json::from_slice::<SnapshotWire>(&message.body)
+                            .ok()
+                            .map(|snapshot| (snapshot, None)),
+                    };
+                    if let Some((snapshot, changed)) = screen {
                         self.renders.received += 1;
-                        out.push(Incoming::Render { terminal, snapshot });
+                        out.push(Incoming::Render {
+                            terminal,
+                            snapshot,
+                            changed,
+                        });
                     } else if let Ok(wire) = serde_json::from_slice::<ImageWire>(&message.body) {
                         // An older daemon never sends this shape; a newer client reads
                         // it here, an older client fails the snapshot parse above and
@@ -867,6 +933,7 @@ mod tests {
         SnapshotWire {
             modes: Default::default(),
             behind: 0,
+            title: String::new(),
             cols: 20,
             rows: lines.len(),
             cursor: (1, 3),
@@ -874,6 +941,24 @@ mod tests {
             styles: Vec::new(),
             links: Vec::new(),
         }
+    }
+
+    /// An interface with no microphone says nothing about one; the default still lends.
+    #[test]
+    fn an_interface_can_decline_to_lend_a_microphone() {
+        let lends =
+            |h: &ClientHello| h.extra.get(MICROPHONE) == Some(&serde_json::Value::Bool(true));
+        assert!(lends(&hello(
+            qoop_proto::INTERFACE_ID,
+            false,
+            None,
+            false,
+            false
+        )));
+        set_lends_microphone(false);
+        let declined = hello(qoop_proto::INTERFACE_ID, false, None, false, false);
+        set_lends_microphone(true);
+        assert!(!lends(&declined));
     }
 
     /// A paced reader acknowledges every screen it takes. Acknowledging every sixteen or two
@@ -935,6 +1020,62 @@ mod tests {
             link.drain(&mut stray).is_err(),
             "a delta with no base was passed on"
         );
+    }
+
+    /// A decoding reader that asked for deltas is told which rows each one changed, and a
+    /// whole screen says none; one that did not ask reads every screen as whole.
+    #[test]
+    fn a_delta_reader_names_the_rows_that_changed() {
+        let base = snap(&["one", "two", "three"]);
+        let next = snap(&["one", "TWO", "three"]);
+        let delta = DeltaWire::between(&base, &next).expect("delta");
+        let mut seq = 0;
+        let mut inbuf = terminal_message(3, &mut seq, serde_json::to_vec(&base).unwrap());
+        inbuf.extend_from_slice(&terminal_message(
+            3,
+            &mut seq,
+            serde_json::to_vec(&delta).unwrap(),
+        ));
+        let mut gui = Connection::new().deltas();
+        let said: Vec<_> = gui
+            .drain(&mut inbuf)
+            .expect("drain")
+            .into_iter()
+            .map(|incoming| match incoming {
+                Incoming::Render {
+                    terminal: 3,
+                    snapshot,
+                    changed,
+                } => (snapshot, changed),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(said, vec![(base.clone(), None), (next, Some(vec![1]))]);
+        assert_eq!(gui.renders().received(), 2);
+
+        let mut seq = 0;
+        let mut inbuf = terminal_message(3, &mut seq, serde_json::to_vec(&base).unwrap());
+        let said = Connection::new().drain(&mut inbuf).expect("drain");
+        assert!(matches!(
+            &said[..],
+            [Incoming::Render { changed: None, .. }]
+        ));
+    }
+
+    /// The hello asks for deltas when the caller does, without the link's render window,
+    /// and says nothing of either otherwise.
+    #[test]
+    fn the_hello_asks_for_deltas_only_when_asked() {
+        let local = hello(qoop_proto::INTERFACE_ID, false, None, false, true);
+        assert_eq!(
+            local.extra.get(ROW_DELTAS),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(local.extra.get(RENDER_WINDOW), None);
+        let link = hello(qoop_proto::INTERFACE_ID, false, Some("k"), true, true);
+        assert!(link.extra.contains_key(ROW_DELTAS) && link.extra.contains_key(RENDER_WINDOW));
+        let plain = hello(qoop_proto::INTERFACE_ID, false, None, false, false);
+        assert!(!plain.extra.contains_key(ROW_DELTAS));
     }
 
     /// An older daemon never sent the field, and its cursor was always shown:

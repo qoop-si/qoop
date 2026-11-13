@@ -93,6 +93,12 @@ impl AlacrittyEngine {
         let (tx, rx) = channel();
         let config = Config {
             scrolling_history: SCROLLBACK_ROWS,
+            // A shape `DECSCUSR` never sets, so "never asked" differs from an explicit steady
+            // block (`CSI 2 q`), which is alacritty's own default.
+            default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+                shape: alacritty_terminal::vte::ansi::CursorShape::Hidden,
+                blinking: false,
+            },
             ..Config::default()
         };
         Self {
@@ -255,6 +261,19 @@ impl AlacrittyEngine {
         (text.chars().take(keep).collect(), spans)
     }
 
+    /// The cursor the program asked for as its `DECSCUSR` number, 0 when it never asked.
+    fn cursor_style(&self) -> u8 {
+        use alacritty_terminal::vte::ansi::CursorShape as Shape;
+        let style = self.term.cursor_style();
+        let shape = match style.shape {
+            Shape::Hidden => return 0,
+            Shape::Underline => 3,
+            Shape::Beam => 5,
+            _ => 1,
+        };
+        shape + u8::from(!style.blinking)
+    }
+
     /// The whole of what the engine's modes say, as the engine keeps them.
     pub fn mode_bits(&self) -> u32 {
         self.term.mode().bits()
@@ -338,19 +357,13 @@ impl AlacrittyEngine {
         if self.scheme_reports {
             out.push_str("\x1b[?2031h");
         }
-        let kitty = (mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18;
+        let kitty = kitty_flags(mode);
         if kitty != 0 {
             let _ = write!(out, "\x1b[={kitty};1u");
         }
-        let style = self.term.cursor_style();
-        if style != Default::default() {
-            use alacritty_terminal::vte::ansi::CursorShape as Shape;
-            let shape = match style.shape {
-                Shape::Underline => 3,
-                Shape::Beam => 5,
-                _ => 1,
-            };
-            let _ = write!(out, "\x1b[{} q", shape + u8::from(!style.blinking));
+        let style = self.cursor_style();
+        if style != 0 {
+            let _ = write!(out, "\x1b[{style} q");
         }
         if !self.title.is_empty() {
             let _ = write!(out, "\x1b]2;{}\x07", clean(&self.title));
@@ -527,6 +540,11 @@ fn blank(cell: &alacritty_terminal::term::cell::Cell) -> bool {
         && cell.zerowidth().is_none()
         && Pen::of(cell) == Pen::default()
         && cell.hyperlink().is_none()
+}
+
+/// The kitty keyboard flags in a mode set, as the protocol numbers them (`CSI > flags u`).
+fn kitty_flags(mode: TermMode) -> u8 {
+    ((mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18) as u8
 }
 
 /// Text that goes inside an escape sequence, with whatever could end it left out.
@@ -771,6 +789,7 @@ impl TerminalEngine for AlacrittyEngine {
             lines,
             styles,
             modes: self.modes(),
+            title: clean(&self.title),
         }
     }
 
@@ -800,6 +819,8 @@ impl TerminalEngine for AlacrittyEngine {
             application_cursor: m.contains(TermMode::APP_CURSOR),
             cursor_visible: m.contains(TermMode::SHOW_CURSOR),
             focus_events: m.contains(TermMode::FOCUS_IN_OUT),
+            kitty_keyboard: kitty_flags(m),
+            cursor_style: self.cursor_style(),
         }
     }
 
@@ -1281,6 +1302,48 @@ mod tests {
         assert!(
             e.snapshot().modes.focus_events,
             "a program that asked to hear about focus is never told"
+        );
+    }
+
+    /// The kitty keyboard flags reach a client numbered as `CSI > flags u` numbers them.
+    #[test]
+    fn kitty_flags_are_numbered_as_the_protocol_numbers_them() {
+        assert_eq!(kitty_flags(TermMode::empty()), 0);
+        assert_eq!(kitty_flags(TermMode::DISAMBIGUATE_ESC_CODES), 1);
+        assert_eq!(
+            kitty_flags(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC),
+            0b1001
+        );
+        assert_eq!(
+            kitty_flags(TermMode::KITTY_KEYBOARD_PROTOCOL | TermMode::SHOW_CURSOR),
+            0b11111
+        );
+    }
+
+    /// The cursor a program asks for and the title it sets reach the snapshot, so a client
+    /// draws vim's insert bar and names a shell's tab; a reset gives the shape back.
+    #[test]
+    fn the_cursor_style_and_title_reach_the_snapshot() {
+        let mut e = AlacrittyEngine::new(20, 2);
+        assert_eq!(e.snapshot().modes.cursor_style, 0, "never asked");
+        assert_eq!(e.snapshot().title, "");
+        e.feed(b"\x1b[6 q\x1b]2;my\x07agent\x07");
+        assert_eq!(e.snapshot().modes.cursor_style, 6, "a steady bar");
+        assert_eq!(e.snapshot().title, "my", "the title ends at its BEL");
+        e.feed(b"\x1b]0;tab name\x1b\\\x1b[3 q");
+        assert_eq!(e.snapshot().title, "tab name");
+        assert_eq!(e.snapshot().modes.cursor_style, 3, "a blinking underline");
+        e.feed(b"\x1b[2 q");
+        assert_eq!(
+            e.snapshot().modes.cursor_style,
+            2,
+            "a steady block is asked for, not the default"
+        );
+        e.feed(b"\x1b[0 q");
+        assert_eq!(
+            e.snapshot().modes.cursor_style,
+            0,
+            "back to the client's own"
         );
     }
 

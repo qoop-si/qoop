@@ -448,6 +448,18 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "answer an agent's own menu from its row, on a computer or the phone",
+            method: || {
+                Method::Control(ControlRequest::AnswerMenu {
+                    id: "a".into(),
+                    terminal: 1,
+                    generation: None,
+                    seal: 0,
+                    key: "1".into(),
+                })
+            },
+        },
+        Action {
             name: "search the history from copy mode",
             method: || {
                 Method::Control(ControlRequest::SearchScrollback {
@@ -978,6 +990,13 @@ fn every_control_method_is_reachable_from_some_action() {
             child: String::new(),
             text: String::new(),
         },
+        ControlRequest::AnswerMenu {
+            id: String::new(),
+            terminal: 0,
+            generation: None,
+            seal: 0,
+            key: String::new(),
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -1254,6 +1273,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SubagentMessages { .. }
             | ControlRequest::SubagentDetail { .. }
             | ControlRequest::SubagentSend { .. }
+            | ControlRequest::AnswerMenu { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

@@ -49,6 +49,12 @@ jobs:
       - name: Shells
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh fish
+      # The desktop window builds on macOS only, so the Linux lint job never sees it.
+      - name: Clippy (desktop)
+        if: runner.os == 'macOS'
+        run: |
+          cargo clippy -p qoop-desktop --all-targets --locked -- -D warnings
+          cargo clippy -p qoop-desktop --all-targets --all-features --locked -- -D warnings
       # The idle CPU gates measure a quiet machine; a shared runner is not one.
       - name: Test
         env:

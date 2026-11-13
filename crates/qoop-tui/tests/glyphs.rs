@@ -21,10 +21,21 @@ const SAFE_BLOCKS: [(char, char); 2] = [('\u{2500}', '\u{259f}'), ('\u{2800}', '
 /// Characters a file only compares against what another program wrote, strips or measures,
 /// and never draws.
 const MATCHED: &[(&str, &str)] = &[
-    ("qoop-tui/src/notify.rs", "\u{9f}"),
+    // A question's line breaks, where its first line ends, and the joiner, selectors and flag
+    // halves a cut does not end on: compared, never drawn.
+    (
+        "qoop-tui/src/notify.rs",
+        "\u{85}\u{2028}\u{2029}\u{200d}\u{fe0f}\u{fe0e}\u{1f1e6}\u{1f1ff}",
+    ),
     ("qoop-runtime/src/idle.rs", "⏺◯"),
     // The trust menu's pointers, looked for on an agent's screen, never drawn.
     ("qoop-detect/src/lib.rs", "\u{276f}\u{203a}"),
+    // An agent's own menu read off its screen: its cursor, boxes, ticks and the tree mark of
+    // a list row in a question, compared, never drawn.
+    (
+        "qoop-runtime/src/menu.rs",
+        "\u{276f}\u{2610}\u{2612}\u{2611}\u{2714}\u{23bf}",
+    ),
     ("qoop-runtime/src/asks.rs", "üı\u{307}ö\u{201d}"),
     (
         "qoop-store/src/task.rs",
@@ -39,6 +50,12 @@ const MATCHED: &[(&str, &str)] = &[
         "\u{200d}\u{202a}\u{202e}\u{2066}\u{2069}\u{20e3}\u{fe0e}\u{fe0f}\u{1f1e6}\u{1f1ff}\u{e0020}\u{e007f}",
     ),
     ("qoop-tui/src/config.rs", "\u{feff}"),
+    // The desktop window's font warm-up: rasterized clipped to nothing so the fallback fonts
+    // load before an agent prints these, never shown.
+    (
+        "qoop-desktop/src/element.rs",
+        "\u{2717}\u{23fa}\u{23bf}\u{276f}\u{4e2d}\u{2705}",
+    ),
 ];
 
 /// Files that make a character from a number, and why what they make is safe.
