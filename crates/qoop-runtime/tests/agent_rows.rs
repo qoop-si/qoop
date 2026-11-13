@@ -53,11 +53,19 @@ async fn only_the_named_rows_come_back_as_the_index_writes_them() {
     let row = &some[0];
     assert_eq!(row.terminal, second);
     let listed = all.iter().find(|r| r.terminal == second).expect("listed");
-    assert_eq!(
-        serde_json::to_value(row).expect("row"),
-        serde_json::to_value(listed).expect("listed row"),
-        "the same row as the index"
-    );
+    // The fields that hold still between two reads of a quiet shell (a pid or an activity
+    // stamp may move on a slow runner).
+    let still = |r: &AgentRow| {
+        (
+            r.terminal,
+            r.workspace,
+            r.name.clone(),
+            r.agent,
+            r.state.clone(),
+            r.cwd.clone(),
+        )
+    };
+    assert_eq!(still(row), still(listed), "the same row as the index");
     assert!(
         !some.iter().any(|r| r.terminal == first),
         "a row not named is left out"
