@@ -3110,6 +3110,49 @@ mod tests {
         assert_eq!(r.stop_of(1), None, "the new turn ends the finish");
     }
 
+    /// A turn that ends while its sub-agents run is still working on what was asked (Claude
+    /// reads "Waiting for 2 background agents to finish"); once they end with no new turn, it is
+    /// a finish nobody has seen.
+    #[test]
+    fn a_turn_waiting_on_its_sub_agents_reads_working_until_they_end() {
+        use crate::control::SubagentChange;
+        use AgentRuntimeState as S;
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        {
+            let mut terminals = r.terminals.lock().unwrap();
+            let a = terminals.get_mut(&1).unwrap();
+            a.identity = AgentIdentity::Known {
+                program: "claude".into(),
+                generation: a.belief.generation,
+                agent: true,
+            };
+        }
+        let report = |state, event| {
+            r.observe_hook_event(1, &id, &token, state, false, false, NOW, Some(event))
+                .expect("admitted")
+        };
+        let status = || {
+            let (background, subagents) = r.background_of(1);
+            qoop_domain::status::of(qoop_domain::StatusFacts {
+                state: r.agent(1).expect("agent").belief.state,
+                subagents,
+                background_tasks: background - subagents,
+                needs_you: false,
+                unseen_stop: r.unseen_stop(1),
+                parked: false,
+            })
+        };
+        report(S::Working, "user");
+        r.note_subagents(1, SubagentChange::Started("a1".into()));
+        report(S::Idle, "done");
+        assert_eq!(status(), qoop_domain::Status::Working);
+        r.note_subagents(1, SubagentChange::Ended("a1".into()));
+        assert_eq!(status(), qoop_domain::Status::Done);
+    }
+
     /// A daemon that becomes another binary keeps a terminal's finish and whether it was seen.
     #[test]
     fn a_handover_keeps_the_finish_and_its_look() {

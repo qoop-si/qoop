@@ -381,14 +381,12 @@ pub(crate) async fn write(
     // with it, or the speaker's open one.
     let target = store
         .run(move |s| match (task, speaker) {
-            (Some(task), None) => Ok(s.task(task)?.map(|t| (task, t.terminal))),
+            (Some(task), None) => Ok(s.task(task)?.map(|_| task)),
             (Some(task), Some(terminal)) => Ok(s
                 .task(task)?
                 .filter(|t| t.terminal == Some(i64::from(terminal)))
-                .map(|t| (task, t.terminal))),
-            (None, Some(terminal)) => Ok(s
-                .open_task_of(i64::from(terminal))?
-                .map(|t| (t.id, t.terminal))),
+                .map(|_| task)),
+            (None, Some(terminal)) => Ok(s.open_task_of(i64::from(terminal))?.map(|t| t.id)),
             (None, None) => Ok(None),
         })
         .await;
@@ -397,7 +395,7 @@ pub(crate) async fn write(
         TaskOp::Close { actor, .. } => Some(actor_label(agents, actor.as_ref(), space.as_deref())),
         _ => None,
     };
-    let (task, home) = match target {
+    let task = match target {
         Ok(Some(found)) => found,
         Ok(None) => {
             return failed(

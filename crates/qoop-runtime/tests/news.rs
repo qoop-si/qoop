@@ -5,9 +5,7 @@
 use std::time::{Duration, Instant};
 
 use qoop_runtime::client::{self, Incoming};
-use qoop_runtime::control::{
-    AgentRow, ControlRequest, ControlResponse, EventMessage, SubagentChange, TaskOp,
-};
+use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage, TaskOp};
 use qoop_testkit::{TestClient, TestDaemon};
 use tokio::io::AsyncReadExt;
 
@@ -15,9 +13,9 @@ const PATIENCE: Duration = Duration::from_secs(5);
 
 /// The index's row for `terminal`.
 async fn row(asker: &mut TestClient, terminal: u32) -> AgentRow {
-    match asker
-        .control(&ControlRequest::ListAgents { id: "rows".into() }, PATIENCE)
-        .await
+    // Boxed, here and in each helper: a control call holds a 64 KiB read buffer, and a test
+    // that awaits many of them inline outgrew a debug build's 2 MiB test stack.
+    match Box::pin(asker.control(&ControlRequest::ListAgents { id: "rows".into() }, PATIENCE)).await
     {
         Some(ControlResponse::Agents { agents, .. }) => agents
             .into_iter()
@@ -34,26 +32,25 @@ async fn status(asker: &mut TestClient, terminal: u32) -> String {
 
 /// What a hook in the terminal reports.
 async fn report(hook: &mut TestClient, terminal: u32, token: &str, state: &str, event: &str) {
-    let answer = hook
-        .control(
-            &ControlRequest::ReportAgentState {
-                from: None,
-                id: format!("{state}-{event}"),
-                terminal,
-                token: token.into(),
-                state: state.into(),
-                visible_blocker: false,
-                visible_idle: false,
-                visible_working: false,
-                clock: 0,
-                session: None,
-                event: Some(event.into()),
-                label: None,
-                said: None,
-            },
-            PATIENCE,
-        )
-        .await;
+    let answer = Box::pin(hook.control(
+        &ControlRequest::ReportAgentState {
+            from: None,
+            id: format!("{state}-{event}"),
+            terminal,
+            token: token.into(),
+            state: state.into(),
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            clock: 0,
+            session: None,
+            event: Some(event.into()),
+            label: None,
+            said: None,
+        },
+        PATIENCE,
+    ))
+    .await;
     assert!(
         !matches!(answer, Some(ControlResponse::Failed { .. }) | None),
         "the report was refused: {answer:?}"
@@ -61,17 +58,16 @@ async fn report(hook: &mut TestClient, terminal: u32, token: &str, state: &str, 
 }
 
 async fn seen(client: &mut TestClient, terminal: u32, stop: Option<String>) -> ControlResponse {
-    client
-        .control(
-            &ControlRequest::Seen {
-                id: "seen".into(),
-                terminal,
-                stop,
-            },
-            PATIENCE,
-        )
-        .await
-        .expect("an answer")
+    Box::pin(client.control(
+        &ControlRequest::Seen {
+            id: "seen".into(),
+            terminal,
+            stop,
+        },
+        PATIENCE,
+    ))
+    .await
+    .expect("an answer")
 }
 
 /// Read an index's event lane until it hears that `terminal`'s row changed.
@@ -92,7 +88,7 @@ async fn changed_within(
 ) -> bool {
     let mut connection = client::Connection::new();
     let deadline = Instant::now() + patience;
-    let mut read = [0u8; 64 * 1024];
+    let mut read = vec![0u8; 64 * 1024];
     loop {
         for incoming in connection.drain(inbuf).expect("decode") {
             if let Incoming::Event(EventMessage::AgentChanged { terminal: t }) = incoming
@@ -212,56 +208,6 @@ async fn a_task_waiting_on_the_owner_needs_you_at_once_on_every_row() {
     let waiting = row(&mut asker, terminal).await;
     assert_eq!(waiting.status.as_deref(), Some("blocked"));
     assert_eq!(waiting.state, "idle");
-}
-
-async fn subagent(hook: &mut TestClient, terminal: u32, token: &str, change: SubagentChange) {
-    let answer = hook
-        .control(
-            &ControlRequest::ReportSubagents {
-                id: "sub".into(),
-                terminal,
-                token: token.into(),
-                change,
-                from: None,
-            },
-            PATIENCE,
-        )
-        .await;
-    assert!(
-        !matches!(answer, Some(ControlResponse::Failed { .. }) | None),
-        "the report was refused: {answer:?}"
-    );
-}
-
-/// A turn that ends while its sub-agents run is still working on what was asked (Claude reads
-/// "Waiting for 2 background agents to finish"); once they end with no new turn, it is a finish.
-#[tokio::test]
-async fn a_turn_waiting_on_its_sub_agents_is_working_until_they_end() {
-    let d = TestDaemon::start().await;
-    let terminal = d.terminals().streams()[0];
-    let token = token_of(&d, terminal);
-    let mut hook = d.attach("hook").await;
-    let mut asker = d.attach("qoop-agents").await;
-    report(&mut hook, terminal, &token, "working", "user").await;
-    subagent(
-        &mut hook,
-        terminal,
-        &token,
-        SubagentChange::Started("a1".into()),
-    )
-    .await;
-    report(&mut hook, terminal, &token, "idle", "done").await;
-    let waiting = row(&mut asker, terminal).await;
-    assert_eq!(waiting.state, "idle");
-    assert_eq!(waiting.status.as_deref(), Some("working"));
-    subagent(
-        &mut hook,
-        terminal,
-        &token,
-        SubagentChange::Ended("a1".into()),
-    )
-    .await;
-    assert_eq!(status(&mut asker, terminal).await, "done");
 }
 
 /// qass finishes a turn on every event it handles: its own tab never reads done.
