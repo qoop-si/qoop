@@ -49,14 +49,29 @@ struct Row: Decodable, Equatable, Identifiable {
     /// Set when the qoop interface shows this row as done: it finished while the person
     /// was on another tab. Absent from a qoop that predates it.
     let news: Bool?
+    /// What every surface shows for the row, decided once by the daemon (`AgentRow.status`).
+    /// Absent from a qoop that predates it, whose raw state is read instead.
+    let status: String?
+
+    /// The row's state in the words read below: the daemon's status, else the raw state.
+    var shown: String {
+        switch status {
+        case nil: return state
+        case "blocked", "failed", "working", "done", "idle": return status ?? state
+        case "starting": return "working"
+        case "background", "parked": return "idle"
+        default: return "unknown"
+        }
+    }
 
     enum Kind { case waiting, done, working, idle }
 
     var kind: Kind {
-        switch state {
+        switch shown {
         case "blocked", "failed": return .waiting
         case "working": return .working
-        default: return news == true ? .done : .idle
+        case "done": return .done
+        default: return status == nil && news == true ? .done : .idle
         }
     }
 
@@ -66,7 +81,7 @@ struct Row: Decodable, Equatable, Identifiable {
     var dotKind: DotMark.Kind {
         switch kind {
         case .working: return .working
-        case .waiting: return state == "failed" ? .failed : .wants
+        case .waiting: return shown == "failed" ? .failed : .wants
         case .done: return .done
         case .idle: return .idle
         }
@@ -75,7 +90,7 @@ struct Row: Decodable, Equatable, Identifiable {
     var label: String { name ?? program ?? "terminal" }
     var place: String { cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "" }
     var detail: String {
-        if state == "failed" { return "failed" }
+        if shown == "failed" { return "failed" }
         return agent_title ?? (kind == .waiting ? "needs you" : "")
     }
     /// Blocked or Failed for a row that needs you, its state's green once done, nothing
@@ -180,7 +195,7 @@ final class Store: ObservableObject {
     var waiting: Int { rows.filter { $0.kind == .waiting }.count }
     /// The worst state that needs you, as the TUI ranks them: blocked, then failed.
     var needKind: DotMark.Kind {
-        rows.contains { $0.state == "failed" } && !rows.contains { $0.state == "blocked" } ? .failed : .wants
+        rows.contains { $0.shown == "failed" } && !rows.contains { $0.shown == "blocked" } ? .failed : .wants
     }
     var needInk: Color { DotMark.ink(needKind) }
     var working: Int { rows.filter { $0.kind == .working }.count }

@@ -29,6 +29,7 @@ pub mod rail;
 pub mod run;
 pub mod schedules;
 pub mod screen;
+pub mod seen;
 pub mod selection;
 pub mod sidebar;
 pub mod tabs;
