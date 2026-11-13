@@ -1988,7 +1988,8 @@ fn here(frame: &Frame) -> String {
         .unwrap_or_default();
     match frame.rows.iter().find(|r| r.terminal == frame.focused) {
         Some(row) => {
-            let state = if row.state == "unknown" {
+            let shown = sidebar::shown_state(row);
+            let state = if shown == "unknown" {
                 String::new()
             } else if row.state == "sleeping" {
                 // A slept tab has no screen and takes no keys: name the way
@@ -1997,7 +1998,7 @@ fn here(frame: &Frame) -> String {
             } else if sidebar::is_parked(row) {
                 crate::keys::named(", saved  ctrl-a P unsave")
             } else {
-                format!(", {}", row.state)
+                format!(", {shown}")
             };
             format!("{space} / {}{state}", crate::palette::label(row))
         }

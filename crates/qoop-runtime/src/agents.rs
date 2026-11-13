@@ -1824,7 +1824,10 @@ impl AgentRegistry {
             // hook reported (a message queued during the last). The wait keeps the last spinner
             // frame drawn before the agent redraws after its turn end from reopening the turn.
             // ponytail: whole seconds, so the wait is one to two of them.
+            // ponytail: Claude's manifest only, the one measured (T748); another agent's turn
+            // line joins once a recorded screen of its rest shows that line gone.
             turn_line: verdict.turn_line
+                && manifest == "claude"
                 && agent.belief.source == qoop_domain::ObservationSource::Hook
                 && agent.belief.state == AgentRuntimeState::Idle
                 && agent
@@ -3066,16 +3069,20 @@ mod tests {
             ..spinner.clone()
         };
         assert!(
-            !r.observe_screen(1, "m", &spinner, NOW + 1),
+            !r.observe_screen(1, "claude", &spinner, NOW + 1),
             "the frame before the redraw"
         );
         assert!(
-            !r.observe_screen(1, "m", &title, NOW + 5),
+            !r.observe_screen(1, "claude", &title, NOW + 5),
             "the title alone"
+        );
+        assert!(
+            !r.observe_screen(1, "codex", &spinner, NOW + 5),
+            "an agent whose rest was not measured"
         );
         assert_eq!(r.agent(1).expect("agent").belief.state, S::Idle);
         assert!(
-            r.observe_screen(1, "m", &spinner, NOW + 5),
+            r.observe_screen(1, "claude", &spinner, NOW + 5),
             "a turn no hook reported"
         );
         assert_eq!(r.agent(1).expect("agent").belief.state, S::Working);
