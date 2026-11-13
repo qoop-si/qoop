@@ -38,7 +38,7 @@
 #
 # State mapping is unchanged by focus events: the state words below are what
 # they always were, and `--event/--label` only adds a display row for the
-# focus view. `Stop`/`SessionEnd` still report `idle`, with `--event done`
+# focus view. `Stop` still reports `idle`, with `--event done`
 # beside it; the push behaviour does not move, because pushes derive from
 # state alone.
 #
@@ -63,7 +63,7 @@
 #   Stop -> idle + `--event done`, labelled with the last paragraph of its last message
 #     (the payload's own, else the transcript's); the daemon keeps it only when it asks the
 #     owner something, and files it as a draft card when the agent waits on them;
-#     SessionEnd -> idle + `--event done`, no label
+#     SessionEnd -> idle, no event: a session closing is no finish
 #   StopFailure (the turn ended on an API error or a usage limit) -> failed,
 #     no event: the agent stopped and will not go on by itself
 #   Stop, StopFailure with a `background_tasks` list -> also `--subagents` with
@@ -382,7 +382,8 @@ elif name == "Stop":
     state, flags, event = "idle", "--visible-idle", "done"
     label, said = last_paragraph(payload)
 elif name == "SessionEnd":
-    state, flags, event, label = "idle", "--visible-idle", "done", ""
+    # The session closing (a tab closed, /exit, /clear) is no turn that finished.
+    state, flags, event, label = "idle", "--visible-idle", "", ""
 elif name == "StopFailure":
     state, flags, event, label = "failed", "", "", ""
 else:
