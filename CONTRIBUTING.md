@@ -80,4 +80,11 @@ are recorded publicly in the `cla-signatures` branch.
   the on-disk format.
 - Pull requests land by rebase, never squash or a merge commit.
 
+## Releases
+
+Versions and `CHANGELOG.md` come from the commit subjects: release-please keeps a Release PR open
+(`chore(main): release X.Y.Z`), and merging it is the release. The `release` workflow then builds
+every platform, publishes the GitHub release, and qoop.si serves it. Never edit a version or the
+changelog by hand.
+
 Security problems go through [SECURITY.md](SECURITY.md), never a public issue.
