@@ -363,7 +363,7 @@ fn set_watching_in(dir: &Path, on: bool) -> std::io::Result<bool> {
         return Ok(false);
     }
     // Made when missing: an `off` said before qass ever ran still holds once it starts.
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).map_err(switch_error)?;
     write_switch(dir, on)?;
     note_watch(dir, if on { "switch on" } else { "switch off" });
     Ok(true)
@@ -381,8 +381,31 @@ fn write_switch(dir: &Path, on: bool) -> std::io::Result<()> {
         "off\n".to_string()
     };
     let fresh = dir.join(format!(".{QASS_WATCH_FILE}.{}.new", std::process::id()));
-    std::fs::write(&fresh, body)?;
-    std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE))
+    std::fs::write(&fresh, body)
+        .and_then(|()| std::fs::rename(&fresh, dir.join(QASS_WATCH_FILE)))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&fresh);
+            switch_error(e)
+        })
+}
+
+/// Why the switch did not turn, in words the phone, the sidebar and the command line show as
+/// they are: what to do first, the system's own words last.
+fn switch_error(e: std::io::Error) -> std::io::Error {
+    use std::io::ErrorKind::{PermissionDenied, QuotaExceeded, StorageFull};
+    let said = match e.kind() {
+        StorageFull | QuotaExceeded => {
+            "the disk is full, so the switch could not be saved; free some space and try again"
+                .to_string()
+        }
+        PermissionDenied => {
+            format!(
+                "qoop is not allowed to write to its folder, so the switch could not be saved: {e}"
+            )
+        }
+        _ => format!("the switch could not be saved: {e}"),
+    };
+    std::io::Error::new(e.kind(), said)
 }
 
 /// The nightly learning run's folder (skills/learn), beside qass's own: it runs in qass's
@@ -514,7 +537,7 @@ fn renew_in(dir: &Path) -> std::io::Result<bool> {
     if !watching_in(dir) {
         return Ok(false);
     }
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).map_err(switch_error)?;
     write_switch(dir, true)?;
     note_watch(dir, "watcher gone, told again");
     Ok(true)
@@ -1114,6 +1137,48 @@ mod tests {
         )
         .unwrap();
         assert!(watching_in(&dir) && !resuming_in(&dir));
+    }
+
+    /// A switch that cannot be saved is an error, the switch stays as it was, and the file
+    /// written beside it is gone: a full disk must not also fill with leftovers.
+    #[test]
+    fn a_switch_that_cannot_be_saved_fails_and_leaves_nothing_beside_it() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("qass");
+        // A folder where the file goes: the rename over it fails, as root too.
+        std::fs::create_dir_all(dir.join(QASS_WATCH_FILE).join("x")).unwrap();
+        assert!(watching_in(&dir));
+        assert!(set_watching_in(&dir, false).is_err());
+        assert!(watching_in(&dir));
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".new"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A full disk is said as one, with what to do; any other failure keeps its own words.
+    #[test]
+    fn a_switch_not_saved_says_why_in_words() {
+        let full = switch_error(std::io::Error::from_raw_os_error(28));
+        assert_eq!(full.kind(), std::io::ErrorKind::StorageFull);
+        assert!(full.to_string().starts_with("the disk is full"), "{full}");
+        let denied = switch_error(std::io::Error::from_raw_os_error(1));
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            denied
+                .to_string()
+                .starts_with("qoop is not allowed to write to its folder"),
+            "{denied}"
+        );
+        let other = switch_error(std::io::Error::from_raw_os_error(21));
+        assert!(
+            other
+                .to_string()
+                .starts_with("the switch could not be saved: "),
+            "{other}"
+        );
     }
 
     /// On again is untold until the daemon keeps its stamp as told; forgotten, or on again
