@@ -445,6 +445,7 @@ fn scenario() {
                     Incoming::Render {
                         terminal: t,
                         snapshot,
+                        ..
                     } if *t == terminal
                         && snapshot.lines.iter().any(|l| l.contains("remote-42")) =>
                     {

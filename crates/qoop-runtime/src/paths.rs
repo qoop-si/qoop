@@ -80,9 +80,10 @@ pub fn runtime_dir() -> Result<PathBuf, PathError> {
     Ok(dir)
 }
 
-/// Where the runtime base is: `QOOP_RUNTIME_DIR`, else [`default_runtime_base`]. Nothing is
-/// created or checked.
-fn base_location() -> PathBuf {
+/// Where the runtime base is: `QOOP_RUNTIME_DIR` (or its old name), else
+/// [`default_runtime_base`]. Nothing is created or checked. Public for what hands this
+/// session's daemon to a process started elsewhere (a desktop note's click).
+pub fn base_location() -> PathBuf {
     match crate::legacy::var(RUNTIME_DIR_ENV) {
         Ok(explicit) => PathBuf::from(explicit),
         Err(_) => default_runtime_base(),

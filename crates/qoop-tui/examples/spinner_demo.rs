@@ -33,6 +33,7 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
     AgentRow {
         command: None,
         clients: Vec::new(),
+        menu: None,
         typed_by: None,
         keep_awake: false,
         qass_skip: false,

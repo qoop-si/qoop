@@ -2334,6 +2334,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,

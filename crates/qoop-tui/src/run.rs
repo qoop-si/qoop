@@ -260,6 +260,36 @@ const USAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// that opens one and shows it gets there first, and one that never comes is forgotten.
 const SHOW_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What the hint row says when a click on a desktop note asks for an agent that is gone.
+const GONE: &str = "That agent is gone";
+
+/// What a `Focus` event asks of this interface.
+#[derive(Debug, PartialEq, Eq)]
+enum FocusAsk {
+    /// A number with the remote bit: this window's own name for another machine's terminal,
+    /// which no daemon mints, so it may mean another window's remote. Nothing moves.
+    Ignore,
+    /// A terminal this interface listed that has gone: the list, opened if it was folded
+    /// (`unfolded`), and "That agent is gone" on the hint row.
+    Gone { unfolded: bool },
+    /// Show it, now or once an index lists it.
+    Show,
+}
+
+/// Decide a `Focus` event, and do what it asks of the state alone (the hint, the list).
+fn focus_ask(state: &mut State, terminal: u32) -> FocusAsk {
+    if crate::mux::is_remote_terminal(terminal) {
+        return FocusAsk::Ignore;
+    }
+    if !state.gone.contains(&terminal) {
+        return FocusAsk::Show;
+    }
+    state.hint = Some(GONE.to_string());
+    FocusAsk::Gone {
+        unfolded: std::mem::take(&mut state.collapsed),
+    }
+}
+
 /// How long the terminal under the keyboard is waited for after it went from the index. A
 /// remote daemon moving onto a newer qoop ends its tabs and brings them back with the same
 /// numbers a few seconds later, and the keyboard goes back to the same one rather than to
@@ -1033,6 +1063,11 @@ struct State {
     update: UpdateAsk,
     /// Where a desktop note goes, decided once at start.
     route: crate::notify::Route,
+    /// What a click on a `terminal-notifier` note does here, decided with the route.
+    click: Option<crate::notify::Click>,
+    /// Terminals this interface listed that have since left the index: a click on an old note
+    /// about one says it is gone (`EventMessage::Focus`).
+    gone: std::collections::BTreeSet<u32>,
     /// Whether the hint row still owes the person why notes have nowhere to go: said once,
     /// the first time one had.
     nowhere: bool,
@@ -7580,6 +7615,7 @@ fn peek_screen(mut lines: Vec<String>, cols: usize, rows: usize) -> SnapshotWire
             ..Default::default()
         },
         behind: 0,
+        title: String::new(),
     }
 }
 
@@ -8112,12 +8148,16 @@ where
         command_notes: Vec::new(),
         update: UpdateAsk::default(),
         route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+        click: None,
+        gone: Default::default(),
         nowhere: false,
         config: crate::config::Config::default(),
     };
     // Where a desktop note would go, decided once: the environment does not change under a
     // running interface, and inside tmux it costs asking tmux.
-    state.route = crate::notify::route(&crate::notify::Env::read());
+    let env = crate::notify::Env::read();
+    state.route = crate::notify::route(&env);
+    state.click = crate::notify::Click::read(&env);
     state.nowhere = matches!(state.route, crate::notify::Route::Nowhere(_));
     // The file is read before the first frame, so the first frame already names the
     // prefix the person chose. What in it could not be used is said once, on the hint row,
@@ -10826,7 +10866,9 @@ where
                     let mut unasked = false;
                     for message in connection.drain(&mut inbuf)? {
                         match message {
-                            Incoming::Render { terminal, snapshot } => {
+                            Incoming::Render {
+                                terminal, snapshot, ..
+                            } => {
                                 // The very first render adopts its terminal, which is how
                                 // the interface has something on screen before any answer
                                 // has arrived. Once. After that, nothing focused means
@@ -10929,11 +10971,18 @@ where
                                 refresh = true;
                             }
                             Incoming::Event(EventMessage::AsksChanged) => state.asks.stale = true,
-                            // `qoop focus`, from a notch or a launcher: the same switch a
-                            // click on the row makes. A terminal this interface does not
-                            // list yet waits for the index that names it.
-                            Incoming::Event(EventMessage::Focus { terminal }) => {
-                                if !state.rows.iter().any(|r| r.terminal == terminal) {
+                            // `qoop focus`, from a notch, a launcher or a click on a desktop
+                            // note: the same switch a click on the row makes. A terminal this
+                            // interface does not list yet waits for the index that names it.
+                            Incoming::Event(EventMessage::Focus { terminal }) => match focus_ask(&mut state, terminal) {
+                                FocusAsk::Ignore => {}
+                                FocusAsk::Gone { unfolded } => {
+                                    if unfolded && let Some(resize) = size_terminals(&mut state, &mut seqs)? {
+                                        wr.write_all(&resize).await?;
+                                    }
+                                    dirty = true;
+                                }
+                                FocusAsk::Show => if !state.rows.iter().any(|r| r.terminal == terminal) {
                                     state.show_when_listed =
                                         Some((terminal, std::time::Instant::now() + SHOW_WAIT, false));
                                     refresh = true;
@@ -10947,7 +10996,7 @@ where
                                         dirty = true;
                                     }
                                 }
-                            }
+                            },
                             // The board's news and a result shown: nothing the index draws.
                             Incoming::Event(EventMessage::TasksChanged | EventMessage::ShowsChanged) => {}
                             // The schedules' list is read again; the panel is what draws it.
@@ -12026,6 +12075,8 @@ fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
             urgent: push.priority == qoop_attention::Priority::Urgent,
+            // Read when the note is said, so a card written in the meantime is in it.
+            question: None,
             due,
         });
         state.notes_due = Some(state.notes_due.map_or(due, |at| at.min(due)));
@@ -12055,7 +12106,7 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
     if state.config.mute != qoop_runtime::config::Mute::Off {
         return Ok(());
     }
-    let due: Vec<crate::notify::Note> = ready
+    let mut due: Vec<crate::notify::Note> = ready
         .into_iter()
         .filter(|note| {
             let still = state.rows.iter().any(|r| {
@@ -12070,13 +12121,59 @@ fn fire_notes(state: &mut State, out: &mut impl Write) -> io::Result<()> {
     if due.is_empty() {
         return Ok(());
     }
+    // A failed agent's note says it failed, whatever it asked before.
+    for note in &mut due {
+        note.question = (note.state != "failed")
+            .then(|| question_of(state, note.terminal))
+            .flatten();
+    }
     let urgent = due.iter().any(|note| note.urgent);
-    say_note(state, out, &crate::notify::say(&due), urgent)
+    say_note(
+        state,
+        out,
+        &crate::notify::say(&due),
+        urgent,
+        click_about(&due),
+    )
+}
+
+/// The terminal a click on a note about `due` shows: the first one's, or none for another
+/// machine's agent, whose number is this window's own and means nothing to any daemon.
+fn click_about(due: &[crate::notify::Note]) -> Option<u32> {
+    due.first()
+        .map(|note| note.terminal)
+        .filter(|terminal| !crate::mux::is_remote_terminal(*terminal))
+}
+
+/// The first line of what the agent in `terminal` asks: its open question card's, else its
+/// own menu's as the daemon read it (only on a person's rows, and only while it is blocked).
+fn question_of(state: &State, terminal: u32) -> Option<String> {
+    let card = state
+        .asks
+        .live
+        .iter()
+        .find(|card| card.status == "open" && card.terminal == Some(terminal))
+        .and_then(|card| crate::notify::question_line(&card.body.asks));
+    card.or_else(|| {
+        state
+            .rows
+            .iter()
+            .find(|row| row.terminal == terminal)
+            .and_then(|row| row.menu.as_ref())
+            .and_then(|menu| crate::notify::question_line(&menu.question))
+    })
 }
 
 /// Put one note on the desktop and play its sound, as far as `[notify]` allows: the
-/// caller has already checked the mute.
-fn say_note(state: &State, out: &mut impl Write, text: &str, urgent: bool) -> io::Result<()> {
+/// caller has already checked the mute. `about`: the terminal a click on it shows. A note
+/// about several shows the first of them: the list beside it holds the rest.
+fn say_note(
+    state: &State,
+    out: &mut impl Write,
+    text: &str,
+    urgent: bool,
+    about: Option<u32>,
+) -> io::Result<()> {
     let body = crate::notify::clean(text);
     if state.config.desktop {
         match state.route {
@@ -12085,7 +12182,8 @@ fn say_note(state: &State, out: &mut impl Write, text: &str, urgent: bool) -> io
                 out.flush()?;
             }
             crate::notify::Route::System(program) => {
-                crate::notify::spawn(&crate::notify::call(program, &body));
+                let click = state.click.as_ref().zip(about);
+                crate::notify::spawn(&crate::notify::call(program, &body, click));
             }
             crate::notify::Route::Nowhere(_) => {}
         }
@@ -12142,7 +12240,7 @@ fn fire_command_notes(state: &mut State, out: &mut impl Write) -> io::Result<()>
         return Ok(());
     }
     for (text, failed) in notes {
-        say_note(state, out, &text, failed)?;
+        say_note(state, out, &text, failed, None)?;
     }
     Ok(())
 }
@@ -15007,6 +15105,14 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .iter()
                 .map(|r| (r.terminal, r.command.as_ref().map(|c| c.ended_at)))
                 .collect();
+            for left in state.was.keys() {
+                if !agents.iter().any(|r| r.terminal == *left) {
+                    state.gone.insert(*left);
+                }
+            }
+            for row in &agents {
+                state.gone.remove(&row.terminal);
+            }
             state.was = agents
                 .iter()
                 .map(|r| (r.terminal, sidebar::shown_state(r).to_string()))
@@ -15758,6 +15864,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             keep_awake: false,
@@ -17421,6 +17528,8 @@ mod tests {
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            click: None,
+            gone: Default::default(),
             nowhere: false,
             config: crate::config::Config::default(),
             snapshots: std::collections::BTreeMap::new(),
@@ -18984,6 +19093,8 @@ mod tests {
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            click: None,
+            gone: Default::default(),
             nowhere: false,
             config: crate::config::Config::default(),
             closing: None,
@@ -19003,6 +19114,7 @@ mod tests {
             links: Vec::new(),
             modes: Default::default(),
             behind,
+            title: String::new(),
         }
     }
 
@@ -19143,6 +19255,8 @@ mod tests {
             command_notes: Vec::new(),
             update: UpdateAsk::default(),
             route: crate::notify::Route::Nowhere(crate::notify::Why::NoProgram),
+            click: None,
+            gone: Default::default(),
             nowhere: false,
             config: crate::config::Config::default(),
         };
@@ -21098,6 +21212,162 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "5\n");
     }
 
+    /// A terminal that left the index is gone for a click on an old note about it; one that
+    /// comes back under its number is not.
+    #[test]
+    fn a_terminal_that_left_the_index_is_gone_until_it_comes_back() {
+        let index = |terminals: &[u32]| ControlResponse::Agents {
+            id: "index".to_string(),
+            splits: Vec::new(),
+            agents: terminals
+                .iter()
+                .map(|t| agent(*t, 1, "zsh", "idle"))
+                .collect(),
+            qass_checks: None,
+        };
+        let (mut request, mut dirty) = (0u64, false);
+        let mut state = bare_state();
+        apply(&mut state, index(&[1, 2]), &mut request, &mut dirty);
+        assert!(state.gone.is_empty());
+        apply(&mut state, index(&[1]), &mut request, &mut dirty);
+        assert!(state.gone.contains(&2));
+        assert!(!state.gone.contains(&1));
+        apply(&mut state, index(&[1, 2]), &mut request, &mut dirty);
+        assert!(!state.gone.contains(&2));
+    }
+
+    /// A click on a note about a terminal that has gone opens the list (unfolding it) and says
+    /// so; another machine's number moves nothing; a terminal still here is shown.
+    #[test]
+    fn a_focus_on_a_gone_terminal_opens_the_list_and_a_remote_number_does_nothing() {
+        let mut state = bare_state();
+        state.gone.insert(3);
+        state.collapsed = true;
+        assert_eq!(focus_ask(&mut state, 3), FocusAsk::Gone { unfolded: true });
+        assert_eq!(state.hint.as_deref(), Some(GONE));
+        assert!(!state.collapsed);
+        assert_eq!(focus_ask(&mut state, 3), FocusAsk::Gone { unfolded: false });
+        state.hint = None;
+        let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 3;
+        state.gone.insert(remote);
+        state.collapsed = true;
+        assert_eq!(focus_ask(&mut state, remote), FocusAsk::Ignore);
+        assert_eq!(state.hint, None);
+        assert!(state.collapsed, "nothing moved");
+        assert_eq!(focus_ask(&mut state, 1), FocusAsk::Show);
+    }
+
+    /// Said through to the desktop: a blocked agent with an open card asks its question; a
+    /// failed one with the same card still says it failed.
+    #[test]
+    fn a_failed_agents_note_says_it_failed_and_a_blocked_one_asks() {
+        let mut state = bare_state();
+        state.focused = 1;
+        state.route = crate::notify::Route::Escape {
+            escape: crate::notify::Escape::Osc9,
+            tmux: false,
+        };
+        let blocked = agent(2, 1, "claude", "blocked");
+        let failed = agent(3, 1, "claude", "failed");
+        state.rows = vec![agent(1, 1, "zsh", "idle"), blocked.clone(), failed.clone()];
+        let card = |terminal: u32| -> qoop_runtime::control::AskInfo {
+            serde_json::from_value(serde_json::json!({
+                "card": format!("c{terminal}"), "terminal": terminal, "status": "open",
+                "opened_at": 0,
+                "body": {"handle": "claude", "urgency": "now", "doing": "d", "why": "w",
+                         "asks": "Which region first?", "options": []},
+            }))
+            .expect("a card")
+        };
+        state.asks.live = vec![card(2), card(3)];
+        let note = |row: &AgentRow, what: &'static str| crate::notify::Note {
+            terminal: row.terminal,
+            state: row.state.clone(),
+            generation: sidebar::gen_of(row),
+            label: "claude".into(),
+            what,
+            space: "api".into(),
+            urgent: true,
+            question: None,
+            due: std::time::Instant::now() - crate::notify::DELAY,
+        };
+        let said = |state: &mut State| {
+            let mut out = Vec::new();
+            fire_notes(state, &mut out).expect("fire");
+            String::from_utf8(out).expect("utf8")
+        };
+        state.notes = vec![note(&failed, "failed")];
+        let text = said(&mut state);
+        assert!(text.contains("claude failed in api"), "{text:?}");
+        assert!(!text.contains("Which region"), "{text:?}");
+        state.notes = vec![note(&blocked, "is blocked")];
+        let text = said(&mut state);
+        assert!(text.contains("claude: Which region first?"), "{text:?}");
+    }
+
+    /// A click on a note shows the first agent it names, never another machine's.
+    #[test]
+    fn a_note_about_a_remote_agent_has_no_click_target() {
+        let note = |terminal: u32| crate::notify::Note {
+            terminal,
+            state: "blocked".into(),
+            generation: 0,
+            label: "claude".into(),
+            what: "is blocked",
+            space: String::new(),
+            urgent: true,
+            question: None,
+            due: std::time::Instant::now(),
+        };
+        let remote = crate::mux::REMOTE_TERMINAL | (1 << 24) | 2;
+        assert_eq!(click_about(&[note(4), note(remote)]), Some(4));
+        assert_eq!(click_about(&[note(remote), note(4)]), None);
+        assert_eq!(click_about(&[]), None);
+    }
+
+    /// What a desktop note asks: the first line of the agent's open question card, else of
+    /// its own menu, else nothing (the note then says what happened, as before).
+    #[test]
+    fn a_notes_question_comes_from_the_card_else_the_menu() {
+        let mut state = bare_state();
+        let mut menu = agent(3, 1, "claude", "blocked");
+        menu.menu = Some(qoop_runtime::control::AgentMenu {
+            question: "Do you want to proceed?".into(),
+            options: Vec::new(),
+            multi: false,
+            seal: 1,
+        });
+        state.rows = vec![menu, agent(4, 1, "claude", "blocked")];
+        assert_eq!(
+            question_of(&state, 3).as_deref(),
+            Some("Do you want to proceed?")
+        );
+        assert_eq!(question_of(&state, 4), None, "no card, no menu");
+        let card = |terminal: u32, status: &str, asks: &str| -> qoop_runtime::control::AskInfo {
+            serde_json::from_value(serde_json::json!({
+                "card": format!("c{terminal}"), "terminal": terminal, "status": status,
+                "opened_at": 0,
+                "body": {"handle": "claude", "urgency": "now", "doing": "d", "why": "w",
+                         "asks": asks, "options": []},
+            }))
+            .expect("a card")
+        };
+        state.asks.live = vec![
+            card(3, "open", "\nWhich region\u{1b} first?\nThe rest of it."),
+            card(4, "answered", "Not this one?"),
+        ];
+        assert_eq!(
+            question_of(&state, 3).as_deref(),
+            Some("Which region first?"),
+            "the card wins over the menu"
+        );
+        assert_eq!(
+            question_of(&state, 4),
+            None,
+            "an answered card asks nothing"
+        );
+    }
+
     /// A `--space` window comes back to its own tab even though the daemon's first render,
     /// adopted before any index, was of a terminal in another space: the index that drops
     /// that terminal keeps the window's own place rather than the space's first tab.
@@ -22705,6 +22975,7 @@ mod tests {
             styles: Vec::new(),
             modes: Default::default(),
             behind: 1_000,
+            title: String::new(),
             links: Default::default(),
         });
         // Four rows of pane inside its frame.

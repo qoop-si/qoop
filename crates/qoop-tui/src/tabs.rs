@@ -604,6 +604,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             keep_awake: false,
             qass_skip: false,
@@ -641,6 +642,7 @@ mod tests {
         AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             keep_awake: false,
             qass_skip: false,

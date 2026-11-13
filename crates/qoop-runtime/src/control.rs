@@ -181,6 +181,22 @@ pub enum ControlRequest {
         child: String,
         text: String,
     },
+    /// Answer the agent's own menu with the option `key` (or `Submit`), the menu a row showed
+    /// with `seal` (`AgentMenu::seal`). The daemon types the keys only if that agent, in
+    /// `generation`, is still blocked on the same menu on its screen now, and works them out
+    /// from that screen, as the input of the person who asked. Answered `MenuAnswered`.
+    /// Refused with a short code in `Failed`, nothing typed: `already_answered` (anything
+    /// changed, or the screen has not been read since the last keys), `busy` (keys still
+    /// queued for the terminal: ask again), `no_such_answer` (a key the menu has not, or one
+    /// of two digits), `not_a_person` (a program's connection). An older daemon answers
+    /// `unknown variant`.
+    AnswerMenu {
+        id: String,
+        terminal: TerminalStream,
+        generation: Option<u64>,
+        seal: u64,
+        key: String,
+    },
     /// Look for text in what has scrolled past, one bounded step at a time.
     ///
     /// A step and not a whole search, because a week of history is millions of rows and a
@@ -1853,6 +1869,7 @@ impl ControlRequest {
             | Self::SubagentMessages { id, .. }
             | Self::SubagentDetail { id, .. }
             | Self::SubagentSend { id, .. }
+            | Self::AnswerMenu { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -2017,6 +2034,12 @@ pub enum ControlResponse {
     SubagentSent {
         id: String,
         to: String,
+    },
+    /// An `AnswerMenu` was typed. `answers`: the keys answered the menu, rather than tick a
+    /// box or put the cursor in the agent's answer field.
+    MenuAnswered {
+        id: String,
+        answers: bool,
     },
     /// Where a `SearchScrollback` step got to.
     ///
@@ -2746,6 +2769,47 @@ pub struct AgentRow {
     /// Which kind of client a person last typed from here, and when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed_by: Option<TypedBy>,
+    /// The agent's own numbered menu on its screen, while it is blocked on one.
+    ///
+    /// Screen text, so only on rows sent to a person's connection (a computer, a phone, a
+    /// browser, `qoop attach`): a program's `ListAgents` never carries it, the one exception
+    /// to the rule on `rule`. Answered with `AnswerMenu`. Absent from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu: Option<AgentMenu>,
+}
+
+/// An agent's own menu as a person's client shows it: its question and its options.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMenu {
+    /// Empty when the agent asked nothing above its options.
+    #[serde(default)]
+    pub question: String,
+    pub options: Vec<MenuChoice>,
+    /// Boxes to tick, sent with the key `Submit`: a number only ticks its box.
+    #[serde(default)]
+    pub multi: bool,
+    /// Which menu this is, over which command: what `AnswerMenu` sends back so the daemon types
+    /// nothing into another menu with the same words. Below 2^53, so a JavaScript number holds
+    /// it exactly.
+    #[serde(default)]
+    pub seal: u64,
+}
+
+/// One option of an `AgentMenu`, as the agent numbers and names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MenuChoice {
+    pub key: String,
+    pub label: String,
+    /// The rows the agent drew under it: a description, or the rest of a long label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A box of a multiple choice question, ticked or not; absent on a plain option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    /// The agent's field for an answer of one's own ("Type something."): its key only puts the
+    /// cursor in it, so a client offers it as a field to open rather than as an answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input: bool,
 }
 
 /// A command a shell finished. Says nothing of what the command was: any program can print
@@ -2863,6 +2927,7 @@ impl ControlResponse {
             | Self::Messages { id, .. }
             | Self::MessageDetail { id, .. }
             | Self::SubagentSent { id, .. }
+            | Self::MenuAnswered { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
@@ -3359,6 +3424,7 @@ mod tests {
         let live = AgentRow {
             command: None,
             clients: Vec::new(),
+            menu: None,
             typed_by: None,
             parked: false,
             news: false,

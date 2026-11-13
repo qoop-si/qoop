@@ -75,6 +75,9 @@ pub struct Snapshot {
     /// interface's depends on whether the program asked for the mouse, and asking in a
     /// second round trip is asking about a screen that has already changed.
     pub modes: TerminalModes,
+    /// The window title the program set (`OSC 0` or `OSC 2`), control characters left out,
+    /// empty when none: what a client names a tab running a plain shell by.
+    pub title: String,
 }
 
 /// A run of columns that share one style.
@@ -139,6 +142,14 @@ pub struct TerminalModes {
     /// Whether the program asked to be told when its window gains and loses the focus
     /// (`CSI ? 1004 h`), so a client knows whether to pass that on.
     pub focus_events: bool,
+    /// The kitty keyboard flags the program pushed (`CSI > flags u`), its five bits as the
+    /// protocol numbers them, 0 when none: what a client that encodes keys itself reads to
+    /// choose between `CSI 13;2u` and the legacy bytes.
+    pub kitty_keyboard: u8,
+    /// The cursor the program asked for, as its `DECSCUSR` number: 1 and 2 a block, 3 and 4
+    /// an underline, 5 and 6 a bar, odd blinking. 0 when it never asked, which leaves the
+    /// shape to the client.
+    pub cursor_style: u8,
 }
 
 impl Default for TerminalModes {
@@ -153,6 +164,8 @@ impl Default for TerminalModes {
             application_cursor: false,
             cursor_visible: true,
             focus_events: false,
+            kitty_keyboard: 0,
+            cursor_style: 0,
         }
     }
 }

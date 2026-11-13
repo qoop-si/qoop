@@ -105,6 +105,7 @@ impl Tui {
                 Incoming::Render {
                     terminal: t,
                     snapshot,
+                    ..
                 } if *t == terminal && snapshot.lines.iter().any(|l| l.contains(text)) => Some(()),
                 _ => None,
             },

@@ -98,6 +98,17 @@ pub enum ClientCommand {
         reply: tokio::sync::oneshot::Sender<Paused>,
         go: tokio::sync::oneshot::Receiver<()>,
     },
+    /// Type the keys that answer the agent's own menu with `key`, as input from `from` (a
+    /// person of `kind`), only if the menu on the live screen is the one `seal` names and
+    /// nothing was typed since the screen was last read (`crate::menu::answer`). The reply
+    /// says whether they answered it, or why nothing was typed.
+    AnswerMenu {
+        from: ClientId,
+        kind: &'static str,
+        seal: u64,
+        key: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, &'static str>>,
+    },
 }
 
 /// Where a paused terminal stands: what the next daemon needs of it besides its
@@ -798,6 +809,9 @@ pub struct TerminalHandle {
     /// windows showing it. Written where subscriptions are made and dropped, read by the
     /// terminal's own task: an owner that shows it no longer yields to one that does.
     pub watchers: Arc<std::sync::Mutex<BTreeSet<ClientId>>>,
+    /// The agent's own menu on its screen, as of the task's last read of it (`crate::menu`).
+    /// Written by the terminal's own task, read by the index for a person's rows.
+    pub menu: Arc<std::sync::Mutex<Option<crate::control::AgentMenu>>>,
 }
 
 /// A fresh [`TerminalHandle::incarnation`], never repeated within a daemon.
@@ -3967,6 +3981,8 @@ fn dispatch(
         | ControlRequest::SubagentDetail { .. } => Dispatch::Apart,
         // The same read, and then a pause between the words and their Enter.
         ControlRequest::SubagentSend { .. } => Dispatch::Apart,
+        // A wait on the terminal's own task, which reads its screen and types.
+        ControlRequest::AnswerMenu { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
@@ -5037,6 +5053,8 @@ async fn handle_control(
             Err(reason) => ControlResponse::Failed { id, reason },
         },
         ControlRequest::ListAgents { .. } => {
+            // A menu is screen text: only a person's connection is shown one.
+            let person = connections.kind_of(client).is_some();
             // Titles come out of the agents' own storage: a directory walk, a megabyte of
             // transcript per Claude tab, a database for opencode, on a disk the user
             // chose. All of them at once on the probe pool with a deadline (ADR-011),
@@ -5203,6 +5221,10 @@ async fn handle_control(
                             parked,
                         })
                     });
+                    let menu = terminals
+                        .get(terminal)
+                        .filter(|_| person && state == "blocked")
+                        .and_then(|handle| handle.menu.lock().unwrap().clone());
                     crate::control::AgentRow {
                         news: status == Some(qoop_domain::Status::Done),
                         status: status.map(|s| s.token().to_string()),
@@ -5253,6 +5275,7 @@ async fn handle_control(
                             .map(|watchers| connections.clients_of(terminal, &watchers))
                             .unwrap_or_default(),
                         typed_by: agents.typed_by(terminal),
+                        menu,
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals
@@ -5317,16 +5340,19 @@ async fn handle_control(
                 reason: format!("the split could not be recorded: {e}"),
             },
         },
-        ControlRequest::Focus { terminal, .. } => match terminals.get(terminal) {
-            Some(_) => ControlResponse::Focused {
-                id,
-                clients: connections.focus(terminal),
-            },
-            None => ControlResponse::Failed {
-                id,
-                reason: format!("no terminal {terminal}"),
-            },
-        },
+        ControlRequest::Focus { terminal, .. } => {
+            // Told to the interfaces for a terminal that is gone too: a click on an old desktop
+            // note lands on the list there, which says the agent is gone. The caller is still
+            // refused.
+            let clients = connections.focus(terminal);
+            match terminals.get(terminal) {
+                Some(_) => ControlResponse::Focused { id, clients },
+                None => ControlResponse::Failed {
+                    id,
+                    reason: format!("no terminal {terminal}"),
+                },
+            }
+        }
         // What a released interface still sends: the daemon decides done itself now (the
         // row's `status`, a stop nobody has seen), so the answer is all there is to it.
         ControlRequest::News { .. } => ControlResponse::NewsNoted { id },
@@ -5935,6 +5961,24 @@ async fn handle_control(
             child,
             text,
         } => crate::messages::send(id, terminal, child, text, terminals, agents).await,
+        // A program is never shown a menu, and never answers one.
+        ControlRequest::AnswerMenu {
+            terminal,
+            generation,
+            seal,
+            key,
+            ..
+        } => match connections.kind_of(client) {
+            Some(kind) => {
+                let who = (client.clone(), kind);
+                let at = (terminal, generation);
+                crate::menu::answer(id, at, seal, key, who, terminals, agents).await
+            }
+            None => ControlResponse::Failed {
+                id,
+                reason: crate::menu::NOT_A_PERSON.to_string(),
+            },
+        },
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
         }
@@ -6543,6 +6587,12 @@ pub struct SnapshotWire {
     /// and a person reading is dragged along by the output they are trying to read past.
     #[serde(default)]
     pub behind: u64,
+    /// The window title the program set (`OSC 0` or `OSC 2`), what a client names a tab
+    /// running a plain shell by. Absent when there is none, which is what an older daemon's
+    /// snapshot meant; an older client ignores it (ADR-010). At most the engine's control
+    /// string cap (`qoop_terminal::MAX_CONTROL_STRING`), control characters left out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
 }
 
 /// Only the rows of a screen that changed since the last screen this connection was sent,
@@ -6594,6 +6644,7 @@ impl DeltaWire {
             lines: delta.iter().map(|&i| next.lines[i].clone()).collect(),
             styles,
             links: next.links.clone(),
+            title: next.title.clone(),
             ..*next
         };
         Some(DeltaWire { delta, screen })
@@ -6668,6 +6719,16 @@ pub struct ModesWire {
     /// older daemon's snapshot meant, and costs nothing on the wire for most programs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub focus_events: bool,
+    /// The kitty keyboard flags the program pushed (`CSI > flags u`), 0 when none. A client
+    /// that encodes keys itself sends `CSI 13;2u` for Shift+Enter only when this is set, and
+    /// legacy bytes otherwise, which is also all an older daemon (no field) allows.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kitty_keyboard: u8,
+    /// The cursor the program asked for, as its `DECSCUSR` number: 1 and 2 a block, 3 and 4
+    /// an underline, 5 and 6 a bar, odd blinking. 0, and absent on the wire, when it never
+    /// asked or the daemon predates the field: the client draws its own default.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cursor_style: u8,
 }
 
 /// A missing visibility is a visible cursor, for the reason on the field.
@@ -6689,6 +6750,8 @@ impl Default for ModesWire {
             application_cursor: false,
             cursor_visible: true,
             focus_events: false,
+            kitty_keyboard: 0,
+            cursor_style: 0,
         }
     }
 }
@@ -6847,7 +6910,10 @@ impl From<&Snapshot> for SnapshotWire {
                 application_cursor: s.modes.application_cursor,
                 cursor_visible: s.modes.cursor_visible,
                 focus_events: s.modes.focus_events,
+                kitty_keyboard: s.modes.kitty_keyboard,
+                cursor_style: s.modes.cursor_style,
             },
+            title: s.title.clone(),
         }
     }
 }
@@ -7110,6 +7176,7 @@ fn open_terminal_with(
         lines: vec![String::new(); size.rows as usize],
         styles: Vec::new(),
         modes: Default::default(),
+        title: String::new(),
     }));
     let token = adopt
         .as_ref()
@@ -7153,6 +7220,7 @@ fn open_terminal_with(
         )),
         incarnation: next_incarnation(),
         watchers: Arc::default(),
+        menu: Arc::default(),
     };
     terminals.insert(stream, handle.clone());
     if let Some((session, said)) = adopt.as_ref().and_then(|a| a.session.clone()) {
@@ -11420,6 +11488,7 @@ fn spawn_terminal(
                     lines: vec![String::new(); rows],
                     styles: Vec::new(),
                     modes: Default::default(),
+                    title: String::new(),
                 }
             }
         };
@@ -11965,6 +12034,9 @@ async fn terminal_task(
     // When to read the screen for what the agent is doing. `None` while nothing has
     // happened, which is what keeps an idle terminal at no wakeups at all.
     let mut detect_at: Option<tokio::time::Instant> = None;
+    // Input went to the child since the screen was last read after output settled: an answer
+    // read off this screen now could meet the next menu (`ClientCommand::AnswerMenu`).
+    let mut typed_since_read = false;
     // When the screen was last published, and when the output that arrived since is due.
     // `None` while nothing is held back, so a quiet terminal has no timer.
     let mut published: Option<tokio::time::Instant> = None;
@@ -12074,12 +12146,37 @@ async fn terminal_task(
                             from,
                             bytes: bracketed(&bytes, engine.modes().bracketed_paste),
                         },
+                        // An answer is that person's input, its keys read off this screen. Not
+                        // while anything typed is still unread on it: a second tap, or a key
+                        // queued ahead, would meet the next menu or a moved cursor.
+                        ClientCommand::AnswerMenu { from, kind, seal, key, reply } => {
+                            let sent = if typed_since_read {
+                                Err(crate::menu::ALREADY_ANSWERED)
+                            } else if !writes.is_empty() {
+                                Err(crate::menu::BUSY)
+                            } else {
+                                crate::menu::answer_on(&engine.snapshot(), seal, &key)
+                            };
+                            let _ = reply.send(sent.as_ref().map(|s| s.answers).map_err(|e| *e));
+                            let Ok(sent) = sent else { continue };
+                            // Answered: the row shows no menu until the screen is read again.
+                            if let Some(handle) = terminals.get(stream) {
+                                *handle.menu.lock().unwrap() = None;
+                            }
+                            let bytes = sent.keys.into_bytes();
+                            agents.note_person(stream, &bytes, false, kind, crate::agents::now_unix());
+                            ClientCommand::Input {
+                                from,
+                                bytes: Bytes::from(bytes),
+                            }
+                        }
                         other => other,
                     };
                     match cmd {
                         // Made input just above.
-                        ClientCommand::Paste { .. } => {}
+                        ClientCommand::Paste { .. } | ClientCommand::AnswerMenu { .. } => {}
                         ClientCommand::Input { bytes, from } => {
+                        typed_since_read = true;
                         let arrived = std::time::Instant::now();
                         pending_input = Some(arrived);
                         echo_until = Some(tokio::time::Instant::now() + PUBLISH_EVERY);
@@ -12612,12 +12709,21 @@ async fn terminal_task(
                 }, if detect_at.is_some() => {
                     detect_at = None;
                     detect_since = None;
+                    typed_since_read = false;
                     // Whether or not anyone is subscribed, deliberately: an agent blocked
                     // in a terminal nobody is looking at is exactly what this notices.
                     if let Some(program) = agents.rules_name_of(stream)
                         && let Some(manifest) = qoop_detect::rules_for(&program)
                     {
                         let screen = engine.visible_text();
+                        // An agent's own menu, for a person's row. Not a plain shell's: a
+                        // `select` list there is no agent waiting on anyone.
+                        if let Some(handle) = terminals.get(stream) {
+                            *handle.menu.lock().unwrap() = (program != "generic")
+                                .then(|| crate::menu::menu_of(&screen, None))
+                                .flatten()
+                                .map(|m| m.view());
+                        }
                         if program == "claude"
                             && let Some(at) = note_agent_view(
                                 &screen,
@@ -12720,6 +12826,9 @@ async fn terminal_task(
                                 crate::agents::now_unix(),
                             );
                         }
+                    } else if let Some(handle) = terminals.get(stream) {
+                        // Nothing reads this screen any more (the agent left): no menu on its row.
+                        *handle.menu.lock().unwrap() = None;
                     }
                 }
                 writable = afd.writable(), if want_write => {
@@ -13175,6 +13284,7 @@ mod image_wire_tests {
             links: Vec::new(),
             modes: Default::default(),
             behind: 0,
+            title: String::new(),
         };
         let body = serde_json::to_vec(&snap).expect("serialize");
         assert!(serde_json::from_slice::<ImageWire>(&body).is_err());
@@ -13213,6 +13323,7 @@ mod image_wire_tests {
             links: Vec::new(),
             modes: Default::default(),
             behind: 0,
+            title: String::new(),
         };
         let between = super::DeltaWire::between;
         let base = snap(&["a", "b"], 20);
@@ -13230,6 +13341,89 @@ mod image_wire_tests {
         let mut short = base.clone();
         short.lines.pop();
         assert_eq!(delta.apply(&short), None, "a row the base does not have");
+    }
+
+    /// The screen as a released client (and the phone) knows it: no title, no kitty flags,
+    /// no cursor style. Unknown fields are ignored, so this is what such a client parses.
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct ReleasedScreen {
+        lines: Vec<String>,
+        modes: ReleasedModes,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct ReleasedModes {
+        #[serde(default)]
+        alt_screen: bool,
+        #[serde(default)]
+        focus_events: bool,
+    }
+
+    /// The title, kitty flags and cursor style cross the wire, cost nothing while unset, and
+    /// both mixes of old and new still read: a released client reads a new daemon's screen
+    /// and delta, and a new client reads a released daemon's screen as no title, no flags
+    /// and the client's own cursor.
+    #[test]
+    fn title_kitty_flags_and_cursor_style_cross_the_wire_both_ways() {
+        use qoop_terminal::TerminalEngine as _;
+        let mut engine = qoop_terminal::AlacrittyEngine::new(20, 2);
+        engine.feed(b"plain");
+        let plain = serde_json::to_string(&super::SnapshotWire::from(&engine.snapshot())).unwrap();
+        for unset in ["title", "kitty_keyboard", "cursor_style"] {
+            assert!(!plain.contains(unset), "{unset} costs bytes unset: {plain}");
+        }
+
+        engine.feed(b"\x1b]2;my agent\x07\x1b[5 q");
+        let mut snap = qoop_terminal::TerminalEngine::snapshot(&engine);
+        // The engine has the kitty protocol off; the wire carries whatever it reports.
+        snap.modes.kitty_keyboard = 1;
+        let wire = super::SnapshotWire::from(&snap);
+        assert_eq!(wire.title, "my agent");
+        assert_eq!(wire.modes.cursor_style, 5);
+        assert_eq!(wire.modes.kitty_keyboard, 1);
+        let body = serde_json::to_string(&wire).unwrap();
+        for said in [
+            r#""kitty_keyboard":1"#,
+            r#""cursor_style":5"#,
+            r#""title":"my agent""#,
+        ] {
+            assert!(body.contains(said), "{said} on the wire: {body}");
+        }
+        let back: super::SnapshotWire = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, wire);
+        let released: ReleasedScreen = serde_json::from_str(&body).expect("a released client");
+        assert_eq!(released.lines[0], "plain");
+
+        // Only the title changed: a delta of no rows that carries it.
+        let mut retitled = wire.clone();
+        retitled.title = "renamed".into();
+        let delta = super::DeltaWire::between(&wire, &retitled).expect("a delta");
+        assert!(delta.delta.is_empty());
+        let body = serde_json::to_vec(&delta).unwrap();
+        assert!(body.starts_with(super::DELTA_PREFIX));
+        #[derive(serde::Deserialize)]
+        struct ReleasedDelta {
+            delta: Vec<usize>,
+            screen: ReleasedScreen,
+        }
+        let old: ReleasedDelta = serde_json::from_slice(&body).expect("a released link reader");
+        assert!(old.delta.is_empty() && old.screen.lines.is_empty());
+        let back: super::DeltaWire = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back.apply(&wire).map(|s| s.title), Some("renamed".into()));
+
+        let from_released: super::SnapshotWire = serde_json::from_str(
+            r#"{"cols":20,"rows":1,"cursor":[0,0],"lines":["$"],"modes":{"alt_screen":true}}"#,
+        )
+        .expect("a released daemon's screen");
+        assert_eq!(from_released.title, "");
+        assert_eq!(from_released.modes.kitty_keyboard, 0, "legacy keys");
+        assert_eq!(
+            from_released.modes.cursor_style, 0,
+            "the client's own cursor"
+        );
+        assert!(from_released.modes.alt_screen && from_released.modes.cursor_visible);
     }
 
     /// Hostile input decodes to absent, never panics: wrong version, unknown

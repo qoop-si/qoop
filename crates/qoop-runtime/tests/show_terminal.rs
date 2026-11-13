@@ -62,9 +62,15 @@ async fn an_interface_is_told_and_the_asker_learns_its_process() {
     assert_eq!(shown(&mut ui_rd, &mut ui_in).await, Some(terminal));
 }
 
+/// The asker is refused, and the interfaces are still told: a click on an old desktop note
+/// lands on the list there, which says the agent is gone.
 #[tokio::test]
 async fn a_terminal_that_is_not_there_is_refused() {
     let d = TestDaemon::start().await;
+    let (ui, mut ui_in) = client::connect(d.socket(), qoop_proto::INTERFACE_ID)
+        .await
+        .expect("connect");
+    let (mut ui_rd, _ui_wr) = ui.into_split();
     let mut asker = d.attach("qoop-focus").await;
     let answer = asker
         .control(
@@ -79,4 +85,5 @@ async fn a_terminal_that_is_not_there_is_refused() {
         matches!(answer, Some(ControlResponse::Failed { .. })),
         "{answer:?}"
     );
+    assert_eq!(shown(&mut ui_rd, &mut ui_in).await, Some(9999));
 }
