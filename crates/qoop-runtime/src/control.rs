@@ -3924,6 +3924,40 @@ mod tests {
         assert_eq!(status(waits), (Status::Waits, 400), "unclaimed, no tab");
     }
 
+    /// The board reads an agent off its row the way the row's own status does: a shell or
+    /// monitor left running after its turn is not work, sub-agents it waits on are, and a
+    /// failure is a failure whatever still runs.
+    #[test]
+    fn a_shell_left_running_is_not_work_on_the_board() {
+        let row = |state: &str, background: u32, subagents: u32| -> AgentRow {
+            serde_json::from_value(serde_json::json!({
+                "terminal": 3, "workspace": 1, "state": state, "readiness": "ready",
+                "agent": true, "background": background, "subagents": subagents,
+            }))
+            .expect("a row")
+        };
+        let of = |r: AgentRow| {
+            status(StatusInput {
+                stage: "implementing",
+                updated_at: 500,
+                tab: Tab {
+                    live: Live::of_row(&r),
+                    asleep_since: None,
+                    checks: true,
+                },
+                ..Default::default()
+            })
+            .0
+        };
+        assert_eq!(of(row("idle", 1, 0)), Status::Idle, "one shell");
+        assert_eq!(of(row("idle", 3, 2)), Status::Working, "two sub-agents");
+        assert_eq!(
+            of(row("failed", 2, 2)),
+            Status::Error,
+            "failed with sub-agents"
+        );
+    }
+
     /// One case per row of the status table, in its order: the first that holds wins, and
     /// each takes its time from the field that names the moment.
     #[test]

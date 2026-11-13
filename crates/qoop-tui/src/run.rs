@@ -14904,7 +14904,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 let before = state.was.get(&row.terminal).cloned();
                 let is_qass = Some(row.workspace) == qass;
                 // What the row shows: the daemon's status when it sends one.
-                let shown = sidebar::shown(row);
+                let shown = sidebar::shown_state(row);
                 // A finish under the keyboard of a window in front is in front of the person:
                 // no bell for it (the look tells the daemon a moment later).
                 let looking = row.terminal == state.focused && state.outer_focus != Some(false);
@@ -14989,7 +14989,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
                 .collect();
             state.was = agents
                 .iter()
-                .map(|r| (r.terminal, sidebar::shown(r).to_string()))
+                .map(|r| (r.terminal, sidebar::shown_state(r).to_string()))
                 .collect();
             state.rows = agents;
             sidebar::qass_last(&mut state.spaces, &mut state.rows);

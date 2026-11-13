@@ -3012,6 +3012,11 @@ mod tests {
         assert!(r.unseen_stop(1));
         r.note_person(1, b"a", false, "computer", NOW + 2);
         assert!(!r.unseen_stop(1), "a person typing there has seen it");
+        // A line sent by a program (`qoop prompt`, the inbox's answer) is no look.
+        report(S::Working, Some("user"), NOW + 2);
+        report(S::Idle, Some("done"), NOW + 2);
+        r.note_sent(1, b"go\r", NOW + 2);
+        assert!(r.unseen_stop(1), "a line sent is not a look");
         report(S::Working, Some("user"), NOW + 3);
         let composer = qoop_detect::Verdict {
             visible_idle: true,
