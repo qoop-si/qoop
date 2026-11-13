@@ -130,3 +130,107 @@ async fn a_quiet_phone_hears_a_row_only_when_what_it_shows_moved() {
         "a new state is news to it"
     );
 }
+
+#[tokio::test]
+async fn a_quiet_phone_hears_a_task_open_and_close() {
+    use qoop_runtime::control::{TaskOp, TaskOutcome};
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string();
+    let mut hook = d.attach("hook").await;
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while state(&mut hook, terminal).await != "idle" {
+        assert!(std::time::Instant::now() < deadline, "never idle");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut quiet = d
+        .attach_phone_with(serde_json::json!({ qoop_runtime::client::QUIET_ROWS: true }))
+        .await;
+    let listed = quiet
+        .control(&ControlRequest::ListAgents { id: "rows".into() }, PATIENCE)
+        .await;
+    assert!(
+        matches!(listed, Some(ControlResponse::Agents { .. })),
+        "{listed:?}"
+    );
+    quiet
+        .wait_for_event(|_| false, Duration::from_millis(1500))
+        .await;
+    quiet.forget_events();
+    let ours = |e: &EventMessage| matches!(e, EventMessage::AgentChanged { terminal: t } if *t == terminal);
+
+    let opened = hook
+        .control(
+            &ControlRequest::TaskWrite {
+                id: "begin".into(),
+                terminal: Some(terminal),
+                token: Some(token),
+                task: None,
+                action: TaskOp::Begin,
+            },
+            PATIENCE,
+        )
+        .await;
+    let Some(ControlResponse::TaskWritten { task, .. }) = opened else {
+        panic!("no task: {opened:?}");
+    };
+    assert!(
+        quiet
+            .wait_for_event(ours, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "a task opened is news"
+    );
+    // Read as the phone reads it after the news, which is what it holds now.
+    let read = quiet
+        .control(
+            &ControlRequest::AgentRows {
+                id: "row".into(),
+                terminals: vec![terminal],
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(&read, Some(ControlResponse::Agents { agents, .. }) if agents[0].task.is_some()),
+        "{read:?}"
+    );
+    quiet
+        .wait_for_event(|_| false, Duration::from_millis(1500))
+        .await;
+    quiet.forget_events();
+
+    let closed = hook
+        .control(
+            &ControlRequest::TaskWrite {
+                id: "close".into(),
+                terminal: None,
+                token: None,
+                task: Some(task),
+                action: TaskOp::Close {
+                    outcome: TaskOutcome::Verified,
+                    reason: String::new(),
+                    actor: None,
+                },
+            },
+            PATIENCE,
+        )
+        .await;
+    assert!(
+        matches!(closed, Some(ControlResponse::TaskWritten { .. })),
+        "{closed:?}"
+    );
+    assert!(
+        quiet
+            .wait_for_event(ours, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "a task closed is news"
+    );
+}
