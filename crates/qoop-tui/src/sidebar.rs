@@ -4623,6 +4623,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -4659,6 +4660,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -5437,6 +5439,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -5704,6 +5707,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 13);
         assert!(
@@ -5750,6 +5754,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }];
         let lines = render(&[space(1, "app")], &agents, 1, 5, 13);
         assert!(

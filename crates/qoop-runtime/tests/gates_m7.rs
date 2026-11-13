@@ -253,6 +253,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x24".into(),
             terminals: vec![terminal],
         },
+        // Says a person looked at a finish: read by the index, never typed.
+        ControlRequest::Seen {
+            id: "x24b".into(),
+            terminal,
+            stop: None,
+        },
         // A name for the conversation and a place for the tab: nothing typed.
         ControlRequest::RenameSession {
             id: "x25".into(),
@@ -419,6 +425,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::Focus { .. }
             | ControlRequest::News { .. }
+            | ControlRequest::Seen { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }

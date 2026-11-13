@@ -633,6 +633,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
@@ -671,6 +672,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 

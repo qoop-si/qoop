@@ -1,43 +1,75 @@
-//! `News`: the terminals an interface counts as news for its person are marked on every
-//! row for as long as that interface is attached, and every index hears when that moves.
+//! One status per row, decided by the daemon: a turn end nobody has looked at reads `done`
+//! for every client alike until a person's interface says it was seen, a task waiting on the
+//! owner reads `blocked` the moment its stage moves, and a sub-agent still running is work.
 
 use std::time::{Duration, Instant};
 
 use qoop_runtime::client::{self, Incoming};
-use qoop_runtime::control::{ControlRequest, ControlResponse, EventMessage};
+use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse, EventMessage, TaskOp};
 use qoop_testkit::{TestClient, TestDaemon};
 use tokio::io::AsyncReadExt;
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
-/// Whether the index says `terminal` is news.
-async fn news(asker: &mut TestClient, terminal: u32) -> bool {
+/// The index's row for `terminal`.
+async fn row(asker: &mut TestClient, terminal: u32) -> AgentRow {
     match asker
         .control(&ControlRequest::ListAgents { id: "rows".into() }, PATIENCE)
         .await
     {
         Some(ControlResponse::Agents { agents, .. }) => agents
-            .iter()
-            .any(|row| row.terminal == terminal && row.news),
+            .into_iter()
+            .find(|row| row.terminal == terminal)
+            .expect("a row for the terminal"),
         other => panic!("no index: {other:?}"),
     }
 }
 
-/// Say which terminals are news, from `ui`.
-async fn say(ui: &mut TestClient, terminals: Vec<u32>) {
-    let answer = ui
+/// The row's status token.
+async fn status(asker: &mut TestClient, terminal: u32) -> String {
+    row(asker, terminal).await.status.expect("a status")
+}
+
+/// What a hook in the terminal reports.
+async fn report(hook: &mut TestClient, terminal: u32, token: &str, state: &str, event: &str) {
+    let answer = hook
         .control(
-            &ControlRequest::News {
-                id: "news".into(),
-                terminals,
+            &ControlRequest::ReportAgentState {
+                from: None,
+                id: format!("{state}-{event}"),
+                terminal,
+                token: token.into(),
+                state: state.into(),
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                clock: 0,
+                session: None,
+                event: Some(event.into()),
+                label: None,
+                said: None,
             },
             PATIENCE,
         )
         .await;
-    assert_eq!(
-        answer,
-        Some(ControlResponse::NewsNoted { id: "news".into() })
+    assert!(
+        !matches!(answer, Some(ControlResponse::Failed { .. }) | None),
+        "the report was refused: {answer:?}"
     );
+}
+
+async fn seen(client: &mut TestClient, terminal: u32, stop: Option<String>) -> ControlResponse {
+    client
+        .control(
+            &ControlRequest::Seen {
+                id: "seen".into(),
+                terminal,
+                stop,
+            },
+            PATIENCE,
+        )
+        .await
+        .expect("an answer")
 }
 
 /// Read an index's event lane until it hears that `terminal`'s row changed.
@@ -65,38 +97,97 @@ async fn changed(
     }
 }
 
+fn token_of(d: &TestDaemon, terminal: u32) -> String {
+    d.terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string()
+}
+
 #[tokio::test]
-async fn news_is_on_the_row_while_its_interface_is_attached() {
+async fn a_finish_reads_done_everywhere_until_a_person_sees_it() {
     let d = TestDaemon::start().await;
     let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut hook = d.attach("hook").await;
+    let mut asker = d.attach("qoop-agents").await;
+
+    report(&mut hook, terminal, &token, "working", "user").await;
+    assert_eq!(status(&mut asker, terminal).await, "working");
+    report(&mut hook, terminal, &token, "idle", "done").await;
+    let done = row(&mut asker, terminal).await;
+    assert_eq!(done.status.as_deref(), Some("done"));
+    assert_eq!(
+        done.state, "idle",
+        "the raw state scripts wait on is unchanged"
+    );
+    assert!(done.news, "the notch's field says the same done");
+
+    // A program cannot look; a look at another finish clears nothing.
+    assert!(matches!(
+        seen(&mut asker, terminal, None).await,
+        ControlResponse::Failed { .. }
+    ));
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    seen(&mut ui, terminal, Some("1.1".into())).await;
+    assert_eq!(status(&mut asker, terminal).await, "done");
+
+    // The interface in front of the person says it was seen: every index hears it.
     let (index, mut index_in) = client::connect(d.socket(), "qoop-watch")
         .await
         .expect("connect");
     let (mut index_rd, _index_wr) = index.into_split();
-    let mut asker = d.attach("qoop-agents").await;
-    assert!(!news(&mut asker, terminal).await, "nothing said yet");
+    assert_eq!(
+        seen(&mut ui, terminal, done.stop.clone()).await,
+        ControlResponse::NewsNoted { id: "seen".into() }
+    );
+    assert!(changed(&mut index_rd, &mut index_in, terminal).await);
+    let looked = row(&mut asker, terminal).await;
+    assert_eq!(looked.status.as_deref(), Some("idle"));
+    assert!(!looked.news);
 
-    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
-    say(&mut ui, vec![terminal]).await;
+    // The next turn's end is a new finish nobody has seen.
+    report(&mut hook, terminal, &token, "working", "user").await;
+    report(&mut hook, terminal, &token, "idle", "done").await;
+    assert_eq!(status(&mut asker, terminal).await, "done");
+}
+
+#[tokio::test]
+async fn a_task_waiting_on_the_owner_needs_you_at_once_on_every_row() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut hook = d.attach("hook").await;
+    let mut asker = d.attach("qoop-agents").await;
+    report(&mut hook, terminal, &token, "working", "user").await;
+    report(&mut hook, terminal, &token, "idle", "done").await;
+    let write = |id: &str, action| ControlRequest::TaskWrite {
+        id: id.into(),
+        terminal: Some(terminal),
+        token: Some(token.clone()),
+        task: None,
+        action,
+    };
+    let wrote = hook.control(&write("new", TaskOp::Begin), PATIENCE).await;
+    assert!(matches!(wrote, Some(ControlResponse::TaskWritten { .. })));
+
+    let (index, mut index_in) = client::connect(d.socket(), "qoop-watch")
+        .await
+        .expect("connect");
+    let (mut index_rd, _index_wr) = index.into_split();
+    let stage = TaskOp::Stage {
+        stage: "waiting-human".into(),
+    };
+    let wrote = hook.control(&write("wait", stage), PATIENCE).await;
+    assert!(matches!(wrote, Some(ControlResponse::TaskWritten { .. })));
+    // The stage moved and the agent did not: the row is announced all the same.
     assert!(
         changed(&mut index_rd, &mut index_in, terminal).await,
-        "an index was not told the row moved"
+        "no index heard the question"
     );
-    assert!(news(&mut asker, terminal).await);
-
-    // Said again without it: looked at, news no more.
-    say(&mut ui, Vec::new()).await;
-    assert!(changed(&mut index_rd, &mut index_in, terminal).await);
-    assert!(!news(&mut asker, terminal).await);
-
-    // Held for the interface's life only: gone with it, and the index told.
-    say(&mut ui, vec![terminal]).await;
-    assert!(changed(&mut index_rd, &mut index_in, terminal).await);
-    drop(ui);
-    assert!(changed(&mut index_rd, &mut index_in, terminal).await);
-    let deadline = Instant::now() + PATIENCE;
-    while news(&mut asker, terminal).await {
-        assert!(Instant::now() < deadline, "news outlived its interface");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let waiting = row(&mut asker, terminal).await;
+    assert_eq!(waiting.status.as_deref(), Some("blocked"));
+    assert_eq!(waiting.state, "idle");
 }

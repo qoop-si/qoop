@@ -110,6 +110,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "say the person looked at an agent's finish",
+            method: || {
+                Method::Control(ControlRequest::Seen {
+                    id: "a".into(),
+                    terminal: 1,
+                    stop: None,
+                })
+            },
+        },
+        Action {
             name: "show the workspaces",
             method: || Method::Control(ControlRequest::ListWorkspaces { id: "a".into() }),
         },
@@ -854,6 +864,11 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             terminals: Vec::new(),
         },
+        ControlRequest::Seen {
+            id: String::new(),
+            terminal: 0,
+            stop: None,
+        },
         ControlRequest::ListWorkspaces { id: String::new() },
         ControlRequest::CreateWorkspace {
             id: String::new(),
@@ -1179,6 +1194,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ListAgents { .. }
             | ControlRequest::Focus { .. }
             | ControlRequest::News { .. }
+            | ControlRequest::Seen { .. }
             | ControlRequest::ListWorkspaces { .. }
             | ControlRequest::CreateWorkspace { .. }
             | ControlRequest::CloseWorkspace { .. }

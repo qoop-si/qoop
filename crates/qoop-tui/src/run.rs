@@ -15708,6 +15708,7 @@ mod tests {
             activity: None,
             pgid: None,
             discards: None,
+            status: None,
         }
     }
 
