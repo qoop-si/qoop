@@ -7666,6 +7666,7 @@ fn screen_verdict(reading: qoop_detect::Reading, known: bool) -> Option<qoop_det
                 // An idle fallback is the absence of any dialog, so it clears a gate
                 // rather than holding one.
                 setup_gate: false,
+                turn_line: false,
             })
         }
         _ => None,

@@ -110,6 +110,10 @@ pub struct Verdict {
     /// Work in progress is positively on screen. A `working` rule without it only keeps a
     /// turn going; it cannot start one from idle.
     pub visible_working: bool,
+    /// The work in progress is the agent's own turn line on screen (its spinner or its
+    /// interrupt hint), not the window title, which some agents keep busy while they wait on
+    /// sub-agents with their turn over.
+    pub turn_line: bool,
     /// The matched rule is a startup gate: answering it is what creates the
     /// session rather than what continues one. A trust dialog on first run,
     /// not a permission prompt mid task. The runtime turns this into
@@ -601,6 +605,7 @@ impl Manifest {
             visible_blocker: rule.visible_blocker,
             visible_idle: rule.visible_idle,
             visible_working: rule.visible_working,
+            turn_line: rule.visible_working && !matches!(rule.region, Region::OscTitle),
             setup_gate: rule.setup_gate,
         })
     }

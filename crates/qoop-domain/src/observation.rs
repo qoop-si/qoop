@@ -86,6 +86,11 @@ pub struct AgentObservation {
     /// else: a prompt that was answered leaves no hook event
     /// until the tool ends, and a spinner on screen cannot lie about the prompt being gone.
     pub visible_working: bool,
+    /// True only for a screen observation that saw the agent's own turn line (a spinner, an
+    /// interrupt hint; never the window title) while a hook's idle had stood for a while: a
+    /// turn that no hook reported has started (a message queued during the last one). Like a
+    /// visible blocker, only when newer.
+    pub turn_line: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,7 +196,10 @@ impl AgentBelief {
         // weaker is an absence of evidence and stays outranked, which is what
         // keeps a no-rule screen from clearing a hook-held state it cannot see.
         let answered = obs.visible_working && self.state == AgentRuntimeState::Blocked;
-        if (obs.visible_blocker || obs.visible_idle || answered) && obs.sequence > self.sequence {
+        let restarted = obs.turn_line && self.state == AgentRuntimeState::Idle;
+        if (obs.visible_blocker || obs.visible_idle || answered || restarted)
+            && obs.sequence > self.sequence
+        {
             return ObservationVerdict::Accept;
         }
         ObservationVerdict::Outranked
@@ -258,6 +266,7 @@ mod one_source_changing_its_mind {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            turn_line: false,
         }
     }
 
@@ -312,6 +321,7 @@ mod unknown_is_not_a_claim {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            turn_line: false,
         }
     }
 
@@ -384,6 +394,7 @@ mod tests {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            turn_line: false,
         }
     }
 
@@ -510,6 +521,29 @@ mod tests {
         let mut spinner = draft.clone();
         spinner.visible_working = true;
         assert_eq!(b.evaluate(&spinner), ObservationVerdict::Accept);
+    }
+
+    /// A spinner on screen does not take a turn back from a hook's idle, unless it is the agent's
+    /// own turn line seen after that idle stood: a message queued during the last turn starts the
+    /// next with no hook said.
+    #[test]
+    fn the_agents_turn_line_restarts_a_turn_over_a_hooks_idle() {
+        let b = belief(1, AgentRuntimeState::Idle, ObservationSource::Hook, 5);
+        let mut spinner = obs(
+            1,
+            AgentRuntimeState::Working,
+            ObservationSource::ScreenHeuristic,
+            6,
+        );
+        spinner.visible_working = true;
+        assert_eq!(b.evaluate(&spinner), ObservationVerdict::Outranked);
+        spinner.turn_line = true;
+        assert_eq!(b.evaluate(&spinner), ObservationVerdict::Accept);
+        // A hook's working is not reopened by it: the turn is going already.
+        let working = belief(1, AgentRuntimeState::Working, ObservationSource::Hook, 5);
+        let mut idle = spinner.clone();
+        idle.state = AgentRuntimeState::Idle;
+        assert_eq!(working.evaluate(&idle), ObservationVerdict::Outranked);
     }
 
     #[test]

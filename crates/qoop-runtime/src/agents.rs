@@ -930,6 +930,7 @@ fn settle_exit(agent: &mut TerminalAgent, stream: u32, now_unix: i64) {
         visible_blocker: false,
         visible_idle: false,
         visible_working: false,
+        turn_line: false,
     };
     if let Ok(next) = agent.belief.clone().accept(&idle) {
         agent.belief = next;
@@ -1819,6 +1820,16 @@ impl AgentRegistry {
             visible_blocker: verdict.visible_blocker,
             visible_idle: verdict.visible_idle,
             visible_working: verdict.visible_working,
+            // The agent's own turn line over a hook's idle that has stood two seconds: a turn no
+            // hook reported (a message queued during the last). The wait keeps the last spinner
+            // frame drawn before the agent redraws after its turn end from reopening the turn.
+            // ponytail: whole seconds, so the wait is one to two of them.
+            turn_line: verdict.turn_line
+                && agent.belief.source == qoop_domain::ObservationSource::Hook
+                && agent.belief.state == AgentRuntimeState::Idle
+                && agent
+                    .last_active_at_unix
+                    .is_some_and(|at| now_unix.saturating_sub(at) >= 2),
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -2015,6 +2026,7 @@ impl AgentRegistry {
             visible_blocker,
             visible_idle,
             visible_working: false,
+            turn_line: false,
         };
         let before = agent.belief.state;
         let before_blocker = agent.belief.visible_blocker;
@@ -2826,6 +2838,7 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             setup_gate: false,
+            turn_line: false,
         }
     }
 
@@ -3027,6 +3040,46 @@ mod tests {
             "the Esc reads idle"
         );
         assert_eq!(r.stop_of(1), None, "an interrupted turn is no finish");
+    }
+
+    /// A message queued during a turn starts the next with no hook said: the agent's own spinner,
+    /// seen once its hook's idle has stood two seconds, is that turn; the window title alone (busy
+    /// through a wait on sub-agents) is not, and neither is the last frame before the redraw.
+    #[test]
+    fn the_agents_own_turn_line_restarts_a_turn_a_hook_said_idle() {
+        use AgentRuntimeState as S;
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        r.observe_hook_event(1, &id, &token, S::Working, false, false, NOW, Some("user"))
+            .expect("admitted");
+        r.observe_hook_event(1, &id, &token, S::Idle, false, false, NOW + 1, Some("done"))
+            .expect("admitted");
+        let spinner = qoop_detect::Verdict {
+            visible_working: true,
+            turn_line: true,
+            ..screen_verdict(S::Working, false)
+        };
+        let title = qoop_detect::Verdict {
+            turn_line: false,
+            ..spinner.clone()
+        };
+        assert!(
+            !r.observe_screen(1, "m", &spinner, NOW + 1),
+            "the frame before the redraw"
+        );
+        assert!(
+            !r.observe_screen(1, "m", &title, NOW + 5),
+            "the title alone"
+        );
+        assert_eq!(r.agent(1).expect("agent").belief.state, S::Idle);
+        assert!(
+            r.observe_screen(1, "m", &spinner, NOW + 5),
+            "a turn no hook reported"
+        );
+        assert_eq!(r.agent(1).expect("agent").belief.state, S::Working);
+        assert_eq!(r.stop_of(1), None, "the new turn ends the finish");
     }
 
     /// A daemon that becomes another binary keeps a terminal's finish and whether it was seen.
@@ -3330,6 +3383,7 @@ mod tests {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            turn_line: false,
         };
         assert_eq!(
             r.agent(1).expect("agent").belief.evaluate(&stale_screen),
@@ -3376,6 +3430,7 @@ mod tests {
             visible_idle: true,
             visible_working: false,
             setup_gate: false,
+            turn_line: false,
         };
         assert!(r.observe_screen(1, "test-manifest", &composer, NOW));
         assert_eq!(
@@ -3479,6 +3534,7 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             setup_gate: true,
+            turn_line: false,
         };
         assert!(r.observe_screen(1, "test-manifest", &trust, NOW));
         assert!(r.agent(1).expect("agent").setup_gate);
@@ -3506,6 +3562,7 @@ mod tests {
             visible_idle: false,
             visible_working: false,
             setup_gate: true,
+            turn_line: false,
         };
         assert!(r.observe_screen(1, "test-manifest", &trust, NOW));
         assert!(r.agent(1).expect("agent").setup_gate);
