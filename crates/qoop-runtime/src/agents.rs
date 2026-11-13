@@ -1887,7 +1887,13 @@ impl AgentRegistry {
                 .get_mut(&stream)
                 .is_some_and(|entry| entry.1.take().is_some());
         }
-        if before == S::Working && matches!(after, S::Idle | S::Done) && !agent.turn_end_reported {
+        // An agent's turn, not a shell's command: a shell's prompt coming back is no finish.
+        let is_agent = matches!(agent.identity, AgentIdentity::Known { agent: true, .. });
+        if is_agent
+            && before == S::Working
+            && matches!(after, S::Idle | S::Done)
+            && !agent.turn_end_reported
+        {
             let entry = stops.entry(stream).or_insert((0, None));
             *entry = (entry.0 + 1, Some((now_unix, agent.belief.generation)));
             return true;
@@ -2989,7 +2995,22 @@ mod tests {
         use AgentRuntimeState as S;
         let r = registry();
         r.register(1, TerminalId::new("1"), mint_token(1));
+        let known = |agent: bool| {
+            let mut terminals = r.terminals.lock().unwrap();
+            let a = terminals.get_mut(&1).unwrap();
+            a.identity = AgentIdentity::Known {
+                program: if agent { "aider" } else { "zsh" }.into(),
+                generation: a.belief.generation,
+                agent,
+            };
+        };
         let screen = |state, at| r.observe_screen(1, "m", &screen_reading(state), at);
+        // A shell's command coming back to its prompt is no finish.
+        known(false);
+        screen(S::Working, NOW);
+        screen(S::Idle, NOW);
+        assert_eq!(r.stop_of(1), None, "a shell");
+        known(true);
         screen(S::Starting, NOW);
         screen(S::Idle, NOW + 1);
         assert_eq!(r.stop_of(1), None, "a session opening did nothing");

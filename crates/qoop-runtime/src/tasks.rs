@@ -320,10 +320,9 @@ pub(crate) async fn write(
             })
             .await
         {
+            // The row is announced by the task terminals' watch (`spawn_task_terminals`), once,
+            // when it reads what changed.
             Ok((task, shown, linked)) => {
-                if shown {
-                    agents.announce(terminal);
-                }
                 if shown || linked {
                     agents.tasks_changed();
                 }
@@ -341,7 +340,6 @@ pub(crate) async fn write(
             .await
         {
             Ok(task) => {
-                agents.announce(terminal);
                 agents.tasks_changed();
                 written(id, task)
             }
@@ -483,10 +481,8 @@ pub(crate) async fn write(
         .await;
     match wrote {
         Ok(shown) => {
-            // Only what a row shows: plan and evidence change nothing a reader draws.
-            if shown && let Some(home) = home.and_then(|t| u32::try_from(t).ok()) {
-                agents.announce(home);
-            }
+            // Only what a row shows: plan and evidence change nothing a reader draws. The row is
+            // announced by the task terminals' watch, once, when it reads the change.
             if shown {
                 agents.tasks_changed();
             }
