@@ -24,8 +24,8 @@ pub struct NewWork {
     pub agent: usize,
     pub space: Option<i64>,
     pub space_open: bool,
-    /// The create asked for, and the line it will get.
-    pub pending: Option<(String, String)>,
+    /// When the sheet opened: the branch of a task whose words give none is named after it.
+    pub opened: i64,
     /// Why the last start did not go.
     pub refused: Option<String>,
     /// The sheet's own stops, in Tab order: task, agent, space, Start, Close.
@@ -52,7 +52,7 @@ impl Desk {
             agent: 0,
             space,
             space_open: false,
-            pending: None,
+            opened: crate::app::unix_now(),
             refused: None,
             stops: [
                 field_focus,
@@ -92,7 +92,7 @@ impl Desk {
             return Err("Say what the agent should do.".into());
         }
         state::worktree_line(
-            &state::branch_for(&task),
+            &state::branch_or_clock(&task, sheet.opened),
             Some(state::daemon_space(space)),
             command,
             &task,
@@ -102,23 +102,33 @@ impl Desk {
 
     pub fn start(&mut self, cx: &mut Context<Self>) {
         let Ok(line) = self.line(cx) else { return };
-        let Some(sheet) = self.sheet.as_mut().filter(|s| s.pending.is_none()) else {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(sheet) = self.sheet.as_mut() else {
             return;
         };
-        let id = fresh_id("new-work");
-        sheet.pending = Some((id.clone(), line));
         sheet.refused = None;
-        let workspace = sheet.space;
-        self.ask(qoop_runtime::control::ControlRequest::CreateTerminal {
-            id,
-            cwd: None,
-            workspace,
-            name: None,
-        });
+        self.pending = Some((fresh_id("new-work"), line, sheet.space));
+        self.ask_pending();
         cx.notify();
     }
 
-    /// The terminal for New work is there: type the line into it, close the sheet.
+    /// Ask for New work's terminal: when Start is pressed, and again under the same id after
+    /// a reconnect, which the daemon answers with the first answer when it already made it.
+    pub fn ask_pending(&self) {
+        if let Some((id, _, workspace)) = &self.pending {
+            self.ask(qoop_runtime::control::ControlRequest::CreateTerminal {
+                id: id.clone(),
+                cwd: None,
+                workspace: *workspace,
+                name: None,
+            });
+        }
+    }
+
+    /// The terminal for New work is there: type the line into it, close the sheet if it is
+    /// still open. Typed even when the sheet was closed while it started.
     pub fn started(
         &mut self,
         id: &str,
@@ -126,30 +136,35 @@ impl Desk {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, line)) = self
-            .sheet
+        if self
+            .pending
             .as_ref()
-            .and_then(|s| s.pending.clone())
-            .filter(|(pending, _)| pending == id)
-        else {
+            .is_none_or(|(pending, ..)| pending != id)
+        {
+            return;
+        }
+        let Some((_, line, _)) = self.pending.take() else {
             return;
         };
         let _ = self.up.send(crate::link::Up::Input(
             terminal,
             format!("{line}\r").into_bytes(),
         ));
-        self.close_sheet(window, cx);
+        if self.sheet.is_some() {
+            self.close_sheet(window, cx);
+        }
     }
 
     pub fn refused(&mut self, id: &str, reason: String) {
-        if let Some(sheet) = self.sheet.as_mut()
-            && sheet
-                .pending
-                .as_ref()
-                .is_some_and(|(pending, _)| pending == id)
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, ..)| pending == id)
         {
-            sheet.pending = None;
-            sheet.refused = Some(reason);
+            self.pending = None;
+            if let Some(sheet) = self.sheet.as_mut() {
+                sheet.refused = Some(reason);
+            }
         }
     }
 
@@ -212,7 +227,7 @@ impl Desk {
         };
         let task = sheet.task.read(cx).text.clone();
         let line = self.line(cx);
-        let branch = state::branch_for(&task);
+        let branch = state::branch_or_clock(&task, sheet.opened);
         let space = sheet.space.and_then(|id| self.model.space(id));
         let label = |text: &str| {
             div()
@@ -253,7 +268,7 @@ impl Desk {
                     .id(("agent-option", i as u64))
                     .role(Role::RadioButton)
                     .aria_label(name.clone())
-                    .aria_selected(on)
+                    .aria_toggled(ui::toggled(on))
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -348,7 +363,7 @@ impl Desk {
                         }))
                 }))
         });
-        let ok = line.is_ok() && sheet.pending.is_none();
+        let ok = line.is_ok() && self.pending.is_none();
         let reason = sheet.refused.clone().or_else(|| line.clone().err());
         let start = div()
             .id("start")
@@ -373,7 +388,7 @@ impl Desk {
                 d.cursor_pointer().bg(c(t.sel)).text_color(c(t.on_sel))
             })
             .when(!ok, |d| d.bg(ca(t.fill)).text_color(c(t.t2)))
-            .child(if sheet.pending.is_some() {
+            .child(if self.pending.is_some() {
                 "Starting"
             } else {
                 "Start"
@@ -448,7 +463,7 @@ impl Desk {
                             .font_family(MONO_FONT)
                             .text_size(px(11.5))
                             .text_color(c(t.t1))
-                            .child(if branch.is_empty() {
+                            .child(if state::clean_prompt(&task).is_empty() {
                                 "named from the task".to_string()
                             } else {
                                 branch

@@ -181,10 +181,124 @@ fn the_field_marks_then_commits_what_the_input_method_composes(cx: &mut TestAppC
         assert_eq!(f.text, "か", "the commit replaces the marked text");
         assert_eq!(f.marked, None);
     });
+    // Undo right after the commit goes back to before the composition, never to the romaji.
+    vcx.simulate_keystrokes("cmd-z");
+    field.read_with(&vcx, |f, _| assert_eq!(f.text, ""));
     // Undo of the last edit, and a selection cut.
     vcx.simulate_input("x");
+    vcx.simulate_input("y");
     vcx.simulate_keystrokes("cmd-z");
-    field.read_with(&vcx, |f, _| assert_eq!(f.text, "か"));
+    field.read_with(&vcx, |f, _| assert_eq!(f.text, "x"));
     vcx.simulate_keystrokes("cmd-a backspace");
     field.read_with(&vcx, |f, _| assert_eq!(f.text, ""));
+}
+
+/// A New work whose sheet was closed while it started still gets its line, and one asked
+/// for before a reconnect is asked again under the same id (the daemon answers a known id
+/// with its first answer, so there is still one tab).
+#[gpui::test]
+fn new_work_survives_escape_and_a_reconnect(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.simulate_input("fix it");
+    vcx.simulate_keystrokes("enter");
+    let created = |ups: Vec<Up>| {
+        ups.into_iter().find_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::CreateTerminal { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    let id = created(sent(&mut rx)).expect("a terminal asked for");
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| d.sheet.is_none()));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx);
+            d.apply(Down::Connected, window, cx);
+        })
+    });
+    assert_eq!(
+        created(sent(&mut rx)).as_deref(),
+        Some(id.as_str()),
+        "asked again"
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::TerminalCreated {
+                    id: id.clone(),
+                    terminal: 14,
+                })),
+                window,
+                cx,
+            )
+        })
+    });
+    let typed = sent(&mut rx).into_iter().any(|u| {
+        matches!(u, Up::Input(14, bytes) if bytes.starts_with(b"qoop worktree new feat/fix-it "))
+    });
+    assert!(typed, "the line is typed with the sheet closed");
+    assert!(desk.read_with(&vcx, |d, _| d.pending.is_none()));
+}
+
+/// Every key hint names the prefix `config.toml` picked.
+#[gpui::test]
+fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {
+    let (up, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "prefix = \"ctrl-b\"\n").expect("config");
+    let config = qoop_tui::config::read_from(&path);
+    let window = cx.add_window(|window, cx| Desk::new(up, Latest::default(), &config, window, cx));
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let desk = window.root(&mut vcx).expect("the window's view");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.prefix_name()), "ctrl-b");
+    vcx.simulate_keystrokes("ctrl-b c");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.sheet.is_some()),
+        "ctrl-b c opens New work"
+    );
+}
+
+/// Home shows a sleeping tab as a current daemon lists it, under its space, and a space where
+/// everything sleeps.
+#[gpui::test]
+fn home_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            // The sleeping chip, so every row it holds fits the test window's height.
+            d.chip = crate::state::Chip::Sleeping;
+            let mut spaces = d.model.spaces.clone();
+            spaces.push(crate::state::tests::sleepy_space(
+                7,
+                "docs",
+                &[(70, 70, Some("codex"), "")],
+            ));
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::Workspaces {
+                    id: "spaces".into(),
+                    workspaces: spaces,
+                })),
+                window,
+                cx,
+            );
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("row-2164260866").is_some(),
+        "the remote's sleeper"
+    );
+    assert!(
+        vcx.debug_bounds("row-2164260867").is_none(),
+        "its second pane"
+    );
+    assert!(
+        vcx.debug_bounds("row-70").is_some(),
+        "the space that sleeps whole"
+    );
 }

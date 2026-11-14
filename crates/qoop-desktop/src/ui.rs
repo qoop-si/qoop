@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use gpui::{
     AnyElement, AssetSource, Div, ElementId, FontWeight, Hsla, Role, SharedString, Stateful, Svg,
-    div, prelude::*, px, svg,
+    Toggled, div, prelude::*, px, svg,
 };
 use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
@@ -198,6 +198,11 @@ pub fn logo(size: f32) -> Div {
         }))
 }
 
+/// A radio button's state as AccessKit reads it.
+pub fn toggled(on: bool) -> Toggled {
+    if on { Toggled::True } else { Toggled::False }
+}
+
 /// A key cap: `ctrl-a c`.
 pub fn kbd(keys: &str, t: &Theme) -> Div {
     div()
@@ -280,7 +285,7 @@ pub fn chip(
         None => label.to_string(),
     };
     control(id, Role::RadioButton, said, t)
-        .aria_selected(on)
+        .aria_toggled(toggled(on))
         .flex()
         .items_center()
         .gap(px(6.))

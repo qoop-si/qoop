@@ -2,10 +2,9 @@
 //! Next runs. No spaces in the sidebar here: the same item twice is pointless.
 
 use gpui::{AnyElement, Context, FontWeight, Role, div, prelude::*, px};
-use qoop_runtime::control::AgentRow;
 
 use crate::app::{Desk, Page};
-use crate::state::{self, Chip, Group, Kind};
+use crate::state::{self, Chip, Entry, Group};
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui::{self, Icon};
 
@@ -161,14 +160,14 @@ impl Desk {
             .into_any_element()
     }
 
-    fn row(&self, row: &AgentRow, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let kind = Kind::of(row);
-        let terminal = row.terminal;
+    fn row(&self, entry: Entry<'_>, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let kind = entry.kind();
+        let terminal = entry.terminal();
         let needs = kind.needs_you();
         ui::control(
             ("row", terminal as u64),
             Role::Link,
-            self.model.row_label(row, self.now),
+            self.model.row_label(entry, self.now),
             t,
         )
         .debug_selector(move || format!("row-{terminal}"))
@@ -195,7 +194,7 @@ impl Desk {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(state::title_of(row)),
+                        .child(entry.title()),
                 )
                 .child(
                     div()
@@ -206,7 +205,7 @@ impl Desk {
                         .text_color(c(t.t2))
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .child(state::sub_of(row))
+                        .child(entry.sub())
                         .when(needs, |d| d.child(ui::icon(Icon::Chevron, 10., c(t.t2)))),
                 ),
         )
@@ -225,10 +224,10 @@ impl Desk {
                 .gap(px(6.))
                 .text_size(px(12.5))
                 .text_color(c(t.t1))
-                .when_some(state::kind_pet(row.program.as_deref()), |d, pet| {
+                .when_some(state::kind_pet(entry.program()), |d, pet| {
                     d.child(ui::pet(&pet, 1.))
                 })
-                .child(row.program.clone().unwrap_or_default()),
+                .child(entry.program().unwrap_or_default().to_string()),
         )
         .child(
             div()
@@ -237,7 +236,7 @@ impl Desk {
                 .justify_end()
                 .text_size(px(12.5))
                 .text_color(c(t.t2))
-                .child(state::age_of(row, self.now).unwrap_or_default()),
+                .child(entry.age(self.now).unwrap_or_default()),
         )
         .on_click(
             cx.listener(move |this, _, window, cx| this.open(Page::Session(terminal), window, cx)),

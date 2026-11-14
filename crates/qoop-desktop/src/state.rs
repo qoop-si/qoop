@@ -6,8 +6,9 @@
 
 use std::collections::BTreeSet;
 
+use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
-use qoop_runtime::control::{AgentRow, LinkState, ScheduleInfo, WorkspaceRow};
+use qoop_runtime::control::{AgentRow, LinkState, ScheduleInfo, SleepingTab, WorkspaceRow};
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
 /// What a row shows: the daemon's status, or a sleeping tab (a tab fact, not a status).
@@ -173,10 +174,71 @@ pub struct Model {
     pub folded: BTreeSet<i64>,
 }
 
+/// One line of home's lists: an awake agent's row, or a sleeping tab that held an agent.
+#[derive(Clone, Copy, Debug)]
+pub enum Entry<'a> {
+    Live(&'a AgentRow),
+    /// A sleeping tab as a current daemon lists it, under its space (the second field).
+    Asleep(&'a SleepingTab, i64),
+}
+
+impl<'a> Entry<'a> {
+    pub fn kind(self) -> Kind {
+        match self {
+            Entry::Live(row) => Kind::of(row),
+            Entry::Asleep(..) => Kind::Sleeping,
+        }
+    }
+
+    pub fn terminal(self) -> u32 {
+        match self {
+            Entry::Live(row) => row.terminal,
+            Entry::Asleep(tab, _) => tab.terminal,
+        }
+    }
+
+    pub fn workspace(self) -> i64 {
+        match self {
+            Entry::Live(row) => row.workspace,
+            Entry::Asleep(_, space) => space,
+        }
+    }
+
+    /// The agent in it: the program of an awake row, the agent a sleeping tab resumes.
+    pub fn program(self) -> Option<&'a str> {
+        match self {
+            Entry::Live(row) => row.program.as_deref(),
+            Entry::Asleep(tab, _) => tab.agent.as_deref(),
+        }
+    }
+
+    pub fn title(self) -> String {
+        match self {
+            Entry::Live(row) => title_of(row),
+            Entry::Asleep(tab, _) => tab.label().to_string(),
+        }
+    }
+
+    pub fn sub(self) -> String {
+        match self {
+            Entry::Live(row) => sub_of(row),
+            Entry::Asleep(..) => SLEEPING_SUB.into(),
+        }
+    }
+
+    /// How long it has been as it is; a sleeping tab's list carries no time.
+    pub fn age(self, now: i64) -> Option<String> {
+        match self {
+            Entry::Live(row) => age_of(row, now),
+            Entry::Asleep(..) => None,
+        }
+    }
+}
+
 /// One space header and its agents, as home lists them.
 pub struct Group<'a> {
     pub space: &'a WorkspaceRow,
-    pub rows: Vec<&'a AgentRow>,
+    pub rows: Vec<Entry<'a>>,
     /// All its agents, whatever the chip shows.
     pub count: usize,
 }
@@ -190,9 +252,9 @@ impl Model {
             .collect()
     }
 
-    /// The owner's agents: every agent row outside qass's space, and the sleeping tabs that
-    /// held one.
-    pub fn agents(&self) -> impl Iterator<Item = &AgentRow> {
+    /// The owner's awake agents: every agent row outside qass's space (and the sleeping row
+    /// an older daemon sends for a tab that held one).
+    pub fn live(&self) -> impl Iterator<Item = &AgentRow> {
         let qass = self.qass_spaces();
         self.rows.iter().filter(move |r| {
             !qass.contains(&r.workspace)
@@ -200,42 +262,67 @@ impl Model {
         })
     }
 
+    /// Every agent of the owner: the awake ones, then the sleeping tabs that held an agent,
+    /// one per tab, as the spaces list them (`WorkspaceRow::sleeping`, as the TUI reads them).
+    pub fn agents(&self) -> Vec<Entry<'_>> {
+        let mut out: Vec<Entry<'_>> = self.live().map(Entry::Live).collect();
+        let qass = self.qass_spaces();
+        for space in self.spaces.iter().filter(|w| !qass.contains(&w.id)) {
+            for tab in &space.sleeping {
+                let lead = tab.lead.is_none_or(|lead| lead == tab.terminal);
+                if tab.agent.is_some() && lead && !out.iter().any(|e| e.terminal() == tab.terminal)
+                {
+                    out.push(Entry::Asleep(tab, space.id));
+                }
+            }
+        }
+        out
+    }
+
     /// Home's groups: spaces in the daemon's order, each with its agents by rank and then in
     /// the daemon's order (oldest first), as the TUI lists them. A space with no agent the
     /// chip holds is left out, and so is an empty one.
     pub fn groups(&self, chip: Chip) -> Vec<Group<'_>> {
+        let agents = self.agents();
         self.spaces
             .iter()
             .filter(|w| w.name != QASS_SPACE)
             .filter_map(|space| {
-                let mut all: Vec<&AgentRow> =
-                    self.agents().filter(|r| r.workspace == space.id).collect();
-                all.sort_by_key(|r| Kind::of(r).rank());
-                let count = all.len();
-                let rows: Vec<&AgentRow> = all
-                    .into_iter()
-                    .filter(|r| chip.holds(Kind::of(r)))
+                let mut all: Vec<Entry<'_>> = agents
+                    .iter()
+                    .copied()
+                    .filter(|e| e.workspace() == space.id)
                     .collect();
-                (!rows.is_empty()).then_some(Group { space, rows, count })
+                all.sort_by_key(|e| e.kind().rank());
+                let count = all.len();
+                all.retain(|e| chip.holds(e.kind()));
+                (!all.is_empty()).then_some(Group {
+                    space,
+                    rows: all,
+                    count,
+                })
             })
             .collect()
     }
 
     pub fn count(&self, chip: Chip) -> usize {
-        self.agents().filter(|r| chip.holds(Kind::of(r))).count()
+        self.agents()
+            .iter()
+            .filter(|e| chip.holds(e.kind()))
+            .count()
     }
 
     /// The Inbox badge: Needs you plus Failed, nothing at zero.
     pub fn badge(&self) -> usize {
-        self.agents()
+        self.live()
             .filter(|r| matches!(Kind::of(r), Kind::Status(Status::Blocked | Status::Failed)))
             .count()
     }
 
     /// "7 in 3 spaces on 2 machines".
     pub fn summary(&self) -> String {
-        let agents: Vec<&AgentRow> = self.agents().collect();
-        let spaces: BTreeSet<i64> = agents.iter().map(|r| r.workspace).collect();
+        let agents = self.agents();
+        let spaces: BTreeSet<i64> = agents.iter().map(|e| e.workspace()).collect();
         let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(*w)).collect();
         let n = |count: usize, one: &str, many: &str| {
             format!("{count} {}", if count == 1 { one } else { many })
@@ -263,7 +350,7 @@ impl Model {
     /// The agent the status line points at: the first that needs you, else the first that
     /// failed, in home's order.
     pub fn next_up(&self) -> Option<&AgentRow> {
-        let mut agents: Vec<&AgentRow> = self.agents().collect();
+        let mut agents: Vec<&AgentRow> = self.live().collect();
         agents.sort_by_key(|r| Kind::of(r).rank());
         agents
             .into_iter()
@@ -283,14 +370,14 @@ impl Model {
 
     /// What a screen reader says for a row: "README Coupons section, claude, acme-web,
     /// Needs you, 4m".
-    pub fn row_label(&self, row: &AgentRow, now: i64) -> String {
-        let mut parts = vec![title_of(row)];
-        if let Some(program) = &row.program {
-            parts.push(program.clone());
+    pub fn row_label(&self, entry: Entry<'_>, now: i64) -> String {
+        let mut parts = vec![entry.title()];
+        if let Some(program) = entry.program() {
+            parts.push(program.to_string());
         }
-        parts.push(self.space_name(row.workspace));
-        parts.push(Kind::of(row).word().to_string());
-        if let Some(ago) = age_of(row, now) {
+        parts.push(self.space_name(entry.workspace()));
+        parts.push(entry.kind().word().to_string());
+        if let Some(ago) = entry.age(now) {
             parts.push(ago);
         }
         parts.join(", ")
@@ -317,7 +404,7 @@ impl Model {
             return "not watching".into();
         }
         let agents: Vec<&AgentRow> = self
-            .agents()
+            .live()
             .filter(|r| Kind::of(r) != Kind::Sleeping)
             .collect();
         let watched = agents.iter().filter(|r| !r.qass_skip).count();
@@ -350,11 +437,13 @@ pub fn title_of(row: &AgentRow) -> String {
     .to_string()
 }
 
+const SLEEPING_SUB: &str = "Wakes on a click";
+
 /// A row's second line.
 pub fn sub_of(row: &AgentRow) -> String {
     match Kind::of(row) {
         Kind::Status(Status::Blocked) => "in Inbox".into(),
-        Kind::Sleeping => "Wakes on a click".into(),
+        Kind::Sleeping => SLEEPING_SUB.into(),
         _ => match (&row.task, &row.activity) {
             (Some(task), _) => format!("Task #{}: {}", task.id, task.goal),
             (None, Some(activity)) => activity.clone(),
@@ -442,15 +531,11 @@ pub fn kind_pet(program: Option<&str>) -> Option<qoop_runtime::avatar::Avatar> {
 /// The longest first prompt typed this way.
 pub const PROMPT_MOST: usize = 4000;
 
-/// A word the shell reads back as it is.
-pub fn shell_quote(word: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c);
-    if !word.is_empty() && word.chars().all(safe) {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
+/// The longest line typed. A new shell may still be starting when it arrives, with the
+/// terminal in line mode, and macOS keeps about 1023 bytes of an unfinished line and drops
+/// the rest: measured, 929 bytes typed a second before zsh read them ran, 1229 lost the end
+/// (the quote, `&& exit`, the Enter) and ran nothing.
+pub const LINE_MOST: usize = 1000;
 
 /// The prompt as typed: control characters to spaces, trimmed, cut at [`PROMPT_MOST`].
 pub fn clean_prompt(prompt: &str) -> String {
@@ -477,22 +562,26 @@ pub fn clean_prompt(prompt: &str) -> String {
 
 /// A branch named after the prompt's first words: `feat/fix-the-login-page`. Letters with
 /// marks keep their base letter, so `giriş sayfasını düzelt` is `feat/giris-sayfasini-duzelt`.
+/// Empty when no Latin letter or digit is left (a task in Japanese): see [`branch_or_clock`].
 pub fn branch_for(prompt: &str) -> String {
     let plain: String = prompt
         .chars()
         .filter(|c| *c != '\'' && *c != '\u{2019}')
+        // Lowercase first, so the table needs only lowercase letters; `İ` alone, whose
+        // lowercase adds a combining dot.
+        .map(|c| if c == 'İ' { 'i' } else { c })
+        .flat_map(char::to_lowercase)
         .map(|c| match c {
-            'ç' | 'Ç' => 'c',
-            'ğ' | 'Ğ' => 'g',
-            'ı' | 'İ' | 'í' | 'ì' | 'î' | 'ï' => 'i',
-            'ö' | 'Ö' | 'ó' | 'ò' | 'ô' | 'õ' => 'o',
-            'ş' | 'Ş' => 's',
-            'ü' | 'Ü' | 'ú' | 'ù' | 'û' => 'u',
-            'á' | 'à' | 'â' | 'ä' | 'ã' | 'Ä' => 'a',
+            'ç' => 'c',
+            'ğ' => 'g',
+            'ı' | 'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ö' | 'ó' | 'ò' | 'ô' | 'õ' => 'o',
+            'ş' | 'ß' => 's',
+            'ü' | 'ú' | 'ù' | 'û' => 'u',
+            'á' | 'à' | 'â' | 'ä' | 'ã' => 'a',
             'é' | 'è' | 'ê' | 'ë' => 'e',
             'ñ' => 'n',
-            'ß' => 's',
-            c => c.to_ascii_lowercase(),
+            c => c,
         })
         .collect();
     let words: Vec<&str> = plain
@@ -504,6 +593,16 @@ pub fn branch_for(prompt: &str) -> String {
         String::new()
     } else {
         format!("feat/{}", words.join("-"))
+    }
+}
+
+/// The task's branch, or `feat/work-<at>` (unix seconds) when its words give none.
+pub fn branch_or_clock(prompt: &str, at: i64) -> String {
+    let branch = branch_for(prompt);
+    if branch.is_empty() {
+        format!("feat/work-{at}")
+    } else {
+        branch
     }
 }
 
@@ -587,10 +686,14 @@ pub fn worktree_line(
     }
     let agent = prompted_line(command, prompt)?;
     let space = space.map_or_else(String::new, |s| format!(" --space {s}"));
-    Ok(format!(
+    let line = format!(
         "qoop worktree new {}{space} -- {agent} && exit",
         shell_quote(branch)
-    ))
+    );
+    if line.len() >= LINE_MOST {
+        return Err("The task is too long to type: shorten it.");
+    }
+    Ok(line)
 }
 
 /// A space's number in its own machine's daemon: the mux numbers a remote one above 2^40.
@@ -726,20 +829,34 @@ pub(crate) mod tests {
             .expect("space")
     }
 
-    /// The design's data set: seven agents in three spaces on two machines.
+    /// A space with sleeping tabs, as a current daemon lists it (through the mux, so a remote
+    /// one's tabs carry the interface's numbers): `(terminal, lead, agent, session)`.
+    pub fn sleepy_space(
+        id: i64,
+        name: &str,
+        tabs: &[(u32, u32, Option<&str>, &str)],
+    ) -> WorkspaceRow {
+        let sleeping: Vec<serde_json::Value> = tabs
+            .iter()
+            .map(|(terminal, lead, agent, session)| {
+                serde_json::json!({
+                    "terminal": terminal, "lead": lead, "title": null, "agent": agent,
+                    "session": session, "cwd": "/srv/work",
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "terminals": tabs.len() + 1, "sleeping": sleeping,
+        }))
+        .expect("space")
+    }
+
+    /// The design's data set: seven agents in three spaces on two machines. The remote's
+    /// sleeping tab is listed under its space, as a current daemon sends it (its row is not in
+    /// the agent list at all); beside it the second pane of the same tab and a sleeping shell,
+    /// neither of which is an agent row.
     pub fn fixture() -> Model {
         let remote = 1i64 << 40 | 1;
-        let mut sleeping = row(
-            0x8100_0002,
-            remote,
-            "unknown",
-            "claude",
-            "Test suite status",
-        );
-        sleeping.state = "sleeping".into();
-        sleeping.status = None;
-        sleeping.agent = false;
-        sleeping.slept_at_unix = Some(1000);
         Model {
             rows: vec![
                 row(1, 1, "working", "claude", "Bun test suite status"),
@@ -748,17 +865,57 @@ pub(crate) mod tests {
                 row(4, 2, "done", "claude", "CHANGELOG.md summary"),
                 row(5, 2, "working", "codex", "POST /orders route in routes.ts"),
                 row(0x8100_0001, remote, "working", "codex", "Bun run test:soak"),
-                sleeping,
                 row(9, 3, "working", "claude", "qass"),
             ],
             spaces: vec![
                 space(1, "acme-web"),
                 space(2, "api"),
                 space(3, "qass"),
-                space(remote, "staging:billing-api"),
+                sleepy_space(
+                    remote,
+                    "staging:billing-api",
+                    &[
+                        (
+                            0x8100_0002,
+                            0x8100_0002,
+                            Some("claude"),
+                            "Test suite status",
+                        ),
+                        (
+                            0x8100_0003,
+                            0x8100_0002,
+                            Some("claude"),
+                            "Test suite status",
+                        ),
+                        (0x8100_0004, 0x8100_0004, None, ""),
+                    ],
+                ),
             ],
             ..Model::default()
         }
+    }
+
+    /// A space where everything sleeps has no awake row at all: it is still on home, with its
+    /// sleeping agent. And an older daemon's sleeping row still counts once.
+    #[test]
+    fn a_space_asleep_is_on_home_and_an_older_daemons_sleeper_counts_once() {
+        let mut m = fixture();
+        m.spaces
+            .push(sleepy_space(7, "docs", &[(70, 70, Some("codex"), "")]));
+        let docs = m
+            .groups(Chip::Sleeping)
+            .into_iter()
+            .find(|g| g.space.name == "docs")
+            .expect("the sleeping space is listed");
+        assert_eq!(docs.rows.len(), 1);
+        assert_eq!(docs.rows[0].title(), "codex", "no name: the agent");
+        assert_eq!(m.count(Chip::Sleeping), 2);
+        assert_eq!(m.summary(), "8 in 4 spaces on 2 machines");
+        let mut old = row(70, 7, "unknown", "codex", "");
+        old.state = "sleeping".into();
+        old.agent = false;
+        m.rows.push(old);
+        assert_eq!(m.count(Chip::Sleeping), 2, "listed both ways, counted once");
     }
 
     #[test]
@@ -771,7 +928,7 @@ pub(crate) mod tests {
             ["acme-web", "api", "staging:billing-api"],
             "qass's space is left out"
         );
-        let titles: Vec<String> = groups[0].rows.iter().map(|r| title_of(r)).collect();
+        let titles: Vec<String> = groups[0].rows.iter().map(|e| e.title()).collect();
         assert_eq!(
             titles,
             [
@@ -780,9 +937,19 @@ pub(crate) mod tests {
                 "Bun test suite status"
             ]
         );
-        let api: Vec<u32> = groups[1].rows.iter().map(|r| r.terminal).collect();
+        let api: Vec<u32> = groups[1].rows.iter().map(|e| e.terminal()).collect();
         assert_eq!(api, [4, 5], "done before working");
-        assert_eq!(groups[2].rows.len(), 2, "the sleeping tab is listed");
+        assert_eq!(
+            groups[2].rows.len(),
+            2,
+            "the sleeping tab is listed, once per tab"
+        );
+        let asleep = groups[2]
+            .rows
+            .iter()
+            .find(|e| e.kind() == Kind::Sleeping)
+            .expect("the sleeper");
+        assert_eq!(asleep.title(), "Test suite status");
     }
 
     #[test]
@@ -841,7 +1008,7 @@ pub(crate) mod tests {
         let mut b = blocked.clone();
         b.last_active_at_unix = Some(1000);
         assert_eq!(
-            m.row_label(&b, 1240),
+            m.row_label(Entry::Live(&b), 1240),
             "README Coupons section, claude, acme-web, Needs you, 4m"
         );
         m.rows.retain(|r| r.terminal != 2);
@@ -862,9 +1029,9 @@ pub(crate) mod tests {
         let m = fixture();
         words.push(m.status_line().unwrap_or_default());
         words.push(m.qass_line());
-        for row in &m.rows {
-            words.push(sub_of(row));
-            words.push(m.row_label(row, 2000));
+        for entry in m.agents() {
+            words.push(entry.sub());
+            words.push(m.row_label(entry, 2000));
         }
         for word in words {
             assert!(!word.to_lowercase().contains("blocked"), "{word}");
@@ -931,6 +1098,21 @@ pub(crate) mod tests {
         );
         assert_eq!(branch_for("Don\u{2019}t stop"), "feat/dont-stop");
         assert_eq!(branch_for("!!!"), "");
+        assert_eq!(
+            branch_for("\u{c9}lan \u{d1}and\u{fa} \u{c1}LTO"),
+            "feat/elan-nandu-alto"
+        );
+        let japanese = "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{753b}\u{9762}\u{3092}\u{76f4}\u{3059}";
+        assert_eq!(branch_for(japanese), "", "no Latin word left");
+        assert_eq!(
+            branch_or_clock(japanese, 1_763_100_000),
+            "feat/work-1763100000"
+        );
+        assert_eq!(branch_or_clock("fix it", 1), "feat/fix-it");
+        assert!(
+            worktree_line(&branch_or_clock(japanese, 1), Some(1), "claude", japanese).is_ok(),
+            "a task with no Latin letter still starts"
+        );
         assert_eq!(branch_problem("feat/x"), None);
         assert_eq!(branch_problem("-b"), Some("A branch cannot start with -."));
         assert_eq!(branch_problem("a@{1}"), Some("A branch cannot hold @{."));
@@ -952,23 +1134,33 @@ pub(crate) mod tests {
         words
     }
 
+    /// A backslash before a quote ended the quote early in fish and ran the rest; it is now
+    /// typed outside the quotes. Every shell's reading is checked in `qoop_domain::shell`.
     #[test]
-    fn shell_quote_gives_every_word_back_byte_for_byte() {
-        assert_eq!(shell_quote("feat/x-1"), "feat/x-1");
-        assert_eq!(shell_quote(""), "''");
-        for w in [
-            "it's",
-            "say \"hi\"",
-            "$HOME `id` $(id)",
-            "a\\b",
-            "*",
-            "a b",
-            "!x",
-            "; rm -rf ~",
-            "düzelt",
-        ] {
-            assert_eq!(words(&shell_quote(w)), [w]);
-        }
+    fn a_backslash_in_the_task_stays_one_word_in_every_shell() {
+        let task = r"a\'; touch /tmp/pwn; #";
+        let line = worktree_line("b", None, "claude", task).expect("line");
+        assert_eq!(
+            line,
+            r"qoop worktree new b -- claude 'a'\\\''; touch /tmp/pwn; #' && exit"
+        );
+        assert_eq!(
+            words(line.trim_end_matches(" && exit"))
+                .last()
+                .map(String::as_str),
+            Some(task)
+        );
+    }
+
+    /// A line the terminal would cut before the shell reads it is refused, not typed.
+    #[test]
+    fn a_line_too_long_to_type_is_refused() {
+        let most = LINE_MOST - "qoop worktree new b -- claude  && exit".len();
+        assert!(worktree_line("b", None, "claude", &"x".repeat(most - 1)).is_ok());
+        assert_eq!(
+            worktree_line("b", None, "claude", &"x".repeat(most)),
+            Err("The task is too long to type: shorten it.")
+        );
     }
 
     #[test]

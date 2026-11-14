@@ -4050,6 +4050,7 @@ dependencies = [
  "qoop-proto",
  "qoop-remote",
  "qoop-runtime",
+ "qoop-store",
  "qoop-testkit",
  "qoop-tui",
  "serde_json",
@@ -4160,6 +4161,7 @@ dependencies = [
 name = "qoop-remote"
 version = "0.16.0"
 dependencies = [
+ "qoop-domain",
  "qoop-proto",
  "serde",
  "serde_json",
