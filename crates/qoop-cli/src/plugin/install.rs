@@ -35,7 +35,9 @@ const USAGE: &str = "usage:\n\
 
 /// What every plugin is told it can do, shown before any yes.
 const POWERS: &str = "It runs as you, can read every terminal and the command lines of their \
-                      processes, can type into terminals and run commands in shells.";
+                      processes, can type into terminals and run commands in shells, can close \
+                      panes, tabs and spaces, rename them, move focus, open panes and show \
+                      notifications.";
 
 fn fail(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
@@ -80,6 +82,7 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
         (Some("rm"), [id]) => rm(&home, id),
         (Some("run"), [spec]) => run_action(&home, spec),
         (Some("host"), []) => super::host::run(),
+        (Some("pane-exec"), [nonce]) => super::writes::pane_exec(nonce),
         (Some("--help" | "-h") | None, _) => {
             println!("{USAGE}");
             Ok(())
@@ -146,6 +149,10 @@ pub(crate) struct Consent {
     pub(crate) sha: Option<String>,
     pub(crate) manifest: String,
     pub(crate) source: String,
+    /// Where in the checkout the plugin is, for an `owner/repo/subdir` install: the whole
+    /// checkout is kept, as herdr keeps it, and the plugin runs from here inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subdir: Option<String>,
 }
 
 /// The consent ledger. Opened the ADR-015 way: anything unreadable is empty, so a deleted or
@@ -415,13 +422,6 @@ fn preview(m: &Manifest, from: &str, sha: Option<&str>) -> String {
     for s in &here.startup {
         out += &format!("startup  {}\n", argv(&s.command));
     }
-    if m.wants_newer_herdr() {
-        out += &format!(
-            "warning  it asks for herdr {}; qoop answers as herdr {}, so some of it may not work\n",
-            shown(m.min_herdr_version.as_deref().unwrap_or_default()),
-            manifest::HERDR_VERSION
-        );
-    }
     out + POWERS + "\n"
 }
 
@@ -492,6 +492,10 @@ fn install_from(
     eprintln!("fetching {url}");
     let sha = fetch(url, git_ref, &clone)?;
     let root = root_in(&clone, subdir)?;
+    let inside = root
+        .strip_prefix(clone.canonicalize()?)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let text = read_manifest(&root.join(manifest::FILE))?;
     let m = Manifest::parse(&text).map_err(fail)?;
     placeable(home, &m)?;
@@ -502,14 +506,21 @@ fn install_from(
         return Ok(());
     }
     let dest = home.dir_of(&m.id);
-    std::fs::rename(&root, &dest)?;
-    build(home, &m, &dest).map_err(|e| {
+    std::fs::rename(&clone, &dest)?;
+    let root = dest.join(&inside);
+    // The shim is in place before anything of the plugin runs, so a build that calls `herdr`
+    // reaches qoop and never a herdr of the person's own.
+    super::shim::place(home)?;
+    build(home, &m, &root).map_err(|e| {
         fail(format!(
             "{}'s build failed, so nothing was recorded and it will not run: {e}\n\
              `qoop plugin rm {}` clears it",
             m.id, m.id
         ))
     })?;
+    // Its config and state folders, as herdr makes them at install.
+    std::fs::create_dir_all(home.config_of(&m.id))?;
+    std::fs::create_dir_all(home.state_of(&m.id))?;
     Ledger::update(home, |ledger| {
         ledger.plugins.insert(
             m.id.clone(),
@@ -517,6 +528,8 @@ fn install_from(
                 sha: Some(sha.clone()),
                 manifest: text,
                 source: shown.to_string(),
+                subdir: (!inside.as_os_str().is_empty())
+                    .then(|| inside.to_string_lossy().into_owned()),
             },
         );
     })?;
@@ -528,21 +541,44 @@ fn install_from(
     Ok(())
 }
 
-/// Run the manifest's build steps for this platform, in the plugin's root, with the plugin's
-/// environment and none of qoop's own.
+/// Run the manifest's build steps for this platform, in the plugin's root, as herdr runs
+/// them: stdin closed, nothing of herdr's or qoop's own in the environment. Only `PATH`
+/// differs, with the shim first, so a build never reaches a herdr of the person's own.
 fn build(home: &Home, m: &Manifest, root: &Path) -> std::io::Result<()> {
     for step in &m.here().build {
         eprintln!("building: {:?}", step.command);
         let mut cmd = Command::new(program(root, &step.command[0]));
-        cmd.args(&step.command[1..]).current_dir(root);
-        cmd.envs(plugin_env(home, &m.id, root));
+        cmd.args(&step.command[1..])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null());
         scrub(&mut cmd);
+        for (name, _) in std::env::vars_os() {
+            if herdrs(&name) {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.env("PATH", shim_first(home));
         let status = cmd.status()?;
         if !status.success() {
             return Err(fail(format!("{:?} failed ({status})", step.command)));
         }
     }
     Ok(())
+}
+
+/// Whether a variable is herdr's, which a build never inherits.
+fn herdrs(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"HERDR_")
+}
+
+/// `PATH` with the plugins' `.bin` (the herdr shim) first.
+fn shim_first(home: &Home) -> OsString {
+    let mut path = OsString::from(home.bin());
+    if let Some(inherited) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(inherited);
+    }
+    path
 }
 
 /// A manifest command's program: a relative path with a slash (`bin/tool`) is the plugin's
@@ -647,6 +683,7 @@ fn link(home: &Home, dir: &Path, yes: bool) -> std::io::Result<()> {
                 sha: None,
                 manifest: text,
                 source: from,
+                subdir: None,
             },
         );
     })?;
@@ -656,6 +693,12 @@ fn link(home: &Home, dir: &Path, yes: bool) -> std::io::Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+/// `link`, agreed to at once, for the tests of this crate.
+#[cfg(test)]
+pub(crate) fn link_for_tests(home: &Home, dir: &Path) {
+    link(home, dir, true).expect("linked");
 }
 
 /// A plugin that may run now: its manifest is still the text the person agreed to.
@@ -671,15 +714,25 @@ pub(crate) fn admitted(home: &Home, id: &str) -> Result<Admitted, String> {
     if !manifest::valid_id(id) {
         return Err(format!("{id:?} is not a plugin id"));
     }
-    let root = home
+    let folder = home
         .dir_of(id)
         .canonicalize()
         .map_err(|_| format!("{id} is not installed"))?;
-    let text = read_manifest(&root.join(manifest::FILE)).map_err(|e| format!("{id}: {e}"))?;
     let consent = Ledger::open(&home.ledger())
         .plugins
         .remove(id)
         .ok_or_else(|| format!("{id} has no consent recorded; install or link it again"))?;
+    // The plugin's own folder inside its checkout, never one that leads out of it.
+    let root = match &consent.subdir {
+        Some(subdir) => folder
+            .join(subdir)
+            .canonicalize()
+            .ok()
+            .filter(|root| root.starts_with(&folder))
+            .ok_or_else(|| format!("{id}: its folder {subdir} is gone from its checkout"))?,
+        None => folder,
+    };
+    let text = read_manifest(&root.join(manifest::FILE)).map_err(|e| format!("{id}: {e}"))?;
     if consent.manifest.as_bytes() != text.as_bytes() {
         return Err(format!(
             "{id}'s manifest changed since you agreed to it; `qoop plugin rm {id}` and install \
@@ -839,11 +892,37 @@ fn run_action(home: &Home, spec: &str) -> std::io::Result<()> {
         .into_iter()
         .find(|a| a.id == action)
         .ok_or_else(|| fail(format!("{id} has no action {action} on this machine")))?;
-    // ponytail: checked and resolved only; running it needs the host's socket and context.
-    Err(fail(format!(
-        "{id}.{} is installed and agreed to, but running plugin actions is not available yet",
-        found.id
-    )))
+    // Through the host when it runs, which knows the focused pane for the context and keeps
+    // the action's log; else here, in the foreground, with no context.
+    let socket = super::host::socket_path();
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        let params = serde_json::json!({"plugin_id": id, "action_id": found.id});
+        let answer = super::shim::ask(&socket, "plugin.action.invoke", params)?;
+        if let Some(error) = answer.get("error") {
+            return Err(fail(error["message"].as_str().unwrap_or_default()));
+        }
+        let log_id = answer["result"]["log"]["log_id"]
+            .as_str()
+            .unwrap_or_default();
+        let log = home.state_of(&id).join("host.log");
+        println!(
+            "ran {id}.{} ({log_id}); its output goes to {}",
+            found.id,
+            log.display()
+        );
+        return Ok(());
+    }
+    let mut cmd = Command::new(program(&plugin.root, &found.command[0]));
+    cmd.args(&found.command[1..]).current_dir(&plugin.root);
+    cmd.envs(plugin_env(home, &id, &plugin.root));
+    cmd.env("HERDR_PLUGIN_ACTION_ID", &found.id);
+    scrub(&mut cmd);
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(fail(format!("{id}.{} failed ({status})", found.id)))
+    }
 }
 
 #[cfg(test)]
@@ -889,9 +968,9 @@ mod tests {
         repo_with(
             at,
             &format!(
-                "id = \"{id}\"\nversion = \"0.1.0\"\n\
-                 [[build]]\ncommand = [\"sh\", \"-c\", \"env > built.txt\"]\n\
-                 [[actions]]\nid = \"hello\"\ncommand = [\"echo\", \"hi\"]\n"
+                "{}[[build]]\ncommand = [\"sh\", \"-c\", \"env > built.txt\"]\n\
+                 [[actions]]\nid = \"hello\"\ntitle = \"Hello\"\ncommand = [\"echo\", \"hi\"]\n",
+                manifest::head(id)
             ),
         )
     }
@@ -1016,18 +1095,19 @@ mod tests {
 
     #[test]
     fn the_preview_shows_every_command_and_the_powers() {
-        let m = Manifest::parse(
-            "id = \"p\"\nversion = \"1\"\nmin_herdr_version = \"9.0\"\n\
-             [[build]]\ncommand = [\"sh\", \"b.sh\"]\n\
-             [[actions]]\nid = \"a\"\ncommand = [\"x\", \"\\u001b[2Jhid\\u202Eden\\u2028line\"]\n\
-             [[panes]]\nid = \"v\"\ncommand = [\"v\"]\n\
+        let m = Manifest::parse(&format!(
+            "{}[[build]]\ncommand = [\"sh\", \"b.sh\"]\n\
+             [[actions]]\nid = \"a\"\ntitle = \"A\"\n\
+             command = [\"x\", \"\\u001b[2Jhid\\u202Eden\\u2028line\"]\n\
+             [[panes]]\nid = \"v\"\ntitle = \"V\"\ncommand = [\"v\"]\n\
              [[events]]\non = \"pane.closed\"\ncommand = [\"e\"]\n\
              [[startup]]\ncommand = [\"s\", \"--daemon\"]\n",
-        )
+            manifest::head("p")
+        ))
         .expect("parses");
         let text = preview(&m, "o/r", Some("abc123"));
         for line in [
-            "plugin   p 1\n",
+            "plugin   p 0.1.0\n",
             "from     o/r\n",
             "commit   abc123 (recorded; your yes covers the manifest below)\n",
             "build    [\"sh\", \"b.sh\"]\n",
@@ -1035,7 +1115,6 @@ mod tests {
             "pane     v (overlay) [\"v\"]\n",
             "event    pane.closed [\"e\"]\n",
             "startup  [\"s\", \"--daemon\"]\n",
-            "warning  it asks for herdr 9.0",
         ] {
             assert!(text.contains(line), "{line:?} missing from\n{text}");
         }
@@ -1056,14 +1135,33 @@ mod tests {
         let upstream = repo(dir.path(), "t.plugin");
         let (_keep, home) = home();
         install(&home, &upstream, None).expect("installs");
-        let root = home.dir_of("t.plugin");
+        // The whole checkout is kept; the plugin runs from its folder inside it.
+        assert!(home.dir_of("t.plugin").join(".git").is_dir());
+        let root = home.dir_of("t.plugin").join("sub");
         let built = std::fs::read_to_string(root.join("built.txt")).expect("the build ran");
-        assert!(built.contains("HERDR_PLUGIN_ID=t.plugin"), "{built}");
+        assert!(!built.lines().any(|l| l.starts_with("HERDR_")), "{built}");
+        let path = built
+            .lines()
+            .find_map(|l| l.strip_prefix("PATH="))
+            .expect("PATH");
+        assert!(
+            path.starts_with(&home.bin().display().to_string()),
+            "the shim first: {path}"
+        );
+        assert!(
+            home.bin().join("herdr").exists(),
+            "the shim was placed before the build"
+        );
         assert!(!built.lines().any(|l| l.starts_with("QOOP_")), "{built}");
         let plugin = admitted(&home, "t.plugin").expect("admitted");
         assert_eq!(plugin.consent.source, "t/p/sub");
         assert_eq!(plugin.consent.sha.as_ref().map(String::len), Some(40));
-        assert!(plugin.consent.manifest.starts_with("id = \"t.plugin\""));
+        assert!(
+            plugin
+                .consent
+                .manifest
+                .starts_with(&manifest::head("t.plugin"))
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&home.root)
             .expect("read")
             .filter_map(Result::ok)
@@ -1110,8 +1208,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let upstream = repo_with(
             dir.path(),
-            "id = \"t.win\"\nplatforms = [\"windows\"]\n\
+            &format!(
+                "{}platforms = [\"windows\"]\n\
              [[build]]\ncommand = [\"sh\", \"-c\", \"touch built\"]\n",
+                manifest::head("t.win")
+            ),
         );
         let (_keep, home) = home();
         let err = install(&home, &upstream, None).expect_err("refused");
@@ -1125,7 +1226,7 @@ mod tests {
         let upstream = repo(dir.path(), "t.change");
         let (_keep, home) = home();
         install(&home, &upstream, None).expect("ok");
-        let manifest_at = home.dir_of("t.change").join(manifest::FILE);
+        let manifest_at = home.dir_of("t.change").join("sub").join(manifest::FILE);
         let original = std::fs::read(&manifest_at).expect("read");
         std::fs::write(
             &manifest_at,
@@ -1143,11 +1244,28 @@ mod tests {
     }
 
     #[test]
+    fn a_build_inherits_no_herdr_variable() {
+        for name in [
+            "HERDR_PANE_ID",
+            "HERDR_PLUGIN_ID",
+            "HERDR_ANYTHING_NEW",
+            "HERDR_",
+        ] {
+            assert!(herdrs(OsStr::new(name)), "{name}");
+        }
+        assert!(!herdrs(OsStr::new("HERD")));
+        assert!(!herdrs(OsStr::new("PATH")));
+    }
+
+    #[test]
     fn a_failed_build_records_no_consent() {
         let dir = tempfile::tempdir().expect("dir");
         let upstream = repo_with(
             dir.path(),
-            "id = \"t.broken\"\n[[build]]\ncommand = [\"sh\", \"-c\", \"exit 3\"]\n",
+            &format!(
+                "{}[[build]]\ncommand = [\"sh\", \"-c\", \"exit 3\"]\n",
+                manifest::head("t.broken")
+            ),
         );
         let (_keep, home) = home();
         let err = install(&home, &upstream, None).expect_err("the build failed");
@@ -1161,7 +1279,7 @@ mod tests {
     #[test]
     fn rm_of_a_link_leaves_its_folder_alone() {
         let dir = tempfile::tempdir().expect("dir");
-        let live = folder(dir.path(), "live", "id = \"t.live\"\n");
+        let live = folder(dir.path(), "live", &manifest::head("t.live"));
         std::fs::write(live.join("keep.txt"), "mine").expect("file");
         let (_keep, home) = home();
         link(&home, &live, true).expect("linked");
@@ -1186,7 +1304,7 @@ mod tests {
     fn a_folder_inside_the_plugins_home_cannot_be_linked() {
         let (_keep, home) = home();
         std::fs::create_dir_all(&home.root).expect("mkdir");
-        let inner = folder(&home.root, ".state", "id = \"t.inner\"\n");
+        let inner = folder(&home.root, ".state", &manifest::head("t.inner"));
         let err = link(&home, &inner, true).expect_err("refused");
         assert!(err.to_string().contains("inside qoop's own"), "{err}");
     }
@@ -1194,7 +1312,7 @@ mod tests {
     #[test]
     fn a_link_whose_folder_is_gone_still_shows() {
         let dir = tempfile::tempdir().expect("dir");
-        let live = folder(dir.path(), "gone", "id = \"t.gone\"\n");
+        let live = folder(dir.path(), "gone", &manifest::head("t.gone"));
         let (_keep, home) = home();
         link(&home, &live, true).expect("linked");
         std::fs::remove_dir_all(&live).expect("rm");
@@ -1211,12 +1329,18 @@ mod tests {
         let a = folder(
             dir.path(),
             "a",
-            "id = \"a\"\n[[actions]]\nid = \"x\"\ncommand = [\"x\"]\n",
+            &format!(
+                "{}[[actions]]\nid = \"x\"\ntitle = \"X\"\ncommand = [\"x\"]\n",
+                manifest::head("a")
+            ),
         );
         let ab = folder(
             dir.path(),
             "ab",
-            "id = \"a.b\"\n[[actions]]\nid = \"c\"\ncommand = [\"c\"]\n",
+            &format!(
+                "{}[[actions]]\nid = \"c\"\ntitle = \"C\"\ncommand = [\"c\"]\n",
+                manifest::head("a.b")
+            ),
         );
         link(&home, &a, true).expect("a");
         link(&home, &ab, true).expect("a.b");
@@ -1225,8 +1349,6 @@ mod tests {
         assert_eq!(resolve(&home, "a.b"), Some(("a".into(), "b".into())));
         assert_eq!(resolve(&home, "z.x"), None);
         assert_eq!(resolve(&home, "a."), None);
-        let err = run_action(&home, "a.b.c").expect_err("not yet");
-        assert!(err.to_string().contains("not available yet"), "{err}");
     }
 
     #[test]
@@ -1270,6 +1392,7 @@ mod tests {
             sha: None,
             manifest: format!("id = \"p{n}\""),
             source: "s".into(),
+            subdir: None,
         };
         std::thread::scope(|s| {
             for n in 0..8 {
@@ -1297,6 +1420,7 @@ mod tests {
                     sha: None,
                     manifest: "id = \"p\"".into(),
                     source: "s".into(),
+                    subdir: None,
                 },
             );
         })

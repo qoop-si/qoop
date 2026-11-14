@@ -1,13 +1,17 @@
 //! A herdr plugin's `herdr-plugin.toml`, as qoop reads it.
 //!
-//! Lenient where herdr is lenient: a key qoop does not read (`name`, `description`, a pane's
-//! size, `[[link_handlers]]`) is ignored, so a manifest written for a newer herdr still
-//! installs. Strict where a mistake would run something unexpected: the id must be one qoop
-//! can use as a directory name, and every command is a non-empty argv.
+//! Checked the way herdr 0.9.5 checks it, so a manifest herdr refuses is refused here too: a
+//! name, a version and a `min_herdr_version` no newer than the herdr qoop answers as; titles on
+//! actions and panes; ids in herdr's character sets; platforms from herdr's three; every
+//! command a non-empty argv. A key qoop does not read (`description`, a pane's size,
+//! `[[link_handlers]]`) is left alone. On top of herdr's rules, a plugin id is never one a
+//! path could read as a parent or a hidden name, since it names a folder here.
+
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-/// The herdr release qoop answers as. A plugin that asks for a newer one is warned about.
+/// The herdr release qoop answers as.
 pub(crate) const HERDR_VERSION: &str = super::translate::VERSION;
 
 /// The name of the file at a plugin's root.
@@ -17,15 +21,22 @@ pub(crate) const FILE: &str = "herdr-plugin.toml";
 /// repository can make it hold in memory or in the consent ledger.
 pub(crate) const MAX_BYTES: u64 = 1 << 20;
 
+/// The platforms herdr names.
+const PLATFORMS: [&str; 3] = ["linux", "macos", "windows"];
+
+/// The longest id herdr takes, for a plugin and for its actions and panes.
+const MAX_ID: usize = 120;
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) id: String,
     #[serde(default)]
+    pub(crate) name: Option<String>,
+    #[serde(default)]
     pub(crate) version: Option<String>,
     #[serde(default)]
     pub(crate) min_herdr_version: Option<String>,
-    /// Where the plugin runs at all. Absent is everywhere; an empty list is nowhere, since
-    /// herdr reads the list as the platforms the plugin declares it can run on.
+    /// Where the plugin runs at all; absent is everywhere.
     #[serde(default)]
     pub(crate) platforms: Option<Vec<String>>,
     #[serde(default)]
@@ -94,48 +105,157 @@ fn this_os() -> &'static str {
 }
 
 /// Whether an entry with these `platforms` runs on this machine: absent is everywhere, a list
-/// (an empty one too) is only where it names.
+/// is only where it names.
 pub(crate) fn runs_here(platforms: Option<&[String]>) -> bool {
     platforms.is_none_or(|p| p.iter().any(|name| name == this_os()))
 }
 
-/// Whether `id` can name a plugin: lowercase, a letter or digit first, at most 64 bytes, and
-/// nothing a path could read as a separator or a parent.
+/// Whether `id` can name a plugin: herdr's set (ASCII letters and digits, `:`, `.`, `_`, `-`,
+/// at most 120), and never a name a path reads as hidden or as a parent, since it names a
+/// folder here.
 pub(crate) fn valid_id(id: &str) -> bool {
-    let mut bytes = id.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && id.len() <= 64
-        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-        // The consent ledger and its lock sit beside the plugin folders.
-        && !matches!(id, "consent.json" | "consent.lock")
+    !id.is_empty()
+        && id.len() <= MAX_ID
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":._-".contains(&b))
+        && !id.starts_with('.')
+        && !id.contains("..")
+        // The consent ledger, its lock, its temporary file and a set-aside ledger sit beside
+        // the plugin folders, on a file system that may ignore case.
+        && !id.to_ascii_lowercase().starts_with("consent.")
+}
+
+/// Whether `id` can name an action or a pane: herdr's set, with no dot (a dot separates a
+/// plugin from its action).
+fn valid_item_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":_-".contains(&b))
+}
+
+/// A `min_herdr_version` as herdr reads it: three numbers, an optional leading `v`.
+fn semver(text: &str) -> Option<[u64; 3]> {
+    let parts: Vec<&str> = text.trim().trim_start_matches('v').split('.').collect();
+    let [a, b, c] = parts.as_slice() else {
+        return None;
+    };
+    Some([a.parse().ok()?, b.parse().ok()?, c.parse().ok()?])
+}
+
+fn blank(text: Option<&String>) -> bool {
+    text.is_none_or(|t| t.trim().is_empty())
+}
+
+fn check_platforms(platforms: Option<&[String]>) -> Result<(), String> {
+    let Some(platforms) = platforms else {
+        return Ok(());
+    };
+    if platforms.is_empty() {
+        return Err(
+            "platforms must not be an empty array; omit the field to leave platforms undeclared"
+                .to_string(),
+        );
+    }
+    match platforms.iter().find(|p| !PLATFORMS.contains(&p.as_str())) {
+        Some(unknown) => Err(format!("unknown platform '{unknown}'")),
+        None => Ok(()),
+    }
 }
 
 impl Manifest {
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
-        let manifest: Self =
+        let mut m: Self =
             toml::from_str(text).map_err(|e| format!("{FILE} does not parse: {e}"))?;
-        if !valid_id(&manifest.id) {
-            return Err(format!(
-                "{FILE}: id {:?} is not a plugin id (a-z, 0-9, `.`, `_`, `-`, at most 64)",
-                manifest.id
+        m.id = m.id.trim().to_string();
+        let refuse = |why: String| Err(format!("{FILE}: {why}"));
+        if !valid_id(&m.id) {
+            return refuse("invalid plugin id".into());
+        }
+        if blank(m.name.as_ref()) {
+            return refuse("plugin name is required".into());
+        }
+        if blank(m.version.as_ref()) {
+            return refuse("plugin version is required".into());
+        }
+        let Some(wanted) = m
+            .min_herdr_version
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+        else {
+            return refuse("plugin min_herdr_version is required".into());
+        };
+        let here = semver(HERDR_VERSION).expect("qoop's herdr version is three numbers");
+        let Some(wanted) = semver(wanted) else {
+            return refuse(format!(
+                "plugin min_herdr_version must be a semantic version like {HERDR_VERSION}"
+            ));
+        };
+        if wanted > here {
+            let [a, b, c] = wanted;
+            return refuse(format!(
+                "plugin requires Herdr {a}.{b}.{c} or newer; current Herdr is {HERDR_VERSION}"
             ));
         }
-        let commands = manifest
-            .build
-            .iter()
-            .chain(&manifest.startup)
-            .map(|s| &s.command)
-            .chain(manifest.actions.iter().map(|a| &a.command))
-            .chain(manifest.panes.iter().map(|p| &p.command))
-            .chain(manifest.events.iter().map(|e| &e.command));
-        for command in commands {
-            if command.first().is_none_or(String::is_empty) {
-                return Err(format!("{FILE}: a command with no program"));
+        m.min_herdr_version = Some(format!("{}.{}.{}", wanted[0], wanted[1], wanted[2]));
+
+        let platforms = std::iter::once(m.platforms.as_deref())
+            .chain(
+                m.build
+                    .iter()
+                    .chain(&m.startup)
+                    .map(|s| s.platforms.as_deref()),
+            )
+            .chain(m.actions.iter().map(|a| a.platforms.as_deref()))
+            .chain(m.panes.iter().map(|p| p.platforms.as_deref()))
+            .chain(m.events.iter().map(|e| e.platforms.as_deref()));
+        for list in platforms {
+            check_platforms(list).map_err(|e| format!("{FILE}: {e}"))?;
+        }
+
+        let mut seen = BTreeSet::new();
+        for action in &m.actions {
+            if !valid_item_id(&action.id) {
+                return refuse("invalid action id".into());
+            }
+            if !seen.insert(action.id.as_str()) {
+                return refuse(format!("duplicate action id '{}'", action.id));
+            }
+            if blank(action.title.as_ref()) {
+                return refuse("action title is required".into());
             }
         }
-        Ok(manifest)
+        let mut seen = BTreeSet::new();
+        for pane in &m.panes {
+            if !valid_item_id(&pane.id) {
+                return refuse("invalid pane id".into());
+            }
+            if !seen.insert(pane.id.as_str()) {
+                return refuse(format!("duplicate pane id '{}'", pane.id));
+            }
+            if blank(pane.title.as_ref()) {
+                return refuse("pane title is required".into());
+            }
+        }
+        if m.events.iter().any(|e| e.on.trim().is_empty()) {
+            return refuse("an event hook with no event".into());
+        }
+        let commands = m
+            .build
+            .iter()
+            .chain(&m.startup)
+            .map(|s| &s.command)
+            .chain(m.actions.iter().map(|a| &a.command))
+            .chain(m.panes.iter().map(|p| &p.command))
+            .chain(m.events.iter().map(|e| &e.command));
+        for command in commands {
+            if command.is_empty() || command.iter().any(String::is_empty) {
+                return refuse("command must contain non-empty argv strings".into());
+            }
+        }
+        Ok(m)
     }
 
     /// Whether the plugin runs on this machine at all, by its top-level `platforms`.
@@ -143,46 +263,25 @@ impl Manifest {
         runs_here(self.platforms.as_deref())
     }
 
-    /// The manifest as this machine runs it: only the entries for this platform.
+    /// The manifest as this machine runs it: only the entries for this platform. An entry's own
+    /// `platforms` replace the plugin's, as herdr reads them.
     pub(crate) fn here(&self) -> Self {
+        let top = self.platforms.as_deref();
+        let runs = |own: Option<&[String]>| runs_here(own.or(top));
         let mut out = self.clone();
-        out.build.retain(|s| runs_here(s.platforms.as_deref()));
-        out.startup.retain(|s| runs_here(s.platforms.as_deref()));
-        out.actions.retain(|a| runs_here(a.platforms.as_deref()));
-        out.panes.retain(|p| runs_here(p.platforms.as_deref()));
-        out.events.retain(|e| runs_here(e.platforms.as_deref()));
+        out.build.retain(|s| runs(s.platforms.as_deref()));
+        out.startup.retain(|s| runs(s.platforms.as_deref()));
+        out.actions.retain(|a| runs(a.platforms.as_deref()));
+        out.panes.retain(|p| runs(p.platforms.as_deref()));
+        out.events.retain(|e| runs(e.platforms.as_deref()));
         out
-    }
-
-    /// Whether it asks for a newer herdr than qoop answers as.
-    pub(crate) fn wants_newer_herdr(&self) -> bool {
-        self.min_herdr_version
-            .as_deref()
-            .is_some_and(|wanted| newer(wanted, HERDR_VERSION))
     }
 }
 
-/// Whether dotted version `a` is above `b`, number by number. A part that is not a number (a
-/// `-beta` suffix) counts as zero, which reads a pre-release as its release.
-fn newer(a: &str, b: &str) -> bool {
-    let parts = |v: &str| -> Vec<u64> {
-        v.trim_start_matches('v')
-            .split('.')
-            .map(|p| {
-                p.split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0)
-            })
-            .collect()
-    };
-    let (a, b) = (parts(a), parts(b));
-    let len = a.len().max(b.len());
-    let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
-    (0..len)
-        .map(|i| at(&a, i).cmp(&at(&b, i)))
-        .find(|o| o.is_ne())
-        .is_some_and(std::cmp::Ordering::is_gt)
+/// A manifest head that passes, for the tests of this crate.
+#[cfg(test)]
+pub(crate) fn head(id: &str) -> String {
+    format!("id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\n")
 }
 
 #[cfg(test)]
@@ -193,7 +292,7 @@ mod tests {
 id = "pat.notes"
 name = "Notes"
 version = "1.2.3"
-min_herdr_version = "0.8.0"
+min_herdr_version = "v0.8.0"
 description = "Keep notes beside the agent."
 platforms = ["linux", "macos"]
 homepage = "a key qoop does not know"
@@ -248,8 +347,9 @@ action = "open"
     fn every_table_is_read() {
         let m = Manifest::parse(EVERY_TABLE).expect("parses");
         assert_eq!(m.id, "pat.notes");
+        assert_eq!(m.name.as_deref(), Some("Notes"));
         assert_eq!(m.version.as_deref(), Some("1.2.3"));
-        assert_eq!(m.min_herdr_version.as_deref(), Some("0.8.0"));
+        assert_eq!(m.min_herdr_version.as_deref(), Some("0.8.0"), "normalised");
         assert_eq!(m.platforms, Some(vec!["linux".into(), "macos".into()]));
         assert_eq!(m.build.len(), 2);
         assert_eq!(m.build[1].platforms, Some(vec!["windows".into()]));
@@ -270,7 +370,6 @@ action = "open"
         assert_eq!(m.events[0].on, "pane.closed");
         assert_eq!(m.events[1].id, None);
         assert_eq!(m.startup[0].command, ["bin/notes", "--daemon"]);
-        assert!(!m.wants_newer_herdr());
         assert!(m.runs_here(), "this test runs on linux or macos");
     }
 
@@ -280,67 +379,125 @@ action = "open"
         assert_eq!(m.build.len(), 1, "the windows build is not this machine's");
         assert_eq!(m.events.len(), 1);
         assert_eq!(m.actions.len(), 2);
+        // An entry's own platforms replace the plugin's.
+        let text = format!(
+            "{}platforms = [\"windows\"]\n[[actions]]\nid = \"a\"\ntitle = \"A\"\ncommand = [\"a\"]\nplatforms = [\"linux\", \"macos\"]\n",
+            head("x")
+        );
+        let m = Manifest::parse(&text).expect("parses");
+        assert!(!m.runs_here());
+        assert_eq!(m.here().actions.len(), 1);
     }
 
     #[test]
     fn top_level_platforms_decide_whether_it_runs_here_at_all() {
         let runs = |platforms: &str| {
-            Manifest::parse(&format!("id = \"a\"\n{platforms}"))
+            Manifest::parse(&format!("{}{platforms}", head("a")))
                 .expect("parses")
                 .runs_here()
         };
         assert!(runs(""), "absent is everywhere");
-        assert!(!runs("platforms = []"), "empty is nowhere");
         assert!(!runs("platforms = [\"windows\"]"));
         assert!(runs("platforms = [\"linux\", \"macos\", \"windows\"]"));
+        for bad in ["platforms = []", "platforms = [\"beos\"]"] {
+            assert!(
+                Manifest::parse(&format!("{}{bad}", head("a"))).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
     fn a_bare_manifest_parses() {
-        let m = Manifest::parse("id = \"x\"").expect("parses");
+        let m = Manifest::parse(&head("x")).expect("parses");
         assert!(m.actions.is_empty() && m.panes.is_empty() && m.build.is_empty());
     }
 
     #[test]
+    fn what_herdr_requires_is_required() {
+        let without = |key: &str| {
+            head("a")
+                .lines()
+                .filter(|l| !l.starts_with(key))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for key in ["name", "version", "min_herdr_version"] {
+            let err = Manifest::parse(&without(key)).expect_err(key);
+            assert!(err.contains("is required"), "{err}");
+        }
+        let newer = head("a").replace("0.9.0", "0.9.6");
+        let err = Manifest::parse(&newer).expect_err("newer");
+        assert!(
+            err.contains("plugin requires Herdr 0.9.6 or newer; current Herdr is 0.9.5"),
+            "{err}"
+        );
+        let odd = head("a").replace("0.9.0", "0.9");
+        assert!(
+            Manifest::parse(&odd)
+                .expect_err("odd")
+                .contains("semantic version")
+        );
+        let untitled = format!("{}[[actions]]\nid = \"x\"\ncommand = [\"x\"]\n", head("a"));
+        assert!(
+            Manifest::parse(&untitled)
+                .expect_err("title")
+                .contains("title is required")
+        );
+        let untitled = format!("{}[[panes]]\nid = \"x\"\ncommand = [\"x\"]\n", head("a"));
+        assert!(
+            Manifest::parse(&untitled)
+                .expect_err("title")
+                .contains("title is required")
+        );
+    }
+
+    #[test]
     fn a_bad_id_or_an_empty_command_is_refused() {
-        let long = "a".repeat(65);
+        let long = "a".repeat(121);
         for id in [
             "",
-            "X",
-            "-a",
             ".a",
             "a/b",
             "a b",
+            "a\\b",
+            "a..b",
             "../a",
             long.as_str(),
             "consent.json",
             "consent.lock",
+            "Consent.JSON",
+            "consent.tmp",
+            "consent.json.bad-1",
         ] {
-            let text = format!("id = {id:?}");
-            assert!(Manifest::parse(&text).is_err(), "{id:?}");
+            assert!(Manifest::parse(&head(id)).is_err(), "{id:?}");
         }
-        assert!(valid_id(&"a".repeat(64)));
+        assert!(valid_id(&"a".repeat(120)));
         assert!(valid_id("persiyanov.reviewr"));
-        for command in ["[]", "[\"\"]"] {
-            let text = format!("id = \"a\"\n[[actions]]\nid = \"x\"\ncommand = {command}\n");
+        assert!(valid_id("Pat:Notes_1-x"), "herdr's own set");
+        for item in ["a.b", "a b", ""] {
+            let text = format!(
+                "{}[[actions]]\nid = {item:?}\ntitle = \"T\"\ncommand = [\"x\"]\n",
+                head("a")
+            );
+            assert!(Manifest::parse(&text).is_err(), "{item:?}");
+        }
+        let twice = format!(
+            "{0}[[panes]]\nid = \"p\"\ntitle = \"P\"\ncommand = [\"x\"]\n[[panes]]\nid = \"p\"\ntitle = \"P\"\ncommand = [\"y\"]\n",
+            head("a")
+        );
+        assert!(
+            Manifest::parse(&twice)
+                .expect_err("dup")
+                .contains("duplicate pane id")
+        );
+        for command in ["[]", "[\"\"]", "[\"a\", \"\"]"] {
+            let text = format!(
+                "{}[[actions]]\nid = \"x\"\ntitle = \"T\"\ncommand = {command}\n",
+                head("a")
+            );
             assert!(Manifest::parse(&text).is_err(), "{command}");
         }
-        assert!(Manifest::parse("id = \"a\"\n[[actions]]\nid = \"x\"\n").is_err());
         assert!(Manifest::parse("not toml at all [").is_err());
-    }
-
-    #[test]
-    fn a_newer_herdr_is_noticed() {
-        let wants = |v: &str| {
-            Manifest::parse(&format!("id = \"a\"\nmin_herdr_version = {v:?}"))
-                .expect("parses")
-                .wants_newer_herdr()
-        };
-        assert!(wants("0.9.6"));
-        assert!(wants("0.10.0"));
-        assert!(wants("1.0"));
-        assert!(!wants("0.9.5"));
-        assert!(!wants("0.9"));
-        assert!(!wants("0.7.2"));
     }
 }

@@ -21,6 +21,8 @@ struct Stack {
 fn qoop(dir: &Path) -> Command {
     let mut cmd = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"));
     cmd.env("QOOP_RUNTIME_DIR", dir)
+        // Never followed by anything of qoop's own: only the shim reads it (Acceptance 6).
+        .env("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock")
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("SHELL", "/bin/sh");
@@ -72,7 +74,8 @@ impl Stack {
         let host = qoop(dir.path())
             .args(["plugin", "host"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Kept, so a failing test can say what the host said.
+            .stderr(std::fs::File::create(dir.path().join("host.err")).expect("host.err"))
             .spawn()
             .expect("spawn the host");
         let stack = Self { daemon, host, dir };
@@ -96,7 +99,11 @@ impl Stack {
             .expect("write");
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).expect("read");
-        serde_json::from_str(&line).expect("one json line")
+        serde_json::from_str(&line).unwrap_or_else(|e| {
+            let said =
+                std::fs::read_to_string(self.dir.path().join("host.err")).unwrap_or_default();
+            panic!("{method}: no answer ({e}); the host said:\n{said}")
+        })
     }
 
     fn shim(&self) -> PathBuf {
@@ -202,7 +209,7 @@ fn a_subscriber_hears_a_pane_open_and_close() {
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("timeout");
     let subscribe = json!({"id": "s", "method": "events.subscribe", "params": {"subscriptions": [
-        {"type": "pane.created"}, {"type": "pane.closed"}
+        {"type": "pane.created"}, {"type": "pane.exited"}
     ]}});
     stream
         .write_all(format!("{subscribe}\n").as_bytes())
@@ -240,7 +247,10 @@ fn a_subscriber_hears_a_pane_open_and_close() {
         .expect("qoop close");
     assert!(closed.status.success(), "{closed:?}");
     let gone = next();
-    assert_eq!(gone["event"], "pane_closed", "{gone}");
+    assert_eq!(
+        gone["event"], "pane_exited",
+        "a terminal closed outside the API: {gone}"
+    );
     assert_eq!(gone["data"]["pane_id"], pane_id.as_str());
 
     let mut other = UnixStream::connect(stack.herdr_socket()).expect("connect");
@@ -297,10 +307,33 @@ fn the_shim_is_herdr_for_a_plugin_and_nothing_else() {
         "--format prints the text itself: {text:?}"
     );
 
+    // Called wrong: plain words and exit 2, as herdr's command line says it.
     let unknown = herdr(&["integration", "status"]);
-    assert_eq!(unknown.status.code(), Some(1));
-    let refused: Value = serde_json::from_slice(&unknown.stderr).expect("json on stderr");
-    assert_eq!(refused["error"]["code"], "invalid_request");
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).starts_with("unknown command: integration status")
+    );
+    // A refusal from the host: its envelope on stderr and exit 1.
+    let refused = herdr(&["pane", "get", "w1:p999"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let refused: Value = serde_json::from_slice(&refused.stderr).expect("json on stderr");
+    assert_eq!(refused["error"]["code"], "pane_not_found");
+    // The quiet commands print nothing on success.
+    let quiet = herdr(&["pane", "send-text", &first, ""]);
+    assert!(
+        quiet.status.success() && quiet.stdout.is_empty(),
+        "{quiet:?}"
+    );
+    // No host at the socket named: herdr's `server_not_running`.
+    let gone = qoop_testkit::sandboxed(&shim)
+        .args(["pane", "list"])
+        .env("XDG_DATA_HOME", stack.dir.path().join("data"))
+        .env("HERDR_SOCKET_PATH", stack.dir.path().join("nobody.sock"))
+        .output()
+        .expect("run");
+    assert_eq!(gone.status.code(), Some(1));
+    let gone: Value = serde_json::from_slice(&gone.stderr).expect("json");
+    assert_eq!(gone["error"]["code"], "server_not_running");
 
     // The same binary under the name herdr anywhere else is plain qoop.
     let elsewhere = stack.dir.path().join("elsewhere");
@@ -335,10 +368,22 @@ fn the_host_leaves_when_the_daemon_does() {
 
 /// A linked plugin in `data`, recorded in the consent ledger as `agreed` (its own manifest
 /// unless the test wants a mismatch).
+/// A manifest's first line `id = "x"` made the head herdr requires: a name, a version and the
+/// herdr it needs.
+fn headed(manifest: &str) -> String {
+    match manifest.split_once('\n') {
+        Some((first, rest)) if first.starts_with("id = ") => format!(
+            "{first}\nname = \"test\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\n{rest}"
+        ),
+        _ => manifest.to_string(),
+    }
+}
+
 fn plant(data: &Path, id: &str, manifest: &str, agreed: &str, ledger: &mut Value) {
+    let (manifest, agreed) = (headed(manifest), headed(agreed));
     let folder = data.join("folders").join(id);
     std::fs::create_dir_all(&folder).expect("mkdir");
-    std::fs::write(folder.join("herdr-plugin.toml"), manifest).expect("manifest");
+    std::fs::write(folder.join("herdr-plugin.toml"), &manifest).expect("manifest");
     let plugins = data.join("qoop/plugins");
     std::fs::create_dir_all(&plugins).expect("mkdir");
     std::os::unix::fs::symlink(&folder, plugins.join(id)).expect("link");
@@ -384,7 +429,7 @@ fn hooks_and_startup_run_with_the_herdr_env_and_only_with_consent() {
     });
     let env = std::fs::read_to_string(&event).expect("read");
     for want in [
-        "HERDR_PLUGIN_EVENT=pane_created".to_string(),
+        "HERDR_PLUGIN_EVENT=pane.created".to_string(),
         "\"type\":\"pane_created\"".to_string(),
         format!("HERDR_PANE_ID=w1:p{terminal}"),
         "HERDR_PLUGIN_CONTEXT_JSON=".to_string(),
@@ -461,4 +506,373 @@ fn startup_commands_end_when_the_host_leaves() {
         stack.host.try_wait().expect("wait").is_some()
     });
     wait_for("its startup command to end", || !alive());
+}
+
+fn ok(answer: &Value) -> &Value {
+    if answer.get("error").is_some() || answer.is_null() {
+        eprintln!("answer: {answer}");
+    }
+    assert!(answer.get("error").is_none(), "refused: {answer}");
+    &answer["result"]
+}
+
+fn panes(stack: &Stack) -> Vec<Value> {
+    stack.ask("pane.list", json!({}))["result"]["panes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn screen_has(stack: &Stack, pane: &str, text: &str) -> bool {
+    stack.ask("pane.read", json!({"pane_id": pane, "source": "visible"}))["result"]["read"]["text"]
+        .as_str()
+        .is_some_and(|t| t.contains(text))
+}
+
+#[test]
+fn writes_change_qoop_as_herdr_asks() {
+    let stack = Stack::start_with(|dir| {
+        let base = "id = \"t.base\"\n";
+        plant(
+            &dir.join("data"),
+            "t.base",
+            base,
+            base,
+            &mut json!({"plugins": {}}),
+        );
+        // No desktop note reaches the person running the tests.
+        let config = dir.join("config/qoop");
+        std::fs::create_dir_all(&config).expect("mkdir");
+        std::fs::write(config.join("config.toml"), "[notify]\nmute = \"here\"\n").expect("config");
+    });
+    let first = panes(&stack)[0]["pane_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let split = stack.ask(
+        "pane.split",
+        json!({"target_pane_id": first, "direction": "right", "focus": false}),
+    );
+    let second = ok(&split)["pane"]["pane_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let now = panes(&stack);
+    assert_eq!(now.len(), 2);
+    assert_eq!(now[0]["tab_id"], now[1]["tab_id"], "one tab, split");
+
+    let renamed = stack.ask("pane.rename", json!({"pane_id": second, "label": "logs"}));
+    assert_eq!(ok(&renamed)["pane"]["label"], "logs");
+
+    ok(&stack.ask(
+        "pane.send_text",
+        json!({"pane_id": second, "text": "echo hi-there"}),
+    ));
+    ok(&stack.ask(
+        "pane.send_input",
+        json!({"pane_id": second, "keys": ["Enter"]}),
+    ));
+    wait_for("the typed command's output", || {
+        stack.ask("pane.read", json!({"pane_id": second, "source": "visible"}))["result"]["read"]
+            ["text"]
+            .as_str()
+            .is_some_and(|t| t.matches("hi-there").count() >= 2)
+    });
+    ok(&stack.ask(
+        "agent.prompt",
+        json!({"target": first, "text": "echo prompted-ok"}),
+    ));
+    wait_for("the prompt's output", || {
+        screen_has(&stack, &first, "prompted-ok\n")
+    });
+
+    let unnamed = stack.ask("pane.zoom", json!({"mode": "on"}));
+    assert_eq!(
+        unnamed["error"]["code"], "pane_not_found",
+        "no pane named, no caller, no focus reported: refused, not guessed"
+    );
+    // A focus is shown in every interface, so from then on it is what is shown.
+    ok(&stack.ask("pane.focus", json!({"pane_id": second})));
+    assert_eq!(
+        ok(&stack.ask("pane.current", json!({})))["pane"]["pane_id"],
+        second.as_str()
+    );
+    let zoom = stack.ask("pane.zoom", json!({"pane_id": second, "mode": "on"}));
+    assert_eq!(ok(&zoom)["zoom"]["zoomed"], true);
+    assert_eq!(zoom["result"]["zoom"]["pane_id"], second.as_str());
+
+    let tab = stack.ask("tab.create", json!({"label": "Files", "focus": false}));
+    let tab_id = ok(&tab)["tab"]["tab_id"].as_str().expect("tab").to_string();
+    assert_eq!(tab["result"]["tab"]["label"], "Files");
+    let tab_renamed = stack.ask("tab.rename", json!({"tab_id": tab_id, "label": "Docs"}));
+    assert_eq!(ok(&tab_renamed)["tab"]["label"], "Docs");
+    ok(&stack.ask("tab.focus", json!({"tab_id": tab_id})));
+    ok(&stack.ask("tab.close", json!({"tab_id": tab_id})));
+    assert!(panes(&stack).iter().all(|p| p["tab_id"] != tab_id.as_str()));
+
+    let made = stack.ask("workspace.create", json!({"label": "api", "focus": false}));
+    let space = ok(&made)["workspace"]["workspace_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    assert!(made["result"]["root_pane"]["pane_id"].is_string());
+    let renamed = stack.ask(
+        "workspace.rename",
+        json!({"workspace_id": space, "label": "api2"}),
+    );
+    assert_eq!(ok(&renamed)["workspace"]["label"], "api2");
+    ok(&stack.ask("workspace.focus", json!({"workspace_id": space})));
+    ok(&stack.ask("workspace.close", json!({"workspace_id": space})));
+    let spaces = stack.ask("workspace.list", json!({}));
+    assert!(
+        ok(&spaces)["workspaces"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .all(|w| w["workspace_id"] != space.as_str())
+    );
+
+    ok(&stack.ask("pane.close", json!({"pane_id": second})));
+    assert_eq!(panes(&stack).len(), 1);
+
+    // A shell asked for with an environment starts with it, and it is never typed.
+    let with_env = stack.ask(
+        "pane.split",
+        json!({"target_pane_id": first, "focus": false, "env": {"HELLO_ENV": "yes"}}),
+    );
+    let shell = ok(&with_env)["pane"]["pane_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    wait_for("the new shell", || screen_has(&stack, &shell, "$"));
+    ok(&stack.ask(
+        "pane.send_input",
+        json!({"pane_id": shell, "text": "echo $HELLO_ENV-seen", "keys": ["Enter"]}),
+    ));
+    wait_for("the variable in the shell", || {
+        screen_has(&stack, &shell, "yes-seen")
+    });
+    assert!(
+        !screen_has(&stack, &shell, "HELLO_ENV=yes"),
+        "never on the screen"
+    );
+    ok(&stack.ask("pane.close", json!({"pane_id": shell})));
+
+    let note = stack.ask(
+        "notification.show",
+        json!({"title": "done", "body": "green"}),
+    );
+    assert_eq!(ok(&note)["shown"], false, "muted here");
+    assert_eq!(note["result"]["reason"], "disabled");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_person_at_the_tab_refuses_a_plugins_write() {
+    let stack = Stack::start();
+    let first = panes(&stack)[0]["pane_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let terminal: u32 = first
+        .rsplit(":p")
+        .next()
+        .expect("p")
+        .parse()
+        .expect("number");
+    let socket = qoop_testkit::socket_in(stack.dir.path());
+    let (stream, inbuf) = qoop_runtime::client::connect(&socket, qoop_proto::INTERFACE_ID)
+        .await
+        .expect("connect");
+    let mut person = qoop_testkit::TestClient::from_parts(stream, inbuf, terminal);
+    person.input_to(terminal, b"half a thought").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let refused = stack.ask(
+        "pane.send_text",
+        json!({"pane_id": first, "text": "echo no"}),
+    );
+    assert_eq!(refused["error"]["code"], "input_refused", "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("a person is at terminal")),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_focus_is_told_as_herdr_tells_it_and_a_status_already_there_at_once() {
+    let stack = Stack::start();
+    let first = panes(&stack)[0].clone();
+    let pane = first["pane_id"].as_str().expect("id").to_string();
+    let mut stream = UnixStream::connect(stack.herdr_socket()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let subscribe = json!({"id": "s", "method": "events.subscribe", "params": {"subscriptions": [
+        {"type": "workspace.focused"}, {"type": "tab.focused"}, {"type": "pane.focused"},
+        {"type": "pane.agent_status_changed", "pane_id": pane, "agent_status": "unknown"}
+    ]}});
+    stream
+        .write_all(format!("{subscribe}\n").as_bytes())
+        .expect("write");
+    let mut lines = BufReader::new(stream).lines();
+    let mut next = || -> Value {
+        serde_json::from_str(&lines.next().expect("a line").expect("read")).expect("json")
+    };
+    assert_eq!(next()["result"]["type"], "subscription_started");
+    // A shell's status is already `unknown`: told at once.
+    let already = next();
+    assert_eq!(already["event"], "pane.agent_status_changed", "{already}");
+    assert_eq!(already["data"]["agent_status"], "unknown");
+
+    let terminal: u64 = first["terminal_id"]
+        .as_str()
+        .expect("t")
+        .parse()
+        .expect("n");
+    ok(&stack.ask("qoop.focus", json!({"terminal": terminal})));
+    let told: Vec<Value> = (0..3).map(|_| next()).collect();
+    let names: Vec<&str> = told
+        .iter()
+        .map(|e| e["event"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names, ["workspace_focused", "tab_focused", "pane_focused"]);
+    assert_eq!(told[2]["data"]["pane_id"], pane.as_str());
+    assert_eq!(told[2]["data"]["type"], "pane_focused");
+}
+
+#[test]
+fn the_interfaces_focus_is_checked_and_served() {
+    let stack = Stack::start();
+    let refused = stack.ask("qoop.focus", json!({"terminal": 999}));
+    assert_eq!(refused["error"]["code"], "pane_not_found");
+    let first = panes(&stack)[0].clone();
+    let terminal: u64 = first["terminal_id"]
+        .as_str()
+        .expect("t")
+        .parse()
+        .expect("n");
+    ok(&stack.ask("qoop.focus", json!({"terminal": terminal})));
+    assert_eq!(panes(&stack)[0]["focused"], true);
+    assert_eq!(
+        ok(&stack.ask("pane.current", json!({})))["pane"]["pane_id"],
+        first["pane_id"]
+    );
+    let snapshot = stack.ask("session.snapshot", json!({}));
+    assert_eq!(
+        ok(&snapshot)["snapshot"]["focused_pane_id"],
+        first["pane_id"]
+    );
+    let unknown = stack.ask("qoop.nothing", json!({}));
+    assert_eq!(unknown["error"]["code"], "invalid_request");
+}
+
+#[test]
+fn a_plugin_pane_runs_its_spec_and_a_popup_hands_focus_back() {
+    let manifest = "id = \"t.pane\"\n\
+                    [[panes]]\nid = \"view\"\ntitle = \"Viewer\"\nplacement = \"popup\"\n\
+                    command = [\"sh\", \"-c\", \"env > \\\"$HERDR_PLUGIN_STATE_DIR/pane-env.txt\\\"; sleep 30\"]\n\
+                    [[actions]]\nid = \"go\"\ntitle = \"Go\"\n\
+                    command = [\"sh\", \"-c\", \"env > \\\"$HERDR_PLUGIN_STATE_DIR/action-env.txt\\\"\"]\n";
+    let stack = Stack::start_with(|dir| {
+        plant(
+            &dir.join("data"),
+            "t.pane",
+            manifest,
+            manifest,
+            &mut json!({"plugins": {}}),
+        );
+    });
+    let first = panes(&stack)[0].clone();
+    let terminal: u64 = first["terminal_id"]
+        .as_str()
+        .expect("t")
+        .parse()
+        .expect("n");
+    ok(&stack.ask("qoop.focus", json!({"terminal": terminal})));
+
+    let opened = stack.ask(
+        "plugin.pane.open",
+        json!({"plugin_id": "t.pane", "entrypoint": "view",
+               "env": {"EXTRA": "yes", "HERDR_PLUGIN_ID": "someone.else"}}),
+    );
+    assert_eq!(
+        ok(&opened),
+        &json!({"type": "ok"}),
+        "a popup answers ok, as in herdr"
+    );
+    let popup = panes(&stack)
+        .into_iter()
+        .find(|p| p["label"] == "Viewer")
+        .expect("the popup, named after its title")["pane_id"]
+        .as_str()
+        .expect("pane")
+        .to_string();
+    let again = stack.ask(
+        "plugin.pane.open",
+        json!({"plugin_id": "t.pane", "entrypoint": "view"}),
+    );
+    assert_eq!(again["error"]["code"], "ui_busy", "one popup at a time");
+    let state = stack.dir.path().join("data/qoop/plugins/.state/t.pane");
+    let env_file = state.join("pane-env.txt");
+    wait_for("the pane's program", || {
+        std::fs::read_to_string(&env_file).is_ok_and(|e| e.contains("HERDR_PANE_ID="))
+    });
+    let env = std::fs::read_to_string(&env_file).expect("env");
+    for want in [
+        format!("HERDR_PANE_ID={popup}"),
+        "EXTRA=yes".to_string(),
+        "HERDR_WORKSPACE_ID=w1".to_string(),
+        "HERDR_TAB_ID=w1:t".to_string(),
+        "HERDR_PLUGIN_ENTRYPOINT_ID=view".to_string(),
+        "HERDR_PLUGIN_ID=t.pane".to_string(),
+    ] {
+        assert!(env.contains(&want), "{want} missing from\n{env}");
+    }
+    assert!(!env.lines().any(|l| l.starts_with("QOOP_")), "{env}");
+    assert!(
+        !screen_has(&stack, &popup, "EXTRA"),
+        "the spec never passes through the line editor"
+    );
+
+    assert_eq!(
+        ok(&stack.ask("pane.current", json!({})))["pane"]["pane_id"],
+        popup.as_str()
+    );
+    // A call with no pane named is about the pane before the popup.
+    let zoom = stack.ask("pane.zoom", json!({"mode": "off"}));
+    assert_eq!(ok(&zoom)["zoom"]["pane_id"], first["pane_id"]);
+    ok(&stack.ask(
+        "qoop.focus",
+        json!({"terminal": popup.rsplit(":p").next().expect("p").parse::<u64>().expect("n")}),
+    ));
+
+    ok(&stack.ask("popup.close", json!({})));
+    assert!(panes(&stack).iter().all(|p| p["pane_id"] != popup.as_str()));
+    assert_eq!(
+        ok(&stack.ask("pane.current", json!({})))["pane"]["pane_id"],
+        first["pane_id"],
+        "focus went back"
+    );
+    let none = stack.ask("popup.close", json!({}));
+    assert_eq!(none["error"]["code"], "popup_not_open", "{none}");
+    assert_eq!(none["error"]["message"], "no popup is open");
+
+    // `qoop plugin run` goes through the host, with the plugin's environment.
+    let ran = qoop(stack.dir.path())
+        .args(["plugin", "run", "t.pane.go"])
+        .output()
+        .expect("run");
+    assert!(ran.status.success(), "{ran:?}");
+    let action_env = state.join("action-env.txt");
+    wait_for("the action", || {
+        std::fs::read_to_string(&action_env).is_ok_and(|e| e.contains("HERDR_PLUGIN_ACTION_ID="))
+    });
+    let env = std::fs::read_to_string(&action_env).expect("env");
+    assert!(env.contains("HERDR_PLUGIN_ACTION_ID=go"), "{env}");
+    assert!(env.contains(&format!(
+        "HERDR_PANE_ID={}",
+        first["pane_id"].as_str().expect("id")
+    )));
 }

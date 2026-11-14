@@ -307,7 +307,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 or on a repeat; `qoop schedule` for more\n\
                   \x20 qoop doctor  whether the board, the questions and the agents agree;\n\
                   \x20                 read-only, `qoop doctor --help` for more\n\
-                  \x20 qoop send <terminal> <text> [--enter]  type into another terminal\n\
+                  \x20 qoop send <terminal> <text> [--enter] [--paste]  type into another terminal\n\
                   \x20 qoop send <terminal> --key NAME...  press named keys: enter esc tab\n\
                   \x20                 shift-tab backspace space up down left right home end\n\
                   \x20                 pageup pagedown ctrl-a..ctrl-z\n\
@@ -1614,7 +1614,9 @@ async fn control_roundtrip(
     let want = request.request_id().to_string();
     wr.write_all(&client::encode_control_seq(request, seq)?)
         .await?;
-    let mut read = [0u8; 64 * 1024];
+    // On the heap: a 64 KiB array in an async fn is 64 KiB in every future that awaits it, and
+    // a debug build copies those through its frames until a 2 MiB worker stack runs out.
+    let mut read = vec![0u8; 64 * 1024];
     let mut stashed = Vec::new();
     let answer = tokio::time::timeout(timeout, async {
         loop {
@@ -1752,12 +1754,13 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse};
     use tokio::io::AsyncWriteExt;
 
-    let help = "usage: qoop send <terminal> [--enter] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--generation G]";
+    let help = "usage: qoop send <terminal> [--enter] [--paste] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| usage(help))?;
     let mut enter = false;
+    let mut paste = false;
     let mut parts = Vec::new();
     let mut keys = Vec::new();
     let mut args = args.to_vec();
@@ -1766,6 +1769,8 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     while let Some(arg) = rest.next() {
         if arg == "--enter" {
             enter = true;
+        } else if arg == "--paste" {
+            paste = true;
         } else if arg == "--key" {
             keys.push(rest.next().cloned().ok_or_else(|| usage(help))?);
         } else if arg == "--" {
@@ -1778,7 +1783,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         }
     }
     // Keys and text in one call would have to agree on an order nobody wrote down.
-    if !keys.is_empty() && (!parts.is_empty() || enter) {
+    if !keys.is_empty() && (!parts.is_empty() || enter || paste) {
         return Err(usage(format!(
             "send either text or --key, not both; {help}"
         )));
@@ -1867,16 +1872,34 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         // Who sends, when the sender runs inside a terminal: binds the
         // daemon-side wait edge to its sender. Absent outside one.
         let (from_terminal, from_token) = cli_sender();
-        wr.write_all(&client::encode_command_to(
-            terminal,
-            &ClientWire::Input {
-                bytes: text.into_bytes(),
+        // `--paste`: inside the bracketed paste markers when the program asked for them, as a
+        // paste and not typing; the Enter, if any, after the paste.
+        let mut typed = text.into_bytes();
+        if paste {
+            let enter = enter.then(|| typed.pop()).flatten();
+            let pasted = std::mem::replace(&mut typed, enter.into_iter().collect());
+            wr.write_all(&client::encode_command_to(
+                terminal,
+                &ClientWire::Paste { bytes: pasted },
+                &mut term_seq,
+            )?)
+            .await?;
+            if !typed.is_empty() {
+                // As `qoop prompt` waits: an Enter right on the paste's heels can land
+                // before the program has taken the paste in.
+                wr.flush().await?;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        if !typed.is_empty() {
+            let wire = ClientWire::Input {
+                bytes: typed,
                 from_terminal,
                 from_token,
-            },
-            &mut term_seq,
-        )?)
-        .await?;
+            };
+            wr.write_all(&client::encode_command_to(terminal, &wire, &mut term_seq)?)
+                .await?;
+        }
         wr.flush().await?;
         crate::qass::note_prompted(terminal);
         paths::note_typed(terminal, &typed_by(), &said);
@@ -1965,7 +1988,8 @@ pub(crate) async fn fetch_snapshot(
             )));
         }
     }
-    let mut read = [0u8; 64 * 1024];
+    // On the heap, as in `control_roundtrip`.
+    let mut read = vec![0u8; 64 * 1024];
     // The first snapshot for the terminal can predate the subscription: output
     // printed while nobody watched was never published.
     tokio::time::timeout(Duration::from_secs(10), async {
