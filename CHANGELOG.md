@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.16.0](https://github.com/qoop-si/qoop/compare/v0.15.0...v0.16.0) (2026-11-14)
+
+
+### New
+
+* **cli:** qoop race new and ls, one prompt to many agents ([f08f832](https://github.com/qoop-si/qoop/commit/f08f8324cd8aced126d57419a0da75d9c2bb6733))
+* **cli:** qoop race rm and ls --test ([3eede6b](https://github.com/qoop-si/qoop/commit/3eede6b764ef954b7571e382db9efe2bd39c7b09))
+* **worktree:** finish a worktree with a proof, a pull request, a fast-forward or a discard ([f77ef20](https://github.com/qoop-si/qoop/commit/f77ef2028f8fe5f51ec0e2125f1569d45b5649a1))
+* **worktree:** list stale worktrees with ls --stale ([30027e5](https://github.com/qoop-si/qoop/commit/30027e58ea40d60afed2ed8d512d4498e8d60123))
+* **worktree:** open a worktree's tab in its repository's space and claim an index ([7ac3dd7](https://github.com/qoop-si/qoop/commit/7ac3dd709e35303ca563533d499c25bdc4cce349))
+* **worktree:** set up a new worktree from its space's config ([e51a3c1](https://github.com/qoop-si/qoop/commit/e51a3c18573c21227413dec462c277cd5b0284e0))
+
+
+### Fixed
+
+* **cli:** race rm closes only its own tabs and rechecks each racer ([c682371](https://github.com/qoop-si/qoop/commit/c682371119106289baccbe5361630b30a6a83418))
+* **cli:** race rm closes only the racer's own tab ([2bd63c6](https://github.com/qoop-si/qoop/commit/2bd63c68efd977795edcf121ff509f84aff7e67f))
+* **cli:** race rm finds a pruned racer's tab and judges unknown by row ([df95eb0](https://github.com/qoop-si/qoop/commit/df95eb0ccee2b05b926670c3e0a18f7383eb3e2b))
+* **update:** wait out a busy binary when asking its version ([814148c](https://github.com/qoop-si/qoop/commit/814148c146c40b342812df207c928e0bcad31ae5))
+* **worktree:** call a worktree with nothing the base lacks merged ([d92716a](https://github.com/qoop-si/qoop/commit/d92716a23d239718d8d344fdee610a43685f69a6))
+* **worktree:** pass over the finished branch when picking the default base ([955f208](https://github.com/qoop-si/qoop/commit/955f208fc122bcb71287899044ec774677660819))
+* **worktree:** prove before deleting, full ref names, bounded remote calls ([10b9e5e](https://github.com/qoop-si/qoop/commit/10b9e5e64484e0b231ef8ae33bfffc1728314be9))
+* **worktree:** read origin/HEAD as its branch and bound the pipe drain ([6f4fa0c](https://github.com/qoop-si/qoop/commit/6f4fa0c010513158bdfca92cfc5a3717b32cf410))
+* **worktree:** tighten the worktree setup rules and its copy ([68015c7](https://github.com/qoop-si/qoop/commit/68015c7cbc75d92c5fbae3f0c020fbe0deda6bd7))
+
 ## [0.15.0](https://github.com/qoop-si/qoop/compare/v0.14.0...v0.15.0) (2026-11-14)
 
 
