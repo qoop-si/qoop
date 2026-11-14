@@ -154,7 +154,6 @@ pub fn check(command: &str, cwd: &str) -> Result<Vec<String>, String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("the check could not start: {e}"))?;
-    let pid = child.id() as libc::pid_t;
     let (out_tx, out_rx) = mpsc::channel();
     let (err_tx, err_rx) = mpsc::channel();
     if let Some(pipe) = child.stdout.take() {
@@ -163,24 +162,7 @@ pub fn check(command: &str, cwd: &str) -> Result<Vec<String>, String> {
     if let Some(pipe) = child.stderr.take() {
         std::thread::spawn(move || err_tx.send(tail_of(pipe)));
     }
-    // Exited, but not reaped: `WNOWAIT` leaves the leader a zombie holding its id.
-    let exited = || {
-        // SAFETY: a zeroed siginfo is valid, and the call only writes it.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-        // SAFETY: asks about this call's own child, which is not reaped yet.
-        let asked = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
-        asked == 0 && info.si_signo == libc::SIGCHLD
-    };
-    let deadline = Instant::now() + DEADLINE;
-    while !exited() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let late = !exited();
-    // SAFETY: a plain signal to the process group this call made, whose leader is unreaped.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let status = child
-        .wait()
+    let (status, late) = reap_by(&mut child, Instant::now() + DEADLINE)
         .map_err(|e| format!("the check could not be waited for: {e}"))?;
     if late {
         return Err(format!("the check ran longer than {}s", DEADLINE.as_secs()));
@@ -204,6 +186,60 @@ pub fn check(command: &str, cwd: &str) -> Result<Vec<String>, String> {
         return Err(format!("check exited {code}: {why}"));
     }
     Ok(lines)
+}
+
+/// Wait for `child`, the leader of a process group of its own, until `deadline`; then kill the
+/// whole group, on every way out, before the leader is reaped, so the id is still its own. Its
+/// exit, and whether it was still running at the deadline.
+fn reap_by(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<(std::process::ExitStatus, bool)> {
+    let pid = child.id() as libc::pid_t;
+    // Exited, but not reaped: `WNOWAIT` leaves the leader a zombie holding its id.
+    let exited = || {
+        // SAFETY: a zeroed siginfo is valid, and the call only writes it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: asks about this call's own child, which is not reaped yet.
+        let asked = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        asked == 0 && info.si_signo == libc::SIGCHLD
+    };
+    while !exited() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let late = !exited();
+    // SAFETY: a plain signal to the process group this call made, whose leader is unreaped.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    Ok((child.wait()?, late))
+}
+
+/// How a command run for its exit ended: its code (`None` on a signal) and whether it was
+/// killed at its deadline.
+#[derive(Debug, PartialEq)]
+pub struct Exit {
+    pub code: Option<i32>,
+    pub timed_out: bool,
+}
+
+/// Run `command` with `sh -c` in `cwd` for its exit alone, its output discarded, `within` at
+/// most: a process group of its own, killed with all it started on every way out (see
+/// [`reap_by`]).
+pub fn run_sh(command: &str, cwd: &std::path::Path, within: Duration) -> std::io::Result<Exit> {
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let (status, timed_out) = reap_by(&mut child, Instant::now() + within)?;
+    Ok(Exit {
+        code: status.code().filter(|_| !timed_out),
+        timed_out,
+    })
 }
 
 #[cfg(test)]
@@ -296,5 +332,37 @@ mod tests {
             "a process of the check survived: {}",
             String::from_utf8_lossy(&left.stdout)
         );
+    }
+
+    #[test]
+    fn a_command_run_for_its_exit_says_how_it_ended() {
+        let cwd = std::env::temp_dir();
+        let ran = |line: &str, within| run_sh(line, &cwd, within).unwrap();
+        let soon = Duration::from_secs(10);
+        assert_eq!(
+            ran("echo out; echo err >&2", soon),
+            Exit {
+                code: Some(0),
+                timed_out: false
+            }
+        );
+        assert_eq!(ran("exit 3", soon).code, Some(3));
+        let secs = 700 + std::process::id() % 397;
+        let started = Instant::now();
+        let late = ran(&format!("sleep {secs} | cat"), Duration::from_millis(300));
+        assert_eq!(
+            late,
+            Exit {
+                code: None,
+                timed_out: true
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(300));
+        let left = Command::new("pgrep")
+            .args(["-fx", &format!("sleep {secs}")])
+            .output()
+            .unwrap();
+        assert!(left.stdout.is_empty(), "a process of the command survived");
     }
 }

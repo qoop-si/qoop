@@ -178,12 +178,27 @@ fn terminals(out: &str) -> Vec<String> {
 }
 
 #[test]
-fn a_race_starts_each_agent_in_its_worktree_and_waits_until_all_finished() {
+fn a_race_runs_from_start_to_its_winner() {
     let stack = Stack::start();
     let repo = stack.repo("my repo");
-    let head = git(&repo, &["rev-parse", "HEAD"]);
-    let out = stack.run_in(
+    // Started from a linked checkout on a branch of its own: the base is its HEAD, not main's.
+    let feat = stack.path("w").join("feat");
+    git(
         &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            &feat.display().to_string(),
+        ],
+    );
+    git(&feat, &["commit", "-q", "--allow-empty", "-m", "on feat"]);
+    let head = git(&feat, &["rev-parse", "HEAD"]);
+    assert_ne!(head, git(&repo, &["rev-parse", "HEAD"]));
+    let out = stack.run_in(
+        &feat,
         &[
             "race",
             "new",
@@ -244,6 +259,189 @@ fn a_race_starts_each_agent_in_its_worktree_and_waits_until_all_finished() {
     );
     assert!(lines[0].ends_with("my repo-wt-race-fix-claude"), "{listed}");
     assert!(lines[1].starts_with("agent=claude-2 "), "{listed}");
+
+    // Started once only.
+    let again = stack.run_in(
+        &repo,
+        &["race", "new", "fix", "--agents", "claude,codex", "--", "x"],
+    );
+    assert!(
+        text(&again.stderr).contains("race fix exists"),
+        "{}",
+        text(&again.stderr)
+    );
+
+    // Judged by a command run in each worktree.
+    let ls = |test: &str| {
+        text(
+            &stack
+                .run_in(&repo, &["race", "ls", "fix", "--test", test])
+                .stdout,
+        )
+    };
+    assert_eq!(ls("test -e raced.txt").matches(" tests=pass ").count(), 2);
+    assert_eq!(ls("exit 1").matches(" tests=fail ").count(), 2);
+
+    // A keep that names no racer is refused before anything is looked at.
+    let out = stack.run_in(&repo, &["race", "rm", "fix", "--keep", "codex", "--force"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    // The loser's changes are not dropped without --force, and nothing is touched.
+    let out = stack.run_in(&repo, &["race", "rm", "fix", "--keep", "claude"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("claude-2: uncommitted changes in"),
+        "{}",
+        text(&out.stderr)
+    );
+    let racers = |name: &str| {
+        let prefix = format!("race/{name}/");
+        stack
+            .rows()
+            .iter()
+            .filter(|r| r["name"].as_str().is_some_and(|s| s.starts_with(&prefix)))
+            .count()
+    };
+    assert_eq!(racers("fix"), 2, "every tab is still open");
+    let out = stack.run_in(&repo, &["race", "rm", "fix", "--keep", "claude", "--force"]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}{}", text(&out.stderr));
+    assert!(
+        said.starts_with("removed agent=claude-2 worktree="),
+        "{said}"
+    );
+    assert!(said.contains(" branch=race/fix/claude-2"), "{said}");
+    assert_eq!(racers("fix"), 1);
+    assert!(!has_ref(&repo, "refs/heads/race/fix/claude-2"));
+    assert!(
+        !stack
+            .path("w")
+            .join("my repo-wt-race-fix-claude-2")
+            .exists()
+    );
+    assert!(
+        has_ref(&repo, "refs/qoop/race/fix"),
+        "the winner keeps the race"
+    );
+
+    // The winner committed, which only --force drops; with it, the race is gone.
+    let winner = stack.path("w").join("my repo-wt-race-fix-claude");
+    git(&winner, &["add", "raced.txt"]);
+    git(&winner, &["commit", "-q", "-m", "won"]);
+    let out = stack.run_in(&repo, &["race", "rm", "fix"]);
+    assert!(
+        text(&out.stderr).contains("claude: commits past the base (1)"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = stack.run_in(&repo, &["race", "rm", "fix", "--force"]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}{}", text(&out.stderr));
+    assert!(said.ends_with("removed ref=refs/qoop/race/fix\n"), "{said}");
+    assert!(!has_ref(&repo, "refs/qoop/race/fix"));
+    assert!(!has_ref(&repo, "refs/heads/race/fix/claude"));
+    assert_eq!(racers("fix"), 0);
+}
+
+#[test]
+fn a_racer_still_working_or_with_another_tab_inside_is_never_dropped() {
+    let stack = Stack::start();
+    let repo = stack.repo("h");
+    let racers = |name: &str| {
+        let prefix = format!("race/{name}/");
+        stack
+            .rows()
+            .iter()
+            .filter(|r| r["name"].as_str().is_some_and(|s| s.starts_with(&prefix)))
+            .count()
+    };
+    let out = stack.run_in(
+        &repo,
+        &[
+            "race",
+            "new",
+            "w",
+            "--agents",
+            "claude,claude",
+            "--",
+            "WORK",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        stack.wait(|| stack.agents_in("w", 2)),
+        "the racers never started"
+    );
+    let out = stack.run_in(&repo, &["race", "rm", "w", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("is working"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(racers("w"), 2);
+
+    let out = stack.run_in(
+        &repo,
+        &[
+            "race",
+            "new",
+            "d",
+            "--agents",
+            "claude,claude",
+            "--wait",
+            "--timeout",
+            "60",
+            "--",
+            "DONE",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // A shell of the person's inside a loser's worktree.
+    let inside = stack.path("w").join("h-wt-race-d-claude");
+    let out = stack.run_in(
+        &repo,
+        &[
+            "new",
+            "--name",
+            "mine",
+            "--cwd",
+            &inside.display().to_string(),
+        ],
+    );
+    let mine = text(&out.stdout).trim().to_string();
+    assert!(
+        stack.wait(|| stack.rows().iter().any(|r| r["name"] == "mine"
+            && r["cwd"]
+                .as_str()
+                .is_some_and(|c| c.ends_with("h-wt-race-d-claude")))),
+        "the shell never showed its folder"
+    );
+    let out = stack.run_in(&repo, &["race", "rm", "d", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains(&format!("qoop terminal {mine} is inside")),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(racers("d"), 2, "every tab is still open");
+
+    // With that shell closed and a racer's folder deleted by hand, the race goes whole.
+    assert!(stack.run_in(&repo, &["close", &mine]).status.success());
+    std::fs::remove_dir_all(stack.path("w").join("h-wt-race-d-claude-2")).unwrap();
+    let out = stack.run_in(&repo, &["race", "rm", "d", "--force"]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}{}", text(&out.stderr));
+    assert!(
+        said.contains("removed agent=claude-2 worktree=- branch=race/d/claude-2"),
+        "{said}"
+    );
+    assert_eq!(
+        racers("d"),
+        0,
+        "the tab of the folder deleted by hand is closed too"
+    );
+    assert!(!has_ref(&repo, "refs/heads/race/d/claude-2"));
+    assert!(!has_ref(&repo, "refs/qoop/race/d"));
 }
 
 #[test]

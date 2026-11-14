@@ -761,7 +761,7 @@ pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Res
 /// another session is not this tab. `home` is the session this process was
 /// started in, read before `--session` replaced it.
 /// The terminal this command runs in, when it runs in one of this machine's.
-fn own_terminal() -> Option<u32> {
+pub(crate) fn own_terminal() -> Option<u32> {
     qoop_runtime::legacy::var("QOOP_TERMINAL")
         .ok()?
         .parse()

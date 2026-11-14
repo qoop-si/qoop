@@ -131,6 +131,24 @@ locally, never pushing. `--discard` drops the worktree and the branch with their
 changes, the only mode that loses work. `worktree ls --stale` only lists the
 clean worktrees that are merged or old, with `why=`.
 
+```bash
+qoop race new <name> --agents A,B[,...] [--base REF] [--wait [--timeout SECS]] -- <prompt>|-
+qoop race ls <name> [--test CMD]
+qoop race rm <name> [--keep AGENT] [--force]
+```
+
+A race is the person's or qass's: from a worker agent's terminal `race new` is
+refused, so never start one as a worker. It gives 2 to 5 agents the same prompt,
+each on `race/<name>/<agent>` in its own worktree and tab, from one base commit
+(the ref `refs/qoop/race/<name>`). Each racer is told: change files in its
+worktree only, no commit, push, PR, merge, closing its tab or starting agents,
+end with a self-report. `--wait` prints an `end=` per racer (finished, failed,
+blocked, sleeping, closed, exited, not-started), exit 0 only when all finished; a
+blocked line names the `qoop wait` to keep waiting. `race ls` shows each racer's
+status, files, lines added and removed since the base, and `--test` results. End
+it with `race rm <name> --keep <winner> --force` (losers are dirty, a working
+racer is never dropped); after the winner lands, `race rm <name> --force`.
+
 ## Supervising other agents
 
 1. `qoop agents --json`: note each worker's `terminal` and `generation`.
