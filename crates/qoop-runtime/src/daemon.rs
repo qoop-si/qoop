@@ -10685,18 +10685,32 @@ fn sweep_history(dir: &Path, open: &std::collections::BTreeSet<u32>) {
 ///
 /// A resume command carries a session id that came from an agent, and a directory name
 /// that came from a person. Neither is guaranteed to be free of the characters a shell
-/// reads, and this text is typed into a shell.
+/// reads, and this text is typed into a shell: sh, bash, zsh or fish.
+///
+/// Typed, so a control character other than a newline is a key to the line editor
+/// (`ctrl-u` wipes the line so far) and becomes a space. `'` and `\` never sit inside the
+/// quotes, since fish reads `\'` and `\\` there as escapes; a leading `=` is zsh's path
+/// expansion.
 pub(crate) fn shell_line(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
+            let arg = arg.replace(|c: char| c.is_control() && c != '\n', " ");
             if !arg.is_empty()
+                && !arg.starts_with('=')
                 && arg
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c))
             {
-                arg.clone()
+                arg
             } else {
-                format!("'{}'", arg.replace('\'', r"'\''"))
+                let body: String = arg
+                    .chars()
+                    .map(|c| match c {
+                        '\'' | '\\' => format!("'\\{c}'"),
+                        c => c.to_string(),
+                    })
+                    .collect();
+                format!("'{body}'")
             }
         })
         .collect::<Vec<_>>()
@@ -14003,6 +14017,67 @@ mod restore_report_tests {
         assert!(line.contains("agent folder not available"), "{line:?}");
         // Quoted once for the pasted command, and again for the `printf` that shows it.
         assert!(line.contains(r"cd '\''/tmp/a b'\'' && claude"), "{line:?}");
+    }
+
+    /// A typed resume line runs the argv it names in sh, bash, zsh (with `RC_QUOTES` too)
+    /// and fish, whatever an id or a folder name holds, and nothing else.
+    #[test]
+    fn a_typed_line_round_trips_through_every_real_shell() {
+        let words = [
+            "printf",
+            "%s<END>",
+            r"a\'; touch pwn; #",
+            r"\\",
+            "'",
+            r"'\''",
+            "",
+            "$(touch pwn)",
+            "`touch pwn`",
+            "(touch pwn)",
+            "x\n'; touch pwn; #",
+            "=touch",
+            "çalışma ağacı ĞÜŞİÖÇ",
+        ]
+        .map(String::from);
+        let line = super::shell_line(&words);
+        assert_eq!(
+            super::shell_line(&["a\u{15}touch pwn\r".into()]),
+            "'a touch pwn '"
+        );
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let find = |name: &str| {
+            std::env::split_paths(&path)
+                .chain(["/bin", "/usr/bin", "/opt/homebrew/bin"].map(PathBuf::from))
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+        };
+        let shells: [(&str, &[&str]); 5] = [
+            ("sh", &["-c"]),
+            ("bash", &["-c"]),
+            ("zsh", &["-c"]),
+            ("zsh", &["-o", "rcquotes", "-c"]),
+            ("fish", &["--no-config", "-c"]),
+        ];
+        for (name, args) in shells {
+            let Some(shell) = find(name) else {
+                println!("SKIPPED {name}: not installed on this machine");
+                continue;
+            };
+            let dir = tempfile::tempdir().expect("tempdir");
+            let out = std::process::Command::new(shell)
+                .args(args)
+                .arg(&line)
+                .current_dir(dir.path())
+                .output()
+                .expect("run the shell");
+            let stdout = String::from_utf8(out.stdout).expect("utf-8");
+            let back: Vec<&str> = stdout.split("<END>").collect();
+            assert_eq!(back[..back.len() - 1], words[2..], "{name} {args:?}");
+            assert!(
+                !dir.path().join("pwn").exists(),
+                "{name} {args:?} ran a command"
+            );
+        }
     }
 
     /// The walk up never ends in `/`, and a relative path is never present.

@@ -28,8 +28,7 @@ impl RemoteShell {
     /// `fish` fails with "Unsupported use of '='", which is a message nobody reading "the
     /// daemon did not start" would connect to their shell.
     ///
-    /// The value is quoted, so it is one word of data and never shell text. The posix quote
-    /// reads the same in fish, except that fish folds a doubled backslash inside quotes.
+    /// The value is quoted, so it is one word of data and never shell text, in fish too.
     pub fn with_env(self, name: &str, value: &str, command: &str) -> String {
         let value = crate::saved::shell_quote(value);
         match self {
