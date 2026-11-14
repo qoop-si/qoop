@@ -33,3 +33,6 @@ jobs:
           branch: cla-signatures
           allowlist: qoopsy,*[bot]
           custom-pr-sign-comment: I have read the CLA Document and I hereby sign the CLA
+          # The action locks a merged pull request by default; release-please comments on its merged
+          # Release PR after making the release, and a locked one stops the release run.
+          lock-pullrequest-aftermerge: false
