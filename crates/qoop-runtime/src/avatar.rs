@@ -299,6 +299,42 @@ pub fn save(avatar: &Avatar) -> std::io::Result<()> {
     save_to(&avatar_path(), avatar)
 }
 
+/// Pets dealt from a seed: the same seed deals the same pets, in the same order. `qoop avatar`
+/// seeds it from the clock for a fresh batch; a client that gives each kind of agent a pet
+/// seeds it with that kind's fixed number. A tiny xorshift, as there is no rand crate.
+pub struct Deal(u64);
+
+impl Deal {
+    /// Zero would deal the same pet forever, so it is moved off.
+    pub fn new(seed: u64) -> Self {
+        Deal(if seed == 0 { 0x9e37 } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+
+    /// The next pet: a hair, its eyes and its ink, each from the picker's own sets.
+    pub fn pet(&mut self) -> Avatar {
+        Avatar {
+            body: BODY.into(),
+            hair: HAIR_STYLES[self.below(HAIR_STYLES.len())].into(),
+            eyes: EYE_STYLES[self.below(EYE_STYLES.len())].into(),
+            hair_ink: HAIR_INKS[self.below(HAIR_INKS.len())],
+            body_ink: BODY_INK,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

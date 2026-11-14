@@ -424,6 +424,8 @@ fn scenario() {
                 "local spaces are listed first: {spaces:?}"
             );
 
+            via_reaches_the_named_machine(&mut tui, space, &socket).await;
+
             // Typed into and read back through the mux.
             tui.ask(ControlRequest::Subscribe {
                 id: "show-tiles".into(),
@@ -602,6 +604,154 @@ fn scenario() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// `Via`: a request that names no terminal or space reaches the machine of the space it names,
+/// and only there; its answer carries the inner request's id. One wrapped twice is refused by
+/// the mux, and a daemon reached directly refuses it as a method it does not know.
+async fn via_reaches_the_named_machine(tui: &mut Tui, space: i64, local_socket: &Path) {
+    use qoop_runtime::control::ScheduleOp;
+    let via = |id: &str, request: ControlRequest| ControlRequest::Via {
+        id: id.into(),
+        workspace: space,
+        request: Box::new(request),
+    };
+    tui.ask(via(
+        "via-add",
+        ControlRequest::ScheduleWrite {
+            id: "via-add".into(),
+            terminal: None,
+            token: None,
+            action: Box::new(ScheduleOp::Add {
+                name: "far-only".into(),
+                cron: Some("0 3 1 1 *".into()),
+                at: None,
+                watch: None,
+                agent: None,
+                cwd: "/tmp".into(),
+                space: None,
+                prompt: "echo via".into(),
+            }),
+        },
+    ))
+    .await;
+    tui.until(
+        "the remote to take the schedule",
+        |incoming| match incoming {
+            Incoming::Control(ControlResponse::ScheduleWritten { id, .. }) if id == "via-add" => {
+                Some(())
+            }
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "via-add" => {
+                panic!("the schedule was refused: {reason}")
+            }
+            _ => None,
+        },
+    )
+    .await;
+    let names = |schedules: &[qoop_runtime::control::ScheduleInfo]| -> Vec<String> {
+        schedules.iter().map(|s| s.name.clone()).collect()
+    };
+    tui.ask(via(
+        "via-read",
+        ControlRequest::ScheduleRead {
+            id: "via-read".into(),
+        },
+    ))
+    .await;
+    let there = tui
+        .until("the remote's schedules", |incoming| match incoming {
+            Incoming::Control(ControlResponse::Schedules { id, schedules }) if id == "via-read" => {
+                Some(names(schedules))
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(there, vec!["far-only".to_string()], "read on the remote");
+    tui.ask(ControlRequest::ScheduleRead {
+        id: "here-read".into(),
+    })
+    .await;
+    let here = tui
+        .until("this machine's schedules", |incoming| match incoming {
+            Incoming::Control(ControlResponse::Schedules { id, schedules })
+                if id == "here-read" =>
+            {
+                Some(names(schedules))
+            }
+            _ => None,
+        })
+        .await;
+    assert!(
+        here.is_empty(),
+        "the schedule went to this machine: {here:?}"
+    );
+
+    // Wrapped twice: the mux refuses it under the outer id.
+    tui.ask(via(
+        "via-twice",
+        via(
+            "via-inner",
+            ControlRequest::ScheduleRead {
+                id: "via-inner".into(),
+            },
+        ),
+    ))
+    .await;
+    let reason = tui
+        .until("the nested Via to be refused", |incoming| match incoming {
+            Incoming::Control(ControlResponse::Failed { id, reason }) if id == "via-twice" => {
+                Some(reason.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert!(reason.contains("Via inside a Via"), "{reason}");
+
+    // Straight to a daemon, as a client that skipped the mux would send it.
+    let (stream, mut inbuf) = client::connect(local_socket, "test")
+        .await
+        .expect("connect");
+    let (mut rd, mut wr) = stream.into_split();
+    let mut seq = 0;
+    let frame = client::encode_control_seq(
+        &via(
+            "direct",
+            ControlRequest::ScheduleRead {
+                id: "direct-inner".into(),
+            },
+        ),
+        &mut seq,
+    )
+    .expect("encode");
+    wr.write_all(&frame).await.expect("write");
+    let mut conn = Connection::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reason = loop {
+        let found = conn
+            .drain(&mut inbuf)
+            .expect("decode")
+            .into_iter()
+            .find_map(|incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id, reason }) if id == "direct" => {
+                    Some(reason)
+                }
+                _ => None,
+            });
+        if let Some(reason) = found {
+            break reason;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "the daemon never answered the Via");
+        let mut read = [0u8; 16 * 1024];
+        match tokio::time::timeout(left, rd.read(&mut read)).await {
+            Ok(Ok(n)) if n > 0 => inbuf.extend_from_slice(&read[..n]),
+            other => panic!("the daemon closed or stalled: {other:?}"),
+        }
+    };
+    assert!(
+        qoop_runtime::control::too_old_for(&reason, Some("Via")),
+        "not refused as an unknown method: {reason}"
+    );
 }
 
 /// A machine with no qoop: named as such, installed from the release of this version,

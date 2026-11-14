@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::{Context, Window};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::link::Up;
+use crate::spike_link::Up;
 use crate::view::{Pane, Spike};
 
 static LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);

@@ -1,4 +1,5 @@
-//! The window: the panes, the keyboard and the input method.
+//! The Phase 0 window, kept for the measured runs (`--features bench`): up to four panes, the
+//! keyboard and the input method. The product window is `app.rs`.
 //!
 //! Flags:
 //!   --panes N             terminals to show, 1 to 4 (default 4)
@@ -14,18 +15,18 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Context, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    Pixels, Render, UTF16Selection, Window, WindowBounds, WindowOptions, div, font, point,
-    prelude::*, px, size,
+    Pixels, Render, UTF16Selection, Window, WindowBounds, WindowOptions, div, point, prelude::*,
+    px, size,
 };
 use qoop_domain::Viewport;
 use qoop_runtime::control::TerminalStream;
 use qoop_runtime::daemon::SnapshotWire;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, rgb};
+use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, cells, rgb};
 use crate::keys::{self, Press};
-use crate::link::{self, Down, Latest, Up};
 use crate::probe;
+use crate::spike_link::{self as link, Down, Latest, Up};
 
 /// Between the panes: the ground a step lighter.
 const DIVIDER: [u8; 3] = [0x26, 0x26, 0x2a];
@@ -228,7 +229,12 @@ impl Spike {
                 stale: !self.connected,
                 sent: pane.sent.clone(),
                 viewport: pane.viewport.clone(),
-                up: self.up.clone(),
+                resize: {
+                    let up = self.up.clone();
+                    Rc::new(move |t, cols, rows| {
+                        let _ = up.send(Up::Resize(t, cols, rows));
+                    })
+                },
                 input: focused.then(|| (self.focus.clone(), cx.entity())),
             })
     }
@@ -378,28 +384,6 @@ fn window_size(o: &Options, cells: &Cells) -> gpui::Size<Pixels> {
         cells.width * (f32::from(o.cols) * across) + px(across - 1.),
         cells.height * (f32::from(o.rows) * down) + px(down - 1.),
     )
-}
-
-/// The cell size of the terminal font: the advance of `m` across, 1.2 em down, both in
-/// whole pixels so rows and columns never fall between device pixels.
-fn cells(cx: &App, font_size: f32) -> Cells {
-    let font = font("Menlo");
-    let text = cx.text_system();
-    let id = text.resolve_font(&font);
-    let size = px(font_size);
-    // Whole pixels across too: a fractional advance puts glyphs on four subpixel positions,
-    // each rasterized on its own (Herdr moved to whole-pixel cells for the same reason).
-    let width = text
-        .advance(id, size, 'm')
-        .map(|s| s.width.round())
-        .unwrap_or(px((font_size * 0.6).round()))
-        .max(px(1.));
-    Cells {
-        font,
-        font_size: size,
-        width,
-        height: px((font_size * 1.2).ceil()),
-    }
 }
 
 pub fn main() {

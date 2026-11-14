@@ -1452,6 +1452,22 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Ok(())
             }
             R::ConnectRemote { id, target } => self.connect_remote(id, target).await,
+            // A request that names no terminal or space, for the machine `workspace` is on. It
+            // goes as it is, so its answer carries the inner id and comes back as that daemon
+            // gave it; one wrapped twice is refused rather than sent to a daemon to refuse.
+            R::Via {
+                id,
+                workspace,
+                request,
+            } => {
+                if matches!(*request, R::Via { .. }) {
+                    return self
+                        .failed(id, "a Via inside a Via is not forwarded".into())
+                        .await;
+                }
+                let (link, _) = workspace_in(workspace);
+                self.send_one(link, *request).await
+            }
             // A picture for a tab is kept where the tab runs, so a remote agent can read it.
             R::SaveUpload {
                 id,
