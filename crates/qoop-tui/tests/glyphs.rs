@@ -56,6 +56,14 @@ const MATCHED: &[(&str, &str)] = &[
         "qoop-desktop/src/element.rs",
         "\u{2717}\u{23fa}\u{23bf}\u{276f}\u{4e2d}\u{2705}",
     ),
+    // Letters with marks that a branch made from a task keeps the base letter of: mapped,
+    // never drawn.
+    (
+        "qoop-desktop/src/state.rs",
+        "çÇğĞıİíìîïöÖóòôõşŞüÜúùûáàâäãÄéèêëñß",
+    ),
+    // Typed into the window's text field by a test, as an input method would: never drawn by qoop.
+    ("qoop-desktop/src/tests.rs", "şıüか"),
 ];
 
 /// Files that make a character from a number, and why what they make is safe.
