@@ -79,10 +79,10 @@ fn skill_start(program: &str) -> &'static str {
     }
 }
 
-/// What qass's agent is run with besides its words. opencode runs its own server
-/// (`--standalone`), so the qoop hook loads in qass's tab and not in the shared background
-/// service, whose environment is the first tab's.
-fn own_server(program: &str) -> &'static [&'static str] {
+/// What an agent qoop starts with words (qass, a scheduled run, a racer) is run with besides
+/// them. opencode runs its own server (`--standalone`), so the qoop hook loads in its own tab
+/// and not in the shared background service, whose environment is the first tab's.
+pub(crate) fn own_server(program: &str) -> &'static [&'static str] {
     match program {
         "opencode" => &["--standalone"],
         _ => &[],
@@ -99,7 +99,7 @@ fn bypass(program: &str) -> &'static [&'static str] {
 }
 
 /// `words` without a flag the person's own line already carries (`opencode --standalone`).
-fn not_typed(line: Option<&str>, words: impl Iterator<Item = String>) -> Vec<String> {
+pub(crate) fn not_typed(line: Option<&str>, words: impl Iterator<Item = String>) -> Vec<String> {
     words
         .filter(|w| {
             !(w.starts_with("--") && line.is_some_and(|l| l.split_whitespace().any(|x| x == w)))

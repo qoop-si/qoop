@@ -14,7 +14,7 @@ use qoop_runtime::control::{
 use qoop_runtime::schedule::{Cron, Zone, parse_at, system_zone};
 use qoop_tui::config;
 
-use crate::qass::{first_message_args, program_of};
+use crate::qass::{first_message_args, not_typed, own_server, program_of};
 use crate::supervise::{NewOpts, open_terminal};
 use crate::usage;
 
@@ -324,7 +324,8 @@ fn still_working(name: &str) -> std::io::Result<bool> {
 }
 
 /// What the line typed into the new terminal is: a person's `[agents]` line as written, or the
-/// program's name, then the prompt as that program takes a first message.
+/// program's name; then what it runs its own server with (see [`own_server`]) unless the line
+/// says it already, and the prompt as that program takes a first message.
 pub(crate) fn launch(
     agent: &str,
     prompt: &str,
@@ -350,11 +351,13 @@ pub(crate) fn launch(
             "{agent} runs {program}, which cannot be started with a message"
         ));
     };
-    let command = if line.is_some() {
-        said
-    } else {
-        std::iter::once(agent.to_string()).chain(said).collect()
-    };
+    // Only qoop's own words are checked against the line, never the prompt.
+    let own = not_typed(
+        line.as_deref(),
+        own_server(&program).iter().map(|w| w.to_string()),
+    );
+    let by_name = line.is_none().then(|| agent.to_string());
+    let command = by_name.into_iter().chain(own).chain(said).collect();
     Ok((line, command))
 }
 
@@ -511,6 +514,25 @@ mod tests {
         assert!(agent_ok("opencode", &[]).is_ok());
         assert!(agent_ok("sonnet", &launchers()).is_ok());
         assert!(agent_ok("aider", &launchers()).is_err());
+    }
+
+    #[test]
+    fn opencode_runs_its_own_server_said_once_and_never_in_the_prompt() {
+        let (_, command) = launch("opencode", "x", &[]).unwrap();
+        assert_eq!(command, ["opencode", "--standalone", "--prompt", "x"]);
+        let own = [config::Launcher {
+            name: "oc".into(),
+            command: "opencode --standalone --model m".into(),
+        }];
+        let (typed, command) = launch("oc", "use --standalone", &own).unwrap();
+        assert_eq!(typed.as_deref(), Some("opencode --standalone --model m"));
+        assert_eq!(
+            command,
+            ["--prompt", "use --standalone"],
+            "the line says it already, and the prompt is kept whole"
+        );
+        let (_, command) = launch("claude", "x", &[]).unwrap();
+        assert_eq!(command, ["claude", "x"]);
     }
 
     #[test]
