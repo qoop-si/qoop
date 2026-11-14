@@ -381,19 +381,27 @@ mod tests {
         assert!(rereads(&[EventMessage::TasksChanged]).is_empty());
     }
 
+    /// The mux reads the remotes list and writes the space order beside it: a test's own, never
+    /// the person's. Set once for the whole test binary, before any mux in it starts.
+    fn isolated_remotes() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // SAFETY: set once, before any mux in this binary reads it.
+            unsafe {
+                std::env::set_var(
+                    qoop_remote::saved::REMOTES_ENV,
+                    dir.path().join("remotes.json"),
+                )
+            };
+            dir
+        });
+    }
+
     /// A window linked through the mux gets the merged agent and space lists from a daemon.
     #[tokio::test]
     async fn the_link_gets_agents_and_spaces_through_the_mux() {
-        // The mux takes in the saved remotes as it runs: a list of its own, never the person's.
-        let home = tempfile::tempdir().expect("tempdir");
-        // SAFETY: the only test here that touches the environment, and nothing reads this
-        // variable but the mux it is set for.
-        unsafe {
-            std::env::set_var(
-                qoop_remote::saved::REMOTES_ENV,
-                home.path().join("remotes.json"),
-            )
-        };
+        isolated_remotes();
         let d = qoop_testkit::TestDaemon::start().await;
         let (mut wire, mux) = through_mux(d.socket(), Vec::new()).await.expect("linked");
         for ask in opening_asks() {
@@ -431,6 +439,7 @@ mod tests {
     #[tokio::test]
     async fn a_sleeping_agent_tab_of_a_real_daemon_is_on_home() {
         use crate::state::{Chip, Kind, Model};
+        isolated_remotes();
         let d = qoop_testkit::TestDaemon::start().await;
         let mut c = d.attach("sleeper").await;
         let space = match ask(
