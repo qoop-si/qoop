@@ -76,7 +76,7 @@ setup = "bun install"
 | `spaces.<name>.worktree.setup` | none | run as `sh -c` in the new worktree, stdin `/dev/null`, output to stderr, no time limit, with `QOOP_WORKTREE`, `QOOP_WORKTREE_SOURCE`, `QOOP_WORKTREE_BRANCH` and `QOOP_WORKTREE_INDEX` |
 
 A problem in the matched space's `[spaces.<name>]` table (a wrong type, a refused pattern, an
-unknown key), or a file that is not TOML throughout, uses none of it: the setup fails, the
+unknown key), or a line in `[spaces]` that is not TOML, uses none of it: the setup fails, the
 worktree is kept and no terminal opens. A problem in another space's table is only said.
 
 ## These keys are per machine

@@ -99,7 +99,7 @@ git check-ref-format --branch "$branch" >/dev/null
 
 mkdir -p "@QASS_DATA@"
 cd "$repo"
-# Prints `worktree=<path> branch=<name>`, then `terminal=<n>`.
+# Prints `worktree=<path> branch=<name>`, `setup=<state>` (its space's setup), then `terminal=<n>`.
 t="$(qoop worktree new "$branch" ${where[@]+"${where[@]}"} -- "${cmd[@]}" | sed -n 's/^terminal=//p')"
 case "$t" in '' | *[!0-9]*) echo "spawn: no terminal number from qoop worktree new" >&2; exit 1 ;; esac
 # From here the worker exists: nothing below may end the script early by error.

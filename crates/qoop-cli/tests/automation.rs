@@ -687,7 +687,13 @@ fn worktree_mistakes_exit_two_and_a_vanished_one_names_prune() {
     let help = daemon.run_in(&repo, &["worktree", "help"]);
     assert_eq!(help.status.code(), Some(0));
     assert!(text(&help.stdout).contains("qoop worktree rm"));
-    for args in [&["worktree"][..], &["worktree", "bogus"]] {
+    for args in [
+        &["worktree"][..],
+        &["worktree", "bogus"],
+        &["worktree", "setup", "--bogus"],
+        &["worktree", "setup", "a", "b"],
+        &["worktree", "setup", "--space"],
+    ] {
         let out = daemon.run_in(&repo, args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(text(&out.stderr).contains("qoop worktree rm"), "{args:?}");
@@ -1017,6 +1023,117 @@ fn a_failed_setup_keeps_the_worktree_opens_no_terminal_and_can_be_run_again() {
     assert!(alone.status.success(), "{}", text(&alone.stderr));
     assert_eq!(said(&alone, "setup").as_deref(), Some("none"));
     assert!(!ran.exists());
+
+    // A bad line outside `[spaces]` costs that line only: the space's setup still runs.
+    daemon.config(&format!(
+        "theme = dark\n[spaces.fixme.worktree]\nsetup = \"touch '{}'\"\n",
+        ran.display()
+    ));
+    let elsewhere = daemon.run_in(
+        &repo,
+        &["worktree", "new", "feat/elsewhere", "--space", "fixme"],
+    );
+    assert!(elsewhere.status.success(), "{}", text(&elsewhere.stderr));
+    assert_eq!(said(&elsewhere, "setup").as_deref(), Some("done"));
+    assert!(ran.exists());
+
+    // Patterns that match nothing copy nothing, say so, and with no command are `none`.
+    daemon.config("[spaces.fixme.worktree]\ncopy = [\"nothing-here*\"]\n");
+    let nothing = daemon.run_in(
+        &repo,
+        &["worktree", "new", "feat/nothing", "--space", "fixme"],
+    );
+    assert!(nothing.status.success(), "{}", text(&nothing.stderr));
+    assert_eq!(said(&nothing, "setup").as_deref(), Some("none"));
+    assert!(
+        text(&nothing.stderr).contains(&format!(
+            "setup: copied 0 files from {}",
+            std::fs::canonicalize(&repo).unwrap().display()
+        )),
+        "{}",
+        text(&nothing.stderr)
+    );
+}
+
+/// `--space <id>` keys the space's name; two names that tie with no table are a tie, said;
+/// the deepest folder wins over one above it; qass's own space never counts.
+#[test]
+fn the_space_rule_reads_ids_ties_nesting_and_never_qass() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let sub = root_path.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let repo = repo(&sub);
+    daemon.config("[spaces.named.worktree]\nsetup = \"true\"\n");
+
+    let named = make_space(&daemon, "named");
+    let by_id = daemon.run_in(&repo, &["worktree", "new", "feat/id", "--space", &named]);
+    assert!(by_id.status.success(), "{}", text(&by_id.stderr));
+    assert_eq!(said(&by_id, "setup").as_deref(), Some("done"));
+    assert!(
+        text(&by_id.stderr).contains("setup: space named: running true"),
+        "{}",
+        text(&by_id.stderr)
+    );
+
+    // Nested folders: the deepest that holds the repository; qass's own is passed by.
+    let outer = make_space(&daemon, "outer");
+    let inner = make_space(&daemon, "inner");
+    let qass = make_space(&daemon, "qass");
+    space_dir(&daemon, &outer, &root_path);
+    space_dir(&daemon, &inner, &sub);
+    space_dir(&daemon, &qass, &repo);
+    let (_, terminal) = new_worktree(&daemon, &repo, "feat/nested");
+    assert_eq!(workspace_of(&daemon, &terminal), inner);
+
+    // Two names with the repository as folder, neither with a table: a tie, said.
+    let left = make_space(&daemon, "left");
+    let right = make_space(&daemon, "right");
+    space_dir(&daemon, &left, &repo);
+    space_dir(&daemon, &right, &repo);
+    let tie = daemon.run_in(&repo, &["worktree", "new", "feat/tie"]);
+    assert!(tie.status.success(), "{}", text(&tie.stderr));
+    assert_eq!(said(&tie, "setup").as_deref(), Some("none"));
+    assert!(
+        text(&tie.stderr).contains(&format!(
+            "setup: spaces left ({left}), right ({right}) tie for {}",
+            repo.display()
+        )),
+        "{}",
+        text(&tie.stderr)
+    );
+    let terminal = said(&tie, "terminal").expect("a terminal");
+    assert_eq!(workspace_of(&daemon, &terminal), workspace_of(&daemon, "1"));
+}
+
+/// A repository of its own inside an ignored folder is listed by git as a folder: passed
+/// by, not refused, under the docs' own `**/.env*`.
+#[test]
+fn a_nested_repository_is_passed_by_a_glob_copy() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    std::fs::write(repo.join(".gitignore"), "vendor/\n.env*\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::create_dir_all(repo.join("vendor/lib")).unwrap();
+    std::fs::create_dir_all(repo.join("apps/web")).unwrap();
+    git(&repo.join("vendor/lib"), &["init", "-q"]);
+    std::fs::write(repo.join("vendor/lib/.env"), "theirs\n").unwrap();
+    std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+    std::fs::write(repo.join("apps/web/.env.local"), "B=2\n").unwrap();
+    daemon.config("[spaces.app.worktree]\ncopy = [\"**/.env*\"]\n");
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/glob", "--space", "app"]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+    assert_eq!(said(&made, "setup").as_deref(), Some("done"));
+    let tree = root.path().join("my repo-wt-feat-glob");
+    assert_eq!(std::fs::read_to_string(tree.join(".env")).unwrap(), "A=1\n");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("apps/web/.env.local")).unwrap(),
+        "B=2\n"
+    );
+    assert!(!tree.join("vendor").exists());
 }
 
 #[test]
