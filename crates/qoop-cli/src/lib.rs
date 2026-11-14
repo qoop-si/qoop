@@ -332,7 +332,10 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20 qoop race new <name> --agents A,B[,...] [--base REF] [--wait [--timeout SECS]] -- <prompt...>|-\n\
                   \x20                 one prompt to 2 to 5 agents, each on a branch\n\
                   \x20                 race/<name>/<agent> in a worktree and tab of its own\n\
-                  \x20 qoop race ls <name>  each racer's tab, status, files and lines\n\
+                  \x20 qoop race ls <name> [--test CMD]  each racer's tab, status, files,\n\
+                  \x20                 lines and, with --test, whether CMD passed in it\n\
+                  \x20 qoop race rm <name> [--keep AGENT] [--force]  drop every racer but\n\
+                  \x20                 the kept one; a working one never\n\
                   \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
                   \x20 qoop space goal <id|name> [text|-]  what you want from a space: print it, set it, an empty text clears it\n\
                   \x20 qoop space dir <id|name> [path]  the folder a space's new tabs and agents start in: print it or set it\n\

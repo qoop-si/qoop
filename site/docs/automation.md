@@ -78,6 +78,43 @@ worktree for the review's fixes; `--merge` fast-forwards the main checkout's bra
 `rm` it runs from outside the worktree: every mode, `--discard` included, refuses while a
 process is inside. `ls --stale` only lists, from the refs here.
 
+## Race
+
+```
+qoop race new login --agents claude,codex -- add a login page    one prompt, two agents
+qoop race new login --agents claude,codex --wait -- add a login page
+qoop race ls login --test 'cargo test'      each racer's files, lines and tests
+qoop race rm login --keep codex --force     drop every racer but the winner
+```
+
+`race new` gives each agent (2 to 5, a name from `[agents]` or `claude`, `codex`, `gemini`,
+`opencode`; a second of one agent is `claude-2`) a branch `race/<name>/<agent>`, a worktree
+where `worktree new` puts one, set up as its space says, and a tab named after the branch with
+the agent started on the prompt. Under the prompt each racer is told to change files in its
+worktree only, never commit, push, open a PR, merge, close its tab or start agents, and to end
+with a short self-report. Every racer starts from one commit: `HEAD` of the checkout you run it
+in, or `--base`; uncommitted changes there are not in the racers. A worker agent's terminal
+cannot start a race; your own shell and qass can. `--wait` returns once every racer finished,
+failed, is blocked, asleep, closed, quit to its shell or never started, a line each, and exits
+0 only when every racer finished. A blocked racer waits for you: its line names the `qoop wait`
+that keeps waiting on it.
+
+`race ls` counts what each worktree changed since that commit, committed or not; `--test` runs
+your command in each worktree, which runs the racer's code. To end a race, judge with `race ls`,
+then `race rm <name> --keep <winner> --force`: the racers were told not to commit, so every
+loser that did anything has uncommitted changes, and `--force` is what drops them. A racer
+still working is never dropped, `--force` or not. The winner keeps its branch, worktree and tab;
+once it has landed, `race rm <name> --force` drops it and the race too. Like `worktree rm`, it
+never removes a folder a process still stands in: a tool server an agent's own background
+service started there (Codex's app server keeps them) is named, and `race rm` stops; once
+those end, run it again and it finishes.
+
+Each agent must be installed and signed in, and cost and memory grow with each racer. qoop adds
+no permission flag: without an `[agents]` line that carries yours, each racer stops at its first
+permission prompt, and Claude asks once to trust each new worktree folder. The phone's Changes
+view diffs a racer against the default branch, so with another base it shows that base's own
+commits too; `race ls` is exact.
+
 ## Spaces
 
 ```
