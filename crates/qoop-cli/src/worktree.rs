@@ -306,8 +306,12 @@ fn not_awake() -> std::io::Error {
 enum Place {
     /// `name` keys its `[spaces.<name>]` table; `open` is what the tab is opened in: a found
     /// space's id, or `--space` as typed, so a space that does not exist yet is made only
-    /// when the tab opens.
-    Space { name: String, open: String },
+    /// when the tab opens. `dir` is the space's folder, when it has one.
+    Space {
+        name: String,
+        open: String,
+        dir: Option<String>,
+    },
     /// No space, or a tie nothing breaks: the daemon's default space, nothing set up. `tied`
     /// names the spaces of a tie, as `(id, name)`.
     Default { tied: Vec<(i64, String)> },
@@ -327,12 +331,12 @@ fn place_of(
     has_table: impl Fn(&str) -> bool,
 ) -> std::io::Result<Place> {
     if let Some(wanted) = wanted {
-        let name = supervise::pick_space(spaces, wanted)?
-            .and_then(|id| spaces.iter().find(|s| s.id == id))
-            .map_or(wanted, |s| s.name.as_str());
+        let found = supervise::pick_space(spaces, wanted)?
+            .and_then(|id| spaces.iter().find(|s| s.id == id));
         return Ok(Place::Space {
-            name: name.to_string(),
+            name: found.map_or(wanted, |s| s.name.as_str()).to_string(),
             open: wanted.to_string(),
+            dir: found.and_then(|s| s.dir.clone()),
         });
     }
     let main = real(main);
@@ -372,15 +376,15 @@ fn place_of(
         });
     };
     // Spaces of one name share its table; the tab goes to the lowest id among them.
-    let id = tied
+    let space = tied
         .iter()
         .filter(|s| s.name == name)
-        .map(|s| s.id)
-        .min()
+        .min_by_key(|s| s.id)
         .expect("a chosen name is a tied space's");
     Ok(Place::Space {
         name: name.to_string(),
-        open: id.to_string(),
+        open: space.id.to_string(),
+        dir: space.dir.clone(),
     })
 }
 
@@ -413,8 +417,8 @@ fn git_dirs(tree: &std::path::Path) -> std::io::Result<(PathBuf, String)> {
 /// already holding this id is its index: git reuses an id (the folder's name), so a branch
 /// made again takes up the claim its earlier worktree left. Else the lowest number with no
 /// claim, or with one whose `<common>/worktrees/<id>` is gone, so a worktree removed by
-/// plain git frees its number too. Read and written under a lock of its own, so two parallel
-/// `new`s never take one number.
+/// plain git frees its number too. A claim that cannot be read counts as taken. Read and
+/// written under a lock of its own, so two parallel `new`s never take one number.
 fn claim_index(common: &std::path::Path, id: &str) -> std::io::Result<u32> {
     let claims = common.join("qoop-worktree-index");
     let _held = qoop_runtime::lock::StartupLock::acquire(&common.join("qoop-worktree-index.lock"))?;
@@ -428,16 +432,24 @@ fn claim_index(common: &std::path::Path, id: &str) -> std::io::Result<u32> {
             .and_then(|n| n.parse::<u32>().ok())
             .filter(|&n| n > 0)
         {
-            held.insert(n, std::fs::read_to_string(entry.path())?.trim().to_string());
+            let holder = std::fs::read_to_string(entry.path()).ok();
+            held.insert(n, holder.map(|h| h.trim().to_string()));
         }
     }
-    if let Some((&n, _)) = held.iter().find(|(_, holder)| *holder == id) {
+    if let Some((&n, _)) = held
+        .iter()
+        .find(|(_, holder)| holder.as_deref() == Some(id))
+    {
         return Ok(n);
     }
-    let live =
-        |holder: &String| !holder.is_empty() && common.join("worktrees").join(holder).is_dir();
+    // Unread is taken: a number whose holder nobody can name is never handed out again.
+    let free = |holder: &Option<String>| {
+        holder
+            .as_deref()
+            .is_some_and(|h| h.is_empty() || !common.join("worktrees").join(h).is_dir())
+    };
     let n = (1..)
-        .find(|n| held.get(n).is_none_or(|holder| !live(holder)))
+        .find(|n| held.get(n).is_none_or(free))
         .expect("a free number");
     std::fs::write(claims.join(n.to_string()), id)?;
     Ok(n)
@@ -448,14 +460,50 @@ fn has_table(read: &qoop_tui::config::Read) -> impl Fn(&str) -> bool + '_ {
     |name| read.spaces.get(name).is_some_and(|s| s.worktree)
 }
 
-/// Copy and run what the worktree's space says in `config.toml`, then print the `setup=`
-/// line: `done`, `none` (no space, or none of its settings), or `failed`. A failure says
-/// why on stderr and is the `why` returned.
+/// What a worktree inherits from a git hook or a script that ran qoop, and would point git
+/// or the setup at another repository or change how a pattern matches.
+const GIT_SCOPE: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// Everything after `git worktree add`, for `new` and `setup` alike: claim the worktree's
+/// index, then, unless `skip`, set it up as its space says. Prints the `setup=` line,
+/// `failed` included; the error is why, for the caller's retry hint.
+fn prepare(
+    main: &std::path::Path,
+    tree: &std::path::Path,
+    branch: &str,
+    place: &Place,
+    read: &qoop_tui::config::Read,
+    skip: bool,
+) -> Result<(), String> {
+    let state = git_dirs(tree)
+        .and_then(|(common, id)| claim_index(&common, &id))
+        .map_err(|e| {
+            eprintln!("setup: no index for {}: {e}", tree.display());
+            "no index".to_string()
+        })
+        .and_then(|index| match skip {
+            true => Ok("skipped"),
+            false => set_up(main, tree, branch, index, place, read),
+        });
+    println!("setup={}", state.as_deref().unwrap_or("failed"));
+    state.map(|_| ())
+}
+
+/// Copy and run what the worktree's space says in `config.toml`: `done` when something was
+/// copied or run, `none` when nothing was (no space, none of its settings, nothing matched).
+/// A failure says why on stderr and is the error returned.
 ///
 /// The settings are the person's own file and never the repository's, so a cloned
 /// repository can never run anything. A table with any problem in it is used not at all,
-/// and so is a file that did not read whole wherever a space was found or a tie broken:
-/// a copy or a command without the part that was wrong is not what was written.
+/// and so is a file whose `[spaces]` did not read whole wherever a space was found or a tie
+/// broken: a copy or a command without the part that was wrong is not what was written.
 fn set_up(
     main: &std::path::Path,
     tree: &std::path::Path,
@@ -463,27 +511,24 @@ fn set_up(
     index: u32,
     place: &Place,
     read: &qoop_tui::config::Read,
-) -> Result<(), String> {
-    let done = match settings_of(main, place, read) {
-        Ok(None) => Ok(false),
-        Ok(Some(space)) => copy_ignored(main, tree, &space.copy).and_then(|()| {
-            space
-                .setup
-                .as_deref()
-                .map_or(Ok(()), |line| run_setup(line, main, tree, branch, index))
-                .map(|()| true)
-        }),
-        Err(why) => Err(why),
+) -> Result<&'static str, String> {
+    let Some(space) = settings_of(main, place, read)? else {
+        return Ok("none");
     };
-    println!(
-        "setup={}",
-        match done {
-            Ok(true) => "done",
-            Ok(false) => "none",
-            Err(_) => "failed",
-        }
-    );
-    done.map(|_| ())
+    let copied = copy_ignored(main, tree, &space.copy)?;
+    if let (Some(line), Place::Space { name, dir, .. }) = (&space.setup, place) {
+        let from = dir
+            .as_deref()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        eprintln!("setup: space {name}{from}: running {line}");
+        run_setup(line, main, tree, branch, index)?;
+    }
+    Ok(if copied > 0 || space.setup.is_some() {
+        "done"
+    } else {
+        "none"
+    })
 }
 
 /// The settings that apply to a worktree of `place`, `None` when there are none.
@@ -543,19 +588,20 @@ fn settings_of<'a>(
 /// Git does the matching (`ls-files --others --ignored`), so a tracked file is never
 /// copied and a symlinked folder is never followed. A file this will not copy (its folder
 /// outside the main checkout, a part of its place in the worktree that is a symlink or
-/// leads outside it) stops the copy: it fails closed and says which file and why.
+/// leads outside it, anything but a file or a symlink) stops the copy: it fails closed and
+/// says which file and why, after saying what it had copied. How many it copied.
 fn copy_ignored(
     main: &std::path::Path,
     tree: &std::path::Path,
     patterns: &[String],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     use std::os::unix::ffi::OsStrExt;
 
     if patterns.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let out = Command::new("git")
-        .arg("-C")
+    let mut ls = Command::new("git");
+    ls.arg("-C")
         .arg(main)
         .args([
             "ls-files",
@@ -565,9 +611,11 @@ fn copy_ignored(
             "--exclude-standard",
             "--",
         ])
-        .args(patterns.iter().map(|p| format!(":(glob){p}")))
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
+        .args(patterns.iter().map(|p| format!(":(glob){p}")));
+    for var in GIT_SCOPE {
+        ls.env_remove(var);
+    }
+    let out = ls.output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         let why = format!(
             "git ls-files: {}",
@@ -579,35 +627,41 @@ fn copy_ignored(
     let (main_real, tree_real) = (real(main), real(tree));
     let mut copied = Vec::new();
     let mut kept = 0;
-    for rel in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+    let said = |copied: &[String], kept: usize| {
+        let files = if copied.len() == 1 { "file" } else { "files" };
+        let mut line = format!(
+            "setup: copied {} {files} from {}",
+            copied.len(),
+            main.display()
+        );
+        if !copied.is_empty() {
+            line.push_str(&format!(" ({})", copied.join(", ")));
+        }
+        if kept > 0 {
+            line.push_str(&format!(", kept {kept} already there"));
+        }
+        eprintln!("{line}");
+    };
+    // A folder git does not go into (a repository of its own inside) ends in `/`: none of
+    // its files are the main checkout's to copy.
+    for rel in out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|r| !r.is_empty() && !r.ends_with(b"/"))
+    {
         let rel = std::path::Path::new(std::ffi::OsStr::from_bytes(rel));
         match copy_one(&main_real, &tree_real, rel) {
             Ok(true) => copied.push(rel.display().to_string()),
             Ok(false) => kept += 1,
             Err(why) => {
+                said(&copied, kept);
                 eprintln!("setup: not copying {}: {why}", rel.display());
                 return Err(format!("{} not copied", rel.display()));
             }
         }
     }
-    if copied.is_empty() && kept == 0 {
-        return Ok(());
-    }
-    let files = |n: usize| if n == 1 { "file" } else { "files" };
-    let mut line = format!(
-        "setup: copied {} {} from {}",
-        copied.len(),
-        files(copied.len()),
-        main.display()
-    );
-    if !copied.is_empty() {
-        line.push_str(&format!(" ({})", copied.join(", ")));
-    }
-    if kept > 0 {
-        line.push_str(&format!(", kept {kept} already there"));
-    }
-    eprintln!("{line}");
-    Ok(())
+    said(&copied, kept);
+    Ok(copied.len())
 }
 
 /// Copy one file, `rel` under both, from the main checkout into the worktree. `false` when
@@ -623,8 +677,12 @@ fn copy_one(
     if !real(source.parent().unwrap_or(main)).starts_with(main) {
         return Err(format!("its folder is outside {}", main.display()));
     }
-    // The source itself is never followed: a symlink is copied as one.
+    // The source itself is never followed: a symlink is copied as one. Anything else that
+    // is not a file is refused before a folder is made for it.
     let meta = std::fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+    if !meta.is_file() && !meta.file_type().is_symlink() {
+        return Err("it is not a file or a symlink".to_string());
+    }
     // Every part of its place that already exists, before any folder is made: a symlink
     // there would put the file, and the folders made for it, wherever it points.
     let mut at = tree.to_path_buf();
@@ -658,14 +716,18 @@ fn copy_one(
         std::fs::read_link(&source)
             .and_then(|link| std::os::unix::fs::symlink(link, &target))
             .map(|()| true)
-    } else if meta.is_file() {
-        // `create_new` is the "never overwrite" in one step: anything there, a symlink
-        // included, is kept.
+    } else {
+        // Opened without following a link or waiting on a pipe, and checked on the handle:
+        // what was looked at above may have been swapped since. `create_new` is the "never
+        // overwrite" in one step: anything there, a symlink included, is kept.
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&source)
             .and_then(|mut from| {
+                if !from.metadata()?.is_file() {
+                    return Err(std::io::Error::other("it is not a file"));
+                }
                 let to = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -682,8 +744,6 @@ fn copy_one(
                 }
                 written.map(|()| true)
             })
-    } else {
-        return Err("it is not a file or a symlink".to_string());
     };
     match made {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -703,12 +763,15 @@ fn run_setup(
 ) -> Result<(), String> {
     use std::os::fd::AsFd;
 
-    eprintln!("setup: running {line}");
     let to_stderr = std::io::stderr()
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| e.to_string())?;
-    let status = Command::new("sh")
+    let mut sh = Command::new("sh");
+    for var in GIT_SCOPE {
+        sh.env_remove(var);
+    }
+    let status = sh
         .arg("-c")
         .arg(line)
         .current_dir(tree)
@@ -779,10 +842,8 @@ fn worktree_setup(args: &[String]) -> std::io::Result<()> {
     let read = qoop_tui::config::read();
     let place = place_of(&space_rows()?, main, space.as_deref(), has_table(&read))?;
     let path = real(&tree.path);
-    let (common, id) = git_dirs(&path)?;
-    let index = claim_index(&common, &id)?;
     let branch = tree.branch.clone().unwrap_or_default();
-    set_up(main, &path, &branch, index, &place, &read).map_err(|why| {
+    prepare(main, &path, &branch, &place, &read, false).map_err(|why| {
         let again = tree
             .branch
             .clone()
@@ -966,17 +1027,11 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     // Resolved once it exists, so `--path ../x` is not recorded as a tab's directory.
     let path = real(&path);
     println!("worktree={} branch={branch}", path.display());
-    let (common, id) = git_dirs(&path)?;
-    let index = claim_index(&common, &id)?;
-    if no_setup {
-        println!("setup=skipped");
-    } else {
-        set_up(&main, &path, &branch, index, &place, &read).map_err(|why| {
-            std::io::Error::other(format!(
-                "setup failed ({why}); fix it, then qoop worktree setup {branch}"
-            ))
-        })?;
-    }
+    prepare(&main, &path, &branch, &place, &read, no_setup).map_err(|why| {
+        std::io::Error::other(format!(
+            "setup failed ({why}); fix it, then qoop worktree setup {branch}"
+        ))
+    })?;
     new.space = match place {
         Place::Space { open, .. } => Some(open),
         Place::Default { .. } => None,
@@ -1615,10 +1670,15 @@ mod tests {
         }
     }
 
-    fn found(name: &str, open: &str) -> Place {
+    /// The place of the space `open` names, its folder taken from `spaces`.
+    fn found(spaces: &[WorkspaceRow], name: &str, open: &str) -> Place {
         Place::Space {
             name: name.into(),
             open: open.into(),
+            dir: spaces
+                .iter()
+                .find(|s| s.id.to_string() == open)
+                .and_then(|s| s.dir.clone()),
         }
     }
 
@@ -1635,12 +1695,12 @@ mod tests {
         ];
         assert_eq!(
             place_of(&spaces, main, None, none).unwrap(),
-            found("app", "3")
+            found(&spaces, "app", "3")
         );
         // No exact folder: the deepest that holds it; qass's own space never counts.
         assert_eq!(
             place_of(&spaces[..3], Path::new("/nowhere/code/web"), None, none).unwrap(),
-            found("code", "2")
+            found(&spaces, "code", "2")
         );
         assert_eq!(
             place_of(&spaces[3..], main, None, none).unwrap(),
@@ -1650,11 +1710,11 @@ mod tests {
         // a number that is neither is refused.
         assert_eq!(
             place_of(&spaces, main, Some("2"), none).unwrap(),
-            found("code", "2")
+            found(&spaces, "code", "2")
         );
         assert_eq!(
             place_of(&spaces, main, Some("fresh"), none).unwrap(),
-            found("fresh", "fresh")
+            found(&spaces, "fresh", "fresh")
         );
         assert!(place_of(&spaces, main, Some("99"), none).is_err());
     }
@@ -1668,7 +1728,7 @@ mod tests {
         ];
         assert_eq!(
             place_of(&spaces, main, None, |n| n == "app").unwrap(),
-            found("app", "3")
+            found(&spaces, "app", "3")
         );
         for tables in [&[][..], &["app", "web"]] {
             assert_eq!(
@@ -1686,12 +1746,12 @@ mod tests {
         ];
         assert_eq!(
             place_of(&same, main, None, |_| false).unwrap(),
-            found("app", "4")
+            found(&same, "app", "4")
         );
         // Of two spaces called alike, the one whose folder it is, by id.
         assert_eq!(
             place_of(&same[1..], Path::new("/elsewhere"), None, |_| false).unwrap(),
-            found("app", "5")
+            found(&same, "app", "5")
         );
     }
 
@@ -1717,6 +1777,11 @@ mod tests {
             .filter(|e| std::fs::read_to_string(e.as_ref().unwrap().path()).unwrap() == "d")
             .count();
         assert_eq!(holding_d, 1);
+        // A claim that cannot be read is taken: never handed out again.
+        std::fs::remove_file(common.join("qoop-worktree-index/2")).unwrap();
+        std::fs::create_dir(common.join("qoop-worktree-index/2")).unwrap();
+        std::fs::create_dir_all(common.join("worktrees/e")).unwrap();
+        assert_eq!(claim_index(common, "e").unwrap(), 3);
     }
 
     #[test]

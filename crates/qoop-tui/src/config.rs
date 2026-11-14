@@ -266,7 +266,7 @@ pub struct SpaceSetup {
 }
 
 /// A space's name as a TOML key: bare when it may be, quoted when not.
-pub fn space_key(name: &str) -> String {
+fn space_key(name: &str) -> String {
     let bare = !name.is_empty()
         && name
             .chars()
@@ -490,19 +490,15 @@ pub fn read_from(path: &Path) -> Read {
     let mut broken = false;
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, agents, read_spaces, problems) = parse_with_spaces(&text);
+            let parsed = parse_all(&text);
             if let Some(agent) = qass_agent_in(&text) {
                 qass_agent = agent;
             }
             qass_models = qass_models_in(&text);
             report_send = report_send_in(&text);
-            spaces = read_spaces;
-            broken = text
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&text)
-                .parse::<toml::Table>()
-                .is_err();
-            (config, agents, problems, true)
+            spaces = parsed.spaces;
+            broken = parsed.broken;
+            (parsed.config, parsed.agents, parsed.problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             (Config::default(), Vec::new(), Vec::new(), false)
@@ -566,29 +562,60 @@ fn launcher(name: &str, value: &toml::Value) -> Result<Launcher, String> {
 
 /// The settings, and everything that could not be used.
 pub fn parse(text: &str) -> (Config, Vec<Problem>) {
-    let (config, _, problems) = parse_all(text);
+    let Parsed {
+        config, problems, ..
+    } = parse_all(text);
     (config, problems)
 }
 
-/// The settings, the agents, and everything that could not be used.
-fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
-    let (config, agents, _, problems) = parse_with_spaces(text);
-    (config, agents, problems)
+/// One read of the file's text.
+struct Parsed {
+    config: Config,
+    agents: Vec<Launcher>,
+    spaces: BTreeMap<String, SpaceSetup>,
+    problems: Vec<Problem>,
+    /// A line left out as not TOML was in `[spaces]`, or everything was given up on, so
+    /// what the file says about a space may be missing.
+    broken: bool,
+}
+
+/// Whether a key or a table header names `spaces` first: `spaces.x`, `[spaces.x.worktree]`,
+/// `"spaces".x`.
+fn names_spaces(line: &str) -> bool {
+    let key = line.trim_start().trim_start_matches('[').trim_start();
+    ["spaces", "\"spaces\"", "'spaces'"].iter().any(|name| {
+        key.strip_prefix(name).is_some_and(|rest| {
+            !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+    })
+}
+
+/// Whether line `line` (from one) of `lines` is part of `[spaces]`: a `spaces` key or header
+/// itself, or a line under a `[spaces...]` header.
+fn in_spaces(lines: &[&str], line: usize) -> bool {
+    lines
+        .get(line.saturating_sub(1))
+        .is_some_and(|l| names_spaces(l))
+        || lines[..line.saturating_sub(1).min(lines.len())]
+            .iter()
+            .rev()
+            .find(|l| l.trim_start().starts_with('['))
+            .is_some_and(|header| names_spaces(header))
 }
 
 /// The settings, the agents, `[spaces]`, and everything that could not be used.
-fn parse_with_spaces(
-    text: &str,
-) -> (
-    Config,
-    Vec<Launcher>,
-    BTreeMap<String, SpaceSetup>,
-    Vec<Problem>,
-) {
+fn parse_all(text: &str) -> Parsed {
     let mut problems: Vec<Problem> = Vec::new();
     let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
+    let original = text.clone();
+    let original: Vec<&str> = original.lines().collect();
+    let mut broken = false;
     // The problem for a construct left open to the end of the file, while it is walked back.
     let mut open_at: Option<usize> = None;
+    let given_up = |broken: &mut bool| {
+        *broken = (1..=original.len()).any(|line| in_spaces(&original, line));
+        toml::Table::new()
+    };
     let table = loop {
         let error = match text.parse::<toml::Table>() {
             Ok(table) => break table,
@@ -609,7 +636,7 @@ fn parse_with_spaces(
                 .rposition(|l| !l.trim().is_empty())
                 .map(|at| at + 1)
         }) else {
-            break toml::Table::new();
+            break given_up(&mut broken);
         };
         let problem = Problem::new(Some(line), &unreadable(&text, Some(line), error.message()));
         match open_at {
@@ -617,15 +644,16 @@ fn parse_with_spaces(
             _ => {
                 // Said once: a line already reported would only be reported again.
                 if problems.iter().any(|p| p.line == Some(line)) {
-                    break toml::Table::new();
+                    break given_up(&mut broken);
                 }
                 problems.push(problem);
                 open_at = open.then(|| problems.len() - 1);
             }
         }
         if problems.len() > MAX_BAD_LINES {
-            break toml::Table::new();
+            break given_up(&mut broken);
         }
+        broken |= in_spaces(&original, line);
         // Leave the line out and read the rest, so one bad line costs one setting.
         text = lines
             .iter()
@@ -655,26 +683,22 @@ fn parse_with_spaces(
         #[serde(default)]
         report: Spans,
     }
-    // `[spaces]` apart, so a space that is not a table costs only these lines.
+    // `[spaces]` apart, so a space that is not a table costs only these lines: once for the
+    // keys of each `[spaces.<name>]`, once for those of its `worktree`.
     #[derive(Default, serde::Deserialize)]
-    struct SpaceKeySpans {
-        #[serde(default)]
-        spaces: BTreeMap<String, Spans>,
+    struct SpacesSpans<T> {
+        #[serde(default = "BTreeMap::new")]
+        spaces: BTreeMap<String, T>,
     }
     #[derive(Default, serde::Deserialize)]
     struct WorktreeSpans {
         #[serde(default)]
         worktree: Spans,
     }
-    #[derive(Default, serde::Deserialize)]
-    struct SpacesSpans {
-        #[serde(default)]
-        spaces: BTreeMap<String, WorktreeSpans>,
-    }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
-    let space_spans: SpaceKeySpans = toml::from_str(&text).unwrap_or_default();
-    let worktree_spans: SpacesSpans = toml::from_str(&text).unwrap_or_default();
+    let space_spans: SpacesSpans<Spans> = toml::from_str(&text).unwrap_or_default();
+    let worktree_spans: SpacesSpans<WorktreeSpans> = toml::from_str(&text).unwrap_or_default();
     let mut spaces = BTreeMap::new();
     let line_of = |spans: &Spans, key: &str| spans.get(key).map(|s| line_at(&text, s.span().start));
 
@@ -930,12 +954,13 @@ fn parse_with_spaces(
     // In the order a person reads the file, not the order the table holds its keys.
     problems.sort_by_key(|p| p.line.unwrap_or(usize::MAX));
     agents.sort_by_key(|(line, _)| line.unwrap_or(usize::MAX));
-    (
+    Parsed {
         config,
-        agents.into_iter().map(|(_, a)| a).collect(),
+        agents: agents.into_iter().map(|(_, a)| a).collect(),
         spaces,
         problems,
-    )
+        broken,
+    }
 }
 
 /// The line a byte offset is on, counted from one.
@@ -1274,7 +1299,9 @@ mod tests {
 
     #[test]
     fn a_space_worktree_table_is_read_and_its_problems_are_said() {
-        let (_, _, spaces, problems) = parse_with_spaces(
+        let Parsed {
+            spaces, problems, ..
+        } = parse_all(
             "[spaces.\"my app\".worktree]\ncopy = [\".env\", \"**/.env*\"]\nsetup = \"bun install\"\n",
         );
         assert!(problems.is_empty(), "{problems:?}");
@@ -1287,7 +1314,9 @@ mod tests {
                 problems: Vec::new(),
             })
         );
-        let (_, _, spaces, problems) = parse_with_spaces(
+        let Parsed {
+            spaces, problems, ..
+        } = parse_all(
             "theme = \"dark\"\n[spaces.web.worktree]\ncopy = [\"../x\", \"/etc/passwd\", \":(attr)x\", \"!x\", \"\", 3]\nsetup = 7\nrun = \"x\"\n[spaces.web]\nnote = 1\n[spaces.ok.worktree]\nsetup = \"true\"\n",
         );
         let said: Vec<String> = problems.iter().map(Problem::short).collect();
@@ -1320,9 +1349,25 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[spaces.app.worktree]\nsetup = \"true\"\n").unwrap();
         assert!(!read_from(&path).broken);
-        std::fs::write(&path, "[spaces.app.worktree]\nsetup = true false\n").unwrap();
-        let read = read_from(&path);
-        assert!(read.broken && !read.problems.is_empty());
+        for text in [
+            "[spaces.app.worktree]\nsetup = true false\n",
+            "theme = \"dark\"\nspaces.app.worktree.setup = true false\n",
+            "[spaces.app.worktree\nsetup = \"true\"\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let read = read_from(&path);
+            assert!(read.broken && !read.problems.is_empty(), "{text}");
+        }
+        // A bad line elsewhere leaves `[spaces]` whole.
+        for text in [
+            "theme = dark\n[spaces.app.worktree]\nsetup = \"true\"\n",
+            "[spaces.app.worktree]\nsetup = \"true\"\n[notify]\nsound = yes\n",
+            "[spacesx]\nx = y z\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let read = read_from(&path);
+            assert!(!read.broken && !read.problems.is_empty(), "{text}");
+        }
     }
 
     #[test]
@@ -1345,7 +1390,9 @@ mod tests {
     /// the command a person wrote, trimmed.
     #[test]
     fn agents_read_in_file_order() {
-        let (_, agents, problems) = parse_all(
+        let Parsed {
+            agents, problems, ..
+        } = parse_all(
             "[agents]\nzed = \"claude --dangerously-skip-permissions\"\nlm = \" opencode \"\n",
         );
         assert!(problems.is_empty(), "{problems:?}");
@@ -1366,7 +1413,9 @@ mod tests {
     /// rest still start: a newline would be typed as Enter and run a second command.
     #[test]
     fn an_agent_that_is_not_one_line_is_refused() {
-        let (_, agents, problems) = parse_all(
+        let Parsed {
+            agents, problems, ..
+        } = parse_all(
             "[agents]\nok = \"codex\"\ntwo = \"\"\"\nclaude\nrm -rf x\"\"\"\nnum = 3\nblank = \"  \"\n",
         );
         assert_eq!(agents.len(), 1);
@@ -1378,7 +1427,9 @@ mod tests {
 
     #[test]
     fn agents_that_are_not_a_table_are_said() {
-        let (_, agents, problems) = parse_all("agents = \"claude\"\n");
+        let Parsed {
+            agents, problems, ..
+        } = parse_all("agents = \"claude\"\n");
         assert!(agents.is_empty());
         assert_eq!(problems.len(), 1);
         assert!(problems[0].what.contains("[agents]"), "{problems:?}");
