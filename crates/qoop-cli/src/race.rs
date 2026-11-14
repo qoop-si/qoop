@@ -639,9 +639,15 @@ fn rm(args: &[String]) -> std::io::Result<()> {
         .filter(|r| keep.as_ref() != Some(&r.label))
         .collect();
     let rows = worktree::session_rows()?;
+    // Found by folder only when it is an agent: a person's shell standing there is refused below,
+    // never closed as if it were the racer.
     let tabs: Vec<Option<&AgentRow>> = losers
         .iter()
-        .map(|r| tab_of(&rows, &r.branch, r.tree.map(|w| w.path.as_path())))
+        .map(|r| {
+            let path = r.tree.map(|w| w.path.as_path()).filter(|p| p.exists());
+            tab_of(&rows, &r.branch, path)
+                .filter(|t| t.agent || t.name.as_deref() == Some(r.branch.as_str()))
+        })
         .collect();
     let mut reasons = Vec::new();
     for (racer, tab) in losers.iter().zip(&tabs) {
