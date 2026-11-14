@@ -478,6 +478,10 @@ fn scenario() {
                 !screen(local.path()).contains("remote-42"),
                 "leaked to the local daemon"
             );
+            Box::pin(a_remote_tabs_task_comes_back_in_its_merged_number(
+                &mut tui, terminal,
+            ))
+            .await;
 
             // The remote goes away: its space stays listed, offline, under the same number.
             stop(remote.path());
@@ -603,6 +607,59 @@ fn scenario() {
     let _ = daemon.wait();
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
+    }
+}
+
+/// A task opened inside a remote tab (with that tab's own token, by the qoop in it) is read by
+/// the window through the mux by the tab's merged number, and names the tab by that number
+/// again: the remote's own terminal 1 never reaches the window as a local terminal 1.
+async fn a_remote_tabs_task_comes_back_in_its_merged_number(tui: &mut Tui, terminal: u32) {
+    tui.wire(
+        terminal,
+        ClientWire::Input {
+            bytes: format!("'{}' task new 'remote goal'\r", qoop()).into_bytes(),
+            from_terminal: None,
+            from_token: None,
+        },
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for n in 0.. {
+        let id = format!("task-{n}");
+        tui.ask(ControlRequest::TaskRead {
+            id: id.clone(),
+            board: false,
+            task: None,
+            terminal: Some(terminal),
+            token: None,
+            before: None,
+        })
+        .await;
+        let tasks = tui
+            .until("the remote tab's task", |incoming| match incoming {
+                Incoming::Control(ControlResponse::Tasks { id: i, tasks, .. }) if *i == id => {
+                    Some(tasks.clone())
+                }
+                Incoming::Control(ControlResponse::Failed { id: i, reason }) if *i == id => {
+                    panic!("the task read was refused: {reason}")
+                }
+                _ => None,
+            })
+            .await;
+        if let Some(task) = tasks.first() {
+            assert_eq!(task.goal, "remote goal");
+            assert_eq!(
+                task.terminal,
+                Some(i64::from(terminal)),
+                "named by the merged number"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the remote tab never opened its task"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 

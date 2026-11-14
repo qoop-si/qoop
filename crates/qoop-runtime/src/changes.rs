@@ -287,9 +287,60 @@ fn raw_and_patch(out: &[u8]) -> (Vec<ChangedFile>, &[u8]) {
             path = new;
         }
         let status = status.get(..1).unwrap_or("").to_string();
-        files.push(ChangedFile { path, status });
+        files.push(ChangedFile {
+            path,
+            status,
+            added: None,
+            removed: None,
+        });
     }
     (files, rest.strip_prefix(&[0]).unwrap_or(rest))
+}
+
+/// Each file's lines added and removed from a `git diff --numstat -z`: `<added>\t<removed>\t<path>`
+/// ending in NUL, or for a rename or copy `<added>\t<removed>\t` then the old and the new path,
+/// each ending in NUL. A binary file's counts are `-` and read as none. Keyed by the path the
+/// raw list names (the new one).
+fn counts_of(out: &[u8]) -> std::collections::HashMap<String, (Option<u32>, Option<u32>)> {
+    let text = String::from_utf8_lossy(out);
+    let mut fields = text.split('\0');
+    let mut counts = std::collections::HashMap::new();
+    while let Some(record) = fields.next() {
+        let mut parts = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            // A rename: the old path, then the new.
+            let _old = fields.next();
+            match fields.next() {
+                Some(new) => new.to_string(),
+                None => break,
+            }
+        } else {
+            path.to_string()
+        };
+        counts.insert(path, (added.parse().ok(), removed.parse().ok()));
+    }
+    counts
+}
+
+/// The counts of every tracked file from a second, guarded `git diff --numstat` against the same
+/// `from`. Unanswered or cut short, the files keep no counts: a count that may be low is not
+/// shown as a count.
+fn count_lines(git: &Git, from: &str, files: &mut [ChangedFile]) -> Result<(), String> {
+    let args = [&["diff", "--numstat", "-z"][..], &DIFF, &[from, "--"]].concat();
+    let Some((out, false)) = git.guarded(&args)? else {
+        return Ok(());
+    };
+    let counts = counts_of(&out);
+    for file in files {
+        if let Some(&(added, removed)) = counts.get(&file.path) {
+            (file.added, file.removed) = (added, removed);
+        }
+    }
+    Ok(())
 }
 
 /// The files changed since `from` and the patch, cut on a line's end at the cap.
@@ -333,7 +384,12 @@ fn untracked_of(git: &Git) -> Result<(Vec<ChangedFile>, bool, bool), String> {
             entries.next();
         } else if let Some(path) = entry.strip_prefix("?? ") {
             let (path, status) = (path.to_string(), "?".to_string());
-            files.push(ChangedFile { path, status });
+            files.push(ChangedFile {
+                path,
+                status,
+                added: None,
+                removed: None,
+            });
         }
     }
     Ok((files, cut, true))
@@ -454,6 +510,7 @@ fn look(cwd: &str) -> Result<Looked, String> {
     let base = base_of(&git);
     let from = from_of(&git, &base);
     let (mut files, diff, cut) = diff_of(&git, &from)?;
+    count_lines(&git, &from, &mut files)?;
     let repo = git
         .line(&["config", "--get", "remote.origin.url"])
         .and_then(|url| github_repo(&url));
@@ -567,8 +624,9 @@ fn ask_gh(gh: &Path, repo: &str, branch: &str) -> Option<Option<PullRequest>> {
     }
 }
 
-/// `Changes` for a terminal whose shell is in `cwd`.
-pub(crate) async fn read(id: String, terminal: u32, cwd: Option<String>) -> ControlResponse {
+/// `Changes` for a terminal whose shell is in `cwd`. Public for the desktop window, which reads
+/// a checkout on this machine in its own process, only while its review is open.
+pub async fn read(id: String, terminal: u32, cwd: Option<String>) -> ControlResponse {
     let Some(cwd) = cwd else {
         return failed(id, format!("there is no terminal {terminal}"));
     };
@@ -859,6 +917,46 @@ mod tests {
         let cwd = repo.display().to_string();
         assert!(stat(&cwd, "refs/qoop/race/x").is_err());
         assert!(stat(&cwd, "refs/qoop/race/none").is_err());
+    }
+
+    /// Each file of a look carries its own counts: a text file its lines, a binary one and an
+    /// untracked one none, a rename the counts of its new path.
+    #[test]
+    fn a_look_counts_lines_per_file() {
+        let (_dir, repo) = repo();
+        std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").expect("a");
+        std::fs::write(repo.join("b.txt"), "x\ny\nz\nw\n").expect("b");
+        git(&repo, &["add", "b.txt"]);
+        git(&repo, &["commit", "-q", "-m", "b"]);
+        git(&repo, &["mv", "b.txt", "c.txt"]);
+        std::fs::write(repo.join("c.txt"), "x\ny\nz\nw\nv\n").expect("c");
+        std::fs::write(repo.join("pic.bin"), [0u8, 1, 2, 0, 3]).expect("bin");
+        git(&repo, &["add", "pic.bin", "c.txt"]);
+        std::fs::write(repo.join("loose.txt"), "new\n").expect("loose");
+        // Against the first commit, so the rename and the binary are both changes.
+        git(&repo, &["branch", "main", "HEAD~1"]);
+        let l = looked(&repo);
+        let counts = |path: &str| {
+            let f = l
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} in {:?}", l.files));
+            (f.added, f.removed)
+        };
+        assert_eq!(counts("a.txt"), (Some(2), Some(0)));
+        assert_eq!(counts("c.txt"), (Some(5), Some(0)), "new since main");
+        assert_eq!(counts("pic.bin"), (None, None), "binary");
+        assert_eq!(counts("loose.txt"), (None, None), "untracked");
+    }
+
+    #[test]
+    fn numstat_records_are_keyed_by_the_new_path() {
+        let counts = counts_of(b"1\t2\ta\0-\t-\tb\x003\t0\t\0old\0new\0");
+        assert_eq!(counts.get("a"), Some(&(Some(1), Some(2))));
+        assert_eq!(counts.get("b"), Some(&(None, None)));
+        assert_eq!(counts.get("new"), Some(&(Some(3), Some(0))));
+        assert!(!counts.contains_key("old"));
     }
 
     #[test]

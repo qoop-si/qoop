@@ -236,6 +236,8 @@ impl Spike {
                     })
                 },
                 input: focused.then(|| (self.focus.clone(), cx.entity())),
+                selection: None,
+                area: None,
             })
     }
 

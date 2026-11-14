@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 
 use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
-use qoop_runtime::control::{AgentRow, LinkState, ScheduleInfo, SleepingTab, WorkspaceRow};
+use qoop_runtime::control::{
+    AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, SleepingTab, StepInfo, TaskEventInfo,
+    TaskInfo, WorkspaceRow,
+};
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
 /// What a row shows: the daemon's status, or a sleeping tab (a tab fact, not a status).
@@ -172,6 +175,8 @@ pub struct Model {
     /// qass's switch as `QassWatch` read it; `None` before the first answer.
     pub qass_watch: Option<bool>,
     pub folded: BTreeSet<i64>,
+    /// The tabs split into panes, as the daemon keeps them (`Agents::splits`).
+    pub splits: Vec<Pane>,
 }
 
 /// One line of home's lists: an awake agent's row, or a sleeping tab that held an agent.
@@ -420,6 +425,155 @@ impl Model {
             .and(row.stop.as_deref())
             .map(|stop| (terminal, stop))
     }
+
+    /// The panes `terminal` is shown with: its tab's split tree as the daemon keeps it, or
+    /// the terminal alone.
+    pub fn tree_of(&self, terminal: u32) -> Pane {
+        self.splits
+            .iter()
+            .find(|tree| tree.leaves().contains(&terminal))
+            .cloned()
+            .unwrap_or(Pane::Leaf { terminal })
+    }
+
+    /// A space's tabs in the daemon's order: each of its terminals, the other panes of a split
+    /// folded into its first.
+    pub fn tabs_of(&self, workspace: i64) -> Vec<&AgentRow> {
+        let inner: BTreeSet<u32> = self
+            .splits
+            .iter()
+            .flat_map(|tree| tree.leaves().into_iter().skip(1))
+            .collect();
+        self.rows
+            .iter()
+            .filter(|r| r.workspace == workspace && !inner.contains(&r.terminal))
+            .collect()
+    }
+
+    /// The agent a corner note is for: one of the owner's that turned Needs you since the
+    /// rows `before`, other than the one on screen.
+    pub fn turned_needs(&self, before: &[AgentRow], shown: Option<u32>) -> Option<u32> {
+        let needed = |t: u32| {
+            before
+                .iter()
+                .any(|r| r.terminal == t && Kind::of(r).needs_you())
+        };
+        self.live()
+            .filter(|r| Some(r.terminal) != shown && Kind::of(r).needs_you())
+            .map(|r| r.terminal)
+            .find(|&t| !needed(t))
+    }
+}
+
+/// The task strip of the tab on screen, from the `Tasks` answer to `TaskRead { terminal }`: its
+/// open task, the plan steps of the item it works on, and its events oldest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Strip {
+    pub task: Option<TaskInfo>,
+    pub steps: Vec<StepInfo>,
+    pub events: Vec<TaskEventInfo>,
+}
+
+/// One evidence line: what was checked and whether it read as a failing run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evidence {
+    pub at: i64,
+    pub text: String,
+    pub failed: bool,
+}
+
+impl Strip {
+    pub fn of(
+        tasks: Vec<TaskInfo>,
+        mut events: Vec<TaskEventInfo>,
+        item: Option<Box<ItemCardInfo>>,
+    ) -> Strip {
+        events.reverse();
+        Strip {
+            task: tasks.into_iter().next(),
+            steps: item.map(|card| card.steps).unwrap_or_default(),
+            events,
+        }
+    }
+
+    pub fn done(&self) -> usize {
+        self.steps.iter().filter(|s| s.done_at.is_some()).count()
+    }
+
+    /// The step being worked on: the first one not done.
+    pub fn current(&self) -> Option<usize> {
+        self.steps.iter().position(|s| s.done_at.is_none())
+    }
+
+    /// "Task #12", "2 of 4 done" (or the stage while there is no plan).
+    pub fn heading(&self) -> Option<(String, String)> {
+        let task = self.task.as_ref()?;
+        let progress = if self.steps.is_empty() {
+            task.stage.clone()
+        } else {
+            format!("{} of {} done", self.done(), self.steps.len())
+        };
+        Some((format!("Task #{}", task.id), progress))
+    }
+
+    /// The evidence as recorded, oldest first. A failing run then a passing one shows as both
+    /// only when both were recorded: nothing is inferred from a single line.
+    pub fn evidence(&self) -> Vec<Evidence> {
+        self.events
+            .iter()
+            .filter(|e| e.kind == "evidence")
+            .map(|e| Evidence {
+                at: e.at,
+                text: e.body.clone(),
+                failed: failed_run(&e.body),
+            })
+            .collect()
+    }
+}
+
+/// Whether a check's words say it failed: a count of failures above zero (`12 pass, 1 fail`),
+/// or the word with no count (`build failed`). `0 failed` passes.
+pub fn failed_run(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.iter().enumerate().any(|(i, w)| {
+        matches!(
+            w.as_str(),
+            "fail" | "fails" | "failed" | "failing" | "failure" | "failures"
+        ) && match i.checked_sub(1).and_then(|p| words[p].parse::<u64>().ok()) {
+            Some(n) => n > 0,
+            None => true,
+        }
+    })
+}
+
+/// The text of the cells from `a` to `b` (row, column, either order, both included) of a
+/// screen's rows: whole rows between, each row's trailing blanks dropped, rows joined by a
+/// newline. ponytail: a wide character's spacer cell is copied as the space it holds.
+pub fn selected_text(lines: &[String], a: (usize, usize), b: (usize, usize)) -> String {
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    (from.0..=to.0)
+        .filter_map(|row| {
+            let line = lines.get(row)?;
+            let start = if row == from.0 { from.1 } else { 0 };
+            let end = if row == to.0 { to.1 + 1 } else { usize::MAX };
+            let cut: String = line
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect();
+            Some(cut.trim_end().to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A unix time as "15:58" in `zone`.
+pub fn clock(at: i64, zone: Zone) -> String {
+    (zone.local)(at).clock()
 }
 
 /// A row's title: the name a person gave it, else its conversation's, else its program.
@@ -1266,5 +1420,123 @@ pub(crate) mod tests {
         assert_eq!(until(now + 180, now), "in 3 m");
         assert_eq!(until(now + 7080, now), "in 1 h 58 m");
         assert_eq!(until(now + 124_200, now), "in 1 d 10 h");
+    }
+
+    pub fn split(first: u32, second: u32) -> Pane {
+        Pane::Split {
+            dir: qoop_runtime::control::SplitDir::V,
+            permille: 600,
+            questions: 0,
+            first: Box::new(Pane::Leaf { terminal: first }),
+            second: Box::new(Pane::Leaf { terminal: second }),
+        }
+    }
+
+    /// A split tab lays out its panes and is one tab on the strip; a tab of its own is a leaf.
+    #[test]
+    fn a_split_is_one_tab_with_its_panes() {
+        let mut m = fixture();
+        m.splits = vec![split(1, 3)];
+        assert_eq!(m.tree_of(3), split(1, 3));
+        assert_eq!(m.tree_of(2), Pane::Leaf { terminal: 2 });
+        let tabs: Vec<u32> = m.tabs_of(1).iter().map(|r| r.terminal).collect();
+        assert_eq!(tabs, [1, 2]);
+    }
+
+    /// The corner note is for another agent that turned Needs you, never the one on screen
+    /// nor one that already needed the owner.
+    #[test]
+    fn a_corner_note_is_for_another_agent_turning_needs_you() {
+        let before = fixture().rows;
+        let mut m = fixture();
+        assert_eq!(m.turned_needs(&before, Some(1)), None, "nothing turned");
+        m.rows[2].status = Some("blocked".into());
+        assert_eq!(m.turned_needs(&before, Some(1)), Some(3));
+        assert_eq!(m.turned_needs(&before, Some(3)), None, "the one on screen");
+        m.rows[6].status = Some("blocked".into());
+        m.rows[2].status = Some("done".into());
+        assert_eq!(m.turned_needs(&before, Some(1)), None, "qass's own row");
+    }
+
+    fn event(at: i64, kind: &str, body: &str) -> TaskEventInfo {
+        TaskEventInfo {
+            id: at,
+            at,
+            kind: kind.into(),
+            body: body.into(),
+        }
+    }
+
+    /// The strip from a `Tasks` answer: the steps of the task's item with the current one, the
+    /// evidence oldest first with the failing run marked, and none without a task.
+    #[test]
+    fn the_task_strip_reads_steps_and_evidence() {
+        let task: TaskInfo = serde_json::from_value(serde_json::json!({
+            "id": 12, "terminal": 1, "goal": "Fix the suite", "stage": "implementing",
+            "opened_at": 0, "updated_at": 0,
+        }))
+        .expect("task");
+        let step = |n: i64, done_at: Option<i64>| StepInfo {
+            n,
+            text: format!("step {n}"),
+            done_at,
+        };
+        let card: ItemCardInfo = serde_json::from_value(serde_json::json!({
+            "id": 3, "key": "I3", "workspace": 1, "title": "t", "state": "open",
+            "steps_done": 2, "steps_total": 4, "updated_at": 0, "description": "",
+            "steps": [], "activity": [],
+        }))
+        .unwrap_or_else(|e| panic!("card: {e}"));
+        let card = ItemCardInfo {
+            steps: vec![
+                step(1, Some(10)),
+                step(2, Some(20)),
+                step(3, None),
+                step(4, None),
+            ],
+            ..card
+        };
+        let strip = Strip::of(
+            vec![task],
+            vec![
+                event(
+                    30,
+                    "evidence",
+                    "bun test src/coupon.test.ts: 2 pass, 0 fail",
+                ),
+                event(20, "stage", "implementing"),
+                event(10, "evidence", "bun test: 12 pass, 1 fail"),
+            ],
+            Some(Box::new(card)),
+        );
+        assert_eq!(
+            strip.heading(),
+            Some(("Task #12".into(), "2 of 4 done".into()))
+        );
+        assert_eq!(strip.current(), Some(2));
+        let evidence: Vec<(i64, bool)> =
+            strip.evidence().iter().map(|e| (e.at, e.failed)).collect();
+        assert_eq!(evidence, [(10, true), (30, false)]);
+        assert_eq!(Strip::of(Vec::new(), Vec::new(), None).heading(), None);
+    }
+
+    #[test]
+    fn a_selection_copies_its_cells() {
+        let lines: Vec<String> = ["$ ls   ", "a.txt  b.txt", "c.txt"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(selected_text(&lines, (1, 7), (1, 11)), "b.txt");
+        assert_eq!(
+            selected_text(&lines, (2, 2), (0, 2)),
+            "ls\na.txt  b.txt\nc.t"
+        );
+    }
+
+    #[test]
+    fn a_failing_run_is_told_by_its_count() {
+        assert!(failed_run("bun test: 12 pass, 1 fail"));
+        assert!(failed_run("cargo build failed"));
+        assert!(!failed_run("cargo test: 40 passed; 0 failed"));
+        assert!(!failed_run("bun test: 15 pass, 0 fail, 35 expect() calls"));
     }
 }

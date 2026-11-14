@@ -155,18 +155,24 @@ async fn a_checkout_is_read_against_where_it_left_main_and_runs_nothing_of_its_o
     let real = std::fs::canonicalize(&repo).expect("real");
     assert_eq!(Path::new(&root), real);
     assert_eq!((branch.as_deref(), base.as_str()), (Some("feat"), "main"));
-    let file = |path: &str, status: &str| ChangedFile {
-        path: path.into(),
-        status: status.into(),
-    };
+    let file = |path: &str, status: &str| (path.to_string(), status.to_string());
+    let listed: Vec<(String, String)> = files
+        .iter()
+        .map(|f: &ChangedFile| (f.path.clone(), f.status.clone()))
+        .collect();
     for want in [
         file("a.txt", "M"),
         file("b.txt", "A"),
         file("new.txt", "?"),
         file(".gitattributes", "?"),
     ] {
-        assert!(files.contains(&want), "{want:?} in {files:?}");
+        assert!(listed.contains(&want), "{want:?} in {files:?}");
     }
+    // Counted lines for a tracked file, none for an untracked one.
+    let a = files.iter().find(|f| f.path == "a.txt").expect("a.txt");
+    assert!(a.added.is_some() && a.removed.is_some(), "{a:?}");
+    let new = files.iter().find(|f| f.path == "new.txt").expect("new.txt");
+    assert_eq!((new.added, new.removed), (None, None));
     assert_eq!(files.len(), 4, "{files:?}");
     // Committed and uncommitted together, from where the branch left main.
     assert!(

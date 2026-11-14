@@ -5,8 +5,8 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AnyElement, AssetSource, Div, ElementId, FontWeight, Hsla, Role, SharedString, Stateful, Svg,
-    Toggled, div, prelude::*, px, svg,
+    AnyElement, AnyView, App, AssetSource, Context, Div, ElementId, FontWeight, Hsla, Render, Role,
+    SharedString, Stateful, Svg, Toggled, Window, div, prelude::*, px, svg,
 };
 use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
@@ -327,6 +327,39 @@ pub fn card(t: &Theme) -> Div {
         .rounded(px(14.))
         .border_1()
         .border_color(ca(t.hair))
+}
+
+/// A tooltip: a line of text on the popover ground, shown beside the control it explains.
+pub struct Tip {
+    text: SharedString,
+    t: Theme,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(280.))
+            .px(px(9.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .bg(c(self.t.pop))
+            .border_1()
+            .border_color(ca(self.t.line))
+            .text_size(px(12.))
+            .text_color(c(self.t.t1))
+            .child(self.text.clone())
+    }
+}
+
+/// What `.tooltip()` takes to show `text`.
+pub fn tip(text: &'static str, t: Theme) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_, cx| {
+        cx.new(|_| Tip {
+            text: text.into(),
+            t,
+        })
+        .into()
+    }
 }
 
 /// The sheet's frame: a scrim over the window and a card in its middle, holding `body`.

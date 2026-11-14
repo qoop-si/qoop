@@ -937,6 +937,12 @@ pub struct ChangedFile {
     pub path: String,
     /// git's letter against the base (`M`, `A`, `D`, `R`, `C`, `T`, `U`), or `?` untracked.
     pub status: String,
+    /// Lines added and removed, as `git diff --numstat` counts them. `None` for a binary or an
+    /// untracked file, and from a daemon that predates the counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<u32>,
 }
 
 /// The pull request of a `Changes` answer's branch.

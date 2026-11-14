@@ -31,10 +31,11 @@ const MATCHED: &[(&str, &str)] = &[
     // The trust menu's pointers, looked for on an agent's screen, never drawn.
     ("qoop-detect/src/lib.rs", "\u{276f}\u{203a}"),
     // An agent's own menu read off its screen: its cursor, boxes, ticks and the tree mark of
-    // a list row in a question, compared, never drawn.
+    // a list row in a question, and the play and pause marks of Claude Code's mode footer,
+    // compared, never drawn.
     (
         "qoop-runtime/src/menu.rs",
-        "\u{276f}\u{2610}\u{2612}\u{2611}\u{2714}\u{23bf}",
+        "\u{276f}\u{2610}\u{2612}\u{2611}\u{2714}\u{23bf}\u{23f5}\u{23f8}",
     ),
     ("qoop-runtime/src/asks.rs", "üı\u{307}ö\u{201d}"),
     (

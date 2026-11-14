@@ -30,6 +30,7 @@ use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, cells};
 use crate::keys::{self, Press};
 use crate::link::{self, Down, Latest, Up};
 use crate::newwork::NewWork;
+use crate::review::Review;
 use crate::state::{self, Chip, Kind, Model};
 use crate::theme::{MONO_FONT, TERMINAL_BG, Theme, UI_FONT, c, ca};
 use crate::ui::{self, Icon};
@@ -43,12 +44,45 @@ pub enum Page {
     Settings,
 }
 
-/// The terminal on screen, with what its pane remembers between frames.
+/// A terminal on screen, with what its pane remembers between frames.
 pub struct Term {
     pub terminal: TerminalStream,
     pub screen: Option<Rc<SnapshotWire>>,
-    sent: Rc<Cell<(u16, u16)>>,
-    viewport: Rc<Cell<Option<Viewport>>>,
+    pub(crate) sent: Rc<Cell<(u16, u16)>>,
+    pub(crate) viewport: Rc<Cell<Option<Viewport>>>,
+    /// Where the pane was drawn last, for a mouse position to a cell.
+    pub(crate) area: Rc<Cell<Bounds<Pixels>>>,
+    /// Rows scrolled back from the live screen by the wheel, and the page of scrollback shown
+    /// then (`Scrollback`); 0 is the live screen.
+    pub(crate) scroll: usize,
+    pub(crate) back: Option<Rc<SnapshotWire>>,
+    pub(crate) total: u64,
+    /// Cells selected with the mouse, anchor then end, as (row, column) of what is shown.
+    pub(crate) selection: Option<((usize, usize), (usize, usize))>,
+}
+
+impl Term {
+    pub fn new(terminal: TerminalStream) -> Term {
+        Term {
+            terminal,
+            screen: None,
+            sent: Rc::new(Cell::new((0, 0))),
+            viewport: Rc::new(Cell::new(None)),
+            area: Rc::new(Cell::new(Bounds::default())),
+            scroll: 0,
+            back: None,
+            total: 0,
+            selection: None,
+        }
+    }
+
+    /// What the pane shows: the scrollback page while scrolled, else the live screen.
+    pub fn shown(&self) -> Option<Rc<SnapshotWire>> {
+        match (&self.back, self.scroll) {
+            (Some(back), 1..) => Some(back.clone()),
+            _ => self.screen.clone(),
+        }
+    }
 }
 
 pub struct Desk {
@@ -57,7 +91,18 @@ pub struct Desk {
     pub inbox: bool,
     pub chip: Chip,
     pub sheet: Option<NewWork>,
+    /// The terminal the keys go to, and the other panes of its tab, read only.
     pub term: Option<Term>,
+    pub others: Vec<Term>,
+    /// The task strip of the session on screen, and the read that asked for it.
+    pub strip: Option<state::Strip>,
+    pub(crate) strip_ask: Option<String>,
+    /// The strip drawn as a vertical timeline.
+    pub timeline: bool,
+    /// The corner note: another agent that turned Needs you while this session is open.
+    pub note: Option<TerminalStream>,
+    pub review: Option<Review>,
+    pub review_focus: FocusHandle,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
@@ -76,7 +121,7 @@ pub struct Desk {
     pub now: i64,
     pub zone: Zone,
     pub my_pet: Option<Avatar>,
-    cells: Cells,
+    pub(crate) cells: Cells,
     /// The agents New work offers: (name, command).
     pub offers: Vec<(String, String)>,
     /// New work asked for: the create's id, the line its terminal gets, and the space. Kept
@@ -116,6 +161,13 @@ impl Desk {
             chip: Chip::All,
             sheet: None,
             term: None,
+            others: Vec::new(),
+            strip: None,
+            strip_ask: None,
+            timeline: false,
+            note: None,
+            review: None,
+            review_focus: cx.focus_handle(),
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -153,9 +205,10 @@ impl Desk {
                 // A New work asked for before the connection dropped: asked again, under its id.
                 self.ask_pending();
                 // A new connection, maybe a new daemon: say the size again.
-                if let Some(term) = &self.term {
+                for term in self.term.iter().chain(&self.others) {
                     term.sent.set((0, 0));
                 }
+                self.ask_strip();
             }
             Down::Disconnected(why) => {
                 if self.connected {
@@ -164,13 +217,12 @@ impl Desk {
                 self.connected = false;
             }
             Down::Screens => {
-                let screens =
+                let mut screens =
                     std::mem::take(&mut *self.latest.lock().unwrap_or_else(|e| e.into_inner()));
-                if let Some(term) = &mut self.term
-                    && let Some((_, screen)) =
-                        screens.into_iter().find(|(t, _)| *t == term.terminal)
-                {
-                    term.screen = Some(Rc::new(screen));
+                for term in self.term.iter_mut().chain(self.others.iter_mut()) {
+                    if let Some(screen) = screens.remove(&term.terminal) {
+                        term.screen = Some(Rc::new(screen));
+                    }
                 }
             }
             Down::Answer(answer) => self.answer(*answer, window, cx),
@@ -178,20 +230,70 @@ impl Desk {
                 self.open(Page::Session(terminal), window, cx);
                 window.activate_window();
             }
+            Down::Event(EventMessage::TasksChanged) => self.ask_strip(),
             Down::Event(_) => {}
         }
     }
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
         match answer {
-            ControlResponse::Agents { agents, .. } => self.model.rows = agents,
+            ControlResponse::Agents { agents, splits, .. } => {
+                let before = std::mem::replace(&mut self.model.rows, agents);
+                self.model.splits = splits;
+                self.rows_changed(&before);
+            }
+            ControlResponse::Tasks {
+                id,
+                tasks,
+                events,
+                item,
+                ..
+            } if self.strip_ask.as_deref() == Some(id.as_str()) => {
+                self.strip = Some(state::Strip::of(tasks, events, item));
+            }
+            ControlResponse::Changes {
+                id,
+                root,
+                base,
+                files,
+                diff,
+                cut,
+                pr,
+                ..
+            } => {
+                if let Some(review) = self.review.as_mut().filter(|r| r.id == id) {
+                    review.read = Some(Ok(crate::review::Changes {
+                        root,
+                        base,
+                        files,
+                        diffs: crate::review::split_diff(&diff),
+                        cut,
+                        pr,
+                    }));
+                }
+            }
+            ControlResponse::Scrollback {
+                terminal,
+                total,
+                lines,
+                ..
+            } => self.scrolled_back(terminal, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => self.model.spaces = workspaces,
             ControlResponse::Schedules { schedules, .. } => self.model.schedules = schedules,
             ControlResponse::QassWatch { on, .. } => self.model.qass_watch = Some(on),
             ControlResponse::TerminalCreated { id, terminal } => {
                 self.started(&id, terminal, window, cx)
             }
-            ControlResponse::Failed { id, reason } => self.refused(&id, reason),
+            ControlResponse::Failed { id, reason } => {
+                if let Some(review) = self.review.as_mut().filter(|r| r.id == id) {
+                    review.read = Some(Err(reason));
+                } else if self.strip_ask.as_deref() == Some(id.as_str()) {
+                    // A daemon from before a window could read a tab's task: no strip.
+                    self.strip = Some(state::Strip::default());
+                } else {
+                    self.refused(&id, reason);
+                }
+            }
             _ => {}
         }
     }
@@ -204,21 +306,22 @@ impl Desk {
             _ => None,
         };
         if self.term.as_ref().map(|t| t.terminal) != terminal {
-            if let Some(old) = self.term.take() {
-                let _ = self.up.send(Up::Hide(vec![old.terminal]));
-            }
             self.marked = None;
-            if let Some(terminal) = terminal {
-                self.term = Some(Term {
-                    terminal,
-                    screen: None,
-                    sent: Rc::new(Cell::new((0, 0))),
-                    viewport: Rc::new(Cell::new(None)),
-                });
-                let _ = self.up.send(Up::Show(vec![terminal]));
+            self.review = None;
+            self.strip = None;
+            if self.note == terminal {
+                self.note = None;
             }
         }
         self.page = page;
+        self.set_panes(terminal);
+        if matches!(page, Page::Session(_)) {
+            self.ask_strip();
+        } else {
+            self.strip = None;
+            self.strip_ask = None;
+            self.note = None;
+        }
         if self.term.is_some() {
             window.focus(&self.term_focus, cx);
         } else {
@@ -276,6 +379,8 @@ impl Desk {
             }
             match k.key.as_str() {
                 "c" => self.new_work(None, window, cx),
+                "x" => self.dismiss_note(cx),
+                "tab" => self.open_note(window, cx),
                 "i" => {
                     self.inbox = !self.inbox;
                     cx.notify();
@@ -300,6 +405,11 @@ impl Desk {
         match k.key.as_str() {
             "tab" if k.modifiers.shift => window.focus_prev(cx),
             "tab" => window.focus_next(cx),
+            "escape" if self.review.is_some() => {
+                self.review = None;
+                window.focus(&self.term_focus, cx);
+                cx.notify();
+            }
             "escape" if self.inbox => {
                 self.inbox = false;
                 cx.notify();
@@ -309,10 +419,27 @@ impl Desk {
     }
 
     /// A key for the terminal on screen.
-    fn term_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn term_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let k = &event.keystroke;
         if k.modifiers.platform && k.key == "q" {
             cx.quit();
+            return;
+        }
+        if k.modifiers.platform && k.key == "c" {
+            if self.copy(cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if k.modifiers.platform && k.key == "v" {
+            self.paste(cx);
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         // Nothing typed while the daemon is away: it would land, late, in whatever runs then.
@@ -335,6 +462,11 @@ impl Desk {
         if let Some(bytes) = keys::encode(press, app_cursor) {
             let _ = self.up.send(Up::Input(term.terminal, bytes));
             cx.stop_propagation();
+            // Typing goes back to the live screen, as a terminal does.
+            if term.scroll > 0 || term.selection.is_some() {
+                self.to_live();
+                cx.notify();
+            }
         }
     }
 
@@ -506,7 +638,7 @@ impl Desk {
                         let kind = entry.kind();
                         let terminal = entry.terminal();
                         let on = shown == Some(terminal);
-                        ui::control(
+                        let row = ui::control(
                             ("tree-row", terminal as u64),
                             Role::Link,
                             self.model.row_label(entry, self.now),
@@ -534,11 +666,59 @@ impl Desk {
                         .when_some(entry.age(self.now), |d, age| {
                             d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(age))
                         })
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.open(Page::Session(terminal), window, cx)
-                            },
-                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open(Page::Session(terminal), window, cx)
+                        }))
+                        .into_any_element();
+                        if !kind.needs_you() {
+                            return row;
+                        }
+                        // A Needs you row: its question, except while the corner note shows
+                        // it, and the quiet hand-off line (live once answering lands).
+                        let question = match entry {
+                            state::Entry::Live(r) if self.note != Some(terminal) => r
+                                .menu
+                                .as_ref()
+                                .map(|m| m.question.clone())
+                                .filter(|q| !q.is_empty()),
+                            _ => None,
+                        };
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(row)
+                            .when_some(question, |d, q| {
+                                d.child(
+                                    div()
+                                        .pl(px(29.))
+                                        .pr(px(10.))
+                                        .text_size(px(12.))
+                                        .text_color(c(t.t2))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(q),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("qass-line", terminal as u64))
+                                    .tooltip(ui::tip(
+                                        "qass answers if its rules allow; otherwise it comes \
+                                         back to you as a card",
+                                        *t,
+                                    ))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .h(px(24.))
+                                    .pl(px(29.))
+                                    .text_size(px(12.))
+                                    .text_color(c(t.t2))
+                                    .child(ui::icon(Icon::Eye, 12., c(t.t2)))
+                                    .child("Let qass handle it"),
+                            )
+                            .into_any_element()
                     }))
             }))
     }
@@ -1002,6 +1182,8 @@ impl Desk {
                     let _ = up.send(Up::Resize(t, cols, rows));
                 }),
                 input: Some((self.term_focus.clone(), cx.entity())),
+                selection: None,
+                area: None,
             })
     }
 
@@ -1017,7 +1199,7 @@ impl Desk {
             .bottom(px(26.));
         match self.page {
             Page::Home => body.overflow_y_scroll().child(self.home(t, cx)),
-            Page::Session(_) => body.p(px(12.)).child(self.terminal_area(focused, cx)),
+            Page::Session(_) => body.p(px(12.)).child(self.session(t, focused, cx)),
             Page::Qass if self.term.is_some() => {
                 body.p(px(12.)).child(self.terminal_area(focused, cx))
             }
