@@ -1028,10 +1028,26 @@ impl Drop for SwapLock {
 
 /// The version the file at `exe` says it is, if it runs and says one.
 fn version_at(exe: &Path) -> Option<String> {
-    let out = Command::new(exe).arg("--version").output().ok()?;
+    let out = ask_version(exe).ok()?;
     let line = String::from_utf8_lossy(&out.stdout);
     let version = line.trim().split_once(' ')?.1.to_string();
     paths::parse_version(&version).map(|_| version)
+}
+
+/// `exe --version`. A file just written is refused on Linux as "text file busy" while a
+/// forked child still holds its write descriptor (until that child execs), so that is
+/// waited out for a second instead of reading as a binary that does not run.
+fn ask_version(exe: &Path) -> std::io::Result<std::process::Output> {
+    let mut tries = 0;
+    loop {
+        match Command::new(exe).arg("--version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            out => return out,
+        }
+    }
 }
 
 /// The same swap onto an explicit path, so tests drive the whole chain without
@@ -1424,12 +1440,8 @@ mod tests {
             checksum_url: None,
         };
         install_to(&latest, "0.0.0", &exe, false).expect("install");
-        let out = std::process::Command::new(&exe)
-            .arg("--version")
-            .output()
-            .expect("run the swapped binary");
         assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
+            says(&exe),
             "qoop 9.9.9",
             "the file at the old path is the new release now"
         );
@@ -1484,11 +1496,7 @@ mod tests {
                 .is_symlink(),
             "the link was replaced by a plain file"
         );
-        let out = std::process::Command::new(&real)
-            .arg("--version")
-            .output()
-            .expect("run the swapped binary");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "qoop 9.9.9");
+        assert_eq!(says(&real), "qoop 9.9.9");
     }
 
     #[test]
@@ -1863,11 +1871,10 @@ mod tests {
         exe
     }
 
+    /// What the binary at `exe` answers to `--version`, through the same busy-file wait as
+    /// the install: these files were just written here, while other tests fork.
     fn says(exe: &std::path::Path) -> String {
-        let out = std::process::Command::new(exe)
-            .arg("--version")
-            .output()
-            .expect("run it");
+        let out = super::ask_version(exe).expect("run the binary");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
