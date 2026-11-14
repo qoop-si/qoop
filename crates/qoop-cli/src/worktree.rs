@@ -1082,7 +1082,7 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
     let list = worktrees()?;
     let why: Vec<Option<String>> = if stale {
         let main = &list[0].path;
-        let base = base_of(main, list[0].branch.as_deref(), None)
+        let base = base_of(main, list[0].branch.as_deref(), None, None)
             .ok()
             .map(|b| b.full);
         let now = std::time::SystemTime::now()
@@ -1557,6 +1557,7 @@ fn base_of(
     main: &std::path::Path,
     main_branch: Option<&str>,
     given: Option<&str>,
+    finishing: Option<&str>,
 ) -> std::io::Result<Base> {
     let exists = |r: &str| {
         git_in(
@@ -1586,29 +1587,15 @@ fn base_of(
             shown: given.to_string(),
         });
     }
-    let candidates = [(
-        "refs/remotes/origin/HEAD".to_string(),
-        "origin/HEAD".to_string(),
-    )]
-    .into_iter()
-    .chain(main_branch.map(|b| (format!("refs/remotes/origin/{b}"), format!("origin/{b}"))))
-    .chain(main_branch.map(|b| (format!("refs/heads/{b}"), b.to_string())));
-    let (full, shown) = candidates
-        .into_iter()
-        .find(|(full, _)| exists(full))
-        .ok_or_else(|| {
-            std::io::Error::other(
-                "nothing to compare with: the main checkout has no branch; pass --base REF",
-            )
-        })?;
-    // `origin/HEAD` stands for the branch it points at, which is what gh and the remote
-    // call the base: `main`, never `HEAD`.
-    let target = (full == "refs/remotes/origin/HEAD")
+    // `origin/HEAD` stands for the branch it points at, which is what gh and the remote call
+    // the base: `main`, never `HEAD`. A candidate that is the branch being finished (the
+    // remote's default branch is that branch) proves nothing, so the next one is taken.
+    let resolve = |full: String, shown: String| match (full == "refs/remotes/origin/HEAD")
         .then(|| git_in(main, &["symbolic-ref", "-q", &full]).ok())
         .flatten()
         .map(|t| t.trim().to_string())
-        .filter(|t| t.starts_with("refs/remotes/origin/"));
-    Ok(match target {
+        .filter(|t| t.starts_with("refs/remotes/origin/"))
+    {
         Some(target) => Base {
             shown: target
                 .strip_prefix("refs/remotes/")
@@ -1617,6 +1604,26 @@ fn base_of(
             full: target,
         },
         None => Base { full, shown },
+    };
+    let own = |full: &str| {
+        finishing.is_some_and(|b| {
+            full == format!("refs/heads/{b}") || full == format!("refs/remotes/origin/{b}")
+        })
+    };
+    [(
+        "refs/remotes/origin/HEAD".to_string(),
+        "origin/HEAD".to_string(),
+    )]
+    .into_iter()
+    .chain(main_branch.map(|b| (format!("refs/remotes/origin/{b}"), format!("origin/{b}"))))
+    .chain(main_branch.map(|b| (format!("refs/heads/{b}"), b.to_string())))
+    .filter(|(full, _)| exists(full))
+    .map(|(full, shown)| resolve(full, shown))
+    .find(|base| !own(&base.full))
+    .ok_or_else(|| {
+        std::io::Error::other(
+            "nothing to compare with: the main checkout has no branch; pass --base REF",
+        )
     })
 }
 
@@ -1849,7 +1856,7 @@ fn finish_merged(
     if origin {
         fetch_origin(main);
     }
-    let base = base_of(main, main_branch, given_base.as_deref())?;
+    let base = base_of(main, main_branch, given_base.as_deref(), Some(branch))?;
     // However `--base` was spelled (`refs/heads/...`, a name git expands, a bare commit id
     // of the tip): a branch is always merged into itself, which proves nothing.
     let is_tip = || {
