@@ -137,8 +137,8 @@ qoop race ls <name> [--test CMD]
 qoop race rm <name> [--keep AGENT] [--force]
 ```
 
-A race is the person's or qass's: from a worker agent's terminal `race new` is
-refused, so never start one as a worker. It gives 2 to 5 agents the same prompt,
+A race is the person's or qass's: from a worker agent's terminal `race new` and
+`race rm` are refused, so never start or drop one as a worker. It gives 2 to 5 agents the same prompt,
 each on `race/<name>/<agent>` in its own worktree and tab, from one base commit
 (the ref `refs/qoop/race/<name>`). Each racer is told: change files in its
 worktree only, no commit, push, PR, merge, closing its tab or starting agents,

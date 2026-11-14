@@ -94,9 +94,10 @@ the agent started on the prompt. Under the prompt each racer is told to change f
 worktree only, never commit, push, open a PR, merge, close its tab or start agents, and to end
 with a short self-report. Every racer starts from one commit: `HEAD` of the checkout you run it
 in, or `--base`; uncommitted changes there are not in the racers. A worker agent's terminal
-cannot start a race; your own shell and qass can. `--wait` returns once every racer finished,
-failed, is blocked, asleep, closed, quit to its shell or never started, a line each, and exits
-0 only when every racer finished. A blocked racer waits for you: its line names the `qoop wait`
+cannot start or drop a race; your own shell and qass can. `--wait` returns once every racer
+finished, failed, is blocked, asleep, closed, quit to its shell or never started, a line each.
+It exits 0 when every racer finished, 1 when any ended another way or qoop stopped while it
+waited, and 124 past `--timeout`. A blocked racer waits for you: its line names the `qoop wait`
 that keeps waiting on it.
 
 `race ls` counts what each worktree changed since that commit, committed or not; `--test` runs

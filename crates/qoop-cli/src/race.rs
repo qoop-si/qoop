@@ -159,8 +159,8 @@ fn first_message(prompt: &str) -> String {
     format!("{}\n\n{RULE}", prompt.trim_end())
 }
 
-/// The owner's gate: a race is started by the person (their own shell tab, or outside qoop)
-/// or by qass, never from a worker agent's terminal. Read from the caller's row, not the
+/// The owner's gate: a race is started and dropped by the person (their own shell tab, or
+/// outside qoop) or by qass, never from a worker agent's terminal. Read from the caller's row, not the
 /// daemon: a speed bump like [`crate::qass_guard`], not a lock.
 fn refuse_a_worker() -> std::io::Result<()> {
     let (Some(me), Some(_)) = crate::task::here() else {
@@ -171,7 +171,7 @@ fn refuse_a_worker() -> std::io::Result<()> {
         .any(|r| r.terminal == me && r.agent);
     if agent && !crate::qass::called_by_qass() {
         return Err(std::io::Error::other(
-            "a race is started by the person or qass, not from an agent's terminal",
+            "a race is started and dropped by the person or qass, not from an agent's terminal",
         ));
     }
     Ok(())
@@ -247,15 +247,20 @@ fn new(args: &[String]) -> std::io::Result<()> {
     println!("race={} base={sha} ({wanted})", opts.name);
     let mut started = Vec::new();
     for racer in &racers {
-        let terminal = start(&main, racer, &sha, &place, &read).map_err(|e| {
-            std::io::Error::other(format!(
-                "{} ({}): {e}; `qoop race rm {} --force` removes what was made",
+        let mut opened = None;
+        if let Err(e) = start(&main, racer, &sha, &place, &read, &mut opened) {
+            let tabs: Vec<u32> = started.iter().map(|(_, t)| *t).chain(opened).collect();
+            return Err(std::io::Error::other(format!(
+                "{} ({}): {e}; {}",
                 racer.branch,
                 racer.path.display(),
-                opts.name
-            ))
-        })?;
-        started.push((racer.label.clone(), terminal));
+                undo_hint(&opts.name, &tabs)
+            )));
+        }
+        started.push((
+            racer.label.clone(),
+            opened.expect("a started racer has a tab"),
+        ));
     }
     if opts.wait {
         return wait(&opts.name, &started, opts.timeout);
@@ -270,6 +275,10 @@ fn new(args: &[String]) -> std::io::Result<()> {
 /// folder new: not on disk, not one git still lists, not shared by two racers.
 fn preflight(main: &Path, list: &[Worktree], name: &str, racers: &[Racer]) -> std::io::Result<()> {
     let refuse = |why: String| Err(std::io::Error::other(why));
+    let labels: Vec<String> = racers.iter().map(|r| r.label.clone()).collect();
+    if let Some(twice) = twice(&labels) {
+        return refuse(format!("two racers would both be {twice}"));
+    }
     for racer in racers {
         if worktree::git_in(main, &["check-ref-format", "--branch", &racer.branch]).is_err() {
             return refuse(format!("{} is not a branch name git takes", racer.branch));
@@ -326,14 +335,16 @@ fn preflight(main: &Path, list: &[Worktree], name: &str, racers: &[Racer]) -> st
 }
 
 /// One racer: its worktree from the base, set up as its space says, and a tab with the agent
-/// started on the message. Its line once the tab has it; its terminal.
+/// started on the message; its line once the tab has it. `opened` is its terminal as soon as one
+/// exists, a failure after that included.
 fn start(
     main: &Path,
     racer: &Racer,
     sha: &str,
     place: &worktree::Place,
     read: &qoop_tui::config::Read,
-) -> std::io::Result<u32> {
+    opened: &mut Option<u32>,
+) -> std::io::Result<()> {
     let path = worktree::add(main, &racer.branch, &racer.path, false, Some(sha))?;
     let setup = worktree::prepare(main, &path, &racer.branch, place, read, false)
         .map_err(|why| std::io::Error::other(format!("setup failed ({why})")))?;
@@ -342,18 +353,40 @@ fn start(
         typed: racer.typed.clone(),
         ..NewOpts::default()
     };
-    let mut terminal = None;
     worktree::open_in(new, place, path.clone(), &racer.branch, |t| {
-        terminal = Some(t)
+        *opened = Some(t)
     })?;
-    let terminal = terminal.ok_or_else(|| std::io::Error::other("no terminal was opened"))?;
+    let terminal = opened.ok_or_else(|| std::io::Error::other("no terminal was opened"))?;
     println!(
         "agent={} branch={} worktree={} setup={setup} terminal={terminal} status=starting",
         racer.label,
         racer.branch,
         path.display()
     );
-    Ok(terminal)
+    Ok(())
+}
+
+/// The first name two racers share, as `claude,claude-2,claude` would.
+fn twice(labels: &[String]) -> Option<&str> {
+    labels
+        .iter()
+        .enumerate()
+        .find(|(i, l)| labels[..*i].contains(l))
+        .map(|(_, l)| l.as_str())
+}
+
+/// What undoes a race that stopped midway: its tabs first, since `race rm` never drops a
+/// working racer, then the rest.
+fn undo_hint(name: &str, tabs: &[u32]) -> String {
+    let close: Vec<String> = tabs.iter().map(|t| format!("`qoop close {t}`")).collect();
+    match close.as_slice() {
+        [] => format!("`qoop race rm {name} --force` removes what was made"),
+        _ => format!(
+            "end the tabs it started with {}, then `qoop race rm {name} --force` removes what was \
+             made",
+            close.join(", ")
+        ),
+    }
 }
 
 /// How a racer's wait ended.
@@ -372,25 +405,30 @@ enum End {
 #[derive(Default)]
 struct Seen {
     agent: bool,
+    /// Its turn end was seen: a tab that sleeps or quits to its shell after it finished.
+    stopped: bool,
     ready_since: Option<Instant>,
     blocked_since: Option<Instant>,
 }
 
 /// Whether a racer's row, in this listing, ends its wait. Level-triggered: only whether it
-/// was ever an agent, since when it sat ready without being one, and since when it is blocked,
-/// carry over.
+/// was ever an agent, whether its turn end was seen, since when it sat ready without being one,
+/// and since when it is blocked, carry over.
 fn judge(row: Option<&AgentRow>, seen: &mut Seen, now: Instant) -> Option<End> {
     let Some(row) = row else {
         return Some(End::Closed);
     };
+    // Neither a slept tab nor a new generation keeps a stop: one seen before still counts.
+    let stopped = seen.stopped;
+    let finished_or = |end| Some(if stopped { End::Finished } else { end });
     if row.state == "sleeping" {
-        return Some(End::Sleeping);
+        return finished_or(End::Sleeping);
     }
     if row.agent {
         seen.agent = true;
     } else if seen.agent {
         // The agent quit: its shell is a new generation, which has no stop.
-        return Some(End::Exited);
+        return finished_or(End::Exited);
     }
     let status = row.status.as_deref().unwrap_or(&row.state);
     if status == "failed" {
@@ -407,6 +445,7 @@ fn judge(row: Option<&AgentRow>, seen: &mut Seen, now: Instant) -> Option<End> {
     }
     seen.blocked_since = None;
     if row.stop.is_some() && row.readiness != "spawning" {
+        seen.stopped = true;
         return Some(End::Finished);
     }
     if !seen.agent && row.readiness == "ready" {
@@ -481,14 +520,28 @@ fn wait(name: &str, racers: &[(String, u32)], timeout: Option<Duration>) -> std:
     }
 }
 
-/// A racer found from its branch: its name, its branch and its worktree when it has one.
+/// A racer found from its branch: its name, its branch and its linked worktree as git recorded
+/// it, gone from disk or not, when it has one.
 struct Found<'a> {
     label: String,
     branch: String,
     tree: Option<&'a Worktree>,
 }
 
-/// Every racer of race `name` still on a branch, in name order.
+impl Found<'_> {
+    /// Its worktree as recorded, for finding its tab even when the folder is gone.
+    fn recorded(&self) -> Option<&Path> {
+        self.tree.map(|w| w.path.as_path())
+    }
+
+    /// Its worktree when the folder is still there.
+    fn on_disk(&self) -> Option<&Path> {
+        self.recorded().filter(|p| p.exists())
+    }
+}
+
+/// Every racer of race `name` still on a branch, in name order. Only a linked worktree is a
+/// racer's: a racer branch checked out in the main checkout has none.
 fn racers_of<'a>(main: &Path, list: &'a [Worktree], name: &str) -> std::io::Result<Vec<Found<'a>>> {
     let prefix = format!("refs/heads/race/{name}/");
     let refs = worktree::git_in(main, &["for-each-ref", "--format=%(refname)", &prefix])?;
@@ -499,6 +552,7 @@ fn racers_of<'a>(main: &Path, list: &'a [Worktree], name: &str) -> std::io::Resu
             let branch = branch_of(name, label);
             let tree = list
                 .iter()
+                .skip(1)
                 .find(|w| w.branch.as_deref() == Some(branch.as_str()));
             Found {
                 label: label.to_string(),
@@ -509,21 +563,27 @@ fn racers_of<'a>(main: &Path, list: &'a [Worktree], name: &str) -> std::io::Resu
         .collect())
 }
 
-/// A racer's tab: the row named after its branch, else one inside its worktree, an agent
-/// before a shell.
+/// Whether the race ref is there.
+fn has_ref(main: &Path, race_ref: &str) -> bool {
+    worktree::git_in(main, &["rev-parse", "--verify", "--quiet", race_ref]).is_ok()
+}
+
+/// Whether a row's folder is inside `root`, both resolved (a folder that is gone compares as
+/// written).
+fn inside(row: &AgentRow, root: &Path) -> bool {
+    row.cwd
+        .as_deref()
+        .is_some_and(|c| worktree::real(Path::new(c)).starts_with(root))
+}
+
+/// A racer's tab: the row named after its branch whose folder is inside its worktree (a race of
+/// the same name in another repository names its tabs alike), else an agent inside it. A shell
+/// that only stands there is never taken for the racer.
 fn tab_of<'a>(rows: &'a [AgentRow], branch: &str, tree: Option<&Path>) -> Option<&'a AgentRow> {
+    let root = worktree::real(tree?);
     rows.iter()
-        .find(|r| r.name.as_deref() == Some(branch))
-        .or_else(|| {
-            let root = worktree::real(tree?);
-            rows.iter()
-                .filter(|r| {
-                    r.cwd
-                        .as_deref()
-                        .is_some_and(|c| worktree::real(Path::new(c)).starts_with(&root))
-                })
-                .max_by_key(|r| r.agent)
-        })
+        .find(|r| r.name.as_deref() == Some(branch) && inside(r, &root))
+        .or_else(|| rows.iter().find(|r| r.agent && inside(r, &root)))
 }
 
 /// A count, with `+` when it may be low.
@@ -550,11 +610,11 @@ fn ls(args: &[String]) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("no race {name}")));
     }
     let race_ref = ref_of(name);
-    let has_ref = worktree::git_in(main, &["rev-parse", "--verify", "--quiet", &race_ref]).is_ok();
+    let has_ref = has_ref(main, &race_ref);
     let rows = worktree::session_rows()?;
     for racer in &found {
-        let path = racer.tree.map(|w| w.path.as_path()).filter(|p| p.exists());
-        let tab = tab_of(&rows, &racer.branch, path);
+        let path = racer.on_disk();
+        let tab = tab_of(&rows, &racer.branch, racer.recorded());
         let lines = path
             .filter(|_| has_ref)
             .and_then(|p| qoop_runtime::changes::stat(&p.display().to_string(), &race_ref).ok())
@@ -573,7 +633,11 @@ fn ls(args: &[String]) -> std::io::Result<()> {
             (Some(cmd), Some(p)) => match crate::watch::run_sh(cmd, p, TEST_WITHIN) {
                 Ok(exit) if exit.timed_out => "timeout",
                 Ok(exit) if exit.code == Some(0) => "pass",
-                _ => "fail",
+                Ok(_) => "fail",
+                Err(e) => {
+                    eprintln!("race ls: {}: the test could not start: {e}", racer.label);
+                    "-"
+                }
             },
             _ => "-",
         };
@@ -595,8 +659,9 @@ fn status_of(tab: Option<&AgentRow>) -> &str {
 
 /// `qoop race rm <name> [--keep AGENT] [--force]`: drop every racer but `--keep`, in two
 /// passes. The first touches nothing and names every reason not to, for every racer; the
-/// second closes each tab, removes its worktree and deletes its branch, and stops at the first
-/// error, so a run again finishes it. The race ref goes once no racer branch is left.
+/// second looks at each racer again right before it closes its tab, removes its worktree and
+/// deletes its branch, and stops at the first refusal or error, so a run again finishes it.
+/// The race ref goes once no racer branch is left.
 fn rm(args: &[String]) -> std::io::Result<()> {
     let Some((name, flags)) = args.split_first().filter(|(n, _)| name_ok(n)) else {
         return Err(crate::usage(USAGE));
@@ -615,6 +680,7 @@ fn rm(args: &[String]) -> std::io::Result<()> {
             other => return Err(crate::usage(format!("unexpected {other}; {USAGE}"))),
         }
     }
+    refuse_a_worker()?;
     let list = worktree::worktrees()?;
     let main = list[0].path.clone();
     let found = racers_of(&main, &list, name)?;
@@ -625,7 +691,7 @@ fn rm(args: &[String]) -> std::io::Result<()> {
         return Err(crate::usage(format!("{keep} is no racer of race {name}")));
     }
     let race_ref = ref_of(name);
-    let has_ref = worktree::git_in(&main, &["rev-parse", "--verify", "--quiet", &race_ref]).is_ok();
+    let has_ref = has_ref(&main, &race_ref);
     if found.is_empty() {
         if !has_ref {
             return Err(std::io::Error::other(format!("no race {name}")));
@@ -638,37 +704,44 @@ fn rm(args: &[String]) -> std::io::Result<()> {
         .iter()
         .filter(|r| keep.as_ref() != Some(&r.label))
         .collect();
-    let rows = worktree::session_rows()?;
-    // Found by folder only when it is an agent: a person's shell standing there is refused below,
-    // never closed as if it were the racer.
-    let tabs: Vec<Option<&AgentRow>> = losers
-        .iter()
-        .map(|r| {
-            let path = r.tree.map(|w| w.path.as_path()).filter(|p| p.exists());
-            tab_of(&rows, &r.branch, path)
-                .filter(|t| t.agent || t.name.as_deref() == Some(r.branch.as_str()))
-        })
-        .collect();
-    let mut reasons = Vec::new();
-    for (racer, tab) in losers.iter().zip(&tabs) {
-        for why in refusals(&main, racer, *tab, &rows, &race_ref, has_ref, force) {
-            reasons.push(format!("{}: {why}", racer.label));
+    let check = |racer: &Found| -> std::io::Result<Option<(Option<u32>, Option<u64>)>> {
+        let rows = worktree::session_rows()?;
+        let tab = tab_of(&rows, &racer.branch, racer.recorded());
+        let why = refusals(&main, racer, tab, &rows, &race_ref, has_ref, force);
+        for reason in &why {
+            eprintln!("race rm: {}: {reason}", racer.label);
         }
+        Ok(why
+            .is_empty()
+            .then(|| (tab.map(|t| t.terminal), tab.and_then(|t| t.generation))))
+    };
+    let mut refused = false;
+    for racer in &losers {
+        refused |= check(racer)?.is_none();
     }
-    if !reasons.is_empty() {
-        for reason in &reasons {
-            eprintln!("race rm: {reason}");
-        }
+    if refused {
         return Err(std::io::Error::other(format!(
             "nothing was removed from race {name}"
         )));
     }
     // A racer folder deleted by hand: forgotten first, so neither the removal nor the branch
-    // delete trips on it.
-    worktree::git_in(&main, &["worktree", "prune"])?;
-    for (racer, tab) in losers.iter().zip(&tabs) {
-        if let Some(tab) = tab {
-            crate::supervise::close_terminal(tab.terminal, tab.generation)?;
+    // delete trips on it. Only then: a prune forgets every missing worktree of the repository.
+    if losers
+        .iter()
+        .any(|r| r.recorded().is_some() && r.on_disk().is_none())
+    {
+        worktree::git_in(&main, &["worktree", "prune"])?;
+    }
+    for racer in &losers {
+        // Looked at again: a racer that went back to work since the first pass is not dropped.
+        let Some((terminal, generation)) = check(racer)? else {
+            return Err(std::io::Error::other(format!(
+                "stopped at {}; the racers above were removed",
+                racer.label
+            )));
+        };
+        if let Some(terminal) = terminal {
+            crate::supervise::close_terminal(terminal, generation)?;
         }
         let tree = racer.tree.filter(|w| w.path.exists());
         if let Some(tree) = tree {
@@ -689,10 +762,11 @@ fn rm(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Why a losing racer cannot be dropped now: its tab is still at work (never overridden, as
-/// `worktree rm` never overrides a live process) or is the caller's own, the caller or another
-/// tab stands in its worktree, or, without `force`, it has commits past the base (unknown with
-/// no race ref) or uncommitted changes.
+/// Why a losing racer cannot be dropped now: its tab is still at work or its state is unknown
+/// (never overridden, as `worktree rm` never overrides a live process), its tab runs something
+/// that is neither its agent nor a shell, or is the caller's own, the caller or another tab
+/// stands in its worktree, or, without `force`, it has commits past the base (unknown with no
+/// race ref) or uncommitted changes.
 fn refusals(
     main: &Path,
     racer: &Found,
@@ -703,18 +777,27 @@ fn refusals(
     force: bool,
 ) -> Vec<String> {
     let mut why = Vec::new();
-    if let Some(tab) = tab {
+    if let Some(tab) = tab.filter(|t| t.state != "sleeping") {
+        let t = tab.terminal;
         let status = status_of(Some(tab));
-        if matches!(status, "working" | "starting" | "background") {
+        if matches!(status, "working" | "starting" | "background" | "unknown") {
             why.push(format!(
                 "terminal {t} is {status}: wait for it (`qoop wait {t}`) or close it first; \
-                 --force does not override a running agent",
-                t = tab.terminal
+                 --force does not override a running agent"
             ));
         }
-        if crate::supervise::own_terminal() == Some(tab.terminal) {
-            why.push(format!("terminal {} is the one this runs in", tab.terminal));
+        let program = tab.program.as_deref();
+        if !tab.agent && !program.is_some_and(qoop_runtime::idle::is_shell_program) {
+            why.push(format!(
+                "terminal {t} runs {}, not its agent or a shell: close it first",
+                program.unwrap_or("something qoop cannot name")
+            ));
         }
+    }
+    if let Some(tab) = tab
+        && crate::supervise::own_terminal() == Some(tab.terminal)
+    {
+        why.push(format!("terminal {} is the one this runs in", tab.terminal));
     }
     if !force {
         let ahead = has_ref
@@ -739,11 +822,7 @@ fn refusals(
             ),
         }
     }
-    let Some(root) = racer
-        .tree
-        .filter(|w| w.path.exists())
-        .map(|w| worktree::real(&w.path))
-    else {
+    let Some(root) = racer.on_disk().map(worktree::real) else {
         return why;
     };
     if !force && worktree::dirty(&root).unwrap_or(true) {
@@ -758,11 +837,7 @@ fn refusals(
     let others: Vec<String> = rows
         .iter()
         .filter(|r| r.state != "sleeping" && Some(r.terminal) != tab.map(|t| t.terminal))
-        .filter(|r| {
-            r.cwd
-                .as_deref()
-                .is_some_and(|c| worktree::real(Path::new(c)).starts_with(&root))
-        })
+        .filter(|r| inside(r, &root))
         .map(|r| r.terminal.to_string())
         .collect();
     if !others.is_empty() {
@@ -921,6 +996,39 @@ mod tests {
             blocked.starts_with("agent=codex terminal=4 end=blocked why=trust_required; ")
                 && blocked.contains("qoop wait 4 --until done,idle,failed"),
             "{blocked}"
+        );
+    }
+
+    #[test]
+    fn a_racer_that_finished_still_reads_finished_once_it_sleeps_or_quits() {
+        let t0 = Instant::now();
+        for after in [
+            row(1, false, "sleeping", "ready", false),
+            row(1, false, "idle", "ready", false),
+        ] {
+            let mut seen = Seen::default();
+            let done = row(1, true, "done", "ready", true);
+            assert_eq!(judge(Some(&done), &mut seen, t0), Some(End::Finished));
+            assert_eq!(judge(Some(&after), &mut seen, t0), Some(End::Finished));
+        }
+    }
+
+    #[test]
+    fn two_racers_of_one_name_are_refused_and_a_stop_midway_says_how_to_undo_it() {
+        let agents = ["claude", "claude-2", "claude"].map(String::from);
+        assert_eq!(twice(&labels(&agents)), Some("claude-2"));
+        assert_eq!(
+            twice(&labels(&["claude", "claude"].map(String::from))),
+            None
+        );
+        assert_eq!(
+            undo_hint("x", &[]),
+            "`qoop race rm x --force` removes what was made"
+        );
+        assert_eq!(
+            undo_hint("x", &[3, 4]),
+            "end the tabs it started with `qoop close 3`, `qoop close 4`, then \
+             `qoop race rm x --force` removes what was made"
         );
     }
 }

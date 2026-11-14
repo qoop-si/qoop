@@ -141,6 +141,7 @@ impl Git {
         for inherited in [
             "GIT_DIR",
             "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
             "GIT_INDEX_FILE",
             "GIT_CONFIG_PARAMETERS",
         ] {
@@ -351,13 +352,15 @@ pub struct Stat {
 /// The largest untracked file whose lines are counted; a larger one is a file of no lines.
 const COUNTED: u64 = 1024 * 1024;
 
-/// What the checkout `cwd` is in changed since it left `base` (see [`from_of`]): the tracked
-/// files as `git diff --numstat` counts them, every rename a removal and an addition, a binary
-/// file one of no lines; then each untracked file, its lines counted as git would (see
-/// [`lines_of`]). The index is never touched.
+/// What the checkout `cwd` is in changed since it left `base` (their merge base; none is
+/// an error, never a guess): the tracked files as `git diff --numstat` counts them, every
+/// rename a removal and an addition, a binary file one of no lines; then each untracked file,
+/// its lines counted as git would (see [`lines_of`]). The index is never touched.
 pub fn stat(cwd: &str, base: &str) -> Result<Stat, String> {
     let git = open(cwd, GIT_WITHIN)?;
-    let from = from_of(&git, base);
+    let from = git
+        .line(&["merge-base", "--end-of-options", "HEAD", base])
+        .ok_or_else(|| format!("HEAD and {base} have no merge base"))?;
     let args = [
         &["diff", "--numstat", "-z", "--no-renames"][..],
         &DIFF,
@@ -844,6 +847,18 @@ mod tests {
             before,
             "the index is never touched"
         );
+    }
+
+    #[test]
+    fn a_stat_against_a_base_never_met_is_an_error() {
+        let (_dir, repo) = repo();
+        git(&repo, &["checkout", "-q", "--orphan", "elsewhere"]);
+        git(&repo, &["commit", "-q", "-m", "elsewhere"]);
+        git(&repo, &["update-ref", "refs/qoop/race/x", "HEAD"]);
+        git(&repo, &["checkout", "-q", "trunk"]);
+        let cwd = repo.display().to_string();
+        assert!(stat(&cwd, "refs/qoop/race/x").is_err());
+        assert!(stat(&cwd, "refs/qoop/race/none").is_err());
     }
 
     #[test]

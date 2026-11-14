@@ -53,7 +53,7 @@ pub(crate) fn parse_worktrees(raw: &str) -> Vec<Worktree> {
 
 /// What a git hook or a script that ran qoop leaves in the environment, and would point git
 /// at another repository or change how a pattern matches.
-const GIT_SCOPE: [&str; 7] = [
+pub(crate) const GIT_SCOPE: [&str; 7] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -278,7 +278,7 @@ pub(crate) fn real(path: &std::path::Path) -> PathBuf {
 
 /// Which worktree a directory is in: the deepest one containing it, compared by path
 /// component after resolving both, so `/repo-wt-a` is not inside `/repo`.
-pub(crate) fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
+fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
     let cwd = real(cwd);
     roots
         .iter()
@@ -1308,9 +1308,15 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
 }
 
 /// Remove a linked worktree from the main checkout `main`, keeping its branch: refused while
-/// any process is inside (see [`refuse_if_in_use`]), and when it is dirty unless `force`.
+/// any process is inside (see [`refuse_if_in_use`]), and when it is dirty unless `force`; never
+/// the main one.
 /// Prints nothing.
 pub(crate) fn remove(main: &std::path::Path, tree: &Worktree, force: bool) -> std::io::Result<()> {
+    if real(&tree.path) == real(main) {
+        return Err(std::io::Error::other(
+            "that is the main worktree; only a linked one is removed",
+        ));
+    }
     refuse_if_in_use(tree)?;
     let status = git(
         &tree.path,
