@@ -321,6 +321,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 config says, with a terminal in it\n\
                   \x20 qoop worktree setup [<branch|path>] [--space ID|NAME]  run that setup\n\
                   \x20                 again on an existing worktree\n\
+                  \x20 qoop worktree finish <branch|path> [--pr|--merge|--discard] [--base REF]\n\
+                  \x20                 clean up merged work, open a PR, fast-forward, or drop it\n\
                   \x20 qoop worktree ls [--json]  every worktree and the terminals inside\n\
                   \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\

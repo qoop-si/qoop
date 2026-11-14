@@ -53,6 +53,8 @@ qoop close 7                                end a terminal and what it started
 ```
 qoop worktree new feat/login -- claude      a git worktree beside the repo, an agent in it
 qoop worktree setup feat/login              run its space's setup again
+qoop worktree finish feat/login --pr        push it and open a pull request, keeping it
+qoop worktree finish feat/login             once merged: remove it, its branch and origin's
 qoop worktree ls                            every worktree and the terminals inside it
 qoop worktree rm feat/login                 remove it, keeping the branch
 ```
@@ -66,6 +68,13 @@ files it lists and runs its `setup` (see [Configuration](#configuration)); stdou
 opens no terminal and exits 1; `worktree setup <branch>` runs it again. `worktree rm` refuses
 while any process has its directory inside (named by pid, and by qoop terminal where it
 knows), and refuses a tree with uncommitted changes unless `--force`.
+
+`worktree finish` deletes only work it can prove is kept: plain `finish` removes the worktree,
+its branch and `origin/<branch>` once the branch is merged (fast-forward, rebase, or a squash
+merge gh knows of), and refuses otherwise. `--pr` pushes and opens a pull request, keeping the
+worktree for the review's fixes; `--merge` fast-forwards the main checkout's branch, locally;
+`--discard` drops the work. It never force pushes, every step is safe to run again, and like
+`rm` it runs from outside the worktree.
 
 ## Spaces
 
