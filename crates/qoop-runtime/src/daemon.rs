@@ -1979,7 +1979,7 @@ impl Daemon {
 }
 
 /// Remove a socket file only when nothing is listening on it, and only when it is ours.
-fn remove_stale_socket(path: &Path) -> io::Result<()> {
+pub fn remove_stale_socket(path: &Path) -> io::Result<()> {
     // Not `exists()`, which follows a link: a link left pointing at the socket of a daemon that
     // has gone (see `legacy`) is a name that has to be freed too, or the bind fails for good.
     if path.symlink_metadata().is_err() {
@@ -2101,7 +2101,7 @@ pub fn peer_pid(stream: &impl AsRawFd) -> Option<u32> {
     }
 }
 
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "macos")]
     {

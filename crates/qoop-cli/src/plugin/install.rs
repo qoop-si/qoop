@@ -67,12 +67,19 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
             };
             let source = Source::parse(source).map_err(fail)?;
             let subdir = source.subdir.as_deref();
-            install_from(&home, &source.url, subdir, &source.shown, git_ref, yes)
+            install_from(&home, &source.url, subdir, &source.shown, git_ref, yes)?;
+            super::host::ensure_plugin_host();
+            Ok(())
         }
-        (Some("link"), [dir]) => link(&home, Path::new(dir), yes),
+        (Some("link"), [dir]) => {
+            link(&home, Path::new(dir), yes)?;
+            super::host::ensure_plugin_host();
+            Ok(())
+        }
         (Some("ls"), []) => ls(&home, flag("--json")),
         (Some("rm"), [id]) => rm(&home, id),
         (Some("run"), [spec]) => run_action(&home, spec),
+        (Some("host"), []) => super::host::run(),
         (Some("--help" | "-h") | None, _) => {
             println!("{USAGE}");
             Ok(())
@@ -84,6 +91,7 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
 /// Where plugins live: `<data>/plugins`, one folder (or a link, for `link`) per id, beside the
 /// consent ledger and its lock. Dot names are qoop's own (`.bin`, `.state`, install scratch,
 /// the ledger's temporaries), never an id.
+#[derive(Clone)]
 pub(crate) struct Home {
     root: PathBuf,
     /// `<config>/plugins`: each plugin's config folder, `HERDR_PLUGIN_CONFIG_DIR`.
@@ -91,7 +99,12 @@ pub(crate) struct Home {
 }
 
 impl Home {
-    fn here() -> std::io::Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn at(root: PathBuf, config: PathBuf) -> Self {
+        Self { root, config }
+    }
+
+    pub(crate) fn here() -> std::io::Result<Self> {
         let data = paths::data_dir().ok_or_else(|| fail("no HOME to keep plugins under"))?;
         Ok(Self {
             root: data.join("plugins"),
@@ -103,20 +116,25 @@ impl Home {
         self.root.join("consent.json")
     }
 
-    fn dir_of(&self, id: &str) -> PathBuf {
+    pub(crate) fn dir_of(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
 
-    fn state_of(&self, id: &str) -> PathBuf {
+    pub(crate) fn state_of(&self, id: &str) -> PathBuf {
         self.root.join(".state").join(id)
     }
 
-    fn config_of(&self, id: &str) -> PathBuf {
+    pub(crate) fn config_of(&self, id: &str) -> PathBuf {
         self.config.join(id)
     }
 
+    /// The herdr config file plugins are pointed at; a dot name, so never a plugin's folder.
+    fn herdr_config(&self) -> PathBuf {
+        self.config.join(".herdr-config.toml")
+    }
+
     /// The folder the herdr shim is on `PATH` from.
-    fn bin(&self) -> PathBuf {
+    pub(crate) fn bin(&self) -> PathBuf {
         self.root.join(".bin")
     }
 }
@@ -515,7 +533,7 @@ fn install_from(
 fn build(home: &Home, m: &Manifest, root: &Path) -> std::io::Result<()> {
     for step in &m.here().build {
         eprintln!("building: {:?}", step.command);
-        let mut cmd = Command::new(&step.command[0]);
+        let mut cmd = Command::new(program(root, &step.command[0]));
         cmd.args(&step.command[1..]).current_dir(root);
         cmd.envs(plugin_env(home, &m.id, root));
         scrub(&mut cmd);
@@ -525,6 +543,17 @@ fn build(home: &Home, m: &Manifest, root: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A manifest command's program: a relative path with a slash (`bin/tool`) is the plugin's
+/// own and found from its root, as herdr finds it; a bare name is looked up on `PATH`.
+pub(crate) fn program(root: &Path, name: &str) -> PathBuf {
+    let path = Path::new(name);
+    if path.is_relative() && name.contains('/') {
+        root.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// Whether a variable is qoop's own and never reaches a plugin: a terminal's token, the
@@ -554,6 +583,11 @@ pub(crate) fn plugin_env(home: &Home, id: &str, root: &Path) -> Vec<(String, OsS
     let config = home.config_of(id);
     let _ = std::fs::create_dir_all(&state);
     let _ = std::fs::create_dir_all(&config);
+    // Present, if empty, for a plugin that reads it before it writes it.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.herdr_config());
     let mut path = OsString::from(home.bin());
     if let Some(inherited) = std::env::var_os("PATH") {
         path.push(":");
@@ -572,6 +606,10 @@ pub(crate) fn plugin_env(home: &Home, id: &str, root: &Path) -> Vec<(String, OsS
         ("HERDR_SOCKET_PATH".into(), socket.clone().into()),
         ("HERDR_CLIENT_SOCKET_PATH".into(), socket.into()),
         ("PATH".into(), path),
+        // herdr's own config, which some plugins read or edit: a file of their own here, which
+        // qoop never reads.
+        ("HERDR_CONFIG_PATH".into(), home.herdr_config().into()),
+        ("HERDR_CONFIG_FILE".into(), home.herdr_config().into()),
     ]
 }
 
@@ -660,7 +698,7 @@ pub(crate) fn admitted(home: &Home, id: &str) -> Result<Admitted, String> {
 }
 
 /// Every plugin id here, in name order, a link whose folder is gone among them.
-fn installed(home: &Home) -> Vec<String> {
+pub(crate) fn installed(home: &Home) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(&home.root) else {
         return Vec::new();
     };
@@ -766,6 +804,8 @@ fn rm(home: &Home, id: &str) -> std::io::Result<()> {
     Ledger::update(home, |ledger| {
         ledger.plugins.remove(id);
     })?;
+    // Its startup commands end with it; the host leaves on its own once no plugin is left.
+    super::host::end_startups(home, Some(id));
     remove_entry(home, &path)?;
     // Not followed if a link: remove_dir_all takes a link itself away.
     match std::fs::remove_dir_all(home.state_of(id)) {

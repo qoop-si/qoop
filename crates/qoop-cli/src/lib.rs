@@ -99,6 +99,11 @@ pub type Phone = fn(&[String]) -> std::io::Result<()>;
 
 /// `qoop`, with the phone app's part when the binary carries it.
 pub fn main_with(phone: Option<Phone>) {
+    // Called as `herdr` from the plugins' own folder: the herdr shim a plugin runs, and nothing
+    // else of qoop (see `plugin::shim`).
+    if plugin::shim_invoked() {
+        std::process::exit(plugin::shim_run());
+    }
     // Called as `arecord` from a tab: the shim, before anything else touches the home, as
     // Claude Code checks it on every start of its voice.
     if arecord::called() {
@@ -622,6 +627,8 @@ fn run_client() -> std::io::Result<()> {
     }
     let focus = own_focus();
     let exe = own_path();
+    // The herdr plugins' host, once one is installed; it leaves with the daemon.
+    plugin::ensure_plugin_host();
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
 
@@ -1917,7 +1924,7 @@ fn cli_sender_from(
 /// subscribe, so settle briefly and keep the last snapshot rather than the
 /// first. Shared by `read` and `context` so the two cannot disagree about
 /// what "the screen" means.
-async fn fetch_snapshot(
+pub(crate) async fn fetch_snapshot(
     terminal: u32,
     who: &str,
 ) -> std::io::Result<qoop_runtime::daemon::SnapshotWire> {
