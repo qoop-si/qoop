@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/qoop-si/qoop/compare/v0.16.0...v0.16.1) (2026-11-14)
+
+
+### Fixed
+
+* **cli:** quote typed shell words safely for fish ([0225184](https://github.com/qoop-si/qoop/commit/02251842071ace09b348d7a1c464cfc05ed3a829))
+
 ## [0.16.0](https://github.com/qoop-si/qoop/compare/v0.15.0...v0.16.0) (2026-11-14)
 
 
