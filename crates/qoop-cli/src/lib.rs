@@ -35,6 +35,7 @@ mod notch;
 mod onboard;
 mod page;
 mod places;
+mod plugin;
 mod qass;
 mod qass_brief;
 mod qass_page;
@@ -3905,6 +3906,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }

@@ -5250,6 +5250,11 @@ async fn handle_control(
                         // Linux answers zero when nothing holds the foreground, and zero is
                         // every kernel thread's group: no group rather than theirs.
                         .filter(|group| *group > 0);
+                    // The shell the terminal started, which a client on this machine reads the
+                    // process table under; a map lookup.
+                    let shell_pid = agents
+                        .leader_of(terminal)
+                        .and_then(|(pid, _)| u32::try_from(pid).ok());
                     // What it is doing, only while it is doing something: a calm agent
                     // has no activity, whatever its last tool was.
                     let activity = matches!(
@@ -5333,6 +5338,7 @@ async fn handle_control(
                         slept_at_unix: None,
                         activity,
                         pgid,
+                        shell_pid,
                         background: u32::try_from(background).unwrap_or(u32::MAX),
                         subagents: u32::try_from(subagents).unwrap_or(u32::MAX),
                         task,
@@ -7771,7 +7777,16 @@ const QUIET_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
 /// right now, who is watching, the explanation fields `qoop agents explain` reads. Stripped from
 /// a fixed list, so a field added later is compared, never hidden by accident.
 const QUIET_FIELDS: &[&str] = &[
-    "activity", "clients", "command", "pgid", "source", "rule", "manifest", "menu", "discards",
+    "activity",
+    "clients",
+    "command",
+    "pgid",
+    "shell_pid",
+    "source",
+    "rule",
+    "manifest",
+    "menu",
+    "discards",
     "news",
 ];
 
@@ -7879,6 +7894,25 @@ fn quiet_differs(was: Option<&serde_json::Value>, now: Option<&serde_json::Value
             }
             now != *was
         }
+    }
+}
+
+#[cfg(test)]
+mod quiet_view_tests {
+    use super::quiet_view;
+    use std::collections::BTreeSet;
+
+    /// A shell's pid moves with nothing a phone shows, so it is never news to a quiet connection.
+    #[test]
+    fn the_shell_pid_is_not_news() {
+        let row: crate::control::AgentRow = serde_json::from_str(
+            r#"{"terminal":1,"workspace":1,"state":"idle","pgid":900,"shell_pid":880}"#,
+        )
+        .expect("a row");
+        let view = quiet_view(&row, &BTreeSet::new());
+        assert!(view.get("shell_pid").is_none(), "{view}");
+        assert!(view.get("pgid").is_none(), "{view}");
+        assert_eq!(view["state"], "idle");
     }
 }
 
