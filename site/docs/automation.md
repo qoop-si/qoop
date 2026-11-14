@@ -75,7 +75,8 @@ its branch and `origin/<branch>` once the branch is merged (fast-forward, rebase
 merge gh knows of), and refuses otherwise. `--pr` pushes and opens a pull request, keeping the
 worktree for the review's fixes; `--merge` fast-forwards the main checkout's branch, locally;
 `--discard` drops the work. It never force pushes, every step is safe to run again, and like
-`rm` it runs from outside the worktree. `ls --stale` only lists, from the refs here.
+`rm` it runs from outside the worktree: every mode, `--discard` included, refuses while a
+process is inside. `ls --stale` only lists, from the refs here.
 
 ## Spaces
 

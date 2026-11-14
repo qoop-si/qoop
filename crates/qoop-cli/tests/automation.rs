@@ -1313,9 +1313,24 @@ fn qoop_in(cwd: &Path, args: &[&str], bin: Option<&Path>) -> Output {
     cmd.output().expect("run qoop")
 }
 
+/// [`qoop_in`] with `path` as the whole `PATH`.
+fn qoop_alone(cwd: &Path, args: &[&str], path: &Path) -> Output {
+    let runtime = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod");
+    qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
+        .args(args)
+        .current_dir(cwd)
+        .env("QOOP_RUNTIME_DIR", runtime.path())
+        .env("PATH", path)
+        .output()
+        .expect("run qoop")
+}
+
 /// A fake `gh` in `<dir>/bin`: it notes each argv in `<dir>/bin/argv`, answers `pr list
 /// --state merged` from `merged` and `--state open` from `open` (none: `[]`), and `pr create`
-/// with a URL it then lists as open. `fails` makes it exit 1 and leave `ran` instead.
+/// with a URL it then lists as open, or exit 1 while `create-fails` is there. `fails` makes it
+/// exit 1 to everything and leave `ran` instead.
 fn fake_gh(dir: &Path, fails: bool) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
@@ -1326,7 +1341,7 @@ fn fake_gh(dir: &Path, fails: bool) -> PathBuf {
          case \"$*\" in\n\
          *\"--state merged\"*) cat \"$d/merged\" 2>/dev/null || echo '[]' ;;\n\
          *\"--state open\"*) cat \"$d/open\" 2>/dev/null || echo '[]' ;;\n\
-         \"pr create\"*) echo '[{\"url\":\"https://github.com/o/r/pull/7\"}]' > \"$d/open\"; \
+         \"pr create\"*) [ -e \"$d/create-fails\" ] && exit 1; echo '[{\"url\":\"https://github.com/o/r/pull/7\"}]' > \"$d/open\"; \
          echo https://github.com/o/r/pull/7 ;;\n\
          *) exit 1 ;;\n\
          esac\n"
@@ -1517,15 +1532,27 @@ fn finish_pr_pushes_reuses_the_pr_and_keeps_the_worktree_until_gh_says_merged() 
         argv()
     );
 
-    // Squash-merged on GitHub: gh's merged PR with this head is the proof.
-    std::fs::write(gh.join("merged"), format!("[{{\"headRefOid\":\"{tip}\"}}]")).unwrap();
+    // Squash-merged on GitHub: gh's merged PR with this head, into the base's branch, is the
+    // proof; one into another branch is not.
+    let merged_into = |base: &str| {
+        std::fs::write(
+            gh.join("merged"),
+            format!("[{{\"headRefOid\":\"{tip}\",\"baseRefName\":\"{base}\"}}]"),
+        )
+        .unwrap();
+    };
+    merged_into("release");
+    let elsewhere = qoop_in(&repo, &["worktree", "finish", "feat/p"], Some(&gh));
+    assert_eq!(elsewhere.status.code(), Some(1));
+    assert!(text(&elsewhere.stderr).contains("feat/p is not merged into origin/main"));
+    merged_into("main");
     let done = qoop_in(&repo, &["worktree", "finish", "feat/p"], Some(&gh));
     assert!(done.status.success(), "{}", text(&done.stderr));
     assert!(text(&done.stdout).contains("deleted origin/feat/p"));
     assert!(!wt.exists() && !has_ref(&repo, "refs/heads/feat/p"));
     std::fs::remove_file(gh.join("merged")).unwrap();
 
-    // gh failing is gh missing: pushed, said, kept, exit 1.
+    // gh that fails: pushed, said, kept, exit 1.
     let broken = fake_gh(&root.path().join("broken"), true);
     let wt = add_worktree(&repo, "feat/f");
     commit(&wt, "f.txt", "f\n");
@@ -1536,12 +1563,45 @@ fn finish_pr_pushes_reuses_the_pr_and_keeps_the_worktree_until_gh_says_merged() 
     );
     assert_eq!(pr.status.code(), Some(1));
     assert_eq!(text(&pr.stdout), "pushed\n");
+    assert!(broken.join("ran").exists(), "the fake gh never ran");
+    assert!(
+        text(&pr.stderr).contains("gh could not list the pull requests of feat/f"),
+        "{}",
+        text(&pr.stderr)
+    );
+    assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/f"));
+
+    // gh that lists but cannot create.
+    std::fs::remove_file(gh.join("open")).unwrap();
+    std::fs::write(gh.join("create-fails"), "").unwrap();
+    let wt = add_worktree(&repo, "feat/g");
+    commit(&wt, "g.txt", "g\n");
+    let pr = qoop_in(&repo, &["worktree", "finish", "feat/g", "--pr"], Some(&gh));
+    assert_eq!(pr.status.code(), Some(1));
+    assert!(
+        text(&pr.stderr).contains("gh could not open the PR (run gh pr create to see why)"),
+        "{}",
+        text(&pr.stderr)
+    );
+
+    // No gh on PATH at all: only git there.
+    let only_git = root.path().join("only-git");
+    std::fs::create_dir(&only_git).unwrap();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .expect("git on PATH");
+    std::os::unix::fs::symlink(real_git, only_git.join("git")).unwrap();
+    let wt = add_worktree(&repo, "feat/h");
+    commit(&wt, "h.txt", "h\n");
+    let pr = qoop_alone(&repo, &["worktree", "finish", "feat/h", "--pr"], &only_git);
+    assert_eq!(pr.status.code(), Some(1), "{}", text(&pr.stderr));
+    assert_eq!(text(&pr.stdout), "pushed\n");
     assert!(
         text(&pr.stderr).contains("gh is not available: open the PR by hand"),
         "{}",
         text(&pr.stderr)
     );
-    assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/f"));
 }
 
 #[test]
@@ -1669,10 +1729,12 @@ fn a_remote_step_that_fails_keeps_everything_and_a_rerun_finishes() {
     git(&repo, &["push", "-q", "origin", "main"]);
     let gh = fake_gh(root.path(), true);
 
-    let locked = bare.join("refs/heads/feat");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // The remote refuses every ref change while its update hook says no.
+    let hook = bare.join("hooks/update");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let failed = qoop_in(&repo, &["worktree", "finish", "feat/r"], Some(&gh));
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&hook).unwrap();
     assert_eq!(failed.status.code(), Some(1), "{}", text(&failed.stdout));
     assert!(
         text(&failed.stderr).contains("could not delete origin/feat/r"),
@@ -1746,11 +1808,19 @@ fn ls_stale_lists_empty_merged_and_old_worktrees_and_nothing_in_use() {
         .spawn()
         .expect("a process inside");
 
+    // A worktree git cannot read is passed by and said, never the end of the listing.
+    let broken = add_worktree(&repo, "feat/broken");
+    std::fs::write(broken.join(".git"), "gitdir: /nonexistent/qoop-test\n").unwrap();
     let listed = qoop_in(&repo, &["worktree", "ls", "--stale"], None);
     let as_json = qoop_in(&repo, &["worktree", "ls", "--json", "--stale"], None);
     let _ = inside.kill();
     let _ = inside.wait();
     assert!(listed.status.success(), "{}", text(&listed.stderr));
+    assert!(
+        text(&listed.stderr).contains(&format!("ls: skipping {} (", broken.display())),
+        "{}",
+        text(&listed.stderr)
+    );
     assert_eq!(
         text(&listed.stdout),
         format!(
@@ -1773,8 +1843,206 @@ fn ls_stale_lists_empty_merged_and_old_worktrees_and_nothing_in_use() {
     }
     let plain = qoop_in(&repo, &["worktree", "ls", "--json"], None);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&plain.stdout).expect("JSON");
-    assert_eq!(rows.len(), 7);
+    assert_eq!(rows.len(), 8);
     assert!(rows.iter().all(|r| r.get("why").is_none()));
     let twice = qoop_in(&repo, &["worktree", "ls", "--stale", "--stale"], None);
     assert_eq!(twice.status.code(), Some(2));
+}
+
+/// A merge commit can carry a change nothing on the base holds; `git cherry` skips merges,
+/// so a range with one is never proven by it.
+#[test]
+fn an_evil_merge_is_never_proven_by_git_cherry() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    git(&repo, &["branch", "side"]);
+    let side = root.path().join("side-wt");
+    git(
+        &repo,
+        &["worktree", "add", "-q", side.to_str().unwrap(), "side"],
+    );
+    commit(&side, "s.txt", "s\n");
+    let wt = add_worktree(&repo, "feat/e");
+    commit(&wt, "x.txt", "x\n");
+    git(&wt, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+    std::fs::write(wt.join("evil.txt"), "only in the merge\n").unwrap();
+    git(&wt, &["add", "evil.txt"]);
+    git(&wt, &["commit", "-q", "-m", "merge side"]);
+    // The base holds both plain changes under other ids, never the merge's own.
+    commit(&repo, "first.txt", "first\n");
+    commit(&repo, "x.txt", "x\n");
+    commit(&repo, "s.txt", "s\n");
+    let refused = qoop_in(&repo, &["worktree", "finish", "feat/e"], None);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stdout));
+    assert!(
+        text(&refused.stderr).contains("feat/e is not merged into main"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/e"));
+}
+
+/// A tag named like the base or the branch, and a branch whose name starts with `+`, are
+/// never read as something else: every ref is named in full.
+#[test]
+fn full_ref_names_keep_tags_and_plus_names_from_being_taken_for_branches() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["tag", "main", &first]);
+    let wt = add_worktree(&repo, "feat/t");
+    commit(&wt, "t.txt", "t\n");
+    git(&repo, &["merge", "-q", "--ff-only", "refs/heads/feat/t"]);
+    let done = qoop_in(&repo, &["worktree", "finish", "feat/t"], None);
+    assert!(done.status.success(), "{}", text(&done.stderr));
+    assert!(!wt.exists());
+
+    let wt = add_worktree(&repo, "feat/u");
+    let tip = commit(&wt, "u.txt", "u\n");
+    git(&repo, &["tag", "feat/u", &first]);
+    let merged = qoop_in(&repo, &["worktree", "finish", "feat/u", "--merge"], None);
+    assert!(merged.status.success(), "{}", text(&merged.stderr));
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), tip);
+
+    // `+feat` pushed by name would be a forced push: the remote's own `+feat` stays.
+    let other = tempfile::tempdir().expect("tempdir");
+    let (repo, bare) = with_origin(other.path());
+    let elsewhere = add_worktree(&repo, "elsewhere");
+    commit(&elsewhere, "o.txt", "o\n");
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "refs/heads/elsewhere:refs/heads/+feat",
+        ],
+    );
+    let before = git(&bare, &["rev-parse", "refs/heads/+feat"]);
+    let plus = add_worktree(&repo, "+feat");
+    commit(&plus, "p.txt", "p\n");
+    let gh = fake_gh(other.path(), false);
+    let pr = qoop_in(&repo, &["worktree", "finish", "+feat", "--pr"], Some(&gh));
+    assert_eq!(pr.status.code(), Some(1), "{}", text(&pr.stdout));
+    assert!(
+        text(&pr.stderr).contains("could not push +feat"),
+        "{}",
+        text(&pr.stderr)
+    );
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/+feat"]), before);
+}
+
+/// The local branch is deleted only at the commit that was proven: one that moved since is
+/// kept and said. Here the remote's update hook moves it while its delete is pushed.
+#[test]
+fn a_branch_that_moved_after_its_proof_is_kept() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (repo, bare) = with_origin(root.path());
+    let gh = fake_gh(root.path(), true);
+    let wt = add_worktree(&repo, "feat/v");
+    commit(&wt, "v.txt", "v\n");
+    git(&wt, &["push", "-q", "origin", "feat/v"]);
+    git(&repo, &["merge", "-q", "--ff-only", "refs/heads/feat/v"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let hook = bare.join("hooks/update");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH\n\
+             export GIT_DIR='{}'\n\
+             late=$(git -c user.name=t -c user.email=t@t commit-tree 'refs/heads/feat/v^{{tree}}' \
+             -p refs/heads/feat/v -m late)\n\
+             git update-ref refs/heads/feat/v \"$late\"\n",
+            repo.join(".git").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let kept = qoop_in(&repo, &["worktree", "finish", "feat/v"], Some(&gh));
+    assert_eq!(kept.status.code(), Some(1), "{}", text(&kept.stdout));
+    assert!(
+        text(&kept.stderr).contains("branch feat/v moved to")
+            && text(&kept.stderr).contains("so it was kept"),
+        "{}",
+        text(&kept.stderr)
+    );
+    assert!(has_ref(&repo, "refs/heads/feat/v"));
+}
+
+#[test]
+fn the_remotes_default_branch_is_never_deleted() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (repo, bare) = with_origin(root.path());
+    let gh = fake_gh(root.path(), true);
+    let wt = add_worktree(&repo, "feat/d");
+    commit(&wt, "d.txt", "d\n");
+    git(&wt, &["push", "-q", "origin", "feat/d"]);
+    git(&repo, &["merge", "-q", "--ff-only", "refs/heads/feat/d"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/feat/d"]);
+    let done = qoop_in(&repo, &["worktree", "finish", "feat/d"], Some(&gh));
+    assert!(done.status.success(), "{}", text(&done.stderr));
+    assert!(
+        text(&done.stdout).contains("kept origin/feat/d: it is the remote's default branch"),
+        "{}",
+        text(&done.stdout)
+    );
+    assert!(has_ref(&bare, "refs/heads/feat/d"));
+    assert!(!wt.exists());
+}
+
+#[test]
+fn finish_refuses_a_process_inside_and_a_base_that_is_the_branch_itself() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let wt = add_worktree(&repo, "feat/i");
+    commit(&wt, "i.txt", "i\n");
+    git(&repo, &["merge", "-q", "--ff-only", "refs/heads/feat/i"]);
+    let mut inside = Command::new("sleep")
+        .arg("300")
+        .current_dir(&wt)
+        .spawn()
+        .expect("a process inside");
+    let plain = qoop_in(&repo, &["worktree", "finish", "feat/i"], None);
+    let discard = qoop_in(&repo, &["worktree", "finish", "feat/i", "--discard"], None);
+    let _ = inside.kill();
+    let _ = inside.wait();
+    for out in [&plain, &discard] {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            text(&out.stderr).contains("(sleep)"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/i"));
+
+    for base in ["feat/i", "origin/feat/i"] {
+        let out = qoop_in(
+            &repo,
+            &["worktree", "finish", "feat/i", "--base", base],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(1), "{base}");
+        assert!(
+            text(&out.stderr).contains("is the branch being finished"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    let out = qoop_in(
+        &repo,
+        &[
+            "worktree",
+            "finish",
+            "feat/i",
+            "--discard",
+            "--base",
+            "main",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(wt.exists());
 }

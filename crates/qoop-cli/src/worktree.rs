@@ -1082,17 +1082,23 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
     let list = worktrees()?;
     let why: Vec<Option<String>> = if stale {
         let main = &list[0].path;
-        let base = base_of(main, list[0].branch.as_deref(), None).ok();
+        let base = base_of(main, list[0].branch.as_deref(), None)
+            .ok()
+            .map(|b| b.full);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        std::iter::once(Ok(None))
-            .chain(
-                list.iter()
-                    .skip(1)
-                    .map(|w| stale_why(main, base.as_deref(), w, now)),
-            )
-            .collect::<std::io::Result<_>>()?
+        // One scan for every worktree, and a scan that fails stops the listing: it cannot
+        // tell an occupied worktree from an idle one.
+        let dirs = process_dirs()?;
+        std::iter::once(None)
+            .chain(list.iter().skip(1).map(|w| {
+                stale_why(main, base.as_deref(), w, now, &dirs).unwrap_or_else(|e| {
+                    eprintln!("ls: skipping {} ({e})", w.path.display());
+                    None
+                })
+            }))
+            .collect()
     } else {
         vec![None; list.len()]
     };
@@ -1176,6 +1182,16 @@ struct Occupant {
 /// without one starts. Fails closed when the scan cannot even see this process, because
 /// an empty answer from a scan that does not work reads exactly like "nobody is inside".
 fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
+    Ok(process_dirs()?
+        .into_iter()
+        .filter(|(_, cwd)| cwd.starts_with(root))
+        .filter_map(|(pid, _)| occupant(pid))
+        .collect())
+}
+
+/// Every readable process of this user and its directory, resolved: one scan, which
+/// [`processes_inside`] filters by worktree. Fails closed as it says.
+fn process_dirs() -> std::io::Result<Vec<(i32, PathBuf)>> {
     use qoop_pty::sys;
 
     let me = std::process::id() as i32;
@@ -1188,33 +1204,35 @@ fn processes_inside(root: &std::path::Path) -> std::io::Result<Vec<Occupant>> {
     }
     Ok(pids
         .into_iter()
-        .filter_map(|pid| {
-            let cwd = sys::cwd_of(qoop_pty::Pid(pid))?;
-            if !real(&cwd).starts_with(root) {
-                return None;
-            }
-            let program = sys::program_of(qoop_pty::Pid(pid))
-                .and_then(|p| {
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "?".to_string());
-            let mut daemon = false;
-            if program == "qoop" {
-                let argv = sys::argv_of(qoop_pty::Pid(pid));
-                if !argv.iter().any(|a| a == "daemon") {
-                    return None;
-                }
-                daemon = true;
-            }
-            Some(Occupant {
-                pid,
-                program,
-                daemon,
-            })
-        })
+        .filter_map(|pid| Some((pid, real(&sys::cwd_of(qoop_pty::Pid(pid))?))))
         .collect())
+}
+
+/// The process `pid` as an occupant of a worktree, `None` for a qoop client (see
+/// [`processes_inside`]).
+fn occupant(pid: i32) -> Option<Occupant> {
+    use qoop_pty::sys;
+
+    let program = sys::program_of(qoop_pty::Pid(pid))
+        .and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let mut daemon = false;
+    if program == "qoop" {
+        let argv = sys::argv_of(qoop_pty::Pid(pid));
+        if !argv.iter().any(|a| a == "daemon") {
+            return None;
+        }
+        daemon = true;
+    }
+    Some(Occupant {
+        pid,
+        program,
+        daemon,
+    })
 }
 
 /// `qoop worktree rm`: remove a linked worktree, keeping its branch.
@@ -1356,11 +1374,28 @@ fn dirty(dir: &std::path::Path) -> std::io::Result<bool> {
     )
 }
 
+/// How long git that reaches the remote may take, a fetch or a push of a big repository
+/// on a slow link included.
+const NET_TIME: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Git that may reach the remote, and never waits on a prompt: no terminal prompt, nothing
 /// to read, and a session of its own, so ssh has no terminal to ask for a host key or a
 /// passphrase on and fails instead. Never `GIT_SSH_COMMAND`: it would override the person's
 /// own `core.sshCommand`. The whole answer, exit code included.
+///
+/// Being in a session of its own, it is not in the terminal's foreground group either, so a
+/// Ctrl-C does not reach it: [`NET_TIME`] bounds it instead, and past it the whole session
+/// is killed, everything git started with it.
 fn net_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    net_git_by(dir, args, std::time::Instant::now() + NET_TIME)
+}
+
+/// [`net_git`] with its deadline given.
+fn net_git_by(
+    dir: &std::path::Path,
+    args: &[&str],
+    by: std::time::Instant,
+) -> std::io::Result<std::process::Output> {
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new("git");
@@ -1369,7 +1404,9 @@ fn net_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std::process
         .arg(dir)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     // SAFETY: runs between fork and exec, and calls only `setsid`, which is
     // async-signal-safe, with no allocation.
     unsafe {
@@ -1380,7 +1417,47 @@ fn net_git(dir: &std::path::Path, args: &[&str]) -> std::io::Result<std::process
             Ok(())
         });
     }
-    cmd.output()
+    let mut child = cmd.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= by {
+            // SAFETY: `kill` only sends a signal. Since `setsid` the child leads its own
+            // session and process group, so `-pid` is that group and nothing else.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "git {} gave no answer in time",
+                    args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"")
+                ),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Everything a pipe gives, read on a thread of its own so a full pipe never stalls git.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut got = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut got);
+        }
+        got
+    })
 }
 
 /// What `net_git` said on stderr, on one line.
@@ -1391,26 +1468,65 @@ fn said_on_stderr(out: &std::process::Output) -> String {
         .join(" ")
 }
 
-/// gh's stdout when it answers by `secs`; missing, failing or slow is `None`, never an error.
-fn gh(dir: &std::path::Path, args: &[&str], secs: u64) -> Option<String> {
+/// Why gh gave no answer.
+enum Gh {
+    /// Not on `PATH`.
+    Missing,
+    /// It ran and failed, gave nothing usable, or took too long.
+    Failed,
+}
+
+/// gh's stdout when it answers by `secs`. Neither way of not answering is ever an error
+/// of its own: each caller says what it means there.
+fn gh(dir: &std::path::Path, args: &[&str], secs: u64) -> Result<String, Gh> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|d| {
+            std::fs::metadata(d.join("gh"))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    });
+    if !on_path {
+        return Err(Gh::Missing);
+    }
     let mut cmd = Command::new("gh");
-    cmd.args(args)
+    scrub(&mut cmd)
+        .args(args)
         .current_dir(dir)
         .env("GH_PROMPT_DISABLED", "1");
     let by = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     qoop_runtime::changes::run_by(&mut cmd, by, None)
         .map(|(out, _)| String::from_utf8_lossy(&out).into_owned())
+        .ok_or(Gh::Failed)
 }
 
-/// The ref the proofs compare with, the first that exists: `--base`, `origin/HEAD`,
-/// `origin/<the main checkout's branch>`, that branch. `origin/HEAD` is missing when the
-/// remote's HEAD names a branch that does not exist or git is old, and the local branch
-/// lacks a merge done on the remote, so `origin/<branch>` comes before it.
+/// The ref the proofs compare with: its full name, so a tag named like a branch is never
+/// taken for it, and how it is said.
+struct Base {
+    full: String,
+    shown: String,
+}
+
+impl Base {
+    /// The branch it names, as gh and a remote name it: `main` for `origin/main`.
+    fn branch(&self) -> &str {
+        ["refs/remotes/origin/", "refs/heads/"]
+            .iter()
+            .find_map(|p| self.full.strip_prefix(p))
+            .unwrap_or_else(|| self.shown.strip_prefix("origin/").unwrap_or(&self.shown))
+    }
+}
+
+/// The base, the first that exists: `--base`, `origin/HEAD`, `origin/<the main checkout's
+/// branch>`, that branch. `origin/HEAD` is missing when the remote's HEAD names a branch
+/// that does not exist or git is old, and the local branch lacks a merge done on the
+/// remote, so `origin/<branch>` comes before it.
 fn base_of(
     main: &std::path::Path,
     main_branch: Option<&str>,
     given: Option<&str>,
-) -> std::io::Result<String> {
+) -> std::io::Result<Base> {
     let exists = |r: &str| {
         git_in(
             main,
@@ -1424,29 +1540,51 @@ fn base_of(
         .is_ok()
     };
     if let Some(given) = given {
-        return match exists(given) {
-            true => Ok(given.to_string()),
-            false => Err(std::io::Error::other(format!(
+        if !exists(given) {
+            return Err(std::io::Error::other(format!(
                 "no commit {given} to compare with"
-            ))),
-        };
+            )));
+        }
+        let full = git_in(main, &["rev-parse", "--symbolic-full-name", given])
+            .map(|f| f.trim().to_string())
+            .ok()
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| given.to_string());
+        return Ok(Base {
+            full,
+            shown: given.to_string(),
+        });
     }
-    let candidates = ["origin/HEAD".to_string()]
+    let candidates = [(
+        "refs/remotes/origin/HEAD".to_string(),
+        "origin/HEAD".to_string(),
+    )]
+    .into_iter()
+    .chain(main_branch.map(|b| (format!("refs/remotes/origin/{b}"), format!("origin/{b}"))))
+    .chain(main_branch.map(|b| (format!("refs/heads/{b}"), b.to_string())));
+    candidates
         .into_iter()
-        .chain(main_branch.map(|b| format!("origin/{b}")))
-        .chain(main_branch.map(str::to_string));
-    candidates.into_iter().find(|r| exists(r)).ok_or_else(|| {
-        std::io::Error::other(
-            "nothing to compare with: the main checkout has no branch; pass --base REF",
-        )
-    })
+        .find(|(full, _)| exists(full))
+        .map(|(full, shown)| Base { full, shown })
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "nothing to compare with: the main checkout has no branch; pass --base REF",
+            )
+        })
 }
 
 /// Whether `tip` is in `base` as git sees it here: an ancestor, or every commit of it
-/// applied there under another id (`git cherry`, a rebase merge).
+/// applied there under another id (`git cherry`, a rebase merge). A merge commit in the
+/// range is never proven by `git cherry`: it skips merges, and a merge can carry changes of
+/// its own (an evil merge) that nothing on the base holds.
 fn merged_here(main: &std::path::Path, base: &str, tip: &str) -> bool {
     if git_in(main, &["merge-base", "--is-ancestor", tip, base]).is_ok() {
         return true;
+    }
+    let range = format!("{base}..{tip}");
+    let merges = git_in(main, &["rev-list", "--count", "--merges", &range]);
+    if !merges.is_ok_and(|n| n.trim() == "0") {
+        return false;
     }
     git_in(main, &["cherry", base, tip]).is_ok_and(|out| {
         let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1454,10 +1592,10 @@ fn merged_here(main: &std::path::Path, base: &str, tip: &str) -> bool {
     })
 }
 
-/// Whether gh knows a merged pull request from `branch` whose head is `tip`: the proof of a
-/// squash merge. gh missing or failing proves nothing.
-fn merged_on_github(main: &std::path::Path, branch: &str, tip: &str) -> bool {
-    let Some(out) = gh(
+/// Whether gh knows a pull request from `branch` into the base's branch, merged, whose head
+/// is `tip`: the proof of a squash merge. gh missing or failing proves nothing.
+fn merged_on_github(main: &std::path::Path, branch: &str, base: &Base, tip: &str) -> bool {
+    let Ok(out) = gh(
         main,
         &[
             "pr",
@@ -1467,15 +1605,17 @@ fn merged_on_github(main: &std::path::Path, branch: &str, tip: &str) -> bool {
             "--state",
             "merged",
             "--json",
-            "headRefOid",
+            "headRefOid,baseRefName",
         ],
         30,
     ) else {
         return false;
     };
     serde_json::from_str::<Vec<serde_json::Value>>(&out).is_ok_and(|prs| {
-        prs.iter()
-            .any(|pr| pr.get("headRefOid").and_then(|h| h.as_str()) == Some(tip))
+        prs.iter().any(|pr| {
+            pr.get("headRefOid").and_then(|h| h.as_str()) == Some(tip)
+                && pr.get("baseRefName").and_then(|b| b.as_str()) == Some(base.branch())
+        })
     })
 }
 
@@ -1497,12 +1637,14 @@ fn fetch_origin(main: &std::path::Path) {
     }
 }
 
-/// Remove the worktree and delete its branch: `-D`, because the caller proved the work is
-/// kept (merged, fast-forwarded) or was told to drop it.
+/// Remove the worktree, then delete its branch only while it is still at `tip`, the commit
+/// the caller proved kept (merged, fast-forwarded) or was told to drop: a commit made on it
+/// since is never lost.
 fn remove_and_delete(
     main: &std::path::Path,
     tree: &Worktree,
     branch: &str,
+    tip: &str,
     force: bool,
 ) -> std::io::Result<()> {
     let mut remove = vec!["worktree", "remove"];
@@ -1512,7 +1654,17 @@ fn remove_and_delete(
     let path = tree.path.to_string_lossy();
     remove.push(&path);
     git_in(main, &remove)?;
-    git_in(main, &["branch", "-D", branch])?;
+    let refname = format!("refs/heads/{branch}");
+    if git_in(main, &["update-ref", "-d", &refname, tip]).is_err() {
+        let now = git_in(main, &["rev-parse", "--verify", "--quiet", &refname])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return Err(std::io::Error::other(format!(
+            "removed {}; branch {branch} moved to {} since it was checked, so it was kept",
+            tree.path.display(),
+            &now[..now.len().min(12)]
+        )));
+    }
     println!("removed {}; branch {branch} deleted", tree.path.display());
     Ok(())
 }
@@ -1531,7 +1683,8 @@ enum Finish {
 ///
 /// Every step is safe to run again, nothing is ever force pushed, and only work that is
 /// proven kept is deleted unless `--discard` says to drop it. Every refusal comes before
-/// anything changes.
+/// anything changes. Branches are named by their full refs throughout, so a tag or a name
+/// that starts with `+` is never taken for one.
 fn worktree_finish(args: &[String]) -> std::io::Result<()> {
     let target = args
         .get(3)
@@ -1566,6 +1719,11 @@ fn worktree_finish(args: &[String]) -> std::io::Result<()> {
         }
         mode = chosen;
     }
+    if mode == Finish::Discard && given_base.is_some() {
+        return Err(crate::usage(format!(
+            "--discard compares with nothing, so it takes no --base; {WORKTREE_USAGE}"
+        )));
+    }
     let list = worktrees()?;
     let main = list[0].path.clone();
     let main_branch = list[0].branch.clone();
@@ -1576,20 +1734,51 @@ fn worktree_finish(args: &[String]) -> std::io::Result<()> {
             tree.path.display()
         )));
     };
+    if let Some(given) = given_base.as_deref()
+        && given.strip_prefix("origin/").unwrap_or(given) == branch
+    {
+        return Err(std::io::Error::other(format!(
+            "--base {given} is the branch being finished; name the branch it goes into"
+        )));
+    }
     if mode != Finish::Discard && dirty(&tree.path)? {
         return Err(std::io::Error::other(format!(
             "{} has uncommitted changes: commit them, or --discard to lose them",
             tree.path.display()
         )));
     }
+    let tip = git_in(
+        &main,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )?
+    .trim()
+    .to_string();
     match mode {
         Finish::Discard => {
             refuse_if_in_use(tree)?;
-            remove_and_delete(&main, tree, &branch, true)
+            remove_and_delete(&main, tree, &branch, &tip, true)
         }
-        Finish::Merge => finish_merge(&main, main_branch.as_deref(), tree, &branch, given_base),
+        Finish::Merge => finish_merge(
+            &main,
+            main_branch.as_deref(),
+            tree,
+            &branch,
+            &tip,
+            given_base,
+        ),
         Finish::Pr => finish_pr(&main, tree, &branch, given_base.as_deref()),
-        Finish::Clean => finish_merged(&main, main_branch.as_deref(), tree, &branch, given_base),
+        Finish::Clean => finish_merged(
+            &main,
+            main_branch.as_deref(),
+            tree,
+            &branch,
+            &tip,
+            given_base,
+        ),
     }
 }
 
@@ -1600,6 +1789,7 @@ fn finish_merged(
     main_branch: Option<&str>,
     tree: &Worktree,
     branch: &str,
+    tip: &str,
     given_base: Option<String>,
 ) -> std::io::Result<()> {
     refuse_if_in_use(tree)?;
@@ -1608,30 +1798,36 @@ fn finish_merged(
         fetch_origin(main);
     }
     let base = base_of(main, main_branch, given_base.as_deref())?;
-    let tip = git_in(
-        main,
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-    )?
-    .trim()
-    .to_string();
-    let merged = merged_here(main, &base, &tip) || (origin && merged_on_github(main, branch, &tip));
+    let merged = merged_here(main, &base.full, tip)
+        || (origin && merged_on_github(main, branch, &base, tip));
     if !merged {
         return Err(std::io::Error::other(format!(
-            "{branch} is not merged into {base}: --pr opens a pull request for it, --merge \
+            "{branch} is not merged into {}: --pr opens a pull request for it, --merge \
              fast-forwards {} to it, --discard drops it",
+            base.shown,
             main_branch.unwrap_or("the main checkout's branch")
         )));
     }
     if origin {
-        remote_branch_done(main, branch, &tip)?;
+        remote_branch_done(main, branch, &base, tip)?;
     }
-    remove_and_delete(main, tree, branch, false)
+    remove_and_delete(main, tree, branch, tip, false)
 }
 
 /// The remote branch of a merged `branch`: deleted when it is at `tip` (asked of the
-/// remote itself, never the possibly stale `origin/<branch>`), kept and said when it moved,
-/// done when it is gone already (GitHub deletes merged branches). Not knowing stops.
-fn remote_branch_done(main: &std::path::Path, branch: &str, tip: &str) -> std::io::Result<()> {
+/// remote itself, never the possibly stale `origin/<branch>`), kept and said when it moved
+/// or is the remote's default branch or the base's own, done when it is gone already
+/// (GitHub deletes merged branches). Not knowing stops.
+///
+/// The check and the delete are two steps, so a push landing on the remote in the moment
+/// between them would be deleted with it; a lease would close that window only by forcing
+/// the push, which this never does. The window is that of one round trip.
+fn remote_branch_done(
+    main: &std::path::Path,
+    branch: &str,
+    base: &Base,
+    tip: &str,
+) -> std::io::Result<()> {
     let refname = format!("refs/heads/{branch}");
     let out = net_git(main, &["ls-remote", "--exit-code", "origin", &refname])?;
     let stop = |what: &str, out: &std::process::Output| {
@@ -1652,7 +1848,25 @@ fn remote_branch_done(main: &std::path::Path, branch: &str, tip: &str) -> std::i
                 );
                 return Ok(());
             }
-            let deleted = net_git(main, &["push", "origin", "--delete", branch])?;
+            if base.branch() == branch {
+                println!("kept origin/{branch}: it is the base's own branch");
+                return Ok(());
+            }
+            let head = net_git(main, &["ls-remote", "--symref", "origin", "HEAD"])?;
+            if !head.status.success() {
+                return Err(stop(&format!("could not ask origin about {branch}"), &head));
+            }
+            let default = String::from_utf8_lossy(&head.stdout).lines().find_map(|l| {
+                l.strip_prefix("ref: ")?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+            if default.as_deref() == Some(refname.as_str()) {
+                println!("kept origin/{branch}: it is the remote's default branch");
+                return Ok(());
+            }
+            let deleted = net_git(main, &["push", "origin", "--delete", &refname])?;
             if !deleted.status.success() {
                 return Err(stop(&format!("could not delete origin/{branch}"), &deleted));
             }
@@ -1678,7 +1892,8 @@ fn finish_pr(
         ));
     }
     fetch_origin(main);
-    let pushed = net_git(&tree.path, &["push", "-q", "-u", "origin", branch])?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let pushed = net_git(&tree.path, &["push", "-q", "-u", "origin", &refspec])?;
     if !pushed.status.success() {
         return Err(std::io::Error::other(format!(
             "could not push {branch} ({})",
@@ -1686,38 +1901,46 @@ fn finish_pr(
         )));
     }
     println!("pushed");
-    let open = gh(
+    let missing = || std::io::Error::other("gh is not available: open the PR by hand");
+    let listed = match gh(
         main,
         &[
             "pr", "list", "--head", branch, "--state", "open", "--json", "url",
         ],
         30,
-    )
-    .and_then(|out| serde_json::from_str::<Vec<serde_json::Value>>(&out).ok());
-    let url = match open {
-        None => None,
-        Some(prs) => match prs.iter().find_map(|pr| pr.get("url")?.as_str()) {
-            Some(url) => Some(url.to_string()),
-            None => {
-                let mut create = vec!["pr", "create", "--fill", "--head", branch];
-                let base = given_base.map(|b| b.strip_prefix("origin/").unwrap_or(b));
-                if let Some(base) = base {
-                    create.extend(["--base", base]);
-                }
-                gh(main, &create, 60).and_then(|out| {
-                    out.lines()
-                        .rev()
-                        .map(str::trim)
-                        .find(|l| l.starts_with("http"))
-                        .map(str::to_string)
-                })
-            }
-        },
+    ) {
+        Err(Gh::Missing) => return Err(missing()),
+        Err(Gh::Failed) => None,
+        Ok(out) => serde_json::from_str::<Vec<serde_json::Value>>(&out).ok(),
     };
-    let Some(url) = url else {
-        return Err(std::io::Error::other(
-            "gh is not available: open the PR by hand",
-        ));
+    let Some(open) = listed else {
+        return Err(std::io::Error::other(format!(
+            "gh could not list the pull requests of {branch} (run gh pr list --head {branch} \
+             to see why)"
+        )));
+    };
+    let url = match open.iter().find_map(|pr| pr.get("url")?.as_str()) {
+        Some(url) => url.to_string(),
+        None => {
+            let mut create = vec!["pr", "create", "--fill", "--head", branch];
+            let base = given_base.map(|b| b.strip_prefix("origin/").unwrap_or(b));
+            if let Some(base) = base {
+                create.extend(["--base", base]);
+            }
+            let made = match gh(main, &create, 60) {
+                Err(Gh::Missing) => return Err(missing()),
+                Err(Gh::Failed) => None,
+                Ok(out) => out
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| l.starts_with("http"))
+                    .map(str::to_string),
+            };
+            made.ok_or_else(|| {
+                std::io::Error::other("gh could not open the PR (run gh pr create to see why)")
+            })?
+        }
     };
     println!("pr={url}");
     println!(
@@ -1727,14 +1950,16 @@ fn finish_pr(
     Ok(())
 }
 
-/// `finish --merge`: fast-forward the main checkout's own branch to `branch`, then remove
-/// the worktree and the branch. Local only: the base is never pushed and the remote branch
-/// is left as it is, since nothing on the remote is proven.
+/// `finish --merge`: fast-forward the main checkout's own branch to `tip`, the branch's
+/// commit read at the start, then remove the worktree and the branch. Local only: the base
+/// is never pushed and the remote branch is left as it is, since nothing on the remote is
+/// proven.
 fn finish_merge(
     main: &std::path::Path,
     main_branch: Option<&str>,
     tree: &Worktree,
     branch: &str,
+    tip: &str,
     given_base: Option<String>,
 ) -> std::io::Result<()> {
     let Some(into) = main_branch else {
@@ -1758,24 +1983,25 @@ fn finish_merge(
             "the main checkout has uncommitted changes: commit them before {into} moves"
         )));
     }
-    git_in(main, &["merge", "--ff-only", "-q", branch]).map_err(|_| {
+    git_in(main, &["merge", "--ff-only", "-q", tip]).map_err(|e| {
         std::io::Error::other(format!(
-            "{into} cannot fast-forward to {branch}: rebase {branch} onto {into} first"
+            "{into} cannot fast-forward to {branch} ({e}): rebase {branch} onto {into} first"
         ))
     })?;
     println!("merged {branch} into {into} (fast-forward)");
-    remove_and_delete(main, tree, branch, false)
+    remove_and_delete(main, tree, branch, tip, false)
 }
 
 /// Why a linked worktree is stale, the first reason that holds: `empty` (no commits beyond
 /// the base), `merged` (an ancestor of the base, or every commit applied there), `old:<n>d`
 /// (its tip's commit is 30 days old or more). Local refs only. `None` for a worktree that is
-/// not clean, gone, or has a process inside.
+/// not clean, gone, or has a process inside; `dirs` is one scan of every process's folder.
 fn stale_why(
     main: &std::path::Path,
     base: Option<&str>,
     tree: &Worktree,
     now: i64,
+    dirs: &[(i32, PathBuf)],
 ) -> std::io::Result<Option<String>> {
     let Some(tip) = tree.head.as_deref() else {
         return Ok(None);
@@ -1783,7 +2009,11 @@ fn stale_why(
     if tree.bare || !tree.path.exists() || dirty(&tree.path)? {
         return Ok(None);
     }
-    if !processes_inside(&real(&tree.path))?.is_empty() {
+    let root = real(&tree.path);
+    if dirs
+        .iter()
+        .any(|(pid, cwd)| cwd.starts_with(&root) && occupant(*pid).is_some())
+    {
         return Ok(None);
     }
     if let Some(base) = base {
@@ -1798,7 +2028,7 @@ fn stale_why(
     let when: i64 = git_in(main, &["log", "-1", "--format=%ct", tip])?
         .trim()
         .parse()
-        .unwrap_or(now);
+        .map_err(std::io::Error::other)?;
     let days = (now - when) / 86_400;
     Ok((days >= STALE_DAYS).then(|| format!("old:{days}d")))
 }
@@ -2322,6 +2552,35 @@ mod tests {
         std::fs::create_dir(common.join("qoop-worktree-index/2")).unwrap();
         std::fs::create_dir_all(common.join("worktrees/e")).unwrap();
         assert_eq!(claim_index(common, "e").unwrap(), 3);
+    }
+
+    /// Git that reaches the remote is bounded: past its deadline it and everything it
+    /// started are gone, and it says so.
+    #[test]
+    fn net_git_past_its_deadline_kills_its_whole_session() {
+        let dir = tempfile::tempdir().expect("dir");
+        let pid_file = dir.path().join("pid");
+        let alias = format!(
+            "alias.slow=!sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        );
+        let start = std::time::Instant::now();
+        let by = start + std::time::Duration::from_millis(1500);
+        let err = net_git_by(dir.path(), &["-c", &alias, "slow"], by).expect_err("timed out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the alias ran")
+            .trim()
+            .parse()
+            .expect("pid");
+        let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // SAFETY: signal 0 only asks whether the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < gone_by {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "sleep {pid} left running");
     }
 
     #[test]
