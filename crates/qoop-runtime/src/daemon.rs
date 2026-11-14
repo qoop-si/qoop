@@ -12053,7 +12053,7 @@ const PARENT_AGENT_ENV: &[&str] = &[
     "TRACEPARENT",
 ];
 
-fn scrub_parent_agent_env(cmd: &mut std::process::Command) {
+pub fn scrub_parent_agent_env(cmd: &mut std::process::Command) {
     for name in PARENT_AGENT_ENV {
         cmd.env_remove(name);
     }
