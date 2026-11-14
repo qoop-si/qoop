@@ -428,6 +428,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             terminal,
             token: "not-its-token".into(),
         },
+        // Only a mux takes it; a daemon refuses it whole, inner request and all.
+        ControlRequest::Via {
+            id: "x45".into(),
+            workspace: 1,
+            request: Box::new(ControlRequest::ScheduleRead { id: "x46".into() }),
+        },
     ];
     // Exhaustiveness, checked by the compiler rather than by a reviewer counting.
     for request in &all {
@@ -473,6 +479,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::Via { .. }
             | ControlRequest::Telemetry { .. }
             | ControlRequest::PersonAt { .. }
             | ControlRequest::TaskWrite { .. }

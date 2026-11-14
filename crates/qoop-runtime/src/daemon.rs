@@ -4129,6 +4129,12 @@ async fn handle_control(
             id,
             reason: "a tunnel is opened on the connection that carries it".into(),
         },
+        // Only an interface's mux takes it; a daemon answers as one that never heard of it, so
+        // a client reads the refusal the way it reads an older daemon's.
+        ControlRequest::Via { id, .. } => ControlResponse::Failed {
+            id,
+            reason: "unknown variant `Via`: only an interface's mux forwards it".into(),
+        },
         ControlRequest::Changes { terminal, .. } => {
             Box::pin(crate::changes::read(
                 id,
@@ -10692,29 +10698,7 @@ fn sweep_history(dir: &Path, open: &std::collections::BTreeSet<u32>) {
 /// quotes, since fish reads `\'` and `\\` there as escapes; a leading `=` is zsh's path
 /// expansion.
 pub(crate) fn shell_line(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            let arg = arg.replace(|c: char| c.is_control() && c != '\n', " ");
-            if !arg.is_empty()
-                && !arg.starts_with('=')
-                && arg
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c))
-            {
-                arg
-            } else {
-                let body: String = arg
-                    .chars()
-                    .map(|c| match c {
-                        '\'' | '\\' => format!("'\\{c}'"),
-                        c => c.to_string(),
-                    })
-                    .collect();
-                format!("'{body}'")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    qoop_domain::shell::line(argv)
 }
 
 /// What to say about a control request this daemon could not read.

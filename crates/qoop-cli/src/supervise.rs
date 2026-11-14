@@ -2032,26 +2032,9 @@ pub(crate) fn key_needs_mode(name: &str) -> bool {
     matches!(name, "up" | "down" | "right" | "left" | "home" | "end")
 }
 
-/// One argv word as a line typed into sh, bash, zsh or fish reads it back:
-/// bare when it is plainly safe, quoted for all four otherwise.
-///
-/// The line is typed, so the shell's line editor reads it before the parser
-/// does: a control character other than a newline is a key there (`ctrl-u`
-/// wipes the line typed so far, and what follows it runs as a line of its
-/// own), so each becomes a space. A leading `=` is zsh's path expansion.
-pub(crate) fn shell_quote(word: &str) -> String {
-    let word = word.replace(|c: char| c.is_control() && c != '\n', " ");
-    let safe = !word.is_empty()
-        && !word.starts_with('=')
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+-,".contains(&b));
-    if safe {
-        word
-    } else {
-        qoop_remote::saved::shell_quote(&word)
-    }
-}
+/// One argv word as a line typed into sh, bash, zsh or fish reads it back
+/// (`qoop_domain::shell`, the one quoting the daemon, the remotes and the window use).
+pub(crate) use qoop_domain::shell::quote as shell_quote;
 
 #[cfg(test)]
 mod tests {

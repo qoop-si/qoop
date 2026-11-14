@@ -1,69 +1,60 @@
-//! The connection to the daemon, on a thread of its own.
+//! The connection to the daemons, on a thread of its own.
 //!
-//! Reading the socket, reassembling frames and parsing every screen's JSON happen here,
-//! never on the window's thread. A screen goes into one slot per terminal, the newest
-//! replacing an older one the window has not taken yet, so memory stays at one screen per
-//! pane and a busy terminal costs the window only the screens it draws. The daemon hears
-//! that this client keeps up only once the window has taken what arrived.
+//! The window speaks to the TUI's mux (`qoop_tui::mux::serve`) over an in-memory pipe, as the
+//! TUI does: the mux holds this machine's daemon and every saved remote, gives a remote's
+//! terminals and spaces their own numbers, and merges the agent and space lists. Reading the
+//! pipe, reassembling frames and parsing every screen's JSON happen here, never on the
+//! window's thread. A screen goes into one slot per terminal, the newest replacing an older
+//! one the window has not taken yet, so memory stays at one screen per shown terminal.
 //!
-//! When the daemon goes away (`qoop update` restarts it) the link connects again, shows the
-//! same terminals and tells the window, which keeps the last screens drawn faded meanwhile.
+//! When this machine's daemon goes away (`qoop update` restarts it) the mux ends with it; the
+//! link connects again, asks for the lists again and shows the same terminals.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use qoop_runtime::client::{self, Connection, Incoming};
 use qoop_runtime::control::{ControlRequest, ControlResponse, EventMessage, TerminalStream};
 use qoop_runtime::daemon::{ClientWire, SnapshotWire};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// The newest screen per terminal that the window has not taken yet.
 pub type Latest = Arc<Mutex<HashMap<TerminalStream, SnapshotWire>>>;
 
-/// What the window asks of the daemon.
+/// What the window asks of the daemons.
 #[derive(Debug)]
 pub enum Up {
     Input(TerminalStream, Vec<u8>),
     Resize(TerminalStream, u16, u16),
-    /// Receive renders for these again (the window became visible).
+    /// Receive renders for these (a session opened, or the window came back into view).
     Show(Vec<TerminalStream>),
-    /// Stop the renders for these (the window is hidden: nothing would be presented).
+    /// Stop the renders for these.
     Hide(Vec<TerminalStream>),
-    /// A pane shows another terminal now (`qoop focus` named one no pane showed).
-    Swap {
-        from: Option<TerminalStream>,
-        to: TerminalStream,
-    },
-    /// The window took the screens out of `Latest`.
-    Taken,
+    Request(Box<ControlRequest>),
 }
 
-/// What the daemon told the window.
+/// What the daemons told the window.
 #[derive(Debug)]
 pub enum Down {
-    /// The terminals the panes show, in pane order, after every (re)connect.
-    Terminals(Vec<TerminalStream>),
+    /// Linked to this machine's daemon, again or for the first time; the lists follow.
+    Connected,
+    Answer(Box<ControlResponse>),
+    Event(EventMessage),
     /// New screens are waiting in `Latest`.
     Screens,
-    /// These terminals closed, or the daemon refused to show them.
-    Gone(Vec<TerminalStream>),
-    /// `qoop focus` asked for this terminal.
-    Focus(TerminalStream),
     /// The connection ended; the link is trying again.
     Disconnected(String),
 }
 
-/// Start the link: connect as the person's interface (`qoro-tui`), make sure `want`
-/// terminals exist and show them, and keep doing so across daemon restarts.
+/// Start the link to the daemon at `socket` and the saved remotes, and keep it across
+/// restarts of either.
 pub fn start(
     socket: PathBuf,
-    want: usize,
     host: ([u8; 3], [u8; 3]),
 ) -> (UnboundedSender<Up>, UnboundedReceiver<Down>, Latest) {
     let (up_tx, up_rx) = unbounded_channel();
@@ -83,7 +74,7 @@ pub fn start(
                 let _ = down_tx.send(Down::Disconnected("no async runtime".into()));
                 return;
             };
-            runtime.block_on(keep_linked(socket, want, host, up_rx, down_tx, slot));
+            runtime.block_on(keep_linked(socket, host, up_rx, down_tx, slot));
         })
         .expect("spawn the link thread");
     (up_tx, down_rx, latest)
@@ -93,19 +84,17 @@ pub fn start(
 /// 2 s between tries, back to 100 ms once one connects.
 async fn keep_linked(
     socket: PathBuf,
-    want: usize,
     host: ([u8; 3], [u8; 3]),
     mut up: UnboundedReceiver<Up>,
     down: UnboundedSender<Down>,
     latest: Latest,
 ) {
-    let mut shown: Vec<TerminalStream> = Vec::new();
+    let mut shown: BTreeSet<TerminalStream> = BTreeSet::new();
     let mut backoff = Duration::from_millis(100);
     loop {
         let mut connected = false;
-        match session(
+        let linked = session(
             &socket,
-            want,
             host,
             &mut shown,
             &mut up,
@@ -113,8 +102,8 @@ async fn keep_linked(
             &latest,
             &mut connected,
         )
-        .await
-        {
+        .await;
+        match linked {
             Ok(()) => return,
             Err(e) => {
                 if down.send(Down::Disconnected(e.to_string())).is_err() {
@@ -130,89 +119,32 @@ async fn keep_linked(
     }
 }
 
-struct Wire {
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
+/// The window's end of the pipe to the mux.
+pub struct Wire {
+    rd: ReadHalf<DuplexStream>,
+    wr: WriteHalf<DuplexStream>,
     inbuf: BytesMut,
     conn: Connection,
     control_seq: u32,
     terminal_seqs: HashMap<TerminalStream, u32>,
 }
 
-/// What one read brought besides screens.
-#[derive(Default)]
-struct Brought {
-    answers: Vec<ControlResponse>,
-    events: Vec<EventMessage>,
-}
-
 impl Wire {
-    /// What one read brought: screens go to the slot, the rest to the caller.
-    fn take(
-        &mut self,
-        read: usize,
-        down: &UnboundedSender<Down>,
-        latest: &Latest,
-    ) -> io::Result<Brought> {
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the daemon closed the connection",
-            ));
+    pub fn new(pipe: DuplexStream) -> Self {
+        let (rd, wr) = tokio::io::split(pipe);
+        Wire {
+            rd,
+            wr,
+            inbuf: BytesMut::new(),
+            conn: Connection::new(),
+            control_seq: 0,
+            terminal_seqs: HashMap::new(),
         }
-        let mut brought = Brought::default();
-        for incoming in self.conn.drain(&mut self.inbuf)? {
-            match incoming {
-                Incoming::Render {
-                    terminal, snapshot, ..
-                } => {
-                    let was_empty = {
-                        let mut slot = latest.lock().unwrap_or_else(|e| e.into_inner());
-                        let empty = slot.is_empty();
-                        slot.insert(terminal, snapshot);
-                        empty
-                    };
-                    if was_empty {
-                        let _ = down.send(Down::Screens);
-                    }
-                }
-                Incoming::Control(answer) => brought.answers.push(answer),
-                Incoming::Event(event) => brought.events.push(event),
-                _ => {}
-            }
-        }
-        Ok(brought)
     }
 
-    /// Say this client has taken everything that arrived. Sent once the window has, so a
-    /// window that stalls reads as one that stalled.
-    async fn ack(&mut self) -> io::Result<()> {
-        if let Some(ack) = self.conn.renders().due_ack(Instant::now()) {
-            self.wr.write_all(&ack).await?;
-        }
-        Ok(())
-    }
-
-    async fn request(&mut self, request: &ControlRequest) -> io::Result<()> {
+    pub async fn request(&mut self, request: &ControlRequest) -> io::Result<()> {
         let frame = client::encode_control_seq(request, &mut self.control_seq)?;
         self.wr.write_all(&frame).await
-    }
-
-    /// Send a request and wait for the daemon's answer, keeping screens meanwhile. Only at
-    /// the start of a connection, while no other request is out.
-    async fn ask(
-        &mut self,
-        request: &ControlRequest,
-        down: &UnboundedSender<Down>,
-        latest: &Latest,
-    ) -> io::Result<ControlResponse> {
-        self.request(request).await?;
-        loop {
-            let n = self.rd.read_buf(&mut self.inbuf).await?;
-            if let Some(answer) = self.take(n, down, latest)?.answers.into_iter().next() {
-                return Ok(answer);
-            }
-        }
     }
 
     async fn send(&mut self, terminal: TerminalStream, wire: &ClientWire) -> io::Result<()> {
@@ -221,26 +153,41 @@ impl Wire {
         self.wr.write_all(&frame).await
     }
 
-    async fn subscribe(&mut self, terminals: Vec<TerminalStream>, on: bool) -> io::Result<()> {
-        let request = if on {
-            ControlRequest::Subscribe {
-                id: "show".into(),
-                terminals,
+    /// Read once: screens go to `latest`, the rest is returned.
+    pub async fn read(
+        &mut self,
+        latest: &Latest,
+    ) -> io::Result<(Vec<ControlResponse>, Vec<EventMessage>, bool)> {
+        let n = self.rd.read_buf(&mut self.inbuf).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the daemon closed the connection",
+            ));
+        }
+        let (mut answers, mut events, mut screens) = (Vec::new(), Vec::new(), false);
+        for incoming in self.conn.drain(&mut self.inbuf)? {
+            match incoming {
+                Incoming::Render {
+                    terminal, snapshot, ..
+                } => {
+                    let mut slot = latest.lock().unwrap_or_else(|e| e.into_inner());
+                    screens |= slot.is_empty();
+                    slot.insert(terminal, snapshot);
+                }
+                Incoming::Control(answer) => answers.push(answer),
+                Incoming::Event(event) => events.push(event),
+                _ => {}
             }
-        } else {
-            ControlRequest::Unsubscribe {
-                id: "hide".into(),
-                terminals,
-            }
-        };
-        self.request(&request).await
+        }
+        Ok((answers, events, screens))
     }
 }
 
 /// A request id the daemon has never seen. It keeps the answer to an id for 30 days and
 /// answers a repeat with the first answer, so a reused id would bring back a terminal made
 /// long ago.
-fn fresh_id(what: &str) -> String {
+pub fn fresh_id(what: &str) -> String {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -249,102 +196,101 @@ fn fresh_id(what: &str) -> String {
     format!("desktop-{what}-{}-{nanos}-{n}", std::process::id())
 }
 
-/// The terminals to show: those shown before that still exist, then other existing ones,
-/// lowest first, then new ones.
-fn choose(
-    shown: &[TerminalStream],
-    existing: &[TerminalStream],
-    want: usize,
-) -> Vec<TerminalStream> {
-    let mut chosen: Vec<TerminalStream> = shown
-        .iter()
-        .copied()
-        .filter(|t| existing.contains(t))
-        .collect();
-    let mut rest: Vec<TerminalStream> = existing
-        .iter()
-        .copied()
-        .filter(|t| !chosen.contains(t))
-        .collect();
-    rest.sort_unstable();
-    chosen.extend(rest);
-    chosen.truncate(want);
-    chosen
+/// The mux over this machine's daemon at `socket` and the saved remotes, and the window's
+/// end of the pipe to it. The mux ends when this machine's daemon does.
+pub async fn through_mux(
+    socket: &Path,
+    remotes: Vec<qoop_remote::Remote>,
+) -> io::Result<(Wire, tokio::task::JoinHandle<()>)> {
+    let local = client::connect(socket, qoop_proto::INTERFACE_ID).await?;
+    // A megabyte each way: a full screen is tens of kilobytes, and this end reads as fast
+    // as it can into the one slot per terminal.
+    let (ours, theirs) = tokio::io::duplex(1 << 20);
+    let mux = tokio::spawn(qoop_tui::mux::serve(theirs, Some(local), remotes, None));
+    Ok((Wire::new(ours), mux))
+}
+
+/// The lists the window keeps, asked once linked: spaces, agents, this machine's schedules
+/// and qass's switch.
+pub fn opening_asks() -> Vec<ControlRequest> {
+    vec![
+        ControlRequest::ListWorkspaces {
+            id: fresh_id("spaces"),
+        },
+        ControlRequest::ListAgents {
+            id: fresh_id("agents"),
+        },
+        ControlRequest::ScheduleRead {
+            id: fresh_id("schedules"),
+        },
+        ControlRequest::QassWatch {
+            id: fresh_id("qass"),
+            on: None,
+        },
+    ]
+}
+
+/// What a batch of events asks to be read again: one list per batch, however many changes.
+pub fn rereads(events: &[EventMessage]) -> Vec<ControlRequest> {
+    let any = |f: fn(&EventMessage) -> bool| events.iter().any(f);
+    let mut asks = Vec::new();
+    if any(|e| matches!(e, EventMessage::Resync)) {
+        return opening_asks();
+    }
+    // No event names a new space: one made by the CLI, the phone or another window shows
+    // up when its first agent does, so the spaces are read with the agents.
+    if any(|e| matches!(e, EventMessage::AgentChanged { .. })) {
+        asks.push(ControlRequest::ListAgents {
+            id: fresh_id("agents"),
+        });
+        asks.push(ControlRequest::ListWorkspaces {
+            id: fresh_id("spaces"),
+        });
+    }
+    if any(|e| matches!(e, EventMessage::SchedulesChanged)) {
+        asks.push(ControlRequest::ScheduleRead {
+            id: fresh_id("schedules"),
+        });
+    }
+    asks
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn session(
-    socket: &std::path::Path,
-    want: usize,
+    socket: &Path,
     host: ([u8; 3], [u8; 3]),
-    shown: &mut Vec<TerminalStream>,
+    shown: &mut BTreeSet<TerminalStream>,
     up: &mut UnboundedReceiver<Up>,
     down: &UnboundedSender<Down>,
     latest: &Latest,
     connected: &mut bool,
 ) -> io::Result<()> {
-    let (stream, inbuf) = client::connect(socket, qoop_proto::INTERFACE_ID).await?;
+    // As `qoop` reads them; a list that does not read is no remotes rather than no window.
+    let remotes = qoop_remote::saved::load().unwrap_or_default();
+    let (mut wire, mux) = through_mux(socket, remotes).await?;
     *connected = true;
-    let (rd, wr) = stream.into_split();
-    let mut wire = Wire {
-        rd,
-        wr,
-        inbuf,
-        conn: Connection::new().paced(),
-        control_seq: 0,
-        terminal_seqs: HashMap::new(),
-    };
-    let existing = match wire
-        .ask(
-            &ControlRequest::ListTerminals {
-                id: fresh_id("list"),
-            },
-            down,
-            latest,
-        )
-        .await?
-    {
-        ControlResponse::Terminals { terminals, .. } => terminals,
-        other => return Err(io::Error::other(format!("listing terminals: {other:?}"))),
-    };
-    *shown = choose(shown, &existing, want);
-    while shown.len() < want {
-        let request = ControlRequest::CreateTerminal {
-            id: fresh_id("new"),
-            cwd: None,
-            workspace: None,
-            name: None,
-        };
-        match wire.ask(&request, down, latest).await? {
-            ControlResponse::TerminalCreated { terminal, .. } => shown.push(terminal),
-            other => return Err(io::Error::other(format!("making a terminal: {other:?}"))),
-        }
+    let ran = linked(&mut wire, host, shown, up, down, latest).await;
+    mux.abort();
+    ran
+}
+
+async fn linked(
+    wire: &mut Wire,
+    host: ([u8; 3], [u8; 3]),
+    shown: &mut BTreeSet<TerminalStream>,
+    up: &mut UnboundedReceiver<Up>,
+    down: &UnboundedSender<Down>,
+    latest: &Latest,
+) -> io::Result<()> {
+    for ask in opening_asks() {
+        wire.request(&ask).await?;
     }
-    let _ = down.send(Down::Terminals(shown.clone()));
-    // Shown, or refused (asleep, gone): a refused one is a pane with nothing in it.
-    match wire
-        .ask(
-            &ControlRequest::Subscribe {
-                id: fresh_id("show"),
-                terminals: shown.clone(),
-            },
-            down,
-            latest,
-        )
-        .await?
-    {
-        ControlResponse::Subscribed { terminals, .. } => {
-            let refused: Vec<TerminalStream> = shown
-                .iter()
-                .copied()
-                .filter(|t| !terminals.contains(t))
-                .collect();
-            if !refused.is_empty() {
-                shown.retain(|t| !refused.contains(t));
-                let _ = down.send(Down::Gone(refused));
-            }
-        }
-        other => return Err(io::Error::other(format!("showing terminals: {other:?}"))),
+    if !shown.is_empty() {
+        wire.request(&ControlRequest::Subscribe {
+            id: fresh_id("show"),
+            terminals: shown.iter().copied().collect(),
+        })
+        .await?;
     }
     // What a program inside asks for with `OSC 10 ?` and `OSC 11 ?`: this window's colours.
     // An older daemon refuses the request, which changes nothing.
@@ -354,34 +300,24 @@ async fn session(
         bg: host.1,
     })
     .await?;
-
+    let _ = down.send(Down::Connected);
     loop {
         tokio::select! {
             // Only the read itself races the other arm: it loses nothing when cancelled,
             // and a write cut in half by a cancel would corrupt the stream.
-            read = wire.rd.read_buf(&mut wire.inbuf) => {
-                let brought = wire.take(read?, down, latest)?;
-                for answer in brought.answers {
-                    if let ControlResponse::Terminals { terminals, .. } = answer {
-                        let gone: Vec<TerminalStream> = shown.iter().copied().filter(|t| !terminals.contains(t)).collect();
-                        if !gone.is_empty() {
-                            shown.retain(|t| !gone.contains(t));
-                            let _ = down.send(Down::Gone(gone));
-                        }
-                    }
+            read = wire.read(latest) => {
+                let (answers, events, screens) = read?;
+                if screens {
+                    let _ = down.send(Down::Screens);
                 }
-                for event in brought.events {
-                    match event {
-                        // Something about the terminals changed, or the daemon dropped news
-                        // for this client: list them again, as the TUI does.
-                        EventMessage::AgentChanged { .. } | EventMessage::Resync => {
-                            wire.request(&ControlRequest::ListTerminals { id: fresh_id("list") }).await?;
-                        }
-                        EventMessage::Focus { terminal } => {
-                            let _ = down.send(Down::Focus(terminal));
-                        }
-                        _ => {}
-                    }
+                for ask in rereads(&events) {
+                    wire.request(&ask).await?;
+                }
+                for answer in answers {
+                    let _ = down.send(Down::Answer(Box::new(answer)));
+                }
+                for event in events {
+                    let _ = down.send(Down::Event(event));
                 }
             }
             asked = up.recv() => match asked {
@@ -399,20 +335,17 @@ async fn session(
                 Some(Up::Resize(terminal, cols, rows)) => {
                     wire.send(terminal, &ClientWire::Resize { cols, rows }).await?;
                 }
-                Some(Up::Show(terminals)) => wire.subscribe(terminals, true).await?,
-                Some(Up::Hide(terminals)) => wire.subscribe(terminals, false).await?,
-                Some(Up::Swap { from, to }) => {
-                    // In place, so the pane order survives a reconnect.
-                    match shown.iter().position(|t| Some(*t) == from) {
-                        Some(i) => shown[i] = to,
-                        None => shown.push(to),
-                    }
-                    if let Some(from) = from {
-                        wire.subscribe(vec![from], false).await?;
-                    }
-                    wire.subscribe(vec![to], true).await?;
+                Some(Up::Show(terminals)) => {
+                    shown.extend(&terminals);
+                    wire.request(&ControlRequest::Subscribe { id: fresh_id("show"), terminals }).await?;
                 }
-                Some(Up::Taken) => wire.ack().await?,
+                Some(Up::Hide(terminals)) => {
+                    for t in &terminals {
+                        shown.remove(t);
+                    }
+                    wire.request(&ControlRequest::Unsubscribe { id: fresh_id("hide"), terminals }).await?;
+                }
+                Some(Up::Request(request)) => wire.request(&request).await?,
             },
         }
     }
@@ -423,14 +356,187 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_reconnect_keeps_the_terminals_that_still_exist() {
-        assert_eq!(choose(&[5, 2], &[1, 2, 3, 5], 4), vec![5, 2, 1, 3]);
-        assert_eq!(choose(&[5, 2], &[2, 9], 4), vec![2, 9]);
-        assert_eq!(choose(&[], &[4, 1, 3], 2), vec![1, 3]);
+    fn request_ids_are_never_reused() {
+        assert_ne!(fresh_id("new"), fresh_id("new"));
     }
 
     #[test]
-    fn request_ids_are_never_reused() {
-        assert_ne!(fresh_id("new"), fresh_id("new"));
+    fn a_batch_of_changes_reads_each_list_once() {
+        let events = [
+            EventMessage::AgentChanged { terminal: 1 },
+            EventMessage::AgentChanged { terminal: 2 },
+            EventMessage::SchedulesChanged,
+        ];
+        let asks: Vec<&str> = rereads(&events)
+            .iter()
+            .map(|a| match a {
+                ControlRequest::ListAgents { .. } => "agents",
+                ControlRequest::ListWorkspaces { .. } => "spaces",
+                ControlRequest::ScheduleRead { .. } => "schedules",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(asks, ["agents", "spaces", "schedules"]);
+        assert_eq!(rereads(&[EventMessage::Resync]).len(), opening_asks().len());
+        assert!(rereads(&[EventMessage::TasksChanged]).is_empty());
+    }
+
+    /// The mux reads the remotes list and writes the space order beside it: a test's own, never
+    /// the person's. Set once for the whole test binary, before any mux in it starts.
+    fn isolated_remotes() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // SAFETY: set once, before any mux in this binary reads it.
+            unsafe {
+                std::env::set_var(
+                    qoop_remote::saved::REMOTES_ENV,
+                    dir.path().join("remotes.json"),
+                )
+            };
+            dir
+        });
+    }
+
+    /// A window linked through the mux gets the merged agent and space lists from a daemon.
+    #[tokio::test]
+    async fn the_link_gets_agents_and_spaces_through_the_mux() {
+        isolated_remotes();
+        let d = qoop_testkit::TestDaemon::start().await;
+        let (mut wire, mux) = through_mux(d.socket(), Vec::new()).await.expect("linked");
+        for ask in opening_asks() {
+            wire.request(&ask).await.expect("ask");
+        }
+        let latest = Latest::default();
+        let (mut agents, mut spaces) = (None, None);
+        let deadline = std::time::Instant::now() + qoop_testkit::PATIENCE;
+        while (agents.is_none() || spaces.is_none()) && std::time::Instant::now() < deadline {
+            let read = tokio::time::timeout(Duration::from_secs(1), wire.read(&latest)).await;
+            let Ok(read) = read else { continue };
+            for answer in read.expect("read").0 {
+                match answer {
+                    ControlResponse::Agents { agents: a, .. } => agents = Some(a),
+                    ControlResponse::Workspaces { workspaces, .. } => spaces = Some(workspaces),
+                    _ => {}
+                }
+            }
+        }
+        let terminal = d.terminals().streams()[0];
+        let agents = agents.expect("an Agents answer");
+        assert!(agents.iter().any(|r| r.terminal == terminal), "{agents:?}");
+        assert!(!spaces.expect("a Workspaces answer").is_empty());
+        mux.abort();
+    }
+
+    async fn ask(c: &mut qoop_testkit::TestClient, request: ControlRequest) -> ControlResponse {
+        c.control(&request, qoop_testkit::PATIENCE)
+            .await
+            .expect("an answer")
+    }
+
+    /// A real daemon's sleeping agent tab, read through the mux as the window reads it, is on
+    /// home: the daemon lists it under its space, not as an agent row.
+    #[tokio::test]
+    async fn a_sleeping_agent_tab_of_a_real_daemon_is_on_home() {
+        use crate::state::{Chip, Kind, Model};
+        isolated_remotes();
+        let d = qoop_testkit::TestDaemon::start().await;
+        let mut c = d.attach("sleeper").await;
+        let space = match ask(
+            &mut c,
+            ControlRequest::CreateWorkspace {
+                id: "space".into(),
+                name: "dozing".into(),
+            },
+        )
+        .await
+        {
+            ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+            other => panic!("{other:?}"),
+        };
+        let tab = match ask(
+            &mut c,
+            ControlRequest::CreateTerminal {
+                id: "tab".into(),
+                cwd: None,
+                workspace: Some(space),
+                name: None,
+            },
+        )
+        .await
+        {
+            ControlResponse::TerminalCreated { terminal, .. } => terminal,
+            other => panic!("{other:?}"),
+        };
+        // A fresh shell is refused while it starts: asked again until it has settled.
+        let deadline = std::time::Instant::now() + qoop_testkit::PATIENCE;
+        for n in 0.. {
+            let answer = ask(
+                &mut c,
+                ControlRequest::SleepWorkspace {
+                    id: format!("sleep-{n}"),
+                    workspace: space,
+                    terminal: None,
+                },
+            )
+            .await;
+            match answer {
+                ControlResponse::WorkspaceAsleep { .. } => break,
+                other if std::time::Instant::now() > deadline => panic!("{other:?}"),
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        // What a sleep of an agent's tab writes down.
+        d.store()
+            .checkpoint(vec![qoop_store::Checkpoint {
+                terminal: i64::from(tab),
+                agent: Some("claude".into()),
+                agent_session: None,
+            }])
+            .await
+            .expect("a checkpoint");
+
+        let (mut wire, mux) = through_mux(d.socket(), Vec::new()).await.expect("linked");
+        for ask in opening_asks() {
+            wire.request(&ask).await.expect("ask");
+        }
+        let latest = Latest::default();
+        let mut model = Model::default();
+        let (mut agents, mut spaces) = (false, false);
+        let deadline = std::time::Instant::now() + qoop_testkit::PATIENCE;
+        while !(agents && spaces) && std::time::Instant::now() < deadline {
+            let read = tokio::time::timeout(Duration::from_secs(1), wire.read(&latest)).await;
+            let Ok(read) = read else { continue };
+            for answer in read.expect("read").0 {
+                match answer {
+                    ControlResponse::Agents { agents: a, .. } => {
+                        model.rows = a;
+                        agents = true;
+                    }
+                    ControlResponse::Workspaces { workspaces, .. } => {
+                        model.spaces = workspaces;
+                        spaces = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        mux.abort();
+        assert!(
+            !model.rows.iter().any(|r| r.terminal == tab && r.agent),
+            "not an awake agent row"
+        );
+        let group = model
+            .groups(Chip::All)
+            .into_iter()
+            .find(|g| g.space.id == space)
+            .expect("the sleeping space is on home");
+        let kinds: Vec<(u32, Kind)> = group
+            .rows
+            .iter()
+            .map(|e| (e.terminal(), e.kind()))
+            .collect();
+        assert_eq!(kinds, [(tab, Kind::Sleeping)]);
+        assert_eq!(model.count(Chip::Sleeping), 1);
     }
 }

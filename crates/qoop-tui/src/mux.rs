@@ -1452,6 +1452,32 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 Ok(())
             }
             R::ConnectRemote { id, target } => self.connect_remote(id, target).await,
+            // A request that names no terminal or space, for the machine `workspace` is on. It
+            // goes as it is, so its answer carries the inner id, and `answer` renumbers what
+            // comes back. Only those requests: one that names a terminal or a space would reach
+            // that machine in the interface's numbers, so it has its own routed arm instead,
+            // and one wrapped twice is refused rather than sent to a daemon to refuse.
+            R::Via {
+                id,
+                workspace,
+                request,
+            } => {
+                if matches!(*request, R::Via { .. }) {
+                    return self
+                        .failed(id, "a Via inside a Via is not forwarded".into())
+                        .await;
+                }
+                if !via_carries(&request) {
+                    return self
+                        .failed(
+                            id,
+                            "Via carries only a request that names no terminal or space".into(),
+                        )
+                        .await;
+                }
+                let (link, _) = workspace_in(workspace);
+                self.send_one(link, *request).await
+            }
             // A picture for a tab is kept where the tab runs, so a remote agent can read it.
             R::SaveUpload {
                 id,
@@ -2085,9 +2111,42 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                     _ => Ok(()),
                 }
             }
+            // A remote's schedules (asked through `Via`) name its last run's tab in its own
+            // numbers; one that does not fit is dropped rather than left to name a local tab.
+            C::Schedules { id, mut schedules } => {
+                for s in &mut schedules {
+                    s.last_terminal = s
+                        .last_terminal
+                        .and_then(|t| u32::try_from(t).ok())
+                        .and_then(|t| terminal_out(link, t))
+                        .map(i64::from);
+                }
+                self.respond(&C::Schedules { id, schedules }).await
+            }
             // Answers that carry no number of either kind.
             other => self.respond(&other).await,
         }
+    }
+}
+
+/// What `Via` takes to another machine: a request that names no terminal and no space, so
+/// it means the same there. Extended as `ScheduleRuns` and `Pet` land, each with its
+/// answer's numbers mapped in `answer`.
+fn via_carries(request: &ControlRequest) -> bool {
+    use qoop_runtime::control::ScheduleOp;
+    match request {
+        ControlRequest::ScheduleRead { .. }
+        | ControlRequest::SleepSettings { .. }
+        | ControlRequest::QassWatch { .. } => true,
+        // A run's report names its tab: written by the run on its own machine, never sent
+        // through an interface.
+        ControlRequest::ScheduleWrite {
+            terminal: None,
+            token: None,
+            action,
+            ..
+        } => !matches!(**action, ScheduleOp::Report { .. }),
+        _ => false,
     }
 }
 
@@ -2744,6 +2803,83 @@ mod tests {
                 terminal: there,
                 revision: 9,
             }
+        );
+    }
+
+    /// `Via` takes a request that names nothing of its own to the machine of the space it
+    /// names, and the answer comes back renumbered; one that names a terminal is refused,
+    /// since it would reach that machine in the interface's numbers.
+    #[tokio::test]
+    async fn via_carries_only_plain_requests_and_its_answers_are_renumbered() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let via = |id: &str, workspace: i64, request: ControlRequest| ControlRequest::Via {
+            id: id.into(),
+            workspace,
+            request: Box::new(request),
+        };
+        let read = |id: &str| ControlRequest::ScheduleRead { id: id.into() };
+        let remote_space = workspace_out(1, 3).expect("fits");
+        mux.control(via("v1", remote_space, read("r1")))
+            .await
+            .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, read("r1"), "the inner request, unchanged");
+
+        // A local space goes home.
+        mux.control(via("v2", 2, read("r2"))).await.expect("sent");
+        assert!(remote_rx.try_recv().is_err(), "the remote was asked");
+        let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+        assert_eq!(asked, read("r2"));
+
+        // A request naming a terminal is refused under the outer id and sent nowhere.
+        mux.control(via(
+            "v3",
+            remote_space,
+            ControlRequest::CloseTerminal {
+                id: "c3".into(),
+                terminal: 5,
+            },
+        ))
+        .await
+        .expect("answered");
+        assert!(remote_rx.try_recv().is_err() && home_rx.try_recv().is_err());
+        let refused: ControlResponse = body_of(&mux.down);
+        assert!(
+            matches!(&refused, ControlResponse::Failed { id, .. } if id == "v3"),
+            "{refused:?}"
+        );
+        mux.down.clear();
+
+        // The remote's schedules name its own tab 5: the interface hears its number for it,
+        // and a number that does not fit is dropped rather than left to name a local tab.
+        let schedule = |last_terminal: i64| -> qoop_runtime::control::ScheduleInfo {
+            serde_json::from_value(serde_json::json!({
+                "id": 1, "name": "soak", "cron": "0 * * * *", "agent": "claude", "cwd": "/tmp",
+                "prompt": "go", "paused": false, "created_at": 0, "when": "hourly",
+                "last_terminal": last_terminal,
+            }))
+            .expect("a schedule")
+        };
+        mux.answer(
+            1,
+            ControlResponse::Schedules {
+                id: "r1".into(),
+                schedules: vec![schedule(5), schedule(1 << 30)],
+            },
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        let ControlResponse::Schedules { id, schedules } = answered else {
+            panic!("{answered:?}");
+        };
+        assert_eq!(id, "r1");
+        let last: Vec<Option<i64>> = schedules.iter().map(|s| s.last_terminal).collect();
+        assert_eq!(
+            last,
+            [terminal_out(1, 5).map(i64::from), None],
+            "in the interface's numbers"
         );
     }
 

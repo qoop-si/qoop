@@ -266,6 +266,16 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "read another machine's schedules from the desktop",
+            method: || {
+                Method::Control(ControlRequest::Via {
+                    id: "a".into(),
+                    workspace: 1 << 40,
+                    request: Box::new(ControlRequest::ScheduleRead { id: "a".into() }),
+                })
+            },
+        },
+        Action {
             name: "see, stop or turn back on the usage counts",
             method: || {
                 Method::Control(ControlRequest::Telemetry {
@@ -1217,6 +1227,11 @@ fn every_control_method_is_reachable_from_some_action() {
             probe: false,
             token: String::new(),
         },
+        ControlRequest::Via {
+            id: String::new(),
+            workspace: 0,
+            request: Box::new(ControlRequest::ScheduleRead { id: String::new() }),
+        },
     ];
     for request in &all {
         match request {
@@ -1261,6 +1276,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::Via { .. }
             | ControlRequest::Telemetry { .. }
             | ControlRequest::PersonAt { .. }
             | ControlRequest::TaskWrite { .. }
