@@ -228,6 +228,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("wake") => supervise::run_wake(&args),
         Some("close") => supervise::run_close(&args),
         Some("worktree") => worktree::run(&args),
+        Some("plugin") => plugin::run(&args),
         Some("race") => race::run(&args),
         Some("space") => supervise::run_space(&args),
         Some("setup") => run_setup(&args),
@@ -330,6 +331,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 inside; --stale only the clean empty, merged or old ones\n\
                   \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
+                  \x20 qoop plugin install|link|ls|rm|run  herdr plugins in qoop; `qoop plugin` for more\n\
                   \x20 qoop race new <name> --agents A,B[,...] [--base REF] [--wait [--timeout SECS]] -- <prompt...>|-\n\
                   \x20                 one prompt to 2 to 5 agents, each on a branch\n\
                   \x20                 race/<name>/<agent> in a worktree and tab of its own\n\
