@@ -15,7 +15,7 @@ use crate::supervise::{self, NewOpts};
 /// One entry of `git worktree list --porcelain -z`.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Worktree {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// The short branch name; `None` when detached or bare.
     pub(crate) branch: Option<String>,
     head: Option<String>,
@@ -101,7 +101,7 @@ pub(crate) fn git(dir: &std::path::Path, args: &[&std::ffi::OsStr]) -> std::io::
 ///
 /// Git lists the main worktree first from inside any linked one, which is what makes
 /// "beside the repository" mean the same thing wherever this runs.
-fn worktrees() -> std::io::Result<Vec<Worktree>> {
+pub(crate) fn worktrees() -> std::io::Result<Vec<Worktree>> {
     let here = std::env::current_dir()?;
     let raw = git(
         &here,
@@ -256,7 +256,7 @@ pub(crate) fn worktree_slug(branch: &str) -> String {
 /// Where a new worktree goes when `--path` is not given: `<parent>/<repo>-wt-<slug>`,
 /// beside the main worktree. A bare repository's `.git` is not part of its name, and
 /// neither is a `.git` directory given as the main path.
-fn default_worktree_path(main: &std::path::Path, branch: &str) -> PathBuf {
+pub(crate) fn default_worktree_path(main: &std::path::Path, branch: &str) -> PathBuf {
     let main = if main.file_name().is_some_and(|n| n == ".git") {
         main.parent().unwrap_or(main)
     } else {
@@ -272,13 +272,13 @@ fn default_worktree_path(main: &std::path::Path, branch: &str) -> PathBuf {
 
 /// A path with its symlinks resolved, so `/tmp` and `/private/tmp` are one place. A path
 /// that cannot be resolved (gone, or not yet made) is compared as written.
-fn real(path: &std::path::Path) -> PathBuf {
+pub(crate) fn real(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Which worktree a directory is in: the deepest one containing it, compared by path
 /// component after resolving both, so `/repo-wt-a` is not inside `/repo`.
-fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
+pub(crate) fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
     let cwd = real(cwd);
     roots
         .iter()
@@ -302,7 +302,7 @@ fn ask(request: &ControlRequest) -> std::io::Result<Option<ControlResponse>> {
 
 /// This machine's rows, or none when qoop is not running: with no daemon there are no
 /// terminals, which is the true answer and not a failure.
-fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
+pub(crate) fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
     match ask(&ControlRequest::ListAgents {
         id: crate::request_id("worktree"),
     })? {
@@ -333,9 +333,28 @@ fn not_awake() -> std::io::Error {
     std::io::Error::other("nothing is awake: `qoop` or `qoop wake` starts it")
 }
 
+/// Refused when nothing listens on this machine's socket, before anything is made.
+pub(crate) fn awake() -> std::io::Result<()> {
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    match std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(not_awake()),
+    }
+}
+
+/// The space a worktree of the repository whose main checkout is `main` belongs to, from the
+/// running daemon's spaces (see [`place_of`]).
+pub(crate) fn place_for(
+    main: &std::path::Path,
+    space: Option<&str>,
+    read: &qoop_tui::config::Read,
+) -> std::io::Result<Place> {
+    place_of(&space_rows()?, main, space, has_table(read))
+}
+
 /// The space a worktree belongs to: its tab opens there and its settings are that space's.
 #[derive(Debug, PartialEq)]
-enum Place {
+pub(crate) enum Place {
     /// `name` keys its `[spaces.<name>]` table; `open` is what the tab is opened in: a found
     /// space's id, or `--space` as typed, so a space that does not exist yet is made only
     /// when the tab opens. `dir` is the space's folder, when it has one.
@@ -492,18 +511,19 @@ fn has_table(read: &qoop_tui::config::Read) -> impl Fn(&str) -> bool + '_ {
     |name| read.spaces.get(name).is_some_and(|s| s.worktree)
 }
 
-/// Everything after `git worktree add`, for `new` and `setup` alike: claim the worktree's
-/// index, then, unless `skip`, set it up as its space says. Prints the `setup=` line,
-/// `failed` included; the error is why, for the caller's retry hint.
-fn prepare(
+/// Everything after `git worktree add`, for `new`, `setup` and `race new` alike: claim the
+/// worktree's index, then, unless `skip`, set it up as its space says. The state the caller
+/// prints as `setup=` (`skipped`, `none`, `done`); the error is why it `failed`, for the
+/// caller's retry hint.
+pub(crate) fn prepare(
     main: &std::path::Path,
     tree: &std::path::Path,
     branch: &str,
     place: &Place,
     read: &qoop_tui::config::Read,
     skip: bool,
-) -> Result<(), String> {
-    let state = git_dirs(tree)
+) -> Result<&'static str, String> {
+    git_dirs(tree)
         .and_then(|(common, id)| claim_index(&common, &id))
         .map_err(|e| {
             eprintln!("setup: no index for {}: {e}", tree.display());
@@ -512,9 +532,7 @@ fn prepare(
         .and_then(|index| match skip {
             true => Ok("skipped"),
             false => set_up(main, tree, branch, index, place, read),
-        });
-    println!("setup={}", state.as_deref().unwrap_or("failed"));
-    state.map(|_| ())
+        })
 }
 
 /// Copy and run what the worktree's space says in `config.toml`: `done` when something was
@@ -833,10 +851,7 @@ fn worktree_setup(args: &[String]) -> std::io::Result<()> {
             other => target = Some(other.to_string()),
         }
     }
-    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-    if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
-        return Err(not_awake());
-    }
+    awake()?;
     let list = worktrees()?;
     let at = match &target {
         Some(target) => find_worktree(&list, target)?,
@@ -860,10 +875,12 @@ fn worktree_setup(args: &[String]) -> std::io::Result<()> {
     }
     let main = &list[0].path;
     let read = qoop_tui::config::read();
-    let place = place_of(&space_rows()?, main, space.as_deref(), has_table(&read))?;
+    let place = place_for(main, space.as_deref(), &read)?;
     let path = real(&tree.path);
     let branch = tree.branch.clone().unwrap_or_default();
-    prepare(main, &path, &branch, &place, &read, false).map_err(|why| {
+    let state = prepare(main, &path, &branch, &place, &read, false);
+    println!("setup={}", state.as_deref().unwrap_or("failed"));
+    state.map(|_| ()).map_err(|why| {
         let again = tree
             .branch
             .clone()
@@ -986,13 +1003,10 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
         base,
         path,
         no_setup,
-        mut new,
+        new,
     } = parse_worktree_new_args(args).map_err(crate::usage)?;
     // Checked before git runs, so qoop not running does not leave a worktree behind.
-    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
-    if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
-        return Err(not_awake());
-    }
+    awake()?;
     let list = worktrees()?;
     let main = list[0].path.clone();
     if let Some(taken) = list.iter().find(|w| w.branch.as_deref() == Some(&branch)) {
@@ -1030,38 +1044,62 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     }
     // Found before git runs and never made here, so a bad `--space` leaves no worktree.
     let read = qoop_tui::config::read();
-    let place = place_of(
-        &space_rows()?,
-        &main,
-        new.space.as_deref(),
-        has_table(&read),
-    )?;
+    let place = place_for(&main, new.space.as_deref(), &read)?;
     let here = std::env::current_dir()?;
     let path = path.map_or_else(|| default_worktree_path(&main, &branch), |p| here.join(p));
-    let mut add: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
-    if local || remote {
-        add.extend([path.as_os_str(), branch.as_ref()]);
-    } else {
-        add.extend(["-b".as_ref(), branch.as_ref(), path.as_os_str()]);
-        add.extend(base.as_deref().map(std::ffi::OsStr::new));
-    }
-    git(&main, &add)?;
-    // Resolved once it exists, so `--path ../x` is not recorded as a tab's directory.
-    let path = real(&path);
+    let path = add(&main, &branch, &path, local || remote, base.as_deref())?;
     println!("worktree={} branch={branch}", path.display());
-    prepare(&main, &path, &branch, &place, &read, no_setup).map_err(|why| {
+    let state = prepare(&main, &path, &branch, &place, &read, no_setup);
+    println!("setup={}", state.as_deref().unwrap_or("failed"));
+    state.map_err(|why| {
         std::io::Error::other(format!(
             "setup failed ({why}); fix it, then qoop worktree setup {branch}"
         ))
     })?;
+    open_in(new, &place, path, &branch, |terminal| {
+        println!("terminal={terminal}")
+    })
+}
+
+/// `git worktree add` from the main checkout `main` at `path`: `branch` as it is when it
+/// `exists` (locally, or only on a remote, which git then tracks), else a new branch from
+/// `base` (the main checkout's `HEAD` when `None`). The path resolved once it exists, so
+/// `--path ../x` is not recorded as a tab's directory. Prints nothing.
+pub(crate) fn add(
+    main: &std::path::Path,
+    branch: &str,
+    path: &std::path::Path,
+    exists: bool,
+    base: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let mut add: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
+    if exists {
+        add.extend([path.as_os_str(), branch.as_ref()]);
+    } else {
+        add.extend(["-b".as_ref(), branch.as_ref(), path.as_os_str()]);
+        add.extend(base.map(std::ffi::OsStr::new));
+    }
+    git(main, &add)?;
+    Ok(real(path))
+}
+
+/// Open a worktree's terminal in its space, named after its branch unless `new` names it,
+/// marked as started by the caller's terminal (see [`NewOpts::spawned`]).
+pub(crate) fn open_in(
+    mut new: NewOpts,
+    place: &Place,
+    path: PathBuf,
+    branch: &str,
+    announce: impl FnOnce(u32),
+) -> std::io::Result<()> {
     new.space = match place {
-        Place::Space { open, .. } => Some(open),
+        Place::Space { open, .. } => Some(open.clone()),
         Place::Default { .. } => None,
     };
     new.cwd = Some(path);
-    new.name = new.name.or_else(|| Some(branch.clone()));
+    new.name = new.name.or_else(|| Some(branch.to_string()));
     new.spawned = true;
-    supervise::open_terminal(&new, |terminal| println!("terminal={terminal}"))
+    supervise::open_terminal(&new, announce)
 }
 
 /// `qoop worktree ls`: every worktree, and this machine's terminals inside each. `--stale`
@@ -1260,6 +1298,19 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
     }
     let list = worktrees()?;
     let tree = linked(&list, target)?;
+    remove(&list[0].path, tree, force)?;
+    println!(
+        "removed {}; branch {} kept",
+        tree.path.display(),
+        tree.branch.as_deref().unwrap_or("-")
+    );
+    Ok(())
+}
+
+/// Remove a linked worktree from the main checkout `main`, keeping its branch: refused while
+/// any process is inside (see [`refuse_if_in_use`]), and when it is dirty unless `force`.
+/// Prints nothing.
+pub(crate) fn remove(main: &std::path::Path, tree: &Worktree, force: bool) -> std::io::Result<()> {
     refuse_if_in_use(tree)?;
     let status = git(
         &tree.path,
@@ -1275,18 +1326,12 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
         Err(e) if !force => return Err(e),
         _ => {}
     }
-    let mut remove: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "remove".as_ref()];
+    let mut args: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "remove".as_ref()];
     if force {
-        remove.push("--force".as_ref());
+        args.push("--force".as_ref());
     }
-    remove.push(tree.path.as_os_str());
-    git(&list[0].path, &remove)?;
-    println!(
-        "removed {}; branch {} kept",
-        tree.path.display(),
-        tree.branch.as_deref().unwrap_or("-")
-    );
-    Ok(())
+    args.push(tree.path.as_os_str());
+    git(main, &args).map(|_| ())
 }
 
 /// A linked worktree by branch or path, refused when it is the main one or already gone.
@@ -1358,7 +1403,7 @@ fn refuse_if_in_use(tree: &Worktree) -> std::io::Result<()> {
 }
 
 /// Git with string arguments, from `dir`.
-fn git_in(dir: &std::path::Path, args: &[&str]) -> std::io::Result<String> {
+pub(crate) fn git_in(dir: &std::path::Path, args: &[&str]) -> std::io::Result<String> {
     git(
         dir,
         &args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
@@ -1366,7 +1411,7 @@ fn git_in(dir: &std::path::Path, args: &[&str]) -> std::io::Result<String> {
 }
 
 /// Whether a worktree has anything uncommitted, untracked files included.
-fn dirty(dir: &std::path::Path) -> std::io::Result<bool> {
+pub(crate) fn dirty(dir: &std::path::Path) -> std::io::Result<bool> {
     Ok(
         !git_in(dir, &["status", "--porcelain", "--untracked-files=all"])?
             .trim()

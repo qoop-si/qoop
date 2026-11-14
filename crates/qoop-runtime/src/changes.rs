@@ -308,9 +308,9 @@ fn diff_of(git: &Git, from: &str) -> Result<(Vec<ChangedFile>, String, bool), St
     Ok((files, String::from_utf8_lossy(patch).into_owned(), cut))
 }
 
-/// The untracked files, and whether the list was cut. Unanswered is none: a checkout full of
-/// them is slow here, and loses only this list.
-fn untracked_of(git: &Git) -> Result<(Vec<ChangedFile>, bool), String> {
+/// The untracked files, whether the list was cut, and whether git answered at all. Unanswered
+/// is none: a checkout full of them is slow here, and loses only this list.
+fn untracked_of(git: &Git) -> Result<(Vec<ChangedFile>, bool, bool), String> {
     let args = [
         "status",
         "--porcelain=v1",
@@ -319,7 +319,7 @@ fn untracked_of(git: &Git) -> Result<(Vec<ChangedFile>, bool), String> {
         "--ignore-submodules=all",
     ];
     let Some((out, cut)) = git.guarded(&args)? else {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, false));
     };
     let mut files = Vec::new();
     let text = String::from_utf8_lossy(&out);
@@ -335,7 +335,98 @@ fn untracked_of(git: &Git) -> Result<(Vec<ChangedFile>, bool), String> {
             files.push(ChangedFile { path, status });
         }
     }
-    Ok((files, cut))
+    Ok((files, cut, true))
+}
+
+/// How much a checkout changed since a base: files, lines added and removed, and whether a
+/// count may be low (git's answer was cut, or the untracked files were not listed in time).
+#[derive(Debug, Default, PartialEq)]
+pub struct Stat {
+    pub files: usize,
+    pub added: u64,
+    pub removed: u64,
+    pub cut: bool,
+}
+
+/// The largest untracked file whose lines are counted; a larger one is a file of no lines.
+const COUNTED: u64 = 1024 * 1024;
+
+/// What the checkout `cwd` is in changed since it left `base` (see [`from_of`]): the tracked
+/// files as `git diff --numstat` counts them, every rename a removal and an addition, a binary
+/// file one of no lines; then each untracked file, its lines counted as git would (see
+/// [`lines_of`]). The index is never touched.
+pub fn stat(cwd: &str, base: &str) -> Result<Stat, String> {
+    let git = open(cwd, GIT_WITHIN)?;
+    let from = from_of(&git, base);
+    let args = [
+        &["diff", "--numstat", "-z", "--no-renames"][..],
+        &DIFF,
+        &[&from, "--"],
+    ]
+    .concat();
+    let (out, cut) = git.guarded(&args)?.ok_or("git diff did not answer")?;
+    let mut stat = numstat(&out, cut);
+    let (untracked, more, answered) = untracked_of(&git)?;
+    stat.cut |= more || !answered;
+    for file in untracked {
+        if let Some(lines) = lines_of(&git.root.join(&file.path)) {
+            stat.files += 1;
+            stat.added += lines;
+        }
+    }
+    Ok(stat)
+}
+
+/// The records of a `git diff --numstat -z --no-renames`: `<added>\t<removed>\t<path>`, each
+/// ending in NUL, `-` for both counts of a binary file. A list `cut` at the cap drops its last
+/// record, which may be part of one.
+fn numstat(out: &[u8], cut: bool) -> Stat {
+    let text = String::from_utf8_lossy(out);
+    let mut records: Vec<&str> = text.split('\0').collect();
+    // The last is empty, or was cut.
+    records.pop();
+    let mut stat = Stat {
+        cut,
+        ..Stat::default()
+    };
+    for record in records {
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(_)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        stat.files += 1;
+        stat.added += added.parse::<u64>().unwrap_or(0);
+        stat.removed += removed.parse::<u64>().unwrap_or(0);
+    }
+    stat
+}
+
+/// The lines of an untracked file as git would count them, `None` for anything but a file
+/// (a symlink, a folder, a pipe). Opened without following a link or waiting on a pipe, and
+/// checked on the handle, since what was listed may have been swapped since. Over [`COUNTED`]
+/// bytes, or with a NUL in its first 8000 (git's test for binary), it has no lines.
+fn lines_of(path: &Path) -> Option<u64> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(COUNTED + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > COUNTED || bytes.iter().take(8000).any(|&b| b == 0) {
+        return Some(0);
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    Some(newlines + u64::from(bytes.last().is_some_and(|&b| b != b'\n')))
 }
 
 /// The fields of an answer, and the GitHub repository to ask about its pull request.
@@ -358,7 +449,7 @@ fn look(cwd: &str) -> Result<Looked, String> {
     let repo = git
         .line(&["config", "--get", "remote.origin.url"])
         .and_then(|url| github_repo(&url));
-    let (untracked, more) = untracked_of(&git)?;
+    let (untracked, more, _) = untracked_of(&git)?;
     files.extend(untracked);
     Ok(Looked {
         root: git.root.display().to_string(),
@@ -712,5 +803,57 @@ mod tests {
             look(&repo.display().to_string()).err().as_deref(),
             Some(UNREAD)
         );
+    }
+
+    #[test]
+    fn a_stat_counts_lines_since_the_base_as_git_would() {
+        let (_dir, repo) = repo();
+        std::fs::write(repo.join("c.txt"), "x\ny\nz\n").expect("c");
+        std::fs::write(repo.join("bin2.dat"), b"\0x").expect("bin2");
+        git(&repo, &["add", "c.txt", "bin2.dat"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        git(&repo, &["update-ref", "refs/qoop/race/x", "HEAD"]);
+        // A rename is a removal and an addition; a binary file is one of no lines.
+        git(&repo, &["mv", "c.txt", "d.txt"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").expect("a");
+        std::fs::write(repo.join("bin2.dat"), b"\0y").expect("bin2");
+        // Untracked: lines as git counts them, a binary or an oversized file of none, a
+        // symlink not at all.
+        std::fs::write(repo.join("new.txt"), "1\n2").expect("new");
+        std::fs::write(repo.join("bin.dat"), b"a\0b\n").expect("bin");
+        std::fs::write(repo.join("big.txt"), "l\n".repeat(600 * 1024)).expect("big");
+        std::os::unix::fs::symlink("a.txt", repo.join("link")).expect("link");
+        let before = git(&repo, &["diff", "--cached", "--name-only"]);
+        let got = stat(&repo.display().to_string(), "refs/qoop/race/x").expect("stat");
+        assert_eq!(
+            got,
+            Stat {
+                files: 7,
+                added: 6,
+                removed: 3,
+                cut: false
+            }
+        );
+        assert_eq!(
+            git(&repo, &["diff", "--cached", "--name-only"]),
+            before,
+            "the index is never touched"
+        );
+    }
+
+    #[test]
+    fn a_numstat_cut_short_drops_its_last_record_and_says_so() {
+        let whole = numstat(b"1\t2\ta\0-\t-\tb\0", false);
+        assert_eq!(
+            whole,
+            Stat {
+                files: 2,
+                added: 1,
+                removed: 2,
+                cut: false
+            }
+        );
+        let cut = numstat(b"1\t2\ta\0-\t-\tb\x003\t4\tc", true);
+        assert_eq!(cut, Stat { cut: true, ..whole });
     }
 }

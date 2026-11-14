@@ -97,8 +97,9 @@ fn write(action: ScheduleOp) -> std::io::Result<i64> {
     }
 }
 
-/// The agent names a schedule may use: qass's four and the person's own `[agents]` lines.
-fn agent_ok(agent: &str, launchers: &[config::Launcher]) -> Result<(), String> {
+/// The agent names a schedule or a race may use: qass's four and the person's own `[agents]`
+/// lines.
+pub(crate) fn agent_ok(agent: &str, launchers: &[config::Launcher]) -> Result<(), String> {
     let program = launchers
         .iter()
         .find(|l| l.name == agent)
@@ -107,8 +108,8 @@ fn agent_ok(agent: &str, launchers: &[config::Launcher]) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "{agent} cannot be started with a message; scheduled runs use {} or a name from [agents] \
-         that runs one of them",
+        "{agent} cannot be started with a message; use {} or a name from [agents] that runs \
+         one of them",
         config::QASS_AGENTS.join(", ")
     ))
 }
@@ -324,7 +325,7 @@ fn still_working(name: &str) -> std::io::Result<bool> {
 
 /// What the line typed into the new terminal is: a person's `[agents]` line as written, or the
 /// program's name, then the prompt as that program takes a first message.
-fn launch(
+pub(crate) fn launch(
     agent: &str,
     prompt: &str,
     launchers: &[config::Launcher],
