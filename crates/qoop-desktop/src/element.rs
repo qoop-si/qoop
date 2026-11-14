@@ -10,19 +10,17 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontId, FontStyle, FontWeight, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Point, Rgba, Style, TextRun, Window, fill, point, px, relative, size,
+    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Font, FontId, FontStyle, FontWeight, GlobalElementId, GlyphId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba, Style, TextRun, Window, fill,
+    point, px, relative, size,
 };
 use qoop_domain::Viewport;
 use qoop_runtime::client::viewport_for;
 use qoop_runtime::control::TerminalStream;
 use qoop_runtime::daemon::{ColourWire, SnapshotWire, SpanWire, attrs};
-use tokio::sync::mpsc::UnboundedSender;
 
-use crate::link::Up;
 use crate::probe;
-use crate::view::Spike;
 
 /// qoop's own ground and ink: the logo's background and its dots.
 pub const BACKGROUND: [u8; 3] = [0x0f, 0x0f, 0x11];
@@ -50,8 +48,30 @@ impl Cells {
 /// A width and a height in pixels.
 pub type Size2 = (Pixels, Pixels);
 
+/// The cell size of the terminal font: the advance of `m` across, 1.2 em down, both in
+/// whole pixels so rows and columns never fall between device pixels.
+pub fn cells(cx: &App, font_size: f32) -> Cells {
+    let font = gpui::font("Menlo");
+    let text = cx.text_system();
+    let id = text.resolve_font(&font);
+    let size = px(font_size);
+    // Whole pixels across too: a fractional advance puts glyphs on four subpixel positions,
+    // each rasterized on its own (Herdr moved to whole-pixel cells for the same reason).
+    let width = text
+        .advance(id, size, 'm')
+        .map(|s| s.width.round())
+        .unwrap_or(px((font_size * 0.6).round()))
+        .max(px(1.));
+    Cells {
+        font,
+        font_size: size,
+        width,
+        height: px((font_size * 1.2).ceil()),
+    }
+}
+
 /// What one pane needs to paint itself, say its size and take typed text.
-pub struct TerminalElement {
+pub struct TerminalElement<V: 'static> {
     pub pane: usize,
     pub terminal: Option<TerminalStream>,
     pub screen: Option<Rc<SnapshotWire>>,
@@ -64,12 +84,13 @@ pub struct TerminalElement {
     pub sent: Rc<Cell<(u16, u16)>>,
     /// The part of a bigger grid this pane shows, kept so it moves only to follow the cursor.
     pub viewport: Rc<Cell<Option<Viewport>>>,
-    pub up: UnboundedSender<Up>,
+    /// Tells the terminal its new size.
+    pub resize: Rc<dyn Fn(TerminalStream, u16, u16)>,
     /// Where text from the input method goes (dead keys, IME), for the focused pane.
-    pub input: Option<(FocusHandle, Entity<Spike>)>,
+    pub input: Option<(FocusHandle, Entity<V>)>,
 }
 
-impl IntoElement for TerminalElement {
+impl<V: EntityInputHandler> IntoElement for TerminalElement<V> {
     type Element = Self;
     fn into_element(self) -> Self {
         self
@@ -96,7 +117,7 @@ pub struct Painted {
     frame: probe::Frame,
 }
 
-impl Element for TerminalElement {
+impl<V: EntityInputHandler> Element for TerminalElement<V> {
     type RequestLayoutState = ();
     type PrepaintState = Painted;
 
@@ -137,7 +158,7 @@ impl Element for TerminalElement {
             && fit != self.sent.get()
         {
             self.sent.set(fit);
-            let _ = self.up.send(Up::Resize(terminal, fit.0, fit.1));
+            (self.resize)(terminal, fit.0, fit.1);
         }
         let mut painted = Painted {
             origin: bounds.origin,
@@ -567,6 +588,8 @@ fn indexed(i: u8) -> [u8; 3] {
 mod tests {
     use super::*;
 
+    type Asked = Rc<std::cell::RefCell<Vec<(TerminalStream, u16, u16)>>>;
+
     #[test]
     fn the_colour_table_matches_xterm() {
         assert_eq!(indexed(1), [0xcd, 0, 0]);
@@ -613,9 +636,9 @@ mod tests {
 
     fn element(
         screen: Rc<SnapshotWire>,
-        up: UnboundedSender<Up>,
+        asked: Asked,
         sent: Rc<Cell<(u16, u16)>>,
-    ) -> TerminalElement {
+    ) -> TerminalElement<crate::field::Field> {
         TerminalElement {
             pane: 1,
             terminal: Some(7),
@@ -630,7 +653,7 @@ mod tests {
             stale: false,
             sent,
             viewport: Rc::new(Cell::new(None)),
-            up,
+            resize: Rc::new(move |t, c, r| asked.borrow_mut().push((t, c, r))),
             input: None,
         }
     }
@@ -640,12 +663,12 @@ mod tests {
     /// placed, and the terminal is asked for the pane's size once.
     #[gpui::test]
     fn a_pane_paints_on_the_grid_and_sizes_its_terminal(cx: &mut gpui::TestAppContext) {
-        let (up, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let asked = Asked::default();
         let sent = Rc::new(Cell::new((0, 0)));
         let window = cx.add_empty_window();
         let snap = screen(&["abcdef", "$ ls"], (1, 4), 100, 30);
         for _ in 0..2 {
-            let e = element(snap.clone(), up.clone(), sent.clone());
+            let e = element(snap.clone(), asked.clone(), sent.clone());
             let (_, painted) =
                 window.draw(point(px(0.), px(0.)), size(px(800.), px(480.)), |_, _| e);
             let xs: Vec<Pixels> = painted.glyphs.iter().take(6).map(|g| g.at.x).collect();
@@ -661,9 +684,9 @@ mod tests {
             let (cursor, _) = painted.cursor.as_ref().expect("the cursor is shown");
             assert_eq!(cursor.origin, point(px(32.), px(16.)));
         }
-        assert!(matches!(asked.try_recv(), Ok(Up::Resize(7, 100, 30))));
+        assert_eq!(asked.borrow().first(), Some(&(7, 100, 30)));
         assert!(
-            asked.try_recv().is_err(),
+            asked.borrow().len() == 1,
             "an unchanged size is not sent again"
         );
     }
@@ -672,7 +695,7 @@ mod tests {
     /// cursor, not cut off at the top.
     #[gpui::test]
     fn a_bigger_grid_follows_the_cursor(cx: &mut gpui::TestAppContext) {
-        let (up, _asked) = tokio::sync::mpsc::unbounded_channel();
+        let up = Asked::default();
         let window = cx.add_empty_window();
         let lines: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();

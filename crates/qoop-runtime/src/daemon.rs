@@ -4129,6 +4129,12 @@ async fn handle_control(
             id,
             reason: "a tunnel is opened on the connection that carries it".into(),
         },
+        // Only an interface's mux takes it; a daemon answers as one that never heard of it, so
+        // a client reads the refusal the way it reads an older daemon's.
+        ControlRequest::Via { id, .. } => ControlResponse::Failed {
+            id,
+            reason: "unknown variant `Via`: only an interface's mux forwards it".into(),
+        },
         ControlRequest::Changes { terminal, .. } => {
             Box::pin(crate::changes::read(
                 id,

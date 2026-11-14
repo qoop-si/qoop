@@ -646,6 +646,16 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<bool>,
     },
+    /// For an interface's mux only: send `request` to the machine `workspace` is on, for a
+    /// request that names no terminal or space of its own (`ScheduleRead`, `SleepSettings`,
+    /// `QassWatch`). The mux forwards the inner request unchanged, so the answer carries the
+    /// inner request's id. A daemon never serves it: reached directly, it answers `unknown
+    /// variant`, as a daemon from before it does.
+    Via {
+        id: String,
+        workspace: i64,
+        request: Box<ControlRequest>,
+    },
     /// Usage counts (ADR-023). `Status` looks at the conditions and acts on them now, `Show`
     /// answers every day not yet sent as it would be sent, `Off` stops counting and any send at
     /// once and deletes the counts, the id and the notice mark, `On` lifts an `Off`. `On` is
@@ -1908,6 +1918,7 @@ impl ControlRequest {
             | Self::UpdateState { id }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::Via { id, .. }
             | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
             | Self::TaskWrite { id, .. }

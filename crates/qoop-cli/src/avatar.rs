@@ -315,43 +315,14 @@ fn curated_batch() -> Batch {
 }
 
 fn random_batch() -> Batch {
-    let mut rng = Rng::new();
-    let mut pets = Vec::with_capacity(BATCH);
-    for _ in 0..BATCH {
-        pets.push(Avatar {
-            body: BODY.into(),
-            hair: HAIR_STYLES[rng.below(HAIR_STYLES.len())].into(),
-            eyes: EYE_STYLES[rng.below(EYE_STYLES.len())].into(),
-            hair_ink: HAIR_INKS[rng.below(HAIR_INKS.len())],
-            body_ink: BODY_INK,
-        });
-    }
-    Batch { pets }
-}
-
-/// A tiny generator: the batch must differ run to run, and there is no rand crate.
-struct Rng(u64);
-
-impl Rng {
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9e37);
-        Rng(nanos ^ (std::process::id() as u64).wrapping_mul(0x9e3779b9))
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
+    // The batch must differ run to run: seeded from the clock and the process.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37);
+    let mut deal = avatar::Deal::new(nanos ^ (std::process::id() as u64).wrapping_mul(0x9e3779b9));
+    Batch {
+        pets: (0..BATCH).map(|_| deal.pet()).collect(),
     }
 }
 
