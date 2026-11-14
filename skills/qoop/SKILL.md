@@ -100,8 +100,11 @@ screen only, not the scrollback; with `--until` both must hold.
 t=$(qoop new --name worker --cwd ~/repo -- <agent>)  # prints the number
 qoop new --space review -- <agent>                     # a space by id or name
 qoop close <terminal>                                  # never your own
-qoop worktree new <branch> [--base REF] [-- <agent>]   # a worktree and a terminal in it
+qoop worktree new <branch> [--base REF] [--no-setup] [-- <agent>]   # a worktree and a terminal in it
+qoop worktree setup [<branch|path>]                    # set a worktree up again
+qoop worktree finish <branch|path> [--pr|--merge|--discard] [--base REF]
 qoop worktree ls [--json]
+qoop worktree ls --stale [--json]                      # clean ones that are empty, merged or old
 qoop worktree rm <branch|path> [--force]
 ```
 
@@ -109,9 +112,24 @@ qoop worktree rm <branch|path> [--force]
 `new` never starts qoop; a new `--space` name is made once. `worktree new`
 adds `<repo>-wt-<slug>` beside the repository (the branch lowercased, other
 characters as dashes) with a terminal named after the branch; a branch only
-on a remote is checked out tracking it. `worktree rm` refuses while any
-process is inside it (`--force` only overrides a dirty tree); run it from
-outside. The branch is kept.
+on a remote is checked out tracking it. Before the terminal opens, the
+worktree is set up from its space's `[spaces.<name>.worktree]` in
+`config.toml` (`copy` for ignored files, `setup` for a command; each worktree
+has `QOOP_WORKTREE_INDEX`, 0 for the main checkout). Stdout says
+`setup=done`, `none`, `skipped` (`--no-setup`) or `failed`; a failure keeps the
+worktree, opens no terminal and exits 1, and `worktree setup <branch>` retries
+(also for a worktree made by plain `git worktree add`; not on the main
+checkout). `worktree rm` refuses while any process is inside it (`--force` only
+overrides a dirty tree); run it from outside. The branch is kept.
+
+`worktree finish` ends the work. Plain: refused with uncommitted changes or any
+process inside (run it from outside), and refused unless the branch is proven
+merged into the base; then it removes the worktree, the branch and
+`origin/<branch>`. `--pr` pushes and opens a pull request (`pr=<url>`) and keeps
+the worktree and branch. `--merge` fast-forwards the main checkout's branch
+locally, never pushing. `--discard` drops the worktree and the branch with their
+changes, the only mode that loses work. `worktree ls --stale` only lists the
+clean worktrees that are empty, merged or old, with `why=`.
 
 ## Supervising other agents
 
