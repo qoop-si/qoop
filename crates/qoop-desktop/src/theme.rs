@@ -71,7 +71,8 @@ pub const DARK: Theme = Theme {
     ink: 0xf3f1ed,
     t1: 0xe6e1da,
     t2: 0xb0aaa2,
-    t3: 0x938d85,
+    // One step over the design's #938d85, which reads 4.49:1 on a hovered card.
+    t3: 0x958f87,
     line: 0xfff0e11f,
     hair: 0xfff0e112,
     fill: 0xfff0e111,
@@ -220,10 +221,6 @@ mod tests {
             texts.extend(t.spaces.iter().map(|s| ("space", *s)));
             for (name, text) in texts {
                 for ground in grounds {
-                    // The quietest ink is never drawn on a Needs you row.
-                    if name == "t3" && ground == over(t.needs_bg, t.card) {
-                        continue;
-                    }
                     let ratio = contrast(text, ground);
                     assert!(
                         ratio >= 4.5,
