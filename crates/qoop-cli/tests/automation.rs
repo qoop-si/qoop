@@ -159,6 +159,52 @@ fn new_worktree(daemon: &Daemon, repo: &Path, branch: &str) -> (PathBuf, String)
     (checkout, terminal)
 }
 
+/// The space a terminal is in, from `qoop agents`.
+fn workspace_of(daemon: &Daemon, terminal: &str) -> String {
+    let listed = text(&daemon.run(&["agents"]).stdout);
+    listed
+        .lines()
+        .find(|l| l.starts_with(&format!("term={terminal} ")))
+        .and_then(|l| l.split(' ').find_map(|w| w.strip_prefix("workspace=")))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no terminal {terminal}: {listed}"))
+}
+
+/// A new space called `name`, even when one already is, and its id: what a rename or a
+/// phone can leave, and `new --space` never makes.
+fn make_space(daemon: &Daemon, name: &str) -> String {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let socket = qoop_testkit::socket_in(daemon.dir.path());
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let (stream, inbuf) = qoop_runtime::client::connect(&socket, "test-space")
+            .await
+            .expect("connect");
+        let mut client = qoop_testkit::TestClient::from_parts(stream, inbuf, 1);
+        match client
+            .control(
+                &ControlRequest::CreateWorkspace {
+                    id: format!("space-{made}"),
+                    name: name.to_string(),
+                },
+                PATIENCE,
+            )
+            .await
+        {
+            Some(ControlResponse::WorkspaceCreated { workspace, .. }) => workspace.to_string(),
+            other => panic!("no space made: {other:?}"),
+        }
+    })
+}
+
+/// Set a space's folder, by id or name.
+fn space_dir(daemon: &Daemon, space: &str, dir: &Path) {
+    let set = daemon.run(&["space", "dir", space, dir.to_str().expect("utf8")]);
+    assert!(set.status.success(), "{}", text(&set.stderr));
+}
+
 #[test]
 fn wait_match_sees_text_on_the_live_screen() {
     let daemon = Daemon::start();
@@ -645,4 +691,111 @@ fn worktree_mistakes_exit_two_and_a_vanished_one_names_prune() {
         "{}",
         text(&out.stderr)
     );
+}
+
+/// Without `--space` a worktree's tab opens in the space whose folder is the repository,
+/// else the one whose folder holds it, else the default space as before.
+#[test]
+fn a_worktree_tab_opens_in_the_space_of_its_repository() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let default = workspace_of(&daemon, "1");
+
+    let elsewhere = repo_named(root.path(), "elsewhere");
+    let (_, terminal) = new_worktree(&daemon, &elsewhere, "feat/plain");
+    assert_eq!(
+        workspace_of(&daemon, &terminal),
+        default,
+        "no space matches"
+    );
+
+    let code = make_space(&daemon, "code");
+    space_dir(&daemon, &code, root.path());
+    let (_, terminal) = new_worktree(&daemon, &repo, "feat/parent");
+    assert_eq!(
+        workspace_of(&daemon, &terminal),
+        code,
+        "the folder holding it"
+    );
+
+    let app = make_space(&daemon, "app");
+    space_dir(&daemon, &app, &repo);
+    let (_, terminal) = new_worktree(&daemon, &repo, "feat/exact");
+    assert_eq!(
+        workspace_of(&daemon, &terminal),
+        app,
+        "the repository's own"
+    );
+
+    // Two spaces called alike, only the second about this repository: the tab goes to that
+    // one, by id, never to the first of the name.
+    let first = make_space(&daemon, "twin");
+    let second = make_space(&daemon, "twin");
+    let twin = repo_named(root.path(), "twin repo");
+    space_dir(&daemon, &first, &elsewhere);
+    space_dir(&daemon, &second, &twin);
+    let (_, terminal) = new_worktree(&daemon, &twin, "feat/twin");
+    assert_eq!(workspace_of(&daemon, &terminal), second);
+
+    // `--space` still wins, and an id that is no space is refused before git runs.
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/given", "--space", &code]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+    let terminal = text(&made.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("terminal="))
+        .expect("a terminal")
+        .to_string();
+    assert_eq!(workspace_of(&daemon, &terminal), code);
+    let refused = daemon.run_in(&repo, &["worktree", "new", "feat/nowhere", "--space", "99"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("no space with id or name 99"),
+        "{}",
+        text(&refused.stderr)
+    );
+    assert!(refused.stdout.is_empty(), "{}", text(&refused.stdout));
+    assert!(!root.path().join("my repo-wt-feat-nowhere").exists());
+    assert!(git(&repo, &["branch", "--list", "feat/nowhere"]).is_empty());
+}
+
+/// A branch removed and made again gets the same git id, and so its old number back, held
+/// by one claim.
+#[test]
+fn a_worktree_made_again_keeps_its_index_claim() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let claims = repo.join(".git/qoop-worktree-index");
+    let holders = || {
+        let mut all: Vec<(String, String)> = std::fs::read_dir(&claims)
+            .expect("claims")
+            .map(|e| {
+                let e = e.expect("entry");
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(e.path()).expect("claim"),
+                )
+            })
+            .collect();
+        all.sort();
+        all
+    };
+    let (_, one) = new_worktree(&daemon, &repo, "feat/one");
+    let (_, two) = new_worktree(&daemon, &repo, "feat/two");
+    let before = holders();
+    assert_eq!(
+        before,
+        [
+            ("1".to_string(), "my-repo-wt-feat-one".to_string()),
+            ("2".to_string(), "my-repo-wt-feat-two".to_string())
+        ]
+    );
+    daemon.close(&one);
+    daemon.close(&two);
+    let removed = daemon.run_in(&repo, &["worktree", "rm", "feat/one"]);
+    assert!(removed.status.success(), "{}", text(&removed.stderr));
+    git(&repo, &["branch", "-D", "feat/one"]);
+    new_worktree(&daemon, &repo, "feat/one");
+    assert_eq!(holders(), before, "the same number, one claim");
 }
