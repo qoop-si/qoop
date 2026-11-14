@@ -11,12 +11,11 @@
 //! daemon's `AgentChanged` and `Resync`, and from every request that reads them, all applied
 //! one at a time so no listing is applied over a newer one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,8 +35,9 @@ use crate::supervise::Link;
 
 /// How often the host lists the daemon when nothing told it to.
 const POLL: Duration = Duration::from_secs(2);
-/// How long an `[[events]]` command may run before its process group is killed.
-const HANDLER_LIMIT: Duration = Duration::from_secs(60);
+/// How long an `[[events]]` command may run before its process group is killed. herdr sets no
+/// limit; qoop keeps one so a hook that hangs cannot stay forever.
+const HANDLER_LIMIT: Duration = Duration::from_secs(600);
 /// How long the host waits for a daemon that went away to answer again (a live upgrade
 /// re-executes in place) before it leaves too.
 const RECONNECT: Duration = Duration::from_secs(10);
@@ -45,7 +45,7 @@ const RECONNECT: Duration = Duration::from_secs(10);
 const PROCS_FRESH: Duration = Duration::from_millis(500);
 /// The area layouts are drawn in. qoop keeps no pane sizes, so rectangles are the split
 /// tree's proportions of this, not cells on anyone's screen.
-const AREA: Rect = Rect {
+pub(super) const AREA: Rect = Rect {
     x: 0,
     y: 0,
     width: 200,
@@ -57,24 +57,34 @@ const BACKLOG: usize = 1024;
 /// is let settle before one listing reads them all.
 const FRESH: Duration = Duration::from_millis(150);
 const COALESCE: Duration = Duration::from_millis(150);
-/// How many `[[events]]` commands of one plugin run at once.
-const HANDLERS_PER_PLUGIN: usize = 8;
+/// How many `[[events]]` commands run at once, across every plugin, as in herdr; the rest wait
+/// their turn rather than being dropped.
+const HANDLERS_AT_ONCE: usize = 32;
+/// Hook commands one plugin may have waiting for a turn; more are dropped and logged.
+const WAITING_PER_PLUGIN: usize = 256;
 /// How big a plugin's host log grows before it is moved aside.
 const LOG_CAP: u64 = 1 << 20;
 
 /// The socket's name, beside the daemon's in the session's verified 0700 directory.
 pub(crate) const SOCKET: &str = "herdr.sock";
 
-/// Where the host listens: what the plugin was told, else the session's own path. Nothing is
-/// created here.
+/// Where this session's host listens. Everything of qoop's own uses this and never
+/// `HERDR_SOCKET_PATH`, so nothing qoop runs can reach a real herdr. Nothing is created here.
 pub(crate) fn socket_path() -> PathBuf {
-    std::env::var_os("HERDR_SOCKET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths::session_dir(&paths::base_location(), "default").join(SOCKET))
+    paths::session_dir(&paths::base_location(), "default").join(SOCKET)
 }
 
-/// The methods C1 answers. The rest of `translate::METHODS` is [`LATER`]; a test holds the two
-/// to exactly `METHODS`, so the unknown-method text never names what is not served.
+/// Where the shim asks: the socket the plugin was told, else the session's. Only the shim reads
+/// `HERDR_SOCKET_PATH`, which the host itself set for the plugin.
+pub(crate) fn shim_socket_path() -> PathBuf {
+    std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(socket_path)
+}
+
+/// The methods that only read, answered here; with [`WRITES`] exactly `translate::METHODS`, so
+/// the unknown-method text never names what is not served.
+#[cfg(test)]
 const SERVED: &[&str] = &[
     "ping",
     "session.snapshot",
@@ -99,10 +109,9 @@ const SERVED: &[&str] = &[
     "events.subscribe",
 ];
 
-/// Methods a pinned plugin calls that write, which land with the next part of the host.
-// ponytail: refused as not served yet until C2 wires the writes.
-#[cfg(test)]
-const LATER: &[&str] = &[
+/// The methods that change something in qoop, answered by `writes`. With [`SERVED`] exactly
+/// `translate::METHODS` (a test holds them to it).
+const WRITES: &[&str] = &[
     "pane.split",
     "pane.close",
     "pane.focus",
@@ -166,23 +175,44 @@ impl Event {
 
 /// One listing of the daemon, with the host's tab keys applied.
 #[derive(Clone, Default)]
-struct Listing {
-    spaces: Vec<WorkspaceRow>,
-    rows: Vec<AgentRow>,
-    tabs: Vec<Tab>,
+pub(super) struct Listing {
+    pub(super) spaces: Vec<WorkspaceRow>,
+    pub(super) rows: Vec<AgentRow>,
+    pub(super) tabs: Vec<Tab>,
 }
 
 /// The herdr view of qoop the host keeps between listings.
 #[derive(Default)]
 pub(crate) struct State {
-    now: Listing,
+    pub(super) now: Listing,
     /// Per pane, raised on every change to its row and never reset: a reset reads as a new
     /// pane to a plugin that compares them.
     revisions: BTreeMap<u32, u64>,
     /// What each row's revision is compared on.
     seen: BTreeMap<u32, Value>,
-    /// The terminal the interface shows, once it says.
-    focused: Option<u32>,
+    /// The terminal the interface shows, once it says (`qoop.focus`, or a `Focus` the daemon
+    /// passes on), or the last one a plugin focused.
+    pub(super) focused: Option<u32>,
+    /// The space and pane the last focus events were about, so a change is told once.
+    told_focus: Option<(i64, u32)>,
+    /// Plugin panes opened as a popup or an overlay, each with the pane focused before it, which
+    /// focus returns to when it closes.
+    pub(super) popups: BTreeMap<u32, Popup>,
+    /// Panes a plugin zoomed. qoop's zoom is the interface's own, so this is only what herdr
+    /// answers about it.
+    pub(super) zoomed: BTreeSet<u32>,
+    /// Whether the interface has said what it shows (`qoop.focus`). Until it has, a call that
+    /// names no pane and comes from no pane is refused rather than sent to a guess.
+    pub(super) reported: bool,
+    /// Panes whose popup went away on its own (its program ended): focus goes back to them.
+    pub(super) restore: Vec<u32>,
+    /// Terminals the host closed for a plugin: their going is `pane_closed`. Any other terminal
+    /// that goes (its program ended, or a person closed it) is `pane_exited`, as a pane whose
+    /// process ended is in herdr.
+    pub(super) closing: BTreeSet<u32>,
+    /// Terminals the host renamed for `pane.rename` or `agent.rename`: in herdr those name the
+    /// pane, never the tab, so the tab label that follows here is not told as `tab_renamed`.
+    pub(super) renamed: BTreeSet<u32>,
     /// Whether a listing has been applied: the first one is the starting point, not news.
     primed: bool,
 }
@@ -230,6 +260,23 @@ fn keyed(mut fresh: Vec<Tab>, old: &[Tab]) -> Vec<Tab> {
     fresh
 }
 
+/// The agent a row runs, by the name herdr would give it, when there is one.
+fn agent_of(row: &AgentRow) -> Option<String> {
+    translate::agent_name(row).map(str::to_string)
+}
+
+/// `pane.agent_status_changed`'s data: what is unknown or empty is left out, as herdr writes it.
+fn status_data(id: &str, row: &AgentRow) -> Value {
+    translate::compact(json!({
+        "pane_id": id,
+        "workspace_id": Id::Workspace(row.workspace).to_string(),
+        "agent_status": translate::agent_status(row),
+        "agent": agent_of(row),
+        "display_agent": agent_of(row),
+        "title": row.agent_title,
+    }))
+}
+
 impl State {
     /// Apply a listing and say what changed since the last one.
     pub(crate) fn update(
@@ -248,13 +295,79 @@ impl State {
         }
         let old = std::mem::replace(&mut self.now, Listing { spaces, rows, tabs });
         if !std::mem::replace(&mut self.primed, true) {
+            self.told_focus = self.focus_pair();
             return Vec::new();
         }
-        let mut events = self.diff(&old);
-        for event in &mut events {
-            event.scope = scope_of(event, &self.now, &old);
+        // A popup or a zoom whose pane has gone: forgotten, and focus handed back.
+        let alive: BTreeSet<u32> = self.now.rows.iter().map(|r| r.terminal).collect();
+        self.zoomed.retain(|t| alive.contains(t));
+        let gone: Vec<u32> = self
+            .popups
+            .keys()
+            .filter(|t| !alive.contains(t))
+            .copied()
+            .collect();
+        for popup in gone {
+            if let Some(previous) = self.popups.remove(&popup).and_then(|p| p.previous)
+                && alive.contains(&previous)
+            {
+                self.focused = Some(previous);
+                self.restore.push(previous);
+            }
         }
+        let mut events = self.diff(&old);
+        self.closing.retain(|t| alive.contains(t));
+        self.renamed.clear();
+        for event in &mut events {
+            event.scope = scope_of(event, &self.now, &old, self.focused);
+        }
+        events.extend(self.focus_events());
         events
+    }
+
+    /// The space and pane in focus, when the focused terminal is listed.
+    fn focus_pair(&self) -> Option<(i64, u32)> {
+        let terminal = self.focused?;
+        let row = self.now.rows.iter().find(|r| r.terminal == terminal)?;
+        Some((row.workspace, terminal))
+    }
+
+    /// `workspace_focused`, `tab_focused` and `pane_focused`, in that order, when the focus
+    /// moved since they were last told: herdr tells all three for any move, even within a tab.
+    pub(super) fn focus_events(&mut self) -> Vec<Event> {
+        let now = self.focus_pair();
+        if now.is_none() || now == self.told_focus {
+            return Vec::new();
+        }
+        self.told_focus = now;
+        let (space, terminal) = now.expect("checked above");
+        let workspace_id = Id::Workspace(space).to_string();
+        let pane_id = Id::Pane {
+            workspace: space,
+            terminal,
+        }
+        .to_string();
+        let mut out = vec![Event::new(
+            "workspace.focused",
+            None,
+            json!({"workspace_id": workspace_id}),
+        )];
+        if let Some(tab) = self.now.tabs.iter().find(|t| t.leaves.contains(&terminal)) {
+            out.push(Event::new(
+                "tab.focused",
+                None,
+                json!({"tab_id": tab.id(), "workspace_id": workspace_id}),
+            ));
+        }
+        out.push(Event::new(
+            "pane.focused",
+            Some(pane_id.clone()),
+            json!({"pane_id": pane_id, "workspace_id": workspace_id}),
+        ));
+        for event in &mut out {
+            event.scope = scope_of(event, &self.now, &self.now, self.focused);
+        }
+        out
     }
 
     pub(crate) fn view(&self) -> View<'_> {
@@ -271,6 +384,16 @@ impl State {
         }
     }
 
+    /// `layout_updated` for a tab, laid out as it is now.
+    pub(super) fn layout_event(&self, tab: &Tab) -> Event {
+        let zoomed = tab.leaves.iter().any(|t| self.zoomed.contains(t));
+        Event::new(
+            "layout.updated",
+            None,
+            json!({"layout": translate::layout(tab, AREA, self.focused, zoomed)}),
+        )
+    }
+
     fn diff(&self, old: &Listing) -> Vec<Event> {
         let new = &self.now;
         let (view, before) = (self.view(), self.view_of(old));
@@ -281,7 +404,7 @@ impl State {
                 .unwrap_or(Value::Null)
         };
         let (workspaces, tabs, panes) = (view.workspace_infos(), view.tab_infos(), view.panes());
-        let old_tabs = before.tab_infos();
+        let (old_workspaces, old_tabs) = (before.workspace_infos(), before.tab_infos());
         let ws = |id: i64| Id::Workspace(id).to_string();
         let pane_id = |row: &AgentRow| {
             Id::Pane {
@@ -290,12 +413,12 @@ impl State {
             }
             .to_string()
         };
-        let key_of = |listing: &Listing, t: u32| {
+        let tab_of = |listing: &'_ Listing, t: u32| -> Option<Tab> {
             listing
                 .tabs
                 .iter()
                 .find(|tab| tab.leaves.contains(&t))
-                .map(|tab| tab.key)
+                .cloned()
         };
         let mut out = Vec::new();
 
@@ -340,11 +463,15 @@ impl State {
             }
         }
 
+        let mut layouts = Vec::new();
         for tab in &new.tabs {
             let id = tab.id();
             let info = find(&tabs, "tab_id", &id);
             match old.tabs.iter().find(|o| o.key == tab.key) {
-                None => out.push(Event::new("tab.created", None, json!({"tab": info}))),
+                None => {
+                    out.push(Event::new("tab.created", None, json!({"tab": info})));
+                    layouts.push(self.layout_event(tab));
+                }
                 Some(was) => {
                     let was_info = find(&old_tabs, "tab_id", &was.id());
                     if was.workspace != tab.workspace {
@@ -361,13 +488,19 @@ impl State {
                                    "insert_index": index, "tabs": siblings}),
                         ));
                     }
-                    if was_info["label"] != info["label"] {
+                    let renamed_by_pane = self.renamed.contains(&tab.leaves[0]);
+                    if was_info["label"] != info["label"] && !renamed_by_pane {
                         out.push(Event::new(
                             "tab.renamed",
                             None,
                             json!({"tab_id": id, "workspace_id": ws(tab.workspace),
                                    "label": info["label"]}),
                         ));
+                    }
+                    // A pane added, or one gone from a tab that keeps others, as herdr tells a
+                    // layout.
+                    if was.leaves != tab.leaves {
+                        layouts.push(self.layout_event(tab));
                     }
                 }
             }
@@ -376,7 +509,6 @@ impl State {
         for row in &new.rows {
             let id = pane_id(row);
             let pane = find(&panes, "pane_id", &id);
-            let agent_now = translate::agent_status(row);
             match old.rows.iter().find(|o| o.terminal == row.terminal) {
                 None => {
                     out.push(Event::new(
@@ -384,33 +516,48 @@ impl State {
                         Some(id.clone()),
                         json!({"pane": pane}),
                     ));
-                    if row.agent {
-                        out.push(detected(&id, row, &pane));
+                    // A pane that already runs an agent when first listed (one started
+                    // with it): herdr tells the agent right after the pane.
+                    if let Some(agent) = agent_of(row) {
+                        out.push(Event::new(
+                            "pane.agent_detected",
+                            Some(id.clone()),
+                            json!({"pane_id": id, "workspace_id": ws(row.workspace),
+                                   "agent": agent}),
+                        ));
                     }
                 }
                 Some(was) => {
-                    if !was.agent && row.agent {
-                        out.push(detected(&id, row, &pane));
+                    // An agent arriving, leaving or changing, never a pane being made.
+                    let (before, after) = (agent_of(was), agent_of(row));
+                    if before != after {
+                        let data = match (&before, &after) {
+                            (Some(left), None) => json!({
+                                "pane_id": id, "workspace_id": ws(row.workspace),
+                                "agent": left, "released": true,
+                                "final_status": translate::agent_status(was),
+                            }),
+                            _ => translate::compact(json!({
+                                "pane_id": id, "workspace_id": ws(row.workspace),
+                                "agent": after,
+                            })),
+                        };
+                        out.push(Event::new("pane.agent_detected", Some(id.clone()), data));
                     }
-                    if translate::agent_status(was) != agent_now {
+                    let (was_data, data) = (status_data(&id, was), status_data(&id, row));
+                    let presentation =
+                        |d: &Value| json!([d["agent_status"], d["display_agent"], d["title"]]);
+                    if presentation(&was_data) != presentation(&data) {
                         out.push(Event::new(
                             "pane.agent_status_changed",
                             Some(id.clone()),
-                            json!({"pane_id": id, "workspace_id": ws(row.workspace),
-                                   "agent_status": agent_now, "agent": pane["agent"],
-                                   "display_agent": pane["display_agent"],
-                                   "title": pane["title"], "state_labels": {}}),
+                            data,
                         ));
                     }
-                    let (was_key, key) = (key_of(old, was.terminal), key_of(new, row.terminal));
-                    if was.workspace != row.workspace || was_key != key {
-                        let previous_tab = was_key.map(|key| {
-                            Id::Tab {
-                                workspace: was.workspace,
-                                key,
-                            }
-                            .to_string()
-                        });
+                    let (was_tab, tab) = (tab_of(old, was.terminal), tab_of(new, row.terminal));
+                    let key = |t: &Option<Tab>| t.as_ref().map(|t| t.key);
+                    if was.workspace != row.workspace || key(&was_tab) != key(&tab) {
+                        let previous_tab = was_tab.map(|t| t.id()).unwrap_or_default();
                         out.push(Event::new(
                             "pane.moved",
                             Some(id.clone()),
@@ -426,11 +573,16 @@ impl State {
         for was in &old.rows {
             if !new.rows.iter().any(|r| r.terminal == was.terminal) {
                 let data = json!({"pane_id": pane_id(was), "workspace_id": ws(was.workspace)});
-                let id = Some(pane_id(was));
-                out.push(Event::new("pane.closed", id.clone(), data.clone()));
-                out.push(Event::new("pane.exited", id, data));
+                // Closed through the host, or gone on its own: one of the two, never both.
+                let name = if self.closing.contains(&was.terminal) {
+                    "pane.closed"
+                } else {
+                    "pane.exited"
+                };
+                out.push(Event::new(name, Some(pane_id(was)), data));
             }
         }
+        out.extend(layouts);
         for was in &old.tabs {
             if !new.tabs.iter().any(|t| t.key == was.key) {
                 out.push(Event::new(
@@ -442,10 +594,12 @@ impl State {
         }
         for was in &old.spaces {
             if !new.spaces.iter().any(|s| s.id == was.id) {
+                let id = ws(was.id);
                 out.push(Event::new(
                     "workspace.closed",
                     None,
-                    json!({"workspace_id": ws(was.id)}),
+                    json!({"workspace_id": id,
+                           "workspace": find(&old_workspaces, "workspace_id", &id)}),
                 ));
             }
         }
@@ -453,19 +607,20 @@ impl State {
     }
 }
 
-fn detected(id: &str, row: &AgentRow, pane: &Value) -> Event {
-    Event::new(
-        "pane.agent_detected",
-        Some(id.to_string()),
-        json!({"pane_id": id, "workspace_id": Id::Workspace(row.workspace).to_string(),
-               "agent": pane["agent"]}),
-    )
+/// A plugin pane opened as a popup or an overlay.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Popup {
+    /// The pane focused before it, where focus goes back when it closes.
+    pub(super) previous: Option<u32>,
+    pub(super) plugin: String,
+    /// A popup, not an overlay: only a popup blocks another and closes on `popup.close`.
+    pub(super) popup: bool,
 }
 
 /// A herdr refusal: its code and message.
-type Refused = (&'static str, String);
+pub(super) type Refused = (&'static str, String);
 
-fn not_found(what: &'static str, id: &str) -> Refused {
+pub(super) fn not_found(what: &'static str, id: &str) -> Refused {
     let code = match what {
         "pane" => "pane_not_found",
         "tab" => "tab_not_found",
@@ -476,7 +631,7 @@ fn not_found(what: &'static str, id: &str) -> Refused {
 }
 
 /// The pane of `panes` that is `terminal`.
-fn pane_of(panes: Vec<Value>, terminal: u32) -> Option<Value> {
+pub(super) fn pane_of(panes: Vec<Value>, terminal: u32) -> Option<Value> {
     let id = terminal.to_string();
     panes
         .into_iter()
@@ -484,29 +639,35 @@ fn pane_of(panes: Vec<Value>, terminal: u32) -> Option<Value> {
 }
 
 /// The terminal a pane id (or a bare terminal number) names.
-fn terminal_of(text: &str) -> Option<u32> {
+pub(super) fn terminal_of(text: &str) -> Option<u32> {
     match Id::parse(text) {
         Some(Id::Pane { terminal, .. }) => Some(terminal),
         _ => text.parse().ok().filter(|n| *n > 0),
     }
 }
 
-fn param<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
+pub(super) fn param<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
     params.get(name).and_then(Value::as_str)
 }
 
 /// The host: its view of qoop, its subscribers and its plugins.
 pub(crate) struct Host {
-    home: Home,
-    state: Mutex<State>,
+    pub(super) home: Home,
+    pub(super) state: Mutex<State>,
+    /// Plugin pane specs waiting for their `pane-exec`, by nonce.
+    pub(super) specs: super::writes::Specs,
     /// Held across a listing's round trips and its update, so listings apply in order.
     refreshing: tokio::sync::Mutex<()>,
-    events: broadcast::Sender<Arc<Event>>,
+    pub(super) events: broadcast::Sender<Arc<Event>>,
     procs: Mutex<Option<(Instant, Arc<Vec<ProcRow>>)>>,
     /// When the last listing was applied, so a burst of requests lists the daemon once.
     listed_at: Mutex<Option<Instant>>,
-    /// How many `[[events]]` commands each plugin has running.
-    running: Mutex<BTreeMap<String, Arc<AtomicUsize>>>,
+    /// Turns for `[[events]]` commands, [`HANDLERS_AT_ONCE`] of them.
+    hooks: Arc<tokio::sync::Semaphore>,
+    /// Hook commands waiting for a turn, by plugin, at most [`WAITING_PER_PLUGIN`] each.
+    waiting: Arc<Mutex<HashMap<String, usize>>>,
+    /// The last `plugin-log-N` an action was given.
+    pub(super) log_ids: std::sync::atomic::AtomicU64,
 }
 
 impl Host {
@@ -522,7 +683,10 @@ impl Host {
             events: broadcast::channel(backlog).0,
             procs: Mutex::new(None),
             listed_at: Mutex::new(None),
-            running: Mutex::new(BTreeMap::new()),
+            specs: super::writes::Specs::default(),
+            hooks: Arc::new(tokio::sync::Semaphore::new(HANDLERS_AT_ONCE)),
+            waiting: Arc::default(),
+            log_ids: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -545,22 +709,35 @@ impl Host {
                 "unexpected answer to the space listing",
             ));
         };
-        let events = self
-            .state
-            .lock()
-            .unwrap()
-            .update(workspaces, agents, &splits);
+        let (events, restore) = {
+            let mut state = self.state.lock().unwrap();
+            let events = state.update(workspaces, agents, &splits);
+            (events, std::mem::take(&mut state.restore))
+        };
         for event in events {
             let _ = self.events.send(Arc::new(event));
         }
         *self.listed_at.lock().unwrap() = Some(Instant::now());
+        // A popup that ended on its own hands focus back, as one closed by a call does.
+        for terminal in restore {
+            let _ = super::writes::control(ControlRequest::Focus {
+                id: crate::request_id("plugin-host"),
+                terminal,
+            })
+            .await;
+        }
         Ok(())
+    }
+
+    /// Take the last listing as stale, so the next read lists the daemon again.
+    pub(super) fn forget_listing(&self) {
+        *self.listed_at.lock().unwrap() = None;
     }
 
     /// A fresh listing on a connection of its own, for a request about to read the state. One
     /// applied in the last [`FRESH`] is fresh enough; with no daemon to ask (a live upgrade
     /// between its two halves), the last listing answers.
-    async fn refresh(&self) -> Result<(), Refused> {
+    pub(super) async fn refresh(&self) -> Result<(), Refused> {
         if self
             .listed_at
             .lock()
@@ -570,7 +747,7 @@ impl Host {
             return Ok(());
         }
         let primed = || self.state.lock().unwrap().primed;
-        let unavailable = |e: std::io::Error| ("server_unavailable", e.to_string());
+        let unavailable = |e: std::io::Error| ("server_not_running", e.to_string());
         match Link::open_observer("qoop-plugin-host").await {
             Ok(mut link) => match self.refresh_on(&mut link).await {
                 Err(_) if primed() => Ok(()),
@@ -616,7 +793,7 @@ impl Host {
 
     /// Read a copy of the state with each row's directory made live; the lock is not held
     /// while the process table is read.
-    fn with_view<R>(&self, read: impl FnOnce(&View) -> R) -> R {
+    pub(super) fn with_view<R>(&self, read: impl FnOnce(&View) -> R) -> R {
         let (mut listing, revisions, focused) = {
             let state = self.state.lock().unwrap();
             (state.now.clone(), state.revisions.clone(), state.focused)
@@ -635,6 +812,13 @@ impl Host {
 
     /// One request, answered in herdr's envelope.
     async fn answer(&self, id: &str, method: &str, params: &Value) -> Value {
+        // qoop's own, never among herdr's methods: the interface's focus and a pane's spec.
+        if method.starts_with("qoop.") {
+            return match self.internal(method, params).await {
+                Ok(result) => translate::reply(id, result),
+                Err((code, message)) => translate::refuse(id, code, &message),
+            };
+        }
         if !translate::METHODS.contains(&method) {
             return translate::unknown_method(id, method);
         }
@@ -645,8 +829,10 @@ impl Host {
     }
 
     async fn result(&self, method: &str, params: &Value) -> Result<Value, Refused> {
-        if !SERVED.contains(&method) {
-            return Err(("not_supported", format!("{method} is not served yet")));
+        if WRITES.contains(&method) {
+            // Boxed: every write's state in one future is more stack than a worker has in a
+            // debug build.
+            return Box::pin(self.write(method, params)).await;
         }
         match method {
             "ping" => {
@@ -685,13 +871,15 @@ impl Host {
         let pane = self
             .with_view(|view| pane_of(view.panes(), terminal))
             .ok_or_else(|| not_found("pane", asked))?;
-        let source = param(params, "source").unwrap_or("visible").to_string();
+        // As herdr reads: `recent` when not said, at most 1000 lines, 80 of the history when
+        // not said, the whole screen for `visible` and `detection`.
+        let source = param(params, "source").unwrap_or("recent").to_string();
         let lines = params
             .get("lines")
             .and_then(Value::as_u64)
-            .map(|n| n as usize);
-        let unavailable = |e: std::io::Error| ("server_unavailable", e.to_string());
-        let rows: Vec<String> = if source == "visible" {
+            .map(|n| (n as usize).min(1000));
+        let unavailable = |e: std::io::Error| ("server_not_running", e.to_string());
+        let rows: Vec<String> = if matches!(source.as_str(), "visible" | "detection") {
             let snapshot = crate::fetch_snapshot(terminal, "qoop-plugin-host")
                 .await
                 .map_err(unavailable)?;
@@ -702,7 +890,7 @@ impl Host {
             let keep = lines.unwrap_or(rows.len()).min(rows.len());
             rows.split_off(rows.len() - keep)
         } else {
-            let n = lines.unwrap_or(200);
+            let n = lines.unwrap_or(80);
             let mut link = Link::open_observer("qoop-plugin-host")
                 .await
                 .map_err(unavailable)?;
@@ -722,7 +910,8 @@ impl Host {
             "pane_id": pane["pane_id"], "workspace_id": pane["workspace_id"],
             "tab_id": pane["tab_id"], "source": source,
             "format": param(params, "format").unwrap_or("text"),
-            "text": rows.join("\n"), "revision": pane["revision"], "truncated": false,
+            "text": if rows.is_empty() { String::new() } else { rows.join("\n") + "\n" },
+            "revision": pane["revision"], "truncated": false,
         }}))
     }
 
@@ -782,10 +971,12 @@ fn answer_from(view: &View, method: &str, params: &Value) -> Result<Value, Refus
             Ok(json!({"type": "pane_info", "pane": pane}))
         }
         "pane.current" => {
-            let terminal = view
-                .focused
-                .or_else(|| param(params, "caller_pane_id").and_then(terminal_of))
-                .ok_or(("pane_not_found", "no focused pane is known".to_string()))?;
+            // The pane the call comes from, when it says; the focused pane only without one.
+            let terminal = match param(params, "caller_pane_id") {
+                Some(caller) => terminal_of(caller),
+                None => view.focused,
+            }
+            .ok_or(("pane_not_found", "pane not found".to_string()))?;
             let pane = pane_of(view.panes(), terminal)
                 .ok_or_else(|| not_found("pane", &terminal.to_string()))?;
             Ok(json!({"type": "pane_current", "pane": pane}))
@@ -834,27 +1025,36 @@ fn answer_from(view: &View, method: &str, params: &Value) -> Result<Value, Refus
                 .ok_or_else(|| not_found("agent", target))?;
             Ok(json!({"type": "agent_info", "agent": agent}))
         }
-        _ => Err(("not_supported", format!("{method} is not served"))),
+        _ => Err((
+            "invalid_request",
+            format!("invalid request: unknown variant `{method}`"),
+        )),
     }
 }
 
 /// herdr's `InstalledPluginInfo` for each plugin here (or the one asked for).
-fn plugins(home: &Home, only: Option<&str>) -> Vec<Value> {
+pub(super) fn plugins(home: &Home, only: Option<&str>) -> Vec<Value> {
     install::installed(home)
         .into_iter()
         .filter(|id| only.is_none_or(|o| o == id))
         .map(|id| {
             let checked = install::admitted(home, &id);
-            let root = home
+            let checkout = home
                 .dir_of(&id)
                 .canonicalize()
                 .unwrap_or_else(|_| home.dir_of(&id));
-            let (version, source) = match &checked {
-                Ok(a) => (a.manifest.version.clone(), source_info(a)),
-                Err(_) => (None, json!({"kind": "local"})),
+            let (root, name, version, source) = match &checked {
+                Ok(a) => (
+                    a.root.clone(),
+                    a.manifest.name.clone(),
+                    a.manifest.version.clone(),
+                    source_info(a, &checkout),
+                ),
+                Err(_) => (checkout.clone(), None, None, json!({"kind": "local"})),
             };
             json!({
-                "plugin_id": id, "name": id, "version": version.unwrap_or_default(),
+                "plugin_id": id, "name": name.unwrap_or_else(|| id.clone()),
+                "version": version.unwrap_or_default(),
                 "manifest_path": root.join(manifest::FILE), "plugin_root": root,
                 "enabled": checked.is_ok(), "source": source,
             })
@@ -863,13 +1063,13 @@ fn plugins(home: &Home, only: Option<&str>) -> Vec<Value> {
 }
 
 /// herdr's `PluginSourceInfo` from what was agreed to.
-fn source_info(plugin: &Admitted) -> Value {
+fn source_info(plugin: &Admitted, checkout: &Path) -> Value {
     let Some(sha) = &plugin.consent.sha else {
         return json!({"kind": "local", "managed_path": null});
     };
     let mut parts = plugin.consent.source.splitn(3, '/');
     let (owner, repo, subdir) = (parts.next(), parts.next(), parts.next());
-    json!({"kind": "github", "managed_path": plugin.root, "owner": owner, "repo": repo,
+    json!({"kind": "github", "managed_path": checkout, "owner": owner, "repo": repo,
            "subdir": subdir, "resolved_commit": sha})
 }
 
@@ -905,6 +1105,38 @@ pub(crate) struct Scope {
     pub(crate) env: Vec<(String, OsString)>,
 }
 
+impl Scope {
+    /// A scope of just these context fields (what herdr tells about something closed).
+    fn bare(fields: &[(&str, Option<String>)]) -> Self {
+        let context: serde_json::Map<String, Value> = fields
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_string(), json!(v.clone()?))))
+            .collect();
+        Self::of(Value::Object(context))
+    }
+
+    /// A scope from its context: the ids a command is told come from the context, as herdr
+    /// sets them.
+    pub(super) fn of(context: Value) -> Self {
+        let env = env_of_context(&context);
+        Self { context, env }
+    }
+}
+
+/// `HERDR_WORKSPACE_ID`, `_TAB_ID`, `_PANE_ID` from a context's ids, and qoop's
+/// `HERDR_WORKSPACE_CWD` from its `workspace_cwd`.
+pub(super) fn env_of_context(context: &Value) -> Vec<(String, OsString)> {
+    [
+        ("HERDR_WORKSPACE_ID", "workspace_id"),
+        ("HERDR_TAB_ID", "tab_id"),
+        ("HERDR_PANE_ID", "focused_pane_id"),
+        ("HERDR_WORKSPACE_CWD", "workspace_cwd"),
+    ]
+    .into_iter()
+    .filter_map(|(var, key)| Some((var.to_string(), context.get(key)?.as_str()?.into())))
+    .collect()
+}
+
 /// The id an event's data names under `key`, directly or inside its `object`.
 fn named<'a>(data: &'a Value, key: &str, object: &str) -> Option<&'a str> {
     data.get(key)
@@ -912,12 +1144,59 @@ fn named<'a>(data: &'a Value, key: &str, object: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// The scope of an event: its pane, else its tab, else its space, found in the listing it
-/// was made from (the previous one for what has just closed).
-fn scope_of(event: &Event, new: &Listing, old: &Listing) -> Scope {
+/// The pane a set of terminals stands for: the focused one when it is among them, else the
+/// first.
+fn shown(focused: Option<u32>, terminals: &[u32]) -> Option<u32> {
+    focused
+        .filter(|t| terminals.contains(t))
+        .or_else(|| terminals.first().copied())
+}
+
+/// The scope of an event, as herdr tells a hook: a pane event its pane; a tab event the tab
+/// with its shown pane; a space event the space with its shown tab and pane. What has closed
+/// is told by its ids only (a space by its label and last tab too), from the listing it was in.
+fn scope_of(event: &Event, new: &Listing, old: &Listing, focused: Option<u32>) -> Scope {
     let data = &event.data;
-    // The narrowest thing named wins, in whichever listing still has it: a closed pane's own
-    // pane and tab, never just the space it was in.
+    let id = |key: &str, object: &str| named(data, key, object).map(str::to_string);
+    match event.dotted {
+        "pane.closed" => {
+            return Scope::bare(&[
+                ("workspace_id", id("workspace_id", "workspace")),
+                ("focused_pane_id", id("pane_id", "pane")),
+            ]);
+        }
+        "tab.closed" => {
+            return Scope::bare(&[
+                ("workspace_id", id("workspace_id", "workspace")),
+                ("tab_id", id("tab_id", "tab")),
+            ]);
+        }
+        "workspace.closed" => {
+            let space = id("workspace_id", "workspace");
+            let parsed = space.as_deref().and_then(Id::parse);
+            let label = old
+                .spaces
+                .iter()
+                .find(|s| Some(Id::Workspace(s.id)) == parsed)
+                .map(|s| s.name.clone());
+            let tabs: Vec<&Tab> = old
+                .tabs
+                .iter()
+                .filter(|t| Some(Id::Workspace(t.workspace)) == parsed)
+                .collect();
+            let tab = tabs
+                .iter()
+                .find(|t| focused.is_some_and(|f| t.leaves.contains(&f)))
+                .or(tabs.first())
+                .map(|t| t.id());
+            return Scope::bare(&[
+                ("workspace_id", space),
+                ("workspace_label", label),
+                ("tab_id", tab),
+            ]);
+        }
+        _ => {}
+    }
     let terminal = named(data, "pane_id", "pane").and_then(terminal_of);
     for listing in [new, old] {
         if let Some(row) = terminal.and_then(|t| listing.rows.iter().find(|r| r.terminal == t)) {
@@ -927,7 +1206,7 @@ fn scope_of(event: &Event, new: &Listing, old: &Listing) -> Scope {
     let tab_id = named(data, "tab_id", "tab");
     for listing in [new, old] {
         if let Some(tab) = tab_id.and_then(|id| listing.tabs.iter().find(|t| t.id() == id)) {
-            return scope(listing, tab.workspace, Some(tab.leaves[0]));
+            return scope(listing, tab.workspace, shown(focused, &tab.leaves));
         }
     }
     let space = named(data, "workspace_id", "workspace").and_then(Id::parse);
@@ -935,27 +1214,30 @@ fn scope_of(event: &Event, new: &Listing, old: &Listing) -> Scope {
         if let Some(Id::Workspace(space)) = space
             && listing.spaces.iter().any(|s| s.id == space)
         {
-            return scope(listing, space, None);
+            let terminals: Vec<u32> = listing
+                .rows
+                .iter()
+                .filter(|r| r.workspace == space)
+                .map(|r| r.terminal)
+                .collect();
+            return scope(listing, space, shown(focused, &terminals));
         }
     }
-    Scope {
-        context: json!({"selected_text": ""}),
-        env: Vec::new(),
-    }
+    Scope::of(json!({}))
 }
 
-/// The scope of a space and, when given, one terminal in it.
-fn scope(listing: &Listing, workspace: i64, terminal: Option<u32>) -> Scope {
+/// The scope of a space and, when given, one pane in it. Fields with nothing in them are left
+/// out, as herdr leaves them out. The space's folder is its focused pane's, else its own.
+pub(super) fn scope(listing: &Listing, workspace: i64, terminal: Option<u32>) -> Scope {
     let space = listing.spaces.iter().find(|s| s.id == workspace);
     let row = terminal.and_then(|t| listing.rows.iter().find(|r| r.terminal == t));
     let tab = terminal.and_then(|t| listing.tabs.iter().find(|tab| tab.leaves.contains(&t)));
     let tab_label = tab
         .and_then(|tab| listing.rows.iter().find(|r| r.terminal == tab.leaves[0]))
         .and_then(|r| r.name.clone().or_else(|| r.program.clone()));
-    let workspace_id = Id::Workspace(workspace).to_string();
-    let workspace_cwd = space
-        .and_then(|s| s.dir.clone())
-        .or_else(|| row.and_then(|r| r.cwd.clone()));
+    let workspace_cwd = row
+        .and_then(|r| r.cwd.clone())
+        .or_else(|| space.and_then(|s| s.dir.clone()));
     let pane_id = row.map(|r| {
         Id::Pane {
             workspace: r.workspace,
@@ -963,42 +1245,43 @@ fn scope(listing: &Listing, workspace: i64, terminal: Option<u32>) -> Scope {
         }
         .to_string()
     });
-    let context = json!({
-        "workspace_id": workspace_id,
+    Scope::of(translate::compact(json!({
+        "workspace_id": Id::Workspace(workspace).to_string(),
         "workspace_label": space.map(|s| s.name.clone()),
         "workspace_cwd": workspace_cwd,
         "tab_id": tab.map(Tab::id),
         "tab_label": tab_label,
         "focused_pane_id": pane_id,
         "focused_pane_cwd": row.and_then(|r| r.cwd.clone()),
-        "focused_pane_agent": row.and_then(|r| r.agent.then(|| r.program.clone()).flatten()),
-        "selected_text": "",
-    });
-    let mut env: Vec<(String, OsString)> = vec![("HERDR_WORKSPACE_ID".into(), workspace_id.into())];
-    if let Some(tab) = tab {
-        env.push(("HERDR_TAB_ID".into(), tab.id().into()));
-    }
-    if let Some(pane) = pane_id {
-        env.push(("HERDR_PANE_ID".into(), pane.into()));
-    }
-    if let Some(cwd) = workspace_cwd {
-        env.push(("HERDR_WORKSPACE_CWD".into(), cwd.into()));
-    }
-    Scope { context, env }
+        "focused_pane_agent": row.and_then(translate::agent_name),
+        "focused_pane_status": row.map(translate::agent_status),
+    })))
 }
 
-/// The scope of what the interface shows, when it has said; for a startup command.
-fn focused_scope(state: &State) -> Scope {
+/// The scope of what the interface shows, when it has said; for a startup command or an
+/// action.
+pub(super) fn focused_scope(state: &State) -> Scope {
     match state
         .focused
         .and_then(|t| state.now.rows.iter().find(|r| r.terminal == t))
     {
         Some(row) => scope(&state.now, row.workspace, Some(row.terminal)),
-        None => Scope {
-            context: json!({"selected_text": ""}),
-            env: Vec::new(),
-        },
+        None => Scope::of(json!({})),
     }
+}
+
+/// `context` with how the command came to run, as herdr marks it.
+pub(super) fn invoked(context: &Value, source: &str, correlation: &str) -> Value {
+    let mut context = context.clone();
+    if let Value::Object(fields) = &mut context {
+        fields
+            .entry("invocation_source")
+            .or_insert_with(|| json!(source));
+        fields
+            .entry("correlation_id")
+            .or_insert_with(|| json!(correlation));
+    }
+    context
 }
 
 /// A plugin's host log, moved aside to `host.log.1` once it passes [`LOG_CAP`].
@@ -1017,7 +1300,7 @@ fn open_log(log: &Path) -> std::io::Result<std::fs::File> {
 
 /// One line in a plugin's host log; a log that cannot be written is not worth failing over,
 /// and a plugin that has been removed gets none (its state folder is not made again).
-fn note(home: &Home, id: &str, line: &str) {
+pub(super) fn note(home: &Home, id: &str, line: &str) {
     if std::fs::symlink_metadata(home.dir_of(id)).is_err() {
         return;
     }
@@ -1028,7 +1311,7 @@ fn note(home: &Home, id: &str, line: &str) {
 
 /// Run one plugin command in its root with its environment, in a process group of its own,
 /// output appended to `log`. The caller bounds it ([`wait_bounded`]) or records its group.
-fn spawn(
+pub(super) fn spawn(
     root: &Path,
     argv: &[String],
     env: Vec<(String, OsString)>,
@@ -1123,62 +1406,92 @@ pub(crate) fn end_startups(home: &Home, only: Option<&str>) {
     });
 }
 
+/// Events herdr never runs a hook for.
+const NOT_HOOKABLE: &[&str] = &[
+    "layout.updated",
+    "pane.output_changed",
+    "pane.updated",
+    "workspace.metadata_updated",
+];
+
 impl Host {
-    /// Run every plugin's `[[events]]` for one event, each bounded by [`HANDLER_LIMIT`] and at
-    /// most [`HANDLERS_PER_PLUGIN`] at once per plugin; one past that is dropped and logged.
+    /// Run every plugin's `[[events]]` for one event, at most [`HANDLERS_AT_ONCE`] across all
+    /// plugins (the rest wait their turn), each ended at [`HANDLER_LIMIT`].
     fn run_hooks(&self, event: &Event) {
+        if NOT_HOOKABLE.contains(&event.dotted) {
+            return;
+        }
         let Some((name, payload)) = event.for_hook() else {
             return;
         };
+        let context = invoked(&event.scope.context, "api", event.dotted);
         for id in install::installed(&self.home) {
-            let log = self.home.state_of(&id).join("host.log");
             let plugin = match install::admitted(&self.home, &id) {
                 Ok(plugin) => plugin,
                 Err(refused) => {
-                    if !hooks_for_unchecked(&self.home, &id, name) {
-                        continue;
+                    if hooks_for_unchecked(&self.home, &id, name) {
+                        note(&self.home, &id, &format!("{name}: not run: {refused}"));
                     }
-                    note(&self.home, &id, &format!("{name}: not run: {refused}"));
                     continue;
                 }
             };
             for hook in hooks_for(&plugin.manifest.here().events, name) {
-                let running = self
-                    .running
-                    .lock()
-                    .unwrap()
-                    .entry(id.clone())
-                    .or_default()
-                    .clone();
-                if running.fetch_add(1, Ordering::SeqCst) >= HANDLERS_PER_PLUGIN {
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    note(
-                        &self.home,
-                        &id,
-                        &format!("{name}: dropped, {HANDLERS_PER_PLUGIN} already running"),
-                    );
-                    continue;
-                }
                 let mut env = install::plugin_env(&self.home, &id, &plugin.root);
                 env.extend(event.scope.env.clone());
-                env.push(("HERDR_PLUGIN_EVENT".into(), name.into()));
+                env.push(("HERDR_PLUGIN_EVENT".into(), event.dotted.into()));
                 env.push(("HERDR_PLUGIN_EVENT_JSON".into(), payload.to_string().into()));
                 env.push((
                     "HERDR_PLUGIN_CONTEXT_JSON".into(),
-                    event.scope.context.to_string().into(),
+                    context.to_string().into(),
                 ));
-                match spawn(&plugin.root, &hook.command, env, &log) {
-                    Ok(child) => {
-                        std::thread::spawn(move || {
-                            wait_bounded(child, HANDLER_LIMIT);
-                            running.fetch_sub(1, Ordering::SeqCst);
-                        });
+                {
+                    let mut waiting = self.waiting.lock().unwrap();
+                    let queued = waiting.entry(id.clone()).or_default();
+                    if *queued >= WAITING_PER_PLUGIN {
+                        drop(waiting);
+                        note(
+                            &self.home,
+                            &id,
+                            &format!("{name}: not run: too many hooks waiting"),
+                        );
+                        continue;
                     }
-                    Err(e) => {
-                        running.fetch_sub(1, Ordering::SeqCst);
-                        note(&self.home, &id, &format!("{name}: {:?}: {e}", hook.command));
-                    }
+                    *queued += 1;
                 }
+                let (gate, home, id) = (self.hooks.clone(), self.home.clone(), id.clone());
+                let (root, command) = (plugin.root.clone(), hook.command.clone());
+                let waiting = self.waiting.clone();
+                tokio::spawn(async move {
+                    let turn = gate.acquire_owned().await;
+                    if let Some(queued) = waiting.lock().unwrap().get_mut(&id) {
+                        *queued -= 1;
+                    }
+                    let Ok(_turn) = turn else {
+                        return;
+                    };
+                    // Asked again at its turn: a plugin removed, or whose manifest changed,
+                    // while this waited does not run it.
+                    let still = install::admitted(&home, &id).is_ok_and(|p| {
+                        p.root == root
+                            && hooks_for(&p.manifest.here().events, name)
+                                .iter()
+                                .any(|h| h.command == command)
+                    });
+                    if !still {
+                        note(&home, &id, &format!("{name}: not run: no longer agreed to"));
+                        return;
+                    }
+                    let log = home.state_of(&id).join("host.log");
+                    match spawn(&root, &command, env, &log) {
+                        Ok(child) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                wait_bounded(child, HANDLER_LIMIT)
+                            })
+                            .await;
+                        }
+                        Err(e) => note(&home, &id, &format!("{name}: {command:?}: {e}")),
+                    }
+                });
             }
         }
     }
@@ -1188,6 +1501,7 @@ impl Host {
     fn run_startups(&self) {
         end_startups(&self.home, None);
         let scope = focused_scope(&self.state.lock().unwrap());
+        let context = invoked(&scope.context, "startup", "plugin.startup");
         for id in install::installed(&self.home) {
             let log = self.home.state_of(&id).join("host.log");
             let plugin = match install::admitted(&self.home, &id) {
@@ -1200,9 +1514,10 @@ impl Host {
             for step in plugin.manifest.here().startup {
                 let mut env = install::plugin_env(&self.home, &id, &plugin.root);
                 env.extend(scope.env.clone());
+                env.push(("HERDR_PLUGIN_EVENT".into(), "startup".into()));
                 env.push((
                     "HERDR_PLUGIN_CONTEXT_JSON".into(),
-                    scope.context.to_string().into(),
+                    context.to_string().into(),
                 ));
                 match spawn(&plugin.root, &step.command, env, &log) {
                     Ok(mut child) => {
@@ -1222,6 +1537,25 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// Take `terminal` as what is shown, when it is listed, and tell the focus events that
+    /// follow from it. `reported` says it came from what a person sees (the interface, or a
+    /// `Focus` the daemon passed on), not only from a plugin's own call.
+    pub(super) fn set_focus(&self, terminal: u32, reported: bool) -> bool {
+        let events = {
+            let mut state = self.state.lock().unwrap();
+            if !state.now.rows.iter().any(|r| r.terminal == terminal) {
+                return false;
+            }
+            state.focused = Some(terminal);
+            state.reported |= reported;
+            state.focus_events()
+        };
+        for event in events {
+            let _ = self.events.send(Arc::new(event));
+        }
+        true
     }
 }
 
@@ -1250,22 +1584,28 @@ fn moves_rows(event: &EventMessage) -> bool {
 }
 
 /// Wait on the link until the rows may have moved or the poll is due. A burst of changes is
-/// let settle for [`COALESCE`] and read as one. `Err` when the daemon closed the link.
-async fn changed(link: &mut Link) -> std::io::Result<()> {
+/// let settle for [`COALESCE`] and read as one. A `Focus` the daemon passes on (`qoop focus`,
+/// a notch) is what every interface now shows, and is taken as the focus. `Err` when the daemon
+/// closed the link.
+async fn changed(host: &Host, link: &mut Link) -> std::io::Result<()> {
     let poll = Instant::now() + POLL;
     loop {
-        match link.next_events(Some(poll)).await? {
-            None => return Ok(()),
-            Some(events) if events.iter().any(moves_rows) => {
-                tokio::time::sleep(COALESCE).await;
-                // What came meanwhile is read with it, for one more window at most, so a daemon
-                // that never goes quiet still gets listed.
-                let until = Instant::now() + COALESCE;
-                let soon = || Some((Instant::now() + Duration::from_millis(1)).min(until));
-                while Instant::now() < until && link.next_events(soon()).await?.is_some() {}
-                return Ok(());
+        let Some(events) = link.next_events(Some(poll)).await? else {
+            return Ok(());
+        };
+        for event in &events {
+            if let EventMessage::Focus { terminal } = event {
+                host.set_focus(*terminal, true);
             }
-            Some(_) => {}
+        }
+        if events.iter().any(moves_rows) {
+            tokio::time::sleep(COALESCE).await;
+            // What came meanwhile is read with it, for one more window at most, so a daemon
+            // that never goes quiet still gets listed.
+            let until = Instant::now() + COALESCE;
+            let soon = || Some((Instant::now() + Duration::from_millis(1)).min(until));
+            while Instant::now() < until && link.next_events(soon()).await?.is_some() {}
+            return Ok(());
         }
     }
 }
@@ -1284,7 +1624,9 @@ async fn follow(host: &Host) {
                     break;
                 }
                 gone_since = None;
-                if install::installed(&host.home).is_empty() || changed(&mut link).await.is_err() {
+                if install::installed(&host.home).is_empty()
+                    || changed(host, &mut link).await.is_err()
+                {
                     break;
                 }
             }
@@ -1322,7 +1664,15 @@ async fn serve(host: Arc<Host>, stream: tokio::net::UnixStream) {
     }
     let (rd, mut wr) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(rd).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut early = None;
+    loop {
+        let line = match early.take() {
+            Some(line) => line,
+            None => match lines.next_line().await {
+                Ok(Some(line)) => line,
+                _ => return,
+            },
+        };
         let parsed: Result<Value, String> = serde_json::from_str(&line).map_err(|e| e.to_string());
         let (request, id) = match parsed.and_then(|r| {
             let id = request_id(&r).ok_or("missing or invalid field `id`".to_string())?;
@@ -1344,7 +1694,25 @@ async fn serve(host: Arc<Host>, stream: tokio::net::UnixStream) {
             stream_events(&host, &id, &params, wr).await;
             return;
         }
-        let answer = host.answer("", method, &params).await;
+        let answer = host.answer("", method, &params);
+        let waits = method == "agent.prompt" && params.get("wait").is_some_and(Value::is_object);
+        let answer = if waits {
+            // A prompt waiting for its turn ends when its peer leaves (by then the text is
+            // typed, or `qoop prompt` is on its way and finishes it). A peer that only shuts
+            // its write side reads as gone too.
+            tokio::pin!(answer);
+            loop {
+                tokio::select! {
+                    a = &mut answer => break a,
+                    next = lines.next_line(), if early.is_none() => match next {
+                        Ok(Some(line)) => early = Some(line),
+                        _ => return,
+                    },
+                }
+            }
+        } else {
+            answer.await
+        };
         if send(&mut wr, &under(answer, &id)).await.is_err() {
             return;
         }
@@ -1365,25 +1733,85 @@ const PER_PANE: &[&str] = &[
     "pane.scroll_changed",
 ];
 
-/// What a subscription asks for: dotted types, each optionally bound to a pane.
-fn subscriptions(params: &Value) -> Result<Vec<(String, Option<String>)>, String> {
+/// One subscription: a dotted type, bound to a pane for the per-pane ones, and for
+/// `pane.agent_status_changed` optionally to one status.
+#[derive(Clone, Debug, PartialEq)]
+struct Wanted {
+    kind: &'static str,
+    pane: Option<String>,
+    status: Option<String>,
+}
+
+impl Wanted {
+    fn hears(&self, event: &Event) -> bool {
+        self.kind == event.dotted
+            && self
+                .pane
+                .as_ref()
+                .is_none_or(|p| Some(p) == event.pane.as_ref())
+            && self
+                .status
+                .as_ref()
+                .is_none_or(|s| event.data["agent_status"] == s.as_str())
+    }
+}
+
+/// What a subscription asks for.
+fn subscriptions(params: &Value) -> Result<Vec<Wanted>, String> {
     let list = params["subscriptions"]
         .as_array()
         .ok_or("invalid request: missing field `subscriptions`")?;
     list.iter()
         .map(|s| {
-            let kind = s["type"].as_str().unwrap_or_default();
-            if translate::written(translate::SUBSCRIPTIONS, kind).is_none() {
-                return Err(format!("invalid request: unknown variant `{kind}`"));
-            }
+            let asked = s["type"].as_str().unwrap_or_default();
+            let Some(kind) = translate::SUBSCRIPTIONS
+                .iter()
+                .map(|(dotted, _)| *dotted)
+                .find(|dotted| *dotted == asked)
+            else {
+                return Err(format!("invalid request: unknown variant `{asked}`"));
+            };
             let pane = s["pane_id"].as_str().map(str::to_string);
             if PER_PANE.contains(&kind) && pane.is_none() {
                 return Err(format!("invalid request: {kind} needs a `pane_id`"));
             }
-            Ok((kind.to_string(), pane))
+            let status = s["agent_status"].as_str().map(str::to_string);
+            if let Some(status) = &status
+                && !["idle", "working", "blocked", "done", "unknown"].contains(&status.as_str())
+            {
+                return Err(format!("invalid request: unknown variant `{status}`"));
+            }
+            Ok(Wanted { kind, pane, status })
         })
         .collect()
 }
+
+/// The lines a subscriber is sent before any event: for a status it asked of a pane that has
+/// it already, one event now, as herdr sends it. `Err` with the pane id when a pane it names
+/// is not there.
+fn first_lines(host: &Host, wanted: &[Wanted]) -> Result<Vec<Value>, String> {
+    let state = host.state.lock().unwrap();
+    let mut out = Vec::new();
+    for w in wanted {
+        let Some(pane) = &w.pane else {
+            continue;
+        };
+        let row = terminal_of(pane)
+            .and_then(|t| state.now.rows.iter().find(|r| r.terminal == t))
+            .ok_or_else(|| pane.clone())?;
+        if w.kind == "pane.agent_status_changed"
+            && w.status.as_deref() == Some(translate::agent_status(row))
+        {
+            let event = Event::new(w.kind, Some(pane.clone()), status_data(pane, row));
+            out.extend(event.for_subscriber());
+        }
+    }
+    Ok(out)
+}
+
+/// What herdr says when a subscriber fell further behind than the history it keeps.
+const EVENTS_LOST: &str =
+    "event subscription fell behind retained history; resubscribe and resync with session.snapshot";
 
 async fn stream_events(
     host: &Host,
@@ -1399,52 +1827,40 @@ async fn stream_events(
             return;
         }
     };
-    let panes: Vec<&String> = wanted.iter().filter_map(|(_, p)| p.as_ref()).collect();
-    if !panes.is_empty() {
+    if wanted.iter().any(|w| w.pane.is_some()) {
         let _ = host.refresh().await;
-        let known = |p: &String| {
-            terminal_of(p).is_some_and(|t| {
-                host.state
-                    .lock()
-                    .unwrap()
-                    .now
-                    .rows
-                    .iter()
-                    .any(|r| r.terminal == t)
-            })
-        };
-        if let Some(missing) = panes.into_iter().find(|p| !known(p)) {
+    }
+    let first = match first_lines(host, &wanted) {
+        Ok(first) => first,
+        Err(pane) => {
             let refused =
-                translate::refuse("", "pane_not_found", &format!("pane {missing} not found"));
+                translate::refuse("", "pane_not_found", &format!("pane {pane} not found"));
             let _ = send(&mut wr, &under(refused, id)).await;
             return;
         }
-    }
+    };
     let mut rx = host.events.subscribe();
     let ack = translate::reply("", json!({"type": "subscription_started"}));
     if send(&mut wr, &under(ack, id)).await.is_err() {
         return;
     }
+    for line in first {
+        if send(&mut wr, &line).await.is_err() {
+            return;
+        }
+    }
     loop {
         let line = match rx.recv().await {
-            Ok(event) => {
-                let hit = wanted.iter().any(|(kind, pane)| {
-                    kind == event.dotted
-                        && pane.as_ref().is_none_or(|p| Some(p) == event.pane.as_ref())
-                });
-                match event.for_subscriber() {
-                    Some(line) if hit => line,
-                    _ => continue,
-                }
+            Ok(event) => match event.for_subscriber() {
+                Some(line) if wanted.iter().any(|w| w.hears(&event)) => line,
+                _ => continue,
+            },
+            // Past the history a subscriber may lag by, the stream ends, as herdr's does.
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let lost = translate::refuse("", "events_lost", EVENTS_LOST);
+                let _ = send(&mut wr, &under(lost, id)).await;
+                return;
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => under(
-                translate::refuse(
-                    "",
-                    "events_lost",
-                    &format!("{n} events were dropped; read a fresh snapshot"),
-                ),
-                id,
-            ),
             Err(broadcast::error::RecvError::Closed) => return,
         };
         if send(&mut wr, &line).await.is_err() {
@@ -1600,8 +2016,16 @@ mod tests {
         );
         assert_eq!(
             names(&events),
-            ["tab.created", "pane.created", "pane.agent_detected"]
+            [
+                "tab.created",
+                "pane.created",
+                "pane.agent_detected",
+                "layout.updated"
+            ],
+            "a pane listed with its agent tells it right after the pane, as herdr's later \
+             detection does"
         );
+        assert_eq!(events[2].data["agent"], "claude");
         assert_eq!(events[1].data["pane"]["pane_id"], "w1:p2");
         assert_eq!(events[0].data["tab"]["tab_id"], "w1:t2");
         let (hook, payload) = events[1].for_hook().expect("a hook name");
@@ -1609,12 +2033,26 @@ mod tests {
         assert_eq!(payload["data"]["type"], "pane_created");
 
         let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
-        assert_eq!(names(&events), ["pane.closed", "pane.exited", "tab.closed"]);
+        assert_eq!(
+            names(&events),
+            ["pane.exited", "tab.closed"],
+            "gone on its own is exited, never closed too"
+        );
         assert_eq!(
             events[0].data,
             json!({"pane_id": "w1:p2", "workspace_id": "w1"})
         );
-        assert_eq!(events[2].data["tab_id"], "w1:t2");
+        assert_eq!(events[1].data["tab_id"], "w1:t2");
+
+        // Closed through the host: closed, and only that.
+        state.update(
+            vec![space(1, "api")],
+            vec![row(1, 1, json!({})), row(3, 1, json!({}))],
+            &[],
+        );
+        state.closing.insert(3);
+        let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
+        assert_eq!(names(&events), ["pane.closed", "tab.closed"]);
     }
 
     #[test]
@@ -1691,7 +2129,11 @@ mod tests {
             "w1:t5",
             "the survivor keeps the tab's id"
         );
-        assert_eq!(names(&events), ["pane.closed", "pane.exited"]);
+        assert_eq!(
+            names(&events),
+            ["pane.exited", "layout.updated"],
+            "a tab that had two panes tells its new layout"
+        );
         let layout = translate::layout(&state.now.tabs[0], AREA, None, false);
         assert_eq!(layout["panes"][0]["pane_id"], "w1:p6");
 
@@ -1707,6 +2149,239 @@ mod tests {
         );
         let ids: Vec<String> = state.now.tabs.iter().map(Tab::id).collect();
         assert_eq!(ids, ["w1:t5", "w1:t1", "w1:t7"]);
+    }
+
+    #[test]
+    fn a_focus_move_tells_space_tab_and_pane_in_that_order() {
+        let mut state = State::default();
+        state.update(
+            vec![space(1, "a"), space(2, "b")],
+            vec![row(1, 1, json!({})), row(2, 2, json!({}))],
+            &[],
+        );
+        state.focused = Some(2);
+        let told = state.focus_events();
+        assert_eq!(
+            names(&told),
+            ["workspace.focused", "tab.focused", "pane.focused"]
+        );
+        assert_eq!(told[0].data, json!({"workspace_id": "w2"}));
+        assert_eq!(
+            told[1].data,
+            json!({"tab_id": "w2:t2", "workspace_id": "w2"})
+        );
+        assert_eq!(
+            told[2].data,
+            json!({"pane_id": "w2:p2", "workspace_id": "w2"})
+        );
+        assert!(state.focus_events().is_empty(), "told once");
+        let (hook, _) = told[2].for_hook().expect("hookable");
+        assert_eq!(hook, "pane_focused");
+    }
+
+    #[test]
+    fn a_pane_rename_is_not_a_tab_rename_and_a_split_is_a_layout() {
+        let mut state = primed();
+        state.renamed.insert(1);
+        let events = state.update(
+            vec![space(1, "api")],
+            vec![row(1, 1, json!({"name": "logs"}))],
+            &[],
+        );
+        assert!(names(&events).is_empty(), "{:?}", names(&events));
+        let events = state.update(
+            vec![space(1, "api")],
+            vec![row(1, 1, json!({"name": "logs2"}))],
+            &[],
+        );
+        assert_eq!(
+            names(&events),
+            ["tab.renamed"],
+            "a rename that came from elsewhere"
+        );
+        let events = state.update(
+            vec![space(1, "api")],
+            vec![row(1, 1, json!({"name": "logs2"})), row(7, 1, json!({}))],
+            &[split(1, 7)],
+        );
+        assert_eq!(names(&events), ["pane.created", "layout.updated"]);
+        assert_eq!(events[1].data["layout"]["panes"][1]["pane_id"], "w1:p7");
+        assert!(events[1].for_hook().is_some() && NOT_HOOKABLE.contains(&events[1].dotted));
+    }
+
+    #[test]
+    fn an_agent_arriving_changing_title_and_leaving() {
+        let mut state = primed();
+        let claude = |extra: Value| {
+            let mut fields = json!({"agent": true, "program": "claude", "state": "idle"});
+            if let (Value::Object(f), Value::Object(e)) = (&mut fields, extra) {
+                f.extend(e);
+            }
+            row(1, 1, fields)
+        };
+        let events = state.update(vec![space(1, "api")], vec![claude(json!({}))], &[]);
+        // The tab is named after its program here, so it is renamed too; the pane events:
+        let events: Vec<Event> = events
+            .into_iter()
+            .filter(|e| e.dotted.starts_with("pane."))
+            .collect();
+        assert_eq!(
+            names(&events),
+            ["pane.agent_detected", "pane.agent_status_changed"]
+        );
+        assert_eq!(events[0].data["agent"], "claude");
+        assert!(
+            events[1].data.get("state_labels").is_none(),
+            "empty is left out"
+        );
+        let events = state.update(
+            vec![space(1, "api")],
+            vec![claude(json!({"agent_title": "Fix login"}))],
+            &[],
+        );
+        assert_eq!(
+            names(&events),
+            ["pane.agent_status_changed"],
+            "a title is presentation"
+        );
+        assert_eq!(events[0].data["title"], "Fix login");
+        let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
+        let left = events
+            .iter()
+            .find(|e| e.dotted == "pane.agent_detected")
+            .expect("left");
+        assert_eq!(
+            left.data,
+            json!({"pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude",
+                   "released": true, "final_status": "idle"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_pane_is_checked_as_herdr_checks_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = test_home(dir.path());
+        let folder = dir.path().join("p");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let text = format!(
+            "{}[[panes]]\nid = \"v\"\ntitle = \"V\"\nplacement = \"popup\"\ncommand = [\"v\"]\n",
+            manifest::head("t.p")
+        );
+        std::fs::write(folder.join(manifest::FILE), &text).expect("manifest");
+        install::link_for_tests(&home, &folder);
+        let host = Host::new(home);
+        let refused = |params: Value| {
+            let host = host.clone();
+            async move { host.open_pane(&params).await.expect_err("refused") }
+        };
+        let base = json!({"plugin_id": "t.p", "entrypoint": "v"});
+        let with = |extra: Value| {
+            let mut p = base.clone();
+            if let (Value::Object(p), Value::Object(e)) = (&mut p, extra) {
+                p.extend(e);
+            }
+            p
+        };
+        assert_eq!(
+            refused(with(json!({"entrypoint": "nope"}))).await,
+            (
+                "plugin_pane_not_found",
+                "plugin pane entrypoint 'nope' not found".into()
+            )
+        );
+        assert_eq!(
+            refused(with(json!({"placement": "split", "width": 10}))).await,
+            (
+                "invalid_params",
+                "width and height are only supported when placement is popup".into()
+            )
+        );
+        assert_eq!(
+            refused(with(json!({"target_pane_id": "w1:p1"}))).await,
+            (
+                "invalid_params",
+                "overlay and popup plugin panes target the active pane".into()
+            )
+        );
+        assert_eq!(
+            refused(with(json!({"placement": "split", "workspace_id": "w1"}))).await,
+            (
+                "invalid_params",
+                "split and zoomed plugin panes target an existing pane; use target_pane_id".into()
+            )
+        );
+        assert_eq!(
+            refused(with(json!({"placement": "tab", "direction": "down"}))).await,
+            (
+                "invalid_params",
+                "tab plugin panes support workspace_id but not target_pane_id or direction".into()
+            )
+        );
+        let open = |popup| {
+            host.state.lock().unwrap().popups.insert(
+                5,
+                Popup {
+                    previous: None,
+                    plugin: "t.p".into(),
+                    popup,
+                },
+            )
+        };
+        open(false);
+        assert_ne!(
+            refused(base.clone()).await.0,
+            "ui_busy",
+            "an open overlay does not block a popup"
+        );
+        open(true);
+        assert_eq!(
+            refused(base.clone()).await,
+            ("ui_busy", "a popup pane is already open".into())
+        );
+        assert_eq!(
+            refused(json!({"plugin_id": "nope", "entrypoint": "v"})).await,
+            ("plugin_not_found", "plugin not found".into())
+        );
+    }
+
+    #[test]
+    fn an_action_named_without_its_plugin_is_found_once_or_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = test_home(dir.path());
+        for (id, action) in [("t.a", "go"), ("t.b", "go"), ("t.b", "only")] {
+            let folder = dir.path().join(id);
+            std::fs::create_dir_all(&folder).expect("mkdir");
+            let manifest_at = folder.join(manifest::FILE);
+            let mut text =
+                std::fs::read_to_string(&manifest_at).unwrap_or_else(|_| manifest::head(id));
+            text +=
+                &format!("[[actions]]\nid = \"{action}\"\ntitle = \"T\"\ncommand = [\"true\"]\n");
+            std::fs::write(&manifest_at, text).expect("manifest");
+        }
+        for id in ["t.a", "t.b"] {
+            install::link_for_tests(&home, &dir.path().join(id));
+        }
+        let host = Host::new(home);
+        let ask = |params: Value| host.invoke_param(&params).expect_err("refused");
+        assert_eq!(
+            ask(json!({"action_id": "go"})),
+            (
+                "ambiguous_plugin_action",
+                "plugin action id matches more than one action; include plugin_id".into()
+            )
+        );
+        assert_eq!(
+            ask(json!({"action_id": "nothing"})).0,
+            "plugin_action_not_found"
+        );
+        assert_eq!(
+            ask(json!({"plugin_id": "t.a", "action_id": "only"})).0,
+            "plugin_action_not_found"
+        );
+        assert_eq!(
+            ask(json!({"plugin_id": "t.zz", "action_id": "go"})),
+            ("plugin_not_found", "plugin not found".into())
+        );
     }
 
     #[test]
@@ -1728,12 +2403,12 @@ mod tests {
 
     #[test]
     fn served_and_later_are_exactly_what_unknown_method_names() {
-        let mut both: Vec<&str> = SERVED.iter().chain(LATER).copied().collect();
+        let mut both: Vec<&str> = SERVED.iter().chain(WRITES).copied().collect();
         both.sort_unstable();
         let mut methods = translate::METHODS.to_vec();
         methods.sort_unstable();
         assert_eq!(both, methods);
-        assert!(SERVED.iter().all(|m| !LATER.contains(m)));
+        assert!(SERVED.iter().all(|m| !WRITES.contains(m)));
         assert!(!translate::METHODS.contains(&"pane.report_agent"));
     }
 
@@ -1753,8 +2428,6 @@ mod tests {
             ping["result"],
             json!({"type": "pong", "version": "0.9.5", "protocol": 22})
         );
-        let later = host.answer("9", "pane.split", &json!({})).await;
-        assert_eq!(later["error"]["code"], "not_supported");
     }
 
     #[test]
@@ -1763,9 +2436,18 @@ mod tests {
             {"type": "pane.created"}, {"type": "pane.agent_status_changed", "pane_id": "w1:p2"}
         ]}))
         .expect("ok");
-        assert_eq!(
-            ok[1],
-            ("pane.agent_status_changed".into(), Some("w1:p2".into()))
+        assert_eq!(ok[1].kind, "pane.agent_status_changed");
+        assert_eq!(ok[1].pane.as_deref(), Some("w1:p2"));
+        let filtered = subscriptions(&json!({"subscriptions": [
+            {"type": "pane.agent_status_changed", "pane_id": "w1:p2", "agent_status": "done"}
+        ]}))
+        .expect("ok");
+        assert_eq!(filtered[0].status.as_deref(), Some("done"));
+        assert!(
+            subscriptions(&json!({"subscriptions": [
+                {"type": "pane.agent_status_changed", "pane_id": "w1:p2", "agent_status": "x"}
+            ]}))
+            .is_err()
         );
         let err =
             subscriptions(&json!({"subscriptions": [{"type": "pane.nope"}]})).expect_err("no");
@@ -1782,12 +2464,13 @@ mod tests {
 
     #[test]
     fn hooks_run_for_their_own_event_only() {
-        let m = manifest::Manifest::parse(
-            "id = \"h\"\n\
+        let m = manifest::Manifest::parse(&format!(
+            "{}\
              [[events]]\non = \"pane.closed\"\ncommand = [\"a\"]\n\
              [[events]]\non = \"pane.agent_status_changed\"\ncommand = [\"b\"]\n\
              [[events]]\non = \"tab.closed\"\ncommand = [\"c\"]\n",
-        )
+            manifest::head("h")
+        ))
         .expect("parses");
         let run = |name| -> Vec<String> {
             hooks_for(&m.events, name)
@@ -1803,6 +2486,58 @@ mod tests {
 
     fn test_home(at: &Path) -> Home {
         Home::at(at.join("data/plugins"), at.join("config/plugins"))
+    }
+
+    #[tokio::test]
+    async fn a_waiting_hook_is_asked_again_and_the_queue_is_bounded() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = test_home(dir.path());
+        let folder = dir.path().join("p");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let manifest_at = folder.join(manifest::FILE);
+        let text = format!(
+            "{}[[events]]\non = \"pane.closed\"\ncommand = [\"sh\", \"-c\", \"touch ran\"]\n",
+            manifest::head("t.q")
+        );
+        std::fs::write(&manifest_at, &text).expect("manifest");
+        install::link_for_tests(&home, &folder);
+        let host = Host::new(home.clone());
+        // Every turn taken, so what is asked for waits.
+        let turns = host
+            .hooks
+            .clone()
+            .acquire_many_owned(HANDLERS_AT_ONCE as u32)
+            .await
+            .expect("turns");
+        let closed = Event::new(
+            "pane.closed",
+            Some("w1:p1".into()),
+            json!({"pane_id": "w1:p1", "workspace_id": "w1"}),
+        );
+        for _ in 0..WAITING_PER_PLUGIN + 3 {
+            host.run_hooks(&closed);
+        }
+        assert_eq!(host.waiting.lock().unwrap()["t.q"], WAITING_PER_PLUGIN);
+        let log = home.state_of("t.q").join("host.log");
+        let logged = std::fs::read_to_string(&log).expect("log");
+        assert_eq!(logged.matches("too many hooks waiting").count(), 3);
+
+        // The manifest changed while they waited: none of them runs.
+        std::fs::write(&manifest_at, format!("{text}# changed\n")).expect("rewrite");
+        drop(turns);
+        for _ in 0..100 {
+            if host.waiting.lock().unwrap()["t.q"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !folder.join("ran").exists(),
+            "a hook ran after its consent went"
+        );
+        let logged = std::fs::read_to_string(&log).expect("log");
+        assert!(logged.contains("not run: no longer agreed to"), "{logged}");
     }
 
     #[test]
@@ -1888,13 +2623,21 @@ mod tests {
             .find(|e| e.dotted == "tab.closed")
             .expect("tab closed");
         assert_eq!(closed.scope.context["tab_id"], "w3:t4");
-        assert_eq!(closed.scope.context["workspace_label"], "docs");
+        assert!(
+            closed.scope.context.get("workspace_label").is_none(),
+            "a closed tab is told by its ids only, as herdr tells it"
+        );
         let space_closed = events
             .iter()
             .find(|e| e.dotted == "workspace.closed")
             .expect("space closed");
         let env: BTreeMap<_, _> = space_closed.scope.env.clone().into_iter().collect();
         assert_eq!(env["HERDR_WORKSPACE_ID"], "w3");
+        assert_eq!(space_closed.scope.context["workspace_label"], "docs");
+        assert_eq!(
+            space_closed.data["workspace"]["label"], "docs",
+            "the space it was"
+        );
 
         let mut focused = State::default();
         let mut s = space(2, "web");
@@ -1912,13 +2655,14 @@ mod tests {
         assert_eq!(env["HERDR_PANE_ID"], "w2:p9");
         assert_eq!(env["HERDR_WORKSPACE_CWD"], "/src/web");
 
-        // A closed pane in a space that stays is told as itself, not only as its space.
+        // A pane closed through the host is told by its pane and space, as herdr tells it.
         let mut state = State::default();
         state.update(
             vec![space(1, "a")],
             vec![row(1, 1, json!({})), row(2, 1, json!({}))],
             &[],
         );
+        state.closing.insert(2);
         let events = state.update(vec![space(1, "a")], vec![row(1, 1, json!({}))], &[]);
         let closed = events
             .iter()
@@ -1926,7 +2670,8 @@ mod tests {
             .expect("closed");
         let env: BTreeMap<_, _> = closed.scope.env.clone().into_iter().collect();
         assert_eq!(env["HERDR_PANE_ID"], "w1:p2");
-        assert_eq!(env["HERDR_TAB_ID"], "w1:t2");
+        assert_eq!(env["HERDR_WORKSPACE_ID"], "w1");
+        assert!(!env.contains_key("HERDR_TAB_ID"));
     }
 
     #[tokio::test]
@@ -1961,12 +2706,13 @@ mod tests {
                 .expect("json");
         assert_eq!(lost["id"], 41);
         assert_eq!(lost["error"]["code"], "events_lost");
-        let next: Value =
-            serde_json::from_str(&lines.next_line().await.expect("read").expect("line"))
-                .expect("json");
         assert_eq!(
-            next["event"], "pane_created",
-            "the stream goes on after the loss"
+            lost["error"]["message"],
+            "event subscription fell behind retained history; resubscribe and resync with session.snapshot"
+        );
+        assert!(
+            lines.next_line().await.expect("read").is_none(),
+            "the stream ends after the loss, as herdr's does"
         );
         streaming.abort();
     }

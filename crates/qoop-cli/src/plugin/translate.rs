@@ -335,7 +335,7 @@ fn tab_label(tab: &Tab, rows: &[AgentRow]) -> String {
 
 /// The agent a row runs, only when the daemon calls it one: its program's name, else what
 /// stands in front of it, else plain `agent`, so an agent never reads as no agent.
-fn agent_name(row: &AgentRow) -> Option<&str> {
+pub(crate) fn agent_name(row: &AgentRow) -> Option<&str> {
     row.agent.then(|| {
         row.program
             .as_deref()
@@ -354,6 +354,16 @@ fn agent_session(row: &AgentRow) -> Value {
     }
 }
 
+/// A herdr info object as herdr writes it: a field with nothing in it (`None`, an empty map)
+/// is left out, not written as `null` or `{}`.
+pub(crate) fn compact(mut value: Value) -> Value {
+    if let Value::Object(fields) = &mut value {
+        fields
+            .retain(|_, v| !(v.is_null() || v.as_object().is_some_and(serde_json::Map::is_empty)));
+    }
+    value
+}
+
 /// herdr's `PaneInfo` for a row. `revision` is the caller's: the host keeps a count per pane
 /// that rises on every change to its row (state, title, cwd, generation), since qoop counts no
 /// output revisions and a plugin such as auto-title reads a revision change as activity. `cwd`
@@ -362,7 +372,7 @@ fn agent_session(row: &AgentRow) -> Value {
 /// title a row carries.
 pub(crate) fn pane_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64) -> Value {
     let agent = agent_name(row);
-    json!({
+    compact(json!({
         "pane_id": pane_id(row),
         "terminal_id": row.terminal.to_string(),
         "workspace_id": workspace_id(row.workspace),
@@ -381,13 +391,13 @@ pub(crate) fn pane_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64)
         "revision": revision,
         "tokens": {},
         "state_labels": {},
-    })
+    }))
 }
 
 /// herdr's `AgentInfo` for a row the daemon calls an agent; `revision` as for [`pane_info`].
 pub(crate) fn agent_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64) -> Value {
     let agent = agent_name(row);
-    json!({
+    compact(json!({
         "terminal_id": row.terminal.to_string(),
         "pane_id": pane_id(row),
         "workspace_id": workspace_id(row.workspace),
@@ -406,7 +416,7 @@ pub(crate) fn agent_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64
         "revision": revision,
         "tokens": {},
         "state_labels": {},
-    })
+    }))
 }
 
 /// herdr's `TabInfo`. `number` counts from one within the space, in tab order.
@@ -448,8 +458,6 @@ pub(crate) fn workspace_info(
         "tab_count": own.len(),
         "active_tab_id": active.unwrap_or_default(),
         "agent_status": summary(rows.iter().filter(|row| row.workspace == space.id)),
-        "tokens": {},
-        "worktree": Value::Null,
     })
 }
 
@@ -1021,8 +1029,7 @@ mod tests {
                 "agent": "claude", "display_agent": "claude", "agent_status": "working",
                 "agent_session": {"source": "qoop", "agent": "claude", "kind": "id", "value": "s-1"},
                 "title": "Fix login", "terminal_title": "Fix login",
-                "terminal_title_stripped": "Fix login", "revision": 12, "tokens": {},
-                "state_labels": {},
+                "terminal_title_stripped": "Fix login", "revision": 12,
             })
         );
         assert_eq!(
@@ -1035,7 +1042,6 @@ mod tests {
                 "cwd": "/src/api", "foreground_cwd": "/src/api", "title": "Fix login",
                 "terminal_title": "Fix login", "terminal_title_stripped": "Fix login",
                 "revision": 12,
-                "tokens": {}, "state_labels": {},
             })
         );
         let shell = row(8, 2, json!({"program": "zsh", "agent_session": "ignored"}));
@@ -1143,10 +1149,10 @@ mod tests {
             json!([
                 {"workspace_id": "w1", "number": 1, "label": "api", "focused": true,
                  "pane_count": 3, "tab_count": 2, "active_tab_id": "w1:t3",
-                 "agent_status": "blocked", "tokens": {}, "worktree": null},
+                 "agent_status": "blocked"},
                 {"workspace_id": "w2", "number": 2, "label": "empty", "focused": false,
                  "pane_count": 0, "tab_count": 0, "active_tab_id": "",
-                 "agent_status": "unknown", "tokens": {}, "worktree": null},
+                 "agent_status": "unknown"},
             ])
         );
         assert_eq!(

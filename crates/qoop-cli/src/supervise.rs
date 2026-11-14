@@ -231,7 +231,7 @@ impl Link {
     }
 
     /// Bytes into a terminal on the input lane, signed like `send` signs them.
-    async fn input(&mut self, terminal: u32, bytes: Vec<u8>) -> std::io::Result<()> {
+    pub(crate) async fn input(&mut self, terminal: u32, bytes: Vec<u8>) -> std::io::Result<()> {
         let (from_terminal, from_token) = super::cli_sender();
         let seq = self.input_seq.entry(terminal).or_insert(0);
         let frame = client::encode_command_to(
@@ -258,7 +258,8 @@ impl Link {
         &mut self,
         deadline: Option<Instant>,
     ) -> std::io::Result<Option<Vec<EventMessage>>> {
-        let mut read = [0u8; 64 * 1024];
+        // On the heap, as in `control_roundtrip`.
+        let mut read = vec![0u8; 64 * 1024];
         loop {
             if let Some(ack) = self.connection.renders().due_ack(Instant::now()) {
                 self.wr.write_all(&ack).await?;

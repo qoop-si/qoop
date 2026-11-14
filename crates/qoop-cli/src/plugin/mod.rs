@@ -7,6 +7,7 @@ mod install;
 #[allow(dead_code)]
 mod manifest;
 mod shim;
+mod writes;
 // Shapes the writes and the plugin panes use land with the next part of the host.
 #[allow(dead_code)]
 mod translate;
