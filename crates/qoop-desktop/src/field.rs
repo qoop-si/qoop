@@ -9,7 +9,7 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, Pixels, Point, Render,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, Pixels, Point, Render, Role,
     ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
     div, fill, point, prelude::*, px, relative, size,
 };
@@ -60,9 +60,17 @@ impl Field {
         self.anchor.min(self.head)..self.anchor.max(self.head)
     }
 
+    /// Keep the text as it is now for one undo, unless a composition is under way: then the
+    /// text from before it began is the one an undo brings back, never the half-typed romaji.
+    fn keep_undo(&mut self) {
+        if self.marked.is_none() {
+            self.undo = Some((self.text.clone(), self.head));
+        }
+    }
+
     /// Put `new` in place of `range`, keeping one step of undo.
     fn replace(&mut self, range: Range<usize>, new: &str) {
-        self.undo = Some((self.text.clone(), self.head));
+        self.keep_undo();
         self.text.replace_range(range.clone(), new);
         self.head = range.start + new.len();
         self.anchor = self.head;
@@ -193,31 +201,50 @@ impl Field {
         cx.notify();
     }
 
-    fn utf16_to_byte(&self, offset: usize) -> usize {
-        let mut units = 0;
-        for (i, c) in self.text.char_indices() {
-            if units >= offset {
-                return i;
-            }
-            units += c.len_utf16();
+    // The input method counts in UTF-16 units; the field keeps byte offsets. These two are
+    // the only crossings.
+
+    /// A range the input method names, as bytes of `text`, start before end.
+    fn bytes_of(&self, units: Range<usize>) -> Range<usize> {
+        let (a, b) = (
+            byte_at(&self.text, units.start),
+            byte_at(&self.text, units.end),
+        );
+        a.min(b)..a.max(b)
+    }
+
+    /// A byte range of `text`, in the input method's units.
+    fn units_of(&self, bytes: Range<usize>) -> Range<usize> {
+        units_at(&self.text, bytes.start)..units_at(&self.text, bytes.end)
+    }
+
+    /// What an edit from the input method replaces: the range it names, else what is being
+    /// composed, else the selection (AppKit's rule for a replacement range of "not found").
+    fn target(&self, units: Option<Range<usize>>) -> Range<usize> {
+        match (units, &self.marked) {
+            (Some(units), _) => self.bytes_of(units),
+            (None, Some(marked)) => marked.clone(),
+            (None, None) => self.selection(),
         }
-        self.text.len()
     }
+}
 
-    fn byte_to_utf16(&self, offset: usize) -> usize {
-        self.text[..offset.min(self.text.len())]
-            .chars()
-            .map(char::len_utf16)
-            .sum()
-    }
+/// The byte where UTF-16 offset `units` falls in `text`, on a character's start: an offset
+/// inside a character (half a surrogate pair) is that character's start, one past the end is
+/// the end.
+fn byte_at(text: &str, units: usize) -> usize {
+    let mut through = 0;
+    text.char_indices()
+        .find(|(_, c)| {
+            through += c.len_utf16();
+            through > units
+        })
+        .map_or(text.len(), |(at, _)| at)
+}
 
-    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.utf16_to_byte(range.start)..self.utf16_to_byte(range.end)
-    }
-
-    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.byte_to_utf16(range.start)..self.byte_to_utf16(range.end)
-    }
+/// The UTF-16 offset of byte `at` of `text`, the whole length for anything past it.
+fn units_at(text: &str, at: usize) -> usize {
+    text.get(..at).unwrap_or(text).encode_utf16().count()
 }
 
 impl EntityInputHandler for Field {
@@ -228,9 +255,9 @@ impl EntityInputHandler for Field {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range);
-        adjusted.replace(self.range_to_utf16(&range));
-        Some(self.text[range].to_string())
+        let bytes = self.bytes_of(range);
+        *adjusted = Some(self.units_of(bytes.clone()));
+        self.text.get(bytes).map(str::to_string)
     }
 
     fn selected_text_range(
@@ -240,13 +267,13 @@ impl EntityInputHandler for Field {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selection()),
+            range: self.units_of(self.selection()),
             reversed: self.head < self.anchor,
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.as_ref().map(|r| self.range_to_utf16(r))
+        self.marked.clone().map(|m| self.units_of(m))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -260,12 +287,8 @@ impl EntityInputHandler for Field {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range
-            .map(|r| self.range_from_utf16(&r))
-            .or(self.marked.clone())
-            .unwrap_or_else(|| self.selection());
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        self.replace(range, &text);
+        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+        self.replace(self.target(range), &typed);
         cx.notify();
     }
 
@@ -277,30 +300,18 @@ impl EntityInputHandler for Field {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range
-            .map(|r| self.range_from_utf16(&r))
-            .or(self.marked.clone())
-            .unwrap_or_else(|| self.selection());
-        self.text.replace_range(range.clone(), new_text);
-        self.marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        let inside = new_selected
-            .map(|r| {
-                let at = |u: usize| {
-                    new_text
-                        .char_indices()
-                        .scan(0, |units, (i, c)| {
-                            let here = *units;
-                            *units += c.len_utf16();
-                            Some((here, i))
-                        })
-                        .find(|(units, _)| *units >= u)
-                        .map_or(new_text.len(), |(_, i)| i)
-                };
-                at(r.start)..at(r.end)
-            })
-            .unwrap_or(new_text.len()..new_text.len());
-        self.anchor = range.start + inside.start;
-        self.head = range.start + inside.end;
+        let at = self.target(range);
+        // The first mark of a composition is where its undo starts.
+        self.keep_undo();
+        self.text.replace_range(at.clone(), new_text);
+        self.marked = (!new_text.is_empty()).then(|| at.start..at.start + new_text.len());
+        // The caret (or selection) the input method wants, counted inside the new text.
+        let end = new_text.len();
+        let (from, to) = new_selected.map_or((end, end), |units| {
+            (byte_at(new_text, units.start), byte_at(new_text, units.end))
+        });
+        self.anchor = at.start + from;
+        self.head = at.start + to;
         cx.notify();
     }
 
@@ -311,11 +322,11 @@ impl EntityInputHandler for Field {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        let bytes = self.bytes_of(range);
         let line = self.line.as_ref()?;
-        let range = self.range_from_utf16(&range);
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+            point(bounds.left() + line.x_for_index(bytes.start), bounds.top()),
+            point(bounds.left() + line.x_for_index(bytes.end), bounds.bottom()),
         ))
     }
 
@@ -327,7 +338,7 @@ impl EntityInputHandler for Field {
     ) -> Option<usize> {
         let (line, bounds) = (self.line.as_ref()?, self.bounds?);
         let at = line.closest_index_for_x(at.x - bounds.left());
-        Some(self.byte_to_utf16(at))
+        Some(units_at(&self.text, at))
     }
 }
 
@@ -339,7 +350,13 @@ impl Focusable for Field {
 
 impl Render for Field {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A text field to a screen reader: its name, its hint and what is typed in it.
         div()
+            .id("field")
+            .role(Role::TextInput)
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
+            .aria_value(self.text.clone())
             .track_focus(&self.focus)
             .key_context("Field")
             .on_key_down(cx.listener(Self::key))
@@ -490,5 +507,21 @@ impl Element for FieldText {
             field.line = Some(line);
             field.bounds = Some(bounds);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{byte_at, units_at};
+
+    /// `a`, a two-byte letter, a four-byte emoji (two UTF-16 units), `b`.
+    const TEXT: &str = "a\u{e9}\u{1f600}b";
+
+    #[test]
+    fn input_method_offsets_land_on_character_starts() {
+        let bytes: Vec<usize> = (0..7).map(|u| byte_at(TEXT, u)).collect();
+        assert_eq!(bytes, [0, 1, 3, 3, 7, 8, 8], "half an emoji is its start");
+        let units: Vec<usize> = [0, 1, 3, 7, 8, 99].map(|b| units_at(TEXT, b)).to_vec();
+        assert_eq!(units, [0, 1, 2, 4, 5, 5]);
     }
 }

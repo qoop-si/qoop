@@ -224,19 +224,9 @@ pub fn canonical(text: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
-/// One word that sh, bash, zsh (with `RC_QUOTES` too) and fish all read back as it is,
-/// whatever is in it. `'` and `\` never sit inside the quotes: fish reads `\'` and `\\`
-/// there as escapes, so each is closed out and written escaped instead.
-pub fn shell_quote(word: &str) -> String {
-    let body: String = word
-        .chars()
-        .map(|c| match c {
-            '\'' | '\\' => format!("'\\{c}'"),
-            c => c.to_string(),
-        })
-        .collect();
-    format!("'{body}'")
-}
+/// One word for a shell, whatever is in it: an ssh command runs in the remote's login shell,
+/// which may be fish.
+pub use qoop_domain::shell::quote as shell_quote;
 
 /// The command ssh runs on the remote: print the marker, then run qoop's `verb`
 /// (`relay`, or `--hello`).

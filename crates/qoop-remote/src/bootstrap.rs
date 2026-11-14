@@ -217,11 +217,11 @@ mod tests {
     fn setting_a_variable_uses_the_shells_own_syntax() {
         assert_eq!(
             RemoteShell::PosixLike.with_env("A", "1", "qoopd"),
-            "A='1' qoopd"
+            "A=1 qoopd"
         );
         assert_eq!(
             RemoteShell::Fish.with_env("A", "1", "qoopd"),
-            "env A='1' qoopd"
+            "env A=1 qoopd"
         );
     }
 
@@ -236,13 +236,18 @@ mod tests {
             RemoteShell::Fish.with_env("A", "it's", "qoopd"),
             r"env A='it'\''s' qoopd"
         );
+        // Inside quotes fish reads `\'`: a backslash before the quote is kept out of them.
+        assert_eq!(
+            RemoteShell::Fish.with_env("A", r"a\'; touch x", "qoopd"),
+            r"env A='a'\\\''; touch x' qoopd"
+        );
     }
 
     #[test]
     fn an_unknown_shell_is_treated_as_posix_like_rather_than_refused() {
         assert_eq!(
             RemoteShell::Unknown.with_env("A", "1", "qoopd"),
-            "A='1' qoopd"
+            "A=1 qoopd"
         );
     }
 

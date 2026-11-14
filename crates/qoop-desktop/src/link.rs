@@ -237,9 +237,14 @@ pub fn rereads(events: &[EventMessage]) -> Vec<ControlRequest> {
     if any(|e| matches!(e, EventMessage::Resync)) {
         return opening_asks();
     }
+    // No event names a new space: one made by the CLI, the phone or another window shows
+    // up when its first agent does, so the spaces are read with the agents.
     if any(|e| matches!(e, EventMessage::AgentChanged { .. })) {
         asks.push(ControlRequest::ListAgents {
             id: fresh_id("agents"),
+        });
+        asks.push(ControlRequest::ListWorkspaces {
+            id: fresh_id("spaces"),
         });
     }
     if any(|e| matches!(e, EventMessage::SchedulesChanged)) {
@@ -366,11 +371,12 @@ mod tests {
             .iter()
             .map(|a| match a {
                 ControlRequest::ListAgents { .. } => "agents",
+                ControlRequest::ListWorkspaces { .. } => "spaces",
                 ControlRequest::ScheduleRead { .. } => "schedules",
                 _ => "other",
             })
             .collect();
-        assert_eq!(asks, ["agents", "schedules"]);
+        assert_eq!(asks, ["agents", "spaces", "schedules"]);
         assert_eq!(rereads(&[EventMessage::Resync]).len(), opening_asks().len());
         assert!(rereads(&[EventMessage::TasksChanged]).is_empty());
     }
@@ -412,5 +418,116 @@ mod tests {
         assert!(agents.iter().any(|r| r.terminal == terminal), "{agents:?}");
         assert!(!spaces.expect("a Workspaces answer").is_empty());
         mux.abort();
+    }
+
+    async fn ask(c: &mut qoop_testkit::TestClient, request: ControlRequest) -> ControlResponse {
+        c.control(&request, qoop_testkit::PATIENCE)
+            .await
+            .expect("an answer")
+    }
+
+    /// A real daemon's sleeping agent tab, read through the mux as the window reads it, is on
+    /// home: the daemon lists it under its space, not as an agent row.
+    #[tokio::test]
+    async fn a_sleeping_agent_tab_of_a_real_daemon_is_on_home() {
+        use crate::state::{Chip, Kind, Model};
+        let d = qoop_testkit::TestDaemon::start().await;
+        let mut c = d.attach("sleeper").await;
+        let space = match ask(
+            &mut c,
+            ControlRequest::CreateWorkspace {
+                id: "space".into(),
+                name: "dozing".into(),
+            },
+        )
+        .await
+        {
+            ControlResponse::WorkspaceCreated { workspace, .. } => workspace,
+            other => panic!("{other:?}"),
+        };
+        let tab = match ask(
+            &mut c,
+            ControlRequest::CreateTerminal {
+                id: "tab".into(),
+                cwd: None,
+                workspace: Some(space),
+                name: None,
+            },
+        )
+        .await
+        {
+            ControlResponse::TerminalCreated { terminal, .. } => terminal,
+            other => panic!("{other:?}"),
+        };
+        // A fresh shell is refused while it starts: asked again until it has settled.
+        let deadline = std::time::Instant::now() + qoop_testkit::PATIENCE;
+        for n in 0.. {
+            let answer = ask(
+                &mut c,
+                ControlRequest::SleepWorkspace {
+                    id: format!("sleep-{n}"),
+                    workspace: space,
+                    terminal: None,
+                },
+            )
+            .await;
+            match answer {
+                ControlResponse::WorkspaceAsleep { .. } => break,
+                other if std::time::Instant::now() > deadline => panic!("{other:?}"),
+                _ => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        // What a sleep of an agent's tab writes down.
+        d.store()
+            .checkpoint(vec![qoop_store::Checkpoint {
+                terminal: i64::from(tab),
+                agent: Some("claude".into()),
+                agent_session: None,
+            }])
+            .await
+            .expect("a checkpoint");
+
+        let (mut wire, mux) = through_mux(d.socket(), Vec::new()).await.expect("linked");
+        for ask in opening_asks() {
+            wire.request(&ask).await.expect("ask");
+        }
+        let latest = Latest::default();
+        let mut model = Model::default();
+        let (mut agents, mut spaces) = (false, false);
+        let deadline = std::time::Instant::now() + qoop_testkit::PATIENCE;
+        while !(agents && spaces) && std::time::Instant::now() < deadline {
+            let read = tokio::time::timeout(Duration::from_secs(1), wire.read(&latest)).await;
+            let Ok(read) = read else { continue };
+            for answer in read.expect("read").0 {
+                match answer {
+                    ControlResponse::Agents { agents: a, .. } => {
+                        model.rows = a;
+                        agents = true;
+                    }
+                    ControlResponse::Workspaces { workspaces, .. } => {
+                        model.spaces = workspaces;
+                        spaces = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        mux.abort();
+        assert!(
+            !model.rows.iter().any(|r| r.terminal == tab && r.agent),
+            "not an awake agent row"
+        );
+        let group = model
+            .groups(Chip::All)
+            .into_iter()
+            .find(|g| g.space.id == space)
+            .expect("the sleeping space is on home");
+        let kinds: Vec<(u32, Kind)> = group
+            .rows
+            .iter()
+            .map(|e| (e.terminal(), e.kind()))
+            .collect();
+        assert_eq!(kinds, [(tab, Kind::Sleeping)]);
+        assert_eq!(model.count(Chip::Sleeping), 1);
     }
 }
