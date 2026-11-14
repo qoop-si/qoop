@@ -227,7 +227,12 @@ pub struct Exit {
 /// [`reap_by`]).
 pub fn run_sh(command: &str, cwd: &std::path::Path, within: Duration) -> std::io::Result<Exit> {
     use std::os::unix::process::CommandExt;
-    let mut child = Command::new("/bin/sh")
+    let mut sh = Command::new("/bin/sh");
+    // Run in `cwd`'s own repository, whatever repository the caller's environment names.
+    for var in crate::worktree::GIT_SCOPE {
+        sh.env_remove(var);
+    }
+    let mut child = sh
         .args(["-c", command])
         .current_dir(cwd)
         .stdin(Stdio::null())

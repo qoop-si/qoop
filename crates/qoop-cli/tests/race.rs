@@ -24,6 +24,10 @@ esac
 while [ -d "$dir" ]; do /bin/sleep 1; done
 "#;
 
+/// How long a test lets `--wait` look before an agent it must have seen goes away: it lists the
+/// tabs once a second, and a racer it never saw as an agent reads `not-started`, not `exited`.
+const SEEN_BY_WAIT: Duration = Duration::from_secs(3);
+
 struct Stack {
     child: Option<Child>,
     dir: tempfile::TempDir,
@@ -118,15 +122,25 @@ impl Stack {
         false
     }
 
-    /// Whether every row named `race/<name>/...` is an agent, and there are `n` of them.
-    fn agents_in(&self, name: &str, n: usize) -> bool {
+    /// The rows named `race/<name>/...`, whichever repository they race in.
+    fn racers(&self, name: &str) -> Vec<serde_json::Value> {
         let prefix = format!("race/{name}/");
-        let racers: Vec<_> = self
-            .rows()
+        self.rows()
             .into_iter()
             .filter(|r| r["name"].as_str().is_some_and(|s| s.starts_with(&prefix)))
-            .collect();
+            .collect()
+    }
+
+    /// Whether every row named `race/<name>/...` is an agent, and there are `n` of them.
+    fn agents_in(&self, name: &str, n: usize) -> bool {
+        let racers = self.racers(name);
         racers.len() == n && racers.iter().all(|r| r["agent"] == true)
+    }
+
+    /// Whether there are `n` rows named `race/<name>/...`, each `working`.
+    fn working_in(&self, name: &str, n: usize) -> bool {
+        let racers = self.racers(name);
+        racers.len() == n && racers.iter().all(|r| r["status"] == "working")
     }
 }
 
@@ -281,6 +295,36 @@ fn a_race_runs_from_start_to_its_winner() {
     };
     assert_eq!(ls("test -e raced.txt").matches(" tests=pass ").count(), 2);
     assert_eq!(ls("exit 1").matches(" tests=fail ").count(), 2);
+    // Neither the counts nor the test follow a repository the environment names.
+    let out = stack
+        .command(&repo)
+        .env("GIT_DIR", "/nonexistent")
+        .env("GIT_COMMON_DIR", "/nonexistent")
+        .args([
+            "race",
+            "ls",
+            "fix",
+            "--test",
+            "git rev-parse --show-toplevel",
+        ])
+        .output()
+        .unwrap();
+    let said = text(&out.stdout);
+    assert_eq!(said.matches(" files=1 added=2 ").count(), 2, "{said}");
+    assert_eq!(said.matches(" tests=pass ").count(), 2, "{said}");
+    // A worktree no racer had, its folder gone: a race never prunes it.
+    let stray = stack.path("w").join("stray");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &stray.display().to_string(),
+        ],
+    );
+    std::fs::remove_dir_all(&stray).unwrap();
 
     // A keep that names no racer is refused before anything is looked at.
     let out = stack.run_in(&repo, &["race", "rm", "fix", "--keep", "codex", "--force"]);
@@ -321,6 +365,10 @@ fn a_race_runs_from_start_to_its_winner() {
     assert!(
         has_ref(&repo, "refs/qoop/race/fix"),
         "the winner keeps the race"
+    );
+    assert!(
+        git(&repo, &["worktree", "list", "--porcelain"]).contains("prunable"),
+        "a worktree no racer had is not pruned"
     );
 
     // The winner committed, which only --force drops; with it, the race is gone.
@@ -368,8 +416,8 @@ fn a_racer_still_working_or_with_another_tab_inside_is_never_dropped() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
-        stack.wait(|| stack.agents_in("w", 2)),
-        "the racers never started"
+        stack.wait(|| stack.working_in("w", 2)),
+        "the racers never started working"
     );
     let out = stack.run_in(&repo, &["race", "rm", "w", "--force"]);
     assert_eq!(out.status.code(), Some(1));
@@ -442,6 +490,133 @@ fn a_racer_still_working_or_with_another_tab_inside_is_never_dropped() {
     );
     assert!(!has_ref(&repo, "refs/heads/race/d/claude-2"));
     assert!(!has_ref(&repo, "refs/qoop/race/d"));
+
+    // A racer's tab back at its shell and running something else is not closed under it.
+    let out = stack.run_in(
+        &repo,
+        &[
+            "race",
+            "new",
+            "e",
+            "--agents",
+            "claude,claude",
+            "--",
+            "EXIT",
+        ],
+    );
+    let tab = terminals(&text(&out.stdout)).remove(0);
+    assert!(stack.wait(|| stack.agents_in("e", 2)), "never agents");
+    std::fs::write(stack.path("exit"), "").unwrap();
+    assert!(
+        stack.wait(|| stack.racers("e").iter().all(|r| r["agent"] == false)),
+        "never back at their shells"
+    );
+    let sent = stack.run_in(&repo, &["send", &tab, "sleep 120", "--enter"]);
+    assert!(sent.status.success(), "{}", text(&sent.stderr));
+    assert!(
+        stack.wait(|| stack.racers("e").iter().any(|r| r["program"] == "sleep")),
+        "the tab never ran sleep"
+    );
+    let out = stack.run_in(&repo, &["race", "rm", "e", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "terminal {tab} runs sleep, not its agent or a shell"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(racers("e"), 2, "every tab is still open");
+    let _ = stack.run_in(&repo, &["send", &tab, "--key", "ctrl-c"]);
+}
+
+#[test]
+fn a_race_of_the_same_name_in_another_repository_is_left_alone() {
+    let stack = Stack::start();
+    let (a, b) = (stack.repo("a"), stack.repo("b"));
+    // The other repository's first, so its tabs are listed before this one's.
+    for repo in [&b, &a] {
+        let out = stack.run_in(
+            repo,
+            &[
+                "race",
+                "new",
+                "same",
+                "--agents",
+                "claude,claude",
+                "--wait",
+                "--timeout",
+                "60",
+                "--",
+                "DONE",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    }
+    let out = stack.run_in(&a, &["race", "rm", "same", "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let left = stack.racers("same");
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(
+        left.iter().all(|r| r["cwd"]
+            .as_str()
+            .is_some_and(|c| c.contains("/b-wt-race-same-"))),
+        "{left:?}"
+    );
+    let listed = text(&stack.run_in(&b, &["race", "ls", "same"]).stdout);
+    assert_eq!(listed.matches(" status=done ").count(), 2, "{listed}");
+}
+
+#[test]
+fn a_wait_ends_at_its_timeout_and_when_qoop_stops() {
+    let mut stack = Stack::start();
+    let repo = stack.repo("t");
+    let out = stack.run_in(
+        &repo,
+        &[
+            "race",
+            "new",
+            "slow",
+            "--agents",
+            "claude,claude",
+            "--wait",
+            "--timeout",
+            "3",
+            "--",
+            "WORK",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+
+    let waiting = stack
+        .command(&repo)
+        .args([
+            "race",
+            "new",
+            "cut",
+            "--agents",
+            "claude,claude",
+            "--wait",
+            "--timeout",
+            "60",
+            "--",
+            "WORK",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("race new");
+    assert!(stack.wait(|| stack.working_in("cut", 2)), "never working");
+    let mut daemon = stack.child.take().expect("a daemon");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    let out = waiting.wait_with_output().expect("race new");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("qoop stopped while waiting"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]
@@ -497,8 +672,7 @@ fn a_blocked_racer_points_at_qoop_wait_and_one_that_quit_reads_exited() {
         stack.wait(|| stack.agents_in("gone", 2)),
         "the racers never showed as agents"
     );
-    // The wait lists once a second: an agent it never saw as one reads as not started.
-    std::thread::sleep(Duration::from_secs(3));
+    std::thread::sleep(SEEN_BY_WAIT);
     std::fs::write(stack.path("exit"), "").unwrap();
     let out = waiting.wait_with_output().expect("race new");
     let said = text(&out.stdout);
@@ -585,6 +759,15 @@ fn nothing_is_made_when_a_check_before_the_start_fails() {
         );
     }
     assert!(!beside.join("p-wt-race-r2-claude").exists());
+
+    // A racer branch checked out in the main checkout has no worktree of its own.
+    let main = stack.repo("m");
+    git(&main, &["checkout", "-q", "-b", "race/m/claude"]);
+    let listed = text(&stack.run_in(&main, &["race", "ls", "m"]).stdout);
+    assert!(listed.ends_with(" tests=- worktree=-\n"), "{listed}");
+    let out = stack.run_in(&main, &["race", "rm", "m", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(main.join(".git").is_dir(), "the main checkout stays");
 }
 
 #[test]
@@ -652,4 +835,19 @@ fn a_worker_agents_terminal_cannot_start_a_race_and_the_persons_shell_can() {
     let said = std::fs::read_to_string(stack.path("shell.done.out")).unwrap();
     assert!(said.starts_with("race=mine "), "{said}");
     assert!(has_ref(&repo, "refs/qoop/race/mine"));
+    // Dropping racers is the same power: a worker cannot.
+    let out = stack
+        .command(&repo)
+        .env("QOOP_TERMINAL", &worker)
+        .env("QOOP_TOKEN", &token)
+        .args(["race", "rm", "mine", "--force"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("not from an agent's terminal"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(has_ref(&repo, "refs/heads/race/mine/claude"));
 }
