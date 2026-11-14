@@ -35,7 +35,7 @@ const STATES: &[&str] = &[
 const DEFAULT_UNTIL: &[&str] = &["idle", "done", "blocked", "failed"];
 
 /// The exit status of a wait that ran out of time, the same as `timeout(1)`.
-const TIMED_OUT: i32 = 124;
+pub(crate) const TIMED_OUT: i32 = 124;
 
 /// How long `new` waits for a fresh shell before typing its command.
 const SHELL_PATIENCE: Duration = Duration::from_secs(10);

@@ -38,6 +38,7 @@ mod places;
 mod qass;
 mod qass_brief;
 mod qass_page;
+mod race;
 mod remote;
 pub mod report;
 mod schedule;
@@ -226,6 +227,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("wake") => supervise::run_wake(&args),
         Some("close") => supervise::run_close(&args),
         Some("worktree") => worktree::run(&args),
+        Some("race") => race::run(&args),
         Some("space") => supervise::run_space(&args),
         Some("setup") => run_setup(&args),
         Some("hook-report") => run_hook_report(&args),
@@ -327,6 +329,10 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 inside; --stale only the clean empty, merged or old ones\n\
                   \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
+                  \x20 qoop race new <name> --agents A,B[,...] [--base REF] [--wait [--timeout SECS]] -- <prompt...>|-\n\
+                  \x20                 one prompt to 2 to 5 agents, each on a branch\n\
+                  \x20                 race/<name>/<agent> in a worktree and tab of its own\n\
+                  \x20 qoop race ls <name>  each racer's tab, status, files and lines\n\
                   \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\
                   \x20 qoop space goal <id|name> [text|-]  what you want from a space: print it, set it, an empty text clears it\n\
                   \x20 qoop space dir <id|name> [path]  the folder a space's new tabs and agents start in: print it or set it\n\

@@ -369,6 +369,11 @@ pub fn stat(cwd: &str, base: &str) -> Result<Stat, String> {
     let (untracked, more, answered) = untracked_of(&git)?;
     stat.cut |= more || !answered;
     for file in untracked {
+        // The files are read by the same deadline as git: past it, the rest is not counted.
+        if Instant::now() >= git.by {
+            stat.cut = true;
+            break;
+        }
         if let Some(lines) = lines_of(&git.root.join(&file.path)) {
             stat.files += 1;
             stat.added += lines;
