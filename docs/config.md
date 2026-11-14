@@ -56,6 +56,29 @@ cards = "full"
 | `board.view` | `"list"` | the board page's first view: `list` groups the items by what they want (Needs you, In progress, Not started, Done); `board` is the three lanes. `b` on the board, or its `[ list · board ]` switch, writes it |
 | `daemon.exit_when_asleep` | `true` | the daemon leaves ten seconds after nothing is awake and no interface is attached, so a machine with everything asleep runs nothing of qoop; the next `qoop` starts it again. `false` keeps it up |
 
+## Spaces
+
+`[spaces.<name>.worktree]` is read by `qoop worktree new` and `qoop worktree setup` for a
+worktree of the space called `<name>` (quoted when it is not a bare key:
+`[spaces."my app".worktree]`), from the file of the machine that makes the worktree. It is
+edited by hand; qoop has no writer for it and reads it at each run. A rename of a space does
+not move its table: rename the table too.
+
+```toml
+[spaces."my app".worktree]
+copy = [".env", "apps/web/.env.local", "**/.env*"]
+setup = "bun install"
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `spaces.<name>.worktree.copy` | none | git glob pathspecs of the main checkout's ignored files to copy (`git ls-files --others --ignored --exclude-standard`), never over a file already there; a symlink is recreated, not followed, and a relative one points from its new place. Empty, absolute, `:` or `!` first, or a `..` part: refused |
+| `spaces.<name>.worktree.setup` | none | run as `sh -c` in the new worktree, stdin `/dev/null`, output to stderr, no time limit, with `QOOP_WORKTREE`, `QOOP_WORKTREE_SOURCE`, `QOOP_WORKTREE_BRANCH` and `QOOP_WORKTREE_INDEX` |
+
+A problem in the matched space's `[spaces.<name>]` table (a wrong type, a refused pattern, an
+unknown key), or a file that is not TOML throughout, uses none of it: the setup fails, the
+worktree is kept and no terminal opens. A problem in another space's table is only said.
+
 ## These keys are per machine
 
 `sleep.idle_minutes`, `sleep.qass_idle_minutes` and `daemon.exit_when_asleep` belong to the machine

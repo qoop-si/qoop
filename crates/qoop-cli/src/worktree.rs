@@ -443,12 +443,372 @@ fn claim_index(common: &std::path::Path, id: &str) -> std::io::Result<u32> {
     Ok(n)
 }
 
+/// Whether a space's name has a `[spaces.<name>.worktree]` table, for breaking a tie.
+fn has_table(read: &qoop_tui::config::Read) -> impl Fn(&str) -> bool + '_ {
+    |name| read.spaces.get(name).is_some_and(|s| s.worktree)
+}
+
+/// Copy and run what the worktree's space says in `config.toml`, then print the `setup=`
+/// line: `done`, `none` (no space, or none of its settings), or `failed`. A failure says
+/// why on stderr and is the `why` returned.
+///
+/// The settings are the person's own file and never the repository's, so a cloned
+/// repository can never run anything. A table with any problem in it is used not at all,
+/// and so is a file that did not read whole wherever a space was found or a tie broken:
+/// a copy or a command without the part that was wrong is not what was written.
+fn set_up(
+    main: &std::path::Path,
+    tree: &std::path::Path,
+    branch: &str,
+    index: u32,
+    place: &Place,
+    read: &qoop_tui::config::Read,
+) -> Result<(), String> {
+    let done = match settings_of(main, place, read) {
+        Ok(None) => Ok(false),
+        Ok(Some(space)) => copy_ignored(main, tree, &space.copy).and_then(|()| {
+            space
+                .setup
+                .as_deref()
+                .map_or(Ok(()), |line| run_setup(line, main, tree, branch, index))
+                .map(|()| true)
+        }),
+        Err(why) => Err(why),
+    };
+    println!(
+        "setup={}",
+        match done {
+            Ok(true) => "done",
+            Ok(false) => "none",
+            Err(_) => "failed",
+        }
+    );
+    done.map(|_| ())
+}
+
+/// The settings that apply to a worktree of `place`, `None` when there are none.
+fn settings_of<'a>(
+    main: &std::path::Path,
+    place: &Place,
+    read: &'a qoop_tui::config::Read,
+) -> Result<Option<&'a qoop_tui::config::SpaceSetup>, String> {
+    let broken = || {
+        for problem in &read.problems {
+            eprintln!("setup: {} {}", read.path.display(), problem.short());
+        }
+        Err("config.toml has a problem".to_string())
+    };
+    let name = match place {
+        Place::Default { tied } if tied.len() > 1 && read.broken => return broken(),
+        // Said only to a person who set something up, so nobody else sees anything new.
+        Place::Default { .. } if read.spaces.is_empty() => return Ok(None),
+        Place::Default { tied } if tied.is_empty() => {
+            eprintln!(
+                "setup: no space has {main} as its folder; qoop space dir NAME {main} sets one",
+                main = main.display()
+            );
+            return Ok(None);
+        }
+        Place::Default { tied } => {
+            let named: Vec<String> = tied
+                .iter()
+                .map(|(id, name)| format!("{name} ({id})"))
+                .collect();
+            eprintln!(
+                "setup: spaces {} tie for {}: qoop space dir moves one, --space NAME picks one \
+                 for this run",
+                named.join(", "),
+                main.display()
+            );
+            return Ok(None);
+        }
+        Place::Space { .. } if read.broken => return broken(),
+        Place::Space { name, .. } => name,
+    };
+    let Some(space) = read.spaces.get(name) else {
+        return Ok(None);
+    };
+    if !space.problems.is_empty() {
+        for problem in &space.problems {
+            eprintln!("setup: {} {}", read.path.display(), problem.short());
+        }
+        return Err("config.toml has a problem".to_string());
+    }
+    Ok(space.worktree.then_some(space))
+}
+
+/// Copy the main checkout's ignored files that `patterns` match into `tree`, never over
+/// anything already there, and say what was copied.
+///
+/// Git does the matching (`ls-files --others --ignored`), so a tracked file is never
+/// copied and a symlinked folder is never followed. A file this will not copy (its folder
+/// outside the main checkout, a part of its place in the worktree that is a symlink or
+/// leads outside it) stops the copy: it fails closed and says which file and why.
+fn copy_ignored(
+    main: &std::path::Path,
+    tree: &std::path::Path,
+    patterns: &[String],
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(main)
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+        ])
+        .args(patterns.iter().map(|p| format!(":(glob){p}")))
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        let why = format!(
+            "git ls-files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        eprintln!("setup: {why}");
+        return Err(why);
+    }
+    let (main_real, tree_real) = (real(main), real(tree));
+    let mut copied = Vec::new();
+    let mut kept = 0;
+    for rel in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rel = std::path::Path::new(std::ffi::OsStr::from_bytes(rel));
+        match copy_one(&main_real, &tree_real, rel) {
+            Ok(true) => copied.push(rel.display().to_string()),
+            Ok(false) => kept += 1,
+            Err(why) => {
+                eprintln!("setup: not copying {}: {why}", rel.display());
+                return Err(format!("{} not copied", rel.display()));
+            }
+        }
+    }
+    if copied.is_empty() && kept == 0 {
+        return Ok(());
+    }
+    let files = |n: usize| if n == 1 { "file" } else { "files" };
+    let mut line = format!(
+        "setup: copied {} {} from {}",
+        copied.len(),
+        files(copied.len()),
+        main.display()
+    );
+    if !copied.is_empty() {
+        line.push_str(&format!(" ({})", copied.join(", ")));
+    }
+    if kept > 0 {
+        line.push_str(&format!(", kept {kept} already there"));
+    }
+    eprintln!("{line}");
+    Ok(())
+}
+
+/// Copy one file, `rel` under both, from the main checkout into the worktree. `false` when
+/// something is already at its place, which is kept. Both roots are resolved.
+fn copy_one(
+    main: &std::path::Path,
+    tree: &std::path::Path,
+    rel: &std::path::Path,
+) -> Result<bool, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let source = main.join(rel);
+    if !real(source.parent().unwrap_or(main)).starts_with(main) {
+        return Err(format!("its folder is outside {}", main.display()));
+    }
+    // The source itself is never followed: a symlink is copied as one.
+    let meta = std::fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+    // Every part of its place that already exists, before any folder is made: a symlink
+    // there would put the file, and the folders made for it, wherever it points.
+    let mut at = tree.to_path_buf();
+    for part in rel
+        .parent()
+        .into_iter()
+        .flat_map(std::path::Path::components)
+    {
+        at.push(part);
+        let shown = || at.strip_prefix(tree).unwrap_or(&at).display().to_string();
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("{} in the worktree is a symlink", shown()));
+            }
+            Ok(m) if !m.is_dir() => {
+                return Err(format!("{} in the worktree is not a folder", shown()));
+            }
+            Ok(_) if !real(&at).starts_with(tree) => {
+                return Err(format!("{} leads outside the worktree", shown()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let target = tree.join(rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let made = if meta.file_type().is_symlink() {
+        std::fs::read_link(&source)
+            .and_then(|link| std::os::unix::fs::symlink(link, &target))
+            .map(|()| true)
+    } else if meta.is_file() {
+        // `create_new` is the "never overwrite" in one step: anything there, a symlink
+        // included, is kept.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&source)
+            .and_then(|mut from| {
+                let to = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(meta.permissions().mode() & 0o777)
+                    .open(&target);
+                let mut to = match to {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                    other => other?,
+                };
+                let written = std::io::copy(&mut from, &mut to)
+                    .and_then(|_| to.set_permissions(meta.permissions()));
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&target);
+                }
+                written.map(|()| true)
+            })
+    } else {
+        return Err("it is not a file or a symlink".to_string());
+    };
+    match made {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        other => other.map_err(|e| e.to_string()),
+    }
+}
+
+/// Run a space's `setup` line with `sh -c` in the new worktree. Its output goes to stderr,
+/// so stdout keeps only the lines a script reads; it reads nothing, and has no time limit
+/// (Ctrl-C reaches it).
+fn run_setup(
+    line: &str,
+    main: &std::path::Path,
+    tree: &std::path::Path,
+    branch: &str,
+    index: u32,
+) -> Result<(), String> {
+    use std::os::fd::AsFd;
+
+    eprintln!("setup: running {line}");
+    let to_stderr = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| e.to_string())?;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(line)
+        .current_dir(tree)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(to_stderr))
+        .env("QOOP_WORKTREE", tree)
+        .env("QOOP_WORKTREE_SOURCE", main)
+        .env("QOOP_WORKTREE_BRANCH", branch)
+        .env("QOOP_WORKTREE_INDEX", index.to_string())
+        .status()
+        .map_err(|e| format!("sh: {e}"))?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("exit {code}")),
+        None => Err("ended by a signal".to_string()),
+    }
+}
+
+/// `qoop worktree setup`: set up a linked worktree that exists already (the caller's own
+/// when none is named) as `new` does: claim its index, copy what is missing, run `setup`.
+/// For a retry after a failure, or a worktree made by plain `git worktree add`. Opens no
+/// terminal, so it never makes a space either: `--space` with a new name is only the key.
+fn worktree_setup(args: &[String]) -> std::io::Result<()> {
+    let mut target = None;
+    let mut space = None;
+    let mut it = args.iter().skip(3);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--space" => {
+                space = Some(it.next().cloned().ok_or_else(|| {
+                    crate::usage(format!("missing value for --space; {WORKTREE_USAGE}"))
+                })?);
+            }
+            other if other.starts_with('-') || target.is_some() => {
+                return Err(crate::usage(format!(
+                    "unexpected {other}; {WORKTREE_USAGE}"
+                )));
+            }
+            other => target = Some(other.to_string()),
+        }
+    }
+    let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
+    if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
+        return Err(not_awake());
+    }
+    let list = worktrees()?;
+    let at = match &target {
+        Some(target) => find_worktree(&list, target)?,
+        None => {
+            let roots: Vec<PathBuf> = list.iter().map(|w| real(&w.path)).collect();
+            worktree_of(&roots, &std::env::current_dir()?)
+                .ok_or_else(|| std::io::Error::other("this is not inside a worktree"))?
+        }
+    };
+    if at == 0 {
+        return Err(std::io::Error::other(
+            "that is the main checkout: it is where the files come from",
+        ));
+    }
+    let tree = &list[at];
+    if !tree.path.exists() {
+        return Err(std::io::Error::other(format!(
+            "{} is already gone; `git worktree prune` forgets it",
+            tree.path.display()
+        )));
+    }
+    let main = &list[0].path;
+    let read = qoop_tui::config::read();
+    let place = place_of(&space_rows()?, main, space.as_deref(), has_table(&read))?;
+    let path = real(&tree.path);
+    let (common, id) = git_dirs(&path)?;
+    let index = claim_index(&common, &id)?;
+    let branch = tree.branch.clone().unwrap_or_default();
+    set_up(main, &path, &branch, index, &place, &read).map_err(|why| {
+        let again = tree
+            .branch
+            .clone()
+            .unwrap_or_else(|| path.display().to_string());
+        std::io::Error::other(format!(
+            "setup failed ({why}); fix it, then qoop worktree setup {again}"
+        ))
+    })
+}
+
+/// A worktree by its branch, else by its path from here.
+fn find_worktree(list: &[Worktree], target: &str) -> std::io::Result<usize> {
+    let wanted = real(&std::env::current_dir()?.join(target));
+    list.iter()
+        .position(|w| w.branch.as_deref() == Some(target))
+        .or_else(|| list.iter().position(|w| real(&w.path) == wanted))
+        .ok_or_else(|| std::io::Error::other(format!("no worktree for branch or path {target}")))
+}
+
 /// `qoop worktree`: a git worktree beside the repository, with a terminal in it.
 pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
     match args.get(2).map(String::as_str) {
         Some("new") => worktree_new(args),
         Some("ls") => worktree_ls(args),
         Some("rm") => worktree_rm(args),
+        Some("setup") => worktree_setup(args),
         Some("help" | "--help" | "-h") => {
             println!("{WORKTREE_USAGE}");
             Ok(())
@@ -458,16 +818,18 @@ pub(crate) fn run(args: &[String]) -> std::io::Result<()> {
 }
 
 const WORKTREE_USAGE: &str = "usage:\n\
-     \x20 qoop worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [-- CMD...]\n\
+     \x20 qoop worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [--no-setup] [-- CMD...]\n\
+     \x20 qoop worktree setup [<branch|path>] [--space ID|NAME]\n\
      \x20 qoop worktree ls [--json]\n\
      \x20 qoop worktree rm <branch|path> [--force]";
 
-/// Parsed `qoop worktree new` arguments. Its own two flags come out first and the rest
-/// is `qoop new`'s own parse, so the two cannot drift apart about `--space` or `--`.
+/// Parsed `qoop worktree new` arguments. Its own flags come out first and the rest is
+/// `qoop new`'s own parse, so the two cannot drift apart about `--space` or `--`.
 struct WorktreeNewOpts {
     branch: String,
     base: Option<String>,
     path: Option<PathBuf>,
+    no_setup: bool,
     new: NewOpts,
 }
 
@@ -481,6 +843,7 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
         .ok_or_else(|| WORKTREE_USAGE.to_string())?;
     let mut base = None;
     let mut path = None;
+    let mut no_setup = false;
     let mut rest = vec!["qoop".to_string(), "new".to_string()];
     let mut it = args.iter().skip(4);
     while let Some(arg) = it.next() {
@@ -498,6 +861,7 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
                 base = Some(from);
             }
             "--path" => path = Some(PathBuf::from(value()?)),
+            "--no-setup" => no_setup = true,
             "--" => {
                 rest.push(arg.clone());
                 rest.extend(it.cloned());
@@ -521,6 +885,7 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
         branch,
         base,
         path,
+        no_setup,
         new,
     })
 }
@@ -529,13 +894,15 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
 /// branch. A branch already checked out elsewhere is refused with where, because git's
 /// own refusal is about a path the person did not type. A branch that exists only on a
 /// remote is handed to git by name, so git makes the local branch tracking it rather than
-/// a fresh one from HEAD. The terminal opens in the worktree's space (see [`place_of`]),
-/// and the worktree claims its index.
+/// a fresh one from HEAD. The terminal opens in the worktree's space (see [`place_of`]);
+/// before it does, the worktree claims its index and that space's setup runs (see
+/// [`set_up`]). A setup that fails keeps the worktree and opens no terminal.
 fn worktree_new(args: &[String]) -> std::io::Result<()> {
     let WorktreeNewOpts {
         branch,
         base,
         path,
+        no_setup,
         mut new,
     } = parse_worktree_new_args(args).map_err(crate::usage)?;
     // Checked before git runs, so qoop not running does not leave a worktree behind.
@@ -579,7 +946,13 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
         )));
     }
     // Found before git runs and never made here, so a bad `--space` leaves no worktree.
-    let place = place_of(&space_rows()?, &main, new.space.as_deref(), |_| false)?;
+    let read = qoop_tui::config::read();
+    let place = place_of(
+        &space_rows()?,
+        &main,
+        new.space.as_deref(),
+        has_table(&read),
+    )?;
     let here = std::env::current_dir()?;
     let path = path.map_or_else(|| default_worktree_path(&main, &branch), |p| here.join(p));
     let mut add: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
@@ -594,7 +967,16 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     let path = real(&path);
     println!("worktree={} branch={branch}", path.display());
     let (common, id) = git_dirs(&path)?;
-    claim_index(&common, &id)?;
+    let index = claim_index(&common, &id)?;
+    if no_setup {
+        println!("setup=skipped");
+    } else {
+        set_up(&main, &path, &branch, index, &place, &read).map_err(|why| {
+            std::io::Error::other(format!(
+                "setup failed ({why}); fix it, then qoop worktree setup {branch}"
+            ))
+        })?;
+    }
     new.space = match place {
         Place::Space { open, .. } => Some(open),
         Place::Default { .. } => None,
@@ -744,16 +1126,7 @@ fn worktree_rm(args: &[String]) -> std::io::Result<()> {
         }
     }
     let list = worktrees()?;
-    let wanted = real(&std::env::current_dir()?.join(target));
-    let Some(at) = list
-        .iter()
-        .position(|w| w.branch.as_deref() == Some(target.as_str()))
-        .or_else(|| list.iter().position(|w| real(&w.path) == wanted))
-    else {
-        return Err(std::io::Error::other(format!(
-            "no worktree for branch or path {target}"
-        )));
-    };
+    let at = find_worktree(&list, target)?;
     if at == 0 {
         return Err(std::io::Error::other(
             "that is the main worktree; only a linked one is removed",

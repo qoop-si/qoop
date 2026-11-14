@@ -35,6 +35,34 @@ A mistake never stops qoop: a value it cannot use keeps that key's default, and 
 says which line and why (`line 3: sound is true or false`). A line that is not TOML at all
 is left out and the rest of the file is still read.
 
+## Spaces
+
+`qoop worktree new` sets up a new worktree with what its space says: the files to copy from
+the main checkout and a command to run. You write the table by hand; qoop only reads it, at
+each `worktree new`, so an edit needs no restart. Nothing in the repository itself is ever
+run, so a cloned repository cannot run anything.
+
+```toml
+[spaces."my app".worktree]
+copy = [".env", "apps/web/.env.local"]
+setup = "bun install && cp -n .env.example .env"
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `spaces.<name>.worktree.copy` | none | files from the main checkout to copy into the new worktree, as git glob patterns: `*` stays inside one folder, `**/` crosses folders, a folder name takes what is under it. Only files git ignores are copied, so a tracked file never is, and nothing already in the worktree is overwritten. A symlink is copied as a symlink; a relative one points from its new place, which differs when the worktree sits elsewhere (`--path`). A pattern that is empty, absolute, starts with `:` or `!`, or holds `..` is refused |
+| `spaces.<name>.worktree.setup` | none | a command line run with `sh -c` in the new worktree after the copy, with `QOOP_WORKTREE` (the worktree), `QOOP_WORKTREE_SOURCE` (the main checkout), `QOOP_WORKTREE_BRANCH` and `QOOP_WORKTREE_INDEX` (0 is the main checkout, each linked worktree keeps the lowest free number from 1, for ports: `PORT=$((3000 + QOOP_WORKTREE_INDEX))`). Its output goes to stderr |
+
+The space is `--space` when given, else the one whose folder is the repository
+(`qoop space dir NAME <repo>` sets it), else the one whose folder holds it. The key is the
+space's name, quoted when it holds a space or another sign: when you rename a space, rename
+its table too.
+
+When the copy refuses a file (one that would land under a symlink in the worktree), the
+command fails, or the space's table has a mistake (a wrong type, a refused pattern, an
+unknown key), the worktree is kept, no terminal opens, and `worktree new` exits 1. Fix it,
+then `qoop worktree setup <branch>` runs the setup again; `--no-setup` skips it.
+
 ## In the environment
 
 | Variable | What it does |
