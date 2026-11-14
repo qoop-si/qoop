@@ -415,12 +415,12 @@ struct Seen {
 /// was ever an agent, whether its turn end was seen, since when it sat ready without being one,
 /// and since when it is blocked, carry over.
 fn judge(row: Option<&AgentRow>, seen: &mut Seen, now: Instant) -> Option<End> {
-    let Some(row) = row else {
-        return Some(End::Closed);
-    };
-    // Neither a slept tab nor a new generation keeps a stop: one seen before still counts.
+    // Neither a closed or slept tab nor a new generation keeps a stop: one seen before counts.
     let stopped = seen.stopped;
     let finished_or = |end| Some(if stopped { End::Finished } else { end });
+    let Some(row) = row else {
+        return finished_or(End::Closed);
+    };
     if row.state == "sleeping" {
         return finished_or(End::Sleeping);
     }
@@ -431,6 +431,10 @@ fn judge(row: Option<&AgentRow>, seen: &mut Seen, now: Instant) -> Option<End> {
         return finished_or(End::Exited);
     }
     let status = row.status.as_deref().unwrap_or(&row.state);
+    // Back at work since its turn end: that one no longer counts.
+    if status == "working" && row.stop.is_none() {
+        seen.stopped = false;
+    }
     if status == "failed" {
         return Some(End::Failed);
     }
@@ -568,19 +572,46 @@ fn has_ref(main: &Path, race_ref: &str) -> bool {
     worktree::git_in(main, &["rev-parse", "--verify", "--quiet", race_ref]).is_ok()
 }
 
-/// Whether a row's folder is inside `root`, both resolved (a folder that is gone compares as
-/// written).
+/// A path resolved as far as it exists: a folder that is gone keeps its resolved parent, so
+/// `/var/x` and `/private/var/x` are one place even after `x` was deleted.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(part)) => {
+                rest.push(part);
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether a row's folder is inside `root`, both [`resolved`].
 fn inside(row: &AgentRow, root: &Path) -> bool {
     row.cwd
         .as_deref()
-        .is_some_and(|c| worktree::real(Path::new(c)).starts_with(root))
+        .is_some_and(|c| resolved(Path::new(c)).starts_with(resolved(root)))
 }
 
 /// A racer's tab: the row named after its branch whose folder is inside its worktree (a race of
 /// the same name in another repository names its tabs alike), else an agent inside it. A shell
-/// that only stands there is never taken for the racer.
-fn tab_of<'a>(rows: &'a [AgentRow], branch: &str, tree: Option<&Path>) -> Option<&'a AgentRow> {
-    let root = worktree::real(tree?);
+/// that only stands there is never taken for the racer. With no worktree record left (pruned),
+/// its folder is where `race new` put it.
+fn tab_of<'a>(
+    rows: &'a [AgentRow],
+    main: &Path,
+    branch: &str,
+    tree: Option<&Path>,
+) -> Option<&'a AgentRow> {
+    let root = tree.map_or_else(
+        || worktree::default_worktree_path(main, branch),
+        Path::to_path_buf,
+    );
     rows.iter()
         .find(|r| r.name.as_deref() == Some(branch) && inside(r, &root))
         .or_else(|| rows.iter().find(|r| r.agent && inside(r, &root)))
@@ -614,7 +645,7 @@ fn ls(args: &[String]) -> std::io::Result<()> {
     let rows = worktree::session_rows()?;
     for racer in &found {
         let path = racer.on_disk();
-        let tab = tab_of(&rows, &racer.branch, racer.recorded());
+        let tab = tab_of(&rows, main, &racer.branch, racer.recorded());
         let lines = path
             .filter(|_| has_ref)
             .and_then(|p| qoop_runtime::changes::stat(&p.display().to_string(), &race_ref).ok())
@@ -706,7 +737,7 @@ fn rm(args: &[String]) -> std::io::Result<()> {
         .collect();
     let check = |racer: &Found| -> std::io::Result<Option<(Option<u32>, Option<u64>)>> {
         let rows = worktree::session_rows()?;
-        let tab = tab_of(&rows, &racer.branch, racer.recorded());
+        let tab = tab_of(&rows, &main, &racer.branch, racer.recorded());
         let why = refusals(&main, racer, tab, &rows, &race_ref, has_ref, force);
         for reason in &why {
             eprintln!("race rm: {}: {reason}", racer.label);
@@ -736,7 +767,7 @@ fn rm(args: &[String]) -> std::io::Result<()> {
         // Looked at again: a racer that went back to work since the first pass is not dropped.
         let Some((terminal, generation)) = check(racer)? else {
             return Err(std::io::Error::other(format!(
-                "stopped at {}; the racers above were removed",
+                "stopped at {}; the `removed` lines above, if any, were done",
                 racer.label
             )));
         };
@@ -780,7 +811,10 @@ fn refusals(
     if let Some(tab) = tab.filter(|t| t.state != "sleeping") {
         let t = tab.terminal;
         let status = status_of(Some(tab));
-        if matches!(status, "working" | "starting" | "background" | "unknown") {
+        // A shell reads `unknown` too; what it runs is judged below.
+        if matches!(status, "working" | "starting" | "background")
+            || (tab.agent && status == "unknown")
+        {
             why.push(format!(
                 "terminal {t} is {status}: wait for it (`qoop wait {t}`) or close it first; \
                  --force does not override a running agent"
@@ -1000,17 +1034,37 @@ mod tests {
     }
 
     #[test]
-    fn a_racer_that_finished_still_reads_finished_once_it_sleeps_or_quits() {
+    fn a_racer_that_finished_still_reads_finished_once_it_sleeps_quits_or_closes() {
         let t0 = Instant::now();
+        let done = row(1, true, "done", "ready", true);
+        let sleeping = row(1, false, "sleeping", "ready", false);
         for after in [
-            row(1, false, "sleeping", "ready", false),
-            row(1, false, "idle", "ready", false),
+            Some(&sleeping),
+            Some(&row(1, false, "idle", "ready", false)),
+            None,
         ] {
             let mut seen = Seen::default();
-            let done = row(1, true, "done", "ready", true);
             assert_eq!(judge(Some(&done), &mut seen, t0), Some(End::Finished));
-            assert_eq!(judge(Some(&after), &mut seen, t0), Some(End::Finished));
+            assert_eq!(judge(after, &mut seen, t0), Some(End::Finished));
         }
+        // Back at work after that turn end: it no longer counts.
+        let mut seen = Seen::default();
+        assert_eq!(judge(Some(&done), &mut seen, t0), Some(End::Finished));
+        let working = row(1, true, "working", "ready", false);
+        assert_eq!(judge(Some(&working), &mut seen, t0), None);
+        assert_eq!(judge(Some(&sleeping), &mut seen, t0), Some(End::Sleeping));
+    }
+
+    #[test]
+    fn a_folder_that_is_gone_resolves_through_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        assert_eq!(
+            resolved(&dir.path().join("link/gone/deeper")),
+            std::fs::canonicalize(&real).unwrap().join("gone/deeper")
+        );
     }
 
     #[test]

@@ -527,7 +527,43 @@ fn a_racer_still_working_or_with_another_tab_inside_is_never_dropped() {
         text(&out.stderr)
     );
     assert_eq!(racers("e"), 2, "every tab is still open");
+    // Once it ended, both shells are the racers' own and go.
     let _ = stack.run_in(&repo, &["send", &tab, "--key", "ctrl-c"]);
+    assert!(
+        stack.wait(|| stack.racers("e").iter().all(|r| r["program"] != "sleep")),
+        "sleep never ended"
+    );
+    let out = stack.run_in(&repo, &["race", "rm", "e", "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(racers("e"), 0);
+
+    // A racer whose folder was deleted and pruned: its tab is still found where it was made.
+    let out = stack.run_in(
+        &repo,
+        &[
+            "race",
+            "new",
+            "q",
+            "--agents",
+            "claude,claude",
+            "--wait",
+            "--timeout",
+            "60",
+            "--",
+            "DONE",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    std::fs::remove_dir_all(stack.path("w").join("h-wt-race-q-claude")).unwrap();
+    git(&repo, &["worktree", "prune"]);
+    let out = stack.run_in(&repo, &["race", "rm", "q", "--force"]);
+    let said = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{said}{}", text(&out.stderr));
+    assert!(
+        said.contains("removed agent=claude worktree=- branch=race/q/claude"),
+        "{said}"
+    );
+    assert_eq!(racers("q"), 0, "the pruned racer's tab is closed too");
 }
 
 #[test]
