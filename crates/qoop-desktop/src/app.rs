@@ -79,6 +79,9 @@ pub struct Desk {
     cells: Cells,
     /// The agents New work offers: (name, command).
     pub offers: Vec<(String, String)>,
+    /// New work asked for: the create's id, the line its terminal gets, and the space. Kept
+    /// here, not on the sheet, so a sheet closed while it starts still gets its line.
+    pub pending: Option<(String, String, Option<i64>)>,
 }
 
 pub fn unix_now() -> i64 {
@@ -130,6 +133,7 @@ impl Desk {
             my_pet: qoop_runtime::avatar::load(),
             cells: cells(cx, 12.),
             offers: state::worktree_agents(&offered),
+            pending: None,
         }
     }
 
@@ -146,6 +150,8 @@ impl Desk {
         match down {
             Down::Connected => {
                 self.connected = true;
+                // A New work asked for before the connection dropped: asked again, under its id.
+                self.ask_pending();
                 // A new connection, maybe a new daemon: say the size again.
                 if let Some(term) = &self.term {
                     term.sent.set((0, 0));
@@ -232,6 +238,11 @@ impl Desk {
             .iter()
             .find(|r| r.workspace == space.id && r.agent)
             .map(|r| r.terminal)
+    }
+
+    /// The prefix as `config.toml` names it, for the key hints: `ctrl-b`.
+    pub fn prefix_name(&self) -> String {
+        qoop_tui::keys::name_of(self.prefix)
     }
 
     fn is_prefix(&self, k: &gpui::Keystroke) -> bool {
@@ -332,7 +343,7 @@ impl Desk {
     /// every half minute.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let now = unix_now();
-        let fresh = self.model.agents().any(|r| {
+        let fresh = self.model.live().any(|r| {
             r.last_active_at_unix
                 .is_some_and(|at| now.saturating_sub(at) < 60)
         });
@@ -491,14 +502,14 @@ impl Desk {
                             .text_color(t.space(slot))
                             .child(g.space.name.clone()),
                     )
-                    .children(g.rows.into_iter().map(|row| {
-                        let kind = Kind::of(row);
-                        let terminal = row.terminal;
+                    .children(g.rows.into_iter().map(|entry| {
+                        let kind = entry.kind();
+                        let terminal = entry.terminal();
                         let on = shown == Some(terminal);
                         ui::control(
                             ("tree-row", terminal as u64),
                             Role::Link,
-                            self.model.row_label(row, self.now),
+                            self.model.row_label(entry, self.now),
                             t,
                         )
                         .flex()
@@ -518,9 +529,9 @@ impl Desk {
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
-                                .child(state::title_of(row)),
+                                .child(entry.title()),
                         )
-                        .when_some(state::age_of(row, self.now), |d, age| {
+                        .when_some(entry.age(self.now), |d, age| {
                             d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(age))
                         })
                         .on_click(cx.listener(
@@ -753,7 +764,7 @@ impl Desk {
                         ui::pill("new-work", "New work", t)
                             .child(ui::icon(Icon::Plus, 15., c(t.t1)))
                             .child("New work")
-                            .child(ui::kbd("ctrl-a c", t))
+                            .child(ui::kbd(&format!("{} c", self.prefix_name()), t))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.new_work(None, window, cx)),
                             ),
@@ -787,7 +798,7 @@ impl Desk {
                                     .child(badge.to_string()),
                             )
                         })
-                        .child(ui::kbd("ctrl-a i", t))
+                        .child(ui::kbd(&format!("{} i", self.prefix_name()), t))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.inbox = !this.inbox;
                             cx.notify();
@@ -817,7 +828,7 @@ impl Desk {
                 self.model.status_line().filter(|_| self.connected),
                 |d, line| d.child(div().text_color(c(t.needs_text)).child(line)),
             )
-            .child("ctrl-a: [c new work] [i inbox]")
+            .child(format!("{}: [c new work] [i inbox]", self.prefix_name()))
     }
 
     /// The right panel: what waits on the person, newest state first. Answering comes later;
@@ -825,7 +836,7 @@ impl Desk {
     fn inbox_panel(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut rows: Vec<_> = self
             .model
-            .agents()
+            .live()
             .filter(|r| {
                 matches!(
                     Kind::of(r),
@@ -907,7 +918,7 @@ impl Desk {
                 ui::control(
                     ("inbox-row", terminal as u64),
                     Role::Link,
-                    self.model.row_label(row, self.now),
+                    self.model.row_label(state::Entry::Live(row), self.now),
                     t,
                 )
                 .debug_selector(move || format!("inbox-row-{terminal}"))

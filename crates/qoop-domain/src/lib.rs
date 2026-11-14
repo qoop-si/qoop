@@ -16,6 +16,7 @@ pub mod launch;
 pub mod observation;
 pub mod program;
 pub mod report;
+pub mod shell;
 pub mod sizing;
 pub mod status;
 pub mod terminal;

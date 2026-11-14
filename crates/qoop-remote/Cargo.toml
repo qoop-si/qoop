@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+qoop-domain = { path = "../qoop-domain" }
 qoop-proto = { path = "../qoop-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
