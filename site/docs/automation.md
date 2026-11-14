@@ -52,13 +52,18 @@ qoop close 7                                end a terminal and what it started
 
 ```
 qoop worktree new feat/login -- claude      a git worktree beside the repo, an agent in it
+qoop worktree setup feat/login              run its space's setup again
 qoop worktree ls                            every worktree and the terminals inside it
 qoop worktree rm feat/login                 remove it, keeping the branch
 ```
 
 `worktree new` puts the worktree at `<parent>/<repo>-wt-feat-login` and opens its terminal in
 the space whose folder is the repository (`qoop space dir NAME <repo>` sets one), else in the
-space whose folder holds it, else in the default space; `--space` picks one. `worktree rm` refuses
+space whose folder holds it, else in the default space; `--space` picks one. Before the
+terminal opens, that space's `[spaces.<name>.worktree]` in `config.toml` copies the ignored
+files it lists and runs its `setup` (see [Configuration](#configuration)); stdout says
+`setup=done`, `none`, `skipped` (`--no-setup`) or `failed`. A failed setup keeps the worktree,
+opens no terminal and exits 1; `worktree setup <branch>` runs it again. `worktree rm` refuses
 while any process has its directory inside (named by pid, and by qoop terminal where it
 knows), and refuses a tree with uncommitted changes unless `--force`.
 

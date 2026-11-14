@@ -27,9 +27,12 @@ impl Daemon {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
+        // A `config.toml` per test: the sandbox's home is shared by every test in the file.
+        std::fs::create_dir_all(dir.path().join("c/qoop")).expect("config dir");
         let child = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .arg("daemon")
             .env("QOOP_RUNTIME_DIR", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("c"))
             .env("SHELL", "/bin/sh")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -50,6 +53,7 @@ impl Daemon {
             .args(args)
             .current_dir(cwd)
             .env("QOOP_RUNTIME_DIR", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.dir.path().join("c"))
             .env_remove("QOOP_TERMINAL")
             .env_remove("QORO_TERMINAL")
             .env_remove("QOOP_TOKEN")
@@ -58,6 +62,11 @@ impl Daemon {
             .env_remove("QORO_SESSION")
             .output()
             .expect("run qoop")
+    }
+
+    /// Write this test's `config.toml`.
+    fn config(&self, text: &str) {
+        std::fs::write(self.dir.path().join("c/qoop/config.toml"), text).expect("config");
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -254,7 +263,11 @@ fn verbs_refuse_without_a_daemon_and_start_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
     // `agents` is not here: with nothing awake it answers an empty list.
-    for args in [&["new", "--", "true"][..], &["read", "1"]] {
+    for args in [
+        &["new", "--", "true"][..],
+        &["read", "1"],
+        &["worktree", "setup", "feat/x"],
+    ] {
         let out = qoop_testkit::sandboxed(env!("CARGO_BIN_EXE_qoop"))
             .args(args)
             .env("QOOP_RUNTIME_DIR", dir.path())
@@ -798,4 +811,370 @@ fn a_worktree_made_again_keeps_its_index_claim() {
     git(&repo, &["branch", "-D", "feat/one"]);
     new_worktree(&daemon, &repo, "feat/one");
     assert_eq!(holders(), before, "the same number, one claim");
+}
+
+/// The value of a `key=` line on stdout.
+fn said(out: &Output, key: &str) -> Option<String> {
+    text(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .map(str::to_string)
+}
+
+/// A setup line that writes its four variables and where it ran to `<file>-<index>`,
+/// then says a marker that carries the index.
+fn recording_setup(file: &Path) -> String {
+    format!(
+        "printf '%s\\n' \"$QOOP_WORKTREE\" \"$QOOP_WORKTREE_SOURCE\" \"$QOOP_WORKTREE_BRANCH\" \
+         \"$QOOP_WORKTREE_INDEX\" \"$PWD\" > '{}'-\"$QOOP_WORKTREE_INDEX\"; echo SETUP_SAID_$QOOP_WORKTREE_INDEX",
+        file.display()
+    )
+}
+
+/// A TOML literal string, which needs no escapes.
+fn literal(text: &str) -> String {
+    format!("'''{text}'''")
+}
+
+#[test]
+fn a_space_setup_copies_only_listed_ignored_files_then_runs_with_its_variables() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let repo = repo(&root_path);
+    std::fs::write(repo.join(".gitignore"), ".env*\n").unwrap();
+    std::fs::write(repo.join(".env.example"), "tracked\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["add", "-f", ".env.example"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(repo.join(".env.example"), "changed, not committed\n").unwrap();
+    std::fs::write(repo.join(".env"), "SECRET=1\n").unwrap();
+    std::fs::set_permissions(repo.join(".env"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(".env", repo.join(".env.link")).unwrap();
+    let vars = root_path.join("vars");
+    daemon.config(&format!(
+        "[spaces.\"my app\".worktree]\ncopy = [\".env*\"]\nsetup = {}\n\n[spaces.bare.worktree]\nsetup = \"true\"\n",
+        literal(&recording_setup(&vars))
+    ));
+
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/a", "--space", "my app"]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+    let out = text(&made.stdout);
+    let tree = root_path.join("my repo-wt-feat-a");
+    assert_eq!(
+        out.lines()
+            .map(|l| l.split('=').next().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        ["worktree", "setup", "terminal"],
+        "{out}"
+    );
+    assert_eq!(said(&made, "setup").as_deref(), Some("done"));
+    assert!(!out.contains("SETUP_SAID"), "setup output on stdout: {out}");
+    let err = text(&made.stderr);
+    assert!(err.contains("SETUP_SAID_1"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "setup: copied 2 files from {} (.env, .env.link)",
+            repo.display()
+        )),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{}-1", vars.display())).unwrap(),
+        format!(
+            "{tree}\n{repo}\nfeat/a\n1\n{tree}\n",
+            tree = tree.display(),
+            repo = repo.display()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+    let mode = std::fs::metadata(tree.join(".env"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_link(tree.join(".env.link")).unwrap(),
+        PathBuf::from(".env"),
+        "a symlink stays one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join(".env.example")).unwrap(),
+        "tracked\n",
+        "a tracked file is never copied"
+    );
+
+    // Again on the same worktree: what is there is kept, the index is the same.
+    std::fs::write(tree.join(".env"), "mine\n").unwrap();
+    let again = daemon.run_in(&tree, &["worktree", "setup", "--space", "my app"]);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    assert_eq!(said(&again, "setup").as_deref(), Some("done"));
+    assert!(said(&again, "terminal").is_none());
+    assert!(
+        text(&again.stderr).contains("copied 0 files from")
+            && text(&again.stderr).contains("kept 2 already there"),
+        "{}",
+        text(&again.stderr)
+    );
+    assert!(text(&again.stderr).contains("SETUP_SAID_1"));
+    assert_eq!(
+        std::fs::read_to_string(tree.join(".env")).unwrap(),
+        "mine\n"
+    );
+
+    // A table with no `copy` copies nothing, even with a `.env` there.
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/b", "--space", "bare"]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+    assert_eq!(said(&made, "setup").as_deref(), Some("done"));
+    assert!(!root_path.join("my repo-wt-feat-b/.env").exists());
+
+    // `worktree setup` never makes a space, and on the main checkout is refused.
+    let none = daemon.run_in(&tree, &["worktree", "setup", "--space", "brand new"]);
+    assert!(none.status.success(), "{}", text(&none.stderr));
+    assert_eq!(said(&none, "setup").as_deref(), Some("none"));
+    assert!(!text(&daemon.run(&["ls"]).stdout).contains("brand new"));
+    let main = daemon.run_in(&repo, &["worktree", "setup"]);
+    assert_eq!(main.status.code(), Some(1));
+    assert!(text(&main.stderr).contains("where the files come from"));
+}
+
+#[test]
+fn a_failed_setup_keeps_the_worktree_opens_no_terminal_and_can_be_run_again() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    daemon.config("[spaces.fixme.worktree]\nsetup = \"echo FAILING; exit 3\"\n");
+    let failed = daemon.run_in(&repo, &["worktree", "new", "feat/f", "--space", "fixme"]);
+    assert_eq!(failed.status.code(), Some(1), "{}", text(&failed.stderr));
+    assert_eq!(said(&failed, "setup").as_deref(), Some("failed"));
+    assert!(said(&failed, "terminal").is_none());
+    assert!(
+        text(&failed.stderr)
+            .ends_with("qoop: setup failed (exit 3); fix it, then qoop worktree setup feat/f\n"),
+        "{}",
+        text(&failed.stderr)
+    );
+    assert!(root.path().join("my repo-wt-feat-f").is_dir());
+    assert!(
+        !text(&daemon.run(&["ls"]).stdout).contains("fixme"),
+        "a failed setup made the space"
+    );
+
+    daemon.config("[spaces.fixme.worktree]\nsetup = \"true\"\n");
+    let fixed = daemon.run_in(&repo, &["worktree", "setup", "feat/f", "--space", "fixme"]);
+    assert!(fixed.status.success(), "{}", text(&fixed.stderr));
+    assert_eq!(said(&fixed, "setup").as_deref(), Some("done"));
+
+    let skipped = daemon.run_in(
+        &repo,
+        &[
+            "worktree",
+            "new",
+            "feat/s",
+            "--space",
+            "fixme",
+            "--no-setup",
+        ],
+    );
+    assert!(skipped.status.success(), "{}", text(&skipped.stderr));
+    assert_eq!(said(&skipped, "setup").as_deref(), Some("skipped"));
+    assert!(said(&skipped, "terminal").is_some());
+
+    // A problem in the space's own table: nothing of it is copied or run.
+    let ran = root.path().join("RAN");
+    daemon.config(&format!(
+        "[spaces.fixme.worktree]\ncopy = [\"../x\"]\nsetup = \"touch '{}'\"\n",
+        ran.display()
+    ));
+    let bad = daemon.run_in(&repo, &["worktree", "new", "feat/bad", "--space", "fixme"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(said(&bad, "setup").as_deref(), Some("failed"));
+    let err = text(&bad.stderr);
+    assert!(err.contains("../x has a .. part"), "{err}");
+    assert!(
+        err.contains("setup failed (config.toml has a problem)"),
+        "{err}"
+    );
+    assert!(!ran.exists());
+    assert!(root.path().join("my repo-wt-feat-bad").is_dir());
+
+    // A file that is not TOML fails a found space, and is nothing to a repository with none.
+    daemon.config(&format!(
+        "[spaces.fixme.worktree]\nsetup = \"touch '{}'\"\nthis is not toml\n",
+        ran.display()
+    ));
+    let broken = daemon.run_in(
+        &repo,
+        &["worktree", "new", "feat/broken", "--space", "fixme"],
+    );
+    assert_eq!(broken.status.code(), Some(1));
+    assert!(text(&broken.stderr).contains("config.toml has a problem"));
+    assert!(!ran.exists());
+    let alone = daemon.run_in(&repo, &["worktree", "new", "feat/alone"]);
+    assert!(alone.status.success(), "{}", text(&alone.stderr));
+    assert_eq!(said(&alone, "setup").as_deref(), Some("none"));
+    assert!(!ran.exists());
+}
+
+#[test]
+fn a_file_under_a_tracked_symlinked_folder_is_refused_and_nothing_is_made_outside() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    std::fs::create_dir(repo.join("apps")).unwrap();
+    std::fs::write(repo.join("apps/keep"), "x").unwrap();
+    std::fs::write(repo.join(".gitignore"), ".env\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "apps"]);
+    git(&repo, &["checkout", "-q", "-b", "feat/link"]);
+    git(&repo, &["rm", "-q", "-r", "apps"]);
+    std::os::unix::fs::symlink(outside.path(), repo.join("apps")).unwrap();
+    git(&repo, &["add", "apps"]);
+    git(&repo, &["commit", "-q", "-m", "apps elsewhere"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("apps/.env"), "SECRET=1\n").unwrap();
+    let ran = root.path().join("RAN");
+    daemon.config(&format!(
+        "[spaces.app.worktree]\ncopy = [\"apps/.env\"]\nsetup = \"touch '{}'\"\n",
+        ran.display()
+    ));
+
+    let refused = daemon.run_in(&repo, &["worktree", "new", "feat/link", "--space", "app"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    assert_eq!(said(&refused, "setup").as_deref(), Some("failed"));
+    assert!(said(&refused, "terminal").is_none());
+    let err = text(&refused.stderr);
+    assert!(
+        err.contains("setup: not copying apps/.env: apps in the worktree is a symlink"),
+        "{err}"
+    );
+    assert!(err.contains("setup failed (apps/.env not copied)"), "{err}");
+    assert!(!ran.exists(), "setup ran after a refused copy");
+    assert!(!outside.path().join(".env").exists());
+}
+
+/// Without `--space`, the repository's space is found, and of two that tie the one with a
+/// table runs; spaces of one name share their table and the tab goes to the lower id.
+#[test]
+fn the_repositorys_space_runs_its_setup_and_a_tie_goes_to_the_table() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+
+    // No space, no `[spaces]`: nothing new is said.
+    let plain = daemon.run_in(&repo, &["worktree", "new", "feat/plain"]);
+    assert!(plain.status.success(), "{}", text(&plain.stderr));
+    assert_eq!(said(&plain, "setup").as_deref(), Some("none"));
+    assert!(
+        !text(&plain.stderr).contains("setup:"),
+        "{}",
+        text(&plain.stderr)
+    );
+
+    let vars = root.path().join("vars");
+    daemon.config(&format!(
+        "[spaces.web.worktree]\nsetup = {}\n",
+        literal(&recording_setup(&vars))
+    ));
+    let hinted = daemon.run_in(&repo, &["worktree", "new", "feat/hinted"]);
+    assert_eq!(said(&hinted, "setup").as_deref(), Some("none"));
+    assert!(
+        text(&hinted.stderr).contains("as its folder; qoop space dir NAME"),
+        "{}",
+        text(&hinted.stderr)
+    );
+
+    let api = make_space(&daemon, "api");
+    let web = make_space(&daemon, "web");
+    space_dir(&daemon, &api, &repo);
+    space_dir(&daemon, &web, &repo);
+    let (_, terminal) = new_worktree(&daemon, &repo, "feat/tie");
+    assert_eq!(workspace_of(&daemon, &terminal), web);
+    assert!(
+        std::fs::read_to_string(format!("{}-3", vars.display()))
+            .unwrap()
+            .contains("feat/tie")
+    );
+
+    // Both called alike: their one table runs, the tab goes to the lower id.
+    let twin = make_space(&daemon, "web");
+    space_dir(&daemon, &twin, &repo);
+    space_dir(&daemon, &api, root.path());
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/twins"]);
+    assert!(made.status.success(), "{}", text(&made.stderr));
+    assert_eq!(said(&made, "setup").as_deref(), Some("done"));
+    let terminal = said(&made, "terminal").expect("a terminal");
+    assert_eq!(workspace_of(&daemon, &terminal), web);
+}
+
+/// Parallel `new`s take distinct indexes, and a worktree made again on a reused git id
+/// keeps the number `new` gave it when `worktree setup` runs.
+#[test]
+fn parallel_worktrees_take_distinct_indexes_and_keep_them() {
+    let daemon = Daemon::start();
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let vars = root.path().join("vars");
+    daemon.config(&format!(
+        "[spaces.app.worktree]\nsetup = {}\n",
+        literal(&recording_setup(&vars))
+    ));
+    let index_of = |out: &Output| {
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stderr)
+            .rsplit("SETUP_SAID_")
+            .next()
+            .and_then(|s| s.lines().next())
+            .expect("an index")
+            .to_string()
+    };
+    let branches = ["feat/p0", "feat/p1", "feat/p2", "feat/p3"];
+    let indexes: std::collections::BTreeMap<&str, String> = std::thread::scope(|scope| {
+        let runs: Vec<_> = branches
+            .iter()
+            .map(|b| {
+                let (daemon, repo) = (&daemon, &repo);
+                scope.spawn(move || {
+                    (
+                        *b,
+                        daemon.run_in(repo, &["worktree", "new", b, "--space", "app"]),
+                    )
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|r| {
+                let (branch, out) = r.join().unwrap();
+                (branch, index_of(&out))
+            })
+            .collect()
+    });
+    let distinct: std::collections::BTreeSet<&String> = indexes.values().collect();
+    assert_eq!(distinct.len(), 4, "{indexes:?}");
+
+    let listed = text(&daemon.run(&["agents"]).stdout);
+    let terminal = listed
+        .lines()
+        .find(|l| l.contains("name=feat/p1"))
+        .and_then(|l| l.split(' ').next()?.strip_prefix("term="))
+        .unwrap_or_else(|| panic!("no feat/p1 tab: {listed}"));
+    daemon.close(terminal);
+    let removed = daemon.run_in(&repo, &["worktree", "rm", "feat/p1"]);
+    assert!(removed.status.success(), "{}", text(&removed.stderr));
+    git(&repo, &["branch", "-D", "feat/p1"]);
+    let made = daemon.run_in(&repo, &["worktree", "new", "feat/p1", "--space", "app"]);
+    let set_up = daemon.run_in(&repo, &["worktree", "setup", "feat/p1", "--space", "app"]);
+    assert_eq!(index_of(&made), indexes["feat/p1"]);
+    assert_eq!(index_of(&set_up), index_of(&made));
+    let claims = std::fs::read_dir(repo.join(".git/qoop-worktree-index"))
+        .unwrap()
+        .filter(|e| {
+            std::fs::read_to_string(e.as_ref().unwrap().path()).unwrap() == "my-repo-wt-feat-p1"
+        })
+        .count();
+    assert_eq!(claims, 1);
 }

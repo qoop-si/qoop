@@ -24,6 +24,9 @@
 //! [agents]            # a name for a new agent, and the line typed to start it
 //! claudec = "claude --dangerously-skip-permissions"
 //! lm = "opencode"
+//! [spaces."my app".worktree]   # read by `qoop worktree new` for a worktree of that space
+//! copy = [".env", "apps/web/.env.local"]
+//! setup = "bun install"
 //! ```
 //!
 //! Read by the interface at start and again within two seconds of a change (its modified
@@ -235,11 +238,156 @@ pub struct Read {
     pub qass_models: [String; 3],
     /// `[report] send`, one of [`REPORT_SENDS`].
     pub report_send: String,
+    /// `[spaces.<name>]`, by the space's name.
+    pub spaces: BTreeMap<String, SpaceSetup>,
     pub problems: Vec<Problem>,
     pub path: PathBuf,
     /// Whether there was a file at all, noted once here so nothing asks the disk per frame.
     pub exists: bool,
+    /// The file did not read whole: it could not be read, or a line of it is not TOML and
+    /// was left out, so what it says about a space may be missing.
+    pub broken: bool,
 }
+
+/// `[spaces.<name>.worktree]`: what `qoop worktree new` copies into a new worktree of that
+/// space and runs there. Edited by hand; qoop only reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpaceSetup {
+    /// Whether the space has a `[spaces.<name>.worktree]` table at all.
+    pub worktree: bool,
+    /// Patterns of the main checkout's ignored files to copy, matched by git as glob
+    /// pathspecs.
+    pub copy: Vec<String>,
+    /// The command line run with `sh -c` in the new worktree.
+    pub setup: Option<String>,
+    /// What in `[spaces.<name>]` could not be used. Any one means none of it is used: a
+    /// copy or a command run without the part that was wrong is not what was written.
+    pub problems: Vec<Problem>,
+}
+
+/// A space's name as a TOML key: bare when it may be, quoted when not.
+pub fn space_key(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare {
+        name.to_string()
+    } else {
+        toml::Value::String(name.to_string()).to_string()
+    }
+}
+
+/// Why a `copy` pattern is refused: it would reach outside the main checkout, or be read
+/// by git as something other than a path.
+fn copy_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("a pattern is empty".to_string());
+    }
+    if pattern.starts_with('/') {
+        return Err(format!("{pattern} is absolute"));
+    }
+    if pattern.starts_with([':', '!']) {
+        return Err(format!("{pattern} starts with : or !"));
+    }
+    if pattern.split('/').any(|part| part == "..") {
+        return Err(format!("{pattern} has a .. part"));
+    }
+    Ok(())
+}
+
+/// One `[spaces.<name>]` table, read. `keys` and `inner` are where the keys of
+/// `[spaces.<name>]` and of its `worktree` table are, and `line` where `[spaces]` is.
+fn space_setup(
+    name: &str,
+    value: &toml::Value,
+    text: &str,
+    keys: Option<&Spans>,
+    inner: Option<&Spans>,
+    line: Option<usize>,
+) -> SpaceSetup {
+    let at = |spans: Option<&Spans>, key: &str| {
+        spans
+            .and_then(|s| s.get(key))
+            .map(|s| line_at(text, s.span().start))
+            .or(line)
+    };
+    let key = space_key(name);
+    let mut out = SpaceSetup::default();
+    let mut problems = Vec::new();
+    let mut say = |line: Option<usize>, what: String| problems.push(Problem::new(line, &what));
+    let toml::Value::Table(space) = value else {
+        say(
+            line,
+            format!("spaces.{key} is a table: [spaces.{key}.worktree] then copy = [\".env\"]"),
+        );
+        out.problems = problems;
+        return out;
+    };
+    for (field, value) in space {
+        match (field.as_str(), value) {
+            ("worktree", toml::Value::Table(worktree)) => {
+                out.worktree = true;
+                for (field, value) in worktree {
+                    let line = at(inner, field);
+                    match (field.as_str(), value) {
+                        ("copy", toml::Value::Array(items)) => {
+                            for item in items {
+                                match item.as_str().map(|p| (p, copy_pattern(p))) {
+                                    Some((pattern, Ok(()))) => out.copy.push(pattern.to_string()),
+                                    Some((_, Err(why))) => {
+                                        say(line, format!("spaces.{key}.worktree.copy: {why}"));
+                                    }
+                                    None => say(
+                                        line,
+                                        format!(
+                                            "spaces.{key}.worktree.copy: {item} is not a pattern in quotes"
+                                        ),
+                                    ),
+                                }
+                            }
+                        }
+                        ("copy", _) => say(
+                            line,
+                            format!(
+                                "spaces.{key}.worktree.copy = {value} is not a list of patterns in quotes"
+                            ),
+                        ),
+                        ("setup", toml::Value::String(command)) => {
+                            out.setup = Some(command.clone());
+                        }
+                        ("setup", _) => say(
+                            line,
+                            format!(
+                                "spaces.{key}.worktree.setup = {value} is not a command line in quotes"
+                            ),
+                        ),
+                        _ => say(
+                            line,
+                            format!("there is no setting spaces.{key}.worktree.{field}"),
+                        ),
+                    }
+                }
+            }
+            ("worktree", _) => say(
+                at(keys, field),
+                format!(
+                    "spaces.{key}.worktree is a table: [spaces.{key}.worktree] then copy = [\".env\"]"
+                ),
+            ),
+            _ => say(
+                at(keys, field),
+                format!("there is no setting spaces.{key}.{field}"),
+            ),
+        }
+    }
+    out.problems = problems;
+    out
+}
+
+/// Where each value of one table is, for the ones refused. The tables themselves carry no
+/// spans, so the text is read once more for them.
+type Spans = BTreeMap<String, toml::Spanned<toml::Value>>;
 
 impl Read {
     /// The first problem, as the hint row says it: the file, the line, and what was kept.
@@ -338,25 +486,36 @@ pub fn read_from(path: &Path) -> Read {
     let mut qass_agent = "claude".to_string();
     let mut qass_models = QASS_TIERS.map(|(_, family)| family.to_string());
     let mut report_send = "ask".to_string();
+    let mut spaces = BTreeMap::new();
+    let mut broken = false;
     let (config, agents, problems, exists) = match std::fs::read_to_string(path) {
         Ok(text) => {
-            let (config, agents, problems) = parse_all(&text);
+            let (config, agents, read_spaces, problems) = parse_with_spaces(&text);
             if let Some(agent) = qass_agent_in(&text) {
                 qass_agent = agent;
             }
             qass_models = qass_models_in(&text);
             report_send = report_send_in(&text);
+            spaces = read_spaces;
+            broken = text
+                .strip_prefix('\u{feff}')
+                .unwrap_or(&text)
+                .parse::<toml::Table>()
+                .is_err();
             (config, agents, problems, true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             (Config::default(), Vec::new(), Vec::new(), false)
         }
-        Err(error) => (
-            Config::default(),
-            Vec::new(),
-            vec![Problem::new(None, &format!("could not be read ({error})"))],
-            true,
-        ),
+        Err(error) => {
+            broken = true;
+            (
+                Config::default(),
+                Vec::new(),
+                vec![Problem::new(None, &format!("could not be read ({error})"))],
+                true,
+            )
+        }
     };
     Read {
         config,
@@ -364,9 +523,11 @@ pub fn read_from(path: &Path) -> Read {
         qass_agent,
         qass_models,
         report_send,
+        spaces,
         problems,
         path: path.to_path_buf(),
         exists,
+        broken,
     }
 }
 
@@ -411,6 +572,19 @@ pub fn parse(text: &str) -> (Config, Vec<Problem>) {
 
 /// The settings, the agents, and everything that could not be used.
 fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
+    let (config, agents, _, problems) = parse_with_spaces(text);
+    (config, agents, problems)
+}
+
+/// The settings, the agents, `[spaces]`, and everything that could not be used.
+fn parse_with_spaces(
+    text: &str,
+) -> (
+    Config,
+    Vec<Launcher>,
+    BTreeMap<String, SpaceSetup>,
+    Vec<Problem>,
+) {
     let mut problems: Vec<Problem> = Vec::new();
     let mut text = text.strip_prefix('\u{feff}').unwrap_or(text).to_string();
     // The problem for a construct left open to the end of the file, while it is walked back.
@@ -462,7 +636,6 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
     };
     // Where each value is, for the ones refused below. The table itself carries no spans,
     // so the same text is read once more for them, top level and `[notify]`.
-    type Spans = BTreeMap<String, toml::Spanned<toml::Value>>;
     #[derive(Default, serde::Deserialize)]
     struct NestedSpans {
         #[serde(default)]
@@ -482,8 +655,27 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
         #[serde(default)]
         report: Spans,
     }
+    // `[spaces]` apart, so a space that is not a table costs only these lines.
+    #[derive(Default, serde::Deserialize)]
+    struct SpaceKeySpans {
+        #[serde(default)]
+        spaces: BTreeMap<String, Spans>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct WorktreeSpans {
+        #[serde(default)]
+        worktree: Spans,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct SpacesSpans {
+        #[serde(default)]
+        spaces: BTreeMap<String, WorktreeSpans>,
+    }
     let top: Spans = toml::from_str(&text).unwrap_or_default();
     let nested: NestedSpans = toml::from_str(&text).unwrap_or_default();
+    let space_spans: SpaceKeySpans = toml::from_str(&text).unwrap_or_default();
+    let worktree_spans: SpacesSpans = toml::from_str(&text).unwrap_or_default();
+    let mut spaces = BTreeMap::new();
     let line_of = |spans: &Spans, key: &str| spans.get(key).map(|s| line_at(&text, s.span().start));
 
     let mut config = Config::default();
@@ -712,6 +904,26 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
                 line,
                 "agents is a table: [agents] then lm = \"opencode\"".into(),
             ),
+            ("spaces", toml::Value::Table(table)) => {
+                for (name, value) in table {
+                    let setup = space_setup(
+                        name,
+                        value,
+                        &text,
+                        space_spans.spaces.get(name),
+                        worktree_spans.spaces.get(name).map(|s| &s.worktree),
+                        line,
+                    );
+                    for problem in &setup.problems {
+                        refuse(problem.line, problem.what.clone());
+                    }
+                    spaces.insert(name.clone(), setup);
+                }
+            }
+            ("spaces", _) => refuse(
+                line,
+                "spaces is a table: [spaces.NAME.worktree] then copy = [\".env\"]".into(),
+            ),
             _ => refuse(line, format!("there is no setting {key}")),
         }
     }
@@ -721,6 +933,7 @@ fn parse_all(text: &str) -> (Config, Vec<Launcher>, Vec<Problem>) {
     (
         config,
         agents.into_iter().map(|(_, a)| a).collect(),
+        spaces,
         problems,
     )
 }
@@ -1057,6 +1270,59 @@ mod tests {
             said.iter().any(|w| w.contains("qass.models.huge")),
             "{said:?}"
         );
+    }
+
+    #[test]
+    fn a_space_worktree_table_is_read_and_its_problems_are_said() {
+        let (_, _, spaces, problems) = parse_with_spaces(
+            "[spaces.\"my app\".worktree]\ncopy = [\".env\", \"**/.env*\"]\nsetup = \"bun install\"\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            spaces.get("my app"),
+            Some(&SpaceSetup {
+                worktree: true,
+                copy: vec![".env".into(), "**/.env*".into()],
+                setup: Some("bun install".into()),
+                problems: Vec::new(),
+            })
+        );
+        let (_, _, spaces, problems) = parse_with_spaces(
+            "theme = \"dark\"\n[spaces.web.worktree]\ncopy = [\"../x\", \"/etc/passwd\", \":(attr)x\", \"!x\", \"\", 3]\nsetup = 7\nrun = \"x\"\n[spaces.web]\nnote = 1\n[spaces.ok.worktree]\nsetup = \"true\"\n",
+        );
+        let said: Vec<String> = problems.iter().map(Problem::short).collect();
+        assert_eq!(
+            said,
+            [
+                "line 3: spaces.web.worktree.copy: ../x has a .. part",
+                "line 3: spaces.web.worktree.copy: /etc/passwd is absolute",
+                "line 3: spaces.web.worktree.copy: :(attr)x starts with : or !",
+                "line 3: spaces.web.worktree.copy: !x starts with : or !",
+                "line 3: spaces.web.worktree.copy: a pattern is empty",
+                "line 3: spaces.web.worktree.copy: 3 is not a pattern in quotes",
+                "line 4: spaces.web.worktree.setup = 7 is not a command line in quotes",
+                "line 5: there is no setting spaces.web.worktree.run",
+                "line 7: there is no setting spaces.web.note",
+            ],
+            "{said:?}"
+        );
+        assert_eq!(spaces["web"].problems.len(), 9);
+        assert!(spaces["ok"].problems.is_empty() && spaces["ok"].worktree);
+        // `spaces` is a setting, but only as a table.
+        let (_, problems) = parse("spaces = 1\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(!problems[0].what.contains("there is no setting"));
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_is_broken_for_the_spaces() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[spaces.app.worktree]\nsetup = \"true\"\n").unwrap();
+        assert!(!read_from(&path).broken);
+        std::fs::write(&path, "[spaces.app.worktree]\nsetup = true false\n").unwrap();
+        let read = read_from(&path);
+        assert!(read.broken && !read.problems.is_empty());
     }
 
     #[test]
