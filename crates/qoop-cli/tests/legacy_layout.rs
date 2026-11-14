@@ -138,10 +138,16 @@ fn the_directories_of_a_qoro_install_move_and_its_daemon_is_reached() {
     }
     // The new socket path is a way to the old daemon, which this build's client used.
     assert!(is_link(&m.new_session().join("qoopd.sock")));
-    assert!(
-        seen.load(Ordering::SeqCst) >= 1,
-        "the old daemon was never reached"
-    );
+    // A connect returns once the kernel queues it, before the listener's thread accepts and
+    // counts it, so `ls` can exit first: wait for the count rather than read it once.
+    let deadline = Instant::now() + qoop_testkit::PATIENCE;
+    while seen.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the old daemon was never reached"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
