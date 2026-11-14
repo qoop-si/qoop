@@ -55,7 +55,7 @@ qoop worktree new feat/login -- claude      a git worktree beside the repo, an a
 qoop worktree setup feat/login              run its space's setup again
 qoop worktree finish feat/login --pr        push it and open a pull request, keeping it
 qoop worktree finish feat/login             once merged: remove it, its branch and origin's
-qoop worktree ls --stale                    the clean ones that are empty, merged or old
+qoop worktree ls --stale                    the clean ones that are merged or old
 qoop worktree ls                            every worktree and the terminals inside it
 qoop worktree rm feat/login                 remove it, keeping the branch
 ```
