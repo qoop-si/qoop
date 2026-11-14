@@ -104,7 +104,7 @@ qoop worktree new <branch> [--base REF] [--no-setup] [-- <agent>]   # a worktree
 qoop worktree setup [<branch|path>]                    # set a worktree up again
 qoop worktree finish <branch|path> [--pr|--merge|--discard] [--base REF]
 qoop worktree ls [--json]
-qoop worktree ls --stale [--json]                      # clean ones that are empty, merged or old
+qoop worktree ls --stale [--json]                      # clean ones that are merged or old
 qoop worktree rm <branch|path> [--force]
 ```
 
@@ -129,7 +129,7 @@ merged into the base; then it removes the worktree, the branch and
 the worktree and branch. `--merge` fast-forwards the main checkout's branch
 locally, never pushing. `--discard` drops the worktree and the branch with their
 changes, the only mode that loses work. `worktree ls --stale` only lists the
-clean worktrees that are empty, merged or old, with `why=`.
+clean worktrees that are merged or old, with `why=`.
 
 ## Supervising other agents
 
