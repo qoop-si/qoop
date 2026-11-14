@@ -4050,8 +4050,12 @@ dependencies = [
  "libc",
  "qoop-domain",
  "qoop-proto",
+ "qoop-remote",
  "qoop-runtime",
+ "qoop-testkit",
+ "qoop-tui",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

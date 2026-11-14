@@ -28,10 +28,17 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6d
 qoop-domain = { path = "../qoop-domain" }
 qoop-proto = { path = "../qoop-proto" }
 qoop-runtime = { path = "../qoop-runtime" }
+# The mux the TUI speaks through (this machine and its remotes), the config file, seen, the
+# icon font: linked as a library, so the window and the TUI cannot disagree about them.
+qoop-tui = { path = "../qoop-tui" }
+qoop-remote = { path = "../qoop-remote" }
 bytes = { workspace = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+qoop-testkit = { path = "../qoop-testkit" }
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "d2a4fb6ded7c470be25d1541281da3882495b65b", default-features = false, features = ["font-kit", "test-support"] }
