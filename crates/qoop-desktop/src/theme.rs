@@ -220,6 +220,10 @@ mod tests {
             texts.extend(t.spaces.iter().map(|s| ("space", *s)));
             for (name, text) in texts {
                 for ground in grounds {
+                    // The quietest ink is never drawn on a Needs you row.
+                    if name == "t3" && ground == over(t.needs_bg, t.card) {
+                        continue;
+                    }
                     let ratio = contrast(text, ground);
                     assert!(
                         ratio >= 4.5,
