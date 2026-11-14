@@ -1723,6 +1723,15 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
         Some([n]) => n.parse().map_err(|_| super::usage(help))?,
         _ => return Err(super::usage(help)),
     };
+    close_terminal(terminal, generation)?;
+    println!("closed terminal {terminal}");
+    Ok(())
+}
+
+/// What `qoop close` does, saying nothing: refused for the terminal this runs in, for qass's
+/// own (see [`super::qass_guard`]) and, with a `generation`, when the process is no longer
+/// that one; then closed, and returned once the index no longer lists it.
+pub(crate) fn close_terminal(terminal: u32, generation: Option<u64>) -> std::io::Result<()> {
     if own_terminal() == Some(terminal) {
         return Err(std::io::Error::other(
             "refusing to close the terminal this command runs in",
@@ -1758,7 +1767,6 @@ pub(crate) fn run_close(args: &[String]) -> std::io::Result<()> {
         loop {
             let (rows, _) = link.agents().await?;
             if !rows.iter().any(|r| r.terminal == terminal) {
-                println!("closed terminal {terminal}");
                 return Ok(());
             }
             let tick = (Instant::now() + Duration::from_millis(250)).min(deadline);
