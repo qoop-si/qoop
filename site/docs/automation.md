@@ -55,6 +55,7 @@ qoop worktree new feat/login -- claude      a git worktree beside the repo, an a
 qoop worktree setup feat/login              run its space's setup again
 qoop worktree finish feat/login --pr        push it and open a pull request, keeping it
 qoop worktree finish feat/login             once merged: remove it, its branch and origin's
+qoop worktree ls --stale                    the clean ones that are empty, merged or old
 qoop worktree ls                            every worktree and the terminals inside it
 qoop worktree rm feat/login                 remove it, keeping the branch
 ```
@@ -74,7 +75,7 @@ its branch and `origin/<branch>` once the branch is merged (fast-forward, rebase
 merge gh knows of), and refuses otherwise. `--pr` pushes and opens a pull request, keeping the
 worktree for the review's fixes; `--merge` fast-forwards the main checkout's branch, locally;
 `--discard` drops the work. It never force pushes, every step is safe to run again, and like
-`rm` it runs from outside the worktree.
+`rm` it runs from outside the worktree. `ls --stale` only lists, from the refs here.
 
 ## Spaces
 

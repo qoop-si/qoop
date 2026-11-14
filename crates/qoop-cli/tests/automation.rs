@@ -1705,3 +1705,76 @@ fn a_remote_step_that_fails_keeps_everything_and_a_rerun_finishes() {
     assert!(!text(&stopped.stdout).contains("already gone"));
     assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/s"));
 }
+
+/// `ls --stale`: clean linked worktrees nothing runs in, one reason each, the first that
+/// holds: empty before merged, then old; local refs only.
+#[test]
+fn ls_stale_lists_empty_merged_and_old_worktrees_and_nothing_in_use() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = repo(root.path());
+    let empty = add_worktree(&repo, "feat/empty");
+    let merged = add_worktree(&repo, "feat/merged");
+    commit(&merged, "m.txt", "m\n");
+    // The same change on top of another, so under another id: a rebase merge.
+    commit(&repo, "first.txt", "first\n");
+    commit(&repo, "m.txt", "m\n");
+    let old = add_worktree(&repo, "feat/old");
+    std::fs::write(old.join("o.txt"), "o\n").unwrap();
+    git(&old, &["add", "o.txt"]);
+    let forty_days_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 40 * 86_400;
+    let made = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+        .arg(&old)
+        .args(["commit", "-q", "-m", "old"])
+        .env("GIT_COMMITTER_DATE", format!("@{forty_days_ago} +0000"))
+        .env("GIT_AUTHOR_DATE", format!("@{forty_days_ago} +0000"))
+        .status()
+        .expect("git");
+    assert!(made.success());
+    let fresh = add_worktree(&repo, "feat/fresh");
+    commit(&fresh, "f.txt", "f\n");
+    let loose = add_worktree(&repo, "feat/loose");
+    std::fs::write(loose.join("loose.txt"), "x").unwrap();
+    let busy = add_worktree(&repo, "feat/busy");
+    let mut inside = Command::new("sleep")
+        .arg("300")
+        .current_dir(&busy)
+        .spawn()
+        .expect("a process inside");
+
+    let listed = qoop_in(&repo, &["worktree", "ls", "--stale"], None);
+    let as_json = qoop_in(&repo, &["worktree", "ls", "--json", "--stale"], None);
+    let _ = inside.kill();
+    let _ = inside.wait();
+    assert!(listed.status.success(), "{}", text(&listed.stderr));
+    assert_eq!(
+        text(&listed.stdout),
+        format!(
+            "path={} branch=feat/empty terminals=0 why=empty\n\
+             path={} branch=feat/merged terminals=0 why=merged\n\
+             path={} branch=feat/old terminals=0 why=old:40d\n",
+            empty.display(),
+            merged.display(),
+            old.display()
+        )
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&as_json.stdout).expect("a JSON array");
+    let whys: Vec<&str> = rows.iter().map(|r| r["why"].as_str().unwrap()).collect();
+    assert_eq!(whys, ["empty", "merged", "old:40d"]);
+    for row in &rows {
+        for key in ["path", "branch", "head", "bare", "terminals"] {
+            assert!(row.get(key).is_some(), "{key} missing: {row}");
+        }
+    }
+    let plain = qoop_in(&repo, &["worktree", "ls", "--json"], None);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&plain.stdout).expect("JSON");
+    assert_eq!(rows.len(), 7);
+    assert!(rows.iter().all(|r| r.get("why").is_none()));
+    let twice = qoop_in(&repo, &["worktree", "ls", "--stale", "--stale"], None);
+    assert_eq!(twice.status.code(), Some(2));
+}
