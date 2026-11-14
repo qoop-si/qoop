@@ -2713,6 +2713,11 @@ pub struct AgentRow {
     /// never reads it for a terminal of another machine. `None` from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pgid: Option<i32>,
+    /// The pid of the process the terminal started (its shell), on the daemon's machine,
+    /// for a client on the same machine that reads the process table under it. Meaningless
+    /// anywhere else, like `pgid`. `None` once it has exited, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_pid: Option<u32>,
     /// Where this terminal is, last known, as an absolute path.
     ///
     /// Best effort with a documented bound: the per-terminal task writes it
@@ -3470,6 +3475,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         };
@@ -3535,6 +3541,24 @@ mod tests {
             serde_json::to_string(&new)
                 .unwrap()
                 .contains(r#""stop":"1750000005.2""#)
+        );
+    }
+
+    /// A row's shell pid crosses old daemons both ways, as the stop does.
+    #[test]
+    fn the_shell_pid_field_parses_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"idle"}"#).expect("decode");
+        assert_eq!(old.shell_pid, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("shell_pid"));
+        let new: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"idle","shell_pid":4242}"#)
+                .expect("decode");
+        assert_eq!(new.shell_pid, Some(4242));
+        assert!(
+            serde_json::to_string(&new)
+                .unwrap()
+                .contains(r#""shell_pid":4242"#)
         );
     }
 

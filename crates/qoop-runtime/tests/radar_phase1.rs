@@ -319,3 +319,19 @@ async fn the_row_names_the_stop_of_each_turn_end() {
     assert_ne!(second, first, "each turn end is a new stop");
     assert_eq!(report("s4", "working", "tool").await, None, "work ends it");
 }
+
+/// The row names the shell the terminal started, for a client on this machine that reads the
+/// process table under it: the registry's own leader, never a guess.
+#[tokio::test]
+async fn the_row_names_the_shell_the_terminal_started() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let mut client = d.attach("shells").await;
+    let rows = agents_of(&mut client, "l1").await;
+    let leader = d
+        .agents_arc()
+        .leader_of(terminal)
+        .map(|(pid, _)| pid as u32);
+    assert!(leader.is_some(), "a running terminal has a leader");
+    assert_eq!(row_of(&rows, terminal).shell_pid, leader);
+}

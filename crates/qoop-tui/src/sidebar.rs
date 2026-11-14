@@ -4668,6 +4668,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }
@@ -4706,6 +4707,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }
@@ -5486,6 +5488,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }
@@ -5755,6 +5758,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }];
@@ -5803,6 +5807,7 @@ mod tests {
             slept_at_unix: None,
             activity: None,
             pgid: None,
+            shell_pid: None,
             discards: None,
             status: None,
         }];
