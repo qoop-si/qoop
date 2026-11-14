@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use qoop_runtime::control::{ControlRequest, ControlResponse, WorkspaceRow};
 use qoop_runtime::paths;
 
 use crate::supervise::{self, NewOpts};
@@ -255,31 +256,191 @@ fn worktree_of(roots: &[PathBuf], cwd: &std::path::Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// This machine's rows, or none when qoop is not running: with no daemon there are no
-/// terminals, which is the true answer and not a failure.
-fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
-    use qoop_runtime::control::{ControlRequest, ControlResponse};
-
+/// One question to this machine's daemon, or `None` when qoop is not running.
+fn ask(request: &ControlRequest) -> std::io::Result<Option<ControlResponse>> {
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     let socket = paths::socket_path(&dir);
     if std::os::unix::net::UnixStream::connect(&socket).is_err() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let rt = tokio::runtime::Runtime::new()?;
-    let answer = rt.block_on(crate::ask_daemon(
-        &socket,
-        "qoop-worktree",
-        &ControlRequest::ListAgents {
-            id: crate::request_id("worktree"),
-        },
-    ))?;
-    match answer {
-        ControlResponse::Agents { agents, .. } => Ok(agents),
-        ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
-        _ => Err(std::io::Error::other(
+    rt.block_on(crate::ask_daemon(&socket, "qoop-worktree", request))
+        .map(Some)
+}
+
+/// This machine's rows, or none when qoop is not running: with no daemon there are no
+/// terminals, which is the true answer and not a failure.
+fn session_rows() -> std::io::Result<Vec<qoop_runtime::control::AgentRow>> {
+    match ask(&ControlRequest::ListAgents {
+        id: crate::request_id("worktree"),
+    })? {
+        None => Ok(Vec::new()),
+        Some(ControlResponse::Agents { agents, .. }) => Ok(agents),
+        Some(ControlResponse::Failed { reason, .. }) => Err(std::io::Error::other(reason)),
+        Some(_) => Err(std::io::Error::other(
             "unexpected answer to the agent listing",
         )),
     }
+}
+
+/// This machine's spaces, from the running daemon; refused when nothing runs.
+fn space_rows() -> std::io::Result<Vec<WorkspaceRow>> {
+    match ask(&ControlRequest::ListWorkspaces {
+        id: crate::request_id("worktree"),
+    })? {
+        None => Err(not_awake()),
+        Some(ControlResponse::Workspaces { workspaces, .. }) => Ok(workspaces),
+        Some(ControlResponse::Failed { reason, .. }) => Err(std::io::Error::other(reason)),
+        Some(_) => Err(std::io::Error::other(
+            "unexpected answer to the space listing",
+        )),
+    }
+}
+
+fn not_awake() -> std::io::Error {
+    std::io::Error::other("nothing is awake: `qoop` or `qoop wake` starts it")
+}
+
+/// The space a worktree belongs to: its tab opens there and its settings are that space's.
+#[derive(Debug, PartialEq)]
+enum Place {
+    /// `name` keys its `[spaces.<name>]` table; `open` is what the tab is opened in: a found
+    /// space's id, or `--space` as typed, so a space that does not exist yet is made only
+    /// when the tab opens.
+    Space { name: String, open: String },
+    /// No space, or a tie nothing breaks: the daemon's default space, nothing set up. `tied`
+    /// names the spaces of a tie, as `(id, name)`.
+    Default { tied: Vec<(i64, String)> },
+}
+
+/// Which space a worktree of the repository whose main checkout is `main` belongs to.
+///
+/// `--space` (`wanted`) is looked up and never made: a number that is no id and no name is
+/// refused, a new name is the key as typed. Without it, the space whose folder is the main
+/// checkout, else the one with the deepest folder holding it (a folder of several
+/// repositories); qass's own space never counts. Spaces that tie there are one when they
+/// share a name, and otherwise the one whose name `has_table` wins, when exactly one does.
+fn place_of(
+    spaces: &[WorkspaceRow],
+    main: &std::path::Path,
+    wanted: Option<&str>,
+    has_table: impl Fn(&str) -> bool,
+) -> std::io::Result<Place> {
+    if let Some(wanted) = wanted {
+        let name = supervise::pick_space(spaces, wanted)?
+            .and_then(|id| spaces.iter().find(|s| s.id == id))
+            .map_or(wanted, |s| s.name.as_str());
+        return Ok(Place::Space {
+            name: name.to_string(),
+            open: wanted.to_string(),
+        });
+    }
+    let main = real(main);
+    let homes: Vec<(&WorkspaceRow, usize)> = spaces
+        .iter()
+        .filter(|s| s.name != qoop_runtime::asks::QASS_SPACE)
+        .filter_map(|s| {
+            let dir = real(std::path::Path::new(s.dir.as_deref()?));
+            (dir.is_absolute() && main.starts_with(&dir)).then(|| (s, dir.components().count()))
+        })
+        .collect();
+    // The folder equal to the main checkout is the deepest that holds it.
+    let deepest = homes.iter().map(|(_, depth)| *depth).max();
+    let tied: Vec<&WorkspaceRow> = homes
+        .iter()
+        .filter(|(_, depth)| Some(*depth) == deepest)
+        .map(|(s, _)| *s)
+        .collect();
+    let mut names: Vec<&str> = tied.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let chosen = match names.as_slice() {
+        [one] => Some(*one),
+        many => match many
+            .iter()
+            .filter(|n| has_table(n))
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [one] => Some(**one),
+            _ => None,
+        },
+    };
+    let Some(name) = chosen else {
+        return Ok(Place::Default {
+            tied: tied.iter().map(|s| (s.id, s.name.clone())).collect(),
+        });
+    };
+    // Spaces of one name share its table; the tab goes to the lowest id among them.
+    let id = tied
+        .iter()
+        .filter(|s| s.name == name)
+        .map(|s| s.id)
+        .min()
+        .expect("a chosen name is a tied space's");
+    Ok(Place::Space {
+        name: name.to_string(),
+        open: id.to_string(),
+    })
+}
+
+/// A linked worktree's git common dir and its id there: the `<id>` of
+/// `<common>/worktrees/<id>`.
+fn git_dirs(tree: &std::path::Path) -> std::io::Result<(PathBuf, String)> {
+    let out = git(
+        tree,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--git-dir",
+        ]
+        .map(std::ffi::OsStr::new),
+    )?;
+    let mut lines = out.lines();
+    let common = PathBuf::from(lines.next().unwrap_or_default());
+    let id = std::path::Path::new(lines.next().unwrap_or_default())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok((common, id))
+}
+
+/// The worktree's index (`QOOP_WORKTREE_INDEX`): the main checkout is 0, a linked worktree
+/// takes the lowest free number from 1, for good.
+///
+/// A claim is the file `<common>/qoop-worktree-index/<n>` holding the worktree's id. A claim
+/// already holding this id is its index: git reuses an id (the folder's name), so a branch
+/// made again takes up the claim its earlier worktree left. Else the lowest number with no
+/// claim, or with one whose `<common>/worktrees/<id>` is gone, so a worktree removed by
+/// plain git frees its number too. Read and written under a lock of its own, so two parallel
+/// `new`s never take one number.
+fn claim_index(common: &std::path::Path, id: &str) -> std::io::Result<u32> {
+    let claims = common.join("qoop-worktree-index");
+    let _held = qoop_runtime::lock::StartupLock::acquire(&common.join("qoop-worktree-index.lock"))?;
+    std::fs::create_dir_all(&claims)?;
+    let mut held = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&claims)? {
+        let entry = entry?;
+        if let Some(n) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+        {
+            held.insert(n, std::fs::read_to_string(entry.path())?.trim().to_string());
+        }
+    }
+    if let Some((&n, _)) = held.iter().find(|(_, holder)| *holder == id) {
+        return Ok(n);
+    }
+    let live =
+        |holder: &String| !holder.is_empty() && common.join("worktrees").join(holder).is_dir();
+    let n = (1..)
+        .find(|n| held.get(n).is_none_or(|holder| !live(holder)))
+        .expect("a free number");
+    std::fs::write(claims.join(n.to_string()), id)?;
+    Ok(n)
 }
 
 /// `qoop worktree`: a git worktree beside the repository, with a terminal in it.
@@ -368,7 +529,8 @@ fn parse_worktree_new_args(args: &[String]) -> Result<WorktreeNewOpts, String> {
 /// branch. A branch already checked out elsewhere is refused with where, because git's
 /// own refusal is about a path the person did not type. A branch that exists only on a
 /// remote is handed to git by name, so git makes the local branch tracking it rather than
-/// a fresh one from HEAD.
+/// a fresh one from HEAD. The terminal opens in the worktree's space (see [`place_of`]),
+/// and the worktree claims its index.
 fn worktree_new(args: &[String]) -> std::io::Result<()> {
     let WorktreeNewOpts {
         branch,
@@ -379,9 +541,7 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     // Checked before git runs, so qoop not running does not leave a worktree behind.
     let dir = paths::runtime_dir().map_err(std::io::Error::other)?;
     if std::os::unix::net::UnixStream::connect(paths::socket_path(&dir)).is_err() {
-        return Err(std::io::Error::other(
-            "nothing is awake: `qoop` or `qoop wake` starts it",
-        ));
+        return Err(not_awake());
     }
     let list = worktrees()?;
     let main = list[0].path.clone();
@@ -418,6 +578,8 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
             "branch {branch} exists; --base only applies to a new branch"
         )));
     }
+    // Found before git runs and never made here, so a bad `--space` leaves no worktree.
+    let place = place_of(&space_rows()?, &main, new.space.as_deref(), |_| false)?;
     let here = std::env::current_dir()?;
     let path = path.map_or_else(|| default_worktree_path(&main, &branch), |p| here.join(p));
     let mut add: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
@@ -431,6 +593,12 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     // Resolved once it exists, so `--path ../x` is not recorded as a tab's directory.
     let path = real(&path);
     println!("worktree={} branch={branch}", path.display());
+    let (common, id) = git_dirs(&path)?;
+    claim_index(&common, &id)?;
+    new.space = match place {
+        Place::Space { open, .. } => Some(open),
+        Place::Default { .. } => None,
+    };
     new.cwd = Some(path);
     new.name = new.name.or_else(|| Some(branch.clone()));
     new.spawned = true;
@@ -1055,6 +1223,146 @@ mod tests {
             }
             assert!(!alive(pid), "process {pid} left running");
         }
+    }
+
+    fn space(id: i64, name: &str, dir: Option<&str>) -> WorkspaceRow {
+        WorkspaceRow {
+            id,
+            name: name.into(),
+            terminals: 0,
+            asleep: false,
+            sleeping: Vec::new(),
+            closable: true,
+            ink: None,
+            link: None,
+            keep_awake: false,
+            qass_skip: false,
+            goal: None,
+            dir: dir.map(String::from),
+        }
+    }
+
+    fn found(name: &str, open: &str) -> Place {
+        Place::Space {
+            name: name.into(),
+            open: open.into(),
+        }
+    }
+
+    #[test]
+    fn a_worktree_belongs_to_the_space_of_its_repo_or_the_deepest_folder_holding_it() {
+        let main = Path::new("/nowhere/code/app");
+        let none = |_: &str| false;
+        let spaces = vec![
+            space(1, "default", None),
+            space(2, "code", Some("/nowhere/code")),
+            space(3, "app", Some("/nowhere/code/app")),
+            space(4, "qass", Some("/nowhere/code/app")),
+            space(5, "sibling", Some("/nowhere/code/app-wt-x")),
+        ];
+        assert_eq!(
+            place_of(&spaces, main, None, none).unwrap(),
+            found("app", "3")
+        );
+        // No exact folder: the deepest that holds it; qass's own space never counts.
+        assert_eq!(
+            place_of(&spaces[..3], Path::new("/nowhere/code/web"), None, none).unwrap(),
+            found("code", "2")
+        );
+        assert_eq!(
+            place_of(&spaces[3..], main, None, none).unwrap(),
+            Place::Default { tied: vec![] }
+        );
+        // `--space` is looked up, never made: an id gives its name, a new name is the key,
+        // a number that is neither is refused.
+        assert_eq!(
+            place_of(&spaces, main, Some("2"), none).unwrap(),
+            found("code", "2")
+        );
+        assert_eq!(
+            place_of(&spaces, main, Some("fresh"), none).unwrap(),
+            found("fresh", "fresh")
+        );
+        assert!(place_of(&spaces, main, Some("99"), none).is_err());
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_one_name_with_a_table_and_one_name_is_the_lowest_id() {
+        let main = Path::new("/nowhere/app");
+        let spaces = vec![
+            space(2, "web", Some("/nowhere/app")),
+            space(3, "app", Some("/nowhere/app/")),
+        ];
+        assert_eq!(
+            place_of(&spaces, main, None, |n| n == "app").unwrap(),
+            found("app", "3")
+        );
+        for tables in [&[][..], &["app", "web"]] {
+            assert_eq!(
+                place_of(&spaces, main, None, |n| tables.contains(&n)).unwrap(),
+                Place::Default {
+                    tied: vec![(2, "web".into()), (3, "app".into())]
+                },
+                "{tables:?}"
+            );
+        }
+        let same = vec![
+            space(7, "app", Some("/nowhere/app")),
+            space(4, "app", Some("/nowhere/app")),
+            space(5, "app", Some("/elsewhere")),
+        ];
+        assert_eq!(
+            place_of(&same, main, None, |_| false).unwrap(),
+            found("app", "4")
+        );
+        // Of two spaces called alike, the one whose folder it is, by id.
+        assert_eq!(
+            place_of(&same[1..], Path::new("/elsewhere"), None, |_| false).unwrap(),
+            found("app", "5")
+        );
+    }
+
+    #[test]
+    fn an_index_is_the_lowest_free_number_and_a_reused_id_keeps_its_own() {
+        let dir = tempfile::tempdir().expect("dir");
+        let common = dir.path();
+        for id in ["a", "b", "c"] {
+            std::fs::create_dir_all(common.join("worktrees").join(id)).unwrap();
+        }
+        assert_eq!(claim_index(common, "a").unwrap(), 1);
+        assert_eq!(claim_index(common, "b").unwrap(), 2);
+        assert_eq!(claim_index(common, "a").unwrap(), 1, "asked again");
+        // `b` went away without qoop: its number is free for the next one.
+        std::fs::remove_dir(common.join("worktrees/b")).unwrap();
+        assert_eq!(claim_index(common, "c").unwrap(), 2);
+        // A claim left by an earlier worktree of the same id is taken up, never doubled.
+        std::fs::write(common.join("qoop-worktree-index/5"), "d").unwrap();
+        std::fs::create_dir_all(common.join("worktrees/d")).unwrap();
+        assert_eq!(claim_index(common, "d").unwrap(), 5);
+        let holding_d = std::fs::read_dir(common.join("qoop-worktree-index"))
+            .unwrap()
+            .filter(|e| std::fs::read_to_string(e.as_ref().unwrap().path()).unwrap() == "d")
+            .count();
+        assert_eq!(holding_d, 1);
+    }
+
+    #[test]
+    fn parallel_claims_take_distinct_numbers() {
+        let dir = tempfile::tempdir().expect("dir");
+        let common = dir.path();
+        let ids: Vec<String> = (0..8).map(|i| format!("w{i}")).collect();
+        for id in &ids {
+            std::fs::create_dir_all(common.join("worktrees").join(id)).unwrap();
+        }
+        let mut got: Vec<u32> = std::thread::scope(|scope| {
+            let runs: Vec<_> = ids
+                .iter()
+                .map(|id| scope.spawn(move || claim_index(common, id).unwrap()))
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        got.sort_unstable();
+        assert_eq!(got, (1..=8).collect::<Vec<u32>>());
     }
 
     #[test]

@@ -56,7 +56,9 @@ qoop worktree ls                            every worktree and the terminals ins
 qoop worktree rm feat/login                 remove it, keeping the branch
 ```
 
-`worktree new` puts the worktree at `<parent>/<repo>-wt-feat-login`. `worktree rm` refuses
+`worktree new` puts the worktree at `<parent>/<repo>-wt-feat-login` and opens its terminal in
+the space whose folder is the repository (`qoop space dir NAME <repo>` sets one), else in the
+space whose folder holds it, else in the default space; `--space` picks one. `worktree rm` refuses
 while any process has its directory inside (named by pid, and by qoop terminal where it
 knows), and refuses a tree with uncommitted changes unless `--force`.
 
