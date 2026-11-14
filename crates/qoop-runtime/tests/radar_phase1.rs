@@ -39,6 +39,17 @@ async fn hook_report_stamps_and_session_report_and_forgery_do_not() {
         .as_str()
         .to_string();
     let mut client = d.attach("hook").await;
+    // Reported once the shell answers, as a real hook is, from inside a shell that runs.
+    // Sooner, the report can land while the program is still starting: on macOS `/bin/sh`
+    // execs `/bin/bash` in the same process, that exec is a new generation, and a new
+    // generation clears what was believed about the old one, the blocker with it.
+    client.input_to(terminal, b"echo READY_$((6*7))\n").await;
+    assert!(
+        client
+            .wait_for_text_on(terminal, "READY_42", PATIENCE)
+            .await,
+        "the shell never started"
+    );
 
     let before = row_of(&agents_of(&mut client, "l0").await, terminal).last_active_at_unix;
     let accepted = client

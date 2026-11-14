@@ -3478,6 +3478,17 @@ mod tests {
         std::fs::create_dir(&turns).expect("turns");
         let plain = dir.path().join("plain");
         std::fs::create_dir(&plain).expect("a directory outside git");
+        // The hook runs the git this test runs, not whatever `/usr/bin` holds: on macOS that
+        // is the Xcode shim, which looks the real git up on each call and can take longer than
+        // the hook's timeout on a cold runner. A timed out look is no mark, and no task.
+        let git_dir = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .find(|d| d.join("git").is_file())
+            .expect("git on PATH");
+        let path = format!(
+            "{}:{}:/usr/bin:/bin",
+            dir.path().display(),
+            git_dir.display()
+        );
         let run_in = |agent: &str, event: &str, cwd: &std::path::Path| -> String {
             let _ = std::fs::remove_file(&log);
             let script = dir.path().join(format!("{agent}.sh"));
@@ -3489,7 +3500,7 @@ mod tests {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(&script)
                 .arg("working")
-                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("PATH", &path)
                 .env("QOOP_TERMINAL", "1")
                 .env("QOOP_TOKEN", "t")
                 .env("TMPDIR", &turns)
