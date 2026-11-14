@@ -2806,9 +2806,6 @@ mod tests {
         );
     }
 
-    /// A picture for a remote tab is kept by that remote's daemon, under its own number for
-    /// the tab: kept at home, its path would name a file the remote agent cannot read. One
-    /// that names no tab still goes home, as the phone's do.
     /// `Via` takes a request that names nothing of its own to the machine of the space it
     /// names, and the answer comes back renumbered; one that names a terminal is refused,
     /// since it would reach that machine in the interface's numbers.
@@ -2886,6 +2883,9 @@ mod tests {
         );
     }
 
+    /// A picture for a remote tab is kept by that remote's daemon, under its own number for
+    /// the tab: kept at home, its path would name a file the remote agent cannot read. One
+    /// that names no tab still goes home, as the phone's do.
     #[tokio::test]
     async fn a_picture_for_a_remote_tab_is_kept_where_the_tab_runs() {
         let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
