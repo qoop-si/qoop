@@ -530,8 +530,10 @@ fn a_racer_still_working_or_with_another_tab_inside_is_never_dropped() {
     // Once it ended, both shells are the racers' own and go.
     let _ = stack.run_in(&repo, &["send", &tab, "--key", "ctrl-c"]);
     assert!(
-        stack.wait(|| stack.racers("e").iter().all(|r| r["program"] != "sleep")),
-        "sleep never ended"
+        stack.wait(|| stack.racers("e").iter().all(|r| r["program"]
+            .as_str()
+            .is_some_and(qoop_runtime::idle::is_shell_program))),
+        "the tabs never came back to their shells"
     );
     let out = stack.run_in(&repo, &["race", "rm", "e", "--force"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
