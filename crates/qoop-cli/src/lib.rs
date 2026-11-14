@@ -323,7 +323,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 again on an existing worktree\n\
                   \x20 qoop worktree finish <branch|path> [--pr|--merge|--discard] [--base REF]\n\
                   \x20                 clean up merged work, open a PR, fast-forward, or drop it\n\
-                  \x20 qoop worktree ls [--json]  every worktree and the terminals inside\n\
+                  \x20 qoop worktree ls [--stale] [--json]  every worktree and the terminals\n\
+                  \x20                 inside; --stale only the clean empty, merged or old ones\n\
                   \x20 qoop worktree rm <branch|path> [--force]  remove one, keeping the\n\
                   \x20                 branch; refused while any process is inside\n\
                   \x20 qoop space rm <id|name>  remove a space with no tabs in it, asleep or awake\n\

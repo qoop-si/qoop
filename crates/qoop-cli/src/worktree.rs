@@ -903,7 +903,7 @@ const WORKTREE_USAGE: &str = "usage:\n\
      \x20 qoop worktree new <branch> [--base REF] [--path DIR] [--space ID|NAME] [--name NAME] [--no-setup] [-- CMD...]\n\
      \x20 qoop worktree setup [<branch|path>] [--space ID|NAME]\n\
      \x20 qoop worktree finish <branch|path> [--pr|--merge|--discard] [--base REF]\n\
-     \x20 qoop worktree ls [--json]\n\
+     \x20 qoop worktree ls [--stale] [--json]\n\
      \x20 qoop worktree rm <branch|path> [--force]";
 
 /// Parsed `qoop worktree new` arguments. Its own flags come out first and the rest is
@@ -1064,14 +1064,39 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
     supervise::open_terminal(&new, |terminal| println!("terminal={terminal}"))
 }
 
-/// `qoop worktree ls`: every worktree, and this machine's terminals inside each.
+/// `qoop worktree ls`: every worktree, and this machine's terminals inside each. `--stale`
+/// keeps the clean linked ones nothing runs in that are empty, merged or old, each with why
+/// (see [`stale_why`]); it only lists, from the refs here, with no fetch and no gh.
 fn worktree_ls(args: &[String]) -> std::io::Result<()> {
-    let json = match args.get(3).map(String::as_str) {
-        None => false,
-        Some("--json") if args.len() == 4 => true,
-        _ => return Err(crate::usage(WORKTREE_USAGE)),
-    };
+    let (mut json, mut stale) = (false, false);
+    for arg in args.iter().skip(3) {
+        let flag = match arg.as_str() {
+            "--json" => &mut json,
+            "--stale" => &mut stale,
+            _ => return Err(crate::usage(WORKTREE_USAGE)),
+        };
+        if std::mem::replace(flag, true) {
+            return Err(crate::usage(WORKTREE_USAGE));
+        }
+    }
     let list = worktrees()?;
+    let why: Vec<Option<String>> = if stale {
+        let main = &list[0].path;
+        let base = base_of(main, list[0].branch.as_deref(), None).ok();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        std::iter::once(Ok(None))
+            .chain(
+                list.iter()
+                    .skip(1)
+                    .map(|w| stale_why(main, base.as_deref(), w, now)),
+            )
+            .collect::<std::io::Result<_>>()?
+    } else {
+        vec![None; list.len()]
+    };
+    let shown = |i: usize| !stale || why[i].is_some();
     let rows = session_rows()?;
     let roots: Vec<PathBuf> = list.iter().map(|w| real(&w.path)).collect();
     let mut inside: Vec<Vec<&qoop_runtime::control::AgentRow>> = vec![Vec::new(); list.len()];
@@ -1089,14 +1114,20 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
         let out: Vec<_> = list
             .iter()
             .zip(&inside)
-            .map(|(w, rows)| {
-                serde_json::json!({
+            .enumerate()
+            .filter(|(i, _)| shown(*i))
+            .map(|(i, (w, rows))| {
+                let mut row = serde_json::json!({
                     "path": w.path,
                     "branch": w.branch,
                     "head": w.head,
                     "bare": w.bare,
                     "terminals": rows,
-                })
+                });
+                if let Some(why) = &why[i] {
+                    row["why"] = why.as_str().into();
+                }
+                row
             })
             .collect();
         println!(
@@ -1105,9 +1136,16 @@ fn worktree_ls(args: &[String]) -> std::io::Result<()> {
         );
         return Ok(());
     }
-    for (w, rows) in list.iter().zip(&inside) {
+    for (i, (w, rows)) in list.iter().zip(&inside).enumerate() {
+        if !shown(i) {
+            continue;
+        }
+        let why = why[i]
+            .as_deref()
+            .map(|why| format!(" why={why}"))
+            .unwrap_or_default();
         println!(
-            "path={} branch={} terminals={}",
+            "path={} branch={} terminals={}{why}",
             w.path.display(),
             w.branch.as_deref().unwrap_or("-"),
             rows.len()
@@ -1728,6 +1766,45 @@ fn finish_merge(
     println!("merged {branch} into {into} (fast-forward)");
     remove_and_delete(main, tree, branch, false)
 }
+
+/// Why a linked worktree is stale, the first reason that holds: `empty` (no commits beyond
+/// the base), `merged` (an ancestor of the base, or every commit applied there), `old:<n>d`
+/// (its tip's commit is 30 days old or more). Local refs only. `None` for a worktree that is
+/// not clean, gone, or has a process inside.
+fn stale_why(
+    main: &std::path::Path,
+    base: Option<&str>,
+    tree: &Worktree,
+    now: i64,
+) -> std::io::Result<Option<String>> {
+    let Some(tip) = tree.head.as_deref() else {
+        return Ok(None);
+    };
+    if tree.bare || !tree.path.exists() || dirty(&tree.path)? {
+        return Ok(None);
+    }
+    if !processes_inside(&real(&tree.path))?.is_empty() {
+        return Ok(None);
+    }
+    if let Some(base) = base {
+        let ahead = git_in(main, &["rev-list", "--count", &format!("{base}..{tip}")])?;
+        if ahead.trim() == "0" {
+            return Ok(Some("empty".to_string()));
+        }
+        if merged_here(main, base, tip) {
+            return Ok(Some("merged".to_string()));
+        }
+    }
+    let when: i64 = git_in(main, &["log", "-1", "--format=%ct", tip])?
+        .trim()
+        .parse()
+        .unwrap_or(now);
+    let days = (now - when) / 86_400;
+    Ok((days >= STALE_DAYS).then(|| format!("old:{days}d")))
+}
+
+/// How old a worktree's last commit is before `ls --stale` lists it as old.
+const STALE_DAYS: i64 = 30;
 
 #[cfg(test)]
 mod tests {
