@@ -233,6 +233,64 @@ async fn only_the_terminals_own_token_speaks_for_it() {
     );
 }
 
+/// A person's window reads the open task of the tab it shows by the tab's number alone; a
+/// token that does not hold the tab is still refused.
+#[tokio::test]
+async fn a_window_reads_a_tabs_open_task_without_its_token() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = d
+        .agents_arc()
+        .token_of(terminal)
+        .expect("a token")
+        .as_str()
+        .to_string();
+    let mut c = d.attach("qoop-task").await;
+    let opened = write(
+        &mut c,
+        Some(terminal),
+        Some(token),
+        None,
+        TaskOp::New {
+            goal: "read me".into(),
+            replace: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(opened, ControlResponse::TaskWritten { .. }),
+        "{opened:?}"
+    );
+    let read = |token: Option<String>| ControlRequest::TaskRead {
+        id: "r".into(),
+        board: false,
+        task: None,
+        terminal: Some(terminal),
+        token,
+        before: None,
+    };
+    let mut window = d.attach("qoop-desktop").await;
+    let answer = window
+        .control(&read(None), PATIENCE)
+        .await
+        .expect("an answer");
+    let ControlResponse::Tasks { tasks, .. } = answer else {
+        panic!("not read: {answer:?}")
+    };
+    assert_eq!(
+        tasks.iter().map(|t| t.goal.as_str()).collect::<Vec<_>>(),
+        ["read me"]
+    );
+    let forged = window
+        .control(&read(Some("not-its-token".into())), PATIENCE)
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(forged, ControlResponse::Failed { .. }),
+        "{forged:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_begin_opens_once_and_is_heard_once() {
     let d = TestDaemon::start().await;

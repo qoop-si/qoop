@@ -691,6 +691,34 @@ pub fn seal(menu: &Menu) -> u64 {
     h.finish() & ((1 << 53) - 1)
 }
 
+/// The mode Claude Code's footer states under its prompt box (`⏵⏵ accept edits on (shift+tab
+/// to cycle)`, `⏸ plan mode on`, `⏵⏵ bypass permissions on · 1 shell`): its words, `accept
+/// edits`. `None` when the footer states none, which is the default mode. Only the first line
+/// under the last rule is read, so a footer quoted in an answer above the box says nothing.
+pub fn mode_of(screen: &[String]) -> Option<String> {
+    let region = qoop_detect::Region::AfterLastHorizontalRule.view(
+        screen,
+        &qoop_detect::OscContext { title: "" },
+        false,
+    );
+    let footer = region
+        .lines
+        .into_iter()
+        .find(|row| !row.trim().is_empty())?;
+    let first = footer.split(" · ").next()?.trim_start();
+    let words = first.trim_start_matches(['\u{23F5}', '\u{23F8}']);
+    if words.len() == first.len() {
+        return None;
+    }
+    let words = words.split(" (").next()?.trim();
+    let mode = words.strip_suffix(" on")?.trim();
+    let plain = mode.split(' ').count() <= 3
+        && mode
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == ' ' || c == '\'');
+    (plain && !mode.is_empty()).then(|| mode.to_string())
+}
+
 impl Menu {
     /// The menu as a person's client shows it.
     pub fn view(&self) -> AgentMenu {
@@ -1901,5 +1929,42 @@ mod tests {
         let mut gone = screen("    ls /tmp");
         gone.lines.truncate(2);
         assert_eq!(answer_on(&gone, shown.seal, "1"), Err(ALREADY_ANSWERED));
+    }
+
+    /// Claude Code's footer per mode, and none: the default mode states nothing, and a mode
+    /// quoted above the prompt box is not the footer.
+    #[test]
+    fn the_mode_is_read_off_the_footer() {
+        let rule = "\u{2500}".repeat(40);
+        let boxed =
+            |above: &str, footer: &str| rows(&[above, rule.as_str(), "> ", rule.as_str(), footer]);
+        let cases = [
+            (
+                "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
+                Some("accept edits"),
+            ),
+            (
+                "  \u{23F8} plan mode on (shift+tab to cycle)",
+                Some("plan mode"),
+            ),
+            (
+                "  \u{23F5}\u{23F5} bypass permissions on \u{b7} 1 shell \u{b7} \u{2190} 5 agents",
+                Some("bypass permissions"),
+            ),
+            ("  ? for shortcuts", None),
+            ("", None),
+        ];
+        for (footer, want) in cases {
+            assert_eq!(
+                mode_of(&boxed("\u{25cf} Done.", footer)).as_deref(),
+                want,
+                "{footer:?}"
+            );
+        }
+        let quoted = boxed(
+            "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
+            "  ? for shortcuts",
+        );
+        assert_eq!(mode_of(&quoted), None);
     }
 }

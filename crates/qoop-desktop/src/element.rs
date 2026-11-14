@@ -88,6 +88,10 @@ pub struct TerminalElement<V: 'static> {
     pub resize: Rc<dyn Fn(TerminalStream, u16, u16)>,
     /// Where text from the input method goes (dead keys, IME), for the focused pane.
     pub input: Option<(FocusHandle, Entity<V>)>,
+    /// Cells selected with the mouse, as (row, column) of what is shown, either order.
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    /// Told where the grid was drawn, for a mouse position to a cell.
+    pub area: Option<Rc<Cell<Bounds<Pixels>>>>,
 }
 
 impl<V: EntityInputHandler> IntoElement for TerminalElement<V> {
@@ -153,6 +157,9 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
     ) -> Painted {
         let mut frame = probe::Frame::start();
         let bounds = on_device_pixels(bounds, window.scale_factor());
+        if let Some(area) = &self.area {
+            area.set(bounds);
+        }
         let fit = self.cells.fit((bounds.size.width, bounds.size.height));
         if let Some(terminal) = self.terminal
             && fit != self.sent.get()
@@ -201,6 +208,12 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
             for (rect, bg) in &painted.quads {
                 window.paint_quad(fill(*rect, *bg));
             }
+            if let Some((a, b)) = self.selection {
+                let ink = rgb(FOREGROUND).opacity(0.28);
+                for rect in selected_rects(a, b, painted.origin, &self.cells, self.sent.get().0) {
+                    window.paint_quad(fill(rect, ink));
+                }
+            }
             for glyph in &painted.glyphs {
                 paint_glyph(glyph, glyph.ink, self.cells.font_size, window);
             }
@@ -231,6 +244,36 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
         let frame = std::mem::replace(&mut painted.frame, probe::Frame::start());
         probe::painted(frame, self.pane, shown, window);
     }
+}
+
+/// The rectangles of a selection from `a` to `b` (either order): the first row from its
+/// column, whole rows between, the last row to its column, `cols` wide.
+fn selected_rects(
+    a: (usize, usize),
+    b: (usize, usize),
+    origin: Point<Pixels>,
+    cells: &Cells,
+    cols: u16,
+) -> Vec<Bounds<Pixels>> {
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    let cols = usize::from(cols.max(1));
+    (from.0..=to.0)
+        .map(|row| {
+            let start = if row == from.0 { from.1.min(cols) } else { 0 };
+            let end = if row == to.0 {
+                (to.1 + 1).min(cols)
+            } else {
+                cols
+            };
+            Bounds::new(
+                point(
+                    origin.x + cells.width * start as f32,
+                    origin.y + cells.height * row as f32,
+                ),
+                size(cells.width * end.saturating_sub(start) as f32, cells.height),
+            )
+        })
+        .collect()
 }
 
 fn paint_glyph(glyph: &Glyph, ink: Hsla, size: Pixels, window: &mut Window) {
@@ -655,6 +698,8 @@ mod tests {
             viewport: Rc::new(Cell::new(None)),
             resize: Rc::new(move |t, c, r| asked.borrow_mut().push((t, c, r))),
             input: None,
+            selection: None,
+            area: None,
         }
     }
 

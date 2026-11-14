@@ -19,6 +19,10 @@ mod link;
 mod newwork;
 #[cfg(target_os = "macos")]
 mod probe;
+#[cfg(target_os = "macos")]
+mod review;
+#[cfg(target_os = "macos")]
+mod session;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod spike_link;
 #[cfg(target_os = "macos")]

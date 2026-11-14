@@ -1215,6 +1215,26 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 let (link, terminal) = terminal_in(terminal);
                 self.send_one(link, R::SetParked { id, terminal, on }).await
             }
+            // A tab's open task is the machine's that runs the tab, asked in its own numbers.
+            R::TaskRead {
+                id,
+                board,
+                task,
+                terminal: Some(terminal),
+                token,
+                before,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                let request = R::TaskRead {
+                    id,
+                    board,
+                    task,
+                    terminal: Some(terminal),
+                    token,
+                    before,
+                };
+                self.send_one(link, request).await
+            }
             // A look at a finish goes to the machine whose stop it is.
             R::Seen { id, terminal, stop } => {
                 let (link, terminal) = terminal_in(terminal);
@@ -2123,6 +2143,37 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 self.respond(&C::Schedules { id, schedules }).await
             }
+            // A remote tab's task (a window asked it by the tab's number) names the tab in the
+            // remote's own numbers; one that does not fit names none.
+            C::Tasks {
+                id,
+                mut tasks,
+                events,
+                more,
+                space,
+                items,
+                item,
+                loose,
+            } => {
+                for t in &mut tasks {
+                    t.terminal = t
+                        .terminal
+                        .and_then(|t| u32::try_from(t).ok())
+                        .and_then(|t| terminal_out(link, t))
+                        .map(i64::from);
+                }
+                let tasks = C::Tasks {
+                    id,
+                    tasks,
+                    events,
+                    more,
+                    space,
+                    items,
+                    item,
+                    loose,
+                };
+                self.respond(&tasks).await
+            }
             // Answers that carry no number of either kind.
             other => self.respond(&other).await,
         }
@@ -2905,6 +2956,62 @@ mod tests {
         assert!(remote_rx.try_recv().is_err(), "the remote was asked");
         let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
         assert_eq!(asked, upload("up-2", None));
+    }
+
+    /// A remote tab's open task is asked of the remote in its own number for the tab, and the
+    /// task that comes back names the tab in the interface's number; one that does not fit
+    /// names none. A read that names no tab still goes home.
+    #[tokio::test]
+    async fn a_remote_tabs_task_is_read_there_and_renumbered() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let read = |id: &str, terminal| ControlRequest::TaskRead {
+            id: id.into(),
+            board: false,
+            task: None,
+            terminal,
+            token: None,
+            before: None,
+        };
+        mux.control(read("t1", Some(terminal_out(1, 1).expect("fits"))))
+            .await
+            .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, read("t1", Some(1)));
+        mux.control(read("t2", None)).await.expect("sent");
+        assert!(remote_rx.try_recv().is_err(), "the remote was asked");
+        let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+        assert_eq!(asked, read("t2", None));
+
+        let task = |terminal: i64| -> qoop_runtime::control::TaskInfo {
+            serde_json::from_value(serde_json::json!({
+                "id": 4, "terminal": terminal, "goal": "soak", "stage": "implementing",
+                "opened_at": 0, "updated_at": 0,
+            }))
+            .expect("a task")
+        };
+        mux.answer(
+            1,
+            ControlResponse::Tasks {
+                id: "t1".into(),
+                tasks: vec![task(1), task(1 << 30)],
+                events: Vec::new(),
+                more: false,
+                space: None,
+                items: None,
+                item: None,
+                loose: None,
+            },
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        let ControlResponse::Tasks { id, tasks, .. } = answered else {
+            panic!("{answered:?}");
+        };
+        assert_eq!(id, "t1");
+        let named: Vec<Option<i64>> = tasks.iter().map(|t| t.terminal).collect();
+        assert_eq!(named, [terminal_out(1, 1).map(i64::from), None]);
     }
 
     /// A remote's recording names its terminal in the interface's numbering: left as the

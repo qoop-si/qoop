@@ -830,9 +830,15 @@ pub(crate) async fn read(
     agents: &AgentRegistry,
     store: &StoreHandle,
 ) -> ControlResponse {
-    let speaker = match speaker(agents, terminal, token.as_deref()) {
-        Ok(s) => s,
-        Err(reason) => return failed(id, reason),
+    // A read names a terminal with its token (`qoop task` inside it) or with none (a person's
+    // window showing that tab): every open task is readable by anyone already, so only a token
+    // that does not hold the terminal is refused.
+    let speaker = match (terminal, token.as_deref()) {
+        (Some(t), None) => Some(t),
+        _ => match speaker(agents, terminal, token.as_deref()) {
+            Ok(s) => s,
+            Err(reason) => return failed(id, reason),
+        },
     };
     let now = now();
     let found = store

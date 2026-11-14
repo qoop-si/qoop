@@ -244,6 +244,268 @@ fn new_work_survives_escape_and_a_reconnect(cx: &mut TestAppContext) {
     assert!(desk.read_with(&vcx, |d, _| d.pending.is_none()));
 }
 
+fn request_of(ups: &[Up], pick: impl Fn(&ControlRequest) -> bool) -> Option<ControlRequest> {
+    ups.iter().find_map(|u| match u {
+        Up::Request(r) if pick(r) => Some((**r).clone()),
+        _ => None,
+    })
+}
+
+fn answer(desk: &Entity<Desk>, vcx: &mut VisualTestContext, response: ControlResponse) {
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Answer(Box::new(response)), window, cx);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+}
+
+/// A split tab as the daemon keeps it: both panes are shown, each terminal is told the size
+/// of its own pane, and the wider share gets the wider pane.
+#[gpui::test]
+fn a_split_tab_lays_out_its_panes_and_sizes_each(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.model.splits = vec![crate::state::tests::split(1, 3)];
+            d.open(Page::Session(1), window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let ups = sent(&mut rx);
+    let shown: Vec<u32> = ups
+        .iter()
+        .filter_map(|u| match u {
+            Up::Show(t) => Some(t.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(shown, [1, 3], "both panes of the tab");
+    let size_of = |terminal: u32| {
+        ups.iter()
+            .rev()
+            .find_map(|u| match u {
+                Up::Resize(t, cols, rows) if *t == terminal => Some((*cols, *rows)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("terminal {terminal} was told no size: {ups:?}"))
+    };
+    let (left, right) = (size_of(1), size_of(3));
+    assert!(
+        left.0 > right.0,
+        "60 of 100 is the wider: {left:?} {right:?}"
+    );
+    assert_eq!(left.1, right.1, "side by side, the same height");
+}
+
+/// The strip shows the answer to its own read of the tab's task, and says so when there is no
+/// task.
+#[gpui::test]
+fn the_task_strip_is_the_tabs_own_task(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    let read = request_of(&sent(&mut rx), |r| {
+        matches!(
+            r,
+            ControlRequest::TaskRead {
+                terminal: Some(1),
+                token: None,
+                ..
+            }
+        )
+    })
+    .expect("the tab's task asked for by its number");
+    let task: qoop_runtime::control::TaskInfo = serde_json::from_value(serde_json::json!({
+        "id": 12, "terminal": 1, "goal": "Check the bun test suite", "stage": "implementing",
+        "opened_at": 0, "updated_at": 0,
+    }))
+    .expect("task");
+    let tasks = |id: &str, tasks| ControlResponse::Tasks {
+        id: id.into(),
+        tasks,
+        events: Vec::new(),
+        more: false,
+        space: None,
+        items: None,
+        item: None,
+        loose: None,
+    };
+    answer(&desk, &mut vcx, tasks("someone-else", vec![task.clone()]));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.strip.is_none()),
+        "another read's answer"
+    );
+    answer(&desk, &mut vcx, tasks(read.request_id(), vec![task]));
+    let heading = desk.read_with(&vcx, |d, _| d.strip.as_ref().and_then(|s| s.heading()));
+    assert_eq!(heading.map(|h| h.0).as_deref(), Some("Task #12"));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    let read = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::TaskRead { .. })
+    })
+    .expect("asked again for the new tab");
+    answer(&desk, &mut vcx, tasks(read.request_id(), Vec::new()));
+    let none = desk.read_with(&vcx, |d, _| d.strip.as_ref().map(|s| s.heading().is_none()));
+    assert_eq!(none, Some(true), "No task for this terminal");
+}
+
+/// Another agent turning Needs you while a session is open shows the corner note; the one on
+/// screen never does; `ctrl-a x` dismisses it and `ctrl-a tab` opens its agent.
+#[gpui::test]
+fn the_corner_note_is_for_a_second_agent_only(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    let agents = |turned: &[u32]| {
+        let mut rows = crate::state::tests::fixture().rows;
+        for row in &mut rows {
+            if turned.contains(&row.terminal) {
+                row.status = Some("blocked".into());
+            }
+        }
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        }
+    };
+    answer(&desk, &mut vcx, agents(&[1]));
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.note),
+        None,
+        "the agent on screen"
+    );
+    answer(&desk, &mut vcx, agents(&[1, 3]));
+    assert_eq!(desk.read_with(&vcx, |d, _| d.note), Some(3));
+    assert!(vcx.debug_bounds("corner-note").is_some(), "drawn");
+    vcx.simulate_keystrokes("ctrl-a x");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.note), None, "dismissed");
+    assert!(vcx.debug_bounds("corner-note").is_none());
+    answer(&desk, &mut vcx, agents(&[1]));
+    answer(&desk, &mut vcx, agents(&[1, 4]));
+    assert_eq!(desk.read_with(&vcx, |d, _| d.note), Some(4));
+    vcx.simulate_keystrokes("ctrl-a tab");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Session(4));
+    assert_eq!(desk.read_with(&vcx, |d, _| d.note), None);
+}
+
+/// Cmd+V pastes the clipboard's text into the tab on screen as a paste.
+#[gpui::test]
+fn cmd_v_pastes_into_the_tab(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.write_to_clipboard(gpui::ClipboardItem::new_string("cargo test\n".into()));
+    vcx.simulate_keystrokes("cmd-v");
+    let pasted = sent(&mut rx)
+        .into_iter()
+        .any(|u| matches!(u, Up::Paste(1, bytes) if bytes == b"cargo test\n"));
+    assert!(pasted, "pasted, not typed");
+}
+
+/// d-review by keyboard: Changes reads the tab's checkout in this process, `n` opens the next
+/// file, `x` marks the finish read for its stop, Escape closes it; a remote tab has no review.
+#[gpui::test]
+fn the_review_reads_here_and_takes_n_and_x(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let row = d
+                .model
+                .rows
+                .iter_mut()
+                .find(|r| r.terminal == 3)
+                .expect("row");
+            row.cwd = Some("/srv/acme-web".into());
+            row.stop = Some("1700000000.4".into());
+            d.open(Page::Session(3), window, cx);
+            d.toggle_review(window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let id = sent(&mut rx)
+        .into_iter()
+        .find_map(|u| match u {
+            Up::Changes {
+                id,
+                terminal: 3,
+                cwd,
+            } if cwd == "/srv/acme-web" => Some(id),
+            _ => None,
+        })
+        .expect("read here, for this tab's folder");
+    let file = |path: &str, added, removed| qoop_runtime::control::ChangedFile {
+        path: path.into(),
+        status: "M".into(),
+        added,
+        removed,
+    };
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Changes {
+            id,
+            root: "/srv/acme-web".into(),
+            branch: Some("acme-web/coupon-tests".into()),
+            base: "main".into(),
+            files: vec![
+                file("src/a.ts", Some(12), Some(0)),
+                file("src/b.ts", Some(1), Some(1)),
+            ],
+            diff: String::new(),
+            cut: false,
+            pr: None,
+            pr_known: false,
+        },
+    );
+    let totals = desk.read_with(&vcx, |d, _| {
+        d.review.as_ref().and_then(|r| match &r.read {
+            Some(Ok(c)) => Some(c.totals()),
+            _ => None,
+        })
+    });
+    assert_eq!(totals, Some((13, 1)));
+    vcx.simulate_keystrokes("n");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.review.as_ref().map(|r| r.open)),
+        Some(1)
+    );
+    vcx.simulate_keystrokes("x");
+    let seen = request_of(&sent(&mut rx), |r| matches!(r, ControlRequest::Seen { .. }));
+    assert_eq!(
+        seen,
+        Some(ControlRequest::Seen {
+            id: seen
+                .as_ref()
+                .map(|s| s.request_id().to_string())
+                .unwrap_or_default(),
+            terminal: 3,
+            stop: Some("1700000000.4".into()),
+        })
+    );
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| d.review.is_none()));
+    // A remote tab: no review is read.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Session(0x8100_0001), window, cx);
+            d.toggle_review(window, cx);
+        })
+    });
+    assert!(desk.read_with(&vcx, |d, _| d.review.is_none()));
+    assert!(
+        !sent(&mut rx)
+            .iter()
+            .any(|u| matches!(u, Up::Changes { .. })),
+        "nothing read for a remote tab"
+    );
+}
+
 /// Every key hint names the prefix `config.toml` picked.
 #[gpui::test]
 fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {
