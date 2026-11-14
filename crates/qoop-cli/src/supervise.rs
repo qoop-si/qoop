@@ -54,7 +54,7 @@ const KEY_GAP: Duration = Duration::from_millis(50);
 /// starts a connection's event pump when it accepts it, so a change made
 /// between a listing and the wait that follows is still delivered on the
 /// same connection. A second connection would open a window where it is not.
-struct Link {
+pub(crate) struct Link {
     rd: tokio::net::unix::OwnedReadHalf,
     wr: tokio::net::unix::OwnedWriteHalf,
     inbuf: bytes::BytesMut,
@@ -74,7 +74,7 @@ impl Link {
 
     /// The same, as a connection that only watches: a daemon with nothing awake leaves
     /// with this one still open, which is what lets a notch watch without keeping it up.
-    async fn open_observer(who: &str) -> std::io::Result<Self> {
+    pub(crate) async fn open_observer(who: &str) -> std::io::Result<Self> {
         Self::open_as(who, true).await
     }
 
@@ -178,7 +178,7 @@ impl Link {
     /// passes: a subscription delivers the current screen inside its own round trip, and
     /// a `wait --match` that only read screens between round trips never saw text that
     /// was already there.
-    async fn ask(
+    pub(crate) async fn ask(
         &mut self,
         request: &ControlRequest,
     ) -> std::io::Result<(ControlResponse, Vec<client::Incoming>)> {
@@ -254,7 +254,7 @@ impl Link {
     /// subscribed to a terminal the moment it is accepted. `None` at the
     /// deadline. A render of the `screen_text` terminal updates `on_screen`
     /// and wakes the caller with no events.
-    async fn next_events(
+    pub(crate) async fn next_events(
         &mut self,
         deadline: Option<Instant>,
     ) -> std::io::Result<Option<Vec<EventMessage>>> {
