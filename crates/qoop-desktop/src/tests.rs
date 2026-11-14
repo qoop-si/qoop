@@ -270,7 +270,7 @@ fn home_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
     vcx.update(|window, cx| {
         desk.update(cx, |d, cx| {
-            // The sleeping chip, so every row it holds fits the test window's height.
+            // The sleeping chip: what it lists is the sleeping tabs only.
             d.chip = crate::state::Chip::Sleeping;
             let mut spaces = d.model.spaces.clone();
             spaces.push(crate::state::tests::sleepy_space(
@@ -286,6 +286,8 @@ fn home_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
+            // As the link's pump does after each batch.
+            cx.notify();
         })
     });
     vcx.run_until_parked();
