@@ -1550,6 +1550,14 @@ fn finish_pr_pushes_reuses_the_pr_and_keeps_the_worktree_until_gh_says_merged() 
     assert!(done.status.success(), "{}", text(&done.stderr));
     assert!(text(&done.stdout).contains("deleted origin/feat/p"));
     assert!(!wt.exists() && !has_ref(&repo, "refs/heads/feat/p"));
+    // The upstream `--pr` set goes with the branch, as `branch -D` would drop it.
+    let upstream = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["config", "--get", "branch.feat/p.remote"])
+        .output()
+        .expect("git");
+    assert!(!upstream.status.success(), "{}", text(&upstream.stdout));
     std::fs::remove_file(gh.join("merged")).unwrap();
 
     // gh that fails: pushed, said, kept, exit 1.
@@ -1591,7 +1599,14 @@ fn finish_pr_pushes_reuses_the_pr_and_keeps_the_worktree_until_gh_says_merged() 
         .map(|d| d.join("git"))
         .find(|g| g.is_file())
         .expect("git on PATH");
-    std::os::unix::fs::symlink(real_git, only_git.join("git")).unwrap();
+    // A wrapper, not a symlink: git finds its helpers from its own path, not the link's.
+    let wrapper = only_git.join("git");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", real_git.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     let wt = add_worktree(&repo, "feat/h");
     commit(&wt, "h.txt", "h\n");
     let pr = qoop_alone(&repo, &["worktree", "finish", "feat/h", "--pr"], &only_git);
@@ -1904,32 +1919,29 @@ fn full_ref_names_keep_tags_and_plus_names_from_being_taken_for_branches() {
     assert!(merged.status.success(), "{}", text(&merged.stderr));
     assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), tip);
 
-    // `+feat` pushed by name would be a forced push: the remote's own `+feat` stays.
+    // `+feat` pushed by name is a forced push of `feat`: a local and a remote `feat` that
+    // went apart show it never happens, and `+feat` itself is what is pushed.
     let other = tempfile::tempdir().expect("tempdir");
     let (repo, bare) = with_origin(other.path());
-    let elsewhere = add_worktree(&repo, "elsewhere");
-    commit(&elsewhere, "o.txt", "o\n");
+    let ours = add_worktree(&repo, "feat");
+    commit(&ours, "ours.txt", "ours\n");
+    let theirs = add_worktree(&repo, "theirs");
+    commit(&theirs, "theirs.txt", "theirs\n");
     git(
         &repo,
-        &[
-            "push",
-            "-q",
-            "origin",
-            "refs/heads/elsewhere:refs/heads/+feat",
-        ],
+        &["push", "-q", "origin", "refs/heads/theirs:refs/heads/feat"],
     );
-    let before = git(&bare, &["rev-parse", "refs/heads/+feat"]);
+    let local_feat = git(&repo, &["rev-parse", "refs/heads/feat"]);
+    let remote_feat = git(&bare, &["rev-parse", "refs/heads/feat"]);
+    assert_ne!(local_feat, remote_feat);
     let plus = add_worktree(&repo, "+feat");
-    commit(&plus, "p.txt", "p\n");
+    let plus_tip = commit(&plus, "p.txt", "p\n");
     let gh = fake_gh(other.path(), false);
     let pr = qoop_in(&repo, &["worktree", "finish", "+feat", "--pr"], Some(&gh));
-    assert_eq!(pr.status.code(), Some(1), "{}", text(&pr.stdout));
-    assert!(
-        text(&pr.stderr).contains("could not push +feat"),
-        "{}",
-        text(&pr.stderr)
-    );
-    assert_eq!(git(&bare, &["rev-parse", "refs/heads/+feat"]), before);
+    assert!(pr.status.success(), "{}", text(&pr.stderr));
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/feat"]), remote_feat);
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/feat"]), local_feat);
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/+feat"]), plus_tip);
 }
 
 /// The local branch is deleted only at the commit that was proven: one that moved since is
@@ -1953,7 +1965,8 @@ fn a_branch_that_moved_after_its_proof_is_kept() {
              export GIT_DIR='{}'\n\
              late=$(git -c user.name=t -c user.email=t@t commit-tree 'refs/heads/feat/v^{{tree}}' \
              -p refs/heads/feat/v -m late)\n\
-             git update-ref refs/heads/feat/v \"$late\"\n",
+             git update-ref refs/heads/feat/v \"$late\"\n\
+             exit 0\n",
             repo.join(".git").display()
         ),
     )
@@ -2018,7 +2031,8 @@ fn finish_refuses_a_process_inside_and_a_base_that_is_the_branch_itself() {
     }
     assert!(wt.exists() && has_ref(&repo, "refs/heads/feat/i"));
 
-    for base in ["feat/i", "origin/feat/i"] {
+    let tip = git(&repo, &["rev-parse", "refs/heads/feat/i"]);
+    for base in ["feat/i", "origin/feat/i", "refs/heads/feat/i", tip.as_str()] {
         let out = qoop_in(
             &repo,
             &["worktree", "finish", "feat/i", "--base", base],
@@ -2045,4 +2059,44 @@ fn finish_refuses_a_process_inside_and_a_base_that_is_the_branch_itself() {
     );
     assert_eq!(out.status.code(), Some(2));
     assert!(wt.exists());
+}
+
+/// A clone has `origin/HEAD`: the base is the branch it points at, so a squash merge gh
+/// knows into `main` proves it, where `HEAD` would match no pull request.
+#[test]
+fn origin_head_stands_for_its_branch_in_a_gh_proof() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let seed = repo_named(root.path(), "seed");
+    git(
+        root.path(),
+        &["init", "-q", "--bare", "-b", "main", "up.git"],
+    );
+    let up = root.path().join("up.git");
+    git(&seed, &["push", "-q", up.to_str().unwrap(), "main"]);
+    git(
+        root.path(),
+        &["clone", "-q", up.to_str().unwrap(), "my repo"],
+    );
+    let repo = root.path().join("my repo");
+    assert_eq!(
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+        "refs/remotes/origin/main"
+    );
+    let gh = fake_gh(root.path(), false);
+    let wt = add_worktree(&repo, "feat/sq");
+    let tip = commit(&wt, "sq.txt", "sq\n");
+    git(&wt, &["push", "-q", "origin", "feat/sq"]);
+    std::fs::write(
+        gh.join("merged"),
+        format!("[{{\"headRefOid\":\"{tip}\",\"baseRefName\":\"main\"}}]"),
+    )
+    .unwrap();
+    let done = qoop_in(&repo, &["worktree", "finish", "feat/sq"], Some(&gh));
+    assert!(done.status.success(), "{}", text(&done.stderr));
+    assert!(
+        text(&done.stdout).contains("deleted origin/feat/sq"),
+        "{}",
+        text(&done.stdout)
+    );
+    assert!(!wt.exists() && !has_ref(&repo, "refs/heads/feat/sq"));
 }

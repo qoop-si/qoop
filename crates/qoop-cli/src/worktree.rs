@@ -1442,22 +1442,53 @@ fn net_git_by(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    // Git has exited, but something it started may still hold its pipes open (an ssh
+    // ControlPersist master keeps stderr): what came by then is the answer.
+    let grace = std::time::Instant::now() + std::time::Duration::from_secs(1);
     Ok(std::process::Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout.take_by(grace),
+        stderr: stderr.take_by(grace),
     })
 }
 
-/// Everything a pipe gives, read on a thread of its own so a full pipe never stalls git.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+/// A pipe read on a thread of its own, so a full pipe never stalls git, and what it gave.
+struct Drained {
+    got: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drained {
+    /// What the pipe gave once it closed, or by `by` if it is still open then.
+    fn take_by(self, by: std::time::Instant) -> Vec<u8> {
+        let _ = self
+            .done
+            .recv_timeout(by.saturating_duration_since(std::time::Instant::now()));
+        let mut got = self
+            .got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *got)
+    }
+}
+
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drained {
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, done) = std::sync::mpsc::channel();
+    let shared = got.clone();
     std::thread::spawn(move || {
-        let mut got = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut got);
+            let mut buf = vec![0; 64 * 1024];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&buf[..n]);
+            }
         }
-        got
-    })
+        let _ = tx.send(());
+    });
+    Drained { got, done }
 }
 
 /// What `net_git` said on stderr, on one line.
@@ -1562,15 +1593,31 @@ fn base_of(
     .into_iter()
     .chain(main_branch.map(|b| (format!("refs/remotes/origin/{b}"), format!("origin/{b}"))))
     .chain(main_branch.map(|b| (format!("refs/heads/{b}"), b.to_string())));
-    candidates
+    let (full, shown) = candidates
         .into_iter()
         .find(|(full, _)| exists(full))
-        .map(|(full, shown)| Base { full, shown })
         .ok_or_else(|| {
             std::io::Error::other(
                 "nothing to compare with: the main checkout has no branch; pass --base REF",
             )
-        })
+        })?;
+    // `origin/HEAD` stands for the branch it points at, which is what gh and the remote
+    // call the base: `main`, never `HEAD`.
+    let target = (full == "refs/remotes/origin/HEAD")
+        .then(|| git_in(main, &["symbolic-ref", "-q", &full]).ok())
+        .flatten()
+        .map(|t| t.trim().to_string())
+        .filter(|t| t.starts_with("refs/remotes/origin/"));
+    Ok(match target {
+        Some(target) => Base {
+            shown: target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string(),
+            full: target,
+        },
+        None => Base { full, shown },
+    })
 }
 
 /// Whether `tip` is in `base` as git sees it here: an ancestor, or every commit of it
@@ -1665,6 +1712,11 @@ fn remove_and_delete(
             &now[..now.len().min(12)]
         )));
     }
+    // What `branch -D` would also drop: its upstream, set by an earlier `--pr`. None is fine.
+    let _ = git_in(
+        main,
+        &["config", "--remove-section", &format!("branch.{branch}")],
+    );
     println!("removed {}; branch {branch} deleted", tree.path.display());
     Ok(())
 }
@@ -1798,6 +1850,32 @@ fn finish_merged(
         fetch_origin(main);
     }
     let base = base_of(main, main_branch, given_base.as_deref())?;
+    // However `--base` was spelled (`refs/heads/...`, a name git expands, a bare commit id
+    // of the tip): a branch is always merged into itself, which proves nothing.
+    let is_tip = || {
+        git_in(
+            main,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{}^{{commit}}", base.full),
+            ],
+        )
+        .is_ok_and(|at| at.trim() == tip)
+    };
+    if [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+    .contains(&base.full)
+        || (!base.full.starts_with("refs/") && is_tip())
+    {
+        return Err(std::io::Error::other(format!(
+            "--base {} is the branch being finished; name the branch it goes into",
+            base.shown
+        )));
+    }
     let merged = merged_here(main, &base.full, tip)
         || (origin && merged_on_github(main, branch, &base, tip));
     if !merged {
