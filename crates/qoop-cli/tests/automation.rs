@@ -1839,7 +1839,7 @@ fn ls_stale_lists_empty_merged_and_old_worktrees_and_nothing_in_use() {
     assert_eq!(
         text(&listed.stdout),
         format!(
-            "path={} branch=feat/empty terminals=0 why=empty\n\
+            "path={} branch=feat/empty terminals=0 why=merged\n\
              path={} branch=feat/merged terminals=0 why=merged\n\
              path={} branch=feat/old terminals=0 why=old:40d\n",
             empty.display(),
@@ -1850,7 +1850,7 @@ fn ls_stale_lists_empty_merged_and_old_worktrees_and_nothing_in_use() {
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&as_json.stdout).expect("a JSON array");
     let whys: Vec<&str> = rows.iter().map(|r| r["why"].as_str().unwrap()).collect();
-    assert_eq!(whys, ["empty", "merged", "old:40d"]);
+    assert_eq!(whys, ["merged", "merged", "old:40d"]);
     for row in &rows {
         for key in ["path", "branch", "head", "bare", "terminals"] {
             assert!(row.get(key).is_some(), "{key} missing: {row}");

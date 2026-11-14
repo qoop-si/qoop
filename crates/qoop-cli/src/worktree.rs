@@ -1065,7 +1065,7 @@ fn worktree_new(args: &[String]) -> std::io::Result<()> {
 }
 
 /// `qoop worktree ls`: every worktree, and this machine's terminals inside each. `--stale`
-/// keeps the clean linked ones nothing runs in that are empty, merged or old, each with why
+/// keeps the clean linked ones nothing runs in that are merged or old, each with why
 /// (see [`stale_why`]); it only lists, from the refs here, with no fetch and no gh.
 fn worktree_ls(args: &[String]) -> std::io::Result<()> {
     let (mut json, mut stale) = (false, false);
@@ -2077,9 +2077,10 @@ fn finish_merge(
     remove_and_delete(main, tree, branch, tip, false)
 }
 
-/// Why a linked worktree is stale, the first reason that holds: `empty` (no commits beyond
-/// the base), `merged` (an ancestor of the base, or every commit applied there), `old:<n>d`
-/// (its tip's commit is 30 days old or more). Local refs only. `None` for a worktree that is
+/// Why a linked worktree is stale, the first reason that holds: `merged` (nothing on it the
+/// base lacks: an ancestor of the base, or every commit applied there), `old:<n>d` (its tip's
+/// commit is 30 days old or more). A branch with no commits of its own and one merged by a
+/// fast-forward look the same to git, so both are `merged`. Local refs only. `None` for a worktree that is
 /// not clean, gone, or has a process inside; `dirs` is one scan of every process's folder.
 fn stale_why(
     main: &std::path::Path,
@@ -2101,14 +2102,8 @@ fn stale_why(
     {
         return Ok(None);
     }
-    if let Some(base) = base {
-        let ahead = git_in(main, &["rev-list", "--count", &format!("{base}..{tip}")])?;
-        if ahead.trim() == "0" {
-            return Ok(Some("empty".to_string()));
-        }
-        if merged_here(main, base, tip) {
-            return Ok(Some("merged".to_string()));
-        }
+    if base.is_some_and(|base| merged_here(main, base, tip)) {
+        return Ok(Some("merged".to_string()));
     }
     let when: i64 = git_in(main, &["log", "-1", "--format=%ct", tip])?
         .trim()
