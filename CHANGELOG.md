@@ -1,0 +1,37 @@
+# Changelog
+
+## [0.15.0](https://github.com/qoop-si/qoop/compare/v0.14.0...v0.15.0) (2026-11-14)
+
+
+### New
+
+* **asks:** questions carry options, leave after a day and come back ([4718ccc](https://github.com/qoop-si/qoop/commit/4718ccc141d8eb4f32d46f2a33009d811303937d))
+* desktop app core, agent menu reader and question notes ([cb18276](https://github.com/qoop-si/qoop/commit/cb18276cd8344c0cd19054e749ece5b4454e28f1))
+* **parsed:** rows carry questions, workflows, labels and idle teammates ([6f78cfb](https://github.com/qoop-si/qoop/commit/6f78cfb225a907189e493f376dd9a651bbf5207e))
+* **runtime:** AgentRows answers only the rows a client names ([5b40388](https://github.com/qoop-si/qoop/commit/5b403884ba71a63f5add1d23af4c5f1b5b698d5d))
+* **runtime:** quiet_rows tells a phone only the row changes it shows ([a30d581](https://github.com/qoop-si/qoop/commit/a30d5811e118fd2eb3b55c9fbf258f6d81b75cda))
+
+
+### Fixed
+
+* **board:** a task waiting on its agent's sub-agents is working too ([2a1fed7](https://github.com/qoop-si/qoop/commit/2a1fed7494a32d5bb9d2e2b30bda14319863e464))
+* **board:** a task whose turn runs is working, not waits ([fb2b6f1](https://github.com/qoop-si/qoop/commit/fb2b6f1f6e915d0b3b4fd79f5518eb10f0a1e707))
+* **hooks:** a Claude session closing is no finish ([1dcd975](https://github.com/qoop-si/qoop/commit/1dcd9755aaad44039b58d3687360f11594271bc5))
+* **hooks:** give the turn's git look five seconds, as the other calls get ([6a34dc5](https://github.com/qoop-si/qoop/commit/6a34dc5ce90caa12e19d589fc9fd6ee554d69311))
+* **pty:** let one /proc scan answer a settle's group lookups on Linux ([0117d2e](https://github.com/qoop-si/qoop/commit/0117d2e176aaf92e675eac077958bc501119b141))
+* **qass:** say why the watch switch could not be saved ([6d560b4](https://github.com/qoop-si/qoop/commit/6d560b4b69c94143805454efbe72a5270135e5a6))
+* **release:** hub step as its own job, re-runs that keep the release whole ([2e7252e](https://github.com/qoop-si/qoop/commit/2e7252e56e17345889569cd63423403252f8e993))
+* **remote:** tell a fish login shell by its version ([81fcaae](https://github.com/qoop-si/qoop/commit/81fcaaedb085b9cce8ec9d751b48a9875129841c))
+* **runtime:** a closed task is news to a quiet phone, and a raced look looks again ([f6eddca](https://github.com/qoop-si/qoop/commit/f6eddca5054f1053827f0e61783fb40ab0821658))
+* **runtime:** announce a held blocker once, not every 800 ms ([e2c3522](https://github.com/qoop-si/qoop/commit/e2c352269a5a5b8ef013e9bee18a3d7386ca9e69))
+* **runtime:** announce a task's row once, and finish only agents' turns ([8af6bcc](https://github.com/qoop-si/qoop/commit/8af6bcced6971822f1801d3f88a78a9ab3ea5843))
+* **runtime:** check a caller's token under one lock, not against a stale read ([6986827](https://github.com/qoop-si/qoop/commit/69868274273effc89807831ff9b988637697a401))
+* **runtime:** decide each agent row's status once in the daemon ([a5cb55f](https://github.com/qoop-si/qoop/commit/a5cb55f45c63807ceba4298c4e51c1780b09aef1))
+* **runtime:** ring the probe on input only, and wait out a busy exec only where nothing leaks ([2dfe578](https://github.com/qoop-si/qoop/commit/2dfe578f8579348c64803f2324151b556297dfc2))
+* **runtime:** settle only the terminals that moved on the probe platform ([4046f9e](https://github.com/qoop-si/qoop/commit/4046f9e3078a8a17e6bc9ede588adc6aab125b68))
+* **runtime:** the agent's own spinner starts a turn no hook reported ([a66f30e](https://github.com/qoop-si/qoop/commit/a66f30e392f6b88007a5f5a85b901b7ba9a6a9e8))
+* **runtime:** wait out a busy binary before a move gives up ([902fc96](https://github.com/qoop-si/qoop/commit/902fc96ac4e003420eb5e1514aec495b5a4d8e3d))
+* **status:** a turn that runs is working, whatever card or stage is open ([626b312](https://github.com/qoop-si/qoop/commit/626b312413494fef7a03802625a0bd0685419b74))
+* **tui:** draw the daemon's status in the sidebar and the notch ([c5734b0](https://github.com/qoop-si/qoop/commit/c5734b00f8e1a58b90009494e754f33455e5bd27))
+* **tui:** read the status in the last views; one bell a finish ([843d79f](https://github.com/qoop-si/qoop/commit/843d79f3399ebe56b2693f3074fa87710a1a36ec))
+* **tui:** take the remote swap lock with the shell's exclusive create ([0dfdf63](https://github.com/qoop-si/qoop/commit/0dfdf631041b5dbb18220f2a5dbcc4e3b3a269ae))
