@@ -2032,17 +2032,24 @@ pub(crate) fn key_needs_mode(name: &str) -> bool {
     matches!(name, "up" | "down" | "right" | "left" | "home" | "end")
 }
 
-/// One argv word as a POSIX shell reads it back: bare when it is plainly
-/// safe, single quoted otherwise, with an embedded quote closed and reopened.
+/// One argv word as a line typed into sh, bash, zsh or fish reads it back:
+/// bare when it is plainly safe, quoted for all four otherwise.
+///
+/// The line is typed, so the shell's line editor reads it before the parser
+/// does: a control character other than a newline is a key there (`ctrl-u`
+/// wipes the line typed so far, and what follows it runs as a line of its
+/// own), so each becomes a space. A leading `=` is zsh's path expansion.
 pub(crate) fn shell_quote(word: &str) -> String {
+    let word = word.replace(|c: char| c.is_control() && c != '\n', " ");
     let safe = !word.is_empty()
+        && !word.starts_with('=')
         && word
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+-,".contains(&b));
     if safe {
-        word.to_string()
+        word
     } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
+        qoop_remote::saved::shell_quote(&word)
     }
 }
 
@@ -2189,8 +2196,17 @@ mod tests {
         }
     }
 
+    /// A shell by name: on the PATH, else where an install puts it.
+    fn find_shell(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .chain(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"].map(Into::into))
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+    }
+
     #[test]
-    fn quoting_round_trips_through_a_real_shell() {
+    fn quoting_round_trips_through_every_real_shell() {
         let words = [
             "claude",
             "fix the bug",
@@ -2199,24 +2215,69 @@ mod tests {
             "$HOME",
             "a\"b",
             "--x=1",
+            r"a\'; touch pwn; #",
+            r"a\\'; touch pwn; #",
+            r"\",
+            r"\\",
+            "'",
+            "''",
+            r"'\''",
+            "$(touch pwn)",
+            "`touch pwn`",
+            "(touch pwn)",
+            "; touch pwn",
+            "line one\nline two; touch pwn",
+            "x\n'; touch pwn; #",
+            "=touch",
+            "~",
+            "*",
+            "{a,b}",
+            "!!",
+            "çalışma ağacı: ĞÜŞİÖÇ ğüşıöç",
         ];
         let line: Vec<String> = words.iter().map(|w| shell_quote(w)).collect();
         assert_eq!(line[0], "claude");
         assert_eq!(line[1], "'fix the bug'");
         assert_eq!(line[6], "--x=1");
-        let script = format!(
-            "for a in {}; do printf '%s\\n' \"$a\"; done",
-            line.join(" ")
+        let script = format!("printf '%s<END>' {}", line.join(" "));
+        let mut shells: Vec<(&str, std::path::PathBuf, &[&str])> =
+            vec![("sh", "/bin/sh".into(), &["-c"])];
+        for (name, args) in [
+            ("bash", &["-c"][..]),
+            ("zsh", &["-c"]),
+            ("zsh", &["-o", "rcquotes", "-c"]),
+            ("fish", &["--no-config", "-c"]),
+        ] {
+            match find_shell(name) {
+                Some(path) => shells.push((name, path, args)),
+                None => println!("SKIPPED {name}: not installed on this machine"),
+            }
+        }
+        for (name, path, args) in shells {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let out = std::process::Command::new(&path)
+                .args(args)
+                .arg(&script)
+                .current_dir(dir.path())
+                .output()
+                .expect("run the shell");
+            let stdout = String::from_utf8(out.stdout).expect("utf-8");
+            let back: Vec<&str> = stdout.split("<END>").collect();
+            assert_eq!(back[..back.len() - 1], words, "{name} {args:?}");
+            assert!(
+                !dir.path().join("pwn").exists(),
+                "{name} {args:?} ran a command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_word_holds_no_key_but_a_newline() {
+        // `ctrl-u` would wipe the line typed so far and run what follows it.
+        assert_eq!(
+            shell_quote("a\u{15}touch pwn\r\t\u{3}\u{1b}[A\n"),
+            "'a touch pwn    [A\n'"
         );
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", &script])
-            .output()
-            .expect("run sh");
-        let back: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(back, words);
     }
 
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {

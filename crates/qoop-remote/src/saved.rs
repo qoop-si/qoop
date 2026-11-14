@@ -224,9 +224,18 @@ pub fn canonical(text: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
-/// One word for a posix shell, whatever is in it.
+/// One word that sh, bash, zsh (with `RC_QUOTES` too) and fish all read back as it is,
+/// whatever is in it. `'` and `\` never sit inside the quotes: fish reads `\'` and `\\`
+/// there as escapes, so each is closed out and written escaped instead.
 pub fn shell_quote(word: &str) -> String {
-    format!("'{}'", word.replace('\'', r"'\''"))
+    let body: String = word
+        .chars()
+        .map(|c| match c {
+            '\'' | '\\' => format!("'\\{c}'"),
+            c => c.to_string(),
+        })
+        .collect();
+    format!("'{body}'")
 }
 
 /// The command ssh runs on the remote: print the marker, then run qoop's `verb`
