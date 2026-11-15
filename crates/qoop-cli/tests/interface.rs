@@ -1921,6 +1921,39 @@ fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
     );
 }
 
+/// A refusal stays on the status line while the tab under it prints: the tab's output is
+/// not the person moving on, and a busy tab would otherwise wipe it before it is read.
+/// A key typed into the tab is, and takes it down.
+#[test]
+fn a_refusal_stays_while_the_focused_tab_prints() {
+    let mut ui = Interface::start();
+    assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
+    ui.type_in(b"while :; do echo TICK_$((6*7)); sleep 0.05; done\n");
+    assert!(
+        ui.wait_for("TICK_42", Duration::from_secs(10)).is_some(),
+        "the loop never printed:\n{}",
+        ui.screen
+    );
+    ui.command(b'W');
+    // A second of the loop's output, twenty renders of the focused tab.
+    let _ = ui.wait_for("this needle never appears", Duration::from_secs(1));
+    let screen = ui.screen.to_string();
+    assert!(
+        screen.contains("close them first") && screen.contains("TICK_42"),
+        "the refusal did not stay while the tab printed:\n{screen}"
+    );
+    ui.type_in(b"\x03");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && ui.screen.to_string().contains("close them first") {
+        let _ = ui.wait_for("this needle never appears", Duration::from_millis(80));
+    }
+    let screen = ui.screen.to_string();
+    assert!(
+        !screen.contains("close them first"),
+        "a key typed into the tab left the refusal up:\n{screen}"
+    );
+}
+
 /// A refusal on the status line has been read once the next command runs, or the next
 /// click: it does not stay under the box that opened, where it reads as the box's own answer.
 #[test]
