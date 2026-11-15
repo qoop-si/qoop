@@ -110,9 +110,8 @@ fn short_copied(text: &str) -> String {
 
 /// Say `text` twice: on the notice row, and as the small box over the pane.
 ///
-/// The notice row alone is wiped by the next render, which while an agent streams is
-/// milliseconds away, so a copy made mid-stream never got read. The box stays its
-/// two seconds on a clock instead.
+/// The notice row stays until the person types or runs the next command; the box over
+/// the pane, where the eye is while copying, stays its two seconds on a clock.
 fn say(state: &mut State, text: String) {
     state.message = Some(text.clone());
     state.toast = Some(Toast {
@@ -207,6 +206,12 @@ fn request_seed() -> u64 {
 
 /// The notice a new interface shows until its focused terminal first renders.
 const CONNECTING: &str = "connecting";
+
+/// The notice `qoop qass` started in the background shows until it has run.
+const QASS_OPENING: &str = "opening qass";
+
+/// What a second press says while that `qoop qass` is still running.
+const QASS_ON_ITS_WAY: &str = "qass is on its way";
 
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
@@ -999,9 +1004,8 @@ struct State {
     modes: Modes,
     /// Something worth saying once, until the person does anything at all.
     ///
-    /// Not a message: a message is cleared by the first render, which arrives in
-    /// milliseconds, so a thing said that way is a thing nobody reads. This sits under
-    /// everything urgent and goes on the first keystroke.
+    /// Not a message: a message is an answer to what the person just did, on the
+    /// notice row. This sits under everything urgent and goes on the first keystroke.
     hint: Option<String>,
     /// The row the top of the pane is pinned to, when the pane is not at the bottom.
     ///
@@ -4591,6 +4595,7 @@ fn apply_menu_choice(state: &mut State, item: usize, request: &mut u64) -> MenuS
         MenuKind::Install { target, .. } => {
             if item != 0 {
                 state.connecting = None;
+                state.message = None;
                 return MenuSend::Nothing;
             }
             *request += 1;
@@ -9194,9 +9199,12 @@ where
                                 } else {
                                     bytes
                                 };
-                                // The hint has been read or it has not; either way the
-                                // person is working now.
+                                // The hint and the notice have been read or they have not;
+                                // either way the person is working now.
                                 state.hint = None;
+                                if state.message.take().is_some() {
+                                    dirty = true;
+                                }
                                 // Typing into a tab that shows chat shows its terminal for
                                 // the moment (`ChatState::typed`).
                                 state.chat.typed(state.focused, &bytes, std::time::Instant::now());
@@ -10911,7 +10919,13 @@ where
                                 // silently put the keyboard back in it.
                                 if terminal == state.focused {
                                     state.snapshot = Some(snapshot);
-                                    state.message = None;
+                                    // A picture answers "connecting" and nothing else: what
+                                    // the status line said to the person stays until the
+                                    // next command, or a tab printing many times a second
+                                    // wipes it before a frame shows it.
+                                    if state.message.as_deref() == Some(CONNECTING) {
+                                        state.message = None;
+                                    }
                                     refetch_pinned(&mut state);
                                     dirty = true;
                                 } else if state.subs.contains(&terminal)
@@ -11460,13 +11474,18 @@ where
                         state.message = Some(crate::plugins::ran_notice(&name, &ran));
                         dirty = true;
                     }
-                    Blocked::Qass(said) => {
-                        if let Err(why) = said {
+                    Blocked::Qass(said) => match said {
+                        Err(why) => {
                             state.qass_asked = None;
                             state.message = Some(why);
                             dirty = true;
                         }
-                    }
+                        Ok(()) if matches!(state.message.as_deref(), Some(QASS_OPENING | QASS_ON_ITS_WAY)) => {
+                            state.message = None;
+                            dirty = true;
+                        }
+                        Ok(()) => {}
+                    },
                     // Only the answer last asked for, and only while its agent still has the
                     // keyboard: a slow read for a terminal left behind opens nothing.
                     Blocked::Answer(terminal, _) if answer_for != Some(terminal) || state.focused != terminal => {
@@ -14169,11 +14188,11 @@ fn qass_toggle(
         return Ok(QassStep::Moved(moved));
     }
     if asked {
-        state.message = Some("qass is on its way".to_string());
+        state.message = Some(QASS_ON_ITS_WAY.to_string());
         return Ok(QassStep::Moved(None));
     }
     state.qass_asked = Some(std::time::Instant::now());
-    state.message = Some("opening qass".to_string());
+    state.message = Some(QASS_OPENING.to_string());
     Ok(QassStep::Start)
 }
 
@@ -15595,9 +15614,7 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         }
         // A remote that will move onto a newer qoop once nothing there is working, and what
         // it waits on, or that it has moved: the mux words it, and says it once. On the
-        // hint row, which stays until the person does something: the notice row is
-        // cleared by the next render of the tab in front of them, which a working agent
-        // sends many times a second, so a line said there was painted once and never read.
+        // hint row, which stays until the person does something.
         // The click's own answer, with something in the way: nothing is moving, so the stream
         // closing later is not the move.
         ControlResponse::RestartArmed {
@@ -15647,6 +15664,19 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             state.focus_offset = state
                 .focus_offset
                 .min(state.focus_events.len().saturating_sub(focus_height(state)));
+            *dirty = true;
+        }
+        // The answer to "reload agent detection" from the menu, said as `qoop
+        // reload-manifests` prints it: a file that kept the old rules is named.
+        ControlResponse::ManifestsReloaded { errors, .. } => {
+            state.message = Some(if errors.is_empty() {
+                "agent detection reloaded".to_string()
+            } else {
+                format!(
+                    "agent detection reloaded, kept the old rules for {}",
+                    errors.join("; ")
+                )
+            });
             *dirty = true;
         }
         _ => {}
@@ -21536,6 +21566,35 @@ mod tests {
                 &mut dirty,
             );
             assert_eq!(state.message.is_none(), cleared, "{state_word}");
+        }
+    }
+
+    /// "reloading agent detection" ends with the daemon's answer: done, or the files that
+    /// kept their old rules.
+    #[test]
+    fn a_detection_reload_says_how_it_went() {
+        for (errors, said) in [
+            (Vec::new(), "agent detection reloaded".to_string()),
+            (
+                vec!["x.toml: bad".to_string()],
+                "agent detection reloaded, kept the old rules for x.toml: bad".to_string(),
+            ),
+        ] {
+            let mut state = bare_state();
+            state.message = Some("reloading agent detection".to_string());
+            let mut dirty = false;
+            apply(
+                &mut state,
+                ControlResponse::ManifestsReloaded {
+                    id: "reload-1".to_string(),
+                    loaded: vec!["claude".to_string()],
+                    errors,
+                },
+                &mut 0,
+                &mut dirty,
+            );
+            assert_eq!(state.message.as_deref(), Some(said.as_str()));
+            assert!(dirty);
         }
     }
 
