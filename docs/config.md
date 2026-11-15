@@ -79,6 +79,22 @@ A problem in the matched space's `[spaces.<name>]` table (a wrong type, a refuse
 unknown key), or a line in `[spaces]` that is not TOML, uses none of it: the setup fails, the
 worktree is kept and no terminal opens. A problem in another space's table is only said.
 
+## Plugins
+
+herdr plugins ([herdr plugins](plugins.md)) add no key to this file. Only `notify.mute` reaches
+them: a plugin's notification is not shown while it is `here` or `everywhere`. What a plugin
+keeps is on disk, per machine, beside the rest of qoop's files:
+
+| Path | What it holds |
+|---|---|
+| `<data>/plugins/consent.json` | what was agreed to for each plugin, its manifest text whole |
+| `<data>/plugins/<id>/` | the plugin's checkout, or a link to a folder given to `qoop plugin link` |
+| `<data>/plugins/.state/<id>/` | what the plugin host keeps for it, with `host.log` |
+| `<config>/plugins/<id>/` | the plugin's own settings (`HERDR_PLUGIN_CONFIG_DIR`); `qoop plugin rm` leaves it |
+
+`<data>` is `$XDG_DATA_HOME/qoop`, else `~/Library/Application Support/qoop` on macOS and
+`~/.local/share/qoop` on Linux; `<config>` is the folder this file is in.
+
 ## These keys are per machine
 
 `sleep.idle_minutes`, `sleep.qass_idle_minutes` and `daemon.exit_when_asleep` belong to the machine
