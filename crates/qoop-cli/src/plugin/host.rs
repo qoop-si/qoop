@@ -188,6 +188,9 @@ pub(crate) struct State {
     /// Per pane, raised on every change to its row and never reset: a reset reads as a new
     /// pane to a plugin that compares them.
     revisions: BTreeMap<u32, u64>,
+    /// What plugins keep on panes and spaces with `report_metadata`, by terminal and space.
+    pub(super) pane_tokens: BTreeMap<u32, super::tokens::Tokens>,
+    pub(super) space_tokens: BTreeMap<i64, super::tokens::Tokens>,
     /// What each row's revision is compared on.
     seen: BTreeMap<u32, Value>,
     /// The terminal the interface shows, once it says (`qoop.focus`, or a `Focus` the daemon
@@ -298,9 +301,14 @@ impl State {
             self.told_focus = self.focus_pair();
             return Vec::new();
         }
-        // A popup or a zoom whose pane has gone: forgotten, and focus handed back.
+        // A popup or a zoom whose pane has gone: forgotten, and focus handed back when it was
+        // still on the popup (a plugin that focused elsewhere first keeps that, as in herdr,
+        // whose popup floats over a focus it never took).
         let alive: BTreeSet<u32> = self.now.rows.iter().map(|r| r.terminal).collect();
         self.zoomed.retain(|t| alive.contains(t));
+        self.pane_tokens.retain(|t, _| alive.contains(t));
+        let spaces: BTreeSet<i64> = self.now.spaces.iter().map(|s| s.id).collect();
+        self.space_tokens.retain(|s, _| spaces.contains(s));
         let gone: Vec<u32> = self
             .popups
             .keys()
@@ -308,7 +316,9 @@ impl State {
             .copied()
             .collect();
         for popup in gone {
+            let shown = self.focused == Some(popup);
             if let Some(previous) = self.popups.remove(&popup).and_then(|p| p.previous)
+                && shown
                 && alive.contains(&previous)
             {
                 self.focused = Some(previous);
@@ -322,10 +332,57 @@ impl State {
             event.scope = scope_of(event, &self.now, &old, self.focused);
         }
         events.extend(self.focus_events());
+        events.extend(self.expire_tokens(Instant::now()));
         events
     }
 
-    /// The space and pane in focus, when the focused terminal is listed.
+    /// Tokens past their time removed, as herdr's runtime removes them: a pane's revision rises
+    /// and both kinds are told as a report that changed them is.
+    pub(super) fn expire_tokens(&mut self, now: Instant) -> Vec<Event> {
+        let panes: Vec<u32> = (self.pane_tokens.iter_mut())
+            .filter_map(|(t, held)| held.expire(now).then_some(*t))
+            .collect();
+        for terminal in &panes {
+            *self.revisions.entry(*terminal).or_insert(0) += 1;
+        }
+        let spaces: Vec<i64> = (self.space_tokens.iter_mut())
+            .filter_map(|(s, held)| held.expire(now).then_some(*s))
+            .collect();
+        self.token_events(&panes, &spaces)
+    }
+
+    /// `pane_updated` with the pane for each of `panes`, and `workspace_metadata_updated` with
+    /// the space for each of `spaces`, whose tokens changed. Neither runs a plugin's hooks
+    /// ([`NOT_HOOKABLE`]), so a hook that refreshes its own token cannot loop.
+    pub(super) fn token_events(&self, panes: &[u32], spaces: &[i64]) -> Vec<Event> {
+        let view = self.view();
+        let mut out = Vec::new();
+        if !panes.is_empty() {
+            let infos = view.panes();
+            for terminal in panes {
+                if let Some(pane) = pane_of(infos.clone(), *terminal) {
+                    let id = pane["pane_id"].as_str().map(str::to_string);
+                    out.push(Event::new("pane.updated", id, json!({"pane": pane})));
+                }
+            }
+        }
+        if !spaces.is_empty() {
+            let infos = view.workspace_infos();
+            for space in spaces {
+                let id = Id::Workspace(*space).to_string();
+                if let Some(workspace) = infos.iter().find(|w| w["workspace_id"] == id) {
+                    out.push(Event::new(
+                        "workspace.metadata_updated",
+                        None,
+                        json!({"workspace": workspace}),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// The space and pane in focus, when the focused terminal is listed.)
     fn focus_pair(&self) -> Option<(i64, u32)> {
         let terminal = self.focused?;
         let row = self.now.rows.iter().find(|r| r.terminal == terminal)?;
@@ -381,6 +438,24 @@ impl State {
             tabs: &listing.tabs,
             focused: self.focused,
             revisions: &self.revisions,
+            tokens: self.token_values(),
+        }
+    }
+
+    /// The tokens alive now, by pane and by space, for a view.
+    pub(super) fn token_values(&self) -> translate::Tokens {
+        let now = Instant::now();
+        translate::Tokens {
+            panes: self
+                .pane_tokens
+                .iter()
+                .map(|(t, held)| (*t, held.values(now)))
+                .collect(),
+            spaces: self
+                .space_tokens
+                .iter()
+                .map(|(s, held)| (*s, held.values(now)))
+                .collect(),
         }
     }
 
@@ -794,9 +869,14 @@ impl Host {
     /// Read a copy of the state with each row's directory made live; the lock is not held
     /// while the process table is read.
     pub(super) fn with_view<R>(&self, read: impl FnOnce(&View) -> R) -> R {
-        let (mut listing, revisions, focused) = {
+        let (mut listing, revisions, focused, tokens) = {
             let state = self.state.lock().unwrap();
-            (state.now.clone(), state.revisions.clone(), state.focused)
+            (
+                state.now.clone(),
+                state.revisions.clone(),
+                state.focused,
+                state.token_values(),
+            )
         };
         for row in &mut listing.rows {
             row.cwd = self.live_cwd(row);
@@ -807,6 +887,7 @@ impl Host {
             tabs: &listing.tabs,
             focused,
             revisions: &revisions,
+            tokens,
         })
     }
 
@@ -828,6 +909,57 @@ impl Host {
         }
     }
 
+    /// `pane.report_metadata` and `workspace.report_metadata`: the tokens kept for the pane or
+    /// space named, read back as its `tokens`; a pane's revision rises when they change.
+    async fn report_metadata(&self, method: &str, params: &Value) -> Result<Value, Refused> {
+        self.refresh().await?;
+        let now = Instant::now();
+        let events = {
+            let mut state = self.state.lock().unwrap();
+            Self::report_tokens(&mut state, method, params, now)?
+        };
+        for event in events {
+            let _ = self.events.send(Arc::new(event));
+        }
+        Ok(json!({"type": "ok"}))
+    }
+
+    /// Apply one report to `state`; the events to tell when tokens changed.
+    fn report_tokens(
+        state: &mut State,
+        method: &str,
+        params: &Value,
+        now: Instant,
+    ) -> Result<Vec<Event>, Refused> {
+        if method == "pane.report_metadata" {
+            let id = param(params, "pane_id").unwrap_or_default();
+            let terminal = terminal_of(id)
+                .filter(|t| state.now.rows.iter().any(|r| r.terminal == *t))
+                .ok_or_else(|| not_found("pane", id))?;
+            let held = state.pane_tokens.entry(terminal).or_default();
+            if super::tokens::report_pane(held, params, now)? {
+                *state.revisions.entry(terminal).or_insert(0) += 1;
+                return Ok(state.token_events(&[terminal], &[]));
+            }
+        } else {
+            let id = param(params, "workspace_id").unwrap_or_default();
+            let space = match Id::parse(id) {
+                Some(Id::Workspace(n)) => Some(n),
+                _ => None,
+            }
+            .filter(|n| state.now.spaces.iter().any(|s| s.id == *n))
+            .ok_or_else(|| not_found("workspace", id))?;
+            if super::tokens::report_space(
+                state.space_tokens.entry(space).or_default(),
+                params,
+                now,
+            )? {
+                return Ok(state.token_events(&[], &[space]));
+            }
+        }
+        Ok(Vec::new())
+    }
+
     async fn result(&self, method: &str, params: &Value) -> Result<Value, Refused> {
         if WRITES.contains(&method) {
             // Boxed: every write's state in one future is more stack than a worker has in a
@@ -845,7 +977,7 @@ impl Host {
                 );
             }
             "pane.report_metadata" | "workspace.report_metadata" => {
-                return Ok(json!({"type": "ok"}));
+                return self.report_metadata(method, params).await;
             }
             "plugin.list" => {
                 return Ok(json!({"type": "plugin_list",
@@ -2149,6 +2281,84 @@ mod tests {
         );
         let ids: Vec<String> = state.now.tabs.iter().map(Tab::id).collect();
         assert_eq!(ids, ["w1:t5", "w1:t1", "w1:t7"]);
+    }
+
+    #[test]
+    fn a_token_change_is_told_and_expiry_tells_it_too() {
+        let mut state = State::default();
+        state.update(vec![space(1, "a")], vec![row(4, 1, json!({}))], &[]);
+        let now = Instant::now();
+        let pane = |tokens: Value, ttl: Option<u64>| {
+            let mut p = json!({"pane_id": "w1:p4", "source": "t.sb", "tokens": tokens});
+            if let Some(ms) = ttl {
+                p["ttl_ms"] = json!(ms);
+            }
+            p
+        };
+        let report = |state: &mut State, method, params: Value| {
+            Host::report_tokens(state, method, &params, now).expect("accepted")
+        };
+        let before = state.revisions.get(&4).copied().unwrap_or(0);
+        let events = report(
+            &mut state,
+            "pane.report_metadata",
+            pane(json!({"a": "1"}), Some(1000)),
+        );
+        assert_eq!(names(&events), ["pane.updated"]);
+        assert_eq!(events[0].data["pane"]["tokens"], json!({"a": "1"}));
+        assert_eq!(events[0].pane.as_deref(), Some("w1:p4"));
+        assert_eq!(state.revisions[&4], before + 1);
+        let line = events[0].for_subscriber().expect("subscribers hear it");
+        assert_eq!(line["event"], "pane_updated");
+        assert!(NOT_HOOKABLE.contains(&events[0].dotted), "never a hook");
+        assert!(
+            report(
+                &mut state,
+                "pane.report_metadata",
+                pane(json!({"a": "1"}), Some(1000))
+            )
+            .is_empty(),
+            "no change, no event"
+        );
+
+        let space_report = json!({"workspace_id": "w1", "source": "t.sb", "tokens": {"k": "v"}});
+        let events = report(&mut state, "workspace.report_metadata", space_report);
+        assert_eq!(names(&events), ["workspace.metadata_updated"]);
+        assert_eq!(events[0].data["workspace"]["tokens"], json!({"k": "v"}));
+        assert!(NOT_HOOKABLE.contains(&events[0].dotted));
+
+        // The poll removes what expired, and says so as a report would.
+        let revision = state.revisions[&4];
+        let events = state.expire_tokens(now + Duration::from_secs(2));
+        assert_eq!(names(&events), ["pane.updated"]);
+        assert!(events[0].data["pane"].get("tokens").is_none(), "gone");
+        assert_eq!(state.revisions[&4], revision + 1);
+        assert!(state.expire_tokens(now + Duration::from_secs(3)).is_empty());
+    }
+
+    #[test]
+    fn a_popup_gives_focus_back_only_while_it_has_it() {
+        let rows = |n: &[u32]| n.iter().map(|t| row(*t, 1, json!({}))).collect::<Vec<_>>();
+        for (focused, want) in [(3, Some(1)), (2, Some(2))] {
+            let mut state = State::default();
+            state.update(vec![space(1, "a")], rows(&[1, 2, 3]), &[]);
+            state.popups.insert(
+                3,
+                Popup {
+                    previous: Some(1),
+                    plugin: "t.bar".into(),
+                    popup: true,
+                },
+            );
+            state.focused = Some(focused);
+            state.update(vec![space(1, "a")], rows(&[1, 2]), &[]);
+            assert_eq!(state.focused, want, "focused {focused} when the popup went");
+            assert_eq!(
+                state.restore,
+                if focused == 3 { vec![1] } else { vec![] },
+                "a plugin that focused elsewhere first keeps it"
+            );
+        }
     }
 
     #[test]

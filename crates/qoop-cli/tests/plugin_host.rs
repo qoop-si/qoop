@@ -565,6 +565,38 @@ fn writes_change_qoop_as_herdr_asks() {
     let renamed = stack.ask("pane.rename", json!({"pane_id": second, "label": "logs"}));
     assert_eq!(ok(&renamed)["pane"]["label"], "logs");
 
+    // Metadata tokens are kept on the pane and its space and read back, as herdr does.
+    let before = ok(&stack.ask("pane.get", json!({"pane_id": second})))["pane"]["revision"]
+        .as_u64()
+        .expect("revision");
+    ok(&stack.ask(
+        "pane.report_metadata",
+        json!({"pane_id": second, "source": "t.base", "tokens": {"role": "sidebar"}}),
+    ));
+    let pane = ok(&stack.ask("pane.get", json!({"pane_id": second})))["pane"].clone();
+    assert_eq!(pane["tokens"], json!({"role": "sidebar"}));
+    assert!(
+        pane["revision"].as_u64() > Some(before),
+        "a token change is a revision"
+    );
+    let listed = panes(&stack);
+    assert!(
+        listed.iter().any(|p| p["tokens"]["role"] == "sidebar"),
+        "{listed:?}"
+    );
+    let space = pane["workspace_id"].as_str().expect("space").to_string();
+    ok(&stack.ask(
+        "workspace.report_metadata",
+        json!({"workspace_id": space, "source": "t.base", "tokens": {"kind": "api"}}),
+    ));
+    let spaces = ok(&stack.ask("workspace.list", json!({})))["workspaces"].clone();
+    assert_eq!(spaces[0]["tokens"], json!({"kind": "api"}));
+    let refused = stack.ask(
+        "pane.report_metadata",
+        json!({"pane_id": second, "source": "t.base"}),
+    );
+    assert_eq!(refused["error"]["code"], "invalid_metadata_request");
+
     ok(&stack.ask(
         "pane.send_text",
         json!({"pane_id": second, "text": "echo hi-there"}),

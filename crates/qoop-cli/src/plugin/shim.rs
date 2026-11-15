@@ -96,6 +96,9 @@ const VALUED: &[&str] = &[
     "--agent",
     "--seq",
     "--ttl-ms",
+    "--display-agent",
+    "--applies-to-source",
+    "--state-label",
     "--split",
     "--until",
     "--timeout",
@@ -225,6 +228,77 @@ fn rest_text(raw: &[String]) -> Result<String, String> {
     }
 }
 
+/// `report-metadata`'s options, as herdr's CLI sends them: `--source` (required), `--token
+/// NAME=VALUE` and `--clear-token NAME` (a later one for the same name wins), `--seq`,
+/// `--ttl-ms`; a pane's also its presentation fields.
+fn metadata(w: &Words, pane: bool) -> Result<Value, String> {
+    let source = w
+        .value("--source")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("missing required --source")?;
+    let mut params = json!({"source": source});
+    let mut tokens = serde_json::Map::new();
+    for (name, value) in &w.options {
+        match (*name, value) {
+            ("--token", Some(kv)) => {
+                let (key, value) = kv.split_once('=').ok_or("token must use NAME=VALUE")?;
+                if key.is_empty() {
+                    return Err("token name must not be empty".into());
+                }
+                tokens.insert(key.into(), json!(value));
+            }
+            ("--clear-token", Some(key)) => {
+                tokens.insert((*key).into(), Value::Null);
+            }
+            _ => {}
+        }
+    }
+    if !tokens.is_empty() {
+        params["tokens"] = Value::Object(tokens);
+    } else if !pane {
+        return Err("missing token to set or clear".into());
+    }
+    for (flag, key) in [("--seq", "seq"), ("--ttl-ms", "ttl_ms")] {
+        if let Some(n) = w.value(flag) {
+            let n: u64 = n
+                .parse()
+                .map_err(|_| format!("invalid value '{n}' for '{flag}'"))?;
+            params[key] = json!(n);
+        }
+    }
+    if pane {
+        for (flag, key) in [
+            ("--title", "title"),
+            ("--display-agent", "display_agent"),
+            ("--agent", "agent"),
+            ("--applies-to-source", "applies_to_source"),
+        ] {
+            params = with(params, key, w.value(flag));
+        }
+        for (flag, key) in [
+            ("--clear-title", "clear_title"),
+            ("--clear-display-agent", "clear_display_agent"),
+            ("--clear-state-labels", "clear_state_labels"),
+        ] {
+            if w.has(flag) {
+                params[key] = json!(true);
+            }
+        }
+        let mut labels = serde_json::Map::new();
+        for (name, value) in &w.options {
+            if *name == "--state-label"
+                && let Some((status, label)) = value.and_then(|v| v.split_once('='))
+            {
+                labels.insert(status.into(), json!(label));
+            }
+        }
+        if !labels.is_empty() {
+            params["state_labels"] = Value::Object(labels);
+        }
+    }
+    Ok(params)
+}
+
 /// A herdr CLI form, as the host is asked it. `caller` is the plugin's own pane
 /// (`HERDR_PANE_ID`); `socket` is where the host is, for `session list`.
 fn parse(args: &[String], caller: Option<&str>, socket: &Path) -> Result<Call, String> {
@@ -301,11 +375,8 @@ fn parse(args: &[String], caller: Option<&str>, socket: &Path) -> Result<Call, S
         }
         ["pane", "report-metadata", ..] => {
             let w = rest(2);
-            let params = with(json!({}), "pane_id", w.plain.first().copied());
-            Call::Quiet(
-                "pane.report_metadata",
-                with(params, "source", w.value("--source")),
-            )
+            let params = with(metadata(&w, true)?, "pane_id", w.plain.first().copied());
+            Call::Quiet("pane.report_metadata", params)
         }
         ["tab", "list", ..] => Call::Ask(
             "tab.list",
@@ -320,10 +391,15 @@ fn parse(args: &[String], caller: Option<&str>, socket: &Path) -> Result<Call, S
             "workspace.get",
             with(json!({}), "workspace_id", rest(2).plain.first().copied()),
         ),
-        ["workspace", "report-metadata", ..] => Call::Quiet(
-            "workspace.report_metadata",
-            with(json!({}), "workspace_id", rest(2).plain.first().copied()),
-        ),
+        ["workspace", "report-metadata", ..] => {
+            let w = rest(2);
+            let params = with(
+                metadata(&w, false)?,
+                "workspace_id",
+                w.plain.first().copied(),
+            );
+            Call::Quiet("workspace.report_metadata", params)
+        }
         ["agent", "list", ..] => Call::Ask("agent.list", json!({})),
         ["agent", "get", ..] => Call::Ask(
             "agent.get",
@@ -987,6 +1063,47 @@ mod tests {
             quiet(&["pane", "report-metadata", "w1:p4", "--source", "x"]).0,
             "pane.report_metadata"
         );
+        assert_eq!(
+            quiet(&[
+                "pane",
+                "report-metadata",
+                "w1:p4",
+                "--source",
+                "t.sb",
+                "--token",
+                "role=sidebar",
+                "--token",
+                "x=1",
+                "--clear-token",
+                "x",
+                "--seq",
+                "7",
+                "--ttl-ms",
+                "5000",
+            ]),
+            (
+                "pane.report_metadata",
+                json!({"pane_id": "w1:p4", "source": "t.sb", "seq": 7, "ttl_ms": 5000,
+                       "tokens": {"role": "sidebar", "x": null}})
+            )
+        );
+        assert_eq!(
+            quiet(&[
+                "workspace",
+                "report-metadata",
+                "w1",
+                "--source",
+                "s",
+                "--token",
+                "k=v"
+            ]),
+            (
+                "workspace.report_metadata",
+                json!({"workspace_id": "w1", "source": "s", "tokens": {"k": "v"}})
+            )
+        );
+        assert!(call(&["workspace", "report-metadata", "w1", "--source", "s"]).is_err());
+        assert!(call(&["pane", "report-metadata", "w1:p4", "--token", "a=b"]).is_err());
         assert!(
             call(&["pane", "send-text", "w1:p2"]).is_err(),
             "no text at all"

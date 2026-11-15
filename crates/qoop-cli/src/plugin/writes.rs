@@ -408,9 +408,8 @@ async fn create(workspace: i64, cwd: Option<String>, name: Option<String>) -> Re
     Ok(terminal)
 }
 
-/// Type `line` and Enter into a new terminal once its shell has drawn something and gone
-/// quiet, as `qoop new` types a command.
-async fn type_when_ready(terminal: u32, line: &str) -> Result<(), Refused> {
+/// Wait until `terminal` has drawn something: its shell has started and taken over the terminal.
+async fn drawn(terminal: u32) -> Result<(), Refused> {
     let unavailable = |e: std::io::Error| ("server_not_running", e.to_string());
     let deadline = Instant::now() + SHELL_PATIENCE;
     loop {
@@ -428,6 +427,12 @@ async fn type_when_ready(terminal: u32, line: &str) -> Result<(), Refused> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Ok(())
+}
+
+/// Type `line` and Enter into `terminal` now; a new terminal waits for [`drawn`] first.
+async fn type_line(terminal: u32, line: &str) -> Result<(), Refused> {
+    let unavailable = |e: std::io::Error| ("server_not_running", e.to_string());
     let mut link = Link::open_observer("qoop-plugin-host")
         .await
         .map_err(unavailable)?;
@@ -717,10 +722,17 @@ impl Host {
                 self.state.lock().unwrap().closing.remove(terminal);
                 return Err(refused);
             }
+            // Focus goes back only from a popup still shown: one that moved focus elsewhere
+            // before closing keeps that.
             let previous = {
                 let mut state = self.state.lock().unwrap();
                 state.zoomed.remove(terminal);
-                state.popups.remove(terminal).and_then(|p| p.previous)
+                let shown = state.focused == Some(*terminal);
+                state
+                    .popups
+                    .remove(terminal)
+                    .and_then(|p| p.previous)
+                    .filter(|_| shown)
             };
             if let Some(previous) = previous {
                 let _ = self.focus(previous).await;
@@ -815,6 +827,9 @@ impl Host {
         cwd: Option<String>,
         env: Vec<(String, String)>,
     ) -> Result<(), Refused> {
+        // Read once the shell has drawn: before that its process may still be the daemon's
+        // fork, with no command line of its own yet.
+        drawn(terminal).await?;
         self.refresh_now().await?;
         let row = self
             .state
@@ -851,7 +866,8 @@ impl Host {
                 scrub: false,
             },
         );
-        type_when_ready(terminal, &exec_line(&nonce)?).await
+        // Drawn already, above.
+        type_line(terminal, &exec_line(&nonce)?).await
     }
 
     /// qoop's own methods on the host socket, never among herdr's.

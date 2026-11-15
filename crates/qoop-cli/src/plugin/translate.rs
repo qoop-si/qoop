@@ -652,6 +652,14 @@ pub(crate) struct View<'a> {
     pub(crate) tabs: &'a [Tab],
     pub(crate) focused: Option<TerminalStream>,
     pub(crate) revisions: &'a BTreeMap<TerminalStream, u64>,
+    pub(crate) tokens: Tokens,
+}
+
+/// Metadata tokens alive now, by terminal and by space, as `tokens` in the infos.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Tokens {
+    pub(crate) panes: BTreeMap<TerminalStream, BTreeMap<String, String>>,
+    pub(crate) spaces: BTreeMap<i64, BTreeMap<String, String>>,
 }
 
 impl View<'_> {
@@ -673,12 +681,14 @@ impl View<'_> {
             .iter()
             .filter_map(|row| {
                 let tab = self.tab_of(row.terminal)?;
-                Some(pane_info(
+                let mut info = pane_info(
                     row,
                     tab,
                     self.focused == Some(row.terminal),
                     self.revision(row.terminal),
-                ))
+                );
+                super::tokens::put(&mut info, self.tokens.panes.get(&row.terminal));
+                Some(info)
             })
             .collect()
     }
@@ -710,7 +720,10 @@ impl View<'_> {
             .enumerate()
             .map(|(i, space)| {
                 let here = focused.filter(|tab| tab.workspace == space.id);
-                workspace_info(space, i + 1, self.tabs, self.rows, here.is_some(), here)
+                let mut info =
+                    workspace_info(space, i + 1, self.tabs, self.rows, here.is_some(), here);
+                super::tokens::put(&mut info, self.tokens.spaces.get(&space.id));
+                info
             })
             .collect()
     }
@@ -722,12 +735,14 @@ impl View<'_> {
             .filter(|row| row.agent)
             .filter_map(|row| {
                 let tab = self.tab_of(row.terminal)?;
-                Some(agent_info(
+                let mut info = agent_info(
                     row,
                     tab,
                     self.focused == Some(row.terminal),
                     self.revision(row.terminal),
-                ))
+                );
+                super::tokens::put(&mut info, self.tokens.panes.get(&row.terminal));
+                Some(info)
             })
             .collect()
     }
@@ -1131,6 +1146,16 @@ mod tests {
             tabs: &tabs,
             focused: Some(4),
             revisions: &BTreeMap::from([(3, 5)]),
+            tokens: Tokens {
+                panes: BTreeMap::from([(
+                    4,
+                    BTreeMap::from([("dock".to_string(), "left".to_string())]),
+                )]),
+                spaces: BTreeMap::from([(
+                    1,
+                    BTreeMap::from([("kind".to_string(), "api".to_string())]),
+                )]),
+            },
         };
         let area = Rect {
             x: 0,
@@ -1149,7 +1174,7 @@ mod tests {
             json!([
                 {"workspace_id": "w1", "number": 1, "label": "api", "focused": true,
                  "pane_count": 3, "tab_count": 2, "active_tab_id": "w1:t3",
-                 "agent_status": "blocked"},
+                 "agent_status": "blocked", "tokens": {"kind": "api"}},
                 {"workspace_id": "w2", "number": 2, "label": "empty", "focused": false,
                  "pane_count": 0, "tab_count": 0, "active_tab_id": "",
                  "agent_status": "unknown"},
@@ -1168,6 +1193,12 @@ mod tests {
         assert_eq!(panes.len(), 3);
         assert_eq!(panes[1]["focused"], true);
         assert_eq!(panes[1]["tab_id"], "w1:t3");
+        assert_eq!(
+            panes[1]["tokens"],
+            json!({"dock": "left"}),
+            "a pane's tokens"
+        );
+        assert!(panes[0].get("tokens").is_none(), "none, none shown");
         let agents = snapshot["agents"].as_array().expect("agents");
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["pane_id"], "w1:p3");
