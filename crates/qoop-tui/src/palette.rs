@@ -34,6 +34,15 @@ pub enum Item {
         cwd: Option<String>,
         line: String,
     },
+    /// A herdr plugin's action, run through the plugin host.
+    PluginAction {
+        plugin: String,
+        action: String,
+        /// Its title, as the row shows it, for the notice row to name it the same way.
+        title: String,
+    },
+    /// Plugins are installed but their host is not running: picking it says how to start it.
+    PluginHostDown,
 }
 
 /// One filtered row: what it does, which section it is under, and what to draw.
@@ -123,6 +132,9 @@ pub struct Palette {
     pub earlier_again: bool,
     /// They were asked for: at the first key or the agent filter, not at every opening.
     pub earlier_asked: bool,
+    /// What the plugin host listed when the palette opened: its actions, still on its way,
+    /// or that it is not running.
+    pub plugins: crate::plugins::Listed,
 }
 
 impl Palette {
@@ -379,10 +391,50 @@ impl Palette {
                 });
             }
         }
+        // Plugin actions last, so their arrival (the host answers a moment after the palette
+        // opens) never moves the row already picked. Each by its title, its plugin beside it.
+        match &self.plugins {
+            crate::plugins::Listed::Nothing => {}
+            crate::plugins::Listed::Actions(actions) => {
+                for a in actions
+                    .iter()
+                    .filter(|a| crate::plugins::shown_for(&a.contexts, focused))
+                {
+                    out.push(Entry {
+                        item: Item::PluginAction {
+                            plugin: a.plugin.clone(),
+                            action: a.action.clone(),
+                            title: a.title.clone(),
+                        },
+                        section: "plugins",
+                        text: a.title.clone(),
+                        sub: a.plugin.clone(),
+                        space: None,
+                        space_len: 0,
+                        state: None,
+                        program: None,
+                    });
+                }
+            }
+            crate::plugins::Listed::HostDown => out.push(Entry {
+                item: Item::PluginHostDown,
+                section: "plugins",
+                text: "plugin host not running".to_string(),
+                sub: "enter for how to start".to_string(),
+                space: None,
+                space_len: 0,
+                state: None,
+                program: None,
+            }),
+        }
         let query = self.query.to_lowercase();
         out.into_iter()
             .filter(|e| self.filter.keeps(&e.item))
             .filter(|e| {
+                // Not a search hit: offered on an empty query, or while "plugin" is being typed.
+                if e.item == Item::PluginHostDown {
+                    return query.is_empty() || "plugin".starts_with(query.as_str());
+                }
                 // An earlier conversation by its title, agent or place only: its age and its
                 // header would match half the alphabet.
                 if matches!(e.item, Item::Resume { .. }) {
@@ -1124,5 +1176,80 @@ mod tests {
                 )
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn plugin_actions_follow_their_contexts_and_come_last() {
+        let (rows, spaces) = sample();
+        let action = |id: &str, contexts: &[&str]| crate::plugins::Action {
+            plugin: "t.p".into(),
+            action: id.into(),
+            title: format!("do {id}"),
+            contexts: contexts.iter().map(|c| c.to_string()).collect(),
+        };
+        let mut palette = Palette::open();
+        palette.plugins = crate::plugins::Listed::Actions(vec![
+            action("anywhere", &[]),
+            action("here", &["pane"]),
+            action("picked", &["selection"]),
+        ]);
+        let shown = |palette: &Palette, focused| -> Vec<String> {
+            palette
+                .items(
+                    &rows,
+                    &spaces,
+                    focused,
+                    &crate::sidebar::Seen::new(),
+                    &crate::sidebar::Unseen::new(),
+                )
+                .into_iter()
+                .filter(|e| e.section == "plugins")
+                .map(|e| format!("{} {}", e.text, e.sub))
+                .collect()
+        };
+        assert_eq!(shown(&palette, 1), ["do anywhere t.p", "do here t.p"]);
+        assert_eq!(
+            shown(&palette, 0),
+            ["do anywhere t.p"],
+            "no terminal, no pane action"
+        );
+        let all = palette.items(
+            &rows,
+            &spaces,
+            1,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        assert_eq!(
+            all.last().map(|e| e.section),
+            Some("plugins"),
+            "last, so arriving moves nothing"
+        );
+        palette.filter = Filter::Actions;
+        assert_eq!(shown(&palette, 1).len(), 2, "plugin actions are actions");
+        palette.filter = Filter::All;
+        for c in "do here".chars() {
+            palette.push(c);
+        }
+        assert_eq!(shown(&palette, 1), ["do here t.p"]);
+
+        let mut palette = Palette::open();
+        palette.plugins = crate::plugins::Listed::HostDown;
+        assert_eq!(
+            shown(&palette, 1),
+            ["plugin host not running enter for how to start"]
+        );
+        for c in "plu".chars() {
+            palette.push(c);
+        }
+        assert_eq!(shown(&palette, 1).len(), 1, "offered while plugin is typed");
+        let mut searching = Palette::open();
+        searching.plugins = crate::plugins::Listed::HostDown;
+        for c in "running".chars() {
+            searching.push(c);
+        }
+        assert!(shown(&searching, 1).is_empty(), "never a search hit");
+        palette.plugins = crate::plugins::Listed::Nothing;
+        assert!(shown(&palette, 1).is_empty(), "no plugins, nothing extra");
     }
 }

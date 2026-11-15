@@ -324,6 +324,10 @@ enum Blocked {
     Qass(Result<(), String>),
     /// A picture for a remote tab made small, or the clipboard read for one, by its id.
     Picture(String, Result<Option<crate::picture::Prepared>, String>),
+    /// What the plugin host listed for the palette.
+    PluginActions(crate::plugins::Listed),
+    /// A plugin action picked in the palette: started, or why not.
+    PluginRan(String, Result<(), crate::plugins::Failed>),
 }
 
 /// `qoop qass`, which wakes qass or starts it in its own space and shows it: from this
@@ -8290,6 +8294,9 @@ where
     let mut presenter = present::Presenter::default();
     let mut written = String::new();
     let mut presented = tokio::time::Instant::now();
+    // The terminal on screen as the plugin host was last told it, and the sender that tells it.
+    let mut focus_reported = 0u32;
+    let focus_report = crate::plugins::FocusReport::start();
     // At most one index request in flight. Announces that land while one is out ride on its
     // answer, which asks once more: a burst of tool calls, each one news for the sidebar,
     // costs one round trip at a time rather than one request per announce, and the last
@@ -8428,6 +8435,12 @@ where
                 state.last.keep(state.focused);
             }
             if dirty && presented.elapsed() >= FRAME {
+                // Once per change and at most once a frame, so fast switching is told once.
+                if let Some(terminal) =
+                    crate::plugins::focus_to_report(state.focused, &mut focus_reported)
+                {
+                    focus_report.send(terminal);
+                }
                 // An open answer lays out for the pane before the frame borrows the state:
                 // once per width, so a long answer is not wrapped again every frame.
                 if let Some(answer) = state.answer.as_mut() {
@@ -8874,6 +8887,21 @@ where
                                     palette::Item::CopyMode => enter_copy(&mut state),
                                     palette::Item::Resize => enter_resize(&mut state),
                                     palette::Item::Equalize => equalize(&mut state),
+                                    palette::Item::PluginAction { plugin, action, title } => {
+                                        let named = crate::plugins::named(&title, &plugin);
+                                        // Said at once; what the host answers replaces it.
+                                        state.message = Some(format!("starting {named}"));
+                                        let tx = blocking_tx.clone();
+                                        let focused = state.focused;
+                                        tokio::task::spawn_blocking(move || {
+                                            let ran = crate::plugins::run(&plugin, &action, focused);
+                                            let _ = tx.send(Blocked::PluginRan(named, ran));
+                                        });
+                                    }
+                                    palette::Item::PluginHostDown => {
+                                        state.message =
+                                            Some(crate::plugins::HOST_DOWN_NOTICE.to_string());
+                                    }
                                 }
                                 dirty = true;
                             }
@@ -10559,6 +10587,11 @@ where
                             }
                             Action::Palette => {
                                 state.palette = Some(Palette::with_agents(crate::config::agents()));
+                                // The plugin host is asked off the render path; its rows land when it answers.
+                                let tx = blocking_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let _ = tx.send(Blocked::PluginActions(crate::plugins::list()));
+                                });
                                 dirty = true;
                             }
                             // The first of the next row's queue, the way a click on that row
@@ -11414,6 +11447,18 @@ where
                         let (upload, done) = state.pictures.prepared(&id, picture);
                         state.picture_out.extend(upload);
                         state.picture_done.extend(done);
+                    }
+                    Blocked::PluginActions(listed) => {
+                        if let Some(palette) = state.palette.as_mut() {
+                            palette.plugins = listed;
+                            dirty = true;
+                        }
+                    }
+                    // Said on the notice row either way: an action shows nothing of its own
+                    // until it does something.
+                    Blocked::PluginRan(name, ran) => {
+                        state.message = Some(crate::plugins::ran_notice(&name, &ran));
+                        dirty = true;
                     }
                     Blocked::Qass(said) => {
                         if let Err(why) = said {

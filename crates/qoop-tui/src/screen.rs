@@ -5702,6 +5702,44 @@ mod tests {
         );
     }
 
+    /// A plugin's title comes from its manifest: on the notice row it is cut to the row and
+    /// carries nothing a terminal would act on, at the widths the interface is checked at.
+    #[test]
+    fn a_plugin_actions_notice_fits_and_is_clean() {
+        let title = format!("\x1b[2J{}\r", "a very long plugin action title ".repeat(5));
+        let named = crate::plugins::named(&title, "someone.long-plugin-id");
+        for notice in [
+            format!("starting {named}"),
+            crate::plugins::ran_notice(&named, &Ok(())),
+            crate::plugins::ran_notice(
+                &named,
+                &Err(crate::plugins::Failed::Said(
+                    "plugin action not found".into(),
+                )),
+            ),
+        ] {
+            for cols in [60, 80] {
+                let said = fit_notice(&notice, cols);
+                assert_eq!(width::width(&said), cols, "{said:?}");
+                assert!(said.chars().all(width::drawn), "{said:?}");
+            }
+        }
+        let failed = crate::plugins::ran_notice(
+            &named,
+            &Err(crate::plugins::Failed::Said(
+                "plugin action not found".into(),
+            )),
+        );
+        assert!(
+            fit_notice(&failed, 60).contains("see qoop plugin ls"),
+            "what to do survives the cut"
+        );
+        assert_eq!(
+            fit_notice(crate::plugins::HOST_DOWN_NOTICE, 60).trim_end(),
+            crate::plugins::HOST_DOWN_NOTICE
+        );
+    }
+
     #[test]
     fn the_menu_is_centred_not_hugging_the_column() {
         let rows = crate::run::menu_rows(&crate::run::MenuKind::Main);

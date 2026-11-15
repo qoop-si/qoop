@@ -66,12 +66,12 @@ const WAITING_PER_PLUGIN: usize = 256;
 const LOG_CAP: u64 = 1 << 20;
 
 /// The socket's name, beside the daemon's in the session's verified 0700 directory.
-pub(crate) const SOCKET: &str = "herdr.sock";
+pub(crate) const SOCKET: &str = paths::PLUGIN_HOST_SOCKET;
 
 /// Where this session's host listens. Everything of qoop's own uses this and never
 /// `HERDR_SOCKET_PATH`, so nothing qoop runs can reach a real herdr. Nothing is created here.
 pub(crate) fn socket_path() -> PathBuf {
-    paths::session_dir(&paths::base_location(), "default").join(SOCKET)
+    paths::plugin_host_socket()
 }
 
 /// Where the shim asks: the socket the plugin was told, else the session's. Only the shim reads

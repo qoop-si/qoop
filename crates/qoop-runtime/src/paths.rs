@@ -637,6 +637,14 @@ pub fn session_dir(runtime: &Path, name: &str) -> PathBuf {
     sessions_dir(runtime).join(name)
 }
 
+/// The plugin host's socket's name, beside the daemon's in the session's 0700 directory.
+pub const PLUGIN_HOST_SOCKET: &str = "herdr.sock";
+
+/// Where this session's plugin host listens, for the host and the interface alike.
+pub fn plugin_host_socket() -> PathBuf {
+    session_dir(&base_location(), DEFAULT_SESSION).join(PLUGIN_HOST_SOCKET)
+}
+
 /// Accept a session name only if it is the default one, or empty. Any other name belonged
 /// to a session of its own, which is now a space: refused with where its files are, rather
 /// than quietly reaching the default daemon and a different tab under the same number.
