@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.17.0](https://github.com/qoop-si/qoop/compare/v0.16.0...v0.17.0) (2026-11-15)
+
+
+### New
+
+* **cli:** install herdr plugins with consent pinned to the manifest ([1899611](https://github.com/qoop-si/qoop/commit/189961138200016efc89afe812b399b2840a07ee))
+* **cli:** keep herdr plugin metadata tokens ([e5db1e0](https://github.com/qoop-si/qoop/commit/e5db1e02e56b9aa043d01d209a180525be155260))
+* **cli:** let herdr plugins act on terminals and open panes ([68bfdb3](https://github.com/qoop-si/qoop/commit/68bfdb3dbf870a9ee51654d5fb55bae800d60916))
+* **cli:** serve herdr plugins from a plugin host ([9915a36](https://github.com/qoop-si/qoop/commit/9915a368005e1f0f6015697f67147846d7530bc1))
+* **cli:** translate qoop rows into herdr plugin shapes ([14b4cbb](https://github.com/qoop-si/qoop/commit/14b4cbbc59ad8bbddc4feaade2da5a8fe3ab8203))
+* **tui:** list plugin actions in the palette and report focus ([394a6c2](https://github.com/qoop-si/qoop/commit/394a6c2e93005d42f40a19beae724853ce193526))
+
+
+### Fixed
+
+* **cli:** quote typed shell words safely for fish ([0225184](https://github.com/qoop-si/qoop/commit/02251842071ace09b348d7a1c464cfc05ed3a829))
+* **tui:** keep a status line notice while the focused tab prints ([08aa8da](https://github.com/qoop-si/qoop/commit/08aa8dab86872aded81f35b7451d7a9f00d6da9f))
+
 ## [0.16.0](https://github.com/qoop-si/qoop/compare/v0.15.0...v0.16.0) (2026-11-14)
 
 
