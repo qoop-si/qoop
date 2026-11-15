@@ -40,7 +40,7 @@ program.
 
 | Key | Does |
 |---|---|
-| `ctrl-a space` | find anything: a space, an agent, a tab, an action |
+| `ctrl-a space` | find anything: a space, an agent, a tab, an action, an action of an installed [herdr plugin](#plugins) |
 | `ctrl-a [` | copy mode: move, select, search the whole history (see [Copy mode](#copy-mode)) |
 | `ctrl-a g` | tree or priority: agents grouped by space, or ranked by priority |
 | `ctrl-a a` | agents column: the keyboard on it, to move over its rows, open, sleep, search |

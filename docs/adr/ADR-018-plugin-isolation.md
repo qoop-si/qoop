@@ -73,3 +73,42 @@ stopped plugin.
 If the process boundary turns out to be too expensive for something real, the change is a
 capability that a plugin can be granted to run in process, with the prompt that implies, not
 a redesign: the protocol surface is the same either way.
+
+## Amendment, 2026-11-15: herdr-compatible plugins
+
+Two sentences above stop being the whole story: "a plugin cannot type into a terminal" and
+"a capability set granted at load". They still describe the native model, the `qoop-plugin`
+crate, which is unchanged and stays the model for a future qoop-native plugin API. A second
+kind of plugin now exists beside it: a herdr TUI plugin, installed with `qoop plugin install`
+and run unchanged (`docs/plugins.md`).
+
+A herdr plugin is a program the person chose to install, and its manifest carries build steps
+that run arbitrary code. So the boundary is not a capability set. It is consent pinned to
+content and rechecked at every run:
+
+- `qoop plugin install` and `link` print every build, action, pane, event and startup command,
+  the commit and what a plugin can do, and record the person's yes in the consent ledger
+  (`<data>/plugins/consent.json`, the ADR-015 pattern). The ledger pins the manifest text,
+  compared byte for byte. It records the commit and does not verify it again, and it does not
+  pin the files the commands run: the plugin runs as the person and could rewrite them anyway.
+  The docs say exactly this.
+- Every `qoop plugin run`, handler, startup, pane open and host start compares the manifest
+  with the ledger. A mismatch or a missing ledger refuses (fail closed). An id is installed
+  again only after `qoop plugin rm`.
+- A plugin runs as the person and can read every terminal and the command lines of their
+  processes. It can also type into terminals, but only through the refusals of `qoop send`
+  and `qoop prompt`: a person at the terminal, a blocked agent and the trust-prompt and
+  sleeping guards turn a plugin's write into an error for the plugin, with no retry and no
+  bypass. This reverses the last consequence above for this kind of plugin, on purpose, and
+  says so here so nobody has to discover it.
+- A plugin never gets a terminal's token. A plugin pane starts through a one-time spec held in
+  the host's memory, and `pane-exec` strips qoop's variables before the plugin starts, so an
+  agent started inside a plugin pane has no hook authority. A plugin cannot report agent
+  state: `pane.report_agent` is an unknown method.
+- The plugin host is an observer of the daemon, never keeps it up, and has no token of its
+  own. It is started lazily, when a plugin is installed and the interface starts or an
+  install runs, and never restarted in a loop: it leaves with the daemon, and when no plugin
+  is left. A hook command is stopped by process group after ten minutes, and at most 32 run
+  at once.
+- Nothing qoop runs for a plugin reads `HERDR_SOCKET_PATH` except the `herdr` shim, which only
+  a plugin's own `PATH` finds, so no plugin of this kind can reach a herdr of the person's own.

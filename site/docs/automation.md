@@ -18,6 +18,7 @@ qoop context 3                   all of the above in one call
 ```
 qoop prompt 3 "fix the failing test"        text plus Enter; refused while it is blocked
 qoop send 3 "y" --enter                     raw typing, no checks
+qoop send 3 --paste "long text"             as a paste, inside the paste markers when the program asked
 qoop send 3 --key esc --key enter           named keys
 ```
 

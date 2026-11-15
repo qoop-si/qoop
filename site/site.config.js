@@ -42,6 +42,7 @@ export default {
         { title: "Hooks and skills", slug: "hooks" },
         { title: "Notifications", slug: "notifications" },
         { title: "Automation", slug: "automation" },
+        { title: "herdr plugins", slug: "plugins" },
       ],
     },
     {
