@@ -58,6 +58,11 @@ struct Stack {
 
 impl Stack {
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// A stack whose daemon has these variables besides: a timer shortened for a test.
+    fn start_with(extra: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
@@ -92,6 +97,9 @@ impl Stack {
             .stderr(Stdio::null());
         for var in ["QOOP_TERMINAL", "QOOP_TOKEN", "QORO_TERMINAL", "QORO_TOKEN"] {
             cmd.env_remove(var);
+        }
+        for (name, value) in extra {
+            cmd.env(name, value);
         }
         let child = cmd.spawn().expect("spawn the daemon");
         let socket = qoop_testkit::socket_in(dir.path());
@@ -283,6 +291,103 @@ impl Stack {
         let (ok, _, err) = self.run(&["send", terminal, line, "--enter"]);
         assert!(ok, "send failed: {err}");
     }
+
+    /// A connection to the daemon on `rt` that says it is `id` in its hello: an interface's
+    /// (a person's client) or anything else (a program's).
+    fn connect(&self, rt: &tokio::runtime::Runtime, id: &str) -> qoop_testkit::TestClient {
+        let socket = qoop_testkit::socket_in(self.dir.path());
+        rt.block_on(async {
+            let (stream, inbuf) = qoop_runtime::client::connect(&socket, id)
+                .await
+                .expect("connect");
+            qoop_testkit::TestClient::from_parts(stream, inbuf, 1)
+        })
+    }
+}
+
+/// Every row, as `client` is shown them.
+fn rows(
+    rt: &tokio::runtime::Runtime,
+    client: &mut qoop_testkit::TestClient,
+) -> Vec<qoop_runtime::control::AgentRow> {
+    let asked = qoop_runtime::control::ControlRequest::ListAgents { id: "rows".into() };
+    match rt.block_on(client.control(&asked, qoop_testkit::PATIENCE)) {
+        Some(qoop_runtime::control::ControlResponse::Agents { agents, .. }) => agents,
+        other => panic!("no rows: {other:?}"),
+    }
+}
+
+/// The row of `terminal`, as `client` is shown it.
+fn row_of(
+    rt: &tokio::runtime::Runtime,
+    client: &mut qoop_testkit::TestClient,
+    terminal: u32,
+) -> qoop_runtime::control::AgentRow {
+    rows(rt, client)
+        .into_iter()
+        .find(|r| r.terminal == terminal)
+        .unwrap_or_else(|| panic!("terminal {terminal} is not listed"))
+}
+
+/// `HandToQass` for `terminals`, each in the conversation its row shows now.
+fn hand_to_qass(
+    rt: &tokio::runtime::Runtime,
+    client: &mut qoop_testkit::TestClient,
+    id: &str,
+    terminals: &[u32],
+) -> qoop_runtime::control::ControlResponse {
+    let listed = rows(rt, client);
+    let hands = terminals
+        .iter()
+        .map(|t| qoop_runtime::control::Hand {
+            terminal: *t,
+            generation: listed
+                .iter()
+                .find(|r| r.terminal == *t)
+                .and_then(|r| r.generation),
+            seal: None,
+        })
+        .collect();
+    let asked = qoop_runtime::control::ControlRequest::HandToQass {
+        id: id.into(),
+        hands,
+    };
+    rt.block_on(client.control(&asked, qoop_testkit::PATIENCE))
+        .expect("an answer")
+}
+
+/// The code a request was refused with, or what it was answered instead.
+fn refusal(response: &qoop_runtime::control::ControlResponse) -> String {
+    match response {
+        qoop_runtime::control::ControlResponse::Failed { reason, .. } => reason.clone(),
+        other => format!("not refused: {other:?}"),
+    }
+}
+
+/// Read `terminal`'s row on every change of it the daemon announces, until `want` holds: what
+/// a client that reads a row on its `AgentChanged` sees.
+fn on_change_until(
+    rt: &tokio::runtime::Runtime,
+    client: &mut qoop_testkit::TestClient,
+    terminal: u32,
+    want: impl Fn(&qoop_runtime::control::AgentRow) -> bool,
+) -> bool {
+    use qoop_runtime::control::EventMessage;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let changed = |e: &EventMessage| matches!(e, EventMessage::AgentChanged { terminal: t } if *t == terminal);
+        if rt
+            .block_on(client.wait_for_event(changed, Duration::from_secs(2)))
+            .is_none()
+        {
+            continue;
+        }
+        client.forget_events();
+        if want(&row_of(rt, client, terminal)) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Drop for Stack {
@@ -1675,4 +1780,128 @@ fn an_agent_ask_needs_a_worker_with_a_task() {
         "{:?}",
         stack.log("api")
     );
+}
+
+/// Questions handed to qass from a person's client (`HandToQass`): refused with a code a client
+/// words while qass cannot take them; otherwise every tab named goes to qass in one `hand-off`
+/// line once qass is at rest, and each row says `with_qass` until its own question ends.
+#[test]
+fn questions_handed_to_qass_go_as_one_line_and_end_with_their_question() {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    let stack = Stack::start();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let mut script = stack.connect(&rt, "a-script");
+    let number = |t: String| t.parse::<u32>().expect("a terminal number");
+    let (first, second) = (
+        stack.agent("work", "first", None),
+        stack.agent("work", "second", None),
+    );
+    stack.send(&first, "MENU");
+    stack.send(&second, "MENU");
+    assert!(
+        stack.wait(|| stack.state_of(&first) == "blocked" && stack.state_of(&second) == "blocked"),
+        "never blocked: {:?}",
+        stack.run(&["agents"]).1
+    );
+    let (first, second) = (number(first), number(second));
+
+    // No qass yet, and a program asking: refused, nothing kept.
+    let none = hand_to_qass(&rt, &mut ui, "h1", &[first]);
+    assert_eq!(refusal(&none), "qass_not_running");
+    let _qass = stack.agent("qass", "qass", None);
+    let program = hand_to_qass(&rt, &mut script, "h2", &[first]);
+    assert_eq!(refusal(&program), "not_a_person");
+    assert!(!row_of(&rt, &mut ui, first).with_qass);
+
+    // Both taken, both rows say so, and qass hears of both in one line. It was typed into when
+    // it opened: the inbox's 30 quiet seconds come first.
+    let taken = hand_to_qass(&rt, &mut ui, "h3", &[first, second]);
+    assert_eq!(
+        taken,
+        ControlResponse::Handed {
+            id: "h3".into(),
+            taken: vec![first, second],
+        }
+    );
+    assert!(row_of(&rt, &mut ui, first).with_qass);
+    assert!(row_of(&rt, &mut ui, second).with_qass);
+    let line = format!(
+        "hand-off T{first}, T{second}: the owner handed you these tabs' questions. Answer each if \
+         your rules allow; otherwise write a card for it now."
+    );
+    let told = || stack.log("qass").contains(&line);
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "qass was never told: {:?}",
+        stack.log("qass")
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.log("qass").matches("hand-off").count(), 1, "once");
+
+    // The first agent's menu closes: its row is no longer with qass, the second's still is.
+    ui.forget_events();
+    stack.send(&first.to_string(), "FREE");
+    assert!(
+        on_change_until(&rt, &mut ui, first, |r| !r.with_qass),
+        "still with qass: {:?}",
+        row_of(&rt, &mut ui, first)
+    );
+    assert!(row_of(&rt, &mut ui, second).with_qass);
+
+    // A question that moved on, and a tab qass leaves alone.
+    let stale = hand_to_qass(&rt, &mut ui, "h4", &[first]);
+    assert_eq!(refusal(&stale), "already_answered");
+    let space = row_of(&rt, &mut ui, second).workspace;
+    let skip = ControlRequest::SetQassSkip {
+        id: "skip".into(),
+        workspace: space,
+        terminal: Some(second),
+        on: true,
+    };
+    assert!(
+        rt.block_on(ui.control(&skip, qoop_testkit::PATIENCE))
+            .is_some()
+    );
+    let skipped = hand_to_qass(&rt, &mut ui, "h5", &[second]);
+    assert_eq!(refusal(&skipped), "skipped");
+}
+
+/// A hand qass never took (it is in its quiet seconds after it opened) runs out: the row stops
+/// saying `with_qass` and says `qass_missed` for a while, each change announced, and nothing was
+/// typed to qass. With watching off, a hand is refused.
+#[test]
+fn a_hand_qass_never_took_runs_out_and_its_row_says_so() {
+    use qoop_runtime::control::ControlResponse;
+    let stack = Stack::start_with(&[("QOOP_HAND_SECS", "3")]);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let _qass = stack.agent("qass", "qass", None);
+    let worker = stack.agent("work", "worker", None);
+    stack.send(&worker, "MENU");
+    assert!(stack.wait(|| stack.state_of(&worker) == "blocked"));
+    let worker = worker.parse::<u32>().expect("a terminal number");
+
+    ui.forget_events();
+    let taken = hand_to_qass(&rt, &mut ui, "h1", &[worker]);
+    assert!(
+        matches!(&taken, ControlResponse::Handed { taken, .. } if *taken == [worker]),
+        "{taken:?}"
+    );
+    assert!(
+        on_change_until(&rt, &mut ui, worker, |r| !r.with_qass && r.qass_missed),
+        "never ran out: {:?}",
+        row_of(&rt, &mut ui, worker)
+    );
+    assert!(
+        on_change_until(&rt, &mut ui, worker, |r| !r.qass_missed),
+        "still says missed: {:?}",
+        row_of(&rt, &mut ui, worker)
+    );
+    assert!(!stack.log("qass").contains("hand-off"), "qass was told");
+
+    let (ok, out, err) = stack.run(&["qass", "watch", "off"]);
+    assert!(ok && out.trim() == "watching off", "{out} {err}");
+    let off = hand_to_qass(&rt, &mut ui, "h2", &[worker]);
+    assert_eq!(refusal(&off), "not_watching");
 }

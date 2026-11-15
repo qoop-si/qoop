@@ -258,6 +258,13 @@ pub struct AgentRegistry {
     /// Which kind of client a person last typed from in each terminal, when, and when that
     /// was last news (unix seconds).
     typed_by: Mutex<BTreeMap<u32, (&'static str, i64, i64)>>,
+    /// The menu each terminal last had answered from a client, and that menu's seal, while a
+    /// row still says so (`crate::menu::answered_on`). Here and not in a static, so two daemons
+    /// in one process never show each other's answers.
+    pub(crate) answered: Mutex<HashMap<u32, (crate::control::Answered, u64)>>,
+    /// The questions handed to qass and the hands that ran out untold (`crate::asks::hand`).
+    /// Memory only: lost on a daemon restart.
+    pub(crate) hands: Mutex<crate::asks::HandBook>,
     /// Tasks, board items or a space goal changed: a board reads them again. Its own
     /// channel, because it is not about any terminal's row.
     tasks: tokio::sync::broadcast::Sender<()>,
@@ -970,6 +977,8 @@ impl AgentRegistry {
             announce_due: Arc::new(Mutex::new(BTreeSet::new())),
             commands: Mutex::new(BTreeMap::new()),
             typed_by: Mutex::new(BTreeMap::new()),
+            answered: Mutex::new(HashMap::new()),
+            hands: Mutex::default(),
             tasks: tokio::sync::broadcast::channel(16).0,
         })
     }

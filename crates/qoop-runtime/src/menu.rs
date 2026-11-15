@@ -75,6 +75,32 @@ pub const BUSY: &str = "busy";
 
 /// A connection no person sees through: programs never answer a menu.
 pub const NOT_A_PERSON: &str = "not_a_person";
+/// `AnswerMenuText`'s own refusals: the key is neither a `tell` nor an `input` option; no words
+/// left once cleaned; more than [`TEXT_MAX`] characters; the key went but the agent did not
+/// rest on its input row within [`TELL_WAIT`], so no words were typed.
+pub const NO_TEXT_FIELD: &str = "no_text_field";
+pub const EMPTY: &str = "empty";
+pub const TOO_LONG: &str = "too_long";
+pub const NOT_AT_INPUT: &str = "not_at_input";
+/// The most characters of a person's own words one `AnswerMenuText` types.
+pub const TEXT_MAX: usize = 4000;
+/// The words a client sends with a `tell` option to have the agent explain before he decides.
+/// Each client keeps its own copy, pinned to this one by a test on its side.
+pub const EXPLAIN: &str = "Explain this in more detail before I decide: what it will do, why, and what it changes. Then ask me again.";
+/// How long after a `tell` key the daemon waits for the agent to come back to its input row.
+const TELL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The pause after a key and after the words, so the agent reads each as its own input and
+/// not one run of keys (the pause `qoop prompt` leaves before its Enter).
+const BETWEEN: std::time::Duration = std::time::Duration::from_millis(300);
+/// The most rows, and characters a row, of the prompt a menu's view carries as its context.
+const CONTEXT_ROWS: usize = 12;
+const CONTEXT_WIDTH: usize = 200;
+
+/// How long a row says who answered its menu, in milliseconds: 10 s. A seam and not a
+/// constant, so a test sees the row clear without waiting 10 s.
+#[doc(hidden)]
+pub static ANSWERED_FOR_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(10_000);
 /// What may sit under a menu: a hint line, a rule, the status line.
 const BELOW: usize = 4;
 /// How far up a menu's question may be from its first option.
@@ -733,12 +759,121 @@ impl Menu {
                     detail: o.detail.clone(),
                     checked: o.checked,
                     input: o.input,
+                    tell: tells(o),
                 })
                 .collect(),
             multi: self.options.iter().any(|o| o.checked.is_some()),
             seal: seal(self),
+            context: context_of(&self.prompt),
         }
     }
+}
+
+/// An option that declines and asks for other instructions: Claude Code's and Codex's "No, and
+/// tell Claude what to do differently", its words wrapped into `detail` or not.
+fn tells(o: &MenuOption) -> bool {
+    let words = format!("{} {}", o.label, o.detail.as_deref().unwrap_or_default());
+    let words = words.to_lowercase();
+    ["claude", "codex"]
+        .iter()
+        .any(|agent| words.contains(&format!("tell {agent} what to do differently")))
+}
+
+/// The prompt's rows as a client shows them over the options: the first [`CONTEXT_ROWS`] (the
+/// command, the file and its lines come first), each cut to [`CONTEXT_WIDTH`] characters,
+/// control characters dropped, since the screen's text goes to another program's view.
+fn context_of(prompt: &str) -> Vec<String> {
+    prompt
+        .lines()
+        .take(CONTEXT_ROWS)
+        .map(|row| {
+            row.chars()
+                .filter(|c| !c.is_control())
+                .take(CONTEXT_WIDTH)
+                .collect()
+        })
+        .collect()
+}
+
+/// A person's words as they are typed into an agent: one line, every control character
+/// dropped (C0, C1 and ESC: nothing in them may act as a key), newlines made spaces.
+pub fn clean_words(text: &str) -> String {
+    text.chars()
+        .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Whether the agent rests on its input row: no menu at the bottom of `screen`, and a row there
+/// that is a prompt's cursor, bare or before words (Claude Code's `>` in its box, Codex's `›`).
+pub fn at_input(screen: &[String]) -> bool {
+    if menu_of(screen, None).is_some() {
+        return false;
+    }
+    let rows: Vec<String> = screen.iter().map(|r| unbox(r)).collect();
+    let Some(last) = rows.iter().rposition(|r| !r.trim().is_empty()) else {
+        return false;
+    };
+    rows[last.saturating_sub(BOTTOM)..=last].iter().any(|r| {
+        r.trim_start()
+            .strip_prefix(CURSORS)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            && option_row(r).is_none()
+    })
+}
+
+/// Who answered the menu on `terminal`, for a person's row: kept until the timer of
+/// [`note_answered`] ends it, and not once another menu than the one answered is up.
+pub(crate) fn answered_on(
+    agents: &crate::agents::AgentRegistry,
+    terminal: u32,
+    menu: Option<u64>,
+) -> Option<crate::control::Answered> {
+    let answered = agents.answered.lock().unwrap();
+    let (said, sealed) = answered.get(&terminal)?;
+    menu.is_none_or(|seal| seal == *sealed)
+        .then(|| said.clone())
+}
+
+/// A menu was answered from a client of `kind`: the rows say so for [`ANSWERED_FOR_MS`], then
+/// a change tells every client it is gone.
+fn note_answered(
+    agents: &std::sync::Arc<crate::agents::AgentRegistry>,
+    terminal: u32,
+    sealed: u64,
+    label: String,
+    kind: &'static str,
+) {
+    let said = crate::control::Answered {
+        label,
+        by: kind.to_string(),
+        at: crate::agents::now_unix(),
+    };
+    agents
+        .answered
+        .lock()
+        .unwrap()
+        .insert(terminal, (said.clone(), sealed));
+    agents.announce(terminal);
+    let agents = agents.clone();
+    let wait = ANSWERED_FOR_MS.load(std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        let ended = {
+            let mut answered = agents.answered.lock().unwrap();
+            // ponytail: two answers of one menu in the same second read as one; the later
+            // one's timer then ends both, a few seconds early.
+            let ours = answered
+                .get(&terminal)
+                .is_some_and(|(now, seal)| *now == said && *seal == sealed);
+            ours && answered.remove(&terminal).is_some()
+        };
+        if ended {
+            agents.announce(terminal);
+        }
+    });
 }
 
 /// The keys answering `key` on the screen now, only if its menu is the one `sealed`.
@@ -763,19 +898,155 @@ pub(crate) async fn answer(
     key: String,
     (from, kind): (qoop_domain::ClientId, &'static str),
     terminals: &crate::daemon::TerminalRegistry,
-    agents: &crate::agents::AgentRegistry,
+    agents: &std::sync::Arc<crate::agents::AgentRegistry>,
 ) -> ControlResponse {
-    let refuse = |id: String, reason: &str| ControlResponse::Failed {
+    let Some(handle) = blocked_on(terminals, agents, (terminal, generation)) else {
+        return refuse(id, ALREADY_ANSWERED);
+    };
+    let label = label_of(&handle, seal, &key);
+    match press(&handle, seal, key, (from, kind)).await {
+        Ok(answers) => {
+            if answers {
+                note_answered(agents, terminal, seal, label, kind);
+            }
+            ControlResponse::MenuAnswered { id, answers }
+        }
+        Err(reason) => refuse(id, reason),
+    }
+}
+
+/// Answer an `AnswerMenuText`: the key of a `tell` or `input` option as `answer` types it, then
+/// the person's own words and Enter, as that person's input. For `tell` the words wait until the
+/// agent has left the menu and rests on its input row, or are not typed at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_text(
+    id: String,
+    (terminal, generation): (u32, Option<u64>),
+    seal: u64,
+    key: String,
+    text: &str,
+    (from, kind): (qoop_domain::ClientId, &'static str),
+    terminals: &crate::daemon::TerminalRegistry,
+    agents: &std::sync::Arc<crate::agents::AgentRegistry>,
+) -> ControlResponse {
+    let words = clean_words(text);
+    if words.is_empty() {
+        return refuse(id, EMPTY);
+    }
+    if words.chars().count() > TEXT_MAX {
+        return refuse(id, TOO_LONG);
+    }
+    let Some(handle) = blocked_on(terminals, agents, (terminal, generation)) else {
+        return refuse(id, ALREADY_ANSWERED);
+    };
+    // The menu the person saw, as the screen was last read: which kind of option the key is.
+    // The terminal's task checks the seal again on the live screen before a key goes.
+    let shown = handle
+        .menu
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|m| m.seal == seal);
+    let Some(menu) = shown else {
+        return refuse(id, ALREADY_ANSWERED);
+    };
+    let Some(option) = menu.options.iter().find(|o| o.key == key) else {
+        return refuse(id, NO_SUCH_ANSWER);
+    };
+    if !option.tell && !option.input {
+        return refuse(id, NO_TEXT_FIELD);
+    }
+    let (tell, label) = (option.tell, option.label.clone());
+    // Watched from before the key, so the screen it brings is never missed.
+    let mut screens = handle.updates.subscribe();
+    if let Err(reason) = press(&handle, seal, key, (from.clone(), kind)).await {
+        return refuse(id, reason);
+    }
+    if tell {
+        let deadline = tokio::time::Instant::now() + TELL_WAIT;
+        let rested = loop {
+            let rests = matches!(
+                &*screens.borrow_and_update(),
+                crate::daemon::TerminalUpdate::Full(s) if at_input(&s.lines)
+            );
+            if rests {
+                break true;
+            }
+            match tokio::time::timeout_at(deadline, screens.changed()).await {
+                Ok(Ok(())) => {}
+                _ => break false,
+            }
+        };
+        if !rested {
+            return refuse(id, NOT_AT_INPUT);
+        }
+    }
+    tokio::time::sleep(BETWEEN).await;
+    let typed = |bytes: Vec<u8>| {
+        handle.commands.send(crate::daemon::ClientCommand::Input {
+            from: from.clone(),
+            bytes: bytes::Bytes::from(bytes),
+        })
+    };
+    agents.note_person(
+        terminal,
+        words.as_bytes(),
+        true,
+        kind,
+        crate::agents::now_unix(),
+    );
+    if typed(words.into_bytes()).await.is_err() {
+        return refuse(id, ALREADY_ANSWERED);
+    }
+    tokio::time::sleep(BETWEEN).await;
+    if typed(b"\r".to_vec()).await.is_err() {
+        return refuse(id, ALREADY_ANSWERED);
+    }
+    note_answered(agents, terminal, seal, label, kind);
+    ControlResponse::MenuAnswered { id, answers: true }
+}
+
+fn refuse(id: String, reason: &str) -> ControlResponse {
+    ControlResponse::Failed {
         id,
         reason: reason.to_string(),
-    };
+    }
+}
+
+/// The terminal, while its agent in `generation` is blocked: nothing is typed otherwise.
+fn blocked_on(
+    terminals: &crate::daemon::TerminalRegistry,
+    agents: &crate::agents::AgentRegistry,
+    (terminal, generation): (u32, Option<u64>),
+) -> Option<crate::daemon::TerminalHandle> {
     let blocked = agents.agent(terminal).is_some_and(|a| {
         a.belief.state == qoop_domain::AgentRuntimeState::Blocked
             && a.identity.generation().map(|g| g.0) == generation
     });
-    let Some(handle) = terminals.get(terminal).filter(|_| blocked) else {
-        return refuse(id, ALREADY_ANSWERED);
-    };
+    terminals.get(terminal).filter(|_| blocked)
+}
+
+/// The label of `key` on the menu the row showed, for who answered what: the key itself when
+/// the screen has not been read with that menu (Submit, or a menu read since).
+fn label_of(handle: &crate::daemon::TerminalHandle, seal: u64, key: &str) -> String {
+    handle
+        .menu
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|m| m.seal == seal)
+        .and_then(|m| m.options.iter().find(|o| o.key == key))
+        .map_or_else(|| key.to_string(), |o| o.label.clone())
+}
+
+/// Have the terminal's own task type the keys answering `key`, read off its live screen: whether
+/// they answered the menu, or why nothing was typed.
+async fn press(
+    handle: &crate::daemon::TerminalHandle,
+    seal: u64,
+    key: String,
+    (from, kind): (qoop_domain::ClientId, &'static str),
+) -> Result<bool, &'static str> {
     let (reply, typed) = tokio::sync::oneshot::channel();
     let asked = crate::daemon::ClientCommand::AnswerMenu {
         from,
@@ -785,13 +1056,9 @@ pub(crate) async fn answer(
         reply,
     };
     if handle.commands.send(asked).await.is_err() {
-        return refuse(id, ALREADY_ANSWERED);
+        return Err(ALREADY_ANSWERED);
     }
-    match typed.await {
-        Ok(Ok(answers)) => ControlResponse::MenuAnswered { id, answers },
-        Ok(Err(reason)) => refuse(id, reason),
-        Err(_) => refuse(id, ALREADY_ANSWERED),
-    }
+    typed.await.unwrap_or(Err(ALREADY_ANSWERED))
 }
 
 #[cfg(test)]
@@ -1966,5 +2233,81 @@ mod tests {
             "  ? for shortcuts",
         );
         assert_eq!(mode_of(&quoted), None);
+    }
+
+    #[test]
+    fn the_option_that_asks_for_other_instructions_is_a_tell() {
+        let m = menu(&[
+            "  Do you want to make this edit to README.md?",
+            "  > 1. Yes",
+            "    2. Yes, allow all edits during this session (shift+tab)",
+            "    3. No, and tell Claude what to do differently (esc)",
+        ]);
+        let tells: Vec<bool> = m.view().options.iter().map(|o| o.tell).collect();
+        assert_eq!(tells, [false, false, true]);
+        // Codex's, wrapped onto a second row as a narrow terminal draws it.
+        let codex = menu(&[
+            "Run this command?",
+            "> 1. Yes",
+            "  2. No, and tell Codex what to do",
+            "     differently",
+        ]);
+        assert!(codex.view().options[1].tell);
+        // Another agent's words, or none such: no tell.
+        assert!(!menu(&PERMISSION).view().options.iter().any(|o| o.tell));
+    }
+
+    #[test]
+    fn a_menus_context_is_its_prompt_cut_short_and_clean() {
+        assert_eq!(
+            menu(&PERMISSION).view().context,
+            [
+                "Bash command",
+                "cargo test -p qoop-tui",
+                "Run the TUI tests",
+                "Do you want to proceed?"
+            ]
+        );
+        let mut screen = vec!["  Edit file".to_string()];
+        for i in 0..20 {
+            screen.push(format!("    {i} {}\u{7}", "x".repeat(300)));
+        }
+        screen.extend(rows(&[
+            "  Do you want to proceed?",
+            "  > 1. Yes",
+            "    2. No",
+        ]));
+        let context = menu_of(&screen, None).expect("a menu").view().context;
+        assert_eq!(context.len(), CONTEXT_ROWS);
+        assert_eq!(context[0], "Edit file");
+        assert!(
+            context
+                .iter()
+                .all(|r| r.chars().count() <= CONTEXT_WIDTH && !r.chars().any(char::is_control)),
+            "{context:?}"
+        );
+    }
+
+    #[test]
+    fn words_are_one_line_with_no_control_characters() {
+        assert_eq!(
+            clean_words("do\r\nthis\x1b[2J\u{9b}31m now\t!\n"),
+            "do  this[2J31m now!"
+        );
+        assert_eq!(clean_words("\x1b\r\n\x07"), "");
+    }
+
+    #[test]
+    fn an_agent_rests_on_its_input_row_with_no_menu_under_it() {
+        assert!(at_input(&rows(&[
+            "  Interrupted by user",
+            "╭──────────────────────╮",
+            "│ >                    │",
+            "╰──────────────────────╯",
+            "  ? for shortcuts",
+        ])));
+        assert!(at_input(&rows(&["  Done.", "", "› ", "  ? for shortcuts"])));
+        assert!(!at_input(&rows(&PERMISSION)), "a menu is no input row");
+        assert!(!at_input(&rows(&["Working...", "esc to interrupt"])));
     }
 }

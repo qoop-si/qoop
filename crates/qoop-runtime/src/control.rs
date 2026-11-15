@@ -197,6 +197,33 @@ pub enum ControlRequest {
         seal: u64,
         key: String,
     },
+    /// Answer the agent's menu with words of the person's own, through its option `key`: one
+    /// that tells the agent what to do instead (`MenuChoice::tell`) or its answer field
+    /// (`MenuChoice::input`). The words are cleaned first (control characters dropped, newlines
+    /// made spaces), at most 4000 characters. For `tell` the daemon types the key, waits up to
+    /// 5 s for the agent to rest on its input row, then types the words and Enter; for `input`
+    /// the key, the words and Enter. Answered `MenuAnswered`. Refused as `AnswerMenu` is, and
+    /// with `no_text_field` (the key is neither), `empty`, `too_long`, or `not_at_input` (the
+    /// key went but the agent did not come to its input row in time: no words typed). A
+    /// daemon from before it answers `unknown variant`, with nothing typed.
+    AnswerMenuText {
+        id: String,
+        terminal: TerminalStream,
+        generation: Option<u64>,
+        seal: u64,
+        key: String,
+        text: String,
+    },
+    /// Hand these agents' questions to qass: the daemon types one `hand-off` line for them
+    /// into qass's terminal when qass takes words. Answered `Handed` with the terminals taken;
+    /// a hand whose question has moved on, or whose tab qass leaves alone, is left out.
+    /// Refused with `not_a_person`, `qass_not_running`, `not_watching`, `already_answered`
+    /// (every hand moved on) or `skipped` (every hand left alone). An older daemon answers
+    /// `unknown variant`.
+    HandToQass {
+        id: String,
+        hands: Vec<Hand>,
+    },
     /// Look for text in what has scrolled past, one bounded step at a time.
     ///
     /// A step and not a whole search, because a week of history is millions of rows and a
@@ -740,6 +767,13 @@ pub enum ControlRequest {
         /// reconciles its notes against.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         all: bool,
+    },
+    /// What qass did on its own since `since` (unix seconds, at most 7 days back), answered
+    /// `QassActs`: its prompts to agents, the cards it closed, the tasks it verified. Read on
+    /// the home daemon only: its acts on a remote's agents are recorded here.
+    QassActs {
+        id: String,
+        since: i64,
     },
     /// Put a result on the owner's phone (`qoop show`): `target` is an absolute file path or
     /// an `http`/`https` url, sent with the token of the terminal whose agent shows it.
@@ -1902,6 +1936,9 @@ impl ControlRequest {
             | Self::SubagentDetail { id, .. }
             | Self::SubagentSend { id, .. }
             | Self::AnswerMenu { id, .. }
+            | Self::AnswerMenuText { id, .. }
+            | Self::HandToQass { id, .. }
+            | Self::QassActs { id, .. }
             | Self::CloseTerminal { id, .. }
             | Self::ListTerminals { id }
             | Self::ListAgents { id }
@@ -2074,6 +2111,16 @@ pub enum ControlResponse {
     MenuAnswered {
         id: String,
         answers: bool,
+    },
+    /// A `HandToQass` was taken: the terminals whose questions qass is told of.
+    Handed {
+        id: String,
+        taken: Vec<u32>,
+    },
+    /// What `QassActs` asked for, newest first, at most 200.
+    QassActs {
+        id: String,
+        acts: Vec<QassAct>,
     },
     /// Where a `SearchScrollback` step got to.
     ///
@@ -2815,6 +2862,54 @@ pub struct AgentRow {
     /// to the rule on `rule`. Answered with `AnswerMenu`. Absent from a daemon that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<AgentMenu>,
+    /// The menu just answered from a client: which option, from which kind of connection, so
+    /// another client shows who answered rather than a menu that vanished. Kept 10 s, or until
+    /// the next menu. Only on a person's rows, like `menu`. Absent from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<Answered>,
+    /// The owner handed this agent's question to qass (`HandToQass`), and it has not been
+    /// answered, carded or given up on yet. False from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub with_qass: bool,
+    /// A hand to qass ran out with qass never told of it: said for 10 s, so a client can say
+    /// qass did not take it. False from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qass_missed: bool,
+}
+
+/// Who answered a menu: the option's label, the kind of connection it came from (`computer`,
+/// `phone`, `browser`, `attach`), and when, as unix seconds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    pub label: String,
+    pub by: String,
+    pub at: i64,
+}
+
+/// One agent handed to qass: its terminal, the conversation, and the menu the person saw
+/// (`AgentMenu::seal`), when there was one qoop could read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hand {
+    pub terminal: TerminalStream,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub seal: Option<u64>,
+}
+
+/// One thing qass did on its own: `wrote` to an agent, `closed` a card, `verified` a task.
+/// `terminal` is a tab of this machine; a remote's is only in `text` (`wrote to ubox/T3`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QassAct {
+    pub at: i64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<i64>,
+    pub text: String,
 }
 
 /// An agent's own menu as a person's client shows it: its question and its options.
@@ -2832,6 +2927,10 @@ pub struct AgentMenu {
     /// it exactly.
     #[serde(default)]
     pub seal: u64,
+    /// The prompt above the options as the agent drew it (the command, the file and lines it
+    /// would change): at most 12 rows of 200 characters, control characters dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
 }
 
 /// One option of an `AgentMenu`, as the agent numbers and names it.
@@ -2849,6 +2948,10 @@ pub struct MenuChoice {
     /// cursor in it, so a client offers it as a field to open rather than as an answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub input: bool,
+    /// The option that declines and asks for different instructions ("No, and tell Claude
+    /// what to do differently"): a client offers it with a field, answered `AnswerMenuText`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tell: bool,
 }
 
 /// A command a shell finished. Says nothing of what the command was: any program can print
@@ -2972,6 +3075,8 @@ impl ControlResponse {
             | Self::MessageDetail { id, .. }
             | Self::SubagentSent { id, .. }
             | Self::MenuAnswered { id, .. }
+            | Self::Handed { id, .. }
+            | Self::QassActs { id, .. }
             | Self::Subscribed { id, .. }
             | Self::OwnershipRequested { id, .. }
             | Self::OwnershipGranted { id, .. }
@@ -3500,6 +3605,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");

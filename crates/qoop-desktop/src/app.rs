@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,7 +21,9 @@ use gpui::{
 };
 use qoop_domain::Viewport;
 use qoop_runtime::avatar::Avatar;
-use qoop_runtime::control::{ControlRequest, ControlResponse, EventMessage, TerminalStream};
+use qoop_runtime::control::{
+    AskInfo, ControlRequest, ControlResponse, EventMessage, QassAct, TerminalStream,
+};
 use qoop_runtime::daemon::SnapshotWire;
 use qoop_runtime::schedule::Zone;
 use qoop_tui::seen;
@@ -30,6 +33,7 @@ use crate::element::{BACKGROUND, Cells, FOREGROUND, TerminalElement, cells};
 use crate::keys::{self, Press};
 use crate::link::{self, Down, Latest, Up};
 use crate::newwork::NewWork;
+use crate::question::{OwnAnswer, Said};
 use crate::review::Review;
 use crate::state::{self, Chip, Kind, Model};
 use crate::theme::{MONO_FONT, TERMINAL_BG, Theme, UI_FONT, c, ca};
@@ -106,6 +110,16 @@ pub struct Desk {
     pub note: Option<TerminalStream>,
     pub review: Option<Review>,
     pub review_focus: FocusHandle,
+    /// Picks waiting out their 3 s, and what became of each sent one, per agent.
+    pub holds: state::Holds,
+    pub said: HashMap<TerminalStream, Said>,
+    /// Machines whose qoop refused a typed answer as unknown: no typed answers there.
+    pub(crate) too_old: BTreeSet<usize>,
+    /// The owner's own words for an agent's answer field, while it is open.
+    pub(crate) own: Option<OwnAnswer>,
+    /// qass's cards waiting on the owner, and what qass did on its own today.
+    pub asks: Vec<AskInfo>,
+    pub acts: Vec<QassAct>,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
@@ -171,6 +185,12 @@ impl Desk {
             note: None,
             review: None,
             review_focus: cx.focus_handle(),
+            holds: state::Holds::default(),
+            said: HashMap::new(),
+            too_old: BTreeSet::new(),
+            own: None,
+            asks: Vec::new(),
+            acts: Vec::new(),
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -212,6 +232,7 @@ impl Desk {
                     term.sent.set((0, 0));
                 }
                 self.ask_strip();
+                self.ask_inbox();
             }
             Down::Disconnected(why) => {
                 if self.connected {
@@ -234,17 +255,24 @@ impl Desk {
                 window.activate_window();
             }
             Down::Event(EventMessage::TasksChanged) => self.ask_strip(),
+            Down::Event(EventMessage::AsksChanged) => self.ask_inbox(),
             Down::Event(_) => {}
         }
     }
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
+        if self.answer_reply(&answer, cx) {
+            return;
+        }
         match answer {
             ControlResponse::Agents { agents, splits, .. } => {
                 let before = std::mem::replace(&mut self.model.rows, agents);
                 self.model.splits = splits;
                 self.rows_changed(&before);
+                self.menus_changed();
             }
+            ControlResponse::Asks { live, .. } => self.asks = live,
+            ControlResponse::QassActs { acts, .. } => self.acts = acts,
             ControlResponse::Tasks {
                 id,
                 tasks,
@@ -406,7 +434,54 @@ impl Desk {
         }
         if self.sheet.is_some() {
             self.sheet_key(event, window, cx);
+            return;
         }
+        self.answer_key(event, window, cx);
+    }
+
+    /// While a question card is on screen: a digit picks its answer, `u` undoes the pick,
+    /// Enter in the own-answer field holds those words. Other keys go on as before.
+    fn answer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let k = &event.keystroke;
+        if k.modifiers.control || k.modifiers.platform || k.modifiers.alt {
+            return;
+        }
+        if k.key == "enter" && self.own_enter(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.own.is_some() || self.card_offers().is_none() {
+            return;
+        }
+        // Only while the keys are the terminal's: a field or a control keeps its own.
+        if !self.term_focus.is_focused(window) {
+            return;
+        }
+        let taken = match k.key.as_str() {
+            "u" => self.undo(None, cx),
+            d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
+                self.digit(d.as_bytes()[0] - b'0', window, cx)
+            }
+            _ => false,
+        };
+        if taken {
+            cx.stop_propagation();
+        }
+    }
+
+    /// qass's cards and what it did today, read again.
+    pub(crate) fn ask_inbox(&self) {
+        self.ask(ControlRequest::AskRead {
+            id: link::fresh_id("asks"),
+            all: false,
+        });
+        let wall = (self.zone.local)(unix_now()).secs();
+        let midnight = qoop_runtime::schedule::Naive::from_secs(wall - wall.rem_euclid(86_400));
+        let today = (self.zone.unix)(midnight);
+        self.ask(ControlRequest::QassActs {
+            id: link::fresh_id("acts"),
+            since: today,
+        });
     }
 
     /// Keys nobody else took: Tab moves focus, Escape closes the right panel.
@@ -437,6 +512,7 @@ impl Desk {
     ) {
         let k = &event.keystroke;
         if k.modifiers.platform && k.key == "q" {
+            self.flush_holds();
             cx.quit();
             return;
         }
@@ -710,24 +786,54 @@ impl Desk {
                                         .child(q),
                                 )
                             })
-                            .child(
-                                div()
-                                    .id(("qass-line", terminal as u64))
-                                    .tooltip(ui::tip(
-                                        "qass answers if its rules allow; otherwise it comes \
-                                         back to you as a card",
-                                        *t,
-                                    ))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .h(px(24.))
-                                    .pl(px(29.))
-                                    .text_size(px(12.))
-                                    .text_color(c(t.t2))
-                                    .child(ui::icon(Icon::Eye, 12., c(t.t2)))
-                                    .child("Let qass handle it"),
-                            )
+                            .child({
+                                let live = match entry {
+                                    state::Entry::Live(r) => Some(r),
+                                    _ => None,
+                                };
+                                let with = live.is_some_and(|r| r.with_qass);
+                                let why = live.and_then(|r| self.qass_reason(r));
+                                let words = if with {
+                                    "With qass"
+                                } else {
+                                    "Let qass handle it"
+                                };
+                                ui::control(
+                                    ("qass-line", terminal as u64),
+                                    Role::Button,
+                                    match &why {
+                                        Some(why) => format!("{words}, unavailable: {why}"),
+                                        None => words.to_string(),
+                                    },
+                                    t,
+                                )
+                                .tooltip(ui::tip(
+                                    "qass answers if its rules allow; otherwise it comes                                      back to you as a card",
+                                    *t,
+                                ))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(24.))
+                                .pl(px(29.))
+                                .rounded(px(8.))
+                                .text_size(px(12.))
+                                .text_color(c(if why.is_some() { t.t3 } else { t.t2 }))
+                                .when(why.is_none() && !with, |d| d.hover(|s| s.bg(ca(t.fill))))
+                                .child(ui::icon(Icon::Eye, 12., c(t.t2)))
+                                .child(words)
+                                .when(why.is_none() && !with, |d| {
+                                    d.on_click(cx.listener(move |this, _, window, cx| {
+                                        let qass = state::Offer {
+                                            digit: None,
+                                            label: "Let qass handle it".into(),
+                                            detail: None,
+                                            pick: state::Pick::Qass,
+                                        };
+                                        this.pick(terminal, &qass, window, cx)
+                                    }))
+                                })
+                            })
                             .into_any_element()
                     }))
             }))
@@ -1021,148 +1127,14 @@ impl Desk {
             .child(format!(
                 "{}: [c new work] [i inbox] [a keys off the terminal]{}",
                 self.prefix_name(),
-                if matches!(self.page, Page::Session(_)) {
+                if let Page::Session(t) = self.page
+                    && self.here(t).is_some()
+                {
                     " [D changes]"
                 } else {
                     ""
                 }
             ))
-    }
-
-    /// The right panel: what waits on the person, newest state first. Answering comes later;
-    /// a row opens its agent.
-    fn inbox_panel(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut rows: Vec<_> = self
-            .model
-            .live()
-            .filter(|r| {
-                matches!(
-                    Kind::of(r),
-                    Kind::Status(
-                        qoop_domain::Status::Blocked
-                            | qoop_domain::Status::Failed
-                            | qoop_domain::Status::Done
-                    )
-                )
-            })
-            .collect();
-        rows.sort_by_key(|r| Kind::of(r).rank());
-        let needs = rows.iter().filter(|r| Kind::of(r).needs_you()).count();
-        let unread = rows.len() - needs;
-        div()
-            .id("inbox-panel")
-            .role(Role::Complementary)
-            .aria_label("Inbox")
-            .absolute()
-            .right_0()
-            .top(px(56.))
-            .bottom_0()
-            .w(px(360.))
-            .px(px(14.))
-            .py(px(12.))
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .bg(c(t.panel))
-            .border_l_1()
-            .border_color(ca(t.line))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .pb(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Inbox"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(14.))
-                            .text_color(c(t.t2))
-                            .child(format!("{needs} needs you, {unread} unread")),
-                    )
-                    .child(ui::kbd("esc", t))
-                    .child(
-                        ui::control("inbox-close", Role::Button, "Close the Inbox", t)
-                            .size(px(24.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.))
-                            .child(ui::icon(Icon::Close, 14., c(t.t2)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.inbox = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(rows.is_empty(), |d| {
-                d.child(
-                    div()
-                        .pt(px(8.))
-                        .text_size(px(13.))
-                        .text_color(c(t.t2))
-                        .child("Nothing needs you."),
-                )
-            })
-            .children(rows.into_iter().map(|row| {
-                let kind = Kind::of(row);
-                let terminal = row.terminal;
-                let space = self.model.space(row.workspace);
-                ui::control(
-                    ("inbox-row", terminal as u64),
-                    Role::Link,
-                    self.model.row_label(state::Entry::Live(row), self.now),
-                    t,
-                )
-                .debug_selector(move || format!("inbox-row-{terminal}"))
-                .flex()
-                .gap(px(8.))
-                .px(px(4.))
-                .py(px(7.))
-                .rounded(px(10.))
-                .when(kind.needs_you(), |d| {
-                    d.border_color(ca(t.needs_line)).bg(c(t.card))
-                })
-                .hover(|s| s.bg(ca(t.fill)))
-                .child(div().pt(px(3.)).child(ui::mark(kind, t, 12.)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(div().text_size(px(13.5)).child(state::title_of(row)))
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(6.))
-                                .text_size(px(12.))
-                                .child(
-                                    div()
-                                        .text_color(c(ui::word_ink(kind, t)))
-                                        .child(kind.word()),
-                                )
-                                .when_some(space, |d, w| {
-                                    d.child(
-                                        div()
-                                            .text_color(t.space(state::space_slot(w)))
-                                            .child(w.name.clone()),
-                                    )
-                                }),
-                        ),
-                )
-                .when_some(state::age_of(row, self.now), |d, age| {
-                    d.child(div().text_size(px(12.)).text_color(c(t.t2)).child(age))
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open(Page::Session(terminal), window, cx)
-                }))
-            }))
     }
 
     fn terminal_area(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1534,6 +1506,16 @@ fn wire(
         })
         .detach();
     desk.update(cx, |_, cx| {
+        // A pick on hold goes at once when the window closes or the app quits, given a moment
+        // for the link to write it.
+        cx.on_release(|this: &mut Desk, _| this.flush_holds())
+            .detach();
+        cx.on_app_quit(|this: &mut Desk, cx| {
+            this.flush_holds();
+            let timer = cx.background_executor().timer(Duration::from_millis(200));
+            async move { timer.await }
+        })
+        .detach();
         cx.observe_window_appearance(window, |this: &mut Desk, window, cx| {
             this.dark = dark_for(this.theme_pref, window.appearance());
             cx.notify();

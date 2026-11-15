@@ -4,13 +4,14 @@
 //! The daemon decides every row's status once (`AgentRow::status`); this file only groups,
 //! orders, counts and words what it was told. It never classifies a state on its own.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, SleepingTab, StepInfo, TaskEventInfo,
-    TaskInfo, WorkspaceRow,
+    AgentMenu, AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, SleepingTab, StepInfo,
+    TaskEventInfo, TaskInfo, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -577,6 +578,193 @@ pub fn selected_text(lines: &[String], a: (usize, usize), b: (usize, usize)) -> 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What the window types for "Explain this in more detail", pinned to the daemon's copy by a
+/// test (`qoop_runtime::menu::EXPLAIN`).
+pub const EXPLAIN: &str = "Explain this in more detail before I decide: what it will do, why, and \
+                           what it changes. Then ask me again.";
+
+/// How long a pick waits before it is sent, for Undo.
+pub const HOLD: Duration = Duration::from_secs(3);
+
+/// A menu younger than this takes no digit: a key meant for the screen before it.
+pub const ARMING: Duration = Duration::from_millis(500);
+
+/// What a pick sends once its hold is up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// One of the agent's own options, by its key (`AnswerMenu`).
+    Key(String),
+    /// Words typed through the option `key`, a `tell` or `input` one (`AnswerMenuText`):
+    /// Explain, or the person's own answer.
+    Text { key: String, text: String },
+    /// The question handed to qass (`HandToQass`).
+    Qass,
+}
+
+/// One answer the question card offers: its digit (none for an "always" option, which is
+/// click only), its words and what it sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    pub digit: Option<u8>,
+    pub label: String,
+    pub detail: Option<String>,
+    pub pick: Pick,
+}
+
+/// The card's answers: the agent's own options (its field for an answer of one's own is the
+/// card's text field, not an option), then "Explain this in more detail" when the menu takes
+/// words, then "Let qass handle it"; digits in that order, skipping "always" options. A
+/// multiple choice menu offers nothing here: the card says the question and Open.
+pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
+    if menu.multi {
+        return Vec::new();
+    }
+    let mut out: Vec<Offer> = menu
+        .options
+        .iter()
+        .filter(|o| !o.input)
+        .map(|o| Offer {
+            digit: None,
+            label: o.label.clone(),
+            detail: o.detail.clone(),
+            pick: Pick::Key(o.key.clone()),
+        })
+        .collect();
+    if let Some(key) = text_key(menu) {
+        out.push(Offer {
+            digit: None,
+            label: "Explain this in more detail".into(),
+            detail: None,
+            pick: Pick::Text {
+                key,
+                text: EXPLAIN.into(),
+            },
+        });
+    }
+    out.push(Offer {
+        digit: None,
+        label: "Let qass handle it".into(),
+        detail: None,
+        pick: Pick::Qass,
+    });
+    let mut next = 1u8;
+    for offer in &mut out {
+        if !offer.label.to_lowercase().contains("always") && next <= 9 {
+            offer.digit = Some(next);
+            next += 1;
+        }
+    }
+    out
+}
+
+/// The option words go through: the agent's own answer field, else its "tell it what to do
+/// differently"; `None` when the menu takes no words.
+pub fn text_key(menu: &AgentMenu) -> Option<String> {
+    menu.options
+        .iter()
+        .find(|o| o.input)
+        .or_else(|| menu.options.iter().find(|o| o.tell))
+        .map(|o| o.key.clone())
+}
+
+/// A pick waiting out its hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    pub terminal: u32,
+    pub generation: Option<u64>,
+    pub seal: u64,
+    pub pick: Pick,
+    /// What the card says it sends: "Yes".
+    pub label: String,
+    pub until: Instant,
+}
+
+/// The picks on hold, one per agent, and when each menu was first seen (for the arming).
+#[derive(Clone, Debug, Default)]
+pub struct Holds {
+    pub held: Vec<Hold>,
+    seen: HashMap<u32, (u64, Instant)>,
+}
+
+impl Holds {
+    /// The menus on the rows now: a new one starts its arming; a hold whose menu changed or
+    /// went is dropped and returned, so the card can say who answered.
+    pub fn menus(&mut self, rows: &[AgentRow], now: Instant) -> Vec<Hold> {
+        let shown: HashMap<u32, u64> = rows
+            .iter()
+            .filter_map(|r| Some((r.terminal, r.menu.as_ref()?.seal)))
+            .collect();
+        self.seen.retain(|t, (seal, _)| shown.get(t) == Some(seal));
+        for (&t, &seal) in &shown {
+            self.seen.entry(t).or_insert((seal, now));
+        }
+        let (kept, dropped): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|h| h.pick == Pick::Qass || shown.get(&h.terminal) == Some(&h.seal));
+        self.held = kept;
+        dropped
+    }
+
+    /// Whether the menu `seal` of `terminal` takes a digit yet.
+    pub fn armed(&self, terminal: u32, seal: u64, now: Instant) -> bool {
+        self.seen
+            .get(&terminal)
+            .is_some_and(|&(s, at)| s == seal && now.duration_since(at) >= ARMING)
+    }
+
+    /// Hold `hold`, in place of any other pick for that agent.
+    pub fn start(&mut self, hold: Hold) {
+        self.held.retain(|h| h.terminal != hold.terminal);
+        self.held.push(hold);
+    }
+
+    /// Undo: `terminal`'s pick, or with none every pick (one shared Undo for a hand-off of
+    /// several). Whether anything was on hold.
+    pub fn undo(&mut self, terminal: Option<u32>) -> bool {
+        let before = self.held.len();
+        self.held
+            .retain(|h| terminal.is_some_and(|t| h.terminal != t));
+        self.held.len() != before
+    }
+
+    /// The picks whose hold is up, taken out to be sent.
+    pub fn due(&mut self, now: Instant) -> Vec<Hold> {
+        let (due, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|h| h.until <= now);
+        self.held = kept;
+        due
+    }
+
+    /// Every pick on hold, to be sent now: the window is closing.
+    pub fn flush(&mut self) -> Vec<Hold> {
+        std::mem::take(&mut self.held)
+    }
+
+    pub fn of(&self, terminal: u32) -> Option<&Hold> {
+        self.held.iter().find(|h| h.terminal == terminal)
+    }
+}
+
+/// How a refusal of an answer reads on the card.
+pub fn refusal_words(reason: &str, machine: &str) -> String {
+    let here = machine == "This Mac";
+    match reason {
+        "already_answered" => "Already answered".into(),
+        "busy" => "The agent was busy; try again".into(),
+        "no_such_answer" => "That answer is not on its screen any more".into(),
+        "not_at_input" => "The agent did not open its answer field; nothing was typed".into(),
+        "qass_not_running" if here => "qass is not running".into(),
+        "qass_not_running" => format!("qass is not running on {machine}"),
+        "not_watching" => "qass is not watching".into(),
+        "skipped" => "qass leaves this agent alone".into(),
+        r if r.contains("unknown variant") => {
+            format!("qoop on {machine} is too old for typed answers")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// A unix time as "15:58" in `zone`.
@@ -1555,5 +1743,120 @@ pub(crate) mod tests {
         assert!(!failed_run("Fixed the failing coupon test: 2 pass, 0 fail"));
         assert!(!failed_run("all green, no failures"));
         assert!(failed_run("cargo test: 3 failed; 40 passed"));
+    }
+
+    /// Claude Code's edit question: Yes, an "always" option, No and tell it, and its field.
+    pub fn edit_menu(seal: u64) -> AgentMenu {
+        serde_json::from_value(serde_json::json!({
+            "question": "Do you want to make this edit to README.md?",
+            "seal": seal,
+            "options": [
+                {"key": "1", "label": "Yes"},
+                {"key": "2", "label": "Yes, allow all edits during this session (shift+tab)"},
+                {"key": "3", "label": "Yes, and always allow access to src/ from this project"},
+                {"key": "4", "label": "No, and tell Claude what to do differently (esc)", "tell": true},
+            ],
+        }))
+        .expect("menu")
+    }
+
+    #[test]
+    fn the_explain_words_are_the_daemons() {
+        assert_eq!(EXPLAIN, qoop_runtime::menu::EXPLAIN);
+    }
+
+    /// Digits 1 to 5 in order, none on the "always" option, Explain and qass after the agent's
+    /// own; a multiple choice menu offers nothing to pick here.
+    #[test]
+    fn the_card_numbers_its_answers() {
+        let menu = edit_menu(7);
+        let all = offers(&menu);
+        let offered: Vec<(Option<u8>, &str)> = all
+            .iter()
+            .map(|o| (o.digit, o.label.split(',').next().unwrap_or("")))
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                (Some(1), "Yes"),
+                (Some(2), "Yes"),
+                (None, "Yes"),
+                (Some(3), "No"),
+                (Some(4), "Explain this in more detail"),
+                (Some(5), "Let qass handle it"),
+            ]
+        );
+        assert_eq!(text_key(&menu).as_deref(), Some("4"));
+        let multi = AgentMenu {
+            multi: true,
+            ..menu
+        };
+        assert!(offers(&multi).is_empty());
+    }
+
+    fn held(terminal: u32, seal: u64, until: Instant) -> Hold {
+        Hold {
+            terminal,
+            generation: Some(1),
+            seal,
+            pick: Pick::Key("1".into()),
+            label: "Yes".into(),
+            until,
+        }
+    }
+
+    /// With a fake clock: a menu arms after 500 ms, a pick goes after 3 s, Undo cancels it, a
+    /// new menu drops it, and closing the window sends what is on hold.
+    #[test]
+    fn a_pick_waits_three_seconds_and_can_be_undone() {
+        let t0 = Instant::now();
+        let mut rows = fixture().rows;
+        rows[1].menu = Some(edit_menu(7));
+        let mut holds = Holds::default();
+        assert!(holds.menus(&rows, t0).is_empty());
+        assert!(!holds.armed(2, 7, t0 + Duration::from_millis(499)));
+        assert!(holds.armed(2, 7, t0 + ARMING));
+
+        holds.start(held(2, 7, t0 + HOLD));
+        assert!(holds.due(t0 + Duration::from_millis(2999)).is_empty());
+        assert_eq!(holds.due(t0 + HOLD).len(), 1, "sent after 3 s");
+
+        holds.start(held(2, 7, t0 + HOLD));
+        assert!(holds.undo(Some(2)));
+        assert!(holds.due(t0 + HOLD).is_empty(), "Undo cancels");
+
+        holds.start(held(2, 7, t0 + HOLD));
+        rows[1].menu = Some(edit_menu(8));
+        let dropped = holds.menus(&rows, t0 + Duration::from_secs(1));
+        assert_eq!(dropped.len(), 1, "another menu drops the pick");
+        assert!(
+            !holds.armed(2, 8, t0 + Duration::from_secs(1)),
+            "and arms anew"
+        );
+
+        holds.start(held(2, 8, t0 + HOLD));
+        holds.start(held(3, 9, t0 + HOLD));
+        assert_eq!(holds.flush().len(), 2, "closing sends both at once");
+        assert!(holds.held.is_empty());
+    }
+
+    #[test]
+    fn refusals_read_as_words() {
+        assert_eq!(
+            refusal_words("already_answered", "This Mac"),
+            "Already answered"
+        );
+        assert_eq!(
+            refusal_words("qass_not_running", "staging"),
+            "qass is not running on staging"
+        );
+        assert_eq!(
+            refusal_words(
+                "this daemon is older than the client that called it: it does not know the \
+                 method that was asked for (unknown variant `AnswerMenuText`)",
+                "staging"
+            ),
+            "qoop on staging is too old for typed answers"
+        );
     }
 }

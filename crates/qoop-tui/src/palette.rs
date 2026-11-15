@@ -556,6 +556,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         }
     }
 
@@ -595,6 +598,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         }
     }
 

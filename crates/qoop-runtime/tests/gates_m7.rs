@@ -251,6 +251,29 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             seal: 0,
             key: "1".into(),
         },
+        // The same with words of one's own, refused the same way before any byte moves.
+        ControlRequest::AnswerMenuText {
+            id: "x47".into(),
+            terminal,
+            generation: None,
+            seal: 0,
+            key: "3".into(),
+            text: "echo PWNED".into(),
+        },
+        // Types a fixed line into qass's terminal, never the victim's, and only for a person.
+        ControlRequest::HandToQass {
+            id: "x48".into(),
+            hands: vec![qoop_runtime::control::Hand {
+                terminal,
+                generation: None,
+                seal: None,
+            }],
+        },
+        // A read of the store and qass's own log.
+        ControlRequest::QassActs {
+            id: "x49".into(),
+            since: 0,
+        },
         ControlRequest::SetSplit {
             id: "x22".into(),
             tree: qoop_runtime::control::Pane::Leaf { terminal },
@@ -508,6 +531,9 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::SubagentDetail { .. }
             | ControlRequest::SubagentSend { .. }
             | ControlRequest::AnswerMenu { .. }
+            | ControlRequest::AnswerMenuText { .. }
+            | ControlRequest::HandToQass { .. }
+            | ControlRequest::QassActs { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
     }

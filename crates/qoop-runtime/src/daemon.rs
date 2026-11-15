@@ -4071,6 +4071,12 @@ fn dispatch(
         ControlRequest::SubagentSend { .. } => Dispatch::Apart,
         // A wait on the terminal's own task, which reads its screen and types.
         ControlRequest::AnswerMenu { .. } => Dispatch::Apart,
+        // The same, then a wait of seconds for the agent's input row and the words.
+        ControlRequest::AnswerMenuText { .. } => Dispatch::Apart,
+        // The store, for qass's space.
+        ControlRequest::HandToQass { .. } => Dispatch::Apart,
+        // The store and qass's own log on disk.
+        ControlRequest::QassActs { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
@@ -5333,6 +5339,16 @@ async fn handle_control(
                         .get(terminal)
                         .filter(|_| person && state == "blocked")
                         .and_then(|handle| handle.menu.lock().unwrap().clone());
+                    // Who answered its menu, for a person's row, until another menu is up.
+                    let answered = person
+                        .then(|| {
+                            let up = terminals
+                                .get(terminal)
+                                .and_then(|h| h.menu.lock().unwrap().as_ref().map(|m| m.seal));
+                            crate::menu::answered_on(agents, terminal, up)
+                        })
+                        .flatten();
+                    let (with_qass, qass_missed) = agents.hands.lock().unwrap().of(terminal);
                     crate::control::AgentRow {
                         news: status == Some(qoop_domain::Status::Done),
                         status: status.map(|s| s.token().to_string()),
@@ -5385,6 +5401,9 @@ async fn handle_control(
                             .unwrap_or_default(),
                         typed_by: agents.typed_by(terminal),
                         menu,
+                        answered,
+                        with_qass,
+                        qass_missed,
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals
@@ -6095,6 +6114,50 @@ async fn handle_control(
                 reason: crate::menu::NOT_A_PERSON.to_string(),
             },
         },
+        ControlRequest::AnswerMenuText {
+            terminal,
+            generation,
+            seal,
+            key,
+            text,
+            ..
+        } => match connections.kind_of(client) {
+            Some(kind) => {
+                let who = (client.clone(), kind);
+                let at = (terminal, generation);
+                Box::pin(crate::menu::answer_text(
+                    id, at, seal, key, &text, who, terminals, agents,
+                ))
+                .await
+            }
+            None => ControlResponse::Failed {
+                id,
+                reason: crate::menu::NOT_A_PERSON.to_string(),
+            },
+        },
+        // A program never hands a question on: only a person who saw it does.
+        ControlRequest::HandToQass { hands, .. } => {
+            if connections.kind_of(client).is_none() {
+                ControlResponse::Failed {
+                    id,
+                    reason: crate::menu::NOT_A_PERSON.to_string(),
+                }
+            } else {
+                // Each tab's space read first, so the registry and the skips are never locked
+                // at once.
+                let skipped: Vec<u32> = hands
+                    .iter()
+                    .map(|h| (h.terminal, terminals.workspace_of(h.terminal)))
+                    .filter(|(t, space)| books.skip.lock().unwrap().covers(*space, *t))
+                    .map(|(t, _)| t)
+                    .collect();
+                let with = (terminals, agents, connections, store);
+                Box::pin(crate::asks::hand(id, hands, &skipped, with)).await
+            }
+        }
+        ControlRequest::QassActs { id, since } => {
+            Box::pin(crate::claims::qass_acts(id, since, store)).await
+        }
         ControlRequest::AskRead { id, all } => {
             Box::pin(crate::asks::read(id, all, terminals, store)).await
         }

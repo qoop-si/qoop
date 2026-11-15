@@ -16478,6 +16478,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         }
     }
 
@@ -22046,6 +22049,7 @@ mod tests {
             options: Vec::new(),
             multi: false,
             seal: 1,
+            context: Vec::new(),
         });
         state.rows = vec![menu, agent(4, 1, "claude", "blocked")];
         assert_eq!(

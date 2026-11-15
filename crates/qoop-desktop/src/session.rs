@@ -287,7 +287,7 @@ impl Desk {
     }
 
     /// The tab on screen runs on this machine: its checkout can be read and opened here.
-    fn here(&self, terminal: TerminalStream) -> Option<String> {
+    pub(crate) fn here(&self, terminal: TerminalStream) -> Option<String> {
         let row = self.model.row(terminal)?;
         (state::machine_of(row.workspace) == 0)
             .then(|| row.cwd.clone())
@@ -399,9 +399,15 @@ impl Desk {
             return div().into_any_element();
         };
         let tree = self.model.tree_of(term.terminal);
-        let right = match &self.review {
-            Some(review) => self.review_panel(review, t, cx).into_any_element(),
-            None => self.task_column(t, cx).into_any_element(),
+        // The agent on screen asks something: its card under its screen, the panel beside.
+        let asking = self
+            .model
+            .row(term.terminal)
+            .filter(|r| r.menu.is_some() && Kind::of(r).needs_you());
+        let right = match (&self.review, asking) {
+            (Some(review), _) => self.review_panel(review, t, cx).into_any_element(),
+            (None, Some(row)) => self.question_side(row, t),
+            (None, None) => self.task_column(t, cx).into_any_element(),
         };
         div()
             .size_full()
@@ -420,7 +426,16 @@ impl Desk {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.layout(&tree, focused, cx)),
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(self.layout(&tree, focused, cx)),
+                            )
+                            .when_some(asking, |d, row| d.child(self.question_card(row, t, cx))),
                     )
                     .child(
                         div()
@@ -941,29 +956,25 @@ impl Desk {
                 d.child(
                     div()
                         .id("note-options")
-                        .role(Role::List)
-                        .aria_label("Its options")
+                        .role(Role::Group)
+                        .aria_label("Answers")
                         .flex()
                         .flex_col()
                         .gap(px(3.))
-                        .children(m.options.iter().take(5).map(|o| {
-                            div()
-                                .flex()
-                                .gap(px(8.))
-                                .text_size(px(12.5))
-                                .child(
-                                    div()
-                                        .w(px(16.))
-                                        .flex_none()
-                                        .font_family(MONO_FONT)
-                                        .text_color(c(t.t2))
-                                        .child(o.key.clone()),
-                                )
-                                .child(div().flex_1().min_w_0().child(o.label.clone()))
-                        })),
+                        .children(
+                            state::offers(m)
+                                .iter()
+                                .take(5)
+                                .enumerate()
+                                .map(|(n, o)| self.offer_button(terminal, o, ("note", n), t, cx)),
+                        ),
                 )
             })
-            .child(quiet("Shown once, then it waits in the Inbox.", t))
+            .when_some(self.said_line(terminal, t, cx), |d, line| d.child(line))
+            .child(quiet(
+                "Clicks only; the terminal keeps the keys. Shown once, then it waits in the Inbox.",
+                t,
+            ))
             .child(
                 div()
                     .flex()

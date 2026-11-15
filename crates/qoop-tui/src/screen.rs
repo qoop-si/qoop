@@ -830,6 +830,9 @@ pub fn bar_tabs(
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         });
     }
     tabs
@@ -4558,6 +4561,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         }
     }
 
@@ -7492,6 +7498,9 @@ mod tests {
             shell_pid: None,
             discards: None,
             status: None,
+            answered: None,
+            with_qass: false,
+            qass_missed: false,
         }
     }
 
@@ -8157,6 +8166,9 @@ mod tests {
                 shell_pid: None,
                 discards: None,
                 status: None,
+                answered: None,
+                with_qass: false,
+                qass_missed: false,
             })
             .collect();
         // Nothing scrolls: all nine agents draw their row under the space's rule, and
