@@ -1796,6 +1796,276 @@ async fn flush_watch(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
     }
 }
 
+/// `HandToQass`'s refusals, besides `not_a_person` and `already_answered` (every hand's question
+/// moved on): qass has no tab here; its watching is off; every hand is on a tab qass leaves alone.
+pub const QASS_NOT_RUNNING: &str = "qass_not_running";
+pub const NOT_WATCHING: &str = "not_watching";
+pub const SKIPPED: &str = "skipped";
+
+/// How long a hand waits for qass before it runs out.
+const HAND_SECS: u64 = 30 * 60;
+/// Sets [`HAND_SECS`] instead, for a test that cannot wait half an hour.
+const HAND_ENV: &str = "QOOP_HAND_SECS";
+/// How long a row says a hand ran out untold.
+const MISSED_SECS: u64 = 10;
+
+/// How long a hand waits for qass, read once.
+fn hand_life() -> Duration {
+    static LIFE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *LIFE.get_or_init(|| {
+        Duration::from_secs(
+            crate::legacy::var(HAND_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(HAND_SECS),
+        )
+    })
+}
+
+/// How long a row says a hand ran out: [`MISSED_SECS`], or a test's shorter hand life.
+fn missed_for() -> Duration {
+    Duration::from_secs(MISSED_SECS).min(hand_life())
+}
+
+/// One question handed to qass: the menu it was (`None` for one qoop cannot read), when it was
+/// handed (on both clocks: the store's cards are stamped in unix seconds), and whether qass was
+/// told of it yet.
+pub(crate) struct Handed {
+    generation: Option<u64>,
+    seal: Option<u64>,
+    at: Instant,
+    at_unix: i64,
+    told: bool,
+}
+
+/// The hands that live, and the terminals whose hand ran out untold, said for a while.
+#[derive(Default)]
+pub(crate) struct HandBook {
+    live: HashMap<u32, Handed>,
+    missed: HashSet<u32>,
+}
+
+impl HandBook {
+    /// What a row says of `terminal`: handed to qass, and a hand that ran out untold.
+    pub(crate) fn of(&self, terminal: u32) -> (bool, bool) {
+        (
+            self.live.contains_key(&terminal),
+            self.missed.contains(&terminal),
+        )
+    }
+}
+
+/// The seal of the menu on `terminal` while its agent, in `generation`, is still blocked on the
+/// question a hand names (`seal`, when it names one): `Some(None)` for a question with no menu
+/// qoop reads. `None` when it moved on.
+fn still_asking(
+    terminals: &TerminalRegistry,
+    agents: &AgentRegistry,
+    hand: &crate::control::Hand,
+) -> Option<Option<u64>> {
+    let blocked = agents.agent(hand.terminal).is_some_and(|a| {
+        a.belief.state == qoop_domain::AgentRuntimeState::Blocked
+            && a.identity.generation().map(|g| g.0) == hand.generation
+    });
+    let menu = terminals
+        .get(hand.terminal)
+        .filter(|_| blocked)?
+        .menu
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.seal);
+    hand.seal
+        .is_none_or(|seal| menu == Some(seal))
+        .then_some(menu)
+}
+
+/// Hand questions to qass (`HandToQass`, from a person): each one still asked, on a tab qass
+/// does not leave alone, is kept and its row says so; the flusher types one line for all of
+/// them once qass takes words. `skipped`: the terminals qass leaves alone.
+pub(crate) async fn hand(
+    id: String,
+    hands: Vec<crate::control::Hand>,
+    skipped: &[u32],
+    (terminals, agents, connections, store): Hands<'_>,
+) -> ControlResponse {
+    let Some(qass) = qass_terminal(terminals, agents, store).await else {
+        return failed(id, QASS_NOT_RUNNING);
+    };
+    if !crate::paths::qass_watching() {
+        return failed(id, NOT_WATCHING);
+    }
+    // The menu each hand is about, as it is now: a hand that named none takes the one there.
+    let asked: Vec<(crate::control::Hand, Option<u64>)> = hands
+        .into_iter()
+        .filter_map(|h| {
+            let seal = still_asking(terminals, agents, &h)?;
+            Some((h, seal))
+        })
+        .collect();
+    if asked.is_empty() {
+        return failed(id, crate::menu::ALREADY_ANSWERED);
+    }
+    let taken: Vec<(crate::control::Hand, Option<u64>)> = asked
+        .into_iter()
+        .filter(|(h, _)| !skipped.contains(&h.terminal) && h.terminal != qass)
+        .collect();
+    if taken.is_empty() {
+        return failed(id, SKIPPED);
+    }
+    {
+        let mut book = agents.hands.lock().unwrap();
+        for (hand, seal) in &taken {
+            book.missed.remove(&hand.terminal);
+            book.live.entry(hand.terminal).or_insert(Handed {
+                generation: hand.generation,
+                seal: *seal,
+                at: Instant::now(),
+                at_unix: now(),
+                told: false,
+            });
+        }
+    }
+    for (hand, _) in &taken {
+        agents.announce(hand.terminal);
+    }
+    kick(terminals, agents, connections, store);
+    ControlResponse::Handed {
+        id,
+        taken: taken.into_iter().map(|(h, _)| h.terminal).collect(),
+    }
+}
+
+/// Whether any hand still lives: the flusher keeps looking while one does.
+fn hands_live(agents: &AgentRegistry) -> bool {
+    !agents.hands.lock().unwrap().live.is_empty()
+}
+
+/// The line qass is told for hands: tab numbers and fixed words only, since a tab's name is
+/// written by any connection.
+fn hand_line(terminals: &[u32]) -> String {
+    let tabs: Vec<String> = terminals.iter().map(|t| format!("T{t}")).collect();
+    format!(
+        "hand-off {}: the owner handed you these tabs' questions. Answer each if your rules \
+         allow; otherwise write a card for it now.",
+        tabs.join(", ")
+    )
+}
+
+/// Ends the hands whose question is over: the agent is no longer blocked on it, its menu
+/// changed, a card was written for its tab since, or it waited [`hand_life`]. One that ran out
+/// untold says so on its row for [`missed_for`]. Each end is a change of its row.
+async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
+    if !hands_live(agents) {
+        return;
+    }
+    let carded: Vec<(i64, i64)> = match store.run(|s| s.live_asks()).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|r| Some((r.terminal?, r.opened_at)))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // Read under the book's lock alone and judged outside it, so the book is never held while
+    // the registries are locked.
+    let held: Vec<(crate::control::Hand, Instant, i64, bool)> = {
+        let book = agents.hands.lock().unwrap();
+        book.live
+            .iter()
+            .map(|(terminal, h)| {
+                let hand = crate::control::Hand {
+                    terminal: *terminal,
+                    generation: h.generation,
+                    seal: h.seal,
+                };
+                (hand, h.at, h.at_unix, h.told)
+            })
+            .collect()
+    };
+    let mut ended = Vec::new();
+    let mut missed = Vec::new();
+    for (hand, at, at_unix, told) in held {
+        let asking = still_asking(terminals, agents, &hand).is_some();
+        let carded = carded
+            .iter()
+            .any(|(t, opened)| *t == i64::from(hand.terminal) && *opened >= at_unix);
+        let out = at.elapsed() >= hand_life();
+        if asking && !carded && !out {
+            continue;
+        }
+        ended.push(hand.terminal);
+        if out && asking && !carded && !told {
+            missed.push(hand.terminal);
+        }
+    }
+    {
+        let mut book = agents.hands.lock().unwrap();
+        for terminal in &ended {
+            book.live.remove(terminal);
+        }
+        book.missed.extend(missed.iter().copied());
+    }
+    for terminal in ended {
+        agents.announce(terminal);
+    }
+    for terminal in missed {
+        let agents = agents.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(missed_for()).await;
+            let gone = agents.hands.lock().unwrap().missed.remove(&terminal);
+            if gone {
+                agents.announce(terminal);
+            }
+        });
+    }
+}
+
+/// One look at the hands, in the flusher's turn: the ones over are ended, and the untold ones
+/// are typed to qass as one line when it takes words and was not typed to just before. Kept as
+/// told before the line is typed, as a card is flipped before its answer goes; told again next
+/// round when the typing failed.
+async fn flush_hands(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hands: Hands<'_>) {
+    sweep_hands(hands).await;
+    let (terminals, agents, _, store) = hands;
+    if !agents.hands.lock().unwrap().live.values().any(|h| !h.told) {
+        return;
+    }
+    let Some(qass) = qass_terminal(terminals, agents, store).await else {
+        return;
+    };
+    let now = standing(agents, terminals, qass)
+        .map(|s| (qass, s, agents.typed_ago(qass, crate::agents::now_unix())));
+    if !takes_words(Route::Qass(qass), None, now.as_ref())
+        || seen.contains(&qass)
+        || sent.get(&qass).is_some_and(|at| at.elapsed() < SETTLE)
+    {
+        return;
+    }
+    let told: Vec<u32> = {
+        let mut book = agents.hands.lock().unwrap();
+        let mut told: Vec<u32> = book
+            .live
+            .iter_mut()
+            .filter(|(_, h)| !h.told)
+            .map(|(t, h)| {
+                h.told = true;
+                *t
+            })
+            .collect();
+        told.sort_unstable();
+        told
+    };
+    sent.insert(qass, Instant::now());
+    if type_into(terminals, qass, &hand_line(&told)).await.is_err() {
+        let mut book = agents.hands.lock().unwrap();
+        for t in &told {
+            if let Some(h) = book.live.get_mut(t) {
+                h.told = false;
+            }
+        }
+    }
+}
+
 /// Type `text`, a pause, then Enter, into a terminal.
 pub(crate) async fn type_into(
     terminals: &Arc<TerminalRegistry>,
@@ -2015,7 +2285,9 @@ fn kick(
             FLUSHING.store(false, Ordering::SeqCst);
             // An answer queued after the last look and before the flag went down.
             let waiting = store.run(|s| s.queued_asks()).await;
-            let waiting = waiting.is_ok_and(|rows| !rows.is_empty()) || watch_tell_due();
+            let waiting = waiting.is_ok_and(|rows| !rows.is_empty())
+                || watch_tell_due()
+                || hands_live(&agents);
             if !waiting || FLUSHING.swap(true, Ordering::SeqCst) {
                 break;
             }
@@ -2033,10 +2305,18 @@ async fn flush(
 ) {
     let mut sent: HashMap<u32, Instant> = HashMap::new();
     loop {
-        let Ok(rows) = store.run(|s| s.queued_asks()).await else {
-            return;
+        // A store that fails ends the look, unless a hand lives: those are memory, and are
+        // looked at again within this loop rather than from a restart with no pause.
+        let rows = match store.run(|s| s.queued_asks()).await {
+            Ok(rows) => rows,
+            Err(_) if hands_live(&agents) => Vec::new(),
+            Err(_) => return,
         };
-        if rows.is_empty() && !watch_tell_due() && sent.values().all(|at| at.elapsed() >= SETTLE) {
+        if rows.is_empty()
+            && !watch_tell_due()
+            && !hands_live(&agents)
+            && sent.values().all(|at| at.elapsed() >= SETTLE)
+        {
             return;
         }
         // The oldest answer of a target goes first: a target seen once is left to it.
@@ -2051,6 +2331,12 @@ async fn flush(
             .await;
         }
         flush_watch(
+            &seen,
+            &mut sent,
+            (&terminals, &agents, &connections, &store),
+        )
+        .await;
+        flush_hands(
             &seen,
             &mut sent,
             (&terminals, &agents, &connections, &store),

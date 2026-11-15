@@ -480,6 +480,41 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "answer an agent's menu with one's own words, or ask it to explain, on the desktop",
+            method: || {
+                Method::Control(ControlRequest::AnswerMenuText {
+                    id: "a".into(),
+                    terminal: 1,
+                    generation: None,
+                    seal: 0,
+                    key: "3".into(),
+                    text: "explain first".into(),
+                })
+            },
+        },
+        Action {
+            name: "let qass handle an agent's question, on the desktop",
+            method: || {
+                Method::Control(ControlRequest::HandToQass {
+                    id: "a".into(),
+                    hands: vec![qoop_runtime::control::Hand {
+                        terminal: 1,
+                        generation: None,
+                        seal: None,
+                    }],
+                })
+            },
+        },
+        Action {
+            name: "read what qass handled today, in the desktop's inbox",
+            method: || {
+                Method::Control(ControlRequest::QassActs {
+                    id: "a".into(),
+                    since: 0,
+                })
+            },
+        },
+        Action {
             name: "search the history from copy mode",
             method: || {
                 Method::Control(ControlRequest::SearchScrollback {
@@ -1022,6 +1057,22 @@ fn every_control_method_is_reachable_from_some_action() {
             seal: 0,
             key: String::new(),
         },
+        ControlRequest::AnswerMenuText {
+            id: String::new(),
+            terminal: 0,
+            generation: None,
+            seal: 0,
+            key: String::new(),
+            text: String::new(),
+        },
+        ControlRequest::HandToQass {
+            id: String::new(),
+            hands: Vec::new(),
+        },
+        ControlRequest::QassActs {
+            id: String::new(),
+            since: 0,
+        },
         ControlRequest::GrantOwnership {
             id: String::new(),
             terminal: 0,
@@ -1306,6 +1357,9 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::SubagentDetail { .. }
             | ControlRequest::SubagentSend { .. }
             | ControlRequest::AnswerMenu { .. }
+            | ControlRequest::AnswerMenuText { .. }
+            | ControlRequest::HandToQass { .. }
+            | ControlRequest::QassActs { .. }
             | ControlRequest::GrantOwnership { .. } => {}
         }
         let name = Method::Control(request.clone()).name();

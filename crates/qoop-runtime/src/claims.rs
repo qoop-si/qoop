@@ -137,6 +137,139 @@ fn write_whole(dir: &std::path::Path, name: &str, body: &str) -> std::io::Result
     std::fs::rename(&fresh, dir.join(name))
 }
 
+/// The most acts one `QassActs` answer carries, and how far back one reads, in seconds.
+const ACTS_MAX: usize = 200;
+const ACTS_BACK: i64 = 7 * 24 * 3600;
+/// How many ended cards are read to find the ones qass closed.
+/// ponytail: the newest 1000 ended cards; a week with more ends loses its oldest closes.
+const ENDED_READ: usize = 1000;
+/// The note qass closes a card it handled itself with (`escalate.sh done E<n> qass`).
+const QASS_NOTE: &str = "qass";
+
+/// What qass did on its own since `since` (`QassActs`), clamped to [`ACTS_BACK`]: every write
+/// it made to an agent (`prompted.log`, each record and not only the newest per tab), the
+/// cards it closed with its own note, the tasks it closed verified.
+pub(crate) async fn qass_acts(
+    id: String,
+    since: i64,
+    store: &StoreHandle,
+) -> crate::control::ControlResponse {
+    let since = since.max(now() - ACTS_BACK);
+    let space = crate::asks::qass_space(store).await;
+    let read = store
+        .run(move |s| {
+            let qass: BTreeSet<u32> = match space {
+                Some(space) => s
+                    .open_terminals(space)?
+                    .into_iter()
+                    .filter_map(|t| u32::try_from(t.id).ok())
+                    .collect(),
+                None => BTreeSet::new(),
+            };
+            let mut verified = Vec::new();
+            for task in s.closed_tasks_since(since, ACTS_MAX)? {
+                if task.outcome.as_deref() != Some("verified") {
+                    continue;
+                }
+                let closed = s.task_events_of(task.id, "closed", 1)?;
+                if let Some(event) = closed.first()
+                    && event.body.starts_with("verified by qass")
+                {
+                    verified.push((task.id, event.at));
+                }
+            }
+            Ok((qass, s.ended_asks(ENDED_READ)?, verified))
+        })
+        .await;
+    match read {
+        Ok((qass, asks, verified)) => {
+            // ponytail: qass's terminals are the ones its space holds now, as in the scan.
+            let log = crate::paths::qass_data_dir()
+                .and_then(|dir| std::fs::read_to_string(dir.join("prompted.log")).ok())
+                .unwrap_or_default();
+            crate::control::ControlResponse::QassActs {
+                id,
+                acts: acts(&log, &qass, &asks, &verified, since),
+            }
+        }
+        Err(e) => crate::control::ControlResponse::Failed {
+            id,
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// The acts from their three sources at or after `since`, newest first, at most [`ACTS_MAX`]:
+/// `log` is `prompted.log` (`<unix> <from terminal> T<n>` or `<machine>/T<n>`), kept for a
+/// record sent from one of `qass`'s terminals; `asks` the ended cards; `verified` each task
+/// qass closed verified, with when.
+fn acts(
+    log: &str,
+    qass: &BTreeSet<u32>,
+    asks: &[qoop_store::AskRow],
+    verified: &[(i64, i64)],
+    since: i64,
+) -> Vec<crate::control::QassAct> {
+    use crate::control::QassAct;
+    let tab = |s: &str| s.strip_prefix('T').and_then(|n| n.parse::<u32>().ok());
+    let mut acts = Vec::new();
+    for line in log.lines() {
+        let mut w = line.split_whitespace();
+        let (Some(at), Some(from), Some(to)) = (w.next(), w.next(), w.next()) else {
+            continue;
+        };
+        let (Ok(at), Ok(from)) = (at.parse::<i64>(), from.parse::<u32>()) else {
+            continue;
+        };
+        let remote = to
+            .split_once('/')
+            .is_some_and(|(machine, t)| !machine.is_empty() && tab(t).is_some());
+        if at < since
+            || !qass.contains(&from)
+            || to.chars().any(char::is_control)
+            || (tab(to).is_none() && !remote)
+        {
+            continue;
+        }
+        acts.push(QassAct {
+            at,
+            kind: "wrote".to_string(),
+            terminal: tab(to),
+            card: None,
+            task: None,
+            text: format!("wrote to {to}"),
+        });
+    }
+    for card in asks {
+        let by_qass =
+            card.status == "closed" && card.note.as_deref().map(str::trim) == Some(QASS_NOTE);
+        let Some(at) = card.closed_at.filter(|at| by_qass && *at >= since) else {
+            continue;
+        };
+        acts.push(QassAct {
+            at,
+            kind: "closed".to_string(),
+            terminal: card.terminal.and_then(|t| u32::try_from(t).ok()),
+            card: Some(card.card.clone()),
+            task: card.task,
+            text: format!("closed {}", card.card),
+        });
+    }
+    for &(task, at) in verified.iter().filter(|(_, at)| *at >= since) {
+        acts.push(QassAct {
+            at,
+            kind: "verified".to_string(),
+            terminal: None,
+            card: None,
+            task: Some(task),
+            text: format!("verified task {task}"),
+        });
+    }
+    acts.sort_by_key(|a| std::cmp::Reverse(a.at));
+    acts.truncate(ACTS_MAX);
+    acts
+}
+
 /// Run the scan for the life of the daemon. Only with a qass folder: a person without qass gets
 /// no file.
 pub(crate) fn scan_stranded_claims(store: &StoreHandle) {
@@ -289,5 +422,91 @@ mod tests {
         let line = claims_line(&stranded(&tasks, &carded, &written, now)).expect("a line");
         assert!(line.starts_with("claims 5 6 4: "), "{line}");
         assert_eq!(claims_line(&[]), None, "nothing stranded says nothing");
+    }
+
+    fn ended(card: &str, status: &str, note: &str, closed_at: i64) -> qoop_store::AskRow {
+        qoop_store::AskRow {
+            id: 1,
+            card: card.into(),
+            agent: Some("T14".into()),
+            terminal: Some(14),
+            session: None,
+            task: Some(11),
+            status: status.into(),
+            note: Some(note.into()),
+            body: "{}".into(),
+            answer: None,
+            option: None,
+            opened_at: 0,
+            closed_at: Some(closed_at),
+        }
+    }
+
+    fn said(acts: &[crate::control::QassAct]) -> Vec<(i64, &str, &str)> {
+        acts.iter()
+            .map(|a| (a.at, a.kind.as_str(), a.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn every_write_qass_made_is_an_act_and_no_one_elses() {
+        // Two writes to one tab are two acts, not the newest only; a worker's write and a
+        // line that is no record are none.
+        let log = "100 9 T14\n200 9 T14\n300 12 T14\n400 9 ubox/T3\nnot a record\n500 9 E7\n";
+        let acts = acts(log, &BTreeSet::from([9]), &[], &[], 0);
+        assert_eq!(
+            said(&acts),
+            [
+                (400, "wrote", "wrote to ubox/T3"),
+                (200, "wrote", "wrote to T14"),
+                (100, "wrote", "wrote to T14"),
+            ]
+        );
+        assert_eq!(acts[1].terminal, Some(14));
+        assert_eq!(acts[0].terminal, None, "a remote's tab is no tab here");
+    }
+
+    #[test]
+    fn a_card_is_qass_s_act_only_when_closed_with_its_own_note() {
+        let asks = [
+            ended("E41", "closed", "qass", 100),
+            ended("E42", "closed", "stale", 200),
+            ended("E43", "answered", "qass", 300),
+        ];
+        let acts = acts("", &BTreeSet::new(), &asks, &[], 0);
+        assert_eq!(said(&acts), [(100, "closed", "closed E41")]);
+        assert_eq!(acts[0].card.as_deref(), Some("E41"));
+        assert_eq!((acts[0].terminal, acts[0].task), (Some(14), Some(11)));
+    }
+
+    #[test]
+    fn a_task_qass_verified_is_an_act() {
+        let acts = acts("", &BTreeSet::new(), &[], &[(11, 100)], 0);
+        assert_eq!(said(&acts), [(100, "verified", "verified task 11")]);
+        assert_eq!(acts[0].task, Some(11));
+    }
+
+    #[test]
+    fn acts_come_newest_first_from_every_source_and_none_before_since() {
+        let acts = acts(
+            "50 9 T1\n300 9 T2\n",
+            &BTreeSet::from([9]),
+            &[ended("E1", "closed", "qass", 200)],
+            &[(5, 250), (6, 60)],
+            100,
+        );
+        assert_eq!(
+            said(&acts),
+            [
+                (300, "wrote", "wrote to T2"),
+                (250, "verified", "verified task 5"),
+                (200, "closed", "closed E1"),
+            ]
+        );
+        let many = "1 9 T1\n".repeat(ACTS_MAX + 5);
+        assert_eq!(
+            super::acts(&many, &BTreeSet::from([9]), &[], &[], 0).len(),
+            ACTS_MAX
+        );
     }
 }

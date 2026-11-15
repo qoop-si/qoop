@@ -253,3 +253,232 @@ async fn a_menu_reaches_a_persons_row_only_and_is_answered_once_while_it_is_ther
         "{kind:?}"
     );
 }
+
+/// A stand-in drawn as Claude Code draws a permission prompt, its third option the one that
+/// asks for other instructions. It reads keys, not lines, as Claude Code does: `3` clears the
+/// menu and rests on an input row (`>`), where it takes words until Enter and then shows them
+/// as `got:<words>`, each control byte as `<xx>`; `M` draws the menu again; any other key shows
+/// `key:<key>` with no menu. Named `aider` for the reason the one above is.
+fn claude_shaped(dir: &Path) -> PathBuf {
+    let source = dir.join("aider.rs");
+    let program = r#"use std::io::{Read, Write};
+const MENU: &str = "  Bash command\r\n    ls /tmp\r\n  Do you want to proceed?\r\n  > 1. Yes\r\n    2. Yes, and don't ask again for ls\r\n    3. No, and tell Claude what to do differently (esc)\r\n";
+fn draw(text: &str) {
+    let mut out = std::io::stdout();
+    write!(out, "\x1b[2J\x1b[H{text}").unwrap();
+    out.flush().unwrap();
+}
+fn main() {
+    let _ = std::process::Command::new("stty").args(["-icanon", "-echo", "min", "1"]).status();
+    draw(MENU);
+    let (mut input, mut line) = (false, String::new());
+    for byte in std::io::stdin().lock().bytes() {
+        let b = byte.unwrap();
+        if input {
+            if b == b'\r' || b == b'\n' {
+                draw(&format!("got:{line}\r\n"));
+                line.clear();
+                input = false;
+            } else if b < 0x20 || b >= 0x7f {
+                line.push_str(&format!("<{b:02x}>"));
+            } else {
+                line.push(b as char);
+            }
+            continue;
+        }
+        match b {
+            b'3' => {
+                input = true;
+                draw("  Interrupted by user\r\n\r\n> ");
+            }
+            b'M' => draw(MENU),
+            other => draw(&format!("key:{}\r\n", other as char)),
+        }
+    }
+}
+"#;
+    std::fs::write(&source, program).expect("write");
+    let built = std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("aider"))
+        .output()
+        .expect("run rustc");
+    assert!(
+        built.status.success(),
+        "the stand in did not build: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    dir.join("aider")
+}
+
+/// Start `program` in `terminal` and wait until the daemon reads it as aider.
+async fn start_aider(d: &TestDaemon, owner: &mut TestClient, terminal: u32, program: &Path) {
+    owner
+        .input_to(terminal, format!("'{}'\n", program.display()).as_bytes())
+        .await;
+    assert!(
+        owner
+            .wait_for_text_on(terminal, "Do you want to proceed?", PATIENCE)
+            .await
+    );
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while !d.agent(terminal).is_some_and(|a| {
+        matches!(&a.identity, qoop_domain::AgentIdentity::Known { program, .. } if program == "aider")
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stand in was never read as aider: {:?}",
+            d.agent(terminal)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn token_of(d: &TestDaemon, terminal: u32) -> String {
+    d.terminals()
+        .get(terminal)
+        .expect("the terminal")
+        .token
+        .as_str()
+        .to_string()
+}
+
+async fn answer_text(
+    client: &mut TestClient,
+    terminal: u32,
+    generation: Option<u64>,
+    menu: &AgentMenu,
+    key: &str,
+    text: &str,
+) -> Option<ControlResponse> {
+    Box::pin(client.control(
+        &ControlRequest::AnswerMenuText {
+            id: "t".into(),
+            terminal,
+            generation,
+            seal: menu.seal,
+            key: key.into(),
+            text: text.into(),
+        },
+        PATIENCE,
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn own_words_go_after_the_tell_key_once_the_agent_rests_on_its_input_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = claude_shaped(dir.path());
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut owner = d.attach("owner").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    start_aider(&d, &mut owner, terminal, &agent).await;
+
+    let (shown, generation) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    let tells: Vec<bool> = shown.options.iter().map(|o| o.tell).collect();
+    assert_eq!(tells, [false, false, true]);
+    assert!(
+        shown.context.iter().any(|r| r == "ls /tmp"),
+        "{:?}",
+        shown.context
+    );
+
+    // A plain answer takes no words: refused, and nothing typed.
+    let plain = answer_text(&mut ui, terminal, generation, &shown, "1", "hello").await;
+    assert!(refused(&plain, "no_text_field"), "{plain:?}");
+    assert!(
+        !owner
+            .wait_for_text_on(terminal, "key:", Duration::from_millis(500))
+            .await
+    );
+
+    // The key first, then, on the input row, the words cleaned of every control byte, then
+    // Enter: had any of them come before the key, the stand in would show `key:`, and a byte
+    // left in them would show as `<xx>` or end the line early.
+    let words = "use \x1b[31mred\x1b[0m\r\nthen\u{9b}2J stop";
+    let cleaned = "use [31mred[0m  then2J stop";
+    assert_eq!(qoop_runtime::menu::clean_words(words), cleaned);
+    let typed = answer_text(&mut ui, terminal, generation, &shown, "3", words).await;
+    assert!(
+        matches!(
+            typed,
+            Some(ControlResponse::MenuAnswered { answers: true, .. })
+        ),
+        "{typed:?}"
+    );
+    assert!(
+        owner
+            .wait_for_text_on(terminal, &format!("got:{cleaned}"), PATIENCE)
+            .await
+    );
+    let screen = owner.screen(terminal).expect("a screen").lines.join("\n");
+    assert!(
+        !screen.contains("key:") && !screen.contains('<'),
+        "{screen}"
+    );
+}
+
+#[tokio::test]
+async fn who_answered_is_on_a_persons_row_for_a_while_and_never_on_a_programs() {
+    // Ten seconds in the product; shorter here, so the end is seen without the wait.
+    qoop_runtime::menu::ANSWERED_FOR_MS.store(1500, std::sync::atomic::Ordering::Relaxed);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = claude_shaped(dir.path());
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut owner = d.attach("owner").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    let mut program = d.attach("qoop-agents").await;
+    start_aider(&d, &mut owner, terminal, &agent).await;
+    let (shown, generation) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    assert!(!shown.context.is_empty());
+
+    // What `qoop agents --json` reads, a program's listing: no menu, no context, while the
+    // person's row has both.
+    let listed = row(&mut program, terminal).await;
+    let json = serde_json::to_string(&listed).expect("encode");
+    for key in ["\"menu\":", "\"context\":", "\"answered\":"] {
+        assert!(!json.contains(key), "a program's row carries {key} {json}");
+    }
+
+    let mut phone = d.attach_phone().await;
+    let answered = answer(&mut phone, terminal, generation, &shown).await;
+    assert!(
+        matches!(
+            answered,
+            Some(ControlResponse::MenuAnswered { answers: true, .. })
+        ),
+        "{answered:?}"
+    );
+    let said = row(&mut ui, terminal).await.answered.expect("who answered");
+    assert_eq!((said.label.as_str(), said.by.as_str()), ("Yes", "phone"));
+    let listed = row(&mut program, terminal).await;
+    assert_eq!(listed.answered, None);
+    let json = serde_json::to_string(&listed).expect("encode");
+    assert!(!json.contains("\"answered\":"), "{json}");
+
+    // Then gone, and a change says so to a client that reads the row on one.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let ours = |e: &qoop_runtime::control::EventMessage| matches!(e, qoop_runtime::control::EventMessage::AgentChanged { terminal: t } if *t == terminal);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still says who answered"
+        );
+        if ui
+            .wait_for_event(ours, Duration::from_secs(1))
+            .await
+            .is_none()
+        {
+            continue;
+        }
+        ui.forget_events();
+        if row(&mut ui, terminal).await.answered.is_none() {
+            break;
+        }
+    }
+}

@@ -482,6 +482,7 @@ fn scenario() {
                 &mut tui, terminal,
             ))
             .await;
+            Box::pin(answers_and_hands_reach_the_remote(&mut tui, terminal)).await;
 
             // The remote goes away: its space stays listed, offline, under the same number.
             stop(remote.path());
@@ -661,6 +662,85 @@ async fn a_remote_tabs_task_comes_back_in_its_merged_number(tui: &mut Tui, termi
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+}
+
+/// An answer to a remote tab's menu, its own words for it and a hand to qass reach the remote
+/// in its own number for the tab. Told apart by who answers: this test's connection to the
+/// local daemon is a program's, which the local daemon refuses as `not_a_person`, while the
+/// mux's link to the remote is an interface's, so the remote judges the request itself (its
+/// tab holds a shell, no question; it has no qass). A hand naming tabs on two machines is
+/// refused by the mux. What a remote's qass took coming back in merged numbers needs a running
+/// qass and a blocked agent there: the mux's own test feeds it a `Handed` instead.
+async fn answers_and_hands_reach_the_remote(tui: &mut Tui, terminal: u32) {
+    use qoop_runtime::control::Hand;
+    let hand = |terminal| Hand {
+        terminal,
+        generation: None,
+        seal: None,
+    };
+    let asks = [
+        (
+            ControlRequest::AnswerMenu {
+                id: "menu-1".into(),
+                terminal,
+                generation: None,
+                seal: 1,
+                key: "1".into(),
+            },
+            "already_answered",
+        ),
+        (
+            ControlRequest::AnswerMenuText {
+                id: "menu-2".into(),
+                terminal,
+                generation: None,
+                seal: 1,
+                key: "3".into(),
+                text: "explain first".into(),
+            },
+            "already_answered",
+        ),
+        (
+            ControlRequest::HandToQass {
+                id: "menu-3".into(),
+                hands: vec![hand(terminal)],
+            },
+            "qass_not_running",
+        ),
+    ];
+    for (request, want) in asks {
+        let id = request.request_id().to_string();
+        tui.ask(request).await;
+        let reason = tui
+            .until("the remote's answer", |incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id: i, reason }) if *i == id => {
+                    Some(reason.clone())
+                }
+                Incoming::Control(other) if other.request_id() == id => {
+                    panic!("{id} was answered {other:?}")
+                }
+                _ => None,
+            })
+            .await;
+        assert_eq!(reason, want, "{id} was not judged by the remote");
+    }
+    tui.ask(ControlRequest::HandToQass {
+        id: "menu-4".into(),
+        hands: vec![hand(terminal), hand(1)],
+    })
+    .await;
+    let reason = tui
+        .until(
+            "the two machine hand to be refused",
+            |incoming| match incoming {
+                Incoming::Control(ControlResponse::Failed { id, reason }) if id == "menu-4" => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            },
+        )
+        .await;
+    assert!(reason.contains("two machines"), "{reason}");
 }
 
 /// `Via`: a request that names no terminal or space reaches the machine of the space it names,

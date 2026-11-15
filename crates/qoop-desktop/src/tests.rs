@@ -528,6 +528,146 @@ fn ctrl_a_a_takes_the_keys_off_the_terminal(cx: &mut TestAppContext) {
     );
 }
 
+/// The question card under an agent that needs the owner: answers with digits 1 to 5, none on
+/// the "always" option; a digit before the menu is armed does nothing; `1` holds "Yes", `u`
+/// undoes it; held again it goes as `AnswerMenu` with key 1, and the card says Sent once the
+/// daemon typed it.
+#[gpui::test]
+fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(77));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    for digit in 1..=5 {
+        let at = format!("card-2-{digit}");
+        let at: &'static str = Box::leak(at.into_boxed_str());
+        assert!(vcx.debug_bounds(at).is_some(), "{at} is drawn");
+    }
+    assert!(
+        vcx.debug_bounds("card-2-0").is_some(),
+        "the always option, no digit"
+    );
+    assert!(vcx.debug_bounds("card-2-6").is_none());
+    sent(&mut rx);
+    vcx.simulate_keystrokes("1");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "too soon after the menu came"
+    );
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "and not typed into the agent"
+    );
+    std::thread::sleep(crate::state::ARMING);
+    vcx.simulate_keystrokes("1");
+    let held = desk.read_with(&vcx, |d, _| d.holds.of(2).map(|h| h.label.clone()));
+    assert_eq!(held.as_deref(), Some("Yes"));
+    vcx.simulate_keystrokes("u");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "undone"
+    );
+    vcx.simulate_keystrokes("1");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            for hold in &mut d.holds.held {
+                hold.until = std::time::Instant::now();
+            }
+            d.fire();
+        })
+    });
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::AnswerMenu { terminal: 2, .. })
+    })
+    .expect("sent after its hold");
+    let ControlRequest::AnswerMenu { id, key, seal, .. } = asked else {
+        unreachable!()
+    };
+    assert_eq!((key.as_str(), seal), ("1", 77));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::MenuAnswered { id, answers: true },
+    );
+    let said = desk.read_with(&vcx, |d, _| d.said.get(&2).cloned());
+    assert!(
+        matches!(said, Some(crate::question::Said::Sent { ref label, .. }) if label == "Yes"),
+        "{said:?}"
+    );
+}
+
+/// Explain goes as typed words through the agent's "tell it" option, and an older daemon's
+/// refusal hides typed answers for that machine.
+#[gpui::test]
+fn explain_is_typed_words_and_an_old_daemon_hides_them(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(5));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Session(2), window, cx);
+            let explain =
+                crate::state::offers(d.model.row(2).and_then(|r| r.menu.as_ref()).expect("menu"))
+                    .into_iter()
+                    .find(|o| o.digit == Some(4))
+                    .expect("Explain is 4");
+            d.pick(2, &explain, window, cx);
+            for hold in &mut d.holds.held {
+                hold.until = std::time::Instant::now();
+            }
+            d.fire();
+        })
+    });
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::AnswerMenuText { .. })
+    })
+    .expect("typed words");
+    let ControlRequest::AnswerMenuText { id, key, text, .. } = asked else {
+        unreachable!()
+    };
+    assert_eq!(key, "4");
+    assert_eq!(text, crate::state::EXPLAIN);
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id,
+            reason: "unknown variant `AnswerMenuText`".into(),
+        },
+    );
+    let (said, offered) = desk.read_with(&vcx, |d, _| {
+        (d.said.get(&2).cloned(), d.too_old.contains(&0))
+    });
+    assert!(offered, "this machine takes no typed answers now");
+    assert_eq!(
+        said,
+        Some(crate::question::Said::Refused(
+            "qoop on This Mac is too old for typed answers".into()
+        ))
+    );
+}
+
 /// Every key hint names the prefix `config.toml` picked.
 #[gpui::test]
 fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {

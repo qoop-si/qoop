@@ -12,6 +12,8 @@ mod field;
 #[cfg(target_os = "macos")]
 mod home;
 #[cfg(target_os = "macos")]
+mod inbox;
+#[cfg(target_os = "macos")]
 mod keys;
 #[cfg(target_os = "macos")]
 mod link;
@@ -19,6 +21,8 @@ mod link;
 mod newwork;
 #[cfg(target_os = "macos")]
 mod probe;
+#[cfg(target_os = "macos")]
+mod question;
 #[cfg(target_os = "macos")]
 mod review;
 #[cfg(target_os = "macos")]

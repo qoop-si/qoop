@@ -1235,6 +1235,59 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 self.send_one(link, request).await
             }
+            // An answer to an agent's menu is typed where the agent runs, in its own numbers.
+            R::AnswerMenu {
+                id,
+                terminal,
+                generation,
+                seal,
+                key,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                let request = R::AnswerMenu {
+                    id,
+                    terminal,
+                    generation,
+                    seal,
+                    key,
+                };
+                self.send_one(link, request).await
+            }
+            R::AnswerMenuText {
+                id,
+                terminal,
+                generation,
+                seal,
+                key,
+                text,
+            } => {
+                let (link, terminal) = terminal_in(terminal);
+                let request = R::AnswerMenuText {
+                    id,
+                    terminal,
+                    generation,
+                    seal,
+                    key,
+                    text,
+                };
+                self.send_one(link, request).await
+            }
+            // A hand-off goes to the qass of the machine its agents run on: one machine per
+            // request, so one that names tabs on two is refused (a client sends one per machine).
+            R::HandToQass { id, mut hands } => {
+                let links: BTreeSet<usize> =
+                    hands.iter().map(|h| terminal_in(h.terminal).0).collect();
+                if links.len() > 1 {
+                    return self
+                        .failed(id, "a hand-off names tabs on two machines".into())
+                        .await;
+                }
+                for h in &mut hands {
+                    h.terminal = terminal_in(h.terminal).1;
+                }
+                let link = links.first().copied().unwrap_or(self.home);
+                self.send_one(link, R::HandToQass { id, hands }).await
+            }
             // A look at a finish goes to the machine whose stop it is.
             R::Seen { id, terminal, stop } => {
                 let (link, terminal) = terminal_in(terminal);
@@ -2174,6 +2227,14 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 };
                 self.respond(&tasks).await
             }
+            // The tabs a remote's qass took, in the interface's numbers.
+            C::Handed { id, taken } => {
+                let taken = taken
+                    .into_iter()
+                    .filter_map(|t| terminal_out(link, t))
+                    .collect();
+                self.respond(&C::Handed { id, taken }).await
+            }
             // Answers that carry no number of either kind.
             other => self.respond(&other).await,
         }
@@ -3012,6 +3073,100 @@ mod tests {
         assert_eq!(id, "t1");
         let named: Vec<Option<i64>> = tasks.iter().map(|t| t.terminal).collect();
         assert_eq!(named, [terminal_out(1, 1).map(i64::from), None]);
+    }
+
+    /// An answer to a remote agent's menu, its own words for it, and a hand to qass go to the
+    /// machine the agent runs on, in its own number for the tab; the tabs its qass took come
+    /// back in the interface's numbers. A hand naming tabs on two machines reaches neither.
+    #[tokio::test]
+    async fn answers_and_hands_go_where_the_agent_runs() {
+        use qoop_runtime::control::Hand;
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let far = terminal_out(1, 21).expect("fits");
+        let hand = |terminal| Hand {
+            terminal,
+            generation: Some(2),
+            seal: Some(9),
+        };
+        let asks = |terminal: u32, hands: Vec<Hand>| {
+            [
+                ControlRequest::AnswerMenu {
+                    id: "m1".into(),
+                    terminal,
+                    generation: Some(2),
+                    seal: 9,
+                    key: "1".into(),
+                },
+                ControlRequest::AnswerMenuText {
+                    id: "m2".into(),
+                    terminal,
+                    generation: Some(2),
+                    seal: 9,
+                    key: "3".into(),
+                    text: "use the other file".into(),
+                },
+                ControlRequest::HandToQass {
+                    id: "m3".into(),
+                    hands,
+                },
+            ]
+        };
+        let (sent, wanted) = (
+            asks(
+                far,
+                vec![hand(far), hand(terminal_out(1, 22).expect("fits"))],
+            ),
+            asks(21, vec![hand(21), hand(22)]),
+        );
+        for (request, want) in sent.into_iter().zip(wanted) {
+            mux.control(request).await.expect("sent");
+            assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+            let asked: ControlRequest =
+                body_of(&remote_rx.try_recv().expect("the remote was asked"));
+            assert_eq!(asked, want);
+        }
+        // A local tab's answer stays home.
+        mux.control(asks(4, Vec::new()).into_iter().next().expect("one"))
+            .await
+            .expect("sent");
+        assert!(remote_rx.try_recv().is_err(), "the remote was asked");
+        let asked: ControlRequest = body_of(&home_rx.try_recv().expect("home was asked"));
+        assert_eq!(asked, asks(4, Vec::new()).into_iter().next().expect("one"));
+
+        mux.down.clear();
+        mux.control(ControlRequest::HandToQass {
+            id: "m4".into(),
+            hands: vec![hand(4), hand(far)],
+        })
+        .await
+        .expect("refused");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        assert!(remote_rx.try_recv().is_err(), "the remote was asked");
+        let refused: ControlResponse = body_of(&mux.down);
+        assert!(
+            matches!(&refused, ControlResponse::Failed { id, .. } if id == "m4"),
+            "{refused:?}"
+        );
+
+        mux.down.clear();
+        mux.answer(
+            1,
+            ControlResponse::Handed {
+                id: "m3".into(),
+                taken: vec![21, 1 << 30],
+            },
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        assert_eq!(
+            answered,
+            ControlResponse::Handed {
+                id: "m3".into(),
+                taken: vec![far],
+            },
+            "in the interface's numbers, one that does not fit dropped"
+        );
     }
 
     /// A remote's recording names its terminal in the interface's numbering: left as the
