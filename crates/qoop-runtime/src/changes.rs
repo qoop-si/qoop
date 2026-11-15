@@ -30,12 +30,15 @@ const GH_WITHIN: Duration = Duration::from_secs(5);
 /// What a diff is taken from when there is no commit at all.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-/// What the repository's config cannot turn back on.
-const OFF: [(&str, &str); 4] = [
+/// What the repository's config cannot turn back on; and paths in the patch's headers as
+/// they are, not quoted with octal escapes for each letter beyond ASCII, so a reader finds a
+/// file's rows by the path the file list names.
+const OFF: [(&str, &str); 5] = [
     ("core.fsmonitor", "false"),
     ("core.hooksPath", "/dev/null"),
     ("diff.external", ""),
     ("core.pager", "cat"),
+    ("core.quotePath", "false"),
 ];
 
 /// After `diff`: no driver, conversion, colour or submodule of the checkout's choosing.
@@ -552,14 +555,14 @@ pub(crate) fn head_and_clean(cwd: &str, within: Duration) -> (Option<String>, Op
     (head, clean)
 }
 
-/// `gh` on the daemon's PATH, else where Homebrew puts it: a daemon started by a service may
-/// have a PATH without it.
-fn gh() -> Option<PathBuf> {
+/// A program on the PATH, else where Homebrew puts it: a daemon started by a service, or an
+/// app started from the Finder, may have a PATH without it.
+pub fn tool(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .map(|dir| dir.join("gh"))
-        .find(|gh| gh.is_file())
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 /// A pull request as `gh --json number,state,statusCheckRollup` describes one.
@@ -624,9 +627,16 @@ fn ask_gh(gh: &Path, repo: &str, branch: &str) -> Option<Option<PullRequest>> {
     }
 }
 
-/// `Changes` for a terminal whose shell is in `cwd`. Public for the desktop window, which reads
-/// a checkout on this machine in its own process, only while its review is open.
-pub async fn read(id: String, terminal: u32, cwd: Option<String>) -> ControlResponse {
+/// `Changes` for a terminal whose shell is in `cwd`, its pull request asked of `gh` when `with_pr`.
+/// Public for the desktop window, which reads a checkout on this machine in its own process,
+/// only while its review is open, and draws no pull request (so asks none: a network call
+/// for nothing would hold the answer up to its deadline).
+pub async fn read(
+    id: String,
+    terminal: u32,
+    cwd: Option<String>,
+    with_pr: bool,
+) -> ControlResponse {
     let Some(cwd) = cwd else {
         return failed(id, format!("there is no terminal {terminal}"));
     };
@@ -638,8 +648,8 @@ pub async fn read(id: String, terminal: u32, cwd: Option<String>) -> ControlResp
             Ok(Err(reason)) => return failed(id, reason),
             Err(_) => return failed(id, "the checkout is not readable right now"),
         };
-    let asked = match (looked.repo.clone(), looked.branch.clone(), gh()) {
-        (Some(repo), Some(branch), Some(gh)) => {
+    let asked = match (looked.repo.clone(), looked.branch.clone(), tool("gh")) {
+        (Some(repo), Some(branch), Some(gh)) if with_pr => {
             crate::blocking::probe_asked(&looked.root, GH_WITHIN + slack, move || {
                 ask_gh(&gh, &repo, &branch)
             })
@@ -835,7 +845,9 @@ mod tests {
             l.files,
             [ChangedFile {
                 path: "a.txt".into(),
-                status: "M".into()
+                status: "M".into(),
+                added: Some(1),
+                removed: Some(0),
             }]
         );
     }
@@ -948,6 +960,25 @@ mod tests {
         assert_eq!(counts("c.txt"), (Some(5), Some(0)), "new since main");
         assert_eq!(counts("pic.bin"), (None, None), "binary");
         assert_eq!(counts("loose.txt"), (None, None), "untracked");
+    }
+
+    /// A path with a space and a letter beyond ASCII is written in the patch's header as the
+    /// file list names it, so its rows can be found by that name.
+    #[test]
+    fn a_patch_names_a_file_as_the_list_does() {
+        let (_dir, repo) = repo();
+        let name = "caf\u{e9} notes.md";
+        std::fs::write(repo.join(name), "one\n").expect("file");
+        git(&repo, &["add", name]);
+        git(&repo, &["commit", "-q", "-m", "notes"]);
+        std::fs::write(repo.join(name), "one\ntwo\n").expect("file");
+        let l = looked(&repo);
+        assert!(l.files.iter().any(|f| f.path == name), "{:?}", l.files);
+        assert!(
+            l.diff.contains(&format!("+++ b/{name}")),
+            "unquoted: {}",
+            l.diff
+        );
     }
 
     #[test]

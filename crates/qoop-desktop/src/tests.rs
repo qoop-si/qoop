@@ -408,8 +408,9 @@ fn cmd_v_pastes_into_the_tab(cx: &mut TestAppContext) {
     assert!(pasted, "pasted, not typed");
 }
 
-/// d-review by keyboard: Changes reads the tab's checkout in this process, `n` opens the next
-/// file, `x` marks the finish read for its stop, Escape closes it; a remote tab has no review.
+/// d-review by keyboard only: from the terminal, `ctrl-a D` reads the tab's checkout in this
+/// process, `n` opens the next file, `x` marks the finish read for its stop, Escape closes it
+/// and gives the terminal the keys back; a remote tab has no review.
 #[gpui::test]
 fn the_review_reads_here_and_takes_n_and_x(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
@@ -424,9 +425,11 @@ fn the_review_reads_here_and_takes_n_and_x(cx: &mut TestAppContext) {
             row.cwd = Some("/srv/acme-web".into());
             row.stop = Some("1700000000.4".into());
             d.open(Page::Session(3), window, cx);
-            d.toggle_review(window, cx);
         })
     });
+    vcx.run_until_parked();
+    // The terminal has the keys; the prefix opens Changes.
+    vcx.simulate_keystrokes("ctrl-a shift-d");
     vcx.run_until_parked();
     let id = sent(&mut rx)
         .into_iter()
@@ -490,19 +493,38 @@ fn the_review_reads_here_and_takes_n_and_x(cx: &mut TestAppContext) {
     );
     vcx.simulate_keystrokes("escape");
     assert!(desk.read_with(&vcx, |d, _| d.review.is_none()));
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
     // A remote tab: no review is read.
     vcx.update(|window, cx| {
         desk.update(cx, |d, cx| {
             d.open(Page::Session(0x8100_0001), window, cx);
-            d.toggle_review(window, cx);
         })
     });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a shift-d");
     assert!(desk.read_with(&vcx, |d, _| d.review.is_none()));
     assert!(
         !sent(&mut rx)
             .iter()
             .any(|u| matches!(u, Up::Changes { .. })),
         "nothing read for a remote tab"
+    );
+}
+
+/// `ctrl-a a` takes the keys off the terminal: `tab` then moves between the controls and types
+/// nothing into the agent.
+#[gpui::test]
+fn ctrl_a_a_takes_the_keys_off_the_terminal(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    sent(&mut rx);
+    vcx.simulate_keystrokes("ctrl-a a tab tab");
+    assert!(!vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "nothing typed into the agent"
     );
 }
 

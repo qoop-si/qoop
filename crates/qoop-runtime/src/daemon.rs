@@ -4168,6 +4168,7 @@ async fn handle_control(
                 id,
                 terminal,
                 terminals.cwd_of(terminal),
+                true,
             ))
             .await
         }

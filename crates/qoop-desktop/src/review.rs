@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use qoop_runtime::control::{ChangedFile, PullRequest};
+use qoop_runtime::control::ChangedFile;
 
 /// A `Changes` answer, kept while the review is open.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,7 +15,6 @@ pub struct Changes {
     pub files: Vec<ChangedFile>,
     pub diffs: Vec<FileDiff>,
     pub cut: bool,
-    pub pr: Option<PullRequest>,
 }
 
 /// The review of one tab: asked under `id`, then the answer or why there is none.
@@ -60,6 +59,8 @@ pub fn counts(file: &ChangedFile) -> Option<String> {
         return Some("new".into());
     }
     match (file.added?, file.removed?) {
+        // A mode change only: no lines to count.
+        (0, 0) => None,
         (a, 0) => Some(format!("+{a}")),
         (0, r) => Some(format!("-{r}")),
         (a, r) => Some(format!("+{a} -{r}")),
@@ -113,7 +114,8 @@ pub fn split_diff(diff: &str) -> Vec<FileDiff> {
         };
         if !in_hunk {
             if let Some(path) = row.strip_prefix("+++ b/") {
-                file.path = path.to_string();
+                // git ends the line with a tab when the path holds a space.
+                file.path = path.strip_suffix('\t').unwrap_or(path).to_string();
             } else if row.starts_with("Binary files ") {
                 file.binary = true;
             }
@@ -175,8 +177,11 @@ pub fn editor_for(
         .join(file)
         .canonicalize()
         .map_err(|_| format!("{file} is not there any more"))?;
-    if !path.starts_with(&root) || !path.is_file() {
+    if !path.starts_with(&root) {
         return Err(format!("{file} is outside the checkout"));
+    }
+    if !path.is_file() {
+        return Err(format!("{file} is not a file to open"));
     }
     let path = path.display().to_string();
     let at = match line {
@@ -190,16 +195,6 @@ pub fn editor_for(
         return Ok((code, vec!["-g".into(), at]));
     }
     Ok((PathBuf::from("/usr/bin/open"), vec!["-t".into(), path]))
-}
-
-/// A program on the PATH, else where Homebrew puts it: an app started from the Finder has a
-/// short PATH.
-pub fn find_tool(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .map(|dir| dir.join(name))
-        .find(|p| p.is_file())
 }
 
 /// Start `program` with `args`, not waiting for it; a failure is said on stderr.
@@ -281,6 +276,21 @@ Binary files /dev/null and b/pic.png differ
         assert_eq!(files[1].path, "pic.png");
     }
 
+    /// git ends a `+++` line with a tab when the path holds a space: the file is still named
+    /// as the list names it.
+    #[test]
+    fn a_path_with_a_space_keeps_its_name() {
+        let diff = "diff --git a/docs/release notes.md b/docs/release notes.md\n\
+                    --- a/docs/release notes.md\t\n\
+                    +++ b/docs/release notes.md\t\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let files = split_diff(diff);
+        assert_eq!(files[0].path, "docs/release notes.md");
+        assert_eq!(files[0].lines.len(), 3);
+    }
+
     fn checkout() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("dir");
         let root = dir.path().join("work");
@@ -344,5 +354,6 @@ Binary files /dev/null and b/pic.png differ
         );
         assert_eq!(counts(&file("?", None, None)).as_deref(), Some("new"));
         assert_eq!(counts(&file("M", None, None)), None, "binary");
+        assert_eq!(counts(&file("M", Some(0), Some(0))), None, "mode only");
     }
 }

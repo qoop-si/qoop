@@ -163,7 +163,11 @@ impl Wire {
             },
         }
     }
+}
 
+/// One half at a time from a test, before the halves go to their own tasks.
+#[cfg(test)]
+impl Wire {
     pub async fn request(&mut self, request: &ControlRequest) -> io::Result<()> {
         self.writer.request(request).await
     }
@@ -364,7 +368,7 @@ async fn linked(
                 Some(Up::Changes { id, terminal, cwd }) => {
                     let down = down.clone();
                     tokio::spawn(async move {
-                        let answer = qoop_runtime::changes::read(id, terminal, Some(cwd)).await;
+                        let answer = qoop_runtime::changes::read(id, terminal, Some(cwd), false).await;
                         let _ = down.send(Down::Answer(Box::new(answer)));
                     });
                 }
