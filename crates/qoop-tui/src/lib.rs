@@ -23,6 +23,7 @@ pub mod mux;
 pub mod notify;
 pub mod palette;
 pub mod picture;
+pub mod plugins;
 pub mod present;
 pub mod qass_screen;
 pub mod rail;
