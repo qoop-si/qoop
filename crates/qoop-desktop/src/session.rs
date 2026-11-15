@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, ClipboardItem, Context, FontFeatures, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollEvent, Window, div,
-    prelude::*, px, relative,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollDelta, ScrollEvent,
+    Window, div, prelude::*, px, relative,
 };
 use qoop_runtime::control::{ControlRequest, Pane, SplitDir, TerminalStream};
 use qoop_runtime::daemon::{ModesWire, SnapshotWire};
@@ -82,7 +82,13 @@ impl Desk {
             return;
         };
         let shown = self.term.as_ref().map(|t| t.terminal);
-        if let Some(t) = self.model.turned_needs(before, shown) {
+        let on_screen: Vec<TerminalStream> = self
+            .term
+            .iter()
+            .chain(&self.others)
+            .map(|t| t.terminal)
+            .collect();
+        if let Some(t) = self.model.turned_needs(before, &on_screen) {
             self.note = Some(t);
         }
         let needs = |t: TerminalStream| self.model.row(t).is_some_and(|r| Kind::of(r).needs_you());
@@ -180,7 +186,7 @@ impl Desk {
     }
 
     /// Back to the live screen, as typing does.
-    pub(crate) fn to_live(&mut self) {
+    pub(crate) fn back_to_live(&mut self) {
         if let Some(term) = self.term.as_mut() {
             term.scroll = 0;
             term.back = None;
@@ -277,7 +283,7 @@ impl Desk {
         {
             let _ = self.up.send(Up::Paste(term.terminal, text.into_bytes()));
         }
-        self.to_live();
+        self.back_to_live();
     }
 
     /// The tab on screen runs on this machine: its checkout can be read and opened here.
@@ -295,7 +301,7 @@ impl Desk {
             cx.notify();
             return;
         }
-        let Some(terminal) = self.term.as_ref().map(|t| t.terminal) else {
+        let Page::Session(terminal) = self.page else {
             return;
         };
         let Some(cwd) = self.here(terminal) else {
@@ -359,7 +365,12 @@ impl Desk {
         let Some(Ok(changes)) = &review.read else {
             return;
         };
-        match review::editor_for(Path::new(&changes.root), path, line, review::find_tool) {
+        match review::editor_for(
+            Path::new(&changes.root),
+            path,
+            line,
+            qoop_runtime::changes::tool,
+        ) {
             Ok((program, args)) => {
                 review.said = None;
                 review::launch(&program, &args);
@@ -447,9 +458,6 @@ impl Desk {
             _ => None,
         });
         div()
-            .id("tabs")
-            .role(Role::TabList)
-            .aria_label("Tabs")
             .flex_none()
             .h(px(36.))
             .flex()
@@ -466,36 +474,46 @@ impl Desk {
                         .child(w.name.clone()),
                 )
             })
-            .children(tabs.into_iter().map(|tab| {
-                let terminal = tab.terminal;
-                let on = tree.contains(&terminal);
-                let title = state::title_of(tab);
-                ui::control(("tab", terminal as u64), Role::Tab, title.clone(), t)
-                    .aria_selected(on)
+            .child(
+                div()
+                    .id("tabs")
+                    .role(Role::TabList)
+                    .aria_label("Tabs")
+                    .min_w_0()
                     .flex()
                     .items_center()
-                    .gap(px(7.))
-                    .h(px(30.))
-                    .max_w(px(220.))
-                    .px(px(10.))
-                    .rounded(px(9.))
-                    .text_size(px(12.5))
-                    .text_color(c(if on { t.ink } else { t.t1 }))
-                    .when(on, |d| d.bg(ca(t.fill)))
-                    .hover(|s| s.bg(ca(t.fill)))
-                    .child(ui::mark(Kind::of(tab), t, 10.))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open(Page::Session(terminal), window, cx)
-                    }))
-            }))
+                    .gap(px(4.))
+                    .children(tabs.into_iter().map(|tab| {
+                        let terminal = tab.terminal;
+                        let on = tree.contains(&terminal);
+                        let title = state::title_of(tab);
+                        ui::control(("tab", terminal as u64), Role::Tab, title.clone(), t)
+                            .aria_selected(on)
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .h(px(30.))
+                            .max_w(px(220.))
+                            .px(px(10.))
+                            .rounded(px(9.))
+                            .text_size(px(12.5))
+                            .text_color(c(if on { t.ink } else { t.t1 }))
+                            .when(on, |d| d.bg(ca(t.fill)))
+                            .hover(|s| s.bg(ca(t.fill)))
+                            .child(ui::mark(Kind::of(tab), t, 10.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(title),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open(Page::Session(terminal), window, cx)
+                            }))
+                    })),
+            )
             .child(div().flex_1())
             .when_some(space.filter(|w| state::machine_of(w.id) != 0), |d, w| {
                 d.child(quiet(
@@ -530,6 +548,7 @@ impl Desk {
                         d.child(div().text_color(c(t.done_text)).child(format!("+{a}")))
                             .child(div().text_color(c(t.fail_text)).child(format!("-{r}")))
                     })
+                    .child(ui::kbd(&format!("{} D", self.prefix_name()), t))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_review(window, cx))),
                 )
                 .child(
@@ -693,11 +712,12 @@ impl Desk {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::pane_up))
                     .on_scroll(cx.listener(move |this, event: &ScrollEvent, _, cx| {
                         let height = this.cells.height;
-                        let rows = (event.delta.pixel_delta(height).y / height / WHEEL_ROWS)
-                            .round()
-                            * WHEEL_ROWS;
-                        if rows != 0. {
-                            this.wheel(terminal, rows as i64);
+                        let Some(term) = this.pane_mut(terminal) else {
+                            return;
+                        };
+                        let rows = wheel_rows(event.delta, height, &mut term.wheel_left);
+                        if rows != 0 {
+                            this.wheel(terminal, rows);
                             cx.notify();
                         }
                     }))
@@ -972,6 +992,8 @@ impl Desk {
 
     /// d-review: the files the tab's checkout changed against its base, one open.
     fn review_panel(&self, review: &Review, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let ring = c(t.ink);
+
         let row = self.model.row(review.terminal);
         let agent = row
             .and_then(|r| r.program.clone())
@@ -1045,45 +1067,63 @@ impl Desk {
                     div()
                         .flex()
                         .flex_col()
+                        // The file's button and its Open in editor side by side: a link
+                        // inside a button is flattened away for a screen reader.
                         .child(
-                            ui::control(("file", i as u64), Role::Button, file.path.clone(), t)
-                                .aria_expanded(open)
+                            div()
                                 .flex()
                                 .items_center()
-                                .gap(px(8.))
-                                .min_h(px(30.))
-                                .px(px(6.))
-                                .rounded(px(8.))
-                                .hover(|s| s.bg(ca(t.fill)))
-                                .child(ui::icon(Icon::Chevron, 13., c(t.t2)))
+                                .gap(px(6.))
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .font_family(MONO_FONT)
-                                        .text_size(px(12.))
-                                        .child(file.path.clone()),
+                                    ui::control(
+                                        ("file", i as u64),
+                                        Role::Button,
+                                        file.path.clone(),
+                                        t,
+                                    )
+                                    .aria_expanded(open)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .min_h(px(30.))
+                                    .px(px(6.))
+                                    .rounded(px(8.))
+                                    .hover(|s| s.bg(ca(t.fill)))
+                                    .child(ui::icon(Icon::Chevron, 13., c(t.t2)))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .font_family(MONO_FONT)
+                                            .text_size(px(12.))
+                                            .child(file.path.clone()),
+                                    )
+                                    .when_some(review::counts(file), |d, n| {
+                                        d.child(
+                                            div().text_size(px(12.)).text_color(c(t.t2)).child(n),
+                                        )
+                                    })
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if let Some(r) = this.review.as_mut() {
+                                                r.open = i;
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
                                 )
-                                .when_some(review::counts(file), |d, n| {
-                                    d.child(div().text_size(px(12.)).text_color(c(t.t2)).child(n))
-                                })
                                 .child(
                                     ui::link_button(("file-editor", i as u64), "Open in editor", t)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.open_file(&opened, None);
-                                            cx.stop_propagation();
                                             cx.notify();
                                         })),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(r) = this.review.as_mut() {
-                                        r.open = i;
-                                    }
-                                    cx.notify();
-                                })),
+                                ),
                         )
                         .when(open, |d| {
                             d.child(self.file_body(file.status.as_str(), &path, diff, t, cx))
@@ -1101,6 +1141,7 @@ impl Desk {
             .id("review")
             .role(Role::Region)
             .aria_label("Changes")
+            .focus_visible(move |s| s.border_color(ring))
             .track_focus(&self.review_focus)
             .on_key_down(cx.listener(Self::review_key))
             .flex_1()
@@ -1320,10 +1361,26 @@ fn step_row(
     }
 }
 
+/// Whole rows to scroll for one wheel event: a notch (`Lines`) is `WHEEL_ROWS` rows, a
+/// trackpad's pixels are counted by the row height. What does not make a whole row yet is
+/// kept in `left` for the next event, so a slow swipe still scrolls.
+fn wheel_rows(delta: ScrollDelta, row: Pixels, left: &mut f32) -> i64 {
+    let rows = match delta {
+        ScrollDelta::Lines(lines) => lines.y * WHEEL_ROWS,
+        ScrollDelta::Pixels(pixels) => pixels.y / row,
+    };
+    let total = *left + rows;
+    let whole = total.trunc();
+    *left = total - whole;
+    whole as i64
+}
+
 /// A page of scrollback rows as a screen: no styles, no cursor.
 fn page_of(lines: Vec<String>, cols: u16, rows: u16) -> SnapshotWire {
-    let mut modes = ModesWire::default();
-    modes.cursor_visible = false;
+    let modes = ModesWire {
+        cursor_visible: false,
+        ..ModesWire::default()
+    };
     SnapshotWire {
         cols: usize::from(cols),
         rows: usize::from(rows),
@@ -1334,5 +1391,33 @@ fn page_of(lines: Vec<String>, cols: u16, rows: u16) -> SnapshotWire {
         modes,
         title: String::new(),
         behind: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{point, px};
+
+    use super::*;
+
+    /// A notch of a mouse wheel scrolls three rows; a slow trackpad swipe scrolls once its
+    /// pixels make a whole row, and both directions keep what is left over.
+    #[test]
+    fn every_wheel_event_counts() {
+        let mut left = 0.;
+        assert_eq!(
+            wheel_rows(ScrollDelta::Lines(point(0., 1.)), px(16.), &mut left),
+            3
+        );
+        assert_eq!(
+            wheel_rows(ScrollDelta::Lines(point(0., -1.)), px(16.), &mut left),
+            -3
+        );
+        let slow = ScrollDelta::Pixels(point(px(0.), px(6.)));
+        let rows: Vec<i64> = (0..6)
+            .map(|_| wheel_rows(slow, px(16.), &mut left))
+            .collect();
+        assert_eq!(rows, [0, 0, 1, 0, 0, 1], "6 px at a time of 16 px rows");
+        assert_eq!(rows.iter().sum::<i64>(), 2, "36 px is two rows and a bit");
     }
 }

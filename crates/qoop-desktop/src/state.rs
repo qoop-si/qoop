@@ -450,18 +450,19 @@ impl Model {
             .collect()
     }
 
-    /// The agent a corner note is for: one of the owner's that turned Needs you since the
-    /// rows `before`, other than the one on screen.
-    pub fn turned_needs(&self, before: &[AgentRow], shown: Option<u32>) -> Option<u32> {
-        let needed = |t: u32| {
+    /// The agent a corner note is for: one of the owner's that was listed in `before` and has
+    /// turned Needs you since, outside the panes on screen (`shown`). A row that was not listed
+    /// (a remote back, the first list) is no turn.
+    pub fn turned_needs(&self, before: &[AgentRow], shown: &[u32]) -> Option<u32> {
+        let was_calm = |t: u32| {
             before
                 .iter()
-                .any(|r| r.terminal == t && Kind::of(r).needs_you())
+                .any(|r| r.terminal == t && !Kind::of(r).needs_you())
         };
         self.live()
-            .filter(|r| Some(r.terminal) != shown && Kind::of(r).needs_you())
+            .filter(|r| !shown.contains(&r.terminal) && Kind::of(r).needs_you())
             .map(|r| r.terminal)
-            .find(|&t| !needed(t))
+            .find(|&t| was_calm(t))
     }
 }
 
@@ -532,22 +533,29 @@ impl Strip {
 }
 
 /// Whether a check's words say it failed: a count of failures above zero (`12 pass, 1 fail`),
-/// or the word with no count (`build failed`). `0 failed` passes.
+/// or one of a few exact phrases (`build failed`). Nothing else is read as a verdict: `the
+/// failing test`, `no failures` and `0 failed` say nothing failed.
 pub fn failed_run(text: &str) -> bool {
+    const PHRASES: [&str; 5] = [
+        "build failed",
+        "test failed",
+        "tests failed",
+        "check failed",
+        "checks failed",
+    ];
     let words: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
         .collect();
-    words.iter().enumerate().any(|(i, w)| {
-        matches!(
-            w.as_str(),
-            "fail" | "fails" | "failed" | "failing" | "failure" | "failures"
-        ) && match i.checked_sub(1).and_then(|p| words[p].parse::<u64>().ok()) {
-            Some(n) => n > 0,
-            None => true,
-        }
-    })
+    let counted = words.windows(2).any(|pair| {
+        pair[0].parse::<u64>().is_ok_and(|n| n > 0)
+            && matches!(
+                pair[1].as_str(),
+                "fail" | "fails" | "failed" | "failing" | "failure" | "failures"
+            )
+    });
+    counted || PHRASES.iter().any(|p| words.join(" ").contains(p))
 }
 
 /// The text of the cells from `a` to `b` (row, column, either order, both included) of a
@@ -1449,13 +1457,19 @@ pub(crate) mod tests {
     fn a_corner_note_is_for_another_agent_turning_needs_you() {
         let before = fixture().rows;
         let mut m = fixture();
-        assert_eq!(m.turned_needs(&before, Some(1)), None, "nothing turned");
+        assert_eq!(m.turned_needs(&before, &[1]), None, "nothing turned");
         m.rows[2].status = Some("blocked".into());
-        assert_eq!(m.turned_needs(&before, Some(1)), Some(3));
-        assert_eq!(m.turned_needs(&before, Some(3)), None, "the one on screen");
+        assert_eq!(m.turned_needs(&before, &[1]), Some(3));
+        assert_eq!(m.turned_needs(&before, &[3]), None, "the one on screen");
+        assert_eq!(
+            m.turned_needs(&before, &[1, 3]),
+            None,
+            "the other pane on screen"
+        );
         m.rows[6].status = Some("blocked".into());
         m.rows[2].status = Some("done".into());
-        assert_eq!(m.turned_needs(&before, Some(1)), None, "qass's own row");
+        assert_eq!(m.turned_needs(&before, &[1]), None, "qass's own row");
+        assert_eq!(m.turned_needs(&[], &[1]), None, "a row not listed before");
     }
 
     fn event(at: i64, kind: &str, body: &str) -> TaskEventInfo {
@@ -1538,5 +1552,8 @@ pub(crate) mod tests {
         assert!(failed_run("cargo build failed"));
         assert!(!failed_run("cargo test: 40 passed; 0 failed"));
         assert!(!failed_run("bun test: 15 pass, 0 fail, 35 expect() calls"));
+        assert!(!failed_run("Fixed the failing coupon test: 2 pass, 0 fail"));
+        assert!(!failed_run("all green, no failures"));
+        assert!(failed_run("cargo test: 3 failed; 40 passed"));
     }
 }

@@ -57,6 +57,8 @@ pub struct Term {
     pub(crate) scroll: usize,
     pub(crate) back: Option<Rc<SnapshotWire>>,
     pub(crate) total: u64,
+    /// The part of a row the wheel moved that has not scrolled yet.
+    pub(crate) wheel_left: f32,
     /// Cells selected with the mouse, anchor then end, as (row, column) of what is shown.
     pub(crate) selection: Option<((usize, usize), (usize, usize))>,
 }
@@ -72,6 +74,7 @@ impl Term {
             scroll: 0,
             back: None,
             total: 0,
+            wheel_left: 0.,
             selection: None,
         }
     }
@@ -258,7 +261,6 @@ impl Desk {
                 files,
                 diff,
                 cut,
-                pr,
                 ..
             } => {
                 if let Some(review) = self.review.as_mut().filter(|r| r.id == id) {
@@ -268,7 +270,6 @@ impl Desk {
                         files,
                         diffs: crate::review::split_diff(&diff),
                         cut,
-                        pr,
                     }));
                 }
             }
@@ -381,6 +382,15 @@ impl Desk {
                 "c" => self.new_work(None, window, cx),
                 "x" => self.dismiss_note(cx),
                 "tab" => self.open_note(window, cx),
+                // The keyboard off the terminal, as the TUI's `ctrl-a a` puts it on the agents
+                // column: `tab` then goes round the controls.
+                "a" => {
+                    window.focus(&self.focus, cx);
+                    cx.notify();
+                }
+                // Changes, `D` for diff: a key the TUI leaves unbound, so one prefix key never
+                // means two things across qoop. ponytail: the owner's naming pick.
+                "d" | "D" if k.modifiers.shift || k.key == "D" => self.toggle_review(window, cx),
                 "i" => {
                     self.inbox = !self.inbox;
                     cx.notify();
@@ -464,7 +474,7 @@ impl Desk {
             cx.stop_propagation();
             // Typing goes back to the live screen, as a terminal does.
             if term.scroll > 0 || term.selection.is_some() {
-                self.to_live();
+                self.back_to_live();
                 cx.notify();
             }
         }
@@ -1008,7 +1018,15 @@ impl Desk {
                 self.model.status_line().filter(|_| self.connected),
                 |d, line| d.child(div().text_color(c(t.needs_text)).child(line)),
             )
-            .child(format!("{}: [c new work] [i inbox]", self.prefix_name()))
+            .child(format!(
+                "{}: [c new work] [i inbox] [a keys off the terminal]{}",
+                self.prefix_name(),
+                if matches!(self.page, Page::Session(_)) {
+                    " [D changes]"
+                } else {
+                    ""
+                }
+            ))
     }
 
     /// The right panel: what waits on the person, newest state first. Answering comes later;
