@@ -91,15 +91,28 @@ A plugin runs as you, with your file permissions, and through qoop it can:
   process group of what runs in it;
 - type into terminals (`send-text`, `send-input`, `send-keys`, `pane run`, `agent prompt`);
 - close panes, tabs and spaces;
-- rename them, and move focus;
+- rename them, and move focus (to a named pane, or to the neighbour on a side with
+  `pane focus --direction`);
+- swap and resize panes in a split tab;
 - open panes, tabs and spaces, and start a plugin's own panes;
 - show a desktop notification, which follows `[notify] mute`.
 
 Writes go through the same refusals as `qoop send` and `qoop prompt`. While a person is at a
 terminal (their keys from the interface, the phone, the browser or `qoop attach`), a plugin's
 write is an error for the plugin, naming the second it frees. A blocked agent, a trust prompt
-and a sleeping tab refuse the same way. The plugin gets the error; there is no retry and no
-way around it.
+and a sleeping tab refuse the same way. The plugin gets the error; there is no retry.
+
+While a pane a plugin opened still runs that plugin's program, the plugin's writes into it are
+never held by a person there: a sidebar closes itself with `ctrl+q` right after you typed in it.
+Once something else runs there (a shell, after qoop restarted), it is a terminal like any other.
+The plugin's writes into any other terminal follow the rules above and below.
+
+One more exception: a key a person presses in a plugin's own pane lets that plugin send text and
+keys (not `agent prompt`) into the terminals of the pane's tab for the next 10 seconds, until
+its first write that ends in Enter.
+It passes only the hold that a line the person sent puts on a terminal (120 seconds); a draft
+they are typing there, a trust prompt, a blocked agent and a sleeping tab still refuse. Hooks,
+startup commands and actions started from the palette never get it.
 
 A plugin cannot report an agent's state: `pane.report_agent` is an unknown method here, and
 `agent report` is not a command. It never gets a terminal's token, because qoop strips its own
@@ -188,13 +201,16 @@ itself can land in shell history. A missing, used or expired nonce exits with a 
 
 These do not work, and a plugin that needs one will install and then not do its main job:
 
-- no floating popups: a popup or overlay is a split beside its target;
-- no `layout.*`, no pane move, swap or real resize (`pane resize` succeeds and changes
-  nothing, and layout rectangles are the split tree's proportions, not cells on a screen);
-- no `[[link_handlers]]`: the key is ignored;
-- no worktree events, and no `pane.output_matched`, `pane.scroll_changed`, `pane.updated`,
-  `pane.output_changed`, `workspace.metadata_updated`, `workspace.updated` or
-  `workspace.reordered` events: a subscription to one is accepted and never fires;
+- no floating popups: a popup or overlay opens as a split beside its target, zoomed to fill the
+  tab, and the zoom goes back when it closes;
+- no `layout.*` and no pane move;
+- `[[link_handlers]]` are read and listed in `plugin list`, but a clicked link never runs one;
+- no worktree events, and no `pane.output_matched`, `pane.scroll_changed`,
+  `pane.output_changed`, `workspace.updated` or `workspace.reordered` events: a subscription to
+  one is accepted and never fires;
+- `pane read --source recent-unwrapped` joins a row that fills the pane's width to the next
+  one, since qoop does not keep which rows wrapped: a line exactly as wide as the pane is joined
+  by mistake;
 - no `agent start`, `agent report`, `agent view`, `events.wait`, `herdr integration` or
   `herdr machine`: unknown methods or commands;
 - `pane report-metadata` and `workspace report-metadata` keep their tokens (per pane or space,
@@ -203,8 +219,10 @@ These do not work, and a plugin that needs one will install and then not do its 
   state labels are accepted and left unused; the tokens live in the plugin host, so a host that
   restarts starts without them;
 - `server reload-config` succeeds and changes nothing, and no `session.json` is written;
-- a pane, an agent and a tab share one name: `pane rename`, `agent rename` and a tab's first
-  pane's `tab rename` all set the terminal's name, where herdr keeps three;
+- a tab's name is the qoop name of its first terminal, which only `tab rename` sets; `pane
+  rename` and `agent rename` keep a pane label and an agent name for plugins (kept across a
+  restart of the plugin host), which qoop itself does not show; a tab with no name is labelled by
+  its number, as in herdr;
 - after a daemon restart a plugin pane comes back as a plain shell in its folder: the restore
   opens a fresh shell and types a resume line only for a known agent, and the plugin's program
   and environment are not kept (a plugin program that was a known agent is resumed as that
