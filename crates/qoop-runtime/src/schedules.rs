@@ -481,24 +481,34 @@ pub(crate) async fn write(
                     if closed(books) {
                         return failed(id, "qoop is restarting; run it again in a moment");
                     }
-                    // One run at a time from Run now: while the newest run has not ended (it
-                    // is claimed or its agent still works), a second would start the same
-                    // prompt in the same folder beside it.
-                    let newest = store.run(move |s| s.schedule_runs(schedule, None, 1)).await;
-                    match newest {
-                        Ok(runs) if runs.first().is_some_and(still_running) => {
-                            return failed(id, STILL_RUNNING);
-                        }
-                        Ok(_) => {}
+                    // One run at a time from Run now: while any run of the schedule is open,
+                    // a second would start the same prompt in the same folder beside it. The
+                    // tabs of the open runs are checked first: one that closed no longer
+                    // holds it back. Check and new row are one transaction in the store.
+                    let tabs = match store.run(move |s| s.open_run_tabs(schedule)).await {
+                        Ok(tabs) => tabs,
                         Err(e) => return failed(id, why(e)),
-                    }
+                    };
+                    let closed: Vec<i64> = tabs
+                        .into_iter()
+                        .filter(|t| match u32::try_from(*t) {
+                            Ok(t) => agents.live(t).is_none(),
+                            Err(_) => true,
+                        })
+                        .collect();
                     // Its own run: the slot the row holds is the key the run reports under,
                     // and nothing is claimed or moved. Its row is its own.
                     let slot = row.last_slot.unwrap_or(0);
                     let at = now();
-                    let run = match store.run(move |s| s.start_run(schedule, slot, at)).await {
-                        Ok(Some(run)) => run,
-                        Ok(None) => return failed(id, format!("no schedule {schedule}")),
+                    let asked = store
+                        .run(move |s| s.run_now(schedule, slot, at, &closed))
+                        .await;
+                    let run = match asked {
+                        Ok(qoop_store::schedule::RunNow::Started(run)) => run,
+                        Ok(qoop_store::schedule::RunNow::Open) => return failed(id, STILL_RUNNING),
+                        Ok(qoop_store::schedule::RunNow::NoSchedule) => {
+                            return failed(id, format!("no schedule {schedule}"));
+                        }
                         Err(e) => return failed(id, why(e)),
                     };
                     spawn_run(books, connections, row, slot, Some(run), starting, true);
@@ -815,6 +825,9 @@ async fn claim(
     }
 }
 
+/// What a Run now is refused with while a run of the schedule is still open.
+pub(crate) const STILL_RUNNING: &str = "still_running";
+
 /// The binary this daemon runs as, which is the one a handover moved onto.
 fn own_exe(books: &Bookkeeping) -> Option<PathBuf> {
     books.restart.exe().or_else(|| std::env::current_exe().ok())
@@ -825,14 +838,6 @@ fn own_exe(books: &Bookkeeping) -> Option<PathBuf> {
 /// A run that ends without having reported is written down as failed, its row `run` too (a
 /// watch's check has none). `manual` is the owner asking for it now, which a run still going
 /// does not hold back.
-/// What a Run now is refused with while the schedule's newest run still works.
-pub(crate) const STILL_RUNNING: &str = "still_running";
-
-/// A run not ended yet: claimed, or started with its agent still at work (its end is written
-/// when the agent's turn ends or its tab closes).
-fn still_running(run: &qoop_store::schedule::ScheduleRunRow) -> bool {
-    run.ended_at.is_none() && matches!(run.result.as_str(), "claimed" | "started")
-}
 
 fn spawn_run(
     books: &Bookkeeping,

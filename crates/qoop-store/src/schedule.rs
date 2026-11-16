@@ -83,6 +83,18 @@ fn ending(result: &str, at: i64) -> (Option<i64>, Option<&'static str>) {
 }
 
 /// Record a run of `schedule` and keep only its newest [`RUNS_KEPT`]. Answers its id.
+/// What a Run now came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunNow {
+    Started(i64),
+    /// A run of the schedule is still open: no second one.
+    Open,
+    NoSchedule,
+}
+
+/// How long a run may go without a tab before it counts as one that never started.
+pub const NO_TAB_FOR: i64 = 120;
+
 fn insert_run(
     conn: &Connection,
     schedule: i64,
@@ -356,6 +368,73 @@ impl Store {
         let run = insert_run(&tx, id, slot, now, "claimed", None)?;
         tx.commit()?;
         Ok(Some(run))
+    }
+
+    /// A run the owner asked for now, unless a run of the schedule is still open (claimed, or
+    /// started and not ended), whichever of its runs that is: a skipped slot written after a
+    /// run that still works is newer and already ended, and must not let a second run start.
+    /// The check and the new row are one write transaction (`BEGIN IMMEDIATE`), so two asks at
+    /// once make one run. Before the check, a run that cannot still be going is ended `gone`:
+    /// one whose tab the daemon found closed (`closed`, terminal numbers), and one that has had
+    /// no tab for [`NO_TAB_FOR`] seconds.
+    pub fn run_now(
+        &self,
+        id: i64,
+        slot: i64,
+        now: i64,
+        closed: &[i64],
+    ) -> Result<RunNow, StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let there = tx
+            .query_row("SELECT 1 FROM schedule WHERE id = ?1", params![id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !there {
+            return Ok(RunNow::NoSchedule);
+        }
+        const OPEN: &str = "ended_at IS NULL AND result IN ('claimed', 'started')";
+        for terminal in closed {
+            tx.execute(
+                &format!(
+                    "UPDATE schedule_run SET ended_at = ?3, outcome = 'gone'                      WHERE schedule = ?1 AND terminal = ?2 AND {OPEN}"
+                ),
+                params![id, terminal, now],
+            )?;
+        }
+        tx.execute(
+            &format!(
+                "UPDATE schedule_run SET ended_at = ?2, outcome = 'gone'                  WHERE schedule = ?1 AND terminal IS NULL AND started_at < ?3 AND {OPEN}"
+            ),
+            params![id, now, now - NO_TAB_FOR],
+        )?;
+        let open: bool = tx.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM schedule_run WHERE schedule = ?1 AND {OPEN})"),
+            params![id],
+            |r| r.get(0),
+        )?;
+        if open {
+            tx.commit()?;
+            return Ok(RunNow::Open);
+        }
+        let run = insert_run(&tx, id, slot, now, "claimed", None)?;
+        tx.commit()?;
+        Ok(RunNow::Started(run))
+    }
+
+    /// The open runs of schedule `id` and the tabs they opened: what the daemon checks for
+    /// tabs that closed before a Run now.
+    pub fn open_run_tabs(&self, id: i64) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT terminal FROM schedule_run WHERE schedule = ?1 AND ended_at IS NULL              AND result IN ('claimed', 'started') AND terminal IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?)
     }
 
     /// Mark run `run` failed with `why`, only while it still reads `claimed`: its child ended
@@ -840,6 +919,71 @@ mod tests {
 
     fn runs(s: &Store, id: i64) -> Vec<ScheduleRunRow> {
         s.schedule_runs(id, None, 100).unwrap()
+    }
+
+    #[test]
+    /// Run now is refused while any run of the schedule is open, a newer skipped row on top
+    /// of a working run included; a run whose tab closed, or that never got one in time, no
+    /// longer holds it back.
+    #[test]
+    fn run_now_waits_for_every_open_run() {
+        let s = Store::in_memory().expect("open");
+        let id = s.add_schedule(&made("a")).unwrap();
+        let first = s.claim_run(id, None, 500, 501, "claimed").unwrap().unwrap();
+        assert!(
+            s.report_schedule(id, 500, "started", Some(7), None, Some(first))
+                .unwrap()
+        );
+        // The next slot is skipped while the first works: a newer row, already ended.
+        let skipped = s
+            .claim_run(id, Some(500), 600, 601, "skipped: the last run still works")
+            .unwrap();
+        assert!(skipped.is_some(), "a skipped row is written");
+        assert_eq!(s.run_now(id, 600, 602, &[]).unwrap(), RunNow::Open);
+        assert_eq!(s.open_run_tabs(id).unwrap(), [7]);
+        // Its tab closed: it ended, and Run now starts one.
+        let started = s.run_now(id, 600, 603, &[7]).unwrap();
+        assert!(matches!(started, RunNow::Started(_)), "{started:?}");
+        assert_eq!(
+            s.run_now(id, 600, 604, &[]).unwrap(),
+            RunNow::Open,
+            "the new one is open"
+        );
+        // A run with no tab long after it was claimed never started.
+        let later = 604 + NO_TAB_FOR + 1;
+        assert!(matches!(
+            s.run_now(id, 600, later, &[]).unwrap(),
+            RunNow::Started(_)
+        ));
+        assert_eq!(s.run_now(77, 0, later, &[]).unwrap(), RunNow::NoSchedule);
+    }
+
+    /// Two Run now asks at the same moment, from two connections, make one run.
+    #[test]
+    fn two_run_nows_at_once_make_one_run() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("qoop.db");
+        let id = Store::open(&path)
+            .unwrap()
+            .add_schedule(&made("a"))
+            .unwrap();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let asks: Vec<_> = (0..6)
+            .map(|_| {
+                let (path, gate) = (path.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    let s = Store::open(&path).expect("open");
+                    gate.wait();
+                    s.run_now(id, 0, 1_000, &[]).expect("an answer")
+                })
+            })
+            .collect();
+        let started = asks
+            .into_iter()
+            .map(|t| t.join().expect("an ask"))
+            .filter(|r| matches!(r, RunNow::Started(_)))
+            .count();
+        assert_eq!(started, 1);
     }
 
     #[test]
