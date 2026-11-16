@@ -181,7 +181,7 @@ impl Desk {
                                 .child("Undo")
                                 .child(ui::kbd("u", t))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.undo(None, cx);
+                                    this.undo_hand_off(cx);
                                 })),
                         ),
                 )

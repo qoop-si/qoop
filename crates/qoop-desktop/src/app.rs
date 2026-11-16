@@ -124,6 +124,8 @@ pub struct Desk {
     pub lessons: Option<state::Lessons>,
     /// What starting qass said, while it starts or when it could not.
     pub(crate) qass_said: Option<String>,
+    /// The one timer of the holds is running.
+    pub(crate) ticking: bool,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
@@ -197,6 +199,7 @@ impl Desk {
             acts: Vec::new(),
             lessons: None,
             qass_said: None,
+            ticking: false,
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
