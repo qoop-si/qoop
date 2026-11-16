@@ -814,7 +814,8 @@ impl Desk {
                     .px(px(8.))
                     .py(px(6.))
                     .rounded(px(10.))
-                    .bg(c(if on { t.card2 } else { t.card }))
+                    .bg(c(t.card))
+                    .when(on, |d| ui::paint(d, t.picked()))
                     .when(this_day == today, |s| s.border_color(ca(t.line)))
                     .text_size(px(12.5))
                     .child(
@@ -952,7 +953,7 @@ impl Desk {
                         .rounded(px(8.))
                         .text_size(px(12.5))
                         .when(d == today, |s| s.border_color(ca(t.line)))
-                        .hover(|s| s.bg(ca(t.fill)))
+                        .hover(|s| ui::paint(s, t.hover()))
                         .child((n + 1).to_string())
                         .when(d == today, |s| {
                             s.child(div().text_size(px(10.)).text_color(c(t.t2)).child("today"))
@@ -1039,8 +1040,8 @@ impl Desk {
                 .px(px(8.))
                 .py(px(6.))
                 .rounded(px(10.))
-                .when(on, |d| d.bg(ca(t.fill)))
-                .hover(|s| s.bg(ca(t.fill)))
+                .when(on, |d| ui::paint(d, t.current()))
+                .hover(|s| ui::paint(s, t.hover()))
                 .child(
                     div()
                         .w(px(44.))
@@ -1490,14 +1491,12 @@ impl Desk {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.press(schedule, Write::Run, cx)
                             })),
-                        false => ui::pill(
+                        false => ui::pill_off(
                             "run-now",
                             "Run now, unavailable: its last run is still working",
                             t,
                         )
                         .h(px(28.))
-                        .tab_stop(false)
-                        .opacity(0.5)
                         .child("Run now"),
                     }),
             )

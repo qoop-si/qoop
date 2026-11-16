@@ -13,7 +13,7 @@ use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
 
 use crate::state::{Kind, mark_dots};
-use crate::theme::{MONO_FONT, Theme, c, ca};
+use crate::theme::{MONO_FONT, Pair, Theme, c, ca};
 
 /// The outline icons of the design (24 x 24, 1.6 stroke), drawn as masks in the ink asked for.
 #[derive(Clone, Copy, Debug)]
@@ -208,17 +208,21 @@ pub fn toggled(on: bool) -> Toggled {
     if on { Toggled::True } else { Toggled::False }
 }
 
+/// A control state painted: its fill and the ink of the label on it, never one without the
+/// other. Takes a control or the style of its hover, so every state goes through here.
+pub fn paint<S: Styled>(s: S, pair: Pair) -> S {
+    s.bg(ca(pair.fill)).text_color(c(pair.text))
+}
+
 /// A key cap: `ctrl-a c`.
 pub fn kbd(keys: &str, t: &Theme) -> Div {
-    div()
+    paint(div(), t.key())
         .flex_none()
         .px(px(6.))
         .py(px(3.))
         .rounded(px(6.))
-        .bg(ca(t.fill))
         .font_family(MONO_FONT)
         .text_size(px(10.5))
-        .text_color(c(t.t2))
         .whitespace_nowrap()
         .child(keys.to_string())
 }
@@ -244,36 +248,50 @@ pub fn control(
         .focus_visible(move |s| focus_ring(s, &ring))
 }
 
-/// The keyboard's ring: a 2 px band in the focus ink just inside the control's edge, over its
-/// fill and under its label, so the fill and the text stay as they are. It is an inset
-/// shadow because GPUI draws an outer one under the whole control: a control with no fill
-/// of its own (a link, a chip) would be filled with it and its label lost.
+/// The keyboard's ring: a 2 px band in the focus ink just inside the control's edge and a
+/// 1 px band of `bg` inside that, over its fill and under its label, so the fill and the
+/// text stay as they are and the ring reads on any fill (an on switch's included). Inset
+/// shadows, in paint order, because GPUI draws an outer one under the whole control: a
+/// control with no fill of its own (a link, a chip) would be filled with it and its label
+/// lost.
 pub fn focus_ring(s: StyleRefinement, t: &Theme) -> StyleRefinement {
     let ring: Hsla = c(t.focus).into();
-    s.border_color(ring).shadow(vec![BoxShadow {
-        color: ring,
+    let band = |color: Hsla, spread: f32| BoxShadow {
+        color,
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
-        spread_radius: px(2.),
+        spread_radius: px(spread),
         inset: true,
-    }])
+    };
+    s.border_color(ring)
+        .shadow(vec![band(c(t.bg).into(), 3.), band(ring, 2.)])
 }
 
 /// A pill button with an outline: `+ New work ctrl-a c`.
 pub fn pill(id: impl Into<ElementId>, label: &str, t: &Theme) -> Stateful<Div> {
-    control(id, Role::Button, label.to_string(), t)
+    let pressed = t.pressed();
+    pill_frame(id, label, t, t.rest()).hover(move |s| paint(s, pressed))
+}
+
+/// A pill that cannot be pressed now: its reason in the label, out of the tab order, and
+/// its text still readable (no opacity over it).
+pub fn pill_off(id: impl Into<ElementId>, label: &str, t: &Theme) -> Stateful<Div> {
+    pill_frame(id, label, t, t.off())
+        .tab_stop(false)
+        .cursor_default()
+}
+
+fn pill_frame(id: impl Into<ElementId>, label: &str, t: &Theme, pair: Pair) -> Stateful<Div> {
+    paint(control(id, Role::Button, label.to_string(), t), pair)
         .flex()
         .items_center()
         .gap(px(7.))
         .h(px(34.))
         .px(px(12.))
         .rounded_full()
-        .bg(ca(t.fill))
         .text_size(px(13.))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(c(t.ink))
         .whitespace_nowrap()
-        .hover(|s| s.bg(ca(t.fill2)))
 }
 
 /// A small outlined text button: `Schedules >`, `Mark all read`.
@@ -313,8 +331,8 @@ pub fn chip(
         .px(px(9.))
         .rounded_full()
         .text_size(px(12.5))
-        .text_color(c(if on { t.ink } else { t.t2 }))
-        .when(on, |d| d.bg(c(t.card2)))
+        .text_color(c(t.t2))
+        .when(on, |d| paint(d, t.picked()))
         .when_some(kind, |d, kind| d.child(mark(kind, t, 9.)))
         .child(label.to_string())
         .when_some(count, |d, n| {
@@ -330,7 +348,26 @@ pub fn chip(
 /// An on and off switch, 36 by 20, its state said to a screen reader. The caller adds
 /// `on_click`.
 pub fn switch(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Stateful<Div> {
-    control(id, Role::Switch, label.to_string(), t)
+    switch_frame(id, label, on, t, if on { t.on() } else { t.pressed() })
+}
+
+/// A switch that cannot be turned now: the off pair on either side, its knob still showing
+/// which, out of the tab order.
+pub fn switch_off(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Stateful<Div> {
+    switch_frame(id, label, on, t, t.off())
+        .tab_stop(false)
+        .cursor_default()
+}
+
+/// The knob is the text drawn on the track.
+fn switch_frame(
+    id: impl Into<ElementId>,
+    label: &str,
+    on: bool,
+    t: &Theme,
+    pair: Pair,
+) -> Stateful<Div> {
+    paint(control(id, Role::Switch, label.to_string(), t), pair)
         .aria_toggled(toggled(on))
         .flex_none()
         .w(px(36.))
@@ -339,14 +376,8 @@ pub fn switch(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Sta
         .rounded_full()
         .flex()
         .items_center()
-        .when(on, |d| d.justify_end().bg(c(t.sel)))
-        .when(!on, |d| d.bg(ca(t.fill2)))
-        .child(
-            div()
-                .size(px(14.))
-                .rounded_full()
-                .bg(c(if on { t.on_sel } else { t.t2 })),
-        )
+        .when(on, |d| d.justify_end())
+        .child(div().size(px(14.)).rounded_full().bg(c(pair.text)))
 }
 
 /// A small tag with an outline: `local`, `remote`.
@@ -446,23 +477,36 @@ mod tests {
     use super::*;
     use crate::theme::{DARK, LIGHT};
 
-    /// The ring is the focus ink inside the edge: it never sets the fill, and no shadow of
-    /// it is drawn outside, where GPUI would paint it under the label.
+    /// The ring is the focus ink inside the edge with a `bg` band inside it: it never sets
+    /// the fill or the text, and no shadow of it is drawn outside, where GPUI would paint it
+    /// under the label. The focus band is painted last, over the `bg` one.
     #[test]
     fn the_focus_ring_keeps_the_fill_and_the_label() {
         for t in [DARK, LIGHT] {
             let s = focus_ring(StyleRefinement::default(), &t);
             assert!(s.background.is_none(), "the fill stays the control's own");
+            assert!(s.text.color.is_none(), "the label stays the state's own");
             let ring: Hsla = c(t.focus).into();
             assert_eq!(s.border_color, Some(ring));
             let shadows = s.box_shadow.unwrap_or_default();
-            assert!(!shadows.is_empty(), "a 2 px band");
-            assert!(
-                shadows
-                    .iter()
-                    .all(|b| b.inset && b.color == ring && b.spread_radius == px(2.)),
-                "{shadows:?}"
-            );
+            let bands: Vec<_> = shadows
+                .iter()
+                .map(|b| (b.inset, b.color, b.spread_radius))
+                .collect();
+            let bg: Hsla = c(t.bg).into();
+            assert_eq!(bands, [(true, bg, px(3.)), (true, ring, px(2.))]);
+        }
+    }
+
+    /// A painted state sets its fill and its text together, on a control and on a hover.
+    #[test]
+    fn a_state_paints_its_fill_and_its_text() {
+        for t in [DARK, LIGHT] {
+            for pair in [t.rest(), t.pressed(), t.on(), t.off()] {
+                let s = paint(StyleRefinement::default(), pair);
+                assert_eq!(s.background, Some(ca(pair.fill).into()));
+                assert_eq!(s.text.color, Some(c(pair.text).into()));
+            }
         }
     }
 }

@@ -554,9 +554,9 @@ impl Desk {
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
-        .bg(ca(t.fill))
-        .when(reason.is_none(), |d| d.hover(|s| s.bg(ca(t.fill2))))
-        .when(reason.is_some(), |d| d.text_color(c(t.t3)))
+        .map(|d| ui::paint(d, t.rest()))
+        .when(reason.is_none(), |d| d.hover(|s| ui::paint(s, t.pressed())))
+        .when(reason.is_some(), |d| ui::paint(d, t.off()))
         .child(
             div()
                 .w(px(14.))
@@ -696,8 +696,7 @@ impl Desk {
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(8.))
-                    .bg(ca(t.fill))
-                    .text_color(c(t.t3))
+                    .map(|d| ui::paint(d, t.off()))
                     .child(
                         div()
                             .w(px(14.))

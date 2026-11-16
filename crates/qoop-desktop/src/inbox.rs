@@ -259,7 +259,7 @@ impl Desk {
         .px(px(4.))
         .py(px(5.))
         .rounded(px(10.))
-        .hover(|s| s.bg(ca(t.fill)))
+        .hover(|s| ui::paint(s, t.hover()))
         .child(div().pt(px(3.)).child(ui::mark(kind, t, 12.)))
         .child(
             div()
@@ -399,8 +399,8 @@ impl Desk {
                 .px(px(8.))
                 .py(px(4.))
                 .rounded(px(8.))
-                .bg(ca(t.fill))
-                .hover(|s| s.bg(ca(t.fill2)))
+                .map(|d| ui::paint(d, t.rest()))
+                .hover(|s| ui::paint(s, t.pressed()))
                 .text_size(px(12.5))
                 .child(
                     div()
