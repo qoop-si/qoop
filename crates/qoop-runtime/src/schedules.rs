@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use qoop_store::schedule::Fired;
 use qoop_store::{ScheduleRow, ScheduleRunRow};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
@@ -489,13 +490,7 @@ pub(crate) async fn write(
                         Ok(tabs) => tabs,
                         Err(e) => return failed(id, why(e)),
                     };
-                    let closed: Vec<i64> = tabs
-                        .into_iter()
-                        .filter(|t| match u32::try_from(*t) {
-                            Ok(t) => agents.live(t).is_none(),
-                            Err(_) => true,
-                        })
-                        .collect();
+                    let closed = closed_tabs(agents, tabs);
                     // Its own run: the slot the row holds is the key the run reports under,
                     // and nothing is claimed or moved. Its row is its own.
                     let slot = row.last_slot.unwrap_or(0);
@@ -638,7 +633,7 @@ async fn look(
     agents: &Arc<AgentRegistry>,
 ) -> (Option<Duration>, BTreeSet<u32>) {
     let going = end_runs(books, connections, terminals, agents).await;
-    let wait = claim_due(books, connections).await;
+    let wait = claim_due(books, connections, agents).await;
     // A run going is looked at again within a minute, whatever the schedules wait for.
     if going.is_empty() || books.stopping.load(Ordering::SeqCst) {
         return (wait, going);
@@ -722,7 +717,11 @@ fn cut(mut text: String, most: usize) -> String {
 
 /// Claim what is due and start its run. Answers how long to sleep before the next look, or
 /// none to park until a write.
-async fn claim_due(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Option<Duration> {
+async fn claim_due(
+    books: &Bookkeeping,
+    connections: &Arc<ConnectionRegistry>,
+    agents: &AgentRegistry,
+) -> Option<Duration> {
     let (at, zone) = (now(), system_zone());
     let rows = match books.store.run(|s| s.schedules()).await {
         Ok(rows) => rows,
@@ -753,13 +752,29 @@ async fn claim_due(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -
                     waiting_on_gate = true;
                     continue;
                 }
-                // A watch's check keeps the last run shown: most checks start nothing.
-                let result = row.watch.is_none().then(|| "claimed".to_string());
-                if let Some(run) = claim(books, &row, slot, at, result).await {
-                    claimed = true;
-                    spawn_run(books, connections, row, slot, run, starting, false);
-                } else {
-                    lost = true;
+                // A watch's check keeps the last run shown: most checks start nothing. A run
+                // goes by Run now's rule: while one of the schedule's runs is open, the slot
+                // is skipped rather than a second agent started beside it.
+                let fired = match row.watch {
+                    Some(_) => claim(books, &row, slot, at, None).await,
+                    None => fire(books, agents, &row, slot, at).await,
+                };
+                match fired {
+                    Some(Some(Fired::Skipped(_))) => {
+                        crate::say!(
+                            "qoopd: schedule {} skipped: its last run is still open",
+                            row.name
+                        );
+                        claimed = true;
+                    }
+                    Some(run) => {
+                        let run = run.map(|f| match f {
+                            Fired::Run(r) | Fired::Skipped(r) => r,
+                        });
+                        claimed = true;
+                        spawn_run(books, connections, row, slot, run, starting, false);
+                    }
+                    None => lost = true,
                 }
             }
             Decision::Skip(slot, because) => {
@@ -805,12 +820,14 @@ async fn claim(
     slot: i64,
     at: i64,
     result: Option<String>,
-) -> Option<Option<i64>> {
+) -> Option<Option<Fired>> {
     let (id, expected) = (row.id, row.last_slot);
     match books
         .store
         .run(move |s| match result {
-            Some(result) => Ok(s.claim_run(id, expected, slot, at, &result)?.map(Some)),
+            Some(result) => Ok(s
+                .claim_run(id, expected, slot, at, &result)?
+                .map(|run| Some(Fired::Skipped(run)))),
             None => Ok(s
                 .claim_schedule(id, expected, slot, at, None)?
                 .then_some(None)),
@@ -823,6 +840,48 @@ async fn claim(
             None
         }
     }
+}
+
+/// Claim a due slot for its run by Run now's rule: the tabs of the schedule's open runs
+/// checked first, then the store skips the slot while a run is still open. None when somebody
+/// else took the slot, or the store did not answer.
+async fn fire(
+    books: &Bookkeeping,
+    agents: &AgentRegistry,
+    row: &ScheduleRow,
+    slot: i64,
+    at: i64,
+) -> Option<Option<Fired>> {
+    let (id, expected) = (row.id, row.last_slot);
+    let tabs = match books.store.run(move |s| s.open_run_tabs(id)).await {
+        Ok(tabs) => tabs,
+        Err(e) => {
+            crate::say!("qoopd: schedules: {}", why(e));
+            return None;
+        }
+    };
+    let closed = closed_tabs(agents, tabs);
+    match books
+        .store
+        .run(move |s| s.claim_fire(id, expected, slot, at, &closed))
+        .await
+    {
+        Ok(fired) => fired.map(Some),
+        Err(e) => {
+            crate::say!("qoopd: schedules: {}", why(e));
+            None
+        }
+    }
+}
+
+/// The tabs among `tabs` that are not open any more.
+fn closed_tabs(agents: &AgentRegistry, tabs: Vec<i64>) -> Vec<i64> {
+    tabs.into_iter()
+        .filter(|t| match u32::try_from(*t) {
+            Ok(t) => agents.live(t).is_none(),
+            Err(_) => true,
+        })
+        .collect()
 }
 
 /// What a Run now is refused with while a run of the schedule is still open.
