@@ -145,7 +145,11 @@ pub fn mark(kind: Kind, t: &Theme, size: f32) -> Div {
 
 /// A pet, one `cell` px square per pixel of its 16 x 12 grid.
 pub fn pet(pet: &Avatar, cell: f32) -> Div {
-    let rects = avatar::rects(pet);
+    pet_rects(&avatar::rects(pet), cell)
+}
+
+/// A pet from its rects: this Mac's drawn here, another machine's as its daemon sent it.
+pub fn pet_rects(rects: &[crate::state::PetRect], cell: f32) -> Div {
     let w = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(0);
     let h = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(0);
     div()
@@ -153,14 +157,14 @@ pub fn pet(pet: &Avatar, cell: f32) -> Div {
         .w(px(f32::from(w) * cell))
         .h(px(f32::from(h) * cell))
         .flex_none()
-        .children(rects.into_iter().map(|(x, y, w, h, hex)| {
+        .children(rects.iter().map(|(x, y, w, h, hex)| {
             let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
             div()
                 .absolute()
-                .left(px(f32::from(x) * cell))
-                .top(px(f32::from(y) * cell))
-                .w(px(f32::from(w) * cell))
-                .h(px(f32::from(h) * cell))
+                .left(px(f32::from(*x) * cell))
+                .top(px(f32::from(*y) * cell))
+                .w(px(f32::from(*w) * cell))
+                .h(px(f32::from(*h) * cell))
                 .bg(c(rgb))
         }))
 }

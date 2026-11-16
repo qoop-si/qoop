@@ -244,7 +244,7 @@ impl Desk {
 
     /// One agent's row: it opens the agent.
     fn row_head(&self, row: &AgentRow, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let kind = Kind::of(row);
+        let kind = self.shown_kind(state::Entry::Live(row));
         let terminal = row.terminal;
         let space = self.model.space(row.workspace);
         ui::control(

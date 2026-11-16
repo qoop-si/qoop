@@ -735,17 +735,7 @@ impl Desk {
 
     /// This Mac and every other machine with a space: which one's schedules are shown.
     fn machine_row(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut machines: Vec<(String, Option<i64>)> = vec![("This Mac".into(), None)];
-        for w in &self.model.spaces {
-            let m = state::machine_of(w.id);
-            if m != 0
-                && !machines
-                    .iter()
-                    .any(|(_, v)| v.map(state::machine_of) == Some(m))
-            {
-                machines.push((state::machine_name(w), Some(w.id)));
-            }
-        }
+        let machines = state::machines(&self.model.spaces);
         let shown = self.sched_machine();
         div()
             .id("machines")
@@ -754,8 +744,8 @@ impl Desk {
             .flex()
             .gap(px(4.))
             .when(machines.len() > 1, |d| {
-                d.children(machines.into_iter().enumerate().map(|(n, (name, via))| {
-                    let on = via.map_or(0, state::machine_of) == shown;
+                d.children(machines.into_iter().enumerate().map(|(n, (m, name, via))| {
+                    let on = m == shown;
                     ui::chip(("machine", n as u64), &name, None, None, on, t)
                         .on_click(cx.listener(move |this, _, _, cx| this.show_machine(via, cx)))
                 }))

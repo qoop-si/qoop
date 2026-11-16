@@ -678,6 +678,12 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on: Option<bool>,
     },
+    /// This machine's pet as rectangles to draw, answered `Pet`: what a window shows beside
+    /// another machine's name, asked through `Via`. A daemon from before it answers `unknown
+    /// variant`, and the window draws no pet.
+    Pet {
+        id: String,
+    },
     /// For an interface's mux only: send `request` to the machine `workspace` is on, for a
     /// request that names no terminal or space of its own (`ScheduleRead`, `SleepSettings`,
     /// `QassWatch`). The mux forwards the inner request unchanged, so the answer carries the
@@ -2038,6 +2044,7 @@ impl ControlRequest {
             | Self::UpdateState { id }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::Pet { id, .. }
             | Self::Via { id, .. }
             | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
@@ -2295,6 +2302,12 @@ pub enum ControlResponse {
     QassWatch {
         id: String,
         on: bool,
+    },
+    /// This machine's pet, as `avatar::rects` draws it: `(x, y, width, height, "#rrggbb")`;
+    /// empty when none was picked.
+    Pet {
+        id: String,
+        rects: Vec<(u8, u8, u8, u8, String)>,
     },
     /// Where usage counts stand after a `Telemetry`: `on`, `paused` or `off`, why when not on,
     /// and for `Show` the days as they would be sent. `counting` is false on a daemon that
@@ -3174,6 +3187,7 @@ impl ControlResponse {
             | Self::UpdateState { id, .. }
             | Self::SleepSettings { id, .. }
             | Self::QassWatch { id, .. }
+            | Self::Pet { id, .. }
             | Self::Telemetry { id, .. }
             | Self::PersonAt { id, .. }
             | Self::TaskWritten { id, .. }

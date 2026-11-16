@@ -267,6 +267,10 @@ fn actions() -> Vec<Action> {
             },
         },
         Action {
+            name: "show another machine's pet beside its name in the desktop",
+            method: || Method::Control(ControlRequest::Pet { id: "a".into() }),
+        },
+        Action {
             name: "read another machine's schedules from the desktop",
             method: || {
                 Method::Control(ControlRequest::Via {
@@ -1193,6 +1197,7 @@ fn every_control_method_is_reachable_from_some_action() {
             id: String::new(),
             on: None,
         },
+        ControlRequest::Pet { id: String::new() },
         ControlRequest::Telemetry {
             id: String::new(),
             terminal: None,
@@ -1346,6 +1351,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::Pet { .. }
             | ControlRequest::Via { .. }
             | ControlRequest::Telemetry { .. }
             | ControlRequest::PersonAt { .. }

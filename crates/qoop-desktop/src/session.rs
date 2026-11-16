@@ -435,7 +435,15 @@ impl Desk {
                                     .min_h_0()
                                     .child(self.layout(&tree, focused, cx)),
                             )
-                            .when_some(asking, |d, row| d.child(self.question_card(row, t, cx))),
+                            .when_some(asking, |d, row| d.child(self.question_card(row, t, cx)))
+                            .when_some(
+                                self.closed_card
+                                    .as_ref()
+                                    .filter(|(on, _, _)| *on == term.terminal && asking.is_none()),
+                                |d, (_, menu, line)| {
+                                    d.child(self.closed_card_view(menu, line, t, cx))
+                                },
+                            ),
                     )
                     .child(
                         div()
@@ -745,7 +753,7 @@ impl Desk {
                         screen: term.shown(),
                         cells: self.cells.clone(),
                         focused: focused && is_focus,
-                        stale: !self.connected,
+                        stale: self.term_stale(terminal),
                         sent: term.sent.clone(),
                         viewport: term.viewport.clone(),
                         resize: Rc::new(move |t, cols, rows| {

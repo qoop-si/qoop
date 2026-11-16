@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
 use qoop_runtime::avatar::{self, Avatar};
-use qoop_runtime::control::ControlRequest;
+use qoop_runtime::control::{ControlRequest, ControlResponse};
 use qoop_tui::config::Read;
 
 use crate::app::Desk;
@@ -31,6 +31,9 @@ pub struct SettingsPage {
     pub pets: Vec<Avatar>,
     /// A pet picked and waiting out its hold, with when it is saved: Undo takes it back.
     pub pet_hold: Option<(Avatar, std::time::Instant)>,
+    /// The machine shown: `None` for This Mac, else a space of it to ask through.
+    pub via: Option<i64>,
+    pub remote: RemoteSettings,
 }
 
 impl Desk {
@@ -187,6 +190,27 @@ impl Desk {
     }
 
     pub(crate) fn settings_page(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.settings.via.is_some() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(self.settings_machines(t, cx))
+                .when_some(self.settings.said.clone(), |d, said| {
+                    d.child(
+                        div()
+                            .id("setting-said")
+                            .role(Role::Status)
+                            .aria_label(said.clone())
+                            .text_size(px(12.5))
+                            .text_color(c(t.t1))
+                            .child(said),
+                    )
+                })
+                .child(self.remote_settings(t, cx))
+                .into_any_element();
+        }
         let Some(read) = self.settings.read.as_ref() else {
             return div().into_any_element();
         };
@@ -214,6 +238,7 @@ impl Desk {
             .flex()
             .flex_col()
             .gap(px(10.))
+            .child(self.settings_machines(t, cx))
             .child(
                 div()
                     .flex()
@@ -645,6 +670,299 @@ impl Desk {
 }
 
 /// A number for a setting's controls.
+/// Another machine's settings as its daemon answered them: only what crosses today, its sleep
+/// keys and qass's switch. `asked` holds the reads and writes still out (true for a write).
+#[derive(Default)]
+pub struct RemoteSettings {
+    pub idle_minutes: Option<u64>,
+    pub exit_when_asleep: Option<bool>,
+    pub qass: Option<bool>,
+    pub asked: std::collections::HashMap<String, bool>,
+}
+
+impl Desk {
+    /// Show `via`'s machine (`Some` space of it) or This Mac, and read what crosses.
+    pub(crate) fn show_settings_machine(&mut self, via: Option<i64>, cx: &mut Context<Self>) {
+        self.settings.via = via;
+        self.settings.remote = RemoteSettings::default();
+        self.settings.said = None;
+        if via.is_some() {
+            self.ask_remote(
+                ControlRequest::SleepSettings {
+                    id: link::fresh_id("sleep"),
+                    idle_minutes: None,
+                    exit_when_asleep: None,
+                },
+                false,
+            );
+            self.ask_remote(
+                ControlRequest::QassWatch {
+                    id: link::fresh_id("qass"),
+                    on: None,
+                },
+                false,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Ask the machine shown, through `Via`; a write is said when it is answered.
+    fn ask_remote(&mut self, request: ControlRequest, write: bool) {
+        let Some(workspace) = self.settings.via else {
+            return;
+        };
+        let outer = link::fresh_id("via");
+        self.settings
+            .remote
+            .asked
+            .insert(request.request_id().to_string(), write);
+        self.settings.remote.asked.insert(outer.clone(), write);
+        self.ask(ControlRequest::Via {
+            id: outer,
+            workspace,
+            request: Box::new(request),
+        });
+    }
+
+    /// The machine shown, as a person names it.
+    fn settings_machine(&self) -> String {
+        self.settings
+            .via
+            .and_then(|w| self.model.space(w))
+            .map_or_else(|| "This Mac".to_string(), state::machine_name)
+    }
+
+    /// An answer to a read or write of the machine shown; `false` when it was not one.
+    pub(crate) fn remote_setting_came(&mut self, response: &ControlResponse) -> bool {
+        let id = response.request_id();
+        let Some(write) = self.settings.remote.asked.remove(id) else {
+            return false;
+        };
+        let machine = self.settings_machine();
+        let when = state::clock(self.now, self.zone);
+        let remote = &mut self.settings.remote;
+        match response {
+            ControlResponse::SleepSettings {
+                idle_minutes,
+                exit_when_asleep,
+                problem,
+                ..
+            } => {
+                remote.idle_minutes = Some(*idle_minutes);
+                remote.exit_when_asleep = Some(*exit_when_asleep);
+                if let Some(why) = problem {
+                    self.settings.said = Some(why.clone());
+                } else if write {
+                    self.settings.said = Some(format!("Sleep: written on {machine}, {when}"));
+                }
+            }
+            ControlResponse::QassWatch { on, .. } => {
+                remote.qass = Some(*on);
+                if write {
+                    self.settings.said = Some(format!("qass: written on {machine}, {when}"));
+                }
+            }
+            ControlResponse::Failed { reason, .. } => {
+                self.settings.said = Some(format!("{machine} did not take it: {reason}"));
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The machine switcher: This Mac and every other machine with a space.
+    fn settings_machines(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let machines = state::machines(&self.model.spaces);
+        let shown = self.settings.via.map_or(0, state::machine_of);
+        div()
+            .id("settings-machines")
+            .role(Role::RadioGroup)
+            .aria_label("Machine")
+            .flex()
+            .gap(px(4.))
+            .when(machines.len() > 1, |d| {
+                d.children(machines.into_iter().map(|(m, name, via)| {
+                    ui::chip(
+                        ("settings-machine", m as u64),
+                        &name,
+                        None,
+                        None,
+                        m == shown,
+                        t,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.show_settings_machine(via, cx)),
+                    )
+                }))
+            })
+    }
+
+    /// Another machine's settings: its sleep keys and qass's switch, written there through
+    /// `Via`; every other key is set on that machine.
+    fn remote_settings(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let machine = self.settings_machine();
+        let stale = self
+            .settings
+            .via
+            .and_then(|w| self.as_of(w))
+            .map(|when| format!("{machine} is not reached, {when}"));
+        let off = stale.is_some();
+        let remote = &self.settings.remote;
+        let row = |label: &'static str, help: &'static str, control: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(ca(t.hair))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(13.)).child(label))
+                        .child(div().text_size(px(11.5)).text_color(c(t.t2)).child(help)),
+                )
+                .child(control)
+        };
+        let reading = || {
+            div()
+                .text_size(px(12.))
+                .text_color(c(t.t2))
+                .child("reading")
+                .into_any_element()
+        };
+        let minutes = match remote.idle_minutes {
+            Some(now) => div()
+                .flex()
+                .gap(px(3.))
+                .children(MINUTES.iter().enumerate().map(|(n, m)| {
+                    let m = *m;
+                    let label = if m == "0" { "never" } else { m };
+                    let chip = ui::chip(
+                        ("remote-minutes", n as u64),
+                        label,
+                        None,
+                        None,
+                        m == now.to_string(),
+                        t,
+                    );
+                    if off {
+                        return chip.tab_stop(false);
+                    }
+                    chip.on_click(cx.listener(move |this, _, _, cx| {
+                        let Ok(minutes) = m.parse() else { return };
+                        this.ask_remote(
+                            ControlRequest::SleepSettings {
+                                id: link::fresh_id("sleep"),
+                                idle_minutes: Some(minutes),
+                                exit_when_asleep: None,
+                            },
+                            true,
+                        );
+                        cx.notify();
+                    }))
+                }))
+                .into_any_element(),
+            None => reading(),
+        };
+        let exit = match remote.exit_when_asleep {
+            Some(on) => {
+                let switch = ui::switch("remote-exit", "Leave when all sleep", on, t)
+                    .debug_selector(|| "remote-exit".to_string());
+                if off {
+                    switch.tab_stop(false).into_any_element()
+                } else {
+                    switch
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ask_remote(
+                                ControlRequest::SleepSettings {
+                                    id: link::fresh_id("sleep"),
+                                    idle_minutes: None,
+                                    exit_when_asleep: Some(!on),
+                                },
+                                true,
+                            );
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+            }
+            None => reading(),
+        };
+        let qass = match remote.qass {
+            Some(on) => {
+                let switch = ui::switch("remote-qass", "qass watches the agents", on, t);
+                if off {
+                    switch.tab_stop(false).into_any_element()
+                } else {
+                    switch
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ask_remote(
+                                ControlRequest::QassWatch {
+                                    id: link::fresh_id("qass"),
+                                    on: Some(!on),
+                                },
+                                true,
+                            );
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+            }
+            None => reading(),
+        };
+        div()
+            .id("remote-settings")
+            .w(px(520.))
+            .flex()
+            .flex_col()
+            .p(px(12.))
+            .rounded(px(14.))
+            .bg(c(t.card))
+            .border_1()
+            .border_color(ca(t.hair))
+            .when_some(stale, |d, stale| {
+                d.child(
+                    div()
+                        .id("remote-stale")
+                        .role(Role::Status)
+                        .aria_label(stale.clone())
+                        .pb(px(6.))
+                        .text_size(px(12.5))
+                        .text_color(c(t.t1))
+                        .child(stale),
+                )
+            })
+            .child(row(
+                "Sleep idle tabs",
+                "Minutes a tab idles before it sleeps; never keeps them awake",
+                minutes,
+            ))
+            .child(row(
+                "Leave when all sleep",
+                "qoop's daemon ends once nothing is awake",
+                exit,
+            ))
+            .child(row(
+                "qass watches the agents",
+                "qass answers what it can and asks you the rest",
+                qass,
+            ))
+            .child(
+                div()
+                    .pt(px(8.))
+                    .text_size(px(12.))
+                    .text_color(c(t.t2))
+                    .child(format!(
+                        "Every other setting: set on {machine} with qoop config set"
+                    )),
+            )
+            .into_any_element()
+    }
+}
+
 fn key_id(key: &str) -> u64 {
     SETTINGS
         .iter()

@@ -2261,7 +2261,8 @@ fn via_carries(request: &ControlRequest) -> bool {
         ControlRequest::ScheduleRead { .. }
         | ControlRequest::ScheduleRuns { .. }
         | ControlRequest::SleepSettings { .. }
-        | ControlRequest::QassWatch { .. } => true,
+        | ControlRequest::QassWatch { .. }
+        | ControlRequest::Pet { .. } => true,
         // A run's report names its tab: written by the run on its own machine, never sent
         // through an interface.
         ControlRequest::ScheduleWrite {

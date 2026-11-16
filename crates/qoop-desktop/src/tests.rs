@@ -2,7 +2,7 @@
 //! work's keyboard path, and the input method in the text field.
 
 use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
-use qoop_runtime::control::{ControlRequest, ControlResponse};
+use qoop_runtime::control::{ControlRequest, ControlResponse, LinkState};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{Desk, Page};
@@ -24,6 +24,7 @@ fn open(cx: &mut TestAppContext) -> (Entity<Desk>, VisualTestContext, UnboundedR
             d.config_path = std::path::PathBuf::from("/nonexistent/qoop/config.toml");
             d.pet_path = std::path::PathBuf::from("/nonexistent/qoop/avatar.json");
             d.model = fixture();
+            d.listed = true;
             d.now = 2000;
             cx.notify();
         })
@@ -1101,5 +1102,148 @@ fn home_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) {
     assert!(
         vcx.debug_bounds("row-70").is_some(),
         "the space that sleeps whole"
+    );
+}
+
+/// A remote that stops answering: retrying at first, then after 15 s its tile and the banner
+/// say "not reached, as of", its rows stay (neutral, as of then) and cannot be answered; back,
+/// it is live again. This Mac's daemon gone: every machine as of then.
+#[gpui::test]
+fn a_machine_not_answering_goes_stale_and_comes_back(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote_row = 0x8100_0001u32;
+    let set_link = |link| {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if crate::state::machine_of(w.id) == 1 {
+                w.link = Some(link);
+            }
+        }
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        }
+    };
+    let local_rows = || ControlResponse::Agents {
+        id: "mux".into(),
+        agents: fixture()
+            .rows
+            .into_iter()
+            .filter(|r| crate::state::machine_of(r.workspace) == 0)
+            .collect(),
+        splits: Vec::new(),
+        qass_checks: None,
+    };
+    answer(&desk, &mut vcx, set_link(LinkState::Up));
+    let pet = sent(&mut rx).into_iter().any(|u| {
+        matches!(u, Up::Request(r) if matches!(&*r, ControlRequest::Via { request, .. }
+            if matches!(**request, ControlRequest::Pet { .. })))
+    });
+    assert!(pet, "the remote's pet asked through Via");
+    // The link drops: the mux lists the spaces down, then the agents without the remote's.
+    answer(&desk, &mut vcx, set_link(LinkState::Down));
+    answer(&desk, &mut vcx, local_rows());
+    assert!(
+        desk.read_with(&vcx, |d, _| d.model.row(remote_row).is_some()),
+        "its rows stay"
+    );
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "retrying");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.now += crate::state::STALE_AFTER;
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    let zone = desk.read_with(&vcx, |d, _| d.zone);
+    let words = format!("not reached, as of {}", crate::state::clock(2000, zone));
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.banner()),
+        Some(format!("staging {words}"))
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| crate::state::reach_words(
+            d.machine_state(1),
+            d.zone
+        )),
+        words,
+        "the tile's words"
+    );
+    assert!(vcx.debug_bounds("tile-1").is_some());
+    let workspace = desk.read_with(&vcx, |d, _| d.model.row(remote_row).map(|r| r.workspace));
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| workspace.and_then(|w| d.as_of(w))),
+        Some(format!("as of {}", crate::state::clock(2000, zone)))
+    );
+    // Back.
+    answer(&desk, &mut vcx, set_link(LinkState::Up));
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "live again");
+    // This Mac's daemon gone: every machine stale.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx)
+        })
+    });
+    let banner = desk.read_with(&vcx, |d, _| d.banner()).unwrap_or_default();
+    assert!(banner.starts_with("This Mac not reached"), "{banner}");
+    assert!(banner.contains("staging not reached"), "{banner}");
+}
+
+/// Settings for another machine: its sleep keys and qass's switch are read and written there
+/// through `Via`; its answer fills the rows, and a write says where it landed.
+#[gpui::test]
+fn remote_settings_go_through_via(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Settings, window, cx);
+            d.settings.via = Some(remote);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_settings_machine(Some(remote), cx)));
+    let inner: Vec<ControlRequest> = sent(&mut rx)
+        .into_iter()
+        .filter_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::Via {
+                    workspace, request, ..
+                } if workspace == remote => Some(*request),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let sleep = inner
+        .iter()
+        .find(|r| matches!(r, ControlRequest::SleepSettings { .. }))
+        .expect("sleep read through Via");
+    assert!(
+        inner
+            .iter()
+            .any(|r| matches!(r, ControlRequest::QassWatch { on: None, .. }))
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::SleepSettings {
+            id: sleep.request_id().to_string(),
+            idle_minutes: 30,
+            exit_when_asleep: true,
+            problem: None,
+        },
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.settings.remote.idle_minutes),
+        Some(30)
+    );
+    assert!(vcx.debug_bounds("remote-exit").is_some(), "drawn");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.settings.said.clone()),
+        None,
+        "a read says nothing"
     );
 }

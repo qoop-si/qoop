@@ -1253,6 +1253,212 @@ pub fn setting_found(setting: &Setting, find: &str) -> bool {
             .any(|s| s.to_lowercase().contains(&find))
 }
 
+/// A pet as filled rects `(x, y, w, h, "#rrggbb")`: how a daemon sends it.
+pub type PetRect = (u8, u8, u8, u8, String);
+
+/// A machine silent this long keeps its rows, but as of when it last answered.
+pub const STALE_AFTER: i64 = 15;
+
+/// Since when each machine has not answered, kept from the space lists. The mux pushes a list
+/// the moment a link drops, so that moment is also when the machine last answered.
+#[derive(Clone, Debug, Default)]
+pub struct Reach {
+    pub down_since: std::collections::BTreeMap<usize, i64>,
+}
+
+/// How a machine stands for the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineState {
+    Live,
+    /// Let go while nothing ran there.
+    Parked,
+    /// Not answering for less than [`STALE_AFTER`].
+    Retrying,
+    /// Not answering: its rows are as of `as_of`.
+    Stale {
+        as_of: i64,
+    },
+}
+
+/// Whether every space of machine `m` says its link is down (and it has one).
+fn all_down(spaces: &[WorkspaceRow], m: usize) -> bool {
+    let mut of = spaces.iter().filter(|w| machine_of(w.id) == m).peekable();
+    of.peek().is_some() && of.all(|w| w.link == Some(LinkState::Down))
+}
+
+impl Reach {
+    /// The space list came: a machine whose every link is down has not answered since the
+    /// first list that said so; any other has.
+    pub fn note(&mut self, spaces: &[WorkspaceRow], now: i64) {
+        let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(w.id)).collect();
+        self.down_since.retain(|m, _| machines.contains(m));
+        for m in machines {
+            if all_down(spaces, m) {
+                self.down_since.entry(m).or_insert(now);
+            } else {
+                self.down_since.remove(&m);
+            }
+        }
+    }
+
+    /// How machine `m` stands at `now`. `lost` is when this Mac's daemon went away, if it has:
+    /// then every machine is stale, the remotes too (the mux ended with it).
+    pub fn state(
+        &self,
+        m: usize,
+        spaces: &[WorkspaceRow],
+        now: i64,
+        lost: Option<i64>,
+    ) -> MachineState {
+        let since = self.down_since.get(&m).copied();
+        if let Some(lost) = lost {
+            return MachineState::Stale {
+                as_of: since.map_or(lost, |s| s.min(lost)),
+            };
+        }
+        let parked = spaces
+            .iter()
+            .filter(|w| machine_of(w.id) == m)
+            .all(|w| w.link == Some(LinkState::Parked));
+        match since {
+            Some(since) if now - since >= STALE_AFTER => MachineState::Stale { as_of: since },
+            Some(_) => MachineState::Retrying,
+            None if parked && m != 0 => MachineState::Parked,
+            None => MachineState::Live,
+        }
+    }
+}
+
+/// A machine's state in the words its tile and the banner both use.
+pub fn reach_words(state: MachineState, zone: Zone) -> String {
+    match state {
+        MachineState::Live => "connected".into(),
+        MachineState::Parked => "parked".into(),
+        MachineState::Retrying => "retrying".into(),
+        MachineState::Stale { as_of } => format!("not reached, as of {}", clock(as_of, zone)),
+    }
+}
+
+/// The banner over the page: every machine not reached, in its tile's words.
+pub fn reach_banner(machines: &[(String, MachineState)], zone: Zone) -> Option<String> {
+    let stale: Vec<String> = machines
+        .iter()
+        .filter(|(_, s)| matches!(s, MachineState::Stale { .. }))
+        .map(|(name, s)| format!("{name} {}", reach_words(*s, zone)))
+        .collect();
+    (!stale.is_empty()).then(|| stale.join("; "))
+}
+
+/// Why a row's answers cannot be pressed while its machine is not reached.
+pub const STALE_REASON: &str = "Answering opens again when the daemon is back";
+
+/// Each machine with a space, This Mac first, as a person names it, with one space of it
+/// (`None` for This Mac) to ask it through.
+pub fn machines(spaces: &[WorkspaceRow]) -> Vec<(usize, String, Option<i64>)> {
+    let mut out: Vec<(usize, String, Option<i64>)> = vec![(0, "This Mac".into(), None)];
+    for w in spaces {
+        let m = machine_of(w.id);
+        if m != 0 && !out.iter().any(|(n, _, _)| *n == m) {
+            out.push((m, machine_name(w), Some(w.id)));
+        }
+    }
+    out
+}
+
+/// A space's own name, without its machine or the reason a link adds while down.
+pub fn short_space(space: &WorkspaceRow) -> String {
+    let name = space.name.rsplit(':').next().unwrap_or(&space.name);
+    name.split(" (").next().unwrap_or(name).to_string()
+}
+
+/// A machine not answering keeps the rows it last had: the mux drops a lost link's agents,
+/// the window keeps them, as of then. The rows of `before` to add to `now`.
+pub fn unreached_rows(
+    before: &[AgentRow],
+    now: &[AgentRow],
+    spaces: &[WorkspaceRow],
+) -> Vec<AgentRow> {
+    let listed: BTreeSet<usize> = now.iter().map(|r| machine_of(r.workspace)).collect();
+    before
+        .iter()
+        .filter(|r| {
+            let m = machine_of(r.workspace);
+            m != 0 && !listed.contains(&m) && all_down(spaces, m)
+        })
+        .cloned()
+        .collect()
+}
+
+/// While a machine has not answered yet and has no rows: which spaces are in, and whose
+/// rows are still to come. "acme-web and api are in; billing-api rows come when staging
+/// answers".
+pub fn loading_line(spaces: &[WorkspaceRow], rows: &[AgentRow]) -> Option<String> {
+    let has_rows = |m: usize| rows.iter().any(|r| machine_of(r.workspace) == m);
+    let waiting: Vec<String> = machines(spaces)
+        .into_iter()
+        .filter(|(m, _, _)| all_down(spaces, *m) && !has_rows(*m))
+        .map(|(m, name, _)| {
+            let names: Vec<String> = spaces
+                .iter()
+                .filter(|w| machine_of(w.id) == m)
+                .map(short_space)
+                .collect();
+            format!("{} rows come when {name} answers", and_list(&names))
+        })
+        .collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    let mut seen: BTreeSet<i64> = BTreeSet::new();
+    let ins: Vec<String> = rows
+        .iter()
+        .filter(|r| seen.insert(r.workspace))
+        .filter_map(|r| spaces.iter().find(|w| w.id == r.workspace))
+        .filter(|w| w.name != QASS_SPACE)
+        .map(short_space)
+        .collect();
+    let rest = waiting.join("; ");
+    Some(if ins.is_empty() {
+        rest
+    } else {
+        format!(
+            "{} {} in; {rest}",
+            and_list(&ins),
+            if ins.len() == 1 { "is" } else { "are" }
+        )
+    })
+}
+
+/// "a", "a and b", "a, b and c".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The question on `before` was answered by another client: its closed options stay on the
+/// card, greyed, under this line. `None` when it was not, or the window answered it.
+pub fn answered_elsewhere(before: &AgentRow, now: &AgentRow, zone: Zone) -> Option<String> {
+    before.menu.as_ref()?;
+    if now.menu.is_some() {
+        return None;
+    }
+    let answered = now.answered.as_ref()?;
+    let by = match answered.by.as_str() {
+        "computer" => "Mac",
+        "phone" => "iPhone",
+        "attach" => "terminal",
+        other => other,
+    };
+    Some(format!(
+        "Answered on your {by}: {}, {}",
+        answered.label,
+        clock(answered.at, zone)
+    ))
+}
+
 /// qass's rules as its lessons file counts them: the lessons that keep a question the owner's
 /// (`escalate`, `ask first`), the ones it answers alone (`do it`), and every lesson. A lesson
 /// is a line `- <when> -> <action> (<source>)`, as `skills/qass/SKILL.md` writes them.
@@ -1362,15 +1568,6 @@ pub fn machine_name(space: &WorkspaceRow) -> String {
         .name
         .split_once(':')
         .map_or_else(|| space.name.clone(), |(machine, _)| machine.to_string())
-}
-
-/// A space's connection as its tile says it.
-pub fn link_word(space: &WorkspaceRow) -> &'static str {
-    match space.link {
-        None | Some(LinkState::Up) => "connected",
-        Some(LinkState::Parked) => "parked",
-        Some(LinkState::Down) => "retrying",
-    }
 }
 
 /// Which of the six space inks a space wears: the one picked for it, else its number's.
@@ -2615,5 +2812,142 @@ pub(crate) mod tests {
         assert!(setting_found(sound, "SOUND"));
         assert!(setting_found(sound, ""));
         assert!(!setting_found(sound, "prefix"));
+    }
+
+    /// A remote silent 15 s goes stale as of when it went quiet; back, it is live again.
+    /// This Mac's daemon gone makes every machine stale. The tile and the banner say it in the
+    /// same words.
+    #[test]
+    fn a_silent_machine_goes_stale_after_fifteen_seconds() {
+        let zone = utc();
+        let mut m = fixture();
+        let remote = 1usize;
+        let mut reach = Reach::default();
+        reach.note(&m.spaces, 1_000);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_000, None),
+            MachineState::Live
+        );
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Down);
+            }
+        }
+        reach.note(&m.spaces, 1_005);
+        reach.note(&m.spaces, 1_009);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_010, None),
+            MachineState::Retrying
+        );
+        let stale = reach.state(remote, &m.spaces, 1_005 + STALE_AFTER, None);
+        assert_eq!(stale, MachineState::Stale { as_of: 1_005 });
+        assert_eq!(
+            reach.state(0, &m.spaces, 1_020, None),
+            MachineState::Live,
+            "this Mac"
+        );
+        let words = reach_words(stale, zone);
+        assert_eq!(words, format!("not reached, as of {}", clock(1_005, zone)));
+        let banner = reach_banner(
+            &[
+                ("This Mac".into(), MachineState::Live),
+                ("staging".into(), stale),
+            ],
+            zone,
+        );
+        assert_eq!(banner, Some(format!("staging {words}")));
+        // Its rows stay while it is down.
+        let rows = m.rows.clone();
+        let local: Vec<AgentRow> = rows
+            .iter()
+            .filter(|r| machine_of(r.workspace) == 0)
+            .cloned()
+            .collect();
+        let kept = unreached_rows(&rows, &local, &m.spaces);
+        assert!(!kept.is_empty());
+        assert!(kept.iter().all(|r| machine_of(r.workspace) == remote));
+        // Back: live again, and its own rows are what counts.
+        for w in &mut m.spaces {
+            w.link = Some(LinkState::Up);
+        }
+        reach.note(&m.spaces, 1_030);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_031, None),
+            MachineState::Live
+        );
+        assert!(unreached_rows(&rows, &local, &m.spaces).is_empty());
+        // This Mac's daemon gone: every machine stale, as of then.
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_040, Some(1_035)),
+            MachineState::Stale { as_of: 1_035 }
+        );
+        assert_eq!(
+            reach.state(0, &m.spaces, 1_040, Some(1_035)),
+            MachineState::Stale { as_of: 1_035 }
+        );
+    }
+
+    /// A machine not heard from yet: the spaces in are named, and whose rows come when.
+    #[test]
+    fn loading_names_what_is_in_and_what_comes() {
+        let mut m = fixture();
+        let remote = 1usize;
+        assert_eq!(loading_line(&m.spaces, &m.rows), None);
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Down);
+                w.name = format!("{} (connecting)", w.name);
+            }
+        }
+        let local: Vec<AgentRow> = m
+            .rows
+            .iter()
+            .filter(|r| machine_of(r.workspace) == 0)
+            .cloned()
+            .collect();
+        let line = loading_line(&m.spaces, &local).expect("a line");
+        let machine = m
+            .spaces
+            .iter()
+            .find(|w| machine_of(w.id) == remote)
+            .map(machine_name)
+            .unwrap_or_default();
+        assert!(
+            line.ends_with(&format!("rows come when {machine} answers")),
+            "{line}"
+        );
+        assert!(!line.contains("connecting"), "{line}");
+        assert_eq!(
+            and_list(&["a".into(), "b".into(), "c".into()]),
+            "a, b and c"
+        );
+    }
+
+    /// A menu that closed with an answer from the phone keeps its card, with who answered.
+    #[test]
+    fn a_question_answered_on_the_phone_says_so() {
+        let zone = utc();
+        let m = fixture();
+        let mut before = m.rows[1].clone();
+        before.menu = Some(edit_menu(7));
+        let mut now = before.clone();
+        now.menu = None;
+        assert_eq!(
+            answered_elsewhere(&before, &now, zone),
+            None,
+            "not answered"
+        );
+        now.answered = Some(qoop_runtime::control::Answered {
+            label: "Yes".into(),
+            by: "phone".into(),
+            at: 1_000,
+        });
+        assert_eq!(
+            answered_elsewhere(&before, &now, zone),
+            Some(format!(
+                "Answered on your iPhone: Yes, {}",
+                clock(1_000, zone)
+            ))
+        );
     }
 }

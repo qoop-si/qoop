@@ -889,6 +889,53 @@ async fn via_reaches_the_named_machine(tui: &mut Tui, space: i64, local_socket: 
         qoop_runtime::control::too_old_for(&reason, Some("Via")),
         "not refused as an unknown method: {reason}"
     );
+    Box::pin(via_carries_the_window_reads(tui, space)).await;
+}
+
+/// The window's reads of another machine through `Via`: its pet, its sleep settings and qass's
+/// switch, each answered by the remote under the inner request's id.
+async fn via_carries_the_window_reads(tui: &mut Tui, space: i64) {
+    let via = |request: ControlRequest| ControlRequest::Via {
+        id: format!("outer-{}", request.request_id()),
+        workspace: space,
+        request: Box::new(request),
+    };
+    tui.ask(via(ControlRequest::Pet {
+        id: "via-pet".into(),
+    }))
+    .await;
+    let pet = answer_to(tui, "via-pet").await;
+    assert!(matches!(pet, ControlResponse::Pet { .. }), "{pet:?}");
+    tui.ask(via(ControlRequest::SleepSettings {
+        id: "via-sleep".into(),
+        idle_minutes: None,
+        exit_when_asleep: None,
+    }))
+    .await;
+    let sleep = answer_to(tui, "via-sleep").await;
+    assert!(
+        matches!(sleep, ControlResponse::SleepSettings { .. }),
+        "{sleep:?}"
+    );
+    tui.ask(via(ControlRequest::QassWatch {
+        id: "via-qass".into(),
+        on: None,
+    }))
+    .await;
+    let watch = answer_to(tui, "via-qass").await;
+    assert!(
+        matches!(watch, ControlResponse::QassWatch { .. }),
+        "{watch:?}"
+    );
+}
+
+/// The answer to the request `id`, refused or not.
+async fn answer_to(tui: &mut Tui, id: &str) -> ControlResponse {
+    tui.until("an answer through Via", |incoming| match incoming {
+        Incoming::Control(response) if response.request_id() == id => Some(response.clone()),
+        _ => None,
+    })
+    .await
 }
 
 /// A machine with no qoop: named as such, installed from the release of this version,
