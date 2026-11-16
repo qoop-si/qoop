@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/qoop-si/qoop/compare/v0.17.0...v0.17.1) (2026-11-16)
+
+
+### Fixed
+
+* **cli:** make herdr plugins behave as they do under herdr ([b91356c](https://github.com/qoop-si/qoop/commit/b91356c83a9edfa54a5daf71b99c3f493cc222ed))
+* **qass:** keep a handled same rest quiet in the watcher ([b6a48a9](https://github.com/qoop-si/qoop/commit/b6a48a944283ad90f071bc1b66af9bf895174de5))
+
 ## [0.17.0](https://github.com/qoop-si/qoop/compare/v0.16.0...v0.17.0) (2026-11-15)
 
 
