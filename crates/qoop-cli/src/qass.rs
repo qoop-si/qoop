@@ -1003,7 +1003,7 @@ pub(crate) fn send(terminal: u64, text: &str) -> std::io::Result<()> {
 /// page as a new item.
 fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
     use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir};
-    use qoop_runtime::idle::{BOARD_PANE, has_board};
+    use qoop_runtime::idle::{BOARD_PANE, has_board, lone_board};
 
     let qass = u32::try_from(qass).map_err(std::io::Error::other)?;
     let patience = std::time::Duration::from_secs(10);
@@ -1018,23 +1018,31 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
             "unexpected answer to the agent listing",
         ));
     };
+    let left = lone_board(&agents, &splits, qass);
     let tree = splits.into_iter().find(|t| t.leaves().contains(&qass));
     let panes = tree.as_ref().map(|t| t.leaves()).unwrap_or_default();
     if has_board(agents.iter().filter(|r| panes.contains(&r.terminal)), qass) {
         return Ok(());
     }
-    let me = std::env::current_exe()?.display().to_string();
-    let page = ["exec", &me, "task", "board", "--page"];
-    let opts = supervise::NewOpts {
-        name: Some(BOARD_PANE.into()),
-        cwd: Some(folder.to_path_buf()),
-        space: Some(SPACE.into()),
-        command: page.iter().map(|w| w.to_string()).collect(),
-        typed: None,
-        spawned: false,
+    // A board an earlier qass left behind is taken back: one board in the space, never two.
+    let board = match left {
+        Some(board) => board,
+        None => {
+            let me = std::env::current_exe()?.display().to_string();
+            let page = ["exec", &me, "task", "board", "--page"];
+            let opts = supervise::NewOpts {
+                name: Some(BOARD_PANE.into()),
+                cwd: Some(folder.to_path_buf()),
+                space: Some(SPACE.into()),
+                command: page.iter().map(|w| w.to_string()).collect(),
+                typed: None,
+                spawned: false,
+            };
+            let mut board = 0;
+            supervise::open_terminal(&opts, |t| board = t)?;
+            board
+        }
     };
-    let mut board = 0;
-    supervise::open_terminal(&opts, |t| board = t)?;
     // The board first, so the tab is still one tab and the board is on the left; the
     // interface stacks it over qass when the pane is too narrow for the two side by side.
     let tree = Pane::Split {
