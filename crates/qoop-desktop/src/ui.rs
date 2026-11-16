@@ -246,7 +246,8 @@ pub fn control(
 
 /// The keyboard's ring: the border in `ring` and a 2 px band of it outside, so it shows on a
 /// control whose own fill is near `ring` (a switch that is on, a picked chip).
-pub fn focus_ring(s: StyleRefinement, ring: Hsla) -> StyleRefinement {
+pub fn focus_ring(s: StyleRefinement, ring: impl Into<Hsla>) -> StyleRefinement {
+    let ring: Hsla = ring.into();
     s.border_color(ring).shadow(vec![BoxShadow {
         color: ring,
         offset: point(px(0.), px(0.)),

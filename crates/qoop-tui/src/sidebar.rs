@@ -10387,6 +10387,7 @@ mod tests {
             closable,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let agents = (1..=held as u32)
@@ -11133,6 +11134,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }];
         let agents: Vec<AgentRow> = (1..=3).map(|n| agent(n, 1, "claude", "idle")).collect();
