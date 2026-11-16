@@ -340,7 +340,7 @@ impl Desk {
         if k.modifiers.control || k.modifiers.platform || k.modifiers.alt {
             return;
         }
-        match k.key.as_str() {
+        match crate::keys::typed(k) {
             "x" => self.mark_read(),
             "n" => {
                 if let Some(review) = self.review.as_mut() {

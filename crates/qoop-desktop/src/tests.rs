@@ -21,6 +21,8 @@ fn open(cx: &mut TestAppContext) -> (Entity<Desk>, VisualTestContext, UnboundedR
             d.apply(Down::Connected, window, cx);
             // Never the owner's own qass lessons.
             d.lessons_path = std::path::PathBuf::from("/nonexistent/qass/lessons.md");
+            d.config_path = std::path::PathBuf::from("/nonexistent/qoop/config.toml");
+            d.pet_path = std::path::PathBuf::from("/nonexistent/qoop/avatar.json");
             d.model = fixture();
             d.now = 2000;
             cx.notify();
@@ -979,7 +981,8 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
     let said = desk.read_with(&vcx, |d, _| d.settings.said.clone().unwrap_or_default());
     assert!(said.starts_with("Sound on: written as line"), "{said}");
 
-    vcx.simulate_keystrokes("/");
+    // `/` as a Turkish Q keyboard types it: shift-7.
+    vcx.simulate_keystrokes("shift-7->/");
     vcx.simulate_input("sound");
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("setting-notify.sound").is_some());
@@ -999,6 +1002,45 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
     assert!(desk.read_with(&vcx, |d, _| {
         d.settings.read.as_ref().is_some_and(|r| r.broken)
     }));
+}
+
+/// A pet picked from a new deal waits out the hold with Undo; once it is up the pet is saved to
+/// the test's own file. Keep closes the deal and changes nothing.
+#[gpui::test]
+fn a_new_pet_waits_its_hold_and_can_be_undone(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let dir = tempfile::tempdir().expect("dir");
+    let pet_path = dir.path().join("avatar.json");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.pet_path = pet_path.clone();
+            d.open(Page::Settings, window, cx);
+            d.deal_pets(cx);
+        })
+    });
+    let first = desk.read_with(&vcx, |d, _| d.settings.pets[0].clone());
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.pick_pet(first.clone(), cx);
+            d.undo_pet(cx);
+        })
+    });
+    assert!(
+        desk.read_with(&vcx, |d, _| d.settings.pet_hold.is_none()),
+        "undone"
+    );
+    assert!(!pet_path.exists(), "nothing saved");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.pick_pet(first.clone(), cx);
+            if let Some((_, until)) = d.settings.pet_hold.as_mut() {
+                *until = std::time::Instant::now();
+            }
+            d.save_held_pet(false);
+        })
+    });
+    assert!(pet_path.exists(), "saved once the hold was up");
+    assert_eq!(desk.read_with(&vcx, |d, _| d.my_pet.clone()), Some(first));
 }
 
 /// Every key hint names the prefix `config.toml` picked.

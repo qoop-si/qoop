@@ -484,7 +484,7 @@ impl Desk {
                 }
                 return;
             }
-            match k.key.as_str() {
+            match keys::typed(k) {
                 "c" => self.new_work(None, window, cx),
                 "x" => self.dismiss_note(cx),
                 "tab" => self.open_note(window, cx),
@@ -496,7 +496,9 @@ impl Desk {
                 }
                 // Changes, `D` for diff: a key the TUI leaves unbound, so one prefix key never
                 // means two things across qoop. ponytail: the owner's naming pick.
-                "d" | "D" if k.modifiers.shift || k.key == "D" => self.toggle_review(window, cx),
+                // The character the layout typed, or shift with the D key where none came.
+                "D" => self.toggle_review(window, cx),
+                "d" if k.modifiers.shift => self.toggle_review(window, cx),
                 "i" => {
                     self.inbox = !self.inbox;
                     cx.notify();
@@ -539,7 +541,7 @@ impl Desk {
         // `u` belongs to Undo while anything is on hold, wherever its line shows (card, corner
         // note, Inbox): the card's agent's pick, else the newest. It never reaches the terminal
         // then.
-        if k.key == "u" && !self.holds.held.is_empty() {
+        if keys::typed(k) == "u" && !self.holds.held.is_empty() {
             let card = self
                 .card_offers()
                 .map(|(t, ..)| state::Slot::Agent(t))
@@ -555,7 +557,7 @@ impl Desk {
         if !self.term_focus.is_focused(window) {
             return;
         }
-        let taken = match k.key.as_str() {
+        let taken = match keys::typed(k) {
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 self.digit(d.as_bytes()[0] - b'0', window, cx)
             }
@@ -592,7 +594,7 @@ impl Desk {
     /// Keys nobody else took: Tab moves focus, Escape closes the right panel.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
-        match k.key.as_str() {
+        match keys::typed(k) {
             "tab" if k.modifiers.shift => window.focus_prev(cx),
             "tab" => window.focus_next(cx),
             "escape" if self.review.is_some() => {
@@ -1563,10 +1565,14 @@ fn wire(
     desk.update(cx, |_, cx| {
         // A pick on hold goes at once when the window closes or the app quits, given a moment
         // for the link to write it.
-        cx.on_release(|this: &mut Desk, _| this.flush_holds())
-            .detach();
+        cx.on_release(|this: &mut Desk, _| {
+            this.flush_holds();
+            this.save_held_pet(true);
+        })
+        .detach();
         cx.on_app_quit(|this: &mut Desk, cx| {
             this.flush_holds();
+            this.save_held_pet(true);
             cx.background_executor().timer(Duration::from_millis(200))
         })
         .detach();

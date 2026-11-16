@@ -261,9 +261,19 @@ fn telemetry_off_in(value: &toml::Value, at: &str) -> Option<String> {
     }
 }
 
+/// The lock file beside `config.toml` that every writer of it holds while it reads, changes and
+/// writes the file.
+fn lock_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
 /// Read the file at `path` as TOML, let `change` edit it, and put it back whole: the one way
-/// this process writes `config.toml`. A file that is not TOML is left alone and said, since
-/// writing over it would lose what a person was typing.
+/// qoop writes `config.toml`. A file that is not TOML is left alone and said, since writing
+/// over it would lose what a person was typing. The read, the change and the write hold an OS
+/// lock on a file beside it, so the TUI, the CLI and the window, each in a process of its own,
+/// never write over a change another made in between; a writer that dies lets go with it.
 fn edit_doc(
     path: &Path,
     change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
@@ -272,6 +282,25 @@ fn edit_doc(
     let _one = WRITING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(path))
+        .map_err(|e| format!("{}: {e}", lock_path(path).display()))?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let edited = edit_locked(path, change);
+    let _ = lock.unlock();
+    edited
+}
+
+fn edit_locked(
+    path: &Path,
+    change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
+) -> Result<(), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -658,14 +687,52 @@ mod tests {
         let writer = table["writer"].as_table().expect("table");
         assert_eq!(writer.len(), 32, "a writer's key was lost:\n{text}");
         assert!(text.contains("# kept"));
-        let left: Vec<_> = std::fs::read_dir(dir.path())
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
             .expect("dir")
             .map(|e| e.expect("entry").file_name())
             .collect();
+        left.sort();
         assert_eq!(
             left,
-            vec![std::ffi::OsString::from("config.toml")],
+            vec![
+                std::ffi::OsString::from("config.toml"),
+                std::ffi::OsString::from("config.toml.lock"),
+            ],
             "staged files left"
+        );
+    }
+
+    /// A writer in another process holds the file's lock: a write here waits for it, then
+    /// lands on what that writer left, so neither change is lost.
+    #[test]
+    fn a_write_waits_for_another_writers_lock() {
+        let (_dir, path) = file_with("# kept\n");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(&path))
+            .expect("lock file");
+        held.lock().expect("held");
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || edit(&path, &[("theirs", toml_edit::value(2))]))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("theirs"),
+            "it wrote while the lock was held"
+        );
+        // What the holder writes before it lets go.
+        std::fs::write(&path, "# kept\nmine = 1\n").expect("the holder's write");
+        held.unlock().expect("let go");
+        writer.join().expect("writer").expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("mine = 1") && text.contains("theirs = 2"),
+            "{text}"
         );
     }
 

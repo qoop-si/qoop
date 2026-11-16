@@ -22,6 +22,15 @@ pub struct Press<'a> {
 
 /// The bytes for one press, or `None` for a press the terminal does not get (Cmd chords
 /// belong to the app).
+/// What a keystroke types, for the window's own one-letter keys: the character the layout
+/// produced (`/` is shift-7 on a Turkish Q keyboard), else the key's name (`tab`, `escape`).
+pub fn typed(k: &gpui::Keystroke) -> &str {
+    k.key_char
+        .as_deref()
+        .filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control))
+        .unwrap_or(&k.key)
+}
+
 pub fn encode(p: Press<'_>, app_cursor: bool) -> Option<Vec<u8>> {
     if p.cmd {
         return None;
