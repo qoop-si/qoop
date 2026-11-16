@@ -96,6 +96,27 @@ pub fn has_board<'a>(
         .any(|r| r.terminal != qass && r.name.as_deref() == Some(BOARD_PANE))
 }
 
+/// A board pane in qass's space left in a tab of its own (qass's tab closed and the board
+/// stayed): the next start puts that one beside the new qass rather than opening a second
+/// board. A board sharing a tab with anything else is left alone.
+pub fn lone_board(
+    rows: &[crate::control::AgentRow],
+    trees: &[crate::control::Pane],
+    qass: u32,
+) -> Option<u32> {
+    let space = rows.iter().find(|r| r.terminal == qass)?.workspace;
+    rows.iter()
+        .filter(|r| {
+            r.terminal != qass && r.workspace == space && r.name.as_deref() == Some(BOARD_PANE)
+        })
+        .map(|r| r.terminal)
+        .find(|t| {
+            trees
+                .iter()
+                .all(|tree| !tree.leaves().contains(t) || tree.leaves() == [*t])
+        })
+}
+
 /// [`board_page`], for the process in front of the terminal `master`, run by this very
 /// binary: a script that only calls itself `qoop` is no page of ours, and keeps its tab awake.
 pub fn shows_board(master: std::os::fd::RawFd) -> bool {
@@ -563,6 +584,45 @@ mod tests {
                 "anywhere: {program:?}"
             );
         }
+    }
+
+    /// qass's tab closed and its board stayed in a tab of its own: the next start takes that
+    /// board back, never a second one; a board in a tab with something else, or in another
+    /// space, is not it.
+    #[test]
+    fn a_board_left_alone_is_taken_back() {
+        use crate::control::Pane;
+        let row = |terminal: u32, workspace: i64, name: &str| {
+            serde_json::from_value::<crate::control::AgentRow>(serde_json::json!({
+                "terminal": terminal, "workspace": workspace, "name": name,
+                "program": "qoop", "behind": null, "state": "idle", "generation": null,
+            }))
+            .unwrap()
+        };
+        let leaf = |terminal| Pane::Leaf { terminal };
+        let pair = |a, b| Pane::Split {
+            dir: crate::control::SplitDir::V,
+            permille: 500,
+            questions: 0,
+            first: Box::new(leaf(a)),
+            second: Box::new(leaf(b)),
+        };
+        let qass = row(20, 3, "qass");
+        let left = row(9, 3, BOARD_PANE);
+        assert_eq!(lone_board(&[qass.clone(), left.clone()], &[], 20), Some(9));
+        assert_eq!(
+            lone_board(&[qass.clone(), left.clone()], &[leaf(9)], 20),
+            Some(9),
+            "a tab of its own"
+        );
+        assert_eq!(
+            lone_board(&[qass.clone(), left.clone()], &[pair(9, 11)], 20),
+            None,
+            "it shares a tab"
+        );
+        let elsewhere = row(9, 4, BOARD_PANE);
+        assert_eq!(lone_board(&[qass.clone(), elsewhere], &[], 20), None);
+        assert_eq!(lone_board(&[left], &[], 20), None, "no qass listed");
     }
 
     #[test]
