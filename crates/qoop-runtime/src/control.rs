@@ -367,6 +367,11 @@ pub enum ControlRequest {
     Focus {
         id: String,
         terminal: TerminalStream,
+        /// Zoom the terminal in its tab (`true`) or show its tab unzoomed (`false`) once shown.
+        /// Absent, the zoom is left as it is: what every sender before it meant, and what an
+        /// older interface does with it, the field being unknown there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zoom: Option<bool>,
     },
     /// What an interface before `Seen` sent: the terminals it counted as news. Taken and
     /// ignored, since the daemon decides done itself (`AgentRow::status`).
@@ -3544,6 +3549,43 @@ mod tests {
         );
     }
 
+    /// `Focus`'s zoom crosses older peers both ways: absent is read as no zoom asked, and
+    /// no zoom is written as nothing, so an older daemon or interface sees the shape it knows.
+    #[test]
+    fn the_focus_zoom_parses_both_ways() {
+        let old: ControlRequest =
+            serde_json::from_str(r#"{"op":"Focus","id":"f","terminal":3}"#).expect("decode");
+        assert!(matches!(old, ControlRequest::Focus { zoom: None, .. }));
+        let plain = ControlRequest::Focus {
+            id: "f".into(),
+            terminal: 3,
+            zoom: None,
+        };
+        assert!(
+            !serde_json::to_string(&plain)
+                .expect("encode")
+                .contains("zoom")
+        );
+        let event = EventMessage::Focus {
+            terminal: 3,
+            zoom: Some(true),
+        };
+        let wire = serde_json::to_string(&event).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<EventMessage>(&wire).expect("decode"),
+            event
+        );
+        let older: EventMessage =
+            serde_json::from_str(&wire.replace(",\"zoom\":true", "")).expect("an older event");
+        assert_eq!(
+            older,
+            EventMessage::Focus {
+                terminal: 3,
+                zoom: None
+            }
+        );
+    }
+
     /// A row's shell pid crosses old daemons both ways, as the stop does.
     #[test]
     fn the_shell_pid_field_parses_both_ways() {
@@ -4283,7 +4325,13 @@ pub enum EventMessage {
     /// Show this terminal, asked for by `qoop focus`. An interface switches to it as if
     /// its row were clicked; every other client ignores it, and so does an older
     /// interface, the event lane being lenient.
-    Focus { terminal: TerminalStream },
+    Focus {
+        terminal: TerminalStream,
+        /// As the request's `zoom`: absent leaves the zoom alone, and an older interface
+        /// ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zoom: Option<bool>,
+    },
     /// Some news for this connection was dropped before it arrived. Re-read the whole
     /// index rather than waiting for the next change: the missed change may be the last
     /// one for a while, and waiting would leave the client behind silently.

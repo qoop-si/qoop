@@ -3,8 +3,8 @@
 //! Checked the way herdr 0.9.5 checks it, so a manifest herdr refuses is refused here too: a
 //! name, a version and a `min_herdr_version` no newer than the herdr qoop answers as; titles on
 //! actions and panes; ids in herdr's character sets; platforms from herdr's three; every
-//! command a non-empty argv. A key qoop does not read (`description`, a pane's size,
-//! `[[link_handlers]]`) is left alone. On top of herdr's rules, a plugin id is never one a
+//! command a non-empty argv; `[[link_handlers]]` too, which are listed and never run. A key
+//! qoop does not read is left alone. On top of herdr's rules, a plugin id is never one a
 //! path could read as a parent or a hidden name, since it names a folder here.
 
 use std::collections::BTreeSet;
@@ -33,6 +33,8 @@ pub(crate) struct Manifest {
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
     pub(crate) version: Option<String>,
     #[serde(default)]
     pub(crate) min_herdr_version: Option<String>,
@@ -49,6 +51,20 @@ pub(crate) struct Manifest {
     pub(crate) events: Vec<Hook>,
     #[serde(default)]
     pub(crate) startup: Vec<Step>,
+    /// Read and listed as herdr lists them; qoop never opens a link with one.
+    #[serde(default)]
+    pub(crate) link_handlers: Vec<LinkHandler>,
+}
+
+/// A `[[link_handlers]]` entry: links matching `pattern` go to the action `action`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct LinkHandler {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) pattern: String,
+    pub(crate) action: String,
+    #[serde(default)]
+    pub(crate) platforms: Option<Vec<String>>,
 }
 
 /// A `[[build]]` or `[[startup]]` entry: one command, on some platforms.
@@ -64,6 +80,8 @@ pub(crate) struct Action {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
     /// `global`, `workspace`, `tab`, `pane`, `selection`; none is everywhere.
     #[serde(default)]
     pub(crate) contexts: Vec<String>,
@@ -77,6 +95,13 @@ pub(crate) struct PaneEntry {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    /// A popup's size, as written: cells or a percentage.
+    #[serde(default)]
+    pub(crate) width: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) height: Option<serde_json::Value>,
     /// `overlay`, `popup`, `split`, `tab` or `zoomed`; herdr's default when absent is overlay.
     #[serde(default)]
     pub(crate) placement: Option<String>,
@@ -242,6 +267,29 @@ impl Manifest {
         if m.events.iter().any(|e| e.on.trim().is_empty()) {
             return refuse("an event hook with no event".into());
         }
+        // As herdr checks them, but for compiling the pattern: qoop never matches a link.
+        let mut seen = BTreeSet::new();
+        for handler in &m.link_handlers {
+            if !valid_item_id(&handler.id) {
+                return refuse("invalid link handler id".into());
+            }
+            if !seen.insert(handler.id.as_str()) {
+                return refuse(format!("duplicate link handler id '{}'", handler.id));
+            }
+            if handler.title.trim().is_empty() {
+                return refuse("link handler title is required".into());
+            }
+            if handler.pattern.trim().is_empty() {
+                return refuse("link handler pattern is required".into());
+            }
+            if !m.actions.iter().any(|a| a.id == handler.action) {
+                return refuse(format!(
+                    "link handler '{}' references unknown action '{}'",
+                    handler.id, handler.action
+                ));
+            }
+            check_platforms(handler.platforms.as_deref()).map_err(|e| format!("{FILE}: {e}"))?;
+        }
         let commands = m
             .build
             .iter()
@@ -358,6 +406,7 @@ action = "open"
             Action {
                 id: "open".into(),
                 title: Some("Open notes".into()),
+                description: None,
                 contexts: vec!["pane".into(), "workspace".into()],
                 command: vec!["bin/notes".into(), "--open".into()],
                 platforms: None,
@@ -370,7 +419,11 @@ action = "open"
         assert_eq!(m.events[0].on, "pane.closed");
         assert_eq!(m.events[1].id, None);
         assert_eq!(m.startup[0].command, ["bin/notes", "--daemon"]);
+        assert_eq!(m.link_handlers[0].action, "open");
         assert!(m.runs_here(), "this test runs on linux or macos");
+        let stray = EVERY_TABLE.replace("action = \"open\"", "action = \"gone\"");
+        let refused = Manifest::parse(&stray).expect_err("an unknown action");
+        assert!(refused.contains("unknown action 'gone'"), "{refused}");
     }
 
     #[test]

@@ -729,6 +729,12 @@ struct State {
     /// Recordings sent and not yet answered. While any is out, trees in the
     /// index may predate it and are not adopted.
     split_saving: usize,
+    /// The daemon's trees as this client last read them, with every tree it sent since. A
+    /// tree in the index that is not among them was changed by someone else (a second
+    /// interface, the plugin host) and replaces this client's copy; one that is among them
+    /// is unchanged or this client's own echo, and a local resize the daemon never kept
+    /// stays as it is.
+    split_seen: Vec<qoop_runtime::control::Pane>,
     /// A tree came on screen outside a focus change (adopted from the index), so
     /// the loop owes the daemon a subscription sync and a resize.
     resync: bool,
@@ -802,6 +808,9 @@ struct State {
     /// person puts the keyboard anywhere themselves, so a tab coming back never takes it
     /// from where they went.
     show_when_listed: Option<(u32, std::time::Instant, bool)>,
+    /// A zoom a `Focus` asked for: the terminal, zoomed or not, and until when. Applied once
+    /// that terminal is the focused one in the tab on screen, dropped after.
+    zoom_asked: Option<(u32, bool, std::time::Instant)>,
     /// The id of a create asked for in a space that is not on screen, from a space's `+`.
     /// Its tab is shown once an index lists it, because only the row says which space to
     /// bring on screen with it.
@@ -1446,6 +1455,15 @@ impl State {
     /// The tab the keyboard is in: the focused terminal, or the tab it is a split of.
     fn focused_tab(&self) -> u32 {
         screen::tab_of(self.focused, &self.panes())
+    }
+
+    /// The trees queued for the daemon, counted as out and as seen: the index that answers
+    /// them shows them back, and that echo is no change of anybody else's.
+    fn take_split_writes(&mut self) -> Vec<qoop_runtime::control::Pane> {
+        let trees = std::mem::take(&mut self.split_writes);
+        self.split_saving += trees.len();
+        self.split_seen.extend(trees.iter().cloned());
+        trees
     }
 
     /// Every tree this client holds, on screen and parked, in every space.
@@ -8036,6 +8054,7 @@ where
         parked: std::collections::BTreeMap::new(),
         split_writes: Vec::new(),
         split_saving: 0,
+        split_seen: Vec::new(),
         resync: false,
         split_origin: std::collections::BTreeMap::new(),
         config_stamp: config_stamp(),
@@ -8065,6 +8084,7 @@ where
         chat: crate::chat_view::ChatState::read(chat_file),
         last: LastFocus::read(last_focus, own_focus),
         show_when_listed: None,
+        zoom_asked: None,
         elsewhere: None,
         waking: None,
         dim: 0,
@@ -8300,7 +8320,7 @@ where
     let mut written = String::new();
     let mut presented = tokio::time::Instant::now();
     // The terminal on screen as the plugin host was last told it, and the sender that tells it.
-    let mut focus_reported = 0u32;
+    let mut focus_reported = crate::plugins::Shown::default();
     let focus_report = crate::plugins::FocusReport::start();
     // At most one index request in flight. Announces that land while one is out ride on its
     // answer, which asks once more: a burst of tool calls, each one news for the sidebar,
@@ -8340,9 +8360,8 @@ where
             // Splits a person made or took apart since the last turn, recorded so a
             // restart brings the tab back whole. Queued wherever the change was made,
             // sent here, where there is always a write in hand.
-            for tree in std::mem::take(&mut state.split_writes) {
+            for tree in state.take_split_writes() {
                 request += 1;
-                state.split_saving += 1;
                 wr.write_all(&client::encode_control_seq(
                     &ControlRequest::SetSplit {
                         id: format!("tree-{request}"),
@@ -8431,6 +8450,13 @@ where
             // together than that wait for the timer arm below and go out as one frame.
             // `ctrl-a` waiting for its letter produces no action of its own, so the key row
             // learns it here: a flip either way repaints the row.
+            // A zoom asked with a `Focus`, once its terminal is the one shown.
+            if let Some(out) = apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)? {
+                if !out.is_empty() {
+                    wr.write_all(&out).await?;
+                }
+                dirty = true;
+            }
             if keys.prefix_pending() != state.prefix_pending {
                 state.prefix_pending = keys.prefix_pending();
                 dirty = true;
@@ -8440,11 +8466,23 @@ where
                 state.last.keep(state.focused);
             }
             if dirty && presented.elapsed() >= FRAME {
-                // Once per change and at most once a frame, so fast switching is told once.
-                if let Some(terminal) =
-                    crate::plugins::focus_to_report(state.focused, &mut focus_reported)
-                {
-                    focus_report.send(terminal);
+                // Once per change and at most once a frame, so fast switching is told once; with
+                // the cells a tab is laid out in, which plugin layouts are drawn in.
+                let (cols, rows) = screen::pane_size_for(
+                    state.cols,
+                    state.lines,
+                    state.collapsed,
+                    0,
+                    state.sidebar_width,
+                );
+                let shown = crate::plugins::Shown {
+                    terminal: state.focused,
+                    cols,
+                    rows,
+                    back: state.rows_back(),
+                };
+                if let Some(shown) = crate::plugins::focus_to_report(shown, &mut focus_reported) {
+                    focus_report.send(shown);
                 }
                 // An open answer lays out for the pane before the frame borrows the state:
                 // once per width, so a long answer is not wrapped again every frame.
@@ -11021,7 +11059,7 @@ where
                             // `qoop focus`, from a notch, a launcher or a click on a desktop
                             // note: the same switch a click on the row makes. A terminal this
                             // interface does not list yet waits for the index that names it.
-                            Incoming::Event(EventMessage::Focus { terminal }) => match focus_ask(&mut state, terminal) {
+                            Incoming::Event(EventMessage::Focus { terminal, zoom }) => match focus_ask_zoomed(&mut state, terminal, zoom) {
                                 FocusAsk::Ignore => {}
                                 FocusAsk::Gone { unfolded } => {
                                     if unfolded && let Some(resize) = size_terminals(&mut state, &mut seqs)? {
@@ -12983,31 +13021,46 @@ fn rename_from_row(state: &mut State, terminal: u32) {
     });
 }
 
-/// Take the index's split trees for tabs this client holds no split of.
+/// Take the index's split trees: for tabs this client holds no split of, and for tabs whose
+/// tree somebody else changed.
 ///
-/// A client that already has a split over any of the same terminals keeps its
-/// own: it made or adopted it, and it writes every change it makes. A tree of
-/// one pane is not a split and yields, which is what lets a restart's first
-/// render (a single pane) grow back into its tab. Nothing is adopted while a
-/// recording is out: the index may predate it.
+/// The daemon's tree is the tab's. A split this client holds yields to a tree it has not
+/// seen (`split_seen`): a second interface or the plugin host changed it. One it has seen
+/// changes nothing, so a resize made here and never recorded is not undone, and a tree this
+/// client sent does not come back as a flicker. A tree of one pane is not a split and
+/// yields, which is what lets a restart's first render (a single pane) grow back into its
+/// tab. Nothing is adopted, and nothing counts as seen, while a change made here is queued or
+/// out for recording: the index may predate it, and taking it would undo that change, or the
+/// change would later write over the tree taken. A tree waiting on a split made here (its
+/// terminal not yet made) is not taken and not seen either, so it is taken once it can be.
 fn adopt_splits(state: &mut State, agents: &[AgentRow], splits: Vec<qoop_runtime::control::Pane>) {
-    if state.split_saving > 0 {
+    if state.split_saving > 0 || !state.split_writes.is_empty() {
         return;
     }
+    let seen = std::mem::take(&mut state.split_seen);
     let space_of = |t: u32| agents.iter().find(|r| r.terminal == t).map(|r| r.workspace);
-    for tree in splits {
-        let Some(tree) = tree.retain(&|t| space_of(t).is_some()) else {
+    for raw in splits {
+        let changed = !seen.contains(&raw);
+        state.split_seen.push(raw.clone());
+        let Some(tree) = raw.retain(&|t| space_of(t).is_some()) else {
             continue;
         };
         let leaves = tree.leaves();
         let Some(space) = space_of(leaves[0]) else {
             continue;
         };
-        let held = state.trees().any(|layout| {
-            (layout.leaf_count() > 1 || layout.has_pending())
-                && layout.leaves().iter().any(|t| leaves.contains(t))
-        });
-        if leaves.len() < 2 || held || leaves.iter().any(|t| space_of(*t) != Some(space)) {
+        if leaves.len() < 2 || leaves.iter().any(|t| space_of(*t) != Some(space)) {
+            continue;
+        }
+        let overlaps = |layout: &Layout| layout.leaves().iter().any(|t| leaves.contains(t));
+        if state.trees().any(|l| l.has_pending() && overlaps(l)) {
+            state.split_seen.pop();
+            continue;
+        }
+        if state.trees().any(|l| l.leaf_count() > 1 && overlaps(l)) {
+            if changed {
+                take_split(state, space, &tree);
+            }
             continue;
         }
         state
@@ -13027,6 +13080,45 @@ fn adopt_splits(state: &mut State, agents: &[AgentRow], splits: Vec<qoop_runtime
             // The focused tile just shrank into its split.
             state.adopted_resize = true;
         }
+    }
+}
+
+/// Put a tree somebody else changed in place of every tree here sharing a terminal with it.
+///
+/// The keyboard stays in the pane it was in: a tree on screen that still holds it is
+/// replaced on screen, zoom and the last pane kept where their panes still are. A pane that
+/// left the tree stays on screen alone, and the tree is parked with its tab.
+fn take_split(state: &mut State, space: i64, tree: &qoop_runtime::control::Pane) {
+    let leaves = tree.leaves();
+    let overlaps = |layout: &Layout| layout.leaves().iter().any(|t| leaves.contains(t));
+    for trees in state.parked.values_mut() {
+        trees.retain(|layout| !overlaps(layout));
+    }
+    let mut next = Layout::from_pane(tree);
+    let shown: Vec<i64> = state
+        .layouts
+        .iter()
+        .filter(|(_, layout)| overlaps(layout))
+        .map(|(at, _)| *at)
+        .collect();
+    let mut placed = false;
+    for at in shown {
+        let Some(old) = state.layouts.remove(&at) else {
+            continue;
+        };
+        state.resync = true;
+        state.adopted_resize = true;
+        if !placed && at == space && next.focus_terminal(old.focus) {
+            next.prev_focus = old.prev_focus.filter(|t| next.contains(*t));
+            next.zoomed = old.zoomed.filter(|t| next.contains(*t));
+            state.layouts.insert(at, next.clone());
+            placed = true;
+        } else if !next.contains(old.focus) {
+            state.layouts.insert(at, Layout::single(old.focus));
+        }
+    }
+    if !placed {
+        state.parked.entry(space).or_default().push(next);
     }
 }
 
@@ -13236,6 +13328,59 @@ fn zoom_flip(
         out.extend_from_slice(&resize);
     }
     Ok((true, if out.is_empty() { None } else { Some(out) }))
+}
+
+/// A `Focus` from the daemon: its zoom, if it asks one (a plugin's zoomed pane, or its close),
+/// kept to apply once that terminal is the one shown; then the same ask as a plain focus.
+fn focus_ask_zoomed(state: &mut State, terminal: u32, zoom: Option<bool>) -> FocusAsk {
+    state.zoom_asked = zoom.map(|on| (terminal, on, std::time::Instant::now() + SHOW_WAIT));
+    focus_ask(state, terminal)
+}
+
+/// Apply a zoom a `Focus` asked for, once its terminal is the one shown: zoomed in its tab, or
+/// the tab unzoomed. The same follow-up as the zoom key. `None` when there is nothing to do
+/// yet or any more; an ask past its time is dropped.
+fn apply_zoom_ask(
+    state: &mut State,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<BytesMut>> {
+    let Some((terminal, on, until)) = state.zoom_asked else {
+        return Ok(None);
+    };
+    if std::time::Instant::now() >= until {
+        state.zoom_asked = None;
+        return Ok(None);
+    }
+    if state.focused != terminal {
+        return Ok(None);
+    }
+    let Some(layout) = state
+        .space
+        .and_then(|s| state.layouts.get_mut(&s))
+        .filter(|l| l.contains(terminal))
+    else {
+        return Ok(None);
+    };
+    // A pane still alone in its tree waits: its split may be on its way from the daemon.
+    if on && layout.leaf_count() < 2 {
+        return Ok(None);
+    }
+    state.zoom_asked = None;
+    let want = on.then_some(terminal);
+    if layout.zoomed == want {
+        return Ok(None);
+    }
+    layout.focus = terminal;
+    layout.zoomed = want;
+    let mut out = BytesMut::new();
+    if let Some(sync) = sync_subs(state, control_seq)? {
+        out.extend_from_slice(&sync);
+    }
+    if let Some(resize) = size_terminals(state, seqs)? {
+        out.extend_from_slice(&resize);
+    }
+    Ok(Some(out))
 }
 
 /// The onlookers' screens outside `keep` move to `last_seen` instead of being dropped, so a
@@ -17516,6 +17661,7 @@ mod tests {
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
+            zoom_asked: None,
             elsewhere: None,
             waking: None,
             dim: 0,
@@ -17621,6 +17767,7 @@ mod tests {
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
             split_saving: 0,
+            split_seen: Vec::new(),
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             config_stamp: None,
@@ -19056,6 +19203,7 @@ mod tests {
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
             split_saving: 0,
+            split_seen: Vec::new(),
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             config_stamp: None,
@@ -19081,6 +19229,7 @@ mod tests {
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
+            zoom_asked: None,
             elsewhere: None,
             waking: None,
             dim: 0,
@@ -19218,6 +19367,7 @@ mod tests {
             parked: std::collections::BTreeMap::new(),
             split_writes: Vec::new(),
             split_saving: 0,
+            split_seen: Vec::new(),
             resync: false,
             split_origin: std::collections::BTreeMap::new(),
             config_stamp: None,
@@ -19243,6 +19393,7 @@ mod tests {
             last: LastFocus::default(),
             chat: Default::default(),
             show_when_listed: None,
+            zoom_asked: None,
             elsewhere: None,
             waking: None,
             dim: 0,
@@ -19807,9 +19958,11 @@ mod tests {
     }
 
     #[test]
-    fn a_split_this_client_holds_is_not_replaced_by_the_index() {
+    fn a_split_this_client_holds_is_not_replaced_by_a_tree_it_has_seen() {
         let mut state = tiled_state();
         state.rows.push(agent(3, 1, "sh", "idle"));
+        // Read before (or sent from here): nobody changed it since.
+        state.split_seen = vec![three_panes()];
         let mut dirty = false;
         apply(
             &mut state,
@@ -20642,6 +20795,66 @@ mod tests {
         let (changed, out) = zoom_flip(&mut state, &mut control_seq, &mut seqs).unwrap();
         assert!(changed, "unzoom answers too");
         assert!(out.is_some(), "show and resize go out");
+        assert_eq!(state.layouts.get(&1).unwrap().zoomed, None);
+    }
+
+    #[test]
+    fn a_focus_zoom_ask_zooms_once_its_terminal_is_shown() {
+        let mut state = tiled_state();
+        let mut control_seq = 0;
+        let mut seqs = std::collections::BTreeMap::new();
+        let later = std::time::Instant::now() + SHOW_WAIT;
+        // Shown, but still alone in its tree (its split not adopted yet): the ask waits.
+        let split = state
+            .layouts
+            .insert(1, crate::layout::Layout::single(2))
+            .expect("a split");
+        state.focused = 2;
+        state.zoom_asked = Some((2, true, later));
+        assert!(
+            apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.zoom_asked.is_some(), "kept for the split on its way");
+        state.layouts.insert(1, split);
+        state.focused = 1;
+        // For terminal 2, not shown yet: kept, nothing done.
+        state.zoom_asked = Some((2, true, later));
+        assert!(
+            apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.zoom_asked.is_some(), "waits for its terminal");
+        state.focused = 2;
+        assert!(
+            apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            state.layouts.get(&1).unwrap().zoomed,
+            Some(2),
+            "zoomed in its tab"
+        );
+        assert_eq!(state.zoom_asked, None, "applied once");
+        // Unzoom: the tab shows every pane again.
+        state.zoom_asked = Some((2, false, later));
+        assert!(
+            apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(state.layouts.get(&1).unwrap().zoomed, None);
+        // Past its time it is dropped.
+        state.zoom_asked = Some((2, true, std::time::Instant::now()));
+        assert!(
+            apply_zoom_ask(&mut state, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.zoom_asked, None);
         assert_eq!(state.layouts.get(&1).unwrap().zoomed, None);
     }
 
@@ -21709,6 +21922,217 @@ mod tests {
             );
             assert_eq!(state.focused, 5);
         }
+    }
+
+    fn pair(first: u32, second: u32, permille: u16) -> qoop_runtime::control::Pane {
+        use qoop_runtime::control::{Pane, SplitDir};
+        Pane::Split {
+            dir: SplitDir::V,
+            permille,
+            questions: 0,
+            first: Box::new(Pane::Leaf { terminal: first }),
+            second: Box::new(Pane::Leaf { terminal: second }),
+        }
+    }
+
+    fn split_index(rows: &[AgentRow], splits: Vec<qoop_runtime::control::Pane>) -> ControlResponse {
+        ControlResponse::Agents {
+            id: "index".to_string(),
+            agents: rows.to_vec(),
+            splits,
+            qass_checks: None,
+        }
+    }
+
+    /// A split on screen with the keyboard in terminal 2, adopted from the index.
+    fn shown_split(rows: &[AgentRow]) -> State {
+        let mut state = bare_state();
+        state.adopted = true;
+        state.space = Some(1);
+        state.rows = rows.to_vec();
+        state.focused = 2;
+        state.layouts.insert(1, Layout::single(2));
+        apply(
+            &mut state,
+            split_index(rows, vec![pair(1, 2, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(state.layouts[&1].leaves(), vec![1, 2]);
+        assert_eq!(state.layouts[&1].focus, 2);
+        state
+    }
+
+    /// A tab this interface shows as a split follows the daemon's tree when somebody else
+    /// changes it (a second interface, the plugin host's swap, resize or new pane), with the
+    /// keyboard left in the pane it was in. Before, only a tab shown alone took the index's
+    /// tree, and the change was invisible until an attach again.
+    #[test]
+    fn a_split_somebody_else_changed_replaces_the_one_on_screen() {
+        use qoop_runtime::control::Pane;
+        let rows = [1, 2, 3].map(|t| agent(t, 1, "zsh", "idle")).to_vec();
+        let mut state = shown_split(&rows);
+        let mut show = |tree: Pane| {
+            apply(
+                &mut state,
+                split_index(&rows, vec![tree]),
+                &mut 0,
+                &mut false,
+            );
+            let shown = &state.layouts[&1];
+            (
+                shown.leaves(),
+                shown.focus,
+                shown.root_split().map(|(_, r)| r),
+            )
+        };
+        assert_eq!(show(pair(2, 1, 500)), (vec![2, 1], 2, Some(0.5)), "a swap");
+        assert_eq!(
+            show(pair(2, 1, 300)),
+            (vec![2, 1], 2, Some(0.3)),
+            "a resize"
+        );
+        let grown = Pane::Split {
+            dir: qoop_runtime::control::SplitDir::H,
+            permille: 500,
+            questions: 0,
+            first: Box::new(pair(2, 1, 300)),
+            second: Box::new(Pane::Leaf { terminal: 3 }),
+        };
+        assert_eq!(show(grown), (vec![2, 1, 3], 2, Some(0.5)), "a new pane");
+        assert!(
+            state.resync && state.adopted_resize,
+            "new tiles are subscribed and sized"
+        );
+    }
+
+    /// A pane taken out of the tree by somebody else keeps the keyboard, on its own; the
+    /// tree goes on in its tab.
+    #[test]
+    fn a_pane_that_left_the_split_keeps_the_keyboard() {
+        let rows = [1, 2, 3].map(|t| agent(t, 1, "zsh", "idle")).to_vec();
+        let mut state = shown_split(&rows);
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(1, 3, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(state.layouts[&1].leaves(), vec![2]);
+        let parked: Vec<Vec<u32>> = state.parked[&1].iter().map(|l| l.leaves()).collect();
+        assert_eq!(parked, vec![vec![1, 3]]);
+    }
+
+    /// What the daemon already had changes nothing here: a resize this interface made and
+    /// never recorded stays, and a tree it recorded does not come back over a later local
+    /// change as a flicker.
+    #[test]
+    fn a_local_resize_is_not_undone_by_the_index_or_its_own_echo() {
+        let rows = [1, 2].map(|t| agent(t, 1, "zsh", "idle")).to_vec();
+        let mut state = shown_split(&rows);
+        let ratio = |state: &State| state.layouts[&1].root_split().map(|(_, r)| r);
+        let resize = |state: &mut State, to: f32| {
+            let layout = state.layouts.get_mut(&1).expect("shown");
+            assert!(layout.set_root_split(crate::layout::Dir::V, to));
+        };
+        resize(&mut state, 0.3);
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(1, 2, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(ratio(&state), Some(0.3), "the index did not undo it");
+
+        // Recorded, then moved again before the echo lands.
+        state.split_writes.push(pair(1, 2, 300));
+        assert_eq!(state.take_split_writes().len(), 1);
+        resize(&mut state, 0.4);
+        apply(
+            &mut state,
+            ControlResponse::SplitSaved {
+                id: "tree-1".into(),
+            },
+            &mut 0,
+            &mut false,
+        );
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(1, 2, 300)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(ratio(&state), Some(0.4), "its own echo did not bounce back");
+    }
+
+    /// A change made here and not yet sent is not undone by an index from before it, and the
+    /// index's tree is not counted as seen, so it is still taken once nothing is on its way.
+    #[test]
+    fn a_queued_local_change_holds_the_index_back() {
+        let rows = [1, 2].map(|t| agent(t, 1, "zsh", "idle")).to_vec();
+        let mut state = shown_split(&rows);
+        state.split_writes.push(pair(1, 2, 300));
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(2, 1, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(
+            state.layouts[&1].leaves(),
+            vec![1, 2],
+            "the local change stands"
+        );
+        assert_eq!(
+            state.split_seen,
+            vec![pair(1, 2, 500)],
+            "nothing new counted as seen"
+        );
+        state.split_writes.clear();
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(2, 1, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(
+            state.layouts[&1].leaves(),
+            vec![2, 1],
+            "taken once nothing is queued"
+        );
+    }
+
+    /// A tree that overlaps a split made here and still waiting for its terminal is left, and
+    /// not counted as seen: once the split lands, the same tree is taken.
+    #[test]
+    fn a_tree_skipped_for_a_waiting_split_is_taken_later() {
+        let rows = [1, 2, 3].map(|t| agent(t, 1, "zsh", "idle")).to_vec();
+        let mut state = shown_split(&rows);
+        let area = pane_area(&state);
+        assert!(state.layouts.get_mut(&1).expect("shown").split_placeholder(
+            2,
+            crate::layout::Dir::H,
+            area
+        ));
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(2, 1, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert!(
+            state.layouts[&1].has_pending(),
+            "the waiting split is left alone"
+        );
+        assert!(state.split_seen.is_empty(), "and the tree is not seen");
+        assert!(state.layouts.get_mut(&1).expect("shown").drop_placeholder());
+        apply(
+            &mut state,
+            split_index(&rows, vec![pair(2, 1, 500)]),
+            &mut 0,
+            &mut false,
+        );
+        assert_eq!(state.layouts[&1].leaves(), vec![2, 1]);
     }
 
     /// An index arriving while the focus list is open marks a refetch: a tool

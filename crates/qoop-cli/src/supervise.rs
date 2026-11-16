@@ -689,6 +689,7 @@ pub(crate) fn run_focus(terminal: u32) -> std::io::Result<Vec<u32>> {
             .ask(&ControlRequest::Focus {
                 id: super::request_id("focus"),
                 terminal,
+                zoom: None,
             })
             .await?
             .0

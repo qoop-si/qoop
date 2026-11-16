@@ -260,6 +260,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
         ControlRequest::Focus {
             id: "x23".into(),
             terminal,
+            zoom: None,
         },
         // Says which rows are news for the person: read by the index, never typed.
         ControlRequest::News {

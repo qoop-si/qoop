@@ -106,6 +106,7 @@ fn actions() -> Vec<Action> {
                 Method::Control(ControlRequest::Focus {
                     id: "a".into(),
                     terminal: 1,
+                    zoom: None,
                 })
             },
         },
@@ -884,6 +885,7 @@ fn every_control_method_is_reachable_from_some_action() {
         ControlRequest::Focus {
             id: String::new(),
             terminal: 0,
+            zoom: None,
         },
         ControlRequest::News {
             id: String::new(),

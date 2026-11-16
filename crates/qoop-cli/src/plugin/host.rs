@@ -43,8 +43,8 @@ const HANDLER_LIMIT: Duration = Duration::from_secs(600);
 const RECONNECT: Duration = Duration::from_secs(10);
 /// How long a process table read is reused.
 const PROCS_FRESH: Duration = Duration::from_millis(500);
-/// The area layouts are drawn in. qoop keeps no pane sizes, so rectangles are the split
-/// tree's proportions of this, not cells on anyone's screen.
+/// The area layouts are drawn in until an interface says the size of its panes' area
+/// (`qoop.focus`): rectangles are then the split tree's proportions of that.
 pub(super) const AREA: Rect = Rect {
     x: 0,
     y: 0,
@@ -57,6 +57,9 @@ const BACKLOG: usize = 1024;
 /// is let settle before one listing reads them all.
 const FRESH: Duration = Duration::from_millis(150);
 const COALESCE: Duration = Duration::from_millis(150);
+/// How long the history sizes read for pane reads are reused: a sidebar lists every few
+/// seconds, and each read asks the daemon once per terminal.
+const HISTORY_FRESH: Duration = Duration::from_secs(2);
 /// How many `[[events]]` commands run at once, across every plugin, as in herdr; the rest wait
 /// their turn rather than being dropped.
 const HANDLERS_AT_ONCE: usize = 32;
@@ -94,7 +97,6 @@ const SERVED: &[&str] = &[
     "pane.read",
     "pane.layout",
     "pane.process_info",
-    "pane.resize",
     "pane.report_metadata",
     "tab.list",
     "tab.get",
@@ -119,6 +121,9 @@ const WRITES: &[&str] = &[
     "pane.send_input",
     "pane.rename",
     "pane.zoom",
+    "pane.resize",
+    "pane.swap",
+    "pane.focus_direction",
     "tab.create",
     "tab.rename",
     "tab.focus",
@@ -181,6 +186,46 @@ pub(super) struct Listing {
     pub(super) tabs: Vec<Tab>,
 }
 
+impl Listing {
+    /// The listing with `hidden` terminals left out, as if not yet made: their rows go, their
+    /// own tabs go, and they leave the trees of the tabs they sit in.
+    fn without(&self, hidden: &BTreeSet<u32>) -> Listing {
+        if hidden.is_empty() {
+            return self.clone();
+        }
+        let shown = |t: u32| !hidden.contains(&t);
+        Listing {
+            spaces: self.spaces.clone(),
+            rows: self
+                .rows
+                .iter()
+                .filter(|r| shown(r.terminal))
+                .cloned()
+                .collect(),
+            tabs: self
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let leaves: Vec<u32> =
+                        tab.leaves.iter().copied().filter(|t| shown(*t)).collect();
+                    let first = *leaves.first()?;
+                    let tree = tab
+                        .tree
+                        .as_ref()
+                        .and_then(|t| t.retain(&shown))
+                        .filter(|t| matches!(t, Pane::Split { .. }));
+                    Some(Tab {
+                        workspace: tab.workspace,
+                        key: if shown(tab.key) { tab.key } else { first },
+                        leaves,
+                        tree,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The herdr view of qoop the host keeps between listings.
 #[derive(Default)]
 pub(crate) struct State {
@@ -213,9 +258,39 @@ pub(crate) struct State {
     /// that goes (its program ended, or a person closed it) is `pane_exited`, as a pane whose
     /// process ended is in herdr.
     pub(super) closing: BTreeSet<u32>,
-    /// Terminals the host renamed for `pane.rename` or `agent.rename`: in herdr those name the
-    /// pane, never the tab, so the tab label that follows here is not told as `tab_renamed`.
-    pub(super) renamed: BTreeSet<u32>,
+    /// Terminals the host is still placing (made, not yet in the split it asked for): left
+    /// out of what the events compare, so a split is told once, as herdr tells it, and not as
+    /// a tab that came and went. `hidden_told` is the set the last comparison used.
+    /// The cells the interface lays a tab out in, as it last said with `qoop.focus`.
+    pub(super) area: Option<Rect>,
+    /// Each pane's agent status as last listed, and herdr's `state_change_seq`: one count of
+    /// status changes across every pane (`seq`), each pane holding the count of its last one.
+    statuses: BTreeMap<u32, &'static str>,
+    seq: u64,
+    seqs: BTreeMap<u32, u64>,
+    pub(super) hidden: BTreeSet<u32>,
+    /// `now` as a plugin reads it ([`State::view`]).
+    listed: Listing,
+    hidden_told: BTreeSet<u32>,
+    /// Terminals of a tab the host is closing with `tab.close`: herdr tells that as
+    /// `tab_closed` alone, with no pane event, rename or layout on the way.
+    pub(super) closing_tab: BTreeSet<u32>,
+    /// Pane labels and agent names plugins gave (`pane.rename`, `agent.rename`, a plugin pane's
+    /// title), kept in `.state/.labels.json` across restarts; `names_changed` until written.
+    pub(super) names: translate::Names,
+    pub(super) names_changed: bool,
+    /// Whether a listing may prune `names`: not the first after the host starts or the daemon
+    /// comes back, which may not hold every terminal yet.
+    pub(super) prune_ready: bool,
+    /// Rows kept behind each pane's screen (read with the panes, at most every
+    /// [`HISTORY_FRESH`]) and the pane the interface shows scrolled back (`qoop.focus`).
+    pub(super) scrolls: translate::Scrolls,
+    history_at: Option<Instant>,
+    /// The plugin that opened each plugin pane in this run of the host. Only a first filter:
+    /// the pane's own program is asked too (`writes::own_pane`), and a restart forgets it.
+    pub(super) owners: BTreeMap<u32, String>,
+    /// Grants already used, by plugin pane: the person key (its time) each was given for.
+    pub(super) grants_used: BTreeMap<u32, i64>,
     /// Whether a listing has been applied: the first one is the starting point, not news.
     primed: bool,
 }
@@ -290,6 +365,16 @@ impl State {
     ) -> Vec<Event> {
         let tabs = keyed(translate::tabs(&rows, splits), &self.now.tabs);
         for row in &rows {
+            // herdr counts an agent's status changes from when it is found: 1 at the first.
+            if row.agent {
+                let status = translate::agent_status(row);
+                if self.statuses.insert(row.terminal, status) != Some(status) {
+                    self.seq += 1;
+                    self.seqs.insert(row.terminal, self.seq);
+                }
+            } else {
+                self.statuses.remove(&row.terminal);
+            }
             let now = compared(row);
             if self.seen.get(&row.terminal) != Some(&now) {
                 *self.revisions.entry(row.terminal).or_insert(0) += 1;
@@ -297,7 +382,25 @@ impl State {
             }
         }
         let old = std::mem::replace(&mut self.now, Listing { spaces, rows, tabs });
+        // Names of terminals gone go with them; a sleeping tab's are kept for its wake.
+        let listed: BTreeSet<u32> = self.now.rows.iter().map(|r| r.terminal).collect();
+        let asleep = self
+            .now
+            .spaces
+            .iter()
+            .flat_map(|s| &s.sleeping)
+            .map(|t| t.terminal);
+        let kept: BTreeSet<u32> = listed.iter().copied().chain(asleep).collect();
+        if std::mem::replace(&mut self.prune_ready, true) {
+            let before = self.names.clone();
+            self.names.panes.retain(|t, _| kept.contains(t));
+            self.names.agents.retain(|t, _| kept.contains(t));
+            self.names_changed |= before != self.names;
+        }
+        self.owners.retain(|t, _| listed.contains(t));
+        self.grants_used.retain(|t, _| listed.contains(t));
         if !std::mem::replace(&mut self.primed, true) {
+            self.listed = self.now.clone();
             self.told_focus = self.focus_pair();
             return Vec::new();
         }
@@ -325,14 +428,37 @@ impl State {
                 self.restore.push(previous);
             }
         }
-        let mut events = self.diff(&old);
+        // Compared as told: terminals still being placed, and popups, left out, on each side as
+        // it was then.
+        let unlisted = self.unlisted();
+        let mut events = if unlisted.is_empty() && self.hidden_told.is_empty() {
+            self.told(&old)
+        } else {
+            let told_old = old.without(&self.hidden_told);
+            let told_new = self.now.without(&unlisted);
+            self.hidden_told = unlisted;
+            let full = std::mem::replace(&mut self.now, told_new);
+            let events = self.told(&told_old);
+            self.now = full;
+            events
+        };
         self.closing.retain(|t| alive.contains(t));
-        self.renamed.clear();
-        for event in &mut events {
-            event.scope = scope_of(event, &self.now, &old, self.focused);
-        }
+        self.closing_tab.retain(|t| alive.contains(t));
+        // One listed before and gone now went before it was placed; one not listed yet stays.
+        self.hidden
+            .retain(|t| alive.contains(t) || !old.rows.iter().any(|r| r.terminal == *t));
+        self.listed = self.now.without(&self.unlisted());
         events.extend(self.focus_events());
         events.extend(self.expire_tokens(Instant::now()));
+        events
+    }
+
+    /// What changed from `old` to `now`, each event with its scope.
+    fn told(&self, old: &Listing) -> Vec<Event> {
+        let mut events = self.diff(old);
+        for event in &mut events {
+            event.scope = scope_of(event, &self.now, old, self.focused);
+        }
         events
     }
 
@@ -384,9 +510,24 @@ impl State {
 
     /// The space and pane in focus, when the focused terminal is listed.)
     fn focus_pair(&self) -> Option<(i64, u32)> {
-        let terminal = self.focused?;
+        let terminal = self.shown_focus()?;
         let row = self.now.rows.iter().find(|r| r.terminal == terminal)?;
         Some((row.workspace, terminal))
+    }
+
+    /// An interface's focus told again while it stands: taken when no interface has said what
+    /// it shows, with no focus events and so no hooks; ignored otherwise. Whether `terminal`
+    /// is listed.
+    pub(super) fn keep_focus(&mut self, terminal: u32) -> bool {
+        if !self.now.rows.iter().any(|r| r.terminal == terminal) {
+            return false;
+        }
+        if !self.reported {
+            self.focused = Some(terminal);
+            self.reported = true;
+            self.told_focus = self.focus_pair();
+        }
+        true
     }
 
     /// `workspace_focused`, `tab_focused` and `pane_focused`, in that order, when the focus
@@ -427,8 +568,38 @@ impl State {
         out
     }
 
+    /// What a plugin reads: popups and terminals still being placed left out, as herdr's
+    /// popups are no panes, and the focus behind a popup taken as the focus.
     pub(crate) fn view(&self) -> View<'_> {
-        self.view_of(&self.now)
+        self.view_of(&self.listed)
+    }
+
+    /// Terminals a plugin does not see: those being placed, and popups.
+    pub(super) fn unlisted(&self) -> BTreeSet<u32> {
+        let popups = self.popups.iter().filter(|(_, p)| p.popup).map(|(t, _)| *t);
+        self.hidden.iter().copied().chain(popups).collect()
+    }
+
+    /// A space's focused pane: the one shown when it is in that space, else its first tab's first.
+    pub(super) fn space_pane(&self, space: i64) -> Option<u32> {
+        let here = |t: &u32| {
+            self.now
+                .rows
+                .iter()
+                .any(|r| r.terminal == *t && r.workspace == space)
+        };
+        self.shown_focus().filter(here).or_else(|| {
+            let tab = self.listed.tabs.iter().find(|t| t.workspace == space)?;
+            Some(tab.leaves[0])
+        })
+    }
+
+    /// The focus as a plugin sees it: the pane behind a popup when a popup has it.
+    pub(super) fn shown_focus(&self) -> Option<u32> {
+        match self.focused {
+            Some(t) if self.popups.get(&t).is_some_and(|p| p.popup) => self.popups[&t].previous,
+            other => other,
+        }
     }
 
     fn view_of<'a>(&'a self, listing: &'a Listing) -> View<'a> {
@@ -436,9 +607,14 @@ impl State {
             spaces: &listing.spaces,
             rows: &listing.rows,
             tabs: &listing.tabs,
-            focused: self.focused,
+            focused: self.shown_focus(),
             revisions: &self.revisions,
             tokens: self.token_values(),
+            area: self.area.unwrap_or(AREA),
+            zoomed: self.zoomed.clone(),
+            seqs: self.seqs.clone(),
+            names: self.names.clone(),
+            scrolls: self.scrolls.clone(),
         }
     }
 
@@ -465,13 +641,13 @@ impl State {
         Event::new(
             "layout.updated",
             None,
-            json!({"layout": translate::layout(tab, AREA, self.focused, zoomed)}),
+            json!({"layout": translate::layout(tab, self.area.unwrap_or(AREA), self.focused, zoomed)}),
         )
     }
 
     fn diff(&self, old: &Listing) -> Vec<Event> {
         let new = &self.now;
-        let (view, before) = (self.view(), self.view_of(old));
+        let (view, before) = (self.view_of(&self.now), self.view_of(old));
         let find = |list: &[Value], key: &str, id: &str| {
             list.iter()
                 .find(|v| v[key] == id)
@@ -479,7 +655,7 @@ impl State {
                 .unwrap_or(Value::Null)
         };
         let (workspaces, tabs, panes) = (view.workspace_infos(), view.tab_infos(), view.panes());
-        let (old_workspaces, old_tabs) = (before.workspace_infos(), before.tab_infos());
+        let old_workspaces = before.workspace_infos();
         let ws = |id: i64| Id::Workspace(id).to_string();
         let pane_id = |row: &AgentRow| {
             Id::Pane {
@@ -548,7 +724,6 @@ impl State {
                     layouts.push(self.layout_event(tab));
                 }
                 Some(was) => {
-                    let was_info = find(&old_tabs, "tab_id", &was.id());
                     if was.workspace != tab.workspace {
                         let siblings: Vec<Value> = tabs
                             .iter()
@@ -563,8 +738,12 @@ impl State {
                                    "insert_index": index, "tabs": siblings}),
                         ));
                     }
-                    let renamed_by_pane = self.renamed.contains(&tab.leaves[0]);
-                    if was_info["label"] != info["label"] && !renamed_by_pane {
+                    // A tab on its way out with `tab.close` says nothing until it is gone.
+                    let closing = was.leaves.iter().any(|t| self.closing_tab.contains(t));
+                    // Renamed when its own name changed (`tab.rename`), never because a number moved.
+                    let renamed =
+                        translate::tab_name(was, &old.rows) != translate::tab_name(tab, &new.rows);
+                    if renamed && !closing {
                         out.push(Event::new(
                             "tab.renamed",
                             None,
@@ -574,7 +753,7 @@ impl State {
                     }
                     // A pane added, or one gone from a tab that keeps others, as herdr tells a
                     // layout.
-                    if was.leaves != tab.leaves {
+                    if was.leaves != tab.leaves && !closing {
                         layouts.push(self.layout_event(tab));
                     }
                 }
@@ -622,7 +801,12 @@ impl State {
                     let (was_data, data) = (status_data(&id, was), status_data(&id, row));
                     let presentation =
                         |d: &Value| json!([d["agent_status"], d["display_agent"], d["title"]]);
-                    if presentation(&was_data) != presentation(&data) {
+                    // An agent just found is told by `pane_agent_detected` alone while its state
+                    // is still unknown: herdr tells its first status once it has one.
+                    let unsettled = before.is_none()
+                        && after.is_some()
+                        && translate::agent_status(row) == "unknown";
+                    if presentation(&was_data) != presentation(&data) && !unsettled {
                         out.push(Event::new(
                             "pane.agent_status_changed",
                             Some(id.clone()),
@@ -646,7 +830,10 @@ impl State {
         }
 
         for was in &old.rows {
-            if !new.rows.iter().any(|r| r.terminal == was.terminal) {
+            // The panes of a tab closed with `tab.close` go with it, told as `tab_closed` alone.
+            if !new.rows.iter().any(|r| r.terminal == was.terminal)
+                && !self.closing_tab.contains(&was.terminal)
+            {
                 let data = json!({"pane_id": pane_id(was), "workspace_id": ws(was.workspace)});
                 // Closed through the host, or gone on its own: one of the two, never both.
                 let name = if self.closing.contains(&was.terminal) {
@@ -732,7 +919,7 @@ pub(crate) struct Host {
     /// Plugin pane specs waiting for their `pane-exec`, by nonce.
     pub(super) specs: super::writes::Specs,
     /// Held across a listing's round trips and its update, so listings apply in order.
-    refreshing: tokio::sync::Mutex<()>,
+    pub(super) refreshing: tokio::sync::Mutex<()>,
     pub(super) events: broadcast::Sender<Arc<Event>>,
     procs: Mutex<Option<(Instant, Arc<Vec<ProcRow>>)>>,
     /// When the last listing was applied, so a burst of requests lists the daemon once.
@@ -746,14 +933,17 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    fn new(home: Home) -> Arc<Self> {
+    pub(super) fn new(home: Home) -> Arc<Self> {
         Self::with_backlog(home, BACKLOG)
     }
 
     fn with_backlog(home: Home, backlog: usize) -> Arc<Self> {
         Arc::new(Self {
+            state: Mutex::new(State {
+                names: load_names(&home),
+                ..State::default()
+            }),
             home,
-            state: Mutex::new(State::default()),
             refreshing: tokio::sync::Mutex::new(()),
             events: broadcast::channel(backlog).0,
             procs: Mutex::new(None),
@@ -787,6 +977,9 @@ impl Host {
         let (events, restore) = {
             let mut state = self.state.lock().unwrap();
             let events = state.update(workspaces, agents, &splits);
+            if std::mem::take(&mut state.names_changed) {
+                save_names(&self.home, &state.names);
+            }
             (events, std::mem::take(&mut state.restore))
         };
         for event in events {
@@ -798,6 +991,7 @@ impl Host {
             let _ = super::writes::control(ControlRequest::Focus {
                 id: crate::request_id("plugin-host"),
                 terminal,
+                zoom: Some(false),
             })
             .await;
         }
@@ -869,13 +1063,18 @@ impl Host {
     /// Read a copy of the state with each row's directory made live; the lock is not held
     /// while the process table is read.
     pub(super) fn with_view<R>(&self, read: impl FnOnce(&View) -> R) -> R {
-        let (mut listing, revisions, focused, tokens) = {
+        let (mut listing, revisions, focused, tokens, area, zoomed, seqs, names, scrolls) = {
             let state = self.state.lock().unwrap();
             (
-                state.now.clone(),
+                state.listed.clone(),
                 state.revisions.clone(),
-                state.focused,
+                state.shown_focus(),
                 state.token_values(),
+                state.area.unwrap_or(AREA),
+                state.zoomed.clone(),
+                state.seqs.clone(),
+                state.names.clone(),
+                state.scrolls.clone(),
             )
         };
         for row in &mut listing.rows {
@@ -888,7 +1087,46 @@ impl Host {
             focused,
             revisions: &revisions,
             tokens,
+            area,
+            zoomed,
+            seqs,
+            names,
+            scrolls,
         })
+    }
+
+    /// How many rows each listed terminal keeps behind its screen, asked of the daemon at
+    /// most every [`HISTORY_FRESH`]: what a pane read's `scroll` says it can go back.
+    async fn read_histories(&self) {
+        let terminals: Vec<u32> = {
+            let state = self.state.lock().unwrap();
+            if state
+                .history_at
+                .is_some_and(|at| at.elapsed() < HISTORY_FRESH)
+            {
+                return;
+            }
+            state.now.rows.iter().map(|r| r.terminal).collect()
+        };
+        let Ok(mut link) = Link::open_observer("qoop-plugin-host").await else {
+            return;
+        };
+        let mut history = BTreeMap::new();
+        for terminal in terminals {
+            // From as far back as there is, no rows: the answer says where that is.
+            let ask = ControlRequest::Scrollback {
+                id: crate::request_id("plugin-host"),
+                terminal,
+                up: usize::MAX,
+                rows: 0,
+            };
+            if let Ok((ControlResponse::Scrollback { from, total, .. }, _)) = link.ask(&ask).await {
+                history.insert(terminal, total.saturating_sub(from));
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.scrolls.history = history;
+        state.history_at = Some(Instant::now());
     }
 
     /// One request, answered in herdr's envelope.
@@ -968,8 +1206,15 @@ impl Host {
         }
         match method {
             "ping" => {
+                // What this host does of what herdr's server says it can: it answers health
+                // checks and runs detached; no handoff, ssh agent or surface registration.
                 return Ok(json!({"type": "pong", "version": translate::VERSION,
-                                 "protocol": translate::PROTOCOL}));
+                                 "protocol": translate::PROTOCOL, "capabilities": {
+                                     "detached_server_daemon": true,
+                                     "endpoint_protocol_generation": 1,
+                                     "health_check": true, "live_handoff": false,
+                                     "ssh_agent_registration": false,
+                                     "surface_interest": false}}));
             }
             "server.reload_config" => {
                 return Ok(
@@ -990,6 +1235,12 @@ impl Host {
             _ => {}
         }
         self.refresh().await?;
+        if matches!(
+            method,
+            "pane.list" | "pane.get" | "pane.current" | "session.snapshot"
+        ) {
+            self.read_histories().await;
+        }
         match method {
             "pane.read" => self.read(params).await,
             "pane.process_info" => self.process_info(params),
@@ -1011,39 +1262,68 @@ impl Host {
             .and_then(Value::as_u64)
             .map(|n| (n as usize).min(1000));
         let unavailable = |e: std::io::Error| ("server_not_running", e.to_string());
-        let rows: Vec<String> = if matches!(source.as_str(), "visible" | "detection") {
-            let snapshot = crate::fetch_snapshot(terminal, "qoop-plugin-host")
-                .await
-                .map_err(unavailable)?;
+        let snapshot = crate::fetch_snapshot(terminal, "qoop-plugin-host")
+            .await
+            .map_err(unavailable)?;
+        let (rows, truncated) = if matches!(source.as_str(), "visible" | "detection") {
             let mut rows = snapshot.lines;
             while rows.last().is_some_and(|r| r.trim().is_empty()) {
                 rows.pop();
             }
             let keep = lines.unwrap_or(rows.len()).min(rows.len());
-            rows.split_off(rows.len() - keep)
+            let truncated = keep < rows.len();
+            (rows.split_off(rows.len() - keep), truncated)
         } else {
+            // The last `n` rows written, the screen included, as herdr reads them: what went
+            // past is read from the history only for the rows the screen does not hold.
             let n = lines.unwrap_or(80);
-            let mut link = Link::open_observer("qoop-plugin-host")
-                .await
-                .map_err(unavailable)?;
-            let ask = ControlRequest::Scrollback {
-                id: crate::request_id("plugin-host"),
-                terminal,
-                up: n,
-                rows: n,
+            let alt = snapshot.modes.alt_screen;
+            let held = if alt {
+                0
+            } else {
+                screen_end(&snapshot.lines, snapshot.cursor.0).map_or(0, |end| end + 1)
             };
-            match link.ask(&ask).await.map_err(unavailable)?.0 {
-                ControlResponse::Scrollback { lines, .. } => lines,
-                ControlResponse::Failed { reason, .. } => return Err(("read_failed", reason)),
-                _ => return Err(("read_failed", "unexpected answer to a history read".into())),
-            }
+            // Never further back than there is: asked for more, the read starts at the oldest
+            // row and comes back short of the newest.
+            let up = n.saturating_sub(held).min(snapshot.behind as usize);
+            let history = if up == 0 || alt {
+                Vec::new()
+            } else {
+                let mut link = Link::open_observer("qoop-plugin-host")
+                    .await
+                    .map_err(unavailable)?;
+                let ask = ControlRequest::Scrollback {
+                    id: crate::request_id("plugin-host"),
+                    terminal,
+                    up,
+                    rows: up,
+                };
+                match link.ask(&ask).await.map_err(unavailable)?.0 {
+                    ControlResponse::Scrollback { lines, .. } => lines,
+                    ControlResponse::Failed { reason, .. } => return Err(("read_failed", reason)),
+                    _ => return Err(("read_failed", "unexpected answer to a history read".into())),
+                }
+            };
+            let total = snapshot.behind as usize + snapshot.rows;
+            let rows = recent_rows(history, &snapshot.lines, snapshot.cursor.0, alt, n);
+            let rows = if source == "recent_unwrapped" {
+                unwrapped(rows, snapshot.cols)
+            } else {
+                rows
+            };
+            (rows, total > n)
         };
         Ok(json!({"type": "pane_read", "read": {
             "pane_id": pane["pane_id"], "workspace_id": pane["workspace_id"],
             "tab_id": pane["tab_id"], "source": source,
             "format": param(params, "format").unwrap_or("text"),
-            "text": if rows.is_empty() { String::new() } else { rows.join("\n") + "\n" },
-            "revision": pane["revision"], "truncated": false,
+            // herdr ends every read with a newline but an unwrapped one, read as one span.
+            "text": match (rows.is_empty(), source.as_str()) {
+                (true, _) => String::new(),
+                (false, "recent_unwrapped") => rows.join("\n"),
+                (false, _) => rows.join("\n") + "\n",
+            },
+            "revision": pane["revision"], "truncated": truncated,
         }}))
     }
 
@@ -1090,7 +1370,7 @@ fn answer_from(view: &View, method: &str, params: &Value) -> Result<Value, Refus
     };
     match method {
         "session.snapshot" => {
-            Ok(json!({"type": "session_snapshot", "snapshot": view.snapshot(AREA)}))
+            Ok(json!({"type": "session_snapshot", "snapshot": view.snapshot(view.area)}))
         }
         "pane.list" => {
             Ok(json!({"type": "pane_list", "panes": only(view.panes(), "workspace_id")}))
@@ -1113,7 +1393,7 @@ fn answer_from(view: &View, method: &str, params: &Value) -> Result<Value, Refus
                 .ok_or_else(|| not_found("pane", &terminal.to_string()))?;
             Ok(json!({"type": "pane_current", "pane": pane}))
         }
-        "pane.layout" | "pane.resize" => {
+        "pane.layout" => {
             let asked = param(params, "pane_id");
             let terminal = asked.and_then(terminal_of).or(view.focused);
             let tab = view
@@ -1121,16 +1401,8 @@ fn answer_from(view: &View, method: &str, params: &Value) -> Result<Value, Refus
                 .iter()
                 .find(|t| terminal.is_some_and(|x| t.leaves.contains(&x)))
                 .ok_or_else(|| not_found("pane", asked.unwrap_or("current")))?;
-            let layout = translate::layout(tab, AREA, view.focused, false);
-            if method == "pane.layout" {
-                return Ok(json!({"type": "pane_layout", "layout": layout}));
-            }
-            // qoop keeps no pane sizes to change: herdr's answer for a resize that moved nothing.
-            Ok(json!({"type": "pane_resize", "resize": {
-                "changed": false,
-                "pane_id": Id::Pane { workspace: tab.workspace, terminal: terminal.unwrap_or(tab.leaves[0]) }.to_string(),
-                "focused_pane_id": layout["focused_pane_id"].clone(), "layout": layout,
-            }}))
+            let layout = translate::layout(tab, view.area, view.focused, view.zoomed_tab(tab));
+            Ok(json!({"type": "pane_layout", "layout": layout}))
         }
         "tab.list" => {
             Ok(json!({"type": "tab_list", "tabs": only(view.tab_infos(), "workspace_id")}))
@@ -1175,29 +1447,70 @@ pub(super) fn plugins(home: &Home, only: Option<&str>) -> Vec<Value> {
                 .dir_of(&id)
                 .canonicalize()
                 .unwrap_or_else(|_| home.dir_of(&id));
-            let (root, name, version, source) = match &checked {
-                Ok(a) => (
-                    a.root.clone(),
-                    a.manifest.name.clone(),
-                    a.manifest.version.clone(),
-                    source_info(a, &checkout),
-                ),
-                Err(_) => (checkout.clone(), None, None, json!({"kind": "local"})),
+            let (root, source) = match &checked {
+                Ok(a) => (a.root.clone(), source_info(a, &checkout)),
+                Err(_) => (checkout.clone(), json!({"kind": "local"})),
             };
-            json!({
-                "plugin_id": id, "name": name.unwrap_or_else(|| id.clone()),
-                "version": version.unwrap_or_default(),
+            let mut info = json!({
+                "plugin_id": id, "name": id, "version": "",
                 "manifest_path": root.join(manifest::FILE), "plugin_root": root,
                 "enabled": checked.is_ok(), "source": source,
-            })
+            });
+            if let Ok(a) = &checked {
+                described(&mut info, &a.manifest);
+            }
+            info
         })
         .collect()
+}
+
+/// What herdr's `plugin.list` says of a plugin's manifest, every entry as written (herdr lists
+/// them all, whatever platform they are for); empty lists and absent values left out.
+fn described(info: &mut Value, m: &manifest::Manifest) {
+    let steps = |steps: &[manifest::Step]| -> Vec<Value> {
+        steps
+            .iter()
+            .map(|s| translate::compact(json!({"platforms": s.platforms, "command": s.command})))
+            .collect()
+    };
+    let fields = json!({
+        "name": m.name, "version": m.version.clone().unwrap_or_default(),
+        "min_herdr_version": m.min_herdr_version.clone().unwrap_or_default(),
+        "description": m.description, "platforms": m.platforms,
+        "build": steps(&m.build), "startup": steps(&m.startup),
+        "actions": m.actions.iter().map(|a| translate::compact(json!({
+            "id": a.id, "title": a.title.clone().unwrap_or_else(|| a.id.clone()),
+            "description": a.description, "contexts": a.contexts,
+            "platforms": a.platforms, "command": a.command,
+        }))).collect::<Vec<_>>(),
+        "events": m.events.iter().map(|h| translate::compact(json!({
+            "on": h.on, "platforms": h.platforms, "command": h.command,
+        }))).collect::<Vec<_>>(),
+        "panes": m.panes.iter().map(|p| translate::compact(json!({
+            "id": p.id, "title": p.title.clone().unwrap_or_else(|| p.id.clone()),
+            "description": p.description, "platforms": p.platforms,
+            "placement": p.placement.clone().unwrap_or_else(|| "overlay".into()),
+            "width": p.width, "height": p.height, "command": p.command,
+        }))).collect::<Vec<_>>(),
+        "link_handlers": m.link_handlers.iter().map(|l| translate::compact(json!({
+            "id": l.id, "title": l.title, "pattern": l.pattern, "action": l.action,
+            "platforms": l.platforms,
+        }))).collect::<Vec<_>>(),
+    });
+    if let (Value::Object(info), Value::Object(fields)) = (info, fields) {
+        for (key, value) in fields {
+            let empty = value.is_null() || value.as_array().is_some_and(Vec::is_empty);
+            if !empty {
+                info.insert(key, value);
+            }
+        }
+    }
 }
 
 /// herdr's `PluginSourceInfo` from what was agreed to.
 fn source_info(plugin: &Admitted, checkout: &Path) -> Value {
     let Some(sha) = &plugin.consent.sha else {
-        return json!({"kind": "local", "managed_path": null});
+        return json!({"kind": "local"});
     };
     let mut parts = plugin.consent.source.splitn(3, '/');
     let (owner, repo, subdir) = (parts.next(), parts.next(), parts.next());
@@ -1213,9 +1526,16 @@ fn actions(home: &Home, only: Option<&str>) -> Vec<Value> {
         .filter_map(|id| install::admitted(home, &id).ok().map(|a| (id, a)))
         .flat_map(|(id, a)| {
             a.manifest.here().actions.into_iter().map(move |action| {
-                json!({"plugin_id": id, "action_id": action.id,
+                let mut info = json!({"plugin_id": id, "action_id": action.id,
                            "title": action.title.unwrap_or_else(|| action.id.clone()),
-                           "command": action.command, "contexts": action.contexts})
+                           "command": action.command, "contexts": action.contexts,
+                           "description": action.description, "platforms": action.platforms});
+                // As herdr writes them: no empty contexts, nothing absent.
+                if let Value::Object(fields) = &mut info {
+                    fields
+                        .retain(|_, v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+                }
+                info
             })
         })
         .collect()
@@ -1364,9 +1684,16 @@ pub(super) fn scope(listing: &Listing, workspace: i64, terminal: Option<u32>) ->
     let space = listing.spaces.iter().find(|s| s.id == workspace);
     let row = terminal.and_then(|t| listing.rows.iter().find(|r| r.terminal == t));
     let tab = terminal.and_then(|t| listing.tabs.iter().find(|tab| tab.leaves.contains(&t)));
-    let tab_label = tab
-        .and_then(|tab| listing.rows.iter().find(|r| r.terminal == tab.leaves[0]))
-        .and_then(|r| r.name.clone().or_else(|| r.program.clone()));
+    // Its name, else its number in its space, as herdr labels a tab.
+    let tab_label = tab.map(|tab| {
+        let number = listing
+            .tabs
+            .iter()
+            .filter(|t| t.workspace == tab.workspace)
+            .position(|t| t.key == tab.key)
+            .map_or(1, |i| i + 1);
+        translate::tab_label(tab, &listing.rows, number)
+    });
     let workspace_cwd = row
         .and_then(|r| r.cwd.clone())
         .or_else(|| space.and_then(|s| s.dir.clone()));
@@ -1379,7 +1706,7 @@ pub(super) fn scope(listing: &Listing, workspace: i64, terminal: Option<u32>) ->
     });
     Scope::of(translate::compact(json!({
         "workspace_id": Id::Workspace(workspace).to_string(),
-        "workspace_label": space.map(|s| s.name.clone()),
+        "workspace_label": space.map(|s| translate::space_label(s, &listing.rows)),
         "workspace_cwd": workspace_cwd,
         "tab_id": tab.map(Tab::id),
         "tab_label": tab_label,
@@ -1477,6 +1804,36 @@ fn wait_bounded(mut child: std::process::Child, limit: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Where the pane labels and agent names plugins gave are kept.
+fn names_file(home: &Home) -> PathBuf {
+    home.state_of(".labels.json")
+}
+
+/// The names kept from before, none when there are none or they cannot be read.
+pub(super) fn load_names(home: &Home) -> translate::Names {
+    std::fs::read(names_file(home))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Keep `names`, written whole beside the old file and moved over it.
+pub(super) fn save_names(home: &Home, names: &translate::Names) {
+    let file = names_file(home);
+    let Some(dir) = file.parent() else {
+        return;
+    };
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| tempfile::NamedTempFile::new_in(dir))
+        .and_then(|mut tmp| {
+            serde_json::to_writer(&mut tmp, names).map_err(std::io::Error::other)?;
+            tmp.persist(&file).map(drop).map_err(|e| e.error)
+        });
+    if let Err(e) = written {
+        eprintln!("qoop plugin host: the pane names could not be kept: {e}");
     }
 }
 
@@ -1726,7 +2083,7 @@ async fn changed(host: &Host, link: &mut Link) -> std::io::Result<()> {
             return Ok(());
         };
         for event in &events {
-            if let EventMessage::Focus { terminal } = event {
+            if let EventMessage::Focus { terminal, .. } = event {
                 host.set_focus(*terminal, true);
             }
         }
@@ -1762,6 +2119,9 @@ async fn follow(host: &Host) {
                     break;
                 }
             }
+            // The daemon went: its next listing, which may come before it holds every tab
+            // again, prunes no names.
+            host.state.lock().unwrap().prune_ready = false;
         }
         if gone_since.get_or_insert_with(Instant::now).elapsed() > RECONNECT {
             return;
@@ -1779,10 +2139,100 @@ fn request_id(request: &Value) -> Option<Value> {
     }
 }
 
+/// The last screen row that counts as written: the last with text, or the cursor's row when it
+/// is lower (a prompt waiting at an empty line). `None` for a screen with neither.
+fn screen_end(screen: &[String], cursor_row: usize) -> Option<usize> {
+    let last = screen.iter().rposition(|r| !r.trim().is_empty());
+    match last {
+        Some(row) => Some(row.max(cursor_row).min(screen.len().saturating_sub(1))),
+        None if screen.is_empty() => None,
+        None => Some(cursor_row.min(screen.len() - 1)),
+    }
+}
+
+/// herdr's `recent` read: the last `n` rows written, history then the screen up to
+/// [`screen_end`]; on the alternate screen only its last `n` rows. Blank rows at the end go.
+fn recent_rows(
+    history: Vec<String>,
+    screen: &[String],
+    cursor_row: usize,
+    alt: bool,
+    n: usize,
+) -> Vec<String> {
+    let mut rows = if alt {
+        screen.to_vec()
+    } else {
+        let end = screen_end(screen, cursor_row).map_or(0, |end| end + 1);
+        let mut rows = history;
+        rows.extend_from_slice(&screen[..end]);
+        rows
+    };
+    let mut rows = rows.split_off(rows.len().saturating_sub(n));
+    while rows.last().is_some_and(|r| r.trim().is_empty()) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Rows a program wrote past the right edge joined back into the lines it wrote, as herdr's
+/// `recent_unwrapped` reads them: a row that fills every column runs on into the next.
+///
+/// ponytail: a full row is taken as wrapped, since neither the screen nor the history says
+/// which rows wrapped. A line exactly as wide as the pane joins the next, and a wrap at a
+/// space is missed; a wrap flag per row from the engine is the upgrade.
+fn unwrapped(rows: Vec<String>, cols: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut runs_on = false;
+    for row in rows {
+        // A char is a column here: the engine keeps a wide character's spacer.
+        let full = cols > 0 && row.chars().count() >= cols;
+        match out.last_mut() {
+            Some(last) if runs_on => last.push_str(&row),
+            _ => out.push(row),
+        }
+        runs_on = full;
+    }
+    out
+}
+
 /// A line answered under `id` as the request wrote it.
 fn under(mut line: Value, id: &Value) -> Value {
     line["id"] = id.clone();
     line
+}
+
+/// The key a request carries the asking process under: set here from that process alone.
+pub(super) const PEER: &str = "qoop_peer";
+
+/// The plugin identity of the process at the other end: the pane, plugin and plugin pane
+/// (entrypoint) its environment names, as herdr set them for it (a plugin pane's program, a
+/// hook, an action, or the shim one of them ran).
+fn peer_of(pid: u32) -> Value {
+    let [pane, plugin, entrypoint] = env_of_process(
+        pid,
+        [
+            "HERDR_PANE_ID",
+            "HERDR_PLUGIN_ID",
+            "HERDR_PLUGIN_ENTRYPOINT_ID",
+        ],
+    )
+    .unwrap_or_default();
+    translate::compact(json!({"pane": pane, "plugin": plugin, "entrypoint": entrypoint}))
+}
+
+/// `names` as the starting environment of process `pid` holds them, or `None` when it cannot
+/// be read or `pid` became another process while it was read (its start time moved).
+///
+/// What this proves is courtesy, not a boundary: any process of this user can start a program
+/// with these variables set (ADR-018).
+pub(super) fn env_of_process<const N: usize>(
+    pid: u32,
+    names: [&str; N],
+) -> Option<[Option<String>; N]> {
+    let pid = qoop_pty::Pid(pid as i32);
+    let started = qoop_pty::sys::start_time_of(pid)?;
+    let values = names.map(|name| qoop_pty::sys::env_of(pid, name));
+    (qoop_pty::sys::start_time_of(pid)? == started).then_some(values)
 }
 
 /// Serve one connection: requests answered in order, until it subscribes, after which it is
@@ -1794,6 +2244,9 @@ async fn serve(host: Arc<Host>, stream: tokio::net::UnixStream) {
     if qoop_runtime::daemon::peer_uid(&stream).ok() != Some(me) {
         return;
     }
+    // Who is asking, from the asking process's own environment: what a person's key in a
+    // plugin pane grants ([`PEER`]) is never taken from what a request says.
+    let peer = qoop_runtime::daemon::peer_pid(&stream).map(peer_of);
     let (rd, mut wr) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(rd).lines();
     let mut early = None;
@@ -1821,7 +2274,13 @@ async fn serve(host: Arc<Host>, stream: tokio::net::UnixStream) {
             }
         };
         let method = request["method"].as_str().unwrap_or_default();
-        let params = request.get("params").cloned().unwrap_or(json!({}));
+        let mut params = request.get("params").cloned().unwrap_or(json!({}));
+        if let Value::Object(fields) = &mut params {
+            fields.remove(PEER);
+            if let Some(peer) = &peer {
+                fields.insert(PEER.into(), peer.clone());
+            }
+        }
         if method == "events.subscribe" {
             stream_events(&host, &id, &params, wr).await;
             return;
@@ -2124,6 +2583,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_recent_read_is_the_last_rows_written_screen_included() {
+        let s = |v: &[&str]| v.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        // After `seq 1 60` on a short screen: 57 to 60 and the prompt are on screen.
+        let screen = s(&["57", "58", "59", "60", "us@us-2 repo %", "", ""]);
+        let history = s(&["55", "56"]);
+        assert_eq!(
+            recent_rows(Vec::new(), &screen, 4, false, 5),
+            s(&["57", "58", "59", "60", "us@us-2 repo %"]),
+            "herdr: 57 58 59 60 and the prompt"
+        );
+        assert_eq!(
+            recent_rows(history, &screen, 4, false, 7),
+            s(&["55", "56", "57", "58", "59", "60", "us@us-2 repo %"]),
+            "the history makes up what the screen does not hold"
+        );
+        assert_eq!(screen_end(&screen, 4), Some(4));
+        assert_eq!(
+            screen_end(&screen, 6),
+            Some(6),
+            "a cursor below the text counts"
+        );
+        // Output that still fits the screen is read, not an empty answer.
+        let short = s(&["fake agent working", "fake agent done", ""]);
+        assert_eq!(
+            recent_rows(Vec::new(), &short, 1, false, 80),
+            s(&["fake agent working", "fake agent done"])
+        );
+        // The alternate screen: its own last rows, no history.
+        let alt = s(&["top", "middle", "bottom", ""]);
+        assert_eq!(recent_rows(Vec::new(), &alt, 0, true, 2), s(&["bottom"]));
+    }
+
+    #[test]
+    fn an_unwrapped_read_joins_the_rows_a_line_ran_over() {
+        let s = |rows: &[&str]| rows.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        // Four columns: `abcdefghij` wrote three rows, `xy` one.
+        assert_eq!(
+            unwrapped(s(&["abcd", "efgh", "ij", "xy"]), 4),
+            s(&["abcdefghij", "xy"])
+        );
+        assert_eq!(unwrapped(s(&["ab", "cd"]), 4), s(&["ab", "cd"]));
+        assert_eq!(unwrapped(s(&["abcd"]), 4), s(&["abcd"]), "full at the end");
+    }
+
     fn names(events: &[Event]) -> Vec<&'static str> {
         events.iter().map(|e| e.dotted).collect()
     }
@@ -2185,6 +2689,241 @@ mod tests {
         state.closing.insert(3);
         let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
         assert_eq!(names(&events), ["pane.closed", "tab.closed"]);
+    }
+
+    #[test]
+    fn a_split_is_told_once_and_never_as_a_passing_tab() {
+        let mut state = primed();
+        // The new terminal is made hidden, listed first as a tab of its own, then split.
+        state.hidden.insert(2);
+        let rows = || vec![row(1, 1, json!({})), row(2, 1, json!({}))];
+        assert!(state.update(vec![space(1, "api")], rows(), &[]).is_empty());
+        assert!(
+            state
+                .update(vec![space(1, "api")], rows(), &[split(1, 2)])
+                .is_empty()
+        );
+        assert_eq!(state.now.rows.len(), 2, "reads still see it");
+        state.hidden.remove(&2);
+        let events = state.update(vec![space(1, "api")], rows(), &[split(1, 2)]);
+        assert_eq!(names(&events), ["pane.created", "layout.updated"]);
+        assert_eq!(events[0].data["pane"]["tab_id"], "w1:t1");
+    }
+
+    #[test]
+    fn a_tab_pane_is_told_its_spaces_focused_pane_and_folder() {
+        let mut state = State::default();
+        state.update(
+            vec![space(1, "a"), space(2, "b")],
+            vec![
+                row(1, 1, json!({"cwd": "/src/a"})),
+                row(2, 2, json!({"cwd": "/src/b"})),
+                row(3, 2, json!({"cwd": "/src/b/sub"})),
+            ],
+            &[],
+        );
+        state.focused = Some(3);
+        assert_eq!(state.space_pane(2), Some(3), "the one shown, in that space");
+        assert_eq!(state.space_pane(1), Some(1), "else the space's first");
+        let context = scope(&state.now, 2, state.space_pane(2)).context;
+        assert_eq!(context["focused_pane_cwd"], "/src/b/sub");
+        assert_eq!(context["workspace_cwd"], "/src/b/sub");
+        assert_eq!(context["focused_pane_id"], "w2:p3");
+    }
+
+    #[test]
+    fn plugin_list_carries_the_manifest_as_herdr_lists_it() {
+        let m = manifest::Manifest::parse(&format!(
+            "{}description = \"Notes\"\nplatforms = [\"macos\"]\n\
+             [[actions]]\nid = \"go\"\ntitle = \"Go\"\ndescription = \"Go now\"\ncommand = [\"g\"]\n\
+             [[events]]\non = \"pane.closed\"\ncommand = [\"e\"]\n\
+             [[panes]]\nid = \"v\"\ntitle = \"V\"\nplacement = \"popup\"\nwidth = \"60%\"\ncommand = [\"v\"]\n\
+             [[link_handlers]]\nid = \"md\"\ntitle = \"Markdown\"\npattern = \"[.]md$\"\naction = \"go\"\n",
+            manifest::head("t.n")
+        ))
+        .expect("parses");
+        let mut info = json!({"plugin_id": "t.n"});
+        described(&mut info, &m);
+        assert_eq!(info["description"], "Notes");
+        assert_eq!(info["min_herdr_version"], "0.9.0");
+        assert_eq!(info["platforms"], json!(["macos"]));
+        assert_eq!(info["actions"][0]["description"], "Go now");
+        assert_eq!(
+            info["events"][0],
+            json!({"on": "pane.closed", "command": ["e"]})
+        );
+        assert_eq!(info["panes"][0]["width"], "60%");
+        assert_eq!(
+            info["link_handlers"],
+            json!([{"id": "md", "title": "Markdown", "pattern": "[.]md$", "action": "go"}])
+        );
+        assert!(info.get("build").is_none(), "empty lists are left out");
+    }
+
+    #[test]
+    fn names_plugins_give_are_kept_across_a_restart_and_go_with_their_terminal() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = test_home(dir.path());
+        assert_eq!(load_names(&home), translate::Names::default(), "none yet");
+        let mut names = translate::Names::default();
+        names.panes.insert(3, "logs".into());
+        names.agents.insert(4, "reviewer".into());
+        save_names(&home, &names);
+        let host = Host::new(home.clone());
+        assert_eq!(
+            host.state.lock().unwrap().names,
+            names,
+            "a new host reads them back"
+        );
+        let mut state = State {
+            names: names.clone(),
+            ..State::default()
+        };
+        // The first listing after a start (or a daemon that came back) may not hold every tab
+        // yet: nothing is pruned on it.
+        state.update(vec![space(1, "a")], vec![row(3, 1, json!({}))], &[]);
+        assert_eq!(state.names, names, "nothing pruned on the first listing");
+        // A sleeping tab keeps its names for its wake.
+        let mut sleeping = space(1, "a");
+        sleeping.sleeping = vec![
+            serde_json::from_value(json!({"terminal": 4, "title": null, "agent": null,
+                                          "cwd": "/tmp"}))
+            .expect("a sleeping tab"),
+        ];
+        state.update(vec![sleeping], vec![row(3, 1, json!({}))], &[]);
+        assert_eq!(state.names, names, "terminal 4 sleeps");
+        assert!(!state.names_changed);
+        state.update(vec![space(1, "a")], vec![row(3, 1, json!({}))], &[]);
+        assert_eq!(state.names.panes.get(&3).map(String::as_str), Some("logs"));
+        assert!(
+            state.names.agents.is_empty(),
+            "terminal 4 is gone, and its name"
+        );
+        assert!(state.names_changed, "to be written");
+    }
+
+    #[test]
+    #[ignore = "a program whose environment the tests read"]
+    fn a_sleeper_to_read() {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_asker_is_known_by_its_own_environment() {
+        // This test binary, running only the sleeper below: a program of ours, whose start
+        // environment can be read (a system one's cannot).
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "--ignored",
+                "--exact",
+                "plugin::host::tests::a_sleeper_to_read",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .env("HERDR_PANE_ID", "w1:p9")
+            .env("HERDR_PLUGIN_ID", "t.rev")
+            .env("HERDR_PLUGIN_ENTRYPOINT_ID", "pane")
+            .spawn()
+            .expect("sleep");
+        std::thread::sleep(Duration::from_millis(300));
+        let peer = peer_of(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            peer,
+            json!({"pane": "w1:p9", "plugin": "t.rev", "entrypoint": "pane"})
+        );
+    }
+
+    #[test]
+    fn a_popup_is_no_pane_to_a_plugin() {
+        let mut state = primed();
+        state.popups.insert(
+            2,
+            Popup {
+                previous: Some(1),
+                plugin: "t.bar".into(),
+                popup: true,
+            },
+        );
+        state.focused = Some(2);
+        let rows = vec![row(1, 1, json!({})), row(2, 1, json!({}))];
+        let events = state.update(vec![space(1, "api")], rows, &[split(1, 2)]);
+        let made = |events: &[Event]| {
+            names(events)
+                .into_iter()
+                .filter(|n| {
+                    matches!(
+                        *n,
+                        "pane.created" | "pane.closed" | "pane.exited" | "layout.updated"
+                    )
+                })
+                .count()
+        };
+        assert_eq!(made(&events), 0, "{:?}", names(&events));
+        let panes = state.view().panes();
+        assert_eq!(panes.len(), 1, "only the pane behind it");
+        assert_eq!(panes[0]["pane_id"], "w1:p1");
+        assert_eq!(panes[0]["focused"], true, "the focus behind the popup");
+        // Closed: nothing is told either.
+        state.popups.clear();
+        let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
+        assert_eq!(made(&events), 0, "{:?}", names(&events));
+    }
+
+    #[test]
+    fn a_tab_closed_by_the_host_is_told_as_tab_closed_alone() {
+        let mut state = primed();
+        let rows = vec![
+            row(1, 1, json!({})),
+            row(2, 1, json!({"name": "logs"})),
+            row(3, 1, json!({})),
+        ];
+        state.update(vec![space(1, "api")], rows, &[split(2, 3)]);
+        state.closing.extend([2, 3]);
+        state.closing_tab.extend([2, 3]);
+        // The first pane goes first: no rename, no layout, no pane event on the way.
+        let events = state.update(
+            vec![space(1, "api")],
+            vec![row(1, 1, json!({})), row(3, 1, json!({}))],
+            &[],
+        );
+        assert!(events.is_empty(), "{:?}", names(&events));
+        let events = state.update(vec![space(1, "api")], vec![row(1, 1, json!({}))], &[]);
+        assert_eq!(names(&events), ["tab.closed"]);
+    }
+
+    #[test]
+    fn an_agent_found_is_told_before_any_status() {
+        let mut state = primed();
+        let codex = |s: &str| row(1, 1, json!({"agent": true, "program": "codex", "state": s}));
+        let events = state.update(vec![space(1, "api")], vec![codex("unknown")], &[]);
+        let pane_events: Vec<&str> = names(&events)
+            .into_iter()
+            .filter(|n| n.starts_with("pane."))
+            .collect();
+        assert_eq!(
+            pane_events,
+            ["pane.agent_detected"],
+            "no leading unknown status"
+        );
+        assert_eq!(
+            state.seqs[&1], 1,
+            "herdr's state_change_seq starts at the agent"
+        );
+        let events = state.update(vec![space(1, "api")], vec![codex("idle")], &[]);
+        assert_eq!(names(&events), ["pane.agent_status_changed"]);
+        assert_eq!(state.seqs[&1], 2);
+        assert_eq!(events[0].data["agent_status"], "idle");
+        // One count across every pane, as herdr keeps it: a second agent's first status is
+        // the next number, and the first pane keeps the number of its own last change.
+        let claude = row(
+            2,
+            1,
+            json!({"agent": true, "program": "claude", "state": "idle"}),
+        );
+        state.update(vec![space(1, "api")], vec![codex("idle"), claude], &[]);
+        assert_eq!((state.seqs[&1], state.seqs[&2]), (2, 3));
     }
 
     #[test]
@@ -2390,25 +3129,23 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_rename_is_not_a_tab_rename_and_a_split_is_a_layout() {
+    fn a_tab_is_renamed_by_its_name_only_and_a_split_is_a_layout() {
         let mut state = primed();
-        state.renamed.insert(1);
+        // A program that changes is not a rename: an unnamed tab is labelled by its number.
         let events = state.update(
             vec![space(1, "api")],
-            vec![row(1, 1, json!({"name": "logs"}))],
+            vec![row(1, 1, json!({"program": "vim"}))],
             &[],
         );
         assert!(names(&events).is_empty(), "{:?}", names(&events));
+        assert_eq!(state.view().tab_infos()[0]["label"], "1");
         let events = state.update(
             vec![space(1, "api")],
             vec![row(1, 1, json!({"name": "logs2"}))],
             &[],
         );
-        assert_eq!(
-            names(&events),
-            ["tab.renamed"],
-            "a rename that came from elsewhere"
-        );
+        assert_eq!(names(&events), ["tab.renamed"], "its own name changed");
+        assert_eq!(events[0].data["label"], "logs2");
         let events = state.update(
             vec![space(1, "api")],
             vec![row(1, 1, json!({"name": "logs2"})), row(7, 1, json!({}))],
@@ -2634,10 +3371,14 @@ mod tests {
             "invalid request: unknown variant `pane.report_agent`, expected one of `ping`"
         ));
         let ping = host.answer("8", "ping", &json!({})).await;
+        assert_eq!(ping["result"]["type"], "pong");
+        assert_eq!(ping["result"]["version"], "0.9.5");
+        assert_eq!(ping["result"]["protocol"], 22);
         assert_eq!(
-            ping["result"],
-            json!({"type": "pong", "version": "0.9.5", "protocol": 22})
+            ping["result"]["capabilities"]["health_check"], true,
+            "herdr's capabilities, as this host has them"
         );
+        assert_eq!(ping["result"]["capabilities"]["live_handoff"], false);
     }
 
     #[test]
