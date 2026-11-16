@@ -387,6 +387,12 @@ fn the_corner_note_is_for_a_second_agent_only(cx: &mut TestAppContext) {
     answer(&desk, &mut vcx, agents(&[1, 3]));
     assert_eq!(desk.read_with(&vcx, |d, _| d.note), Some(3));
     assert!(vcx.debug_bounds("corner-note").is_some(), "drawn");
+    // Its Open button stays inside the note, which stays inside the window.
+    let note = vcx.debug_bounds("corner-note").expect("the note");
+    let open = vcx.debug_bounds("note-open").expect("Open");
+    assert!(open.right() <= note.right(), "{open:?} inside {note:?}");
+    let size = vcx.update(|window, _| window.viewport_size());
+    assert!(note.right() <= size.width, "{note:?}");
     vcx.simulate_keystrokes("ctrl-a x");
     assert_eq!(desk.read_with(&vcx, |d, _| d.note), None, "dismissed");
     assert!(vcx.debug_bounds("corner-note").is_none());
@@ -563,6 +569,10 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         vcx.debug_bounds("card-2-0").is_some(),
         "the always option, no digit"
     );
+    assert!(
+        vcx.debug_bounds("task-strip").is_some(),
+        "the task strip stays beside the question"
+    );
     assert!(vcx.debug_bounds("card-2-6").is_none());
     sent(&mut rx);
     vcx.simulate_keystrokes("1");
@@ -615,6 +625,26 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
     assert!(
         matches!(said, Some(crate::question::Said::Sent { ref label, .. }) if label == "Yes"),
         "{said:?}"
+    );
+    // The agent asks again: the card is for the new question, without the old one's Sent line.
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(78));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d
+            .said
+            .get(&crate::state::Slot::Agent(2))
+            .is_none()),
+        "the new question starts clean"
     );
 }
 

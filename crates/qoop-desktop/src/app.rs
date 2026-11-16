@@ -385,6 +385,13 @@ impl Desk {
                 ));
                 let before = std::mem::replace(&mut self.model.rows, agents);
                 self.model.splits = splits;
+                // A new question on a row: "Sent: Yes, 18:16" was the old one's.
+                for terminal in state::new_menus(&before, &self.model.rows) {
+                    let slot = state::Slot::Agent(terminal);
+                    if !matches!(self.said.get(&slot), Some(Said::Sending { .. })) {
+                        self.said.remove(&slot);
+                    }
+                }
                 self.listed = true;
                 self.first_run_field(cx);
                 self.answered_elsewhere(&before);

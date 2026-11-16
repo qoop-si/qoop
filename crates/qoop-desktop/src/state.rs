@@ -11,7 +11,7 @@ use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
     AgentMenu, AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun, SleepingTab,
-    StepInfo, TaskEventInfo, TaskInfo, WorkspaceRow,
+    StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -363,13 +363,14 @@ impl Model {
             .find(|r| matches!(Kind::of(r), Kind::Status(Status::Blocked | Status::Failed)))
     }
 
-    /// "next: acme-web/claude needs you", or nothing when nothing waits.
+    /// "next: acme-web/review-pr needs you", or nothing when nothing waits. By the agent's
+    /// own title: two claude tabs in one space would read the same by their program.
     pub fn status_line(&self) -> Option<String> {
         let row = self.next_up()?;
         Some(format!(
             "next: {}/{} {}",
             self.space_name(row.workspace),
-            row.program.as_deref().unwrap_or("agent"),
+            title_of(row),
             Kind::of(row).word().to_lowercase()
         ))
     }
@@ -1267,6 +1268,22 @@ pub fn qoop_bin() -> Option<std::path::PathBuf> {
         let local = std::path::PathBuf::from(home).join(".local/bin/qoop");
         local.is_file().then_some(local)
     })
+}
+
+/// The terminals whose menu is new since `before` (none then, or another seal): what was said
+/// of their last answer belongs to the old question.
+pub fn new_menus(before: &[AgentRow], now: &[AgentRow]) -> Vec<TerminalStream> {
+    now.iter()
+        .filter_map(|r| {
+            let seal = r.menu.as_ref()?.seal;
+            let was = before
+                .iter()
+                .find(|b| b.terminal == r.terminal)
+                .and_then(|b| b.menu.as_ref())
+                .map(|m| m.seal);
+            (was != Some(seal)).then_some(r.terminal)
+        })
+        .collect()
 }
 
 /// A machine silent this long keeps its rows, but as of when it last answered.
@@ -2175,7 +2192,18 @@ pub(crate) mod tests {
         let mut m = fixture();
         assert_eq!(
             m.status_line().as_deref(),
-            Some("next: acme-web/claude needs you")
+            Some(
+                format!(
+                    "next: acme-web/{} needs you",
+                    title_of(m.row(2).expect("row"))
+                )
+                .as_str()
+            )
+        );
+        // Another claude tab in the same space working: the line still names the one that waits.
+        assert_ne!(
+            title_of(m.row(1).expect("row")),
+            title_of(m.row(2).expect("row"))
         );
         let blocked = m.row(2).expect("row").clone();
         let mut b = blocked.clone();
@@ -3066,6 +3094,19 @@ pub(crate) mod tests {
             reach.state(remote, &m.spaces, 9_000, None),
             MachineState::Parked
         );
+    }
+
+    /// A question after the one answered is a new menu; the same menu read again is not.
+    #[test]
+    fn a_new_menu_is_one_with_another_seal() {
+        let mut before = fixture().rows;
+        before[1].menu = Some(edit_menu(7));
+        let mut now = before.clone();
+        assert!(new_menus(&before, &now).is_empty(), "the same menu");
+        now[1].menu = Some(edit_menu(8));
+        assert_eq!(new_menus(&before, &now), vec![now[1].terminal]);
+        now[1].menu = None;
+        assert!(new_menus(&before, &now).is_empty(), "no menu now");
     }
 
     /// A request is another machine's by the terminal or the space it names.
