@@ -2417,6 +2417,7 @@ mod tests {
                 closable: true,
                 ink: None,
                 link: None,
+                link_reason: None,
                 goal: None,
             },
             WorkspaceRow {
@@ -2431,6 +2432,7 @@ mod tests {
                 closable: true,
                 ink: None,
                 link: None,
+                link_reason: None,
                 goal: None,
             },
         ];
@@ -2450,6 +2452,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }];
         assert_eq!(
@@ -2485,6 +2488,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let before = vec![space(1, vec![pane(6, 6), pane(7, 6)]), space(2, Vec::new())];

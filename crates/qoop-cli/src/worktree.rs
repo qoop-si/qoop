@@ -2564,6 +2564,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             keep_awake: false,
             qass_skip: false,
             goal: None,

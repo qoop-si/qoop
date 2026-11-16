@@ -415,7 +415,9 @@ fn scenario() {
             .await;
             let spaces = tui
                 .spaces_where("the remote space in the merged list", |s| {
-                    s.iter().any(|w| w.id == space && w.name == "devbox:work")
+                    s.iter().any(|w| {
+                        w.id == space && w.name == "devbox:work" && w.link_reason.is_none()
+                    })
                 })
                 .await;
             assert!(
@@ -487,14 +489,19 @@ fn scenario() {
             // The remote goes away: its space stays listed, offline, under the same number.
             stop(remote.path());
             tui.spaces_where("the remote space to be offline", |s| {
-                s.iter()
-                    .any(|w| w.id == space && w.name.ends_with("(offline)"))
+                s.iter().any(|w| {
+                    w.id == space
+                        && w.link_reason
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with("offline"))
+                })
             })
             .await;
 
             // And comes back on its own: the relay starts its daemon again.
             tui.spaces_where("the remote space to be back", |s| {
-                s.iter().any(|w| w.id == space && w.name == "devbox:work")
+                s.iter()
+                    .any(|w| w.id == space && w.name == "devbox:work" && w.link_reason.is_none())
             })
             .await;
 
@@ -1263,6 +1270,7 @@ async fn pre_feature_daemon(
                                     closable: true,
                                     ink: None,
                                     link: None,
+                                    link_reason: None,
                                     goal: None,
                                 }],
                             },

@@ -1270,25 +1270,14 @@ pub fn qoop_bin() -> Option<std::path::PathBuf> {
     })
 }
 
-/// A remote space whose link is down or let go carries why in its name ("staging:api
-/// (offline: ssh: connect to host staging port 22: Network is unreachable)"). The name goes
-/// back to the space's own, so every place that shows it says the state words; the reason is
-/// kept apart, by machine, for a tooltip.
-pub fn split_reasons(spaces: &mut [WorkspaceRow]) -> HashMap<usize, String> {
-    let mut why = HashMap::new();
-    for w in spaces.iter_mut() {
-        let m = machine_of(w.id);
-        if m == 0 || matches!(w.link, None | Some(LinkState::Up)) {
-            continue;
-        }
-        if let Some((name, rest)) = w.name.split_once(" (")
-            && let Some(reason) = rest.strip_suffix(')')
-        {
-            why.insert(m, reason.to_string());
-            w.name = name.to_string();
-        }
-    }
-    why
+/// Why each machine not reached is not, as the mux sends it beside its spaces (the names stay
+/// the spaces' own), kept by machine for a tooltip.
+pub fn link_reasons(spaces: &[WorkspaceRow]) -> HashMap<usize, String> {
+    spaces
+        .iter()
+        .filter(|w| machine_of(w.id) != 0)
+        .filter_map(|w| Some((machine_of(w.id), w.link_reason.clone()?)))
+        .collect()
 }
 
 /// The terminals whose menu is new since `before` (none then, or another seal): what was said
@@ -3135,32 +3124,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// A down link's raw reason leaves the space's name and is kept by machine; an up one's
-    /// name is left as it is.
+    /// A down link's reason is kept by machine; an up one has none.
     #[test]
-    fn a_down_links_reason_leaves_the_name() {
+    fn a_down_links_reason_is_kept_by_machine() {
         let mut spaces = fixture().spaces;
         for w in &mut spaces {
             if machine_of(w.id) == 1 {
                 w.link = Some(LinkState::Down);
-                w.name = format!(
-                    "{} (offline: ssh: connect to host staging port 22: Network is unreachable)",
-                    w.name
+                w.link_reason = Some(
+                    "offline: ssh: connect to host staging port 22: Network is unreachable".into(),
                 );
             }
         }
-        let why = split_reasons(&mut spaces);
-        let remote = spaces
-            .iter()
-            .find(|w| machine_of(w.id) == 1)
-            .expect("remote");
-        assert_eq!(remote.name, "staging:billing-api");
+        let why = link_reasons(&spaces);
         assert_eq!(
             why.get(&1).map(String::as_str),
             Some("offline: ssh: connect to host staging port 22: Network is unreachable")
         );
-        let mut up = fixture().spaces;
-        assert!(split_reasons(&mut up).is_empty());
+        assert!(link_reasons(&fixture().spaces).is_empty());
     }
 
     /// A question after the one answered is a new menu; the same menu read again is not.

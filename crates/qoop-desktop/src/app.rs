@@ -475,8 +475,8 @@ impl Desk {
                 lines,
                 ..
             } => self.scrolled_back(terminal, total, lines),
-            ControlResponse::Workspaces { mut workspaces, .. } => {
-                self.link_reasons = state::split_reasons(&mut workspaces);
+            ControlResponse::Workspaces { workspaces, .. } => {
+                self.link_reasons = state::link_reasons(&workspaces);
                 self.reach.note(&workspaces, self.now);
                 // An ask a dropped link took with it is answered by nobody: ask again once up.
                 let down = &self.reach.down_since;

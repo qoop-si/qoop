@@ -947,6 +947,7 @@ mod tests {
             closable: true,
             ink,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let spaces = [row(1, Some(4)), row(2, None), row(3, Some(7))];

@@ -25,6 +25,7 @@ fn space(id: i64, name: &str) -> WorkspaceRow {
         closable: true,
         ink: None,
         link: None,
+        link_reason: None,
         goal: None,
     }
 }

@@ -2646,6 +2646,11 @@ pub struct WorkspaceRow {
     /// a space of this machine has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkState>,
+    /// Why that machine is not reached while its link is down: "connecting", "asleep",
+    /// "offline: ssh: ...". Set beside `link` by the same interface; the name stays the
+    /// space's own, and each interface shows the reason its way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_reason: Option<String>,
     /// A person asked to keep it awake: idle sleep passes its tabs by. Written only when
     /// true, and false from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

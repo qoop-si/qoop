@@ -2675,6 +2675,7 @@ fn waiting_daemon(mut stream: std::os::unix::net::UnixStream) {
                             closable: true,
                             ink: None,
                             link: None,
+                            link_reason: None,
                             goal: None,
                         }],
                     },
