@@ -713,10 +713,9 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         },
     );
     assert!(
-        desk.read_with(&vcx, |d, _| d
+        desk.read_with(&vcx, |d, _| !d
             .said
-            .get(&crate::state::Slot::Agent(2))
-            .is_none()),
+            .contains_key(&crate::state::Slot::Agent(2))),
         "the new question starts clean"
     );
     // Answered again, and the agent asks its next question before the answer comes back: the
@@ -757,10 +756,9 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         ControlResponse::MenuAnswered { id, answers: true },
     );
     assert!(
-        desk.read_with(&vcx, |d, _| d
+        desk.read_with(&vcx, |d, _| !d
             .said
-            .get(&crate::state::Slot::Agent(2))
-            .is_none()),
+            .contains_key(&crate::state::Slot::Agent(2))),
         "no Sent line under the next question"
     );
 }
