@@ -278,9 +278,12 @@ impl Desk {
     pub fn ask(&self, request: ControlRequest) {
         let m = state::request_machine(&request);
         if m != 0 {
-            self.sent_to
-                .borrow_mut()
-                .insert(request.request_id().to_string(), m);
+            // A `Via` is answered by the far daemon under the inner request's id.
+            let id = match &request {
+                ControlRequest::Via { request: inner, .. } => inner.request_id(),
+                other => other.request_id(),
+            };
+            self.sent_to.borrow_mut().insert(id.to_string(), m);
         }
         let _ = self.up.send(Up::Request(Box::new(request)));
     }

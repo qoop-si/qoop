@@ -1441,3 +1441,61 @@ fn any_traffic_from_a_machine_counts_as_heard(cx: &mut TestAppContext) {
         "silent 15 s"
     );
 }
+
+/// A healthy idle remote: no events, no screens, only the answers to its pings, which come back
+/// under the inner request's id. It stays connected past 15 s from any one answer.
+#[gpui::test]
+fn an_idle_remote_that_answers_its_pings_stays_live(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let up = || {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if crate::state::machine_of(w.id) == 1 {
+                w.link = Some(LinkState::Up);
+            }
+        }
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        }
+    };
+    let ping = |rx: &mut UnboundedReceiver<Up>| {
+        via_sent(rx, remote)
+            .into_iter()
+            .find_map(|r| match r {
+                ControlRequest::Pet { id } => Some(id),
+                _ => None,
+            })
+            .expect("a ping")
+    };
+    let at = |vcx: &mut VisualTestContext, now: i64| {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, cx| {
+                d.now = now;
+                cx.notify();
+            })
+        })
+    };
+    answer(&desk, &mut vcx, up());
+    for now in [2000, 2010, 2020, 2030] {
+        at(&mut vcx, now);
+        // As the clock asks: the last ping was answered, so the next goes.
+        answer(&desk, &mut vcx, up());
+        let id = ping(&mut rx);
+        answer(
+            &desk,
+            &mut vcx,
+            ControlResponse::Pet {
+                id,
+                rects: Vec::new(),
+            },
+        );
+    }
+    at(&mut vcx, 2030 + crate::state::STALE_AFTER - 1);
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "still live");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.machine_state(1)),
+        crate::state::MachineState::Live
+    );
+}
