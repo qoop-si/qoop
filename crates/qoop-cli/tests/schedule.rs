@@ -252,9 +252,20 @@ fn a_schedule_starts_the_agent_at_its_time_with_its_prompt() {
     );
     assert!(ran["next_at"].is_null(), "a one-off is done: {ran}");
 
-    // `run` starts another, by hand, and leaves the schedule's slot alone.
+    // `run` while that run still works is refused: two agents would share one folder.
     let (ok, _, err) = stack.run(&["schedule", "run", "morning"]);
-    assert!(ok, "run failed: {err}");
+    assert!(
+        !ok && err.contains("still working"),
+        "a second run beside the first: {err}"
+    );
+    // Once its tab is closed the run has ended, and `run` starts another, by hand, leaving the
+    // schedule's slot alone.
+    let (ok, _, err) = stack.run(&["close", &terminal.to_string()]);
+    assert!(ok, "close failed: {err}");
+    assert!(
+        stack.wait(|| stack.run(&["schedule", "run", "morning"]).0),
+        "a run by hand was never taken after the first ended"
+    );
     assert!(
         stack.wait(|| stack.starts("check the inbox") == 2),
         "a run by hand never started the agent"

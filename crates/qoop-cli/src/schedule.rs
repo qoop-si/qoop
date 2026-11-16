@@ -68,6 +68,9 @@ fn answered(response: ControlResponse) -> std::io::Result<ControlResponse> {
                 "the running qoop daemon is older; run `qoop restart`",
             ))
         }
+        ControlResponse::Failed { reason, .. } if reason == "still_running" => Err(
+            std::io::Error::other("its last run is still working; run it again once that ends"),
+        ),
         ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
         other => Ok(other),
     }
