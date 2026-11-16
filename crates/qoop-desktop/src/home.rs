@@ -352,7 +352,26 @@ impl Desk {
                     )
                     .children(runs[..running].iter().map(line))
                     .child(now_line)
-                    .children(runs[running..].iter().map(line)),
+                    .children(runs[running..].iter().map(line))
+                    .when_some(
+                        state::last_run_line(
+                            &self.model.schedules,
+                            &self.local_runs(),
+                            self.now,
+                            self.zone,
+                        ),
+                        |d, last| {
+                            d.child(
+                                div()
+                                    .py(px(6.))
+                                    .border_t_1()
+                                    .border_color(ca(t.hair))
+                                    .text_size(px(12.5))
+                                    .text_color(c(t.t2))
+                                    .child(last),
+                            )
+                        },
+                    ),
             )
         })
     }

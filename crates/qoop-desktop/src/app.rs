@@ -126,6 +126,8 @@ pub struct Desk {
     pub(crate) qass_said: Option<String>,
     /// The one timer of the holds is running.
     pub(crate) ticking: bool,
+    /// The schedules page: machine, runs, day, the report open, the sheet.
+    pub schedule_page: crate::schedules::SchedulePage,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
@@ -200,6 +202,7 @@ impl Desk {
             lessons: None,
             qass_said: None,
             ticking: false,
+            schedule_page: Default::default(),
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -270,7 +273,7 @@ impl Desk {
     }
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
-        if self.answer_reply(&answer, cx) {
+        if self.answer_reply(&answer, cx) || self.report_came(&answer) {
             return;
         }
         match answer {
@@ -322,7 +325,10 @@ impl Desk {
                 ..
             } => self.scrolled_back(terminal, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => self.model.spaces = workspaces,
-            ControlResponse::Schedules { schedules, .. } => self.model.schedules = schedules,
+            ControlResponse::Schedules { id, schedules } => self.schedules_came(&id, schedules),
+            ControlResponse::ScheduleRuns { id, runs } => {
+                self.runs_came(&id, runs);
+            }
             ControlResponse::QassWatch { on, .. } => self.model.qass_watch = Some(on),
             ControlResponse::TerminalCreated { id, terminal } => {
                 self.started(&id, terminal, window, cx)
@@ -359,6 +365,10 @@ impl Desk {
         self.page = page;
         if page == Page::Qass {
             self.read_lessons();
+        }
+        if page == Page::Schedules && self.schedule_page.via.is_none() {
+            let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
+            self.ask_runs(&ids);
         }
         self.set_panes(terminal);
         if matches!(page, Page::Session(_)) {
@@ -531,6 +541,7 @@ impl Desk {
                 window.focus(&self.term_focus, cx);
                 cx.notify();
             }
+            "escape" if self.page == Page::Schedules && self.schedules_escape(cx) => {}
             "escape" if self.inbox => {
                 self.inbox = false;
                 cx.notify();
@@ -1227,10 +1238,7 @@ impl Desk {
             Page::Home => body.overflow_y_scroll().child(self.home(t, cx)),
             Page::Session(_) => body.p(px(12.)).child(self.session(t, focused, cx)),
             Page::Qass => body.p(px(12.)).child(self.qass_page(t, focused, cx)),
-            Page::Schedules => body
-                .overflow_y_scroll()
-                .p(px(24.))
-                .child(self.schedule_list(t)),
+            Page::Schedules => body.p(px(12.)).child(self.schedules_page(t, cx)),
             Page::Settings => body.p(px(24.)).child(
                 div()
                     .font_family(MONO_FONT)
@@ -1239,44 +1247,6 @@ impl Desk {
                     .child(qoop_tui::config::path().display().to_string()),
             ),
         }
-    }
-
-    fn schedule_list(&self, t: &Theme) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .when(self.model.schedules.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_size(px(13.5))
-                        .text_color(c(t.t2))
-                        .child("No schedules yet."),
-                )
-            })
-            .children(self.model.schedules.iter().map(|s| {
-                let next = match (s.paused, s.next_at) {
-                    (true, _) => "paused".to_string(),
-                    (false, Some(at)) => state::until(at, self.now),
-                    (false, None) => String::new(),
-                };
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .min_h(px(34.))
-                    .border_b_1()
-                    .border_color(ca(t.hair))
-                    .text_size(px(12.5))
-                    .child(
-                        div()
-                            .w(px(160.))
-                            .font_family(MONO_FONT)
-                            .child(s.name.clone()),
-                    )
-                    .child(div().w(px(80.)).text_color(c(t.t1)).child(s.agent.clone()))
-                    .child(div().flex_1().text_color(c(t.t1)).child(s.when.clone()))
-                    .child(div().text_color(c(t.t2)).child(next))
-            }))
     }
 }
 
