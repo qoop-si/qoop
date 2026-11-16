@@ -189,27 +189,6 @@ pub struct Desk {
     pub pending: Option<(String, String, Option<i64>)>,
 }
 
-/// `QOOP_DESKTOP_A11Y=<file>`: at each tick, what the window holds for assistive technology:
-/// a line on stderr (whether an AX client has activated the tree, and how many nodes the last
-/// frame sent) and the last frame's whole tree as JSON in `<file>`. A probe for the platform
-/// side, which a GPUI test cannot see. Debug builds only.
-#[cfg(debug_assertions)]
-fn a11y_probe(window: &Window) {
-    static TO: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    let Some(to) = TO.get_or_init(|| std::env::var_os("QOOP_DESKTOP_A11Y")) else {
-        return;
-    };
-    let tree = window.debug_a11y_tree_json().unwrap_or_default();
-    let nodes = tree.matches("\"accesskit_id\"").count();
-    eprintln!(
-        "qoop-desktop a11y: enabled={} active={} nodes={nodes} bytes={}",
-        window.is_a11y_enabled(),
-        window.is_a11y_active(),
-        tree.len()
-    );
-    let _ = std::fs::write(to, &tree);
-}
-
 pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -959,8 +938,6 @@ impl Desk {
     /// something shown can have changed: every second while an age is under a minute, else
     /// every half minute.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(debug_assertions)]
-        a11y_probe(window);
         let now = unix_now();
         let fresh = self.model.live().any(|r| {
             r.last_active_at_unix
