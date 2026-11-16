@@ -784,9 +784,11 @@ fn a_stale_question_card_is_neutral_and_closed(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("question-card").is_some());
     assert!(vcx.debug_bounds("own-open-off").is_none(), "answerable");
+    // As `wire` does after each batch: the news applied, then the window drawn again.
     vcx.update(|window, cx| {
         desk.update(cx, |d, cx| {
-            d.apply(Down::Disconnected("gone".into()), window, cx)
+            d.apply(Down::Disconnected("gone".into()), window, cx);
+            cx.notify();
         })
     });
     vcx.run_until_parked();
