@@ -417,6 +417,8 @@ impl Desk {
             }
             SettingKind::Choice(words) => div()
                 .flex()
+                .flex_wrap()
+                .justify_end()
                 .gap(px(3.))
                 .children(words.iter().enumerate().map(|(n, word)| {
                     let word = *word;
@@ -435,6 +437,8 @@ impl Desk {
                 .into_any_element(),
             SettingKind::Minutes => div()
                 .flex()
+                .flex_wrap()
+                .justify_end()
                 .gap(px(3.))
                 .children(MINUTES.iter().enumerate().map(|(n, m)| {
                     let m = *m;
@@ -842,6 +846,7 @@ impl Desk {
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .child(div().text_size(px(13.)).child(label))
@@ -859,6 +864,8 @@ impl Desk {
         let minutes = match remote.idle_minutes {
             Some(now) => div()
                 .flex()
+                .flex_wrap()
+                .justify_end()
                 .gap(px(3.))
                 .children(MINUTES.iter().enumerate().map(|(n, m)| {
                     let m = *m;
@@ -870,7 +877,8 @@ impl Desk {
                         None,
                         m == now.to_string(),
                         t,
-                    );
+                    )
+                    .debug_selector(move || format!("remote-minutes-{m}"));
                     if off {
                         return chip.tab_stop(false);
                     }
@@ -938,6 +946,7 @@ impl Desk {
         };
         div()
             .id("remote-settings")
+            .debug_selector(|| "remote-settings".to_string())
             .w(px(520.))
             .flex()
             .flex_col()
