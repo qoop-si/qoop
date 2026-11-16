@@ -185,10 +185,11 @@ away any other way, including you closing it, is `pane_exited`. Never both.
 ## Plugin panes
 
 `plugin pane open` places a pane as `tab` (a new tab), `split` (beside a target pane) or
-`zoomed`, `popup` and `overlay`. The last three open as a split beside the target and take
-focus; qoop draws no floating pane, so width and height are ignored and nothing is zoomed on
-screen, though the host reports the pane as zoomed. A popup or overlay hands focus back to the
-pane it was opened over when it closes, and there is one popup at a time, as in herdr.
+`zoomed`, `popup` and `overlay`. The last three open as a split beside the target, take focus
+and are zoomed to fill the tab: the host asks the interface to zoom them, and the zoom goes back
+when they close. qoop draws no floating pane, so width and height are ignored. A popup or
+overlay hands focus back to the pane it was opened over when it closes, and there is one popup
+at a time, as in herdr.
 
 A plugin's program is not typed into the shell. The host keeps its argv, environment and
 working folder in memory under a random one-time nonce for 30 seconds and types only a
