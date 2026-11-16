@@ -4521,6 +4521,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }]
     }
@@ -7300,6 +7301,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }];
         let rows = [row(1, "claude", "working")];
@@ -7688,6 +7690,7 @@ mod tests {
                 closable: true,
                 ink: None,
                 link: None,
+                link_reason: None,
                 goal: None,
             }]
         };
@@ -8123,6 +8126,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }];
         let states = [

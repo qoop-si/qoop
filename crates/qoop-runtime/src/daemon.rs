@@ -4624,6 +4624,7 @@ async fn handle_control(
                     closable: row.id != workspace,
                     ink: row.ink,
                     link: None,
+                    link_reason: None,
                     goal: row.goal,
                     dir: row.dir,
                 });

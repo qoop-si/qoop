@@ -1620,9 +1620,9 @@ fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
     for w in &mut spaces {
         if crate::state::machine_of(w.id) == 1 {
             w.link = Some(LinkState::Down);
-            w.name = format!(
-                "{} (offline: ssh: connect to host staging port 22: Network is unreachable)",
-                w.name
+            w.name = format!("{} (old)", w.name);
+            w.link_reason = Some(
+                "offline: ssh: connect to host staging port 22: Network is unreachable".into(),
             );
         }
     }
@@ -1641,7 +1641,11 @@ fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
             .find(|w| crate::state::machine_of(w.id) == 1)
             .map(|w| w.name.clone())
     });
-    assert_eq!(name.as_deref(), Some("staging:billing-api"));
+    assert_eq!(
+        name.as_deref(),
+        Some("staging:billing-api (old)"),
+        "a name of its own"
+    );
     assert!(
         desk.read_with(&vcx, |d, _| d.link_reasons.get(&1).cloned())
             .is_some_and(|r| r.contains("Network is unreachable"))

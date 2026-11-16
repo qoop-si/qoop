@@ -345,6 +345,8 @@ impl Link {
             return Vec::new();
         }
         let state = |state| (!self.name.is_empty()).then_some(state);
+        // Beside the down state, never in the name: a space may hold brackets of its own.
+        let reason = || (!self.name.is_empty()).then(|| self.reason.clone());
         // A machine let go runs nothing: its spaces read as asleep, so an interface with
         // nothing else awake detaches rather than staying up, and this machine's daemon with
         // it, for a remote space that has no tab. Asking for one wakes the machine.
@@ -371,13 +373,13 @@ impl Link {
             return self
                 .shown_spaces()
                 .map(|row| WorkspaceRow {
-                    name: format!("{} ({})", row.name, self.reason),
                     terminals: 0,
                     // A link that is not answering cannot be asked to close anything, and
                     // what the far daemon would say about it is as stale as the rest of this
                     // row. No close, and no dead control drawn for one.
                     closable: false,
                     link: state(LinkState::Down),
+                    link_reason: reason(),
                     ..row.clone()
                 })
                 .collect();
@@ -387,13 +389,14 @@ impl Link {
             keep_awake: false,
             qass_skip: false,
             id: (link as i64) << WORKSPACE_SHIFT,
-            name: format!("{} ({})", self.name, self.reason),
+            name: self.name.clone(),
             terminals: 0,
             asleep: false,
             sleeping: Vec::new(),
             closable: false,
             ink: None,
             link: state(LinkState::Down),
+            link_reason: reason(),
             goal: None,
         }]
     }
@@ -3388,6 +3391,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let far = workspace_out(1, 3).expect("fits");
@@ -3470,6 +3474,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let far = workspace_out(1, 3).expect("fits");
@@ -3565,6 +3570,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let (r1, r2, r3) = (
@@ -3809,17 +3815,28 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let mut remote = Link::new("devbox".into(), None);
         assert_eq!(links(&remote), [Some(LinkState::Down)], "never listed");
         remote.listed = true;
-        remote.spaces = vec![row.clone()];
+        remote.spaces = vec![WorkspaceRow {
+            name: "devbox:api (old)".into(),
+            ..row.clone()
+        }];
+        remote.reason = "offline: ssh: connect to host devbox port 22: Connection refused".into();
         assert_eq!(
             links(&remote),
             [Some(LinkState::Down)],
             "listed, not connected"
         );
+        // The reason rides beside the down state; the name stays the space's own, brackets
+        // and all.
+        let down = remote.listed_spaces(1);
+        assert_eq!(down[0].name, "devbox:api (old)");
+        assert_eq!(down[0].link_reason.as_deref(), Some(remote.reason.as_str()));
+        remote.spaces = vec![row.clone()];
         remote.conn = Some((1, mpsc::unbounded_channel().0));
         assert_eq!(links(&remote), [Some(LinkState::Up)]);
         remote.parked.send_replace(true);
@@ -3853,6 +3870,7 @@ mod tests {
             closable: false,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         let ids = |name: &str, spaces: Vec<WorkspaceRow>| -> Vec<i64> {
@@ -4284,6 +4302,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         };
         mux.answer(

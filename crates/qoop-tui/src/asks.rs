@@ -3432,6 +3432,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }
     }

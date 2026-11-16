@@ -2254,7 +2254,12 @@ fn rule(c: &Column, space: &WorkspaceRow, kids: &[&AgentRow], open: bool) -> Lin
         .cloned()
         .unwrap_or_default();
     let slot_w = crate::width::width(&slot);
-    let name = shorten_middle(&space.name, room(&slot));
+    // A down link's reason after the name, as the mux sends it beside the name.
+    let named = space.link_reason.as_ref().map_or_else(
+        || space.name.clone(),
+        |why| format!("{} ({why})", space.name),
+    );
+    let name = shorten_middle(&named, room(&slot));
     let name_w = crate::width::width(&name);
     let fold = if folds(c, space.id) {
         if open { "\u{25be}" } else { "\u{25b8}" }
@@ -4659,6 +4664,7 @@ mod tests {
             closable: true,
             ink: None,
             link: None,
+            link_reason: None,
             goal: None,
         }
     }
@@ -11059,8 +11065,12 @@ mod tests {
             (LinkState::Parked, "ubox:webshop", Role::Faint),
             (LinkState::Down, "ubox:webshop (connecting)", Role::Blocked),
         ] {
-            let mut row = space(1, name);
+            // The mux sends a down link's reason beside the name; the rule shows it after.
+            let mut row = space(1, "ubox:webshop");
             row.link = Some(link);
+            if link == LinkState::Down {
+                row.link_reason = Some("connecting".into());
+            }
             let spaces = vec![row];
             let none = (Seen::new(), Unseen::new(), Shut::new());
             let mut c = clicks(&spaces, &[], View::Tree, SIDEBAR_MAX, &none);
