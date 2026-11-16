@@ -112,6 +112,13 @@ pub fn read() -> Lifecycle {
 }
 
 /// What a person is told about a file that is not TOML.
+/// Whether qoop's config writer can write a file with this text: the whole of it is TOML. The
+/// readers are kinder (a bad line costs only its own setting), the writer is not, since writing
+/// over a line it cannot read would lose what a person was typing.
+pub fn writable(text: &str) -> bool {
+    text.parse::<toml_edit::DocumentMut>().is_ok()
+}
+
 fn not_toml(path: &Path) -> String {
     format!(
         "{} is not TOML; fix it first (qoop config says where)",
@@ -816,6 +823,25 @@ mod tests {
             lock_path_in(&config.join("config.toml"), config, None),
             config.join("config.toml.lock")
         );
+    }
+
+    /// The writer takes a file only when all of it is TOML; an empty file is.
+    #[test]
+    fn only_a_whole_toml_file_is_writable() {
+        assert!(writable(""));
+        assert!(writable("theme = "dark"
+[notify]
+sound = true
+"));
+        assert!(!writable(
+            "[notify
+sound = = true
+"
+        ));
+        assert!(!writable(
+            "theme = dark
+"
+        ));
     }
 
     #[test]

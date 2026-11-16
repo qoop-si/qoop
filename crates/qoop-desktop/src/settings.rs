@@ -31,6 +31,8 @@ pub struct SettingsPage {
     pub pets: Vec<Avatar>,
     /// A pet picked and waiting out its hold, with when it is saved: Undo takes it back.
     pub pet_hold: Option<(Avatar, std::time::Instant)>,
+    /// The file is not TOML as a whole: shown, and nothing on the page writes to it.
+    pub broken: bool,
     /// The machine shown: `None` for This Mac, else a space of it to ask through.
     pub via: Option<i64>,
     pub remote: RemoteSettings,
@@ -45,6 +47,8 @@ impl Desk {
     pub(crate) fn read_settings(&mut self) {
         let read = qoop_tui::config::read_from(&self.config_path);
         self.settings.text = std::fs::read_to_string(&self.config_path).unwrap_or_default();
+        // Nothing can be written while a line is not TOML: the writer refuses the whole file.
+        self.settings.broken = read.broken || !qoop_runtime::config::writable(&self.settings.text);
         self.settings.read = Some(read);
     }
 
@@ -222,7 +226,7 @@ impl Desk {
             return div().into_any_element();
         };
         let blank = qoop_tui::config::read_from(&PathBuf::from("/nonexistent/qoop/config.toml"));
-        let broken = read.broken;
+        let broken = self.settings.broken;
         let find = self
             .settings
             .find
