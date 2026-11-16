@@ -29,8 +29,7 @@ impl Desk {
 
     /// Read qass's lessons file again (on opening the page): small, on this Mac only.
     pub(crate) fn read_lessons(&mut self) {
-        let path = qoop_runtime::paths::qass_config_dir().join("lessons.md");
-        self.lessons = std::fs::read_to_string(path)
+        self.lessons = std::fs::read_to_string(&self.lessons_path)
             .ok()
             .map(|text| state::lessons_of(&text));
     }
@@ -64,7 +63,17 @@ impl Desk {
 
     /// `qoop qass`, as the TUI's `ctrl-a Q` runs it: it starts qass in its own space, or wakes
     /// it. Off the window's thread; what it says when it cannot is shown.
+    /// Whether a start of qass is under way: asked, and its terminal not an agent yet, for at
+    /// most a minute (as `qoop qass` holds its own claim).
+    pub(crate) fn qass_starting(&self) -> bool {
+        self.qass_starting_until
+            .is_some_and(|until| self.now < until)
+    }
+
     fn start_qass(&mut self, cx: &mut Context<Self>) {
+        if self.qass_starting() {
+            return;
+        }
         let Some(qoop) = qoop_runtime::changes::tool("qoop") else {
             self.qass_said =
                 Some("qoop is not on this Mac's PATH, so qass cannot be started here.".into());
@@ -72,6 +81,7 @@ impl Desk {
             return;
         };
         self.qass_said = Some("Starting qass.".into());
+        self.qass_starting_until = Some(self.now + 60);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let ran = cx
@@ -94,6 +104,11 @@ impl Desk {
                 Err(e) => Some(format!("qoop qass did not start: {e}")),
             };
             let _ = this.update(cx, |d, cx| {
+                // Refused or failed: Start can be pressed again; started, it stays greyed
+                // until qass's terminal is an agent.
+                if said.is_some() {
+                    d.qass_starting_until = None;
+                }
                 d.qass_said = said;
                 cx.notify();
             });
@@ -114,6 +129,7 @@ impl Desk {
 
     /// A chip: its words into qass's input, with no Enter, and the keys to the terminal.
     fn type_into_qass(&mut self, words: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.back_to_live();
         if let Some(term) = self.term.as_ref().filter(|_| self.connected) {
             let _ = self
                 .up
@@ -191,6 +207,7 @@ impl Desk {
                 .qass_state(
                     "qass is asleep.",
                     ("wake-qass", "Wake it"),
+                    true,
                     t,
                     cx.listener(|this, _, _, cx| this.wake_qass(cx)),
                 )
@@ -199,6 +216,7 @@ impl Desk {
                 .qass_state(
                     "qass is not running.",
                     ("start-qass", "Start it"),
+                    !self.qass_starting(),
                     t,
                     cx.listener(|this, _, _, cx| this.start_qass(cx)),
                 )
@@ -254,7 +272,9 @@ impl Desk {
         &self,
         line: &str,
         (id, label): (&'static str, &'static str),
+        enabled: bool,
         t: &Theme,
+        enabled: bool,
         press: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> impl IntoElement {
         div()
@@ -272,7 +292,13 @@ impl Desk {
                     .text_color(c(crate::theme::DARK.t1))
                     .child(line.to_string()),
             )
-            .child(ui::pill(id, label, t).child(label).on_click(press))
+            .child(match enabled {
+                true => ui::pill(id, label, t).child(label).on_click(press),
+                false => ui::pill(id, &format!("{label}, unavailable: qass is starting"), t)
+                    .tab_stop(false)
+                    .opacity(0.5)
+                    .child(label),
+            })
             .when_some(self.qass_said.clone(), |d, said| {
                 d.child(
                     div()
@@ -604,7 +630,10 @@ fn watch_row(
     t: &Theme,
     press: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Div {
-    let label = format!("Watch {name}");
+    let label = match enabled {
+        true => format!("Watch {name}"),
+        false => format!("Watch {name}, unavailable: what holds it is off"),
+    };
     let selector = format!("{id}-{n}");
     div()
         .flex()
@@ -631,7 +660,7 @@ fn watch_row(
         .child(
             ui::switch((id, n), &label, on, t)
                 .debug_selector(move || selector.clone())
-                .when(!enabled, |d| d.opacity(0.5))
+                .when(!enabled, |d| d.opacity(0.5).tab_stop(false))
                 .when(enabled, |d| d.on_click(press)),
         )
 }

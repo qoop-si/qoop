@@ -2098,6 +2098,7 @@ pub(crate) mod tests {
         holds.start(held(2, 8, t0 + HOLD));
         holds.start(held(3, 9, t0 + HOLD));
         assert_eq!(holds.flush().len(), 2, "closing sends both at once");
+        assert!(holds.held.is_empty());
 
         // The hand-off's own Undo takes back the hand-off, not a single answer held later.
         let hand = |terminal| Hold {
@@ -2110,7 +2111,6 @@ pub(crate) mod tests {
         assert!(holds.undo_hand_off());
         let left: Vec<Option<u32>> = holds.held.iter().map(Hold::terminal).collect();
         assert_eq!(left, [Some(2)]);
-        assert!(holds.held.is_empty());
     }
 
     #[test]

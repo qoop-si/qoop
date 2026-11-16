@@ -19,6 +19,8 @@ fn open(cx: &mut TestAppContext) -> (Entity<Desk>, VisualTestContext, UnboundedR
     vcx.update(|window, cx| {
         desk.update(cx, |d, cx| {
             d.apply(Down::Connected, window, cx);
+            // Never the owner's own qass lessons.
+            d.lessons_path = std::path::PathBuf::from("/nonexistent/qass/lessons.md");
             d.model = fixture();
             d.now = 2000;
             cx.notify();
@@ -896,6 +898,46 @@ fn the_schedules_page_reads_runs_opens_a_report_and_pauses(cx: &mut TestAppConte
         desk.read_with(&vcx, |d, _| !d.schedule_page.calendar),
         "Escape closes it"
     );
+}
+
+/// The rules card counts the lessons file the page is pointed at (a test's own, never the
+/// owner's), and qass's own terminal brought forward keeps the qass page.
+#[gpui::test]
+fn the_qass_page_reads_its_lessons_and_keeps_its_page(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("lessons.md");
+    std::fs::write(
+        &path,
+        "- a release -> escalate (owner)\n- a test run -> do it (E7)\n- a bump -> wait (E9)\n",
+    )
+    .expect("lessons");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.lessons_path = path.clone();
+            d.open(Page::Qass, window, cx);
+        })
+    });
+    let lessons = desk.read_with(&vcx, |d, _| d.lessons);
+    assert_eq!(
+        lessons,
+        Some(crate::state::Lessons {
+            yours: 1,
+            alone: 1,
+            all: 3,
+        })
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Home, window, cx);
+            d.apply(
+                Down::Event(qoop_runtime::control::EventMessage::Focus { terminal: 9 }),
+                window,
+                cx,
+            );
+        })
+    });
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Qass);
 }
 
 /// Every key hint names the prefix `config.toml` picked.

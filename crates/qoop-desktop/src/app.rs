@@ -126,6 +126,10 @@ pub struct Desk {
     pub(crate) qass_said: Option<String>,
     /// The one timer of the holds is running.
     pub(crate) ticking: bool,
+    /// qass's lessons file, read when its page opens.
+    pub lessons_path: std::path::PathBuf,
+    /// A start of qass asked from here holds Start greyed until this unix second.
+    pub(crate) qass_starting_until: Option<i64>,
     /// The schedules page: machine, runs, day, the report open, the sheet.
     pub schedule_page: crate::schedules::SchedulePage,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
@@ -203,6 +207,8 @@ impl Desk {
             qass_said: None,
             ticking: false,
             schedule_page: Default::default(),
+            lessons_path: qoop_runtime::paths::qass_config_dir().join("lessons.md"),
+            qass_starting_until: None,
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -263,10 +269,23 @@ impl Desk {
             }
             Down::Answer(answer) => self.answer(*answer, window, cx),
             Down::Event(EventMessage::Focus { terminal }) => {
-                self.open(Page::Session(terminal), window, cx);
+                let qass = self
+                    .model
+                    .row(terminal)
+                    .and_then(|r| self.model.space(r.workspace))
+                    .is_some_and(|w| w.name == state::QASS_SPACE);
+                let page = if qass {
+                    Page::Qass
+                } else {
+                    Page::Session(terminal)
+                };
+                self.open(page, window, cx);
                 window.activate_window();
             }
-            Down::Event(EventMessage::TasksChanged) => self.ask_strip(),
+            Down::Event(EventMessage::TasksChanged) => {
+                self.ask_strip();
+                self.ask_watch();
+            }
             Down::Event(EventMessage::AsksChanged) => self.ask_inbox(),
             Down::Event(_) => {}
         }
@@ -283,6 +302,9 @@ impl Desk {
                 self.rows_changed(&before);
                 self.menus_changed();
                 // qass started or woke while its page is open: its terminal comes on.
+                if self.qass_terminal().is_some() {
+                    self.qass_starting_until = None;
+                }
                 if self.page == Page::Qass && self.term.is_none() && self.qass_terminal().is_some()
                 {
                     self.open(Page::Qass, window, cx);
@@ -365,6 +387,7 @@ impl Desk {
         self.page = page;
         if page == Page::Qass {
             self.read_lessons();
+            self.ask_watch();
         }
         if page == Page::Schedules && self.schedule_page.via.is_none() {
             let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
@@ -513,6 +536,14 @@ impl Desk {
         if taken {
             cx.stop_propagation();
         }
+    }
+
+    /// qass's switch read again: the CLI, the TUI or the phone may have turned it.
+    pub(crate) fn ask_watch(&self) {
+        self.ask(ControlRequest::QassWatch {
+            id: link::fresh_id("qass"),
+            on: None,
+        });
     }
 
     /// qass's cards and what it did today, read again.

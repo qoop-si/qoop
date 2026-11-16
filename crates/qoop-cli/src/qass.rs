@@ -148,6 +148,40 @@ fn running_row(folder: &Path) -> Option<serde_json::Value> {
         .cloned()
 }
 
+/// The file a start of qass claims, holding when, so a second start finds the first.
+const STARTING: &str = "starting";
+
+/// How long a start holds its claim: the program in qass's new terminal has started by then.
+const STARTING_FOR: i64 = 60;
+
+/// Claim the start of qass in `folder` at `now` (unix seconds), or refuse it while another
+/// start's claim is younger than `STARTING_FOR`. The claim is made with `create_new`, so two
+/// starts at the same moment cannot both make it; an old claim is taken over.
+fn claim_start(folder: &Path, now: i64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let claim = folder.join(STARTING);
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claim);
+    match made {
+        Ok(mut file) => writeln!(file, "{now}"),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let since = std::fs::read_to_string(&claim)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            if now.saturating_sub(since) < STARTING_FOR {
+                return Err(std::io::Error::other(
+                    "qass is already starting: it shows in a moment",
+                ));
+            }
+            std::fs::write(&claim, format!("{now}\n"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The terminal of a running qass.
 fn running(folder: &Path) -> Option<u64> {
     running_row(folder)?["terminal"].as_u64()
@@ -626,6 +660,13 @@ pub(crate) fn start(board: bool) -> std::io::Result<u64> {
         println!("qass woke in terminal {terminal}");
         terminal
     } else {
+        // One start at a time: qass's terminal is not an agent until its program has started,
+        // so a second `qoop qass` in those seconds would find none running and start another.
+        std::fs::create_dir_all(&folder)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        claim_start(&folder, now)?;
         let read = config::read();
         let (typed, command, program) = launch(&read.qass_agent, &read)?;
         let tabs = tabs_of(&folder);
@@ -974,6 +1015,21 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One start of qass at a time: a second start while the first's claim is young is
+    /// refused, and an old claim is taken over.
+    #[test]
+    fn a_second_start_waits_for_the_first() {
+        let dir = tempfile::tempdir().expect("dir");
+        assert!(claim_start(dir.path(), 1_000).is_ok(), "the first start");
+        let second = claim_start(dir.path(), 1_030).expect_err("a second start");
+        assert!(second.to_string().contains("already starting"), "{second}");
+        assert!(
+            claim_start(dir.path(), 1_000 + STARTING_FOR).is_ok(),
+            "an old claim is taken over"
+        );
+        assert!(claim_start(dir.path(), 1_000 + STARTING_FOR + 1).is_err());
+    }
 
     /// A line for qass is refused while it waits on the owner, and only then.
     #[test]
