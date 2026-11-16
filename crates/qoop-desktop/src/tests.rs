@@ -719,6 +719,92 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
             .is_none()),
         "the new question starts clean"
     );
+    // Answered again, and the agent asks its next question before the answer comes back: the
+    // late "Sent" belongs to the old question and never lands under the new one.
+    std::thread::sleep(crate::state::ARMING);
+    vcx.simulate_keystrokes("1");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            for hold in &mut d.holds.held {
+                hold.until = std::time::Instant::now();
+            }
+            d.fire();
+        })
+    });
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::AnswerMenu { terminal: 2, .. })
+    })
+    .expect("the second answer sent");
+    let ControlRequest::AnswerMenu { id, seal, .. } = asked else {
+        unreachable!()
+    };
+    assert_eq!(seal, 78);
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(79));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::MenuAnswered { id, answers: true },
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d
+            .said
+            .get(&crate::state::Slot::Agent(2))
+            .is_none()),
+        "no Sent line under the next question"
+    );
+}
+
+/// A question from a machine not reached is the last one seen: neutral, with when it was seen,
+/// and its own answer field cannot be opened.
+#[gpui::test]
+fn a_stale_question_card_is_neutral_and_closed(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(5));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("question-card").is_some());
+    assert!(vcx.debug_bounds("own-open-off").is_none(), "answerable");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx)
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        desk.read_with(&vcx, |d, _| d
+            .model
+            .row(2)
+            .and_then(|r| d.as_of(r.workspace)))
+            .is_some(),
+        "stale"
+    );
+    assert!(vcx.debug_bounds("question-card-when").is_some());
+    assert!(
+        vcx.debug_bounds("own-open-off").is_some(),
+        "the answer field is closed"
+    );
 }
 
 /// Explain goes as typed words through the agent's "tell it" option, and an older daemon's
@@ -1345,6 +1431,11 @@ fn remote_settings_go_through_via(cx: &mut TestAppContext) {
         Some(30)
     );
     assert!(vcx.debug_bounds("remote-exit").is_some(), "drawn");
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.title().1).as_deref(),
+        Some("staging"),
+        "the title names the machine, not This Mac's file"
+    );
     let card = vcx.debug_bounds("remote-settings").expect("the card");
     let last = vcx
         .debug_bounds("remote-minutes-240")

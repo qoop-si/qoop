@@ -340,6 +340,17 @@ impl Desk {
         let now = crate::app::unix_now();
         for (hold, retried) in mine {
             let terminal = hold.terminal();
+            // The agent put up its next question before this answer came back: what happened
+            // to the old one is not said under the new card.
+            let moved_on = hold.seal != 0
+                && terminal
+                    .and_then(|t| self.model.row(t))
+                    .and_then(|r| r.menu.as_ref())
+                    .is_some_and(|m| m.seal != hold.seal);
+            if moved_on {
+                self.said.remove(&hold.slot);
+                continue;
+            }
             let machine = terminal
                 .and_then(|t| self.model.row(t))
                 .map_or_else(|| "This Mac".to_string(), |r| self.machine_of_row(r));
@@ -730,12 +741,26 @@ impl Desk {
         let terminal = row.terminal;
         let offers = state::offers(menu);
         let words = state::text_key(menu).is_some() && self.takes_words(row);
-        let own_open = self.own.as_ref().filter(|o| o.terminal == terminal);
+        // Its machine is not reached: the question is the last one seen, neutral, not answerable.
+        let as_of = self.as_of(row.workspace);
+        let stale = as_of.is_some();
+        let own_open = self
+            .own
+            .as_ref()
+            .filter(|o| o.terminal == terminal && !stale);
+        let kind = if stale {
+            Kind::Status(qoop_domain::status::Status::Unknown)
+        } else {
+            Kind::of(row)
+        };
         div()
             .id("question-card")
             .debug_selector(|| "question-card".to_string())
             .role(Role::Group)
-            .aria_label(format!("Question: {}", menu.question))
+            .aria_label(match &as_of {
+                Some(when) => format!("Question, {when}: {}", menu.question),
+                None => format!("Question: {}", menu.question),
+            })
             .flex_none()
             .p(px(12.))
             .flex()
@@ -744,17 +769,26 @@ impl Desk {
             .rounded(px(12.))
             .bg(c(t.card))
             .border_1()
-            .border_color(ca(t.needs_line))
+            .border_color(ca(if stale { t.line } else { t.needs_line }))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(7.))
                     .text_size(px(12.5))
-                    .child(ui::mark(Kind::of(row), t, 11.))
-                    .child(div().text_color(c(t.needs_text)).child("Needs you"))
-                    .when_some(state::age_of(row, self.now), |d, age| {
-                        d.child(div().text_color(c(t.t2)).child(age))
+                    .child(ui::mark(kind, t, 11.))
+                    .child(
+                        div()
+                            .text_color(c(if stale { t.t2 } else { t.needs_text }))
+                            .child("Needs you"),
+                    )
+                    .when_some(as_of.or_else(|| state::age_of(row, self.now)), |d, age| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "question-card-when".to_string())
+                                .text_color(c(t.t2))
+                                .child(age),
+                        )
                     }),
             )
             .when(!menu.question.is_empty(), |d| {
@@ -788,6 +822,25 @@ impl Desk {
                         .border_1()
                         .border_color(ca(t.line))
                         .child(own.field.clone()),
+                ),
+                None if stale => d.child(
+                    ui::control(
+                        "own-open",
+                        Role::Link,
+                        format!(
+                            "Something else? Type your own answer, unavailable: {}",
+                            state::STALE_REASON
+                        ),
+                        t,
+                    )
+                    .debug_selector(|| "own-open-off".to_string())
+                    .tab_stop(false)
+                    .cursor_default()
+                    .min_h(px(24.))
+                    .px(px(4.))
+                    .text_size(px(12.))
+                    .text_color(c(t.t3))
+                    .child("Something else? Type your own answer"),
                 ),
                 None => d.child(
                     ui::link_button("own-open", "Something else? Type your own answer", t)

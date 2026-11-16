@@ -192,7 +192,8 @@ pub struct Desk {
 /// `QOOP_DESKTOP_A11Y=<file>`: at each tick, what the window holds for assistive technology:
 /// a line on stderr (whether an AX client has activated the tree, and how many nodes the last
 /// frame sent) and the last frame's whole tree as JSON in `<file>`. A probe for the platform
-/// side, which a GPUI test cannot see.
+/// side, which a GPUI test cannot see. Debug builds only.
+#[cfg(debug_assertions)]
 fn a11y_probe(window: &Window) {
     static TO: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
     let Some(to) = TO.get_or_init(|| std::env::var_os("QOOP_DESKTOP_A11Y")) else {
@@ -958,6 +959,7 @@ impl Desk {
     /// something shown can have changed: every second while an age is under a minute, else
     /// every half minute.
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(debug_assertions)]
         a11y_probe(window);
         let now = unix_now();
         let fresh = self.model.live().any(|r| {
@@ -1350,7 +1352,7 @@ impl Desk {
             })
     }
 
-    fn title(&self) -> (String, Option<String>) {
+    pub(crate) fn title(&self) -> (String, Option<String>) {
         match self.page {
             Page::Home => ("All agents".into(), Some(self.model.summary())),
             Page::Session(t) => {
@@ -1369,11 +1371,13 @@ impl Desk {
                 let n = self.model.schedules.len();
                 ("Schedules".into(), Some(format!("{n} schedules, {on} on")))
             }
+            // Another machine's settings: its name, never This Mac's file.
             Page::Settings => (
                 "Settings".into(),
-                Some(state::tilde(
-                    &qoop_tui::config::path().display().to_string(),
-                )),
+                match self.settings.via {
+                    Some(via) => self.model.space(via).map(state::machine_name),
+                    None => Some(state::tilde(&self.config_path.display().to_string())),
+                },
             ),
         }
     }
