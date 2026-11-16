@@ -82,7 +82,69 @@ fn ending(result: &str, at: i64) -> (Option<i64>, Option<&'static str>) {
     }
 }
 
-/// Record a run of `schedule` and keep only its newest [`RUNS_KEPT`]. Answers its id.
+/// The run row a slot claimed while a run of its schedule is still open says this.
+pub const SKIPPED_OPEN: &str = "skipped: its last run is still open";
+
+/// What a due slot came to when it was claimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fired {
+    /// Its run starts, under this row.
+    Run(i64),
+    /// A run of the schedule was still open: the slot's row says skipped.
+    Skipped(i64),
+}
+
+/// The open-run rule of Run now and of a due slot, inside the caller's transaction: first the
+/// runs that cannot still be going end `gone` (their tab is among `closed`, or they had no tab
+/// for [`NO_TAB_FOR`] seconds), then whether any run of schedule `id` is still open (claimed,
+/// or started and not ended).
+fn open_after_sweep(tx: &Connection, id: i64, now: i64, closed: &[i64]) -> rusqlite::Result<bool> {
+    const OPEN: &str = "ended_at IS NULL AND result IN ('claimed', 'started')";
+    for terminal in closed {
+        tx.execute(
+            &format!(
+                "UPDATE schedule_run SET ended_at = ?3, outcome = 'gone' \
+                 WHERE schedule = ?1 AND terminal = ?2 AND {OPEN}"
+            ),
+            params![id, terminal, now],
+        )?;
+    }
+    tx.execute(
+        &format!(
+            "UPDATE schedule_run SET ended_at = ?2, outcome = 'gone' \
+             WHERE schedule = ?1 AND terminal IS NULL AND started_at < ?3 AND {OPEN}"
+        ),
+        params![id, now, now - NO_TAB_FOR],
+    )?;
+    tx.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM schedule_run WHERE schedule = ?1 AND {OPEN})"),
+        params![id],
+        |r| r.get(0),
+    )
+}
+
+/// Take `slot` of schedule `id` from `expected` with `result`, and its run's row: none when the
+/// schedule moved on or is paused.
+fn claim_in(
+    tx: &Connection,
+    id: i64,
+    expected: Option<i64>,
+    slot: i64,
+    now: i64,
+    result: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let won = tx.execute(
+        "UPDATE schedule SET last_slot = ?3, last_at = ?4, last_result = ?5, \
+         last_terminal = NULL \
+         WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
+        params![id, expected, slot, now, result],
+    )? > 0;
+    if !won {
+        return Ok(None);
+    }
+    insert_run(tx, id, slot, now, result, None).map(Some)
+}
+
 /// What a Run now came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunNow {
@@ -95,6 +157,7 @@ pub enum RunNow {
 /// How long a run may go without a tab before it counts as one that never started.
 pub const NO_TAB_FOR: i64 = 120;
 
+/// Record a run of `schedule` and keep only its newest [`RUNS_KEPT`]. Answers its id.
 fn insert_run(
     conn: &Connection,
     schedule: i64,
@@ -338,18 +401,39 @@ impl Store {
         result: &str,
     ) -> Result<Option<i64>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let won = tx.execute(
-            "UPDATE schedule SET last_slot = ?3, last_at = ?4, last_result = ?5, \
-             last_terminal = NULL \
-             WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
-            params![id, expected, slot, now, result],
-        )? > 0;
-        if !won {
-            return Ok(None);
-        }
-        let run = insert_run(&tx, id, slot, now, result, None)?;
+        let run = claim_in(&tx, id, expected, slot, now, result)?;
         tx.commit()?;
-        Ok(Some(run))
+        Ok(run)
+    }
+
+    /// Claim a due slot to start its run, by the same rule as Run now: while a run of the
+    /// schedule is still open (one that waits on a question, or a Run now just claimed), the
+    /// slot is claimed as skipped and no second agent starts. One write transaction: the sweep
+    /// of runs that cannot still be going (`closed` tabs, no tab in time), the check and the
+    /// claim. None when somebody else took the slot first.
+    pub fn claim_fire(
+        &self,
+        id: i64,
+        expected: Option<i64>,
+        slot: i64,
+        now: i64,
+        closed: &[i64],
+    ) -> Result<Option<Fired>, StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let open = open_after_sweep(&tx, id, now, closed)?;
+        let result = if open { SKIPPED_OPEN } else { "claimed" };
+        let run = claim_in(&tx, id, expected, slot, now, result)?;
+        tx.commit()?;
+        Ok(run.map(|run| {
+            if open {
+                Fired::Skipped(run)
+            } else {
+                Fired::Run(run)
+            }
+        }))
     }
 
     /// A run the owner asked for now: a row of its own under the slot the schedule holds, with
@@ -397,27 +481,7 @@ impl Store {
         if !there {
             return Ok(RunNow::NoSchedule);
         }
-        const OPEN: &str = "ended_at IS NULL AND result IN ('claimed', 'started')";
-        for terminal in closed {
-            tx.execute(
-                &format!(
-                    "UPDATE schedule_run SET ended_at = ?3, outcome = 'gone'                      WHERE schedule = ?1 AND terminal = ?2 AND {OPEN}"
-                ),
-                params![id, terminal, now],
-            )?;
-        }
-        tx.execute(
-            &format!(
-                "UPDATE schedule_run SET ended_at = ?2, outcome = 'gone'                  WHERE schedule = ?1 AND terminal IS NULL AND started_at < ?3 AND {OPEN}"
-            ),
-            params![id, now, now - NO_TAB_FOR],
-        )?;
-        let open: bool = tx.query_row(
-            &format!("SELECT EXISTS (SELECT 1 FROM schedule_run WHERE schedule = ?1 AND {OPEN})"),
-            params![id],
-            |r| r.get(0),
-        )?;
-        if open {
+        if open_after_sweep(&tx, id, now, closed)? {
             tx.commit()?;
             return Ok(RunNow::Open);
         }
@@ -430,7 +494,8 @@ impl Store {
     /// tabs that closed before a Run now.
     pub fn open_run_tabs(&self, id: i64) -> Result<Vec<i64>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT terminal FROM schedule_run WHERE schedule = ?1 AND ended_at IS NULL              AND result IN ('claimed', 'started') AND terminal IS NOT NULL",
+            "SELECT terminal FROM schedule_run WHERE schedule = ?1 AND ended_at IS NULL \
+             AND result IN ('claimed', 'started') AND terminal IS NOT NULL",
         )?;
         Ok(stmt
             .query_map(params![id], |r| r.get(0))?
@@ -921,7 +986,6 @@ mod tests {
         s.schedule_runs(id, None, 100).unwrap()
     }
 
-    #[test]
     /// Run now is refused while any run of the schedule is open, a newer skipped row on top
     /// of a working run included; a run whose tab closed, or that never got one in time, no
     /// longer holds it back.
@@ -956,6 +1020,37 @@ mod tests {
             RunNow::Started(_)
         ));
         assert_eq!(s.run_now(77, 0, later, &[]).unwrap(), RunNow::NoSchedule);
+    }
+
+    /// A due slot while a run of the schedule is still open is skipped, whether that run waits
+    /// on a question (started, not ended) or is a Run now just claimed; once it ends, the next
+    /// due slot starts its run.
+    #[test]
+    fn a_due_slot_waits_for_an_open_run_as_run_now_does() {
+        let s = Store::in_memory().expect("open");
+        let id = s.add_schedule(&made("a")).unwrap();
+        let Some(Fired::Run(first)) = s.claim_fire(id, None, 500, 501, &[]).unwrap() else {
+            panic!("the first slot starts");
+        };
+        // It started and now waits on a question: open, not ended.
+        s.report_schedule(id, 500, "started", Some(7), None, Some(first))
+            .unwrap();
+        let skipped = s.claim_fire(id, Some(500), 600, 601, &[]).unwrap();
+        assert!(matches!(skipped, Some(Fired::Skipped(_))), "{skipped:?}");
+        let rows = runs(&s, id);
+        assert_eq!(rows[0].result, SKIPPED_OPEN);
+        // Its tab closed: the next slot starts.
+        let next = s.claim_fire(id, Some(600), 700, 701, &[7]).unwrap();
+        assert!(matches!(next, Some(Fired::Run(_))), "{next:?}");
+        // A Run now claimed (no tab yet) holds the next slot back too.
+        let s = Store::in_memory().expect("open");
+        let id = s.add_schedule(&made("b")).unwrap();
+        assert!(matches!(
+            s.run_now(id, 0, 1_000, &[]).unwrap(),
+            RunNow::Started(_)
+        ));
+        let held = s.claim_fire(id, None, 1_010, 1_011, &[]).unwrap();
+        assert!(matches!(held, Some(Fired::Skipped(_))), "{held:?}");
     }
 
     /// Two Run now asks at the same moment, from two connections, make one run.

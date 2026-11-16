@@ -18,6 +18,10 @@ use crate::state;
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui::{self, Icon};
 
+/// How long a run may go without a tab before the daemon counts it as never started
+/// (`qoop_store::schedule::NO_TAB_FOR`, pinned by a test).
+pub const NO_TAB_FOR: i64 = 120;
+
 /// How many runs of each schedule are read.
 const RUNS_READ: u32 = 50;
 
@@ -58,12 +62,15 @@ pub enum Write {
 }
 
 /// A run of `schedule` among `runs` is open (claimed, or started and not ended), whichever
-/// it is: Run now waits for it, as the daemon does.
-pub fn running_now(runs: &[ScheduleRun], schedule: i64) -> bool {
+/// it is: Run now waits for it, as the daemon does. A run that has had no tab for
+/// `qoop_store::schedule::NO_TAB_FOR` seconds is one that never started, as the daemon
+/// counts it, and holds nothing back.
+pub fn running_now(runs: &[ScheduleRun], schedule: i64, now: i64) -> bool {
     runs.iter().any(|r| {
         r.schedule == schedule
             && r.ended_at.is_none()
             && matches!(r.result.as_str(), "claimed" | "started")
+            && (r.terminal.is_some() || now - r.started_at < NO_TAB_FOR)
     })
 }
 
@@ -397,7 +404,7 @@ impl Desk {
 
     /// Run now can be pressed: no Run now in flight, and the newest run has ended.
     pub(crate) fn can_run(&self, schedule: i64, runs: &[ScheduleRun]) -> bool {
-        !running_now(runs, schedule)
+        !running_now(runs, schedule, self.now)
             && !self
                 .schedule_page
                 .writes
@@ -1722,10 +1729,22 @@ mod tests {
     /// Run now waits while any run is claimed or still works, a newer skipped row or not.
     #[test]
     fn run_now_waits_for_any_open_run() {
-        assert!(!running_now(&[], 1));
-        assert!(running_now(&[run(1, 10, "started", None)], 1));
-        assert!(running_now(&[run(1, 10, "claimed", None)], 1));
-        assert!(!running_now(&[run(1, 10, "started", Some(20))], 1));
+        assert_eq!(NO_TAB_FOR, qoop_store::schedule::NO_TAB_FOR);
+        assert!(!running_now(&[], 1, 100));
+        // Claimed with no tab: open for its first two minutes, then never started.
+        assert!(running_now(
+            &[run(1, 10, "claimed", None)],
+            1,
+            10 + NO_TAB_FOR - 1
+        ));
+        assert!(!running_now(
+            &[run(1, 10, "claimed", None)],
+            1,
+            10 + NO_TAB_FOR
+        ));
+        assert!(running_now(&[run(1, 10, "started", None)], 1, 100));
+        assert!(running_now(&[run(1, 10, "claimed", None)], 1, 100));
+        assert!(!running_now(&[run(1, 10, "started", Some(20))], 1, 100));
         assert!(
             running_now(
                 &[
@@ -1737,7 +1756,7 @@ mod tests {
             "a newer skipped row does not end the run that still works"
         );
         assert!(
-            !running_now(&[run(1, 10, "started", None)], 2),
+            !running_now(&[run(1, 10, "started", None)], 2, 100),
             "another schedule's"
         );
         assert_eq!(
