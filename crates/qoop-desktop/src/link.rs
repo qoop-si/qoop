@@ -308,9 +308,15 @@ async fn session(
 ) -> io::Result<()> {
     // As `qoop` reads them; a list that does not read is no remotes rather than no window.
     let remotes = qoop_remote::saved::load().unwrap_or_default();
-    let (wire, mux) = through_mux(socket, remotes).await?;
+    let (wire, mut mux) = through_mux(socket, remotes).await?;
     *connected = true;
     let ran = linked(wire, host, shown, up, down, latest).await;
+    if ran.is_ok() {
+        // The window went: what it asked last (an answer on hold, sent as it closed) is in the
+        // pipe, which `linked` has closed. The mux forwards it, sees the end and stops; it is
+        // given up to two seconds before it is stopped.
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut mux).await;
+    }
     mux.abort();
     ran
 }
@@ -363,7 +369,11 @@ async fn linked(
                 }
             }
             asked = up.recv() => match asked {
-                None => break Ok(()),
+                None => {
+                    // The window went: the mux reads to the end of the pipe, then stops.
+                    let _ = writer.wr.shutdown().await;
+                    break Ok(());
+                }
                 // git in the folder, by its own deadline, beside the link: an answer like any.
                 Some(Up::Changes { id, terminal, cwd }) => {
                     let down = down.clone();

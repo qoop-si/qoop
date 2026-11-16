@@ -970,7 +970,10 @@ impl Desk {
                         ),
                 )
             })
-            .when_some(self.said_line(terminal, t, cx), |d, line| d.child(line))
+            .when_some(
+                self.said_line(&state::Slot::Agent(terminal), t, cx),
+                |d, line| d.child(line),
+            )
             .child(quiet(
                 "Clicks only; the terminal keeps the keys. Shown once, then it waits in the Inbox.",
                 t,

@@ -571,7 +571,11 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
     );
     std::thread::sleep(crate::state::ARMING);
     vcx.simulate_keystrokes("1");
-    let held = desk.read_with(&vcx, |d, _| d.holds.of(2).map(|h| h.label.clone()));
+    let held = desk.read_with(&vcx, |d, _| {
+        d.holds
+            .of(&crate::state::Slot::Agent(2))
+            .map(|h| h.label.clone())
+    });
     assert_eq!(held.as_deref(), Some("Yes"));
     vcx.simulate_keystrokes("u");
     assert!(
@@ -600,7 +604,9 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
         &mut vcx,
         ControlResponse::MenuAnswered { id, answers: true },
     );
-    let said = desk.read_with(&vcx, |d, _| d.said.get(&2).cloned());
+    let said = desk.read_with(&vcx, |d, _| {
+        d.said.get(&crate::state::Slot::Agent(2)).cloned()
+    });
     assert!(
         matches!(said, Some(crate::question::Said::Sent { ref label, .. }) if label == "Yes"),
         "{said:?}"
@@ -657,14 +663,100 @@ fn explain_is_typed_words_and_an_old_daemon_hides_them(cx: &mut TestAppContext) 
         },
     );
     let (said, offered) = desk.read_with(&vcx, |d, _| {
-        (d.said.get(&2).cloned(), d.too_old.contains(&0))
+        (
+            d.said.get(&crate::state::Slot::Agent(2)).cloned(),
+            d.too_old.contains(&0),
+        )
     });
     assert!(offered, "this machine takes no typed answers now");
     assert_eq!(
         said,
         Some(crate::question::Said::Refused(
-            "qoop on This Mac is too old for typed answers".into()
+            "qoop on This Mac is too old for typed answers.".into()
         ))
+    );
+}
+
+/// A qass card's option goes through the same hold as an agent's answer: held, `u` undoes it
+/// from anywhere it shows (never typed into the terminal), held again it is written as the
+/// owner's answer after the hold, and the card says Sent.
+#[gpui::test]
+fn a_card_answer_waits_out_the_hold_too(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let card: qoop_runtime::control::AskInfo = serde_json::from_value(serde_json::json!({
+        "card": "E41", "agent": "staging/T3", "status": "open", "opened_at": 1000,
+        "body": {
+            "handle": "soak", "urgency": "later", "doing": "running the soak test",
+            "why": "the migration touches billing", "asks": "Run the migration?",
+            "options": [
+                {"key": "a", "label": "Run it", "reason": "the test passed", "words": "run it"},
+                {"key": "b", "label": "Wait", "reason": "after the release", "words": "wait"},
+            ],
+        },
+    }))
+    .expect("card");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks = vec![card.clone()];
+            d.open(Page::Session(1), window, cx);
+            d.inbox = true;
+            d.pick_card(&card, "a", window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    sent(&mut rx);
+    let slot = crate::state::Slot::Card("E41".into());
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.of(&slot).is_some()),
+        "held"
+    );
+    vcx.simulate_keystrokes("u");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+        "undone"
+    );
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "u went to Undo, not to the agent on screen"
+    );
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.pick_card(&card, "a", window, cx);
+            for hold in &mut d.holds.held {
+                hold.until = std::time::Instant::now();
+            }
+            d.fire();
+        })
+    });
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::AskWrite { .. })
+    })
+    .expect("written after the hold");
+    let ControlRequest::AskWrite { id, action, .. } = asked else {
+        unreachable!()
+    };
+    assert_eq!(
+        action,
+        qoop_runtime::control::AskOp::Answer {
+            card: "E41".into(),
+            option: Some("a".into()),
+            text: None,
+            seen: None,
+        }
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::AskWritten {
+            id,
+            card: "E41".into(),
+            result: qoop_runtime::control::AskResult::Passed,
+        },
+    );
+    let said = desk.read_with(&vcx, |d, _| d.said.get(&slot).cloned());
+    assert!(
+        matches!(said, Some(crate::question::Said::Sent { ref label, .. }) if label == "Run it"),
+        "{said:?}"
     );
 }
 

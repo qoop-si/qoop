@@ -7,7 +7,7 @@ use qoop_runtime::control::{AgentRow, AskInfo, AskOp, ControlRequest, TerminalSt
 
 use crate::app::{Desk, Page};
 use crate::link;
-use crate::state::{self, Kind, Pick};
+use crate::state::{self, Kind, Pick, Slot};
 use crate::theme::{Theme, c, ca};
 use crate::ui::{self, Icon};
 
@@ -108,7 +108,15 @@ impl Desk {
                             .text_color(c(t.t2))
                             .child(format!(
                                 "{} needs you, {} unread",
-                                needs.len() + cards.len(),
+                                needs.len()
+                                    + cards
+                                        .iter()
+                                        .filter(|a| {
+                                            !a.terminal.is_some_and(|t| {
+                                                needs.iter().any(|r| r.terminal == t)
+                                            })
+                                        })
+                                        .count(),
                                 unread.len()
                             )),
                     )
@@ -318,7 +326,9 @@ impl Desk {
                         .map(|(n, o)| self.offer_button(terminal, o, ("inbox", n), t, cx)),
                 )
             })
-            .when_some(self.said_line(terminal, t, cx), |d, line| d.child(line))
+            .when_some(self.said_line(&Slot::Agent(terminal), t, cx), |d, line| {
+                d.child(line)
+            })
             .into_any_element()
     }
 
@@ -376,7 +386,7 @@ impl Desk {
                     .child(format!("Why: {}", body.why)),
             )
             .children(body.options.iter().enumerate().map(|(n, o)| {
-                let card_id = id.clone();
+                let info = card.clone();
                 let key = o.key.clone();
                 ui::control(
                     ("card-option", ((index as u64) << 8) | n as u64),
@@ -411,16 +421,13 @@ impl Desk {
                                 .child(o.reason.clone()),
                         ),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.card_write(AskOp::Answer {
-                        card: card_id.clone(),
-                        option: Some(key.clone()),
-                        text: None,
-                        seen: None,
-                    });
-                    cx.notify();
-                }))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.pick_card(&info, &key, window, cx)),
+                )
             }))
+            .when_some(self.said_line(&Slot::Card(id.clone()), t, cx), |d, line| {
+                d.child(line)
+            })
             .when_some(pick, |d, p| {
                 d.child(div().text_size(px(12.)).text_color(c(t.t2)).child(p))
             })
