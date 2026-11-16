@@ -20,6 +20,7 @@ export default {
         { title: "Install", slug: "install" },
         { title: "Quick start", slug: "quick-start" },
         { title: "Coming from tmux", slug: "coming-from" },
+        { title: "Coming from herdr", slug: "coming-from-herdr" },
       ],
     },
     {

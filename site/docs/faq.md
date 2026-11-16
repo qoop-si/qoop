@@ -44,6 +44,14 @@ is taken as dark; set `theme = "light"` in [Configuration](#configuration).
 
 Run `qoop reset`: it puts the terminal back from raw mode.
 
+## Does qoop run herdr plugins?
+
+Yes, for the parts of herdr's plugin interface that the plugins we tried use.
+`qoop plugin install owner/repo` fetches one and shows what it runs before anything does, and
+its actions appear in the palette. Floating popups, moving panes and layout changes are not
+supported, so a plugin that needs one installs and then does not do its main job: see
+[herdr plugins](#plugins) for the limits and the plugins that were tried.
+
 ## Which systems does it run on?
 
 macOS (Apple silicon or Intel) and Linux with glibc 2.17 or newer (x86_64 or arm64), so

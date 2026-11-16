@@ -46,7 +46,7 @@ pick a pet and signs you in. Then type `claude` or `codex` in it. macOS and Linu
 ## Docs
 
 Everything else lives in the [docs](https://qoop.si/docs/): keys, spaces and
-splits, servers, the phone, qass, hooks, settings. To build the open part from source, see
+splits, servers, the phone, qass, hooks, herdr plugins, settings. To build the open part from source, see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
