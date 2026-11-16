@@ -1259,12 +1259,21 @@ pub type PetRect = (u8, u8, u8, u8, String);
 /// A machine silent this long keeps its rows, but as of when it last answered.
 pub const STALE_AFTER: i64 = 15;
 
-/// Since when each machine has not answered, kept from the space lists. The mux pushes a list
-/// the moment a link drops, so that moment is also when the machine last answered.
+/// How each machine was last heard. `heard` is the last answer from the machine's own daemon
+/// (the window asks each one that is up every [`PING_EVERY`]): a link that stays up while its
+/// daemon says nothing goes stale by it. `down_since` is when the space lists first said every
+/// link to it was down, which counts for a machine never heard on its own (a qoop from before
+/// the window's ask). The mux pushes a list the moment a link drops.
 #[derive(Clone, Debug, Default)]
 pub struct Reach {
     pub down_since: std::collections::BTreeMap<usize, i64>,
+    pub heard: std::collections::BTreeMap<usize, i64>,
+    /// The machines whose link was up in the last list.
+    up: BTreeSet<usize>,
 }
+
+/// How often the window asks each machine that is up for a word from its daemon.
+pub const PING_EVERY: i64 = 5;
 
 /// How a machine stands for the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1280,6 +1289,13 @@ pub enum MachineState {
     },
 }
 
+/// Whether a space of machine `m` says its link is up (a remote's; this Mac's say nothing).
+fn link_up(spaces: &[WorkspaceRow], m: usize) -> bool {
+    spaces
+        .iter()
+        .any(|w| machine_of(w.id) == m && w.link == Some(LinkState::Up))
+}
+
 /// Whether every space of machine `m` says its link is down (and it has one).
 fn all_down(spaces: &[WorkspaceRow], m: usize) -> bool {
     let mut of = spaces.iter().filter(|w| machine_of(w.id) == m).peekable();
@@ -1292,13 +1308,31 @@ impl Reach {
     pub fn note(&mut self, spaces: &[WorkspaceRow], now: i64) {
         let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(w.id)).collect();
         self.down_since.retain(|m, _| machines.contains(m));
-        for m in machines {
+        self.heard.retain(|m, _| machines.contains(m));
+        let up: BTreeSet<usize> = machines
+            .iter()
+            .copied()
+            .filter(|m| link_up(spaces, *m))
+            .collect();
+        for &m in &machines {
             if all_down(spaces, m) {
                 self.down_since.entry(m).or_insert(now);
             } else {
                 self.down_since.remove(&m);
             }
         }
+        // A link that just came up is the machine's daemon answering.
+        for m in up.difference(&self.up) {
+            if let Some(heard) = self.heard.get_mut(m) {
+                *heard = now;
+            }
+        }
+        self.up = up;
+    }
+
+    /// An answer from machine `m`'s own daemon came at `now`.
+    pub fn hear(&mut self, m: usize, now: i64) {
+        self.heard.insert(m, now);
     }
 
     /// How machine `m` stands at `now`. `lost` is when this Mac's daemon went away, if it has:
@@ -1311,20 +1345,29 @@ impl Reach {
         lost: Option<i64>,
     ) -> MachineState {
         let since = self.down_since.get(&m).copied();
+        let heard = self.heard.get(&m).copied();
+        // The last word from it: its own answer, else when its link went down.
+        let last = match (heard, since) {
+            (Some(h), Some(s)) => Some(h.min(s)),
+            (h, s) => h.or(s),
+        };
         if let Some(lost) = lost {
             return MachineState::Stale {
-                as_of: since.map_or(lost, |s| s.min(lost)),
+                as_of: last.map_or(lost, |l| l.min(lost)),
             };
         }
         let parked = spaces
             .iter()
             .filter(|w| machine_of(w.id) == m)
             .all(|w| w.link == Some(LinkState::Parked));
-        match since {
-            Some(since) if now - since >= STALE_AFTER => MachineState::Stale { as_of: since },
-            Some(_) => MachineState::Retrying,
-            None if parked && m != 0 => MachineState::Parked,
-            None => MachineState::Live,
+        let quiet = last.filter(|l| now - l >= STALE_AFTER);
+        match (since, quiet) {
+            (Some(_), Some(as_of)) => MachineState::Stale { as_of },
+            (Some(_), None) => MachineState::Retrying,
+            (None, _) if parked && m != 0 => MachineState::Parked,
+            // Up, and its daemon has said nothing for the whole time.
+            (None, Some(as_of)) if link_up(spaces, m) => MachineState::Stale { as_of },
+            (None, _) => MachineState::Live,
         }
     }
 }
@@ -2884,6 +2927,82 @@ pub(crate) mod tests {
         assert_eq!(
             reach.state(0, &m.spaces, 1_040, Some(1_035)),
             MachineState::Stale { as_of: 1_035 }
+        );
+    }
+
+    /// A link that stays up while its daemon says nothing: stale 15 s after the last answer
+    /// from that daemon, as of then; an answer brings it back. A parked machine is not asked
+    /// and never goes stale this way.
+    #[test]
+    fn an_up_link_with_a_silent_daemon_goes_stale() {
+        let zone = utc();
+        let mut m = fixture();
+        let remote = 1usize;
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Up);
+            }
+        }
+        let mut reach = Reach::default();
+        reach.note(&m.spaces, 1_000);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 5_000, None),
+            MachineState::Live,
+            "never heard"
+        );
+        reach.hear(remote, 1_002);
+        reach.note(&m.spaces, 1_010);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_016, None),
+            MachineState::Live
+        );
+        let stale = reach.state(remote, &m.spaces, 1_017, None);
+        assert_eq!(stale, MachineState::Stale { as_of: 1_002 });
+        assert_eq!(
+            reach_banner(&[("staging".into(), stale)], zone),
+            Some(format!("staging not reached, as of {}", clock(1_002, zone)))
+        );
+        reach.hear(remote, 1_020);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_021, None),
+            MachineState::Live
+        );
+        // The link drops 10 s after its last answer: stale 5 s later, as of that answer.
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Down);
+            }
+        }
+        reach.note(&m.spaces, 1_030);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_034, None),
+            MachineState::Retrying
+        );
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_035, None),
+            MachineState::Stale { as_of: 1_020 }
+        );
+        // Back up: heard again as it comes up.
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Up);
+            }
+        }
+        reach.note(&m.spaces, 1_100);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_101, None),
+            MachineState::Live
+        );
+        // Parked: let go, never asked, never stale.
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Parked);
+            }
+        }
+        reach.note(&m.spaces, 1_200);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 9_000, None),
+            MachineState::Parked
         );
     }
 

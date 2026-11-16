@@ -1247,3 +1247,112 @@ fn remote_settings_go_through_via(cx: &mut TestAppContext) {
         "a read says nothing"
     );
 }
+
+/// The requests the window sent through `Via` to `workspace`, unwrapped.
+fn via_sent(rx: &mut UnboundedReceiver<Up>, workspace: i64) -> Vec<ControlRequest> {
+    sent(rx)
+        .into_iter()
+        .filter_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::Via {
+                    workspace: to,
+                    request,
+                    ..
+                } if to == workspace => Some(*request),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A remote's answer that comes after the page went back to This Mac is dropped: it never
+/// lands on This Mac's qass switch or its settings.
+#[gpui::test]
+fn a_late_remote_settings_answer_is_dropped(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Settings, window, cx);
+            d.show_settings_machine(Some(remote), cx);
+        })
+    });
+    let qass = via_sent(&mut rx, remote)
+        .into_iter()
+        .find(|r| matches!(r, ControlRequest::QassWatch { .. }))
+        .expect("qass read through Via");
+    let before = desk.read_with(&vcx, |d, _| d.model.qass_watch);
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.show_settings_machine(None, cx)));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::QassWatch {
+            id: qass.request_id().to_string(),
+            on: before != Some(true),
+        },
+    );
+    assert_eq!(desk.read_with(&vcx, |d, _| d.model.qass_watch), before);
+    assert_eq!(desk.read_with(&vcx, |d, _| d.settings.remote.qass), None);
+    assert_eq!(desk.read_with(&vcx, |d, _| d.settings.said.clone()), None);
+}
+
+/// A link that stays up while the daemon behind it sends nothing: 15 s after its last answer
+/// the machine reads "not reached, as of" that answer; its next answer brings it back.
+#[gpui::test]
+fn an_up_link_that_sends_nothing_goes_stale(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let up = || {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if crate::state::machine_of(w.id) == 1 {
+                w.link = Some(LinkState::Up);
+            }
+        }
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        }
+    };
+    let pet_id = |rx: &mut UnboundedReceiver<Up>| {
+        via_sent(rx, remote)
+            .into_iter()
+            .find_map(|r| match r {
+                ControlRequest::Pet { id } => Some(id),
+                _ => None,
+            })
+            .expect("the machine asked for a word")
+    };
+    let pet = |id: String| ControlResponse::Pet {
+        id,
+        rects: Vec::new(),
+    };
+    answer(&desk, &mut vcx, up());
+    let id = pet_id(&mut rx);
+    answer(&desk, &mut vcx, pet(id));
+    let set_now = |vcx: &mut VisualTestContext, now: i64| {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, cx| {
+                d.now = now;
+                cx.notify();
+            })
+        })
+    };
+    set_now(&mut vcx, 2000 + crate::state::STALE_AFTER - 1);
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "still heard");
+    set_now(&mut vcx, 2000 + crate::state::STALE_AFTER);
+    let zone = desk.read_with(&vcx, |d, _| d.zone);
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.banner()),
+        Some(format!(
+            "staging not reached, as of {}",
+            crate::state::clock(2000, zone)
+        ))
+    );
+    // The list comes again with the link still up: a new ask, and its answer.
+    answer(&desk, &mut vcx, up());
+    let id = pet_id(&mut rx);
+    answer(&desk, &mut vcx, pet(id));
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "heard again");
+}

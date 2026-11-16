@@ -34,6 +34,10 @@ pub struct SettingsPage {
     /// The machine shown: `None` for This Mac, else a space of it to ask through.
     pub via: Option<i64>,
     pub remote: RemoteSettings,
+    /// Each settings request still out, under its id: the machine it went to (0 for This
+    /// Mac) and whether it writes. An answer from a machine no longer shown is dropped, so a
+    /// remote's late answer never lands on This Mac's page, nor This Mac's on a remote's.
+    pub sent: std::collections::HashMap<String, (usize, bool)>,
 }
 
 impl Desk {
@@ -91,6 +95,9 @@ impl Desk {
         };
         match request {
             Some(request) if self.connected => {
+                self.settings
+                    .sent
+                    .insert(request.request_id().to_string(), (0, true));
                 self.ask(request);
                 self.settings.said = Some(format!("{}: sent to qoop's daemon", setting.label));
                 cx.notify();
@@ -669,15 +676,13 @@ impl Desk {
     }
 }
 
-/// A number for a setting's controls.
 /// Another machine's settings as its daemon answered them: only what crosses today, its sleep
-/// keys and qass's switch. `asked` holds the reads and writes still out (true for a write).
+/// keys and qass's switch.
 #[derive(Default)]
 pub struct RemoteSettings {
     pub idle_minutes: Option<u64>,
     pub exit_when_asleep: Option<bool>,
     pub qass: Option<bool>,
-    pub asked: std::collections::HashMap<String, bool>,
 }
 
 impl Desk {
@@ -686,7 +691,9 @@ impl Desk {
         self.settings.via = via;
         self.settings.remote = RemoteSettings::default();
         self.settings.said = None;
-        if via.is_some() {
+        if via.is_none() {
+            self.read_settings();
+        } else {
             self.ask_remote(
                 ControlRequest::SleepSettings {
                     id: link::fresh_id("sleep"),
@@ -712,11 +719,10 @@ impl Desk {
             return;
         };
         let outer = link::fresh_id("via");
-        self.settings
-            .remote
-            .asked
-            .insert(request.request_id().to_string(), write);
-        self.settings.remote.asked.insert(outer.clone(), write);
+        let machine = state::machine_of(workspace);
+        let sent = &mut self.settings.sent;
+        sent.insert(request.request_id().to_string(), (machine, write));
+        sent.insert(outer.clone(), (machine, write));
         self.ask(ControlRequest::Via {
             id: outer,
             workspace,
@@ -732,12 +738,19 @@ impl Desk {
             .map_or_else(|| "This Mac".to_string(), state::machine_name)
     }
 
-    /// An answer to a read or write of the machine shown; `false` when it was not one.
+    /// An answer to a settings request: dropped when its machine is no longer shown, left to
+    /// the usual handling (`false`) when it is This Mac's or not a settings request at all.
     pub(crate) fn remote_setting_came(&mut self, response: &ControlResponse) -> bool {
         let id = response.request_id();
-        let Some(write) = self.settings.remote.asked.remove(id) else {
+        let Some((from, write)) = self.settings.sent.remove(id) else {
             return false;
         };
+        if from != self.settings.via.map_or(0, state::machine_of) {
+            return true;
+        }
+        if from == 0 {
+            return false;
+        }
         let machine = self.settings_machine();
         let when = state::clock(self.now, self.zone);
         let remote = &mut self.settings.remote;
@@ -963,6 +976,7 @@ impl Desk {
     }
 }
 
+/// A number for a setting's controls.
 fn key_id(key: &str) -> u64 {
     SETTINGS
         .iter()

@@ -144,6 +144,12 @@ pub struct Desk {
     /// Other machines' pets, as their daemons drew them, and the reads still out.
     pub(crate) machine_pets: HashMap<usize, Vec<state::PetRect>>,
     pet_asks: HashMap<String, usize>,
+    /// When each machine was last asked for a word (its pet), and the ones whose qoop cannot
+    /// answer that ask.
+    pinged: HashMap<usize, i64>,
+    no_pet: BTreeSet<usize>,
+    /// The machine states last drawn: the clock draws again when one changes.
+    drawn_states: Vec<state::MachineState>,
     /// The agent list came at least once: before it, Home draws skeleton rows.
     pub(crate) listed: bool,
     /// Home's one field while there is no agent yet.
@@ -235,6 +241,9 @@ impl Desk {
             closed_card: None,
             machine_pets: HashMap::new(),
             pet_asks: HashMap::new(),
+            pinged: HashMap::new(),
+            no_pet: BTreeSet::new(),
+            drawn_states: Vec::new(),
             listed: false,
             first_run: None,
             prefix: config.config.prefix,
@@ -403,10 +412,12 @@ impl Desk {
             ControlResponse::Workspaces { workspaces, .. } => {
                 self.reach.note(&workspaces, self.now);
                 self.model.spaces = workspaces;
-                self.ask_pets();
+                self.ping_machines();
             }
             ControlResponse::Pet { id, rects } => {
                 if let Some(m) = self.pet_asks.remove(&id) {
+                    self.pet_asks.retain(|_, a| *a != m);
+                    self.reach.hear(m, self.now);
                     self.machine_pets.insert(m, rects);
                 }
             }
@@ -421,6 +432,11 @@ impl Desk {
             ControlResponse::Failed { id, reason } => {
                 if let Some(review) = self.review.as_mut().filter(|r| r.id == id) {
                     review.read = Some(Err(reason));
+                } else if let Some(m) = self.pet_asks.remove(&id) {
+                    // A qoop there from before the ask: it keeps the link's own rule.
+                    if reason.contains("unknown variant") {
+                        self.no_pet.insert(m);
+                    }
                 } else if self.strip_ask.as_deref() == Some(id.as_str()) {
                     // A daemon from before a window could read a tab's task: no strip.
                     self.strip = Some(state::Strip::default());
@@ -768,15 +784,24 @@ impl Desk {
             .map(|rects| ui::pet_rects(rects, 0.8))
     }
 
-    /// Ask each other machine that answers for its pet, once.
-    fn ask_pets(&mut self) {
+    /// Ask each other machine whose link is up for a word from its daemon, every
+    /// [`state::PING_EVERY`]: its pet, which also draws its tile. A link can stay up while
+    /// the daemon behind it says nothing; the answers are what [`state::Reach`] counts.
+    /// A parked machine is not asked, since asking wakes it.
+    fn ping_machines(&mut self) {
         for (m, _, via) in state::machines(&self.model.spaces) {
             let Some(workspace) = via else { continue };
-            let asked =
-                self.machine_pets.contains_key(&m) || self.pet_asks.values().any(|a| *a == m);
-            if asked || self.reach.down_since.contains_key(&m) {
+            let up = self.model.spaces.iter().any(|w| {
+                state::machine_of(w.id) == m && w.link == Some(qoop_runtime::control::LinkState::Up)
+            });
+            let due = self
+                .pinged
+                .get(&m)
+                .is_none_or(|at| self.now - at >= state::PING_EVERY);
+            if !up || !due || self.no_pet.contains(&m) {
                 continue;
             }
+            self.pinged.insert(m, self.now);
             let id = link::fresh_id("pet");
             self.pet_asks.insert(id.clone(), m);
             self.ask(ControlRequest::Via {
@@ -825,9 +850,15 @@ impl Desk {
             r.last_active_at_unix
                 .is_some_and(|at| now.saturating_sub(at) < 60)
         });
-        let down = !self.reach.down_since.is_empty();
-        let redraw = now != self.now && (fresh || down || now / 30 != self.now / 30);
+        let redraw = now != self.now && (fresh || now / 30 != self.now / 30);
         self.now = now;
+        self.ping_machines();
+        let states: Vec<state::MachineState> = state::machines(&self.model.spaces)
+            .into_iter()
+            .map(|(m, _, _)| self.machine_state(m))
+            .collect();
+        let redraw = redraw || states != self.drawn_states;
+        self.drawn_states = states;
         let finish = match self.page {
             Page::Session(t) => self.model.finish(t),
             _ => None,
@@ -1339,7 +1370,7 @@ impl Desk {
             .left(px(248.))
             .right(px(right))
             .bottom(px(4.))
-            .h(px(20.))
+            .min_h(px(20.))
             .flex()
             .items_center()
             .justify_center()
@@ -1354,6 +1385,9 @@ impl Desk {
                         .id("reach-banner")
                         .role(Role::Status)
                         .aria_label(banner.clone())
+                        .flex_shrink()
+                        .min_w_0()
+                        .whitespace_normal()
                         .text_color(c(t.t1))
                         .child(banner),
                 )
