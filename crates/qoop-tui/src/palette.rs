@@ -267,7 +267,12 @@ impl Palette {
                 item: Item::Space(space.id),
                 section: "spaces",
                 text: space.name.clone(),
-                sub: "space".to_string(),
+                // The name no longer carries a down link's reason: the sub line says it.
+                sub: if space.link == Some(qoop_runtime::control::LinkState::Down) {
+                    "space, offline".to_string()
+                } else {
+                    "space".to_string()
+                },
                 space: Some(space.id),
                 space_len: crate::width::width(&space.name),
                 state: None,
@@ -1071,6 +1076,33 @@ mod tests {
         assert_eq!(hits[0].section, "sleeping");
         assert_eq!(hits[0].text, "api claude");
         assert!(entries.iter().any(|e| e.item == Item::Sleep));
+    }
+
+    /// A space whose machine is not reached says so on its sub line, its name left as it is.
+    #[test]
+    fn a_down_space_reads_offline_on_its_sub_line() {
+        use qoop_runtime::control::LinkState;
+        let mut down = space(2, "devbox:api (old)");
+        down.link = Some(LinkState::Down);
+        down.link_reason = Some("offline: ssh: connect to host devbox port 22".into());
+        let mut up = space(3, "devbox:web");
+        up.link = Some(LinkState::Up);
+        let entries = Palette::open().items(
+            &[],
+            &[space(1, "default"), down, up],
+            0,
+            &crate::sidebar::Seen::new(),
+            &crate::sidebar::Unseen::new(),
+        );
+        let sub = |id| {
+            entries
+                .iter()
+                .find(|e| e.item == Item::Space(id))
+                .map(|e| (e.text.as_str(), e.sub.as_str()))
+        };
+        assert_eq!(sub(2), Some(("devbox:api (old)", "space, offline")));
+        assert_eq!(sub(3), Some(("devbox:web", "space")));
+        assert_eq!(sub(1), Some(("default", "space")));
     }
 
     /// The empty query stays short: one agent row that asks which command,
