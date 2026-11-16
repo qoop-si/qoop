@@ -377,6 +377,18 @@ impl Render for Tip {
     }
 }
 
+/// What `.tooltip()` takes to show a text made at run time (a link's reason).
+pub fn tip_text(text: String, t: Theme) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| {
+        cx.new(|_| Tip {
+            text: text.clone(),
+            t,
+        })
+        .into()
+    }
+}
+
 /// What `.tooltip()` takes to show `text`.
 pub fn tip(text: &'static str, t: Theme) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_, cx| {
