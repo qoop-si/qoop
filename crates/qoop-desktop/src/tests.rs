@@ -760,6 +760,72 @@ fn a_card_answer_waits_out_the_hold_too(cx: &mut TestAppContext) {
     );
 }
 
+/// The qass page's switches: All asks qass to stop watching, a space's and a tab's switch tell
+/// qass to leave them alone.
+#[gpui::test]
+fn the_qass_switches_send_their_requests(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    let click = |vcx: &mut VisualTestContext, what: &'static str| {
+        let at = vcx
+            .debug_bounds(what)
+            .unwrap_or_else(|| panic!("{what} is not drawn"))
+            .center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+    };
+    click(&mut vcx, "watch-all-0");
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::QassWatch { .. })
+    });
+    assert!(
+        matches!(
+            asked,
+            Some(ControlRequest::QassWatch {
+                on: Some(false),
+                ..
+            })
+        ),
+        "{asked:?}"
+    );
+    // Watching back on, then one tab and one space left alone.
+    click(&mut vcx, "watch-all-0");
+    sent(&mut rx);
+    click(&mut vcx, "watch-tab-1");
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::SetQassSkip { .. })
+    });
+    assert!(
+        matches!(
+            asked,
+            Some(ControlRequest::SetQassSkip {
+                workspace: 1,
+                terminal: Some(1),
+                on: true,
+                ..
+            })
+        ),
+        "{asked:?}"
+    );
+    click(&mut vcx, "watch-space-2");
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::SetQassSkip { .. })
+    });
+    assert!(
+        matches!(
+            asked,
+            Some(ControlRequest::SetQassSkip {
+                workspace: 2,
+                terminal: None,
+                on: true,
+                ..
+            })
+        ),
+        "{asked:?}"
+    );
+}
+
 /// Every key hint names the prefix `config.toml` picked.
 #[gpui::test]
 fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {

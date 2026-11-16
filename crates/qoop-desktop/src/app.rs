@@ -120,6 +120,10 @@ pub struct Desk {
     /// qass's cards waiting on the owner, and what qass did on its own today.
     pub asks: Vec<AskInfo>,
     pub acts: Vec<QassAct>,
+    /// qass's lessons file counted, read when its page opens; `None` when there is none.
+    pub lessons: Option<state::Lessons>,
+    /// What starting qass said, while it starts or when it could not.
+    pub(crate) qass_said: Option<String>,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
@@ -191,6 +195,8 @@ impl Desk {
             own: None,
             asks: Vec::new(),
             acts: Vec::new(),
+            lessons: None,
+            qass_said: None,
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -270,6 +276,11 @@ impl Desk {
                 self.model.splits = splits;
                 self.rows_changed(&before);
                 self.menus_changed();
+                // qass started or woke while its page is open: its terminal comes on.
+                if self.page == Page::Qass && self.term.is_none() && self.qass_terminal().is_some()
+                {
+                    self.open(Page::Qass, window, cx);
+                }
             }
             ControlResponse::Asks { live, .. } => self.asks = live,
             ControlResponse::QassActs { acts, .. } => self.acts = acts,
@@ -343,6 +354,9 @@ impl Desk {
             }
         }
         self.page = page;
+        if page == Page::Qass {
+            self.read_lessons();
+        }
         self.set_panes(terminal);
         if matches!(page, Page::Session(_)) {
             self.ask_strip();
@@ -1156,7 +1170,7 @@ impl Desk {
             ))
     }
 
-    fn terminal_area(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn terminal_area(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let term = self.term.as_ref();
         let up = self.up.clone();
         div()
@@ -1209,15 +1223,7 @@ impl Desk {
         match self.page {
             Page::Home => body.overflow_y_scroll().child(self.home(t, cx)),
             Page::Session(_) => body.p(px(12.)).child(self.session(t, focused, cx)),
-            Page::Qass if self.term.is_some() => {
-                body.p(px(12.)).child(self.terminal_area(focused, cx))
-            }
-            Page::Qass => body.p(px(24.)).child(
-                div()
-                    .text_size(px(13.5))
-                    .text_color(c(t.t2))
-                    .child("qass is not running."),
-            ),
+            Page::Qass => body.p(px(12.)).child(self.qass_page(t, focused, cx)),
             Page::Schedules => body
                 .overflow_y_scroll()
                 .p(px(24.))

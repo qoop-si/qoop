@@ -22,6 +22,8 @@ mod newwork;
 #[cfg(target_os = "macos")]
 mod probe;
 #[cfg(target_os = "macos")]
+mod qass;
+#[cfg(target_os = "macos")]
 mod question;
 #[cfg(target_os = "macos")]
 mod review;

@@ -307,6 +307,28 @@ pub fn chip(
         })
 }
 
+/// An on and off switch, 36 by 20, its state said to a screen reader. The caller adds
+/// `on_click`.
+pub fn switch(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Stateful<Div> {
+    control(id, Role::Switch, label.to_string(), t)
+        .aria_toggled(toggled(on))
+        .flex_none()
+        .w(px(36.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .when(on, |d| d.justify_end().bg(c(t.sel)))
+        .when(!on, |d| d.bg(ca(t.fill2)))
+        .child(
+            div()
+                .size(px(14.))
+                .rounded_full()
+                .bg(c(if on { t.on_sel } else { t.t2 })),
+        )
+}
+
 /// A small tag with an outline: `local`, `remote`.
 pub fn tag(text: &str, t: &Theme) -> Div {
     div()

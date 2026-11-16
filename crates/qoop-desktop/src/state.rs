@@ -815,6 +815,41 @@ pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
     }
 }
 
+/// qass's rules as its lessons file counts them: the lessons that keep a question the owner's
+/// (`escalate`, `ask first`), the ones it answers alone (`do it`), and every lesson. A lesson
+/// is a line `- <when> -> <action> (<source>)`, as `skills/qass/SKILL.md` writes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lessons {
+    pub yours: usize,
+    pub alone: usize,
+    pub all: usize,
+}
+
+pub fn lessons_of(text: &str) -> Lessons {
+    let mut out = Lessons::default();
+    for line in text.lines() {
+        let Some(entry) = line.trim_start().strip_prefix("- ") else {
+            continue;
+        };
+        let Some((_, action)) = entry.rsplit_once(" -> ") else {
+            continue;
+        };
+        let action = action
+            .split(" (")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        out.all += 1;
+        match action.as_str() {
+            "escalate" | "ask first" => out.yours += 1,
+            "do it" => out.alone += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A unix time as "15:58" in `zone`.
 pub fn clock(at: i64, zone: Zone) -> String {
     (zone.local)(at).clock()
@@ -1950,5 +1985,27 @@ pub(crate) mod tests {
         assert!(!standing(
             "Yes, allow all edits during this session (shift+tab)"
         ));
+    }
+
+    /// The rules card counts a lessons file the way qass writes it.
+    #[test]
+    fn the_lessons_are_counted_by_their_action() {
+        let file = "# Lessons\n\
+                    \n\
+                    - a release or a tag -> escalate (owner 2026-10-02)\n\
+                    - an edit to README in acme-web -> do it (E7)\n\
+                    - a delete outside the repo -> ask first (owner 2026-10-03)\n\
+                    - a test run in the repo -> do it (owner 2026-10-04)\n\
+                    - a dependency bump -> wait (E9)\n\
+                    a note that is not a lesson -> do it\n";
+        assert_eq!(
+            lessons_of(file),
+            Lessons {
+                yours: 2,
+                alone: 2,
+                all: 5,
+            }
+        );
+        assert_eq!(lessons_of(""), Lessons::default());
     }
 }
