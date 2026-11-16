@@ -837,6 +837,17 @@ fn actions() -> Vec<Action> {
             method: || Method::Control(ControlRequest::ScheduleRead { id: "a".into() }),
         },
         Action {
+            name: "read a schedule's runs on the desktop's schedules page",
+            method: || {
+                Method::Control(ControlRequest::ScheduleRuns {
+                    id: "a".into(),
+                    schedule: 1,
+                    before: None,
+                    limit: 20,
+                })
+            },
+        },
+        Action {
             name: "preview a dev server shown on the phone",
             method: || {
                 Method::Control(ControlRequest::TunnelOpen {
@@ -1259,6 +1270,12 @@ fn every_control_method_is_reachable_from_some_action() {
             action: Box::new(ScheduleOp::Pause { schedule: 0 }),
         },
         ControlRequest::ScheduleRead { id: String::new() },
+        ControlRequest::ScheduleRuns {
+            id: String::new(),
+            schedule: 0,
+            before: None,
+            limit: 0,
+        },
         ControlRequest::TunnelOpen {
             id: String::new(),
             show: 0,
@@ -1344,6 +1361,7 @@ fn every_control_method_is_reachable_from_some_action() {
             | ControlRequest::ShowFetch { .. }
             | ControlRequest::ScheduleWrite { .. }
             | ControlRequest::ScheduleRead { .. }
+            | ControlRequest::ScheduleRuns { .. }
             | ControlRequest::TunnelOpen { .. }
             | ControlRequest::Changes { .. }
             | ControlRequest::ShowOpen { .. }

@@ -22,7 +22,10 @@ const USAGE: &str = "usage:
   qoop schedule add <name> (--cron \"<m h dom mon dow>\" | --at <HH:MM|YYYY-MM-DD HH:MM|+30s|+10m|+2h>
                     | --watch \"<command>\") [--agent NAME] [--cwd DIR] [--space NAME] [--json] -- <prompt>
   qoop schedule ls [--json]
+  qoop schedule edit <id|name> [--name NAME] [--cron \"...\" | --at ... | --watch \"...\"] [--agent NAME]
+                    [--cwd DIR] [--space NAME] [-- <prompt>]
   qoop schedule pause|resume|rm|run <id|name>
+  an edit keeps the id and the runs; a new timing starts from now
   times are the computer's local time; a bare HH:MM that has passed today means tomorrow
   a watch runs its command in the folder every 5 minutes; lines its last check did not see
   start the agent, with them under the prompt; the first check only notes what is there";
@@ -35,6 +38,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     match rest.first().map(String::as_str) {
         Some("add") => add(&rest[1..]),
         Some("ls") => list(&rest[1..]),
+        Some("edit") => edit(&rest[1..]),
         Some(verb @ ("pause" | "resume" | "rm" | "run")) => change(verb, &rest[1..]),
         Some("fire") => fire(&rest[1..]),
         Some("--help" | "-h") => {
@@ -178,25 +182,114 @@ fn add(args: &[String]) -> std::io::Result<()> {
         space,
         prompt,
     })?;
-    let made = read_all()?
-        .into_iter()
-        .find(|s| s.id == schedule)
-        .ok_or_else(|| std::io::Error::other("the schedule was added and is not there"))?;
+    let made = written(schedule)?;
     if json {
         println!(
             "{}",
             serde_json::to_string(&made).map_err(std::io::Error::other)?
         );
     } else {
-        let next = if made.watch.is_some() {
-            " (the first check notes what is there)".to_string()
-        } else {
-            made.next_at.map_or_else(String::new, |at| {
-                format!(", next {}", clock_of(at, system_zone()))
-            })
-        };
-        println!("added {} {}: {}{next}", made.id, made.name, made.when);
+        println!("{}", said("added", &made));
     }
+    Ok(())
+}
+
+/// The schedule a write just answered, read back.
+fn written(schedule: i64) -> std::io::Result<ScheduleInfo> {
+    read_all()?
+        .into_iter()
+        .find(|s| s.id == schedule)
+        .ok_or_else(|| std::io::Error::other("the schedule was written and is not there"))
+}
+
+/// What `add` and `edit` print of the schedule they wrote.
+fn said(verb: &str, made: &ScheduleInfo) -> String {
+    let next = if made.watch.is_some() {
+        " (the first check notes what is there)".to_string()
+    } else {
+        made.next_at.map_or_else(String::new, |at| {
+            format!(", next {}", clock_of(at, system_zone()))
+        })
+    };
+    format!("{verb} {} {}: {}{next}", made.id, made.name, made.when)
+}
+
+/// `qoop schedule edit <id|name> ...`: what is given replaces what the schedule has; its id and
+/// its runs stay.
+fn edit(args: &[String]) -> std::io::Result<()> {
+    let (mut wanted, mut name, mut cron, mut at, mut watch) = (None, None, None, None, None);
+    let (mut agent, mut cwd, mut space, mut prompt) = (None, None, None, None);
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let mut value = || words_next(&mut words);
+        match word.as_str() {
+            "--name" => name = Some(value()?),
+            "--cron" => cron = Some(value()?),
+            "--at" => at = Some(value()?),
+            "--watch" => watch = Some(value()?),
+            "--agent" => agent = Some(value()?),
+            "--cwd" => cwd = Some(value()?),
+            "--space" => space = Some(value()?),
+            "--" => {
+                let rest: Vec<String> = words.by_ref().cloned().collect();
+                prompt = Some(crate::task::text(&rest)?.trim().to_string());
+                break;
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other if other.starts_with("--") => return Err(usage(USAGE)),
+            _ if wanted.is_none() => wanted = Some(word.clone()),
+            _ => return Err(usage(USAGE)),
+        }
+    }
+    let wanted = wanted.ok_or_else(|| usage(USAGE))?;
+    let timings = [cron.is_some(), at.is_some(), watch.is_some()];
+    let others = [
+        name.is_some(),
+        agent.is_some(),
+        cwd.is_some(),
+        space.is_some(),
+        prompt.is_some(),
+    ];
+    // One timing at most, something to change, and a prompt given is not empty.
+    if timings.iter().filter(|given| **given).count() > 1
+        || !timings.iter().chain(&others).any(|given| *given)
+        || prompt.as_ref().is_some_and(String::is_empty)
+    {
+        return Err(usage(USAGE));
+    }
+    if let Some(cron) = &cron {
+        Cron::parse(cron).map_err(|e| std::io::Error::other(format!("{cron:?}: {e}")))?;
+    }
+    let at = match at {
+        Some(text) => Some(
+            parse_at(&text, qoop_runtime::store::now(), system_zone())
+                .map_err(std::io::Error::other)?,
+        ),
+        None => None,
+    };
+    if let Some(agent) = &agent {
+        agent_ok(agent, &config::read().agents).map_err(std::io::Error::other)?;
+    }
+    let cwd = match cwd {
+        Some(dir) => Some(std::path::absolute(dir)?.to_string_lossy().into_owned()),
+        None => None,
+    };
+    let change = ScheduleOp::Change {
+        schedule: resolve(&wanted)?,
+        name,
+        cron,
+        at,
+        watch,
+        agent,
+        cwd,
+        space,
+        prompt,
+    };
+    let made = written(write(change)?)?;
+    println!("{}", said("changed", &made));
     Ok(())
 }
 
@@ -361,16 +454,24 @@ pub(crate) fn launch(
     Ok((line, command))
 }
 
-/// `qoop schedule fire <id> --slot <s> [--now] [--seen]`: what the daemon starts at a claimed
-/// slot. A watch's run is given the lines of its last check on stdin (`--seen`); a watch with
-/// none was never checked.
+/// `qoop schedule fire <id> --slot <s> [--run <r>] [--now] [--seen]`: what the daemon starts at
+/// a claimed slot. A watch's run is given the lines of its last check on stdin (`--seen`); a
+/// watch with none was never checked. `--run` is the run's own row, which its report names.
 fn fire(args: &[String]) -> std::io::Result<()> {
-    let bad = || usage("usage: qoop schedule fire <id> --slot <s> [--now] [--seen]");
-    let (mut id, mut slot, mut now, mut seen) = (None, None, false, false);
+    let bad = || usage("usage: qoop schedule fire <id> --slot <s> [--run <r>] [--now] [--seen]");
+    let (mut id, mut slot, mut run, mut now, mut seen) = (None, None, None, false, false);
     let mut words = args.iter();
     while let Some(word) = words.next() {
         match word.as_str() {
             "--slot" => slot = words.next().and_then(|s| s.parse::<i64>().ok()),
+            "--run" => {
+                run = Some(
+                    words
+                        .next()
+                        .and_then(|r| r.parse::<i64>().ok())
+                        .ok_or_else(bad)?,
+                );
+            }
             "--now" => now = true,
             "--seen" => seen = true,
             _ if id.is_none() => id = word.parse::<i64>().ok(),
@@ -396,10 +497,6 @@ fn fire(args: &[String]) -> std::io::Result<()> {
     let Some(row) = read_all()?.into_iter().find(|s| s.id == id) else {
         return Ok(());
     };
-    // Removed, or claimed again since: this run is not the slot's any more.
-    if row.last_slot.unwrap_or(0) != slot {
-        return Ok(());
-    }
     let report = |result: String, terminal: Option<i64>, seen: Option<String>| {
         write(ScheduleOp::Report {
             schedule: id,
@@ -407,9 +504,18 @@ fn fire(args: &[String]) -> std::io::Result<()> {
             result,
             terminal,
             seen,
+            run,
         })
         .map(|_| ())
     };
+    // Claimed again since, or edited to a new timing: this run is not the slot's any more. Its
+    // own row, when it has one, says so rather than waiting for ever.
+    if row.last_slot.unwrap_or(0) != slot {
+        if run.is_some() {
+            return report("skipped: the schedule changed first".into(), None, None);
+        }
+        return Ok(());
+    }
     // `--now` is the owner asking, which is not held back by a run that is still going. A
     // watch says nothing: its lines stay new until the run is done, and its row keeps showing
     // the run that is going.

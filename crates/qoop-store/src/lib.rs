@@ -28,7 +28,7 @@ pub use ask::{Added, AskError, AskRow};
 pub use history::History;
 pub use item::{ItemAgent, ItemCard, ItemRow, ItemState, StepRow};
 use rusqlite::{Connection, OptionalExtension, params};
-pub use schedule::{ScheduleError, ScheduleRow};
+pub use schedule::{ScheduleError, ScheduleRow, ScheduleRunRow};
 pub use show::ShowRow;
 pub use task::{Outcome, TaskError, TaskEventRow, TaskRow};
 
@@ -521,6 +521,22 @@ impl Store {
                  command TEXT NOT NULL,
                  seen TEXT
              );
+             -- Each run of a schedule (`schedule.rs`): made when it starts, a skip included,
+             -- and ended when its agent's turn ends or its tab closes. The newest 200 of a
+             -- schedule are kept. New table, no version bump: an older binary never reads it.
+             CREATE TABLE IF NOT EXISTS schedule_run (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 schedule INTEGER NOT NULL REFERENCES schedule(id) ON DELETE CASCADE,
+                 slot INTEGER NOT NULL,
+                 started_at INTEGER NOT NULL,
+                 terminal INTEGER,
+                 task INTEGER,
+                 result TEXT NOT NULL,
+                 ended_at INTEGER,
+                 outcome TEXT,
+                 summary TEXT
+             );
+             CREATE INDEX IF NOT EXISTS schedule_run_at ON schedule_run(schedule, started_at);
              -- Usage counts per UTC day and the sender's few values (`telemetry.rs`). New
              -- tables, no version bump: an older binary never reads them.
              CREATE TABLE IF NOT EXISTS telemetry_day (

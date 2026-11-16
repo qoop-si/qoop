@@ -401,6 +401,12 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             }),
         },
         ControlRequest::ScheduleRead { id: "x44".into() },
+        ControlRequest::ScheduleRuns {
+            id: "x50".into(),
+            schedule: 1,
+            before: None,
+            limit: 10,
+        },
         // Reads of the session files on disk: nothing typed.
         ControlRequest::AgentSessions {
             id: "x41".into(),
@@ -515,6 +521,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::ShowRead { .. }
             | ControlRequest::ScheduleWrite { .. }
             | ControlRequest::ScheduleRead { .. }
+            | ControlRequest::ScheduleRuns { .. }
             | ControlRequest::AgentSessions { .. }
             | ControlRequest::AgentActivity { .. }
             | ControlRequest::ShowFetch { .. }

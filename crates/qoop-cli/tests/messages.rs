@@ -86,13 +86,6 @@ impl Daemon {
     /// The stand in, which also copies every line it is typed to `log` when given one (the
     /// terminal's line discipline turns the Enter into the newline that ends a line).
     fn start_agent_logging(&self, session: Option<&str>, listed: bool, log: Option<&Path>) {
-        let bin = self.dir.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("bin");
-        let source = bin.join("claude.rs");
-        let report = session.map_or(String::new(), |id| {
-            let said = bin.join("report.out");
-            format!("if let Ok(o) = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--session-id\", {id:?}]).output() {{ let _ = std::fs::write({said:?}, format!(\"{{}} {{}}\", o.status, String::from_utf8_lossy(&o.stderr))); }}")
-        });
         let body = log.map_or_else(
             || "std::thread::sleep(std::time::Duration::from_secs(120));".to_string(),
             |log| {
@@ -101,6 +94,35 @@ impl Daemon {
                 )
             },
         );
+        self.start_agent_doing(session, listed, &body);
+    }
+
+    /// The stand in, which ends one turn once `go` exists: its hook says it works, then that
+    /// the turn is done, as Claude's hooks do.
+    fn start_agent_finishing(&self, session: &str, go: &Path) {
+        let hook = |state: &str, event: &str| {
+            format!(
+                "let _ = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--state\", {state:?}, \"--event\", {event:?}]).output();"
+            )
+        };
+        let body = format!(
+            "while !std::path::Path::new({go:?}).exists() {{ std::thread::sleep(std::time::Duration::from_millis(100)); }} {} {} std::thread::sleep(std::time::Duration::from_secs(120));",
+            hook("working", "user"),
+            hook("idle", "done")
+        );
+        self.start_agent_doing(Some(session), true, &body);
+    }
+
+    /// Build the stand in, which reports `session` and then runs `body`, run it in terminal 1
+    /// and wait for its row.
+    fn start_agent_doing(&self, session: Option<&str>, listed: bool, body: &str) {
+        let bin = self.dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let source = bin.join("claude.rs");
+        let report = session.map_or(String::new(), |id| {
+            let said = bin.join("report.out");
+            format!("if let Ok(o) = std::process::Command::new({QOOP:?}).args([\"hook-report\", \"--session-id\", {id:?}]).output() {{ let _ = std::fs::write({said:?}, format!(\"{{}} {{}}\", o.status, String::from_utf8_lossy(&o.stderr))); }}")
+        });
         std::fs::write(&source, format!("fn main() {{ {report} {body} }}\n")).expect("write");
         let built = Command::new("rustc")
             .arg(&source)
@@ -1284,4 +1306,100 @@ async fn a_line_for_a_subagent_waits_for_a_person_at_the_keyboard() {
     // Only the person's own draft reached the terminal, and no newline ended it.
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
     let _ = std::fs::remove_file(&log);
+}
+
+/// A scheduled run in the agent's tab ends `done` at the agent's turn end, with the newest
+/// thing it said as the run's summary.
+#[tokio::test]
+async fn a_runs_agent_ending_its_turn_ends_the_run_done_with_its_last_message() {
+    use qoop_runtime::control::ScheduleOp;
+
+    let daemon = Daemon::start();
+    let id = fresh_id("run-end");
+    std::fs::write(transcript(&id), turns(&id, 2)).expect("write");
+    let go = daemon.dir.path().join("go");
+    daemon.start_agent_finishing(&id, &go);
+
+    // A run of a schedule whose tab is terminal 1, made in the store as the loop makes one.
+    let db = qoop_testkit::socket_in(daemon.dir.path()).with_file_name("qoop.db");
+    let store = qoop_store::Store::open(&db).expect("the daemon's store");
+    let now = qoop_runtime::store::now();
+    let schedule = store
+        .add_schedule(&qoop_store::ScheduleRow {
+            id: 0,
+            name: "nightly".into(),
+            cron: Some("0 9 * * *".into()),
+            at: None,
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            space: None,
+            prompt: "run the tests".into(),
+            paused: false,
+            // Made now, so the daemon has no missed slot to claim.
+            created_at: now,
+            last_slot: None,
+            last_at: None,
+            last_result: None,
+            last_terminal: None,
+            watch: None,
+        })
+        .expect("a schedule");
+    let run = store
+        .start_run(schedule, 0, now)
+        .expect("a run")
+        .expect("the schedule is there");
+    let mut c = daemon.client().await;
+    let reported = ask(
+        &mut c,
+        ControlRequest::ScheduleWrite {
+            id: "report".into(),
+            terminal: None,
+            token: None,
+            action: Box::new(ScheduleOp::Report {
+                schedule,
+                slot: 0,
+                result: "started".into(),
+                terminal: Some(1),
+                seen: None,
+                run: Some(run),
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(reported, ControlResponse::ScheduleWritten { .. }),
+        "{reported:?}"
+    );
+
+    std::fs::write(&go, "").expect("go");
+    let deadline = Instant::now() + PATIENCE;
+    let ended = loop {
+        let ControlResponse::ScheduleRuns { runs, .. } = ask(
+            &mut c,
+            ControlRequest::ScheduleRuns {
+                id: "runs".into(),
+                schedule,
+                before: None,
+                limit: 10,
+            },
+        )
+        .await
+        else {
+            panic!("no runs");
+        };
+        if runs[0].outcome.is_some() {
+            break runs[0].clone();
+        }
+        assert!(Instant::now() < deadline, "the run never ended: {runs:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        (
+            ended.id,
+            ended.outcome.as_deref(),
+            ended.summary.as_deref(),
+            ended.terminal
+        ),
+        (run, Some("done"), Some("answer 1"), Some(1))
+    );
 }

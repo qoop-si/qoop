@@ -170,6 +170,7 @@ async fn each_thing_counts_where_it_happens_and_once() {
                     result: result.into(),
                     terminal: None,
                     seen: None,
+                    run: None,
                 }),
             },
         )
