@@ -26,7 +26,7 @@ case "$1 ${2:-}" in
     "remote ls") cat "$STUB/remotes" 2>/dev/null || true ;;
     "read "*) cat "$STUB/screen" 2>/dev/null || true ;;
     "ls --json") echo '[]' ;;
-    "ask ls") echo '{"live":[],"ended":[]}' ;;
+    "ask ls") cat "$STUB/asks.json" 2>/dev/null || echo '{"live":[],"ended":[]}' ;;
     *) exit 0 ;;
 esac
 "#;
@@ -1326,6 +1326,152 @@ fn the_same_rest_again_is_said_once_the_long_hold_ends() {
     );
     assert_eq!(lines, [staged_line("implementing", "100.1")]);
     assert!(w.read("data/held").is_empty());
+}
+
+/// A rest qass already had and handled (the generation, state and stage of the line said last,
+/// qass at rest since that line went out, no write to the agent since, no card of the agent's
+/// opened or closed since) stays quiet when its hold ends, noted, and its said record stays: an
+/// `again` hold and a waiting-human long hold alike, and after another agent's write (its driver
+/// follows it). A card opened since (its question), one answered since (the owner's answer from
+/// the inbox), a write from qass since and qass not yet at rest since each say it.
+#[test]
+fn a_handled_same_rest_stays_quiet_unless_something_changed() {
+    let card = |opened: i64, closed: Option<i64>| {
+        let (status, closed) = closed.map_or(("open", "null".into()), |ago| {
+            ("answered", (now() - ago).to_string())
+        });
+        format!(
+            r#"{{"live":[],"ended":[{{"card":"Q77","agent":"T5","terminal":5,"status":"{status}","opened_at":{},"closed_at":{closed}}}]}}"#,
+            now() - opened
+        )
+    };
+    let cases = [
+        ("handled", "implementing", "idle", None, None, false),
+        (
+            "waiting-human handled",
+            "waiting-human",
+            "idle",
+            None,
+            None,
+            false,
+        ),
+        (
+            "a card done before the print",
+            "implementing",
+            "idle",
+            Some(card(1500, Some(1200))),
+            None,
+            false,
+        ),
+        (
+            "a card since the print",
+            "implementing",
+            "idle",
+            Some(card(600, None)),
+            None,
+            true,
+        ),
+        (
+            "a card answered since the print",
+            "waiting-human",
+            "idle",
+            Some(card(1500, Some(600))),
+            None,
+            true,
+        ),
+        (
+            "written since",
+            "implementing",
+            "idle",
+            None,
+            Some((QASS, 700)),
+            true,
+        ),
+        (
+            "another agent wrote since",
+            "implementing",
+            "idle",
+            None,
+            Some((8, 700)),
+            false,
+        ),
+        (
+            "qass still working",
+            "implementing",
+            "working",
+            None,
+            None,
+            true,
+        ),
+    ];
+    std::thread::scope(|scope| {
+        for (case, stage, qass, asks, write, said) in cases {
+            scope.spawn(move || {
+                let w = Watch::new();
+                let now = now();
+                let record = format!("5 1 idle {stage} {} 90.1 {}\n", now - 2000, now - 1000);
+                w.put("data/said", &record);
+                if let Some(asks) = asks {
+                    w.put("stub/asks.json", &asks);
+                }
+                if let Some((from, ago)) = write {
+                    w.put("data/prompted.log", &format!("{} {from} T5\n", now - ago));
+                }
+                // qass rested after the line went out (1000 s ago), or works still.
+                let qass = qass_row(qass, now - 500);
+                w.put(
+                    "data/last.json",
+                    &rows(&[staged("working", stage, "?"), qass.clone()]),
+                );
+                w.snaps(&[rows(&[staged("idle", stage, "100.1"), qass])]);
+                let (lines, _) = w.run(11, &[("QASS_QUIET_HOLD", "5")]);
+                let quiet = w.read("data/quiet.log");
+                if said {
+                    assert_eq!(of(&lines, 5), [&staged_line(stage, "100.1")], "{case}");
+                    assert!(!quiet.contains(" same: quiet "), "{case}: {quiet}");
+                } else {
+                    assert!(of(&lines, 5).is_empty(), "{case}: {lines:?}");
+                    assert!(
+                        quiet.contains(" same: quiet T5 g1 claude working->idle "),
+                        "{case}: {quiet}"
+                    );
+                    assert!(w.read("data/held").is_empty(), "{case}");
+                    assert_eq!(w.read("data/said"), record, "{case}");
+                }
+            });
+        }
+    });
+}
+
+/// A handled same rest whose tab the owner is at now is held for him, never kept quiet: he may
+/// type to it.
+#[test]
+fn a_handled_same_rest_with_the_owner_at_the_tab_is_held_for_him() {
+    let w = Watch::new();
+    let now = now();
+    w.put(
+        "data/said",
+        &format!("5 1 idle implementing {} 90.1 {}\n", now - 2000, now - 1000),
+    );
+    w.put(
+        "stub/brief-5.json",
+        &format!(
+            r#"{{"allowed":"write (ending none)","ending":"none","not_now":[],"at":1000,"person_known":true,"person_until":{},"last_typed_by":"owner"}}"#,
+            now + 300
+        ),
+    );
+    let qass = qass_row("idle", now - 500);
+    w.put(
+        "data/last.json",
+        &rows(&[staged("working", "implementing", "?"), qass.clone()]),
+    );
+    w.snaps(&[rows(&[staged("idle", "implementing", "100.1"), qass])]);
+    let (lines, _) = w.run(11, &[("QASS_QUIET_HOLD", "5")]);
+    assert!(of(&lines, 5).is_empty(), "{lines:?}");
+    let quiet = w.read("data/quiet.log");
+    assert!(!quiet.contains(" same: quiet "), "{quiet}");
+    assert!(quiet.contains(" person: T5 until "), "{quiet}");
+    assert!(w.read("data/held").starts_with("5 1 person "));
 }
 
 /// The rest said last printed over an hour ago: a stop in the same stage is short again, so a
