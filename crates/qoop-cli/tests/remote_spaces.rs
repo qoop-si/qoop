@@ -364,7 +364,7 @@ fn scenario() {
             } else {
                 // The first ask can beat the connection. Wait for it, then ask again.
                 tui.spaces_where("the remote to come up", |s| {
-                    remote_rows(s).iter().any(|w| !w.name.contains('('))
+                    remote_rows(s).iter().any(|w| w.link_reason.is_none())
                 })
                 .await;
                 tui.ask(ControlRequest::CreateWorkspace {
