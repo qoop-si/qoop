@@ -406,7 +406,28 @@ impl Desk {
             .filter(|r| r.menu.is_some() && Kind::of(r).needs_you());
         let right = match (&self.review, asking) {
             (Some(review), _) => self.review_panel(review, t, cx).into_any_element(),
-            (None, Some(row)) => self.question_side(row, t),
+            (None, Some(row)) => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.question_side(row, t)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.task_column(t, cx)),
+                )
+                .into_any_element(),
             (None, None) => self.task_column(t, cx).into_any_element(),
         };
         div()
@@ -867,6 +888,7 @@ impl Desk {
         };
         div()
             .id("task-strip")
+            .debug_selector(|| "task-strip".to_string())
             .role(Role::Complementary)
             .aria_label("Task")
             .flex_1()
@@ -901,6 +923,9 @@ impl Desk {
             .role(Role::Alert)
             .aria_label(format!("Needs you: {title}"))
             .flex_none()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .p(px(12.))
             .flex()
             .flex_col()
@@ -989,6 +1014,7 @@ impl Desk {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .child(
@@ -1001,6 +1027,7 @@ impl Desk {
                     .child(div().flex_1())
                     .child(
                         ui::pill("note-open", &format!("Open {title}"), t)
+                            .debug_selector(|| "note-open".to_string())
                             .h(px(28.))
                             .child("Open")
                             .child(ui::kbd(&format!("{prefix} tab"), t))
