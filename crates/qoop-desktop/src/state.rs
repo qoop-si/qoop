@@ -1270,6 +1270,10 @@ pub struct Reach {
     pub heard: std::collections::BTreeMap<usize, i64>,
     /// The machines whose link was up in the last list.
     up: BTreeSet<usize>,
+    /// Every machine a list has named, and the ones down in the first list that named them
+    /// and not up since: down already when the window opened.
+    named: BTreeSet<usize>,
+    never_up: BTreeSet<usize>,
 }
 
 /// How often the window asks each machine that is up for a word from its daemon.
@@ -1287,6 +1291,8 @@ pub enum MachineState {
     Stale {
         as_of: i64,
     },
+    /// Not answering, and never reached since the window opened: there is no time to give.
+    NeverReached,
 }
 
 /// Whether a space of machine `m` says its link is up (a remote's; this Mac's say nothing).
@@ -1315,10 +1321,17 @@ impl Reach {
             .filter(|m| link_up(spaces, *m))
             .collect();
         for &m in &machines {
-            if all_down(spaces, m) {
+            let down = all_down(spaces, m);
+            if self.named.insert(m) && down {
+                self.never_up.insert(m);
+            }
+            if down {
                 self.down_since.entry(m).or_insert(now);
             } else {
                 self.down_since.remove(&m);
+            }
+            if up.contains(&m) {
+                self.never_up.remove(&m);
             }
         }
         // A link that just came up is the machine's daemon answering.
@@ -1338,6 +1351,23 @@ impl Reach {
     /// How machine `m` stands at `now`. `lost` is when this Mac's daemon went away, if it has:
     /// then every machine is stale, the remotes too (the mux ended with it).
     pub fn state(
+        &self,
+        m: usize,
+        spaces: &[WorkspaceRow],
+        now: i64,
+        lost: Option<i64>,
+    ) -> MachineState {
+        match self.state_as_of(m, spaces, now, lost) {
+            MachineState::Stale { .. }
+                if self.never_up.contains(&m) && !self.heard.contains_key(&m) =>
+            {
+                MachineState::NeverReached
+            }
+            state => state,
+        }
+    }
+
+    fn state_as_of(
         &self,
         m: usize,
         spaces: &[WorkspaceRow],
@@ -1372,6 +1402,24 @@ impl Reach {
     }
 }
 
+/// The machine a request goes to: by the terminal or the space it names (a `Via` by its
+/// space); zero for this one and for a request that names neither.
+pub fn request_machine(request: &qoop_runtime::control::ControlRequest) -> usize {
+    let Ok(wire) = serde_json::to_value(request) else {
+        return 0;
+    };
+    let terminal = wire
+        .get("terminal")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|t| u32::try_from(t).ok());
+    if let Some(terminal) = terminal {
+        return qoop_tui::mux::machine_of_terminal(terminal);
+    }
+    wire.get("workspace")
+        .and_then(serde_json::Value::as_i64)
+        .map_or(0, machine_of)
+}
+
 /// A machine's state in the words its tile and the banner both use.
 pub fn reach_words(state: MachineState, zone: Zone) -> String {
     match state {
@@ -1379,6 +1427,7 @@ pub fn reach_words(state: MachineState, zone: Zone) -> String {
         MachineState::Parked => "parked".into(),
         MachineState::Retrying => "retrying".into(),
         MachineState::Stale { as_of } => format!("not reached, as of {}", clock(as_of, zone)),
+        MachineState::NeverReached => "not reached since the window opened".into(),
     }
 }
 
@@ -1386,7 +1435,7 @@ pub fn reach_words(state: MachineState, zone: Zone) -> String {
 pub fn reach_banner(machines: &[(String, MachineState)], zone: Zone) -> Option<String> {
     let stale: Vec<String> = machines
         .iter()
-        .filter(|(_, s)| matches!(s, MachineState::Stale { .. }))
+        .filter(|(_, s)| matches!(s, MachineState::Stale { .. } | MachineState::NeverReached))
         .map(|(name, s)| format!("{name} {}", reach_words(*s, zone)))
         .collect();
     (!stale.is_empty()).then(|| stale.join("; "))
@@ -3003,6 +3052,69 @@ pub(crate) mod tests {
         assert_eq!(
             reach.state(remote, &m.spaces, 9_000, None),
             MachineState::Parked
+        );
+    }
+
+    /// A request is another machine's by the terminal or the space it names.
+    #[test]
+    fn a_request_goes_to_the_machine_it_names() {
+        use qoop_runtime::control::ControlRequest;
+        let remote = 1i64 << 40 | 1;
+        let via = ControlRequest::Via {
+            id: "v".into(),
+            workspace: remote,
+            request: Box::new(ControlRequest::Pet { id: "p".into() }),
+        };
+        assert_eq!(request_machine(&via), 1);
+        let read = ControlRequest::Scrollback {
+            id: "s".into(),
+            terminal: 0x8100_0001,
+            up: 0,
+            rows: 10,
+        };
+        assert_eq!(request_machine(&read), 1);
+        let here = ControlRequest::ListAgents { id: "a".into() };
+        assert_eq!(request_machine(&here), 0);
+    }
+
+    /// A machine already down when the window opened has no time to give: "not reached since
+    /// the window opened" until it is reached once.
+    #[test]
+    fn a_machine_down_from_the_start_has_no_as_of() {
+        let zone = utc();
+        let mut m = fixture();
+        let remote = 1usize;
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Down);
+            }
+        }
+        let mut reach = Reach::default();
+        reach.note(&m.spaces, 1_000);
+        let state = reach.state(remote, &m.spaces, 1_000 + STALE_AFTER, None);
+        assert_eq!(state, MachineState::NeverReached);
+        assert_eq!(
+            reach_words(state, zone),
+            "not reached since the window opened"
+        );
+        assert_eq!(
+            reach_banner(&[("staging".into(), state)], zone),
+            Some("staging not reached since the window opened".into())
+        );
+        // Reached once, then lost: a real time again.
+        for w in &mut m.spaces {
+            w.link = Some(LinkState::Up);
+        }
+        reach.note(&m.spaces, 1_100);
+        for w in &mut m.spaces {
+            if machine_of(w.id) == remote {
+                w.link = Some(LinkState::Down);
+            }
+        }
+        reach.note(&m.spaces, 1_200);
+        assert_eq!(
+            reach.state(remote, &m.spaces, 1_200 + STALE_AFTER, None),
+            MachineState::Stale { as_of: 1_200 }
         );
     }
 

@@ -88,6 +88,11 @@ fn terminal_in(terminal: u32) -> (usize, u32) {
     }
 }
 
+/// Which machine a terminal is on, as the interface numbers it: zero for this one.
+pub fn machine_of_terminal(terminal: u32) -> usize {
+    terminal_in(terminal).0
+}
+
 /// A remote terminal's number in its own daemon.
 pub fn daemon_terminal(terminal: u32) -> u32 {
     terminal_in(terminal).1

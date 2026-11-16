@@ -1359,3 +1359,85 @@ fn an_up_link_that_sends_nothing_goes_stale(cx: &mut TestAppContext) {
     answer(&desk, &mut vcx, pet(id));
     assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "heard again");
 }
+
+/// A busy remote whose pings wait behind its own traffic stays reached while its terminals
+/// speak: any event, screen or answer from it counts, and no second ping goes while the first
+/// is out.
+#[gpui::test]
+fn any_traffic_from_a_machine_counts_as_heard(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let up = || {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if crate::state::machine_of(w.id) == 1 {
+                w.link = Some(LinkState::Up);
+            }
+        }
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        }
+    };
+    let pings = |rx: &mut UnboundedReceiver<Up>| {
+        via_sent(rx, remote)
+            .into_iter()
+            .filter(|r| matches!(r, ControlRequest::Pet { .. }))
+            .count()
+    };
+    answer(&desk, &mut vcx, up());
+    assert_eq!(pings(&mut rx), 1);
+    let at = |vcx: &mut VisualTestContext, now: i64| {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, cx| {
+                d.now = now;
+                cx.notify();
+            })
+        })
+    };
+    // Heard once through its answer to something else it was asked.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.ask(ControlRequest::Scrollback {
+                id: "older".into(),
+                terminal: 0x8100_0001,
+                up: 0,
+                rows: 5,
+            });
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::Scrollback {
+                    id: "older".into(),
+                    terminal: 0x8100_0001,
+                    from: 0,
+                    total: 0,
+                    lines: Vec::new(),
+                })),
+                window,
+                cx,
+            );
+        })
+    });
+    // Its first ping is still out ten seconds on: no second one.
+    at(&mut vcx, 2010);
+    answer(&desk, &mut vcx, up());
+    assert_eq!(pings(&mut rx), 0, "one ping out at a time");
+    // An event about its terminal keeps it reached past 15 s from the answer.
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Event(qoop_runtime::control::EventMessage::AgentChanged {
+                    terminal: 0x8100_0001,
+                }),
+                window,
+                cx,
+            )
+        })
+    });
+    at(&mut vcx, 2020);
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "still heard");
+    at(&mut vcx, 2010 + crate::state::STALE_AFTER);
+    assert!(
+        desk.read_with(&vcx, |d, _| d.banner()).is_some(),
+        "silent 15 s"
+    );
+}

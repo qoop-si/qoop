@@ -144,6 +144,9 @@ pub struct Desk {
     /// Other machines' pets, as their daemons drew them, and the reads still out.
     pub(crate) machine_pets: HashMap<usize, Vec<state::PetRect>>,
     pet_asks: HashMap<String, usize>,
+    /// The requests out to another machine, by id: an answer to any of them is that machine
+    /// heard from.
+    sent_to: std::cell::RefCell<HashMap<String, usize>>,
     /// When each machine was last asked for a word (its pet), and the ones whose qoop cannot
     /// answer that ask.
     pinged: HashMap<usize, i64>,
@@ -241,6 +244,7 @@ impl Desk {
             closed_card: None,
             machine_pets: HashMap::new(),
             pet_asks: HashMap::new(),
+            sent_to: Default::default(),
             pinged: HashMap::new(),
             no_pet: BTreeSet::new(),
             drawn_states: Vec::new(),
@@ -272,11 +276,26 @@ impl Desk {
     }
 
     pub fn ask(&self, request: ControlRequest) {
+        let m = state::request_machine(&request);
+        if m != 0 {
+            self.sent_to
+                .borrow_mut()
+                .insert(request.request_id().to_string(), m);
+        }
         let _ = self.up.send(Up::Request(Box::new(request)));
     }
 
     /// Take in what the link said.
     pub fn apply(&mut self, down: Down, window: &mut Window, cx: &mut Context<Self>) {
+        if let Down::Event(
+            EventMessage::AgentChanged { terminal }
+            | EventMessage::MessagesChanged { terminal, .. }
+            | EventMessage::Listen { terminal, .. }
+            | EventMessage::Focus { terminal, .. },
+        ) = &down
+        {
+            self.heard_from(qoop_tui::mux::machine_of_terminal(*terminal));
+        }
         match down {
             Down::Connected => {
                 self.connected = true;
@@ -300,13 +319,24 @@ impl Desk {
             Down::Screens => {
                 let mut screens =
                     std::mem::take(&mut *self.latest.lock().unwrap_or_else(|e| e.into_inner()));
+                // A screen from another machine's terminal is that machine heard from.
+                for terminal in screens.keys() {
+                    self.heard_from(qoop_tui::mux::machine_of_terminal(*terminal));
+                }
                 for term in self.term.iter_mut().chain(self.others.iter_mut()) {
                     if let Some(screen) = screens.remove(&term.terminal) {
                         term.screen = Some(Rc::new(screen));
                     }
                 }
             }
-            Down::Answer(answer) => self.answer(*answer, window, cx),
+            Down::Answer(answer) => {
+                // A refusal may be the mux's own ("staging went offline"): only an answer counts.
+                let to = self.sent_to.borrow_mut().remove(answer.request_id());
+                if let (Some(m), false) = (to, matches!(*answer, ControlResponse::Failed { .. })) {
+                    self.heard_from(m);
+                }
+                self.answer(*answer, window, cx)
+            }
             Down::Event(EventMessage::Focus { terminal, .. }) => {
                 let qass = self
                     .model
@@ -411,13 +441,15 @@ impl Desk {
             } => self.scrolled_back(terminal, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => {
                 self.reach.note(&workspaces, self.now);
+                // An ask a dropped link took with it is answered by nobody: ask again once up.
+                let down = &self.reach.down_since;
+                self.pet_asks.retain(|_, m| !down.contains_key(m));
                 self.model.spaces = workspaces;
                 self.ping_machines();
             }
             ControlResponse::Pet { id, rects } => {
                 if let Some(m) = self.pet_asks.remove(&id) {
                     self.pet_asks.retain(|_, a| *a != m);
-                    self.reach.hear(m, self.now);
                     self.machine_pets.insert(m, rects);
                 }
             }
@@ -731,6 +763,13 @@ impl Desk {
         }
     }
 
+    /// Machine `m` said something: a screen, an event about its terminals, an answer.
+    fn heard_from(&mut self, m: usize) {
+        if m != 0 {
+            self.reach.hear(m, self.now);
+        }
+    }
+
     /// How machine `m` is reached now.
     pub(crate) fn machine_state(&self, m: usize) -> state::MachineState {
         self.reach
@@ -743,6 +782,7 @@ impl Desk {
             state::MachineState::Stale { as_of } => {
                 Some(format!("as of {}", state::clock(as_of, self.zone)))
             }
+            state::MachineState::NeverReached => Some("since the window opened".into()),
             _ => None,
         }
     }
@@ -798,7 +838,9 @@ impl Desk {
                 .pinged
                 .get(&m)
                 .is_none_or(|at| self.now - at >= state::PING_EVERY);
-            if !up || !due || self.no_pet.contains(&m) {
+            // One ask out at a time: a machine that does not answer gets no pile of them.
+            let out = self.pet_asks.values().any(|a| *a == m);
+            if !up || !due || out || self.no_pet.contains(&m) {
                 continue;
             }
             self.pinged.insert(m, self.now);

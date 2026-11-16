@@ -817,8 +817,14 @@ impl Desk {
         let stale = self
             .settings
             .via
-            .and_then(|w| self.as_of(w))
-            .map(|when| format!("{machine} is not reached, {when}"));
+            .map(|w| self.machine_state(state::machine_of(w)))
+            .filter(|s| {
+                matches!(
+                    s,
+                    state::MachineState::Stale { .. } | state::MachineState::NeverReached
+                )
+            })
+            .map(|s| format!("{machine} is {}", state::reach_words(s, self.zone)));
         let off = stale.is_some();
         let remote = &self.settings.remote;
         let row = |label: &'static str, help: &'static str, control: AnyElement| {
