@@ -332,6 +332,8 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             id: "x31w".into(),
             on: None,
         },
+        // A read: this machine's pet.
+        ControlRequest::Pet { id: "x31q".into() },
         // A read: whether a person is at a terminal, nothing typed.
         ControlRequest::PersonAt {
             id: "x31p".into(),
@@ -509,6 +511,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
             | ControlRequest::UpdateState { .. }
             | ControlRequest::SleepSettings { .. }
             | ControlRequest::QassWatch { .. }
+            | ControlRequest::Pet { .. }
             | ControlRequest::Via { .. }
             | ControlRequest::Telemetry { .. }
             | ControlRequest::PersonAt { .. }

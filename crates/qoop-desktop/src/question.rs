@@ -21,7 +21,7 @@ use crate::field::{Field, FieldColors};
 use crate::link;
 use crate::state::{self, Hold, Kind, Offer, Pick, Slot};
 use crate::theme::{MONO_FONT, Theme, c, ca};
-use crate::ui;
+use crate::ui::{self, Icon};
 
 /// What became of a pick after its hold, as the card says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +88,9 @@ impl Desk {
         let Some(menu) = row.menu.as_ref() else {
             return;
         };
+        if self.as_of(row.workspace).is_some() {
+            return;
+        }
         if offer.pick == Pick::Qass && self.qass_reason(row).is_some() {
             return;
         }
@@ -113,6 +116,10 @@ impl Desk {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // qass's cards live on this Mac's daemon: nothing to answer while it is gone.
+        if self.lost_at.is_some() {
+            return;
+        }
         let label = card
             .body
             .options
@@ -502,7 +509,10 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row = self.model.row(terminal);
-        let reason = match (&offer.pick, row) {
+        let stale = row
+            .and_then(|r| self.as_of(r.workspace))
+            .map(|_| state::STALE_REASON.to_string());
+        let reason = stale.or_else(|| match (&offer.pick, row) {
             (Pick::Qass, Some(r)) => self.qass_reason(r),
             (Pick::Text { .. }, Some(r)) if !self.takes_words(r) => Some(state::refusal_words(
                 "unknown variant",
@@ -510,7 +520,7 @@ impl Desk {
                 &offer.pick,
             )),
             _ => None,
-        };
+        });
         let label = match offer.digit {
             Some(d) => format!("{d}, {}", offer.label),
             None => offer.label.clone(),
@@ -635,6 +645,79 @@ impl Desk {
     }
 
     /// d-question: docked under the agent's screen while it needs the owner.
+    /// A question another client answered: its options stay, closed and greyed, under who
+    /// answered, with Dismiss.
+    pub(crate) fn closed_card_view(
+        &self,
+        menu: &qoop_runtime::control::AgentMenu,
+        line: &str,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("closed-card")
+            .debug_selector(|| "closed-card".to_string())
+            .role(Role::Group)
+            .aria_label(format!("Question: {}. {line}", menu.question))
+            .flex_none()
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .rounded(px(12.))
+            .bg(c(t.card))
+            .border_1()
+            .border_color(ca(t.hair))
+            .when(!menu.question.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c(t.t2))
+                        .child(menu.question.clone()),
+                )
+            })
+            .children(state::offers(menu).into_iter().map(|o| {
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .min_h(px(28.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(8.))
+                    .bg(ca(t.fill))
+                    .text_color(c(t.t3))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .font_family(MONO_FONT)
+                            .child(o.digit.map(|d| d.to_string()).unwrap_or_default()),
+                    )
+                    .child(o.label)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(12.5))
+                    .child(ui::icon(Icon::Phone, 14., c(t.t2)))
+                    .child(div().flex_1().child(line.to_string()))
+                    .child(
+                        ui::pill("closed-dismiss", "Dismiss", t)
+                            .h(px(26.))
+                            .child("Dismiss")
+                            .child(ui::kbd(&format!("{} x", self.prefix_name()), t))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.closed_card = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn question_card(
         &self,
         row: &AgentRow,

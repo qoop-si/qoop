@@ -18,15 +18,60 @@ impl Desk {
             .flex()
             .flex_col()
             .child(self.chips(t, cx))
-            .when(groups.is_empty(), |d| {
-                d.child(
-                    div()
-                        .py(px(24.))
-                        .text_size(px(13.5))
-                        .text_color(c(t.t2))
-                        .child(self.chip.empty()),
-                )
-            })
+            .when(!self.listed, |d| d.children((0..3).map(|n| skeleton(n, t))))
+            .when_some(
+                state::loading_line(&self.model.spaces, &self.model.rows),
+                |d, line| {
+                    d.child(
+                        div()
+                            .id("loading-line")
+                            .role(Role::Status)
+                            .aria_label(line.clone())
+                            .py(px(8.))
+                            .text_size(px(12.5))
+                            .text_color(c(t.t2))
+                            .child(line),
+                    )
+                    .child(skeleton(3, t))
+                },
+            )
+            .when_some(
+                self.first_run
+                    .clone()
+                    .filter(|_| self.listed && self.chip == Chip::All),
+                |d, field| {
+                    d.child(
+                        div()
+                            .id("first-run")
+                            .role(Role::Group)
+                            .aria_label("What should an agent work on?")
+                            .my(px(16.))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(12.))
+                            .h(px(44.))
+                            .rounded(px(12.))
+                            .bg(c(t.card))
+                            .border_1()
+                            .border_color(ca(t.line))
+                            .child(div().flex_1().min_w_0().text_size(px(14.)).child(field))
+                            .child(ui::kbd("enter", t)),
+                    )
+                },
+            )
+            .when(
+                self.listed && groups.is_empty() && self.first_run.is_none(),
+                |d| {
+                    d.child(
+                        div()
+                            .py(px(24.))
+                            .text_size(px(13.5))
+                            .text_color(c(t.t2))
+                            .child(self.chip.empty()),
+                    )
+                },
+            )
             .children(groups.into_iter().map(|g| self.group(g, t, cx)))
             .child(self.next_runs(t, cx))
             .into_any_element()
@@ -161,87 +206,87 @@ impl Desk {
     }
 
     fn row(&self, entry: Entry<'_>, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let kind = entry.kind();
+        let as_of = self.as_of(entry.workspace());
+        let kind = self.shown_kind(entry);
         let terminal = entry.terminal();
         let needs = kind.needs_you();
-        ui::control(
-            ("row", terminal as u64),
-            Role::Link,
-            self.model.row_label(entry, self.now),
-            t,
-        )
-        .debug_selector(move || format!("row-{terminal}"))
-        .flex()
-        .items_center()
-        .gap(px(10.))
-        .min_h(px(46.))
-        .px(px(8.))
-        .py(px(4.))
-        .rounded(px(10.))
-        .text_size(px(13.))
-        .when(needs, |d| d.bg(ca(t.needs_bg)))
-        .hover(|s| s.bg(ca(t.fill)))
-        .child(ui::mark(kind, t, 12.))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(entry.title()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(3.))
-                        .text_size(px(12.))
-                        .text_color(c(t.t2))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(entry.sub())
-                        .when(needs, |d| d.child(ui::icon(Icon::Chevron, 10., c(t.t2)))),
-                ),
-        )
-        .child(
-            div()
-                .w(px(82.))
-                .text_size(px(12.5))
-                .text_color(c(ui::word_ink(kind, t)))
-                .child(kind.word()),
-        )
-        .child(
-            div()
-                .w(px(86.))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .text_size(px(12.5))
-                .text_color(c(t.t1))
-                .when_some(state::kind_pet(entry.program()), |d, pet| {
-                    d.child(ui::pet(&pet, 1.))
-                })
-                .child(entry.program().unwrap_or_default().to_string()),
-        )
-        .child(
-            div()
-                .w(px(52.))
-                .flex()
-                .justify_end()
-                .text_size(px(12.5))
-                .text_color(c(t.t2))
-                .child(entry.age(self.now).unwrap_or_default()),
-        )
-        .on_click(
-            cx.listener(move |this, _, window, cx| this.open(Page::Session(terminal), window, cx)),
-        )
-        .into_any_element()
+        let label = match &as_of {
+            Some(when) => format!("{}, {when}", self.model.row_label(entry, self.now)),
+            None => self.model.row_label(entry, self.now),
+        };
+        ui::control(("row", terminal as u64), Role::Link, label, t)
+            .debug_selector(move || format!("row-{terminal}"))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .min_h(px(46.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(10.))
+            .text_size(px(13.))
+            .when(needs, |d| d.bg(ca(t.needs_bg)))
+            .hover(|s| s.bg(ca(t.fill)))
+            .child(ui::mark(kind, t, 12.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(entry.title()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .text_size(px(12.))
+                            .text_color(c(t.t2))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(entry.sub())
+                            .when(needs, |d| d.child(ui::icon(Icon::Chevron, 10., c(t.t2)))),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(82.))
+                    .text_size(px(12.5))
+                    .text_color(c(ui::word_ink(kind, t)))
+                    .child(as_of.unwrap_or_else(|| entry.kind().word().to_string())),
+            )
+            .child(
+                div()
+                    .w(px(86.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.5))
+                    .text_color(c(t.t1))
+                    .when_some(state::kind_pet(entry.program()), |d, pet| {
+                        d.child(ui::pet(&pet, 1.))
+                    })
+                    .child(entry.program().unwrap_or_default().to_string()),
+            )
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex()
+                    .justify_end()
+                    .text_size(px(12.5))
+                    .text_color(c(t.t2))
+                    .child(entry.age(self.now).unwrap_or_default()),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open(Page::Session(terminal), window, cx)
+            }))
+            .into_any_element()
     }
 
     /// This machine's coming runs, with the "now" rule between the one going now and the
@@ -375,4 +420,27 @@ impl Desk {
             )
         })
     }
+}
+
+/// A row's shape while the list is still to come: no words, no spinner.
+fn skeleton(n: usize, t: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("skeleton", n as u64))
+        .role(Role::Status)
+        .aria_label("Loading agents")
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .h(px(46.))
+        .px(px(8.))
+        .child(div().size(px(12.)).rounded_full().bg(ca(t.fill2)))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().h(px(10.)).w(px(220.)).rounded(px(5.)).bg(ca(t.fill2)))
+                .child(div().h(px(8.)).w(px(140.)).rounded(px(4.)).bg(ca(t.fill))),
+        )
 }

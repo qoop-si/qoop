@@ -22,7 +22,7 @@ use gpui::{
 use qoop_domain::Viewport;
 use qoop_runtime::avatar::Avatar;
 use qoop_runtime::control::{
-    AskInfo, ControlRequest, ControlResponse, EventMessage, QassAct, TerminalStream,
+    AgentMenu, AskInfo, ControlRequest, ControlResponse, EventMessage, QassAct, TerminalStream,
 };
 use qoop_runtime::daemon::SnapshotWire;
 use qoop_runtime::schedule::Zone;
@@ -135,6 +135,19 @@ pub struct Desk {
     pub settings: crate::settings::SettingsPage,
     /// A start of qass asked from here holds Start greyed until this unix second.
     pub(crate) qass_starting_until: Option<i64>,
+    /// Since when each machine has not answered, and when this Mac's daemon went away.
+    pub reach: state::Reach,
+    pub lost_at: Option<i64>,
+    /// The question on screen that another client answered: its closed options, greyed,
+    /// under who answered, until dismissed or a new question.
+    pub(crate) closed_card: Option<(TerminalStream, AgentMenu, String)>,
+    /// Other machines' pets, as their daemons drew them, and the reads still out.
+    pub(crate) machine_pets: HashMap<usize, Vec<state::PetRect>>,
+    pet_asks: HashMap<String, usize>,
+    /// The agent list came at least once: before it, Home draws skeleton rows.
+    pub(crate) listed: bool,
+    /// Home's one field while there is no agent yet.
+    pub(crate) first_run: Option<Entity<crate::field::Field>>,
     /// The schedules page: machine, runs, day, the report open, the sheet.
     pub schedule_page: crate::schedules::SchedulePage,
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
@@ -217,6 +230,13 @@ impl Desk {
             pet_path: qoop_runtime::avatar::avatar_path(),
             settings: Default::default(),
             qass_starting_until: None,
+            reach: state::Reach::default(),
+            lost_at: None,
+            closed_card: None,
+            machine_pets: HashMap::new(),
+            pet_asks: HashMap::new(),
+            listed: false,
+            first_run: None,
             prefix: config.config.prefix,
             theme_pref,
             dark: dark_for(theme_pref, window.appearance()),
@@ -251,6 +271,7 @@ impl Desk {
         match down {
             Down::Connected => {
                 self.connected = true;
+                self.lost_at = None;
                 // A New work asked for before the connection dropped: asked again, under its id.
                 self.ask_pending();
                 // A new connection, maybe a new daemon: say the size again.
@@ -263,6 +284,7 @@ impl Desk {
             Down::Disconnected(why) => {
                 if self.connected {
                     eprintln!("qoop-desktop: {why}; connecting again");
+                    self.lost_at = Some(self.now);
                 }
                 self.connected = false;
             }
@@ -301,13 +323,26 @@ impl Desk {
     }
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
-        if self.answer_reply(&answer, cx) || self.report_came(&answer) {
+        if self.answer_reply(&answer, cx)
+            || self.report_came(&answer)
+            || self.remote_setting_came(&answer)
+        {
             return;
         }
         match answer {
-            ControlResponse::Agents { agents, splits, .. } => {
+            ControlResponse::Agents {
+                mut agents, splits, ..
+            } => {
+                agents.extend(state::unreached_rows(
+                    &self.model.rows,
+                    &agents,
+                    &self.model.spaces,
+                ));
                 let before = std::mem::replace(&mut self.model.rows, agents);
                 self.model.splits = splits;
+                self.listed = true;
+                self.first_run_field(cx);
+                self.answered_elsewhere(&before);
                 self.rows_changed(&before);
                 self.menus_changed();
                 // qass started or woke while its page is open: its terminal comes on.
@@ -365,7 +400,16 @@ impl Desk {
                 lines,
                 ..
             } => self.scrolled_back(terminal, total, lines),
-            ControlResponse::Workspaces { workspaces, .. } => self.model.spaces = workspaces,
+            ControlResponse::Workspaces { workspaces, .. } => {
+                self.reach.note(&workspaces, self.now);
+                self.model.spaces = workspaces;
+                self.ask_pets();
+            }
+            ControlResponse::Pet { id, rects } => {
+                if let Some(m) = self.pet_asks.remove(&id) {
+                    self.machine_pets.insert(m, rects);
+                }
+            }
             ControlResponse::Schedules { id, schedules } => self.schedules_came(&id, schedules),
             ControlResponse::ScheduleRuns { id, runs } => {
                 self.runs_came(&id, runs);
@@ -486,7 +530,10 @@ impl Desk {
             }
             match keys::typed(k) {
                 "c" => self.new_work(None, window, cx),
-                "x" => self.dismiss_note(cx),
+                "x" => {
+                    self.closed_card = None;
+                    self.dismiss_note(cx)
+                }
                 "tab" => self.open_note(window, cx),
                 // The keyboard off the terminal, as the TUI's `ctrl-a a` puts it on the agents
                 // column: `tab` then goes round the controls.
@@ -526,7 +573,7 @@ impl Desk {
         if k.modifiers.control || k.modifiers.platform || k.modifiers.alt {
             return;
         }
-        if k.key == "enter" && self.own_enter(window, cx) {
+        if k.key == "enter" && (self.own_enter(window, cx) || self.first_run_enter(window, cx)) {
             cx.stop_propagation();
             return;
         }
@@ -668,6 +715,107 @@ impl Desk {
         }
     }
 
+    /// How machine `m` is reached now.
+    pub(crate) fn machine_state(&self, m: usize) -> state::MachineState {
+        self.reach
+            .state(m, &self.model.spaces, self.now, self.lost_at)
+    }
+
+    /// "as of 15:58" for what is shown of a space whose machine is not reached.
+    pub(crate) fn as_of(&self, workspace: i64) -> Option<String> {
+        match self.machine_state(state::machine_of(workspace)) {
+            state::MachineState::Stale { as_of } => {
+                Some(format!("as of {}", state::clock(as_of, self.zone)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The mark a row wears: its own, or the neutral one while its machine is not reached.
+    pub(crate) fn shown_kind(&self, entry: state::Entry<'_>) -> state::Kind {
+        match self.as_of(entry.workspace()) {
+            Some(_) => state::Kind::Status(qoop_domain::status::Status::Unknown),
+            None => entry.kind(),
+        }
+    }
+
+    /// A terminal's screen is the last one seen: the link or its machine is not answering.
+    pub(crate) fn term_stale(&self, terminal: TerminalStream) -> bool {
+        !self.connected
+            || self
+                .model
+                .row(terminal)
+                .is_some_and(|r| self.as_of(r.workspace).is_some())
+    }
+
+    /// The banner: each machine not reached, in its tile's words.
+    pub(crate) fn banner(&self) -> Option<String> {
+        let machines: Vec<(String, state::MachineState)> = state::machines(&self.model.spaces)
+            .into_iter()
+            .map(|(m, name, _)| (name, self.machine_state(m)))
+            .collect();
+        state::reach_banner(&machines, self.zone)
+    }
+
+    /// A machine's pet for its tile: this Mac's own, another's as its daemon drew it.
+    pub(crate) fn pet_of(&self, m: usize) -> Option<gpui::Div> {
+        if m == 0 {
+            return self.my_pet.as_ref().map(|pet| ui::pet(pet, 0.8));
+        }
+        self.machine_pets
+            .get(&m)
+            .filter(|rects| !rects.is_empty())
+            .map(|rects| ui::pet_rects(rects, 0.8))
+    }
+
+    /// Ask each other machine that answers for its pet, once.
+    fn ask_pets(&mut self) {
+        for (m, _, via) in state::machines(&self.model.spaces) {
+            let Some(workspace) = via else { continue };
+            let asked =
+                self.machine_pets.contains_key(&m) || self.pet_asks.values().any(|a| *a == m);
+            if asked || self.reach.down_since.contains_key(&m) {
+                continue;
+            }
+            let id = link::fresh_id("pet");
+            self.pet_asks.insert(id.clone(), m);
+            self.ask(ControlRequest::Via {
+                id: link::fresh_id("via"),
+                workspace,
+                request: Box::new(ControlRequest::Pet { id }),
+            });
+        }
+    }
+
+    /// The agent on screen had its question answered by another client: its card stays,
+    /// closed. A new question on it takes the card back.
+    fn answered_elsewhere(&mut self, before: &[qoop_runtime::control::AgentRow]) {
+        let Page::Session(terminal) = self.page else {
+            return;
+        };
+        let Some(now) = self.model.row(terminal) else {
+            return;
+        };
+        if now.menu.is_some() {
+            self.closed_card = None;
+            return;
+        }
+        let ours = matches!(
+            self.said.get(&state::Slot::Agent(terminal)),
+            Some(Said::Sending { .. } | Said::Sent { .. })
+        );
+        let Some(was) = before.iter().find(|r| r.terminal == terminal) else {
+            return;
+        };
+        if let (Some(line), Some(menu), false) = (
+            state::answered_elsewhere(was, now, self.zone),
+            was.menu.clone(),
+            ours,
+        ) {
+            self.closed_card = Some((terminal, menu, line));
+        }
+    }
+
     /// Once a second: the clock for ages and Next runs, and seen. Draws again only when
     /// something shown can have changed: every second while an age is under a minute, else
     /// every half minute.
@@ -677,7 +825,8 @@ impl Desk {
             r.last_active_at_unix
                 .is_some_and(|at| now.saturating_sub(at) < 60)
         });
-        let redraw = now != self.now && (fresh || now / 30 != self.now / 30);
+        let down = !self.reach.down_since.is_empty();
+        let redraw = now != self.now && (fresh || down || now / 30 != self.now / 30);
         self.now = now;
         let finish = match self.page {
             Page::Session(t) => self.model.finish(t),
@@ -833,7 +982,7 @@ impl Desk {
                             .child(g.space.name.clone()),
                     )
                     .children(g.rows.into_iter().map(|entry| {
-                        let kind = entry.kind();
+                        let kind = self.shown_kind(entry);
                         let terminal = entry.terminal();
                         let on = shown == Some(terminal);
                         let row = ui::control(
@@ -951,15 +1100,10 @@ impl Desk {
             }))
     }
 
-    /// One tile per space at the bottom left, naming its machine and its connection, and the
-    /// phone line while a phone has an agent open.
+    /// One tile per machine at the bottom left, naming it and how it is reached, in the words
+    /// the banner uses; and the phone line while a phone has an agent open.
     fn tiles(&self, t: &Theme) -> impl IntoElement {
-        let spaces: Vec<_> = self
-            .model
-            .spaces
-            .iter()
-            .filter(|w| w.name != state::QASS_SPACE)
-            .collect();
+        let machines = state::machines(&self.model.spaces);
         div()
             .flex()
             .flex_col()
@@ -969,70 +1113,43 @@ impl Desk {
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .flex_col()
                     .gap(px(4.))
-                    .children(spaces.into_iter().map(|w| {
-                        let up = state::link_word(w) == "connected" && self.connected;
-                        let word = if self.connected {
-                            state::link_word(w)
-                        } else {
-                            "retrying"
-                        };
-                        let machine = state::machine_name(w);
+                    .children(machines.into_iter().map(|(m, name, _)| {
+                        let reach = self.machine_state(m);
+                        let up = reach == state::MachineState::Live;
+                        let word = state::reach_words(reach, self.zone);
                         div()
-                            .id(("tile", w.id as u64))
+                            .id(("tile", m as u64))
+                            .debug_selector(move || format!("tile-{m}"))
                             .role(Role::Group)
-                            .aria_label(format!("{}, {word}, {machine}", w.name))
-                            .w(px(72.))
+                            .aria_label(format!("{name}, {word}"))
                             .flex()
-                            .flex_col()
-                            .gap(px(1.))
-                            .px(px(6.))
+                            .items_center()
+                            .gap(px(7.))
+                            .px(px(8.))
                             .py(px(5.))
                             .rounded(px(9.))
                             .bg(ca(t.fill))
+                            .text_size(px(11.5))
                             .child(
                                 div()
-                                    .text_size(px(11.5))
-                                    .text_color(t.space(state::space_slot(w)))
+                                    .size(px(7.))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .when(up, |d| d.bg(c(t.done)))
+                                    .when(!up, |d| d.border_1().border_color(c(t.t3))),
+                            )
+                            .when_some(self.pet_of(m), |d, pet| d.child(pet))
+                            .child(div().text_color(c(t.t1)).child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .child(
-                                        w.name.rsplit(':').next().unwrap_or(&w.name).to_string(),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.))
-                                    .text_size(px(11.))
-                                    .text_color(c(t.t1))
-                                    .child(
-                                        div()
-                                            .size(px(7.))
-                                            .rounded_full()
-                                            .when(up, |d| d.bg(c(t.done)))
-                                            .when(!up, |d| d.border_1().border_color(c(t.t3))),
-                                    )
-                                    .child(word),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .text_size(px(10.5))
                                     .text_color(c(t.t2))
-                                    .whitespace_nowrap()
-                                    .when_some(
-                                        self.my_pet
-                                            .as_ref()
-                                            .filter(|_| state::machine_of(w.id) == 0),
-                                        |d, pet| d.child(ui::pet(pet, 0.8)),
-                                    )
-                                    .child(machine),
+                                    .child(word),
                             )
                     })),
             )
@@ -1231,7 +1348,19 @@ impl Desk {
             .text_size(px(11.5))
             .text_color(c(t.t2))
             .whitespace_nowrap()
-            .when(!self.connected, |d| d.child("connecting to the daemon"))
+            .when_some(self.banner(), |d, banner| {
+                d.child(
+                    div()
+                        .id("reach-banner")
+                        .role(Role::Status)
+                        .aria_label(banner.clone())
+                        .text_color(c(t.t1))
+                        .child(banner),
+                )
+            })
+            .when(!self.connected && self.lost_at.is_none(), |d| {
+                d.child("connecting to the daemon")
+            })
             .when_some(
                 self.model.status_line().filter(|_| self.connected),
                 |d, line| d.child(div().text_color(c(t.needs_text)).child(line)),
@@ -1277,7 +1406,7 @@ impl Desk {
                 screen: term.and_then(|t| t.screen.clone()),
                 cells: self.cells.clone(),
                 focused,
-                stale: !self.connected,
+                stale: term.is_none_or(|t| self.term_stale(t.terminal)),
                 sent: term.map_or_else(|| Rc::new(Cell::new((0, 0))), |t| t.sent.clone()),
                 viewport: term.map_or_else(|| Rc::new(Cell::new(None)), |t| t.viewport.clone()),
                 resize: Rc::new(move |t, cols, rows| {

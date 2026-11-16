@@ -65,6 +65,51 @@ impl Desk {
         cx.notify();
     }
 
+    /// The empty first run: one field on Home, "What should an agent work on?", kept while
+    /// there is no agent yet.
+    pub(crate) fn first_run_field(&mut self, cx: &mut Context<Self>) {
+        if !self.model.rows.is_empty() {
+            self.first_run = None;
+            return;
+        }
+        if self.first_run.is_some() {
+            return;
+        }
+        let t = self.theme();
+        let colors = FieldColors {
+            text: c(t.ink).into(),
+            placeholder: c(t.t2).into(),
+            caret: c(t.ink).into(),
+            selection: ca(t.fill2).into(),
+        };
+        let field = cx.new(|cx| Field::new("What should an agent work on?", colors, cx));
+        cx.observe(&field, |_, _, cx| cx.notify()).detach();
+        self.first_run = Some(field);
+    }
+
+    /// Enter in the first run field: New work with those words, started at once in the first
+    /// space with the first agent; the sheet stays open only to say why it could not.
+    pub(crate) fn first_run_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(field) = self.first_run.clone() else {
+            return false;
+        };
+        if !field.read(cx).focus.is_focused(window) {
+            return false;
+        }
+        if state::clean_prompt(&field.read(cx).text).is_empty() {
+            return true;
+        }
+        self.new_work(None, window, cx);
+        let focus = field.read(cx).focus.clone();
+        if let Some(sheet) = self.sheet.as_mut() {
+            sheet.stops[0] = focus.clone();
+            sheet.task = field;
+        }
+        window.focus(&focus, cx);
+        self.start(cx);
+        true
+    }
+
     fn spaces_for_work(&self) -> Vec<&qoop_runtime::control::WorkspaceRow> {
         self.model
             .spaces

@@ -6377,6 +6377,13 @@ async fn handle_control(
         // One small file in qass's folder, like the sleep settings: the watcher reads it, and
         // turned on, qass is told to start its watcher again; a qass asleep is woken first, as
         // the line has no terminal to be typed into otherwise.
+        // This machine's pet, for a window that shows it beside the machine's name.
+        ControlRequest::Pet { id } => ControlResponse::Pet {
+            id,
+            rects: crate::avatar::load()
+                .map(|pet| crate::avatar::rects(&pet))
+                .unwrap_or_default(),
+        },
         ControlRequest::QassWatch { id, on } => {
             if let Some(on) = on {
                 let turned = match crate::paths::set_qass_watching(on) {
