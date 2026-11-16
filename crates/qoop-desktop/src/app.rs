@@ -128,6 +128,11 @@ pub struct Desk {
     pub(crate) ticking: bool,
     /// qass's lessons file, read when its page opens.
     pub lessons_path: std::path::PathBuf,
+    /// The person's `config.toml` and their pet's file: the settings page reads and writes
+    /// these (tests point them at their own).
+    pub config_path: std::path::PathBuf,
+    pub pet_path: std::path::PathBuf,
+    pub settings: crate::settings::SettingsPage,
     /// A start of qass asked from here holds Start greyed until this unix second.
     pub(crate) qass_starting_until: Option<i64>,
     /// The schedules page: machine, runs, day, the report open, the sheet.
@@ -208,6 +213,9 @@ impl Desk {
             ticking: false,
             schedule_page: Default::default(),
             lessons_path: qoop_runtime::paths::qass_config_dir().join("lessons.md"),
+            config_path: qoop_tui::config::path(),
+            pet_path: qoop_runtime::avatar::avatar_path(),
+            settings: Default::default(),
             qass_starting_until: None,
             prefix: config.config.prefix,
             theme_pref,
@@ -312,6 +320,16 @@ impl Desk {
                 }
             }
             ControlResponse::Asks { live, .. } => self.asks = live,
+            ControlResponse::SleepSettings { problem, .. } => {
+                self.read_settings();
+                self.settings.said = Some(match problem {
+                    Some(why) => why,
+                    None => format!(
+                        "Sleep: written by qoop's daemon, {}",
+                        state::clock(self.now, self.zone)
+                    ),
+                });
+            }
             ControlResponse::QassActs { acts, .. } => self.acts = acts,
             ControlResponse::Tasks {
                 id,
@@ -390,6 +408,9 @@ impl Desk {
             self.read_lessons();
             self.ask_watch();
         }
+        if page == Page::Settings {
+            self.read_settings();
+        }
         if page == Page::Schedules && self.schedule_page.via.is_none() {
             let ids: Vec<i64> = self.model.schedules.iter().map(|s| s.id).collect();
             self.ask_runs(&ids);
@@ -421,6 +442,12 @@ impl Desk {
             .iter()
             .find(|r| r.workspace == space.id && r.agent)
             .map(|r| r.terminal)
+    }
+
+    /// What a write to `config.toml` changes in the window now: the prefix and the theme.
+    pub(crate) fn reconfigure(&mut self, read: &qoop_tui::config::Read) {
+        self.prefix = read.config.prefix;
+        self.theme_pref = read.config.theme;
     }
 
     /// The prefix as `config.toml` names it, for the key hints: `ctrl-b`.
@@ -574,6 +601,10 @@ impl Desk {
                 cx.notify();
             }
             "escape" if self.page == Page::Schedules && self.schedules_escape(cx) => {}
+            "escape" if self.page == Page::Settings && self.close_find(window, cx) => {}
+            "/" if self.page == Page::Settings && self.settings.find.is_none() => {
+                self.open_find(window, cx)
+            }
             "escape" if self.inbox => {
                 self.inbox = false;
                 cx.notify();
@@ -1271,13 +1302,7 @@ impl Desk {
             Page::Session(_) => body.p(px(12.)).child(self.session(t, focused, cx)),
             Page::Qass => body.p(px(12.)).child(self.qass_page(t, focused, cx)),
             Page::Schedules => body.p(px(12.)).child(self.schedules_page(t, cx)),
-            Page::Settings => body.p(px(24.)).child(
-                div()
-                    .font_family(MONO_FONT)
-                    .text_size(px(12.))
-                    .text_color(c(t.t2))
-                    .child(qoop_tui::config::path().display().to_string()),
-            ),
+            Page::Settings => body.p(px(12.)).child(self.settings_page(t, cx)),
         }
     }
 }
@@ -1543,6 +1568,15 @@ fn wire(
         cx.on_app_quit(|this: &mut Desk, cx| {
             this.flush_holds();
             cx.background_executor().timer(Duration::from_millis(200))
+        })
+        .detach();
+        // Back to the window: the settings page reads the file again (it may have been edited).
+        cx.observe_window_activation(window, |this: &mut Desk, window, cx| {
+            if window.is_window_active() && this.page == Page::Settings {
+                this.read_settings();
+                this.dark = dark_for(this.theme_pref, window.appearance());
+                cx.notify();
+            }
         })
         .detach();
         cx.observe_window_appearance(window, |this: &mut Desk, window, cx| {

@@ -1,0 +1,576 @@
+//! d-settings, This Mac: every key of `config.toml` as a switch, a choice or a value, each
+//! written at once with `qoop_tui::config::set` (comments and keys it does not know are kept,
+//! a value it refuses never reaches the file) and confirmed in place; the file itself, read
+//! only, beside them; the pet, and six new ones to pick from.
+
+use std::path::PathBuf;
+
+use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
+use qoop_runtime::avatar::{self, Avatar};
+use qoop_runtime::control::ControlRequest;
+use qoop_tui::config::Read;
+
+use crate::app::Desk;
+use crate::field::{Field, FieldColors};
+use crate::link;
+use crate::state::{self, SETTINGS, Setting, SettingKind};
+use crate::theme::{MONO_FONT, Theme, c, ca};
+use crate::ui;
+
+/// The minutes the sleep settings step through; 0 is never.
+const MINUTES: [&str; 6] = ["0", "15", "30", "60", "120", "240"];
+
+/// The settings page as last read.
+#[derive(Default)]
+pub struct SettingsPage {
+    pub read: Option<Read>,
+    pub text: String,
+    /// What the last write came to: "Sound on: written as line 5, 16:02".
+    pub said: Option<String>,
+    pub find: Option<Entity<Field>>,
+    pub pets: Vec<Avatar>,
+}
+
+impl Desk {
+    /// Read the file again: on opening the page, on coming back to the window, after a write.
+    pub(crate) fn read_settings(&mut self) {
+        let read = qoop_tui::config::read_from(&self.config_path);
+        self.settings.text = std::fs::read_to_string(&self.config_path).unwrap_or_default();
+        self.settings.read = Some(read);
+    }
+
+    /// Write `key` = `value` and say where it landed, or why not.
+    pub(crate) fn write_setting(&mut self, setting: &Setting, value: &str, cx: &mut Context<Self>) {
+        let said = match qoop_tui::config::set(&self.config_path, setting.key, value) {
+            Ok(()) => {
+                self.read_settings();
+                let shown = match value {
+                    "true" => "on",
+                    "false" => "off",
+                    other => other,
+                };
+                match state::line_of(&self.settings.text, setting.key) {
+                    Some(line) => format!(
+                        "{} {shown}: written as line {line}, {}",
+                        setting.label,
+                        state::clock(self.now, self.zone)
+                    ),
+                    None => format!("{} {shown}: written", setting.label),
+                }
+            }
+            Err(why) => why,
+        };
+        // The window follows what it shows now: the prefix, the theme.
+        if setting.key == "prefix" || setting.key == "theme" {
+            let read = qoop_tui::config::read_from(&self.config_path);
+            self.reconfigure(&read);
+        }
+        self.settings.said = Some(said);
+        cx.notify();
+    }
+
+    /// The sleep keys the daemon reads go through it, so it answers what the file now says.
+    fn write_sleep(&mut self, setting: &Setting, value: &str, cx: &mut Context<Self>) {
+        let request = match setting.key {
+            "sleep.idle_minutes" => value.parse().ok().map(|m| ControlRequest::SleepSettings {
+                id: link::fresh_id("sleep"),
+                idle_minutes: Some(m),
+                exit_when_asleep: None,
+            }),
+            "daemon.exit_when_asleep" => Some(ControlRequest::SleepSettings {
+                id: link::fresh_id("sleep"),
+                idle_minutes: None,
+                exit_when_asleep: Some(value == "true"),
+            }),
+            _ => None,
+        };
+        match request {
+            Some(request) if self.connected => {
+                self.ask(request);
+                self.settings.said = Some(format!("{}: sent to qoop's daemon", setting.label));
+                cx.notify();
+            }
+            _ => self.write_setting(setting, value, cx),
+        }
+    }
+
+    fn set_setting(&mut self, setting: &Setting, value: &str, cx: &mut Context<Self>) {
+        match setting.key {
+            "sleep.idle_minutes" | "daemon.exit_when_asleep" => {
+                self.write_sleep(setting, value, cx)
+            }
+            _ => self.write_setting(setting, value, cx),
+        }
+    }
+
+    /// `/` on the settings page: the find field.
+    pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = match self.settings.find.clone() {
+            Some(field) => field,
+            None => {
+                let t = self.theme();
+                let colors = FieldColors {
+                    text: c(t.ink).into(),
+                    placeholder: c(t.t2).into(),
+                    caret: c(t.ink).into(),
+                    selection: ca(t.fill2).into(),
+                };
+                let field = cx.new(|cx| Field::new("Find a setting", colors, cx));
+                cx.observe(&field, |_, _, cx| cx.notify()).detach();
+                self.settings.find = Some(field.clone());
+                field
+            }
+        };
+        let focus = field.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Escape on the settings page: the find field goes. Whether it was there.
+    pub(crate) fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.settings.find.take().is_none() {
+            return false;
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+        true
+    }
+
+    fn deal_pets(&mut self, cx: &mut Context<Self>) {
+        let mut deal = avatar::Deal::new(crate::app::unix_now() as u64);
+        self.settings.pets = (0..6).map(|_| deal.pet()).collect();
+        cx.notify();
+    }
+
+    fn pick_pet(&mut self, pet: Avatar, cx: &mut Context<Self>) {
+        self.settings.said = Some(match avatar::save_to(&self.pet_path, &pet) {
+            Ok(()) => "Your pet: saved".into(),
+            Err(e) => format!("The pet was not saved: {e}"),
+        });
+        self.my_pet = Some(pet);
+        self.settings.pets.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn settings_page(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(read) = self.settings.read.as_ref() else {
+            return div().into_any_element();
+        };
+        let blank = qoop_tui::config::read_from(&PathBuf::from("/nonexistent/qoop/config.toml"));
+        let broken = read.broken;
+        let find = self
+            .settings
+            .find
+            .as_ref()
+            .map(|f| f.read(cx).text.clone())
+            .unwrap_or_default();
+        let shown: Vec<&Setting> = SETTINGS
+            .iter()
+            .filter(|s| state::setting_found(s, &find))
+            .collect();
+        let mut groups: Vec<&'static str> = Vec::new();
+        for s in &shown {
+            if !groups.contains(&s.group) {
+                groups.push(s.group);
+            }
+        }
+        let path = state::tilde(&self.config_path.display().to_string());
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .text_size(px(13.))
+                    .child(div().font_family(MONO_FONT).child(path))
+                    .child(
+                        div()
+                            .text_color(c(t.t2))
+                            .child("a change is written as you make it"),
+                    )
+                    .child(div().flex_1())
+                    .child(ui::kbd("/", t))
+                    .child(
+                        ui::pill("open-config", "Open in your editor", t)
+                            .h(px(30.))
+                            .child("Open in your editor")
+                            .on_click(cx.listener(|this, _, _, _| {
+                                if this.config_path.is_file() {
+                                    crate::review::launch(
+                                        std::path::Path::new("/usr/bin/open"),
+                                        &["-t".into(), this.config_path.display().to_string()],
+                                    );
+                                }
+                            })),
+                    ),
+            )
+            .when(broken, |d| {
+                d.child(
+                    div()
+                        .id("config-broken")
+                        .role(Role::Status)
+                        .aria_label("config.toml is not TOML; fix it in your editor")
+                        .text_size(px(13.))
+                        .text_color(c(t.fail_text))
+                        .child("config.toml is not TOML; fix it in your editor"),
+                )
+            })
+            .when(!read.exists, |d| {
+                d.child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(c(t.t2))
+                        .child("No file yet: every setting is its default"),
+                )
+            })
+            .when_some(self.settings.said.clone(), |d, said| {
+                d.child(
+                    div()
+                        .id("setting-said")
+                        .role(Role::Status)
+                        .aria_label(said.clone())
+                        .text_size(px(12.5))
+                        .text_color(c(t.t1))
+                        .child(said),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("settings-list")
+                            .flex_none()
+                            .w(px(520.))
+                            .h_full()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .when_some(self.settings.find.clone(), |d, field| {
+                                d.child(
+                                    div()
+                                        .p(px(6.))
+                                        .rounded(px(8.))
+                                        .border_1()
+                                        .border_color(ca(t.line))
+                                        .child(field),
+                                )
+                            })
+                            .children(groups.into_iter().map(|group| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .p(px(12.))
+                                    .rounded(px(14.))
+                                    .bg(c(t.card))
+                                    .border_1()
+                                    .border_color(ca(t.hair))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c(t.t2))
+                                            .child(group),
+                                    )
+                                    .children(
+                                        shown.iter().filter(|s| s.group == group).map(|s| {
+                                            self.setting_row(s, read, &blank, broken, t, cx)
+                                        }),
+                                    )
+                            }))
+                            .when(!read.agents.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .p(px(12.))
+                                        .rounded(px(14.))
+                                        .bg(c(t.card))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(3.))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(c(t.t2))
+                                                .child("Your agents, [agents]"),
+                                        )
+                                        .children(read.agents.iter().map(|a| {
+                                            div()
+                                                .font_family(MONO_FONT)
+                                                .text_size(px(12.))
+                                                .child(format!("{} = \"{}\"", a.name, a.command))
+                                        })),
+                                )
+                            })
+                            .child(self.pet_panel(t, cx)),
+                    )
+                    .child(self.file_view(read, t)),
+            )
+            .into_any_element()
+    }
+
+    fn setting_row(
+        &self,
+        s: &Setting,
+        read: &Read,
+        blank: &Read,
+        broken: bool,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let value = state::setting_value(read, &self.settings.text, s.key);
+        let default = state::setting_value(blank, "", s.key);
+        let changed = value != default;
+        let setting = *s;
+        let control: AnyElement = match s.kind {
+            _ if broken => div()
+                .text_size(px(12.))
+                .text_color(c(t.t3))
+                .child(value.clone())
+                .into_any_element(),
+            SettingKind::Switch => {
+                let on = value == "true";
+                ui::switch(("setting", key_id(s.key)), s.label, on, t)
+                    .debug_selector(move || format!("setting-{}", setting.key))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_setting(&setting, if on { "false" } else { "true" }, cx)
+                    }))
+                    .into_any_element()
+            }
+            SettingKind::Choice(words) => div()
+                .flex()
+                .gap(px(3.))
+                .children(words.iter().enumerate().map(|(n, word)| {
+                    let word = *word;
+                    ui::chip(
+                        ("setting-choice", key_id(s.key) * 16 + n as u64),
+                        word,
+                        None,
+                        None,
+                        word == value,
+                        t,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_setting(&setting, word, cx)),
+                    )
+                }))
+                .into_any_element(),
+            SettingKind::Minutes => div()
+                .flex()
+                .gap(px(3.))
+                .children(MINUTES.iter().enumerate().map(|(n, m)| {
+                    let m = *m;
+                    let label = if m == "0" { "never" } else { m };
+                    ui::chip(
+                        ("setting-minutes", key_id(s.key) * 16 + n as u64),
+                        label,
+                        None,
+                        None,
+                        m == value,
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_setting(&setting, m, cx)))
+                }))
+                .into_any_element(),
+            SettingKind::Cycle => {
+                let choices: Vec<String> = match s.key {
+                    "prefix" => qoop_tui::config::prefixes(),
+                    _ => qoop_tui::config::sounds_here()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                };
+                let next = choices
+                    .iter()
+                    .position(|v| *v == value)
+                    .map_or(0, |i| (i + 1) % choices.len().max(1));
+                let next = choices.get(next).cloned().unwrap_or_default();
+                ui::pill(
+                    ("setting-cycle", key_id(s.key)),
+                    &format!("{}, {value}; next: {next}", s.label),
+                    t,
+                )
+                .h(px(28.))
+                .font_family(MONO_FONT)
+                .child(value.clone())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_setting(&setting, &next, cx)))
+                .into_any_element()
+            }
+            SettingKind::Text => div()
+                .font_family(MONO_FONT)
+                .text_size(px(12.5))
+                .child(value.clone())
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .py(px(6.))
+            .border_t_1()
+            .border_color(ca(t.hair))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .text_size(px(13.))
+                            .child(s.label)
+                            .when(changed, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(c(t.t2))
+                                        .child("changed"),
+                                )
+                            }),
+                    )
+                    .child(div().text_size(px(11.5)).text_color(c(t.t2)).child(
+                        match (broken, s.kind) {
+                            (true, _) => {
+                                "config.toml is not TOML; fix it in your editor".to_string()
+                            }
+                            (false, SettingKind::Text) => {
+                                format!("{}; change it in your editor", s.help)
+                            }
+                            _ => s.help.to_string(),
+                        },
+                    )),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    /// The file as it is, read only: each line numbered, the lines that set something away from
+    /// its default marked, and what could not be used said under its line.
+    fn file_view(&self, read: &Read, t: &Theme) -> impl IntoElement {
+        let blank = qoop_tui::config::read_from(&PathBuf::from("/nonexistent/qoop/config.toml"));
+        let marked: Vec<usize> = SETTINGS
+            .iter()
+            .filter(|s| {
+                state::setting_value(read, &self.settings.text, s.key)
+                    != state::setting_value(&blank, "", s.key)
+            })
+            .filter_map(|s| state::line_of(&self.settings.text, s.key))
+            .collect();
+        div()
+            .id("config-file")
+            .role(Role::Document)
+            .aria_label("config.toml, read only")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_y_scroll()
+            .p(px(12.))
+            .rounded(px(14.))
+            .bg(c(crate::theme::TERMINAL_BG))
+            .font_family(MONO_FONT)
+            .text_size(px(12.))
+            .text_color(c(crate::theme::DARK.t1))
+            .children(self.settings.text.lines().enumerate().map(|(n, line)| {
+                let number = n + 1;
+                let problems: Vec<String> = read
+                    .problems
+                    .iter()
+                    .filter(|p| p.line == Some(number))
+                    .map(|p| p.what.clone())
+                    .collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(10.))
+                            .when(marked.contains(&number), |d| {
+                                d.bg(ca(crate::theme::DARK.fill))
+                            })
+                            .child(
+                                div()
+                                    .w(px(28.))
+                                    .flex_none()
+                                    .text_color(c(crate::theme::DARK.t3))
+                                    .child(number.to_string()),
+                            )
+                            .child(div().whitespace_nowrap().child(line.to_string())),
+                    )
+                    .children(problems.into_iter().map(|p| {
+                        div()
+                            .pl(px(38.))
+                            .text_color(c(crate::theme::DARK.fail_text))
+                            .child(p)
+                    }))
+            }))
+            .children(read.problems.iter().filter(|p| p.line.is_none()).map(|p| {
+                div()
+                    .text_color(c(crate::theme::DARK.fail_text))
+                    .child(p.what.clone())
+            }))
+    }
+
+    fn pet_panel(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .p(px(12.))
+            .rounded(px(14.))
+            .bg(c(t.card))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c(t.t2))
+                            .child("This Mac's pet"),
+                    )
+                    .when_some(self.my_pet.as_ref(), |d, pet| d.child(ui::pet(pet, 3.)))
+                    .child(div().flex_1())
+                    .child(
+                        ui::pill("deal-pets", "Deal six new pets", t)
+                            .h(px(28.))
+                            .child("Deal six new pets")
+                            .on_click(cx.listener(|this, _, _, cx| this.deal_pets(cx))),
+                    ),
+            )
+            .child(div().flex().flex_wrap().gap(px(8.)).children(
+                self.settings.pets.iter().enumerate().map(|(n, pet)| {
+                    let picked = pet.clone();
+                    ui::control(("pet", n as u64), Role::Button, format!("Pet {}", n + 1), t)
+                        .p(px(8.))
+                        .rounded(px(10.))
+                        .bg(ca(t.fill))
+                        .hover(|s| s.bg(ca(t.fill2)))
+                        .child(ui::pet(pet, 4.))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.pick_pet(picked.clone(), cx)),
+                        )
+                }),
+            ))
+    }
+}
+
+/// A number for a setting's controls.
+fn key_id(key: &str) -> u64 {
+    SETTINGS
+        .iter()
+        .position(|s| s.key == key)
+        .map_or(99, |n| n as u64)
+}
