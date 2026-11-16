@@ -1190,7 +1190,7 @@ impl Desk {
             .id("review")
             .role(Role::Region)
             .aria_label("Changes")
-            .focus_visible(move |s| s.border_color(ring))
+            .focus_visible(move |s| ui::focus_ring(s, ring))
             .track_focus(&self.review_focus)
             .on_key_down(cx.listener(Self::review_key))
             .flex_1()

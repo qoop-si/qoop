@@ -10,9 +10,16 @@ use crate::link::{Down, Latest, Up};
 use crate::state::tests::fixture;
 
 fn open(cx: &mut TestAppContext) -> (Entity<Desk>, VisualTestContext, UnboundedReceiver<Up>) {
-    let (up, rx) = tokio::sync::mpsc::unbounded_channel();
     // Every setting its default (prefix ctrl-a), never the person's own file.
-    let config = qoop_tui::config::read_from(std::path::Path::new("/nonexistent/config.toml"));
+    open_with(cx, std::path::Path::new("/nonexistent/config.toml"))
+}
+
+fn open_with(
+    cx: &mut TestAppContext,
+    config: &std::path::Path,
+) -> (Entity<Desk>, VisualTestContext, UnboundedReceiver<Up>) {
+    let (up, rx) = tokio::sync::mpsc::unbounded_channel();
+    let config = qoop_tui::config::read_from(config);
     let window = cx.add_window(|window, cx| Desk::new(up, Latest::default(), &config, window, cx));
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     let desk = window.root(&mut vcx).expect("the window's view");
@@ -196,6 +203,72 @@ fn the_field_marks_then_commits_what_the_input_method_composes(cx: &mut TestAppC
     field.read_with(&vcx, |f, _| assert_eq!(f.text, "x"));
     vcx.simulate_keystrokes("cmd-a backspace");
     field.read_with(&vcx, |f, _| assert_eq!(f.text, ""));
+}
+
+/// New work offers the `[agents]` names of the config too; one qoop cannot hand the task to
+/// starts as typed, and the sheet says so.
+#[gpui::test]
+fn new_work_offers_the_config_agents(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[agents]\nfast = \"claude --model opus\"\naider = \"aider --model x\"\n",
+    )
+    .expect("config");
+    let (desk, mut vcx, mut rx) = open_with(cx, &path);
+    let names = desk.read_with(&vcx, |d, _| {
+        d.offers.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+    });
+    assert_eq!(names, ["claude", "codex", "opencode", "fast", "aider"]);
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.simulate_input("fix it");
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.sheet.as_mut().expect("open").agent = 4;
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("new-work-note").is_some(),
+        "the note that aider starts without the task"
+    );
+    sent(&mut rx);
+    vcx.simulate_keystrokes("enter");
+    let id = sent(&mut rx)
+        .into_iter()
+        .find_map(|u| match u {
+            Up::Request(r) => match *r {
+                ControlRequest::CreateTerminal { id, .. } => Some(id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a terminal asked for");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(
+                Down::Answer(Box::new(ControlResponse::TerminalCreated {
+                    id,
+                    terminal: 15,
+                })),
+                window,
+                cx,
+            )
+        })
+    });
+    let typed = sent(&mut rx)
+        .into_iter()
+        .find_map(|u| match u {
+            Up::Input(15, bytes) => Some(String::from_utf8(bytes).expect("utf8")),
+            _ => None,
+        })
+        .expect("the line typed");
+    assert_eq!(
+        typed,
+        "qoop worktree new feat/fix-it --space 1 -- aider --model x && exit\r"
+    );
 }
 
 /// A New work whose sheet was closed while it started still gets its line, and one asked
@@ -1272,6 +1345,14 @@ fn remote_settings_go_through_via(cx: &mut TestAppContext) {
         Some(30)
     );
     assert!(vcx.debug_bounds("remote-exit").is_some(), "drawn");
+    let card = vcx.debug_bounds("remote-settings").expect("the card");
+    let last = vcx
+        .debug_bounds("remote-minutes-240")
+        .expect("the 240 chip");
+    assert!(
+        last.right() <= card.right(),
+        "the minutes stay inside their card: {last:?} in {card:?}"
+    );
     assert_eq!(
         desk.read_with(&vcx, |d, _| d.settings.said.clone()),
         None,

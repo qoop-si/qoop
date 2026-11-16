@@ -1650,8 +1650,13 @@ impl Desk {
                             .h(px(28.))
                             .child(agent.clone())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let mut names: Vec<String> =
-                                    this.offers.iter().map(|(name, _)| name.clone()).collect();
+                                // A scheduled run starts with its prompt, so only agents that take one.
+                                let mut names: Vec<String> = this
+                                    .offers
+                                    .iter()
+                                    .filter(|(_, command)| state::takes_prompt(command))
+                                    .map(|(name, _)| name.clone())
+                                    .collect();
                                 if let Some(s) = this.schedule_page.sheet.as_mut() {
                                     if let Some(own) = s.original.as_ref().map(|o| o.agent.clone())
                                         && !names.contains(&own)

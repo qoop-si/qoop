@@ -1852,21 +1852,29 @@ fn plain(command: &str) -> bool {
 fn prompted(program: &str, prompt: &str) -> Option<Vec<String>> {
     match program {
         "claude" | "codex" => Some(vec![prompt.to_string()]),
+        "gemini" => Some(vec!["-i".into(), prompt.to_string()]),
         "opencode" => Some(vec!["--prompt".into(), prompt.to_string()]),
         _ => None,
     }
 }
 
-/// The launchers that can start in a worktree with a prompt, by name and command.
+/// The launchers that can start in a worktree, by name and command: every one typed as plain
+/// words, since `&& exit` follows it on the line.
 pub fn worktree_agents(offers: &[(String, String)]) -> Vec<(String, String)> {
     offers
         .iter()
-        .filter(|(_, command)| plain(command) && prompted(program_of(command), "").is_some())
+        .filter(|(_, command)| plain(command))
         .cloned()
         .collect()
 }
 
-/// The agent's command with its first prompt on it, or why it cannot take one.
+/// Whether the agent takes the task as its first prompt; one qoop does not know starts
+/// without it, and the task only names the branch.
+pub fn takes_prompt(command: &str) -> bool {
+    prompted(program_of(command), "").is_some()
+}
+
+/// The agent's command with its first prompt on it when it takes one, or why it cannot start.
 pub fn prompted_line(command: &str, prompt: &str) -> Result<String, &'static str> {
     let said = clean_prompt(prompt);
     if said.is_empty() {
@@ -1875,12 +1883,13 @@ pub fn prompted_line(command: &str, prompt: &str) -> Result<String, &'static str
     if said.starts_with('-') {
         return Err("The prompt cannot start with -.");
     }
-    let words = plain(command)
-        .then(|| prompted(program_of(command), &said))
-        .flatten()
-        .ok_or("That agent cannot start this way.")?;
+    if !plain(command) {
+        return Err("That agent cannot start this way.");
+    }
     let mut line = vec![command.trim().to_string()];
-    line.extend(words.iter().map(|w| shell_quote(w)));
+    if let Some(words) = prompted(program_of(command), &said) {
+        line.extend(words.iter().map(|w| shell_quote(w)));
+    }
     Ok(line.join(" "))
 }
 
@@ -2445,7 +2454,16 @@ pub(crate) mod tests {
             ("aider".into(), "aider".into()),
         ]);
         let names: Vec<&str> = offered.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["claude", "fast", "cx"]);
+        assert_eq!(names, ["claude", "fast", "cx", "env", "aider"]);
+        assert_eq!(
+            worktree_line("b", None, "aider --model x", "go").as_deref(),
+            Ok("qoop worktree new b -- aider --model x && exit")
+        );
+        assert_eq!(
+            worktree_line("b", None, "gemini", "go").as_deref(),
+            Ok("qoop worktree new b -- gemini -i go && exit")
+        );
+        assert!(takes_prompt("/opt/homebrew/bin/codex") && !takes_prompt("aider"));
     }
 
     fn schedule(name: &str, cron: Option<&str>, next_at: Option<i64>) -> ScheduleInfo {

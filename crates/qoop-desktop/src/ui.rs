@@ -5,8 +5,9 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AnyElement, AnyView, App, AssetSource, Context, Div, ElementId, FontWeight, Hsla, Render, Role,
-    SharedString, Stateful, Svg, Toggled, Window, div, prelude::*, px, svg,
+    AnyElement, AnyView, App, AssetSource, BoxShadow, Context, Div, ElementId, FontWeight, Hsla,
+    Render, Role, SharedString, Stateful, StyleRefinement, Svg, Toggled, Window, div, point,
+    prelude::*, px, svg,
 };
 use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
@@ -240,7 +241,19 @@ pub fn control(
         .cursor_pointer()
         .border_1()
         .border_color(gpui::transparent_black())
-        .focus_visible(move |s| s.border_color(ring))
+        .focus_visible(move |s| focus_ring(s, ring))
+}
+
+/// The keyboard's ring: the border in `ring` and a 2 px band of it outside, so it shows on a
+/// control whose own fill is near `ring` (a switch that is on, a picked chip).
+pub fn focus_ring(s: StyleRefinement, ring: Hsla) -> StyleRefinement {
+    s.border_color(ring).shadow(vec![BoxShadow {
+        color: ring,
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(2.),
+        inset: false,
+    }])
 }
 
 /// A pill button with an outline: `+ New work ctrl-a c`.
