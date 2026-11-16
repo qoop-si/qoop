@@ -144,6 +144,8 @@ pub struct Desk {
     /// Other machines' pets, as their daemons drew them, and the reads still out.
     pub(crate) machine_pets: HashMap<usize, Vec<state::PetRect>>,
     pet_asks: HashMap<String, usize>,
+    /// Why each machine's link is down, as the mux said it (an ssh error): a tooltip, never a name.
+    pub(crate) link_reasons: HashMap<usize, String>,
     /// The requests out to another machine, by id: an answer to any of them is that machine
     /// heard from.
     sent_to: std::cell::RefCell<HashMap<String, usize>>,
@@ -246,6 +248,7 @@ impl Desk {
             closed_card: None,
             machine_pets: HashMap::new(),
             pet_asks: HashMap::new(),
+            link_reasons: HashMap::new(),
             sent_to: Default::default(),
             pinged: HashMap::new(),
             no_pet: BTreeSet::new(),
@@ -452,7 +455,8 @@ impl Desk {
                 lines,
                 ..
             } => self.scrolled_back(terminal, total, lines),
-            ControlResponse::Workspaces { workspaces, .. } => {
+            ControlResponse::Workspaces { mut workspaces, .. } => {
+                self.link_reasons = state::split_reasons(&mut workspaces);
                 self.reach.note(&workspaces, self.now);
                 // An ask a dropped link took with it is answered by nobody: ask again once up.
                 let down = &self.reach.down_since;
@@ -867,6 +871,40 @@ impl Desk {
         }
     }
 
+    /// Try machine `m` now: anything asked of a link that is down makes the mux try it at once
+    /// rather than at the end of its backoff (up to 10 s). Its pet is the ask: it costs nothing
+    /// and is the word that counts as heard once the machine answers.
+    pub(crate) fn retry_machine(&mut self, m: usize) {
+        let Some(workspace) = state::machines(&self.model.spaces)
+            .into_iter()
+            .find(|(n, _, _)| *n == m)
+            .and_then(|(_, _, via)| via)
+        else {
+            return;
+        };
+        let id = link::fresh_id("pet");
+        self.pet_asks.insert(id.clone(), m);
+        self.pinged.insert(m, self.now);
+        self.ask(ControlRequest::Via {
+            id: link::fresh_id("via"),
+            workspace,
+            request: Box::new(ControlRequest::Pet { id }),
+        });
+    }
+
+    /// The window is in front again: every machine not answering is tried at once, as a
+    /// person looking is the moment it should be back.
+    pub(crate) fn retry_away(&mut self) {
+        let away: Vec<usize> = state::machines(&self.model.spaces)
+            .into_iter()
+            .map(|(m, _, _)| m)
+            .filter(|m| *m != 0 && self.machine_state(*m) != state::MachineState::Live)
+            .collect();
+        for m in away {
+            self.retry_machine(m);
+        }
+    }
+
     /// The agent on screen had its question answered by another client: its card stays,
     /// closed. A new question on it takes the card back.
     fn answered_elsewhere(&mut self, before: &[qoop_runtime::control::AgentRow]) {
@@ -1039,7 +1077,7 @@ impl Desk {
                     .mt(px(8.))
                     .when(self.page != Page::Home, |d| d.child(self.tree(t, cx))),
             )
-            .child(self.tiles(t))
+            .child(self.tiles(t, cx))
     }
 
     /// The spaces with their agents, on every page but Home.
@@ -1188,7 +1226,7 @@ impl Desk {
 
     /// One tile per machine at the bottom left, naming it and how it is reached, in the words
     /// the banner uses; and the phone line while a phone has an agent open.
-    fn tiles(&self, t: &Theme) -> impl IntoElement {
+    fn tiles(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let machines = state::machines(&self.model.spaces);
         div()
             .flex()
@@ -1205,8 +1243,19 @@ impl Desk {
                         let reach = self.machine_state(m);
                         let up = reach == state::MachineState::Live;
                         let word = state::reach_words(reach, self.zone);
+                        let away = m != 0
+                            && matches!(
+                                reach,
+                                state::MachineState::Retrying
+                                    | state::MachineState::Stale { .. }
+                                    | state::MachineState::NeverReached
+                            );
+                        let reason = self.link_reasons.get(&m).cloned();
                         div()
                             .id(("tile", m as u64))
+                            .when_some(reason.filter(|_| !up), |d, why| {
+                                d.tooltip(ui::tip_text(why, *t))
+                            })
                             .debug_selector(move || format!("tile-{m}"))
                             .role(Role::Group)
                             .aria_label(format!("{name}, {word}"))
@@ -1227,7 +1276,7 @@ impl Desk {
                                     .when(!up, |d| d.border_1().border_color(c(t.t3))),
                             )
                             .when_some(self.pet_of(m), |d, pet| d.child(pet))
-                            .child(div().text_color(c(t.t1)).child(name))
+                            .child(div().text_color(c(t.t1)).child(name.clone()))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1237,6 +1286,31 @@ impl Desk {
                                     .text_color(c(t.t2))
                                     .child(word),
                             )
+                            .when(away, |d| {
+                                d.child(div().flex_1()).child(
+                                    ui::control(
+                                        ("retry", m as u64),
+                                        Role::Button,
+                                        format!("Retry now, {name}"),
+                                        t,
+                                    )
+                                    .debug_selector(move || format!("retry-{m}"))
+                                    .px(px(6.))
+                                    .h(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .text_color(c(t.t1))
+                                    .hover(|s| s.bg(ca(t.fill2)))
+                                    .child("Retry now")
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.retry_machine(m);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
                     })),
             )
             .when(self.model.phone_here(), |d| {
@@ -1804,6 +1878,9 @@ fn wire(
         .detach();
         // Back to the window: the settings page reads the file again (it may have been edited).
         cx.observe_window_activation(window, |this: &mut Desk, window, cx| {
+            if window.is_window_active() {
+                this.retry_away();
+            }
             if window.is_window_active() && this.page == Page::Settings {
                 this.read_settings();
                 this.dark = dark_for(this.theme_pref, window.appearance());

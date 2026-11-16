@@ -1270,6 +1270,27 @@ pub fn qoop_bin() -> Option<std::path::PathBuf> {
     })
 }
 
+/// A remote space whose link is down or let go carries why in its name ("staging:api
+/// (offline: ssh: connect to host staging port 22: Network is unreachable)"). The name goes
+/// back to the space's own, so every place that shows it says the state words; the reason is
+/// kept apart, by machine, for a tooltip.
+pub fn split_reasons(spaces: &mut [WorkspaceRow]) -> HashMap<usize, String> {
+    let mut why = HashMap::new();
+    for w in spaces.iter_mut() {
+        let m = machine_of(w.id);
+        if m == 0 || matches!(w.link, None | Some(LinkState::Up)) {
+            continue;
+        }
+        if let Some((name, rest)) = w.name.split_once(" (")
+            && let Some(reason) = rest.strip_suffix(')')
+        {
+            why.insert(m, reason.to_string());
+            w.name = name.to_string();
+        }
+    }
+    why
+}
+
 /// The terminals whose menu is new since `before` (none then, or another seal): what was said
 /// of their last answer belongs to the old question.
 pub fn new_menus(before: &[AgentRow], now: &[AgentRow]) -> Vec<TerminalStream> {
@@ -3094,6 +3115,34 @@ pub(crate) mod tests {
             reach.state(remote, &m.spaces, 9_000, None),
             MachineState::Parked
         );
+    }
+
+    /// A down link's raw reason leaves the space's name and is kept by machine; an up one's
+    /// name is left as it is.
+    #[test]
+    fn a_down_links_reason_leaves_the_name() {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if machine_of(w.id) == 1 {
+                w.link = Some(LinkState::Down);
+                w.name = format!(
+                    "{} (offline: ssh: connect to host staging port 22: Network is unreachable)",
+                    w.name
+                );
+            }
+        }
+        let why = split_reasons(&mut spaces);
+        let remote = spaces
+            .iter()
+            .find(|w| machine_of(w.id) == 1)
+            .expect("remote");
+        assert_eq!(remote.name, "staging:billing-api");
+        assert_eq!(
+            why.get(&1).map(String::as_str),
+            Some("offline: ssh: connect to host staging port 22: Network is unreachable")
+        );
+        let mut up = fixture().spaces;
+        assert!(split_reasons(&mut up).is_empty());
     }
 
     /// A question after the one answered is a new menu; the same menu read again is not.

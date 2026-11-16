@@ -1527,3 +1527,57 @@ fn an_idle_remote_that_answers_its_pings_stays_live(cx: &mut TestAppContext) {
         crate::state::MachineState::Live
     );
 }
+
+/// A machine whose link is down: its space reads by its own name (the ssh error only in the
+/// tile's tooltip), its tile offers Retry now, and Retry now or the window coming back asks it
+/// at once, which makes the mux try it then rather than at the end of its backoff.
+#[gpui::test]
+fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let mut spaces = fixture().spaces;
+    for w in &mut spaces {
+        if crate::state::machine_of(w.id) == 1 {
+            w.link = Some(LinkState::Down);
+            w.name = format!(
+                "{} (offline: ssh: connect to host staging port 22: Network is unreachable)",
+                w.name
+            );
+        }
+    }
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        },
+    );
+    let name = desk.read_with(&vcx, |d, _| {
+        d.model
+            .spaces
+            .iter()
+            .find(|w| crate::state::machine_of(w.id) == 1)
+            .map(|w| w.name.clone())
+    });
+    assert_eq!(name.as_deref(), Some("staging:billing-api"));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.link_reasons.get(&1).cloned())
+            .is_some_and(|r| r.contains("Network is unreachable"))
+    );
+    assert!(
+        vcx.debug_bounds("retry-1").is_some(),
+        "Retry now on its tile"
+    );
+    sent(&mut rx);
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.retry_machine(1)));
+    let asked = |rx: &mut UnboundedReceiver<Up>| {
+        via_sent(rx, remote)
+            .iter()
+            .filter(|r| matches!(r, ControlRequest::Pet { .. }))
+            .count()
+    };
+    assert_eq!(asked(&mut rx), 1, "Retry now asks it");
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.retry_away()));
+    assert_eq!(asked(&mut rx), 1, "the window back asks it too");
+}
