@@ -261,12 +261,48 @@ fn telemetry_off_in(value: &toml::Value, at: &str) -> Option<String> {
     }
 }
 
-/// The lock file beside `config.toml` that every writer of it holds while it reads, changes and
-/// writes the file.
+/// The lock file every writer of `path` holds while it reads, changes and writes it. A file
+/// in qoop's config folder locks in qoop's data folder (`config.toml.lock`, `qass-x.toml.lock`),
+/// so a dotfiles checkout of the config folder never sees it; any other file, and every file
+/// when there is no data folder, locks beside itself. The same path for every writer.
 fn lock_path(path: &Path) -> std::path::PathBuf {
+    lock_path_in(path, &crate::paths::config_dir(), crate::paths::data_dir())
+}
+
+fn lock_path_in(
+    path: &Path,
+    config: &Path,
+    data: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let (Ok(inside), Some(data)) = (path.strip_prefix(config), data) {
+        let name = inside.to_string_lossy().replace(['/', '\\'], "-");
+        return data.join(format!("{name}.lock"));
+    }
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
+}
+
+/// How long a write waits for another writer's lock before it gives up: a writer stuck holding
+/// it must not freeze the window that asked.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Take `lock`, waiting at most [`LOCK_WAIT`]; past it, "config.toml is busy, try again".
+fn lock_within(lock: &std::fs::File, path: &Path) -> Result<(), String> {
+    let until = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                return Err(format!("{name} is busy, try again"));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// Read the file at `path` as TOML, let `change` edit it, and put it back whole: the one way
@@ -282,16 +318,17 @@ fn edit_doc(
     let _one = WRITING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(parent) = path.parent() {
+    let lock_at = lock_path(path);
+    if let Some(parent) = lock_at.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(lock_path(path))
-        .map_err(|e| format!("{}: {e}", lock_path(path).display()))?;
-    lock.lock().map_err(|e| e.to_string())?;
+        .open(&lock_at)
+        .map_err(|e| format!("{}: {e}", lock_at.display()))?;
+    lock_within(&lock, path)?;
     let edited = edit_locked(path, change);
     let _ = lock.unlock();
     edited
@@ -733,6 +770,51 @@ mod tests {
         assert!(
             text.contains("mine = 1") && text.contains("theirs = 2"),
             "{text}"
+        );
+    }
+
+    /// A writer that never lets go: a write here gives up after [`LOCK_WAIT`] and says so,
+    /// leaving the file as it was.
+    #[test]
+    fn a_stuck_writer_makes_a_write_give_up_not_hang() {
+        let (_dir, path) = file_with("# kept\n");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(&path))
+            .expect("lock file");
+        held.lock().expect("held");
+        let started = std::time::Instant::now();
+        let refused = edit(&path, &[("theirs", toml_edit::value(2))]);
+        assert_eq!(refused, Err("config.toml is busy, try again".to_string()));
+        assert!(started.elapsed() >= LOCK_WAIT, "it waited");
+        assert!(started.elapsed() < LOCK_WAIT * 3, "and no longer");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "# kept\n");
+        held.unlock().expect("let go");
+    }
+
+    /// qoop's own config files lock in its data folder, out of a dotfiles checkout; any other
+    /// file beside itself; every writer of one file gets one path.
+    #[test]
+    fn the_lock_of_a_config_file_lives_in_the_data_folder() {
+        let config = Path::new("/home/me/.config/qoop");
+        let data = Some(std::path::PathBuf::from("/home/me/.local/share/qoop"));
+        assert_eq!(
+            lock_path_in(&config.join("config.toml"), config, data.clone()),
+            Path::new("/home/me/.local/share/qoop/config.toml.lock")
+        );
+        assert_eq!(
+            lock_path_in(&config.join("qass/config.toml"), config, data.clone()),
+            Path::new("/home/me/.local/share/qoop/qass-config.toml.lock")
+        );
+        assert_eq!(
+            lock_path_in(Path::new("/tmp/x/config.toml"), config, data),
+            Path::new("/tmp/x/config.toml.lock")
+        );
+        assert_eq!(
+            lock_path_in(&config.join("config.toml"), config, None),
+            config.join("config.toml.lock")
         );
     }
 

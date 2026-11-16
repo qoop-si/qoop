@@ -20,17 +20,18 @@ pub struct Press<'a> {
     pub option_is_meta: bool,
 }
 
-/// The bytes for one press, or `None` for a press the terminal does not get (Cmd chords
-/// belong to the app).
-/// What a keystroke types, for the window's own one-letter keys: the character the layout
-/// produced (`/` is shift-7 on a Turkish Q keyboard), else the key's name (`tab`, `escape`).
+/// What a keystroke types, for the window's own one-letter keys: the ASCII character the
+/// layout produced (`/` is shift-7 on a Turkish Q keyboard), else the key's name (`c` on a
+/// Russian layout that types a Cyrillic letter there, `tab`, `escape`).
 pub fn typed(k: &gpui::Keystroke) -> &str {
     k.key_char
         .as_deref()
-        .filter(|c| c.chars().count() == 1 && !c.chars().any(char::is_control))
+        .filter(|c| c.len() == 1 && c.bytes().all(|b| b.is_ascii_graphic()))
         .unwrap_or(&k.key)
 }
 
+/// The bytes for one press, or `None` for a press the terminal does not get (Cmd chords
+/// belong to the app).
 pub fn encode(p: Press<'_>, app_cursor: bool) -> Option<Vec<u8>> {
     if p.cmd {
         return None;
@@ -220,6 +221,22 @@ mod tests {
             ..key("enter")
         };
         assert_eq!(encode(enter, false), Some(b"\r".to_vec()));
+    }
+
+    /// The window's keys by what the layout typed when it is ASCII, else by the key: `/` on a
+    /// Turkish Q shift-7, `c` on a Russian layout's `c` key.
+    #[test]
+    fn typed_takes_ascii_and_falls_back_to_the_key() {
+        let stroke = |key: &str, key_char: Option<&str>| gpui::Keystroke {
+            key: key.into(),
+            key_char: key_char.map(Into::into),
+            ..gpui::Keystroke::default()
+        };
+        assert_eq!(typed(&stroke("7", Some("/"))), "/");
+        assert_eq!(typed(&stroke("c", Some("\u{0441}"))), "c");
+        assert_eq!(typed(&stroke("x", Some("\u{03c7}"))), "x");
+        assert_eq!(typed(&stroke("tab", Some("\t"))), "tab");
+        assert_eq!(typed(&stroke("escape", None)), "escape");
     }
 
     #[test]

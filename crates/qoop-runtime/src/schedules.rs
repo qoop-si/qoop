@@ -752,14 +752,21 @@ async fn claim_due(
                     waiting_on_gate = true;
                     continue;
                 }
-                // A watch's check keeps the last run shown: most checks start nothing. A run
-                // goes by Run now's rule: while one of the schedule's runs is open, the slot
-                // is skipped rather than a second agent started beside it.
-                let fired = match row.watch {
-                    Some(_) => claim(books, &row, slot, at, None).await,
-                    None => fire(books, agents, &row, slot, at).await,
-                };
-                match fired {
+                // A watch's check keeps the last run shown: most checks start nothing. Both
+                // go by Run now's rule: while one of the schedule's runs is open, the slot is
+                // skipped rather than a second agent started beside it.
+                if row.watch.is_some() {
+                    match check(books, agents, &row, slot, at).await {
+                        Some(true) => {
+                            claimed = true;
+                            spawn_run(books, connections, row, slot, None, starting, false);
+                        }
+                        Some(false) => claimed = true,
+                        None => lost = true,
+                    }
+                    continue;
+                }
+                match fire(books, agents, &row, slot, at).await {
                     Some(Some(Fired::Skipped(_))) => {
                         crate::say!(
                             "qoopd: schedule {} skipped: its last run is still open",
@@ -783,7 +790,7 @@ async fn claim_due(
                     continue;
                 }
                 crate::say!("qoopd: schedule {} skipped: {because}", row.name);
-                if claim(books, &row, slot, at, Some(format!("skipped: {because}")))
+                if claim(books, &row, slot, at, format!("skipped: {because}"))
                     .await
                     .is_some()
                 {
@@ -811,27 +818,19 @@ async fn claim_due(
     sleep.map(|s| Duration::from_secs(s as u64))
 }
 
-/// Take `slot` of `row` for a run: the run's row when there is a `result` (a watch's check has
-/// none). None when somebody else did (a second look, a pause, a remove), or the store did not
-/// answer.
+/// Take `slot` of `row` as skipped with `result`, and its run's row. None when somebody else
+/// did (a second look, a pause, a remove), or the store did not answer.
 async fn claim(
     books: &Bookkeeping,
     row: &ScheduleRow,
     slot: i64,
     at: i64,
-    result: Option<String>,
-) -> Option<Option<Fired>> {
+    result: String,
+) -> Option<i64> {
     let (id, expected) = (row.id, row.last_slot);
     match books
         .store
-        .run(move |s| match result {
-            Some(result) => Ok(s
-                .claim_run(id, expected, slot, at, &result)?
-                .map(|run| Some(Fired::Skipped(run)))),
-            None => Ok(s
-                .claim_schedule(id, expected, slot, at, None)?
-                .then_some(None)),
-        })
+        .run(move |s| s.claim_run(id, expected, slot, at, &result))
         .await
     {
         Ok(won) => won,
@@ -853,20 +852,50 @@ async fn fire(
     at: i64,
 ) -> Option<Option<Fired>> {
     let (id, expected) = (row.id, row.last_slot);
-    let tabs = match books.store.run(move |s| s.open_run_tabs(id)).await {
-        Ok(tabs) => tabs,
-        Err(e) => {
-            crate::say!("qoopd: schedules: {}", why(e));
-            return None;
-        }
-    };
-    let closed = closed_tabs(agents, tabs);
+    let closed = closed_runs(books, agents, id).await?;
     match books
         .store
         .run(move |s| s.claim_fire(id, expected, slot, at, &closed))
         .await
     {
         Ok(fired) => fired.map(Some),
+        Err(e) => {
+            crate::say!("qoopd: schedules: {}", why(e));
+            None
+        }
+    }
+}
+
+/// Claim a watch's due check by the same rule as [`fire`]: true to run the check, false when
+/// one of its runs is still open. None when somebody else took the slot, or the store did not
+/// answer.
+async fn check(
+    books: &Bookkeeping,
+    agents: &AgentRegistry,
+    row: &ScheduleRow,
+    slot: i64,
+    at: i64,
+) -> Option<bool> {
+    let (id, expected) = (row.id, row.last_slot);
+    let closed = closed_runs(books, agents, id).await?;
+    match books
+        .store
+        .run(move |s| s.claim_check(id, expected, slot, at, &closed))
+        .await
+    {
+        Ok(check) => check,
+        Err(e) => {
+            crate::say!("qoopd: schedules: {}", why(e));
+            None
+        }
+    }
+}
+
+/// The tabs of schedule `id`'s open runs that are not open any more; none when the store did
+/// not answer.
+async fn closed_runs(books: &Bookkeeping, agents: &AgentRegistry, id: i64) -> Option<Vec<i64>> {
+    match books.store.run(move |s| s.open_run_tabs(id)).await {
+        Ok(tabs) => Some(closed_tabs(agents, tabs)),
         Err(e) => {
             crate::say!("qoopd: schedules: {}", why(e));
             None
@@ -897,7 +926,6 @@ fn own_exe(books: &Bookkeeping) -> Option<PathBuf> {
 /// A run that ends without having reported is written down as failed, its row `run` too (a
 /// watch's check has none). `manual` is the owner asking for it now, which a run still going
 /// does not hold back.
-
 fn spawn_run(
     books: &Bookkeeping,
     connections: &Arc<ConnectionRegistry>,

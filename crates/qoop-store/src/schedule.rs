@@ -123,6 +123,21 @@ fn open_after_sweep(tx: &Connection, id: i64, now: i64, closed: &[i64]) -> rusql
     )
 }
 
+/// Take `slot` of schedule `id` from `expected` with nothing written of a run: a watch's
+/// check. False when the schedule moved on or is paused.
+fn claim_slot_in(
+    tx: &Connection,
+    id: i64,
+    expected: Option<i64>,
+    slot: i64,
+) -> rusqlite::Result<bool> {
+    Ok(tx.execute(
+        "UPDATE schedule SET last_slot = ?3 \
+         WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
+        params![id, expected, slot],
+    )? > 0)
+}
+
 /// Take `slot` of schedule `id` from `expected` with `result`, and its run's row: none when the
 /// schedule moved on or is paused.
 fn claim_in(
@@ -383,11 +398,29 @@ impl Store {
         if let Some(result) = result {
             return Ok(self.claim_run(id, expected, slot, now, result)?.is_some());
         }
-        Ok(self.conn.execute(
-            "UPDATE schedule SET last_slot = ?3 \
-             WHERE id = ?1 AND last_slot IS ?2 AND paused = 0",
-            params![id, expected, slot],
-        )? > 0)
+        Ok(claim_slot_in(&self.conn, id, expected, slot)?)
+    }
+
+    /// Claim a watch's due check by Run now's rule: while one of its runs is still open (the
+    /// agent its last check started), the slot is taken and the check is not run, so the lines
+    /// it would have seen wait for the next one. One write transaction, as [`Store::claim_fire`].
+    /// Answers whether to check, or none when somebody else took the slot first.
+    pub fn claim_check(
+        &self,
+        id: i64,
+        expected: Option<i64>,
+        slot: i64,
+        now: i64,
+        closed: &[i64],
+    ) -> Result<Option<bool>, StoreError> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let open = open_after_sweep(&tx, id, now, closed)?;
+        let won = claim_slot_in(&tx, id, expected, slot)?;
+        tx.commit()?;
+        Ok(won.then_some(!open))
     }
 
     /// [`Store::claim_schedule`] with a result, and the run row of the slot made in the same
@@ -1051,6 +1084,42 @@ mod tests {
         ));
         let held = s.claim_fire(id, None, 1_010, 1_011, &[]).unwrap();
         assert!(matches!(held, Some(Fired::Skipped(_))), "{held:?}");
+    }
+
+    /// A watch whose last check started an agent that is still open does not check again
+    /// (no second agent beside it) until that tab closes; the slot still moves on.
+    #[test]
+    fn a_watch_check_waits_for_its_open_run() {
+        let s = Store::in_memory().expect("open");
+        let row = ScheduleRow {
+            cron: None,
+            watch: Some("gh issue list".into()),
+            ..made("issues")
+        };
+        let id = s.add_schedule(&row).unwrap();
+        assert_eq!(s.claim_check(id, None, 500, 500, &[]).unwrap(), Some(true));
+        assert_eq!(
+            s.claim_check(id, None, 500, 500, &[]).unwrap(),
+            None,
+            "once per slot"
+        );
+        // That check found something and started an agent, still open in tab 4.
+        assert!(
+            s.report_schedule(id, 500, "started", Some(4), Some("#1 a"), None)
+                .unwrap()
+        );
+        assert_eq!(
+            s.claim_check(id, Some(500), 600, 600, &[]).unwrap(),
+            Some(false),
+            "no check beside the open run"
+        );
+        assert_eq!(s.schedule(id).unwrap().unwrap().last_slot, Some(600));
+        assert_eq!(s.watch_seen(id).unwrap().as_deref(), Some("#1 a"));
+        // Its tab closed: the next slot checks.
+        assert_eq!(
+            s.claim_check(id, Some(600), 700, 700, &[4]).unwrap(),
+            Some(true)
+        );
     }
 
     /// Two Run now asks at the same moment, from two connections, make one run.
