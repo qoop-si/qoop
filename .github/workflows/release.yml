@@ -18,7 +18,7 @@ name: release
 #   ASC_KEY_ID            App Store Connect API key id, for notarytool
 #   ASC_ISSUER_ID         its issuer id
 #   ASC_KEY_P8            the key itself (.p8 text)
-# Without MAC_P12_B64 the desktop app is signed ad hoc and not notarized.
+# Without MAC_P12_B64 the desktop app is built and checked only: no zip goes out.
 #
 # No cache anywhere here: a pull request's run can read main's caches, and these jobs compile
 # private code. A failed run is finished with "Re-run failed jobs" on the same run.
@@ -221,8 +221,9 @@ jobs:
           if-no-files-found: error
 
   # The desktop app, a job of its own outside `build`: a GPUI or notary failure never holds up the CLI
-  # release. `publish` waits for it and goes on when it failed. The zip is signed with the Developer ID
-  # and notarized only when the signing secrets are there; else it carries the ad hoc signature.
+  # release. `publish` waits for it and goes on when it failed. A zip goes out only signed with the
+  # Developer ID and notarized; without the signing secrets the app is built and checked, and no zip
+  # is made, so an ad hoc app never sits under the release's names.
   desktop:
     needs: prep
     if: ${{ !cancelled() && needs.prep.result == 'success' }}
@@ -280,10 +281,13 @@ jobs:
           ditto -c -k --keepParent "$RUNNER_TEMP/out/qoop.app" "$RUNNER_TEMP/notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --key "$RUNNER_TEMP/key.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait
           xcrun stapler staple "$RUNNER_TEMP/out/qoop.app"
-      - name: Zip and checksum
+      - name: Check the bundle
         run: |
           codesign --verify --deep --strict "$RUNNER_TEMP/out/qoop.app"
           "$RUNNER_TEMP/out/qoop.app/Contents/MacOS/qoop-desktop" --version
+      - name: Zip and checksum
+        if: env.HAS_SIGNING == 'true'
+        run: |
           mkdir -p dist
           ditto -c -k --keepParent "$RUNNER_TEMP/out/qoop.app" "dist/qoop-desktop-$TRIPLE.zip"
           (cd dist && shasum -a 256 "qoop-desktop-$TRIPLE.zip" > "qoop-desktop-$TRIPLE.zip.sha256")
@@ -292,7 +296,8 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/key.p8"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - if: env.HAS_SIGNING == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-${{ matrix.triple }}
           path: dist/qoop-desktop-*
@@ -343,8 +348,15 @@ jobs:
             echo 'Already installed: `qoop update`, which moves every computer you added along with it.'
             echo
             echo '- Android: `qoop-android-arm64.apk` below. Installed once, the app offers each new version in Settings.'
-            if ls dist/qoop-desktop-*.zip >/dev/null 2>&1; then
-              echo '- Desktop app for macOS: `qoop-desktop-aarch64-apple-darwin.zip` (Apple silicon) or `qoop-desktop-x86_64-apple-darwin.zip` (Intel) below; unzip it into Applications. It uses the `qoop` the line above installs.'
+            # Only the zips this release really has: one leg may have failed.
+            macs=""
+            [ -s dist/qoop-desktop-aarch64-apple-darwin.zip ] && macs="\`qoop-desktop-aarch64-apple-darwin.zip\` (Apple silicon)"
+            if [ -s dist/qoop-desktop-x86_64-apple-darwin.zip ]; then
+              intel="\`qoop-desktop-x86_64-apple-darwin.zip\` (Intel)"
+              macs="${macs:+$macs or }$intel"
+            fi
+            if [ -n "$macs" ]; then
+              echo "- Desktop app for macOS: $macs below; unzip it into Applications. It uses the \`qoop\` the line above installs."
             fi
             echo '- iPhone and any browser: https://qoop.si/app'
             echo '- Docs: https://qoop.si/docs/'
@@ -367,7 +379,9 @@ jobs:
   # commit it deployed last.
   hub:
     needs: [please, publish]
-    if: ${{ github.event_name == 'push' && needs.please.outputs.released == 'true' }}
+    # After a published release, whatever the desktop app did: a failed desktop leg must not keep
+    # qoop.si (install.sh, qoop update) on the old version.
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.please.outputs.released == 'true' && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
