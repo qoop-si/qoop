@@ -601,9 +601,18 @@ pub enum Pick {
     Text { key: String, text: String },
     /// The question handed to qass (`HandToQass`).
     Qass,
+    /// An option of one of qass's cards (`AskWrite` `Answer`), which qass types to the agent.
+    Card { card: String, option: String },
 }
 
-/// One answer the question card offers: its digit (none for an "always" option, which is
+/// What a pick is about: an agent's menu, or one of qass's cards.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Slot {
+    Agent(u32),
+    Card(String),
+}
+
+/// One answer the question card offers: its digit (none for a standing permission, which is
 /// click only), its words and what it sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {
@@ -613,9 +622,19 @@ pub struct Offer {
     pub pick: Pick,
 }
 
+/// Whether an option grants a standing permission: Claude Code's "Yes, and always allow
+/// access to src/" and "Yes, and don't ask again for cargo test commands in /repo", Codex's
+/// "Yes, and don't ask again for this command". Click only: no digit to press by habit.
+pub fn standing(label: &str) -> bool {
+    let words = label.to_lowercase().replace('\u{2019}', "'");
+    ["always", "don't ask again", "do not ask again"]
+        .iter()
+        .any(|w| words.contains(w))
+}
+
 /// The card's answers: the agent's own options (its field for an answer of one's own is the
 /// card's text field, not an option), then "Explain this in more detail" when the menu takes
-/// words, then "Let qass handle it"; digits in that order, skipping "always" options. A
+/// words, then "Let qass handle it"; digits in that order, skipping standing permissions. A
 /// multiple choice menu offers nothing here: the card says the question and Open.
 pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
     if menu.multi {
@@ -651,7 +670,7 @@ pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
     });
     let mut next = 1u8;
     for offer in &mut out {
-        if !offer.label.to_lowercase().contains("always") && next <= 9 {
+        if !standing(&offer.label) && next <= 9 {
             offer.digit = Some(next);
             next += 1;
         }
@@ -672,7 +691,7 @@ pub fn text_key(menu: &AgentMenu) -> Option<String> {
 /// A pick waiting out its hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hold {
-    pub terminal: u32,
+    pub slot: Slot,
     pub generation: Option<u64>,
     pub seal: u64,
     pub pick: Pick,
@@ -681,7 +700,18 @@ pub struct Hold {
     pub until: Instant,
 }
 
-/// The picks on hold, one per agent, and when each menu was first seen (for the arming).
+impl Hold {
+    /// The agent's terminal, for a pick on its menu.
+    pub fn terminal(&self) -> Option<u32> {
+        match self.slot {
+            Slot::Agent(t) => Some(t),
+            Slot::Card(_) => None,
+        }
+    }
+}
+
+/// The picks on hold, one per agent or card, oldest first, and when each menu was first seen
+/// (for the arming).
 #[derive(Clone, Debug, Default)]
 pub struct Holds {
     pub held: Vec<Hold>,
@@ -689,7 +719,7 @@ pub struct Holds {
 }
 
 impl Holds {
-    /// The menus on the rows now: a new one starts its arming; a hold whose menu changed or
+    /// The menus on the rows now: a new one starts its arming; an answer whose menu changed or
     /// went is dropped and returned, so the card can say who answered.
     pub fn menus(&mut self, rows: &[AgentRow], now: Instant) -> Vec<Hold> {
         let shown: HashMap<u32, u64> = rows
@@ -702,7 +732,10 @@ impl Holds {
         }
         let (kept, dropped): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|h| h.pick == Pick::Qass || shown.get(&h.terminal) == Some(&h.seal));
+            .partition(|h| match (&h.pick, h.terminal()) {
+                (Pick::Key(_) | Pick::Text { .. }, Some(t)) => shown.get(&t) == Some(&h.seal),
+                _ => true,
+            });
         self.held = kept;
         dropped
     }
@@ -714,18 +747,24 @@ impl Holds {
             .is_some_and(|&(s, at)| s == seal && now.duration_since(at) >= ARMING)
     }
 
-    /// Hold `hold`, in place of any other pick for that agent.
+    /// Hold `hold`, in place of any other pick for the same agent or card.
     pub fn start(&mut self, hold: Hold) {
-        self.held.retain(|h| h.terminal != hold.terminal);
+        self.held.retain(|h| h.slot != hold.slot);
         self.held.push(hold);
     }
 
-    /// Undo: `terminal`'s pick, or with none every pick (one shared Undo for a hand-off of
-    /// several). Whether anything was on hold.
-    pub fn undo(&mut self, terminal: Option<u32>) -> bool {
+    /// Undo `slot`'s pick; with none, the newest pick, and every pick held with it (one
+    /// shared Undo for a hand-off of several). Whether anything was on hold.
+    pub fn undo(&mut self, slot: Option<&Slot>) -> bool {
         let before = self.held.len();
-        self.held
-            .retain(|h| terminal.is_some_and(|t| h.terminal != t));
+        match slot {
+            Some(slot) => self.held.retain(|h| &h.slot != slot),
+            None => {
+                if let Some(newest) = self.held.last().map(|h| h.until) {
+                    self.held.retain(|h| h.until != newest);
+                }
+            }
+        }
         self.held.len() != before
     }
 
@@ -743,26 +782,35 @@ impl Holds {
         std::mem::take(&mut self.held)
     }
 
-    pub fn of(&self, terminal: u32) -> Option<&Hold> {
-        self.held.iter().find(|h| h.terminal == terminal)
+    pub fn of(&self, slot: &Slot) -> Option<&Hold> {
+        self.held.iter().find(|h| &h.slot == slot)
     }
 }
 
-/// How a refusal of an answer reads on the card.
-pub fn refusal_words(reason: &str, machine: &str) -> String {
+/// How a refusal of `pick` reads on the card, as a sentence.
+pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
     let here = machine == "This Mac";
+    let max = qoop_runtime::menu::TEXT_MAX;
     match reason {
-        "already_answered" => "Already answered".into(),
-        "busy" => "The agent was busy; try again".into(),
-        "no_such_answer" => "That answer is not on its screen any more".into(),
-        "not_at_input" => "The agent did not open its answer field; nothing was typed".into(),
-        "qass_not_running" if here => "qass is not running".into(),
-        "qass_not_running" => format!("qass is not running on {machine}"),
-        "not_watching" => "qass is not watching".into(),
-        "skipped" => "qass leaves this agent alone".into(),
-        r if r.contains("unknown variant") => {
-            format!("qoop on {machine} is too old for typed answers")
+        "already_answered" => "Someone already answered this question.".into(),
+        "busy" => "The agent was still taking keys. Try again in a moment.".into(),
+        "no_such_answer" => "That answer is no longer on the agent's screen.".into(),
+        "not_at_input" => "The agent did not open its answer field, so nothing was typed.".into(),
+        "no_text_field" => "This question takes no typed answer.".into(),
+        "empty" => "There were no words to send.".into(),
+        "too_long" => format!("The answer is too long. Keep it under {max} characters."),
+        "not_a_person" => {
+            "Only a person's window can answer, and this one was not taken as one.".into()
         }
+        "qass_not_running" if here => "qass is not running, so it cannot take this.".into(),
+        "qass_not_running" => format!("qass is not running on {machine}, so it cannot take this."),
+        "not_watching" => "qass is not watching, so it cannot take this.".into(),
+        "skipped" => "qass leaves this agent alone, so it cannot take this.".into(),
+        r if r.contains("unknown variant") => match pick {
+            Pick::Qass => format!("qoop on {machine} is too old to hand questions to qass."),
+            Pick::Text { .. } => format!("qoop on {machine} is too old for typed answers."),
+            _ => format!("qoop on {machine} is too old for this answer."),
+        },
         other => other.to_string(),
     }
 }
@@ -1796,7 +1844,7 @@ pub(crate) mod tests {
 
     fn held(terminal: u32, seal: u64, until: Instant) -> Hold {
         Hold {
-            terminal,
+            slot: Slot::Agent(terminal),
             generation: Some(1),
             seal,
             pick: Pick::Key("1".into()),
@@ -1822,7 +1870,7 @@ pub(crate) mod tests {
         assert_eq!(holds.due(t0 + HOLD).len(), 1, "sent after 3 s");
 
         holds.start(held(2, 7, t0 + HOLD));
-        assert!(holds.undo(Some(2)));
+        assert!(holds.undo(Some(&Slot::Agent(2))));
         assert!(holds.due(t0 + HOLD).is_empty(), "Undo cancels");
 
         holds.start(held(2, 7, t0 + HOLD));
@@ -1842,21 +1890,65 @@ pub(crate) mod tests {
 
     #[test]
     fn refusals_read_as_words() {
+        let key = Pick::Key("1".into());
         assert_eq!(
-            refusal_words("already_answered", "This Mac"),
-            "Already answered"
+            refusal_words("already_answered", "This Mac", &key),
+            "Someone already answered this question."
         );
         assert_eq!(
-            refusal_words("qass_not_running", "staging"),
-            "qass is not running on staging"
+            refusal_words("qass_not_running", "staging", &Pick::Qass),
+            "qass is not running on staging, so it cannot take this."
+        );
+        let old = "this daemon is older than the client that called it: it does not know the \
+                   method that was asked for (unknown variant `AnswerMenuText`)";
+        let words = Pick::Text {
+            key: "4".into(),
+            text: "x".into(),
+        };
+        assert_eq!(
+            refusal_words(old, "staging", &words),
+            "qoop on staging is too old for typed answers."
         );
         assert_eq!(
-            refusal_words(
-                "this daemon is older than the client that called it: it does not know the \
-                 method that was asked for (unknown variant `AnswerMenuText`)",
-                "staging"
-            ),
-            "qoop on staging is too old for typed answers"
+            refusal_words(old, "staging", &Pick::Qass),
+            "qoop on staging is too old to hand questions to qass."
         );
+        // Every code the daemon sends reads as a sentence, never as the code.
+        for code in [
+            "busy",
+            "no_such_answer",
+            "not_at_input",
+            "no_text_field",
+            "empty",
+            "too_long",
+            "not_a_person",
+            "not_watching",
+            "skipped",
+        ] {
+            let said = refusal_words(code, "This Mac", &key);
+            assert!(said.ends_with('.') && !said.contains('_'), "{code}: {said}");
+        }
+    }
+
+    /// Claude Code's Bash question: its "don't ask again" answer is a standing permission,
+    /// click only, as an "always" one is.
+    #[test]
+    fn a_standing_permission_has_no_digit() {
+        let menu: AgentMenu = serde_json::from_value(serde_json::json!({
+            "question": "Do you want to proceed?",
+            "seal": 3,
+            "options": [
+                {"key": "1", "label": "Yes"},
+                {"key": "2", "label": "Yes, and don't ask again for cargo test commands in /srv/repo"},
+                {"key": "3", "label": "No, and tell Claude what to do differently (esc)", "tell": true},
+            ],
+        }))
+        .expect("menu");
+        let digits: Vec<Option<u8>> = offers(&menu).iter().map(|o| o.digit).collect();
+        assert_eq!(digits, [Some(1), None, Some(2), Some(3), Some(4)]);
+        assert!(standing("Yes, and don\u{2019}t ask again for this command"));
+        assert!(!standing(
+            "Yes, allow all edits during this session (shift+tab)"
+        ));
     }
 }

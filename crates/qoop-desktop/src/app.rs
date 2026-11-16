@@ -35,7 +35,7 @@ use crate::link::{self, Down, Latest, Up};
 use crate::newwork::NewWork;
 use crate::question::{OwnAnswer, Said};
 use crate::review::Review;
-use crate::state::{self, Chip, Kind, Model};
+use crate::state::{self, Chip, Model};
 use crate::theme::{MONO_FONT, TERMINAL_BG, Theme, UI_FONT, c, ca};
 use crate::ui::{self, Icon};
 
@@ -112,7 +112,7 @@ pub struct Desk {
     pub review_focus: FocusHandle,
     /// Picks waiting out their 3 s, and what became of each sent one, per agent.
     pub holds: state::Holds,
-    pub said: HashMap<TerminalStream, Said>,
+    pub said: HashMap<state::Slot, Said>,
     /// Machines whose qoop refused a typed answer as unknown: no typed answers there.
     pub(crate) too_old: BTreeSet<usize>,
     /// The owner's own words for an agent's answer field, while it is open.
@@ -450,15 +450,34 @@ impl Desk {
             cx.stop_propagation();
             return;
         }
+        // The own-answer field keeps every key it is given.
+        let typing = self
+            .own
+            .as_ref()
+            .is_some_and(|own| own.field.read(cx).focus.is_focused(window));
+        if typing {
+            return;
+        }
+        // `u` belongs to Undo while anything is on hold, wherever its line shows (card, corner
+        // note, Inbox): the card's agent's pick, else the newest. It never reaches the terminal
+        // then.
+        if k.key == "u" && !self.holds.held.is_empty() {
+            let card = self
+                .card_offers()
+                .map(|(t, ..)| state::Slot::Agent(t))
+                .filter(|slot| self.holds.of(slot).is_some());
+            self.undo(card.as_ref(), cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.own.is_some() || self.card_offers().is_none() {
             return;
         }
-        // Only while the keys are the terminal's: a field or a control keeps its own.
+        // Digits only while the keys are the terminal's: a control keeps its own.
         if !self.term_focus.is_focused(window) {
             return;
         }
         let taken = match k.key.as_str() {
-            "u" => self.undo(None, cx),
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 self.digit(d.as_bytes()[0] - b'0', window, cx)
             }
@@ -808,7 +827,7 @@ impl Desk {
                                     t,
                                 )
                                 .tooltip(ui::tip(
-                                    "qass answers if its rules allow; otherwise it comes                                      back to you as a card",
+                                    "qass answers if its rules allow; otherwise it comes back to you as a card",
                                     *t,
                                 ))
                                 .flex()
@@ -1512,8 +1531,7 @@ fn wire(
             .detach();
         cx.on_app_quit(|this: &mut Desk, cx| {
             this.flush_holds();
-            let timer = cx.background_executor().timer(Duration::from_millis(200));
-            async move { timer.await }
+            cx.background_executor().timer(Duration::from_millis(200))
         })
         .detach();
         cx.observe_window_appearance(window, |this: &mut Desk, window, cx| {

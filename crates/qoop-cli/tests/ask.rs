@@ -1840,6 +1840,9 @@ fn questions_handed_to_qass_go_as_one_line_and_end_with_their_question() {
     assert_eq!(stack.log("qass").matches("hand-off").count(), 1, "once");
 
     // The first agent's menu closes: its row is no longer with qass, the second's still is.
+    // A fresh window: the one above read nothing through qass's quiet seconds, and the daemon
+    // lets go of an interface that has not taken what it was sent for that long.
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
     ui.forget_events();
     stack.send(&first.to_string(), "FREE");
     assert!(

@@ -1,6 +1,7 @@
 //! Answering: the question card docked under an agent that needs the owner, the panel beside
 //! it, the 3 s hold with Undo, typed answers and the hand-off to qass. The card, the corner
-//! note, the sidebar line and the Inbox all answer through `pick`.
+//! note, the sidebar line and the Inbox all answer through `pick`, and a qass card's option
+//! through `pick_card`: one hold, one Undo, one way of saying what became of it.
 //!
 //! A pick is never sent at once: it waits `state::HOLD` ("Sends in 3 s, Undo `u`"), then goes
 //! as `AnswerMenu`, `AnswerMenuText` or `HandToQass`, and the card says "Sending" until the
@@ -11,12 +12,14 @@ use std::path::Path;
 use std::time::Instant;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
-use qoop_runtime::control::{AgentRow, ControlRequest, ControlResponse, Hand, TerminalStream};
+use qoop_runtime::control::{
+    AgentRow, AskInfo, AskOp, ControlRequest, ControlResponse, Hand, TerminalStream,
+};
 
 use crate::app::{Desk, Page};
 use crate::field::{Field, FieldColors};
 use crate::link;
-use crate::state::{self, Hold, Kind, Offer, Pick};
+use crate::state::{self, Hold, Kind, Offer, Pick, Slot};
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui;
 
@@ -92,16 +95,48 @@ impl Desk {
             return;
         }
         let hold = Hold {
-            terminal,
+            slot: Slot::Agent(terminal),
             generation: row.generation,
             seal: menu.seal,
             pick: offer.pick.clone(),
             label: offer.label.clone(),
             until: Instant::now() + state::HOLD,
         };
+        self.hold(hold, window, cx);
+    }
+
+    /// Pick option `option` of qass's card: held for 3 s like any answer, then written.
+    pub(crate) fn pick_card(
+        &mut self,
+        card: &AskInfo,
+        option: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = card
+            .body
+            .options
+            .iter()
+            .find(|o| o.key == option)
+            .map_or_else(|| option.to_string(), |o| o.label.clone());
+        let hold = Hold {
+            slot: Slot::Card(card.card.clone()),
+            generation: None,
+            seal: 0,
+            pick: Pick::Card {
+                card: card.card.clone(),
+                option: option.to_string(),
+            },
+            label,
+            until: Instant::now() + state::HOLD,
+        };
+        self.hold(hold, window, cx);
+    }
+
+    fn hold(&mut self, hold: Hold, _: &mut Window, cx: &mut Context<Self>) {
+        self.said.remove(&hold.slot);
         self.holds.start(hold);
-        self.said.remove(&terminal);
-        self.after_hold(window, cx);
+        self.after_hold(cx);
         cx.notify();
     }
 
@@ -121,34 +156,38 @@ impl Desk {
                 continue;
             }
             let hold = Hold {
-                terminal,
+                slot: Slot::Agent(terminal),
                 generation: row.generation,
                 seal: row.menu.as_ref().map_or(0, |m| m.seal),
                 pick: Pick::Qass,
                 label: "Let qass handle it".into(),
                 until,
             };
+            self.said.remove(&hold.slot);
             self.holds.start(hold);
-            self.said.remove(&terminal);
         }
-        self.after_hold(window, cx);
+        let _ = window;
+        self.after_hold(cx);
         cx.notify();
     }
 
-    /// Wake when the hold is up, and once a second meanwhile for its count.
-    fn after_hold(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        for wait in [1, 2, 3] {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(wait))
-                    .await;
-                let _ = this.update(cx, |d, cx| {
-                    d.fire();
-                    cx.notify();
-                });
-            })
-            .detach();
-        }
+    /// Wake once a second while anything is on hold: its count goes down, and what is due is
+    /// sent. It keeps waking until nothing is held, so a timer that runs a moment early only
+    /// delays a send by a tick.
+    fn after_hold(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
+            let _ = this.update(cx, |d, cx| {
+                d.fire();
+                if !d.holds.held.is_empty() {
+                    d.after_hold(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Send the picks whose hold is up.
@@ -163,13 +202,9 @@ impl Desk {
         self.send(all);
     }
 
-    /// Undo `terminal`'s pick, or every pick on hold.
-    pub(crate) fn undo(
-        &mut self,
-        terminal: Option<TerminalStream>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let undone = self.holds.undo(terminal);
+    /// Undo `slot`'s pick, or the newest one (with every pick held together with it).
+    pub(crate) fn undo(&mut self, slot: Option<&Slot>, cx: &mut Context<Self>) -> bool {
+        let undone = self.holds.undo(slot);
         if undone {
             cx.notify();
         }
@@ -182,9 +217,9 @@ impl Desk {
         for hold in holds {
             match &hold.pick {
                 Pick::Qass => {
-                    let machine = self
-                        .model
-                        .row(hold.terminal)
+                    let machine = hold
+                        .terminal()
+                        .and_then(|t| self.model.row(t))
                         .map_or(0, |r| state::machine_of(r.workspace));
                     hands.entry(machine).or_default().push(hold);
                 }
@@ -197,61 +232,75 @@ impl Desk {
                 id: id.clone(),
                 hands: held
                     .iter()
-                    .map(|h| Hand {
-                        terminal: h.terminal,
-                        generation: h.generation,
-                        seal: (h.seal != 0).then_some(h.seal),
+                    .filter_map(|h| {
+                        Some(Hand {
+                            terminal: h.terminal()?,
+                            generation: h.generation,
+                            seal: (h.seal != 0).then_some(h.seal),
+                        })
                     })
                     .collect(),
             });
             for hold in held {
-                let terminal = hold.terminal;
+                let slot = hold.slot.clone();
                 let sending = Said::Sending {
                     id: id.clone(),
                     hold,
                     retried: true,
                 };
-                self.said.insert(terminal, sending);
+                self.said.insert(slot, sending);
             }
         }
     }
 
     fn send_one(&mut self, hold: Hold, retried: bool) {
         let id = link::fresh_id("answer");
+        let terminal = hold.terminal().unwrap_or_default();
         let request = match &hold.pick {
             Pick::Key(key) => ControlRequest::AnswerMenu {
                 id: id.clone(),
-                terminal: hold.terminal,
+                terminal,
                 generation: hold.generation,
                 seal: hold.seal,
                 key: key.clone(),
             },
             Pick::Text { key, text } => ControlRequest::AnswerMenuText {
                 id: id.clone(),
-                terminal: hold.terminal,
+                terminal,
                 generation: hold.generation,
                 seal: hold.seal,
                 key: key.clone(),
                 text: text.clone(),
             },
+            // The owner's answer to qass's card; qass types it to the agent.
+            Pick::Card { card, option } => ControlRequest::AskWrite {
+                id: id.clone(),
+                terminal: None,
+                token: None,
+                action: AskOp::Answer {
+                    card: card.clone(),
+                    option: Some(option.clone()),
+                    text: None,
+                    seen: None,
+                },
+            },
             Pick::Qass => return,
         };
         self.ask(request);
-        let terminal = hold.terminal;
-        self.said
-            .insert(terminal, Said::Sending { id, hold, retried });
+        let slot = hold.slot.clone();
+        self.said.insert(slot, Said::Sending { id, hold, retried });
     }
 
-    /// The terminal a sending answer was asked under `id`, with its hold.
-    fn sending(&self, id: &str) -> Vec<(TerminalStream, Hold, bool)> {
+    /// The picks a sending answer was asked under `id`, with their holds.
+    fn sending(&self, id: &str) -> Vec<(Hold, bool)> {
         self.said
-            .iter()
-            .filter_map(|(&t, s)| match s {
+            .values()
+            .filter_map(|s| match s {
                 Said::Sending {
                     id: i,
                     hold,
                     retried,
-                } if i == id => Some((t, hold.clone(), *retried)),
+                } if i == id => Some((hold.clone(), *retried)),
                 _ => None,
             })
             .collect()
@@ -265,21 +314,29 @@ impl Desk {
             return false;
         }
         let now = crate::app::unix_now();
-        for (terminal, hold, retried) in mine {
-            let machine = self
-                .model
-                .row(terminal)
+        for (hold, retried) in mine {
+            let terminal = hold.terminal();
+            let machine = terminal
+                .and_then(|t| self.model.row(t))
                 .map_or_else(|| "This Mac".to_string(), |r| self.machine_of_row(r));
             let said = match reply {
-                ControlResponse::MenuAnswered { .. } => Said::Sent {
-                    label: hold.label.clone(),
-                    at: now,
-                },
-                ControlResponse::Handed { taken, .. } if taken.contains(&terminal) => Said::Sent {
-                    label: "Handed to qass".into(),
-                    at: now,
-                },
-                ControlResponse::Handed { .. } => Said::Refused("qass did not take it".into()),
+                ControlResponse::MenuAnswered { .. } | ControlResponse::AskWritten { .. } => {
+                    Said::Sent {
+                        label: hold.label.clone(),
+                        at: now,
+                    }
+                }
+                ControlResponse::Handed { taken, .. }
+                    if terminal.is_some_and(|t| taken.contains(&t)) =>
+                {
+                    Said::Sent {
+                        label: "Handed to qass".into(),
+                        at: now,
+                    }
+                }
+                ControlResponse::Handed { .. } => {
+                    Said::Refused("qass did not take this one: the question had moved on.".into())
+                }
                 ControlResponse::Failed { reason, .. } if reason == "busy" && !retried => {
                     // Keys still queued for the terminal: asked once more, a moment later.
                     cx.spawn(async move |this, cx| {
@@ -295,17 +352,17 @@ impl Desk {
                     continue;
                 }
                 ControlResponse::Failed { reason, .. } => {
-                    if reason.contains("unknown variant") && matches!(hold.pick, Pick::Text { .. })
+                    if reason.contains("unknown variant")
+                        && matches!(hold.pick, Pick::Text { .. })
+                        && let Some(row) = terminal.and_then(|t| self.model.row(t))
                     {
-                        if let Some(row) = self.model.row(terminal) {
-                            self.too_old.insert(state::machine_of(row.workspace));
-                        }
+                        self.too_old.insert(state::machine_of(row.workspace));
                     }
-                    Said::Refused(state::refusal_words(reason, &machine))
+                    Said::Refused(state::refusal_words(reason, &machine, &hold.pick))
                 }
                 _ => continue,
             };
-            self.said.insert(terminal, said);
+            self.said.insert(hold.slot.clone(), said);
         }
         cx.notify();
         true
@@ -316,15 +373,15 @@ impl Desk {
     pub(crate) fn menus_changed(&mut self) {
         let dropped = self.holds.menus(&self.model.rows, Instant::now());
         for hold in dropped {
-            let by = self
-                .model
-                .row(hold.terminal)
+            let by = hold
+                .terminal()
+                .and_then(|t| self.model.row(t))
                 .and_then(|r| r.answered.as_ref())
-                .map(|a| format!("Answered on the {}: {}", by_word(&a.by), a.label));
-            self.said.insert(
-                hold.terminal,
-                Said::Refused(by.unwrap_or_else(|| "Already answered".into())),
-            );
+                .map(|a| format!("Answered on the {}: {}.", by_word(&a.by), a.label));
+            let said = by.unwrap_or_else(|| {
+                state::refusal_words("already_answered", "This Mac", &hold.pick)
+            });
+            self.said.insert(hold.slot.clone(), Said::Refused(said));
         }
         // An answer field for an agent that no longer asks closes.
         let gone = self.own.as_ref().is_some_and(|own| {
@@ -399,6 +456,13 @@ impl Desk {
         let (Some(key), false) = (key, text.is_empty()) else {
             return true;
         };
+        if text.chars().count() > qoop_runtime::menu::TEXT_MAX {
+            let pick = Pick::Text { key, text };
+            let said = state::refusal_words("too_long", "This Mac", &pick);
+            self.said.insert(Slot::Agent(terminal), Said::Refused(said));
+            cx.notify();
+            return true;
+        }
         let offer = Offer {
             digit: None,
             label: format!("\"{}\"", short(&text, 40)),
@@ -426,6 +490,7 @@ impl Desk {
             (Pick::Text { .. }, Some(r)) if !self.takes_words(r) => Some(state::refusal_words(
                 "unknown variant",
                 &self.machine_of_row(r),
+                &offer.pick,
             )),
             _ => None,
         };
@@ -486,11 +551,12 @@ impl Desk {
     /// The hold, the sending or the outcome of `terminal`'s pick, as one line with Undo.
     pub(crate) fn said_line(
         &self,
-        terminal: TerminalStream,
+        slot: &Slot,
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if let Some(hold) = self.holds.of(terminal) {
+        let number = slot_number(slot);
+        if let Some(hold) = self.holds.of(slot) {
             let left = hold
                 .until
                 .saturating_duration_since(Instant::now())
@@ -505,24 +571,31 @@ impl Desk {
                     .text_size(px(12.5))
                     .child(
                         div()
+                            .id(("held", number))
+                            .role(Role::Status)
+                            .aria_label(format!("{}: sends in {left} seconds", hold.label))
                             .flex_1()
                             .text_color(c(t.t1))
                             .child(format!("{}: sends in {left} s", hold.label)),
                     )
-                    .child(
-                        ui::pill(("undo", u64::from(terminal)), "Undo", t)
+                    .child({
+                        let undo = slot.clone();
+                        ui::pill(("undo", number), "Undo", t)
                             .h(px(26.))
                             .child("Undo")
                             .child(ui::kbd("u", t))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.undo(Some(terminal), cx);
-                            })),
-                    )
+                                this.undo(Some(&undo), cx);
+                            }))
+                    })
                     .into_any_element(),
             );
         }
-        let row = self.model.row(terminal);
-        let text = match self.said.get(&terminal) {
+        let row = match slot {
+            Slot::Agent(t) => self.model.row(*t),
+            Slot::Card(_) => None,
+        };
+        let text = match self.said.get(slot) {
             Some(Said::Sending { .. }) => "Sending".to_string(),
             Some(Said::Sent { label, at }) => {
                 format!("Sent: {label}, {}", state::clock(*at, self.zone))
@@ -534,7 +607,7 @@ impl Desk {
         };
         Some(
             div()
-                .id(("said", u64::from(terminal)))
+                .id(("said", number))
                 .role(Role::Status)
                 .aria_label(text.clone())
                 .text_size(px(12.5))
@@ -623,7 +696,9 @@ impl Desk {
                         })),
                 ),
             })
-            .when_some(self.said_line(terminal, t, cx), |d, line| d.child(line))
+            .when_some(self.said_line(&Slot::Agent(terminal), t, cx), |d, line| {
+                d.child(line)
+            })
             .into_any_element()
     }
 
@@ -730,6 +805,20 @@ impl Desk {
             .filter(|w| w.contains('.') && !w.starts_with('.') && !w.contains(".."))
             .find(|w| Path::new(cwd).join(w).is_file())
             .map(str::to_string)
+    }
+}
+
+/// A number for a pick's controls: the terminal for an agent, a hash of the card's id (above
+/// every terminal number) for a card.
+fn slot_number(slot: &Slot) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match slot {
+        Slot::Agent(t) => u64::from(*t),
+        Slot::Card(card) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            card.hash(&mut h);
+            (1 << 40) | (h.finish() & 0xffff_ffff)
+        }
     }
 }
 
