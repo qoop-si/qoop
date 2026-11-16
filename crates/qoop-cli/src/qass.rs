@@ -154,32 +154,68 @@ const STARTING: &str = "starting";
 /// How long a start holds its claim: the program in qass's new terminal has started by then.
 const STARTING_FOR: i64 = 60;
 
-/// Claim the start of qass in `folder` at `now` (unix seconds), or refuse it while another
-/// start's claim is younger than `STARTING_FOR`. The claim is made with `create_new`, so two
-/// starts at the same moment cannot both make it; an old claim is taken over.
-fn claim_start(folder: &Path, now: i64) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let claim = folder.join(STARTING);
-    let made = std::fs::OpenOptions::new()
+/// The file the starts of qass take turns on, beside the claim.
+const STARTING_LOCK: &str = "starting.lock";
+
+/// Run `decide` while holding the lock of qass's starts in `folder`: an OS lock on a file of
+/// its own, so a TUI and a window starting qass at the same moment decide one after the other,
+/// and a start that dies lets go with its process.
+fn one_start_at_a_time<T>(
+    folder: &Path,
+    decide: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    std::fs::create_dir_all(folder)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
         .write(true)
-        .create_new(true)
-        .open(&claim);
-    match made {
-        Ok(mut file) => writeln!(file, "{now}"),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let since = std::fs::read_to_string(&claim)
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            if now.saturating_sub(since) < STARTING_FOR {
-                return Err(std::io::Error::other(
-                    "qass is already starting: it shows in a moment",
-                ));
-            }
-            std::fs::write(&claim, format!("{now}\n"))
-        }
-        Err(e) => Err(e),
+        .open(folder.join(STARTING_LOCK))?;
+    lock.lock()?;
+    let decided = decide();
+    let _ = lock.unlock();
+    decided
+}
+
+/// Claim the start of qass in `folder` at `now` (unix seconds), under the lock: refused while
+/// another start's claim is fresh (no older than `STARTING_FOR`; a claim from the future, the
+/// clock set back, is stale), else written.
+fn claim_start(folder: &Path, now: i64) -> std::io::Result<()> {
+    let claim = folder.join(STARTING);
+    let since = std::fs::read_to_string(&claim)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let fresh = since.is_some_and(|since| (0..STARTING_FOR).contains(&(now - since)));
+    if fresh {
+        return Err(std::io::Error::other(
+            "qass is already starting: it shows in a moment",
+        ));
     }
+    std::fs::write(&claim, format!("{now}\n"))
+}
+
+/// The claim of a start that has not opened qass's terminal yet: dropped unopened (the start
+/// failed), the claim goes, so the next start need not wait it out.
+struct Claim(Option<PathBuf>);
+
+impl Claim {
+    fn opened(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// What a start found, decided under the lock.
+enum Found {
+    Running(u64),
+    Asleep(u64),
+    Claimed,
 }
 
 /// The terminal of a running qass.
@@ -652,21 +688,31 @@ pub(crate) fn start(board: bool) -> std::io::Result<u64> {
     if let Err(e) = crate::skills::refresh_qass_settings() {
         eprintln!("qoop: qass's folder settings were not brought up to date: {e}");
     }
-    let terminal = if let Some(terminal) = running(&folder) {
+    // One start at a time: qass's terminal is not an agent until its program has started, so a
+    // second `qoop qass` in those seconds would find none running and start another. Whether
+    // one runs, sleeps or is starting is decided under one lock, and a start claims its turn.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let found = one_start_at_a_time(&folder, || {
+        Ok(match (running(&folder), asleep(&folder)) {
+            (Some(terminal), _) => Found::Running(terminal),
+            (None, Some(terminal)) => Found::Asleep(terminal),
+            (None, None) => {
+                claim_start(&folder, now)?;
+                Found::Claimed
+            }
+        })
+    })?;
+    let terminal = if let Found::Running(terminal) = found {
         println!("qass is terminal {terminal}");
         terminal
-    } else if let Some(terminal) = asleep(&folder) {
+    } else if let Found::Asleep(terminal) = found {
         run(&["wake", "--tab", &terminal.to_string()])?;
         println!("qass woke in terminal {terminal}");
         terminal
     } else {
-        // One start at a time: qass's terminal is not an agent until its program has started,
-        // so a second `qoop qass` in those seconds would find none running and start another.
-        std::fs::create_dir_all(&folder)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        claim_start(&folder, now)?;
+        let claim = Claim(Some(folder.join(STARTING)));
         let read = config::read();
         let (typed, command, program) = launch(&read.qass_agent, &read)?;
         let tabs = tabs_of(&folder);
@@ -715,6 +761,7 @@ pub(crate) fn start(board: bool) -> std::io::Result<u64> {
         };
         let mut opened = 0;
         supervise::open_terminal(&opts, |terminal| opened = terminal)?;
+        claim.opened();
         let how = if carried {
             "carried on its conversation"
         } else {
@@ -1016,19 +1063,55 @@ fn show_board(qass: u64, folder: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// One start of qass at a time: a second start while the first's claim is young is
-    /// refused, and an old claim is taken over.
+    /// One start of qass at a time: a second start while the first's claim is fresh is refused,
+    /// an old claim or one from the future (a clock set back) is taken over.
     #[test]
     fn a_second_start_waits_for_the_first() {
         let dir = tempfile::tempdir().expect("dir");
-        assert!(claim_start(dir.path(), 1_000).is_ok(), "the first start");
-        let second = claim_start(dir.path(), 1_030).expect_err("a second start");
+        let start = |now| one_start_at_a_time(dir.path(), || claim_start(dir.path(), now));
+        assert!(start(1_000).is_ok(), "the first start");
+        let second = start(1_030).expect_err("a second start");
         assert!(second.to_string().contains("already starting"), "{second}");
         assert!(
-            claim_start(dir.path(), 1_000 + STARTING_FOR).is_ok(),
+            start(1_000 + STARTING_FOR).is_ok(),
             "an old claim is taken over"
         );
-        assert!(claim_start(dir.path(), 1_000 + STARTING_FOR + 1).is_err());
+        assert!(start(1_000 + STARTING_FOR + 1).is_err());
+        assert!(start(500).is_ok(), "a claim from the future is stale");
+    }
+
+    /// Two starts at the same moment, as the TUI and the window would make them: exactly one
+    /// claims the start.
+    #[test]
+    fn two_starts_at_once_make_one_claim() {
+        let dir = tempfile::tempdir().expect("dir");
+        let folder = dir.path().to_path_buf();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let starts: Vec<_> = (0..8)
+            .map(|_| {
+                let (folder, gate) = (folder.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    one_start_at_a_time(&folder, || claim_start(&folder, 5_000)).is_ok()
+                })
+            })
+            .collect();
+        let won = starts
+            .into_iter()
+            .map(|t| t.join().expect("a start"))
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(won, 1);
+    }
+
+    /// A start that fails before qass's terminal opens leaves no claim behind.
+    #[test]
+    fn a_failed_start_drops_its_claim() {
+        let dir = tempfile::tempdir().expect("dir");
+        one_start_at_a_time(dir.path(), || claim_start(dir.path(), 1_000)).expect("claimed");
+        drop(Claim(Some(dir.path().join(STARTING))));
+        assert!(!dir.path().join(STARTING).exists());
+        assert!(one_start_at_a_time(dir.path(), || claim_start(dir.path(), 1_001)).is_ok());
     }
 
     /// A line for qass is refused while it waits on the owner, and only then.

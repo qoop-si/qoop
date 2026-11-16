@@ -274,7 +274,6 @@ impl Desk {
         (id, label): (&'static str, &'static str),
         enabled: bool,
         t: &Theme,
-        enabled: bool,
         press: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> impl IntoElement {
         div()
