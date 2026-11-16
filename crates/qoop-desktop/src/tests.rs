@@ -1003,9 +1003,7 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
         vcx.debug_bounds("setting-notify.sound").is_none(),
         "no switch to press"
     );
-    assert!(desk.read_with(&vcx, |d, _| {
-        d.settings.read.as_ref().is_some_and(|r| r.broken)
-    }));
+    assert!(desk.read_with(&vcx, |d, _| d.settings.broken));
 }
 
 /// A pet picked from a new deal waits out the hold with Undo; once it is up the pet is saved to
