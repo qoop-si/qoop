@@ -31,6 +31,8 @@ mod review;
 mod schedules;
 #[cfg(target_os = "macos")]
 mod session;
+#[cfg(target_os = "macos")]
+mod settings;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod spike_link;
 #[cfg(target_os = "macos")]

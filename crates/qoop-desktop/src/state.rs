@@ -993,6 +993,266 @@ pub fn last_run_line(
     Some(line)
 }
 
+/// How a setting is changed on the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKind {
+    /// A switch: `true` or `false`.
+    Switch,
+    /// One of a few words, as a segmented control.
+    Choice(&'static [&'static str]),
+    /// One of many, stepped through by a button (the prefix, a sound).
+    Cycle,
+    /// Minutes, as a few steps; 0 is never.
+    Minutes,
+    /// Shown as the file says it; changed in the editor.
+    Text,
+}
+
+/// One line of the settings page: its key in `config.toml`, its name, what it does, how it
+/// is changed, and its group.
+#[derive(Clone, Copy, Debug)]
+pub struct Setting {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    pub kind: SettingKind,
+    pub group: &'static str,
+}
+
+/// Every key of `qoop_tui::config::KEYS`, as the page shows it.
+pub const SETTINGS: [Setting; 21] = [
+    Setting {
+        key: "prefix",
+        label: "Prefix key",
+        help: "The key before every qoop key, in the terminal and here",
+        kind: SettingKind::Cycle,
+        group: "Keys and look",
+    },
+    Setting {
+        key: "theme",
+        label: "Theme",
+        help: "Auto follows the system",
+        kind: SettingKind::Choice(&["auto", "dark", "light"]),
+        group: "Keys and look",
+    },
+    Setting {
+        key: "icons",
+        label: "Icons",
+        help: "qoop's own icon font in the terminal interface",
+        kind: SettingKind::Choice(&["auto", "on", "off"]),
+        group: "Keys and look",
+    },
+    Setting {
+        key: "copy_on_select",
+        label: "Copy on select",
+        help: "A drag in the terminal interface copies when you let go",
+        kind: SettingKind::Switch,
+        group: "Keys and look",
+    },
+    Setting {
+        key: "notify.desktop",
+        label: "Desktop notes",
+        help: "A note when an agent finishes, fails or needs you",
+        kind: SettingKind::Switch,
+        group: "Notifications",
+    },
+    Setting {
+        key: "notify.sound",
+        label: "Sound",
+        help: "A sound with each note",
+        kind: SettingKind::Switch,
+        group: "Notifications",
+    },
+    Setting {
+        key: "notify.done_sound",
+        label: "Done sound",
+        help: "Played when an agent finishes",
+        kind: SettingKind::Cycle,
+        group: "Notifications",
+    },
+    Setting {
+        key: "notify.alert_sound",
+        label: "Alert sound",
+        help: "Played when an agent fails or needs you",
+        kind: SettingKind::Cycle,
+        group: "Notifications",
+    },
+    Setting {
+        key: "notify.mute",
+        label: "Mute",
+        help: "Off, this computer only, or everywhere",
+        kind: SettingKind::Choice(&["off", "here", "everywhere"]),
+        group: "Notifications",
+    },
+    Setting {
+        key: "notch.enabled",
+        label: "Notch",
+        help: "The agents in the MacBook notch",
+        kind: SettingKind::Switch,
+        group: "Notifications",
+    },
+    Setting {
+        key: "sleep.idle_minutes",
+        label: "Sleep idle tabs",
+        help: "Minutes a tab idles before it sleeps; never keeps them awake",
+        kind: SettingKind::Minutes,
+        group: "Sleep",
+    },
+    Setting {
+        key: "sleep.qass_idle_minutes",
+        label: "Sleep qass",
+        help: "Minutes qass idles before it sleeps",
+        kind: SettingKind::Minutes,
+        group: "Sleep",
+    },
+    Setting {
+        key: "daemon.exit_when_asleep",
+        label: "Leave when all sleep",
+        help: "qoop's daemon ends once nothing is awake",
+        kind: SettingKind::Switch,
+        group: "Sleep",
+    },
+    Setting {
+        key: "qass.agent",
+        label: "qass runs on",
+        help: "The agent qass starts on",
+        kind: SettingKind::Choice(&["claude", "codex", "gemini", "opencode"]),
+        group: "qass",
+    },
+    Setting {
+        key: "qass.models.best",
+        label: "Best model",
+        help: "What qass's hardest work runs on",
+        kind: SettingKind::Text,
+        group: "qass",
+    },
+    Setting {
+        key: "qass.models.mid",
+        label: "Middle model",
+        help: "What qass's usual work runs on",
+        kind: SettingKind::Text,
+        group: "qass",
+    },
+    Setting {
+        key: "qass.models.low",
+        label: "Small model",
+        help: "What qass's simple work runs on",
+        kind: SettingKind::Text,
+        group: "qass",
+    },
+    Setting {
+        key: "board.cards",
+        label: "Board cards",
+        help: "Full cards or quiet ones",
+        kind: SettingKind::Choice(&["full", "quiet"]),
+        group: "Board",
+    },
+    Setting {
+        key: "board.view",
+        label: "Board view",
+        help: "A list or lanes",
+        kind: SettingKind::Choice(&["list", "board"]),
+        group: "Board",
+    },
+    Setting {
+        key: "report.send",
+        label: "Crash reports",
+        help: "Ask first, always send, or never",
+        kind: SettingKind::Choice(&["ask", "always", "never"]),
+        group: "Privacy",
+    },
+    Setting {
+        key: "telemetry",
+        label: "Usage counts",
+        help: "Daily counts of what is used, nothing typed or shown",
+        kind: SettingKind::Switch,
+        group: "Privacy",
+    },
+];
+
+/// What `read` says for `key`, as `config::set` takes it. `telemetry` is not in a read: it is
+/// off only when the file says `telemetry = false`.
+pub fn setting_value(read: &qoop_tui::config::Read, text: &str, key: &str) -> String {
+    use qoop_tui::config::Theme;
+    use qoop_tui::icons::Setting as Icons;
+    let c = &read.config;
+    let on = |b: bool| if b { "true" } else { "false" }.to_string();
+    match key {
+        "prefix" => qoop_tui::keys::name_of(c.prefix),
+        "theme" => match c.theme {
+            Theme::Auto => "auto",
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+        .into(),
+        "icons" => match c.icons {
+            Icons::Auto => "auto",
+            Icons::On => "on",
+            Icons::Off => "off",
+        }
+        .into(),
+        "copy_on_select" => on(c.copy_on_select),
+        "notify.desktop" => on(c.desktop),
+        "notify.sound" => on(c.sound),
+        "notify.done_sound" => c.done_sound.to_string(),
+        "notify.alert_sound" => c.alert_sound.to_string(),
+        "notify.mute" => c.mute.name().to_string(),
+        "notch.enabled" => on(c.notch),
+        "sleep.idle_minutes" => c.lifecycle.idle_minutes.to_string(),
+        "sleep.qass_idle_minutes" => c
+            .lifecycle
+            .qass_idle_minutes
+            .unwrap_or(c.lifecycle.idle_minutes)
+            .to_string(),
+        "daemon.exit_when_asleep" => on(c.lifecycle.exit_when_asleep),
+        "qass.agent" => read.qass_agent.clone(),
+        "qass.models.best" => read.qass_models[0].clone(),
+        "qass.models.mid" => read.qass_models[1].clone(),
+        "qass.models.low" => read.qass_models[2].clone(),
+        "board.cards" => if c.quiet_cards { "quiet" } else { "full" }.into(),
+        "board.view" => if c.board_list { "list" } else { "board" }.into(),
+        "report.send" => read.report_send.clone(),
+        "telemetry" => on(!text
+            .lines()
+            .any(|l| l.split('#').next().unwrap_or("").replace(' ', "") == "telemetry=false")),
+        _ => String::new(),
+    }
+}
+
+/// The line of `text` that sets `key` (its last part, inside its table), 1 based: where a
+/// write landed, said back to the person.
+pub fn line_of(text: &str, key: &str) -> Option<usize> {
+    let (table, leaf) = match key.rsplit_once('.') {
+        Some((table, leaf)) => (table, leaf),
+        None => ("", key),
+    };
+    let mut here = String::new();
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+            here = name.trim().to_string();
+            continue;
+        }
+        let Some((k, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        if (here == table && k == leaf) || (here.is_empty() && k == key) {
+            return Some(n + 1);
+        }
+    }
+    None
+}
+
+/// Whether a setting matches what the find field holds: its name, key or help.
+pub fn setting_found(setting: &Setting, find: &str) -> bool {
+    let find = find.trim().to_lowercase();
+    find.is_empty()
+        || [setting.label, setting.key, setting.help, setting.group]
+            .iter()
+            .any(|s| s.to_lowercase().contains(&find))
+}
+
 /// qass's rules as its lessons file counts them: the lessons that keep a question the owner's
 /// (`escalate`, `ask first`), the ones it answers alone (`do it`), and every lesson. A lesson
 /// is a line `- <when> -> <action> (<source>)`, as `skills/qass/SKILL.md` writes them.
@@ -2318,5 +2578,42 @@ pub(crate) mod tests {
                 Naive::from_secs(today * day).day
             )
         );
+    }
+
+    /// The page covers every key the config knows, in its order.
+    #[test]
+    fn the_page_lists_every_setting() {
+        let keys: Vec<&str> = SETTINGS.iter().map(|s| s.key).collect();
+        assert_eq!(keys, qoop_tui::config::KEYS);
+    }
+
+    /// A value reads as `config::set` takes it, from the file or its default; a write is found
+    /// on its line; find matches the name, key or help.
+    #[test]
+    fn a_setting_reads_its_value_and_its_line() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        let text = "# mine\nprefix = \"ctrl-b\"\n\n[notify]\nsound = true\n# keep\n\n[sleep]\nidle_minutes = 30\ntelemetry = false\n";
+        std::fs::write(&path, text).expect("file");
+        let read = qoop_tui::config::read_from(&path);
+        let blank = qoop_tui::config::read_from(&dir.path().join("none.toml"));
+        let value = |key| setting_value(&read, text, key);
+        let default = |key| setting_value(&blank, "", key);
+        assert_eq!(value("prefix"), "ctrl-b");
+        assert_eq!(value("notify.sound"), "true");
+        assert_eq!(default("notify.sound"), "false");
+        assert_eq!(value("sleep.idle_minutes"), "30");
+        assert_eq!(value("theme"), default("theme"));
+        assert_eq!(default("telemetry"), "true");
+        assert_eq!(line_of(text, "notify.sound"), Some(5));
+        assert_eq!(line_of(text, "prefix"), Some(2));
+        assert_eq!(line_of(text, "notify.desktop"), None);
+        let sound = SETTINGS
+            .iter()
+            .find(|s| s.key == "notify.sound")
+            .expect("sound");
+        assert!(setting_found(sound, "SOUND"));
+        assert!(setting_found(sound, ""));
+        assert!(!setting_found(sound, "prefix"));
     }
 }

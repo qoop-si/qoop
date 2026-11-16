@@ -940,6 +940,67 @@ fn the_qass_page_reads_its_lessons_and_keeps_its_page(cx: &mut TestAppContext) {
     assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Qass);
 }
 
+/// The settings page on a config file of the test's own: Sound writes `sound = true` keeping
+/// the comments and a key qoop does not know; `/` finds a setting; a file that is not TOML
+/// leaves no switch to press and says why.
+#[gpui::test]
+fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "# my settings\n[notify]\n# beep or not\ndesktop = true\nmine = 1\n",
+    )
+    .expect("config");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.config_path = path.clone();
+            d.pet_path = dir.path().join("avatar.json");
+            d.open(Page::Settings, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("setting-notify.sound")
+        .expect("the Sound switch")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let text = std::fs::read_to_string(&path).expect("config");
+    assert!(text.contains("sound = true"), "{text}");
+    assert!(
+        text.contains("# my settings") && text.contains("# beep or not"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mine = 1"),
+        "a key qoop does not know stays: {text}"
+    );
+    let said = desk.read_with(&vcx, |d, _| d.settings.said.clone().unwrap_or_default());
+    assert!(said.starts_with("Sound on: written as line"), "{said}");
+
+    vcx.simulate_keystrokes("/");
+    vcx.simulate_input("sound");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("setting-notify.sound").is_some());
+    assert!(
+        vcx.debug_bounds("setting-notify.desktop").is_none(),
+        "filtered out"
+    );
+    vcx.simulate_keystrokes("escape");
+
+    std::fs::write(&path, "[notify\nsound = = true\n").expect("broken");
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Settings, window, cx)));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("setting-notify.sound").is_none(),
+        "no switch to press"
+    );
+    assert!(desk.read_with(&vcx, |d, _| {
+        d.settings.read.as_ref().is_some_and(|r| r.broken)
+    }));
+}
+
 /// Every key hint names the prefix `config.toml` picked.
 #[gpui::test]
 fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {
