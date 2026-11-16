@@ -1256,6 +1256,19 @@ pub fn setting_found(setting: &Setting, find: &str) -> bool {
 /// A pet as filled rects `(x, y, w, h, "#rrggbb")`: how a daemon sends it.
 pub type PetRect = (u8, u8, u8, u8, String);
 
+/// The line a person runs to install qoop.
+pub const INSTALL_LINE: &str = "curl -fsSL https://qoop.si/install.sh | sh";
+
+/// The `qoop` the app runs: on `PATH` (with Homebrew's folders), else where the one-line install
+/// puts it. An app opened from the Finder gets a short `PATH` without `~/.local/bin`.
+pub fn qoop_bin() -> Option<std::path::PathBuf> {
+    qoop_runtime::changes::tool("qoop").or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let local = std::path::PathBuf::from(home).join(".local/bin/qoop");
+        local.is_file().then_some(local)
+    })
+}
+
 /// A machine silent this long keeps its rows, but as of when it last answered.
 pub const STALE_AFTER: i64 = 15;
 
