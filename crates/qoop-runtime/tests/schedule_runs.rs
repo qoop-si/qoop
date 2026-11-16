@@ -106,6 +106,39 @@ async fn written(c: &mut TestClient, n: &str, action: ScheduleOp) -> i64 {
 }
 
 #[tokio::test]
+async fn run_now_is_refused_while_a_run_works_under_a_newer_skip() {
+    let d = TestDaemon::start().await;
+    let mut c = d.attach("schedules").await;
+    let s = store(&d);
+    let schedule = s.add_schedule(&row("busy")).expect("a schedule");
+    let now = qoop_runtime::store::now();
+    let run = s
+        .start_run(schedule, 0, now)
+        .expect("a run")
+        .expect("the schedule is there");
+    // Its agent works in a tab that is open.
+    let tab = i64::from(d.terminals().streams()[0]);
+    written(&mut c, "1", report(schedule, 0, Some(tab), Some(run))).await;
+    // The next slot was skipped while it works: a newer row, already ended.
+    let skipped = s
+        .claim_run(
+            schedule,
+            None,
+            600,
+            now + 1,
+            "skipped: the last run still works",
+        )
+        .expect("a skip");
+    assert!(skipped.is_some());
+    match ask(&mut c, write("2", ScheduleOp::Run { schedule })).await {
+        ControlResponse::Failed { reason, .. } => assert_eq!(reason, "still_running"),
+        other => panic!("a second run beside a working one: {other:?}"),
+    }
+    let listed = runs(&mut c, schedule).await;
+    assert_eq!(listed.len(), 2, "no row was added: {listed:?}");
+}
+
+#[tokio::test]
 async fn a_run_whose_tab_closed_ends_gone() {
     let d = TestDaemon::start().await;
     let mut c = d.attach("schedules").await;

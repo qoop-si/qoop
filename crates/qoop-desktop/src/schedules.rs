@@ -57,12 +57,14 @@ pub enum Write {
     Run,
 }
 
-/// The newest run of `schedule` among `runs` has not ended: Run now waits for it.
+/// A run of `schedule` among `runs` is open (claimed, or started and not ended), whichever
+/// it is: Run now waits for it, as the daemon does.
 pub fn running_now(runs: &[ScheduleRun], schedule: i64) -> bool {
-    runs.iter()
-        .filter(|r| r.schedule == schedule)
-        .max_by_key(|r| (r.started_at, r.id))
-        .is_some_and(|r| r.ended_at.is_none() && matches!(r.result.as_str(), "claimed" | "started"))
+    runs.iter().any(|r| {
+        r.schedule == schedule
+            && r.ended_at.is_none()
+            && matches!(r.result.as_str(), "claimed" | "started")
+    })
 }
 
 /// A refusal of a schedule write as a sentence.
@@ -1717,20 +1719,23 @@ mod tests {
         .expect("run")
     }
 
-    /// Run now waits while the newest run is claimed or still works, never for an old one.
+    /// Run now waits while any run is claimed or still works, a newer skipped row or not.
     #[test]
-    fn run_now_waits_for_the_newest_run() {
+    fn run_now_waits_for_any_open_run() {
         assert!(!running_now(&[], 1));
         assert!(running_now(&[run(1, 10, "started", None)], 1));
         assert!(running_now(&[run(1, 10, "claimed", None)], 1));
         assert!(!running_now(&[run(1, 10, "started", Some(20))], 1));
-        assert!(!running_now(
-            &[
-                run(1, 10, "started", None),
-                run(2, 30, "skipped: busy", Some(30))
-            ],
-            1
-        ));
+        assert!(
+            running_now(
+                &[
+                    run(1, 10, "started", None),
+                    run(2, 30, "skipped: busy", Some(30))
+                ],
+                1
+            ),
+            "a newer skipped row does not end the run that still works"
+        );
         assert!(
             !running_now(&[run(1, 10, "started", None)], 2),
             "another schedule's"
