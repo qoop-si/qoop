@@ -829,19 +829,9 @@ mod tests {
     #[test]
     fn only_a_whole_toml_file_is_writable() {
         assert!(writable(""));
-        assert!(writable("theme = "dark"
-[notify]
-sound = true
-"));
-        assert!(!writable(
-            "[notify
-sound = = true
-"
-        ));
-        assert!(!writable(
-            "theme = dark
-"
-        ));
+        assert!(writable("theme = \"dark\"\n[notify]\nsound = true\n"));
+        assert!(!writable("[notify\nsound = = true\n"));
+        assert!(!writable("theme = dark\n"));
     }
 
     #[test]
