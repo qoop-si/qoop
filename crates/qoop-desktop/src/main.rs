@@ -28,6 +28,8 @@ mod question;
 #[cfg(target_os = "macos")]
 mod review;
 #[cfg(target_os = "macos")]
+mod schedules;
+#[cfg(target_os = "macos")]
 mod session;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod spike_link;

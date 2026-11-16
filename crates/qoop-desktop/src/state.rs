@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentMenu, AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, SleepingTab, StepInfo,
-    TaskEventInfo, TaskInfo, WorkspaceRow,
+    AgentMenu, AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun, SleepingTab,
+    StepInfo, TaskEventInfo, TaskInfo, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -820,6 +820,177 @@ pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
         },
         other => other.to_string(),
     }
+}
+
+/// A local day, as days since 1970-01-01 on the wall clock of `zone`.
+pub fn day_of(at: i64, zone: Zone) -> i64 {
+    (zone.local)(at).secs().div_euclid(86_400)
+}
+
+/// "Fri 13" for a local day.
+pub fn day_label(day: i64) -> String {
+    let wall = Naive::from_secs(day * 86_400);
+    format!("{} {}", DAYS[(day + 4).rem_euclid(7) as usize], wall.day)
+}
+
+/// "Fri 13 Nov" for a local day.
+pub fn day_long(day: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let wall = Naive::from_secs(day * 86_400);
+    format!(
+        "{} {}",
+        day_label(day),
+        MONTHS[(wall.month as usize).saturating_sub(1) % 12]
+    )
+}
+
+/// The slots the schedules will run at from `from` up to `until`, soonest first: each one's
+/// `next_at`, then its cron slots after it, on the wall clock of `zone` (so a 02:00 cron stays
+/// at 02:00 across a change of summer time). A watch or a one-off has only its `next_at`.
+pub fn coming_slots(
+    schedules: &[ScheduleInfo],
+    from: i64,
+    until: i64,
+    zone: Zone,
+) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for s in schedules.iter().filter(|s| !s.paused) {
+        let Some(mut at) = s.next_at else { continue };
+        let cron = s.cron.as_deref().and_then(|c| Cron::parse(c).ok());
+        while at <= until && out.len() < 2000 {
+            if at >= from {
+                out.push((at, s.id));
+            }
+            match cron.as_ref().and_then(|c| next_slot(c, at, zone)) {
+                Some(next) if next > at => at = next,
+                _ => break,
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// One day of the strip: its runs (how many, how many failed) or, for a coming day, how many
+/// will run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripDay {
+    pub day: i64,
+    pub runs: usize,
+    pub failed: usize,
+    pub coming: usize,
+}
+
+/// The date strip: the last `past` days that had runs, today, and the next `ahead` days that
+/// will have some. Only days with something on them, and today.
+pub fn strip_days(
+    runs: &[ScheduleRun],
+    coming: &[(i64, i64)],
+    today: i64,
+    zone: Zone,
+    (past, ahead): (usize, usize),
+) -> Vec<StripDay> {
+    let mut days: std::collections::BTreeMap<i64, StripDay> = std::collections::BTreeMap::new();
+    let blank = |day| StripDay {
+        day,
+        runs: 0,
+        failed: 0,
+        coming: 0,
+    };
+    for run in runs {
+        let d = days
+            .entry(day_of(run.started_at, zone))
+            .or_insert_with_key(|&k| blank(k));
+        d.runs += 1;
+        d.failed += usize::from(run_failed(run));
+    }
+    for &(at, _) in coming {
+        let day = day_of(at, zone);
+        if day >= today {
+            days.entry(day).or_insert_with_key(|&k| blank(k)).coming += 1;
+        }
+    }
+    days.entry(today).or_insert_with_key(|&k| blank(k));
+    let before: Vec<StripDay> = days.range(..today).map(|(_, d)| *d).collect();
+    let mut out: Vec<StripDay> = before[before.len().saturating_sub(past)..].to_vec();
+    out.extend(days.range(today..).take(ahead + 1).map(|(_, d)| *d));
+    out
+}
+
+/// Whether a run failed: it ended so, or it never started.
+pub fn run_failed(run: &ScheduleRun) -> bool {
+    run.outcome.as_deref() == Some("failed") || run.result.starts_with("failed")
+}
+
+/// How a run reads, never as a state word for what is not one: Done, "Failed: <why>", "tab
+/// closed", "skipped: <why>", Working while it goes; with the kind for its mark when it has
+/// one.
+pub fn run_words(run: &ScheduleRun) -> (Option<Kind>, String) {
+    if let Some(why) = run.result.strip_prefix("skipped") {
+        let why = why.trim_start_matches(':').trim();
+        return (
+            None,
+            format!("skipped: {why}").trim_end_matches(": ").to_string(),
+        );
+    }
+    if let Some(why) = run.result.strip_prefix("failed") {
+        let why = why.trim_start_matches(':').trim();
+        return (
+            Some(Kind::Status(Status::Failed)),
+            format!("Failed: {why}").trim_end_matches(": ").to_string(),
+        );
+    }
+    match run.outcome.as_deref() {
+        Some("done") => (Some(Kind::Status(Status::Done)), "Done".into()),
+        Some("failed") => (Some(Kind::Status(Status::Failed)), "Failed:".into()),
+        Some("gone") => (None, "tab closed".into()),
+        Some(other) => (None, other.to_string()),
+        None if run.ended_at.is_none() => (Some(Kind::Status(Status::Working)), "Working".into()),
+        None => (None, run.result.clone()),
+    }
+}
+
+/// How long a run took: "41 min", "2 h 5 min", "30 s"; `None` while it goes.
+pub fn took(run: &ScheduleRun) -> Option<String> {
+    let secs = run.ended_at?.saturating_sub(run.started_at).max(0);
+    Some(match secs {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s => format!("{} h {} min", s / 3600, s % 3600 / 60),
+    })
+}
+
+/// Home's "Last:" line for this machine's schedules: the newest run that started, as
+/// "Last: nightly-tests, Fri 02:00, Done, tab 11".
+pub fn last_run_line(
+    schedules: &[ScheduleInfo],
+    runs: &[ScheduleRun],
+    now: i64,
+    zone: Zone,
+) -> Option<String> {
+    let run = runs
+        .iter()
+        .filter(|r| !r.result.starts_with("skipped") && r.result != "claimed")
+        .max_by_key(|r| r.started_at)?;
+    let name = schedules
+        .iter()
+        .find(|s| s.id == run.schedule)?
+        .name
+        .clone();
+    let (_, word) = run_words(run);
+    let mut line = format!(
+        "Last: {name}, {}, {word}",
+        clock_at(run.started_at, now, zone)
+    );
+    if let Some(tab) = run.terminal {
+        line.push_str(&format!(
+            ", tab {}",
+            qoop_tui::mux::daemon_terminal(tab as u32)
+        ));
+    }
+    Some(line)
 }
 
 /// qass's rules as its lessons file counts them: the lessons that keep a question the owner's
@@ -2026,5 +2197,126 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(lessons_of(""), Lessons::default());
+    }
+
+    /// Summer time from 2026-03-29 01:00 UTC: a Central European zone, one hour ahead, then two.
+    const SUMMER: i64 = 1_774_746_000;
+
+    fn cet_local(at: i64) -> Naive {
+        Naive::from_secs(at + if at >= SUMMER { 7200 } else { 3600 })
+    }
+
+    fn cet_unix(wall: Naive) -> i64 {
+        let s = wall.secs();
+        if s - 7200 >= SUMMER {
+            s - 7200
+        } else {
+            s - 3600
+        }
+    }
+
+    fn cet() -> Zone {
+        Zone {
+            local: cet_local,
+            unix: cet_unix,
+        }
+    }
+
+    fn schedule_info(id: i64, name: &str, cron: &str, next_at: i64) -> ScheduleInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "cron": cron, "agent": "claude", "cwd": "/srv/acme-web",
+            "prompt": "go", "paused": false, "created_at": 0, "when": "every day 09:00",
+            "next_at": next_at,
+        }))
+        .expect("schedule")
+    }
+
+    fn run(
+        id: i64,
+        schedule: i64,
+        started_at: i64,
+        result: &str,
+        outcome: Option<&str>,
+    ) -> ScheduleRun {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "schedule": schedule, "slot": started_at, "started_at": started_at,
+            "terminal": 11, "result": result, "ended_at": outcome.map(|_| started_at + 41 * 60),
+            "outcome": outcome,
+        }))
+        .expect("run")
+    }
+
+    /// The coming slots of a 09:00 cron stay at 09:00 on the wall clock across the change to
+    /// summer time, so the night it changes is an hour shorter.
+    #[test]
+    fn coming_slots_keep_the_wall_clock_across_summer_time() {
+        let from = 1_774_648_800;
+        let s = schedule_info(1, "nightly", "0 9 * * *", 1_774_684_800);
+        let slots = coming_slots(&[s], from, from + 3 * 86_400, cet());
+        let walls: Vec<String> = slots.iter().map(|(at, _)| cet_local(*at).clock()).collect();
+        assert_eq!(walls, ["09:00", "09:00", "09:00"]);
+        assert_eq!(slots[1].0 - slots[0].0, 86_400 - 3600, "the short night");
+        assert_eq!(slots[2].0 - slots[1].0, 86_400);
+    }
+
+    /// The strip: days with runs, today, and the coming days; a failure counted; each run in
+    /// words that are never a state word for what is not one.
+    #[test]
+    fn the_strip_and_the_runs_read_as_the_page_says() {
+        let zone = utc();
+        let day = 86_400;
+        let today = 20_000;
+        let runs = [
+            run(1, 1, (today - 3) * day + 7200, "started", Some("done")),
+            run(2, 1, (today - 1) * day + 7200, "started", Some("failed")),
+            run(
+                3,
+                2,
+                (today - 1) * day + 9000,
+                "skipped: the tab was busy",
+                None,
+            ),
+            run(4, 2, today * day + 3600, "started", None),
+        ];
+        let coming = [((today + 2) * day + 7200, 1)];
+        let strip = strip_days(&runs, &coming, today, zone, (7, 3));
+        let seen: Vec<(i64, usize, usize, usize)> = strip
+            .iter()
+            .map(|d| (d.day - today, d.runs, d.failed, d.coming))
+            .collect();
+        assert_eq!(
+            seen,
+            [(-3, 1, 0, 0), (-1, 2, 1, 0), (0, 1, 0, 0), (2, 0, 0, 1)]
+        );
+        let words: Vec<String> = runs.iter().map(|r| run_words(r).1).collect();
+        assert_eq!(
+            words,
+            ["Done", "Failed:", "skipped: the tab was busy", "Working"]
+        );
+        let mut gone = run(5, 1, today * day, "started", Some("gone"));
+        assert_eq!(run_words(&gone).1, "tab closed");
+        gone.result = "failed: bun install could not reach the registry".into();
+        assert_eq!(
+            run_words(&gone).1,
+            "Failed: bun install could not reach the registry"
+        );
+        assert_eq!(took(&runs[0]).as_deref(), Some("41 min"));
+        assert_eq!(took(&runs[3]), None);
+        let schedules = [
+            schedule_info(1, "nightly-tests", "0 2 * * *", today * day),
+            schedule_info(2, "soak", "0 */2 * * *", today * day),
+        ];
+        assert_eq!(
+            last_run_line(&schedules, &runs[..2], (today - 1) * day + 7200, zone).as_deref(),
+            Some("Last: nightly-tests, 02:00, Failed:, tab 11")
+        );
+        assert_eq!(
+            day_label(today),
+            format!(
+                "{} {}",
+                DAYS[(today + 4).rem_euclid(7) as usize],
+                Naive::from_secs(today * day).day
+            )
+        );
     }
 }

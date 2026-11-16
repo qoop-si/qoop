@@ -826,6 +826,78 @@ fn the_qass_switches_send_their_requests(cx: &mut TestAppContext) {
     );
 }
 
+/// The schedules page: opening it reads each schedule's runs; a schedule's switch pauses it;
+/// Escape closes the calendar.
+#[gpui::test]
+fn the_schedules_page_reads_runs_opens_a_report_and_pauses(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let schedule: qoop_runtime::control::ScheduleInfo = serde_json::from_value(serde_json::json!({
+        "id": 1, "name": "nightly-tests", "cron": "0 2 * * 1-5", "agent": "claude",
+        "cwd": "/srv/acme-web", "prompt": "Run bun test", "paused": false, "created_at": 0,
+        "when": "weekdays 02:00", "next_at": 2000 + 86_400,
+    }))
+    .expect("schedule");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.model.schedules = vec![schedule];
+            d.open(Page::Schedules, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::ScheduleRuns { schedule: 1, .. })
+    })
+    .expect("its runs asked for");
+    let run: qoop_runtime::control::ScheduleRun = serde_json::from_value(serde_json::json!({
+        "id": 7, "schedule": 1, "slot": 1000, "started_at": 1000, "terminal": 11,
+        "result": "started", "ended_at": 1000 + 41 * 60, "outcome": "done",
+        "summary": "13 of 13 pass; nothing to fix",
+    }))
+    .expect("run");
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::ScheduleRuns {
+            id: asked.request_id().to_string(),
+            runs: vec![run],
+        },
+    );
+    let day = desk.read_with(&vcx, |d, _| crate::state::day_of(1000, d.zone));
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.schedule_page.day = Some(day);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("schedule-on-1")
+        .expect("its switch")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    let paused = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::ScheduleWrite { .. })
+    });
+    let Some(ControlRequest::ScheduleWrite { action, .. }) = paused.clone() else {
+        panic!("no write: {paused:?}");
+    };
+    assert_eq!(
+        *action,
+        qoop_runtime::control::ScheduleOp::Pause { schedule: 1 }
+    );
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.schedule_page.calendar = true;
+            cx.notify();
+        })
+    });
+    vcx.simulate_keystrokes("escape");
+    assert!(
+        desk.read_with(&vcx, |d, _| !d.schedule_page.calendar),
+        "Escape closes it"
+    );
+}
+
 /// Every key hint names the prefix `config.toml` picked.
 #[gpui::test]
 fn key_hints_name_the_configured_prefix(cx: &mut TestAppContext) {
