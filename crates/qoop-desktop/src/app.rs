@@ -1427,7 +1427,7 @@ impl Desk {
                         .id("reach-banner")
                         .role(Role::Status)
                         .aria_label(banner.clone())
-                        .flex_shrink()
+                        .flex_shrink(1.)
                         .min_w_0()
                         .whitespace_normal()
                         .text_color(c(t.t1))

@@ -378,7 +378,7 @@ impl Desk {
                             })
                             .child(self.pet_panel(t, cx)),
                     )
-                    .child(self.file_view(read, t)),
+                    .child(self.file_view(read)),
             )
             .into_any_element()
     }
@@ -522,7 +522,7 @@ impl Desk {
 
     /// The file as it is, read only: each line numbered, the lines that set something away from
     /// its default marked, and what could not be used said under its line.
-    fn file_view(&self, read: &Read, t: &Theme) -> impl IntoElement {
+    fn file_view(&self, read: &Read) -> impl IntoElement {
         let blank = qoop_tui::config::read_from(&PathBuf::from("/nonexistent/qoop/config.toml"));
         let marked: Vec<usize> = SETTINGS
             .iter()

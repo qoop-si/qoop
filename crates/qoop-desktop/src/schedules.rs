@@ -1741,7 +1741,8 @@ mod tests {
                     run(1, 10, "started", None),
                     run(2, 30, "skipped: busy", Some(30))
                 ],
-                1
+                1,
+                100
             ),
             "a newer skipped row does not end the run that still works"
         );
