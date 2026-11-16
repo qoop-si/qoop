@@ -768,6 +768,13 @@ impl Holds {
         self.held.len() != before
     }
 
+    /// Undo the hand-off to qass: every agent held to be handed over, nothing else.
+    pub fn undo_hand_off(&mut self) -> bool {
+        let before = self.held.len();
+        self.held.retain(|h| h.pick != Pick::Qass);
+        self.held.len() != before
+    }
+
     /// The picks whose hold is up, taken out to be sent.
     pub fn due(&mut self, now: Instant) -> Vec<Hold> {
         let (due, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
@@ -1920,6 +1927,18 @@ pub(crate) mod tests {
         holds.start(held(2, 8, t0 + HOLD));
         holds.start(held(3, 9, t0 + HOLD));
         assert_eq!(holds.flush().len(), 2, "closing sends both at once");
+
+        // The hand-off's own Undo takes back the hand-off, not a single answer held later.
+        let hand = |terminal| Hold {
+            pick: Pick::Qass,
+            ..held(terminal, 0, t0 + HOLD)
+        };
+        holds.start(hand(4));
+        holds.start(hand(5));
+        holds.start(held(2, 8, t0 + HOLD + Duration::from_secs(1)));
+        assert!(holds.undo_hand_off());
+        let left: Vec<Option<u32>> = holds.held.iter().map(Hold::terminal).collect();
+        assert_eq!(left, [Some(2)]);
         assert!(holds.held.is_empty());
     }
 

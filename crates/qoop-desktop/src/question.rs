@@ -172,17 +172,27 @@ impl Desk {
     }
 
     /// Wake once a second while anything is on hold: its count goes down, and what is due is
-    /// sent. It keeps waking until nothing is held, so a timer that runs a moment early only
-    /// delays a send by a tick.
+    /// sent. One timer for every hold, which keeps waking until nothing is held, so a timer that
+    /// runs a moment early only delays a send by a tick.
     fn after_hold(&mut self, cx: &mut Context<Self>) {
+        if self.ticking {
+            return;
+        }
+        self.ticking = true;
+        self.tick_holds(cx);
+    }
+
+    fn tick_holds(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(1))
                 .await;
             let _ = this.update(cx, |d, cx| {
                 d.fire();
-                if !d.holds.held.is_empty() {
-                    d.after_hold(cx);
+                if d.holds.held.is_empty() {
+                    d.ticking = false;
+                } else {
+                    d.tick_holds(cx);
                 }
                 cx.notify();
             });
@@ -200,6 +210,13 @@ impl Desk {
     pub fn flush_holds(&mut self) {
         let all = self.holds.flush();
         self.send(all);
+    }
+
+    /// The hand-off line's Undo: the agents held for qass, and no other pick.
+    pub(crate) fn undo_hand_off(&mut self, cx: &mut Context<Self>) {
+        if self.holds.undo_hand_off() {
+            cx.notify();
+        }
     }
 
     /// Undo `slot`'s pick, or the newest one (with every pick held together with it).
