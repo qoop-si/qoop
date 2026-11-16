@@ -176,6 +176,23 @@ impl Stack {
         (!text.is_empty()).then_some(text)
     }
 
+    /// The result of each run of schedule `name`, oldest first, from the daemon's database.
+    fn runs(&self, name: &str) -> Vec<String> {
+        let db = qoop_testkit::socket_in(self.dir.path()).with_file_name("qoop.db");
+        let out = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "SELECT r.result FROM schedule_run r JOIN schedule s ON s.id = r.schedule \
+                 WHERE s.name = '{name}' ORDER BY r.id"
+            ))
+            .output()
+            .expect("sqlite3");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
     /// How many times the stand-in agent was started with `prompt`.
     fn starts(&self, prompt: &str) -> usize {
         std::fs::read_to_string(self.path("claude.args"))
@@ -244,6 +261,69 @@ fn a_schedule_starts_the_agent_at_its_time_with_its_prompt() {
     );
     let after = stack.schedule("morning").unwrap();
     assert_eq!(after["last_slot"], ran["last_slot"]);
+    // Each run has its own row, the scheduled one and the one by hand.
+    assert!(
+        stack.wait(|| stack.runs("morning") == ["started", "started"]),
+        "the runs: {:?}",
+        stack.runs("morning")
+    );
+}
+
+#[test]
+fn an_edit_keeps_the_schedule_and_changes_what_it_was_given() {
+    let stack = Stack::start();
+    let (ok, _, err) = stack.run(&[
+        "schedule",
+        "add",
+        "nightly",
+        "--cron",
+        "0 3 * * *",
+        "--",
+        "run the tests",
+    ]);
+    assert!(ok, "add failed: {err}");
+    let before = stack.schedule("nightly").expect("it is listed");
+    let (ok, out, err) = stack.run(&[
+        "schedule",
+        "edit",
+        "nightly",
+        "--name",
+        "nightly-2",
+        "--cron",
+        "30 4 * * *",
+        "--",
+        "run every test",
+    ]);
+    assert!(ok, "edit failed: {err}");
+    assert!(
+        out.starts_with(&format!("changed {} nightly-2: ", before["id"])),
+        "{out}"
+    );
+    let after = stack.schedule("nightly-2").expect("renamed");
+    assert_eq!(after["id"], before["id"]);
+    assert_eq!(after["cron"], "30 4 * * *");
+    assert_eq!(after["prompt"], "run every test");
+    assert_eq!(after["cwd"], before["cwd"]);
+    assert!(stack.schedule("nightly").is_none());
+    // Nothing to change, two timings, a cron that does not read, or no such schedule.
+    for args in [
+        &["schedule", "edit", "nightly-2"][..],
+        &[
+            "schedule",
+            "edit",
+            "nightly-2",
+            "--cron",
+            "* * * * *",
+            "--at",
+            "+1h",
+        ],
+        &["schedule", "edit", "nightly-2", "--cron", "nope"],
+        &["schedule", "edit", "missing", "--cron", "0 1 * * *"],
+    ] {
+        let (ok, _, _) = stack.run(args);
+        assert!(!ok, "{args:?} was taken");
+    }
+    assert_eq!(stack.schedule("nightly-2").unwrap()["cron"], "30 4 * * *");
 }
 
 #[test]

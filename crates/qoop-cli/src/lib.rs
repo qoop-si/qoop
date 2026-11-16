@@ -303,7 +303,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 `qoop ask` for more\n\
                   \x20 qoop show <file|url> [--note TEXT]  put a screenshot, recording,\n\
                   \x20                 report or public url on the owner's phone\n\
-                  \x20 qoop schedule add|ls|pause|resume|rm|run  start an agent at a time, once\n\
+                  \x20 qoop schedule add|ls|edit|pause|resume|rm|run  start an agent at a time, once\n\
                   \x20                 or on a repeat; `qoop schedule` for more\n\
                   \x20 qoop doctor  whether the board, the questions and the agents agree;\n\
                   \x20                 read-only, `qoop doctor --help` for more\n\

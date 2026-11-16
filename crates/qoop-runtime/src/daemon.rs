@@ -1872,7 +1872,13 @@ impl Daemon {
         // Scheduled agents: the slots missed while qoop was down are decided before the first
         // client is accepted, so one that connects knows what became of them. Parked, and so
         // free, while no schedule is active.
-        crate::schedules::start(self.books.clone(), self.connections.clone()).await;
+        crate::schedules::start(
+            self.books.clone(),
+            self.connections.clone(),
+            self.terminals.clone(),
+            self.agents.clone(),
+        )
+        .await;
         // Plans that waited too long for qass reach the owner even with qass down.
         crate::asks::watch_stale_plans(
             self.agents.clone(),
@@ -4077,6 +4083,8 @@ fn dispatch(
         ControlRequest::HandToQass { .. } => Dispatch::Apart,
         // The store and qass's own log on disk.
         ControlRequest::QassActs { .. } => Dispatch::Apart,
+        // The store, for a schedule's runs.
+        ControlRequest::ScheduleRuns { .. } => Dispatch::Apart,
         // A chunk of a shown file is disk too, on a path an agent chose.
         ControlRequest::ShowFetch { .. } => Dispatch::Apart,
         // A check of a path the phone named, and the store after it.
@@ -6233,6 +6241,12 @@ async fn handle_control(
             .await
         }
         ControlRequest::ScheduleRead { .. } => crate::schedules::read(id, books).await,
+        ControlRequest::ScheduleRuns {
+            schedule,
+            before,
+            limit,
+            ..
+        } => crate::schedules::runs(id, schedule, before, limit, books).await,
         ControlRequest::AgentSessions {
             dirs,
             from_ms,

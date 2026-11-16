@@ -258,6 +258,7 @@ and it asks again if the question still matters.
 ```bash
 qoop schedule add <name> (--cron "<m h dom mon dow>" | --at <HH:MM | YYYY-MM-DD HH:MM | +30m> | --watch '<command>') [--agent NAME] [--cwd DIR] [--space NAME] -- <prompt>
 qoop schedule ls [--json]
+qoop schedule edit <id|name> [--name NAME] [--cron ... | --at ... | --watch ...] [--agent NAME] [--cwd DIR] [--space NAME] [-- <prompt>]
 qoop schedule pause|resume|rm|run <id|name>
 ```
 

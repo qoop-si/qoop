@@ -2196,6 +2196,17 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
                 }
                 self.respond(&C::Schedules { id, schedules }).await
             }
+            // The same for the tab each of a remote schedule's runs opened.
+            C::ScheduleRuns { id, mut runs } => {
+                for run in &mut runs {
+                    run.terminal = run
+                        .terminal
+                        .and_then(|t| u32::try_from(t).ok())
+                        .and_then(|t| terminal_out(link, t))
+                        .map(i64::from);
+                }
+                self.respond(&C::ScheduleRuns { id, runs }).await
+            }
             // A remote tab's task (a window asked it by the tab's number) names the tab in the
             // remote's own numbers; one that does not fit names none.
             C::Tasks {
@@ -2242,12 +2253,13 @@ impl<W: AsyncWrite + Unpin> Mux<W> {
 }
 
 /// What `Via` takes to another machine: a request that names no terminal and no space, so
-/// it means the same there. Extended as `ScheduleRuns` and `Pet` land, each with its
-/// answer's numbers mapped in `answer`.
+/// it means the same there. Extended as `Pet` lands, with its answer's numbers mapped in
+/// `answer`.
 fn via_carries(request: &ControlRequest) -> bool {
     use qoop_runtime::control::ScheduleOp;
     match request {
         ControlRequest::ScheduleRead { .. }
+        | ControlRequest::ScheduleRuns { .. }
         | ControlRequest::SleepSettings { .. }
         | ControlRequest::QassWatch { .. } => true,
         // A run's report names its tab: written by the run on its own machine, never sent
@@ -2991,6 +3003,62 @@ mod tests {
         assert_eq!(
             last,
             [terminal_out(1, 5).map(i64::from), None],
+            "in the interface's numbers"
+        );
+    }
+
+    /// A remote schedule's runs are read there through `Via`, and the tab each run opened comes
+    /// back in the interface's numbers; one that does not fit names none.
+    #[tokio::test]
+    async fn via_carries_schedule_runs_and_their_tabs_are_renumbered() {
+        let (mut mux, mut home_rx, mut remote_rx, _events) = two_links();
+        let runs = |id: &str| ControlRequest::ScheduleRuns {
+            id: id.into(),
+            schedule: 4,
+            before: Some(100),
+            limit: 20,
+        };
+        mux.control(ControlRequest::Via {
+            id: "v1".into(),
+            workspace: workspace_out(1, 3).expect("fits"),
+            request: Box::new(runs("r1")),
+        })
+        .await
+        .expect("sent");
+        assert!(home_rx.try_recv().is_err(), "the home daemon was asked");
+        let asked: ControlRequest = body_of(&remote_rx.try_recv().expect("the remote was asked"));
+        assert_eq!(asked, runs("r1"), "the inner request, unchanged");
+
+        let run = |terminal: Option<i64>| qoop_runtime::control::ScheduleRun {
+            id: 9,
+            schedule: 4,
+            slot: 0,
+            started_at: 50,
+            terminal,
+            task: None,
+            result: "started".into(),
+            ended_at: None,
+            outcome: None,
+            summary: None,
+        };
+        mux.answer(
+            1,
+            ControlResponse::ScheduleRuns {
+                id: "r1".into(),
+                runs: vec![run(Some(5)), run(Some(1 << 30)), run(None)],
+            },
+        )
+        .await
+        .expect("answered");
+        let answered: ControlResponse = body_of(&mux.down);
+        let ControlResponse::ScheduleRuns { id, runs } = answered else {
+            panic!("{answered:?}");
+        };
+        assert_eq!(id, "r1");
+        let tabs: Vec<Option<i64>> = runs.iter().map(|r| r.terminal).collect();
+        assert_eq!(
+            tabs,
+            [terminal_out(1, 5).map(i64::from), None, None],
             "in the interface's numbers"
         );
     }

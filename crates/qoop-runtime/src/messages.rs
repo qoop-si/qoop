@@ -780,6 +780,36 @@ pub async fn answer(
     }
 }
 
+/// The newest message the agent in `terminal` wrote to the person, from the end of its session
+/// file: what a scheduled run's report shows. None for a tab with no agent, no session file or
+/// nothing said yet, and when the chat pool is not answering.
+pub(crate) async fn last_said(
+    terminals: &TerminalRegistry,
+    agents: &Arc<AgentRegistry>,
+    terminal: u32,
+) -> Option<String> {
+    let (program, session) = who(terminals, agents, terminal).ok()?;
+    let alive_since = alive_since(agents, terminal);
+    crate::blocking::chat(DEADLINE, move || {
+        let dirs = agent_dirs();
+        let source = locate(&dirs, &program, &session)?;
+        let opts = Options {
+            limit: 20,
+            codex_root: dirs.as_ref().map(|d| d.codex.clone()),
+            alive_since,
+            ..Options::default()
+        };
+        let digest = qoop_parsed::load(&source, &opts).ok()?;
+        digest.items.into_iter().rev().find_map(|item| match item {
+            qoop_parsed::Item::Agent { text, .. } if !text.trim().is_empty() => Some(text),
+            _ => None,
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// One line at a time into the leads' terminals: the words and their Enter are two writes with
 /// a pause between, and another line landing in the pause would be sent glued to this one.
 /// ponytail: one lock for every terminal, per-terminal locks if sends ever queue behind it.

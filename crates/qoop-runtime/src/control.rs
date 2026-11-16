@@ -846,7 +846,8 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         auto: bool,
     },
-    /// Add, pause, resume, remove or run a schedule, or report how a run went (`qoop schedule`).
+    /// Add, edit, pause, resume, remove or run a schedule, or report how a run went (`qoop
+    /// schedule`).
     /// A write from a terminal carries its token and is refused unless that terminal is qass's;
     /// a client that speaks for no terminal (the app, the CLI outside qoop, the run itself
     /// reporting) sends none. Answered `ScheduleWritten`.
@@ -861,6 +862,16 @@ pub enum ControlRequest {
     /// Every schedule, answered as `Schedules`.
     ScheduleRead {
         id: String,
+    },
+    /// The runs of `schedule`, newest first, at most `limit` (at most [`RUNS_MOST`]), started
+    /// before `before` when given: the next page is asked with the oldest `started_at` of the
+    /// last. Answered `ScheduleRuns`; an older daemon answers `unknown variant`.
+    ScheduleRuns {
+        id: String,
+        schedule: i64,
+        #[serde(default)]
+        before: Option<i64>,
+        limit: u32,
     },
 }
 
@@ -903,7 +914,9 @@ pub enum ScheduleOp {
     },
     /// How the run of `slot` went (`started` with its terminal, or `failed: <why>`), from the
     /// run itself. Applied only while the schedule still holds that slot. A watch's run also
-    /// sends the lines its check saw (`seen`), and `checked` when it started nothing.
+    /// sends the lines its check saw (`seen`), and `checked` when it started nothing. `run` is
+    /// the run's own row, written whatever slot the schedule holds now; a watch's run has none
+    /// (its check decided to start), and its `started` makes one.
     Report {
         schedule: i64,
         slot: i64,
@@ -912,8 +925,67 @@ pub enum ScheduleOp {
         terminal: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<i64>,
+    },
+    /// Edit a schedule in place: what is given replaces what it has, checked as `Add` checks
+    /// it, and the id and the runs stay. A new timing (any of `cron`, `at`, `watch`, which then
+    /// say the whole timing) starts from now: nothing of the old one is caught up. An older
+    /// daemon answers `unknown variant`.
+    Change {
+        schedule: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cron: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
 }
+
+/// One run of a schedule, as `ScheduleRuns` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRun {
+    pub id: i64,
+    pub schedule: i64,
+    /// The slot the schedule held when it started.
+    pub slot: i64,
+    pub started_at: i64,
+    /// The tab it opened, which may be closed by now.
+    #[serde(default)]
+    pub terminal: Option<i64>,
+    /// The task its agent opened, read when it ended.
+    #[serde(default)]
+    pub task: Option<i64>,
+    /// The start word as written: `claimed` until it reports, then `started`,
+    /// `skipped: <why>` or a failure, `failed: <why>`.
+    pub result: String,
+    #[serde(default)]
+    pub ended_at: Option<i64>,
+    /// `done` or `failed` when its agent's turn ended (a failure to start is `failed` too),
+    /// `gone` when its tab closed first; none while it runs and for a skip.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// Its agent's newest message when the turn ended, at most [`RUN_SUMMARY_MOST`] bytes.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+/// The most runs one `ScheduleRuns` answer carries.
+pub const RUNS_MOST: u32 = 100;
+
+/// The most bytes of a run's summary.
+pub const RUN_SUMMARY_MOST: usize = 4 * 1024;
 
 /// A schedule as a client lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1984,6 +2056,7 @@ impl ControlRequest {
             | Self::ShowOpen { id, .. }
             | Self::ScheduleWrite { id, .. }
             | Self::ScheduleRead { id }
+            | Self::ScheduleRuns { id, .. }
             | Self::ReloadAgentManifests { id }
             | Self::ConnectRemote { id, .. }
             | Self::InstallRemote { id, .. }
@@ -2330,6 +2403,11 @@ pub enum ControlResponse {
     Schedules {
         id: String,
         schedules: Vec<ScheduleInfo>,
+    },
+    /// What `ScheduleRuns` asked for, newest first; none for a schedule that is not there.
+    ScheduleRuns {
+        id: String,
+        runs: Vec<ScheduleRun>,
     },
     /// Bytes of a shown file, as standard base64, with the file's size and modification
     /// time (unix milliseconds) now: a reader starts over when either changed.
@@ -3110,6 +3188,7 @@ impl ControlResponse {
             | Self::ShowChunk { id, .. }
             | Self::ScheduleWritten { id, .. }
             | Self::Schedules { id, .. }
+            | Self::ScheduleRuns { id, .. }
             | Self::TunnelOpened { id, .. }
             | Self::Changes { id, .. }
             | Self::Failed { id, .. } => id,
@@ -4482,8 +4561,9 @@ pub enum EventMessage {
     },
     /// A result was shown: `ShowRead` says what is there. An older client ignores it.
     ShowsChanged,
-    /// A schedule was added, changed, removed or run: `ScheduleRead` says what is there. An
-    /// older client ignores it.
+    /// A schedule was added, changed, removed or run, or a run of one was written (started,
+    /// reported or ended): `ScheduleRead` and `ScheduleRuns` say what is there. An older client
+    /// ignores it.
     SchedulesChanged,
     /// A program in `terminal` is recording (`on`), and will say so every second while it
     /// does, or has stopped. `listener` numbers the recording. An interface lends its

@@ -18,20 +18,28 @@
 //! While one is, it sleeps until the nearest slot, and never longer than a minute, because the
 //! tokio clock does not count the time a Mac spends asleep: a wake or a clock change is seen
 //! within a minute whatever the sleep was meant to be.
+//!
+//! Each look also ends the runs whose agent's turn ended (`done`, or `failed` when the agent
+//! reads failed, with its newest message as the summary) or whose tab closed (`gone`). While a
+//! run is going the loop looks at least once a minute, and at once when that tab's row says a
+//! turn ended or the tab is gone.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use qoop_store::ScheduleRow;
+use qoop_store::{ScheduleRow, ScheduleRunRow};
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::agents::AgentRegistry;
 use crate::asks::{Caller, QASS_SPACE, failed};
 use crate::control::{
-    ControlResponse, SCHEDULE_PROMPT_MAX, SCHEDULES_MOST, SEEN_MOST, ScheduleInfo, ScheduleOp,
+    ControlResponse, RUN_SUMMARY_MOST, RUNS_MOST, SCHEDULE_PROMPT_MAX, SCHEDULES_MOST, SEEN_MOST,
+    ScheduleInfo, ScheduleOp, ScheduleRun,
 };
-use crate::daemon::{Bookkeeping, ConnectionRegistry, PROBE_DEADLINE};
+use crate::daemon::{Bookkeeping, ConnectionRegistry, PROBE_DEADLINE, TerminalRegistry};
 use crate::schedule::{Cron, Decision, Zone, decide, next_at, system_zone, when_words};
 use crate::store::{HandleError, now};
 
@@ -164,6 +172,43 @@ pub(crate) async fn read(id: String, books: &Bookkeeping) -> ControlResponse {
                 schedules: rows.into_iter().map(|row| info(row, at, zone)).collect(),
             }
         }
+        Err(e) => failed(id, why(e)),
+    }
+}
+
+fn run_info(run: ScheduleRunRow) -> ScheduleRun {
+    ScheduleRun {
+        id: run.id,
+        schedule: run.schedule,
+        slot: run.slot,
+        started_at: run.started_at,
+        terminal: run.terminal,
+        task: run.task,
+        result: run.result,
+        ended_at: run.ended_at,
+        outcome: run.outcome,
+        summary: run.summary,
+    }
+}
+
+/// The runs of `schedule`, newest first (`ScheduleRuns`).
+pub(crate) async fn runs(
+    id: String,
+    schedule: i64,
+    before: Option<i64>,
+    limit: u32,
+    books: &Bookkeeping,
+) -> ControlResponse {
+    let limit = limit.min(RUNS_MOST);
+    match books
+        .store
+        .run(move |s| s.schedule_runs(schedule, before, limit))
+        .await
+    {
+        Ok(rows) => ControlResponse::ScheduleRuns {
+            id,
+            runs: rows.into_iter().map(run_info).collect(),
+        },
         Err(e) => failed(id, why(e)),
     }
 }
@@ -364,6 +409,56 @@ pub(crate) async fn write(
                 Err(e) => return failed(id, why(e)),
             }
         }
+        ScheduleOp::Change {
+            schedule,
+            name,
+            cron,
+            at,
+            watch,
+            agent,
+            cwd,
+            space,
+            prompt,
+        } => {
+            let row = match store.run(move |s| s.schedule(schedule)).await {
+                Ok(Some(row)) => row,
+                Ok(None) => return failed(id, format!("no schedule {schedule}")),
+                Err(e) => return failed(id, why(e)),
+            };
+            // A timing given is the whole timing; none keeps the one it has, and an unchanged
+            // moment is checked against when it was made, since it may have passed by now.
+            let timing = cron.is_some() || at.is_some() || watch.is_some();
+            let (cron, at, watch, checked) = if timing {
+                (cron, at, watch, now())
+            } else {
+                (row.cron, row.at, row.watch, row.created_at)
+            };
+            let changed = match made(
+                name.unwrap_or(row.name),
+                cron,
+                at,
+                watch,
+                Some(agent.unwrap_or(row.agent)),
+                cwd.unwrap_or(row.cwd),
+                space.or(row.space),
+                prompt.unwrap_or(row.prompt),
+                checked,
+            )
+            .await
+            {
+                Ok(changed) => ScheduleRow {
+                    id: schedule,
+                    ..changed
+                },
+                Err(reason) => return failed(id, reason),
+            };
+            let moved = timing.then(now);
+            match store.run(move |s| s.change_schedule(&changed, moved)).await {
+                Ok(true) => schedule,
+                Ok(false) => return failed(id, format!("no schedule {schedule}")),
+                Err(e) => return failed(id, why(e)),
+            }
+        }
         ScheduleOp::Pause { schedule }
         | ScheduleOp::Resume { schedule }
         | ScheduleOp::Remove { schedule }
@@ -387,9 +482,15 @@ pub(crate) async fn write(
                         return failed(id, "qoop is restarting; run it again in a moment");
                     }
                     // Its own run: the slot the row holds is the key the run reports under,
-                    // and nothing is claimed or moved.
+                    // and nothing is claimed or moved. Its row is its own.
                     let slot = row.last_slot.unwrap_or(0);
-                    spawn_run(books, connections, row, slot, starting, true);
+                    let at = now();
+                    let run = match store.run(move |s| s.start_run(schedule, slot, at)).await {
+                        Ok(Some(run)) => run,
+                        Ok(None) => return failed(id, format!("no schedule {schedule}")),
+                        Err(e) => return failed(id, why(e)),
+                    };
+                    spawn_run(books, connections, row, slot, Some(run), starting, true);
                     Ok(true)
                 }
                 ScheduleOp::Report {
@@ -397,6 +498,7 @@ pub(crate) async fn write(
                     result,
                     terminal,
                     seen,
+                    run,
                     ..
                 } => {
                     let result = qoop_store::task::one_line(&result);
@@ -412,7 +514,14 @@ pub(crate) async fn write(
                     let started = result == "started";
                     let applied = store
                         .run(move |s| {
-                            s.report_schedule(schedule, slot, &result, terminal, seen.as_deref())
+                            s.report_schedule(
+                                schedule,
+                                slot,
+                                &result,
+                                terminal,
+                                seen.as_deref(),
+                                run,
+                            )
                         })
                         .await;
                     // A run that opened an agent, once: a watch's check that found nothing new
@@ -422,7 +531,9 @@ pub(crate) async fn write(
                     }
                     applied
                 }
-                ScheduleOp::Add { .. } => unreachable!("an add is handled above"),
+                ScheduleOp::Add { .. } | ScheduleOp::Change { .. } => {
+                    unreachable!("an add and a change are handled above")
+                }
             };
             if let Err(e) = applied {
                 return failed(id, why(e));
@@ -440,7 +551,12 @@ pub(crate) async fn write(
 ///
 /// The first look runs here, before the accept loop: a slot missed while qoop was down is
 /// claimed, or skipped, before any client can connect and ask what became of it.
-pub(crate) async fn start(books: Bookkeeping, connections: Arc<ConnectionRegistry>) {
+pub(crate) async fn start(
+    books: Bookkeeping,
+    connections: Arc<ConnectionRegistry>,
+    terminals: Arc<TerminalRegistry>,
+    agents: Arc<AgentRegistry>,
+) {
     // Before anything looks: what was claimed before this daemon started is a run whose child
     // never reported.
     match books.store.run(|s| s.fail_stale_claims()).await {
@@ -450,42 +566,142 @@ pub(crate) async fn start(books: Bookkeeping, connections: Arc<ConnectionRegistr
     }
     // Subscribed before the look, so a write that lands during it is not missed.
     let mut news = connections.subscribe_schedules();
-    let mut wait = look(&books, &connections).await;
+    let mut rows = agents.subscribe();
+    let (mut wait, mut going) = look(&books, &connections, &terminals, &agents).await;
     tokio::spawn(async move {
         loop {
             // Whatever piled up while looking is one reason to look again.
-            while matches!(
-                news.try_recv(),
-                Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
-            ) {}
-            match wait {
-                Some(sleep) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep) => {}
-                        heard = news.recv() => {
-                            if matches!(heard, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
-                                return;
-                            }
+            while matches!(news.try_recv(), Ok(()) | Err(TryRecvError::Lagged(_))) {}
+            // A deadline, not a sleep started again: the rows of a working agent change many
+            // times a second and would put the look off for ever.
+            let deadline = wait.map(|sleep| tokio::time::Instant::now() + sleep);
+            loop {
+                tokio::select! {
+                    () = until(deadline) => break,
+                    heard = news.recv() => {
+                        if matches!(heard, Err(RecvError::Closed)) {
+                            return;
                         }
+                        break;
                     }
-                }
-                None => {
-                    if matches!(
-                        news.recv().await,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed)
-                    ) {
-                        return;
-                    }
+                    changed = rows.recv() => match changed {
+                        // A run's tab whose turn ended or that closed: its run ends now.
+                        Ok(tab) if going.contains(&tab) && (agents.stop_of(tab).is_some()
+                            || terminals.workspace_of(tab).is_none()) => break,
+                        Ok(_) => {}
+                        Err(RecvError::Lagged(_)) => break,
+                        Err(RecvError::Closed) => return,
+                    },
                 }
             }
-            wait = look(&books, &connections).await;
+            (wait, going) = look(&books, &connections, &terminals, &agents).await;
         }
     });
 }
 
-/// One look at every schedule: claim what is due and start its run. Answers how long to sleep
-/// before the next look, or none to park until a write.
-async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Option<Duration> {
+/// Wait until `deadline`, or for ever when there is none.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One look at every schedule: claim what is due and start its run, and end the runs that
+/// ended. Answers how long to sleep before the next look, or none to park until a write, and
+/// the tabs of the runs still going.
+async fn look(
+    books: &Bookkeeping,
+    connections: &Arc<ConnectionRegistry>,
+    terminals: &TerminalRegistry,
+    agents: &Arc<AgentRegistry>,
+) -> (Option<Duration>, BTreeSet<u32>) {
+    let going = end_runs(books, connections, terminals, agents).await;
+    let wait = claim_due(books, connections).await;
+    // A run going is looked at again within a minute, whatever the schedules wait for.
+    if going.is_empty() || books.stopping.load(Ordering::SeqCst) {
+        return (wait, going);
+    }
+    (Some(wait.map_or(LOOK_EVERY, |w| w.min(LOOK_EVERY))), going)
+}
+
+/// When the turn of the agent in `tab` last ended, in unix seconds, while no work came after.
+fn turn_end(agents: &AgentRegistry, tab: u32) -> Option<i64> {
+    agents.stop_of(tab)?.split_once('.')?.0.parse().ok()
+}
+
+/// End each run whose agent's turn ended after it started (`done`, or `failed` when the agent
+/// reads failed now, with its newest message) or whose tab is gone (`gone`). Answers the tabs
+/// of the runs still going.
+async fn end_runs(
+    books: &Bookkeeping,
+    connections: &Arc<ConnectionRegistry>,
+    terminals: &TerminalRegistry,
+    agents: &Arc<AgentRegistry>,
+) -> BTreeSet<u32> {
+    let mut going = BTreeSet::new();
+    let open = match books.store.run(|s| s.open_runs()).await {
+        Ok(open) => open,
+        Err(e) => {
+            crate::say!("qoopd: schedules: {}", why(e));
+            return going;
+        }
+    };
+    let mut ended = false;
+    for run in open {
+        let tab = run
+            .terminal
+            .and_then(|t| u32::try_from(t).ok())
+            .filter(|t| terminals.workspace_of(*t).is_some());
+        let (outcome, summary) = match tab {
+            None => ("gone", None),
+            Some(tab) => match turn_end(agents, tab) {
+                Some(at) if at >= run.started_at => {
+                    let failed = agents
+                        .agent(tab)
+                        .is_some_and(|a| a.belief.state == qoop_domain::AgentRuntimeState::Failed);
+                    let said = crate::messages::last_said(terminals, agents, tab).await;
+                    let said = said.map(|text| cut(text, RUN_SUMMARY_MOST));
+                    (if failed { "failed" } else { "done" }, said)
+                }
+                _ => {
+                    going.insert(tab);
+                    continue;
+                }
+            },
+        };
+        let (id, at) = (run.id, now());
+        match books
+            .store
+            .run(move |s| s.end_run(id, at, outcome, summary.as_deref()))
+            .await
+        {
+            Ok(true) => ended = true,
+            Ok(false) => {}
+            Err(e) => crate::say!("qoopd: schedules: {}", why(e)),
+        }
+    }
+    if ended {
+        connections.schedules_changed();
+    }
+    going
+}
+
+/// `text` cut to at most `most` bytes, on a character's edge.
+fn cut(mut text: String, most: usize) -> String {
+    if text.len() > most {
+        let mut end = most;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// Claim what is due and start its run. Answers how long to sleep before the next look, or
+/// none to park until a write.
+async fn claim_due(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Option<Duration> {
     let (at, zone) = (now(), system_zone());
     let rows = match books.store.run(|s| s.schedules()).await {
         Ok(rows) => rows,
@@ -518,9 +734,9 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
                 }
                 // A watch's check keeps the last run shown: most checks start nothing.
                 let result = row.watch.is_none().then(|| "claimed".to_string());
-                if claim(books, &row, slot, at, result).await {
+                if let Some(run) = claim(books, &row, slot, at, result).await {
                     claimed = true;
-                    spawn_run(books, connections, row, slot, starting, false);
+                    spawn_run(books, connections, row, slot, run, starting, false);
                 } else {
                     lost = true;
                 }
@@ -531,7 +747,10 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
                     continue;
                 }
                 crate::say!("qoopd: schedule {} skipped: {because}", row.name);
-                if claim(books, &row, slot, at, Some(format!("skipped: {because}"))).await {
+                if claim(books, &row, slot, at, Some(format!("skipped: {because}")))
+                    .await
+                    .is_some()
+                {
                     claimed = true;
                 } else {
                     lost = true;
@@ -556,25 +775,31 @@ async fn look(books: &Bookkeeping, connections: &Arc<ConnectionRegistry>) -> Opt
     sleep.map(|s| Duration::from_secs(s as u64))
 }
 
-/// Take `slot` of `row` for a run. False when somebody else did (a second look, a pause, a
-/// remove), or the store did not answer.
+/// Take `slot` of `row` for a run: the run's row when there is a `result` (a watch's check has
+/// none). None when somebody else did (a second look, a pause, a remove), or the store did not
+/// answer.
 async fn claim(
     books: &Bookkeeping,
     row: &ScheduleRow,
     slot: i64,
     at: i64,
     result: Option<String>,
-) -> bool {
+) -> Option<Option<i64>> {
     let (id, expected) = (row.id, row.last_slot);
     match books
         .store
-        .run(move |s| s.claim_schedule(id, expected, slot, at, result.as_deref()))
+        .run(move |s| match result {
+            Some(result) => Ok(s.claim_run(id, expected, slot, at, &result)?.map(Some)),
+            None => Ok(s
+                .claim_schedule(id, expected, slot, at, None)?
+                .then_some(None)),
+        })
         .await
     {
         Ok(won) => won,
         Err(e) => {
             crate::say!("qoopd: schedules: {}", why(e));
-            false
+            None
         }
     }
 }
@@ -586,13 +811,15 @@ fn own_exe(books: &Bookkeeping) -> Option<PathBuf> {
 
 /// Start `qoop schedule fire` for the run of `slot` on a task of its own, never awaited by the
 /// loop: opening a terminal takes seconds and the next schedule's time does not wait for it.
-/// A run that ends without having reported is written down as failed. `manual` is the owner
-/// asking for it now, which a run still going does not hold back.
+/// A run that ends without having reported is written down as failed, its row `run` too (a
+/// watch's check has none). `manual` is the owner asking for it now, which a run still going
+/// does not hold back.
 fn spawn_run(
     books: &Bookkeeping,
     connections: &Arc<ConnectionRegistry>,
     row: ScheduleRow,
     slot: i64,
+    run: Option<i64>,
     starting: Starting,
     manual: bool,
 ) {
@@ -615,7 +842,7 @@ fn spawn_run(
             None
         };
         let ran = match own_exe(&books) {
-            Some(exe) => run_child(exe, row.cwd, id, slot, manual, seen).await,
+            Some(exe) => run_child(exe, row.cwd, id, slot, run, manual, seen).await,
             None => Err("this daemon does not know its own binary".to_string()),
         };
         if let Err(reason) = ran {
@@ -627,9 +854,14 @@ fn spawn_run(
                 .run(move |s| {
                     if manual || watch {
                         let terminal = terminal.filter(|_| watch);
-                        s.report_schedule(id, slot, &format!("failed: {reason}"), terminal, None)
+                        let said = format!("failed: {reason}");
+                        let marked = match run {
+                            Some(run) => s.fail_run(run, &reason)?,
+                            None => false,
+                        };
+                        Ok(s.report_schedule(id, slot, &said, terminal, None, None)? || marked)
                     } else {
-                        s.fail_claimed_schedule(id, slot, &reason)
+                        s.fail_claimed_schedule(id, slot, run, &reason)
                     }
                 })
                 .await;
@@ -647,12 +879,13 @@ fn spawn_run(
 /// nothing of a terminal's identity, so what it does is the owner's and not a worker's, and
 /// wait for it, polling, so that no thread is held while it opens a terminal. A child that
 /// takes longer than [`RUN_PATIENCE`] is killed. A watch's child gets its last check's lines
-/// on its stdin (`--seen`).
+/// on its stdin (`--seen`), and a run with a row its id (`--run`).
 async fn run_child(
     exe: PathBuf,
     cwd: String,
     id: i64,
     slot: i64,
+    run: Option<i64>,
     manual: bool,
     seen: Option<String>,
 ) -> Result<(), String> {
@@ -673,6 +906,9 @@ async fn run_child(
             .stderr(std::process::Stdio::null());
         if manual {
             command.arg("--now");
+        }
+        if let Some(run) = run {
+            command.args(["--run", &run.to_string()]);
         }
         if piped {
             command.arg("--seen").stdin(std::process::Stdio::piped());
