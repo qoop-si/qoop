@@ -32,3 +32,5 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The same tokio, with a clock tests can move.
+tokio = { version = "1", features = ["test-util"] }

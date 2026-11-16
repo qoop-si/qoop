@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use super::host::{self, Host, Popup, Refused, State, not_found, param, terminal_of};
 use super::install;
 use super::translate::{self, Id};
+use crate::PersonGrant;
 use crate::supervise::Link;
 
 /// How long a plugin pane's spec waits for its `pane-exec`.
@@ -345,6 +346,175 @@ fn replace_leaf(tree: &Pane, target: u32, with: &Pane) -> Pane {
     }
 }
 
+/// `tree` with a pane's split moved by `amount` (a share of the split) toward `direction`, as
+/// herdr resizes: the nearest split on that edge of the pane, else the nearest on the other
+/// edge; the ratio kept between a tenth and nine tenths. `None` when nothing moved.
+pub(crate) fn resized(tree: &Pane, terminal: u32, direction: &str, amount: f64) -> Option<Pane> {
+    let (axis, grows) = match direction {
+        "left" => (SplitDir::V, false),
+        "right" => (SplitDir::V, true),
+        "up" => (SplitDir::H, false),
+        "down" => (SplitDir::H, true),
+        _ => return None,
+    };
+    let mut leaf = Vec::new();
+    if !path_to(tree, terminal, &mut leaf) {
+        return None;
+    }
+    // The splits above the pane, deepest first, on the axis asked, each with the pane's half.
+    let splits: Vec<(&[bool], bool)> = (0..leaf.len())
+        .rev()
+        .map(|depth| (&leaf[..depth], leaf[depth]))
+        .filter(|(path, _)| matches!(at(tree, path), Some(Pane::Split { dir, .. }) if *dir == axis))
+        .collect();
+    // Growing right or down moves the split the pane is the first half of; else the other.
+    let (path, _) = splits
+        .iter()
+        .find(|(_, second)| *second != grows)
+        .or_else(|| splits.first())?;
+    let Some(Pane::Split { permille, .. }) = at(tree, path) else {
+        return None;
+    };
+    let step = (amount * 1000.0).round() as i32;
+    let moved = (i32::from(*permille) + if grows { step } else { -step }).clamp(100, 900) as u16;
+    (moved != *permille).then(|| with_ratio(tree, path, moved))
+}
+
+/// The halves from the root down to `terminal`'s leaf (`true` for a second half).
+fn path_to(tree: &Pane, terminal: u32, path: &mut Vec<bool>) -> bool {
+    match tree {
+        Pane::Leaf { terminal: t } => *t == terminal,
+        Pane::Split { first, second, .. } => {
+            for (side, child) in [(false, first), (true, second)] {
+                path.push(side);
+                if path_to(child, terminal, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+    }
+}
+
+/// The part of `tree` at `path`.
+fn at<'a>(tree: &'a Pane, path: &[bool]) -> Option<&'a Pane> {
+    match (tree, path.split_first()) {
+        (_, None) => Some(tree),
+        (Pane::Split { first, second, .. }, Some((side, rest))) => {
+            at(if *side { second } else { first }, rest)
+        }
+        _ => None,
+    }
+}
+
+/// `tree` with the split at `path` set to `permille`.
+fn with_ratio(tree: &Pane, path: &[bool], permille: u16) -> Pane {
+    match (tree, path.split_first()) {
+        (
+            Pane::Split {
+                dir,
+                questions,
+                first,
+                second,
+                ..
+            },
+            None,
+        ) => Pane::Split {
+            dir: *dir,
+            permille,
+            questions: *questions,
+            first: first.clone(),
+            second: second.clone(),
+        },
+        (
+            Pane::Split {
+                dir,
+                permille: p,
+                questions,
+                first,
+                second,
+            },
+            Some((side, rest)),
+        ) => Pane::Split {
+            dir: *dir,
+            permille: *p,
+            questions: *questions,
+            first: Box::new(if *side {
+                (**first).clone()
+            } else {
+                with_ratio(first, rest, permille)
+            }),
+            second: Box::new(if *side {
+                with_ratio(second, rest, permille)
+            } else {
+                (**second).clone()
+            }),
+        },
+        _ => tree.clone(),
+    }
+}
+
+/// `tree` with panes `a` and `b` in each other's place.
+pub(crate) fn swapped(tree: &Pane, a: u32, b: u32) -> Pane {
+    match tree {
+        Pane::Leaf { terminal } if *terminal == a => Pane::Leaf { terminal: b },
+        Pane::Leaf { terminal } if *terminal == b => Pane::Leaf { terminal: a },
+        Pane::Leaf { .. } => tree.clone(),
+        Pane::Split {
+            dir,
+            permille,
+            questions,
+            first,
+            second,
+        } => Pane::Split {
+            dir: *dir,
+            permille: *permille,
+            questions: *questions,
+            first: Box::new(swapped(first, a, b)),
+            second: Box::new(swapped(second, a, b)),
+        },
+    }
+}
+
+/// The pane nearest `from` toward `direction` in a laid out tab (`layout`'s `panes`), as
+/// herdr finds a neighbour: on that side and overlapping it, the nearest edge first, then the
+/// most overlap.
+pub(crate) fn neighbour(panes: &[Value], from: &str, direction: &str) -> Option<String> {
+    let rect = |p: &Value| {
+        let r = &p["rect"];
+        let n = |k: &str| r[k].as_i64().unwrap_or(0);
+        (n("x"), n("y"), n("width"), n("height"))
+    };
+    let me = panes.iter().find(|p| p["pane_id"] == from)?;
+    let (fx, fy, fw, fh) = rect(me);
+    let overlap = |a: i64, al: i64, b: i64, bl: i64| (a + al).min(b + bl) - a.max(b);
+    // Twice the distance between the middles of two ranges, kept whole.
+    let apart = |a: i64, al: i64, b: i64, bl: i64| ((2 * a + al) - (2 * b + bl)).abs();
+    panes
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p["pane_id"] != from)
+        .filter_map(|(index, p)| {
+            let (x, y, w, h) = rect(p);
+            let (distance, shared, middle) = match direction {
+                "left" if x + w <= fx => (fx - (x + w), overlap(y, h, fy, fh), apart(y, h, fy, fh)),
+                "right" if x >= fx + fw => {
+                    (x - (fx + fw), overlap(y, h, fy, fh), apart(y, h, fy, fh))
+                }
+                "up" if y + h <= fy => (fy - (y + h), overlap(x, w, fx, fw), apart(x, w, fx, fw)),
+                "down" if y >= fy + fh => {
+                    (y - (fy + fh), overlap(x, w, fx, fw), apart(x, w, fx, fw))
+                }
+                _ => return None,
+            };
+            let id = p["pane_id"].as_str()?.to_string();
+            (shared > 0).then_some(((distance, -shared, middle, index), id))
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, id)| id)
+}
+
 /// Whether a note may be shown, and herdr's reason: muted here or everywhere is `disabled`.
 pub(crate) fn may_show(mute: qoop_runtime::config::Mute) -> (bool, &'static str) {
     match mute {
@@ -518,6 +688,73 @@ async fn send(terminal: u32, text: &str, paste: bool, presses: Vec<Press>) -> Re
     Ok(())
 }
 
+/// Now, in unix seconds, as the daemon stamps a person's key.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Whether `row` still runs a program of `plugin`: the program the host started there (its
+/// pane-exec chain keeps the pid) carries `HERDR_PLUGIN_ID`, and a shell the daemon put back
+/// after a restart does not.
+fn own_pane(row: &qoop_runtime::control::AgentRow, plugin: &str) -> bool {
+    row.shell_pid
+        .and_then(|pid| host::env_of_process(pid, ["HERDR_PLUGIN_ID"]))
+        .is_some_and(|[id]| id.as_deref() == Some(plugin))
+}
+
+/// How long a person's key in a plugin pane grants that plugin's write.
+const GRANT_FOR: Duration = Duration::from_secs(10);
+
+/// Whether a `typed_by` kind is a person's interface (the app, the phone, the browser page,
+/// `qoop attach`).
+fn person_kind(kind: &str) -> bool {
+    matches!(kind, "computer" | "phone" | "browser" | "attach")
+}
+
+/// As [`send`], through the same code `qoop send` runs, in this process with `grant`: a line
+/// the person sent at the target does not hold it back; everything else that refuses a send
+/// still does ([`crate::person_refusal`]).
+async fn send_granted(
+    terminal: u32,
+    text: &str,
+    paste: bool,
+    presses: Vec<Press>,
+    grant: PersonGrant,
+) -> Result<(), Refused> {
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || {
+        if !text.is_empty() {
+            crate::send_text_to(terminal, text, false, paste, Some(&grant))?;
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for press in presses.iter().chain([&Press::Nothing]) {
+            if !matches!(press, Press::Bytes(_)) && !bytes.is_empty() {
+                let text = String::from_utf8(std::mem::take(&mut bytes))
+                    .map_err(|_| std::io::Error::other("unsupported key"))?;
+                crate::send_text_to(terminal, text, false, false, Some(&grant))?;
+            }
+            if !matches!(press, Press::Key(_)) && !keys.is_empty() {
+                crate::send_keys_to(terminal, &std::mem::take(&mut keys), Some(&grant))?;
+            }
+            match press {
+                Press::Bytes(b) => bytes.extend(b),
+                Press::Key(k) => keys.push((*k).to_string()),
+                Press::Nothing => {}
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| ("failed", e.to_string()))?
+    .map_err(|e| {
+        let said = e.to_string();
+        (refusal_code(&said), said)
+    })
+}
+
 fn bool_param(params: &Value, name: &str, default: bool) -> bool {
     params.get(name).and_then(Value::as_bool).unwrap_or(default)
 }
@@ -651,11 +888,24 @@ impl Host {
         Ok(())
     }
 
+    /// A terminal made hidden ([`Host::new_terminal`]) is placed: the next listing tells it.
+    fn reveal(&self, terminal: u32) {
+        self.state.lock().unwrap().hidden.remove(&terminal);
+        self.forget_listing();
+    }
+
     /// Show `terminal` in every interface, and take it as the focus from now.
     async fn focus(&self, terminal: u32) -> Result<(), Refused> {
+        self.focus_zoomed(terminal, None).await
+    }
+
+    /// As [`Host::focus`], the interfaces also told to zoom it in its tab (`Some(true)`) or to
+    /// show the tab unzoomed (`Some(false)`).
+    async fn focus_zoomed(&self, terminal: u32, zoom: Option<bool>) -> Result<(), Refused> {
         control(ControlRequest::Focus {
             id: crate::request_id("plugin-host"),
             terminal,
+            zoom,
         })
         .await?;
         self.set_focus(terminal, false);
@@ -735,7 +985,8 @@ impl Host {
                     .filter(|_| shown)
             };
             if let Some(previous) = previous {
-                let _ = self.focus(previous).await;
+                // The popup took its tab's zoom; the pane before it is shown as it was.
+                let _ = self.focus_zoomed(previous, Some(false)).await;
             }
         }
         let until = Instant::now() + CLOSE_PATIENCE;
@@ -798,14 +1049,24 @@ impl Host {
     /// A new terminal, its shell started with `env` when there is any. The environment never
     /// passes through the line editor: the shell is handed the same `pane-exec` line a plugin
     /// pane is, whose spec is the shell itself as qoop started it, with `env` added.
+    /// `hide` keeps it out of the events until [`Host::reveal`]: a terminal about to be put
+    /// into a split, made under the listing lock so no listing shows it first.
     async fn new_terminal(
         &self,
         space: i64,
         cwd: Option<String>,
         name: Option<String>,
         env: Vec<(String, String)>,
+        hide: bool,
     ) -> Result<u32, Refused> {
-        let terminal = create(space, cwd.clone(), name).await?;
+        let terminal = if hide {
+            let _turn = self.refreshing.lock().await;
+            let terminal = create(space, cwd.clone(), name).await?;
+            self.state.lock().unwrap().hidden.insert(terminal);
+            terminal
+        } else {
+            create(space, cwd.clone(), name).await?
+        };
         if env.is_empty() {
             return Ok(terminal);
         }
@@ -880,8 +1141,42 @@ impl Host {
                     .and_then(Value::as_u64)
                     .and_then(|t| u32::try_from(t).ok())
                     .ok_or(("invalid_request", "invalid request: `terminal`".to_string()))?;
+                // The size of the area its tabs are laid out in, when it says.
+                let size = |key: &str| {
+                    params
+                        .get(key)
+                        .and_then(Value::as_u64)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0)
+                };
+                // Told again while it stands (`keepalive`), for a host that started later: it
+                // counts only when no interface has said what it shows, and then quietly. Two
+                // interfaces on two panes must not move the focus back and forth.
+                let keepalive = bool_param(params, "keepalive", false);
+                if keepalive && self.state.lock().unwrap().reported {
+                    return Ok(json!({"type": "ok"}));
+                }
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if let (Some(width), Some(height)) = (size("cols"), size("rows")) {
+                        state.area = Some(translate::Rect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        });
+                    }
+                    // How far back the person scrolled the pane, rows from the bottom.
+                    let back = params.get("back").and_then(Value::as_u64).unwrap_or(0);
+                    state.scrolls.back = (back > 0).then_some((terminal, back));
+                }
                 self.refresh().await?;
-                if !self.set_focus(terminal, true) {
+                let known = if keepalive {
+                    self.state.lock().unwrap().keep_focus(terminal)
+                } else {
+                    self.set_focus(terminal, true)
+                };
+                if !known {
                     return Err(not_found("pane", &terminal.to_string()));
                 }
                 Ok(json!({"type": "ok"}))
@@ -917,6 +1212,9 @@ impl Host {
             "pane.focus" | "agent.focus" => Box::pin(self.focus_pane(method, params)).await,
             "pane.rename" | "agent.rename" => Box::pin(self.rename_pane(method, params)).await,
             "pane.zoom" => Box::pin(self.zoom(params)).await,
+            "pane.resize" => Box::pin(self.resize(params)).await,
+            "pane.swap" => Box::pin(self.swap(params)).await,
+            "pane.focus_direction" => Box::pin(self.focus_direction(params)).await,
             "pane.split" => Box::pin(self.split(params)).await,
             "tab.create" => Box::pin(self.create_tab(params)).await,
             "tab.rename" => Box::pin(self.rename_tab(params)).await,
@@ -941,8 +1239,84 @@ impl Host {
         let terminal = self.target(params, "pane_id")?;
         let text = param(params, "text").unwrap_or_default();
         typed(text, &[])?;
-        send(terminal, text, false, Vec::new()).await?;
+        self.fresh_for_grant(params).await?;
+        match self.grant(params, terminal, text.contains(['\r', '\n'])) {
+            Some(grant) => send_granted(terminal, text, false, Vec::new(), grant).await?,
+            None => send(terminal, text, false, Vec::new()).await?,
+        }
         Ok(json!({"type": "ok"}))
+    }
+
+    /// A grant for a write from a plugin into `target`, from the asking process's environment
+    /// (`host::PEER`), never the request:
+    ///
+    /// - into a pane that plugin opened, still running its program (`own_pane`): always, its
+    ///   own program is not a person's work;
+    /// - from a plugin pane, into its tab, when a person pressed a key in that pane (the
+    ///   daemon's `typed_by`, from a person's interface) within [`GRANT_FOR`] and the key has
+    ///   not had its write: a write that `ends` in Enter uses it up here, before it is sent,
+    ///   so two bursts at once cannot both have it.
+    ///
+    /// Writes from anywhere else (a hook, a startup, an action, the palette) get none.
+    fn grant(&self, params: &Value, target: u32, ends: bool) -> Option<PersonGrant> {
+        let peer = params.get(host::PEER)?;
+        let plugin = peer["plugin"].as_str()?;
+        let opened = {
+            let state = self.state.lock().unwrap();
+            state
+                .owners
+                .get(&target)
+                .is_some_and(|o| o == plugin)
+                .then(|| {
+                    state
+                        .now
+                        .rows
+                        .iter()
+                        .find(|r| r.terminal == target)
+                        .cloned()
+                })
+                .flatten()
+        };
+        if let Some(row) = opened.filter(|row| own_pane(row, plugin)) {
+            return Some(PersonGrant {
+                target: row,
+                own: true,
+            });
+        }
+        peer["entrypoint"].as_str()?;
+        // The pane the host itself gave that pane's program when it opened it.
+        let pane = peer["pane"].as_str().and_then(terminal_of)?;
+        let mut state = self.state.lock().unwrap();
+        let same_tab = state
+            .now
+            .tabs
+            .iter()
+            .any(|t| t.leaves.contains(&pane) && t.leaves.contains(&target));
+        let row = |t: u32| state.now.rows.iter().find(|r| r.terminal == t);
+        let typed = row(pane)?.typed_by.clone()?;
+        let fresh = person_kind(&typed.kind)
+            && now_secs() - typed.at <= GRANT_FOR.as_secs() as i64
+            && state.grants_used.get(&pane) != Some(&typed.at);
+        if !(same_tab && fresh) {
+            return None;
+        }
+        let target = row(target)?.clone();
+        if ends {
+            state.grants_used.insert(pane, typed.at);
+        }
+        Some(PersonGrant { target, own: false })
+    }
+
+    /// A write from a plugin pane reads the daemon now: the person's key that grants it may be
+    /// newer than the last listing.
+    async fn fresh_for_grant(&self, params: &Value) -> Result<(), Refused> {
+        if params
+            .get(host::PEER)
+            .is_some_and(|p| p.get("entrypoint").is_some())
+        {
+            self.refresh_now().await?;
+        }
+        Ok(())
     }
 
     /// `pane.send_input` (and `pane run`): the text pasted, then the keys after it.
@@ -955,7 +1329,17 @@ impl Host {
             .cloned()
             .unwrap_or_default();
         let presses = typed(text, &keys)?;
-        send(terminal, text, true, presses).await?;
+        self.fresh_for_grant(params).await?;
+        let ends = text.contains(['\r', '\n'])
+            || presses.iter().any(|p| match p {
+                Press::Bytes(b) => b.contains(&b'\r'),
+                Press::Key(k) => *k == "enter",
+                Press::Nothing => false,
+            });
+        match self.grant(params, terminal, ends) {
+            Some(grant) => send_granted(terminal, text, true, presses, grant).await?,
+            None => send(terminal, text, true, presses).await?,
+        }
         Ok(json!({"type": "ok"}))
     }
 
@@ -1097,9 +1481,9 @@ impl Host {
         }
     }
 
-    /// `pane rename` and `agent rename` both name the terminal, and so does `tab rename` for a
-    /// tab's first pane: qoop has one name per terminal, which is the tab's label too, where
-    /// herdr keeps three.
+    /// `pane rename` gives a pane a label and `agent rename` an agent a name, kept by the host
+    /// (`Names`): neither renames the qoop terminal, whose name is its tab's, as herdr keeps a
+    /// tab label, a pane label and an agent name apart. Empty clears.
     async fn rename_pane(&self, method: &str, params: &Value) -> Result<Value, Refused> {
         let (key, label) = if method == "pane.rename" {
             ("pane_id", "label")
@@ -1108,13 +1492,19 @@ impl Host {
         };
         let terminal = self.target(params, key)?;
         let name = param(params, label).filter(|n| !n.is_empty());
-        control(ControlRequest::RenameTerminal {
-            id: crate::request_id("plugin-host"),
-            terminal,
-            name: name.map(str::to_string),
-        })
-        .await?;
-        self.state.lock().unwrap().renamed.insert(terminal);
+        {
+            let mut state = self.state.lock().unwrap();
+            let names = if method == "pane.rename" {
+                &mut state.names.panes
+            } else {
+                &mut state.names.agents
+            };
+            match name {
+                Some(name) => names.insert(terminal, name.to_string()),
+                None => names.remove(&terminal),
+            };
+            host::save_names(&self.home, &state.names);
+        }
         if method == "pane.rename" {
             let pane = self.after(|v| Self::pane_info(v, terminal)).await?;
             Ok(json!({"type": "pane_info", "pane": pane}))
@@ -1124,8 +1514,8 @@ impl Host {
         }
     }
 
-    /// Zoom is the interface's own in qoop: the host keeps what herdr answers, and `on` focuses
-    /// the pane for real.
+    /// `on` focuses the pane and zooms it in the interfaces; `off` unzooms the tab when the pane
+    /// is the one shown.
     async fn zoom(&self, params: &Value) -> Result<Value, Refused> {
         let terminal = self.target(params, "pane_id")?;
         let mode = param(params, "mode").unwrap_or("toggle");
@@ -1145,14 +1535,16 @@ impl Host {
             (was, now, now && state.focused != Some(terminal))
         };
         if now {
-            self.focus(terminal).await?;
+            self.focus_zoomed(terminal, Some(true)).await?;
+        } else if was && !focus_changed && self.state.lock().unwrap().focused == Some(terminal) {
+            self.focus_zoomed(terminal, Some(false)).await?;
         }
         let layout = self
             .after(|v| {
                 v.tabs
                     .iter()
                     .find(|t| t.leaves.contains(&terminal))
-                    .map(|t| translate::layout(t, host::AREA, v.focused, now))
+                    .map(|t| translate::layout(t, v.area, v.focused, now))
             })
             .await?
             .unwrap_or(Value::Null);
@@ -1175,6 +1567,188 @@ impl Host {
         }}))
     }
 
+    /// The tab a terminal sits in, from the latest listing.
+    fn tab_of(&self, terminal: u32) -> Option<translate::Tab> {
+        self.state
+            .lock()
+            .unwrap()
+            .now
+            .tabs
+            .iter()
+            .find(|t| t.leaves.contains(&terminal))
+            .cloned()
+    }
+
+    /// A tab's split tree set as asked, then its layout told as herdr tells a changed one.
+    async fn set_tree(&self, tree: Pane, terminal: u32) -> Result<(), Refused> {
+        control(ControlRequest::SetSplit {
+            id: crate::request_id("plugin-host"),
+            tree,
+        })
+        .await?;
+        self.refresh_now().await?;
+        let event = {
+            let state = self.state.lock().unwrap();
+            let tab = state.now.tabs.iter().find(|t| t.leaves.contains(&terminal));
+            tab.map(|t| state.layout_event(t))
+        };
+        if let Some(event) = event {
+            let _ = self.events.send(Arc::new(event));
+        }
+        Ok(())
+    }
+
+    /// The layout of the tab `terminal` is in, as a plugin reads it.
+    async fn layout_of(&self, terminal: u32) -> Result<Value, Refused> {
+        Ok(self
+            .after(|v| {
+                v.tabs
+                    .iter()
+                    .find(|t| t.leaves.contains(&terminal))
+                    .map(|t| translate::layout(t, v.area, v.focused, v.zoomed_tab(t)))
+            })
+            .await?
+            .unwrap_or(Value::Null))
+    }
+
+    /// `pane.resize`: herdr's split move on the tab's split tree, 5% when no amount is said.
+    async fn resize(&self, params: &Value) -> Result<Value, Refused> {
+        let terminal = self.target(params, "pane_id")?;
+        let direction = param(params, "direction").unwrap_or("left");
+        if !["left", "right", "up", "down"].contains(&direction) {
+            return Err((
+                "invalid_request",
+                format!("invalid pane direction: {direction}"),
+            ));
+        }
+        let amount = params
+            .get("amount")
+            .and_then(Value::as_f64)
+            .filter(|a| a.is_finite())
+            .unwrap_or(0.05)
+            .abs()
+            .min(0.5);
+        let tab = self
+            .tab_of(terminal)
+            .ok_or_else(|| not_found("pane", &terminal.to_string()))?;
+        let moved = tab
+            .tree
+            .as_ref()
+            .and_then(|tree| resized(tree, terminal, direction, amount));
+        let changed = moved.is_some();
+        if let Some(tree) = moved {
+            self.set_tree(tree, terminal).await?;
+        }
+        let layout = self.layout_of(terminal).await?;
+        Ok(
+            json!({"type": "pane_resize", "resize": translate::compact(json!({
+                "changed": changed, "reason": (!changed).then_some("unchanged"),
+                "pane_id": self.pane_id(terminal), "focused_pane_id": layout["focused_pane_id"].clone(),
+                "layout": layout,
+            }))}),
+        )
+    }
+
+    /// `pane.focus_direction`: the neighbour on that side of the pane (the focused one when none
+    /// is named) takes the focus, found in the tab's real layout as herdr finds it; with none
+    /// there, nothing changes and the answer says `no_neighbor`, as herdr's does.
+    async fn focus_direction(&self, params: &Value) -> Result<Value, Refused> {
+        let direction = param(params, "direction").ok_or((
+            "invalid_request",
+            "invalid request: missing field `direction`".to_string(),
+        ))?;
+        if !["left", "right", "up", "down"].contains(&direction) {
+            return Err((
+                "invalid_request",
+                format!("invalid request: unknown variant `{direction}`"),
+            ));
+        }
+        let source = self.target(params, "pane_id")?;
+        let layout = self.layout_of(source).await?;
+        let panes = layout["panes"].as_array().cloned().unwrap_or_default();
+        let target =
+            neighbour(&panes, &self.pane_id(source), direction).and_then(|id| terminal_of(&id));
+        if let Some(target) = target {
+            self.focus(target).await?;
+        }
+        let layout = self.layout_of(source).await?;
+        let mut focus = json!({
+            "changed": target.is_some(),
+            "source_pane_id": self.pane_id(source),
+            "focused_pane_id": layout["focused_pane_id"].clone(),
+            "layout": layout,
+        });
+        if target.is_none() {
+            focus["reason"] = json!("no_neighbor");
+        }
+        Ok(json!({"type": "pane_focus_direction", "focus": focus}))
+    }
+
+    /// `pane.swap`: two panes of one tab trade places, named or the neighbour in a direction;
+    /// the source keeps the focus, as in herdr.
+    async fn swap(&self, params: &Value) -> Result<Value, Refused> {
+        let direction = param(params, "direction");
+        let explicit =
+            param(params, "source_pane_id").is_some() || param(params, "target_pane_id").is_some();
+        if direction.is_some() == explicit {
+            return Err((
+                "invalid_pane_swap",
+                "provide either direction with optional pane_id, or source_pane_id and target_pane_id".into(),
+            ));
+        }
+        let (source, target, reason) = if let Some(direction) = direction {
+            let source = self.target(params, "pane_id")?;
+            let layout = self.layout_of(source).await?;
+            let panes = layout["panes"].as_array().cloned().unwrap_or_default();
+            let target =
+                neighbour(&panes, &self.pane_id(source), direction).and_then(|id| terminal_of(&id));
+            let reason = target.is_none().then_some("no_neighbor");
+            (source, target, reason)
+        } else {
+            let known = |key: &str| {
+                param(params, key)
+                    .and_then(terminal_of)
+                    .filter(|t| self.tab_of(*t).is_some())
+            };
+            let (source, target) = (known("source_pane_id"), known("target_pane_id"));
+            let reason = match (source, target) {
+                (None, _) | (_, None) => Some("not_found"),
+                (Some(a), Some(b)) if a == b => Some("same_pane"),
+                (Some(a), Some(b))
+                    if self.tab_of(a).map(|t| t.key) != self.tab_of(b).map(|t| t.key) =>
+                {
+                    Some("cross_tab")
+                }
+                _ => None,
+            };
+            let fallback = self.state.lock().unwrap().shown_focus().unwrap_or(0);
+            (source.unwrap_or(fallback), target, reason)
+        };
+        let mut changed = false;
+        if reason.is_none()
+            && let Some(target) = target
+            && let Some(tree) = self.tab_of(source).and_then(|t| t.tree)
+        {
+            self.set_tree(swapped(&tree, source, target), source)
+                .await?;
+            self.focus(source).await?;
+            changed = true;
+        }
+        let layout = self.layout_of(source).await?;
+        let shown = |id: Option<&str>, terminal: Option<u32>| {
+            id.map(str::to_string)
+                .or_else(|| terminal.map(|t| self.pane_id(t)))
+        };
+        Ok(
+            json!({"type": "pane_swap", "swap": translate::compact(json!({
+                "changed": changed, "reason": reason,
+                "source_pane_id": shown(param(params, "source_pane_id"), Some(source)),
+                "target_pane_id": shown(param(params, "target_pane_id"), target),
+                "focused_pane_id": layout["focused_pane_id"].clone(), "layout": layout,
+            }))}),
+        )
+    }
+
     async fn split(&self, params: &Value) -> Result<Value, Refused> {
         let target = self.target(params, "target_pane_id")?;
         self.same_space(params, target)?;
@@ -1183,11 +1757,13 @@ impl Host {
             .ok_or_else(|| not_found("pane", "target"))?;
         let cwd = param(params, "cwd").map(str::to_string);
         let new = self
-            .new_terminal(space, cwd, None, env_param(params)?)
+            .new_terminal(space, cwd, None, env_param(params)?, true)
             .await?;
         let direction = param(params, "direction").unwrap_or("right");
         let ratio = params.get("ratio").and_then(Value::as_f64);
-        self.beside(target, new, direction, ratio).await?;
+        let placed = self.beside(target, new, direction, ratio).await;
+        self.reveal(new);
+        placed?;
         if bool_param(params, "focus", false) {
             self.focus(new).await?;
         }
@@ -1203,7 +1779,7 @@ impl Host {
         let label = param(params, "label").map(str::to_string);
         let cwd = param(params, "cwd").map(str::to_string);
         let new = self
-            .new_terminal(space, cwd, label, env_param(params)?)
+            .new_terminal(space, cwd, label, env_param(params)?, false)
             .await?;
         if bool_param(params, "focus", false) {
             self.focus(new).await?;
@@ -1240,7 +1816,18 @@ impl Host {
 
     async fn close_tab(&self, params: &Value) -> Result<Value, Refused> {
         let leaves = self.tab_leaves(params, "tab_id")?;
-        self.close(&leaves).await?;
+        self.state
+            .lock()
+            .unwrap()
+            .closing_tab
+            .extend(leaves.iter().copied());
+        if let Err(e) = self.close(&leaves).await {
+            let mut state = self.state.lock().unwrap();
+            for t in &leaves {
+                state.closing_tab.remove(t);
+            }
+            return Err(e);
+        }
         Ok(json!({"type": "ok"}))
     }
 
@@ -1263,7 +1850,7 @@ impl Host {
             return Err(("failed", "unexpected answer to a new space".into()));
         };
         let new = self
-            .new_terminal(workspace, cwd, None, env_param(params)?)
+            .new_terminal(workspace, cwd, None, env_param(params)?, false)
             .await?;
         if bool_param(params, "focus", false) {
             self.focus(new).await?;
@@ -1556,13 +2143,12 @@ impl Host {
             .map(PathBuf::from)
             .unwrap_or_else(|| plugin.root.clone());
 
-        // Its context: the target pane's for a pane beside one, the space's for a tab.
+        // Its context: the target pane's for a pane beside one; for a tab, the space's focused
+        // pane's, as herdr builds a space's context, so its cwd is there.
         let scope = {
             let state = self.state.lock().unwrap();
-            match target {
-                Some(t) => host::scope(&state.now, space, Some(t)),
-                None => host::scope(&state.now, space, None),
-            }
+            let pane = target.or_else(|| state.space_pane(space));
+            host::scope(&state.now, space, pane)
         };
         let target_tab = target.and_then(|t| {
             let state = self.state.lock().unwrap();
@@ -1602,6 +2188,14 @@ impl Host {
         };
         let specs = self.specs.clone();
         let tab_placed = placement == "tab";
+        let is_popup = placement == "popup";
+        // One going beside a pane is made under the listing lock and hidden until it is placed,
+        // so its first moment as a tab of its own is never told.
+        let turn = if tab_placed {
+            None
+        } else {
+            Some(self.refreshing.lock().await)
+        };
         let made = tokio::task::spawn_blocking(move || {
             let mut opened = None;
             let result = crate::supervise::open_terminal(&opts, |terminal| {
@@ -1631,7 +2225,12 @@ impl Host {
                     workspace: space,
                     terminal,
                 };
-                env.push(("HERDR_PANE_ID".into(), pane.to_string()));
+                // A popup is no pane in herdr: it has no pane id of its own.
+                if is_popup {
+                    env.retain(|(name, _)| name != "HERDR_PANE_ID");
+                } else {
+                    env.push(("HERDR_PANE_ID".into(), pane.to_string()));
+                }
                 specs.put_at(
                     &nonce,
                     Spec {
@@ -1647,6 +2246,10 @@ impl Host {
         })
         .await
         .map_err(|e| ("failed", e.to_string()))?;
+        if let (Some(_), (_, Some(opened))) = (&turn, &made) {
+            self.state.lock().unwrap().hidden.insert(*opened);
+        }
+        drop(turn);
         let new = match made {
             (Ok(()), Some(terminal)) => terminal,
             (Err(e), opened) => {
@@ -1662,7 +2265,10 @@ impl Host {
         };
         if !tab_placed && let Some(target) = target {
             let direction = param(params, "direction").unwrap_or("right");
-            self.beside(target, new, direction, None).await?;
+            if let Err(e) = self.beside(target, new, direction, None).await {
+                self.reveal(new);
+                return Err(e);
+            }
         }
         if matches!(placement.as_str(), "zoomed" | "popup" | "overlay") {
             let mut state = self.state.lock().unwrap();
@@ -1678,12 +2284,23 @@ impl Host {
                 );
             }
         }
+        // Its title is its pane label, as herdr labels a plugin pane.
+        {
+            let mut state = self.state.lock().unwrap();
+            let title = entry.title.clone().unwrap_or_else(|| entry.id.clone());
+            state.names.panes.insert(new, title);
+            state.owners.insert(new, plugin_id.to_string());
+            host::save_names(&self.home, &state.names);
+        }
+        // Placed, and a popup known as one: what is told and read of it from here is right.
+        self.reveal(new);
         // An overlay or a zoomed pane always takes the focus, as in herdr; split and tab only
         // when asked; a popup is in front of everything as the interface shows it.
         let focus = matches!(placement.as_str(), "overlay" | "zoomed" | "popup")
             || bool_param(params, "focus", false);
         if focus {
-            self.focus(new).await?;
+            let zoom = matches!(placement.as_str(), "overlay" | "zoomed" | "popup");
+            self.focus_zoomed(new, zoom.then_some(true)).await?;
         }
         let pane = self.after(|v| Self::pane_info(v, new)).await?;
         if placement == "popup" {
@@ -1764,7 +2381,18 @@ pub(crate) fn pane_exec(nonce: &str) -> std::io::Result<()> {
     let cwd = spec["cwd"].as_str().unwrap_or("/");
     let scrub = spec["scrub"].as_bool().unwrap_or(true);
     let mut cmd = exec_command(program, &argv[1..], &env, cwd, scrub);
+    // The shell's prompt and the `pane-exec` line typed after it go: what starts here
+    // starts on a clean terminal, as herdr's does on a fresh one.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        let _ = clear_for_exec(&mut std::io::stdout());
+    }
     Err(cmd.exec())
+}
+
+/// Wipe the screen and its history and home the cursor.
+fn clear_for_exec(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    out.write_all(b"\x1b[H\x1b[2J\x1b[3J")?;
+    out.flush()
 }
 
 /// The command `pane-exec` becomes, in its directory with the spec's variables set. For a
@@ -1792,6 +2420,141 @@ pub(crate) fn exec_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_persons_key_in_a_plugin_pane_grants_one_write_burst_into_its_tab() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = install::Home::at(dir.path().join("d"), dir.path().join("c"));
+        let host = Host::new(home);
+        let row = |t: u32, extra: Value| -> qoop_runtime::control::AgentRow {
+            let mut fields = json!({"terminal": t, "workspace": 1, "state": "idle"});
+            if let (Some(f), Value::Object(e)) = (fields.as_object_mut(), extra) {
+                f.extend(e);
+            }
+            serde_json::from_value(fields).expect("row")
+        };
+        let space: qoop_runtime::control::WorkspaceRow =
+            serde_json::from_value(json!({"id": 1, "name": "a", "terminals": 3})).expect("space");
+        let leaf = |t| Box::new(Pane::Leaf { terminal: t });
+        let split = Pane::Split {
+            dir: SplitDir::V,
+            permille: 500,
+            questions: 0,
+            first: leaf(1),
+            second: leaf(2),
+        };
+        let typed =
+            |ago: i64, kind: &str| json!({"typed_by": {"kind": kind, "at": now_secs() - ago}});
+        let list = |pane_typed: Value| {
+            let mut state = host.state.lock().unwrap();
+            state.update(
+                vec![space.clone()],
+                vec![row(1, json!({})), row(2, pane_typed), row(3, json!({}))],
+                std::slice::from_ref(&split),
+            );
+        };
+        let peer = |pane: &str, plugin: &str, entry: Option<&str>| {
+            let mut p = json!({"pane": pane, "plugin": plugin});
+            if let Some(e) = entry {
+                p["entrypoint"] = json!(e);
+            }
+            json!({ host::PEER: p })
+        };
+        let from_pane = peer("w1:p2", "t.rev", Some("pane"));
+        list(typed(3, "computer"));
+        let grant = host
+            .grant(&from_pane, 1, false)
+            .expect("a key 3 s ago in its pane");
+        assert_eq!(grant.target.terminal, 1);
+        assert!(!grant.own, "terminal 1 is no pane of this plugin");
+        assert!(
+            host.grant(&from_pane, 3, false).is_none(),
+            "only into its own tab"
+        );
+        let from_hook = peer("w1:p2", "t.rev", None);
+        assert!(
+            host.grant(&from_hook, 1, false).is_none(),
+            "a hook or an action gets none"
+        );
+        let said = json!({"caller_pane_id": "w1:p2", "caller_plugin_id": "t.rev",
+                          "caller_entrypoint": "pane"});
+        assert!(
+            host.grant(&said, 1, false).is_none(),
+            "what a request says grants nothing"
+        );
+        // Text without Enter keeps it; the burst with the Enter uses it as it is granted, so
+        // a second burst at the same moment finds it gone.
+        assert!(
+            host.grant(&from_pane, 1, false).is_some(),
+            "the burst goes on"
+        );
+        assert!(host.grant(&from_pane, 1, true).is_some(), "the Enter");
+        assert!(host.grant(&from_pane, 1, true).is_none(), "used");
+        assert!(
+            host.grant(&from_pane, 1, false).is_none(),
+            "used for text too"
+        );
+        list(typed(20, "computer"));
+        assert!(
+            host.grant(&from_pane, 1, false).is_none(),
+            "a key 20 s ago is too old"
+        );
+        list(typed(1, "qoop-send"));
+        assert!(
+            host.grant(&from_pane, 1, false).is_none(),
+            "not a person's interface"
+        );
+
+        // A pane this plugin opened is its own while its program runs there (here this test
+        // binary, started with the plugin's variable); from a hook or an action too.
+        let running = |plugin: Option<&str>| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("exe"));
+            cmd.args([
+                "--ignored",
+                "--exact",
+                "plugin::host::tests::a_sleeper_to_read",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            if let Some(plugin) = plugin {
+                cmd.env("HERDR_PLUGIN_ID", plugin);
+            }
+            cmd.spawn().expect("sleep")
+        };
+        let mut program = running(Some("t.rev"));
+        let mut shell = running(None);
+        std::thread::sleep(Duration::from_millis(300));
+        let own_list = |pid: u32| {
+            let mut state = host.state.lock().unwrap();
+            state.update(
+                vec![space.clone()],
+                vec![
+                    row(1, json!({})),
+                    row(2, json!({"shell_pid": pid})),
+                    row(3, json!({})),
+                ],
+                std::slice::from_ref(&split),
+            );
+            state.owners.insert(2, "t.rev".into());
+        };
+        own_list(program.id());
+        let own = host.grant(&from_hook, 2, true).map(|g| g.own);
+        let other = host
+            .grant(&peer("w1:p3", "t.other", None), 2, false)
+            .is_none();
+        let to_shell = host.grant(&from_hook, 1, false).is_none();
+        // The host remembers the pane as the plugin's, but a shell runs there now.
+        own_list(shell.id());
+        let restarted = host.grant(&from_hook, 2, false).is_none();
+        for child in [&mut program, &mut shell] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(own, Some(true), "its own pane, Enter or not");
+        assert!(other, "another plugin's pane");
+        assert!(to_shell, "a shell pane: none");
+        assert!(restarted, "a pane no longer running the plugin's program");
+    }
 
     fn spec() -> Spec {
         Spec {
@@ -1828,6 +2591,97 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn resize_and_swap_change_the_split_tree_as_herdr_does() {
+        let leaf = |t| Box::new(Pane::Leaf { terminal: t });
+        // 1 | (2 over 3)
+        let tree = Pane::Split {
+            dir: SplitDir::V,
+            permille: 500,
+            questions: 0,
+            first: leaf(1),
+            second: Box::new(Pane::Split {
+                dir: SplitDir::H,
+                permille: 500,
+                questions: 0,
+                first: leaf(2),
+                second: leaf(3),
+            }),
+        };
+        let ratio = |t: &Pane, second: bool| match t {
+            Pane::Split {
+                permille,
+                first,
+                second: s,
+                ..
+            } => {
+                if second {
+                    match &**s {
+                        Pane::Split { permille, .. } => *permille,
+                        _ => 0,
+                    }
+                } else {
+                    let _ = first;
+                    *permille
+                }
+            }
+            _ => 0,
+        };
+        let right = resized(&tree, 1, "right", 0.05).expect("1 grows right");
+        assert_eq!(ratio(&right, false), 550);
+        let left = resized(&tree, 2, "left", 0.1).expect("2 grows left");
+        assert_eq!(
+            ratio(&left, false),
+            400,
+            "the split 2 is the second half of"
+        );
+        let down = resized(&tree, 2, "down", 0.05).expect("2 grows down");
+        assert_eq!(ratio(&down, true), 550, "the nearer split on the axis");
+        let up_from_top = resized(&tree, 2, "up", 0.05).expect("no split above 2: the other edge");
+        assert_eq!(ratio(&up_from_top, true), 450);
+        assert!(
+            resized(&tree, 1, "up", 0.05).is_none(),
+            "no split on that axis"
+        );
+        let far = resized(&tree, 1, "right", 0.5).expect("clamped");
+        assert_eq!(ratio(&far, false), 900);
+        assert!(
+            resized(&far, 1, "right", 0.05).is_none(),
+            "already at the bound"
+        );
+
+        let traded = swapped(&tree, 1, 3);
+        let mut leaves = traded.leaves();
+        assert_eq!(leaves, [3, 2, 1]);
+        leaves.sort();
+        assert_eq!(leaves, [1, 2, 3]);
+
+        let pane = |id: &str, x, y, w, h| json!({"pane_id": id, "rect": {"x": x, "y": y, "width": w, "height": h}});
+        let panes = [
+            pane("w1:p1", 0, 0, 47, 35),
+            pane("w1:p2", 47, 0, 47, 17),
+            pane("w1:p3", 47, 17, 47, 18),
+        ];
+        assert_eq!(
+            neighbour(&panes, "w1:p1", "right").as_deref(),
+            Some("w1:p3"),
+            "nearest edge, then most overlap"
+        );
+        assert_eq!(neighbour(&panes, "w1:p3", "up").as_deref(), Some("w1:p2"));
+        assert_eq!(neighbour(&panes, "w1:p3", "left").as_deref(), Some("w1:p1"));
+        assert_eq!(neighbour(&panes, "w1:p1", "left"), None);
+    }
+
+    #[test]
+    fn pane_exec_starts_on_a_clean_screen() {
+        let mut out = Vec::new();
+        clear_for_exec(&mut out).expect("written");
+        assert_eq!(
+            out, b"\x1b[H\x1b[2J\x1b[3J",
+            "home, wipe the screen and its history"
+        );
     }
 
     #[test]

@@ -1751,9 +1751,6 @@ fn skips_any() -> bool {
 /// write method. Same-user processes could already reach any terminal this
 /// way; this only gives that path a name plus an existence check.
 fn run_send(args: &[String]) -> std::io::Result<()> {
-    use qoop_runtime::control::{ControlRequest, ControlResponse};
-    use tokio::io::AsyncWriteExt;
-
     let help = "usage: qoop send <terminal> [--enter] [--paste] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--generation G]";
     let terminal: u32 = args
         .get(2)
@@ -1789,6 +1786,22 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         )));
     }
     supervise::check_generation(terminal, generation)?;
+    if !keys.is_empty() {
+        send_keys_to(terminal, &keys, None)?;
+        println!("sent to terminal {terminal}");
+        return Ok(());
+    }
+    let text = parts.join(" ");
+    if text.is_empty() {
+        return Err(usage(format!("refusing to send empty input; {help}")));
+    }
+    send_text_to(terminal, text, enter, paste, None)?;
+    println!("sent to terminal {terminal}");
+    Ok(())
+}
+
+/// qass's own tab takes nothing from a send, whoever sends.
+fn send_qass_guard(terminal: u32) -> std::io::Result<()> {
     qass_guard(&terminal.to_string())?;
     if let Some(reason) = into_qass_refusal(terminal, || {
         crate::qass::json(&["agents", "--json"])?
@@ -1800,20 +1813,39 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     }) {
         return Err(std::io::Error::other(reason));
     }
-    if !keys.is_empty() {
-        // A key lands in his draft as surely as text: held while he is at the tab too.
-        if let Some(reason) = person_refusal(person_until_now(terminal), terminal, unix_now()) {
-            return Err(std::io::Error::other(reason));
-        }
-        supervise::send_keys(terminal, &keys)?;
-        crate::qass::note_prompted(terminal);
-        println!("sent to terminal {terminal}");
-        return Ok(());
+    Ok(())
+}
+
+/// Named keys into `terminal`, as `qoop send --key` sends them; `grant` as for [`send_text_to`].
+pub(crate) fn send_keys_to(
+    terminal: u32,
+    keys: &[String],
+    grant: Option<&PersonGrant>,
+) -> std::io::Result<()> {
+    send_qass_guard(terminal)?;
+    // A key lands in his draft as surely as text: held while he is at the tab too.
+    if let Some(reason) = person_refusal(person_until_now(terminal), terminal, unix_now(), grant) {
+        return Err(std::io::Error::other(reason));
     }
-    let mut text = parts.join(" ");
-    if text.is_empty() {
-        return Err(usage(format!("refusing to send empty input; {help}")));
-    }
+    supervise::send_keys(terminal, keys)?;
+    crate::qass::note_prompted(terminal);
+    Ok(())
+}
+
+/// `text` into `terminal`, as `qoop send` types it: a paste with `paste`, Enter after it with
+/// `enter`. Refused while a person is at the tab ([`person_refusal`]), unless `grant` lets it
+/// through; only the plugin host passes one.
+pub(crate) fn send_text_to(
+    terminal: u32,
+    mut text: String,
+    enter: bool,
+    paste: bool,
+    grant: Option<&PersonGrant>,
+) -> std::io::Result<()> {
+    use qoop_runtime::control::{ControlRequest, ControlResponse};
+    use tokio::io::AsyncWriteExt;
+
+    send_qass_guard(terminal)?;
     let said = text.clone();
     if enter {
         text.push('\r');
@@ -1865,7 +1897,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         .ok()
         .flatten()
         .flatten();
-        if let Some(reason) = person_refusal(until, terminal, unix_now()) {
+        if let Some(reason) = person_refusal(until, terminal, unix_now(), grant) {
             return Err(std::io::Error::other(reason));
         }
         let mut term_seq = 0u32;
@@ -1903,7 +1935,6 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
         wr.flush().await?;
         crate::qass::note_prompted(terminal);
         paths::note_typed(terminal, &typed_by(), &said);
-        println!("sent to terminal {terminal}");
         Ok(())
     })
 }
@@ -2237,14 +2268,50 @@ fn prompt_refusal(row: &qoop_runtime::control::AgentRow) -> Option<String> {
     None
 }
 
+/// What lets one write through while a person is at the target: a person pressed a key in the
+/// writing plugin's own pane a moment ago (the plugin host decides, and only it makes one).
+/// It carries the target's row as the host last listed it.
+pub(crate) struct PersonGrant {
+    pub(crate) target: qoop_runtime::control::AgentRow,
+    /// The target is a pane the writing plugin opened, by the host's own record: it runs that
+    /// plugin's program, so no person window holds the write (a sidebar closing itself).
+    pub(crate) own: bool,
+}
+
 /// A person at the target tab, as the daemon saw their keys (`PersonAt`): refused, with the
 /// second it frees, so a caller can wait that long. `None` once it is past or nobody is there.
-fn person_refusal(until: Option<i64>, terminal: u32, now: i64) -> Option<String> {
+///
+/// With a `grant`, a line the person sent there (the 120 s window) no longer holds the write,
+/// but a draft they are typing (the 180 s window: the daemon's `until` is then their last key
+/// plus that) still does, and so do a trust prompt, a blocked agent and a sleeping tab. An
+/// `own` grant (the plugin's own pane) passes the person's windows, draft too, and nothing else.
+pub(crate) fn person_refusal(
+    until: Option<i64>,
+    terminal: u32,
+    now: i64,
+    grant: Option<&PersonGrant>,
+) -> Option<String> {
+    if let Some(grant) = grant
+        && let Some(reason) = prompt_refusal(&grant.target)
+    {
+        return Some(reason);
+    }
+    if grant.is_some_and(|g| g.own) {
+        return None;
+    }
     let until = until.filter(|u| *u > now)?;
-    Some(format!(
-        "a person is at terminal {terminal} until {until} (in {} s): nothing was sent",
-        until - now
-    ))
+    let draft = grant.is_none_or(|g| {
+        g.target
+            .typed_by
+            .as_ref()
+            .is_some_and(|t| t.at + qoop_runtime::agents::PERSON_DRAFT_SECS == until)
+    });
+    draft.then(|| {
+        format!(
+            "a person is at terminal {terminal} until {until} (in {} s): nothing was sent",
+            until - now
+        )
+    })
 }
 
 /// [`person_at`] on a connection of its own, for a caller with no runtime: `None` on any
@@ -2400,7 +2467,7 @@ fn run_prompt(args: &[String]) -> std::io::Result<()> {
         .ok()
         .flatten()
         .flatten();
-        if let Some(reason) = person_refusal(until, row.terminal, unix_now()) {
+        if let Some(reason) = person_refusal(until, row.terminal, unix_now(), None) {
             return Err(std::io::Error::other(reason));
         }
         let terminal = row.terminal;
@@ -3801,10 +3868,64 @@ mod tests {
     /// A person at the tab refuses a write until the second the daemon names, then it passes.
     #[test]
     fn a_person_at_the_tab_holds_a_write_back() {
-        assert_eq!(person_refusal(None, 4, 100), None);
-        assert_eq!(person_refusal(Some(100), 4, 100), None, "freed this second");
-        let why = person_refusal(Some(160), 4, 100).expect("refused");
+        assert_eq!(person_refusal(None, 4, 100, None), None);
+        assert_eq!(
+            person_refusal(Some(100), 4, 100, None),
+            None,
+            "freed this second"
+        );
+        let why = person_refusal(Some(160), 4, 100, None).expect("refused");
         assert!(why.contains("until 160 (in 60 s)"), "{why}");
+    }
+
+    /// A grant lets a write through a line the person sent, never through their draft, a
+    /// trust prompt, a blocked agent or a sleeping tab.
+    #[test]
+    fn a_grant_passes_a_sent_line_but_never_a_draft() {
+        use qoop_runtime::agents::{PERSON_DRAFT_SECS, PERSON_SENT_SECS};
+        let row = |extra: serde_json::Value| {
+            let mut fields = serde_json::json!({"terminal": 4, "workspace": 1, "state": "idle",
+                                                "readiness": "ready"});
+            if let (Some(f), serde_json::Value::Object(e)) = (fields.as_object_mut(), extra) {
+                f.extend(e);
+            }
+            serde_json::from_value::<qoop_runtime::control::AgentRow>(fields).expect("a row")
+        };
+        let grant = |extra| super::PersonGrant {
+            target: row(extra),
+            own: false,
+        };
+        // A line sent at 90, the last key with it: held until 90 + 120.
+        let sent = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 90}}));
+        let until = Some(90 + PERSON_SENT_SECS);
+        assert!(
+            person_refusal(until, 4, 100, None).is_some(),
+            "no grant: held"
+        );
+        assert_eq!(person_refusal(until, 4, 100, Some(&sent)), None, "granted");
+        // Keys after it, a draft: held until the last key plus 180, grant or not.
+        let draft = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 95}}));
+        let until = Some(95 + PERSON_DRAFT_SECS);
+        assert!(
+            person_refusal(until, 4, 100, Some(&draft)).is_some(),
+            "a draft holds"
+        );
+        let blocked = grant(serde_json::json!({"state": "blocked"}));
+        let why = person_refusal(None, 4, 100, Some(&blocked)).expect("blocked");
+        assert!(why.contains("blocked"), "{why}");
+        let asleep = grant(serde_json::json!({"state": "sleeping"}));
+        assert!(person_refusal(None, 4, 100, Some(&asleep)).is_some());
+        // The plugin's own pane: even a draft there does not hold it, a blocked one still does.
+        let mut own = grant(serde_json::json!({"typed_by": {"kind": "computer", "at": 95}}));
+        own.own = true;
+        assert_eq!(
+            person_refusal(until, 4, 100, Some(&own)),
+            None,
+            "its own pane"
+        );
+        let mut own_blocked = grant(serde_json::json!({"state": "blocked"}));
+        own_blocked.own = true;
+        assert!(person_refusal(None, 4, 100, Some(&own_blocked)).is_some());
     }
 
     #[test]

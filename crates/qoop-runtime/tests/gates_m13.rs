@@ -1635,3 +1635,105 @@ async fn spaces_keep_their_order_and_the_first_stays_the_daemons() {
         "{nowhere:?}"
     );
 }
+
+/// How many times the lane hears that `terminal`'s row changed in the next `patience`.
+async fn changes(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    inbuf: &mut bytes::BytesMut,
+    terminal: u32,
+    patience: Duration,
+) -> usize {
+    use qoop_runtime::client::Incoming;
+    use qoop_runtime::control::EventMessage;
+    use tokio::io::AsyncReadExt;
+    let mut connection = qoop_runtime::client::Connection::new();
+    let deadline = Instant::now() + patience;
+    let mut read = vec![0u8; 64 * 1024];
+    let mut heard = 0;
+    loop {
+        for incoming in connection.drain(inbuf).expect("decode") {
+            if matches!(incoming, Incoming::Event(EventMessage::AgentChanged { terminal: t }) if t == terminal)
+            {
+                heard += 1;
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, rd.read(&mut read)).await {
+            Ok(Ok(n)) if n > 0 => inbuf.extend_from_slice(&read[..n]),
+            _ => return heard,
+        }
+    }
+}
+
+/// A split recorded by one client is news to every other: interfaces draw tabs from the
+/// index, and a swap or a resize from the plugin host was invisible until an attach again. A
+/// burst of them (a divider dragged) is one piece of news, not one per step.
+#[tokio::test]
+async fn a_split_recorded_by_one_client_is_news_to_the_others() {
+    use qoop_runtime::control::{ControlResponse, Pane, SplitDir};
+
+    let d = qoop_testkit::TestDaemon::start().await;
+    let first = d.terminals().streams()[0];
+    let mut client = d.attach("host").await;
+    let second = match client
+        .control(
+            &ControlRequest::CreateTerminal {
+                id: "t2".into(),
+                cwd: None,
+                workspace: None,
+                name: None,
+            },
+            qoop_testkit::PATIENCE,
+        )
+        .await
+    {
+        Some(ControlResponse::TerminalCreated { terminal, .. }) => terminal,
+        other => panic!("expected a terminal, got {other:?}"),
+    };
+    let (other, mut inbuf) = qoop_runtime::client::connect(d.socket(), "qoop-watch")
+        .await
+        .expect("connect");
+    let (mut rd, _wr) = other.into_split();
+    // What the new terminal announced is heard and done with first.
+    let quiet = Duration::from_secs(1);
+    while changes(&mut rd, &mut inbuf, first, quiet).await
+        + changes(&mut rd, &mut inbuf, second, quiet).await
+        > 0
+    {}
+    let at = |a: u32, b: u32, permille: u16| Pane::Split {
+        dir: SplitDir::V,
+        permille,
+        questions: 0,
+        first: Box::new(leaf(a)),
+        second: Box::new(leaf(b)),
+    };
+    let mut record = async |id: &str, tree: Pane| {
+        let saved = client
+            .control(
+                &ControlRequest::SetSplit {
+                    id: id.into(),
+                    tree,
+                },
+                qoop_testkit::PATIENCE,
+            )
+            .await;
+        assert!(
+            matches!(saved, Some(ControlResponse::SplitSaved { .. })),
+            "{saved:?}"
+        );
+    };
+    // A split, then a divider dragged through five steps.
+    for (step, permille) in [500, 450, 400, 350, 300, 250].into_iter().enumerate() {
+        record(&format!("drag-{step}"), at(first, second, permille)).await;
+    }
+    let heard = changes(&mut rd, &mut inbuf, first, Duration::from_millis(2500)).await;
+    assert!(
+        (1..=2).contains(&heard),
+        "the other client heard the drag {heard} times"
+    );
+    record("swap", at(second, first, 500)).await;
+    assert!(
+        changes(&mut rd, &mut inbuf, second, Duration::from_millis(2500)).await >= 1,
+        "the swap: the other client heard nothing"
+    );
+}

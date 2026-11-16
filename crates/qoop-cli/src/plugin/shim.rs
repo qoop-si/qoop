@@ -79,6 +79,7 @@ const VALUED: &[&str] = &[
     "--direction",
     "--amount",
     "--target-pane",
+    "--source-pane",
     "--cwd",
     "--label",
     "--env",
@@ -370,8 +371,30 @@ fn parse(args: &[String], caller: Option<&str>, socket: &Path) -> Result<Call, S
         }
         ["pane", "resize", ..] => {
             let w = rest(2);
-            let params = json!({"direction": w.value("--direction").unwrap_or("right")});
-            Call::Ask("pane.resize", with(params, "pane_id", w.value("--pane")))
+            let mut params = json!({"direction": w.value("--direction").unwrap_or("left")});
+            if let Some(amount) = w.value("--amount") {
+                let amount: f64 = amount
+                    .parse()
+                    .map_err(|_| format!("invalid value '{amount}' for '--amount'"))?;
+                params["amount"] = json!(amount);
+            }
+            let pane = w.value("--pane").or(w.plain.first().copied());
+            Call::Ask("pane.resize", with(params, "pane_id", pane))
+        }
+        // `pane swap [--pane P] --direction D`, or `--source-pane S --target-pane T`.
+        ["pane", "swap", ..] => {
+            let w = rest(2);
+            let params = with(json!({}), "direction", w.value("--direction"));
+            let params = with(
+                params,
+                "pane_id",
+                w.value("--pane").or(w.plain.first().copied()),
+            );
+            let params = with(params, "source_pane_id", w.value("--source-pane"));
+            Call::Ask(
+                "pane.swap",
+                with(params, "target_pane_id", w.value("--target-pane")),
+            )
         }
         ["pane", "report-metadata", ..] => {
             let w = rest(2);

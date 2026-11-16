@@ -14,6 +14,9 @@ const PATIENCE: Duration = Duration::from_secs(2);
 const FOCUS_SOON: Duration = Duration::from_millis(300);
 const FOCUS_LATER: Duration = Duration::from_secs(2);
 const FOCUS_MOST: Duration = Duration::from_secs(30);
+/// A focus that stands is told again this often: a host started after [`FOCUS_MOST`] learns
+/// it, at one question per interval to a host that is there and none to one that is not.
+const FOCUS_AGAIN: Duration = Duration::from_secs(10);
 
 /// Why the host gave no answer, or the answer it gave instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,19 +179,29 @@ pub fn ran_notice(named: &str, ran: &Result<(), Failed>) -> String {
     }
 }
 
-/// The terminal to tell the host about now, if any: one that changed since `last`, is not
-/// zero and belongs to this machine's daemon (a remote one is numbered by the interface,
+/// What the host is told: the terminal shown, the cells the interface lays a tab out in, and
+/// how many rows back from the bottom the person scrolled it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shown {
+    pub terminal: u32,
+    pub cols: u16,
+    pub rows: u16,
+    pub back: u64,
+}
+
+/// What to tell the host about now, if anything: a change since `last`, of a terminal that is
+/// not zero and belongs to this machine's daemon (a remote one is numbered by the interface,
 /// not by any daemon the host follows).
-pub fn focus_to_report(focused: u32, last: &mut u32) -> Option<u32> {
-    if focused == 0
-        || focused == *last
-        || crate::mux::is_remote_terminal(focused)
+pub fn focus_to_report(shown: Shown, last: &mut Shown) -> Option<Shown> {
+    if shown.terminal == 0
+        || shown == *last
+        || crate::mux::is_remote_terminal(shown.terminal)
         || !crate::mux::has_local()
     {
         return None;
     }
-    *last = focused;
-    Some(focused)
+    *last = shown;
+    Some(shown)
 }
 
 /// How long to wait before telling the host again, after `waited` in all; `None` once
@@ -202,57 +215,83 @@ fn focus_pause(waited: Duration) -> Option<Duration> {
     (waited + pause <= FOCUS_MOST).then_some(pause)
 }
 
+/// Tell `tell` each value `rx` takes, the newest winning. A new value not taken is told again
+/// on [`focus_pause`]; a value that stands, taken or given up on, is told again every
+/// [`FOCUS_AGAIN`] (once each time, as a keepalive: `tell`'s second argument), so a host
+/// started later still learns it.
+async fn report_focus<F, Fut>(mut rx: tokio::sync::watch::Receiver<Shown>, tell: F)
+where
+    F: Fn(Shown, bool) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if rx.changed().await.is_err() {
+        return;
+    }
+    let mut again = false;
+    loop {
+        let shown = *rx.borrow_and_update();
+        let mut waited = Duration::ZERO;
+        let newer = loop {
+            if tell(shown, again).await || again {
+                break false;
+            }
+            let Some(pause) = focus_pause(waited) else {
+                break false;
+            };
+            waited += pause;
+            tokio::select! {
+                _ = tokio::time::sleep(pause) => {}
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break true;
+                }
+            }
+        };
+        again = !newer
+            && tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    false
+                }
+                _ = tokio::time::sleep(FOCUS_AGAIN) => true,
+            };
+    }
+}
+
 /// Tells the host which terminal is on screen, off the render path: the newest value
 /// wins and an older one still on its way is skipped.
 pub struct FocusReport {
-    tx: tokio::sync::watch::Sender<u32>,
+    tx: tokio::sync::watch::Sender<Shown>,
 }
 
 impl FocusReport {
     /// Start the sender. Inside the interface's runtime.
     pub fn start() -> Self {
-        let (tx, mut rx) = tokio::sync::watch::channel(0u32);
-        tokio::spawn(async move {
-            if rx.changed().await.is_err() {
-                return;
+        let (tx, rx) = tokio::sync::watch::channel(Shown::default());
+        tokio::spawn(report_focus(rx, |shown, again| async move {
+            // No socket is no host: nothing to ask, and the host is never started from here.
+            if !qoop_runtime::paths::plugin_host_socket().exists() {
+                return false;
             }
-            loop {
-                let terminal = *rx.borrow_and_update();
-                // A host not listening yet, restarting, or not listing a new terminal yet is
-                // asked again on `focus_pause`; a newer value ends the wait at once.
-                let mut waited = Duration::ZERO;
-                let newer = loop {
-                    let told = tokio::task::spawn_blocking(move || {
-                        ask("qoop.focus", json!({"terminal": terminal}))
-                    })
-                    .await;
-                    if matches!(told, Ok(Ok(_))) {
-                        break false;
-                    }
-                    let Some(pause) = focus_pause(waited) else {
-                        break false;
-                    };
-                    waited += pause;
-                    tokio::select! {
-                        _ = tokio::time::sleep(pause) => {}
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            break true;
-                        }
-                    }
-                };
-                if !newer && rx.changed().await.is_err() {
-                    return;
-                }
-            }
-        });
+            let told = tokio::task::spawn_blocking(move || {
+                ask(
+                    "qoop.focus",
+                    json!({"terminal": shown.terminal, "cols": shown.cols, "rows": shown.rows,
+                           "back": shown.back, "keepalive": again}),
+                )
+            })
+            .await;
+            matches!(told, Ok(Ok(_)))
+        }));
         Self { tx }
     }
 
-    pub fn send(&self, terminal: u32) {
-        let _ = self.tx.send(terminal);
+    pub fn send(&self, shown: Shown) {
+        let _ = self.tx.send(shown);
     }
 }
 
@@ -282,18 +321,96 @@ mod tests {
 
     #[test]
     fn focus_is_reported_once_per_change_and_never_for_zero_or_a_remote() {
-        let mut last = 0;
-        assert_eq!(focus_to_report(0, &mut last), None);
-        assert_eq!(focus_to_report(3, &mut last), Some(3));
-        assert_eq!(focus_to_report(3, &mut last), None, "once per change");
-        let remote = crate::mux::REMOTE_TERMINAL | 2 << 24 | 3;
-        assert_eq!(focus_to_report(remote, &mut last), None);
-        assert_eq!(last, 3, "a remote leaves the last report standing");
-        assert_eq!(focus_to_report(5, &mut last), Some(5));
+        let at = |terminal: u32, cols: u16| Shown {
+            terminal,
+            cols,
+            rows: 35,
+            back: 0,
+        };
+        let mut last = Shown::default();
+        assert_eq!(focus_to_report(at(0, 94), &mut last), None);
+        assert_eq!(focus_to_report(at(3, 94), &mut last), Some(at(3, 94)));
         assert_eq!(
-            focus_to_report(3, &mut last),
-            Some(3),
+            focus_to_report(at(3, 94), &mut last),
+            None,
+            "once per change"
+        );
+        assert_eq!(
+            focus_to_report(at(3, 80), &mut last),
+            Some(at(3, 80)),
+            "a resize is told too"
+        );
+        let scrolled = Shown {
+            back: 12,
+            ..at(3, 80)
+        };
+        assert_eq!(
+            focus_to_report(scrolled, &mut last),
+            Some(scrolled),
+            "a scroll back is told too"
+        );
+        assert_eq!(focus_to_report(at(3, 80), &mut last), Some(at(3, 80)));
+        let remote = crate::mux::REMOTE_TERMINAL | 2 << 24 | 3;
+        assert_eq!(focus_to_report(at(remote, 80), &mut last), None);
+        assert_eq!(last, at(3, 80), "a remote leaves the last report standing");
+        assert_eq!(focus_to_report(at(5, 80), &mut last), Some(at(5, 80)));
+        assert_eq!(
+            focus_to_report(at(3, 80), &mut last),
+            Some(at(3, 80)),
             "back again is a change"
+        );
+    }
+
+    /// A host that starts after the retries ran out still learns what is on screen: a focus
+    /// that stands is told again every ten seconds, once each time, and a new one at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_standing_focus_is_told_again_so_a_late_host_learns_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        // What was told, whether the host was there, and whether it was a keepalive.
+        type Told = Arc<Mutex<Vec<(Shown, bool, bool)>>>;
+        let told: Told = Arc::default();
+        let up = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::watch::channel(Shown::default());
+        let (log, host) = (told.clone(), up.clone());
+        tokio::spawn(report_focus(rx, move |shown, again| {
+            let up = host.load(Ordering::SeqCst);
+            log.lock().unwrap().push((shown, up, again));
+            async move { up }
+        }));
+        let at = |terminal| Shown {
+            terminal,
+            cols: 94,
+            rows: 35,
+            back: 0,
+        };
+        let taken = |told: &Told| told.lock().unwrap().iter().filter(|(_, up, _)| *up).count();
+        tx.send(at(3)).unwrap();
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let down = told.lock().unwrap().len();
+        assert!(
+            (16..=18).contains(&down),
+            "retries, then one ask a pause: {down}"
+        );
+        up.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(taken(&told), 1, "the late host learned it");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            taken(&told),
+            4,
+            "told again every ten seconds, once each time"
+        );
+        assert!(
+            told.lock().unwrap().iter().filter(|t| t.1).all(|t| t.2),
+            "each a keepalive, which moves no focus a host already knows"
+        );
+        tx.send(at(5)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            told.lock().unwrap().last(),
+            Some(&(at(5), true, false)),
+            "a change at once"
         );
     }
 

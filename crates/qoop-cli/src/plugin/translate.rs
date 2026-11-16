@@ -9,7 +9,7 @@
 //! host gave the tab: its first leaf when the host first saw it. A pane is found by T alone,
 //! so a plugin holding an id from before a move still reaches the terminal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use qoop_runtime::control::{AgentRow, Pane, SplitDir, TerminalStream, WorkspaceRow};
@@ -210,6 +210,8 @@ pub(crate) const METHODS: &[&str] = &[
     "pane.process_info",
     "pane.rename",
     "pane.zoom",
+    "pane.swap",
+    "pane.focus_direction",
     "pane.resize",
     "pane.report_metadata",
     "tab.list",
@@ -325,12 +327,26 @@ pub(crate) fn tabs(rows: &[AgentRow], splits: &[Pane]) -> Vec<Tab> {
     out
 }
 
-/// What a person sees on the tab: the name they gave its first terminal, else its program.
-fn tab_label(tab: &Tab, rows: &[AgentRow]) -> String {
+/// A tab's own name: the qoop name of its first terminal, the one `tab.rename` sets.
+pub(crate) fn tab_name(tab: &Tab, rows: &[AgentRow]) -> Option<String> {
     rows.iter()
         .find(|row| row.terminal == tab.leaves[0])
-        .and_then(|row| row.name.clone().or_else(|| row.program.clone()))
-        .unwrap_or_default()
+        .and_then(|row| row.name.clone())
+}
+
+/// A tab's label as herdr gives it: its name, else its number in its space.
+pub(crate) fn tab_label(tab: &Tab, rows: &[AgentRow], number: usize) -> String {
+    tab_name(tab, rows).unwrap_or_else(|| number.to_string())
+}
+
+/// Pane labels and agent names a plugin gave, by terminal: kept by the host apart from the
+/// qoop name, which is the tab's, as herdr keeps the three apart.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Names {
+    #[serde(default)]
+    pub(crate) panes: BTreeMap<TerminalStream, String>,
+    #[serde(default)]
+    pub(crate) agents: BTreeMap<TerminalStream, String>,
 }
 
 /// The agent a row runs, only when the daemon calls it one: its program's name, else what
@@ -378,7 +394,6 @@ pub(crate) fn pane_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64)
         "workspace_id": workspace_id(row.workspace),
         "tab_id": tab.id(),
         "focused": focused,
-        "label": row.name,
         "cwd": row.cwd,
         "foreground_cwd": row.cwd,
         "agent": agent,
@@ -403,7 +418,6 @@ pub(crate) fn agent_info(row: &AgentRow, tab: &Tab, focused: bool, revision: u64
         "workspace_id": workspace_id(row.workspace),
         "tab_id": tab.id(),
         "focused": focused,
-        "name": row.name,
         "agent": agent,
         "display_agent": agent,
         "agent_status": agent_status(row),
@@ -425,7 +439,7 @@ pub(crate) fn tab_info(tab: &Tab, number: usize, rows: &[AgentRow], focused: boo
         "tab_id": tab.id(),
         "workspace_id": workspace_id(tab.workspace),
         "number": number,
-        "label": tab_label(tab, rows),
+        "label": tab_label(tab, rows, number),
         "focused": focused,
         "pane_count": tab.leaves.len(),
         "agent_status": summary(rows.iter().filter(|row| tab.leaves.contains(&row.terminal))),
@@ -452,13 +466,30 @@ pub(crate) fn workspace_info(
     json!({
         "workspace_id": workspace_id(space.id),
         "number": number,
-        "label": space.name,
+        "label": space_label(space, rows),
         "focused": focused,
         "pane_count": own.iter().map(|t| t.leaves.len()).sum::<usize>(),
         "tab_count": own.len(),
         "active_tab_id": active.unwrap_or_default(),
         "agent_status": summary(rows.iter().filter(|row| row.workspace == space.id)),
     })
+}
+
+/// A space's label: its name, except qoop's default space while still called `default`,
+/// which herdr would label by its folder: the space's own folder, else its first pane's.
+pub(crate) fn space_label(space: &WorkspaceRow, rows: &[AgentRow]) -> String {
+    if space.closable || space.name != "default" {
+        return space.name.clone();
+    }
+    let folder = space.dir.clone().or_else(|| {
+        rows.iter()
+            .find(|r| r.workspace == space.id)
+            .and_then(|r| r.cwd.clone())
+    });
+    folder
+        .as_deref()
+        .and_then(|d| std::path::Path::new(d).file_name())
+        .map_or_else(|| space.name.clone(), |n| n.to_string_lossy().into_owned())
 }
 
 /// A cell rectangle, as herdr's layouts give one.
@@ -521,6 +552,10 @@ pub(crate) fn layout(
     focused: Option<TerminalStream>,
     zoomed: bool,
 ) -> Value {
+    // Each tab has a focused pane of its own, as in herdr: the one shown, else its first.
+    let focused_pane = focused
+        .filter(|t| tab.leaves.contains(t))
+        .unwrap_or(tab.leaves[0]);
     let mut panes = Vec::new();
     let mut splits = Vec::new();
     match &tab.tree {
@@ -528,16 +563,13 @@ pub(crate) fn layout(
             tab.workspace,
             tree,
             area,
-            "r".into(),
-            focused,
+            String::new(),
+            Some(focused_pane),
             &mut panes,
             &mut splits,
         ),
-        None => panes.push(leaf(tab.workspace, tab.leaves[0], area, focused)),
+        None => panes.push(leaf(tab.workspace, tab.leaves[0], area, Some(focused_pane))),
     }
-    let focused_pane = focused
-        .filter(|t| tab.leaves.contains(t))
-        .unwrap_or(tab.leaves[0]);
     json!({
         "workspace_id": workspace_id(tab.workspace),
         "tab_id": tab.id(),
@@ -585,8 +617,15 @@ fn place(
                 SplitDir::V => "right",
                 SplitDir::H => "down",
             };
+            // herdr's id: the split's place in this walk, then its path from the root (0 for a
+            // first child, 1 for a second), `root` for the root.
+            let id = if path.is_empty() {
+                format!("split_{}_root", splits.len())
+            } else {
+                format!("split_{}_{path}", splits.len())
+            };
             splits.push(json!({
-                "id": path,
+                "id": id,
                 "direction": direction,
                 "ratio": f64::from(*permille) / 1000.0,
                 "rect": rect.json(),
@@ -627,11 +666,20 @@ pub(crate) fn process_info(row: &AgentRow, foreground: &[Process]) -> Value {
     let processes: Vec<Value> = foreground
         .iter()
         .map(|p| {
+            // As herdr gives them: the program's name, not its path (a login shell's `-zsh`
+            // is `zsh`), and the line as one string.
+            let argv0 = p.argv.first().map(|a| {
+                let a = a.strip_prefix('-').unwrap_or(a);
+                std::path::Path::new(a)
+                    .file_name()
+                    .map_or_else(|| a.to_string(), |n| n.to_string_lossy().into_owned())
+            });
             json!({
                 "pid": p.pid,
                 "name": p.name,
-                "argv0": p.argv.first(),
+                "argv0": argv0,
                 "argv": p.argv,
+                "cmdline": (!p.argv.is_empty()).then(|| p.argv.join(" ")),
                 "cwd": p.cwd,
             })
         })
@@ -653,6 +701,24 @@ pub(crate) struct View<'a> {
     pub(crate) focused: Option<TerminalStream>,
     pub(crate) revisions: &'a BTreeMap<TerminalStream, u64>,
     pub(crate) tokens: Tokens,
+    /// Where the interface lays tabs out, as it said (`qoop.focus`), else a nominal area.
+    pub(crate) area: Rect,
+    /// The panes zoomed in their tabs.
+    pub(crate) zoomed: BTreeSet<TerminalStream>,
+    /// How many times each pane's agent status changed, as herdr's `state_change_seq`.
+    pub(crate) seqs: BTreeMap<TerminalStream, u64>,
+    /// Pane labels and agent names plugins gave.
+    pub(crate) names: Names,
+    /// How far each pane can scroll back and is scrolled back.
+    pub(crate) scrolls: Scrolls,
+}
+
+/// herdr's `scroll` for each pane: the rows kept behind its screen, and the one pane the
+/// interface shows scrolled back (qoop scrolls only the pane in front of a person).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Scrolls {
+    pub(crate) history: BTreeMap<TerminalStream, u64>,
+    pub(crate) back: Option<(TerminalStream, u64)>,
 }
 
 /// Metadata tokens alive now, by terminal and by space, as `tokens` in the infos.
@@ -669,6 +735,11 @@ impl View<'_> {
 
     fn revision(&self, terminal: TerminalStream) -> u64 {
         self.revisions.get(&terminal).copied().unwrap_or(0)
+    }
+
+    /// Whether a pane of `tab` is zoomed.
+    pub(crate) fn zoomed_tab(&self, tab: &Tab) -> bool {
+        tab.leaves.iter().any(|t| self.zoomed.contains(t))
     }
 
     fn focused_tab(&self) -> Option<&Tab> {
@@ -688,9 +759,37 @@ impl View<'_> {
                     self.revision(row.terminal),
                 );
                 super::tokens::put(&mut info, self.tokens.panes.get(&row.terminal));
+                info["scroll"] = self.scroll(tab, row.terminal);
+                if let Some(label) = self.names.panes.get(&row.terminal) {
+                    info["label"] = json!(label);
+                }
                 Some(info)
             })
             .collect()
+    }
+
+    /// herdr's `scroll` for a pane: qoop's terminals stay at their bottom (the interface reads
+    /// what went past from the history on disk, never by scrolling the terminal), so none is
+    /// scrolled and none can be; the rows are the pane's in its tab's layout.
+    fn scroll(&self, tab: &Tab, terminal: TerminalStream) -> Value {
+        let laid = layout(tab, self.area, self.focused, self.zoomed_tab(tab));
+        let rows = laid["panes"]
+            .as_array()
+            .and_then(|panes| {
+                let id = Id::Pane {
+                    workspace: tab.workspace,
+                    terminal,
+                }
+                .to_string();
+                panes.iter().find(|p| p["pane_id"] == id.as_str())
+            })
+            .and_then(|p| p["rect"]["height"].as_u64())
+            .unwrap_or(0);
+        let most = self.scrolls.history.get(&terminal).copied().unwrap_or(0);
+        let back = (self.scrolls.back)
+            .filter(|(t, _)| *t == terminal)
+            .map_or(0, |(_, rows)| rows.min(most));
+        json!({"offset_from_bottom": back, "max_offset_from_bottom": most, "viewport_rows": rows})
     }
 
     /// Every tab, numbered within its space.
@@ -742,6 +841,11 @@ impl View<'_> {
                     self.revision(row.terminal),
                 );
                 super::tokens::put(&mut info, self.tokens.panes.get(&row.terminal));
+                info["state_change_seq"] =
+                    json!(self.seqs.get(&row.terminal).copied().unwrap_or(0));
+                if let Some(name) = self.names.agents.get(&row.terminal) {
+                    info["name"] = json!(name);
+                }
                 Some(info)
             })
             .collect()
@@ -753,7 +857,7 @@ impl View<'_> {
         let layouts: Vec<Value> = self
             .tabs
             .iter()
-            .map(|tab| layout(tab, area, self.focused, false))
+            .map(|tab| layout(tab, area, self.focused, self.zoomed_tab(tab)))
             .collect();
         let focused_pane = self.focused.zip(focused_tab).map(|(terminal, tab)| {
             Id::Pane {
@@ -803,6 +907,36 @@ mod tests {
             first: Box::new(Pane::Leaf { terminal: first }),
             second: Box::new(Pane::Leaf { terminal: second }),
         }
+    }
+
+    #[test]
+    fn the_default_space_is_labelled_by_its_folder() {
+        let rows = [row(1, 1, json!({"cwd": "/src/repo"}))];
+        // qoop's default space: not closable, still called `default`.
+        let default = space(1, "default");
+        assert_eq!(
+            space_label(&default, &rows),
+            "repo",
+            "its first pane's folder"
+        );
+        let mut with_dir = space(1, "default");
+        with_dir.dir = Some("/work/api".into());
+        assert_eq!(space_label(&with_dir, &rows), "api", "its own folder first");
+        let named: WorkspaceRow = serde_json::from_value(
+            json!({"id": 2, "name": "default", "terminals": 0, "closable": true}),
+        )
+        .expect("a space");
+        assert_eq!(
+            space_label(&named, &rows),
+            "default",
+            "a space a person called default"
+        );
+        assert_eq!(space_label(&space(1, "api"), &rows), "api");
+        assert_eq!(
+            space_label(&space(1, "default"), &[]),
+            "default",
+            "no folder known"
+        );
     }
 
     #[test]
@@ -1040,7 +1174,7 @@ mod tests {
             pane_info(&claude, &tab, true, 12),
             json!({
                 "pane_id": "w2:p7", "terminal_id": "7", "workspace_id": "w2", "tab_id": "w2:t7",
-                "focused": true, "label": "api", "cwd": "/src/api", "foreground_cwd": "/src/api",
+                "focused": true, "cwd": "/src/api", "foreground_cwd": "/src/api",
                 "agent": "claude", "display_agent": "claude", "agent_status": "working",
                 "agent_session": {"source": "qoop", "agent": "claude", "kind": "id", "value": "s-1"},
                 "title": "Fix login", "terminal_title": "Fix login",
@@ -1051,7 +1185,7 @@ mod tests {
             agent_info(&claude, &tab, false, 12),
             json!({
                 "terminal_id": "7", "pane_id": "w2:p7", "workspace_id": "w2", "tab_id": "w2:t7",
-                "focused": false, "name": "api", "agent": "claude", "display_agent": "claude",
+                "focused": false, "agent": "claude", "display_agent": "claude",
                 "agent_status": "working",
                 "agent_session": {"source": "qoop", "agent": "claude", "kind": "id", "value": "s-1"},
                 "cwd": "/src/api", "foreground_cwd": "/src/api", "title": "Fix login",
@@ -1073,7 +1207,7 @@ mod tests {
         let fg = [Process {
             pid: 900,
             name: "node".into(),
-            argv: vec!["node".into(), "server.js".into()],
+            argv: vec!["/usr/local/bin/node".into(), "server.js".into()],
             cwd: Some("/src".into()),
         }];
         assert_eq!(
@@ -1081,9 +1215,22 @@ mod tests {
             json!({
                 "pane_id": "w2:p7", "shell_pid": 880, "foreground_process_group_id": 900,
                 "foreground_processes": [
-                    {"pid": 900, "name": "node", "argv0": "node", "argv": ["node", "server.js"], "cwd": "/src"},
+                    {"pid": 900, "name": "node", "argv0": "node",
+                     "argv": ["/usr/local/bin/node", "server.js"],
+                     "cmdline": "/usr/local/bin/node server.js", "cwd": "/src"},
                 ],
             })
+        );
+        let login = [Process {
+            pid: 880,
+            name: "zsh".into(),
+            argv: vec!["-zsh".into()],
+            cwd: None,
+        }];
+        assert_eq!(
+            process_info(&r, &login)["foreground_processes"][0]["argv0"],
+            "zsh",
+            "a login shell's dash is not its name"
         );
         let gone = process_info(&row(7, 2, json!({})), &[]);
         assert_eq!(gone["shell_pid"], Value::Null);
@@ -1119,8 +1266,8 @@ mod tests {
                     {"pane_id": "w1:p9", "focused": false, "rect": {"x": 50, "y": 10, "width": 50, "height": 30}},
                 ],
                 "splits": [
-                    {"id": "r", "direction": "down", "ratio": 0.25, "rect": {"x": 0, "y": 0, "width": 100, "height": 40}},
-                    {"id": "r1", "direction": "right", "ratio": 0.5, "rect": {"x": 0, "y": 10, "width": 100, "height": 30}},
+                    {"id": "split_0_root", "direction": "down", "ratio": 0.25, "rect": {"x": 0, "y": 0, "width": 100, "height": 40}},
+                    {"id": "split_1_1", "direction": "right", "ratio": 0.5, "rect": {"x": 0, "y": 10, "width": 100, "height": 30}},
                 ],
             })
         );
@@ -1156,6 +1303,22 @@ mod tests {
                     BTreeMap::from([("kind".to_string(), "api".to_string())]),
                 )]),
             },
+            area: Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            zoomed: BTreeSet::from([4]),
+            seqs: BTreeMap::from([(3, 2)]),
+            names: Names {
+                panes: BTreeMap::from([(4, "logs pane".to_string())]),
+                agents: BTreeMap::from([(3, "reviewer".to_string())]),
+            },
+            scrolls: Scrolls {
+                history: BTreeMap::from([(4, 900), (5, 40)]),
+                back: Some((4, 30)),
+            },
         };
         let area = Rect {
             x: 0,
@@ -1183,7 +1346,7 @@ mod tests {
         assert_eq!(
             snapshot["tabs"],
             json!([
-                {"tab_id": "w1:t3", "workspace_id": "w1", "number": 1, "label": "codex",
+                {"tab_id": "w1:t3", "workspace_id": "w1", "number": 1, "label": "1",
                  "focused": true, "pane_count": 2, "agent_status": "blocked"},
                 {"tab_id": "w1:t5", "workspace_id": "w1", "number": 2, "label": "logs",
                  "focused": false, "pane_count": 1, "agent_status": "unknown"},
@@ -1199,15 +1362,54 @@ mod tests {
             "a pane's tokens"
         );
         assert!(panes[0].get("tokens").is_none(), "none, none shown");
+        assert_eq!(panes[1]["label"], "logs pane", "a label a plugin gave");
+        assert!(
+            panes[2].get("label").is_none(),
+            "the qoop name `logs` is its tab's, not the pane's"
+        );
         let agents = snapshot["agents"].as_array().expect("agents");
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["pane_id"], "w1:p3");
+        assert_eq!(agents[0]["name"], "reviewer", "a name a plugin gave");
+        assert_eq!(
+            agents[0]["state_change_seq"], 2,
+            "herdr's count of status changes"
+        );
+        assert!(
+            agents[0].get("scroll").is_none(),
+            "an agent has none, as in herdr"
+        );
+        assert_eq!(
+            panes[2]["scroll"],
+            json!({"offset_from_bottom": 0, "max_offset_from_bottom": 40, "viewport_rows": 24}),
+            "a pane at its bottom with 40 rows behind it, its rows from the layout"
+        );
+        assert_eq!(
+            panes[1]["scroll"]["offset_from_bottom"], 30,
+            "the pane the interface shows scrolled back"
+        );
+        assert_eq!(panes[1]["scroll"]["max_offset_from_bottom"], 900);
         assert_eq!(
             agents[0]["revision"], 5,
             "the host's count, not the generation"
         );
         assert_eq!(panes[1]["revision"], 0, "an uncounted pane is at zero");
         assert_eq!(snapshot["layouts"].as_array().expect("layouts").len(), 2);
+        let laid = &snapshot["layouts"];
+        assert_eq!(
+            laid[0]["zoomed"], true,
+            "the tab with the zoomed pane says so"
+        );
+        assert_eq!(laid[1]["zoomed"], false);
+        assert_eq!(
+            laid[0]["splits"][0]["id"], "split_0_root",
+            "herdr's split id"
+        );
+        assert_eq!(
+            laid[1]["panes"][0]["focused"], true,
+            "a tab's own focused pane"
+        );
+        assert_eq!(laid[0]["area"]["width"], 80, "the area given");
 
         let unfocused = View {
             focused: None,

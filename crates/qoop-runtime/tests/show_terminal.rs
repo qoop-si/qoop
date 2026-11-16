@@ -14,14 +14,14 @@ const PATIENCE: Duration = Duration::from_secs(5);
 async fn shown(
     rd: &mut tokio::net::unix::OwnedReadHalf,
     inbuf: &mut bytes::BytesMut,
-) -> Option<u32> {
+) -> Option<(u32, Option<bool>)> {
     let mut connection = client::Connection::new();
     let deadline = Instant::now() + PATIENCE;
     let mut read = [0u8; 64 * 1024];
     loop {
         for incoming in connection.drain(inbuf).expect("decode") {
-            if let Incoming::Event(EventMessage::Focus { terminal }) = incoming {
-                return Some(terminal);
+            if let Incoming::Event(EventMessage::Focus { terminal, zoom }) = incoming {
+                return Some((terminal, zoom));
             }
         }
         let left = deadline.saturating_duration_since(Instant::now());
@@ -47,6 +47,7 @@ async fn an_interface_is_told_and_the_asker_learns_its_process() {
             &ControlRequest::Focus {
                 id: "show-1".into(),
                 terminal,
+                zoom: Some(true),
             },
             PATIENCE,
         )
@@ -59,7 +60,11 @@ async fn an_interface_is_told_and_the_asker_learns_its_process() {
             clients: vec![std::process::id()],
         })
     );
-    assert_eq!(shown(&mut ui_rd, &mut ui_in).await, Some(terminal));
+    assert_eq!(
+        shown(&mut ui_rd, &mut ui_in).await,
+        Some((terminal, Some(true))),
+        "the zoom asked for goes with it"
+    );
 }
 
 /// The asker is refused, and the interfaces are still told: a click on an old desktop note
@@ -77,6 +82,7 @@ async fn a_terminal_that_is_not_there_is_refused() {
             &ControlRequest::Focus {
                 id: "show-2".into(),
                 terminal: 9999,
+                zoom: None,
             },
             PATIENCE,
         )
@@ -85,5 +91,5 @@ async fn a_terminal_that_is_not_there_is_refused() {
         matches!(answer, Some(ControlResponse::Failed { .. })),
         "{answer:?}"
     );
-    assert_eq!(shown(&mut ui_rd, &mut ui_in).await, Some(9999));
+    assert_eq!(shown(&mut ui_rd, &mut ui_in).await, Some((9999, None)));
 }

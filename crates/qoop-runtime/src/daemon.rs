@@ -250,7 +250,7 @@ pub struct ConnectionRegistry {
     inner: std::sync::Mutex<Vec<Connection>>,
     /// `qoop focus`, fanned out to every connection's event task. Bounded and lossy on
     /// purpose: a focus nobody drained in time is a click the person has moved past.
-    focus: tokio::sync::broadcast::Sender<u32>,
+    focus: tokio::sync::broadcast::Sender<(u32, Option<bool>)>,
     /// The question inbox changed, fanned out like `focus` and as lossy: a client that missed
     /// one re-reads on the next, and always on a resync.
     asks: tokio::sync::broadcast::Sender<()>,
@@ -537,9 +537,9 @@ impl ConnectionRegistry {
     }
 
     /// Ask every attached interface to show `terminal`, and say which processes those are.
-    pub fn focus(&self, terminal: u32) -> Vec<u32> {
+    pub fn focus(&self, terminal: u32, zoom: Option<bool>) -> Vec<u32> {
         // No receiver is not an error: nothing is attached, and the empty answer says so.
-        let _ = self.focus.send(terminal);
+        let _ = self.focus.send((terminal, zoom));
         self.inner
             .lock()
             .unwrap()
@@ -2699,7 +2699,7 @@ async fn serve_client(
                 // session that is every later focus lost. Focuses missed while lagging are
                 // clicks already past.
                 shown = focus.recv() => match shown {
-                    Ok(terminal) => Some(crate::control::EventMessage::Focus { terminal }),
+                    Ok((terminal, zoom)) => Some(crate::control::EventMessage::Focus { terminal, zoom }),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -5406,10 +5406,17 @@ async fn handle_control(
             }
         }
         ControlRequest::SetSplit { tree, .. } => match terminals
-            .set_split(tree, store, |t| books.is_marked(t))
+            .set_split(tree.clone(), store, |t| books.is_marked(t))
             .await
         {
-            Ok(true) => ControlResponse::SplitSaved { id },
+            Ok(true) => {
+                // Every interface draws the tab from the index, so the others are told the
+                // way a rename is: a swap or a resize from the plugin host or a second
+                // interface shows without an attach again. Gathered over a short window, so
+                // a divider dragged across the screen is one re-listing, not one per step.
+                agents.announce_soon(tree.leaves()[0]);
+                ControlResponse::SplitSaved { id }
+            }
             Ok(false) => ControlResponse::Failed {
                 id,
                 reason: "a split cannot hold a tab that is asleep".to_string(),
@@ -5419,11 +5426,11 @@ async fn handle_control(
                 reason: format!("the split could not be recorded: {e}"),
             },
         },
-        ControlRequest::Focus { terminal, .. } => {
+        ControlRequest::Focus { terminal, zoom, .. } => {
             // Told to the interfaces for a terminal that is gone too: a click on an old desktop
             // note lands on the list there, which says the agent is gone. The caller is still
             // refused.
-            let clients = connections.focus(terminal);
+            let clients = connections.focus(terminal, zoom);
             match terminals.get(terminal) {
                 Some(_) => ControlResponse::Focused { id, clients },
                 None => ControlResponse::Failed {
