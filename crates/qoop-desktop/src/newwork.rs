@@ -290,7 +290,7 @@ impl Desk {
             .px(px(12.))
             .h(px(40.))
             .rounded(px(10.))
-            .bg(ca(t.fill))
+            .map(|d| ui::paint(d, t.rest()))
             .border_1()
             .border_color(ca(t.line))
             .child(sheet.task.clone());
@@ -307,7 +307,7 @@ impl Desk {
             .gap(px(2.))
             .p(px(2.))
             .rounded(px(15.))
-            .bg(ca(t.fill))
+            .map(|d| ui::paint(d, t.rest()))
             .children(self.offers.iter().enumerate().map(|(i, (name, _))| {
                 let on = sheet.agent == i;
                 div()
@@ -323,8 +323,8 @@ impl Desk {
                     .px(px(10.))
                     .rounded_full()
                     .text_size(px(12.5))
-                    .text_color(c(if on { t.ink } else { t.t2 }))
-                    .when(on, |d| d.bg(c(t.card2)))
+                    .text_color(c(t.t2))
+                    .when(on, |d| ui::paint(d, t.picked()))
                     .when_some(state::kind_pet(Some(name)), |d, pet| {
                         d.child(ui::pet(&pet, 1.))
                     })
@@ -350,7 +350,7 @@ impl Desk {
             .h(px(28.))
             .px(px(11.))
             .rounded_full()
-            .bg(ca(t.fill))
+            .map(|d| ui::paint(d, t.rest()))
             .border_1()
             .border_color(ca(t.line))
             .focus_visible(move |s| ui::focus_ring(s, &ring))
@@ -392,7 +392,7 @@ impl Desk {
                         .items_center()
                         .gap(px(8.))
                         .rounded(px(8.))
-                        .hover(|s| s.bg(ca(t.fill)))
+                        .hover(|s| ui::paint(s, t.hover()))
                         .text_size(px(12.5))
                         .child(
                             div()
@@ -436,10 +436,8 @@ impl Desk {
             .focus_visible(move |s| ui::focus_ring(s, &ring))
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
-            .when(ok, |d| {
-                d.cursor_pointer().bg(c(t.sel)).text_color(c(t.on_sel))
-            })
-            .when(!ok, |d| d.bg(ca(t.fill)).text_color(c(t.t2)))
+            .when(ok, |d| ui::paint(d.cursor_pointer(), t.on()))
+            .when(!ok, |d| ui::paint(d, t.off()))
             .child(if self.pending.is_some() {
                 "Starting"
             } else {

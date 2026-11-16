@@ -41,8 +41,9 @@ pub struct Theme {
     /// The pressed and selected ground (New work's key cap, a switch that is on) and the ink on it.
     pub sel: u32,
     pub on_sel: u32,
-    /// The keyboard's focus ring: 3:1 against every ground and against `sel` (a switch that
-    /// is on), so it reads on both sides of the edge it is drawn on.
+    /// The keyboard's focus ring: 3:1 against every ground and every state fill outside it,
+    /// and against `bg`, the 1 px band drawn inside it, so it reads on any control's own fill
+    /// (a switch that is on included).
     pub focus: u32,
     // States: the mark's ink, and the word's where it differs.
     pub needs: u32,
@@ -82,7 +83,7 @@ pub const DARK: Theme = Theme {
     fill2: 0xfff0e129,
     sel: 0xf3f1ed,
     on_sel: 0x14110f,
-    focus: 0x4a86e8,
+    focus: 0x6aa6ff,
     needs: 0xff8700,
     needs_text: 0xff8700,
     needs_bg: 0xff870017,
@@ -118,7 +119,7 @@ pub const LIGHT: Theme = Theme {
     fill2: 0x261e141f,
     sel: 0x262626,
     on_sel: 0xffffff,
-    focus: 0x2f74e0,
+    focus: 0x1f5fc4,
     needs: 0xaf5f00,
     needs_text: 0x875f00,
     needs_bg: 0xaf5f0012,
@@ -149,9 +150,105 @@ pub fn ca(hex: u32) -> Rgba {
     rgba(hex)
 }
 
+/// A control state's fill (`0xRRGGBBAA`, over the ground it sits on) and the ink of the label
+/// drawn on it: a state fill never ships without the text that reads on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pair {
+    pub fill: u32,
+    pub text: u32,
+}
+
+/// An opaque token as `0xRRGGBBAA`.
+const fn opaque(hex: u32) -> u32 {
+    (hex << 8) | 0xff
+}
+
 impl Theme {
     pub fn pick(dark: bool) -> Theme {
         if dark { DARK } else { LIGHT }
+    }
+
+    /// A control with a fill of its own at rest (a pill, a qass chip, a segmented group).
+    pub fn rest(&self) -> Pair {
+        Pair {
+            fill: self.fill,
+            text: self.ink,
+        }
+    }
+
+    /// A row, link or quiet button under the pointer. Its quieter lines keep their own inks,
+    /// which `every_text_token_reads_on_every_ground` checks on this fill.
+    pub fn hover(&self) -> Pair {
+        Pair {
+            fill: self.fill,
+            text: self.ink,
+        }
+    }
+
+    /// The page, tab, row or run you are on.
+    pub fn current(&self) -> Pair {
+        Pair {
+            fill: self.fill,
+            text: self.ink,
+        }
+    }
+
+    /// A filled control under the pointer, or open (the Inbox while its panel shows), and a
+    /// switch that is off: its knob is the text.
+    pub fn pressed(&self) -> Pair {
+        Pair {
+            fill: self.fill2,
+            text: self.ink,
+        }
+    }
+
+    /// A picked chip, radio or day.
+    pub fn picked(&self) -> Pair {
+        Pair {
+            fill: opaque(self.card2),
+            text: self.ink,
+        }
+    }
+
+    /// A switch that is on, the sheet's Start: the selected ground and the ink on it.
+    pub fn on(&self) -> Pair {
+        Pair {
+            fill: opaque(self.sel),
+            text: self.on_sel,
+        }
+    }
+
+    /// A control that cannot be used now (Start with nothing to start, Run now while a run
+    /// works). Its label still reads at 4.5:1: no opacity over it.
+    pub fn off(&self) -> Pair {
+        Pair {
+            fill: self.fill,
+            text: self.t2,
+        }
+    }
+
+    /// A key cap (`ctrl-a c`), drawn inside a control in any of the states above.
+    pub fn key(&self) -> Pair {
+        Pair {
+            fill: self.fill,
+            text: self.t1,
+        }
+    }
+
+    /// Every state pair, named, for the contrast test. Focused is not a pair: the ring is
+    /// drawn over the state's fill and leaves its text as it is.
+    #[cfg(test)]
+    pub fn states(&self) -> [(&'static str, Pair); 8] {
+        [
+            ("rest", self.rest()),
+            ("hover", self.hover()),
+            ("current", self.current()),
+            ("pressed", self.pressed()),
+            ("picked", self.picked()),
+            ("on", self.on()),
+            ("off", self.off()),
+            ("key", self.key()),
+        ]
     }
 
     pub fn space(&self, slot: usize) -> Hsla {
@@ -234,12 +331,7 @@ mod tests {
                     );
                 }
             }
-            // A pressed chip or pill (fill2) carries the two loudest inks only.
-            for text in [t.ink, t.t1] {
-                assert!(contrast(text, over(t.fill2, t.card)) >= 4.5);
-            }
-            // The ink on the selected ground, and the badge's figure on Needs you.
-            assert!(contrast(t.on_sel, t.sel) >= 4.5);
+            // The badge's figure on Needs you.
             assert!(
                 contrast(t.badge_fg, t.needs) >= 3.0,
                 "an 11 px semibold figure"
@@ -247,31 +339,49 @@ mod tests {
         }
     }
 
-    /// The focus ring reads at 3:1 (WCAG 1.4.11) on every ground, on a filled control (fill
-    /// and fill2, a pill or a switch that is off) and on `sel` (a switch that is on).
+    /// Every state pair, on every ground it can sit on, in both themes: the label reads at
+    /// 4.5:1 on its own fill (the owner's focused qass chip was ink on ink). A ground is a
+    /// page ground or a filled group over one (a segmented control, a machine tile). The
+    /// focus ring reads at 3:1 (WCAG 1.4.11) against what is outside it (a ground, or a state
+    /// fill another control sits on) and against `bg`, its inner band, whatever the control's
+    /// own fill. A key cap reads inside a control in every state but on.
     #[test]
-    fn the_focus_ring_reads_on_every_ground_and_an_on_switch() {
+    fn every_state_label_reads_on_its_fill_and_the_ring_on_its_neighbours() {
         for t in [DARK, LIGHT] {
-            let grounds = [
-                t.bg,
-                t.sidebar,
-                t.card,
-                t.card2,
-                t.panel,
-                t.pop,
-                t.sel,
-                over(t.fill, t.card),
-                over(t.fill, t.sidebar),
-                over(t.fill2, t.card),
-            ];
-            for ground in grounds {
-                let ratio = contrast(t.focus, ground);
-                assert!(
-                    ratio >= 3.0,
-                    "{} focus #{:06x} on #{ground:06x}: {ratio:.2}",
-                    if t.dark { "dark" } else { "light" },
-                    t.focus
-                );
+            let theme = if t.dark { "dark" } else { "light" };
+            let pages = [t.bg, t.sidebar, t.card, t.card2, t.panel, t.pop];
+            let mut grounds = pages.to_vec();
+            grounds.extend(pages.map(|g| over(t.fill, g)));
+            for (name, pair) in t.states() {
+                for &ground in &grounds {
+                    let fill = over(pair.fill, ground);
+                    let ratio = contrast(pair.text, fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{theme} {name}: #{:06x} on #{fill:06x}: {ratio:.2}",
+                        pair.text
+                    );
+                    // `on` is the selected ground of one control, never under another.
+                    if name == "on" {
+                        continue;
+                    }
+                    let ring = contrast(t.focus, fill);
+                    assert!(
+                        ring >= 3.0,
+                        "{theme} ring next to {name} #{fill:06x}: {ring:.2}"
+                    );
+                    let key = t.key();
+                    let cap = over(key.fill, fill);
+                    let ratio = contrast(key.text, cap);
+                    assert!(
+                        ratio >= 4.5,
+                        "{theme} key cap in {name} #{cap:06x}: {ratio:.2}"
+                    );
+                }
+            }
+            for &ground in &grounds {
+                let ring = contrast(t.focus, ground);
+                assert!(ring >= 3.0, "{theme} ring on #{ground:06x}: {ring:.2}");
             }
         }
     }

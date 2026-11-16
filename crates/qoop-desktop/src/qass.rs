@@ -295,9 +295,7 @@ impl Desk {
             )
             .child(match enabled {
                 true => ui::pill(id, label, t).child(label).on_click(press),
-                false => ui::pill(id, &format!("{label}, unavailable: qass is starting"), t)
-                    .tab_stop(false)
-                    .opacity(0.5)
+                false => ui::pill_off(id, &format!("{label}, unavailable: qass is starting"), t)
                     .child(label),
             })
             .when_some(self.qass_said.clone(), |d, said| {
@@ -330,8 +328,8 @@ impl Desk {
                     .flex()
                     .items_center()
                     .rounded_full()
-                    .bg(ca(t.fill))
-                    .hover(|s| s.bg(ca(t.fill2)))
+                    .map(|d| ui::paint(d, t.rest()))
+                    .hover(|s| ui::paint(s, t.pressed()))
                     .text_size(px(12.5))
                     .child(*words)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -659,9 +657,10 @@ fn watch_row(
             d.child(div().text_size(px(12.)).text_color(c(t.t2)).child(n))
         })
         .child(
-            ui::switch((id, n), &label, on, t)
-                .debug_selector(move || selector.clone())
-                .when(!enabled, |d| d.opacity(0.5).tab_stop(false))
-                .when(enabled, |d| d.on_click(press)),
+            match enabled {
+                true => ui::switch((id, n), &label, on, t).on_click(press),
+                false => ui::switch_off((id, n), &label, on, t),
+            }
+            .debug_selector(move || selector.clone()),
         )
 }

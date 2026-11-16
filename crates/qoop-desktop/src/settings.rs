@@ -670,8 +670,8 @@ impl Desk {
                     ui::control(("pet", n as u64), Role::Button, format!("Pet {}", n + 1), t)
                         .p(px(8.))
                         .rounded(px(10.))
-                        .bg(ca(t.fill))
-                        .hover(|s| s.bg(ca(t.fill2)))
+                        .map(|d| ui::paint(d, t.rest()))
+                        .hover(|s| ui::paint(s, t.pressed()))
                         .child(ui::pet(pet, 4.))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.pick_pet(picked.clone(), cx)),

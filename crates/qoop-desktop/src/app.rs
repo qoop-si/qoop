@@ -1035,9 +1035,9 @@ impl Desk {
                 .px(px(10.))
                 .rounded(px(10.))
                 .text_size(px(13.5))
-                .text_color(c(if on { t.ink } else { t.t1 }))
-                .when(on, |d| d.bg(ca(t.fill)))
-                .hover(|s| s.bg(ca(t.fill)))
+                .text_color(c(t.t1))
+                .when(on, |d| ui::paint(d, t.current()))
+                .hover(|s| ui::paint(s, t.hover()))
                 .child(ui::icon(icon, 16., c(t.t2)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| this.open(page, window, cx)))
@@ -1160,8 +1160,8 @@ impl Desk {
                         .px(px(10.))
                         .rounded(px(10.))
                         .text_size(px(13.))
-                        .when(on, |d| d.bg(ca(t.fill)))
-                        .hover(|s| s.bg(ca(t.fill)))
+                        .when(on, |d| ui::paint(d, t.current()))
+                        .hover(|s| ui::paint(s, t.hover()))
                         .child(ui::mark(kind, t, 11.))
                         .child(
                             div()
@@ -1242,7 +1242,9 @@ impl Desk {
                                 .rounded(px(8.))
                                 .text_size(px(12.))
                                 .text_color(c(if why.is_some() { t.t3 } else { t.t2 }))
-                                .when(why.is_none() && !with, |d| d.hover(|s| s.bg(ca(t.fill))))
+                                .when(why.is_none() && !with, |d| {
+                                    d.hover(|s| ui::paint(s, t.hover()))
+                                })
                                 .child(ui::icon(Icon::Eye, 12., c(t.t2)))
                                 .child(words)
                                 .when(why.is_none() && !with, |d| {
@@ -1303,7 +1305,7 @@ impl Desk {
                             .px(px(8.))
                             .py(px(5.))
                             .rounded(px(9.))
-                            .bg(ca(t.fill))
+                            .map(|d| ui::paint(d, t.rest()))
                             .text_size(px(11.5))
                             .child(
                                 div()
@@ -1335,7 +1337,7 @@ impl Desk {
                                     .items_center()
                                     .rounded(px(6.))
                                     .text_color(c(t.t1))
-                                    .hover(|s| s.bg(ca(t.fill2)))
+                                    .hover(|s| ui::paint(s, t.pressed()))
                                     .child("Retry now")
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
@@ -1457,7 +1459,8 @@ impl Desk {
                         .h(px(34.))
                         .px(px(14.))
                         .rounded_full()
-                        .bg(ca(t.fill))
+                        .map(|d| ui::paint(d, t.rest()))
+                        .hover(|s| ui::paint(s, t.pressed()))
                         .text_size(px(13.))
                         .child(ui::icon(Icon::Eye, 15., c(t.t1)))
                         .child(div().font_weight(FontWeight::SEMIBOLD).child("qass"))
@@ -1500,7 +1503,7 @@ impl Desk {
                             t,
                         )
                         .aria_expanded(self.inbox)
-                        .when(self.inbox, |d| d.bg(ca(t.fill2)))
+                        .when(self.inbox, |d| ui::paint(d, t.pressed()))
                         .child(ui::icon(Icon::Inbox, 15., c(t.t1)))
                         .child("Inbox")
                         .when(badge > 0, |d| {

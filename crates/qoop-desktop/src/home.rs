@@ -87,7 +87,7 @@ impl Desk {
                 .gap(px(2.))
                 .p(px(2.))
                 .rounded_full()
-                .bg(ca(t.fill))
+                .map(|d| ui::paint(d, t.rest()))
                 .children(Chip::ALL.into_iter().map(|chip| {
                     ui::chip(
                         ("chip", chip as u64),
@@ -192,7 +192,7 @@ impl Desk {
                         .items_center()
                         .justify_center()
                         .rounded(px(6.))
-                        .hover(|s| s.bg(ca(t.fill)))
+                        .hover(|s| ui::paint(s, t.hover()))
                         .child(ui::icon(Icon::Plus, 14., c(t.t2)))
                         .on_click(cx.listener(
                             move |this, _, window, cx| this.new_work(Some(id), window, cx),
@@ -225,7 +225,7 @@ impl Desk {
             .rounded(px(10.))
             .text_size(px(13.))
             .when(needs, |d| d.bg(ca(t.needs_bg)))
-            .hover(|s| s.bg(ca(t.fill)))
+            .hover(|s| ui::paint(s, t.hover()))
             .child(ui::mark(kind, t, 12.))
             .child(
                 div()

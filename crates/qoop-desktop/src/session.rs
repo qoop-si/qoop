@@ -563,9 +563,9 @@ impl Desk {
                             .px(px(10.))
                             .rounded(px(9.))
                             .text_size(px(12.5))
-                            .text_color(c(if on { t.ink } else { t.t1 }))
-                            .when(on, |d| d.bg(ca(t.fill)))
-                            .hover(|s| s.bg(ca(t.fill)))
+                            .text_color(c(t.t1))
+                            .when(on, |d| ui::paint(d, t.current()))
+                            .hover(|s| ui::paint(s, t.hover()))
                             .child(ui::mark(self.shown_kind(state::Entry::Live(tab)), t, 10.))
                             .child(
                                 div()
@@ -607,8 +607,8 @@ impl Desk {
                     .rounded(px(9.))
                     .text_size(px(12.5))
                     .text_color(c(t.t1))
-                    .when(self.review.is_some(), |d| d.bg(ca(t.fill2)))
-                    .hover(|s| s.bg(ca(t.fill)))
+                    .when(self.review.is_some(), |d| ui::paint(d, t.pressed()))
+                    .hover(|s| ui::paint(s, t.hover()))
                     .child("Changes")
                     .when_some(totals, |d, (a, r)| {
                         d.child(div().text_color(c(t.done_text)).child(format!("+{a}")))
@@ -626,7 +626,7 @@ impl Desk {
                         .rounded(px(9.))
                         .text_size(px(12.5))
                         .text_color(c(t.t1))
-                        .hover(|s| s.bg(ca(t.fill)))
+                        .hover(|s| ui::paint(s, t.hover()))
                         .child("Open in editor")
                         .on_click(cx.listener(move |this, _, _, _| {
                             if let Some(cwd) = this.here(shown) {
@@ -1159,7 +1159,7 @@ impl Desk {
                                     .min_h(px(30.))
                                     .px(px(6.))
                                     .rounded(px(8.))
-                                    .hover(|s| s.bg(ca(t.fill)))
+                                    .hover(|s| ui::paint(s, t.hover()))
                                     .child(ui::icon(Icon::Chevron, 13., c(t.t2)))
                                     .child(
                                         div()
@@ -1324,7 +1324,7 @@ impl Desk {
                     .px(px(6.))
                     .cursor_pointer()
                     .when_some(ground, |d, g| d.bg(g))
-                    .hover(|s| s.bg(ca(DARK.fill)))
+                    .hover(|s| ui::paint(s, DARK.hover()))
                     .when(l.mark == Mark::Hunk, |d| d.text_color(c(DARK.t3)))
                     .child(div().w(px(40.)).flex_none().text_color(c(DARK.t3)).child(
                         if l.mark == Mark::Hunk {
