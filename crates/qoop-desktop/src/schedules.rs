@@ -43,6 +43,37 @@ pub struct SchedulePage {
     pub(crate) task: Option<(String, Option<state::Strip>)>,
     pub(crate) produced: Option<(String, i64, Option<Result<crate::review::Changes, String>>)>,
     pub sheet: Option<ScheduleSheet>,
+    /// Pause, Resume and Run now in flight, by id: the schedule and what was asked.
+    pub(crate) writes: HashMap<String, (i64, Write)>,
+    /// What the last of those came to, per schedule, as a sentence.
+    pub said: HashMap<i64, String>,
+}
+
+/// What a button asked of a schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Write {
+    Pause,
+    Resume,
+    Run,
+}
+
+/// The newest run of `schedule` among `runs` has not ended: Run now waits for it.
+pub fn running_now(runs: &[ScheduleRun], schedule: i64) -> bool {
+    runs.iter()
+        .filter(|r| r.schedule == schedule)
+        .max_by_key(|r| (r.started_at, r.id))
+        .is_some_and(|r| r.ended_at.is_none() && matches!(r.result.as_str(), "claimed" | "started"))
+}
+
+/// A refusal of a schedule write as a sentence.
+pub fn write_refusal(reason: &str, machine: &str) -> String {
+    match reason {
+        "still_running" => "Its last run is still working. Run now is back when it ends.".into(),
+        r if r.contains("unknown variant") || r.contains("unknown field") => {
+            format!("qoop on {machine} is too old for this. Update it there first.")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// New schedule and Edit: one sheet.
@@ -55,8 +86,13 @@ pub struct ScheduleSheet {
     pub folder: Entity<Field>,
     pub prompt: Entity<Field>,
     pub preset: Preset,
-    pub agent: usize,
+    /// The agent by name: a schedule's own stays its own even when this Mac does not offer it.
+    pub agent: String,
     pub space: Option<String>,
+    /// The schedule as it was when Edit opened, and the timing the sheet showed for it: only
+    /// what the person changed is sent back.
+    pub(crate) original: Option<ScheduleInfo>,
+    pub(crate) first_timing: (Preset, String, String),
     pub(crate) id: Option<String>,
     pub refused: Option<String>,
 }
@@ -107,9 +143,15 @@ impl Desk {
         }
     }
 
-    /// Read the runs of every schedule of the machine shown.
+    /// Read the runs of every schedule of the machine shown: what the page shows while it is
+    /// open, else only the newest (home's "Last:" line).
     pub(crate) fn ask_runs(&mut self, schedules: &[i64]) {
         let machine = self.sched_machine();
+        let limit = if self.page == Page::Schedules {
+            RUNS_READ
+        } else {
+            1
+        };
         for &schedule in schedules {
             let id = link::fresh_id("runs");
             self.schedule_page
@@ -119,9 +161,20 @@ impl Desk {
                 id,
                 schedule,
                 before: None,
-                limit: RUNS_READ,
+                limit,
             });
         }
+    }
+
+    /// Another machine's schedules read again (its runs follow), keeping the day and the run
+    /// open: a change came.
+    pub(crate) fn refresh_remote(&mut self) {
+        if self.schedule_page.via.is_none() || self.page != Page::Schedules {
+            return;
+        }
+        let id = link::fresh_id("schedules");
+        self.schedule_page.read = Some(id.clone());
+        self.sched_ask(ControlRequest::ScheduleRead { id });
     }
 
     /// Show another machine's schedules (`Some` space of it), or This Mac's.
@@ -158,7 +211,7 @@ impl Desk {
         if self.schedule_page.via.is_none() {
             self.ask_runs(&ids);
         } else {
-            // Home's "Last:" line keeps reading this Mac's runs.
+            // Home's "Last:" line keeps reading this Mac's newest run.
             for &schedule in &ids {
                 let id = link::fresh_id("runs");
                 self.schedule_page.asked.insert(id.clone(), (0, schedule));
@@ -166,7 +219,7 @@ impl Desk {
                     id,
                     schedule,
                     before: None,
-                    limit: RUNS_READ,
+                    limit: 1,
                 });
             }
         }
@@ -188,6 +241,7 @@ impl Desk {
     pub(crate) fn report_came(&mut self, reply: &qoop_runtime::control::ControlResponse) -> bool {
         use qoop_runtime::control::ControlResponse as R;
         let id = reply.request_id().to_string();
+        let machine = self.machine_shown_name();
         let page = &mut self.schedule_page;
         match reply {
             R::Tasks {
@@ -225,6 +279,22 @@ impl Desk {
                 }
                 true
             }
+            R::Failed { .. } if page.asked.remove(&id).is_some() => true,
+            R::Failed { reason, .. } if page.writes.contains_key(&id) => {
+                if let Some((schedule, _)) = page.writes.remove(&id) {
+                    page.said.insert(schedule, write_refusal(reason, &machine));
+                }
+                true
+            }
+            R::ScheduleWritten { .. } if page.writes.contains_key(&id) => {
+                if let Some((schedule, write)) = page.writes.remove(&id) {
+                    match write {
+                        Write::Run => page.said.insert(schedule, "A run started.".into()),
+                        _ => page.said.remove(&schedule),
+                    };
+                }
+                true
+            }
             R::Failed { reason, .. }
                 if page
                     .sheet
@@ -232,7 +302,7 @@ impl Desk {
                     .is_some_and(|s| s.id.as_deref() == Some(id.as_str())) =>
             {
                 if let Some(sheet) = page.sheet.as_mut() {
-                    sheet.refused = Some(reason.clone());
+                    sheet.refused = Some(write_refusal(reason, &machine));
                 }
                 true
             }
@@ -292,6 +362,47 @@ impl Desk {
         cx.notify();
     }
 
+    /// The machine shown, as its tile names it.
+    fn machine_shown_name(&self) -> String {
+        self.schedule_page
+            .via
+            .and_then(|w| self.model.space(w))
+            .map_or_else(|| "This Mac".to_string(), state::machine_name)
+    }
+
+    /// Pause, Resume or Run now: sent, tracked, and its outcome said on the page.
+    fn press(&mut self, schedule: i64, write: Write, cx: &mut Context<Self>) {
+        let pending = |w: &Write| *w == Write::Run;
+        if write == Write::Run
+            && self
+                .schedule_page
+                .writes
+                .values()
+                .any(|(s, w)| *s == schedule && pending(w))
+        {
+            return;
+        }
+        let action = match write {
+            Write::Pause => ScheduleOp::Pause { schedule },
+            Write::Resume => ScheduleOp::Resume { schedule },
+            Write::Run => ScheduleOp::Run { schedule },
+        };
+        let id = self.write_schedule(action);
+        self.schedule_page.writes.insert(id, (schedule, write));
+        self.schedule_page.said.remove(&schedule);
+        cx.notify();
+    }
+
+    /// Run now can be pressed: no Run now in flight, and the newest run has ended.
+    pub(crate) fn can_run(&self, schedule: i64, runs: &[ScheduleRun]) -> bool {
+        !running_now(runs, schedule)
+            && !self
+                .schedule_page
+                .writes
+                .values()
+                .any(|(s, w)| *s == schedule && *w == Write::Run)
+    }
+
     fn write_schedule(&mut self, action: ScheduleOp) -> String {
         let id = link::fresh_id("schedule");
         self.sched_ask(ControlRequest::ScheduleWrite {
@@ -346,9 +457,15 @@ impl Desk {
             ),
             None => (Preset::Weekdays, "09:00".to_string(), String::new()),
         };
-        let agent = editing
-            .and_then(|s| self.offers.iter().position(|(name, _)| *name == s.agent))
-            .unwrap_or(0);
+        let agent = editing.map_or_else(
+            || {
+                self.offers
+                    .first()
+                    .map_or_else(|| "claude".to_string(), |(name, _)| name.clone())
+            },
+            |s| s.agent.clone(),
+        );
+        let first_timing = (preset, time.clone(), cron.clone());
         let name = self.field("nightly-tests", editing.map_or("", |s| s.name.as_str()), cx);
         let time = self.field("09:00", &time, cx);
         let cron = self.field("0 2 * * 1-5, or the command to check", &cron, cx);
@@ -374,6 +491,8 @@ impl Desk {
             preset,
             agent,
             space: editing.and_then(|s| s.space.clone()),
+            original: editing.cloned(),
+            first_timing,
             id: None,
             refused: None,
         });
@@ -403,8 +522,20 @@ impl Desk {
             (.., true) => Some("Say what the agent does each run.".to_string()),
             _ => None,
         };
+        // An edit sends only what changed: an unchanged timing keeps a one-off's date and the
+        // schedule's last slot, an unchanged agent stays its own.
+        let shown = (sheet.preset, text(&sheet.time), text(&sheet.cron));
+        let (first_preset, first_time, first_cron) = &sheet.first_timing;
+        let timing_changed = sheet.original.is_none()
+            || shown
+                != (
+                    *first_preset,
+                    first_time.trim().to_string(),
+                    first_cron.trim().to_string(),
+                );
         let timing = self.sheet_timing(sheet, cx);
-        let agent = self.offers.get(sheet.agent).map(|(name, _)| name.clone());
+        let original = sheet.original.clone();
+        let agent = Some(sheet.agent.clone());
         let (space, editing) = (sheet.space.clone(), sheet.editing);
         let refused = match (problem, &timing) {
             (Some(p), _) => Some(p),
@@ -420,23 +551,46 @@ impl Desk {
         }
         let Ok(timing) = timing else { return };
         let (cron, at, watch) = match timing {
+            _ if !timing_changed => (None, None, None),
             Timing::Cron(c) => (Some(c), None, None),
             Timing::At(at) => (None, Some(at), None),
             Timing::Watch(w) => (None, None, Some(w)),
         };
-        let action = match editing {
-            Some(schedule) => ScheduleOp::Change {
-                schedule,
-                name: Some(name),
-                cron,
-                at,
-                watch,
-                agent,
-                cwd: Some(folder),
-                space,
-                prompt: Some(prompt),
-            },
-            None => ScheduleOp::Add {
+        let changed = |now: String, was: Option<&String>| (Some(&now) != was).then_some(now);
+        let action = match (editing, original) {
+            (Some(schedule), Some(was)) => {
+                let edit = ScheduleOp::Change {
+                    schedule,
+                    name: changed(name, Some(&was.name)),
+                    cron,
+                    at,
+                    watch,
+                    agent: agent.and_then(|a| changed(a, Some(&was.agent))),
+                    cwd: changed(folder, Some(&was.cwd)),
+                    space: None,
+                    prompt: changed(prompt, Some(&was.prompt)),
+                };
+                if edit
+                    == (ScheduleOp::Change {
+                        schedule,
+                        name: None,
+                        cron: None,
+                        at: None,
+                        watch: None,
+                        agent: None,
+                        cwd: None,
+                        space: None,
+                        prompt: None,
+                    })
+                {
+                    // Nothing changed: nothing to send.
+                    self.schedule_page.sheet = None;
+                    cx.notify();
+                    return;
+                }
+                edit
+            }
+            _ => ScheduleOp::Add {
                 name,
                 cron,
                 at,
@@ -473,7 +627,19 @@ impl Desk {
         let schedules = self.shown_schedules();
         let runs = self.shown_runs();
         let today = state::day_of(self.now, self.zone);
-        let coming = state::coming_slots(schedules, self.now, self.now + 7 * 86_400, self.zone);
+        // Another machine runs its crons on its own clock: only the next run it names itself.
+        let coming = match self.schedule_page.via {
+            None => state::coming_slots(schedules, self.now, self.now + 7 * 86_400, self.zone),
+            Some(_) => {
+                let mut next: Vec<(i64, i64)> = schedules
+                    .iter()
+                    .filter(|s| !s.paused)
+                    .filter_map(|s| Some((s.next_at?, s.id)))
+                    .collect();
+                next.sort_unstable();
+                next
+            }
+        };
         let strip = state::strip_days(&runs, &coming, today, self.zone, (6, 3));
         let day = self.schedule_page.day.unwrap_or(today);
         if schedules.is_empty() {
@@ -492,7 +658,7 @@ impl Desk {
                 )
                 .child(self.new_button(t, cx))
                 .when(self.schedule_page.sheet.is_some(), |d| {
-                    d.child(self.sheet_view(t, cx))
+                    d.child(self.schedule_sheet(t, cx))
                 })
                 .into_any_element();
         }
@@ -546,7 +712,7 @@ impl Desk {
                     .child(self.report(&runs, t, cx)),
             )
             .when(self.schedule_page.sheet.is_some(), |d| {
-                d.child(self.sheet_view(t, cx))
+                d.child(self.schedule_sheet(t, cx))
             })
             .into_any_element()
     }
@@ -994,22 +1160,12 @@ impl Desk {
                     )
                     .child(div().text_size(px(11.5)).text_color(c(t.t2)).child(next))
                     .child(
-                        ui::switch(
-                            ("schedule-on", schedule as u64),
-                            &format!("{} {}", if on { "Pause" } else { "Resume" }, s.name),
-                            on,
-                            t,
-                        )
-                        .debug_selector(move || format!("schedule-on-{schedule}"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let action = if on {
-                                ScheduleOp::Pause { schedule }
-                            } else {
-                                ScheduleOp::Resume { schedule }
-                            };
-                            this.write_schedule(action);
-                            cx.notify();
-                        })),
+                        ui::switch(("schedule-on", schedule as u64), &s.name, on, t)
+                            .debug_selector(move || format!("schedule-on-{schedule}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let write = if on { Write::Pause } else { Write::Resume };
+                                this.press(schedule, write, cx);
+                            })),
                     )
             }))
             .child(
@@ -1084,6 +1240,7 @@ impl Desk {
             .collect();
         earlier.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         let paused = s.paused;
+        let can_run = self.can_run(schedule, runs);
         let edited = s.clone();
         div()
             .p(px(16.))
@@ -1302,24 +1459,41 @@ impl Desk {
                             .h(px(28.))
                             .child(if paused { "Resume" } else { "Pause" })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let action = if paused {
-                                    ScheduleOp::Resume { schedule }
-                                } else {
-                                    ScheduleOp::Pause { schedule }
-                                };
-                                this.write_schedule(action);
-                                cx.notify();
+                                let write = if paused { Write::Resume } else { Write::Pause };
+                                this.press(schedule, write, cx);
                             })),
                     )
-                    .child(
-                        ui::pill("run-now", "Run now", t)
+                    .child(match can_run {
+                        true => ui::pill("run-now", "Run now", t)
                             .h(px(28.))
                             .child("Run now")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.write_schedule(ScheduleOp::Run { schedule });
-                                cx.notify();
+                                this.press(schedule, Write::Run, cx)
                             })),
-                    ),
+                        false => ui::pill(
+                            "run-now",
+                            "Run now, unavailable: its last run is still working",
+                            t,
+                        )
+                        .h(px(28.))
+                        .tab_stop(false)
+                        .opacity(0.5)
+                        .child("Run now"),
+                    }),
+            )
+            .when_some(
+                self.schedule_page.said.get(&schedule).cloned(),
+                |d, said| {
+                    d.child(
+                        div()
+                            .id(("schedule-said", schedule as u64))
+                            .role(Role::Status)
+                            .aria_label(said.clone())
+                            .text_size(px(12.5))
+                            .text_color(c(t.t1))
+                            .child(said),
+                    )
+                },
             )
             .child(quiet("A missed run is caught up once, within 7 days.", t))
             .into_any_element()
@@ -1371,7 +1545,7 @@ impl Desk {
 
     /// New schedule and Edit: name, when (the TUI's presets), agent, space, folder, prompt, the
     /// first run read back, Save.
-    fn sheet_view(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn schedule_sheet(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(sheet) = self.schedule_page.sheet.as_ref() else {
             return div().into_any_element();
         };
@@ -1383,10 +1557,7 @@ impl Desk {
             },
             Err(why) => format!("When: {why}"),
         };
-        let agent = self
-            .offers
-            .get(sheet.agent)
-            .map_or_else(|| "claude".to_string(), |(name, _)| name.clone());
+        let agent = sheet.agent.clone();
         let row = |label: &str, field: &Entity<Field>| {
             div()
                 .flex()
@@ -1476,9 +1647,18 @@ impl Desk {
                             .h(px(28.))
                             .child(agent.clone())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let n = this.offers.len().max(1);
+                                let mut names: Vec<String> =
+                                    this.offers.iter().map(|(name, _)| name.clone()).collect();
                                 if let Some(s) = this.schedule_page.sheet.as_mut() {
-                                    s.agent = (s.agent + 1) % n;
+                                    if let Some(own) = s.original.as_ref().map(|o| o.agent.clone())
+                                        && !names.contains(&own)
+                                    {
+                                        names.push(own);
+                                    }
+                                    let at = names.iter().position(|n| *n == s.agent).unwrap_or(0);
+                                    if let Some(next) = names.get((at + 1) % names.len().max(1)) {
+                                        s.agent = next.clone();
+                                    }
                                 }
                                 cx.notify();
                             })),
@@ -1487,6 +1667,12 @@ impl Desk {
             .child(row("Folder", &sheet.folder))
             .child(row("Prompt", &sheet.prompt))
             .child(quiet(&first, t))
+            .when(self.schedule_page.via.is_some(), |d| {
+                d.child(quiet(
+                    "Times here are read on this Mac's clock; the other machine runs them on its own.",
+                    t,
+                ))
+            })
             .when_some(sheet.refused.clone(), |d, why| {
                 d.child(
                     div()
@@ -1517,4 +1703,45 @@ fn quiet(text: &str, t: &Theme) -> gpui::Div {
         .text_size(px(12.5))
         .text_color(c(t.t2))
         .child(text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(id: i64, started_at: i64, result: &str, ended_at: Option<i64>) -> ScheduleRun {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "schedule": 1, "slot": 0, "started_at": started_at,
+            "result": result, "ended_at": ended_at,
+        }))
+        .expect("run")
+    }
+
+    /// Run now waits while the newest run is claimed or still works, never for an old one.
+    #[test]
+    fn run_now_waits_for_the_newest_run() {
+        assert!(!running_now(&[], 1));
+        assert!(running_now(&[run(1, 10, "started", None)], 1));
+        assert!(running_now(&[run(1, 10, "claimed", None)], 1));
+        assert!(!running_now(&[run(1, 10, "started", Some(20))], 1));
+        assert!(!running_now(
+            &[
+                run(1, 10, "started", None),
+                run(2, 30, "skipped: busy", Some(30))
+            ],
+            1
+        ));
+        assert!(
+            !running_now(&[run(1, 10, "started", None)], 2),
+            "another schedule's"
+        );
+        assert_eq!(
+            write_refusal("still_running", "This Mac"),
+            "Its last run is still working. Run now is back when it ends."
+        );
+        assert_eq!(
+            write_refusal("unknown variant `Change`", "staging"),
+            "qoop on staging is too old for this. Update it there first."
+        );
+    }
 }

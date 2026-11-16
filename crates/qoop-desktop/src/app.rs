@@ -287,6 +287,7 @@ impl Desk {
                 self.ask_watch();
             }
             Down::Event(EventMessage::AsksChanged) => self.ask_inbox(),
+            Down::Event(EventMessage::SchedulesChanged) => self.refresh_remote(),
             Down::Event(_) => {}
         }
     }

@@ -481,6 +481,17 @@ pub(crate) async fn write(
                     if closed(books) {
                         return failed(id, "qoop is restarting; run it again in a moment");
                     }
+                    // One run at a time from Run now: while the newest run has not ended (it
+                    // is claimed or its agent still works), a second would start the same
+                    // prompt in the same folder beside it.
+                    let newest = store.run(move |s| s.schedule_runs(schedule, None, 1)).await;
+                    match newest {
+                        Ok(runs) if runs.first().is_some_and(still_running) => {
+                            return failed(id, STILL_RUNNING);
+                        }
+                        Ok(_) => {}
+                        Err(e) => return failed(id, why(e)),
+                    }
                     // Its own run: the slot the row holds is the key the run reports under,
                     // and nothing is claimed or moved. Its row is its own.
                     let slot = row.last_slot.unwrap_or(0);
@@ -814,6 +825,15 @@ fn own_exe(books: &Bookkeeping) -> Option<PathBuf> {
 /// A run that ends without having reported is written down as failed, its row `run` too (a
 /// watch's check has none). `manual` is the owner asking for it now, which a run still going
 /// does not hold back.
+/// What a Run now is refused with while the schedule's newest run still works.
+pub(crate) const STILL_RUNNING: &str = "still_running";
+
+/// A run not ended yet: claimed, or started with its agent still at work (its end is written
+/// when the agent's turn ends or its tab closes).
+fn still_running(run: &qoop_store::schedule::ScheduleRunRow) -> bool {
+    run.ended_at.is_none() && matches!(run.result.as_str(), "claimed" | "started")
+}
+
 fn spawn_run(
     books: &Bookkeeping,
     connections: &Arc<ConnectionRegistry>,
