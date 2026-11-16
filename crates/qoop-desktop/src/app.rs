@@ -153,6 +153,8 @@ pub struct Desk {
     no_pet: BTreeSet<usize>,
     /// The machine states last drawn: the clock draws again when one changes.
     drawn_states: Vec<state::MachineState>,
+    /// No `qoop` on this Mac (`state::qoop_bin`), looked at when the window opens.
+    pub(crate) qoop_missing: bool,
     /// The agent list came at least once: before it, Home draws skeleton rows.
     pub(crate) listed: bool,
     /// Home's one field while there is no agent yet.
@@ -249,6 +251,7 @@ impl Desk {
             no_pet: BTreeSet::new(),
             drawn_states: Vec::new(),
             listed: false,
+            qoop_missing: state::qoop_bin().is_none(),
             first_run: None,
             prefix: config.config.prefix,
             theme_pref,
@@ -1438,7 +1441,15 @@ impl Desk {
                 )
             })
             .when(!self.connected && self.lost_at.is_none(), |d| {
-                d.child("connecting to the daemon")
+                // No qoop here at all: nothing will ever answer, so say how to get it.
+                d.child(if self.qoop_missing {
+                    format!(
+                        "qoop is not installed. Install it with the one-line install: {}",
+                        state::INSTALL_LINE
+                    )
+                } else {
+                    "connecting to the daemon".to_string()
+                })
             })
             .when_some(
                 self.model.status_line().filter(|_| self.connected),

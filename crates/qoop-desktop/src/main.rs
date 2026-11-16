@@ -47,8 +47,20 @@ mod ui;
 #[cfg(all(target_os = "macos", feature = "bench"))]
 mod view;
 
+/// `--version`: the version the app was built as, for the bundle check and a person's question.
+fn version_asked() -> bool {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("qoop-desktop {}", env!("CARGO_PKG_VERSION"));
+        return true;
+    }
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn main() {
+    if version_asked() {
+        return;
+    }
     #[cfg(feature = "bench")]
     if std::env::args().len() > 1 {
         view::main();
@@ -59,6 +71,9 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if version_asked() {
+        return;
+    }
     eprintln!("qoop-desktop is built for macOS only for now");
     std::process::exit(1);
 }

@@ -90,6 +90,19 @@ terminal to ask on, the script skips the setup and prints the next command, `qoo
 qoop also sends a few numbers a day about how it is used, never content, once it has told you
 so; [Usage counts](#telemetry) shows exactly what and how to stop it.
 
+## The desktop app (macOS)
+
+A window for the same agents: home, sessions, the Inbox, qass, schedules and settings. It uses the
+`qoop` the install line puts in place, so install that first. Download the zip for your Mac:
+
+- Apple silicon: [qoop-desktop-aarch64-apple-darwin.zip](https://qoop.si/releases/latest/qoop-desktop-aarch64-apple-darwin.zip)
+- Intel: [qoop-desktop-x86_64-apple-darwin.zip](https://qoop.si/releases/latest/qoop-desktop-x86_64-apple-darwin.zip)
+
+Unzip it and move `qoop.app` into `/Applications` or `~/Applications`. The app finds `qoop` on your
+`PATH` or at `~/.local/bin/qoop`; with neither it says "qoop is not installed. Install it with the
+one-line install" and shows the line. `qoop update` does not update the app yet: download the new zip
+when a release has one. `qoop-desktop --version` prints the version it was built as.
+
 ## Source
 
 The open part's source is at [github.com/qoop-si/qoop](https://github.com/qoop-si/qoop),

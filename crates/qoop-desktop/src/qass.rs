@@ -74,9 +74,11 @@ impl Desk {
         if self.qass_starting() {
             return;
         }
-        let Some(qoop) = qoop_runtime::changes::tool("qoop") else {
-            self.qass_said =
-                Some("qoop is not on this Mac's PATH, so qass cannot be started here.".into());
+        let Some(qoop) = state::qoop_bin() else {
+            self.qass_said = Some(format!(
+                "qoop is not installed. Install it with the one-line install: {}",
+                state::INSTALL_LINE
+            ));
             cx.notify();
             return;
         };
