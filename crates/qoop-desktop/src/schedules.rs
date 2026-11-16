@@ -25,6 +25,10 @@ pub const NO_TAB_FOR: i64 = 120;
 /// How many runs of each schedule are read.
 const RUNS_READ: u32 = 50;
 
+/// A run's folder read for its report: the read's id, the schedule, and the changes once they came
+/// (or why not).
+pub(crate) type Produced = (String, i64, Option<Result<crate::review::Changes, String>>);
+
 /// The schedules page: which machine, its runs, the day and the run open, and the reads in
 /// flight.
 #[derive(Default)]
@@ -45,7 +49,7 @@ pub struct SchedulePage {
     pub(crate) month: Option<i64>,
     /// The report's task read, and the folder's changes read now, each under its id.
     pub(crate) task: Option<(String, Option<state::Strip>)>,
-    pub(crate) produced: Option<(String, i64, Option<Result<crate::review::Changes, String>>)>,
+    pub(crate) produced: Option<Produced>,
     pub sheet: Option<ScheduleSheet>,
     /// Pause, Resume and Run now in flight, by id: the schedule and what was asked.
     pub(crate) writes: HashMap<String, (i64, Write)>,
