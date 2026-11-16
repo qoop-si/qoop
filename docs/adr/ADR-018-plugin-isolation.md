@@ -112,3 +112,17 @@ content and rechecked at every run:
   at once.
 - Nothing qoop runs for a plugin reads `HERDR_SOCKET_PATH` except the `herdr` shim, which only
   a plugin's own `PATH` finds, so no plugin of this kind can reach a herdr of the person's own.
+
+## Amendment, 2026-11-16: the person grant and the own-pane pass
+
+- Two exceptions loosen the refusal above. A person's key in a plugin's own pane lets that
+  plugin write once into its tab within 10 s, past the hold a sent line puts on a terminal (never
+  past a draft). And a plugin's write into a pane it opened, still running its program, is never
+  held by a person there (a sidebar closing itself with `ctrl+q`).
+- Both are a courtesy against a plugin's mistakes, not a boundary against a process of the same
+  user. The host knows who asks, and what runs in a pane, from the starting environment of a
+  process (`HERDR_PLUGIN_ID`, `HERDR_PANE_ID`, `HERDR_PLUGIN_ENTRYPOINT_ID`), read only while
+  its start time stays the same, never from what a request says. Any process of the same user can
+  start a program with those variables set, and so could pass for a plugin. The guard keeps a
+  well-behaved plugin from typing over a person; it does not keep out a hostile program that
+  already runs as that person.

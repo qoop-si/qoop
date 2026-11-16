@@ -42,8 +42,11 @@ what runs in them. It can type into terminals and run commands in shells, close 
 spaces, rename them, move focus, open panes and show notifications.
 
 Typing goes through the same refusals as `qoop send` and `qoop prompt`. While you are at a
-terminal, or an agent is blocked, a plugin's write fails and the plugin gets the error. A plugin
-cannot tell qoop what state an agent is in, and never gets a terminal's token, so an agent it
+terminal, or an agent is blocked, a plugin's write fails and the plugin gets the error. Two
+exceptions: a plugin may always type into its own pane, and a key you press in a plugin's pane
+lets that plugin send one line into its tab within 10 seconds, unless you left a line half typed
+there. These are a guard against plugin mistakes, not a wall against a program running as you. A
+plugin cannot tell qoop what state an agent is in, and never gets a terminal's token, so an agent it
 starts inside one of its panes is read from its screen only.
 
 ## In the palette
@@ -58,12 +61,14 @@ goes to `host.log` in the plugin's state folder (`qoop plugin run` prints the pa
 
 These do not work, so a plugin that needs one installs and then does not do its main job:
 
-- no floating popups: a popup or overlay opens as a split beside its pane;
-- no layout changes, moving or swapping panes, or resizing;
+- no floating popups: a popup or overlay opens as a split beside its pane, zoomed to fill the tab
+  until it closes;
+- no layout changes or moving panes (swapping and resizing panes work);
 - no link handlers, and no worktree events;
 - what a plugin reports about a pane (its metadata tokens, such as quota marks) is kept for the
   plugin to read, but qoop does not draw it;
-- a pane, an agent and a tab share one name, so renaming one renames all three;
+- only a plugin's tab rename changes the name qoop shows; the names it gives panes and agents are
+  kept for plugins and not drawn;
 - after the daemon restarts, a plugin's pane comes back as a plain shell;
 - a tab with a plugin's pane running will not go to sleep, like a tab running any command;
 - nushell panes are not supported;
