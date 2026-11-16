@@ -230,7 +230,7 @@ impl Desk {
                         )
                     })
                     .child(body)
-                    .when(self.term.is_some(), |d| d.child(self.chips(t, cx))),
+                    .when(self.term.is_some(), |d| d.child(self.qass_chips(t, cx))),
             )
             .child(
                 div()
@@ -283,7 +283,7 @@ impl Desk {
             })
     }
 
-    fn chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn qass_chips(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .flex()
