@@ -75,6 +75,28 @@ impl Desk {
         }
     }
 
+    /// Machines whose link just came up: the mux let go of their subscriptions when the link
+    /// dropped (or never took one made while it was down), so their panes on screen are shown
+    /// again, which brings a fresh screen, told their size again, and the strip is read again
+    /// when the tab on screen is theirs.
+    pub(crate) fn machines_back(&mut self, back: &[usize]) {
+        let theirs = |t: TerminalStream| back.contains(&qoop_tui::mux::machine_of_terminal(t));
+        let mut again = Vec::new();
+        for term in self.term.iter().chain(&self.others) {
+            if theirs(term.terminal) {
+                term.sent.set((0, 0));
+                again.push(term.terminal);
+            }
+        }
+        if again.is_empty() {
+            return;
+        }
+        let _ = self.up.send(Up::Show(again));
+        if self.term.as_ref().is_some_and(|t| theirs(t.terminal)) {
+            self.ask_strip();
+        }
+    }
+
     /// After a new agent list: the corner note for another agent that turned Needs you, gone
     /// once its agent no longer needs the owner; the panes follow a split made or undone.
     pub(crate) fn rows_changed(&mut self, before: &[qoop_runtime::control::AgentRow]) {
@@ -544,7 +566,7 @@ impl Desk {
                             .text_color(c(if on { t.ink } else { t.t1 }))
                             .when(on, |d| d.bg(ca(t.fill)))
                             .hover(|s| s.bg(ca(t.fill)))
-                            .child(ui::mark(Kind::of(tab), t, 10.))
+                            .child(ui::mark(self.shown_kind(state::Entry::Live(tab)), t, 10.))
                             .child(
                                 div()
                                     .min_w_0()
@@ -670,7 +692,8 @@ impl Desk {
         let d = DARK;
         let is_focus = index == 0;
         let row = self.model.row(terminal);
-        let kind = row.map(Kind::of);
+        // Neutral, with its time, while its machine is not reached: as the card under it.
+        let shown = row.map(|r| (self.shown_kind(state::Entry::Live(r)), self.shown_word(r)));
         let mode = row
             .filter(|r| r.program.as_deref() == Some("claude"))
             .and(term.screen.as_ref())
@@ -700,12 +723,9 @@ impl Desk {
                     .gap(px(10.))
                     .text_size(px(12.))
                     .text_color(c(d.t2))
-                    .when_some(kind, |h, kind| {
-                        h.child(ui::mark(kind, &d, 10.)).child(
-                            div()
-                                .text_color(c(ui::word_ink(kind, &d)))
-                                .child(kind.word()),
-                        )
+                    .when_some(shown, |h, (kind, word)| {
+                        h.child(ui::mark(kind, &d, 10.))
+                            .child(div().text_color(c(ui::word_ink(kind, &d))).child(word))
                     })
                     .when_some(row.and_then(|r| state::age_of(r, self.now)), |h, age| {
                         h.child(age)
@@ -1041,7 +1061,7 @@ impl Desk {
 
     /// d-review: the files the tab's checkout changed against its base, one open.
     fn review_panel(&self, review: &Review, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let ring = c(t.ink);
+        let ring = *t;
 
         let row = self.model.row(review.terminal);
         let agent = row
@@ -1190,7 +1210,7 @@ impl Desk {
             .id("review")
             .role(Role::Region)
             .aria_label("Changes")
-            .focus_visible(move |s| ui::focus_ring(s, ring))
+            .focus_visible(move |s| ui::focus_ring(s, &ring))
             .track_focus(&self.review_focus)
             .on_key_down(cx.listener(Self::review_key))
             .flex_1()

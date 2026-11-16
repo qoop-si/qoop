@@ -41,6 +41,9 @@ pub struct Theme {
     /// The pressed and selected ground (New work's key cap, a switch that is on) and the ink on it.
     pub sel: u32,
     pub on_sel: u32,
+    /// The keyboard's focus ring: 3:1 against every ground and against `sel` (a switch that
+    /// is on), so it reads on both sides of the edge it is drawn on.
+    pub focus: u32,
     // States: the mark's ink, and the word's where it differs.
     pub needs: u32,
     pub needs_text: u32,
@@ -79,6 +82,7 @@ pub const DARK: Theme = Theme {
     fill2: 0xfff0e129,
     sel: 0xf3f1ed,
     on_sel: 0x14110f,
+    focus: 0x4a86e8,
     needs: 0xff8700,
     needs_text: 0xff8700,
     needs_bg: 0xff870017,
@@ -114,6 +118,7 @@ pub const LIGHT: Theme = Theme {
     fill2: 0x261e141f,
     sel: 0x262626,
     on_sel: 0xffffff,
+    focus: 0x2f74e0,
     needs: 0xaf5f00,
     needs_text: 0x875f00,
     needs_bg: 0xaf5f0012,
@@ -239,6 +244,35 @@ mod tests {
                 contrast(t.badge_fg, t.needs) >= 3.0,
                 "an 11 px semibold figure"
             );
+        }
+    }
+
+    /// The focus ring reads at 3:1 (WCAG 1.4.11) on every ground, on a filled control (fill
+    /// and fill2, a pill or a switch that is off) and on `sel` (a switch that is on).
+    #[test]
+    fn the_focus_ring_reads_on_every_ground_and_an_on_switch() {
+        for t in [DARK, LIGHT] {
+            let grounds = [
+                t.bg,
+                t.sidebar,
+                t.card,
+                t.card2,
+                t.panel,
+                t.pop,
+                t.sel,
+                over(t.fill, t.card),
+                over(t.fill, t.sidebar),
+                over(t.fill2, t.card),
+            ];
+            for ground in grounds {
+                let ratio = contrast(t.focus, ground);
+                assert!(
+                    ratio >= 3.0,
+                    "{} focus #{:06x} on #{ground:06x}: {ratio:.2}",
+                    if t.dark { "dark" } else { "light" },
+                    t.focus
+                );
+            }
         }
     }
 

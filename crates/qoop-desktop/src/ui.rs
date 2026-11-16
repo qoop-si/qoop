@@ -231,7 +231,7 @@ pub fn control(
     label: impl Into<SharedString>,
     t: &Theme,
 ) -> Stateful<Div> {
-    let ring = c(t.ink);
+    let ring = *t;
     div()
         .id(id)
         .role(role)
@@ -241,19 +241,21 @@ pub fn control(
         .cursor_pointer()
         .border_1()
         .border_color(gpui::transparent_black())
-        .focus_visible(move |s| focus_ring(s, ring))
+        .focus_visible(move |s| focus_ring(s, &ring))
 }
 
-/// The keyboard's ring: the border in `ring` and a 2 px band of it outside, so it shows on a
-/// control whose own fill is near `ring` (a switch that is on, a picked chip).
-pub fn focus_ring(s: StyleRefinement, ring: impl Into<Hsla>) -> StyleRefinement {
-    let ring: Hsla = ring.into();
+/// The keyboard's ring: a 2 px band in the focus ink just inside the control's edge, over its
+/// fill and under its label, so the fill and the text stay as they are. It is an inset
+/// shadow because GPUI draws an outer one under the whole control: a control with no fill
+/// of its own (a link, a chip) would be filled with it and its label lost.
+pub fn focus_ring(s: StyleRefinement, t: &Theme) -> StyleRefinement {
+    let ring: Hsla = c(t.focus).into();
     s.border_color(ring).shadow(vec![BoxShadow {
         color: ring,
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(2.),
-        inset: false,
+        inset: true,
     }])
 }
 
@@ -437,4 +439,30 @@ pub fn sheet(id: &'static str, label: &str, t: &Theme, body: AnyElement) -> Stat
                 .border_color(ca(t.line))
                 .child(body),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{DARK, LIGHT};
+
+    /// The ring is the focus ink inside the edge: it never sets the fill, and no shadow of
+    /// it is drawn outside, where GPUI would paint it under the label.
+    #[test]
+    fn the_focus_ring_keeps_the_fill_and_the_label() {
+        for t in [DARK, LIGHT] {
+            let s = focus_ring(StyleRefinement::default(), &t);
+            assert!(s.background.is_none(), "the fill stays the control's own");
+            let ring: Hsla = c(t.focus).into();
+            assert_eq!(s.border_color, Some(ring));
+            let shadows = s.box_shadow.unwrap_or_default();
+            assert!(!shadows.is_empty(), "a 2 px band");
+            assert!(
+                shadows
+                    .iter()
+                    .all(|b| b.inset && b.color == ring && b.spread_radius == px(2.)),
+                "{shadows:?}"
+            );
+        }
+    }
 }

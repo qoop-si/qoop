@@ -805,6 +805,19 @@ fn a_stale_question_card_is_neutral_and_closed(cx: &mut TestAppContext) {
         vcx.debug_bounds("own-open-off").is_some(),
         "the answer field is closed"
     );
+    // The pane header and the tab chip above the card go neutral with it.
+    let (kind, word) = desk.read_with(&vcx, |d, _| {
+        let row = d.model.row(2).expect("the row");
+        (
+            d.shown_kind(crate::state::Entry::Live(row)),
+            d.shown_word(row),
+        )
+    });
+    assert_eq!(
+        kind,
+        crate::state::Kind::Status(qoop_domain::status::Status::Unknown)
+    );
+    assert!(word.starts_with("Needs you as of "), "{word}");
 }
 
 /// Explain goes as typed words through the agent's "tell it" option, and an older daemon's
@@ -1195,6 +1208,66 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
     assert!(desk.read_with(&vcx, |d, _| d.settings.broken));
 }
 
+/// A run still going reads as its tab does now: Needs you while its agent asks. One whose tab
+/// is not listed keeps its own word.
+#[gpui::test]
+fn an_open_run_reads_as_its_tab(cx: &mut TestAppContext) {
+    let (desk, vcx, _rx) = open(cx);
+    let run = |terminal: i64| -> qoop_runtime::control::ScheduleRun {
+        serde_json::from_value(serde_json::json!({
+            "id": 8, "schedule": 1, "slot": 1000, "started_at": 1000,
+            "terminal": terminal, "result": "started",
+        }))
+        .expect("run")
+    };
+    let (kind, words) = desk.read_with(&vcx, |d, _| d.run_words(&run(2)));
+    assert_eq!(
+        kind,
+        Some(crate::state::Kind::Status(
+            qoop_domain::status::Status::Blocked
+        ))
+    );
+    assert_eq!(words, "Needs you");
+    let (_, words) = desk.read_with(&vcx, |d, _| d.run_words(&run(99)));
+    assert_eq!(words, "Working");
+}
+
+/// The theme follows `config.toml` while the window runs: read on opening Settings, turned at
+/// once by a write from Settings, and again when the file changes under the window.
+#[gpui::test]
+fn the_theme_follows_config_toml_at_once(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "theme = \"dark\"\n").expect("config");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.config_path = path.clone();
+            d.open(Page::Settings, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    assert!(desk.read_with(&vcx, |d, _| d.dark), "dark as the file says");
+    let settings = crate::state::SETTINGS;
+    let theme = settings
+        .iter()
+        .find(|s| s.key == "theme")
+        .expect("the theme setting");
+    vcx.update(|_, cx| desk.update(cx, |d, cx| d.write_setting(theme, "light", cx)));
+    assert!(!desk.read_with(&vcx, |d, _| d.dark), "light at once");
+    // What the window last read is the file as written; a change under it is read again.
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.follow_config()));
+    std::fs::write(&path, "# set elsewhere\ntheme = \"dark\"\n").expect("config");
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.open(Page::Home, window, cx);
+            assert!(d.follow_config(), "the change is seen");
+        })
+    });
+    assert!(desk.read_with(&vcx, |d, _| d.dark), "dark again");
+    vcx.update(|_, cx| desk.update(cx, |d, _| assert!(!d.follow_config(), "no change, no read")));
+}
+
 /// A pet picked from a new deal waits out the hold with Undo; once it is up the pet is saved to
 /// the test's own file. Keep closes the deal and changes nothing.
 #[gpui::test]
@@ -1377,6 +1450,48 @@ fn a_machine_not_answering_goes_stale_and_comes_back(cx: &mut TestAppContext) {
     let banner = desk.read_with(&vcx, |d, _| d.banner()).unwrap_or_default();
     assert!(banner.starts_with("This Mac not reached"), "{banner}");
     assert!(banner.contains("staging not reached"), "{banner}");
+}
+
+/// A remote tab opened while its link is down: once the link is up again its pane is shown
+/// again (the mux took no subscription while the link was down) and its task is read again.
+#[gpui::test]
+fn a_remote_tab_opened_while_down_comes_back_with_its_link(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote_row = 0x8100_0001u32;
+    let set_link = |link| {
+        let mut spaces = fixture().spaces;
+        for w in &mut spaces {
+            if crate::state::machine_of(w.id) == 1 {
+                w.link = Some(link);
+            }
+        }
+        ControlResponse::Workspaces {
+            id: "mux".into(),
+            workspaces: spaces,
+        }
+    };
+    answer(&desk, &mut vcx, set_link(LinkState::Down));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(remote_row), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    answer(&desk, &mut vcx, set_link(LinkState::Up));
+    let ups = sent(&mut rx);
+    assert!(
+        ups.iter()
+            .any(|u| matches!(u, Up::Show(t) if t.contains(&remote_row))),
+        "shown again"
+    );
+    assert!(
+        request_of(&ups, |r| matches!(
+            r,
+            ControlRequest::TaskRead { terminal: Some(t), .. } if *t == remote_row
+        ))
+        .is_some(),
+        "its task read again"
+    );
+    // A link that stays up asks for nothing more.
+    answer(&desk, &mut vcx, set_link(LinkState::Up));
+    assert!(!sent(&mut rx).iter().any(|u| matches!(u, Up::Show(_))));
 }
 
 /// Settings for another machine: its sleep keys and qass's switch are read and written there
