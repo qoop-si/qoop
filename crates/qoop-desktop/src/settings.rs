@@ -29,6 +29,8 @@ pub struct SettingsPage {
     pub said: Option<String>,
     pub find: Option<Entity<Field>>,
     pub pets: Vec<Avatar>,
+    /// A pet picked and waiting out its hold, with when it is saved: Undo takes it back.
+    pub pet_hold: Option<(Avatar, std::time::Instant)>,
 }
 
 impl Desk {
@@ -136,20 +138,52 @@ impl Desk {
         true
     }
 
-    fn deal_pets(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn deal_pets(&mut self, cx: &mut Context<Self>) {
         let mut deal = avatar::Deal::new(crate::app::unix_now() as u64);
         self.settings.pets = (0..6).map(|_| deal.pet()).collect();
         cx.notify();
     }
 
-    fn pick_pet(&mut self, pet: Avatar, cx: &mut Context<Self>) {
+    /// A pet picked: held 3 s as an answer is, with Undo, then saved.
+    pub(crate) fn pick_pet(&mut self, pet: Avatar, cx: &mut Context<Self>) {
+        let until = std::time::Instant::now() + state::HOLD;
+        self.settings.pet_hold = Some((pet, until));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(state::HOLD).await;
+            let _ = this.update(cx, |d, cx| {
+                d.save_held_pet(false);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Save the held pet once its hold is up, or at once (`now`, the window closing).
+    pub(crate) fn save_held_pet(&mut self, now: bool) {
+        let due = self
+            .settings
+            .pet_hold
+            .as_ref()
+            .is_some_and(|(_, until)| now || std::time::Instant::now() >= *until);
+        if !due {
+            return;
+        }
+        let Some((pet, _)) = self.settings.pet_hold.take() else {
+            return;
+        };
         self.settings.said = Some(match avatar::save_to(&self.pet_path, &pet) {
             Ok(()) => "Your pet: saved".into(),
             Err(e) => format!("The pet was not saved: {e}"),
         });
         self.my_pet = Some(pet);
         self.settings.pets.clear();
-        cx.notify();
+    }
+
+    pub(crate) fn undo_pet(&mut self, cx: &mut Context<Self>) {
+        if self.settings.pet_hold.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub(crate) fn settings_page(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -550,6 +584,49 @@ impl Desk {
                             .on_click(cx.listener(|this, _, _, cx| this.deal_pets(cx))),
                     ),
             )
+            .when_some(self.settings.pet_hold.as_ref(), |d, (pet, until)| {
+                let left = until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+                    .max(1);
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(ui::pet(pet, 2.))
+                        .child(
+                            div()
+                                .id("pet-held")
+                                .role(Role::Status)
+                                .aria_label(format!("Your new pet, saved in {left} seconds"))
+                                .flex_1()
+                                .text_size(px(12.5))
+                                .child(format!("Your new pet: saved in {left} s")),
+                        )
+                        .child(
+                            ui::pill("pet-undo", "Undo", t)
+                                .h(px(26.))
+                                .child("Undo")
+                                .on_click(cx.listener(|this, _, _, cx| this.undo_pet(cx))),
+                        ),
+                )
+            })
+            .when(!self.settings.pets.is_empty(), |d| {
+                let name = self
+                    .my_pet
+                    .as_ref()
+                    .map_or_else(|| "none".to_string(), Avatar::name);
+                d.child(
+                    ui::link_button("pet-keep", &format!("Keep {name}"), t).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.settings.pets.clear();
+                            this.settings.pet_hold = None;
+                            cx.notify();
+                        },
+                    )),
+                )
+            })
             .child(div().flex().flex_wrap().gap(px(8.)).children(
                 self.settings.pets.iter().enumerate().map(|(n, pet)| {
                     let picked = pet.clone();
