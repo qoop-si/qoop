@@ -61,3 +61,22 @@ jobs:
           # Full debug info for every test binary fills the Linux runner's disk.
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
         run: cargo test --workspace --locked --no-fail-fast -- --skip costs_almost_nothing
+      # The app bundle from a debug build (cargo test does not build the binary): bundled, signed
+      # ad hoc, verified, asked its version, and kept as an artifact. No release compile on PRs.
+      - name: Bundle (desktop)
+        if: runner.os == 'macOS'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          cargo build -p qoop-desktop --locked
+          sh crates/qoop-desktop/bundle.sh --binary target/debug/qoop-desktop dist
+          codesign --verify --deep --strict dist/qoop.app
+          dist/qoop.app/Contents/MacOS/qoop-desktop --version
+          ditto -c -k --keepParent dist/qoop.app dist/qoop-desktop-debug.zip
+      - name: Keep the bundle
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qoop-desktop-debug
+          path: dist/qoop-desktop-debug.zip
+          retention-days: 7
