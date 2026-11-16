@@ -59,11 +59,17 @@
 #   40, then 60 minutes), and said only if the agent is still there then, never riding along with
 #   another block; a snapshot with that agent working drops it (`again: dropped at work` in
 #   quiet.log), and a new stop of it starts the hold over. A write from qass starts the run over.
-#   An agent that keeps waking for its own notices and stopping where it was is said at most about
-#   once an hour, and at least once an hour, when a stop finds its last line over an hour old.
+#   An agent that keeps waking for its own notices and stopping where it was is held at most about
+#   an hour, and then meets the handled check below like any held line.
 # - Long hold (QASS_QUIET_HOLD, 600 s from its first line): everything else, an agent woken
 #   by its own background work, or one another agent drives. It rides along with any earlier
 #   block.
+# - Handled: a held line about to be said whose agent (this Mac's) rests with the generation, state
+#   and stage of its line said last, once qass rested after that line went out with nothing written
+#   by qass to the agent, no card of it opened (but qass's own) and none answered since
+#   (`handled_rest`), is not said, whatever held it but the owner at its tab: `same: quiet` in
+#   quiet.log, and the line said last stays the one to compare with. A question, a menu, a done
+#   claim and a failure change the state or stage, or open a card.
 # - Ride: a repeat of an agent already said waiting on the owner, and a sleep after an idle
 #   already said, only ever go with another block.
 # - Background hold: an agent at rest (idle or done) whose row counts work still running in the
@@ -615,6 +621,34 @@ handled_of() { # terminal printed
     echo "$h ${rested:--} $wrote"
 }
 
+# Whether the held line just parsed is a rest qass already had and handled, so saying it again
+# tells qass nothing: an agent of this Mac at rest (idle or done, not new, restarted or hands-off)
+# with the generation, state and stage of its line said last, qass at rest since that print
+# (A3's rest time) with nothing written by qass to it since (another agent driving it is its
+# driver's to follow), no card opened for it since but qass's own (`Q<n>` its question, `W<n>` the
+# daemon's draft of one) and none answered or passed since (the owner's answer reached it). A
+# question, a menu, a done claim and a failure each change the state or stage, or open a card; a
+# log or cards list that cannot be read says the line.
+handled_rest() {
+    local s_t s_gen s_state s_stage s_arr s_stop s_printed rested n _
+    [ -z "$L_LABEL" ] || return 1
+    case "$L_STATE" in idle | done) ;; *) return 1 ;; esac
+    case "$L_FROM" in new | restarted | hands-off) return 1 ;; esac
+    read -r s_t s_gen s_state s_stage s_arr s_stop s_printed _ <<< "$(said_of "" "$L_T")"
+    [ "${s_gen:-}" = "$L_G" ] && [ "${s_state:-}" = "$L_STATE" ] && [ "${s_stage:-}" = "$L_STAGE$L_CLAIMED" ] &&
+        [ -n "${s_printed:-}" ] || return 1
+    read -r _ rested _ <<< "$(handled_of "$L_T" "$s_printed")"
+    [ "${rested:--}" != - ] && [ "$rested" -gt "$s_printed" ] || return 1
+    [ ! -e "$dir/prompted.log" ] || { [ -r "$dir/prompted.log" ] && ! tail -n 2000 "$dir/prompted.log" |
+        awk -v t="T$L_T" -v me="$self" -v p="$s_printed" '$3 == t && $2 == me && $1 >= p { f = 1 } END { exit !f }'; } ||
+        return 1
+    n="$(qoop ask ls --json 2>/dev/null | jq -r --arg a "T$L_T" --argjson p "$s_printed" \
+        '[(.live + .ended)[] | select(.agent == $a and ((.opened_at > $p and (.card | startswith("E") | not))
+            or ((.status == "answered" or .status == "passed") and (.closed_at // 0) > $p)))] | length' \
+        2>/dev/null)" || return 1
+    [ "$n" = 0 ]
+}
+
 # One `print:` note per agent line a block puts out, before its said record is replaced: whether
 # it repeats the stop said before, whether that earlier print was handled, when it was printed,
 # when qass last rested and whether the agent was written to since. The replay reads these.
@@ -738,6 +772,14 @@ flush() {
                 note "person: T$L_T until $p" "$l"
                 i=$((i + 1)); continue
             fi
+        fi
+        # A held rest qass already had and handled: nothing new, so no line and no wake. Not one
+        # the owner is or was at the tab for (held for him above, or a person hold that ran out).
+        if [ -n "${c_file[i]}" ] && [ "${c_wp[i]}" = 0 ] && parse_line "$l" && handled_rest; then
+            note "same: quiet" "$l"
+            drop="$drop$L_T ${c_file[i]}
+"
+            i=$((i + 1)); continue
         fi
         [ "${c_go[i]}" = 0 ] || wake=1
         block="$block$l
