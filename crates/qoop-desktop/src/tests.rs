@@ -934,7 +934,10 @@ fn the_qass_page_reads_its_lessons_and_keeps_its_page(cx: &mut TestAppContext) {
         desk.update(cx, |d, cx| {
             d.open(Page::Home, window, cx);
             d.apply(
-                Down::Event(qoop_runtime::control::EventMessage::Focus { terminal: 9 }),
+                Down::Event(qoop_runtime::control::EventMessage::Focus {
+                    terminal: 9,
+                    zoom: None,
+                }),
                 window,
                 cx,
             );

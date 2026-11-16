@@ -378,7 +378,7 @@ async fn session(
                         EventMessage::AgentChanged { .. } | EventMessage::Resync => {
                             wire.request(&ControlRequest::ListTerminals { id: fresh_id("list") }).await?;
                         }
-                        EventMessage::Focus { terminal } => {
+                        EventMessage::Focus { terminal, .. } => {
                             let _ = down.send(Down::Focus(terminal));
                         }
                         _ => {}
