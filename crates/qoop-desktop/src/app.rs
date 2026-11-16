@@ -307,7 +307,7 @@ impl Desk {
                 }
             }
             Down::Answer(answer) => self.answer(*answer, window, cx),
-            Down::Event(EventMessage::Focus { terminal }) => {
+            Down::Event(EventMessage::Focus { terminal, .. }) => {
                 let qass = self
                     .model
                     .row(terminal)
