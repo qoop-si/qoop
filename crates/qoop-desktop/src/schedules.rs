@@ -124,6 +124,23 @@ impl Desk {
         }
     }
 
+    /// A run's mark and words. One still going reads as its tab does now (Needs you while its
+    /// agent asks, neutral while its machine is not reached), not a bare Working.
+    pub(crate) fn run_words(&self, run: &ScheduleRun) -> (Option<state::Kind>, String) {
+        let (kind, words) = state::run_words(run);
+        let tab = run
+            .terminal
+            .and_then(|t| u32::try_from(t).ok())
+            .and_then(|t| self.model.row(t));
+        match (kind, tab) {
+            (Some(state::Kind::Status(qoop_domain::status::Status::Working)), Some(row)) => (
+                Some(self.shown_kind(state::Entry::Live(row))),
+                self.shown_word(row),
+            ),
+            _ => (kind, words),
+        }
+    }
+
     fn shown_runs(&self) -> Vec<ScheduleRun> {
         let machine = self.sched_machine();
         self.schedule_page
@@ -1002,7 +1019,7 @@ impl Desk {
                     })),
             )
             .children(here.into_iter().take(60).map(|r| {
-                let (kind, words) = state::run_words(r);
+                let (kind, words) = self.run_words(r);
                 let schedule = r.schedule;
                 let run = r.clone();
                 let on = open == Some((schedule, r.id));
@@ -1197,7 +1214,7 @@ impl Desk {
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
             return div().into_any_element();
         };
-        let (kind, words) = state::run_words(run);
+        let (kind, words) = self.run_words(run);
         let tab = run
             .terminal
             .and_then(|t| u32::try_from(t).ok())
@@ -1283,17 +1300,17 @@ impl Desk {
                         d.child(
                             ui::pill(
                                 ("its-terminal", u64::from(tab)),
-                                if working {
-                                    "Working, open it"
+                                &if working {
+                                    format!("{words}, open it")
                                 } else {
-                                    "Its terminal"
+                                    "Its terminal".to_string()
                                 },
                                 t,
                             )
                             .h(px(28.))
                             .child(if working {
                                 format!(
-                                    "Working, tab {}, open it",
+                                    "{words}, tab {}, open it",
                                     qoop_tui::mux::daemon_terminal(tab)
                                 )
                             } else {
@@ -1376,7 +1393,7 @@ impl Desk {
             .when(!earlier.is_empty(), |d| {
                 d.child(section(&format!("Earlier runs of {}", s.name), None))
                     .children(earlier.into_iter().take(20).map(|r| {
-                        let (kind, words) = state::run_words(r);
+                        let (kind, words) = self.run_words(r);
                         let run = r.clone();
                         let line = r
                             .summary

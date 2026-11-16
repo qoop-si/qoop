@@ -282,7 +282,7 @@ impl Desk {
                 .text_color(c(t.t2))
                 .child(text.to_string())
         };
-        let ring = c(t.ink);
+        let ring = *t;
         let field_row = div()
             .flex()
             .items_center()
@@ -301,7 +301,7 @@ impl Desk {
             .track_focus(&sheet.stops[1])
             .border_1()
             .border_color(gpui::transparent_black())
-            .focus_visible(move |s| ui::focus_ring(s, ring))
+            .focus_visible(move |s| ui::focus_ring(s, &ring))
             .flex()
             .flex_wrap()
             .gap(px(2.))
@@ -353,7 +353,7 @@ impl Desk {
             .bg(ca(t.fill))
             .border_1()
             .border_color(ca(t.line))
-            .focus_visible(move |s| ui::focus_ring(s, ring))
+            .focus_visible(move |s| ui::focus_ring(s, &ring))
             .text_size(px(12.5))
             .when_some(space, |d, w| d.text_color(t.space(state::space_slot(w))))
             .child(space_name)
@@ -433,7 +433,7 @@ impl Desk {
             .rounded_full()
             .border_1()
             .border_color(gpui::transparent_black())
-            .focus_visible(move |s| ui::focus_ring(s, ring))
+            .focus_visible(move |s| ui::focus_ring(s, &ring))
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .when(ok, |d| {

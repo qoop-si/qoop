@@ -1350,8 +1350,10 @@ fn all_down(spaces: &[WorkspaceRow], m: usize) -> bool {
 
 impl Reach {
     /// The space list came: a machine whose every link is down has not answered since the
-    /// first list that said so; any other has.
-    pub fn note(&mut self, spaces: &[WorkspaceRow], now: i64) {
+    /// first list that said so; any other has. Returns the machines whose link just came up:
+    /// the mux forgets a link's subscriptions when it drops, so what is on screen of them is
+    /// asked for again.
+    pub fn note(&mut self, spaces: &[WorkspaceRow], now: i64) -> Vec<usize> {
         let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(w.id)).collect();
         self.down_since.retain(|m, _| machines.contains(m));
         self.heard.retain(|m, _| machines.contains(m));
@@ -1375,12 +1377,19 @@ impl Reach {
             }
         }
         // A link that just came up is the machine's daemon answering.
-        for m in up.difference(&self.up) {
+        let back: Vec<usize> = up.difference(&self.up).copied().collect();
+        for m in &back {
             if let Some(heard) = self.heard.get_mut(m) {
                 *heard = now;
             }
         }
         self.up = up;
+        back
+    }
+
+    /// This Mac's daemon came back: a new mux, with no link up yet that it was asked about.
+    pub fn forget_links(&mut self) {
+        self.up.clear();
     }
 
     /// An answer from machine `m`'s own daemon came at `now`.

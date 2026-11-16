@@ -166,6 +166,10 @@ pub struct Desk {
     /// The person's `config.toml`: the prefix byte and the theme (auto follows the system).
     prefix: u8,
     theme_pref: qoop_tui::config::Theme,
+    /// The system's appearance, for a theme of auto.
+    appearance: WindowAppearance,
+    /// `config.toml`'s time and size when last read: the window follows a change to it.
+    config_stamp: Option<(SystemTime, u64)>,
     pub dark: bool,
     prefix_pending: bool,
     pub up: UnboundedSender<Up>,
@@ -258,6 +262,8 @@ impl Desk {
             first_run: None,
             prefix: config.config.prefix,
             theme_pref,
+            appearance: window.appearance(),
+            config_stamp: None,
             dark: dark_for(theme_pref, window.appearance()),
             prefix_pending: false,
             up,
@@ -309,6 +315,7 @@ impl Desk {
             Down::Connected => {
                 self.connected = true;
                 self.lost_at = None;
+                self.reach.forget_links();
                 // A New work asked for before the connection dropped: asked again, under its id.
                 self.ask_pending();
                 // A new connection, maybe a new daemon: say the size again.
@@ -457,12 +464,13 @@ impl Desk {
             } => self.scrolled_back(terminal, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => {
                 self.link_reasons = state::link_reasons(&workspaces);
-                self.reach.note(&workspaces, self.now);
+                let back = self.reach.note(&workspaces, self.now);
                 // An ask a dropped link took with it is answered by nobody: ask again once up.
                 let down = &self.reach.down_since;
                 self.pet_asks.retain(|_, m| !down.contains_key(m));
                 self.model.spaces = workspaces;
                 self.ping_machines();
+                self.machines_back(&back);
             }
             ControlResponse::Pet { id, rects } => {
                 if let Some(m) = self.pet_asks.remove(&id) {
@@ -553,10 +561,29 @@ impl Desk {
             .map(|r| r.terminal)
     }
 
-    /// What a write to `config.toml` changes in the window now: the prefix and the theme.
+    /// What `config.toml` changes in the window now: the prefix and the theme.
     pub(crate) fn reconfigure(&mut self, read: &qoop_tui::config::Read) {
         self.prefix = read.config.prefix;
         self.theme_pref = read.config.theme;
+        self.dark = dark_for(self.theme_pref, self.appearance);
+    }
+
+    /// `config.toml` changed since it was last looked at (`qoop config set`, an editor):
+    /// read it again. Returns whether it had.
+    pub(crate) fn follow_config(&mut self) -> bool {
+        let stamp = std::fs::metadata(&self.config_path)
+            .and_then(|m| Ok((m.modified()?, m.len())))
+            .ok();
+        if stamp == self.config_stamp {
+            return false;
+        }
+        self.config_stamp = stamp;
+        if self.page == Page::Settings && self.settings.via.is_none() {
+            self.read_settings();
+        } else {
+            self.reconfigure(&qoop_tui::config::read_from(&self.config_path));
+        }
+        true
     }
 
     /// The prefix as `config.toml` names it, for the key hints: `ctrl-b`.
@@ -812,6 +839,16 @@ impl Desk {
         }
     }
 
+    /// A row's state word as shown beside [`Self::shown_kind`]'s mark: "Needs you", or
+    /// "Needs you as of 15:58" while its machine is not reached.
+    pub(crate) fn shown_word(&self, row: &qoop_runtime::control::AgentRow) -> String {
+        let word = state::Kind::of(row).word();
+        match self.as_of(row.workspace) {
+            Some(when) => format!("{word} {when}"),
+            None => word.to_string(),
+        }
+    }
+
     /// A terminal's screen is the last one seen: the link or its machine is not answering.
     pub(crate) fn term_stale(&self, terminal: TerminalStream) -> bool {
         !self.connected
@@ -952,6 +989,7 @@ impl Desk {
             .collect();
         let redraw = redraw || states != self.drawn_states;
         self.drawn_states = states;
+        let redraw = self.follow_config() || redraw;
         let finish = match self.page {
             Page::Session(t) => self.model.finish(t),
             _ => None,
@@ -1277,17 +1315,11 @@ impl Desk {
                             )
                             .when_some(self.pet_of(m), |d, pet| d.child(pet))
                             .child(div().text_color(c(t.t1)).child(name.clone()))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_color(c(t.t2))
-                                    .child(word),
-                            )
+                            // The whole state, wrapped under itself when the sidebar is narrow:
+                            // "not reached, as of 23:03" is what the tile is for.
+                            .child(div().flex_1().min_w_0().text_color(c(t.t2)).child(word))
                             .when(away, |d| {
-                                d.child(div().flex_1()).child(
+                                d.child(
                                     ui::control(
                                         ("retry", m as u64),
                                         Role::Button,
@@ -1295,6 +1327,8 @@ impl Desk {
                                         t,
                                     )
                                     .debug_selector(move || format!("retry-{m}"))
+                                    .flex_none()
+                                    .whitespace_nowrap()
                                     .px(px(6.))
                                     .h(px(22.))
                                     .flex()
@@ -1885,13 +1919,13 @@ fn wire(
             }
             if window.is_window_active() && this.page == Page::Settings {
                 this.read_settings();
-                this.dark = dark_for(this.theme_pref, window.appearance());
                 cx.notify();
             }
         })
         .detach();
         cx.observe_window_appearance(window, |this: &mut Desk, window, cx| {
-            this.dark = dark_for(this.theme_pref, window.appearance());
+            this.appearance = window.appearance();
+            this.dark = dark_for(this.theme_pref, this.appearance);
             cx.notify();
         })
         .detach();

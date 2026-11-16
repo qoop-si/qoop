@@ -49,6 +49,8 @@ impl Desk {
         self.settings.text = std::fs::read_to_string(&self.config_path).unwrap_or_default();
         // Nothing can be written while a line is not TOML: the writer refuses the whole file.
         self.settings.broken = read.broken || !qoop_runtime::config::writable(&self.settings.text);
+        // The window follows what the file says now: the prefix, the theme.
+        self.reconfigure(&read);
         self.settings.read = Some(read);
     }
 
@@ -73,11 +75,6 @@ impl Desk {
             }
             Err(why) => why,
         };
-        // The window follows what it shows now: the prefix, the theme.
-        if setting.key == "prefix" || setting.key == "theme" {
-            let read = qoop_tui::config::read_from(&self.config_path);
-            self.reconfigure(&read);
-        }
         self.settings.said = Some(said);
         cx.notify();
     }
