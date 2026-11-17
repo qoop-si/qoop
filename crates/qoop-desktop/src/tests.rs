@@ -612,6 +612,47 @@ fn ctrl_a_a_takes_the_keys_off_the_terminal(cx: &mut TestAppContext) {
     );
 }
 
+/// Every sidebar link takes the ring: from the window's own focus, Tab once reaches Home, twice
+/// Schedules, three times Settings, each focused with a key as the last input (what
+/// `focus_visible` draws the ring on), and Space opens the link that has it.
+#[gpui::test]
+fn every_sidebar_link_takes_tab_and_its_ring(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    for (tabs, link, from) in [
+        (1, Page::Home, Page::Settings),
+        (2, Page::Schedules, Page::Home),
+        (3, Page::Settings, Page::Home),
+    ] {
+        vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(from, window, cx)));
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(&vec!["tab"; tabs].join(" "));
+        let (keyboard, on_link) = vcx.update(|window, cx| {
+            let root = desk.read(cx).focus.clone();
+            (
+                window.last_input_was_keyboard(),
+                window.focused(cx).is_some() && !root.is_focused(window),
+            )
+        });
+        assert!(keyboard, "{link:?}: a key was the last input");
+        assert!(on_link, "{link:?}: a control has the focus");
+        vcx.simulate_keystrokes("space");
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                    keystroke: gpui::Keystroke::parse("space").expect("space"),
+                }),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            desk.read_with(&vcx, |d, _| d.page),
+            link,
+            "Tab {tabs} times is the {link:?} link"
+        );
+    }
+}
+
 /// The question card under an agent that needs the owner: answers with digits 1 to 5, none on
 /// the "always" option; a digit before the menu is armed does nothing; `1` holds "Yes", `u`
 /// undoes it; held again it goes as `AnswerMenu` with key 1, and the card says Sent once the
@@ -1813,6 +1854,64 @@ fn an_idle_remote_that_answers_its_pings_stays_live(cx: &mut TestAppContext) {
         desk.read_with(&vcx, |d, _| d.machine_state(1)),
         crate::state::MachineState::Live
     );
+}
+
+/// An idle remote on a qoop from before pets (accept pass 4, staging on 0.17.1): its daemon
+/// refuses every ping as unknown. That refusal is its daemon answering, so the machine is asked
+/// again on the clock and stays connected, where it used to go "not reached" 15 s after the link
+/// came up and stay so while the link held.
+#[gpui::test]
+fn an_idle_remote_from_before_pets_stays_live_on_its_refusals(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let mut spaces = fixture().spaces;
+    for w in &mut spaces {
+        if crate::state::machine_of(w.id) == 1 {
+            w.link = Some(LinkState::Up);
+        }
+    }
+    let up = ControlResponse::Workspaces {
+        id: "mux".into(),
+        workspaces: spaces,
+    };
+    answer(&desk, &mut vcx, up.clone());
+    for now in [2000, 2010, 2020, 2030] {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, cx| {
+                d.now = now;
+                cx.notify();
+            })
+        });
+        answer(&desk, &mut vcx, up.clone());
+        let id = via_sent(&mut rx, remote)
+            .into_iter()
+            .find_map(|r| match r {
+                ControlRequest::Pet { id } => Some(id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a ping at {now}, after a refused one"));
+        answer(
+            &desk,
+            &mut vcx,
+            ControlResponse::Failed {
+                id,
+                reason: "this daemon is older than the client that called it: it does not \
+                         know the method that was asked for (unknown variant `pet`)"
+                    .into(),
+            },
+        );
+    }
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.now = 2030 + crate::state::STALE_AFTER - 1;
+            cx.notify();
+        })
+    });
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.machine_state(1)),
+        crate::state::MachineState::Live
+    );
+    assert_eq!(desk.read_with(&vcx, |d, _| d.banner()), None, "no banner");
 }
 
 /// A machine whose link is down: its space reads by its own name (the ssh error only in the

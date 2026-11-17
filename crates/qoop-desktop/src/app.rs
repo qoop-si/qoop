@@ -149,10 +149,8 @@ pub struct Desk {
     /// The requests out to another machine, by id: an answer to any of them is that machine
     /// heard from.
     sent_to: std::cell::RefCell<HashMap<String, usize>>,
-    /// When each machine was last asked for a word (its pet), and the ones whose qoop cannot
-    /// answer that ask.
+    /// When each machine was last asked for a word (its pet).
     pinged: HashMap<usize, i64>,
-    no_pet: BTreeSet<usize>,
     /// The machine states last drawn: the clock draws again when one changes.
     drawn_states: Vec<state::MachineState>,
     /// No `qoop` on this Mac (`state::qoop_bin`), looked at when the window opens.
@@ -255,7 +253,6 @@ impl Desk {
             link_reasons: HashMap::new(),
             sent_to: Default::default(),
             pinged: HashMap::new(),
-            no_pet: BTreeSet::new(),
             drawn_states: Vec::new(),
             listed: false,
             qoop_missing: state::qoop_bin().is_none(),
@@ -490,9 +487,13 @@ impl Desk {
                 if let Some(review) = self.review.as_mut().filter(|r| r.id == id) {
                     review.read = Some(Err(reason));
                 } else if let Some(m) = self.pet_asks.remove(&id) {
-                    // A qoop there from before the ask: it keeps the link's own rule.
+                    // A qoop there from before pets refuses the ask as unknown: that refusal is
+                    // its daemon answering, so it counts as heard, and it is asked again on
+                    // the clock like any other. The mux's own refusals (a link gone) never say
+                    // that.
                     if reason.contains("unknown variant") {
-                        self.no_pet.insert(m);
+                        self.pet_asks.retain(|_, a| *a != m);
+                        self.heard_from(m);
                     }
                 } else if self.strip_ask.as_deref() == Some(id.as_str()) {
                     // A daemon from before a window could read a tab's task: no strip.
@@ -894,7 +895,7 @@ impl Desk {
                 .is_none_or(|at| self.now - at >= state::PING_EVERY);
             // One ask out at a time: a machine that does not answer gets no pile of them.
             let out = self.pet_asks.values().any(|a| *a == m);
-            if !up || !due || out || self.no_pet.contains(&m) {
+            if !up || !due || out {
                 continue;
             }
             self.pinged.insert(m, self.now);
