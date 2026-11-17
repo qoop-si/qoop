@@ -74,28 +74,29 @@ pub const DARK: Theme = Theme {
     pop: 0x26211d,
     ink: 0xf3f1ed,
     t1: 0xe6e1da,
-    t2: 0xb0aaa2,
-    // One step over the design's #938d85, which reads 4.49:1 on a hovered card.
-    t3: 0x958f87,
+    // The design's #b0aaa2 and #938d85, lifted: they read under 4.5:1 on a hovered row or a
+    // pressed chip in the top glow. The state words below are lifted for the same grounds.
+    t2: 0xc0bcb5,
+    t3: 0xa7a29b,
     line: 0xfff0e11f,
     hair: 0xfff0e112,
     fill: 0xfff0e111,
     fill2: 0xfff0e129,
     sel: 0xf3f1ed,
     on_sel: 0x14110f,
-    focus: 0x6aa6ff,
+    focus: 0x70abff,
     needs: 0xff8700,
     needs_text: 0xff8700,
     needs_bg: 0xff870017,
     needs_line: 0xff87008c,
     work: 0x00afff,
-    work_text: 0x00afff,
+    work_text: 0x52c9ff,
     done: 0x00af5f,
-    done_text: 0x00af5f,
+    done_text: 0x21b974,
     fail: 0xff00ff,
     fail_text: 0xff5fff,
     sleep: 0xaf87d7,
-    sleep_text: 0xaf87d7,
+    sleep_text: 0xb794db,
     idle: 0x6c6c6c,
     badge_fg: 0x14110f,
     spaces: [0xd787ff, 0xd7ff5f, 0x5fffff, 0xffafd7, 0x87d7ff, 0xffff87],
@@ -137,8 +138,13 @@ pub const LIGHT: Theme = Theme {
     spaces: [0x8700d7, 0x5f5f00, 0x005f5f, 0xaf005f, 0x005f87, 0x875f00],
 };
 
-/// The terminal's own ground and ink, the same in both themes.
+/// The terminal's own ground and ink, the same in both themes. Whatever is drawn on it takes
+/// `DARK`'s tokens, a control included.
 pub const TERMINAL_BG: u32 = 0x0f0f11;
+
+/// The dark theme's warm glow at the window's top (`0xRRGGBBAA`), fading out down 300 px:
+/// the top bar and the top of a page sit on it over `bg`.
+pub const TOP_GLOW: u32 = 0x965f374d;
 
 /// An opaque token as a colour.
 pub fn c(hex: u32) -> Rgba {
@@ -177,7 +183,7 @@ impl Theme {
     }
 
     /// A row, link or quiet button under the pointer. Its quieter lines keep their own inks,
-    /// which `every_text_token_reads_on_every_ground` checks on this fill.
+    /// which `every_text_token_reads_on_every_ground` checks on this fill over every ground.
     pub fn hover(&self) -> Pair {
         Pair {
             fill: self.fill,
@@ -292,23 +298,27 @@ fn over(top: u32, under: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// The page grounds a theme draws on. In dark, also the top glow over `bg` (at its
+    /// strongest) and the terminal's ground, which only ever carries `DARK`'s tokens.
+    fn page_grounds(t: &Theme) -> Vec<u32> {
+        let mut pages = vec![t.bg, t.sidebar, t.card, t.card2, t.panel, t.pop];
+        if t.dark {
+            pages.extend([over(TOP_GLOW, t.bg), TERMINAL_BG]);
+        }
+        pages
+    }
+
     /// Every text ink reads at 4.5:1 on every ground it is drawn on, in both themes: the
-    /// grounds, a hovered row (fill over a card or the sidebar), a Needs you row (its tint over
-    /// the card), and the space names in their inks.
+    /// grounds, a hovered row (fill over any of them), a Needs you row (its tint over the
+    /// card), and the space names in their inks. A filled control's quieter lines (its icon,
+    /// the qass chip's state line) also read on its pressed fill.
     #[test]
     fn every_text_token_reads_on_every_ground() {
         for t in [DARK, LIGHT] {
-            let grounds = [
-                t.bg,
-                t.sidebar,
-                t.card,
-                t.card2,
-                t.panel,
-                t.pop,
-                over(t.fill, t.card),
-                over(t.fill, t.sidebar),
-                over(t.needs_bg, t.card),
-            ];
+            let pages = page_grounds(&t);
+            let mut grounds = pages.clone();
+            grounds.extend(pages.iter().map(|&g| over(t.fill, g)));
+            grounds.push(over(t.needs_bg, t.card));
             let mut texts = vec![
                 ("ink", t.ink),
                 ("t1", t.t1),
@@ -322,11 +332,22 @@ mod tests {
             ];
             texts.extend(t.spaces.iter().map(|s| ("space", *s)));
             for (name, text) in texts {
-                for ground in grounds {
+                for &ground in &grounds {
                     let ratio = contrast(text, ground);
                     assert!(
                         ratio >= 4.5,
                         "{} {name} #{text:06x} on #{ground:06x}: {ratio:.2}",
+                        if t.dark { "dark" } else { "light" }
+                    );
+                }
+            }
+            for (name, text) in [("t1", t.t1), ("t2", t.t2), ("work", t.work_text)] {
+                for &page in &pages {
+                    let ground = over(t.fill2, page);
+                    let ratio = contrast(text, ground);
+                    assert!(
+                        ratio >= 4.5,
+                        "{} line {name} #{text:06x} on pressed #{ground:06x}: {ratio:.2}",
                         if t.dark { "dark" } else { "light" }
                     );
                 }
@@ -341,17 +362,18 @@ mod tests {
 
     /// Every state pair, on every ground it can sit on, in both themes: the label reads at
     /// 4.5:1 on its own fill (the owner's focused qass chip was ink on ink). A ground is a
-    /// page ground or a filled group over one (a segmented control, a machine tile). The
-    /// focus ring reads at 3:1 (WCAG 1.4.11) against what is outside it (a ground, or a state
-    /// fill another control sits on) and against `bg`, its inner band, whatever the control's
-    /// own fill. A key cap reads inside a control in every state but on.
+    /// page ground (the dark top glow and the terminal's ground included) or a filled group
+    /// over one (a segmented control, a machine tile). The focus ring reads at 3:1 (WCAG
+    /// 1.4.11) against what is outside it (a ground, or a state fill another control sits on)
+    /// and against `bg`, its inner band, whatever the control's own fill. A key cap reads
+    /// inside a control in every state but on.
     #[test]
     fn every_state_label_reads_on_its_fill_and_the_ring_on_its_neighbours() {
         for t in [DARK, LIGHT] {
             let theme = if t.dark { "dark" } else { "light" };
-            let pages = [t.bg, t.sidebar, t.card, t.card2, t.panel, t.pop];
-            let mut grounds = pages.to_vec();
-            grounds.extend(pages.map(|g| over(t.fill, g)));
+            let pages = page_grounds(&t);
+            let mut grounds = pages.clone();
+            grounds.extend(pages.iter().map(|&g| over(t.fill, g)));
             for (name, pair) in t.states() {
                 for &ground in &grounds {
                     let fill = over(pair.fill, ground);

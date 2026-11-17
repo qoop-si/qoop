@@ -78,7 +78,9 @@ impl Desk {
     /// Machines whose link just came up: the mux let go of their subscriptions when the link
     /// dropped (or never took one made while it was down), so their panes on screen are shown
     /// again, which brings a fresh screen, told their size again, and the strip is read again
-    /// when the tab on screen is theirs.
+    /// when the tab on screen is theirs. Right after this Mac's daemon reconnects the first
+    /// list counts every up link as back, so a remote pane already shown gets a second Show
+    /// and one extra full screen: harmless, both ends keep sets.
     pub(crate) fn machines_back(&mut self, back: &[usize]) {
         let theirs = |t: TerminalStream| back.contains(&qoop_tui::mux::machine_of_terminal(t));
         let mut again = Vec::new();
@@ -607,7 +609,7 @@ impl Desk {
                     .rounded(px(9.))
                     .text_size(px(12.5))
                     .text_color(c(t.t1))
-                    .when(self.review.is_some(), |d| ui::paint(d, t.pressed()))
+                    .when(self.review.is_some(), |d| ui::paint(d, t.current()))
                     .hover(|s| ui::paint(s, t.hover()))
                     .child("Changes")
                     .when_some(totals, |d, (a, r)| {
@@ -1308,11 +1310,15 @@ impl Desk {
             .children(lines.iter().take(DIFF_ROWS).enumerate().map(|(k, l)| {
                 let file = path.to_string();
                 let line = l.line;
-                let ground = match l.mark {
-                    Mark::Added => Some(ca((DARK.done << 8) | 0x26)),
-                    Mark::Removed => Some(ca((DARK.fail << 8) | 0x26)),
+                // An added or removed row keeps its tint under the pointer, only stronger,
+                // and every row keeps its ink.
+                let tint = |alpha: u32| match l.mark {
+                    Mark::Added => Some(ca((DARK.done << 8) | alpha)),
+                    Mark::Removed => Some(ca((DARK.fail << 8) | alpha)),
                     _ => None,
                 };
+                let ground = tint(0x26);
+                let hovered = tint(0x3d).unwrap_or(ca(DARK.fill));
                 let sign = match l.mark {
                     Mark::Added => "+",
                     Mark::Removed => "-",
@@ -1324,7 +1330,7 @@ impl Desk {
                     .px(px(6.))
                     .cursor_pointer()
                     .when_some(ground, |d, g| d.bg(g))
-                    .hover(|s| ui::paint(s, DARK.hover()))
+                    .hover(move |s| s.bg(hovered))
                     .when(l.mark == Mark::Hunk, |d| d.text_color(c(DARK.t3)))
                     .child(div().w(px(40.)).flex_none().text_color(c(DARK.t3)).child(
                         if l.mark == Mark::Hunk {
