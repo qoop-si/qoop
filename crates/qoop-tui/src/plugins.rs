@@ -53,8 +53,8 @@ pub enum Listed {
 }
 
 /// Whether an action belongs in a palette opened over `focused`. A pane, tab or space
-/// action needs a terminal of this machine's daemon, the only one the host acts on; a
-/// selection action needs a selection, which the palette never has.
+/// action needs a terminal of this machine's daemon, the only one the host acts on. A
+/// `selection` action is never listed; an action run from the palette gets the selection.
 pub fn shown_for(contexts: &[String], focused: u32) -> bool {
     let local = focused != 0 && !crate::mux::is_remote_terminal(focused) && crate::mux::has_local();
     contexts.is_empty()
@@ -139,19 +139,29 @@ fn actions_of(result: &Value) -> Vec<Action> {
 }
 
 /// Run one action through the host, about `focused`: the host is told that terminal first,
-/// so the context the action gets is the one the palette was opened over. Blocking.
-pub fn run(plugin: &str, action: &str, focused: u32) -> Result<(), Failed> {
+/// so the context the action gets is the one the palette was opened over. `selected` is the
+/// mouse selection in that terminal, if any. Blocking.
+pub fn run(plugin: &str, action: &str, focused: u32, selected: Option<&str>) -> Result<(), Failed> {
     if focused != 0 && !crate::mux::is_remote_terminal(focused) {
         // A terminal the host does not list yet is no reason not to run.
         let _ = ask("qoop.focus", json!({"terminal": focused}));
     }
-    // herdr runs an action a person picks from a key binding; the palette is that here.
     ask(
         "plugin.action.invoke",
-        json!({"plugin_id": plugin, "action_id": action,
-               "context": {"invocation_source": "keybinding"}}),
+        invoke_params(plugin, action, selected),
     )
     .map(drop)
+}
+
+/// What `plugin.action.invoke` is asked: herdr runs an action a person picks from a key
+/// binding, which the palette is here, and hands it the selection in the focused pane as
+/// `selected_text` (the host cuts it to fit the action's environment).
+fn invoke_params(plugin: &str, action: &str, selected: Option<&str>) -> Value {
+    let mut context = json!({"invocation_source": "keybinding"});
+    if let Some(text) = selected.filter(|t| !t.is_empty()) {
+        context["selected_text"] = json!(text);
+    }
+    json!({"plugin_id": plugin, "action_id": action, "context": context})
 }
 
 /// An action as the notice row names it: its title with nothing a terminal would act on,
@@ -448,6 +458,24 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(pauses.len(), 15);
+    }
+
+    #[test]
+    fn an_action_gets_the_selection() {
+        assert_eq!(
+            invoke_params("t.a", "go", None),
+            json!({"plugin_id": "t.a", "action_id": "go",
+                   "context": {"invocation_source": "keybinding"}})
+        );
+        assert_eq!(
+            invoke_params("t.a", "go", Some(""))["context"].get("selected_text"),
+            None,
+            "an empty selection is none"
+        );
+        assert_eq!(
+            invoke_params("t.a", "go", Some("fix the build"))["context"]["selected_text"],
+            "fix the build"
+        );
     }
 
     #[test]

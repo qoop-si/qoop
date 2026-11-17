@@ -8,6 +8,7 @@ mod install;
 mod manifest;
 mod shim;
 mod tokens;
+mod view;
 mod writes;
 // Shapes the writes and the plugin panes use land with the next part of the host.
 #[allow(dead_code)]

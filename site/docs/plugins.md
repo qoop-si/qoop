@@ -55,7 +55,9 @@ starts inside one of its panes is read from its screen only.
 have open. Pick one and the hint row says it is starting, then that it started or why it did not.
 The plugin host, the small process that serves plugins, starts when qoop does once a plugin is
 installed. If it is not running, one row says so; quit and run `qoop` again. An action's output
-goes to `host.log` in the plugin's state folder (`qoop plugin run` prints the path).
+goes to `host.log` in the plugin's state folder (`qoop plugin run` prints the path). Text you
+selected with the mouse in the pane, while it is still highlighted, goes to the action, so a
+plugin such as an annotator gets your selection.
 
 ## Limits
 
@@ -63,8 +65,10 @@ These do not work, so a plugin that needs one installs and then does not do its 
 
 - no floating popups: a popup or overlay opens as a split beside its pane, zoomed to fill the tab
   until it closes;
-- no layout changes or moving panes (swapping and resizing panes work);
+- no layout changes (swapping, resizing and moving panes between tabs and spaces work);
 - no link handlers, and no worktree events;
+- a plugin's agent view (the filter and order it asks for the agent list) is kept for the plugin,
+  but qoop's sidebar does not change for it;
 - what a plugin reports about a pane (its metadata tokens, such as quota marks) is kept for the
   plugin to read, but qoop does not draw it;
 - only a plugin's tab rename changes the name qoop shows; the names it gives panes and agents are

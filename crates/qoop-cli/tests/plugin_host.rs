@@ -961,6 +961,307 @@ fn the_focus_moves_to_the_neighbour_on_a_side_as_herdr_moves_it() {
     assert_eq!(bad["error"]["code"], "invalid_request", "{bad}");
 }
 
+fn text(value: &Value) -> String {
+    value.as_str().expect("a string").to_string()
+}
+
+/// The events a subscriber hears until one named `last`, by name.
+fn heard_until(
+    lines: &mut impl Iterator<Item = std::io::Result<String>>,
+    last: &str,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    while names.last().map(String::as_str) != Some(last) {
+        let line = lines.next().expect("a line").expect("read");
+        let event: Value = serde_json::from_str(&line).expect("json");
+        names.push(text(&event["event"]));
+    }
+    names
+}
+
+#[test]
+fn a_pane_moves_between_tabs_and_spaces_as_herdr_moves_it() {
+    let stack = Stack::start();
+    let first = panes(&stack)[0].clone();
+    let (first_id, first_tab) = (text(&first["pane_id"]), text(&first["tab_id"]));
+    let made = stack.ask("tab.create", json!({"focus": false}));
+    let (second, second_tab) = (
+        text(&ok(&made)["root_pane"]["pane_id"]),
+        text(&made["result"]["tab"]["tab_id"]),
+    );
+    let to_tab = |pane: &str, tab: &str, extra: Value| {
+        let mut destination = json!({"type": "tab", "tab_id": tab, "split": "down"});
+        if let (Value::Object(d), Value::Object(e)) = (&mut destination, extra) {
+            d.extend(e);
+        }
+        stack.ask(
+            "pane.move",
+            json!({"pane_id": pane, "destination": destination}),
+        )
+    };
+
+    let same = to_tab(&second, &second_tab, json!({}));
+    assert_eq!(ok(&same)["move_result"]["changed"], false);
+    assert_eq!(same["result"]["move_result"]["reason"], "same_tab");
+    for (asked, code) in [
+        (to_tab(&second, "w1:t999", json!({})), "tab_not_found"),
+        (to_tab("w1:p999", &first_tab, json!({})), "pane_not_found"),
+        (
+            to_tab(&second, &first_tab, json!({"target_pane_id": "w1:p999"})),
+            "target_pane_not_found",
+        ),
+    ] {
+        assert_eq!(asked["error"]["code"], code, "{asked}");
+    }
+
+    let mut stream = UnixStream::connect(stack.herdr_socket()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let subscribe = json!({"id": "s", "method": "events.subscribe", "params": {"subscriptions": [
+        {"type": "tab.closed"}, {"type": "tab.created"}, {"type": "workspace.closed"},
+        {"type": "workspace.created"}, {"type": "pane.moved"}
+    ]}});
+    stream
+        .write_all(format!("{subscribe}\n").as_bytes())
+        .expect("write");
+    let mut lines = BufReader::new(stream).lines();
+    lines.next().expect("started").expect("read");
+
+    // Beside the first pane, a third of the height for it: its own tab closes.
+    let moved = to_tab(&second, &first_tab, json!({"ratio": 0.3}));
+    let result = &ok(&moved)["move_result"];
+    assert_eq!(result["changed"], true, "{result}");
+    assert_eq!(result["closed_tab_id"], second_tab.as_str());
+    assert_eq!(result["pane"]["tab_id"], first_tab.as_str());
+    assert!(
+        result.get("source_layout").is_none(),
+        "its tab is gone: {result}"
+    );
+    assert_eq!(result["target_layout"]["splits"][0]["direction"], "down");
+    assert_eq!(result["target_layout"]["splits"][0]["ratio"], 0.3);
+    assert_eq!(
+        heard_until(&mut lines, "pane_moved"),
+        ["tab_closed", "pane_moved"]
+    );
+    let now = panes(&stack);
+    assert_eq!(now.len(), 2);
+    assert!(
+        now.iter().all(|p| p["tab_id"] == first_tab.as_str()),
+        "{now:?}"
+    );
+
+    // Into a space of its own, then back beside the first: the emptied space closes.
+    let away = stack.ask(
+        "pane.move",
+        json!({"pane_id": second, "destination": {"type": "new_workspace", "label": "away",
+                                                  "tab_label": "solo"}}),
+    );
+    let result = &ok(&away)["move_result"];
+    let space = text(&result["created_workspace"]["workspace_id"]);
+    assert_eq!(result["created_workspace"]["label"], "away");
+    assert_eq!(result["created_tab"]["label"], "solo");
+    assert_eq!(result["pane"]["workspace_id"], space.as_str());
+    assert_eq!(
+        result["source_layout"]["panes"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        heard_until(&mut lines, "pane_moved"),
+        ["workspace_created", "tab_created", "pane_moved"]
+    );
+    let moved_id = text(&result["pane"]["pane_id"]);
+    let back = to_tab(&moved_id, &first_tab, json!({"target_pane_id": first_id}));
+    let result = &ok(&back)["move_result"];
+    assert_eq!(result["closed_workspace_id"], space.as_str(), "{result}");
+    assert_eq!(
+        heard_until(&mut lines, "pane_moved"),
+        ["tab_closed", "workspace_closed", "pane_moved"]
+    );
+    let spaces = ok(&stack.ask("workspace.list", json!({})))["workspaces"].clone();
+    assert!(
+        spaces
+            .as_array()
+            .expect("list")
+            .iter()
+            .all(|w| w["workspace_id"] != space.as_str()),
+        "{spaces}"
+    );
+
+    // Out of the split into a tab of its own in the same space: the split is gone.
+    let alone = stack.ask(
+        "pane.move",
+        json!({"pane_id": second, "destination": {"type": "new_tab"}, "focus": true}),
+    );
+    let result = &ok(&alone)["move_result"];
+    let new_tab = text(&result["created_tab"]["tab_id"]);
+    assert_ne!(new_tab, first_tab);
+    assert_eq!(result["source_layout"]["splits"], json!([]), "{result}");
+    assert_eq!(result["focused_pane_id"], result["pane"]["pane_id"]);
+    assert_eq!(
+        heard_until(&mut lines, "pane_moved"),
+        ["tab_created", "pane_moved"]
+    );
+    let tabs = ok(&stack.ask("tab.list", json!({})))["tabs"].clone();
+    assert_eq!(tabs.as_array().map(Vec::len), Some(2), "{tabs}");
+}
+
+#[test]
+fn a_move_into_a_sleeping_tab_or_space_is_refused_before_anything_moves() {
+    let stack = Stack::start();
+    let first = panes(&stack)[0].clone();
+    let (first_id, first_tab) = (text(&first["pane_id"]), text(&first["tab_id"]));
+    let split = stack.ask(
+        "pane.split",
+        json!({"target_pane_id": first_id, "direction": "right", "focus": false}),
+    );
+    let second = text(&ok(&split)["pane"]["pane_id"]);
+    let made = stack.ask("workspace.create", json!({"label": "zz", "focus": false}));
+    let space = text(&ok(&made)["workspace"]["workspace_id"]);
+    let (lone, lone_tab) = (
+        text(&made["result"]["root_pane"]["pane_id"]),
+        text(&made["result"]["tab"]["tab_id"]),
+    );
+    wait_for("the new shell's prompt", || screen_has(&stack, &lone, "$"));
+    let slept = qoop(stack.dir.path())
+        .args(["sleep", space.trim_start_matches('w')])
+        .output()
+        .expect("qoop sleep");
+    assert!(slept.status.success(), "{slept:?}");
+    wait_for("the space asleep", || {
+        panes(&stack).iter().all(|p| p["pane_id"] != lone.as_str())
+    });
+    let into_tab = stack.ask(
+        "pane.move",
+        json!({"pane_id": second, "destination": {"type": "tab", "tab_id": lone_tab,
+                                                  "split": "right"}}),
+    );
+    assert_eq!(into_tab["error"]["code"], "tab_not_found", "{into_tab}");
+    let into_space = stack.ask(
+        "pane.move",
+        json!({"pane_id": second, "destination": {"type": "new_tab", "workspace_id": space}}),
+    );
+    assert_eq!(
+        into_space["error"]["code"], "pane_move_failed",
+        "{into_space}"
+    );
+    let now = panes(&stack);
+    assert!(
+        now.iter()
+            .filter(|p| p["tab_id"] == first_tab.as_str())
+            .count()
+            == 2,
+        "nothing moved, the split whole: {now:?}"
+    );
+}
+
+#[test]
+fn an_action_gets_the_selected_text_in_its_context_cut_to_fit() {
+    let action = "id = \"t.sel\"\n[[actions]]\nid = \"show\"\ntitle = \"Show\"\n\
+                  command = [\"sh\", \"-c\", \"printf %s \\\"$HERDR_PLUGIN_CONTEXT_JSON\\\" > \\\"$HERDR_PLUGIN_STATE_DIR/context.json\\\"\"]\n";
+    let stack = Stack::start_with(|dir| {
+        plant(
+            &dir.join("data"),
+            "t.sel",
+            action,
+            action,
+            &mut json!({"plugins": {}}),
+        );
+    });
+    let file = stack
+        .dir
+        .path()
+        .join("data/qoop/plugins/.state/t.sel/context.json");
+    let seen = |selected: &str| -> Value {
+        let _ = std::fs::remove_file(&file);
+        ok(&stack.ask(
+            "plugin.action.invoke",
+            json!({"plugin_id": "t.sel", "action_id": "show",
+                   "context": {"selected_text": selected}}),
+        ));
+        wait_for("the action's context", || {
+            std::fs::read_to_string(&file).is_ok_and(|t| t.ends_with('}'))
+        });
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("read")).expect("json")
+    };
+    assert_eq!(seen("fix the build")["selected_text"], "fix the build");
+    // Control characters take six bytes each as JSON: cut so the JSON stays at 16 KiB.
+    let long = "a\u{1}".repeat(20_000);
+    let got = seen(&long);
+    let cut = got["selected_text"].as_str().expect("text");
+    assert!(long.starts_with(cut) && !cut.is_empty());
+    let written = serde_json::to_string(cut).expect("json").len() - 2;
+    assert!(written <= 16 * 1024 && written > 16 * 1024 - 7, "{written}");
+}
+
+#[test]
+fn an_agent_view_is_kept_and_answered_as_herdr_answers_it() {
+    let stack = Stack::start_with(|dir| {
+        let data = dir.join("data");
+        let mut ledger = json!({"plugins": {}});
+        for id in ["t.base", "t.keep"] {
+            let manifest = format!("id = \"{id}\"\n");
+            plant(&data, id, &manifest, &manifest, &mut ledger);
+        }
+        // Its manifest changed since the yes: installed, not agreed to.
+        plant(
+            &data,
+            "t.changed",
+            "id = \"t.changed\"\ndescription = \"new\"\n",
+            "id = \"t.changed\"\n",
+            &mut ledger,
+        );
+    });
+    let set = stack.ask(
+        "agent.view.set",
+        json!({"source": "example.views", "label": "busy",
+               "filter": {"op": "eq", "field": "status", "value": "working"}}),
+    );
+    assert_eq!(
+        ok(&set),
+        &json!({"type": "agent_view", "active": true, "source": "example.views", "label": "busy"})
+    );
+    let other = stack.ask("agent.view.clear", json!({"source": "other.views"}));
+    assert_eq!(
+        ok(&other)["active"],
+        true,
+        "another source's clear leaves it"
+    );
+    let mine = stack.ask("agent.view.clear", json!({"source": "example.views"}));
+    assert_eq!(
+        ok(&mine),
+        &json!({"type": "agent_view", "active": false}),
+        "its own source's clear clears it"
+    );
+    ok(&stack.ask("agent.view.set", json!({"source": "example.views"})));
+    let any = stack.ask("agent.view.clear", json!({}));
+    assert_eq!(ok(&any)["active"], false, "no source clears any");
+    for (source, code) in [
+        ("plugin:t.missing", "plugin_not_found"),
+        ("plugin:t.changed", "plugin_disabled"),
+        ("plugin:", "invalid_agent_view"),
+        ("bad source", "invalid_agent_view"),
+    ] {
+        let refused = stack.ask("agent.view.set", json!({"source": source}));
+        assert_eq!(refused["error"]["code"], code, "{source}: {refused}");
+    }
+    let owned = stack.ask("agent.view.set", json!({"source": "plugin:t.base"}));
+    assert_eq!(ok(&owned)["source"], "plugin:t.base");
+    // The plugin goes: its view is dropped at the next call, whatever source that names.
+    std::fs::remove_file(stack.dir.path().join("data/qoop/plugins/t.base")).expect("unlink");
+    let after = stack.ask("agent.view.clear", json!({"source": "other.views"}));
+    assert_eq!(
+        ok(&after),
+        &json!({"type": "agent_view", "active": false}),
+        "dropped with its plugin"
+    );
+    let listed = stack.ask("agent.list", json!({}));
+    assert!(
+        listed.get("error").is_none(),
+        "agent.list is unaffected: {listed}"
+    );
+}
+
 /// What a plugin pane runs in these tests: this test binary, waiting. A program of Apple's own
 /// (`sh`, `sleep`) does not let its environment be read, and the own-pane check reads it.
 #[test]

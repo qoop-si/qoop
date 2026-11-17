@@ -7,6 +7,7 @@
 //! the commands herdr runs quietly print nothing. Only the plugins' own `.bin/herdr` is ever
 //! dispatched here, so a `herdr` elsewhere on the machine (the person's own) is never shadowed.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -72,6 +73,7 @@ const VALUED: &[&str] = &[
     "--workspace",
     "--pane",
     "--tab",
+    "--tab-label",
     "--source",
     "--lines",
     "--format",
@@ -396,6 +398,7 @@ fn parse(args: &[String], caller: Option<&str>, socket: &Path) -> Result<Call, S
                 with(params, "target_pane_id", w.value("--target-pane")),
             )
         }
+        ["pane", "move", ..] => pane_move(tail(2))?,
         ["pane", "report-metadata", ..] => {
             let w = rest(2);
             let params = with(metadata(&w, true)?, "pane_id", w.plain.first().copied());
@@ -699,6 +702,89 @@ fn write(
 
 /// The states `--until` names.
 const STATUSES: &[&str] = &["idle", "working", "blocked", "done", "unknown"];
+
+const PANE_MOVE_USAGE: &str = "usage: herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]";
+
+/// `pane move <pane_id>` and exactly one destination, read as herdr's command line reads it:
+/// every option checked, focused unless `--no-focus`.
+fn pane_move(raw: &[String]) -> Result<Call, String> {
+    let usage = || PANE_MOVE_USAGE.to_string();
+    let (pane, options) = raw.split_first().ok_or_else(usage)?;
+    if pane.starts_with('-') {
+        return Err(usage());
+    }
+    let mut values: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut flags: Vec<&str> = Vec::new();
+    let mut focus = true;
+    let mut i = 0;
+    while i < options.len() {
+        let option = options[i].as_str();
+        match option {
+            "--tab" | "--workspace" | "--target-pane" | "--split" | "--ratio" | "--label"
+            | "--tab-label" => {
+                let value = options
+                    .get(i + 1)
+                    .ok_or_else(|| format!("missing value for {option}"))?;
+                values.insert(option, value);
+                i += 2;
+                continue;
+            }
+            "--new-tab" | "--new-workspace" => flags.push(option),
+            "--focus" => focus = true,
+            "--no-focus" => focus = false,
+            other => return Err(format!("unknown option: {other}")),
+        }
+        i += 1;
+    }
+    let has = |o: &str| values.contains_key(o) || flags.contains(&o);
+    let destinations = ["--tab", "--new-tab", "--new-workspace"];
+    if destinations.iter().filter(|d| has(d)).count() != 1 {
+        return Err(usage());
+    }
+    let not = |others: &[&str]| others.iter().any(|o| has(o));
+    let mut destination = if has("--tab") {
+        if !has("--split") || not(&["--workspace", "--label", "--tab-label"]) {
+            return Err(usage());
+        }
+        let split = values["--split"];
+        if !["right", "down"].contains(&split) {
+            return Err(format!(
+                "invalid split direction: {split} (expected right or down)"
+            ));
+        }
+        json!({"type": "tab", "tab_id": values["--tab"], "split": split})
+    } else if has("--new-tab") {
+        if not(&["--split", "--target-pane", "--tab-label"]) {
+            return Err(usage());
+        }
+        json!({"type": "new_tab"})
+    } else {
+        if not(&["--split", "--target-pane", "--workspace"]) {
+            return Err(usage());
+        }
+        json!({"type": "new_workspace"})
+    };
+    if let Some(ratio) = values.get("--ratio").filter(|_| has("--tab")) {
+        let parsed: f64 = ratio
+            .parse()
+            .ok()
+            .filter(|r: &f64| r.is_finite())
+            .ok_or_else(|| format!("invalid ratio: {ratio}"))?;
+        destination["ratio"] = json!(parsed);
+    }
+    for (option, key) in [
+        ("--target-pane", "target_pane_id"),
+        ("--workspace", "workspace_id"),
+        ("--label", "label"),
+        ("--tab-label", "tab_label"),
+    ] {
+        destination = with(destination, key, values.get(option).copied());
+    }
+    Ok(Call::Ask(
+        "pane.move",
+        json!({"pane_id": pane, "destination": destination, "focus": focus}),
+    ))
+}
 
 /// `agent prompt <target> <text> [--wait [--until S]... [--timeout MS]]`: the target and the
 /// text by position (the text may be `--wait`), the options before or after them.
@@ -1233,6 +1319,46 @@ mod tests {
             )
         );
         assert!(call(&split("pane focus w1:p2")).is_err(), "no id form");
+    }
+
+    #[test]
+    fn pane_move_reads_herdrs_three_destinations() {
+        assert_eq!(
+            asked(
+                "pane move w1:p2 --tab w1:t3 --split down --target-pane w1:p3 --ratio 0.3 --no-focus"
+            ),
+            (
+                "pane.move",
+                json!({"pane_id": "w1:p2", "focus": false, "destination": {
+                    "type": "tab", "tab_id": "w1:t3", "split": "down",
+                    "target_pane_id": "w1:p3", "ratio": 0.3}})
+            )
+        );
+        assert_eq!(
+            asked("pane move w1:p2 --new-tab --workspace w2 --label logs").1,
+            json!({"pane_id": "w1:p2", "focus": true, "destination": {
+                "type": "new_tab", "workspace_id": "w2", "label": "logs"}}),
+            "focused unless told not to, as herdr's command line"
+        );
+        assert_eq!(
+            asked("pane move w1:p2 --new-workspace --label api --tab-label main").1["destination"],
+            json!({"type": "new_workspace", "label": "api", "tab_label": "main"})
+        );
+        for wrong in [
+            "pane move",
+            "pane move --tab w1:t3 --split right",
+            "pane move w1:p2",
+            "pane move w1:p2 --tab w1:t3",
+            "pane move w1:p2 --tab w1:t3 --new-tab --split right",
+            "pane move w1:p2 --tab w1:t3 --split left",
+            "pane move w1:p2 --tab w1:t3 --split right --ratio nan",
+            "pane move w1:p2 --new-tab --target-pane w1:p3",
+            "pane move w1:p2 --new-workspace --workspace w2",
+            "pane move w1:p2 --new-tab --sideways",
+            "pane move w1:p2 --tab",
+        ] {
+            assert!(call(&split(wrong)).is_err(), "{wrong}");
+        }
     }
 
     #[test]

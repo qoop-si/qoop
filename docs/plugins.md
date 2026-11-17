@@ -93,7 +93,8 @@ A plugin runs as you, with your file permissions, and through qoop it can:
 - close panes, tabs and spaces;
 - rename them, and move focus (to a named pane, or to the neighbour on a side with
   `pane focus --direction`);
-- swap and resize panes in a split tab;
+- swap and resize panes in a split tab, and move a pane into another tab or into a tab or
+  space of its own;
 - open panes, tabs and spaces, and start a plugin's own panes;
 - show a desktop notification, which follows `[notify] mute`.
 
@@ -136,9 +137,15 @@ the rest wait. Output of actions, events and startups goes to
 `ctrl-a space` ends with a plugins section: each installed plugin's actions, by title with the
 plugin's id beside it, that fit what the palette was opened over. An action with no `contexts`
 or `global` is always listed; `workspace`, `tab` and `pane` actions are listed when a terminal
-of this machine is on screen; a `selection` action is never listed, because the palette has no
-selection. Picking one says `starting <title> (<id>)` at once, then `started ...`, or `did not
-start (see qoop plugin ls)` with the host's reason.
+of this machine is on screen; a `selection` action is never listed. Picking one says
+`starting <title> (<id>)` at once, then `started ...`, or `did not start (see qoop plugin ls)`
+with the host's reason.
+
+The text you selected with the mouse in the focused pane, while it is still shown, goes to the
+action as `selected_text` in its context, as herdr hands a key-bound action the selection. The
+host cuts any `selected_text`, on a character, to 16 KiB as written in
+`HERDR_PLUGIN_CONTEXT_JSON`, so the variable stays far under the 128 KiB a Linux environment
+variable may hold. A selection made in copy mode is not passed.
 
 The interface tells the host which terminal it shows, so an action gets that terminal as its
 focused pane, tab and space. With plugins installed but no host running, one row says
@@ -164,9 +171,10 @@ a tab `w<N>:t<K>`. A tab keeps its id while any terminal of its splits remains. 
 a revision that rises on every change and never resets. The host answers `ping` and
 `herdr --version` as `0.9.5`, and these methods, the ones the plugins we checked call: `pane`
 list, get, current, read, layout, split, close, focus, send-text, send-input, process-info,
-rename, zoom, resize and report-metadata; `tab` list, get, create, rename, focus and close;
-`workspace` list, get, create, focus, rename, close and report-metadata; `agent` list, get,
-focus, prompt and rename; `session snapshot` and `session list`; `plugin` list, action list,
+rename, zoom, resize, swap, move and report-metadata; `tab` list, get, create, rename, focus
+and close; `workspace` list, get, create, focus, rename, close and report-metadata; `agent`
+list, get, focus, prompt and rename, and `agent.view.set` and `agent.view.clear` on the socket;
+`session snapshot` and `session list`; `plugin` list, action list,
 action invoke, pane open and close, config-dir and popup close; `notification show`;
 `server reload-config`; and `events.subscribe`. Anything else gets herdr's own
 `invalid_request` ("unknown variant") error, which plugins use to fall back.
@@ -181,6 +189,29 @@ agent status changed, and closed or exited; and `layout.updated`. The host reads
 listings on its notices and every two seconds, so an event can arrive up to two seconds late.
 A pane that goes away because the host closed it for a plugin is `pane_closed`; one that goes
 away any other way, including you closing it, is `pane_exited`. Never both.
+
+`pane move` keeps the pane's terminal, and so what runs in it, as herdr does. Into a tab
+(`--tab T --split right|down`, beside `--target-pane` or that tab's focused pane, the target
+keeping `--ratio` of the room, 0.1 to 0.9): it leaves its split, whose other panes stay as they
+were, and joins the target's. `--new-tab` makes it a tab of its own at the end of its space or
+of `--workspace`; `--new-workspace` puts it alone in a new space, which `--label` names and whose
+tab `--tab-label` names. A move within one tab, or out of or into a tab zoomed by a plugin, is
+answered as not made (`same_tab`, `zoomed_tab`), as in herdr. A sleeping tab is `tab_not_found`
+and a sleeping space `pane_move_failed`, before anything moves. A tab left empty closes, and so
+does a space left empty by a move to another one, unless it is the session's default space or
+qass's. Events come in herdr's order: tab and space closed, space and tab created, `pane_moved`
+(naming what it closed and made), then the layouts. If joining the target's split fails after
+the pane left its own, the pane stays a tab of its own in the target's space and the move is an
+error. A pane alone in its tab moved to a new tab in its own space keeps its tab and goes to the
+end.
+
+`agent.view.set` and `agent.view.clear` are checked as herdr checks them (a source of letters,
+digits and `:._-` up to 120, a label up to 32, filters up to 8 deep and 64 nodes, `in` up to 32
+values, up to 8 sort fields; a `plugin:<id>` source needs that plugin installed and agreed to)
+and answered as herdr answers them. There is one view at a time; `clear` with a source clears
+only that source's, without one any. A view a plugin owns is dropped once the plugin is removed.
+qoop draws nothing from it: the agent list in qoop's sidebar stays as it is, and `agent list`
+is unaffected, as in herdr.
 
 ## Plugin panes
 
@@ -204,7 +235,7 @@ These do not work, and a plugin that needs one will install and then not do its 
 
 - no floating popups: a popup or overlay opens as a split beside its target, zoomed to fill the
   tab, and the zoom goes back when it closes;
-- no `layout.*` and no pane move;
+- no `layout.*`;
 - `[[link_handlers]]` are read and listed in `plugin list`, but a clicked link never runs one;
 - no worktree events, and no `pane.output_matched`, `pane.scroll_changed`,
   `pane.output_changed`, `workspace.updated` or `workspace.reordered` events: a subscription to
@@ -212,8 +243,10 @@ These do not work, and a plugin that needs one will install and then not do its 
 - `pane read --source recent-unwrapped` joins a row that fills the pane's width to the next
   one, since qoop does not keep which rows wrapped: a line exactly as wide as the pane is joined
   by mistake;
-- no `agent start`, `agent report`, `agent view`, `events.wait`, `herdr integration` or
+- no `agent start`, `agent report`, `events.wait`, `herdr integration` or
   `herdr machine`: unknown methods or commands;
+- an agent view (`agent.view.set`) is kept and answered, but qoop's sidebar does not filter,
+  sort or relabel its agents by it;
 - `pane report-metadata` and `workspace report-metadata` keep their tokens (per pane or space,
   with `--seq` ordering and `--ttl-ms` expiry) and give them back as `tokens` in pane, agent and
   space lists, but the qoop interface does not draw them, and a pane's title, display agent and
