@@ -1237,6 +1237,10 @@ impl Host {
                 }
                 Ok(json!({"type": "ok"}))
             }
+            // A link ctrl+clicked in a pane, for the plugin handler it matches.
+            "qoop.link" => self.link(params),
+            // The agents a plugin's agent view shows, in its order, for the spaces tree.
+            "qoop.view" => Ok(self.view_order()),
             // A pane's `pane-exec` fetching what it becomes: once, within its time.
             "qoop.pane_spec" => {
                 let nonce = param(params, "nonce").unwrap_or_default();
@@ -2377,6 +2381,15 @@ impl Host {
         let mut env = install::plugin_env(&self.home, plugin_id, &plugin.root);
         env.extend(host::env_of_context(&merged));
         env.push(("HERDR_PLUGIN_ACTION_ID".into(), action_id.into()));
+        // A link handler's run is told the link and the handler, as herdr tells it.
+        for (var, key) in [
+            ("HERDR_PLUGIN_CLICKED_URL", "clicked_url"),
+            ("HERDR_PLUGIN_LINK_HANDLER_ID", "link_handler_id"),
+        ] {
+            if let Some(value) = merged.get(key).and_then(Value::as_str) {
+                env.push((var.into(), value.into()));
+            }
+        }
         env.push((
             "HERDR_PLUGIN_CONTEXT_JSON".into(),
             merged.to_string().into(),

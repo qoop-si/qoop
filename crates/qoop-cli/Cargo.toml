@@ -28,6 +28,7 @@ qoop-proto = { path = "../qoop-proto" }
 qoop-domain = { path = "../qoop-domain" }
 qoop-store = { path = "../qoop-store" }
 qoop-pty = { path = "../qoop-pty" }
+regex = "1"
 
 [dev-dependencies]
 bytes = { workspace = true }

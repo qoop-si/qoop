@@ -2,6 +2,7 @@
 
 mod host;
 mod install;
+mod link;
 // The host reads the rest of a manifest (titles, panes); until the next part lands some fields
 // are only parsed.
 #[allow(dead_code)]

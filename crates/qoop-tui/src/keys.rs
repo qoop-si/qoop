@@ -89,6 +89,9 @@ pub enum Action {
         /// program's": every terminal emulator gives a person their own selection back
         /// this way when the program in front of them has taken the mouse.
         shift: bool,
+        /// Control was held (SGR flag 16): a link under the pointer goes to a plugin's link
+        /// handler first, as herdr's ctrl+click does.
+        ctrl: bool,
     },
     /// A press of the right button, in one based screen coordinates. Only the column's rows
     /// answer it, with what they offer for themselves; anywhere else it does nothing, as every
@@ -343,7 +346,12 @@ pub(crate) fn mouse(bytes: &[u8]) -> Option<Option<Action>> {
     } else if motion {
         press.then_some(Action::Drag { row, col, shift })
     } else if press {
-        Some(Action::Click { row, col, shift })
+        Some(Action::Click {
+            row,
+            col,
+            shift,
+            ctrl: button & 16 != 0,
+        })
     } else {
         Some(Action::Release { row, col, shift })
     };
@@ -537,7 +545,8 @@ mod tests {
             Action::Click {
                 row: 1,
                 col: 5,
-                shift: false
+                shift: false,
+                ctrl: false
             }
             .moves_on()
         );
@@ -832,7 +841,18 @@ mod tests {
             vec![Action::Click {
                 row: 5,
                 col: 10,
-                shift: false
+                shift: false,
+                ctrl: false
+            }]
+        );
+        // With control held: 16 is its flag, and the button is still the left one.
+        assert_eq!(
+            keys.feed(b"\x1b[<16;10;5M"),
+            vec![Action::Click {
+                row: 5,
+                col: 10,
+                shift: false,
+                ctrl: true
             }]
         );
         // The same button, moving: 32 is the motion flag.

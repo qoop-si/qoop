@@ -325,6 +325,217 @@ fn usage_on() -> bool {
     qoop_runtime::legacy::var("QOOP_USAGE").is_ok_and(|v| v.trim() == "1")
 }
 
+/// How long a held link click waits for the plugin host before it goes on as a plain click.
+const LINK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A ctrl+click on a link, as herdr takes one: the press is held, and everything read after
+/// it is kept behind it in order, while the plugin host is asked. A handler that takes it takes
+/// the gesture (the press, its drags and its release) and nothing else; otherwise the press is
+/// replayed as it came, then what was kept, and it goes where a click goes.
+#[derive(Debug, Default)]
+struct LinkClick {
+    held: Option<HeldClick>,
+    /// A plugin took the click before its button came up: its drags and its release are the
+    /// plugin's too, until the release or the next press.
+    swallow: bool,
+    /// The last click's number, so an answer for an older one is never applied.
+    asked: u64,
+}
+
+/// A link click waiting for its answer.
+#[derive(Debug)]
+struct HeldClick {
+    id: u64,
+    /// The press as the terminal sent it.
+    press: Vec<u8>,
+    /// Every read after it, as it came.
+    after: Vec<Vec<u8>>,
+}
+
+/// One SGR mouse report in `bytes`: where it is, its button field, and whether it is a press
+/// (`M`) or a release (`m`).
+#[derive(Clone, Debug, PartialEq)]
+struct Sgr {
+    at: std::ops::Range<usize>,
+    button: u16,
+    col: u16,
+    row: u16,
+    press: bool,
+}
+
+/// The SGR mouse reports in `bytes`, in order.
+fn sgr_reports(bytes: &[u8]) -> Vec<Sgr> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(start) = bytes[from..]
+        .windows(3)
+        .position(|w| w == b"\x1b[<")
+        .map(|p| from + p)
+    {
+        let body = start + 3;
+        let Some(len) = bytes[body..].iter().position(|b| *b == b'M' || *b == b'm') else {
+            break;
+        };
+        let end = body + len;
+        let fields: Option<Vec<u16>> = std::str::from_utf8(&bytes[body..end])
+            .ok()
+            .and_then(|s| s.split(';').map(|f| f.parse().ok()).collect());
+        if let Some([button, col, row]) = fields.as_deref() {
+            out.push(Sgr {
+                at: start..end + 1,
+                button: *button,
+                col: *col,
+                row: *row,
+                press: bytes[end] == b'M',
+            });
+        }
+        from = end + 1;
+    }
+    out
+}
+
+/// The left button with control alone held, pressed: the one gesture a link handler takes.
+fn ctrl_press(report: &Sgr) -> bool {
+    report.press && report.button == 16
+}
+
+/// `bytes` with a taken link click's drags and release left out, while `swallow` holds: a
+/// release ends it, and so does a new press (which stays).
+fn swallowed(bytes: &[u8], swallow: &mut bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut kept = 0;
+    for report in sgr_reports(bytes) {
+        if !*swallow {
+            break;
+        }
+        let left = report.button & 0b11 == 0 && report.button & 64 == 0;
+        let motion = report.button & 32 != 0;
+        if left && report.press && !motion {
+            *swallow = false;
+            break;
+        }
+        if left && (motion || !report.press) {
+            out.extend_from_slice(&bytes[kept..report.at.start]);
+            kept = report.at.end;
+            if !report.press {
+                *swallow = false;
+            }
+        }
+    }
+    out.extend_from_slice(&bytes[kept..]);
+    out
+}
+
+impl LinkClick {
+    /// The host's answer for click `id`: what to read next, in order, each marked whether it is
+    /// the replayed press (which is not taken as a link click again).
+    fn answered(&mut self, id: u64, link: &crate::plugins::Link) -> Vec<(Vec<u8>, bool)> {
+        let Some(held) = self.held.take_if(|h| h.id == id) else {
+            return Vec::new();
+        };
+        if *link == crate::plugins::Link::Left {
+            let after = held.after.into_iter().map(|bytes| (bytes, false));
+            return std::iter::once((held.press, true)).chain(after).collect();
+        }
+        let mut swallow = true;
+        let out = held
+            .after
+            .iter()
+            .map(|bytes| swallowed(bytes, &mut swallow))
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| (bytes, false))
+            .collect();
+        self.swallow = swallow;
+        out
+    }
+}
+
+/// The ctrl+click in a read that a plugin's link handler may take: where its press is, and the
+/// terminal and link under it. Only while a plugin here has a link handler and its host is
+/// listening, and no box or mode has the mouse: anyone else's ctrl+click goes on at once,
+/// exactly as before.
+fn link_press(
+    state: &State,
+    bytes: &[u8],
+    host_up: impl Fn() -> bool,
+) -> Option<(std::ops::Range<usize>, u32, String)> {
+    if !state.plugin_links || state.overlay_open() || state.modes.open() {
+        return None;
+    }
+    let press = sgr_reports(bytes)
+        .into_iter()
+        .find(ctrl_press)
+        .filter(|_| host_up())?;
+    let (terminal, url) = link_click(state, press.row, press.col)?;
+    Some((press.at, terminal, url))
+}
+
+/// Where a read came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    /// The terminal, now.
+    Terminal,
+    /// Given back by a link click: read before, its reports already taken out.
+    Replayed,
+    /// The link click's own press, given back: never held as a link click again.
+    ReplayedPress,
+}
+
+/// The next bytes to act on, and where they came from: what a link click held first, then
+/// what the terminal sent.
+async fn next_input(
+    replay: &mut std::collections::VecDeque<(Vec<u8>, bool)>,
+    typed: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Option<(Vec<u8>, Origin)> {
+    match replay.pop_front() {
+        Some((bytes, true)) => Some((bytes, Origin::ReplayedPress)),
+        Some((bytes, false)) => Some((bytes, Origin::Replayed)),
+        None => typed.recv().await.map(|bytes| (bytes, Origin::Terminal)),
+    }
+}
+
+/// A read with the terminal's reports taken out. A replayed read had them taken out when it
+/// was first read, and is not looked at again: a lone escape held in it must not join the
+/// terminal's next read into a key.
+fn without_reports(
+    reports: &mut crate::input::Reports,
+    raw: Vec<u8>,
+    origin: Origin,
+) -> (Vec<u8>, Vec<crate::input::Report>) {
+    match origin {
+        Origin::Terminal => reports.strip(&raw),
+        Origin::Replayed | Origin::ReplayedPress => (raw, Vec::new()),
+    }
+}
+
+/// The terminal and link under a ctrl+click at one based `row` and `col`, when it lands on a
+/// link in a tile of this machine: the cell's `OSC 8` target, else a web address in its row.
+fn link_click(state: &State, row: u16, col: u16) -> Option<(u32, String)> {
+    let (terminal, _, (tile_row, tile_col)) = state.tile_at_screen(row, col)?;
+    if terminal == 0 || crate::mux::is_remote_terminal(terminal) {
+        return None;
+    }
+    let (line, spans, links) = if terminal == state.focused {
+        let (line, spans) = screen::window_row(
+            state.view(),
+            &state.behind,
+            state.scrolled_rows(),
+            state.anchor.unwrap_or_default(),
+            tile_row,
+        );
+        let links = state.view().map(|s| s.links.as_slice()).unwrap_or(&[]);
+        (line, spans, links)
+    } else {
+        let shot = state.snapshots.get(&terminal)?;
+        (
+            shot.lines.get(tile_row)?.as_str(),
+            shot.styles.get(tile_row).map(Vec::as_slice).unwrap_or(&[]),
+            shot.links.as_slice(),
+        )
+    };
+    crate::hyperlink::link_at(line, spans, links, tile_col).map(|url| (terminal, url))
+}
+
 /// Work done off the loop's own thread, handed back when it is done.
 enum Blocked {
     /// A cost sample: when it was taken, which terminal asked for which group, and what
@@ -344,6 +555,10 @@ enum Blocked {
     PluginActions(crate::plugins::Listed),
     /// A plugin action picked in the palette: started, or why not.
     PluginRan(String, Result<(), crate::plugins::Failed>),
+    /// What the plugin host said of a ctrl+clicked link, by the click's number.
+    Link(u64, crate::plugins::Link),
+    /// What the plugin host said of plugins for this interface (`plugins::ViewWatch`).
+    Plugins(crate::plugins::Said),
 }
 
 /// `qoop qass`, which wakes qass or starts it in its own space and shows it: from this
@@ -1108,6 +1323,14 @@ struct State {
     /// copied something looks at it to check they got the right thing. The next press in
     /// the pane clears it.
     selection: Option<crate::selection::Selection>,
+    /// A ctrl+click on a link, held while the plugin host says whether a plugin takes it.
+    link: LinkClick,
+    /// The agents a plugin's agent view shows, in its order: what the spaces tree follows
+    /// while one is set (`plugins::ViewWatch`).
+    agent_view: Option<crate::plugins::AgentView>,
+    /// Whether a plugin here has a link handler, as the host last said: only then is a
+    /// ctrl+click held for it.
+    plugin_links: bool,
     /// A press went to the program in the focused pane and its release has not. The
     /// program is owed the rest of that gesture wherever the pointer goes; without the
     /// flag a release outside the tile was dropped and vim never saw the button come up.
@@ -1365,6 +1588,7 @@ impl State {
                 handle: self.qass_split().then(|| self.handle()).flatten(),
                 questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
+                agent_order: self.agent_view.as_ref(),
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
                 doze_open: &self.doze_open,
@@ -2633,6 +2857,7 @@ impl State {
             inbox: self.inbox,
             icons: crate::icons::on(),
             nav: self.modes.side.as_ref(),
+            order: self.agent_view.as_ref(),
         }
     }
 
@@ -8160,6 +8385,9 @@ where
         modes: Modes::default(),
         selection: None,
         forwarded_press: false,
+        link: LinkClick::default(),
+        agent_view: None,
+        plugin_links: false,
         board_drag: None,
         board_owed: None,
         last_press: None,
@@ -8232,6 +8460,8 @@ where
     let mut read = [0u8; 64 * 1024];
 
     let (tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // A link click no plugin took, replayed ahead of whatever the terminal sent after it.
+    let mut replay: std::collections::VecDeque<(Vec<u8>, bool)> = std::collections::VecDeque::new();
     // Weak, so it never keeps the channel open after the reader has gone: it only wakes the
     // stdin arm when a held escape runs out of time and is owed to the person as a key.
     let wake_stdin = tx.downgrade();
@@ -8356,6 +8586,13 @@ where
     // Work that blocks (reading /proc, reading a transcript) runs on the blocking pool and
     // comes back here, so the keyboard never waits on a disk. One sample at a time.
     let (blocking_tx, mut blocking_rx) = tokio::sync::mpsc::unbounded_channel::<Blocked>();
+    // A plugin's agent view, for the spaces tree: asked off the render path.
+    let view_watch = {
+        let tx = blocking_tx.clone();
+        crate::plugins::ViewWatch::start(move |said| {
+            let _ = tx.send(Blocked::Plugins(said));
+        })
+    };
     // This machine's microphone while it is lent to a tab: the recorder, and what it hears.
     // Each recorder numbered, so what an ended one still says is never taken for the next's.
     let mut recorder: Option<(u64, tokio::process::Child)> = None;
@@ -8791,11 +9028,11 @@ where
                     }
                     dirty = true;
                 }
-                typed = stdin_rx.recv() => {
-                    let Some(raw) = typed else { return Ok(()) };
+                typed = next_input(&mut replay, &mut stdin_rx) => {
+                    let Some((raw, origin)) = typed else { return Ok(()) };
                     // Reports first, before any overlay or the key decoder sees the bytes:
                     // each of those reads an escape as a cancel.
-                    let (bytes, said) = reports.strip(&raw);
+                    let (bytes, said) = without_reports(&mut reports, raw, origin);
                     if qoop_runtime::agents::person_key(&bytes) {
                         state.keyed_at = Some(std::time::Instant::now());
                     }
@@ -8847,6 +9084,47 @@ where
                     if bytes.is_empty() {
                         continue;
                     }
+                    // A ctrl+click on a link waits for the plugin host, and whatever is read
+                    // after it waits behind it, in order (`LinkClick`). The replayed press
+                    // is never held again.
+                    let bytes = if origin == Origin::ReplayedPress {
+                        bytes
+                    } else if let Some(held) = state.link.held.as_mut() {
+                        held.after.push(bytes);
+                        continue;
+                    } else if state.link.swallow {
+                        let rest = swallowed(&bytes, &mut state.link.swallow);
+                        if rest.is_empty() {
+                            continue;
+                        }
+                        rest
+                    } else if let Some((at, terminal, url)) = link_press(&state, &bytes, || qoop_runtime::paths::plugin_host_socket().exists()) {
+                        state.link.asked += 1;
+                        let id = state.link.asked;
+                        let after = bytes[at.end..].to_vec();
+                        state.link.held = Some(HeldClick {
+                            id,
+                            press: bytes[at.clone()].to_vec(),
+                            after: (!after.is_empty()).then_some(after).into_iter().collect(),
+                        });
+                        let tx = blocking_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let said = crate::plugins::link(terminal, &url, LINK_WAIT);
+                            let _ = tx.send(Blocked::Link(id, said));
+                        });
+                        // An answer later than this is no answer: the click goes on.
+                        let tx = blocking_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(LINK_WAIT).await;
+                            let _ = tx.send(Blocked::Link(id, crate::plugins::Link::Left));
+                        });
+                        if at.start == 0 {
+                            continue;
+                        }
+                        bytes[..at.start].to_vec()
+                    } else {
+                        bytes
+                    };
                     // The person is doing something: a machine they connected a moment
                     // ago no longer gets to move the screen when it arrives, and a list
                     // of its sessions no longer gets to open under their next key. A
@@ -9343,7 +9621,7 @@ where
                                     dirty = true;
                                 }
                             }
-                            Action::Click { row, col, shift } => {
+                            Action::Click { row, col, shift, .. } => {
                                 // Where the press landed is where the key row points next.
                                 let in_column = {
                                     let left = screen::left_for(
@@ -11215,6 +11493,7 @@ where
                                 };
                                 if index_answer {
                                     index_asked = None;
+                                    view_watch.poke();
                                     refresh |= std::mem::take(&mut index_owed);
                                 }
                                 // A picture's answer is the picture's: its refusal is said once
@@ -11528,6 +11807,26 @@ where
                     Blocked::PluginRan(name, ran) => {
                         state.message = Some(crate::plugins::ran_notice(&name, &ran));
                         dirty = true;
+                    }
+                    // What the plugin host says of plugins for this interface: the agent
+                    // view the spaces tree follows, and whether a ctrl+click is held for one.
+                    Blocked::Plugins(said) => {
+                        if state.agent_view != said.view {
+                            state.agent_view = said.view;
+                            dirty = true;
+                        }
+                        state.plugin_links = said.links;
+                    }
+                    // A link click's answer: replayed when no plugin took it, else the
+                    // plugin's (a handler that could not start says why). An answer for an
+                    // older click, or one after the wait, changes nothing.
+                    Blocked::Link(id, said) => {
+                        let current = state.link.held.as_ref().is_some_and(|h| h.id == id);
+                        replay.extend(state.link.answered(id, &said));
+                        if let (true, crate::plugins::Link::Failed(why)) = (current, said) {
+                            state.message = Some(format!("link handler did not start: {why}"));
+                            dirty = true;
+                        }
                     }
                     Blocked::Qass(said) => match said {
                         Err(why) => {
@@ -17785,6 +18084,9 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            link: LinkClick::default(),
+            agent_view: None,
+            plugin_links: false,
             board_drag: None,
             board_owed: None,
             last_press: None,
@@ -19353,6 +19655,9 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            link: LinkClick::default(),
+            agent_view: None,
+            plugin_links: false,
             board_drag: None,
             board_owed: None,
             last_press: None,
@@ -19517,6 +19822,9 @@ mod tests {
             modes: Modes::default(),
             selection: None,
             forwarded_press: false,
+            link: LinkClick::default(),
+            agent_view: None,
+            plugin_links: false,
             board_drag: None,
             board_owed: None,
             last_press: None,
@@ -26212,6 +26520,38 @@ mod tests {
         grid
     }
 
+    /// A plugin's agent view changes the order of the agent rows while it is set, and once it is
+    /// cleared the sidebar's cells, characters and inks, are what they were before it was set.
+    #[test]
+    fn the_sidebar_is_its_own_again_when_an_agent_view_is_cleared() {
+        let mut state = tiled_state();
+        state.rows.push(agent(3, 1, "codex", "idle"));
+        let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
+        let rows = state.lines as usize - screen::STATUS;
+        // The whole painted frame, escapes and all: inks as much as characters.
+        let sidebar = |state: &State| screen::paint(&state.frame());
+        let cells = |state: &State| -> Vec<String> {
+            cells_of(
+                &screen::paint(&state.frame()),
+                state.cols as usize,
+                state.lines as usize,
+            )
+            .into_iter()
+            .take(rows)
+            .map(|row| row[..left - 1].iter().collect())
+            .collect()
+        };
+        let (before, before_cells) = (sidebar(&state), cells(&state));
+        state.agent_view = Some(crate::plugins::AgentView {
+            order: vec![3, 2],
+            hidden: Vec::new(),
+        });
+        assert_ne!(cells(&state), before_cells, "the view orders the rows");
+        state.agent_view = None;
+        assert_eq!(cells(&state), before_cells);
+        assert_eq!(sidebar(&state), before, "inks too");
+    }
+
     /// The left sidebar is the owner's, and stays exactly as it is: whatever the panes do (the
     /// questions folded or beside the board, the board or qass folded, the rail dragged to its
     /// narrowest and widest, a stacked or a swapped tab, a zoom, 200 or 120 columns), the cells of
@@ -28809,6 +29149,174 @@ mod tests {
         );
         let held = s.selection.expect("still held with the setting off");
         assert_eq!(selection_text(&s, &held), " > fix the build");
+    }
+
+    /// A ctrl+click's link: a web address under it in the focused tile's text.
+    #[test]
+    fn a_ctrl_click_on_an_address_in_a_tile_finds_it() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "see https://example.com/x. ok");
+        let window = window_rows(&s);
+        let (row, at) = window
+            .iter()
+            .enumerate()
+            .find_map(|(r, line)| {
+                line.find("https://")
+                    .map(|c| (r, line[..c].chars().count()))
+            })
+            .expect("the address on screen");
+        // The screen cell that is this tile's (row, col).
+        let screen = |col: usize| {
+            (1..=s.lines)
+                .flat_map(|r| (1..=s.cols).map(move |c| (r, c)))
+                .find(|(r, c)| {
+                    s.tile_at_screen(*r, *c)
+                        .is_some_and(|(t, _, at)| t == s.focused && at == (row, col))
+                })
+                .expect("on screen")
+        };
+        let (r, c) = screen(at + 3);
+        assert_eq!(
+            link_click(&s, r, c),
+            Some((s.focused, "https://example.com/x".into()))
+        );
+        let (r, c) = screen(at + 21);
+        assert_eq!(
+            link_click(&s, r, c),
+            None,
+            "its full stop is not the address"
+        );
+
+        // A read with keys before a ctrl+click on it: held only with a link handler here and
+        // its host up, and then just from the press on.
+        let (r, c) = screen(at + 3);
+        let read = format!("ab\x1b[<16;{c};{r}Mcd").into_bytes();
+        assert_eq!(
+            link_press(&s, &read, || true),
+            None,
+            "no plugin link handler"
+        );
+        s.plugin_links = true;
+        assert_eq!(link_press(&s, &read, || false), None, "no host");
+        assert_eq!(
+            link_press(&s, &read, || true),
+            Some((
+                2..read.len() - 2,
+                s.focused,
+                "https://example.com/x".to_string()
+            ))
+        );
+        let plain = format!("\x1b[<0;{c};{r}M").into_bytes();
+        assert_eq!(link_press(&s, &plain, || true), None, "no control held");
+        s.palette = Some(crate::palette::Palette::open());
+        assert_eq!(link_press(&s, &read, || true), None, "a box has the mouse");
+    }
+
+    /// A held link click: no plugin takes it, and the press is replayed (marked, so it is not
+    /// held again) before everything read after it, in order; a plugin takes it, and only its
+    /// own drags and release go, a key or another press read meanwhile still coming through.
+    #[test]
+    fn a_held_link_click_replays_in_order_or_gives_up_only_its_own_gesture() {
+        use crate::plugins::Link;
+        let press = b"\x1b[<16;10;5M".to_vec();
+        let drag = b"\x1b[<48;11;5M".to_vec();
+        let up = b"\x1b[<16;11;5m".to_vec();
+        let held = |after: Vec<Vec<u8>>| LinkClick {
+            held: Some(HeldClick {
+                id: 7,
+                press: press.clone(),
+                after,
+            }),
+            ..LinkClick::default()
+        };
+        let mut link = held(vec![drag.clone(), b"x".to_vec(), up.clone()]);
+        assert!(
+            link.answered(6, &Link::Left).is_empty(),
+            "an older click's answer"
+        );
+        assert_eq!(
+            link.answered(7, &Link::Left),
+            [
+                (press.clone(), true),
+                (drag.clone(), false),
+                (b"x".to_vec(), false),
+                (up.clone(), false)
+            ]
+        );
+        assert!(link.held.is_none() && !link.swallow);
+        assert!(
+            link.answered(7, &Link::Taken).is_empty(),
+            "the wait already gave up"
+        );
+
+        let mut mixed = drag.clone();
+        mixed.extend_from_slice(b"ls");
+        mixed.extend_from_slice(&up);
+        mixed.extend_from_slice(b"\r");
+        let mut link = held(vec![mixed, b"\x1b[<0;3;3M".to_vec()]);
+        assert_eq!(
+            link.answered(7, &Link::Taken),
+            [(b"ls\r".to_vec(), false), (b"\x1b[<0;3;3M".to_vec(), false)],
+            "its drag and release go; the keys and the next press stay"
+        );
+        assert!(!link.swallow, "released already");
+
+        // Taken with the button still down: its release, when it comes, goes too, and a
+        // press ends that if no release came.
+        let mut link = held(vec![drag.clone()]);
+        assert!(link.answered(7, &Link::Failed("x".into())).is_empty());
+        assert!(link.swallow);
+        let mut swallow = true;
+        assert_eq!(
+            swallowed(&[drag.as_slice(), b"q"].concat(), &mut swallow),
+            b"q"
+        );
+        assert!(swallow);
+        let next = b"\x1b[<0;1;1M".to_vec();
+        assert_eq!(
+            swallowed(&[next.as_slice(), up.as_slice()].concat(), &mut swallow),
+            [next.as_slice(), up.as_slice()].concat()
+        );
+        assert!(!swallow, "a new press ends it, and what follows is its own");
+    }
+
+    /// What a held click gave back is read before anything the terminal sent after.
+    #[tokio::test]
+    async fn the_replay_is_read_before_the_terminal() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(b"later".to_vec()).await.expect("send");
+        let mut replay = std::collections::VecDeque::from([
+            (b"press".to_vec(), true),
+            (b"after".to_vec(), false),
+        ]);
+        let mut read = Vec::new();
+        for _ in 0..3 {
+            read.push(next_input(&mut replay, &mut rx).await.expect("bytes"));
+        }
+        assert_eq!(
+            read,
+            [
+                (b"press".to_vec(), Origin::ReplayedPress),
+                (b"after".to_vec(), Origin::Replayed),
+                (b"later".to_vec(), Origin::Terminal)
+            ]
+        );
+    }
+
+    /// A replayed read is not looked at for reports again: a lone escape in it stays a key of
+    /// its own, and never joins the terminal's next read into an arrow.
+    #[test]
+    fn a_replayed_escape_never_joins_the_next_read() {
+        let mut reports = crate::input::Reports::default();
+        let (esc, _) = without_reports(&mut reports, b"\x1b".to_vec(), Origin::Replayed);
+        assert_eq!(esc, b"\x1b");
+        let (next, _) = without_reports(&mut reports, b"[A".to_vec(), Origin::Terminal);
+        assert_eq!(next, b"[A");
+        // From the terminal the same escape waits for what follows it, as it always has.
+        let mut reports = crate::input::Reports::default();
+        let (held, _) = without_reports(&mut reports, b"\x1b".to_vec(), Origin::Terminal);
+        let (next, _) = without_reports(&mut reports, b"[A".to_vec(), Origin::Terminal);
+        assert_eq!([held, next].concat(), b"\x1b[A");
     }
 
     /// A plugin action run from the palette gets the selection held in the focused tile; a

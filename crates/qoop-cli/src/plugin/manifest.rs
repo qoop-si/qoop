@@ -3,7 +3,7 @@
 //! Checked the way herdr 0.9.5 checks it, so a manifest herdr refuses is refused here too: a
 //! name, a version and a `min_herdr_version` no newer than the herdr qoop answers as; titles on
 //! actions and panes; ids in herdr's character sets; platforms from herdr's three; every
-//! command a non-empty argv; `[[link_handlers]]` too, which are listed and never run. A key
+//! command a non-empty argv; `[[link_handlers]]` too, which a ctrl+click on a link runs. A key
 //! qoop does not read is left alone. On top of herdr's rules, a plugin id is never one a
 //! path could read as a parent or a hidden name, since it names a folder here.
 
@@ -51,7 +51,7 @@ pub(crate) struct Manifest {
     pub(crate) events: Vec<Hook>,
     #[serde(default)]
     pub(crate) startup: Vec<Step>,
-    /// Read and listed as herdr lists them; qoop never opens a link with one.
+    /// Read and listed as herdr lists them; a ctrl+click on a link runs the first that matches.
     #[serde(default)]
     pub(crate) link_handlers: Vec<LinkHandler>,
 }
@@ -267,7 +267,7 @@ impl Manifest {
         if m.events.iter().any(|e| e.on.trim().is_empty()) {
             return refuse("an event hook with no event".into());
         }
-        // As herdr checks them, but for compiling the pattern: qoop never matches a link.
+        // As herdr checks them: an id, a title, a pattern that compiles and a known action.
         let mut seen = BTreeSet::new();
         for handler in &m.link_handlers {
             if !valid_item_id(&handler.id) {
@@ -281,6 +281,9 @@ impl Manifest {
             }
             if handler.pattern.trim().is_empty() {
                 return refuse("link handler pattern is required".into());
+            }
+            if let Err(e) = regex::Regex::new(&handler.pattern) {
+                return refuse(e.to_string());
             }
             if !m.actions.iter().any(|a| a.id == handler.action) {
                 return refuse(format!(
@@ -322,6 +325,7 @@ impl Manifest {
         out.actions.retain(|a| runs(a.platforms.as_deref()));
         out.panes.retain(|p| runs(p.platforms.as_deref()));
         out.events.retain(|e| runs(e.platforms.as_deref()));
+        out.link_handlers.retain(|l| runs(l.platforms.as_deref()));
         out
     }
 }

@@ -1156,6 +1156,82 @@ fn a_move_into_a_sleeping_tab_or_space_is_refused_before_anything_moves() {
 }
 
 #[test]
+fn a_clicked_link_runs_the_handler_it_matches_and_a_view_orders_the_agents() {
+    let manifest = "id = \"t.link\"\n[[actions]]\nid = \"open\"\ntitle = \"Open\"\n\
+                    command = [\"sh\", \"-c\", \"env > \\\"$HERDR_PLUGIN_STATE_DIR/link.txt\\\"\"]\n\
+                    [[link_handlers]]\nid = \"files\"\ntitle = \"Files\"\npattern = \"^file://\"\naction = \"open\"\n";
+    let stack = Stack::start_with(|dir| {
+        plant(
+            &dir.join("data"),
+            "t.link",
+            manifest,
+            manifest,
+            &mut json!({"plugins": {}}),
+        );
+    });
+    let pane = panes(&stack)[0].clone();
+    let terminal: u64 = text(&pane["terminal_id"]).parse().expect("n");
+    let file = stack
+        .dir
+        .path()
+        .join("data/qoop/plugins/.state/t.link/link.txt");
+    // Asked after the interface stopped waiting: the click went on as a plain one, so the
+    // handler that matches runs nothing.
+    let late = stack.ask(
+        "qoop.link",
+        json!({"terminal": terminal, "url": "file:///tmp/notes.md", "until_unix_ms": 1}),
+    );
+    assert_eq!(ok(&late)["handled"], false, "{late}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!file.exists(), "a late ask ran the handler");
+    let left = stack.ask(
+        "qoop.link",
+        json!({"terminal": terminal, "url": "https://example.com"}),
+    );
+    assert_eq!(
+        ok(&left),
+        &json!({"type": "pane_link_activated", "url": "https://example.com", "handled": false})
+    );
+    let taken = stack.ask(
+        "qoop.link",
+        json!({"terminal": terminal, "url": "file:///tmp/notes.md"}),
+    );
+    assert_eq!(ok(&taken)["handled"], true);
+    wait_for("the handler's run", || {
+        std::fs::read_to_string(&file).is_ok_and(|e| e.contains("HERDR_PLUGIN_CONTEXT_JSON="))
+    });
+    let env = std::fs::read_to_string(&file).expect("read");
+    for want in [
+        "HERDR_PLUGIN_CLICKED_URL=file:///tmp/notes.md".to_string(),
+        "HERDR_PLUGIN_LINK_HANDLER_ID=files".to_string(),
+        "HERDR_PLUGIN_ACTION_ID=open".to_string(),
+        format!("HERDR_PANE_ID={}", text(&pane["pane_id"])),
+        "\"invocation_source\":\"link_click\"".to_string(),
+    ] {
+        assert!(env.contains(&want), "{want} missing from\n{env}");
+    }
+
+    // The agent view's order, for the spaces tree: none set, then one of this plugin's.
+    assert_eq!(
+        ok(&stack.ask("qoop.view", json!({}))),
+        &json!({"active": false, "links": true}),
+        "its link handler is told, so a ctrl+click is held for it"
+    );
+    ok(&stack.ask(
+        "agent.view.set",
+        json!({"source": "plugin:t.link", "sort": [{"field": "pane_order", "order": "desc"}]}),
+    ));
+    let view = stack.ask("qoop.view", json!({}));
+    assert_eq!(ok(&view)["active"], true, "{view}");
+    assert_eq!(
+        view["result"]["order"],
+        json!([]),
+        "a shell is no agent: {view}"
+    );
+    assert_eq!(view["result"]["hidden"], json!([]));
+}
+
+#[test]
 fn an_action_gets_the_selected_text_in_its_context_cut_to_fit() {
     let action = "id = \"t.sel\"\n[[actions]]\nid = \"show\"\ntitle = \"Show\"\n\
                   command = [\"sh\", \"-c\", \"printf %s \\\"$HERDR_PLUGIN_CONTEXT_JSON\\\" > \\\"$HERDR_PLUGIN_STATE_DIR/context.json\\\"\"]\n";

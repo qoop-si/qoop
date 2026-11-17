@@ -1,7 +1,7 @@
 //! `agent.view.set` and `agent.view.clear`: herdr's one agent view, a plugin's filter and sort
-//! for the agent list in its sidebar. The host checks and keeps it and answers as herdr does;
-//! qoop draws nothing from it (its left sidebar is its own), and `agent.list` is unaffected, as
-//! in herdr.
+//! for the agent list in its sidebar. The host checks and keeps it and answers as herdr does,
+//! and works out the order it gives the agents (`qoop.view`), which the interface's spaces
+//! tree follows. `agent.list` is unaffected, as in herdr.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,11 +16,13 @@ const MAX_SORT_FIELDS: usize = 8;
 const MAX_SOURCE_CHARS: usize = 120;
 const MAX_LABEL_CHARS: usize = 32;
 
-/// The view held: its source and label, all a reply says of it.
+/// The view held: its source and label, which a reply says, and the request it came in, whose
+/// filter and sort order the agents.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Held {
     pub(crate) source: String,
     pub(crate) label: Option<String>,
+    pub(crate) spec: Value,
 }
 
 #[derive(Deserialize)]
@@ -80,8 +82,6 @@ enum Builtin {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-// Read only for its shape: qoop filters nothing by it.
-#[allow(dead_code)]
 enum ViewValue {
     String(String),
     Bool(bool),
@@ -100,18 +100,14 @@ enum Context {
 struct Sort {
     field: SortField,
     #[serde(default)]
-    #[allow(dead_code)]
     order: Order,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SortField {
-    #[allow(dead_code)]
     Builtin(SortBuiltin),
-    Token {
-        token: String,
-    },
+    Token { token: String },
 }
 
 #[derive(Deserialize)]
@@ -278,7 +274,187 @@ fn checked(params: &Value) -> Result<Held, Refused> {
             token(t).map_err(invalid)?;
         }
     }
-    Ok(Held { source, label })
+    Ok(Held {
+        source,
+        label,
+        spec: params.clone(),
+    })
+}
+
+/// One agent as a view reads it: herdr's fields, from the host's agent list.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Entry {
+    pub(crate) terminal: u32,
+    pub(crate) status: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) agent: Option<String>,
+    pub(crate) seq: Option<u64>,
+    pub(crate) tokens: std::collections::BTreeMap<String, String>,
+    /// The space's place in the list, from 0; the tab's number in its space, from 1; the
+    /// pane's number (its terminal), as herdr numbers them.
+    pub(crate) workspace_order: u64,
+    pub(crate) tab_order: Option<u64>,
+    pub(crate) pane_order: u64,
+}
+
+/// What a view compares, ordered as herdr orders its values.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Eval {
+    Str(String),
+    Bool(bool),
+    Num(u64),
+}
+
+impl Entry {
+    /// herdr's `seen`: an agent whose finish nobody has looked at yet reads `done`.
+    fn seen(&self) -> bool {
+        self.status != "done"
+    }
+
+    /// herdr's attention rank: blocked, then done unseen, working, idle, the rest.
+    fn attention(&self) -> u64 {
+        match self.status.as_str() {
+            "blocked" => 4,
+            "done" => 3,
+            "working" => 2,
+            "idle" => 1,
+            _ => 0,
+        }
+    }
+
+    fn field(&self, field: &Field) -> Option<Eval> {
+        let text = |s: &str| Some(Eval::Str(s.to_string()));
+        match field {
+            Field::Token { token } => self.tokens.get(token).and_then(|v| text(v)),
+            Field::Builtin(b) => match b {
+                Builtin::Status => text(&self.status),
+                Builtin::WorkspaceId => text(&self.workspace_id),
+                Builtin::TabId => text(&self.tab_id),
+                Builtin::PaneId => text(&self.pane_id),
+                Builtin::Agent => self.agent.as_deref().and_then(text),
+                Builtin::Seen => Some(Eval::Bool(self.seen())),
+                Builtin::StateChangeSeq => self.seq.map(Eval::Num),
+            },
+        }
+    }
+
+    fn sorted_by(&self, field: &SortField) -> Option<Eval> {
+        match field {
+            SortField::Token { token } => self.tokens.get(token).map(|v| Eval::Str(v.clone())),
+            SortField::Builtin(b) => match b {
+                SortBuiltin::WorkspaceOrder => Some(Eval::Num(self.workspace_order)),
+                SortBuiltin::TabOrder => self.tab_order.map(Eval::Num),
+                SortBuiltin::PaneOrder => Some(Eval::Num(self.pane_order)),
+                SortBuiltin::Attention => Some(Eval::Num(self.attention())),
+                SortBuiltin::Status => Some(Eval::Str(self.status.clone())),
+                SortBuiltin::Agent => self.agent.clone().map(Eval::Str),
+                SortBuiltin::Seen => Some(Eval::Bool(self.seen())),
+                SortBuiltin::StateChangeSeq => self.seq.map(Eval::Num),
+            },
+        }
+    }
+}
+
+/// An entry from herdr's `AgentInfo` as the host lists it, with the space's place in `spaces`
+/// and the tab's number from `tabs` (herdr's `TabInfo`s).
+fn entry_of(
+    agent: &Value,
+    spaces: &[qoop_runtime::control::WorkspaceRow],
+    tabs: &[Value],
+) -> Option<Entry> {
+    let text = |key: &str| agent[key].as_str().map(str::to_string);
+    let workspace_id = text("workspace_id")?;
+    let tab_id = text("tab_id")?;
+    Some(Entry {
+        terminal: text("terminal_id")?.parse().ok()?,
+        status: text("agent_status").unwrap_or_else(|| "unknown".into()),
+        pane_id: text("pane_id")?,
+        agent: text("agent"),
+        seq: agent["state_change_seq"].as_u64(),
+        tokens: agent["tokens"]
+            .as_object()
+            .map(|t| {
+                t.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        workspace_order: spaces
+            .iter()
+            .position(|s| super::translate::Id::Workspace(s.id).to_string() == workspace_id)
+            .unwrap_or(usize::MAX) as u64,
+        tab_order: tabs
+            .iter()
+            .find(|t| t["tab_id"] == tab_id.as_str())
+            .and_then(|t| t["number"].as_u64()),
+        pane_order: text("terminal_id")?.parse().ok()?,
+        workspace_id,
+        tab_id,
+    })
+}
+
+/// The space and tab on screen, which a view's `current_*` values name.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Current {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) tab_id: Option<String>,
+}
+
+fn operand(current: &Current, value: &ViewValue) -> Option<Eval> {
+    match value {
+        ViewValue::String(s) => Some(Eval::Str(s.clone())),
+        ViewValue::Bool(b) => Some(Eval::Bool(*b)),
+        ViewValue::Number(n) => Some(Eval::Num(*n)),
+        ViewValue::Context { context } => match context {
+            Context::CurrentWorkspaceId => current.workspace_id.clone().map(Eval::Str),
+            Context::CurrentTabId => current.tab_id.clone().map(Eval::Str),
+        },
+    }
+}
+
+fn matches(current: &Current, entry: &Entry, f: &Filter) -> bool {
+    match f {
+        Filter::All { filters } => filters.iter().all(|f| matches(current, entry, f)),
+        Filter::Any { filters } => filters.iter().any(|f| matches(current, entry, f)),
+        Filter::Not { filter } => !matches(current, entry, filter),
+        Filter::Eq { field, value } => entry.field(field) == operand(current, value),
+        Filter::In { field, values } => {
+            let actual = entry.field(field);
+            values.iter().any(|v| actual == operand(current, v))
+        }
+        Filter::Exists { field } => entry.field(field).is_some(),
+    }
+}
+
+/// The agents a view shows, in its order: those its filter keeps, sorted by its keys in turn
+/// (a value before none; `desc` the other way), ties kept in the list's own order, as herdr
+/// sorts its panel.
+pub(crate) fn ordered(spec: &Value, current: &Current, entries: &[Entry]) -> Vec<u32> {
+    let Ok(spec) = serde_json::from_value::<SetParams>(spec.clone()) else {
+        return entries.iter().map(|e| e.terminal).collect();
+    };
+    let mut kept: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| spec.filter.as_ref().is_none_or(|f| matches(current, e, f)))
+        .collect();
+    kept.sort_by(|a, b| {
+        for sort in &spec.sort {
+            let order = match (a.sorted_by(&sort.field), b.sorted_by(&sort.field)) {
+                (Some(x), Some(y)) if matches!(sort.order, Order::Desc) => y.cmp(&x),
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            if order.is_ne() {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    kept.iter().map(|e| e.terminal).collect()
 }
 
 /// herdr's `agent_view` answer for what is held.
@@ -313,6 +489,46 @@ impl Host {
             return Err(("plugin_disabled", "plugin is disabled".to_string()));
         }
         Ok(())
+    }
+
+    /// `qoop.view`, what the interface asks of plugins every few seconds: whether a plugin
+    /// here has a link handler (`links`), and the held agent view as the agents it shows in its
+    /// order and the agents its filter leaves out (`active: false` with none held, or its
+    /// plugin gone).
+    pub(super) fn view_order(&self) -> Value {
+        let links = super::link::any_handler(&self.home);
+        let held = self.state.lock().unwrap().agent_view.clone();
+        let Some(held) = held.filter(|h| self.owner_ok(&h.source).is_ok()) else {
+            self.state.lock().unwrap().agent_view = None;
+            return json!({"active": false, "links": links});
+        };
+        let (order, hidden) = self.with_view(|v| {
+            let current = v.focused.and_then(|t| super::host::pane_of(v.panes(), t));
+            let text = |key: &str| {
+                current
+                    .as_ref()
+                    .and_then(|p| p[key].as_str().map(String::from))
+            };
+            let current = Current {
+                workspace_id: text("workspace_id"),
+                tab_id: text("tab_id"),
+            };
+            let tabs = v.tab_infos();
+            let entries: Vec<Entry> = v
+                .agents()
+                .iter()
+                .filter_map(|a| entry_of(a, v.spaces, &tabs))
+                .collect();
+            let order = ordered(&held.spec, &current, &entries);
+            let hidden: Vec<u32> = entries
+                .iter()
+                .map(|e| e.terminal)
+                .filter(|t| !order.contains(t))
+                .collect();
+            (order, hidden)
+        });
+        json!({"active": true, "source": held.source, "order": order, "hidden": hidden,
+               "links": links})
     }
 
     /// `agent.view.set` and `agent.view.clear`. A view a plugin owns is dropped once that
@@ -363,7 +579,8 @@ mod tests {
             held,
             Held {
                 source: "example.views".into(),
-                label: Some("working".into())
+                label: Some("working".into()),
+                spec: working("example.views"),
             }
         );
         let code = |params: Value| checked(&params).err().map(|(code, _)| code);
@@ -444,12 +661,77 @@ mod tests {
     }
 
     #[test]
+    fn a_view_filters_and_sorts_the_agents_as_herdr_does() {
+        let entry = |terminal: u32, status: &str, ws: u64, quota: Option<&str>| Entry {
+            terminal,
+            status: status.into(),
+            workspace_id: format!("w{}", ws + 1),
+            tab_id: format!("w{}:t{terminal}", ws + 1),
+            pane_id: format!("w{}:p{terminal}", ws + 1),
+            agent: Some("claude".into()),
+            seq: Some(u64::from(terminal)),
+            tokens: quota
+                .map(|q| [("quota".to_string(), q.to_string())].into())
+                .unwrap_or_default(),
+            workspace_order: ws,
+            tab_order: Some(1),
+            pane_order: u64::from(terminal),
+        };
+        let agents = [
+            entry(1, "idle", 0, Some("40")),
+            entry(2, "working", 0, None),
+            entry(3, "blocked", 1, Some("90")),
+            entry(4, "done", 1, Some("10")),
+        ];
+        let here = Current {
+            workspace_id: Some("w2".into()),
+            tab_id: None,
+        };
+        let order = |spec: Value| ordered(&spec, &here, &agents);
+        assert_eq!(
+            order(json!({"source": "s"})),
+            [1, 2, 3, 4],
+            "no keys: the list's own order"
+        );
+        assert_eq!(
+            order(json!({"source": "s", "sort": [{"field": "attention", "order": "desc"}]})),
+            [3, 4, 2, 1]
+        );
+        assert_eq!(
+            order(json!({"source": "s", "sort": [{"field": {"token": "quota"}, "order": "desc"}]})),
+            [3, 1, 4, 2],
+            "one with no value goes last, either way"
+        );
+        assert_eq!(
+            order(
+                json!({"source": "s", "filter": {"op": "eq", "field": "workspace_id",
+                                                     "value": {"context": "current_workspace_id"}}})
+            ),
+            [3, 4]
+        );
+        assert_eq!(
+            order(json!({"source": "s", "filter": {"op": "not", "filter":
+                         {"op": "in", "field": "status", "values": ["idle", "done"]}}})),
+            [2, 3]
+        );
+        assert_eq!(
+            order(
+                json!({"source": "s", "filter": {"op": "exists", "field": {"token": "quota"}},
+                         "sort": [{"field": "seen"}, {"field": "pane_order", "order": "desc"}]})
+            ),
+            [4, 3, 1],
+            "false before true, then the next key"
+        );
+    }
+
+    #[test]
     fn the_reply_is_herdrs_agent_view() {
         assert_eq!(reply(None), json!({"type": "agent_view", "active": false}));
         assert_eq!(
             reply(Some(&Held {
                 source: "s".into(),
-                label: None
+                label: None,
+                spec: json!({}),
             })),
             json!({"type": "agent_view", "active": true, "source": "s"})
         );

@@ -422,6 +422,15 @@ fn preview(m: &Manifest, from: &str, sha: Option<&str>) -> String {
     for s in &here.startup {
         out += &format!("startup  {}\n", argv(&s.command));
     }
+    // A ctrl+clicked link that matches runs the action named, so the pattern is shown too.
+    for l in &here.link_handlers {
+        out += &format!(
+            "link     {} {:?} -> {}\n",
+            shown(&l.id),
+            l.pattern,
+            shown(&l.action)
+        );
+    }
     out + POWERS + "\n"
 }
 
@@ -1101,7 +1110,8 @@ mod tests {
              command = [\"x\", \"\\u001b[2Jhid\\u202Eden\\u2028line\"]\n\
              [[panes]]\nid = \"v\"\ntitle = \"V\"\ncommand = [\"v\"]\n\
              [[events]]\non = \"pane.closed\"\ncommand = [\"e\"]\n\
-             [[startup]]\ncommand = [\"s\", \"--daemon\"]\n",
+             [[startup]]\ncommand = [\"s\", \"--daemon\"]\n\
+             [[link_handlers]]\nid = \"files\"\ntitle = \"F\"\npattern = \"^file://\\\\u001b\"\naction = \"a\"\n",
             manifest::head("p")
         ))
         .expect("parses");
@@ -1115,6 +1125,7 @@ mod tests {
             "pane     v (overlay) [\"v\"]\n",
             "event    pane.closed [\"e\"]\n",
             "startup  [\"s\", \"--daemon\"]\n",
+            "link     files \"^file://\\\\u001b\" -> a\n",
         ] {
             assert!(text.contains(line), "{line:?} missing from\n{text}");
         }
