@@ -351,7 +351,7 @@ again beside herdr 0.9.5. 13 passed, 1 failed, and 1 was left out.
 | `dcolinmorgan/herdr-remote` | `051f6e6d` | pass | its status hook sent the expected datagrams; the relay daemon itself was not run |
 | `plannotator/herdr-annotate` | `29643fb4` | pass | a mouse selection held in the pane reached the action from the palette as its selected text, and the overlay saved a comment on it |
 | `levi-qiao/herdr-agent-usage` | `af2ac5e3` | pass | refresh and its order toggle ordered the agents in the sidebar as in herdr, its tokens were set and read back, and its settings and dashboard opened; qoop draws neither the tokens nor the view's label |
-| `nikok6/herdr-mirror` | `195398c1` | fail | it mirrors a remote herdr server over ssh, which needs a herdr server and `pane swap`, `layout` and `agent start` |
+| `nikok6/herdr-mirror` | `195398c1` | fail | it mirrors a remote herdr server over ssh, which needs a herdr server, `layout` and `agent start`; qoop shows another computer's spaces itself (`qoop remote add`) |
 | `ChmaraX/herdr-nvim` | `50b87a62` | pass | its sidebar toggled on and off, the panes parked and moved back with `pane move`, and a ctrl+click on a `file://` link opened the file in its nvim |
 | `AltanS/collie` | `88276e3c` | left out | its build output is killed by macOS at its first run on the test Mac, which is not qoop's doing; its `start` installs a service and was never run |
 
