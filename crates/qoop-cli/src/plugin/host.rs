@@ -3690,10 +3690,15 @@ mod tests {
         let group = live.id() as i32;
         let started = qoop_pty::sys::start_time_of(qoop_pty::Pid(group)).expect("start time");
         let other_group = other.id() as i32;
+        // Off its own start time, not off `started`: the two spawns can straddle a clock tick
+        // (Linux counts in 10 ms ticks, macOS in seconds), and `started + 1` is then exactly
+        // when `other` started.
+        let other_started =
+            qoop_pty::sys::start_time_of(qoop_pty::Pid(other_group)).expect("start time");
         edit_pgids(&home, |groups| {
             groups.push(("t.a".into(), group, started));
             // A recorded group whose pid now belongs to some other process.
-            groups.push(("t.b".into(), other_group, started.wrapping_add(1)));
+            groups.push(("t.b".into(), other_group, other_started.wrapping_add(1)));
         });
         end_startups(&home, Some("t.a"));
         assert!(live.wait().is_ok(), "ended");
