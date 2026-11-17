@@ -4023,6 +4023,7 @@ dependencies = [
  "qoop-store",
  "qoop-testkit",
  "qoop-tui",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

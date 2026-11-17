@@ -66,9 +66,11 @@ These do not work, so a plugin that needs one installs and then does not do its 
 - no floating popups: a popup or overlay opens as a split beside its pane, zoomed to fill the tab
   until it closes;
 - no layout changes (swapping, resizing and moving panes between tabs and spaces work);
-- no link handlers, and no worktree events;
-- a plugin's agent view (the filter and order it asks for the agent list) is kept for the plugin,
-  but qoop's sidebar does not change for it;
+- link handlers run on a ctrl+click, which your terminal has to pass on: iTerm2 does with
+  "Ctrl-click reported to apps" on, and Terminal may open its menu instead;
+- no worktree events;
+- a plugin's agent view orders and filters the agents inside each space of the sidebar's tree;
+  nothing else on the sidebar changes for it;
 - what a plugin reports about a pane (its metadata tokens, such as quota marks) is kept for the
   plugin to read, but qoop does not draw it;
 - only a plugin's tab rename changes the name qoop shows; the names it gives panes and agents are

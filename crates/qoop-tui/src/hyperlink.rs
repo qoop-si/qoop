@@ -51,9 +51,116 @@ pub fn open(uri: &str) -> String {
     format!("\x1b]8;;{uri}\x1b\\")
 }
 
+/// The link at cell `col` of a pane row, as herdr finds one for a ctrl+click: the target a
+/// program gave the cell with `OSC 8`, whatever its scheme; else, in the row's text, an
+/// `http://` or `https://` address the cell is in. `line` holds one char per cell (a wide
+/// character's spacer included), as the engine sends rows.
+pub fn link_at(
+    line: &str,
+    spans: &[qoop_runtime::daemon::SpanWire],
+    links: &[String],
+    col: usize,
+) -> Option<String> {
+    let osc8 = spans
+        .iter()
+        .find(|s| col >= s.at && col < s.at + s.len)
+        .and_then(|s| s.link)
+        .and_then(|at| links.get(at as usize));
+    if let Some(uri) = osc8 {
+        return Some(uri.clone());
+    }
+    let cells: Vec<char> = line.chars().collect();
+    web_span(&cells, col).map(|(start, end)| cells[start..=end].iter().collect())
+}
+
+/// herdr's address span: from an `http://` or `https://` to the next whitespace, its trailing
+/// punctuation and unbalanced closing brackets trimmed, when `col` falls in what is left.
+fn web_span(cells: &[char], col: usize) -> Option<(usize, usize)> {
+    let starts = |at: usize, prefix: &str| {
+        prefix
+            .chars()
+            .enumerate()
+            .all(|(i, c)| cells.get(at + i) == Some(&c))
+    };
+    let mut start = 0;
+    while start < cells.len() {
+        if !(starts(start, "http://") || starts(start, "https://")) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end + 1 < cells.len() && !cells[end + 1].is_whitespace() {
+            end += 1;
+        }
+        if (start..=end).contains(&col) {
+            while end >= start && trims(&cells[start..=end]) {
+                end = end.checked_sub(1)?;
+            }
+            return (start <= end && col <= end).then_some((start, end));
+        }
+        start = end + 1;
+    }
+    None
+}
+
+/// Whether the last cell of an address is punctuation around it rather than part of it: a
+/// quote, a full stop and its kind, or a closing bracket the address did not open.
+fn trims(url: &[char]) -> bool {
+    let (last, before) = url.split_last().expect("not empty");
+    let opened = |open: char, close: char| {
+        before.iter().filter(|c| **c == open).count()
+            > before.iter().filter(|c| **c == close).count()
+    };
+    match last {
+        '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '!' | '?' => true,
+        ')' => !opened('(', ')'),
+        ']' => !opened('[', ']'),
+        '}' => !opened('{', '}'),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ctrl_click_finds_the_cells_link_or_a_web_address_as_herdr_does() {
+        let at = |line: &str, col| link_at(line, &[], &[], col);
+        let line = "see (https://example.com/a_(b)). or http://x.io, ok";
+        assert_eq!(at(line, 10).as_deref(), Some("https://example.com/a_(b)"));
+        assert_eq!(
+            at(line, 4),
+            None,
+            "the bracket before it is not the address"
+        );
+        assert_eq!(at(line, 30), None, "the trimmed full stop is not either");
+        assert_eq!(at(line, 40).as_deref(), Some("http://x.io"));
+        assert_eq!(
+            at("ftp://x.io and a.rs", 2),
+            None,
+            "only web addresses in text"
+        );
+        let span = qoop_runtime::daemon::SpanWire {
+            at: 0,
+            len: 4,
+            fg: None,
+            bg: None,
+            attrs: 0,
+            link: Some(0),
+        };
+        assert_eq!(
+            link_at(
+                "note https://x.io",
+                &[span],
+                &["file:///tmp/note.md".into()],
+                2
+            )
+            .as_deref(),
+            Some("file:///tmp/note.md"),
+            "a program's own link wins, any scheme"
+        );
+    }
 
     #[test]
     fn an_ordinary_address_is_kept_as_it_is() {

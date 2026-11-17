@@ -60,8 +60,8 @@ what qoop runs for itself and are not for typing.
 
 The preview prints, one line each and with every argument quoted and every control character
 escaped (so a manifest cannot hide one): the plugin's id and version, where it came from, the
-commit, every `[[build]]` command, every action, pane, event and startup command, and then
-this, word for word:
+commit, every `[[build]]` command, every action, pane, event and startup command, every link
+handler as `link <id> "<pattern>" -> <action>`, and then this, word for word:
 
 ```text
 It runs as you, can read every terminal and the command lines of their processes, can type
@@ -210,8 +210,45 @@ digits and `:._-` up to 120, a label up to 32, filters up to 8 deep and 64 nodes
 values, up to 8 sort fields; a `plugin:<id>` source needs that plugin installed and agreed to)
 and answered as herdr answers them. There is one view at a time; `clear` with a source clears
 only that source's, without one any. A view a plugin owns is dropped once the plugin is removed.
-qoop draws nothing from it: the agent list in qoop's sidebar stays as it is, and `agent list`
-is unaffected, as in herdr.
+While one is set, the agent rows in the sidebar's spaces tree (and in the folded column) follow
+it: each space keeps its place and its rule, its agents are listed in the view's order (herdr's
+sort keys: space, tab and pane order, attention, status, agent, seen, status change count and
+the plugin's tokens), and the ones its filter leaves out are not listed. An agent the view does
+not know yet (one started since the host was last asked, or another machine's) is listed after
+them, in its own place. Nothing else on the sidebar changes: no header, label or mark, and the
+inbox, the search and its counts read every agent. The interface asks the host every three
+seconds and when the agents change, never more than twice a second, and never starts the host
+for it. Clearing the view, removing its plugin or the host leaving puts
+the rows back in their own order. `agent list` is unaffected, as in herdr.
+
+## Links
+
+A ctrl+click on a link in a pane goes to a plugin's `[[link_handlers]]` first, as in herdr. The
+link is the target a program gave that cell with `OSC 8` (any scheme), else an `http://` or
+`https://` address in the row's text under the pointer (its trailing punctuation and an
+unmatched closing bracket left out). The host tries the plugins agreed to by id, each one's
+handlers that run on this platform in manifest order, and runs the action of the first whose
+`pattern` (a regular expression, unanchored) matches, with the clicked pane as its context,
+`invocation_source` `link_click`, and `HERDR_PLUGIN_CLICKED_URL` and
+`HERDR_PLUGIN_LINK_HANDLER_ID` set. A pattern that does not compile refuses the manifest, as
+in herdr.
+
+A ctrl+click is held only while a plugin here has a link handler for this platform (the
+interface learns that with the agent view) and the host is listening, and only on a link in a
+pane with no box or mode open; anywhere else it goes on at once, exactly as before. While the
+host is asked, at most half a second, the press is held and everything read after it (keys,
+other clicks) waits behind it in order. A handler that takes the link takes that click's press,
+drags and release and nothing else; one that cannot start says why on the notice row and takes
+them too. A link no handler takes, or no answer within the half second: the press is replayed
+as it came, then what waited behind it, and it goes where a click goes (a selection, a focus,
+or the program's own mouse report). An answer after the half second is too late for the click,
+though a handler that matched has run. qoop never opens a link in the browser itself; the
+terminal around qoop does that, as before.
+
+The terminal around qoop has to send ctrl+click to it as a left click with control held. iTerm2
+does when "Ctrl-click reported to apps, does not open menu" is on (Settings, Pointer); otherwise
+it opens its menu. macOS reads ctrl+click as a secondary click, and Terminal does not document
+reporting it to programs, so there a ctrl+click may open the menu and never reach a handler.
 
 ## Plugin panes
 
@@ -236,7 +273,8 @@ These do not work, and a plugin that needs one will install and then not do its 
 - no floating popups: a popup or overlay opens as a split beside its target, zoomed to fill the
   tab, and the zoom goes back when it closes;
 - no `layout.*`;
-- `[[link_handlers]]` are read and listed in `plugin list`, but a clicked link never runs one;
+- a link handler runs only from a ctrl+click the terminal around qoop reports (see Links), and
+  never from a link in a terminal of another machine; no `pane.link.*` methods;
 - no worktree events, and no `pane.output_matched`, `pane.scroll_changed`,
   `pane.output_changed`, `workspace.updated` or `workspace.reordered` events: a subscription to
   one is accepted and never fires;
@@ -245,8 +283,8 @@ These do not work, and a plugin that needs one will install and then not do its 
   by mistake;
 - no `agent start`, `agent report`, `events.wait`, `herdr integration` or
   `herdr machine`: unknown methods or commands;
-- an agent view (`agent.view.set`) is kept and answered, but qoop's sidebar does not filter,
-  sort or relabel its agents by it;
+- an agent view orders and filters the spaces tree's agent rows only: its label is not drawn,
+  and the priority list and the inbox keep their own order;
 - `pane report-metadata` and `workspace report-metadata` keep their tokens (per pane or space,
   with `--seq` ordering and `--ttl-ms` expiry) and give them back as `tokens` in pane, agent and
   space lists, but the qoop interface does not draw them, and a pane's title, display agent and

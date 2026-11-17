@@ -68,6 +68,154 @@ pub fn shown_for(contexts: &[String], focused: u32) -> bool {
 /// One request on the host's socket and its `result`, or why there is none. Blocking: run
 /// it off the render path.
 fn ask(method: &str, params: Value) -> Result<Value, Failed> {
+    let answer = envelope(method, params)?;
+    match answer.get("error") {
+        Some(error) => Err(Failed::Said(
+            error["message"]
+                .as_str()
+                .unwrap_or("the plugin host refused")
+                .to_string(),
+        )),
+        None => Ok(answer["result"].clone()),
+    }
+}
+
+/// What a ctrl+clicked link came to, by the host's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// A plugin's handler took it: the gesture is the plugin's.
+    Taken,
+    /// A handler matched and could not start: the gesture is the plugin's, and this says why.
+    Failed(String),
+    /// No handler took it, or no host answered: the gesture goes on as a plain one.
+    Left,
+}
+
+/// Ask the host whether a plugin's link handler takes `url`, ctrl+clicked in `terminal`.
+/// Blocking: run it off the render path. The host runs nothing once `wait` has passed, when
+/// the interface has stopped waiting and the click has gone on as a plain one.
+pub fn link(terminal: u32, url: &str, wait: Duration) -> Link {
+    link_of(envelope(
+        "qoop.link",
+        json!({"terminal": terminal, "url": url, "until_unix_ms": until_unix_ms(wait)}),
+    ))
+}
+
+/// The wall clock `wait` from now, in milliseconds since the epoch: when the interface stops
+/// waiting for a link's answer, after which the host runs nothing for it.
+fn until_unix_ms(wait: Duration) -> u128 {
+    (std::time::SystemTime::now() + wait)
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
+/// The host's answer to `qoop.link` as what the click does: only `plugin_link_failed` keeps
+/// it from going on, as in herdr; any other refusal (an older host) passes it on.
+fn link_of(answer: Result<Value, Failed>) -> Link {
+    match answer {
+        Ok(a) if a["result"]["handled"] == true => Link::Taken,
+        Ok(a) if a["error"]["code"] == "plugin_link_failed" => Link::Failed(
+            a["error"]["message"]
+                .as_str()
+                .unwrap_or("the link handler did not start")
+                .to_string(),
+        ),
+        _ => Link::Left,
+    }
+}
+
+/// How often the host is asked about plugins when nothing pokes the watch.
+const VIEW_EVERY: Duration = Duration::from_secs(3);
+/// The fewest time between two asks, however often the watch is poked.
+const VIEW_GAP: Duration = Duration::from_millis(500);
+
+/// A plugin's agent view, as the spaces tree follows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentView {
+    /// The agents it shows, in its order.
+    pub order: Vec<u32>,
+    /// The agents its filter leaves out. An agent in neither list (one the host has not
+    /// listed yet, or another machine's) keeps its place after the ordered ones.
+    pub hidden: Vec<u32>,
+}
+
+/// What the host says of plugins for this interface.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Said {
+    /// The agent view set, if any.
+    pub view: Option<AgentView>,
+    /// Whether a plugin here has a link handler for this platform.
+    pub links: bool,
+}
+
+/// The host's answer to `qoop.view`; nothing at all with no host, or an older one.
+fn said_of(answer: &Value) -> Said {
+    let terminals = |key: &str| -> Vec<u32> {
+        answer[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.as_u64().and_then(|t| u32::try_from(t).ok()))
+            .collect()
+    };
+    Said {
+        view: (answer["active"] == true).then(|| AgentView {
+            order: terminals("order"),
+            hidden: terminals("hidden"),
+        }),
+        links: answer["links"] == true,
+    }
+}
+
+/// Keeps what the host says of plugins up to date off the render path: asked every
+/// [`VIEW_EVERY`] and when poked (the agent index changed), never twice within [`VIEW_GAP`],
+/// and handed on only when it changed. With no host socket nothing is asked, and the host is
+/// never started from here.
+pub struct ViewWatch {
+    poke: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ViewWatch {
+    /// Start the watch; `tell` gets each change. Inside the interface's runtime.
+    pub fn start(tell: impl Fn(Said) + Send + 'static) -> Self {
+        let poke = std::sync::Arc::new(tokio::sync::Notify::new());
+        let poked = poke.clone();
+        tokio::spawn(async move {
+            let mut last = Said::default();
+            loop {
+                let asked = tokio::time::Instant::now();
+                let said = if qoop_runtime::paths::plugin_host_socket().exists() {
+                    tokio::task::spawn_blocking(|| ask("qoop.view", json!({})))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|answer| said_of(&answer))
+                        .unwrap_or_default()
+                } else {
+                    Said::default()
+                };
+                if said != last {
+                    tell(said.clone());
+                    last = said;
+                }
+                tokio::select! {
+                    _ = poked.notified() => {}
+                    _ = tokio::time::sleep(VIEW_EVERY) => {}
+                }
+                tokio::time::sleep_until(asked + VIEW_GAP).await;
+            }
+        });
+        Self { poke }
+    }
+
+    /// Ask again soon: the agents changed.
+    pub fn poke(&self) {
+        self.poke.notify_one();
+    }
+}
+
+/// One request on the host's socket and its whole answer, a refusal included. Blocking.
+fn envelope(method: &str, params: Value) -> Result<Value, Failed> {
     let down = |_| Failed::HostDown;
     let mut stream =
         std::os::unix::net::UnixStream::connect(qoop_runtime::paths::plugin_host_socket())
@@ -82,17 +230,8 @@ fn ask(method: &str, params: Value) -> Result<Value, Failed> {
     std::io::BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|e| Failed::Said(format!("the plugin host did not answer: {e}")))?;
-    let answer: Value = serde_json::from_str(&line)
-        .map_err(|_| Failed::Said("the plugin host answered something unreadable".into()))?;
-    match answer.get("error") {
-        Some(error) => Err(Failed::Said(
-            error["message"]
-                .as_str()
-                .unwrap_or("the plugin host refused")
-                .to_string(),
-        )),
-        None => Ok(answer["result"].clone()),
-    }
+    serde_json::from_str(&line)
+        .map_err(|_| Failed::Said("the plugin host answered something unreadable".into()))
 }
 
 /// Whether any plugin is installed here, read from its folder without the host.
@@ -476,6 +615,49 @@ mod tests {
             invoke_params("t.a", "go", Some("fix the build"))["context"]["selected_text"],
             "fix the build"
         );
+    }
+
+    #[test]
+    fn the_hosts_view_answer_becomes_what_the_tree_follows() {
+        assert_eq!(
+            said_of(&json!({})),
+            Said::default(),
+            "an older host: nothing"
+        );
+        assert_eq!(
+            said_of(&json!({"active": false, "links": true})),
+            Said {
+                view: None,
+                links: true
+            }
+        );
+        assert_eq!(
+            said_of(&json!({"active": true, "order": [4, 3], "hidden": [2], "links": false})),
+            Said {
+                view: Some(AgentView {
+                    order: vec![4, 3],
+                    hidden: vec![2]
+                }),
+                links: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_link_answer_says_whether_the_click_goes_on() {
+        let said = |v: Value| link_of(Ok(v));
+        assert_eq!(said(json!({"result": {"handled": true}})), Link::Taken);
+        assert_eq!(said(json!({"result": {"handled": false}})), Link::Left);
+        assert_eq!(
+            said(json!({"error": {"code": "plugin_link_failed", "message": "no such file"}})),
+            Link::Failed("no such file".into())
+        );
+        assert_eq!(
+            said(json!({"error": {"code": "invalid_request", "message": "unknown"}})),
+            Link::Left,
+            "an older host passes the click on"
+        );
+        assert_eq!(link_of(Err(Failed::HostDown)), Link::Left);
     }
 
     #[test]

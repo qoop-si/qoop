@@ -792,6 +792,10 @@ pub struct Column<'a> {
     pub icons: bool,
     /// The keyboard's hold on the column, `None` while it has none: the filter, the pick.
     pub nav: Option<&'a Nav>,
+    /// A plugin's agent view. The spaces tree lists each space's agents in its order, leaves
+    /// out the ones its filter hides, and puts any it does not know after them in their own
+    /// order; nothing else follows it.
+    pub order: Option<&'a crate::plugins::AgentView>,
 }
 
 /// What the keyboard can stand on in the column: a space's rule, or a session's rows.
@@ -1961,7 +1965,7 @@ fn content(c: &Column) -> Vec<Row> {
                 };
                 // A folded space still shows the tab the keyboard is on: the fold hides
                 // what a person is not looking at, never the thing they are typing into.
-                for tab in tabs {
+                for tab in in_view_order(c, &tabs) {
                     if !open && tab.terminal != c.focused_terminal {
                         continue;
                     }
@@ -2009,6 +2013,29 @@ fn content(c: &Column) -> Vec<Row> {
         }
     }
     out
+}
+
+/// A space's agent rows as a plugin's agent view orders them: the ones it shows in its order,
+/// then any it does not know yet (new since the host was asked, or another machine's) as they
+/// came, and never the ones its filter hides; without a view, as they came. Its rule and its
+/// count still read every agent (the owner's fifth change to the column: only the rows follow).
+fn in_view_order<'a>(c: &Column, tabs: &[&'a AgentRow]) -> Vec<&'a AgentRow> {
+    let Some(view) = c.order else {
+        return tabs.to_vec();
+    };
+    let mut shown: Vec<&AgentRow> = tabs
+        .iter()
+        .copied()
+        .filter(|a| !view.hidden.contains(&a.terminal))
+        .collect();
+    // Stable: the ones the view does not order keep their own order, after the rest.
+    shown.sort_by_key(|a| {
+        view.order
+            .iter()
+            .position(|t| *t == a.terminal)
+            .unwrap_or(usize::MAX)
+    });
+    shown
 }
 
 /// The row a search that found nothing leaves in the list.
@@ -3539,7 +3566,7 @@ pub(crate) fn rows_collapsed(c: &Column, height: usize) -> Vec<Row> {
             },
             Some(Hit::Space(space.id)),
         ));
-        for agent in kids {
+        for agent in in_view_order(c, &kids) {
             if open || agent.terminal == c.focused_terminal {
                 content.push(strip_row(agent));
             }
@@ -4374,6 +4401,7 @@ mod tests {
             icons: false,
             nav: None,
             drawer: None,
+            order: None,
         }
     }
 
@@ -4840,6 +4868,65 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A plugin's agent view orders and filters the agent rows inside each space, and nothing
+    /// else: the spaces keep their order and their rules, and without a view the rows are
+    /// their own again.
+    #[test]
+    fn a_plugin_agent_view_orders_and_filters_the_agents_inside_each_space() {
+        let spaces = vec![space(1, "app"), space(2, "personal")];
+        let agents = vec![
+            agent(1, 1, "claude", "working"),
+            agent(2, 1, "codex", "idle"),
+            agent(3, 1, "gemini", "blocked"),
+            agent(4, 2, "claude", "idle"),
+            agent(5, 1, "codex", "idle"),
+        ];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let base = column(
+            &spaces,
+            &agents,
+            1,
+            1,
+            0,
+            View::Tree,
+            &seen,
+            &unseen,
+            NOW,
+            WIDTH,
+            &shut,
+        );
+        let own = rows_folded(&base, 60, None);
+        assert_eq!(order(&own), [1, 2, 3, 5, 4]);
+        let view = crate::plugins::AgentView {
+            order: vec![4, 3, 1],
+            hidden: vec![2],
+        };
+        let with = Column {
+            order: Some(&view),
+            ..base
+        };
+        let viewed = rows_folded(&with, 60, None);
+        assert_eq!(
+            order(&viewed),
+            [3, 1, 5, 4],
+            "spaces in their order; agents in the view's, the one it does not know after, 2 hidden"
+        );
+        assert_eq!(
+            rule_row(&viewed, 1).text,
+            rule_row(&own, 1).text,
+            "the rule is its own"
+        );
+        let collapsed = rows_collapsed(&with, 60);
+        let strip: Vec<u32> = collapsed
+            .iter()
+            .filter_map(|(_, h)| match h {
+                Some(Hit::Terminal(t)) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strip, [3, 1, 5, 4], "the folded column follows it too");
     }
 
     /// The same column with its inbox open at the default height.

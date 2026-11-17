@@ -172,6 +172,8 @@ pub struct Chrome<'a> {
     pub questions_handle: Option<crate::qass_screen::Handle>,
     /// qass's split tab: whose titles fold their pane, and the pane folded.
     pub fold: Option<FoldPaint>,
+    /// A plugin's agent view, the agents it shows in its order (`sidebar::Column::order`).
+    pub agent_order: Option<&'a crate::plugins::AgentView>,
 }
 
 /// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
@@ -266,6 +268,7 @@ impl Default for Chrome<'_> {
             handle: None,
             questions_handle: None,
             fold: None,
+            agent_order: None,
         }
     }
 }
@@ -313,6 +316,7 @@ impl Frame<'_> {
             inbox: self.chrome.inbox,
             icons: crate::icons::on(),
             nav: self.chrome.nav,
+            order: self.chrome.agent_order,
         }
     }
 }
@@ -6935,6 +6939,7 @@ mod tests {
                 row: 1,
                 col: 1,
                 shift: false,
+                ctrl: false,
             },
             Action::Drag {
                 row: 1,
@@ -8179,6 +8184,7 @@ mod tests {
                 scroll: None,
                 icons: false,
                 nav: None,
+                order: None,
             },
             44,
         );
