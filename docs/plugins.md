@@ -334,7 +334,8 @@ this machine's daemon.
 On 2026-11-15, 15 plugins were installed from their pinned commits on an isolated stack and
 each one's main action was run, with its visible effect read back (a pane opened with the right
 content, a tab renamed, a prompt delivered, a file written). Pass means that effect happened.
-10 passed, 2 partly, 2 failed, and 1 was left out.
+On 2026-11-17 the three that had not passed and still could (nvim, agent usage, annotate) were run
+again beside herdr 0.9.5. 13 passed, 1 failed, and 1 was left out.
 
 | Plugin | Commit | Result | What happened |
 |---|---|---|---|
@@ -348,10 +349,10 @@ content, a tab renamed, a prompt delivered, a file written). Pass means that eff
 | `jeffarese/herdr-bar` | `598395f6` | pass | opened its popup, filtered, and switched to the chosen tab |
 | `alexarthurs/herdr-sidebar` | `081ed133` | pass | docked one sidebar per tab, as a split and not full height (no pane move) |
 | `dcolinmorgan/herdr-remote` | `051f6e6d` | pass | its status hook sent the expected datagrams; the relay daemon itself was not run |
-| `plannotator/herdr-annotate` | `29643fb4` | partial | the overlay opened and saved a comment, but it took the clipboard as the selection: qoop passes no selected text |
-| `levi-qiao/herdr-agent-usage` | `af2ac5e3` | partial | its tokens were set and read back and its settings popup opened; the interface does not draw tokens, and `agent view set` is unknown |
+| `plannotator/herdr-annotate` | `29643fb4` | pass | a mouse selection held in the pane reached the action from the palette as its selected text, and the overlay saved a comment on it |
+| `levi-qiao/herdr-agent-usage` | `af2ac5e3` | pass | refresh and its order toggle ordered the agents in the sidebar as in herdr, its tokens were set and read back, and its settings and dashboard opened; qoop draws neither the tokens nor the view's label |
 | `nikok6/herdr-mirror` | `195398c1` | fail | it mirrors a remote herdr server over ssh, which needs a herdr server and `pane swap`, `layout` and `agent start` |
-| `ChmaraX/herdr-nvim` | `50b87a62` | fail | its sidebar needs `pane move` and link handlers, which are not served |
+| `ChmaraX/herdr-nvim` | `50b87a62` | pass | its sidebar toggled on and off, the panes parked and moved back with `pane move`, and a ctrl+click on a `file://` link opened the file in its nvim |
 | `AltanS/collie` | `88276e3c` | left out | its build output is killed by macOS at its first run on the test Mac, which is not qoop's doing; its `start` installs a service and was never run |
 
 The run found one bug in qoop, a popup handing focus back too early after the plugin had moved
