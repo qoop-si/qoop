@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.0](https://github.com/qoop-si/qoop/compare/v0.17.1...v0.18.0) (2026-11-17)
+
+
+### New
+
+* **cli:** move panes, keep agent views and pass selections for plugins ([4ebacae](https://github.com/qoop-si/qoop/commit/4ebacae8022ecb861b76eaecb346d68c62e3d77d))
+* **tui:** herdr plugin link handlers and agent views in the sidebar ([3e29747](https://github.com/qoop-si/qoop/commit/3e2974746e64ac73cfcea8479db7b8a8f232bfb4))
+
 ## [0.17.1](https://github.com/qoop-si/qoop/compare/v0.17.0...v0.17.1) (2026-11-16)
 
 
