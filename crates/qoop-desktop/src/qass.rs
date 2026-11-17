@@ -210,7 +210,6 @@ impl Desk {
                     "qass is asleep.",
                     ("wake-qass", "Wake it"),
                     true,
-                    t,
                     cx.listener(|this, _, _, cx| this.wake_qass(cx)),
                 )
                 .into_any_element(),
@@ -219,7 +218,6 @@ impl Desk {
                     "qass is not running.",
                     ("start-qass", "Start it"),
                     !self.qass_starting(),
-                    t,
                     cx.listener(|this, _, _, cx| this.start_qass(cx)),
                 )
                 .into_any_element(),
@@ -275,9 +273,10 @@ impl Desk {
         line: &str,
         (id, label): (&'static str, &'static str),
         enabled: bool,
-        t: &Theme,
         press: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> impl IntoElement {
+        // The card is the terminal's ground, dark in both themes, and so is its button.
+        let d = &crate::theme::DARK;
         div()
             .flex_1()
             .flex()
@@ -290,21 +289,16 @@ impl Desk {
             .child(
                 div()
                     .text_size(px(14.))
-                    .text_color(c(crate::theme::DARK.t1))
+                    .text_color(c(d.t1))
                     .child(line.to_string()),
             )
             .child(match enabled {
-                true => ui::pill(id, label, t).child(label).on_click(press),
-                false => ui::pill_off(id, &format!("{label}, unavailable: qass is starting"), t)
+                true => ui::pill(id, label, d).child(label).on_click(press),
+                false => ui::pill_off(id, &format!("{label}, unavailable: qass is starting"), d)
                     .child(label),
             })
-            .when_some(self.qass_said.clone(), |d, said| {
-                d.child(
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(c(crate::theme::DARK.t2))
-                        .child(said),
-                )
+            .when_some(self.qass_said.clone(), |s, said| {
+                s.child(div().text_size(px(12.5)).text_color(c(d.t2)).child(said))
             })
     }
 

@@ -36,7 +36,7 @@ use crate::newwork::NewWork;
 use crate::question::{OwnAnswer, Said};
 use crate::review::Review;
 use crate::state::{self, Chip, Model};
-use crate::theme::{MONO_FONT, TERMINAL_BG, Theme, UI_FONT, c, ca};
+use crate::theme::{MONO_FONT, TERMINAL_BG, TOP_GLOW, Theme, UI_FONT, c, ca};
 use crate::ui::{self, Icon};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1788,8 +1788,8 @@ impl Render for Desk {
                 d.child(div().absolute().left_0().right_0().top_0().h(px(300.)).bg(
                     linear_gradient(
                         180.,
-                        linear_color_stop(ca(0x965f374d), 0.),
-                        linear_color_stop(ca(0x965f3700), 1.),
+                        linear_color_stop(ca(TOP_GLOW), 0.),
+                        linear_color_stop(ca(TOP_GLOW & !0xff), 1.),
                     ),
                 ))
             })
