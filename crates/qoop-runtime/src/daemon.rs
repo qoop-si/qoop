@@ -1130,6 +1130,34 @@ impl TerminalRegistry {
             .collect()
     }
 
+    /// The split trees an index sends. A tree with a pane `marked` (a tab going to sleep or
+    /// waking) goes whole while every pane of it is live and not at all otherwise: a tab going
+    /// to sleep is still one tab until its panes end, and a tab still waking has only some of
+    /// its panes back, whose tree cut to those would be taken as the whole split. Any other
+    /// tree is cut to the live terminals, as [`Self::live_splits`] cuts it.
+    pub fn index_splits(
+        &self,
+        live: &[u32],
+        marked: impl Fn(u32) -> bool,
+    ) -> Vec<crate::control::Pane> {
+        self.splits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|tree| {
+                let leaves = tree.leaves();
+                if leaves.iter().any(|t| marked(*t)) {
+                    return leaves
+                        .iter()
+                        .all(|t| live.contains(t))
+                        .then(|| tree.clone());
+                }
+                tree.retain(&|t| live.contains(&t))
+            })
+            .filter(|tree| tree.leaves().len() > 1)
+            .collect()
+    }
+
     /// The terminals of the tab a terminal is in, in tree order: the leaves of its split
     /// tree, or itself when it is in none. The first is the tab.
     pub fn tab_of(&self, stream: u32) -> Vec<u32> {
@@ -5371,21 +5399,16 @@ async fn handle_control(
                     }
                 })
                 .collect();
-            // A tab still waking has only some of its panes back: a tree cut to those would
-            // be taken as the whole split. Its tree comes with the index after the wake.
-            let settled: Vec<u32> = live
-                .iter()
-                .copied()
-                .filter(|t| !books.is_marked(*t))
-                .collect();
             ControlResponse::Agents {
                 id,
                 agents: rows,
-                // A tree is about every tab of a split: none for some rows.
+                // A tree is about every tab of a split: none for some rows. A tab going to
+                // sleep keeps its tree until its panes end; one still waking gets its tree
+                // with the index after the wake (`index_splits`).
                 splits: if only.is_some() {
                     Vec::new()
                 } else {
-                    terminals.live_splits(&settled)
+                    terminals.index_splits(&live, |t| books.is_marked(t))
                 },
                 qass_checks: Some(crate::asks::qass_checks()),
             }
@@ -14909,5 +14932,46 @@ mod chat_dispatch_tests {
             dispatch(&listing, &books, &terminals, 1),
             Dispatch::Inline(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod index_split_tests {
+    use super::TerminalRegistry;
+    use crate::control::{Pane, SplitDir};
+
+    fn two(first: u32, second: u32) -> Pane {
+        Pane::Split {
+            dir: SplitDir::V,
+            permille: 300,
+            questions: 0,
+            first: Box::new(Pane::Leaf { terminal: first }),
+            second: Box::new(Pane::Leaf { terminal: second }),
+        }
+    }
+
+    /// A split being put to sleep is marked while its panes still run: the index keeps its
+    /// whole tree until they end, so no interface takes it apart into tabs meanwhile. A tab
+    /// waking with only some panes back, and a sleep half done, send no tree.
+    #[test]
+    fn a_split_going_to_sleep_stays_in_the_index_until_its_panes_end() {
+        let terminals = TerminalRegistry::default();
+        terminals.load_splits(vec![two(1, 2), two(3, 4)]);
+        let marked = |t: u32| t == 1 || t == 2;
+        assert_eq!(
+            terminals.index_splits(&[1, 2, 3, 4], marked),
+            vec![two(1, 2), two(3, 4)],
+            "marked and still running: whole"
+        );
+        assert_eq!(
+            terminals.index_splits(&[1, 3, 4], marked),
+            vec![two(3, 4)],
+            "one pane ended or not back yet: no tree, never a cut one"
+        );
+        assert_eq!(
+            terminals.index_splits(&[1, 2, 3], |_| false),
+            vec![two(1, 2)],
+            "unmarked: cut to what lives, as before"
+        );
     }
 }

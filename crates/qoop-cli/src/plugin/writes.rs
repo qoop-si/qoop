@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, SplitDir};
+use qoop_runtime::control::{ControlRequest, ControlResponse, Pane, Place, SplitDir};
 use serde_json::{Value, json};
 
 use super::host::{self, Host, Popup, Refused, State, not_found, param, terminal_of};
@@ -133,12 +133,40 @@ fn env_param(params: &Value) -> Result<Vec<(String, String)>, Refused> {
 }
 
 /// A caller's context over ours, field by field; a null it sends leaves ours, as herdr merges.
+/// A `selected_text` is cut to [`SELECTED_MOST`] bytes as JSON: the whole context travels in
+/// one environment variable, which Linux caps at 128 KiB.
 fn merge_context(ours: &mut Value, theirs: Option<&Value>) {
     if let (Value::Object(ours), Some(Value::Object(theirs))) = (ours, theirs) {
         for (key, value) in theirs.iter().filter(|(_, v)| !v.is_null()) {
             ours.insert(key.clone(), value.clone());
         }
+        if let Some(Value::String(text)) = ours.get_mut("selected_text") {
+            *text = selected_cut(text);
+        }
     }
+}
+
+/// The most bytes a context's `selected_text` takes once written as JSON.
+const SELECTED_MOST: usize = 16 * 1024;
+
+/// `text` cut, on a character, to what writes as at most [`SELECTED_MOST`] bytes of JSON: a
+/// control character takes six there.
+fn selected_cut(text: &str) -> String {
+    let mut used = 0;
+    let mut end = 0;
+    for (at, c) in text.char_indices() {
+        let written = match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if used + written > SELECTED_MOST {
+            break;
+        }
+        used += written;
+        end = at + c.len_utf8();
+    }
+    text[..end].to_string()
 }
 
 /// A re-started shell's environment: the variables qoop's zsh integration was started with
@@ -550,6 +578,34 @@ pub(super) async fn control(request: ControlRequest) -> Result<ControlResponse, 
         ControlResponse::Failed { reason, .. } => Err(("failed", reason)),
         other => Ok(other),
     }
+}
+
+/// Move `terminal` to the end of `workspace`: out of its split, into another space or, with
+/// `leave_split`, into a tab of its own in its space. A refusal is herdr's `pane_move_failed`.
+async fn move_terminal(terminal: u32, workspace: i64, leave_split: bool) -> Result<(), Refused> {
+    control(ControlRequest::MoveTerminal {
+        id: crate::request_id("plugin-host"),
+        terminal,
+        workspace,
+        place: Some(Place::End),
+        leave_split,
+    })
+    .await
+    .map(drop)
+    .map_err(|(code, reason)| match code {
+        "failed" => ("pane_move_failed", reason),
+        other => (other, reason),
+    })
+}
+
+/// Close a space a move left empty; the daemon keeps its default space and any space that
+/// still holds a tab, which is no error of the move.
+async fn close_emptied(workspace: i64) {
+    let _ = control(ControlRequest::CloseWorkspace {
+        id: crate::request_id("plugin-host"),
+        workspace,
+    })
+    .await;
 }
 
 /// A new terminal in `workspace`, its number back. The connection that made it is
@@ -1214,6 +1270,7 @@ impl Host {
             "pane.zoom" => Box::pin(self.zoom(params)).await,
             "pane.resize" => Box::pin(self.resize(params)).await,
             "pane.swap" => Box::pin(self.swap(params)).await,
+            "pane.move" => Box::pin(self.move_pane(params)).await,
             "pane.focus_direction" => Box::pin(self.focus_direction(params)).await,
             "pane.split" => Box::pin(self.split(params)).await,
             "tab.create" => Box::pin(self.create_tab(params)).await,
@@ -1224,6 +1281,7 @@ impl Host {
             "workspace.focus" => Box::pin(self.focus_space(params)).await,
             "workspace.rename" => Box::pin(self.rename_space(params)).await,
             "workspace.close" => Box::pin(self.close_space(params)).await,
+            "agent.view.set" | "agent.view.clear" => self.agent_view(method, params),
             "notification.show" => Ok(notification(params)),
             "plugin.action.invoke" => self.invoke_param(params),
             "plugin.pane.open" => Box::pin(self.open_pane(params)).await,
@@ -1747,6 +1805,302 @@ impl Host {
                 "focused_pane_id": layout["focused_pane_id"].clone(), "layout": layout,
             }))}),
         )
+    }
+
+    /// `pane.move`: a pane taken out of its tab, its terminal kept, into another tab beside a
+    /// pane there (`tab`), or into a tab (`new_tab`) or a space (`new_workspace`) of its own,
+    /// as herdr moves it. Every step is made under the listing turn, so one listing tells the
+    /// whole move in herdr's order. A tab move whose split then fails leaves the pane a tab of
+    /// its own in the target's space. A cross-space move that empties its space closes it,
+    /// unless it is the session's default space or qass's.
+    async fn move_pane(&self, params: &Value) -> Result<Value, Refused> {
+        let destination = params.get("destination").filter(|d| d.is_object()).ok_or((
+            "invalid_request",
+            "invalid request: missing field `destination`".to_string(),
+        ))?;
+        let kind = param(destination, "type").unwrap_or_default();
+        if !["tab", "new_tab", "new_workspace"].contains(&kind) {
+            return Err((
+                "invalid_request",
+                format!(
+                    "invalid request: unknown variant `{kind}`, expected one of `tab`, `new_tab`, `new_workspace`"
+                ),
+            ));
+        }
+        self.refresh_now().await?;
+        let asked = param(params, "pane_id").unwrap_or_default();
+        let (source, from) = terminal_of(asked)
+            .and_then(|t| self.tab_of(t).map(|tab| (t, tab)))
+            .ok_or(("pane_not_found", "source pane not found".to_string()))?;
+        let previous = (
+            self.pane_id(source),
+            Id::Workspace(from.workspace).to_string(),
+            from.id(),
+        );
+        let zoomed = |tab: &translate::Tab| {
+            let state = self.state.lock().unwrap();
+            tab.leaves.iter().any(|t| state.zoomed.contains(t))
+        };
+        if zoomed(&from) {
+            return self
+                .unmoved("zoomed_tab", source, previous, &from.id(), &from.id())
+                .await;
+        }
+        let row = |t: u32| {
+            let state = self.state.lock().unwrap();
+            state.now.rows.iter().find(|r| r.terminal == t).cloned()
+        };
+        // Alone in its space (no other tab, awake or asleep): a move out of it closes it.
+        let alone = {
+            let state = self.state.lock().unwrap();
+            let others = state
+                .now
+                .rows
+                .iter()
+                .any(|r| r.workspace == from.workspace && r.terminal != source);
+            let space = state.now.spaces.iter().find(|s| s.id == from.workspace);
+            !others
+                && space.is_some_and(|s| {
+                    s.sleeping.is_empty() && s.name != qoop_runtime::asks::QASS_SPACE
+                })
+        };
+        let label = |key: &str| param(destination, key).map(str::to_string);
+        let mut created_space = None;
+        let mut placed: Result<(), Refused> = Ok(());
+        let made_tab = if kind == "tab" {
+            let tab_id = param(destination, "tab_id").unwrap_or_default();
+            let to = self
+                .state
+                .lock()
+                .unwrap()
+                .now
+                .tabs
+                .iter()
+                .find(|t| t.id() == tab_id)
+                .cloned()
+                .ok_or_else(|| ("tab_not_found", format!("tab {tab_id} not found")))?;
+            if to.key == from.key {
+                return self
+                    .unmoved("same_tab", source, previous, &from.id(), &from.id())
+                    .await;
+            }
+            if zoomed(&to) {
+                return self
+                    .unmoved("zoomed_tab", source, previous, &from.id(), &to.id())
+                    .await;
+            }
+            let target = match param(destination, "target_pane_id") {
+                Some(raw) => {
+                    let target =
+                        terminal_of(raw)
+                            .filter(|t| row(*t).is_some())
+                            .ok_or_else(|| {
+                                (
+                                    "target_pane_not_found",
+                                    format!("target pane {raw} not found"),
+                                )
+                            })?;
+                    if !to.leaves.contains(&target) {
+                        return Err((
+                            "target_pane_not_found",
+                            format!("target pane {raw} is not in tab {tab_id}"),
+                        ));
+                    }
+                    target
+                }
+                None => {
+                    let focused = self.state.lock().unwrap().focused;
+                    focused
+                        .filter(|t| to.leaves.contains(t))
+                        .unwrap_or(to.leaves[0])
+                }
+            };
+            let dir = match param(destination, "split") {
+                Some("right") => SplitDir::V,
+                Some("down") => SplitDir::H,
+                Some(other) => {
+                    return Err((
+                        "invalid_request",
+                        format!(
+                            "invalid request: unknown variant `{other}`, expected `right` or `down`"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err((
+                        "invalid_request",
+                        "invalid request: missing field `split`".to_string(),
+                    ));
+                }
+            };
+            // herdr's valid ratio: the target's share, 0.1 to 0.9, a half when not said.
+            let ratio = destination
+                .get("ratio")
+                .and_then(Value::as_f64)
+                .filter(|r| r.is_finite())
+                .unwrap_or(0.5)
+                .clamp(0.1, 0.9);
+            let split = Pane::Split {
+                dir,
+                permille: (ratio * 1000.0).round() as u16,
+                questions: 0,
+                first: Box::new(Pane::Leaf { terminal: target }),
+                second: Box::new(Pane::Leaf { terminal: source }),
+            };
+            let tree = match &to.tree {
+                Some(tree) => replace_leaf(tree, target, &split),
+                None => split,
+            };
+            let _turn = self.refreshing.lock().await;
+            // Out of its split first (the daemon keeps the rest of it), then into the target's.
+            if to.workspace != from.workspace || from.leaves.len() > 1 {
+                move_terminal(source, to.workspace, to.workspace == from.workspace).await?;
+            }
+            placed = control(ControlRequest::SetSplit {
+                id: crate::request_id("plugin-host"),
+                tree,
+            })
+            .await
+            .map(drop)
+            .map_err(|(_, reason)| ("pane_move_failed", reason));
+            if alone && to.workspace != from.workspace {
+                close_emptied(from.workspace).await;
+            }
+            false
+        } else {
+            let space = if kind == "new_tab" {
+                match param(destination, "workspace_id") {
+                    Some(_) => self.space(destination, "workspace_id")?,
+                    None => from.workspace,
+                }
+            } else {
+                0
+            };
+            // A space asleep runs nothing, so a running pane cannot go there: refused before
+            // anything is written, as the daemon would refuse it after the pane had left its
+            // split. A sleeping tab is in no listing, so a `tab` move to one is not found.
+            let asleep = {
+                let state = self.state.lock().unwrap();
+                state.now.spaces.iter().any(|s| s.id == space && s.asleep)
+            };
+            if asleep {
+                return Err((
+                    "pane_move_failed",
+                    format!("{} is asleep, wake it first", Id::Workspace(space)),
+                ));
+            }
+            let _turn = self.refreshing.lock().await;
+            let space = if kind == "new_workspace" {
+                let name = label("label")
+                    .or_else(|| {
+                        row(source).and_then(|r| r.cwd).and_then(|c| {
+                            std::path::Path::new(&c)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                        })
+                    })
+                    .unwrap_or_else(|| "workspace".to_string());
+                let made = control(ControlRequest::CreateWorkspace {
+                    id: crate::request_id("plugin-host"),
+                    name,
+                })
+                .await?;
+                let ControlResponse::WorkspaceCreated { workspace, .. } = made else {
+                    return Err(("failed", "unexpected answer to a new space".into()));
+                };
+                created_space = Some(workspace);
+                workspace
+            } else {
+                space
+            };
+            if let Err(e) = move_terminal(source, space, space == from.workspace).await {
+                if let Some(made) = created_space {
+                    close_emptied(made).await;
+                }
+                return Err(e);
+            }
+            let tab_label = label(if kind == "new_tab" {
+                "label"
+            } else {
+                "tab_label"
+            });
+            if let Some(name) = tab_label.filter(|n| !n.is_empty()) {
+                let _ = control(ControlRequest::RenameTerminal {
+                    id: crate::request_id("plugin-host"),
+                    terminal: source,
+                    name: Some(name),
+                })
+                .await;
+            }
+            if alone && space != from.workspace {
+                close_emptied(from.workspace).await;
+            }
+            true
+        };
+        self.refresh_now().await?;
+        placed?;
+        if bool_param(params, "focus", false) {
+            self.focus(source).await?;
+            self.refresh_now().await?;
+        }
+        let (previous_pane, previous_space, previous_tab) = previous;
+        Ok(self.with_view(|v| {
+            let layout_of = |id: &str| {
+                v.tabs
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .map(|t| translate::layout(t, v.area, v.focused, v.zoomed_tab(t)))
+            };
+            let tab_now = v.tabs.iter().find(|t| t.leaves.contains(&source));
+            let target_layout = tab_now
+                .map(|t| translate::layout(t, v.area, v.focused, v.zoomed_tab(t)))
+                .unwrap_or(Value::Null);
+            let space_gone = !v.spaces.iter().any(|s| s.id == from.workspace);
+            let tab_gone = layout_of(&previous_tab).is_none();
+            json!({"type": "pane_move", "move_result": translate::compact(json!({
+                "changed": true,
+                "previous_pane_id": previous_pane, "previous_workspace_id": previous_space,
+                "previous_tab_id": previous_tab,
+                "pane": Self::pane_info(v, source),
+                "source_layout": if space_gone { None } else { layout_of(&previous_tab) },
+                "target_layout": target_layout.clone(),
+                "created_workspace": created_space.map(|s| Self::workspace_info(v, s)),
+                "created_tab": made_tab.then(|| Self::tab_info(v, source)),
+                "closed_workspace_id": space_gone.then_some(&previous_space),
+                "closed_tab_id": tab_gone.then_some(&previous_tab),
+                "focused_pane_id": target_layout["focused_pane_id"].clone(),
+            }))})
+        }))
+    }
+
+    /// herdr's answer to a move it does not make (`same_tab`, `zoomed_tab`).
+    async fn unmoved(
+        &self,
+        reason: &str,
+        source: u32,
+        previous: (String, String, String),
+        source_tab: &str,
+        target_tab: &str,
+    ) -> Result<Value, Refused> {
+        let (pane, space, tab) = previous;
+        Ok(self.with_view(|v| {
+            let layout_of = |id: &str| {
+                v.tabs
+                    .iter()
+                    .find(|t| t.id() == id)
+                    .map(|t| translate::layout(t, v.area, v.focused, v.zoomed_tab(t)))
+                    .unwrap_or(Value::Null)
+            };
+            let target_layout = layout_of(target_tab);
+            json!({"type": "pane_move", "move_result": {
+                "changed": false, "reason": reason,
+                "previous_pane_id": pane, "previous_workspace_id": space, "previous_tab_id": tab,
+                "pane": Self::pane_info(v, source),
+                "source_layout": layout_of(source_tab),
+                "target_layout": target_layout.clone(),
+                "focused_pane_id": target_layout["focused_pane_id"].clone(),
+            }})
+        }))
     }
 
     async fn split(&self, params: &Value) -> Result<Value, Refused> {
@@ -2824,6 +3178,25 @@ mod tests {
         let kept = env_param(&json!({"env": {"OK_NAME": "x", "HERDR_PLUGIN_ID": "evil",
                                              "HERDR_SOCKET_PATH": "/elsewhere"}}));
         assert_eq!(kept, Ok(vec![("OK_NAME".to_string(), "x".to_string())]));
+    }
+
+    #[test]
+    fn a_selection_is_cut_to_fit_as_json() {
+        let json_len = |t: &str| serde_json::to_string(t).expect("json").len() - 2;
+        let mut ours = json!({});
+        merge_context(&mut ours, Some(&json!({"selected_text": "short é \"q\""})));
+        assert_eq!(ours["selected_text"], "short é \"q\"");
+        for long in [
+            "a".repeat(20_000),
+            "\u{1}".repeat(5_000),
+            "é".repeat(10_000),
+            "\"\n".repeat(9_000),
+        ] {
+            let cut = selected_cut(&long);
+            assert!(long.starts_with(&cut));
+            let n = json_len(&cut);
+            assert!(n <= SELECTED_MOST && n + 6 > SELECTED_MOST, "{n}");
+        }
     }
 
     #[test]

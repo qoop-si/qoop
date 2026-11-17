@@ -171,6 +171,17 @@ fn selection_text(state: &State, selection: &crate::selection::Selection) -> Str
     selection.text(&window_rows(state), focused_rect(state).cols)
 }
 
+/// The mouse selection still shown in the focused tile, as text: what a plugin action run from
+/// the palette gets as `selected_text`, as herdr hands a key-bound action the selection in the
+/// focused pane. Copy mode's selection is its own and is not this.
+fn held_selection(state: &State) -> Option<String> {
+    state
+        .selection
+        .filter(|s| !s.is_empty())
+        .map(|s| selection_text(state, &s))
+        .filter(|text| !text.is_empty())
+}
+
 /// Copy `text` to the clipboard and say what left, the way every copy path does.
 ///
 /// Answers whether anything was copied: empty text writes nothing and says nothing.
@@ -8936,8 +8947,14 @@ where
                                         state.message = Some(format!("starting {named}"));
                                         let tx = blocking_tx.clone();
                                         let focused = state.focused;
+                                        let selected = held_selection(&state);
                                         tokio::task::spawn_blocking(move || {
-                                            let ran = crate::plugins::run(&plugin, &action, focused);
+                                            let ran = crate::plugins::run(
+                                                &plugin,
+                                                &action,
+                                                focused,
+                                                selected.as_deref(),
+                                            );
                                             let _ = tx.send(Blocked::PluginRan(named, ran));
                                         });
                                     }
@@ -13039,6 +13056,23 @@ fn adopt_splits(state: &mut State, agents: &[AgentRow], splits: Vec<qoop_runtime
     }
     let seen = std::mem::take(&mut state.split_seen);
     let space_of = |t: u32| agents.iter().find(|r| r.terminal == t).map(|r| r.workspace);
+    // A tree read before that the index no longer has, none of whose panes is in a tree it
+    // has now, was taken apart elsewhere (a plugin's `pane.move` into a tab of its own, a pane
+    // a second interface broke out): what is left of it here is a tab again. Only while all
+    // its panes are still listed: a pane that went is pruned on its own. The daemon keeps a
+    // tab going to sleep in its trees until its panes end, and sends a waking tab's tree only
+    // once all of it is back, so neither is taken apart here.
+    let listed: Vec<u32> = splits.iter().flat_map(|t| t.leaves()).collect();
+    let running = |t: u32| agents.iter().any(|r| r.terminal == t);
+    let apart: Vec<Vec<u32>> = seen
+        .iter()
+        .filter(|old| !splits.contains(old))
+        .map(|old| old.leaves())
+        .filter(|leaves| leaves.iter().all(|t| !listed.contains(t) && running(*t)))
+        .collect();
+    for leaves in apart {
+        dissolve(state, &leaves);
+    }
     for raw in splits {
         let changed = !seen.contains(&raw);
         state.split_seen.push(raw.clone());
@@ -13080,6 +13114,35 @@ fn adopt_splits(state: &mut State, agents: &[AgentRow], splits: Vec<qoop_runtime
             // The focused tile just shrank into its split.
             state.adopted_resize = true;
         }
+    }
+}
+
+/// Take apart every tree here holding one of `leaves`, a split the daemon no longer has: the
+/// tile with the keyboard stays on screen alone, every other one of `leaves` is a tab again.
+/// A tree with a split on its way is left as it is.
+fn dissolve(state: &mut State, leaves: &[u32]) {
+    let State {
+        layouts, parked, ..
+    } = &mut *state;
+    let mut changed = false;
+    let shown = layouts.values_mut().map(|l| (true, l));
+    let kept = parked.values_mut().flatten().map(|l| (false, l));
+    for (on_screen, layout) in shown.chain(kept) {
+        if layout.leaf_count() < 2 || layout.has_pending() {
+            continue;
+        }
+        let keep = on_screen.then_some(layout.focus);
+        for t in layout.leaves() {
+            if leaves.contains(&t) && Some(t) != keep {
+                layout.remove(t);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        prune_trees(state, |_| false);
+        state.resync = true;
+        state.adopted_resize = true;
     }
 }
 
@@ -19972,6 +20035,56 @@ mod tests {
         );
         assert_eq!(state.layouts.get(&1).map(|l| l.leaves()), Some(vec![1, 2]));
         assert!(!state.is_pane(3), "the local tree wins; 3 stays a tab");
+    }
+
+    /// After a plugin's `pane.move` of one pane of a two-pane tab into a tab of its own, the
+    /// daemon keeps no tree for them and both still run: the old split is no longer drawn,
+    /// whichever of the two had the keyboard.
+    #[test]
+    fn a_split_moved_apart_into_tabs_is_no_longer_drawn() {
+        for focused in [1, 2] {
+            let mut state = tiled_state();
+            state.layouts.get_mut(&1).unwrap().focus_terminal(focused);
+            state.focused = focused;
+            state.split_seen = state.layouts[&1].to_pane().into_iter().collect();
+            let index = ControlResponse::Agents {
+                id: "index".to_string(),
+                agents: state.rows.clone(),
+                splits: Vec::new(),
+                qass_checks: None,
+            };
+            apply(&mut state, index, &mut 0, &mut false);
+            assert_eq!(
+                state.layouts.get(&1).map(|l| l.leaves()),
+                Some(vec![focused]),
+                "the tile with the keyboard alone"
+            );
+            assert!(state.parked.values().flatten().next().is_none());
+            assert!(!state.is_pane(1) && !state.is_pane(2), "both are tabs");
+            let tabs: Vec<u32> = state.tabs().iter().map(|r| r.terminal).collect();
+            assert_eq!(tabs, vec![1, 2]);
+        }
+    }
+
+    /// A tab being put to sleep: its panes are marked and still run, and the daemon keeps
+    /// sending its tree until they end (`index_splits`), so it stays one split here, its
+    /// ratio and focus as they were.
+    #[test]
+    fn a_split_going_to_sleep_is_not_taken_apart() {
+        let mut state = tiled_state();
+        state.layouts.get_mut(&1).unwrap().focus_terminal(2);
+        let tree = state.layouts[&1].to_pane().expect("a split");
+        state.split_seen = vec![tree.clone()];
+        let index = ControlResponse::Agents {
+            id: "index".to_string(),
+            agents: state.rows.clone(),
+            splits: vec![tree.clone()],
+            qass_checks: None,
+        };
+        apply(&mut state, index, &mut 0, &mut false);
+        let layout = &state.layouts[&1];
+        assert_eq!(layout.to_pane(), Some(tree), "ratio kept");
+        assert_eq!(layout.focus, 2, "focus kept");
     }
 
     #[test]
@@ -28696,6 +28809,19 @@ mod tests {
         );
         let held = s.selection.expect("still held with the setting off");
         assert_eq!(selection_text(&s, &held), " > fix the build");
+    }
+
+    /// A plugin action run from the palette gets the selection held in the focused tile; a
+    /// click (no cells crossed) and no selection give it none.
+    #[test]
+    fn a_palette_action_gets_the_held_selection() {
+        let mut s = chat_single();
+        switch_on(&mut s, 2, "fix the build");
+        assert_eq!(held_selection(&s), None);
+        s.selection = Some(crate::selection::Selection::start(0, 3));
+        assert_eq!(held_selection(&s), None, "a click selects nothing");
+        s.selection = Some(crate::selection::Selection::covering((0, 0), (0, 20)));
+        assert_eq!(held_selection(&s).as_deref(), Some(" > fix the build"));
     }
 
     #[test]

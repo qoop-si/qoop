@@ -123,6 +123,7 @@ const WRITES: &[&str] = &[
     "pane.zoom",
     "pane.resize",
     "pane.swap",
+    "pane.move",
     "pane.focus_direction",
     "tab.create",
     "tab.rename",
@@ -135,6 +136,8 @@ const WRITES: &[&str] = &[
     "agent.focus",
     "agent.prompt",
     "agent.rename",
+    "agent.view.set",
+    "agent.view.clear",
     "notification.show",
     "plugin.action.invoke",
     "plugin.pane.open",
@@ -291,6 +294,8 @@ pub(crate) struct State {
     pub(super) owners: BTreeMap<u32, String>,
     /// Grants already used, by plugin pane: the person key (its time) each was given for.
     pub(super) grants_used: BTreeMap<u32, i64>,
+    /// herdr's one agent view (`agent.view.set`), kept and answered, drawn nowhere.
+    pub(super) agent_view: Option<super::view::Held>,
     /// Whether a listing has been applied: the first one is the starting point, not news.
     primed: bool,
 }
@@ -816,13 +821,31 @@ impl State {
                     let (was_tab, tab) = (tab_of(old, was.terminal), tab_of(new, row.terminal));
                     let key = |t: &Option<Tab>| t.as_ref().map(|t| t.key);
                     if was.workspace != row.workspace || key(&was_tab) != key(&tab) {
-                        let previous_tab = was_tab.map(|t| t.id()).unwrap_or_default();
+                        let previous_tab = was_tab.as_ref().map(|t| t.id()).unwrap_or_default();
+                        // What the move made and closed, as herdr's event carries it.
+                        let made_tab = tab
+                            .as_ref()
+                            .filter(|t| !old.tabs.iter().any(|o| o.key == t.key))
+                            .map(|t| find(&tabs, "tab_id", &t.id()));
+                        let made_space = (!old.spaces.iter().any(|s| s.id == row.workspace))
+                            .then(|| find(&workspaces, "workspace_id", &ws(row.workspace)));
+                        let closed_tab = was_tab
+                            .as_ref()
+                            .filter(|w| !new.tabs.iter().any(|t| t.key == w.key))
+                            .map(|w| w.id());
+                        let closed_space = (!new.spaces.iter().any(|s| s.id == was.workspace))
+                            .then(|| ws(was.workspace));
                         out.push(Event::new(
                             "pane.moved",
                             Some(id.clone()),
-                            json!({"pane": pane, "previous_pane_id": pane_id(was),
+                            translate::compact(
+                                json!({"pane": pane, "previous_pane_id": pane_id(was),
                                    "previous_workspace_id": ws(was.workspace),
-                                   "previous_tab_id": previous_tab}),
+                                   "previous_tab_id": previous_tab,
+                                   "created_workspace": made_space, "created_tab": made_tab,
+                                   "closed_workspace_id": closed_space,
+                                   "closed_tab_id": closed_tab}),
+                            ),
                         ));
                     }
                 }
@@ -864,6 +887,14 @@ impl State {
                            "workspace": find(&old_workspaces, "workspace_id", &id)}),
                 ));
             }
+        }
+        // A move tells what it closed first, as herdr's `pane.move` does: tabs and spaces
+        // closed, then spaces and tabs made, then the move, then the layouts.
+        if out.iter().any(|e| e.dotted == "pane.moved") {
+            let (closed, rest): (Vec<Event>, Vec<Event>) = out
+                .into_iter()
+                .partition(|e| matches!(e.dotted, "tab.closed" | "workspace.closed"));
+            out = closed.into_iter().chain(rest).collect();
         }
         out
     }
@@ -2983,6 +3014,55 @@ mod tests {
             .expect("moved");
         assert_eq!(moved.data["previous_workspace_id"], "w1");
         assert_eq!(moved.data["pane"]["workspace_id"], "w2");
+    }
+
+    /// `pane.move` as herdr tells it: what closed, then what was made, then the move (with
+    /// those ids on it), then the layouts.
+    #[test]
+    fn a_move_tells_closes_first_then_the_move() {
+        let mut state = State::default();
+        let two = vec![space(1, "a"), space(2, "b")];
+        // Pane 4 alone in space 2 moves beside pane 1 in space 1; space 2 closes.
+        state.update(
+            two.clone(),
+            vec![row(1, 1, json!({})), row(4, 2, json!({}))],
+            &[],
+        );
+        let events = state.update(
+            vec![space(1, "a")],
+            vec![row(1, 1, json!({})), row(4, 1, json!({}))],
+            &[split(1, 4)],
+        );
+        assert_eq!(
+            names(&events),
+            [
+                "tab.closed",
+                "workspace.closed",
+                "pane.moved",
+                "layout.updated"
+            ]
+        );
+        let moved = &events[2].data;
+        assert_eq!(moved["previous_pane_id"], "w2:p4");
+        assert_eq!(moved["previous_tab_id"], "w2:t4");
+        assert_eq!(moved["closed_tab_id"], "w2:t4");
+        assert_eq!(moved["closed_workspace_id"], "w2");
+        assert_eq!(moved["pane"]["tab_id"], "w1:t1");
+        assert!(moved.get("created_tab").is_none(), "{moved}");
+
+        // Pane 4 out of that split into a tab of its own in a new space.
+        let events = state.update(two, vec![row(1, 1, json!({})), row(4, 2, json!({}))], &[]);
+        let got = names(&events);
+        assert_eq!(
+            got[..3],
+            ["workspace.created", "tab.created", "pane.moved"],
+            "{got:?}"
+        );
+        assert!(got[3..].iter().all(|e| *e == "layout.updated"), "{got:?}");
+        let moved = &events[2].data;
+        assert_eq!(moved["created_workspace"]["workspace_id"], "w2");
+        assert_eq!(moved["created_tab"]["tab_id"], moved["pane"]["tab_id"]);
+        assert!(moved.get("closed_tab_id").is_none(), "the source tab stays");
     }
 
     #[test]
