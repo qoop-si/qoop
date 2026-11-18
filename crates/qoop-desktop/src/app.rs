@@ -1061,7 +1061,7 @@ impl Desk {
                 .rounded(px(10.))
                 .text_size(px(13.5))
                 .text_color(c(t.t1))
-                .when(on, |d| ui::paint(d, t.current()))
+                .when(on, |d| ui::current(d, t))
                 .hover(|s| ui::paint(s, t.hover()))
                 .child(ui::icon(icon, 16., c(t.t2)))
                 .child(label)
@@ -1185,7 +1185,7 @@ impl Desk {
                         .px(px(10.))
                         .rounded(px(10.))
                         .text_size(px(13.))
-                        .when(on, |d| ui::paint(d, t.current()))
+                        .when(on, |d| ui::current(d, t))
                         .hover(|s| ui::paint(s, t.hover()))
                         .child(ui::mark(kind, t, 11.))
                         .child(

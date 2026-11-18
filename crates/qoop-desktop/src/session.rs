@@ -566,7 +566,7 @@ impl Desk {
                             .rounded(px(9.))
                             .text_size(px(12.5))
                             .text_color(c(t.t1))
-                            .when(on, |d| ui::paint(d, t.current()))
+                            .when(on, |d| ui::current(d, t))
                             .hover(|s| ui::paint(s, t.hover()))
                             .child(ui::mark(self.shown_kind(state::Entry::Live(tab)), t, 10.))
                             .child(
@@ -609,7 +609,7 @@ impl Desk {
                     .rounded(px(9.))
                     .text_size(px(12.5))
                     .text_color(c(t.t1))
-                    .when(self.review.is_some(), |d| ui::paint(d, t.current()))
+                    .when(self.review.is_some(), |d| ui::current(d, t))
                     .hover(|s| ui::paint(s, t.hover()))
                     .child("Changes")
                     .when_some(totals, |d, (a, r)| {
