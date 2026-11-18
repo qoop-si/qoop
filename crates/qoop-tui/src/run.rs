@@ -166,9 +166,43 @@ fn window_rows(state: &State) -> Vec<String> {
         .collect()
 }
 
-/// The text a mouse selection covers, as drawn in the focused tile.
+/// The text a mouse selection covers, by its history rows: rows that scrolled out of view
+/// are in it too. A history row this client does not hold reads blank; `copy_mouse_selection`
+/// fetches them instead.
 fn selection_text(state: &State, selection: &crate::selection::Selection) -> String {
-    selection.text(&window_rows(state), focused_rect(state).cols)
+    let (first, last) = selection.rows();
+    let rows: Vec<String> = (first..=last)
+        .map(|at| copy_row(state, at as u64).unwrap_or_default())
+        .collect();
+    selection.up(first).text(&rows, focused_rect(state).cols)
+}
+
+/// Whether every history row a mouse selection covers is held by this client.
+fn selection_held(state: &State, selection: &crate::selection::Selection) -> bool {
+    let (first, last) = selection.rows();
+    let total = state.live_behind();
+    (first as u64..=last as u64).all(|at| at >= total || copy_row(state, at).is_some())
+}
+
+/// Copy a mouse selection: at once when its rows are all here, else through a yank that
+/// fetches the history rows it covers and copies when the last one lands. Answers whether
+/// anything was copied or set off; a blank selection is neither.
+fn copy_mouse_selection(
+    state: &mut State,
+    selection: &crate::selection::Selection,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    if selection.is_empty() {
+        return Ok(false);
+    }
+    if selection_held(state, selection) {
+        let text = selection_text(state, selection);
+        return copy_and_say(state, &text, out);
+    }
+    let ((r0, c0), (r1, c1)) = selection.ends();
+    let terminal = state.focused;
+    start_yank(state, terminal, (r0 as u64, c0), (r1 as u64, c1), true);
+    Ok(true)
 }
 
 /// The mouse selection still shown in the focused tile, as text: what a plugin action run from
@@ -177,7 +211,7 @@ fn selection_text(state: &State, selection: &crate::selection::Selection) -> Str
 fn held_selection(state: &State) -> Option<String> {
     state
         .selection
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && selection_held(state, s))
         .map(|s| selection_text(state, &s))
         .filter(|text| !text.is_empty())
 }
@@ -1322,7 +1356,12 @@ struct State {
     /// Kept after the button comes up rather than cleared, because a person who has just
     /// copied something looks at it to check they got the right thing. The next press in
     /// the pane clears it.
+    ///
+    /// Its rows are history rows (`view_top`), not the pane's: a selection made and then
+    /// scrolled, or made across a scroll, still covers the text it was made over.
     selection: Option<crate::selection::Selection>,
+    /// The button that started `selection` is still down, so the wheel carries its end.
+    selecting: bool,
     /// A ctrl+click on a link, held while the plugin host says whether a plugin takes it.
     link: LinkClick,
     /// The agents a plugin's agent view shows, in its order: what the spaces tree follows
@@ -1565,7 +1604,10 @@ impl State {
             menu: self.menu.map(|selected| (selected, &self.menu_kind)),
             collapsed: self.collapsed,
             reading: self.reading,
-            selection: self.copy_selection().or(self.selection),
+            selection: self.copy_selection().or_else(|| {
+                self.selection
+                    .and_then(|s| s.in_view(self.view_top() as usize, focused_rect(self).rows))
+            }),
             scroll: self.scrolled_rows(),
             anchor: self.anchor.unwrap_or_default(),
             rows_back: self.rows_back(),
@@ -1811,6 +1853,14 @@ impl State {
         self.anchor
             .map(|anchor| self.live_behind().saturating_sub(anchor))
             .unwrap_or(0)
+    }
+
+    /// The history row the pane's first row shows, counted the way copy mode counts: the
+    /// pin when scrolled back, the first row of the live screen when not, `0` in chat,
+    /// which has no history. A mouse selection's rows are counted from here, so they stay
+    /// on their text while the view scrolls.
+    fn view_top(&self) -> u64 {
+        self.live_behind() - self.rows_back()
     }
 
     /// How many rows are behind this terminal's screen, as of the last thing it said.
@@ -7586,7 +7636,7 @@ fn copy_key(state: &mut State, bytes: &[u8], prefix: u8, request: &mut u64) -> M
             // Copies and leaves; with nothing selected it only leaves, which is what tmux
             // hands expect of the same key.
             ModeKey::Byte(b'y' | b'\r' | b'\n') => {
-                if !start_yank(state, &copy) {
+                if !start_copy_yank(state, &copy) {
                     state.message = Some("nothing was selected, nothing copied".to_string());
                 }
                 leave = true;
@@ -7778,21 +7828,35 @@ fn copy_found(state: &mut State, id: &str, row: Option<u64>, cell: usize, resume
 }
 
 /// Start copying copy mode's selection. False when nothing is selected.
-///
-/// The rows on the screen and those already fetched are taken at once; the rest of the
-/// history is asked for in chunks, and the copy happens when the last one lands.
-fn start_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
+fn start_copy_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
     let Some((start, end)) = copy.selected() else {
         return false;
     };
+    start_yank(state, copy.terminal, start, end, false);
+    true
+}
+
+/// Copy the rows `start..=end` of a terminal's history, cut at the ends by cells, or by
+/// screen columns with `columns`.
+///
+/// The rows on the screen and those already fetched are taken at once; the rest of the
+/// history is asked for in chunks, and the copy happens when the last one lands.
+fn start_yank(
+    state: &mut State,
+    terminal: u32,
+    start: (u64, usize),
+    end: (u64, usize),
+    columns: bool,
+) {
     let total = state.live_behind();
     let mut yank = crate::copy::Yank {
-        terminal: copy.terminal,
+        terminal,
         start,
         end,
         rows: std::collections::BTreeMap::new(),
         total,
         asked: 0,
+        columns,
     };
     for at in start.0..=end.0 {
         if let Some(row) = copy_row(state, at) {
@@ -7807,7 +7871,6 @@ fn start_yank(state: &mut State, copy: &crate::copy::Copy) -> bool {
         }
         None => state.modes.clipboard = Some(yank.text()),
     }
-    true
 }
 
 /// The pane's size in cells, which is what a sleeping tab's screen is cut to.
@@ -8384,6 +8447,7 @@ where
         joining: None,
         modes: Modes::default(),
         selection: None,
+        selecting: false,
         forwarded_press: false,
         link: LinkClick::default(),
         agent_view: None,
@@ -9866,7 +9930,8 @@ where
                                                 )
                                             {
                                                 let text = word.text(&window, tile.cols);
-                                                state.selection = Some(word);
+                                                state.selection =
+                                                    Some(word.down(state.view_top() as usize));
                                                 if state.config.copy_on_select {
                                                     let mut out = std::io::stdout();
                                                     copy_and_say(&mut state, &text, &mut out)?;
@@ -9882,8 +9947,16 @@ where
                                         state.modes.held = None;
                                         state.selection =
                                             Some(crate::selection::Selection::start(
-                                                tile_row, tile_col,
+                                                state.view_top() as usize + tile_row,
+                                                tile_col,
                                             ));
+                                        state.selecting = true;
+                                        // A mouse copy still fetching is let go: its answer
+                                        // landing later would replace this one's. Copy mode's
+                                        // own copy carries on.
+                                        if state.modes.yank.as_ref().is_some_and(|y| y.columns) {
+                                            state.modes.yank = None;
+                                        }
                                         dirty = true;
                                     }
                                     continue;
@@ -10321,8 +10394,9 @@ where
                                 }) else {
                                     continue;
                                 };
+                                let top = state.view_top() as usize;
                                 if let Some(selection) = state.selection.as_mut() {
-                                    selection.extend(pane_row, pane_col);
+                                    selection.extend(top + pane_row, pane_col);
                                     dirty = true;
                                 } else if state.pane_wants_mouse() && !shift {
                                     // 32 is the motion flag on the left button, which is
@@ -10509,20 +10583,24 @@ where
                                         .then(|| clamped_to_focused(&state, row, col))
                                 });
                                 state.forwarded_press = false;
+                                state.selecting = false;
                                 if let Some(selection) = state.selection {
                                     // Copied when the button comes up, with no key to
                                     // press: a selection that has to be confirmed is a
                                     // selection a person makes twice. With `copy_on_select`
                                     // off it stays highlighted for the copy key instead.
+                                    // History rows scrolled through and no longer held are
+                                    // fetched, so the copy is the whole selection.
+                                    let held = selection_held(&state, &selection);
                                     let text = selection_text(&state, &selection);
-                                    if !text.is_empty() {
+                                    if !selection.is_empty() && (!held || !text.is_empty()) {
                                         if state.config.copy_on_select {
                                             let mut out = std::io::stdout();
-                                            if copy_and_say(&mut state, &text, &mut out)? {
+                                            if copy_mouse_selection(&mut state, &selection, &mut out)? {
                                                 dirty = true;
                                             }
                                         } else {
-                                            state.modes.held = Some(text);
+                                            state.modes.held = held.then_some(text);
                                         }
                                     } else {
                                         // A click, not a drag. Nothing was selected, so
@@ -10645,6 +10723,14 @@ where
                                     let next = (next < total).then_some(next);
                                     if next != state.anchor {
                                         state.anchor = next;
+                                        // A drag the wheel scrolled under: the end follows
+                                        // the pointer onto the rows that came into view.
+                                        let top = state.view_top() as usize;
+                                        if state.selecting
+                                            && let Some(selection) = state.selection.as_mut()
+                                        {
+                                            selection.extend(top + pane_row, pane_col);
+                                        }
                                         dirty = true;
                                     }
                                     // Asked for whether or not the pin moved: the first
@@ -10901,19 +10987,14 @@ where
                             Action::CopySelection => {
                                 // Only while a selection is still held: any other end of
                                 // it (typing, a new tab) has dropped the text with it.
-                                let text = match state.selection {
-                                    Some(s) => state
-                                        .modes
-                                        .held
-                                        .clone()
-                                        .unwrap_or_else(|| selection_text(&state, &s)),
-                                    None => String::new(),
+                                let mut out = std::io::stdout();
+                                let copied = match (state.selection, state.modes.held.clone()) {
+                                    (Some(_), Some(text)) => copy_and_say(&mut state, &text, &mut out)?,
+                                    (Some(s), None) => copy_mouse_selection(&mut state, &s, &mut out)?,
+                                    (None, _) => false,
                                 };
-                                if text.is_empty() {
+                                if !copied {
                                     say(&mut state, "nothing selected: drag over text first".to_string());
-                                } else {
-                                    let mut out = std::io::stdout();
-                                    copy_and_say(&mut state, &text, &mut out)?;
                                 }
                                 dirty = true;
                             }
@@ -18087,6 +18168,7 @@ mod tests {
             joining: None,
             modes: Modes::default(),
             selection: None,
+            selecting: false,
             forwarded_press: false,
             link: LinkClick::default(),
             agent_view: None,
@@ -19658,6 +19740,7 @@ mod tests {
             joining: None,
             modes: Modes::default(),
             selection: None,
+            selecting: false,
             forwarded_press: false,
             link: LinkClick::default(),
             agent_view: None,
@@ -19825,6 +19908,7 @@ mod tests {
             joining: None,
             modes: Modes::default(),
             selection: None,
+            selecting: false,
             forwarded_press: false,
             link: LinkClick::default(),
             agent_view: None,
@@ -29155,6 +29239,97 @@ mod tests {
         );
         let held = s.selection.expect("still held with the setting off");
         assert_eq!(selection_text(&s, &held), " > fix the build");
+    }
+
+    /// A shell with 50 rows of history `h0..h49` behind a live screen `live0..live4`, the
+    /// client holding history rows `from..50`.
+    fn shell_with_history(from: u64) -> State {
+        let mut s = state();
+        s.palette = None;
+        let mut snap = pty_screen("");
+        snap.modes.mouse_reporting = false;
+        snap.lines = (0..5).map(|n| format!("live{n}")).collect();
+        s.snapshot = Some(snap);
+        s.behind = Behind {
+            terminal: s.focused,
+            from,
+            lines: (from..50).map(|n| format!("h{n}")).collect(),
+            total: 50,
+        };
+        s
+    }
+
+    #[test]
+    fn a_selection_scrolled_through_copies_every_row_it_covers() {
+        let mut s = shell_with_history(30);
+        // Scrolled back to row 44, a drag starts on the pane's second row (h45)...
+        s.anchor = Some(44);
+        assert_eq!(s.view_top(), 44);
+        let mut sel = crate::selection::Selection::start(s.view_top() as usize + 1, 0);
+        // ...and the view scrolls down to the live screen before the button comes up on
+        // its second row (live1).
+        s.anchor = None;
+        assert_eq!(s.view_top(), 50);
+        sel.extend(s.view_top() as usize + 1, 4);
+        s.selection = Some(sel);
+        assert_eq!(
+            selection_text(&s, &sel),
+            "h45\nh46\nh47\nh48\nh49\nlive0\nlive1"
+        );
+        // Drawn from the view's top, as far as it reaches into the view.
+        let drawn = s.frame().selection.expect("drawn");
+        assert_eq!(drawn.rows(), (0, 1));
+        assert_eq!(drawn.columns_on(0, 80), Some(0..80));
+        // Scrolled out of view altogether, it is not drawn, and still held.
+        s.anchor = Some(0);
+        assert!(s.frame().selection.is_none());
+        assert_eq!(selection_text(&s, &sel).lines().count(), 7);
+        let mut out = Vec::new();
+        assert!(copy_mouse_selection(&mut s, &sel, &mut out).unwrap());
+        assert!(s.modes.yank.is_none(), "every row was held: copied at once");
+    }
+
+    #[test]
+    fn a_selection_over_history_the_client_let_go_of_fetches_it_first() {
+        let mut s = shell_with_history(45);
+        // A click on a row the client does not hold is a click: nothing fetched or copied.
+        let click = crate::selection::Selection::start(40, 1);
+        assert!(!copy_mouse_selection(&mut s, &click, &mut Vec::new()).unwrap());
+        assert!(s.modes.yank.is_none() && s.modes.outbox.is_empty());
+        // Nor is a selection over such rows handed to a plugin half blank.
+        s.selection = Some(crate::selection::Selection::covering((40, 1), (51, 3)));
+        assert_eq!(held_selection(&s), None);
+        let sel = crate::selection::Selection::covering((40, 1), (51, 3));
+        assert!(!selection_held(&s, &sel));
+        let mut out = Vec::new();
+        assert!(copy_mouse_selection(&mut s, &sel, &mut out).unwrap());
+        assert!(out.is_empty(), "nothing copied before the rows are here");
+        let ask = s.modes.outbox.pop().expect("asked for the rows");
+        let ControlRequest::Scrollback {
+            id, up, terminal, ..
+        } = ask
+        else {
+            panic!("{ask:?}");
+        };
+        assert!(id.starts_with("yank-"), "{id}");
+        assert_eq!(up, 10, "from row 40");
+        let (mut request, mut dirty) = (0, false);
+        apply(
+            &mut s,
+            ControlResponse::Scrollback {
+                id,
+                terminal,
+                from: 40,
+                total: 50,
+                lines: (40..45).map(|n| format!("old{n}")).collect(),
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert_eq!(
+            s.modes.clipboard.as_deref(),
+            Some("ld40\nold41\nold42\nold43\nold44\nh45\nh46\nh47\nh48\nh49\nlive0\nlive")
+        );
     }
 
     /// A ctrl+click's link: a web address under it in the focused tile's text.

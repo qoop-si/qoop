@@ -66,7 +66,7 @@ program.
 | Do | Does |
 |---|---|
 | click | focus a tab, a pane, a space or an agent; in a chat, open or close the step you click (shift-click selects over it instead) |
-| drag | select, and copy when you let go |
+| drag | select, and copy when you let go; scroll while the button is down and the selection runs on, and every row it covers is copied, also rows scrolled out of view |
 | drag a divider | resize the panes on either side |
 | click a space's `+`, or the tab bar's | a new agent or terminal in that space, in its directory; an agent asks for its name (empty for the agent's own) |
 | click the pet at the foot of the column | qass, or back to where you were: the same as `ctrl-a Q` |
