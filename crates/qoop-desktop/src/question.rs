@@ -804,6 +804,18 @@ impl Desk {
             (Some(Said::Sent { label, at }), Some(qass)) if label == HANDED => {
                 format!("{qass}, handed {}", state::clock(*at, self.zone))
             }
+            // The hand is over (qass answered, left it, or stopped): no "Sent: Handed" left
+            // standing over a question that waits on the owner again. A moment after the send
+            // the row may not say it is with qass yet.
+            (Some(Said::Sent { label, at }), None)
+                if label == HANDED && !row.is_some_and(|r| r.with_qass) && self.now - *at > 5 =>
+            {
+                if row.is_some_and(|r| r.qass_missed) {
+                    "qass did not take it".into()
+                } else {
+                    return None;
+                }
+            }
             (Some(Said::Sent { label, at }), _) => {
                 format!("Sent: {label}, {}", state::clock(*at, self.zone))
             }

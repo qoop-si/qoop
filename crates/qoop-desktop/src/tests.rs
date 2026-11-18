@@ -1190,6 +1190,9 @@ fn the_local_daemon_down_offers_start_and_no_remote_retry(cx: &mut TestAppContex
         banner.contains("staging not reached while This Mac is down"),
         "{banner}"
     );
+    // Its sidebar line wraps inside the sidebar (248 px) rather than run out of it.
+    let word = vcx.debug_bounds("reach-word-1").expect("staging's line");
+    assert!(word.right() <= gpui::px(248.), "{word:?}");
 }
 
 /// Every sidebar link takes the ring: from the window's own focus, Tab once reaches Home, twice
@@ -1993,6 +1996,105 @@ fn a_schedule_that_never_ran_opens_and_earlier_runs_are_earlier(cx: &mut TestApp
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("earlier-7").is_some(), "the earlier run");
     assert!(vcx.debug_bounds("earlier-9").is_none(), "not the newer one");
+}
+
+/// A one-off's Edit sheet says the one-off's own date, which its time field (a clock only)
+/// does not hold, not the next time that clock comes round.
+#[gpui::test]
+fn a_one_offs_edit_sheet_says_its_own_date(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let (said, want) = vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let at = d.now + 2 * 86_400 + 3_600;
+            let s: qoop_runtime::control::ScheduleInfo =
+                serde_json::from_value(serde_json::json!({
+                    "id": 1, "name": "lint-check", "at": at, "agent": "claude",
+                    "cwd": "/srv/acme-web", "prompt": "go", "paused": false, "created_at": 0,
+                    "when": "once", "next_at": at,
+                }))
+                .expect("schedule");
+            d.model.schedules = vec![s.clone()];
+            d.open(Page::Schedules, window, cx);
+            d.open_sheet(Some(&s), window, cx);
+            let sheet = d.schedule_page.sheet.as_ref().expect("the sheet");
+            (
+                d.sheet_first_line(sheet, cx),
+                format!("Next run: {}", crate::state::clock_at(at, d.now, d.zone)),
+            )
+        })
+    });
+    assert_eq!(said, want);
+}
+
+/// A sheet taller than the window scrolls inside it: its top is never above the window.
+#[gpui::test]
+fn a_sheet_taller_than_the_window_keeps_its_top_in_it(cx: &mut TestAppContext) {
+    let (_desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(300.)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.run_until_parked();
+    let at = vcx.debug_bounds("new-work-sheet").expect("the sheet");
+    assert!(at.origin.y >= gpui::px(0.), "{at:?}");
+}
+
+/// A schedule opened before it ran shows its run's report once one starts, never "Not run yet"
+/// over a run that waits.
+#[gpui::test]
+fn a_schedule_opened_before_its_run_shows_the_run(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.model.schedules = vec![crate::state::tests::schedule_info(
+                1,
+                "review-pr",
+                "0 9 * * *",
+                0,
+            )];
+            d.open(Page::Schedules, window, cx);
+            d.schedule_page.open = Some((1, None));
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("unrun-report").is_some());
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            let run: qoop_runtime::control::ScheduleRun =
+                serde_json::from_value(serde_json::json!({
+                    "id": 8, "schedule": 1, "slot": 1000, "started_at": 1000,
+                    "terminal": 2, "result": "started",
+                }))
+                .expect("run");
+            d.schedule_page.runs.insert((0, 1), vec![run]);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("unrun-report").is_none(),
+        "the run's report"
+    );
+}
+
+/// A hand that ended leaves no "Sent: Handed to qass" over a question that waits again.
+#[gpui::test]
+fn an_ended_hand_leaves_no_sent_line(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let shown = vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            let slot = crate::state::Slot::Agent(2);
+            d.said.insert(
+                slot.clone(),
+                crate::question::Said::Sent {
+                    label: "Handed to qass".into(),
+                    at: d.now - 60,
+                },
+            );
+            let t = d.theme();
+            d.said_line(&slot, &t, cx).is_some()
+        })
+    });
+    assert!(!shown, "the row is not with qass any more");
 }
 
 /// A field filled for editing puts the caret after its text, so typing adds to the end.
