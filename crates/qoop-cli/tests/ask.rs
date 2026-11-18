@@ -2075,7 +2075,9 @@ fn an_away_hand_is_kept_here_and_told_to_no_qass_here() {
         stack.log("qass")
     );
 
-    // A hand for the qass here over the away one replaces it, and the qass here is told.
+    // A hand for the qass here over the away one replaces it, and the qass here is told. A
+    // fresh window: the daemon let go of the one above, which read nothing while qass waited.
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
     let mine = hand_to_qass(&rt, &mut ui, "h5", &[away]);
     assert!(matches!(mine, ControlResponse::Handed { .. }), "{mine:?}");
     assert_eq!(row_of(&rt, &mut ui, away).qass_away, None);
