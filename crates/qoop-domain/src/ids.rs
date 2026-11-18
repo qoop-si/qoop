@@ -38,30 +38,36 @@ macro_rules! id_type {
 
 id_type!(
     /// A compute node that can run the daemon. Machine identity is not workspace identity.
-    MachineId, "machine:"
+    MachineId,
+    "machine:"
 );
 id_type!(
     /// Reusable launch intent. A Setup is not a Workspace.
-    SetupId, "setup:"
+    SetupId,
+    "setup:"
 );
 id_type!(
     /// A runtime instance of a Setup. A workspace may move between machines.
-    WorkspaceId, "ws:"
+    WorkspaceId,
+    "ws:"
 );
 id_type!(
     /// A PTY-backed terminal surface. A Terminal is not an Agent.
-    TerminalId, "term:"
+    TerminalId,
+    "term:"
 );
 id_type!(
     /// An agent process identity, stable across the process generations it goes through.
-    AgentId, "agent:"
+    AgentId,
+    "agent:"
 );
 id_type!(TaskId, "task:");
 id_type!(EventId, "event:");
 id_type!(
     /// One client connection. Deliberately per connection, not per client program: size
     /// ownership keys on it and must end when the connection does (ADR-007).
-    ClientId, "client:"
+    ClientId,
+    "client:"
 );
 
 /// A process generation within one agent identity.
