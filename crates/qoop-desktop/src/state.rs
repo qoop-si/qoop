@@ -184,8 +184,10 @@ pub struct Model {
     /// that is (its tab and generation): a restart starts the clock again.
     pub qass_up: Option<(i64, (u32, Option<u64>))>,
     /// Each row's hand for another machine's qass as last seen (`qass_away.at`), and when the
-    /// window first saw that hand: `None` for one already there in its first list.
+    /// window first saw that hand: `None` for one already there in its machine's first list.
     pub away_seen: HashMap<u32, (i64, Option<i64>)>,
+    /// The machines the last agent list had rows of.
+    pub listed_machines: BTreeSet<usize>,
     /// The agents qass's open cards are about, as their keys (`T5`, `staging/T2`).
     pub carded: Vec<String>,
     /// This Mac's hand id (`paths::hand_id`), once known.
@@ -485,7 +487,7 @@ impl Model {
     /// After a new agent list or switch read at `now` (the window's clock): since when This
     /// Mac's qass runs and watches, and when each hand for another machine's qass was first
     /// seen. `first`: the window's first list, whose hands are older than anything it knows.
-    pub fn note_qass(&mut self, now: i64, first: bool) {
+    pub fn note_qass(&mut self, now: i64) {
         let up = self.qass_line().starts_with("watching");
         let who = self.qass_row().map(|r| (r.terminal, r.generation));
         self.qass_up = match (up, who, self.qass_up) {
@@ -496,6 +498,9 @@ impl Model {
         let mut seen = HashMap::new();
         for r in &self.rows {
             if let Some(away) = &r.qass_away {
+                // A machine's first list in this window (a remote's comes after the window
+                // opens) holds hands older than anything the window knows.
+                let first = !self.listed_machines.contains(&machine_of(r.workspace));
                 let when = match self.away_seen.get(&r.terminal) {
                     Some((at, when)) if *at == away.at => *when,
                     _ if first => None,
@@ -505,6 +510,7 @@ impl Model {
             }
         }
         self.away_seen = seen;
+        self.listed_machines = self.rows.iter().map(|r| machine_of(r.workspace)).collect();
     }
 
     /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. One rule
@@ -2602,12 +2608,12 @@ pub(crate) mod tests {
         let mut m = fixture();
         let t = remote_asking(&mut m, Some("testmac"), 100);
         // Already there in the window's first list: nothing says this qass heard of it.
-        m.note_qass(10, true);
+        m.note_qass(10);
         assert!(!m.with_qass(m.row(t).unwrap()));
         assert!(m.asking().contains(&t));
         // Handed again from here: a new hand, seen after qass came up.
         remote_asking(&mut m, Some("testmac"), 200);
-        m.note_qass(20, false);
+        m.note_qass(20);
         assert!(m.with_qass(m.row(t).unwrap()));
         assert!(!m.asking().contains(&t));
         assert_eq!(m.handed(), 1);
@@ -2625,12 +2631,12 @@ pub(crate) mod tests {
             .find(|r| r.terminal == 9)
             .unwrap()
             .generation = Some(2);
-        m.note_qass(30, false);
+        m.note_qass(30);
         assert!(!m.with_qass(m.row(t).unwrap()));
         assert!(m.asking().contains(&t));
         // Stopped: the row says why nobody holds it.
         m.qass_watch = Some(false);
-        m.note_qass(40, false);
+        m.note_qass(40);
         assert_eq!(
             m.qass_words(m.row(t).unwrap()).as_deref(),
             Some("With qass, not watching")
@@ -2638,8 +2644,23 @@ pub(crate) mod tests {
         // Another Mac's hand is that Mac's qass's.
         m.qass_watch = Some(true);
         remote_asking(&mut m, Some("othermac"), 300);
-        m.note_qass(50, false);
+        m.note_qass(50);
         assert!(m.with_qass(m.row(t).unwrap()));
+    }
+
+    /// A remote's rows reach the window in a later list than This Mac's: a hand in that
+    /// machine's first list is still one the window knows nothing of.
+    #[test]
+    fn a_remote_hand_in_its_machines_first_list_is_unknown() {
+        let mut m = fixture();
+        let t = remote_asking(&mut m, Some("testmac"), 100);
+        let all = m.rows.clone();
+        m.rows.retain(|r| machine_of(r.workspace) == 0);
+        m.note_qass(10);
+        m.rows = all;
+        m.note_qass(20);
+        assert!(!m.with_qass(m.row(t).unwrap()));
+        assert!(m.asking().contains(&t));
     }
 
     /// A card finds its row by its key on another machine too.

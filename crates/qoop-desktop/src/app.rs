@@ -238,8 +238,19 @@ impl Desk {
             }
         }
         let theme_pref = config.config.theme;
+        // This Mac's hand id, read but never made here: another Mac's hand is told apart from
+        // this Mac's own from the first list on (the first remote hand makes the file).
+        let hand_id = qoop_runtime::paths::qass_data_dir()
+            .and_then(|dir| {
+                std::fs::read_to_string(dir.join(qoop_runtime::paths::HAND_ID_FILE)).ok()
+            })
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
         Desk {
-            model: Model::default(),
+            model: Model {
+                hand_id,
+                ..Model::default()
+            },
             page: Page::Home,
             inbox: false,
             chip: Chip::All,
@@ -428,7 +439,7 @@ impl Desk {
                         self.said.remove(&slot);
                     }
                 }
-                self.model.note_qass(self.now, !self.listed);
+                self.model.note_qass(self.now);
                 self.listed = true;
                 // An agent that waited works again: maybe qass wrote to it, an act to show.
                 if (self.page == Page::Qass || self.inbox) && state::woke(&before, &self.model.rows)
@@ -530,7 +541,7 @@ impl Desk {
             }
             ControlResponse::QassWatch { on, .. } => {
                 self.model.qass_watch = Some(on);
-                self.model.note_qass(self.now, false);
+                self.model.note_qass(self.now);
             }
             ControlResponse::TerminalCreated { id, terminal } => {
                 self.started(&id, terminal, window, cx)
@@ -749,8 +760,8 @@ impl Desk {
         self.term.is_some() && matches!(self.page, Page::Session(_) | Page::Qass)
     }
 
-    /// The keys' resting place: an open sheet's first stop, else the terminal on screen, else
-    /// the window. Where focus goes when its control leaves the frame or a panel closes.
+    /// The keys' resting place: an open sheet's first stop, else the open Inbox, else the terminal
+    /// on screen, else the window. Where focus goes when its control leaves the frame or a panel closes.
     pub(crate) fn focus_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let schedule_sheet = self
             .schedule_page
@@ -760,6 +771,9 @@ impl Desk {
         let to = match (&self.sheet, schedule_sheet) {
             (Some(sheet), _) => sheet.stops[0].clone(),
             (None, Some(sheet)) => sheet.name.read(cx).focus.clone(),
+            // A card answered in the open Inbox leaves it: the keys stay in the Inbox, never
+            // in the agent on screen behind it.
+            (None, None) if self.inbox => self.inbox_focus.clone(),
             (None, None) if self.term_drawn() => self.term_focus.clone(),
             (None, None) => self.focus.clone(),
         };
@@ -861,8 +875,16 @@ impl Desk {
             "/" if self.page == Page::Settings && self.settings.find.is_none() => {
                 self.open_find(window, cx)
             }
-            // Off the terminal with nothing open: Escape gives it the keys back.
-            "escape" if self.sheet.is_none() && self.term_drawn() => {
+            // Off the terminal with nothing open: Escape gives it the keys back. Not from the
+            // own-answer field, which stays open: a digit then would go raw to the agent.
+            "escape"
+                if self.sheet.is_none()
+                    && self.term_drawn()
+                    && !self
+                        .own
+                        .as_ref()
+                        .is_some_and(|own| own.field.read(cx).focus.is_focused(window)) =>
+            {
                 window.focus(&self.term_focus, cx);
                 cx.notify();
             }
@@ -1310,6 +1332,13 @@ impl Desk {
             })
             .map(|(m, name, _)| (m, name))
             .collect();
+        // One Retry now per machine, on its first space: three spaces are one machine to retry.
+        let mut machines_seen = std::collections::BTreeSet::new();
+        let firsts: Vec<i64> = groups
+            .iter()
+            .filter(|g| machines_seen.insert(state::machine_of(g.space.id)))
+            .map(|g| g.space.id)
+            .collect();
         div()
             .flex()
             .flex_col()
@@ -1330,7 +1359,9 @@ impl Desk {
                 // The machine's line sits beside the heading, not in it: its Retry now is a
                 // button of its own.
                 let reach =
-                    (m != 0).then(|| self.reach_line(m, state::machine_name(g.space), "", t, cx));
+                    (m != 0).then(|| {
+                        self.reach_line(m, state::machine_name(g.space), "", firsts.contains(&id), t, cx)
+                    });
                 // Its own id: a machine's line under each of its spaces stays apart.
                 div()
                     .id(("side-group", id as u64))
@@ -1499,7 +1530,7 @@ impl Desk {
                     ))
                     .pt(px(10.))
                     .px(px(10.))
-                    .child(self.reach_line(m, name, ", no agents", t, cx))
+                    .child(self.reach_line(m, name, ", no agents", true, t, cx))
             }))
     }
 
@@ -1511,6 +1542,7 @@ impl Desk {
         m: usize,
         name: String,
         tail: &'static str,
+        retry: bool,
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1552,7 +1584,7 @@ impl Desk {
             .when_some(self.pet_of(m), |d, pet| d.child(pet))
             .child(div().text_color(c(t.t1)).child(name.clone()))
             .child(div().text_color(c(ink)).child(format!("{word}{tail}")))
-            .when((away || retrying) && !behind, |d| {
+            .when(retry && (away || retrying) && !behind, |d| {
                 d.child(
                     ui::control(
                         ("retry", m as u64),

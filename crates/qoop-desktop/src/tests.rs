@@ -957,6 +957,27 @@ fn focus_on_a_control_that_goes_comes_back_to_the_terminal(cx: &mut TestAppConte
     );
 }
 
+/// With the Inbox open, a control that goes (a card answered there) leaves the keys in the
+/// Inbox, never in the agent on screen behind it.
+#[gpui::test]
+fn focus_lost_with_the_inbox_open_stays_in_the_inbox(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a i");
+    // A control that is not drawn has the focus: what a card that left leaves behind.
+    vcx.update(|window, cx| {
+        let gone = cx.focus_handle();
+        window.focus(&gone, cx);
+        desk.update(cx, |_, cx| cx.notify());
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| desk.read(cx).inbox_focus.is_focused(window)),
+        "the keys stay in the Inbox"
+    );
+}
+
 /// `ctrl-a i` puts the keys in the Inbox: Tab moves inside the window and types nothing into
 /// the agent; Escape closes it and the terminal has them again.
 #[gpui::test]
