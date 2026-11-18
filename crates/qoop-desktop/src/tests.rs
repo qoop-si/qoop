@@ -74,6 +74,61 @@ fn home_lists_the_rows_under_their_spaces_in_rank_order(cx: &mut TestAppContext)
     );
 }
 
+/// The sidebar lists the spaces on Home too, with no machine tiles under them: a space of
+/// another machine has that machine's line under its name, This Mac's have none, and a parked
+/// machine with no agent gets one quiet line at the end.
+#[gpui::test]
+fn the_sidebar_lists_the_spaces_on_home_with_their_machines(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let remote = 1i64 << 40 | 1;
+    let parked = 2i64 << 40 | 1;
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            let mut idle = crate::state::tests::space(parked, "cdev:scratch");
+            idle.link = Some(LinkState::Parked);
+            d.model.spaces.push(idle);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Home);
+    let y = |vcx: &mut VisualTestContext, what: &'static str| {
+        vcx.debug_bounds(what)
+            .unwrap_or_else(|| panic!("{what} is not drawn"))
+            .origin
+            .y
+    };
+    let remote_space: &'static str = format!("side-space-{remote}").leak();
+    let order = [
+        "side-space-1",
+        "side-space-2",
+        remote_space,
+        "machine-1",
+        "side-machine-2",
+    ];
+    let ys: Vec<_> = order.iter().map(|s| y(&mut vcx, s)).collect();
+    assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} at {ys:?}");
+    assert!(
+        vcx.debug_bounds("machine-0").is_none(),
+        "This Mac has no tag"
+    );
+    assert!(
+        vcx.debug_bounds("retry-1").is_none(),
+        "online: nothing to retry"
+    );
+    assert!(
+        vcx.debug_bounds("retry-2").is_none(),
+        "parked: nothing to retry"
+    );
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| crate::state::reach_words(
+            d.machine_state(1),
+            d.zone
+        )),
+        "online"
+    );
+}
+
 #[gpui::test]
 fn ctrl_a_c_opens_new_work_and_ctrl_a_i_the_inbox(cx: &mut TestAppContext) {
     let (desk, mut vcx, _rx) = open(cx);
@@ -1750,7 +1805,7 @@ fn home_lists_sleeping_tabs_from_the_space_list(cx: &mut TestAppContext) {
     );
 }
 
-/// A remote that stops answering: retrying at first, then after 15 s its tile and the banner
+/// A remote that stops answering: retrying at first, then after 15 s its sidebar line and the banner
 /// say "not reached, as of", its rows stay (neutral, as of then) and cannot be answered; back,
 /// it is live again. This Mac's daemon gone: every machine as of then.
 #[gpui::test]
@@ -1812,9 +1867,9 @@ fn a_machine_not_answering_goes_stale_and_comes_back(cx: &mut TestAppContext) {
             d.zone
         )),
         words,
-        "the tile's words"
+        "the sidebar line's words"
     );
-    assert!(vcx.debug_bounds("tile-1").is_some());
+    assert!(vcx.debug_bounds("machine-1").is_some());
     let workspace = desk.read_with(&vcx, |d, _| d.model.row(remote_row).map(|r| r.workspace));
     assert_eq!(
         desk.read_with(&vcx, |d, _| workspace.and_then(|w| d.as_of(w))),
@@ -2256,8 +2311,8 @@ fn an_idle_remote_from_before_pets_stays_live_on_its_refusals(cx: &mut TestAppCo
 }
 
 /// A machine whose link is down: its space reads by its own name (the ssh error only in the
-/// tile's tooltip), its tile offers Retry now, and Retry now or the window coming back asks it
-/// at once, which makes the mux try it then rather than at the end of its backoff.
+/// sidebar line's tooltip), that line offers Retry now, and Retry now or the window coming
+/// back asks it at once, which makes the mux try it then rather than at the end of its backoff.
 #[gpui::test]
 fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
@@ -2298,7 +2353,7 @@ fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
     );
     assert!(
         vcx.debug_bounds("retry-1").is_some(),
-        "Retry now on its tile"
+        "Retry now on its space's machine line"
     );
     sent(&mut rx);
     vcx.update(|_, cx| desk.update(cx, |d, _| d.retry_machine(1)));

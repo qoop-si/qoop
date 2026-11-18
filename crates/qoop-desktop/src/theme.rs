@@ -386,7 +386,7 @@ mod tests {
     /// Every state pair, on every ground it can sit on, in both themes: the label reads at
     /// 4.5:1 on its own fill (the owner's focused qass chip was ink on ink). A ground is a
     /// page ground (the dark top glow and the terminal's ground included) or a filled group
-    /// over one (a segmented control, a machine tile). The focus ring reads at 3:1 (WCAG
+    /// over one (a segmented control). The focus ring reads at 3:1 (WCAG
     /// 1.4.11) against what is outside it (a ground, or a state fill another control sits on)
     /// and against `bg`, its inner band, whatever the control's own fill. A key cap reads
     /// inside a control in every state, in `key_on` when the control is on.
