@@ -8,7 +8,7 @@
 //! Its column on the board is never stored: it is read from what happened (`state`), so
 //! no write can leave an item in a column its record contradicts.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -891,6 +891,30 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// The item each open task is linked to, with its steps done and all its steps, counted
+    /// as the board counts them (phase headers left out), by task.
+    pub fn linked_steps(&self) -> Result<BTreeMap<i64, (i64, usize, usize)>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT l.task, l.item, \
+             (SELECT COUNT(done_at) FROM task_step WHERE task = l.item AND {REAL_STEP}), \
+             (SELECT COUNT(*) FROM task_step WHERE task = l.item AND {REAL_STEP}) \
+             FROM task_item l JOIN task t ON t.id = l.task WHERE t.closed_at IS NULL"
+        ))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    (
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)? as usize,
+                        r.get::<_, i64>(3)? as usize,
+                    ),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Rewrite an open item's description; empty clears it. Answers whether it changed.

@@ -1,0 +1,328 @@
+//! The questions rail of an agent's tab: a thin column at the right of the tab's panes that
+//! says, without opening anything, how many question cards the tab's agent waits on, which, and
+//! how far its task is (`2/4` steps and a stage word).
+//!
+//! Every tab with a local agent in it keeps one, folded, whether or not a card waits, so a card
+//! arriving or answered changes the rail's rows and never the agent's columns. Pure functions of
+//! the cards and the row the caller read, so a test reads the rail instead of looking at one.
+
+use qoop_runtime::control::{AskInfo, TaskRef};
+
+use crate::layout::Rect;
+use crate::theme::{self, Role};
+use crate::width;
+
+/// The rail's columns, the line it shares with the panes left out: wide in a roomy tab, narrow
+/// (count only, no stage word) in a small one or beside a narrow pane.
+pub const WIDE: usize = 6;
+pub const NARROW: usize = 4;
+
+/// A tab under this many columns, or a pane in it under [`PANE_MIN`] beside the wide rail,
+/// takes the narrow one.
+const WIDE_TAB: usize = 120;
+const PANE_MIN: usize = 60;
+
+/// A tab smaller than this gets no rail at all: the agent needs the room more.
+const TAB_MIN: (usize, usize) = (40, 8);
+
+/// The rows under the cards: the rule, the count, the stage word and a blank.
+const FOOT: usize = 4;
+
+/// A tab's rail: the agent terminal it speaks for and its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rail {
+    pub terminal: u32,
+    pub w: usize,
+}
+
+impl Rail {
+    /// The columns it takes from the tab: its own and the line it draws between it and the panes.
+    pub fn cols(self) -> usize {
+        self.w + 1
+    }
+}
+
+/// How wide a tab's rail is, from the tab's columns and its narrowest pane beside the wide rail;
+/// `None` for a tab too small to give any.
+pub fn width(tab: Rect, narrowest: Option<usize>) -> Option<usize> {
+    if tab.cols < TAB_MIN.0 || tab.rows < TAB_MIN.1 {
+        return None;
+    }
+    let wide = tab.cols >= WIDE_TAB && narrowest.is_none_or(|cols| cols >= PANE_MIN);
+    Some(if wide { WIDE } else { NARROW })
+}
+
+/// The tab's area once the rail took its columns at the right: what its panes are laid out in.
+pub fn carve(tab: Rect, rail: Option<Rail>) -> Rect {
+    match rail {
+        Some(rail) => Rect {
+            cols: tab.cols.saturating_sub(rail.cols()),
+            ..tab
+        },
+        None => tab,
+    }
+}
+
+/// Where the rail's own cells are in the pane: right of the carved area, inside the frame's top
+/// and bottom lines, as a pane's tile is.
+pub fn rect(tab: Rect, rail: Rail) -> Rect {
+    let panes = carve(tab, Some(rail));
+    Rect {
+        x: panes.x + panes.cols,
+        y: tab.y + 1,
+        cols: rail.w,
+        rows: tab.rows.saturating_sub(2),
+    }
+}
+
+/// The rail as a frame paints it: its cells in the pane, its terminal, and every live card (the
+/// rail picks its terminal's open ones).
+#[derive(Clone, Copy, Debug)]
+pub struct Paint<'a> {
+    pub rect: Rect,
+    pub terminal: u32,
+    pub cards: &'a [AskInfo],
+}
+
+/// A stage in a word that fits the wide rail.
+pub fn stage_word(stage: &str) -> &str {
+    match stage {
+        "investigating" => "look",
+        "planning" => "plan",
+        "implementing" => "build",
+        "reviewing" => "review",
+        "verifying" => "verify",
+        "waiting-human" => "waits",
+        other => other,
+    }
+}
+
+/// The rail's rows, each exactly its width: the open cards' count (`⠔2`, or a quiet `⠄0`), one
+/// row per open card (`⠔Q5`), and at the foot a rule over the task's steps done and all (`2/4`)
+/// and its stage word (wide only). No task, no foot. `fade`: a box is open over the screen.
+pub fn rows(paint: &Paint, task: Option<&TaskRef>, fade: bool) -> Vec<String> {
+    let w = paint.rect.cols;
+    let total = paint.rect.rows;
+    let ink = |role: Role| theme::fg(if fade { Role::Unobserved } else { role });
+    // The wide rail stands its words a blank in from the line, the narrow one against it.
+    let lead = if w >= WIDE { " " } else { "" };
+    let cell = |text: &str, role: Role| {
+        format!(
+            "{}{}{}",
+            ink(role),
+            width::fit(&format!("{lead}{text}"), w),
+            theme::RESET
+        )
+    };
+    let blank = " ".repeat(w);
+    let open: Vec<&AskInfo> = paint
+        .cards
+        .iter()
+        .filter(|c| c.status == "open" && c.terminal == Some(paint.terminal))
+        .collect();
+
+    let mut foot = Vec::new();
+    if let Some(task) = task {
+        if task.steps_total > 0 {
+            let done = task.steps_done == task.steps_total;
+            let role = if done { Role::Done } else { Role::Detail };
+            foot.push(cell(
+                &format!("{}/{}", task.steps_done, task.steps_total),
+                role,
+            ));
+        }
+        if w >= WIDE {
+            foot.push(cell(stage_word(&task.stage), Role::FaintText));
+        }
+    }
+    let foot_rows = if foot.is_empty() { 0 } else { FOOT };
+
+    let mut out = Vec::with_capacity(total);
+    out.push(if open.is_empty() {
+        cell("\u{2804}0", Role::Faint)
+    } else {
+        cell(&format!("\u{2814}{}", open.len()), Role::Blocked)
+    });
+    out.push(blank.clone());
+    // The cards between the count and the foot, a blank row kept above the foot; the last row
+    // says how many more there are when they do not all fit.
+    let room = total.saturating_sub(out.len() + foot_rows + usize::from(foot_rows > 0));
+    let shown = if open.len() > room {
+        room.saturating_sub(1)
+    } else {
+        open.len()
+    };
+    for card in &open[..shown] {
+        out.push(cell(&format!("\u{2814}{}", card.card), Role::Blocked));
+    }
+    if shown < open.len() && room > 0 {
+        out.push(cell(&format!("+{}", open.len() - shown), Role::Blocked));
+    }
+    while out.len() + foot_rows < total {
+        out.push(blank.clone());
+    }
+    if foot_rows > 0 {
+        out.push(format!("{}{}{}", ink(Role::Rule), "\u{2500}".repeat(w), theme::RESET));
+        out.extend(foot);
+        while out.len() < total {
+            out.push(blank.clone());
+        }
+    }
+    out.truncate(total);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(n: u32, terminal: u32, status: &str) -> AskInfo {
+        serde_json::from_value(serde_json::json!({
+            "card": format!("Q{n}"),
+            "terminal": terminal,
+            "status": status,
+            "opened_at": 0,
+            "body": {
+                "handle": "claude", "urgency": "later", "doing": "d", "why": "w",
+                "asks": "a?", "options": [],
+            },
+        }))
+        .expect("a card")
+    }
+
+    fn task(stage: &str, done: usize, total: usize) -> TaskRef {
+        TaskRef {
+            id: 12,
+            goal: "g".into(),
+            stage: stage.into(),
+            claimed: false,
+            item: (total > 0).then_some(3),
+            steps_done: done,
+            steps_total: total,
+        }
+    }
+
+    /// The rail's text, escapes taken out and trailing blanks kept off.
+    fn text(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                let mut out = String::new();
+                let mut chars = r.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    out.push(c);
+                }
+                out.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    fn paint(cards: &[AskInfo], w: usize, rows: usize) -> Paint<'_> {
+        Paint {
+            rect: Rect {
+                x: 0,
+                y: 1,
+                cols: w,
+                rows,
+            },
+            terminal: 7,
+            cards,
+        }
+    }
+
+    /// Wide in a roomy tab, narrow under 120 columns or beside a pane under 60, none in a tab
+    /// too small to spare it.
+    #[test]
+    fn the_rail_is_as_wide_as_the_tab_allows() {
+        let tab = |cols, rows| Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        };
+        assert_eq!(width(tab(131, 41), Some(122)), Some(WIDE));
+        assert_eq!(width(tab(131, 41), Some(58)), Some(NARROW));
+        assert_eq!(width(tab(119, 41), None), Some(NARROW));
+        assert_eq!(width(tab(41, 19), Some(34)), Some(NARROW));
+        assert_eq!(width(tab(39, 19), None), None);
+        assert_eq!(width(tab(80, 7), None), None);
+        let rail = Rail { terminal: 1, w: WIDE };
+        assert_eq!(carve(tab(131, 41), Some(rail)).cols, 124);
+        assert_eq!(
+            rect(tab(131, 41), rail),
+            Rect {
+                x: 124,
+                y: 1,
+                cols: 6,
+                rows: 39
+            }
+        );
+    }
+
+    /// Nothing open: a quiet `⠄0`, and the foot still says how far the task is.
+    #[test]
+    fn a_quiet_rail_counts_none_and_keeps_the_task() {
+        let rows = rows(&paint(&[], WIDE, 12), Some(&task("implementing", 2, 4)), false);
+        assert_eq!(rows.len(), 12);
+        let text = text(&rows);
+        assert_eq!(text[0], " \u{2804}0");
+        assert_eq!(&text[8..], ["\u{2500}".repeat(6), " 2/4".into(), " build".into(), String::new()]);
+        assert!(text[1..8].iter().all(String::is_empty), "{text:?}");
+        assert!(text.iter().all(|t| width::width(t) <= WIDE));
+    }
+
+    /// The open cards of its own terminal only, one row each under the count; answered ones and
+    /// other terminals' are not counted.
+    #[test]
+    fn the_rail_lists_its_terminals_open_cards() {
+        let cards = [
+            card(5, 7, "open"),
+            card(6, 7, "open"),
+            card(3, 7, "answered"),
+            card(9, 8, "open"),
+        ];
+        let text = text(&rows(&paint(&cards, WIDE, 12), None, false));
+        assert_eq!(text[0], " \u{2814}2");
+        assert_eq!(text[2], " \u{2814}Q5");
+        assert_eq!(text[3], " \u{2814}Q6");
+        assert!(text[4..].iter().all(String::is_empty), "no task, no foot: {text:?}");
+    }
+
+    /// A task with no linked item shows its stage word alone; at the narrow width the word drops
+    /// and the count stays; a plan grown to six steps reads `d/6`.
+    #[test]
+    fn the_foot_says_steps_and_stage_as_the_width_allows() {
+        let text_at = |w, t: TaskRef| text(&rows(&paint(&[], w, 10), Some(&t), false));
+        let alone = text_at(WIDE, task("waiting-human", 0, 0));
+        assert_eq!(&alone[6..], ["\u{2500}".repeat(6), " waits".into(), String::new(), String::new()]);
+        let narrow = text_at(NARROW, task("implementing", 2, 4));
+        assert_eq!(narrow[0], "\u{2804}0");
+        assert_eq!(&narrow[6..], ["\u{2500}".repeat(4), "2/4".into(), String::new(), String::new()]);
+        assert_eq!(text_at(WIDE, task("implementing", 2, 6))[7], " 2/6");
+        // Narrow, a stage alone has nothing left to say: no foot.
+        let bare = text_at(NARROW, task("waiting-human", 0, 0));
+        assert_eq!(bare[0], "\u{2804}0");
+        assert!(bare[1..].iter().all(String::is_empty), "{bare:?}");
+    }
+
+    /// More cards than rows: as many as fit and a `+n` for the rest, the foot kept whole.
+    #[test]
+    fn a_long_list_ends_in_how_many_more() {
+        let cards: Vec<AskInfo> = (1..=9).map(|n| card(n, 7, "open")).collect();
+        let text = text(&rows(&paint(&cards, NARROW, 10), Some(&task("planning", 0, 3)), false));
+        assert_eq!(text.len(), 10);
+        assert_eq!(text[0], "\u{2814}9");
+        assert_eq!(text[2], "\u{2814}Q1");
+        assert_eq!(text[3], "\u{2814}Q2");
+        assert_eq!(text[4], "+7");
+        assert_eq!(text[6], "\u{2500}".repeat(4));
+        assert_eq!(text[7], "0/3");
+    }
+}

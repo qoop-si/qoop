@@ -1810,6 +1810,9 @@ mod tests {
             goal: "ship".to_string(),
             stage: "waiting-human".to_string(),
             claimed: false,
+            item: None,
+            steps_done: 0,
+            steps_total: 0,
         });
         done.push(asks);
         sidebar::qass_last(&mut spaces.clone(), &mut done);

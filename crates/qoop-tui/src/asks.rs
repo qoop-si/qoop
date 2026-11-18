@@ -3501,6 +3501,9 @@ mod tests {
             goal: "g".to_string(),
             stage: "implementing".to_string(),
             claimed: false,
+            item: None,
+            steps_done: 0,
+            steps_total: 0,
         });
         assert_eq!(talk_target(&c, &rows, &spaces), Some(8));
         // qass is never the agent a card names, and a branch-like name matches on no everyday word.

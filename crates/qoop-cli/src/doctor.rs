@@ -519,6 +519,9 @@ mod tests {
             goal: "g".into(),
             stage: stage.into(),
             claimed,
+            item: None,
+            steps_done: 0,
+            steps_total: 0,
         });
         r
     }
