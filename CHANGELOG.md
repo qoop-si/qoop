@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.1](https://github.com/qoop-si/qoop/compare/v0.18.0...v0.18.1) (2026-11-18)
+
+
+### Fixed
+
+* **detect:** read a Claude draft as weak idle, not weak working ([aaa1d65](https://github.com/qoop-si/qoop/commit/aaa1d657ea7224f85d85d3c08aaff959895340bd))
+* **detect:** read Claude's Linux record mark like the macOS one ([47d1884](https://github.com/qoop-si/qoop/commit/47d1884870c7a28bfdf50bbf14bd50462c9afcd1))
+
 ## [0.18.0](https://github.com/qoop-si/qoop/compare/v0.17.1...v0.18.0) (2026-11-17)
 
 
