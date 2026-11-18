@@ -1512,8 +1512,14 @@ pub fn reach_banner(machines: &[(String, MachineState)], zone: Zone) -> Option<S
     (!stale.is_empty()).then(|| stale.join("; "))
 }
 
-/// Why a row's answers cannot be pressed while its machine is not reached.
-pub const STALE_REASON: &str = "Answering opens again when the daemon is back";
+/// Why a row's answers cannot be pressed while its machine is not reached, by the cause:
+/// this Mac's daemon stopped (`None`), or the link to another machine is down (its name).
+pub fn stale_reason(remote: Option<&str>) -> String {
+    match remote {
+        None => "Answering opens again when the daemon is back".into(),
+        Some(name) => format!("Answering opens again when {name} is reached"),
+    }
+}
 
 /// Each machine with a space, This Mac first, as a person names it, with one space of it
 /// (`None` for This Mac) to ask it through.
@@ -2526,6 +2532,15 @@ pub(crate) mod tests {
             "1 schedule, 1 on"
         );
         assert_eq!(schedules_line(&[nightly, paused]), "2 schedules, 1 on");
+        // A closed answer names its cause: the daemon here, the link to a remote.
+        assert_eq!(
+            stale_reason(None),
+            "Answering opens again when the daemon is back"
+        );
+        assert_eq!(
+            stale_reason(Some("staging")),
+            "Answering opens again when staging is reached"
+        );
         // The day card's "1 run", never "1 runs".
         let runs: Vec<String> = [0, 1, 2].map(|n| count(n, "run")).to_vec();
         assert_eq!(runs, ["0 runs", "1 run", "2 runs"]);
