@@ -220,6 +220,12 @@ pub fn picked<S: Styled>(s: S, t: &Theme) -> S {
     paint(s, t.picked()).border_color(c(t.picked_edge()))
 }
 
+/// The page, tab, row or run you are on: the current pair with the same outline as a pick,
+/// so where you are never rests on a tint alone either. On a `control`'s 1 px border.
+pub fn current<S: Styled>(s: S, t: &Theme) -> S {
+    paint(s, t.current()).border_color(c(t.picked_edge()))
+}
+
 /// A key cap: `ctrl-a c`.
 pub fn kbd(keys: &str, t: &Theme) -> Div {
     paint(div(), t.key())

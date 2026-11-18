@@ -1150,7 +1150,7 @@ impl Desk {
                 .px(px(8.))
                 .py(px(6.))
                 .rounded(px(10.))
-                .when(on, |d| ui::paint(d, t.current()))
+                .when(on, |d| ui::current(d, t))
                 .hover(|s| ui::paint(s, t.hover()))
                 .child(
                     div()

@@ -216,8 +216,9 @@ impl Theme {
         }
     }
 
-    /// The outline a picked chip, radio or day wears over its fill (DECISION's `.tq.on`): the
-    /// tint alone is about 1.1:1 against an unpicked neighbour, the outline 3:1 at least.
+    /// The outline a picked chip, radio or day, and the current page, tab, row or run, wear
+    /// over their fill (DECISION's `.tq.on`): a tint alone is about 1.1:1 against an unpicked
+    /// neighbour, the outline 3:1 at least.
     pub fn picked_edge(&self) -> u32 {
         self.t3
     }
@@ -408,16 +409,22 @@ mod tests {
             for &ground in &grounds {
                 let ring = contrast(t.focus, ground);
                 assert!(ring >= 3.0, "{theme} ring on #{ground:06x}: {ring:.2}");
-                // A pick is told from its unpicked neighbours by its outline, never the tint
-                // alone: 3:1 against the ground beside it and against its own fill.
+                // A pick, and the page, tab, row or run you are on, are told from their
+                // neighbours by the outline, never the tint alone: 3:1 against the ground
+                // beside them (an unpicked neighbour's, hovered or not) and their own fill.
                 let edge = t.picked_edge();
-                let picked = over(t.picked().fill, ground);
-                for (what, next) in [("ground", ground), ("own fill", picked)] {
-                    let ratio = contrast(edge, next);
-                    assert!(
-                        ratio >= 3.0,
-                        "{theme} picked edge on its {what} #{next:06x}: {ratio:.2}"
-                    );
+                for (name, pair) in [("picked", t.picked()), ("current", t.current())] {
+                    let own = over(pair.fill, ground);
+                    let hovered = over(t.hover().fill, ground);
+                    for (what, next) in
+                        [("ground", ground), ("hovered", hovered), ("own fill", own)]
+                    {
+                        let ratio = contrast(edge, next);
+                        assert!(
+                            ratio >= 3.0,
+                            "{theme} {name} edge on its {what} #{next:06x}: {ratio:.2}"
+                        );
+                    }
                 }
             }
         }
