@@ -1834,6 +1834,14 @@ fn missed_for() -> Duration {
     Duration::from_secs(MISSED_SECS).min(hand_life())
 }
 
+/// How long qass may have no running agent before its hands go back: long enough for its
+/// agent to restart, or a test's shorter hand life.
+const QASS_GONE_SECS: u64 = 15;
+
+fn qass_gone_for() -> Duration {
+    Duration::from_secs(QASS_GONE_SECS).min(hand_life())
+}
+
 /// One question handed to qass: the menu it was (`None` for one qoop cannot read), when it was
 /// handed (on both clocks: the store's cards are stamped in unix seconds), and whether qass was
 /// told of it yet.
@@ -1850,6 +1858,8 @@ pub(crate) struct Handed {
 pub(crate) struct HandBook {
     live: HashMap<u32, Handed>,
     missed: HashSet<u32>,
+    /// Since when qass has had no running agent, while it has none.
+    qass_gone_since: Option<Instant>,
 }
 
 impl HandBook {
@@ -1960,12 +1970,28 @@ fn hand_line(terminals: &[u32]) -> String {
 }
 
 /// Ends the hands whose question is over: the agent is no longer blocked on it, its menu
-/// changed, a card was written for its tab since, or it waited [`hand_life`]. One that ran out
-/// untold says so on its row for [`missed_for`]. Each end is a change of its row.
+/// changed, a card was written for its tab since, or it waited [`hand_life`]. Ends them too
+/// when nobody is left to take them: watching is off, or qass has had no running agent for
+/// [`qass_gone_for`]. One that ran out untold, or that qass left that way, says so on its row
+/// for [`missed_for`], so every client offers it again. Each end is a change of its row.
 async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
     if !hands_live(agents) {
         return;
     }
+    let qass_here = qass_terminal(terminals, agents, store).await.is_some();
+    let watching = crate::paths::qass_watching();
+    let qass_gone = {
+        let mut book = agents.hands.lock().unwrap();
+        if qass_here {
+            book.qass_gone_since = None;
+        } else if book.qass_gone_since.is_none() {
+            book.qass_gone_since = Some(Instant::now());
+        }
+        !watching
+            || book
+                .qass_gone_since
+                .is_some_and(|at| at.elapsed() >= qass_gone_for())
+    };
     let carded: Vec<(i64, i64)> = match store.run(|s| s.live_asks()).await {
         Ok(rows) => rows
             .into_iter()
@@ -1997,11 +2023,11 @@ async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
             .iter()
             .any(|(t, opened)| *t == i64::from(hand.terminal) && *opened >= at_unix);
         let out = at.elapsed() >= hand_life();
-        if asking && !carded && !out {
+        if asking && !carded && !out && !qass_gone {
             continue;
         }
         ended.push(hand.terminal);
-        if out && asking && !carded && !told {
+        if asking && !carded && (qass_gone || (out && !told)) {
             missed.push(hand.terminal);
         }
     }
