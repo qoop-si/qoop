@@ -1633,8 +1633,10 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 tag: tag_of(card, ctx).is_some() || card.item.is_some(),
                 stacked,
             };
+            // In an agent's tab, an open card offers the hand-off to qass on a row of its own.
+            let handoff = ctx.tab.is_some() && card.status == "open";
             let b = budget(
-                inner_rows,
+                inner_rows.saturating_sub(usize::from(handoff)),
                 shown.len() - 1,
                 h,
                 pane.typing || !pane.text.is_empty(),
@@ -1802,6 +1804,19 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                         hit: Hit::Option(i),
                     });
                 }
+            }
+            // Not a numbered answer: `q` hands the card to qass, no number reaches it.
+            if handoff {
+                out.push(wrap(&[
+                    seg(Role::Brand, "[q] "),
+                    seg(
+                        Role::Text,
+                        cut_dots(
+                            "hand to qass  qass answers it for you",
+                            cw.saturating_sub(4),
+                        ),
+                    ),
+                ]));
             }
             cut |= clipped.get() || !b.sends || !b.because && lens.becauses.iter().any(|&n| n > 0);
             if b.gap_box {
