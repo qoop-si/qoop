@@ -1627,7 +1627,9 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(row);
             }
             if let (Some(rail), Some(rows)) = (frame.chrome.tab_rail, &tab_rail_rows)
-                && let Some(row) = pane_row.checked_sub(rail.rect.y).and_then(|at| rows.get(at))
+                && let Some(row) = pane_row
+                    .checked_sub(rail.rect.y)
+                    .and_then(|at| rows.get(at))
             {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.rect.x));
                 out.push_str(row);
@@ -3991,8 +3993,8 @@ fn pane_edges(
         }
     }
     // Each pane's name on its top edge, two cells in from its corner: one pane alone is
-    // named on the tab bar already.
-    for tile in tiles.iter().filter(|_| !alone) {
+    // named on the tab bar already, beside a rail too.
+    for tile in tiles.iter().filter(|_| tiles.len() >= 2) {
         let r = tile.rect;
         let Some(top) = r.y.checked_sub(1) else {
             continue;

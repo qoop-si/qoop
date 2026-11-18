@@ -335,8 +335,14 @@ impl Pane {
                     || (id.is_empty()
                         && qoop_runtime::control::too_old_for(reason, Some("AskRead"))) =>
             {
-                self.unsupported = true;
-                self.loaded = false;
+                // Only a daemon that does not know the read has no cards; any other failure is
+                // read again, and what was read stays (the agents' rails with it).
+                if qoop_runtime::control::too_old_for(reason, Some("AskRead")) {
+                    self.unsupported = true;
+                    self.loaded = false;
+                } else {
+                    self.stale = true;
+                }
                 true
             }
             _ => false,
@@ -3592,6 +3598,29 @@ mod tests {
             reason: "unknown variant `AskRead`, expected one of `X`".into(),
         }));
         assert!(old.unsupported);
+        // So does an old daemon answering the read by its id.
+        let mut old = Pane::default();
+        assert!(old.answered(&ControlResponse::Failed {
+            id: READ_ID.into(),
+            reason: "unknown variant `AskRead`, expected one of `X`".into(),
+        }));
+        assert!(old.unsupported);
+    }
+
+    /// A read that fails for any other reason is asked again, and the daemon still keeps cards:
+    /// what was read stays, so no agent's rail goes away with it.
+    #[test]
+    fn a_read_that_fails_is_read_again_not_taken_for_an_old_daemon() {
+        let mut p = Pane::new();
+        assert!(p.read_request().is_some());
+        p.take(Vec::new(), Vec::new());
+        assert!(p.read_request().is_none());
+        assert!(p.answered(&ControlResponse::Failed {
+            id: READ_ID.into(),
+            reason: "the store did not answer in time".into(),
+        }));
+        assert!(!p.unsupported && p.loaded && p.count() == Some(0));
+        assert!(p.read_request().is_some(), "read again");
     }
 
     #[test]

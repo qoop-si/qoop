@@ -162,7 +162,12 @@ pub fn rows(paint: &Paint, task: Option<&TaskRef>, fade: bool) -> Vec<String> {
         out.push(blank.clone());
     }
     if foot_rows > 0 {
-        out.push(format!("{}{}{}", ink(Role::Rule), "\u{2500}".repeat(w), theme::RESET));
+        out.push(format!(
+            "{}{}{}",
+            ink(Role::Rule),
+            "\u{2500}".repeat(w),
+            theme::RESET
+        ));
         out.extend(foot);
         while out.len() < total {
             out.push(blank.clone());
@@ -190,7 +195,7 @@ mod tests {
         .expect("a card")
     }
 
-    fn task(stage: &str, done: usize, total: usize) -> TaskRef {
+    fn task(stage: &str, done: u32, total: u32) -> TaskRef {
         TaskRef {
             id: 12,
             goal: "g".into(),
@@ -253,7 +258,10 @@ mod tests {
         assert_eq!(width(tab(41, 19), Some(34)), Some(NARROW));
         assert_eq!(width(tab(39, 19), None), None);
         assert_eq!(width(tab(80, 7), None), None);
-        let rail = Rail { terminal: 1, w: WIDE };
+        let rail = Rail {
+            terminal: 1,
+            w: WIDE,
+        };
         assert_eq!(carve(tab(131, 41), Some(rail)).cols, 124);
         assert_eq!(
             rect(tab(131, 41), rail),
@@ -269,11 +277,23 @@ mod tests {
     /// Nothing open: a quiet `⠄0`, and the foot still says how far the task is.
     #[test]
     fn a_quiet_rail_counts_none_and_keeps_the_task() {
-        let rows = rows(&paint(&[], WIDE, 12), Some(&task("implementing", 2, 4)), false);
+        let rows = rows(
+            &paint(&[], WIDE, 12),
+            Some(&task("implementing", 2, 4)),
+            false,
+        );
         assert_eq!(rows.len(), 12);
         let text = text(&rows);
         assert_eq!(text[0], " \u{2804}0");
-        assert_eq!(&text[8..], ["\u{2500}".repeat(6), " 2/4".into(), " build".into(), String::new()]);
+        assert_eq!(
+            &text[8..],
+            [
+                "\u{2500}".repeat(6),
+                " 2/4".into(),
+                " build".into(),
+                String::new()
+            ]
+        );
         assert!(text[1..8].iter().all(String::is_empty), "{text:?}");
         assert!(text.iter().all(|t| width::width(t) <= WIDE));
     }
@@ -292,7 +312,10 @@ mod tests {
         assert_eq!(text[0], " \u{2814}2");
         assert_eq!(text[2], " \u{2814}Q5");
         assert_eq!(text[3], " \u{2814}Q6");
-        assert!(text[4..].iter().all(String::is_empty), "no task, no foot: {text:?}");
+        assert!(
+            text[4..].iter().all(String::is_empty),
+            "no task, no foot: {text:?}"
+        );
     }
 
     /// A task with no linked item shows its stage word alone; at the narrow width the word drops
@@ -301,10 +324,26 @@ mod tests {
     fn the_foot_says_steps_and_stage_as_the_width_allows() {
         let text_at = |w, t: TaskRef| text(&rows(&paint(&[], w, 10), Some(&t), false));
         let alone = text_at(WIDE, task("waiting-human", 0, 0));
-        assert_eq!(&alone[6..], ["\u{2500}".repeat(6), " waits".into(), String::new(), String::new()]);
+        assert_eq!(
+            &alone[6..],
+            [
+                "\u{2500}".repeat(6),
+                " waits".into(),
+                String::new(),
+                String::new()
+            ]
+        );
         let narrow = text_at(NARROW, task("implementing", 2, 4));
         assert_eq!(narrow[0], "\u{2804}0");
-        assert_eq!(&narrow[6..], ["\u{2500}".repeat(4), "2/4".into(), String::new(), String::new()]);
+        assert_eq!(
+            &narrow[6..],
+            [
+                "\u{2500}".repeat(4),
+                "2/4".into(),
+                String::new(),
+                String::new()
+            ]
+        );
         assert_eq!(text_at(WIDE, task("implementing", 2, 6))[7], " 2/6");
         // Narrow, a stage alone has nothing left to say: no foot.
         let bare = text_at(NARROW, task("waiting-human", 0, 0));
@@ -316,7 +355,11 @@ mod tests {
     #[test]
     fn a_long_list_ends_in_how_many_more() {
         let cards: Vec<AskInfo> = (1..=9).map(|n| card(n, 7, "open")).collect();
-        let text = text(&rows(&paint(&cards, NARROW, 10), Some(&task("planning", 0, 3)), false));
+        let text = text(&rows(
+            &paint(&cards, NARROW, 10),
+            Some(&task("planning", 0, 3)),
+            false,
+        ));
         assert_eq!(text.len(), 10);
         assert_eq!(text[0], "\u{2814}9");
         assert_eq!(text[2], "\u{2814}Q1");

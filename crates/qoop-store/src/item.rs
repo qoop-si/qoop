@@ -895,7 +895,7 @@ impl Store {
 
     /// The item each open task is linked to, with its steps done and all its steps, counted
     /// as the board counts them (phase headers left out), by task.
-    pub fn linked_steps(&self) -> Result<BTreeMap<i64, (i64, usize, usize)>, StoreError> {
+    pub fn linked_steps(&self) -> Result<BTreeMap<i64, (i64, u32, u32)>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT l.task, l.item, \
              (SELECT COUNT(done_at) FROM task_step WHERE task = l.item AND {REAL_STEP}), \
@@ -908,8 +908,8 @@ impl Store {
                     r.get::<_, i64>(0)?,
                     (
                         r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)? as usize,
-                        r.get::<_, i64>(3)? as usize,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, u32>(3)?,
                     ),
                 ))
             })?

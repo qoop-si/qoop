@@ -2847,8 +2847,10 @@ impl State {
         {
             return None;
         }
+        // Measured in the tab as the drop leaves it: the pane landing may bring the rail or
+        // take it away.
         let (_, rect) = tree
-            .tile_rects(area)
+            .tile_rects(self.tree_area(&tree))
             .into_iter()
             .find(|(t, _)| *t == terminal)?;
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
@@ -3523,7 +3525,7 @@ impl State {
     /// the tab and its panes, never of the focus, so moving the keyboard in the tab resizes
     /// nothing.
     fn rail_in(&self, tab: layout::Rect, tree: &Layout) -> Option<crate::tabq::Rail> {
-        if self.asks.count().is_none() || self.band_over(tree) > 0 {
+        if self.asks.unsupported || self.band_over(tree) > 0 {
             return None;
         }
         let qass = sidebar::qass_space(&self.spaces);
@@ -23396,6 +23398,8 @@ mod tests {
     #[test]
     fn a_divider_drag_sizes_both_tiles_once_per_frame() {
         let mut state = tiled_state();
+        // Room for nine columns off a pane beside the agents' rail.
+        state.cols = 100;
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
         let divider_col = (left + 1 + rect.x + rect.cols) as u16;
@@ -23483,6 +23487,8 @@ mod tests {
     #[test]
     fn a_drag_sizes_the_tabs_off_screen_only_once_it_lets_go() {
         let mut state = tiled_state();
+        // Room for both panes beside the agents' rail, on either side of the drag.
+        state.cols = 100;
         state.rows.push(agent(3, 1, "zsh", "idle"));
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut state, &mut seqs).unwrap();
@@ -26458,8 +26464,9 @@ mod tests {
             state.sized.get(&5),
             Some(&(inner.cols as u16, inner.rows as u16))
         );
-        // The owner's agents: the pane inside its frame.
-        let framed = (cols - 2, rows - 2);
+        // The owner's agents: the pane inside its frame, less each agent tab's rail.
+        let rail = (crate::tabq::WIDE + 1) as u16;
+        let framed = (cols - 2 - rail, rows - 2);
         assert_eq!(state.sized.get(&1), Some(&framed));
         assert_eq!(state.sized.get(&3), Some(&framed));
         assert!(inner.rows < rows as usize && inner.cols < cols as usize);
@@ -30503,7 +30510,11 @@ mod tests {
     fn rail_cells(s: &State) -> Vec<String> {
         let rail = s.tab_rail_paint().expect("a rail").rect;
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let grid = cells_of(&screen::paint(&s.frame()), s.cols as usize, s.lines as usize);
+        let grid = cells_of(
+            &screen::paint(&s.frame()),
+            s.cols as usize,
+            s.lines as usize,
+        );
         (0..rail.rows)
             .map(|y| {
                 grid[screen::TABS + rail.y + y][left + rail.x..left + rail.x + rail.cols]
@@ -30542,14 +30553,22 @@ mod tests {
         assert_eq!(cells[37], " 2/4");
         assert_eq!(cells[38], " build");
         assert!(
-            cells[1..36].iter().chain(&cells[39..]).all(String::is_empty),
+            cells[1..36]
+                .iter()
+                .chain(&cells[39..])
+                .all(String::is_empty),
             "{cells:?}"
         );
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let grid = cells_of(&screen::paint(&s.frame()), 170, 46);
         let (top, bottom) = (&grid[screen::TABS], &grid[screen::TABS + 41]);
         assert_eq!(
-            (top[left + 123], top[left + 130], bottom[left + 123], bottom[left + 130]),
+            (
+                top[left + 123],
+                top[left + 130],
+                bottom[left + 123],
+                bottom[left + 130]
+            ),
             ('\u{252c}', '\u{256e}', '\u{2534}', '\u{256f}'),
             "one frame round the pane and the rail, joined"
         );
@@ -30565,7 +30584,15 @@ mod tests {
         let cells = rail_cells(&s);
         assert_eq!(cells.len(), 18);
         assert_eq!(cells[0], "\u{2804}0");
-        assert_eq!(&cells[14..], ["\u{2500}".repeat(4), "2/4".into(), String::new(), String::new()]);
+        assert_eq!(
+            &cells[14..],
+            [
+                "\u{2500}".repeat(4),
+                "2/4".into(),
+                String::new(),
+                String::new()
+            ]
+        );
     }
 
     /// Beside a shell, an agent pane under 60 columns takes the narrow rail. The rail speaks for
@@ -30579,7 +30606,11 @@ mod tests {
         let tiles = tree.tile_rects(pane_area(&s));
         let (shell, claude) = (tiles[0].1, tiles[1].1);
         assert!(claude.cols < 60 && shell.cols > claude.cols, "{tiles:?}");
-        assert_eq!(claude.x + claude.cols + 1, rail.rect.x, "the rail right of the agent");
+        assert_eq!(
+            claude.x + claude.cols + 1,
+            rail.rect.x,
+            "the rail right of the agent"
+        );
         assert_eq!(rail_cells(&s)[0], "\u{2804}0");
     }
 
@@ -30599,7 +30630,10 @@ mod tests {
         let rows = crate::tabq::rows(&paint, s.rows[0].task.as_ref(), false);
         TEST_LEVEL.with(|c| c.set(None));
         assert_eq!(mono, colour);
-        assert_eq!((mono[0].as_str(), mono[2].as_str()), (" \u{2814}1", " \u{2814}Q8"));
+        assert_eq!(
+            (mono[0].as_str(), mono[2].as_str()),
+            (" \u{2814}1", " \u{2814}Q8")
+        );
         assert!(rows.iter().all(|r| !r.contains("38;5")), "{rows:?}");
     }
 
@@ -30626,9 +30660,6 @@ mod tests {
         qass.spaces = vec![space(1, sidebar::QASS_SPACE)];
         assert_eq!(qass.tree_area(&qass.layouts[&1]).cols, 131, "qass's tab");
 
-        let mut unread = agent_tab(170, 46);
-        unread.asks = Default::default();
-        assert_eq!(whole(&unread), 129, "cards not read yet");
         let mut old = agent_tab(170, 46);
         old.asks.unsupported = true;
         assert_eq!(whole(&old), 129, "a daemon without cards");
@@ -30641,26 +30672,39 @@ mod tests {
         assert!(shells_only.tab_rail_paint().is_none(), "two shells");
     }
 
-    /// The rail takes its columns once, when it first applies; folded, a card arriving or
-    /// answered and a step ticked change its rows and never the agent's size.
+    /// The rail is there from the first size, before any card is read, so an attach sizes the
+    /// agent once; folded, the first read, a card arriving or answered and a step ticked change
+    /// its rows and never the agent's size.
     #[test]
     fn the_agents_size_holds_while_the_rail_is_folded() {
         let mut s = agent_tab(170, 46);
-        s.asks = Default::default();
+        s.asks = crate::asks::Pane::new();
+        assert!(s.tab_rail_paint().is_some(), "no read needed");
         let mut seqs = std::collections::BTreeMap::new();
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
-        assert_eq!(s.sized.get(&1), Some(&(129, 40)));
-        s.asks.take(Vec::new(), Vec::new());
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some(), "once");
         assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+        s.asks.take(Vec::new(), Vec::new());
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "the first read"
+        );
         let mut card = ask_card(1, "claude");
         card.card = "Q8".to_string();
         s.asks.take(vec![card], Vec::new());
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "a card arrives");
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "a card arrives"
+        );
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "a step ticked");
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "a step ticked"
+        );
         s.asks.take(Vec::new(), Vec::new());
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "the card answered");
+        assert!(
+            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
+            "the card answered"
+        );
         assert_eq!(s.sized.get(&1), Some(&(122, 40)));
     }
 
@@ -30692,13 +30736,19 @@ mod tests {
         card.card = "Q8".to_string();
         s.asks.take(vec![card], Vec::new());
         let cells = rail_cells(&s);
-        assert_eq!((cells[0].as_str(), cells[2].as_str()), (" \u{2814}1", " \u{2814}Q8"));
+        assert_eq!(
+            (cells[0].as_str(), cells[2].as_str()),
+            (" \u{2814}1", " \u{2814}Q8")
+        );
         // A task on no item: its stage word alone under the rule.
         let task = s.rows[0].task.as_mut().unwrap();
         (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
         task.stage = "waiting-human".to_string();
         let cells = rail_cells(&s);
-        assert_eq!((cells[36].as_str(), cells[37].as_str()), ("\u{2500}".repeat(6).as_str(), " waits"));
+        assert_eq!(
+            (cells[36].as_str(), cells[37].as_str()),
+            ("\u{2500}".repeat(6).as_str(), " waits")
+        );
     }
 
     /// A press on the rail is the rail's: no pane is under it.
@@ -30725,11 +30775,16 @@ mod tests {
         for (cols, lines) in [(170u16, 46u16), (80, 24)] {
             let with = agent_tab(cols, lines);
             let mut without = agent_tab(cols, lines);
-            without.asks = Default::default();
+            without.asks.unsupported = true;
             assert!(with.tab_rail_paint().is_some() && without.tab_rail_paint().is_none());
             let left = screen::left_for(cols, false, sidebar::WIDTH);
             let bytes = |s: &State| {
-                sidebar_bytes(&screen::paint(&s.frame()), cols as usize, lines as usize, left)
+                sidebar_bytes(
+                    &screen::paint(&s.frame()),
+                    cols as usize,
+                    lines as usize,
+                    left,
+                )
             };
             assert_eq!(bytes(&with), bytes(&without), "at {cols}x{lines}");
         }

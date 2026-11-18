@@ -1934,14 +1934,10 @@ pub struct TaskRef {
     pub item: Option<i64>,
     /// That item's steps ticked and all of them, the numbers `qoop task show` prints. Zero
     /// without an item.
-    #[serde(default, skip_serializing_if = "is_zero_steps")]
-    pub steps_done: usize,
-    #[serde(default, skip_serializing_if = "is_zero_steps")]
-    pub steps_total: usize,
-}
-
-fn is_zero_steps(n: &usize) -> bool {
-    *n == 0
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steps_done: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub steps_total: u32,
 }
 
 /// How much of a goal an agents row carries.
