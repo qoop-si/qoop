@@ -704,6 +704,7 @@ pub(crate) fn qass_screen_of(
             fade: spotlight,
             // The board is already a pane of qass's tab: no tab of the inbox's own for it.
             board_above: frame.tiles.len() >= 2,
+            tab: None,
         };
         let view = crate::asks::view(asks, &seen, side.rect.cols, side.rect.rows);
         screen = screen.with_inbox(view.rows);
@@ -1122,6 +1123,15 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     {
         return None;
     }
+    // The same for an agent tab's open pane, and the agent's own under the pane over its tile.
+    if frame
+        .chrome
+        .tab_rail
+        .and_then(|rail| rail.open)
+        .is_some_and(|open| open.focus || open.over)
+    {
+        return None;
+    }
     // The same for the schedules: their form draws its own caret.
     if frame.chrome.clock.is_some_and(|clock| clock.focus)
         && qass_plan(frame).is_some_and(|p| p.clock.is_some())
@@ -1380,13 +1390,29 @@ pub fn paint(frame: &Frame) -> String {
         .rail
         .map(|rail| rail_rows_of(frame, &rail, spotlight));
     // The agent tab's questions rail: its rows, over the cells its tab left for it.
-    let tab_rail_rows = frame.chrome.tab_rail.map(|rail| {
-        let task = frame
-            .rows
-            .iter()
-            .find(|r| r.terminal == rail.terminal)
-            .and_then(|r| r.task.as_ref());
-        crate::tabq::rows(&rail, task, spotlight)
+    let tab_rail_rows = frame
+        .chrome
+        .tab_rail
+        .filter(|rail| rail.open.is_none_or(|open| open.over))
+        .map(|rail| {
+            let task = frame
+                .rows
+                .iter()
+                .find(|r| r.terminal == rail.terminal)
+                .and_then(|r| r.task.as_ref());
+            crate::tabq::rows(&rail, task, spotlight)
+        });
+    let tab_pane = frame.chrome.tab_rail.and_then(|rail| {
+        let open = rail.open?;
+        let view = crate::tabq::pane_view(
+            &rail,
+            &open,
+            frame.rows,
+            frame.spaces,
+            frame.now_unix,
+            spotlight,
+        );
+        Some((open.rect, view.rows))
     });
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
@@ -1636,6 +1662,13 @@ pub fn paint(frame: &Frame) -> String {
                     .and_then(|at| rows.get(at))
             {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.rect.x));
+                out.push_str(row);
+            }
+            // The rail unfolded: its pane over its own cells, beside the agent or over its tile.
+            if let Some((rect, rows)) = &tab_pane
+                && let Some(row) = pane_row.checked_sub(rect.y).and_then(|at| rows.get(at))
+            {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
                 out.push_str(row);
             }
         }

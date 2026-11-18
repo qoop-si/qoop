@@ -841,6 +841,19 @@ pub struct Ctx<'a> {
     pub fade: bool,
     /// The board is a pane of qass's tab: the inbox keeps no tab for it.
     pub board_above: bool,
+    /// The pane stands in an agent's tab (`crate::tabq`), not on qass's screen.
+    pub(crate) tab: Option<InTab<'a>>,
+}
+
+/// The pane in an agent's tab: its title on the top edge in place of the tabs row, what it says
+/// with no card on show, and the rows under the cards and over the key line (the task).
+#[derive(Clone, Copy)]
+pub(crate) struct InTab<'a> {
+    pub title: &'a str,
+    pub empty: &'a str,
+    pub under: &'a [Vec<Seg>],
+    /// The keyboard is in the pane.
+    pub focus: bool,
 }
 
 /// The inbox painted: one string per row, each exactly as wide as asked, and where a click
@@ -1334,7 +1347,13 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     let blank = || wrap(&[]);
     let hr = || wrap(&[seg(Role::Rule, "\u{2500}".repeat(cw))]);
 
-    out.push(edge(cols, ('\u{256d}', '\u{256e}'), None, None, fade));
+    out.push(edge(
+        cols,
+        ('\u{256d}', '\u{256e}'),
+        ctx.tab.map(|tab| tab.title),
+        None,
+        fade,
+    ));
 
     // The card read whole takes every row but the key line, scrolled by `j k`: the words that
     // could not be sent and a failure, what the card is about, the question, then each answer
@@ -1436,37 +1455,40 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         };
     }
 
-    // The tabs.
-    let n = pane.waiting();
-    // On qass's split tab the title folds the column, with the caret a space's fold wears.
-    let mut tabs = Vec::new();
-    if ctx.board_above {
-        tabs.push(bold(Role::Brand, "\u{25be} "));
-        targets.push(Target {
-            row: out.len(),
-            x0: 2,
-            x1: 2 + 2 + width::width("questions"),
-            hit: Hit::Fold,
-        });
+    // The tabs, but in an agent's tab, whose title is on the top edge.
+    if ctx.tab.is_none() {
+        let n = pane.waiting();
+        // On qass's split tab the title folds the column, with the caret a space's fold wears.
+        let mut tabs = Vec::new();
+        if ctx.board_above {
+            tabs.push(bold(Role::Brand, "\u{25be} "));
+            targets.push(Target {
+                row: out.len(),
+                x0: 2,
+                x1: 2 + 2 + width::width("questions"),
+                hit: Hit::Fold,
+            });
+        }
+        tabs.push(bold(Role::Text, "questions"));
+        if n > 0 {
+            tabs.push(seg(Role::Text, "  "));
+            tabs.push(bold(Role::Blocked, n.to_string()));
+        }
+        let board_x =
+            width::width("questions") + if n > 0 { 2 + n.to_string().len() } else { 0 } + 2;
+        if !ctx.board_above {
+            tabs.push(seg(Role::Text, "  "));
+            tabs.push(seg(Role::FaintText, "board"));
+            targets.push(Target {
+                row: out.len(),
+                x0: 2 + board_x,
+                x1: 2 + board_x + 5,
+                hit: Hit::Board,
+            });
+        }
+        out.push(wrap(&tabs));
+        out.push(hr());
     }
-    tabs.push(bold(Role::Text, "questions"));
-    if n > 0 {
-        tabs.push(seg(Role::Text, "  "));
-        tabs.push(bold(Role::Blocked, n.to_string()));
-    }
-    let board_x = width::width("questions") + if n > 0 { 2 + n.to_string().len() } else { 0 } + 2;
-    if !ctx.board_above {
-        tabs.push(seg(Role::Text, "  "));
-        tabs.push(seg(Role::FaintText, "board"));
-        targets.push(Target {
-            row: out.len(),
-            x0: 2 + board_x,
-            x1: 2 + board_x + 5,
-            hit: Hit::Board,
-        });
-    }
-    out.push(wrap(&tabs));
-    out.push(hr());
 
     if pane.unsupported {
         out.push(wrap(&[seg(Role::Detail, "restart qoop for the questions")]));
@@ -1474,7 +1496,10 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         out.push(wrap(&[seg(Role::FaintText, "reading the questions")]));
     } else if pane.visible().is_empty() && !pane.typing {
         out.push(blank());
-        out.push(wrap(&[seg(Role::Detail, "Nothing waits for you.")]));
+        let empty = ctx.tab.map_or("Nothing waits for you.", |tab| tab.empty);
+        for row in wrap_dots(empty, cw, 3) {
+            out.push(wrap(&[seg(Role::Detail, row)]));
+        }
     }
 
     if let Some(card) = pane.open_card() {
@@ -1511,7 +1536,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 }
             }
             let left = room.saturating_sub(n * h);
-            if left >= 4 && !pane.ended.is_empty() {
+            if left >= 4 && !pane.ended.is_empty() && ctx.tab.is_none() {
                 out.push(blank());
                 out.push(wrap(&[
                     seg(Role::FaintText, "handled for you "),
@@ -1826,13 +1851,19 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             foot.push(wrap(&[seg(Role::Detail, row)]));
         }
     } else if foot.is_empty() {
-        foot.push(wrap(&bottom_line(pane, cw, cut)));
+        foot.push(wrap(&bottom_line(pane, ctx.tab, cw, cut)));
     }
-    let content = inner_rows.saturating_sub(foot.len());
+    // In an agent's tab, its task under the cards and over the key line.
+    let under: Vec<String> = ctx
+        .tab
+        .map(|tab| tab.under.iter().map(|segs| wrap(segs)).collect())
+        .unwrap_or_default();
+    let content = inner_rows.saturating_sub(foot.len() + under.len());
     out.truncate(1 + content);
     while out.len() < 1 + content {
         out.push(blank());
     }
+    out.extend(under);
     out.extend(foot);
     out.push(edge(cols, ('\u{2570}', '\u{256f}'), None, None, fade));
     out.truncate(rows);
@@ -2204,7 +2235,7 @@ fn pick_keys(cw: usize, lines: &[&str]) -> String {
         .map_or_else(String::new, |l| l.to_string())
 }
 
-fn bottom_line(pane: &Pane, cw: usize, cut: bool) -> Vec<Seg> {
+fn bottom_line(pane: &Pane, tab: Option<InTab>, cw: usize, cut: bool) -> Vec<Seg> {
     // For as long as the words stay, never back to `enter send`; named, since another card
     // may stand over them.
     // A failure stands over everything: it is the one thing that cannot be read again.
@@ -2223,6 +2254,24 @@ fn bottom_line(pane: &Pane, cw: usize, cut: bool) -> Vec<Seg> {
     }
     let keys = if pane.typing {
         "enter send  esc stop typing".to_string()
+    } else if let Some(tab) = tab {
+        // In an agent's tab: its own keys, or how to get them.
+        let enter = if pane.is_open() {
+            "enter fold"
+        } else {
+            "enter open"
+        };
+        match tab.focus {
+            true if pane.visible().is_empty() => "g to the agent  esc back".to_string(),
+            true => pick_keys(
+                cw,
+                &[
+                    &format!("1-9 answer  {enter}  r reply  s task  j k move  esc back"),
+                    &format!("1-9 answer  {enter}  r reply  s task  esc"),
+                ],
+            ),
+            false => "ctrl-a T folds this".to_string(),
+        }
     } else if !pane.focus {
         "ctrl-a i focuses this".to_string()
     } else if cut {
@@ -2447,6 +2496,7 @@ mod tests {
             now_unix: 1_000,
             fade: false,
             board_above: false,
+            tab: None,
         }
     }
 
