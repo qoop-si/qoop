@@ -340,6 +340,8 @@ pub enum KeyContext {
     Prefix,
     /// qass's tab with the board: its titles fold their panes, and the keys that fold.
     Qass,
+    /// An agent tab's questions pane has the keyboard (`crate::tabq`): its own keys.
+    Questions,
 }
 
 /// One entry of the key row: the key, what it does, and how soon it goes when the row
@@ -383,6 +385,16 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("space", Some("find"), 3),
             ("?", Some("keys"), 4),
             ("d", Some("detach"), 0),
+        ],
+        KeyContext::Questions => &[
+            ("questions:", None, 0),
+            ("1-9", Some("answer"), 1),
+            ("enter", Some("open"), 2),
+            ("r", Some("reply"), 2),
+            ("q", Some("hand to qass"), 3),
+            ("s", Some("task"), 4),
+            ("j k", Some("move"), 5),
+            ("esc", Some("back to the agent"), 0),
         ],
         // Grouped as the keys box groups them, under the same names, so the row and the
         // box teach one vocabulary. Within a group the most used comes first.
@@ -6694,6 +6706,24 @@ mod tests {
             "the key row did not say how to read"
         );
     }
+    /// An agent tab's questions pane with the keyboard: the row names its own keys, and on a
+    /// short row the way back to the agent stays.
+    #[test]
+    fn the_key_row_names_the_questions_panes_keys() {
+        let row = |cols| strip(&key_row(KeyContext::Questions, Place::default(), cols));
+        assert_eq!(
+            row(200).trim_end(),
+            " questions: [1-9\u{2192}answer] [enter\u{2192}open] [r\u{2192}reply] \
+             [q\u{2192}hand to qass] [s\u{2192}task] [j k\u{2192}move] [esc\u{2192}back to the agent]"
+        );
+        let short = row(60);
+        assert_eq!(width::width(&short), 60);
+        assert!(
+            short.contains("[esc\u{2192}back to the agent]") && short.contains("[1-9"),
+            "{short:?}"
+        );
+    }
+
     /// The key row follows the keyboard: the prefix commands in the pane, what the column
     /// answers to after a click in it, every command while `ctrl-a` waits. Each drops its
     /// least used entries on a short row and keeps the way out on every one.

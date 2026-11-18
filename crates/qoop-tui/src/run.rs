@@ -1704,6 +1704,8 @@ impl State {
                     && screen::left_for(self.cols, self.collapsed, self.sidebar_width) > 0
                 {
                     screen::KeyContext::Sidebar
+                } else if self.tabq_focused() {
+                    screen::KeyContext::Questions
                 } else if self.qass_split() && fold_leaves(self).is_some() {
                     screen::KeyContext::Qass
                 } else {
@@ -31212,7 +31214,9 @@ mod tests {
         assert!(tabq_keys(&mut s, b"r", 0x01).feed.is_none());
         assert!(s.asks.typing(), "r types in the pane");
         tabq_keys(&mut s, b"\x1b", 0x01);
+        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Questions);
         let esc = tabq_keys(&mut s, b"\x1b", 0x01);
+        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Pane);
         assert!(esc.resize && esc.jump == Some(1));
         assert!(s.tabq.is_none() && !s.tabq_focused() && s.asks.scope.is_none());
         // Open again, a press on the agent takes the keyboard out of the pane: the router hands
