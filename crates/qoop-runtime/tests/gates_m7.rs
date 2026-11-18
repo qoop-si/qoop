@@ -361,6 +361,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
                 option: Some("a".into()),
                 text: Some("echo PWNED".into()),
                 seen: None,
+                to_qass: false,
             },
         },
         ControlRequest::AskWrite {

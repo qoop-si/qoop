@@ -14588,7 +14588,7 @@ struct AskKeys {
 /// Keys typed while an agent tab's open pane has the keyboard: the inbox's own (1-9, enter,
 /// j k, r, m, x), `s` folds or opens the task part, `esc` folds the pane and gives the keyboard
 /// back to the agent, `g` gives it back with the pane left open beside it (folded when it is
-/// over the agent's tile). `q` is kept for handing a card to qass; tab and `o` (qass's chat)
+/// over the agent's tile), `q` hands the open card to qass to decide. Tab and `o` (qass's chat)
 /// are not the tab's.
 fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     use crate::asks::Out;
@@ -14604,7 +14604,11 @@ fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
                 state.tabq_task = Some(!shown);
                 return taken;
             }
-            b"q" | b"o" | b"\t" => return taken,
+            b"q" => {
+                state.asks.hand_to_qass();
+                return taken;
+            }
+            b"o" | b"\t" => return taken,
             b"g" => {
                 // Over the agent's tile the pane folds, or the keys would go to a hidden agent.
                 if state.tabq_open().is_some_and(|open| open.over) {
@@ -31184,7 +31188,7 @@ mod tests {
         assert!(s.tabq_open().is_none() && !s.tabq_focused());
     }
 
-    /// In the pane: `1` answers the open card of this agent and no other; `s`, `q` and `r` stay
+    /// In the pane: `1` answers the open card of this agent and no other; `s` and `r` stay
     /// in the pane, never reaching the agent; a card arriving while one is open leaves it open;
     /// esc folds the pane, sizes the tiles back and gives the keyboard to the agent.
     #[test]
@@ -31192,7 +31196,7 @@ mod tests {
         let mut s = agent_tab(170, 46);
         tab_cards(&mut s, 2);
         assert!(fold_key(&mut s));
-        for key in [&b"s"[..], b"q", b"s"] {
+        for key in [&b"s"[..], b"s"] {
             assert!(tabq_keys(&mut s, key, 0x01).feed.is_none());
         }
         assert!(tabq_keys(&mut s, b"\r", 0x01).feed.is_none());
@@ -31227,6 +31231,53 @@ mod tests {
         assert_eq!(s.tile_at_screen(row, col).map(|hit| hit.0), Some(1));
         assert_eq!(s.tabq_click(row, col), None);
         assert!(!s.tabq_focused() && s.tabq_open().is_some());
+    }
+
+    /// `q` hands the open card of this agent to qass, with no option and no words, and never
+    /// reaches the agent; the pane then says `handed to qass: Q1`. With no qass the refusal is
+    /// said in the pane.
+    #[test]
+    fn q_hands_the_open_card_to_qass() {
+        use qoop_runtime::control::{AskOp, AskResult, ControlResponse};
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 2);
+        assert!(fold_key(&mut s));
+        assert!(tabq_keys(&mut s, b"q", 0x01).feed.is_none());
+        let (sent, _) = s.asks.tick(std::time::Instant::now());
+        let [ControlRequest::AskWrite { id, action, .. }] = &sent[..] else {
+            panic!("one write: {sent:?}");
+        };
+        assert_eq!(
+            action,
+            &AskOp::Answer {
+                card: "Q1".into(),
+                option: None,
+                text: None,
+                seen: None,
+                to_qass: true,
+            }
+        );
+        assert!(s.asks.answered(&ControlResponse::AskWritten {
+            id: id.clone(),
+            card: "Q1".into(),
+            result: AskResult::Passed,
+        }));
+        assert!(pane_text(&s).contains("handed to qass: Q1"));
+        // No qass to hand it to: the daemon refuses, and the pane says why.
+        tabq_keys(&mut s, b"q", 0x01);
+        let (sent, _) = s.asks.tick(std::time::Instant::now());
+        let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
+            panic!("one write: {sent:?}");
+        };
+        assert!(s.asks.answered(&ControlResponse::Failed {
+            id: id.clone(),
+            reason: "qass has no tab to hand this to".into(),
+        }));
+        assert!(
+            pane_text(&s).contains("not sent: qass has no tab to hand this to"),
+            "{}",
+            pane_text(&s)
+        );
     }
 
     /// Opened in place, a card shows its whole question and its answers while the other card

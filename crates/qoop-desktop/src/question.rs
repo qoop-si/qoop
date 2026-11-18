@@ -317,6 +317,7 @@ impl Desk {
                     option: Some(option.clone()),
                     text: None,
                     seen: None,
+                    to_qass: false,
                 },
             },
             Pick::Qass => return,

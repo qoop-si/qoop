@@ -406,6 +406,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     option,
                     text,
                     seen,
+                    to_qass: false,
                 },
                 false,
             )?)?;

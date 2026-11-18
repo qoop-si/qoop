@@ -364,6 +364,8 @@ showed that card), and the card stays open until they answer it.
   that card is exactly `<handle> B`, `E7 B` or the lone `B`, with that option's words word for
   word as you wrote them in its card:
   `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<their words>". He chose B: <option B>. Those are the words of the owner: do only what they allow, and ask before anything more.'` (the daemon writes and reads this exact sentence, "He chose" included: keep it as is)
+- A card handed to you: exactly `<handle> you decide` (their `q` on it in its agent's tab). Decide it by their lessons and the card's why; when the choice speaks in their name, spends their money or cannot be undone, show them the card and ask instead. Else pass it on to its terminal, once:
+  `qoop prompt <n> --generation <G> -- 'The owner answered E<n>: "<handle> you decide", and qass decided: <your decision and why, one line>. Do only what that allows, and ask before anything more.'`
 
 Then move the card out of `Waiting on you`: the relay ended it, in any tab; acted on without a relay:
 `"<this skill's dir>/escalate.sh" done E<n> chat` (`qass` when you answered it). Their inbox answer types `<handle> B`

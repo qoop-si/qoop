@@ -328,6 +328,8 @@ impl Pane {
                 self.pending.remove(id);
                 let (handle, words) = self.sent.remove(id).unwrap_or_default();
                 let said = match result {
+                    // A hand-off ([`Pane::hand_to_qass`]): no words, the card's id for a handle.
+                    AskResult::Passed if words.is_empty() => format!("handed to qass: {handle}"),
                     AskResult::Answered => format!("sent to {handle}: {words}"),
                     AskResult::Passed => format!("sent to qass: {words}"),
                     // Only a daemon from before answers were queued says it.
@@ -520,9 +522,32 @@ impl Pane {
                 option,
                 text,
                 seen,
+                to_qass: false,
             },
             handle,
             words,
+        );
+        true
+    }
+
+    /// Hand the open card to qass to decide (`q` in an agent's tab): no option and no words of
+    /// his. The card's id goes where a handle goes and no words, so what comes back says
+    /// `handed to qass: Q5`.
+    pub fn hand_to_qass(&mut self) -> bool {
+        let Some(card) = self.open_card().filter(|c| c.status == "open") else {
+            return false;
+        };
+        let card = card.card.clone();
+        self.write(
+            AskOp::Answer {
+                card: card.clone(),
+                option: None,
+                text: None,
+                seen: None,
+                to_qass: true,
+            },
+            card,
+            String::new(),
         );
         true
     }
@@ -2266,8 +2291,9 @@ fn bottom_line(pane: &Pane, tab: Option<InTab>, cw: usize, cut: bool) -> Vec<Seg
             true => pick_keys(
                 cw,
                 &[
-                    &format!("1-9 answer  {enter}  r reply  s task  j k move  esc back"),
-                    &format!("1-9 answer  {enter}  r reply  s task  esc"),
+                    &format!("1-9 answer  {enter}  r reply  q qass  s task  j k move  esc back"),
+                    &format!("1-9 answer  {enter}  r reply  q qass  s task"),
+                    &format!("1-9 answer  {enter}  q qass  esc"),
                 ],
             ),
             false => "ctrl-a T folds this".to_string(),
@@ -3420,6 +3446,7 @@ mod tests {
                         option,
                         text,
                         seen,
+                        to_qass: false,
                     },
                 terminal: None,
                 token: None,

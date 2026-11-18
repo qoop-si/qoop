@@ -1167,6 +1167,10 @@ pub enum AskOp {
         /// since: he must never send words he did not read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen: Option<String>,
+        /// The owner hands the card to qass to decide: no option and no words of his, qass gets
+        /// `<handle> you decide` even when the agent itself could take an answer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        to_qass: bool,
     },
     /// End a card: it was answered in the chat, qass answered it, or its agent is done.
     Close { card: String, note: String },

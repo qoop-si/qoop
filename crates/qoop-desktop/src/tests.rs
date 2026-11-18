@@ -1294,6 +1294,7 @@ fn a_card_answer_waits_out_the_hold_too(cx: &mut TestAppContext) {
             option: Some("a".into()),
             text: None,
             seen: None,
+            to_qass: false,
         }
     );
     answer(
