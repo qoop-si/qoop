@@ -1853,6 +1853,9 @@ pub(crate) struct Handed {
     at_unix: i64,
     told: bool,
     away: Option<String>,
+    /// The turn of the menu handed (`TerminalHandle::answer_seal`): the same question asked
+    /// again is a turn nobody handed, so the hand ends; and the seal qass is told to answer with.
+    turn: Option<u64>,
 }
 
 /// The hands that live, and the terminals whose hand ran out untold, said for a while.
@@ -1963,6 +1966,7 @@ pub(crate) async fn hand(
                 at_unix: now(),
                 told: hand.away.is_some(),
                 away: hand.away.clone(),
+                turn: terminals.get(hand.terminal).and_then(|h| h.answer_seal()),
             };
             // A new hand for another machine's qass replaces any; so does a hand for the qass
             // here over one for another machine's, which nobody here would ever type.
@@ -2047,7 +2051,8 @@ async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
     };
     // Read under the book's lock alone and judged outside it, so the book is never held while
     // the registries are locked.
-    let held: Vec<(crate::control::Hand, Instant, i64, bool)> = {
+    type Held = (crate::control::Hand, Instant, i64, bool, Option<u64>);
+    let held: Vec<Held> = {
         let book = agents.hands.lock().unwrap();
         book.live
             .iter()
@@ -2058,14 +2063,18 @@ async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
                     seal: h.seal,
                     away: h.away.clone(),
                 };
-                (hand, h.at, h.at_unix, h.told)
+                (hand, h.at, h.at_unix, h.told, h.turn)
             })
             .collect()
     };
     let mut ended = Vec::new();
     let mut missed = Vec::new();
-    for (hand, at, at_unix, told) in held {
-        let asking = still_asking(terminals, agents, &hand).is_some();
+    for (hand, at, at_unix, told, turn) in held {
+        // The same question asked again is another turn: the one handed is over.
+        let same_turn = turn.is_none_or(|turn| {
+            terminals.get(hand.terminal).and_then(|h| h.answer_seal()) == Some(turn)
+        });
+        let asking = same_turn && still_asking(terminals, agents, &hand).is_some();
         let carded = carded
             .iter()
             .any(|(t, opened)| *t == i64::from(hand.terminal) && *opened >= at_unix);
@@ -2131,17 +2140,13 @@ async fn flush_hands(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
             .filter(|(_, h)| !h.told)
             .map(|(t, h)| {
                 h.told = true;
-                (*t, None)
+                // The turn handed, as `qoop send --seal` checks it: never a later one.
+                (*t, h.turn)
             })
             .collect();
         told.sort_unstable();
         told
     };
-    // Each tab's seal as `qoop send --seal` checks it: this turn of its menu, read now.
-    let told: Vec<(u32, Option<u64>)> = told
-        .into_iter()
-        .map(|(t, _)| (t, terminals.get(t).and_then(|h| h.answer_seal())))
-        .collect();
     sent.insert(qass, Instant::now());
     if type_into(terminals, qass, &hand_line(&told)).await.is_err() {
         let mut book = agents.hands.lock().unwrap();
