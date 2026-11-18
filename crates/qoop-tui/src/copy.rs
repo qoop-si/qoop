@@ -1,8 +1,8 @@
 //! Copy mode: the keyboard's way through a terminal's whole history.
 //!
-//! The mouse selection copies what is on the screen, and the wheel reads back a few rows at
-//! a time. Neither reaches the error an agent printed forty thousand rows ago, and neither
-//! can select more than a screen. Copy mode does both, the way tmux's does: a cursor that
+//! The mouse selection runs as far as a drag and the wheel take it, and the wheel reads back
+//! a few rows at a time. Neither reaches the error an agent printed forty thousand rows ago
+//! without a long scroll, and neither searches. Copy mode does both, the way tmux's does: a cursor that
 //! moves through every row the terminal ever wrote, a selection that grows with it, and a
 //! search that runs over the history on disk.
 //!
@@ -390,6 +390,9 @@ pub struct Yank {
     pub total: u64,
     /// Requests made so far, for their ids.
     pub asked: u64,
+    /// The ends' second numbers are screen columns, as a mouse selection gives them, rather
+    /// than copy mode's cells.
+    pub columns: bool,
 }
 
 impl Yank {
@@ -440,7 +443,16 @@ impl Yank {
             } else {
                 usize::MAX
             };
-            out.push(cells_text(row, from, to).trim_end().to_string());
+            let piece = if self.columns {
+                crate::selection::in_columns(row, from..to.saturating_add(1))
+            } else {
+                cells_text(row, from, to)
+            };
+            out.push(piece.trim_end().to_string());
+        }
+        // A mouse selection over blank screen is not text, as `Selection::text` says.
+        if self.columns && out.iter().all(|line| line.is_empty()) {
+            return String::new();
         }
         out.join("\n")
     }
@@ -620,6 +632,7 @@ mod tests {
             rows: BTreeMap::new(),
             total: 1_200,
             asked: 0,
+            columns: false,
         };
         assert!(yank.next_request().is_some());
         // The history grew by a hundred rows before the answer: it starts past the range.
@@ -664,6 +677,7 @@ mod tests {
             rows: BTreeMap::new(),
             total: 1_200,
             asked: 0,
+            columns: false,
         };
         // The screen's rows are already here.
         for at in 1_200..=1_300 {

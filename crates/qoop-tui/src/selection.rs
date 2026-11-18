@@ -40,8 +40,57 @@ impl Selection {
         self.head = (row, col);
     }
 
+    /// The same selection `by` rows further down. Rows are history rows in the interface
+    /// (see `run::State::view_top`), and a view's rows only when drawn or read off a view.
+    pub fn down(self, by: usize) -> Self {
+        Selection {
+            anchor: (self.anchor.0 + by, self.anchor.1),
+            head: (self.head.0 + by, self.head.1),
+        }
+    }
+
+    /// The same selection `by` rows further up; `by` is at most its first row.
+    pub fn up(self, by: usize) -> Self {
+        Selection {
+            anchor: (self.anchor.0 - by, self.anchor.1),
+            head: (self.head.0 - by, self.head.1),
+        }
+    }
+
+    /// The first and the last row it covers.
+    pub fn rows(&self) -> (usize, usize) {
+        let ((top, _), (bottom, _)) = self.ends();
+        (top, bottom)
+    }
+
+    /// The part inside a view of `rows` rows whose first row is `top`, counted from the
+    /// view's first row: a selection made before a scroll stays on the text it covers, and
+    /// the rows it covers that scrolled out of view are drawn as far as the view's edge.
+    pub fn in_view(&self, top: usize, rows: usize) -> Option<Self> {
+        let ((r0, c0), (r1, c1)) = self.ends();
+        let bottom = top + rows.max(1) - 1;
+        if r1 < top || r0 > bottom {
+            return None;
+        }
+        // Far enough right to take any row whole, and far from overflowing when one is
+        // added to it, as copy mode draws it.
+        const EDGE: usize = u16::MAX as usize;
+        // ponytail: a selection from above the view that ends on the view's first cell
+        // clips to one cell, which reads as a click and is not drawn; it is still copied.
+        let start = if r0 < top { (0, 0) } else { (r0 - top, c0) };
+        let end = if r1 > bottom {
+            (bottom - top, EDGE)
+        } else {
+            (r1 - top, c1)
+        };
+        Some(Selection {
+            anchor: start,
+            head: end,
+        })
+    }
+
     /// The two ends in reading order, whichever way the drag went.
-    fn ends(&self) -> ((usize, usize), (usize, usize)) {
+    pub fn ends(&self) -> ((usize, usize), (usize, usize)) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
         } else {
@@ -448,6 +497,30 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_selection_is_drawn_inside_the_view_it_reaches_into() {
+        // History rows 10 to 30, dragged upward.
+        let sel = Selection::covering((30, 4), (10, 2));
+        assert_eq!(sel.down(5).rows(), (15, 35));
+        assert_eq!(sel.up(10).rows(), (0, 20));
+        // Both ends in a view from row 5: rows counted from the view's top.
+        assert_eq!(
+            sel.in_view(5, 40),
+            Some(Selection::covering((5, 2), (25, 4)))
+        );
+        // Starting above a view from row 20: from the view's first cell.
+        let tail = sel.in_view(20, 5).unwrap();
+        assert_eq!(tail.rows(), (0, 4));
+        assert_eq!(tail.columns_on(0, 80), Some(0..80));
+        // Ending below it: to the view's last row, whole.
+        let head = sel.in_view(0, 12).unwrap();
+        assert_eq!(head.columns_on(10, 80), Some(2..80));
+        assert_eq!(head.columns_on(11, 80), Some(0..80));
+        // Out of view either way: nothing drawn.
+        assert_eq!(sel.in_view(31, 5), None);
+        assert_eq!(sel.in_view(0, 10), None);
+    }
 
     #[test]
     fn a_double_click_takes_the_word_under_the_pointer() {
