@@ -176,6 +176,8 @@ pub struct Chrome<'a> {
     pub agent_order: Option<&'a crate::plugins::AgentView>,
     /// The questions rail of the agent's tab on screen, right of its panes (`crate::tabq`).
     pub tab_rail: Option<crate::tabq::Paint<'a>>,
+    /// The question cards as this client last read them, for the column's counts.
+    pub cards: &'a [qoop_runtime::control::AskInfo],
 }
 
 /// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
@@ -272,6 +274,7 @@ impl Default for Chrome<'_> {
             fold: None,
             agent_order: None,
             tab_rail: None,
+            cards: &[],
         }
     }
 }
@@ -320,6 +323,7 @@ impl Frame<'_> {
             icons: crate::icons::on(),
             nav: self.chrome.nav,
             order: self.chrome.agent_order,
+            cards: self.chrome.cards,
         }
     }
 }
@@ -8231,6 +8235,7 @@ mod tests {
                 icons: false,
                 nav: None,
                 order: None,
+                cards: &[],
             },
             44,
         );
