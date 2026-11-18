@@ -243,7 +243,7 @@ impl Desk {
                                 .text_size(px(11.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(c(t.t2))
-                                .child("qass handled today"),
+                                .child("Handled for you today"),
                         )
                         .children(self.acts.iter().take(20).map(|a| {
                             div()
@@ -256,7 +256,12 @@ impl Desk {
                                         .text_color(c(t.t3))
                                         .child(state::clock(a.at, self.zone)),
                                 )
-                                .child(div().flex_1().text_color(c(t.t1)).child(a.text.clone()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_color(c(t.t1))
+                                        .child(self.model.act_text(a)),
+                                )
                         }))
                     }),
             ))

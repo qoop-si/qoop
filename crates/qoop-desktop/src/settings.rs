@@ -820,12 +820,7 @@ impl Desk {
             .settings
             .via
             .map(|w| self.machine_state(state::machine_of(w)))
-            .filter(|s| {
-                matches!(
-                    s,
-                    state::MachineState::Stale { .. } | state::MachineState::NeverReached
-                )
-            })
+            .filter(|s| state::unreached(*s))
             .map(|s| format!("{machine} is {}", state::reach_words(s, self.zone)));
         let off = stale.is_some();
         let remote = &self.settings.remote;

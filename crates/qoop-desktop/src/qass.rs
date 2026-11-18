@@ -346,10 +346,11 @@ impl Desk {
                 d.child(quiet("Nothing yet today.", t))
             })
             .children(self.acts.iter().take(30).map(|a| {
+                // Named as the status line names it: space and title, never the daemon's tab.
                 let agent = a
                     .terminal
                     .and_then(|n| self.model.row(n))
-                    .map(state::title_of);
+                    .map(|r| self.model.agent_name(r));
                 div()
                     .flex()
                     .flex_col()
@@ -381,7 +382,7 @@ impl Desk {
                         div()
                             .text_size(px(12.))
                             .text_color(c(t.t1))
-                            .child(a.text.clone()),
+                            .child(self.model.act_text(a)),
                     )
             }))
     }
