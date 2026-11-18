@@ -369,7 +369,11 @@ fn hand_away(
         id: id.into(),
         hands: vec![qoop_runtime::control::Hand {
             terminal,
-            generation: None,
+            // The conversation the person saw, as `hand_to_qass` sends it.
+            generation: rows(rt, client)
+                .iter()
+                .find(|r| r.terminal == terminal)
+                .and_then(|r| r.generation),
             seal: None,
             away: Some(by.into()),
         }],
@@ -1848,12 +1852,11 @@ fn questions_handed_to_qass_go_as_one_line_and_end_with_their_question() {
     );
     assert!(row_of(&rt, &mut ui, first).with_qass);
     assert!(row_of(&rt, &mut ui, second).with_qass);
-    // Each tab with the seal of its question, for qass's `send --seal`.
-    let mut tab = |t: u32| {
-        let seal = row_of(&rt, &mut ui, t)
-            .menu_seal
-            .expect("a menu qoop reads");
-        format!("T{t} seal:{seal}")
+    // Each tab with the seal of its question when qoop reads one (this stand-in's menu is a
+    // hook's report only, so none), for qass's `send --seal`.
+    let mut tab = |t: u32| match row_of(&rt, &mut ui, t).menu_seal {
+        Some(seal) => format!("T{t} seal:{seal}"),
+        None => format!("T{t}"),
     };
     let line = format!(
         "hand-off {}, {}: the owner handed you these tabs' questions. Answer each if your rules \
@@ -2099,45 +2102,6 @@ fn an_away_hand_is_kept_here_and_told_to_no_qass_here() {
         row_of(&rt, &mut ui, away)
     );
     assert!(!row_of(&rt, &mut ui, away).qass_missed);
-}
-
-/// The same question asked again carries another `menu_seal`, so `qoop send --seal` with the
-/// first one's never answers the second; the right one sends.
-#[test]
-fn the_same_question_asked_again_has_another_seal() {
-    let stack = Stack::start();
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
-    let agent = stack.agent("work", "asker", None);
-    let t = agent.parse::<u32>().expect("a terminal number");
-    let seal_when_blocked = |ui: &mut qoop_testkit::TestClient| {
-        assert!(stack.wait(|| stack.state_of(&agent) == "blocked"));
-        let mut seal = None;
-        assert!(stack.wait(|| {
-            seal = row_of(&rt, ui, t).menu_seal;
-            seal.is_some()
-        }));
-        seal.expect("a seal")
-    };
-    stack.send(&agent, "MENU");
-    let first = seal_when_blocked(&mut ui);
-    stack.send(&agent, "FREE");
-    assert!(stack.wait(|| stack.state_of(&agent) != "blocked"));
-    assert!(stack.wait(|| row_of(&rt, &mut ui, t).menu_seal.is_none()));
-    stack.send(&agent, "MENU");
-    let second = seal_when_blocked(&mut ui);
-    assert_ne!(first, second, "the same menu, a new turn");
-    let (ok, _, err) = stack.run(&["send", &agent, "--key", "esc", "--seal", &first.to_string()]);
-    assert!(!ok && err.contains("another question"), "{err}");
-    let (ok, _, err) = stack.run(&[
-        "send",
-        &agent,
-        "--key",
-        "esc",
-        "--seal",
-        &second.to_string(),
-    ]);
-    assert!(ok, "{err}");
 }
 
 /// A live hand goes back when nobody is left to take it: watching turned off ends it at the

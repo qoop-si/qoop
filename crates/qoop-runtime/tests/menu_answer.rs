@@ -421,6 +421,45 @@ async fn own_words_go_after_the_tell_key_once_the_agent_rests_on_its_input_row()
     );
 }
 
+/// `menu_seal`, on every row, a program's too: the menu's seal for this turn of it. The same
+/// question gone and asked again reads another, so a late `qoop send --seal` for the first
+/// never answers the second; the menu's own seal, which `AnswerMenu` takes, stays the same.
+#[tokio::test]
+async fn the_same_question_asked_again_has_another_menu_seal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = claude_shaped(dir.path());
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut owner = d.attach("owner").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    let mut program = d.attach("qoop-agents").await;
+    start_aider(&d, &mut owner, terminal, &agent).await;
+
+    let (first, _) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    let first_turn = row(&mut program, terminal)
+        .await
+        .menu_seal
+        .expect("a program's row carries the seal");
+
+    // The menu goes (any key but 3 and M), then the same one comes back.
+    owner.input_to(terminal, b"x").await;
+    assert!(owner.wait_for_text_on(terminal, "key:x", PATIENCE).await);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while row(&mut ui, terminal).await.menu.is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the menu never went"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    owner.input_to(terminal, b"M").await;
+    let (again, _) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    assert_eq!(again.seal, first.seal, "the same menu");
+    let second_turn = row(&mut program, terminal).await.menu_seal.expect("a seal");
+    assert_ne!(second_turn, first_turn, "another turn of it");
+}
+
 #[tokio::test]
 async fn who_answered_is_on_a_persons_row_for_a_while_and_never_on_a_programs() {
     // Ten seconds in the product; shorter here, so the end is seen without the wait.
