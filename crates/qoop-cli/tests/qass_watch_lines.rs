@@ -410,7 +410,7 @@ fn a_remote_hand_from_this_mac_is_said_once_as_handed() {
 
     let w = Watch::new();
     let seen = rows(&[away_row(2, "me1", 100)]);
-    let lines = remote_lines(&w, Some(&seen), &[seen.clone()], Some("me1"));
+    let lines = remote_lines(&w, Some(&seen), std::slice::from_ref(&seen), Some("me1"));
     assert!(lines.is_empty(), "said before the restart: {lines:?}");
 
     let w = Watch::new();
