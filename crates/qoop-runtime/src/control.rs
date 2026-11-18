@@ -2991,8 +2991,10 @@ pub struct AgentRow {
     /// daemon that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qass_away: Option<AwayHand>,
-    /// The seal of the menu up while the agent is blocked (`AgentMenu::seal`): a number, no
-    /// screen text, so on every row. `qoop send --seal` refuses once another menu is up.
+    /// The seal of the menu up while the agent is blocked and of this turn of it (the menu's
+    /// `AgentMenu::seal` with how many times a menu came up there): a number, no screen text,
+    /// so on every row. `qoop send --seal` refuses once another menu is up, the same question
+    /// asked again included. Not the seal `AnswerMenu` takes.
     /// Absent with no menu qoop reads, and from a daemon that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_seal: Option<u64>,

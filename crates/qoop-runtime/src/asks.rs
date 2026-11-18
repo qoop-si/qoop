@@ -2131,12 +2131,17 @@ async fn flush_hands(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
             .filter(|(_, h)| !h.told)
             .map(|(t, h)| {
                 h.told = true;
-                (*t, h.seal)
+                (*t, None)
             })
             .collect();
         told.sort_unstable();
         told
     };
+    // Each tab's seal as `qoop send --seal` checks it: this turn of its menu, read now.
+    let told: Vec<(u32, Option<u64>)> = told
+        .into_iter()
+        .map(|(t, _)| (t, terminals.get(t).and_then(|h| h.answer_seal())))
+        .collect();
     sent.insert(qass, Instant::now());
     if type_into(terminals, qass, &hand_line(&told)).await.is_err() {
         let mut book = agents.hands.lock().unwrap();
