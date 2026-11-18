@@ -15,9 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, MouseButton, Pixels, Render, Role, TitlebarOptions, UTF16Selection, Window,
-    WindowAppearance, WindowBounds, WindowOptions, div, linear_color_stop, linear_gradient, point,
-    prelude::*, px, size,
+    KeyDownEvent, MouseButton, Pixels, Render, Role, Subscription, TitlebarOptions, UTF16Selection,
+    Window, WindowAppearance, WindowBounds, WindowOptions, div, linear_color_stop, linear_gradient,
+    point, prelude::*, px, size,
 };
 use qoop_domain::Viewport;
 use qoop_runtime::avatar::Avatar;
@@ -179,6 +179,10 @@ pub struct Desk {
     pub connected: bool,
     pub focus: FocusHandle,
     pub term_focus: FocusHandle,
+    /// The Inbox's heading: where `ctrl-a i` puts the keys, so Tab goes on into the panel.
+    pub inbox_focus: FocusHandle,
+    /// Kept for the window's life: focus that falls out of the frame comes back (WEB-09).
+    _focus_lost: Subscription,
     /// Text the input method composes for the terminal; what it commits is typed.
     marked: Option<String>,
     /// The person's last key or click here, for seen.
@@ -211,6 +215,12 @@ impl Desk {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // A focused control that leaves the frame (a Report link that becomes the shown run,
+        // Retry now once the machine is back, an option whose question was answered) leaves
+        // GPUI dispatching keys above the desk, where no listener hears them, `ctrl-a` too.
+        let focus_lost = cx.on_focus_lost(window, |this: &mut Desk, window, cx| {
+            this.focus_home(window, cx)
+        });
         let mut offered: Vec<(String, String)> = ["claude", "codex", "opencode"]
             .map(|a| (a.to_string(), a.to_string()))
             .to_vec();
@@ -274,6 +284,8 @@ impl Desk {
             connected: false,
             focus,
             term_focus: cx.focus_handle(),
+            inbox_focus: cx.focus_handle(),
+            _focus_lost: focus_lost,
             marked: None,
             last_input: None,
             look: None,
@@ -635,9 +647,13 @@ impl Desk {
                 }
                 "tab" => self.open_note(window, cx),
                 // The keyboard off the terminal, as the TUI's `ctrl-a a` puts it on the agents
-                // column: `tab` then goes round the controls.
+                // column: `tab` then goes round the controls. Again: back on the terminal.
                 "a" => {
-                    window.focus(&self.focus, cx);
+                    if self.term_drawn() && !self.term_focus.is_focused(window) {
+                        window.focus(&self.term_focus, cx);
+                    } else {
+                        window.focus(&self.focus, cx);
+                    }
                     cx.notify();
                 }
                 // Changes, `D` for diff: a key the TUI leaves unbound, so one prefix key never
@@ -645,8 +661,15 @@ impl Desk {
                 // The character the layout typed, or shift with the D key where none came.
                 "D" => self.toggle_review(window, cx),
                 "d" if k.modifiers.shift => self.toggle_review(window, cx),
+                // Open: the keys go into the panel, so a Tab meant for it never reaches the
+                // agent. Closed: back where they belong.
                 "i" => {
                     self.inbox = !self.inbox;
+                    if self.inbox {
+                        window.focus(&self.inbox_focus, cx);
+                    } else {
+                        self.focus_home(window, cx);
+                    }
                     cx.notify();
                 }
                 _ => {}
@@ -669,6 +692,9 @@ impl Desk {
         // interrupts its turn.
         if self.inbox && keys::typed(k) == "escape" {
             self.inbox = false;
+            if !self.term_focus.is_focused(window) {
+                self.focus_home(window, cx);
+            }
             cx.stop_propagation();
             cx.notify();
             return;
@@ -688,6 +714,23 @@ impl Desk {
             .filter(|b| self.focus.contains(b, window))
             .unwrap_or_else(|| self.focus.clone());
         window.focus(&to, cx);
+    }
+
+    /// Whether the page draws a terminal that can take the keys.
+    pub(crate) fn term_drawn(&self) -> bool {
+        self.term.is_some() && matches!(self.page, Page::Session(_) | Page::Qass)
+    }
+
+    /// The keys' resting place: an open sheet's first stop, else the terminal on screen, else
+    /// the window. Where focus goes when its control leaves the frame or a panel closes.
+    pub(crate) fn focus_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to = match &self.sheet {
+            Some(sheet) => sheet.stops[0].clone(),
+            None if self.term_drawn() => self.term_focus.clone(),
+            None => self.focus.clone(),
+        };
+        window.focus(&to, cx);
+        cx.notify();
     }
 
     /// While a question card is on screen: a digit picks its answer, `u` undoes the pick,
@@ -777,6 +820,11 @@ impl Desk {
             "escape" if self.page == Page::Settings && self.close_find(window, cx) => {}
             "/" if self.page == Page::Settings && self.settings.find.is_none() => {
                 self.open_find(window, cx)
+            }
+            // Off the terminal with nothing open: Escape gives it the keys back.
+            "escape" if self.sheet.is_none() && self.term_drawn() => {
+                window.focus(&self.term_focus, cx);
+                cx.notify();
             }
             _ => {}
         }
@@ -1310,6 +1358,9 @@ impl Desk {
                                     },
                                     t,
                                 )
+                                // A click only: the keyboard has option 5 on the card, and a
+                                // stop per waiting agent doubled the Tab path on every page.
+                                .tab_stop(false)
                                 .tooltip(ui::tip(
                                     "qass answers if its rules allow; otherwise it comes back to you as a card",
                                     *t,
@@ -1601,7 +1652,7 @@ impl Desk {
             )
     }
 
-    fn status_line(&self, t: &Theme) -> impl IntoElement {
+    fn status_line(&self, t: &Theme, focused: bool) -> impl IntoElement {
         let right = if self.inbox { 360. } else { 0. };
         div()
             .absolute()
@@ -1646,8 +1697,13 @@ impl Desk {
                 |d, line| d.child(div().text_color(c(t.needs_text)).child(line)),
             )
             .child(format!(
-                "{}: [c new work] [i inbox] [a keys off the terminal]{}",
+                "{}: [c new work] [i inbox] [a keys {} the terminal]{}",
                 self.prefix_name(),
+                if self.term_drawn() && !focused {
+                    "back to"
+                } else {
+                    "off"
+                },
                 if let Page::Session(t) = self.page
                     && self.here(t).is_some()
                 {
@@ -1884,7 +1940,7 @@ impl Render for Desk {
             .child(self.sidebar(&t, cx))
             .child(self.top_bar(&t, cx))
             .child(self.centre(&t, focused, cx))
-            .child(self.status_line(&t));
+            .child(self.status_line(&t, focused));
         if self.inbox {
             root = root.child(self.inbox_panel(&t, cx));
         }
