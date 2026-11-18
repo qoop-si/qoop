@@ -214,8 +214,17 @@ pub fn launch(program: &Path, args: &[String]) {
     }
 }
 
-/// The checkout `cwd` is in, opened in the Finder's way for a folder (`open <root>`): a folder
-/// opens, it never runs. git is asked for the root on a thread, so the window never waits.
+/// How a checkout's folder is shown: revealed in the Finder (`open -R`), never opened, since
+/// `open` on a bundle (`x.app`, put there by an agent or a cloned repository) would run it.
+fn reveal(root: &str) -> (PathBuf, Vec<String>) {
+    (
+        PathBuf::from("/usr/bin/open"),
+        vec!["-R".to_string(), root.to_string()],
+    )
+}
+
+/// The checkout `cwd` is in, revealed in the Finder: shown, never run. git is asked for the
+/// root on a thread, so the window never waits.
 pub fn open_folder(cwd: String) {
     std::thread::spawn(move || {
         let root = std::process::Command::new("git")
@@ -229,8 +238,10 @@ pub fn open_folder(cwd: String) {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|r| !r.is_empty())
             .unwrap_or(cwd);
-        if Path::new(&root).is_dir() {
-            launch(Path::new("/usr/bin/open"), &[root]);
+        // Absolute, so the root is never read as one of `open`'s options.
+        if Path::new(&root).is_absolute() && Path::new(&root).is_dir() {
+            let (program, args) = reveal(&root);
+            launch(&program, &args);
         }
     });
 }
@@ -238,6 +249,14 @@ pub fn open_folder(cwd: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkout whose folder is a bundle is revealed, never opened, so it never runs.
+    #[test]
+    fn a_folder_named_like_an_app_is_revealed_never_run() {
+        let (program, args) = reveal("/Users/me/code/x.app");
+        assert_eq!(program, PathBuf::from("/usr/bin/open"));
+        assert_eq!(args, ["-R", "/Users/me/code/x.app"]);
+    }
 
     const DIFF: &str = "diff --git a/src/a.ts b/src/a.ts
 index 1..2 100644

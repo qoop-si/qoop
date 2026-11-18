@@ -30,11 +30,31 @@ pub struct NewWork {
     pub refused: Option<String>,
     /// The sheet's own stops, in Tab order: task, agent, space, Start, Close.
     pub stops: [FocusHandle; 5],
+    /// What had the focus when the sheet opened: it gets it back on close.
+    pub back: Option<FocusHandle>,
 }
 
 impl Desk {
-    /// Open New work, in `space` or the first of the owner's spaces.
+    /// Open New work, in `space` or the first of the owner's spaces. A task closed unstarted
+    /// comes back as it was left (STATE-41), in `space` when one is asked for.
     pub fn new_work(&mut self, space: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sheet) = self.sheet.as_ref() {
+            // Already open: never built again over what is typed in it.
+            window.focus(&sheet.stops[0], cx);
+            return;
+        }
+        let back = window.focused(cx);
+        if let Some(mut draft) = self.work_draft.take() {
+            draft.back = back;
+            draft.space_open = false;
+            if space.is_some() {
+                draft.space = space;
+            }
+            window.focus(&draft.stops[0], cx);
+            self.sheet = Some(draft);
+            cx.notify();
+            return;
+        }
         let t = self.theme();
         let colors = FieldColors {
             text: c(t.ink).into(),
@@ -61,6 +81,7 @@ impl Desk {
                 cx.focus_handle(),
                 cx.focus_handle(),
             ],
+            back,
         });
         cx.notify();
     }
@@ -118,9 +139,17 @@ impl Desk {
             .collect()
     }
 
-    pub fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sheet = None;
-        window.focus(&self.focus, cx);
+    /// Close New work and give the focus back. `keep`: a task typed in it stays for the next
+    /// open (Escape, Close); a started one does not.
+    pub fn close_sheet(&mut self, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut sheet) = self.sheet.take() else {
+            return;
+        };
+        let back = sheet.back.take();
+        if keep && !sheet.task.read(cx).text.trim().is_empty() {
+            self.work_draft = Some(sheet);
+        }
+        self.focus_back(back, window, cx);
         cx.notify();
     }
 
@@ -195,9 +224,9 @@ impl Desk {
             terminal,
             format!("{line}\r").into_bytes(),
         ));
-        if self.sheet.is_some() {
-            self.close_sheet(window, cx);
-        }
+        // Started: a sheet closed while it started is no draft any more.
+        self.work_draft = None;
+        self.close_sheet(false, window, cx);
     }
 
     pub fn refused(&mut self, id: &str, reason: String) {
@@ -207,7 +236,8 @@ impl Desk {
             .is_some_and(|(pending, ..)| pending == id)
         {
             self.pending = None;
-            if let Some(sheet) = self.sheet.as_mut() {
+            // Said in the sheet, or in the draft it was closed into.
+            if let Some(sheet) = self.sheet.as_mut().or(self.work_draft.as_mut()) {
                 sheet.refused = Some(reason);
             }
         }
@@ -223,7 +253,7 @@ impl Desk {
         match k.key.as_str() {
             "escape" if sheet.space_open => sheet.space_open = false,
             "escape" => {
-                self.close_sheet(window, cx);
+                self.close_sheet(true, window, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -324,7 +354,9 @@ impl Desk {
                     .rounded_full()
                     .text_size(px(12.5))
                     .text_color(c(t.t2))
-                    .when(on, |d| ui::paint(d, t.picked()))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .when(on, |d| ui::picked(d, t))
                     .when_some(state::kind_pet(Some(name)), |d, pet| {
                         d.child(ui::pet(&pet, 1.))
                     })
@@ -446,6 +478,7 @@ impl Desk {
             .child(ui::kbd("enter", t))
             .on_click(cx.listener(|this, _, _, cx| this.start(cx)));
         let close = ui::control("sheet-close", Role::Button, "Close New work", t)
+            .debug_selector(|| "sheet-close".into())
             .track_focus(&sheet.stops[4])
             .size(px(24.))
             .flex()
@@ -453,7 +486,7 @@ impl Desk {
             .justify_center()
             .rounded(px(6.))
             .child(ui::icon(Icon::Close, 14., c(t.t2)))
-            .on_click(cx.listener(|this, _, window, cx| this.close_sheet(window, cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.close_sheet(true, window, cx)));
         let body = div()
             .flex()
             .flex_col()

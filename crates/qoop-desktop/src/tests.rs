@@ -320,6 +320,147 @@ fn new_work_survives_escape_and_a_reconnect(cx: &mut TestAppContext) {
     });
     assert!(typed, "the line is typed with the sheet closed");
     assert!(desk.read_with(&vcx, |d, _| d.pending.is_none()));
+    assert!(
+        desk.read_with(&vcx, |d, _| d.work_draft.is_none()),
+        "a started task is no draft"
+    );
+}
+
+/// A task typed into New work and closed with Escape comes back on the next open, and the
+/// focus goes back to the terminal that opened the sheet (STATE-41, WEB-06).
+#[gpui::test]
+fn new_work_keeps_its_draft_and_gives_the_focus_back(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let term = desk.read(cx).term_focus.clone();
+        window.focus(&term, cx);
+    });
+    vcx.simulate_keystrokes("ctrl-a c");
+    vcx.simulate_input("fix the login page");
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| d.sheet.is_none()));
+    assert!(
+        vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)),
+        "the terminal has the focus again"
+    );
+    vcx.simulate_keystrokes("ctrl-a c");
+    let task = desk.read_with(&vcx, |d, cx| {
+        d.sheet.as_ref().expect("open").task.read(cx).text.clone()
+    });
+    assert_eq!(task, "fix the login page", "the draft is back");
+    // The close button keeps it too.
+    let at = vcx
+        .debug_bounds("sheet-close")
+        .expect("the close button")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(desk.read_with(&vcx, |d, _| d.sheet.is_none() && d.work_draft.is_some()));
+}
+
+/// Escape with the Inbox open closes it and never reaches the agent in the terminal: an
+/// Escape typed into Claude Code interrupts its turn.
+#[gpui::test]
+fn escape_closes_the_inbox_before_the_terminal_hears_it(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let term = desk.read(cx).term_focus.clone();
+        window.focus(&term, cx);
+    });
+    vcx.simulate_keystrokes("ctrl-a i");
+    assert!(desk.read_with(&vcx, |d, _| d.inbox));
+    sent(&mut rx);
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| !d.inbox), "Escape closes it");
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "nothing typed into the terminal"
+    );
+    // With the Inbox closed, Escape is the agent's again.
+    vcx.simulate_keystrokes("escape");
+    assert!(
+        sent(&mut rx)
+            .iter()
+            .any(|u| matches!(u, Up::Input(1, b) if b == b"\x1b"))
+    );
+}
+
+/// The schedule sheet: a close button and Cancel to leave by mouse, Tab and Shift-Tab kept
+/// inside it, the focus back on New schedule when it closes, and what was typed kept by
+/// Escape and dropped by Cancel.
+#[gpui::test]
+fn the_schedule_sheet_traps_the_focus_and_keeps_its_draft(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Schedules, window, cx)));
+    vcx.run_until_parked();
+    let click = |vcx: &mut VisualTestContext, what: &'static str| {
+        let at = vcx
+            .debug_bounds(what)
+            .unwrap_or_else(|| panic!("{what} is not drawn"))
+            .center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+    };
+    click(&mut vcx, "new-schedule");
+    let (frame, back) = desk.read_with(&vcx, |d, _| {
+        let sheet = d.schedule_page.sheet.as_ref().expect("open");
+        (
+            sheet.frame.clone(),
+            sheet.back.clone().expect("New schedule had the focus"),
+        )
+    });
+    assert!(vcx.debug_bounds("schedule-sheet-close").is_some());
+    assert!(vcx.debug_bounds("schedule-sheet-cancel").is_some());
+    for keys in ["tab", "shift-tab"] {
+        for _ in 0..20 {
+            vcx.simulate_keystrokes(keys);
+            assert!(
+                vcx.update(|window, cx| frame.contains_focused(window, cx)),
+                "{keys} left the sheet"
+            );
+        }
+    }
+    // Back on the name field, words typed, Escape: closed, the focus on New schedule.
+    vcx.update(|window, cx| {
+        let name = desk
+            .read(cx)
+            .schedule_page
+            .sheet
+            .as_ref()
+            .expect("open")
+            .name
+            .clone();
+        let focus = name.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    });
+    vcx.simulate_input("nightly-tests");
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| d.schedule_page.sheet.is_none()));
+    assert!(vcx.update(|window, _| back.is_focused(window)));
+    click(&mut vcx, "new-schedule");
+    let (name, restored) = desk.read_with(&vcx, |d, cx| {
+        let sheet = d.schedule_page.sheet.as_ref().expect("open");
+        (sheet.name.read(cx).text.clone(), sheet.restored)
+    });
+    assert_eq!(name, "nightly-tests", "the draft is back");
+    assert!(restored, "and says it is not saved");
+    click(&mut vcx, "schedule-sheet-cancel");
+    assert!(desk.read_with(&vcx, |d, _| d.schedule_page.sheet.is_none()
+        && d.schedule_page.drafts.is_empty()));
+    click(&mut vcx, "new-schedule");
+    let name = desk.read_with(&vcx, |d, cx| {
+        d.schedule_page
+            .sheet
+            .as_ref()
+            .expect("open")
+            .name
+            .read(cx)
+            .text
+            .clone()
+    });
+    assert_eq!(name, "", "Cancel dropped it");
 }
 
 fn request_of(ups: &[Up], pick: impl Fn(&ControlRequest) -> bool) -> Option<ControlRequest> {
@@ -1227,6 +1368,24 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
     );
     let said = desk.read_with(&vcx, |d, _| d.settings.said.clone().unwrap_or_default());
     assert!(said.starts_with("Sound on: written as line"), "{said}");
+    // The file view marks the line away from its default with the word, not a tint alone.
+    vcx.run_until_parked();
+    // A selector is `&'static str`; a test's few leak nothing that matters.
+    let marker = |key: &str| -> &'static str {
+        let n = text
+            .lines()
+            .position(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{key} in {text}"));
+        Box::leak(format!("config-changed-{}", n + 1).into_boxed_str())
+    };
+    assert!(
+        vcx.debug_bounds(marker("sound =")).is_some(),
+        "sound = true is marked changed"
+    );
+    assert!(
+        vcx.debug_bounds(marker("mine =")).is_none(),
+        "a key qoop does not know is not a change"
+    );
 
     // `/` as a Turkish Q keyboard types it: shift-7.
     vcx.simulate_keystrokes("shift-7->/");

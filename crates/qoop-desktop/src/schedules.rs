@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use gpui::{AnyElement, Context, Entity, FontWeight, Role, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, Role, Window, div,
+    prelude::*, px,
+};
 use qoop_runtime::control::{ControlRequest, ScheduleInfo, ScheduleOp, ScheduleRun};
 use qoop_tui::schedules::{Preset, Timing};
 
@@ -51,10 +54,23 @@ pub struct SchedulePage {
     pub(crate) task: Option<(String, Option<state::Strip>)>,
     pub(crate) produced: Option<Produced>,
     pub sheet: Option<ScheduleSheet>,
+    /// Sheets closed with changes in them, by machine and the schedule edited (`None` for a
+    /// new one): the next open of the same gives one back as it was left (STATE-41).
+    pub(crate) drafts: HashMap<(usize, Option<i64>), ScheduleSheet>,
     /// Pause, Resume and Run now in flight, by id: the schedule and what was asked.
     pub(crate) writes: HashMap<String, (i64, Write)>,
     /// What the last of those came to, per schedule, as a sentence.
     pub said: HashMap<i64, String>,
+}
+
+impl SchedulePage {
+    /// The sheet, open or kept as a draft, whose Save asked `id`.
+    fn saving(&mut self, id: &str) -> Option<&mut ScheduleSheet> {
+        self.sheet
+            .iter_mut()
+            .chain(self.drafts.values_mut())
+            .find(|s| s.id.as_deref() == Some(id))
+    }
 }
 
 /// What a button asked of a schedule.
@@ -101,6 +117,7 @@ pub struct ScheduleSheet {
     pub preset: Preset,
     /// The agent by name: a schedule's own stays its own even when this Mac does not offer it.
     pub agent: String,
+    pub(crate) first_agent: String,
     pub space: Option<String>,
     /// The schedule as it was when Edit opened, and the timing the sheet showed for it: only
     /// what the person changed is sent back.
@@ -108,6 +125,12 @@ pub struct ScheduleSheet {
     pub(crate) first_timing: (Preset, String, String),
     pub(crate) id: Option<String>,
     pub refused: Option<String>,
+    /// The sheet's own frame: Tab and Shift-Tab never leave it.
+    pub frame: FocusHandle,
+    /// What had the focus when the sheet opened: it gets it back on close.
+    pub back: Option<FocusHandle>,
+    /// Given back from a draft: the sheet says it is not saved yet.
+    pub restored: bool,
 }
 
 impl Desk {
@@ -268,7 +291,12 @@ impl Desk {
 
     /// The report's task (`Tasks`) or the folder's changes (`Changes`) came: whether it was
     /// one of the report's.
-    pub(crate) fn report_came(&mut self, reply: &qoop_runtime::control::ControlResponse) -> bool {
+    pub(crate) fn report_came(
+        &mut self,
+        reply: &qoop_runtime::control::ControlResponse,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         use qoop_runtime::control::ControlResponse as R;
         let id = reply.request_id().to_string();
         let machine = self.machine_shown_name();
@@ -325,24 +353,23 @@ impl Desk {
                 }
                 true
             }
-            R::Failed { reason, .. }
-                if page
-                    .sheet
-                    .as_ref()
-                    .is_some_and(|s| s.id.as_deref() == Some(id.as_str())) =>
-            {
-                if let Some(sheet) = page.sheet.as_mut() {
+            R::Failed { reason, .. } if page.saving(&id).is_some() => {
+                if let Some(sheet) = page.saving(&id) {
                     sheet.refused = Some(write_refusal(reason, &machine));
                 }
                 true
             }
-            R::ScheduleWritten { .. }
+            // Saved: the sheet closes, and a draft closed while it saved is no draft any more.
+            R::ScheduleWritten { .. } if page.saving(&id).is_some() => {
+                page.drafts
+                    .retain(|_, s| s.id.as_deref() != Some(id.as_str()));
                 if page
                     .sheet
                     .as_ref()
-                    .is_some_and(|s| s.id.as_deref() == Some(id.as_str())) =>
-            {
-                page.sheet = None;
+                    .is_some_and(|s| s.id.as_deref() == Some(id.as_str()))
+                {
+                    self.close_schedule_sheet(false, window, cx);
+                }
                 true
             }
             _ => false,
@@ -455,19 +482,39 @@ impl Desk {
         let field = cx.new(|cx| {
             let mut f = Field::new(placeholder, colors, cx);
             f.text = text.to_string();
+            // A stop in the window's Tab order, which the sheet's trap goes round.
+            f.focus = f.focus.clone().tab_stop(true);
             f
         });
         cx.observe(&field, |_, _, cx| cx.notify()).detach();
         field
     }
 
-    /// New schedule, or Edit of `editing`: one sheet, filled from the schedule when editing.
+    /// New schedule, or Edit of `editing`: one sheet, filled from the schedule when editing, or
+    /// the draft of the same left closed with changes in it.
     fn open_sheet(
         &mut self,
         editing: Option<&ScheduleInfo>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(sheet) = self.schedule_page.sheet.as_ref() {
+            // One open already: never built again over what is typed in it.
+            let focus = sheet.name.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            return;
+        }
+        let back = window.focused(cx);
+        let key = (self.sched_machine(), editing.map(|s| s.id));
+        if let Some(mut draft) = self.schedule_page.drafts.remove(&key) {
+            draft.back = back;
+            draft.restored = true;
+            let focus = draft.name.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            self.schedule_page.sheet = Some(draft);
+            cx.notify();
+            return;
+        }
         let (preset, time, cron) = match editing {
             Some(s) if s.watch.is_some() => (
                 Preset::OnChange,
@@ -519,14 +566,81 @@ impl Desk {
             folder,
             prompt,
             preset,
+            first_agent: agent.clone(),
             agent,
             space: editing.and_then(|s| s.space.clone()),
             original: editing.cloned(),
             first_timing,
             id: None,
             refused: None,
+            frame: cx.focus_handle(),
+            back,
+            restored: false,
         });
         cx.notify();
+    }
+
+    /// Whether anything in the sheet differs from how it opened.
+    fn sheet_changed(sheet: &ScheduleSheet, cx: &Context<Self>) -> bool {
+        let text = |f: &Entity<Field>| f.read(cx).text.clone();
+        let was = sheet.original.as_ref();
+        let (preset, time, cron) = &sheet.first_timing;
+        text(&sheet.name) != was.map_or("", |s| s.name.as_str())
+            || text(&sheet.folder) != was.map_or("", |s| s.cwd.as_str())
+            || text(&sheet.prompt) != was.map_or("", |s| s.prompt.as_str())
+            || (sheet.preset, text(&sheet.time), text(&sheet.cron))
+                != (*preset, time.clone(), cron.clone())
+            || sheet.agent != sheet.first_agent
+    }
+
+    /// Close the schedule sheet and give the focus back. `keep`: what was changed in it stays
+    /// for the next open of the same (Escape, Close); Cancel and a save do not keep it.
+    pub(crate) fn close_schedule_sheet(
+        &mut self,
+        keep: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut sheet) = self.schedule_page.sheet.take() else {
+            return;
+        };
+        let back = sheet.back.take();
+        if keep && (sheet.restored || Self::sheet_changed(&sheet, cx)) {
+            let key = (self.sched_machine(), sheet.editing);
+            self.schedule_page.drafts.insert(key, sheet);
+        }
+        self.focus_back(back, window, cx);
+        cx.notify();
+    }
+
+    /// Keys while the schedule sheet is on screen, heard before anything inside it: Tab and
+    /// Shift-Tab go round its own controls only (WEB-05), Escape closes it and keeps what was
+    /// changed. Whether the key was taken.
+    pub(crate) fn schedule_sheet_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sheet) = self
+            .schedule_page
+            .sheet
+            .as_ref()
+            .filter(|_| self.page == Page::Schedules)
+        else {
+            return false;
+        };
+        let k = &event.keystroke;
+        match crate::keys::typed(k) {
+            "tab" => {
+                let frame = sheet.frame.clone();
+                ui::trap_tab(&frame, k.modifiers.shift, window, cx);
+            }
+            "escape" => self.close_schedule_sheet(true, window, cx),
+            _ => return false,
+        }
+        cx.stop_propagation();
+        true
     }
 
     /// The sheet's timing as the daemon takes it, or why it cannot be.
@@ -540,7 +654,7 @@ impl Desk {
         )
     }
 
-    fn save_sheet(&mut self, cx: &mut Context<Self>) {
+    fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(sheet) = self.schedule_page.sheet.as_ref() else {
             return;
         };
@@ -614,8 +728,7 @@ impl Desk {
                     })
                 {
                     // Nothing changed: nothing to send.
-                    self.schedule_page.sheet = None;
-                    cx.notify();
+                    self.close_schedule_sheet(false, window, cx);
                     return;
                 }
                 edit
@@ -639,14 +752,10 @@ impl Desk {
         cx.notify();
     }
 
-    /// Escape on this page: the sheet, else the calendar. Whether it was taken.
+    /// Escape on this page: the calendar (the sheet takes its own, `schedule_sheet_key`).
+    /// Whether it was taken.
     pub(crate) fn schedules_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        let page = &mut self.schedule_page;
-        let taken = if page.sheet.take().is_some() {
-            true
-        } else {
-            std::mem::take(&mut page.calendar)
-        };
+        let taken = std::mem::take(&mut self.schedule_page.calendar);
         if taken {
             cx.notify();
         }
@@ -749,6 +858,7 @@ impl Desk {
 
     fn new_button(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         ui::pill("new-schedule", "New schedule", t)
+            .debug_selector(|| "new-schedule".into())
             .child(ui::icon(Icon::Plus, 14., c(t.t1)))
             .child("New schedule")
             .on_click(cx.listener(|this, _, window, cx| this.open_sheet(None, window, cx)))
@@ -815,8 +925,8 @@ impl Desk {
                     .py(px(6.))
                     .rounded(px(10.))
                     .bg(c(t.card))
-                    .when(on, |d| ui::paint(d, t.picked()))
                     .when(this_day == today, |s| s.border_color(ca(t.line)))
+                    .when(on, |d| ui::picked(d, t))
                     .text_size(px(12.5))
                     .child(
                         div()
@@ -1601,20 +1711,50 @@ impl Desk {
                 )
         };
         let preset = sheet.preset;
+        let title = if sheet.editing.is_some() {
+            "Edit schedule"
+        } else {
+            "New schedule"
+        };
+        // The way out by mouse, as New work's: Close keeps what was changed, Cancel drops it.
+        let close = ui::control(
+            "schedule-sheet-close",
+            Role::Button,
+            format!("Close {title}"),
+            t,
+        )
+        .debug_selector(|| "schedule-sheet-close".into())
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .child(ui::icon(Icon::Close, 14., c(t.t2)))
+        .on_click(cx.listener(|this, _, window, cx| this.close_schedule_sheet(true, window, cx)));
         let body = div()
+            .id("schedule-sheet-frame")
+            .track_focus(&sheet.frame)
             .flex()
             .flex_col()
             .gap(px(8.))
             .child(
                 div()
-                    .text_size(px(15.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if sheet.editing.is_some() {
-                        "Edit schedule"
-                    } else {
-                        "New schedule"
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(ui::kbd("esc", t))
+                    .child(close),
             )
+            .when(sheet.restored, |d| {
+                d.child(quiet("Not saved yet: as you left it.", t))
+            })
             .child(row("Name", &sheet.name))
             .child(
                 div()
@@ -1710,12 +1850,22 @@ impl Desk {
                     .flex()
                     .gap(px(8.))
                     .child(div().flex_1())
-                    .child(ui::kbd("esc", t))
+                    .child(
+                        ui::pill("schedule-sheet-cancel", "Cancel", t)
+                            .debug_selector(|| "schedule-sheet-cancel".into())
+                            .h(px(30.))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_schedule_sheet(false, window, cx)
+                            })),
+                    )
                     .child(
                         ui::pill("sheet-save", "Save", t)
                             .h(px(30.))
                             .child("Save")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_sheet(cx))),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_sheet(window, cx)),
+                            ),
                     ),
             );
         ui::sheet("schedule-sheet", "Schedule", t, body.into_any_element()).into_any_element()

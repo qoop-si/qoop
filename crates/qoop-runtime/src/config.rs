@@ -111,7 +111,6 @@ pub fn read() -> Lifecycle {
     read_from(&path())
 }
 
-/// What a person is told about a file that is not TOML.
 /// Whether qoop's config writer can write a file with this text: the whole of it is TOML. The
 /// readers are kinder (a bad line costs only its own setting), the writer is not, since writing
 /// over a line it cannot read would lose what a person was typing.
@@ -119,6 +118,7 @@ pub fn writable(text: &str) -> bool {
     text.parse::<toml_edit::DocumentMut>().is_ok()
 }
 
+/// What a person is told about a file that is not TOML.
 fn not_toml(path: &Path) -> String {
     format!(
         "{} is not TOML; fix it first (qoop config says where)",

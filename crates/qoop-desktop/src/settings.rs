@@ -576,7 +576,17 @@ impl Desk {
                                     .text_color(c(crate::theme::DARK.t3))
                                     .child(number.to_string()),
                             )
-                            .child(div().whitespace_nowrap().child(line.to_string())),
+                            .child(div().whitespace_nowrap().child(line.to_string()))
+                            // The word, as on the switch rows: the tint alone is about 1.15:1.
+                            .when(marked.contains(&number), |d| {
+                                d.child(
+                                    div()
+                                        .debug_selector(move || format!("config-changed-{number}"))
+                                        .flex_none()
+                                        .text_color(c(crate::theme::DARK.t2))
+                                        .child("changed"),
+                                )
+                            }),
                     )
                     .children(problems.into_iter().map(|p| {
                         div()
