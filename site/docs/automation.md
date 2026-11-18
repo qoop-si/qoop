@@ -16,7 +16,7 @@ qoop context 3                   all of the above in one call
 ## Write
 
 ```
-qoop prompt 3 "fix the failing test"        text plus Enter; refused while it is blocked
+qoop prompt 3 "fix the failing test"        text plus Enter; refused while it waits on an answer
 qoop send 3 "y" --enter                     raw typing, no checks
 qoop send 3 --paste "long text"             as a paste, inside the paste markers when the program asked
 qoop send 3 --key esc --key enter           named keys
@@ -98,7 +98,8 @@ worktree only, never commit, push, open a PR, merge, close its tab or start agen
 with a short self-report. Every racer starts from one commit: `HEAD` of the checkout you run it
 in, or `--base`; uncommitted changes there are not in the racers. A worker agent's terminal
 cannot start or drop a race; your own shell and qass can. `--wait` returns once every racer
-finished, failed, is blocked, asleep, closed, quit to its shell or never started, a line each.
+finished, failed, waits on an answer (its line says `blocked`), asleep, closed, quit to its
+shell or never started, a line each.
 It exits 0 when every racer finished, 1 when any ended another way or qoop stopped while it
 waited, and 124 past `--timeout`. A blocked racer waits for you: its line names the `qoop wait`
 that keeps waiting on it.

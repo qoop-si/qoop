@@ -2091,7 +2091,7 @@ fn program_of(command: &str) -> &str {
     // Past any `NAME=value` in front, as the TUI's schedule form reads a launcher.
     let first = command
         .split_whitespace()
-        .find(|w| !w.contains('='))
+        .find(|w| !w.contains('=') && *w != "env")
         .unwrap_or("");
     first.rsplit('/').next().unwrap_or("")
 }
@@ -2850,6 +2850,7 @@ pub(crate) mod tests {
             takes_prompt("CLAUDE_CONFIG_DIR=/tmp/c claude"),
             "past an env assignment"
         );
+        assert!(takes_prompt("env FOO=1 claude"), "past env");
     }
 
     fn schedule(name: &str, cron: Option<&str>, next_at: Option<i64>) -> ScheduleInfo {

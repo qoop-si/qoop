@@ -198,12 +198,12 @@ pub fn moment(at: i64, now: i64, zone: Zone) -> String {
     }
 }
 
-/// The program a launcher's command line starts: its first word that is not `NAME=value`,
+/// The program a launcher's command line starts: its first word that is not `NAME=value` or `env`,
 /// without its folder.
 fn program_of(command: &str) -> &str {
     command
         .split_whitespace()
-        .find(|w| !w.contains('='))
+        .find(|w| !w.contains('=') && *w != "env")
         .map_or("", |w| w.rsplit('/').next().unwrap_or(w))
 }
 
