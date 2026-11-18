@@ -1,7 +1,7 @@
 //! The window headless, on GPUI's test platform: home from fixture rows, the prefix keys, New
 //! work's keyboard path, and the input method in the text field.
 
-use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
+use gpui::{AppContext, Entity, EntityInputHandler, TestAppContext, VisualTestContext};
 use qoop_runtime::control::{ControlRequest, ControlResponse, LinkState};
 use tokio::sync::mpsc::UnboundedReceiver;
 
