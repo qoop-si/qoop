@@ -833,19 +833,25 @@ pub fn sheet(id: &'static str, label: &str, t: &Theme, body: AnyElement) -> Stat
         .items_center()
         .justify_center()
         .bg(ca(if t.dark { 0x000000a0 } else { 0x26262640 }))
-        .child(
+        // A sheet taller than the room it opens in scrolls inside it, its top never above
+        // the window: a remote's schedule sheet carries a line more than This Mac's.
+        .p(px(12.))
+        .child(scroll(
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .role(Role::Dialog)
                 .aria_label(label.to_string())
                 .w(px(560.))
+                .max_h_full()
+                .overflow_y_scroll()
                 .p(px(20.))
                 .rounded(px(18.))
                 .bg(c(t.pop))
                 .border_1()
                 .border_color(ca(t.line))
                 .child(body),
-        )
+        ))
 }
 
 #[cfg(test)]

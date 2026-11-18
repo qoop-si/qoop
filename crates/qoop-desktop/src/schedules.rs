@@ -525,7 +525,7 @@ impl Desk {
 
     /// New schedule, or Edit of `editing`: one sheet, filled from the schedule when editing, or
     /// the draft of the same left closed with changes in it.
-    fn open_sheet(
+    pub(crate) fn open_sheet(
         &mut self,
         editing: Option<&ScheduleInfo>,
         window: &mut Window,
@@ -1377,7 +1377,14 @@ impl Desk {
         let Some(s) = self.shown_schedules().iter().find(|s| s.id == schedule) else {
             return div().into_any_element();
         };
-        let Some(run_id) = run_id else {
+        // Opened before it ran, and a run has started since: that run's report, not "Not run
+        // yet" over a run that waits.
+        let newest = runs
+            .iter()
+            .filter(|r| r.schedule == schedule)
+            .max_by_key(|r| r.started_at)
+            .map(|r| r.id);
+        let Some(run_id) = run_id.or(newest) else {
             return self.unrun_report(s, runs, t, cx);
         };
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
@@ -1832,27 +1839,44 @@ impl Desk {
 
     /// New schedule and Edit: name, when (the TUI's presets), agent, space, folder, prompt, the
     /// first run read back, Save.
+    /// The sheet's line on when it runs: "First run: Thu 09:00", or "Next run" when editing.
+    /// A one-off whose time is as it opened runs on its own date, which the time field (a clock
+    /// only) does not hold: that date, as Save keeps it.
+    pub(crate) fn sheet_first_line(&self, sheet: &ScheduleSheet, cx: &Context<Self>) -> String {
+        let (first_preset, first_time, _) = &sheet.first_timing;
+        let kept = sheet.original.as_ref().and_then(|o| o.at).filter(|_| {
+            sheet.preset == Preset::Once
+                && *first_preset == Preset::Once
+                && sheet.time.read(cx).text == *first_time
+        });
+        let at = match kept {
+            Some(at) => Ok(Some(at)),
+            None => self
+                .sheet_timing(sheet, cx)
+                .map(|timing| qoop_tui::schedules::first_run(&timing, self.now, self.zone)),
+        };
+        match at {
+            // A schedule that ran already runs next, not first (C-9).
+            Ok(Some(at)) => format!(
+                "{}: {}",
+                if sheet.editing.is_some() {
+                    "Next run"
+                } else {
+                    "First run"
+                },
+                state::clock_at(at, self.now, self.zone)
+            ),
+            Ok(None) => "A watch: its first check notes what is there, then new lines start a run."
+                .to_string(),
+            Err(why) => format!("When: {why}"),
+        }
+    }
+
     fn schedule_sheet(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(sheet) = self.schedule_page.sheet.as_ref() else {
             return div().into_any_element();
         };
-        let first = match self.sheet_timing(sheet, cx) {
-            Ok(timing) => match qoop_tui::schedules::first_run(&timing, self.now, self.zone) {
-                // A schedule that ran already runs next, not first (C-9).
-                Some(at) => format!(
-                    "{}: {}",
-                    if sheet.editing.is_some() {
-                        "Next run"
-                    } else {
-                        "First run"
-                    },
-                    state::clock_at(at, self.now, self.zone)
-                ),
-                None => "A watch: its first check notes what is there, then new lines start a run."
-                    .to_string(),
-            },
-            Err(why) => format!("When: {why}"),
-        };
+        let first = self.sheet_first_line(sheet, cx);
         let agent = sheet.agent.clone();
         let row = |label: &str, field: &Entity<Field>| {
             div()

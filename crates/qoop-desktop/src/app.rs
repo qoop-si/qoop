@@ -1583,7 +1583,16 @@ impl Desk {
             )
             .when_some(self.pet_of(m), |d, pet| d.child(pet))
             .child(div().text_color(c(t.t1)).child(name.clone()))
-            .child(div().text_color(c(ink)).child(format!("{word}{tail}")))
+            // The longest word ("not reached while This Mac is down, as of 22:36") wraps in the
+            // sidebar's width rather than run out of it uncut.
+            .child(
+                div()
+                    .debug_selector(move || format!("reach-word-{m}"))
+                    .min_w_0()
+                    .whitespace_normal()
+                    .text_color(c(ink))
+                    .child(format!("{word}{tail}")),
+            )
             .when(retry && (away || retrying) && !behind, |d| {
                 d.child(
                     ui::control(
