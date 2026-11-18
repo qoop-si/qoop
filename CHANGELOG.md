@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.20.0](https://github.com/qoop-si/qoop/compare/v0.19.1...v0.20.0) (2026-11-18)
+
+
+### New
+
+* **desktop:** an agent's question cards on its Session page ([03c1bc2](https://github.com/qoop-si/qoop/commit/03c1bc2978b4b6c96bd03ba6e0db908a58fafb82))
+* hand a question card to qass from its agent's tab ([b9c92ec](https://github.com/qoop-si/qoop/commit/b9c92ec0bade5c2788e261017fb9155988217e0c))
+* **tui:** a questions rail on agent tabs, task progress on TaskRef ([bbbc386](https://github.com/qoop-si/qoop/commit/bbbc3869ac72da4f3690edf02839296501a59b6e))
+* **tui:** count an agent's open question cards beside its name ([ed3f91d](https://github.com/qoop-si/qoop/commit/ed3f91d096a363aa7277f24d56a914684c5f5e99))
+* **tui:** name the questions pane's keys on the key row ([5ce30f7](https://github.com/qoop-si/qoop/commit/5ce30f707dce61bc6ac35c8dec17652503db8a78))
+* **tui:** offer the hand-off to qass under an opened card's answers ([dd56531](https://github.com/qoop-si/qoop/commit/dd56531b50be85792b933e9a76c65948208cdf1c))
+* **tui:** scope the question pane to one agent's cards ([dcdd210](https://github.com/qoop-si/qoop/commit/dcdd210b0ba2ee3274f36483ffe28f1007bcac8a))
+* **tui:** unfold an agent tab's questions rail to its pane ([b61a8ca](https://github.com/qoop-si/qoop/commit/b61a8ca09737e086feb1b691087f300b841346df))
+
+
+### Fixed
+
+* a card handed to qass names itself, and keeps his words ([e3399d2](https://github.com/qoop-si/qoop/commit/e3399d2691512480ca016e340a966fc311a51325))
+* **tui:** a refused answer stays in the questions pane only ([e6afe50](https://github.com/qoop-si/qoop/commit/e6afe506dc25979626a987364f4974ef66a5e15e))
+* **tui:** questions pane review fixes ([46e2d8b](https://github.com/qoop-si/qoop/commit/46e2d8b7d09f5596d9c30b8e4225e55a57a35601))
+* **tui:** sidebar count on sleeping rows, quiet on stale rows ([3f5ed60](https://github.com/qoop-si/qoop/commit/3f5ed601dd9d3db821b3cf208c120839af1ab33a))
+* **tui:** tab rail from the first size, no lone pane title, u32 steps ([b190c9f](https://github.com/qoop-si/qoop/commit/b190c9f565835c88b7d0ee6d650dec61a3e2b69e))
+
 ## [0.19.1](https://github.com/qoop-si/qoop/compare/v0.19.0...v0.19.1) (2026-11-18)
 
 
