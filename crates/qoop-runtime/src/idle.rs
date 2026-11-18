@@ -302,7 +302,10 @@ pub fn running_background_agents(screen: &[String]) -> usize {
         .map(|row| row.trim())
         .filter(|row| !row.is_empty())
         .collect();
-    let lead = rows.first().is_some_and(|lead| lead.starts_with('⏺'));
+    // Claude Code draws its record mark `⏺` on macOS and `●` elsewhere (seen on Linux).
+    let lead = rows
+        .first()
+        .is_some_and(|lead| lead.starts_with(['⏺', '●']));
     if !lead && !rows.iter().all(|row| row.starts_with('◯')) {
         return 0;
     }
@@ -930,6 +933,9 @@ mod tests {
             "  ◯ rs-reader    Find the 20 largest .rs files under /Users/u...  1m 5s · ↑ 50 tokens",
         ]);
         assert_eq!(running_background_agents(&s), 2);
+        // Off macOS the lead row's mark is `●`: the same agents still count.
+        let linux: Vec<String> = s.iter().map(|row| row.replace('⏺', "●")).collect();
+        assert_eq!(running_background_agents(&linux), 2);
     }
 
     #[test]

@@ -607,6 +607,24 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
         "draft_after_turn",
         Idle,
     );
+    // Linux draws the note's mark as `●`, not `⏺`. Measured on a Linux remote, Claude Code
+    // with its update notice, 2026-11-18: a sent-looking `devam et` sat unsent for 80 minutes
+    // while the tab read working.
+    assert_rule(
+        "claude",
+        &[
+            "  ⎿  Skills restored (chatwoot-support, crw-public, writing-style, commit, hallet)",
+            "",
+            "● Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json",
+            "                                                                  ✔ Update installed · Restart to update",
+            RULE,
+            "❯ devam et",
+            RULE,
+            footer,
+        ],
+        "draft_after_turn",
+        Idle,
+    );
     // A prompt just sent sits between the old summary and the composer.
 
     assert_not_rule(
