@@ -2104,7 +2104,8 @@ pub(crate) async fn type_into(
 /// The claim note of a card the owner handed to qass: kept while it is queued, so the route
 /// recomputed when it is typed still goes to qass. A reopen clears it.
 const HANDED_NOTE: &str = "to qass";
-/// What qass reads after the card's handle for a hand-off: `<handle> you decide`.
+/// What qass reads after the card's handle for a hand-off: `<card> <handle> you decide`. The card
+/// leads, since one agent's cards share a handle and qass relays by the card's id.
 const HANDED_WORDS: &str = "you decide";
 
 /// Where an answer goes.
@@ -2255,6 +2256,12 @@ fn line_for(row: &AskRow, route: Route) -> Option<String> {
                 .map(|o| (o.key.as_str(), o.words.as_str()));
             Some(line_for_worker(&row.card, &said, chose))
         }
+        // A hand-off names its card: the relay that closes it says which.
+        Route::Qass(_) if row.note.as_deref() == Some(HANDED_NOTE) => Some(format!(
+            "{} {}",
+            row.card,
+            line_for_qass(&body.handle, option, text)
+        )),
         Route::Qass(_) => Some(line_for_qass(&body.handle, option, text)),
         Route::NoQass => None,
     }
@@ -2963,7 +2970,7 @@ mod tests {
     /// A card the owner handed to qass is claimed as the answer does it: no longer open, and
     /// when it is typed (the route worked out again from the stored row, as `flush_card` does)
     /// it goes to qass even though its worker is the same conversation and at rest, typed as
-    /// exactly `<handle> you decide`; with no qass it is refused. Given back (`reopen_ask`
+    /// exactly `<card> <handle> you decide`; with no qass it is refused. Given back (`reopen_ask`
     /// clears the note), it routes as any card until he hands it again.
     #[test]
     fn a_card_handed_to_qass_goes_to_qass_until_it_is_reopened() {
@@ -2978,7 +2985,7 @@ mod tests {
         assert_eq!(route(&row, worker.as_ref(), Some(9)), Route::Qass(9));
         assert_eq!(
             line_for(&row, Route::Qass(9)).as_deref(),
-            Some("billing you decide")
+            Some("Q5 billing you decide")
         );
         assert_eq!(route(&row, worker.as_ref(), None), Route::NoQass);
         s.reopen_ask("Q5", None).unwrap();
@@ -2992,6 +2999,43 @@ mod tests {
             .unwrap();
         let row = s.ask("Q5").unwrap().unwrap();
         assert_eq!(route(&row, worker.as_ref(), Some(9)), Route::Worker(5));
+    }
+
+    /// qass's relay of a handed card closes that card by the id it was handed with, and leaves
+    /// another open card alone.
+    #[tokio::test]
+    async fn the_relay_of_a_handed_card_closes_that_card_only() {
+        let agents = AgentRegistry::new().expect("registry");
+        let connections = Arc::new(ConnectionRegistry::default());
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_workspace(QASS_SPACE, 2).unwrap();
+        s.create_terminal(7, ws, "/tmp", "/bin/sh", 1).unwrap();
+        s.create_terminal(8, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let body =
+            r#"{"handle":"billing","urgency":"now","doing":"d","why":"w","asks":"a","options":[]}"#;
+        s.add_ask("Q5", None, Some(7), None, body, 1).unwrap();
+        s.add_ask("E1", None, Some(8), None, body, 1).unwrap();
+        s.claim_ask("Q5", "queued", None, HANDED_WORDS, HANDED_NOTE, 2)
+            .unwrap();
+        assert!(s.deliver_ask("Q5", "passed", "passed to qass", 3).unwrap());
+        let store = StoreHandle::new(s);
+        let relay = "The owner answered Q5: \"billing you decide\", and qass decided: wait. \
+                     Do only what that allows, and ask before anything more.";
+        relayed(Some(relay), 7, &agents, &connections, &store).await;
+        let status = |card: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .run(move |s| s.ask(card))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+            }
+        };
+        assert_eq!(status("Q5").await, "closed");
+        assert_eq!(status("E1").await, "open");
     }
 
     /// An answer frame from before the hand-off reads as no hand-off, and none is written

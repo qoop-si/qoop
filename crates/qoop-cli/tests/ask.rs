@@ -1908,3 +1908,68 @@ fn a_hand_qass_never_took_runs_out_and_its_row_says_so() {
     let off = hand_to_qass(&rt, &mut ui, "h2", &[worker]);
     assert_eq!(refusal(&off), "not_watching");
 }
+
+/// A card the owner hands to qass from its agent's tab, written as the interface writes it
+/// (`AskWrite` `Answer` with `to_qass`): an option or words sent with it are dropped, it is
+/// passed to qass although its worker is the same conversation and at rest, qass reads
+/// `<card> <handle> you decide`, and the worker hears nothing of it. A terminal never hands one.
+#[test]
+fn a_card_handed_to_qass_goes_to_qass_even_with_its_worker_at_rest() {
+    use qoop_runtime::control::{AskOp, AskResult, ControlRequest, ControlResponse};
+    let stack = Stack::start();
+    let korea = stack.agent("work", "korea", Some("sess-korea"));
+    let shell = stack.open("qass", "qassshell", &[]);
+    let _qass = stack.agent("qass", "qass", None);
+    add(&stack, &shell, "E1", &format!("T{korea}"), "korea");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let hand = |id: &str, terminal: Option<u32>| ControlRequest::AskWrite {
+        id: id.into(),
+        terminal,
+        token: None,
+        action: AskOp::Answer {
+            card: "E1".into(),
+            option: Some("a".into()),
+            text: Some("words that are not sent".into()),
+            seen: None,
+            to_qass: true,
+        },
+    };
+    let number = korea.parse::<u32>().expect("a terminal number");
+    let from_tab = rt.block_on(ui.control(&hand("h1", Some(number)), qoop_testkit::PATIENCE));
+    assert!(
+        matches!(from_tab, Some(ControlResponse::Failed { .. })),
+        "{from_tab:?}"
+    );
+    assert_eq!(stack.card_status("E1"), "open");
+    let owner = rt.block_on(ui.control(&hand("h2", None), qoop_testkit::PATIENCE));
+    assert!(
+        matches!(
+            owner,
+            Some(ControlResponse::AskWritten {
+                result: AskResult::Passed,
+                ..
+            })
+        ),
+        "{owner:?}"
+    );
+    assert_eq!(stack.card_status("E1"), "queued");
+    // qass was typed into when its tab opened: at rest for 30 seconds, it is typed to once.
+    std::thread::sleep(Duration::from_secs(31));
+    assert!(
+        stack.wait(|| stack.log("qass").contains("E1 korea you decide")),
+        "{:?}",
+        stack.log("qass")
+    );
+    let typed = stack.log("qass");
+    assert!(
+        !typed.contains("korea A") && !typed.contains("words that are not sent"),
+        "{typed:?}"
+    );
+    assert!(
+        !stack.log("korea").contains("The owner answered E1"),
+        "{:?}",
+        stack.log("korea")
+    );
+    assert_eq!(stack.card_status("E1"), "passed");
+}
