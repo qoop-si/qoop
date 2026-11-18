@@ -84,6 +84,15 @@ pub struct Paint<'a> {
     pub cards: &'a [AskInfo],
 }
 
+/// The cards `terminal`'s agent waits on: open, not handed to qass or answered. What the rail
+/// and the sidebar's count both read.
+pub fn open_cards(cards: &[AskInfo], terminal: u32) -> Vec<&AskInfo> {
+    cards
+        .iter()
+        .filter(|c| c.status == "open" && c.terminal == Some(terminal))
+        .collect()
+}
+
 /// A stage in a word that fits the wide rail.
 pub fn stage_word(stage: &str) -> &str {
     match stage {
@@ -115,11 +124,7 @@ pub fn rows(paint: &Paint, task: Option<&TaskRef>, fade: bool) -> Vec<String> {
         )
     };
     let blank = " ".repeat(w);
-    let open: Vec<&AskInfo> = paint
-        .cards
-        .iter()
-        .filter(|c| c.status == "open" && c.terminal == Some(paint.terminal))
-        .collect();
+    let open = open_cards(paint.cards, paint.terminal);
 
     let mut foot = Vec::new();
     if let Some(task) = task {

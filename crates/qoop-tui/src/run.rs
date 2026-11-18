@@ -1632,6 +1632,7 @@ impl State {
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
                 agent_order: self.agent_view.as_ref(),
                 tab_rail: self.tab_rail_paint(),
+                cards: &self.asks.live,
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
                 doze_open: &self.doze_open,
@@ -2911,6 +2912,7 @@ impl State {
             icons: crate::icons::on(),
             nav: self.modes.side.as_ref(),
             order: self.agent_view.as_ref(),
+            cards: &self.asks.live,
         }
     }
 
@@ -26752,11 +26754,19 @@ mod tests {
                 "the sidebar has something in it"
             );
             type Change = Box<dyn Fn(&mut State)>;
+            // Cards about no agent of the column: an agent's own count beside its name is the
+            // owner's asked change (left-sidebar.md, 2026-11-18); here only the panes move.
+            fn loose(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
+                qoop_runtime::control::AskInfo {
+                    terminal: None,
+                    ..ask_card(n, handle)
+                }
+            }
             let variants: Vec<(&str, Change)> = vec![
                 (
                     "a card brought up beside the board",
                     Box::new(|s| {
-                        s.asks.take(vec![ask_card(1, "korea")], Vec::new());
+                        s.asks.take(vec![loose(1, "korea")], Vec::new());
                         s.asks.raised = true;
                     }),
                 ),
@@ -26764,7 +26774,7 @@ mod tests {
                     "three waiting on the rail",
                     Box::new(|s| {
                         s.asks.take(
-                            vec![ask_card(1, "a"), ask_card(2, "b"), ask_card(3, "c")],
+                            vec![loose(1, "a"), loose(2, "b"), loose(3, "c")],
                             Vec::new(),
                         );
                     }),
@@ -26795,6 +26805,10 @@ mod tests {
                 (
                     "zoomed",
                     Box::new(|s| s.layouts.get_mut(&9).unwrap().zoomed = Some(5)),
+                ),
+                (
+                    "the agents' tabs without their rails",
+                    Box::new(|s| s.asks.unsupported = true),
                 ),
             ];
             for (what, apply) in variants {
@@ -30740,6 +30754,8 @@ mod tests {
             (cells[0].as_str(), cells[2].as_str()),
             (" \u{2814}1", " \u{2814}Q8")
         );
+        // The agent's row in the column counts it too.
+        assert!(plain(&screen::paint(&s.frame())).contains("claude \u{2814}1"));
         // A task on no item: its stage word alone under the rule.
         let task = s.rows[0].task.as_mut().unwrap();
         (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
