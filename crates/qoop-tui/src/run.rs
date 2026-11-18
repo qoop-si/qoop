@@ -31323,6 +31323,25 @@ mod tests {
         );
     }
 
+    /// The opened card offers the hand-off on its own row under the answers, and it is no
+    /// numbered answer: the number after the last answer sends nothing.
+    #[test]
+    fn the_opened_card_offers_the_hand_off_on_its_own_row() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        tabq_keys(&mut s, b"\r", 0x01);
+        let text = pane_text(&s);
+        assert!(
+            text.contains("[2] pick b")
+                && text.contains("[q] hand to qass qass answers it for you"),
+            "{text}"
+        );
+        assert!(!text.contains("[3]"), "{text}");
+        tabq_keys(&mut s, b"3", 0x01);
+        assert!(s.asks.tick(std::time::Instant::now()).0.is_empty());
+    }
+
     /// Opened in place, a card shows its whole question and its answers while the other card
     /// stays one folded row: an accordion of two, one open.
     #[test]
