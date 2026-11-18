@@ -3921,7 +3921,7 @@ mod tests {
         );
         let blocked = grant(serde_json::json!({"state": "blocked"}));
         let why = person_refusal(None, 4, 100, Some(&blocked)).expect("blocked");
-        assert!(why.contains("blocked"), "{why}");
+        assert!(why.contains("waiting on an answer"), "{why}");
         let asleep = grant(serde_json::json!({"state": "sleeping"}));
         assert!(person_refusal(None, 4, 100, Some(&asleep)).is_some());
         // The plugin's own pane: even a draft there does not hold it, a blocked one still does.
@@ -4620,7 +4620,7 @@ mod tests {
         assert!(
             value["refusal"]
                 .as_str()
-                .is_some_and(|r| r.contains("blocked")),
+                .is_some_and(|r| r.contains("waiting on an answer")),
             "the reason travels with the flag: {value}"
         );
         assert_eq!(value["screen"], serde_json::json!(["$ cargo test"]));
