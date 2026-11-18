@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentMenu, AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun,
-    SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
+    AgentMenu, AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, QassAct, ScheduleInfo,
+    ScheduleRun, SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -144,7 +144,7 @@ impl Chip {
     /// What the list says when the chip holds nothing.
     pub fn empty(self) -> &'static str {
         match self {
-            Chip::All => "No agents yet.",
+            Chip::All => "No agents yet. New work starts one.",
             Chip::NeedsYou => "Nothing needs you.",
             Chip::Working => "Nothing is working.",
             Chip::Done => "Nothing is done.",
@@ -357,6 +357,10 @@ impl Model {
     /// "7 in 3 spaces on 2 machines".
     pub fn summary(&self) -> String {
         let agents = self.agents();
+        // Nothing yet: not "0 in 0 spaces on 0 machines" beside machines that are connected.
+        if agents.is_empty() {
+            return count(0, "agent");
+        }
         let spaces: BTreeSet<i64> = agents.iter().map(|e| e.workspace()).collect();
         let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(*w)).collect();
         format!(
@@ -394,11 +398,24 @@ impl Model {
     pub fn status_line(&self) -> Option<String> {
         let row = self.next_up()?;
         Some(format!(
-            "next: {}/{} {}",
-            self.space_name(row.workspace),
-            title_of(row),
+            "next: {} {}",
+            self.agent_name(row),
             Kind::of(row).word().to_lowercase()
         ))
+    }
+
+    /// An agent as the status line names it: "acme-web/review-pr".
+    pub fn agent_name(&self, row: &AgentRow) -> String {
+        format!("{}/{}", self.space_name(row.workspace), title_of(row))
+    }
+
+    /// What qass did, in the names the window shows: "wrote to api/claude", not the daemon's
+    /// tab number.
+    pub fn act_text(&self, act: &QassAct) -> String {
+        match act.terminal.and_then(|t| self.row(t)) {
+            Some(row) if act.kind == "wrote" => format!("wrote to {}", self.agent_name(row)),
+            _ => act.text.clone(),
+        }
     }
 
     /// What a screen reader says for a row: "README Coupons section, claude, acme-web,
@@ -1501,6 +1518,11 @@ pub enum MachineState {
     },
     /// Not answering, and never reached since the window opened: there is no time to give.
     NeverReached,
+    /// Another machine while This Mac's daemon is down: it is reached through that daemon, so
+    /// it waits on This Mac, not on its own link, and a retry of it can do nothing.
+    Behind {
+        as_of: i64,
+    },
 }
 
 /// Whether a space of machine `m` says its link is up (a remote's; this Mac's say nothing).
@@ -1599,8 +1621,11 @@ impl Reach {
             (h, s) => h.or(s),
         };
         if let Some(lost) = lost {
-            return MachineState::Stale {
-                as_of: last.map_or(lost, |l| l.min(lost)),
+            let as_of = last.map_or(lost, |l| l.min(lost));
+            // Another machine is reached through This Mac's daemon: its own link may be fine.
+            return match m {
+                0 => MachineState::Stale { as_of },
+                _ => MachineState::Behind { as_of },
             };
         }
         let parked = spaces
@@ -1645,15 +1670,48 @@ pub fn reach_words(state: MachineState, zone: Zone) -> String {
         MachineState::Retrying => "retrying".into(),
         MachineState::Stale { as_of } => format!("not reached, as of {}", clock(as_of, zone)),
         MachineState::NeverReached => "not reached since the window opened".into(),
+        MachineState::Behind { as_of } => format!(
+            "not reached while This Mac is down, as of {}",
+            clock(as_of, zone)
+        ),
     }
 }
 
-/// The banner over the page: every machine not reached, in its sidebar line's words.
+/// Whether an agent that waited in `before` (idle, done or blocked) works in `now`: what a
+/// write of qass's looks like from the rows, a prompt or a menu answered alike.
+pub fn woke(before: &[AgentRow], now: &[AgentRow]) -> bool {
+    before
+        .iter()
+        .filter(|b| matches!(b.state.as_str(), "idle" | "done" | "blocked"))
+        .any(|b| {
+            now.iter()
+                .any(|r| r.terminal == b.terminal && r.state == "working")
+        })
+}
+
+/// Whether a machine in `state` is not reached: its rows are shown as of a time.
+pub fn unreached(state: MachineState) -> bool {
+    matches!(
+        state,
+        MachineState::Stale { .. } | MachineState::NeverReached | MachineState::Behind { .. }
+    )
+}
+
+/// The banner over the page: every machine not reached, in its sidebar line's words. This
+/// Mac's daemon down says how to start it again (the TUI's words).
 pub fn reach_banner(machines: &[(String, MachineState)], zone: Zone) -> Option<String> {
     let stale: Vec<String> = machines
         .iter()
-        .filter(|(_, s)| matches!(s, MachineState::Stale { .. } | MachineState::NeverReached))
-        .map(|(name, s)| format!("{name} {}", reach_words(*s, zone)))
+        .filter(|(_, s)| unreached(*s))
+        .map(|(name, s)| match s {
+            MachineState::Stale { .. } if name == "This Mac" => {
+                format!(
+                    "{name} {}; run qoop to start it again",
+                    reach_words(*s, zone)
+                )
+            }
+            _ => format!("{name} {}", reach_words(*s, zone)),
+        })
         .collect();
     (!stale.is_empty()).then(|| stale.join("; "))
 }
@@ -2396,6 +2454,17 @@ pub(crate) mod tests {
             ..Model::default()
         };
         assert_eq!(one.summary(), "1 in 1 space on 1 machine");
+        // A first open: one plain shell tab is no agent, and nothing counts 0 machines.
+        let mut shell = row(1, 1, "idle", "zsh", "");
+        shell.agent = false;
+        let empty = Model {
+            rows: vec![shell],
+            spaces: vec![space(1, "a")],
+            ..Model::default()
+        };
+        assert!(empty.agents().is_empty());
+        assert_eq!(empty.summary(), "0 agents");
+        assert_eq!(Chip::All.empty(), "No agents yet. New work starts one.");
     }
 
     #[test]
@@ -3365,14 +3434,23 @@ pub(crate) mod tests {
             MachineState::Live
         );
         assert!(unreached_rows(&rows, &local, &m.spaces).is_empty());
-        // This Mac's daemon gone: every machine stale, as of then.
+        // This Mac's daemon gone: every machine stale, as of then; another one because it is
+        // reached through This Mac, which the words and the banner say, with how to start it.
+        let behind = reach.state(remote, &m.spaces, 1_040, Some(1_035));
+        assert_eq!(behind, MachineState::Behind { as_of: 1_035 });
+        let here = reach.state(0, &m.spaces, 1_040, Some(1_035));
+        assert_eq!(here, MachineState::Stale { as_of: 1_035 });
+        let zone = utc();
+        let at = clock(1_035, zone);
         assert_eq!(
-            reach.state(remote, &m.spaces, 1_040, Some(1_035)),
-            MachineState::Stale { as_of: 1_035 }
-        );
-        assert_eq!(
-            reach.state(0, &m.spaces, 1_040, Some(1_035)),
-            MachineState::Stale { as_of: 1_035 }
+            reach_banner(
+                &[("This Mac".into(), here), ("staging".into(), behind)],
+                zone
+            ),
+            Some(format!(
+                "This Mac not reached, as of {at}; run qoop to start it again; \
+                 staging not reached while This Mac is down, as of {at}"
+            ))
         );
     }
 

@@ -1082,6 +1082,95 @@ fn a_remote_hand_goes_for_this_macs_qass(cx: &mut TestAppContext) {
     );
 }
 
+/// The qass page follows qass away as well as back: once its tab is a plain shell, the page
+/// drops the dead terminal and shows Start at once.
+#[gpui::test]
+fn the_qass_page_drops_a_terminal_qass_left(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Qass, window, cx)));
+    vcx.run_until_parked();
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.term.as_ref().map(|t| t.terminal)),
+        Some(9)
+    );
+    let mut rows = crate::state::tests::fixture().rows;
+    rows.iter_mut().find(|r| r.terminal == 9).unwrap().agent = false;
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    assert!(
+        desk.read_with(&vcx, |d, _| d.term.is_none()),
+        "no dead terminal"
+    );
+}
+
+/// What qass did today is asked when the Inbox opens and, while it is open, when an agent that
+/// waited works again (a write of qass's raises no event of its own); an act names its agent
+/// as the status line does.
+#[gpui::test]
+fn qass_acts_are_read_when_shown_and_named_by_space(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let acts_asked = |rx: &mut UnboundedReceiver<Up>| {
+        request_of(&sent(rx), |r| matches!(r, ControlRequest::QassActs { .. })).is_some()
+    };
+    sent(&mut rx);
+    vcx.simulate_keystrokes("ctrl-a i");
+    assert!(acts_asked(&mut rx), "asked as the Inbox opened");
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[2].state = "working".into();
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    assert!(
+        acts_asked(&mut rx),
+        "asked once a waiting agent works again"
+    );
+    let text = desk.read_with(&vcx, |d, _| {
+        let act: qoop_runtime::control::QassAct = serde_json::from_value(serde_json::json!({
+            "at": 1000, "kind": "wrote", "terminal": 3, "text": "wrote to T3"
+        }))
+        .expect("act");
+        d.model.act_text(&act)
+    });
+    assert_eq!(text, "wrote to acme-web/Coupon.ts test suggestion");
+}
+
+/// This Mac's daemon down: the banner says how to start it and offers Start qoop, and another
+/// machine waits on This Mac with no Retry now, which could reach nothing.
+#[gpui::test]
+fn the_local_daemon_down_offers_start_and_no_remote_retry(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.apply(Down::Disconnected("gone".into()), window, cx);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("start-qoop").is_some(), "Start qoop");
+    assert!(vcx.debug_bounds("retry-1").is_none(), "no remote retry");
+    let banner = desk.read_with(&vcx, |d, _| d.banner().unwrap_or_default());
+    assert!(banner.contains("run qoop to start it again"), "{banner}");
+    assert!(
+        banner.contains("staging not reached while This Mac is down"),
+        "{banner}"
+    );
+}
+
 /// Every sidebar link takes the ring: from the window's own focus, Tab once reaches Home, twice
 /// Schedules, three times Settings, each focused with a key as the last input (what
 /// `focus_visible` draws the ring on), and Space opens the link that has it.

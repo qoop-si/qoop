@@ -142,6 +142,8 @@ pub struct Desk {
     /// Since when each machine has not answered, and when this Mac's daemon went away.
     pub reach: state::Reach,
     pub lost_at: Option<i64>,
+    /// What Start qoop said while This Mac's daemon is down: starting, or why it could not.
+    pub(crate) qoop_said: Option<String>,
     /// The question on screen that another client answered: its closed options, greyed,
     /// under who answered, until dismissed or a new question.
     pub(crate) closed_card: Option<(TerminalStream, AgentMenu, String)>,
@@ -198,6 +200,9 @@ pub struct Desk {
     /// here, not on the sheet, so a sheet closed while it starts still gets its line.
     pub pending: Option<(String, String, Option<i64>)>,
 }
+
+/// What the status line says once Start qoop is pressed, until the window is connected.
+const STARTING_QOOP: &str = "Starting qoop.";
 
 pub fn unix_now() -> i64 {
     SystemTime::now()
@@ -263,6 +268,7 @@ impl Desk {
             qass_starting_until: None,
             reach: state::Reach::default(),
             lost_at: None,
+            qoop_said: None,
             closed_card: None,
             machine_pets: HashMap::new(),
             pet_asks: HashMap::new(),
@@ -330,6 +336,7 @@ impl Desk {
             Down::Connected => {
                 self.connected = true;
                 self.lost_at = None;
+                self.qoop_said = None;
                 self.reach.forget_links();
                 // A New work asked for before the connection dropped: asked again, under its id.
                 self.ask_pending();
@@ -419,6 +426,11 @@ impl Desk {
                 }
                 self.model.note_qass(self.now, !self.listed);
                 self.listed = true;
+                // An agent that waited works again: maybe qass wrote to it, an act to show.
+                if (self.page == Page::Qass || self.inbox) && state::woke(&before, &self.model.rows)
+                {
+                    self.ask_acts();
+                }
                 self.first_run_field(cx);
                 self.answered_elsewhere(&before);
                 self.rows_changed(&before);
@@ -427,7 +439,11 @@ impl Desk {
                 if self.qass_terminal().is_some() {
                     self.qass_starting_until = None;
                 }
-                if self.page == Page::Qass && self.term.is_none() && self.qass_terminal().is_some()
+                // The qass page follows qass both ways: its terminal comes on when qass starts
+                // or wakes, and goes when qass's agent leaves it (a plain shell is not qass), so
+                // "Start it" shows at once.
+                if self.page == Page::Qass
+                    && self.term.as_ref().map(|t| t.terminal) != self.qass_terminal()
                 {
                     self.open(Page::Qass, window, cx);
                 }
@@ -557,6 +573,7 @@ impl Desk {
         if page == Page::Qass {
             self.read_lessons();
             self.ask_watch();
+            self.ask_acts();
         }
         if page == Page::Settings {
             self.read_settings();
@@ -671,6 +688,7 @@ impl Desk {
                 "i" => {
                     self.inbox = !self.inbox;
                     if self.inbox {
+                        self.ask_acts();
                         window.focus(&self.inbox_focus, cx);
                     } else {
                         self.focus_home(window, cx);
@@ -801,6 +819,12 @@ impl Desk {
             id: link::fresh_id("asks"),
             all: false,
         });
+        self.ask_acts();
+    }
+
+    /// What qass did today, read again: no event says qass wrote to an agent, so the qass page
+    /// and the Inbox ask when they open and when an agent they show starts working again.
+    pub(crate) fn ask_acts(&self) {
         let wall = (self.zone.local)(unix_now()).secs();
         let midnight = qoop_runtime::schedule::Naive::from_secs(wall - wall.rem_euclid(86_400));
         let today = (self.zone.unix)(midnight);
@@ -904,7 +928,7 @@ impl Desk {
     /// "as of 15:58" for what is shown of a space whose machine is not reached.
     pub(crate) fn as_of(&self, workspace: i64) -> Option<String> {
         match self.machine_state(state::machine_of(workspace)) {
-            state::MachineState::Stale { as_of } => {
+            state::MachineState::Stale { as_of } | state::MachineState::Behind { as_of } => {
                 Some(format!("as of {}", state::clock(as_of, self.zone)))
             }
             state::MachineState::NeverReached => Some("since the window opened".into()),
@@ -1008,6 +1032,53 @@ impl Desk {
             workspace,
             request: Box::new(ControlRequest::Pet { id }),
         });
+    }
+
+    /// Start This Mac's daemon again (`qoop ensure-awake`, as the TUI's launcher does): the
+    /// window connects by itself once it is up.
+    pub(crate) fn start_qoop(&mut self, cx: &mut Context<Self>) {
+        if self.qoop_said.as_deref() == Some(STARTING_QOOP) {
+            return;
+        }
+        let Some(qoop) = state::qoop_bin() else {
+            self.qoop_said = Some(format!(
+                "qoop is not installed. Install it with the one-line install: {}",
+                state::INSTALL_LINE
+            ));
+            cx.notify();
+            return;
+        };
+        self.qoop_said = Some(STARTING_QOOP.into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let ran = cx
+                .background_executor()
+                .spawn(async move {
+                    std::process::Command::new(qoop)
+                        .arg("ensure-awake")
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                })
+                .await;
+            let said = match ran {
+                Ok(out) if out.status.success() => None,
+                Ok(out) => Some(
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .trim_start_matches("qoop: ")
+                        .to_string(),
+                ),
+                Err(e) => Some(format!("qoop did not start: {e}")),
+            };
+            let _ = this.update(cx, |d, cx| {
+                // Started: the line stays until the window is connected again.
+                if said.is_some() || d.connected {
+                    d.qoop_said = said;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The window is in front again: every machine not answering is tried at once, as a
@@ -1434,11 +1505,10 @@ impl Desk {
     ) -> impl IntoElement {
         let reach = self.machine_state(m);
         let up = reach == state::MachineState::Live;
-        let away = matches!(
-            reach,
-            state::MachineState::Stale { .. } | state::MachineState::NeverReached
-        );
+        let away = state::unreached(reach);
         let retrying = reach == state::MachineState::Retrying;
+        // While This Mac's daemon is down a retry of another machine goes nowhere: none offered.
+        let behind = matches!(reach, state::MachineState::Behind { .. });
         let (dot, ink) = if up {
             (t.done, t.done_text)
         } else if away {
@@ -1471,7 +1541,7 @@ impl Desk {
             .when_some(self.pet_of(m), |d, pet| d.child(pet))
             .child(div().text_color(c(t.t1)).child(name.clone()))
             .child(div().text_color(c(ink)).child(format!("{word}{tail}")))
-            .when(away || retrying, |d| {
+            .when((away || retrying) && !behind, |d| {
                 d.child(
                     ui::control(
                         ("retry", m as u64),
@@ -1582,7 +1652,10 @@ impl Desk {
                         ui::control(
                             "qass-pill",
                             Role::Button,
-                            format!("qass, {}", self.model.qass_line()),
+                            match self.model.qass_line().as_str() {
+                                "not running" => "qass not running, press to start it".to_string(),
+                                line => format!("qass, {line}"),
+                            },
                             t,
                         )
                         .flex()
@@ -1657,13 +1730,16 @@ impl Desk {
                         .child(ui::kbd(&format!("{} i", self.prefix_name()), t))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.inbox = !this.inbox;
+                            if this.inbox {
+                                this.ask_acts();
+                            }
                             cx.notify();
                         })),
                     ),
             )
     }
 
-    fn status_line(&self, t: &Theme, focused: bool) -> impl IntoElement {
+    fn status_line(&self, t: &Theme, focused: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let right = if self.inbox { 360. } else { 0. };
         div()
             .absolute()
@@ -1691,6 +1767,25 @@ impl Desk {
                         .text_color(c(t.t1))
                         .child(banner),
                 )
+            })
+            // This Mac's daemon down: the step, where the state is said (FLOW-20).
+            .when(self.lost_at.is_some(), |d| {
+                d.child(
+                    ui::link_button("start-qoop", "Start qoop", t)
+                        .debug_selector(|| "start-qoop".into())
+                        .flex_none()
+                        .font_family(UI_FONT)
+                        .on_click(cx.listener(|this, _, _, cx| this.start_qoop(cx))),
+                )
+                .when_some(self.qoop_said.clone(), |d, said| {
+                    d.child(
+                        div()
+                            .id("qoop-said")
+                            .role(Role::Status)
+                            .aria_label(said.clone())
+                            .child(said),
+                    )
+                })
             })
             .when(!self.connected && self.lost_at.is_none(), |d| {
                 // No qoop here at all: nothing will ever answer, so say how to get it.
@@ -1951,7 +2046,7 @@ impl Render for Desk {
             .child(self.sidebar(&t, cx))
             .child(self.top_bar(&t, cx))
             .child(self.centre(&t, focused, cx))
-            .child(self.status_line(&t, focused));
+            .child(self.status_line(&t, focused, cx));
         if self.inbox {
             root = root.child(self.inbox_panel(&t, cx));
         }

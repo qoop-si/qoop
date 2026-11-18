@@ -331,7 +331,7 @@ impl Desk {
             let id = link::fresh_id("hand");
             // Another machine's agent: for This Mac's qass, named by this Mac's hand id. With no
             // id (no home folder) it goes as before and that machine answers for itself.
-            let away = (machine != 0).then(|| self.hand_id()).flatten();
+            let away = if machine == 0 { None } else { self.hand_id() };
             self.ask(ControlRequest::HandToQass {
                 id: id.clone(),
                 hands: held

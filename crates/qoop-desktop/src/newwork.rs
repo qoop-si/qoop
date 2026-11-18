@@ -83,7 +83,9 @@ impl Desk {
     /// The empty first run: one field on Home, "What should an agent work on?", kept while
     /// there is no agent yet.
     pub(crate) fn first_run_field(&mut self, cx: &mut Context<Self>) {
-        if !self.model.rows.is_empty() {
+        // By agents, not rows: `ensure-awake` always leaves one plain shell tab, so on a real
+        // first open the rows are never empty.
+        if !self.model.agents().is_empty() {
             self.first_run = None;
             return;
         }
