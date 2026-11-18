@@ -232,7 +232,7 @@ pub struct Note {
     pub generation: u64,
     /// What the tab bar and the panel call the terminal.
     pub label: String,
-    /// What happened, as the end of a sentence: "finished", "is blocked".
+    /// What happened, as the end of a sentence: "finished", "needs you".
     pub what: &'static str,
     pub space: String,
     /// Waiting on a person (blocked, failed) rather than only done.

@@ -94,6 +94,20 @@ impl Desk {
             .iter()
             .filter(|h| h.pick == Pick::Qass)
             .count();
+        // The batch's hold counts down as a single pick's does (C-23).
+        let left = self
+            .holds
+            .held
+            .iter()
+            .filter(|h| h.pick == Pick::Qass)
+            .map(|h| {
+                h.until
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f32()
+                    .ceil()
+                    .max(1.)
+            })
+            .fold(1., f32::max);
         let cards: Vec<&AskInfo> = self.asks.iter().filter(|a| a.status == "open").collect();
         let empty = rows.is_empty() && cards.is_empty();
         div()
@@ -193,7 +207,7 @@ impl Desk {
                         .child(
                             div()
                                 .flex_1()
-                                .child(format!("Handing {handing} to qass in 3 s")),
+                                .child(format!("Let qass take these {handing}: sends in {left} s")),
                         )
                         .child(
                             ui::pill("undo-all", "Undo", t)
