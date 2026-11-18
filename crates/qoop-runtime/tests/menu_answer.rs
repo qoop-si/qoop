@@ -460,6 +460,62 @@ async fn the_same_question_asked_again_has_another_menu_seal() {
     assert_ne!(second_turn, first_turn, "another turn of it");
 }
 
+/// A hand is for the turn of the question it was given on: the same question asked again is a
+/// turn nobody handed, so the hand ends (and not as missed) rather than live on into it.
+#[tokio::test]
+async fn a_hand_ends_when_the_same_question_is_asked_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent = claude_shaped(dir.path());
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let token = token_of(&d, terminal);
+    let mut owner = d.attach("owner").await;
+    let mut ui = d.attach(qoop_proto::INTERFACE_ID).await;
+    start_aider(&d, &mut owner, terminal, &agent).await;
+    let (shown, generation) = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+
+    // Handed for another machine's qass, so no qass is needed here.
+    let handed = Box::pin(ui.control(
+        &ControlRequest::HandToQass {
+            id: "h".into(),
+            hands: vec![qoop_runtime::control::Hand {
+                terminal,
+                generation,
+                seal: Some(shown.seal),
+                away: Some("abc123".into()),
+            }],
+        },
+        PATIENCE,
+    ))
+    .await;
+    assert!(
+        matches!(handed, Some(ControlResponse::Handed { .. })),
+        "{handed:?}"
+    );
+    let first = row(&mut ui, terminal).await;
+    assert!(first.with_qass, "{first:?}");
+
+    // The same question again: a new turn, and the hand is over.
+    owner.input_to(terminal, b"x").await;
+    assert!(owner.wait_for_text_on(terminal, "key:x", PATIENCE).await);
+    owner.input_to(terminal, b"M").await;
+    let _ = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let now = row(&mut ui, terminal).await;
+        if !now.with_qass {
+            assert!(!now.qass_missed, "{now:?}");
+            assert_ne!(now.menu_seal, first.menu_seal, "another turn");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the hand lived on: {now:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn who_answered_is_on_a_persons_row_for_a_while_and_never_on_a_programs() {
     // Ten seconds in the product; shorter here, so the end is seen without the wait.
