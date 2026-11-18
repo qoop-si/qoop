@@ -27,11 +27,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      fail_desktop:
-        description: "Make the desktop job fail, to see the rest of the release go on without it"
-        type: boolean
-        default: false
 
 permissions: {}
 
@@ -247,9 +242,6 @@ jobs:
           ref: ${{ needs.prep.outputs.qoop_ref }}
           path: qoop
           persist-credentials: false
-      - name: Fail on purpose (dry run input)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_desktop }}
-        run: exit 1
       - name: Build and bundle
         working-directory: qoop
         run: |
@@ -336,8 +328,14 @@ jobs:
       - name: Notes
         run: |
           gh release view "$TAG" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/changes.md"
-          # A re-run finds the block already there.
-          if grep -q 'qoop.si/install.sh' "$RUNNER_TEMP/changes.md"; then exit 0; fi
+          # A re-run finds the block already there and writes it again over the changes below it: a
+          # desktop leg that failed the first time may have made its zips now. A block without the
+          # Docs line it ends on is left as it is.
+          if grep -q 'qoop.si/install.sh' "$RUNNER_TEMP/changes.md"; then
+            grep -qx -- '- Docs: https://qoop.si/docs/' "$RUNNER_TEMP/changes.md" || exit 0
+            sed '1,/^- Docs: https:\/\/qoop\.si\/docs\/$/d' "$RUNNER_TEMP/changes.md" | sed '1{/^$/d;}' > "$RUNNER_TEMP/rest.md"
+            mv "$RUNNER_TEMP/rest.md" "$RUNNER_TEMP/changes.md"
+          fi
           {
             echo 'Install on macOS or Linux:'
             echo
