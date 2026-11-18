@@ -417,6 +417,7 @@ impl Desk {
                         self.said.remove(&slot);
                     }
                 }
+                self.model.note_qass(self.now, !self.listed);
                 self.listed = true;
                 self.first_run_field(cx);
                 self.answered_elsewhere(&before);
@@ -431,7 +432,17 @@ impl Desk {
                     self.open(Page::Qass, window, cx);
                 }
             }
-            ControlResponse::Asks { live, .. } => self.asks = live,
+            ControlResponse::Asks { live, .. } => {
+                // The agents qass's open cards are about: a remote hand with one is over.
+                self.model.carded = live
+                    .iter()
+                    .filter(|a| a.status == "open")
+                    .filter_map(|a| a.agent.as_deref())
+                    .filter_map(qoop_runtime::asks::agent_key)
+                    .map(|(key, _)| key)
+                    .collect();
+                self.asks = live;
+            }
             ControlResponse::SleepSettings { problem, .. } => {
                 self.read_settings();
                 self.settings.said = Some(match problem {
@@ -497,7 +508,10 @@ impl Desk {
             ControlResponse::ScheduleRuns { id, runs } => {
                 self.runs_came(&id, runs);
             }
-            ControlResponse::QassWatch { on, .. } => self.model.qass_watch = Some(on),
+            ControlResponse::QassWatch { on, .. } => {
+                self.model.qass_watch = Some(on);
+                self.model.note_qass(self.now, false);
+            }
             ControlResponse::TerminalCreated { id, terminal } => {
                 self.started(&id, terminal, window, cx)
             }
@@ -568,16 +582,7 @@ impl Desk {
     }
 
     fn qass_terminal(&self) -> Option<TerminalStream> {
-        let space = self
-            .model
-            .spaces
-            .iter()
-            .find(|w| w.name == state::QASS_SPACE)?;
-        self.model
-            .rows
-            .iter()
-            .find(|r| r.workspace == space.id && r.agent)
-            .map(|r| r.terminal)
+        self.model.qass_row().map(|r| r.terminal)
     }
 
     /// What `config.toml` changes in the window now: the prefix and the theme.
@@ -1342,13 +1347,13 @@ impl Desk {
                                     state::Entry::Live(r) => Some(r),
                                     _ => None,
                                 };
-                                let with = live.is_some_and(|r| r.with_qass);
+                                // Handed and held: "With qass"; handed while qass is gone:
+                                // "With qass, not running", in the Needs you ink (C-3).
+                                let held = live.and_then(|r| self.model.qass_words(r));
+                                let with = live.is_some_and(|r| self.model.with_qass(r));
+                                let stranded = held.is_some() && !with;
                                 let why = live.and_then(|r| self.qass_reason(r));
-                                let words = if with {
-                                    "With qass"
-                                } else {
-                                    "Let qass handle it"
-                                };
+                                let words = held.unwrap_or_else(|| "Let qass handle it".into());
                                 ui::control(
                                     ("qass-line", terminal as u64),
                                     Role::Button,
@@ -1372,12 +1377,18 @@ impl Desk {
                                 .pl(px(29.))
                                 .rounded(px(8.))
                                 .text_size(px(12.))
-                                .text_color(c(if why.is_some() { t.t3 } else { t.t2 }))
+                                .text_color(c(if stranded {
+                                    t.needs_text
+                                } else if why.is_some() {
+                                    t.t3
+                                } else {
+                                    t.t2
+                                }))
                                 .when(why.is_none() && !with, |d| {
                                     d.hover(|s| ui::paint(s, t.hover()))
                                 })
                                 .child(ui::icon(Icon::Eye, 12., c(t.t2)))
-                                .child(words)
+                                .child(words.clone())
                                 .when(why.is_none() && !with, |d| {
                                     d.on_click(cx.listener(move |this, _, window, cx| {
                                         let qass = state::Offer {

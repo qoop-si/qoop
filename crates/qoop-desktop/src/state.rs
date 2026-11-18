@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use qoop_domain::shell::quote as shell_quote;
 use qoop_domain::status::{self, Status};
 use qoop_runtime::control::{
-    AgentMenu, AgentRow, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun, SleepingTab,
-    StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
+    AgentMenu, AgentRow, AskInfo, ItemCardInfo, LinkState, Pane, ScheduleInfo, ScheduleRun,
+    SleepingTab, StepInfo, TaskEventInfo, TaskInfo, TerminalStream, WorkspaceRow,
 };
 use qoop_runtime::schedule::{Cron, Naive, Zone, next_slot};
 
@@ -178,6 +178,18 @@ pub struct Model {
     pub folded: BTreeSet<i64>,
     /// The tabs split into panes, as the daemon keeps them (`Agents::splits`).
     pub splits: Vec<Pane>,
+    /// Machines whose qoop refused a hand for This Mac's qass as too old: no option 5 there.
+    pub no_hands: BTreeSet<usize>,
+    /// Since when (the window's clock) This Mac's qass has run and watched, and which agent
+    /// that is (its tab and generation): a restart starts the clock again.
+    pub qass_up: Option<(i64, (u32, Option<u64>))>,
+    /// Each row's hand for another machine's qass as last seen (`qass_away.at`), and when the
+    /// window first saw that hand: `None` for one already there in its first list.
+    pub away_seen: HashMap<u32, (i64, Option<i64>)>,
+    /// The agents qass's open cards are about, as their keys (`T5`, `staging/T2`).
+    pub carded: Vec<String>,
+    /// This Mac's hand id (`paths::hand_id`), once known.
+    pub hand_id: Option<String>,
 }
 
 /// One line of home's lists: an awake agent's row, or a sleeping tab that held an agent.
@@ -318,12 +330,21 @@ impl Model {
             .count()
     }
 
-    /// The terminals of the agents that need the owner.
+    /// The terminals of the agents that need the owner: a question qass holds is not one, one
+    /// it no longer holds is again (`with_qass`). The one count behind the header, the badge,
+    /// the chip and the status line.
     pub fn asking(&self) -> Vec<u32> {
         self.live()
-            .filter(|r| Kind::of(r).needs_you())
+            .filter(|r| Kind::of(r).needs_you() && !self.with_qass(r))
             .map(|r| r.terminal)
             .collect()
+    }
+
+    /// The agents whose question qass holds now.
+    pub fn handed(&self) -> usize {
+        self.live()
+            .filter(|r| Kind::of(r).needs_you() && self.with_qass(r))
+            .count()
     }
 
     /// The agents that failed: the rest of the Inbox badge.
@@ -361,7 +382,7 @@ impl Model {
     /// The agent the status line points at: the first that needs you, else the first that
     /// failed, in home's order.
     pub fn next_up(&self) -> Option<&AgentRow> {
-        let mut agents: Vec<&AgentRow> = self.live().collect();
+        let mut agents: Vec<&AgentRow> = self.live().filter(|r| !self.with_qass(r)).collect();
         agents.sort_by_key(|r| Kind::of(r).rank());
         agents
             .into_iter()
@@ -403,13 +424,22 @@ impl Model {
             .any(|r| r.clients.iter().any(|c| c == "phone"))
     }
 
+    /// This Mac's qass: the first agent in this machine's space named qass. The one that takes
+    /// every hand, remote agents' too.
+    pub fn qass_row(&self) -> Option<&AgentRow> {
+        let spaces: Vec<i64> = self
+            .qass_spaces()
+            .into_iter()
+            .filter(|id| machine_of(*id) == 0)
+            .collect();
+        self.rows
+            .iter()
+            .find(|r| spaces.contains(&r.workspace) && r.agent)
+    }
+
     /// qass's pill: not running, not watching, or "watching 6 of 7".
     pub fn qass_line(&self) -> String {
-        let running = self
-            .rows
-            .iter()
-            .any(|r| self.qass_spaces().contains(&r.workspace) && r.agent);
-        if !running {
+        if self.qass_row().is_none() {
             return "not running".into();
         }
         if self.qass_watch == Some(false) {
@@ -421,6 +451,113 @@ impl Model {
             .collect();
         let watched = agents.iter().filter(|r| !r.qass_skip).count();
         format!("watching {watched} of {}", agents.len())
+    }
+
+    /// After a new agent list or switch read at `now` (the window's clock): since when This
+    /// Mac's qass runs and watches, and when each hand for another machine's qass was first
+    /// seen. `first`: the window's first list, whose hands are older than anything it knows.
+    pub fn note_qass(&mut self, now: i64, first: bool) {
+        let up = self.qass_line().starts_with("watching");
+        let who = self.qass_row().map(|r| (r.terminal, r.generation));
+        self.qass_up = match (up, who, self.qass_up) {
+            (true, Some(who), Some((since, was))) if was == who => Some((since, who)),
+            (true, Some(who), _) => Some((now, who)),
+            _ => None,
+        };
+        let mut seen = HashMap::new();
+        for r in &self.rows {
+            if let Some(away) = &r.qass_away {
+                let when = match self.away_seen.get(&r.terminal) {
+                    Some((at, when)) if *at == away.at => *when,
+                    _ if first => None,
+                    _ => Some(now),
+                };
+                seen.insert(r.terminal, (away.at, when));
+            }
+        }
+        self.away_seen = seen;
+    }
+
+    /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. One rule
+    /// for every place that offers it: This Mac's qass takes every machine's questions.
+    pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
+        if row.qass_skip {
+            return Some("qass leaves this agent alone".into());
+        }
+        match self.qass_line().as_str() {
+            "not running" => return Some("qass is not running".into()),
+            "not watching" => return Some("qass is not watching".into()),
+            _ => {}
+        }
+        let m = machine_of(row.workspace);
+        (m != 0 && self.no_hands.contains(&m)).then(|| {
+            let name = self
+                .space(row.workspace)
+                .map_or_else(|| "that machine".to_string(), machine_name);
+            format!("qoop on {name} is too old to hand questions to qass")
+        })
+    }
+
+    /// Whether `row`'s question waits on qass now, not on the owner. A hand to qass while it
+    /// can take it; a hand from this Mac for another machine's agent only while This Mac's qass
+    /// has run and watched since the window first saw that hand (a restart never heard of it),
+    /// and no card of qass's is about that agent (then the card is what waits on the owner).
+    pub fn with_qass(&self, row: &AgentRow) -> bool {
+        if !row.with_qass || self.qass_reason(row).is_some() {
+            return false;
+        }
+        let Some(away) = &row.qass_away else {
+            return true;
+        };
+        // Another Mac's hand: its qass was told, as far as this window can know.
+        if self.hand_id.as_ref().is_some_and(|me| *me != away.by) {
+            return true;
+        }
+        let seen = self
+            .away_seen
+            .get(&row.terminal)
+            .filter(|(at, _)| *at == away.at)
+            .and_then(|(_, when)| *when);
+        let up = self.qass_up.map(|(since, _)| since);
+        matches!((up, seen), (Some(up), Some(seen)) if up <= seen)
+            && !self.carded.contains(&self.agent_key(row))
+    }
+
+    /// What a handed row says where "Let qass handle it" would be: "With qass", or with why
+    /// nobody takes it now ("With qass, not running"). `None` when it is not handed, or its
+    /// hand is no longer one qass holds.
+    pub fn qass_words(&self, row: &AgentRow) -> Option<String> {
+        if !row.with_qass {
+            return None;
+        }
+        if self.with_qass(row) {
+            return Some("With qass".into());
+        }
+        match self.qass_line().as_str() {
+            line @ ("not running" | "not watching") => Some(format!("With qass, {line}")),
+            _ => None,
+        }
+    }
+
+    /// The agent as qass's cards key it: `T5` on This Mac, `staging/T2` on another machine.
+    pub fn agent_key(&self, row: &AgentRow) -> String {
+        let n = qoop_tui::mux::daemon_terminal(row.terminal);
+        match self.space(row.workspace).filter(|w| machine_of(w.id) != 0) {
+            Some(space) => format!("{}/T{n}", machine_name(space)),
+            None => format!("T{n}"),
+        }
+    }
+
+    /// The row a card of qass's is about: by its terminal on This Mac, else by its key.
+    pub fn card_row(&self, card: &AskInfo) -> Option<u32> {
+        if let Some(t) = card.terminal {
+            return Some(t);
+        }
+        let (key, _) = qoop_runtime::asks::agent_key(card.agent.as_deref()?)?;
+        self.rows
+            .iter()
+            .find(|r| self.agent_key(r) == key)
+            .map(|r| r.terminal)
     }
 
     /// The finish a person looks at when `terminal` is on screen: its turn end, while its
@@ -466,8 +603,11 @@ impl Model {
                 .iter()
                 .any(|r| r.terminal == t && !Kind::of(r).needs_you())
         };
+        // A question qass holds is not put to the owner a second time.
         self.live()
-            .filter(|r| !shown.contains(&r.terminal) && Kind::of(r).needs_you())
+            .filter(|r| {
+                !shown.contains(&r.terminal) && Kind::of(r).needs_you() && !self.with_qass(r)
+            })
             .map(|r| r.terminal)
             .find(|&t| was_calm(t))
     }
@@ -2150,6 +2290,8 @@ pub(crate) mod tests {
                     ],
                 ),
             ],
+            // Never the owner's own file: a test's hand for a remote agent names this.
+            hand_id: Some("testmac".into()),
             ..Model::default()
         }
     }
@@ -2333,6 +2475,101 @@ pub(crate) mod tests {
         assert_eq!(m.qass_line(), "not watching");
         m.rows.retain(|r| r.workspace != 3);
         assert_eq!(m.qass_line(), "not running");
+    }
+
+    /// The fixture's remote agent (staging, its tab 1) asking, handed by `by` at `at`.
+    fn remote_asking(m: &mut Model, by: Option<&str>, at: i64) -> u32 {
+        let t = 0x8100_0001;
+        let r = m.rows.iter_mut().find(|r| r.terminal == t).expect("remote");
+        r.state = "blocked".into();
+        r.status = Some("blocked".into());
+        r.with_qass = by.is_some();
+        r.qass_away = by.map(|by| qoop_runtime::control::AwayHand { at, by: by.into() });
+        t
+    }
+
+    /// One rule offers "Let qass handle it" for every machine: This Mac's qass takes a remote
+    /// agent's question too, and a machine whose qoop refused such a hand as too old is not
+    /// offered it again.
+    #[test]
+    fn this_macs_qass_is_offered_for_remote_agents_too() {
+        let mut m = fixture();
+        let t = remote_asking(&mut m, None, 0);
+        let row = m.row(t).cloned().expect("row");
+        assert_eq!(m.qass_reason(&row), None);
+        assert_eq!(m.agent_key(&row), "staging/T1");
+        m.no_hands.insert(1);
+        assert_eq!(
+            m.qass_reason(&row).as_deref(),
+            Some("qoop on staging is too old to hand questions to qass")
+        );
+        m.no_hands.clear();
+        m.rows.retain(|r| r.workspace != 3);
+        assert_eq!(m.qass_reason(&row).as_deref(), Some("qass is not running"));
+    }
+
+    /// A remote hand from this Mac counts as with qass only while This Mac's qass has run and
+    /// watched since the window first saw it: one already there at launch, one made before a
+    /// qass restart, and one qass wrote a card for wait on the owner again. A hand by another
+    /// Mac is that Mac's qass's.
+    #[test]
+    fn a_remote_hand_is_with_qass_only_while_the_qass_told_of_it_runs() {
+        let mut m = fixture();
+        let t = remote_asking(&mut m, Some("testmac"), 100);
+        // Already there in the window's first list: nothing says this qass heard of it.
+        m.note_qass(10, true);
+        assert!(!m.with_qass(m.row(t).unwrap()));
+        assert!(m.asking().contains(&t));
+        // Handed again from here: a new hand, seen after qass came up.
+        remote_asking(&mut m, Some("testmac"), 200);
+        m.note_qass(20, false);
+        assert!(m.with_qass(m.row(t).unwrap()));
+        assert!(!m.asking().contains(&t));
+        assert_eq!(m.handed(), 1);
+        assert_eq!(
+            m.qass_words(m.row(t).unwrap()).as_deref(),
+            Some("With qass")
+        );
+        // qass's card for it: the card is what waits on the owner now.
+        m.carded = vec!["staging/T1".into()];
+        assert!(!m.with_qass(m.row(t).unwrap()));
+        m.carded.clear();
+        // qass restarted (a new generation): it never heard of the hand.
+        m.rows
+            .iter_mut()
+            .find(|r| r.terminal == 9)
+            .unwrap()
+            .generation = Some(2);
+        m.note_qass(30, false);
+        assert!(!m.with_qass(m.row(t).unwrap()));
+        assert!(m.asking().contains(&t));
+        // Stopped: the row says why nobody holds it.
+        m.qass_watch = Some(false);
+        m.note_qass(40, false);
+        assert_eq!(
+            m.qass_words(m.row(t).unwrap()).as_deref(),
+            Some("With qass, not watching")
+        );
+        // Another Mac's hand is that Mac's qass's.
+        m.qass_watch = Some(true);
+        remote_asking(&mut m, Some("othermac"), 300);
+        m.note_qass(50, false);
+        assert!(m.with_qass(m.row(t).unwrap()));
+    }
+
+    /// A card finds its row by its key on another machine too.
+    #[test]
+    fn a_remote_card_finds_its_row() {
+        let m = fixture();
+        let card: AskInfo = serde_json::from_value(serde_json::json!({
+            "card": "E1", "agent": "staging/T1", "status": "open", "opened_at": 1,
+            "body": {
+                "handle": "soak", "urgency": "later", "doing": "a soak test",
+                "why": "it touches billing", "asks": "Run it?", "options": [],
+            },
+        }))
+        .expect("card");
+        assert_eq!(m.card_row(&card), Some(0x8100_0001));
     }
 
     #[test]

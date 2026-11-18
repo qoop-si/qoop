@@ -1008,6 +1008,80 @@ fn a_pick_on_the_card_gives_the_keys_to_the_terminal(cx: &mut TestAppContext) {
     assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
 }
 
+/// A remote agent's question handed from here goes for This Mac's qass, named by this Mac's
+/// hand id; a far qoop that answers it as one for its own qass is too old for it, says so,
+/// and is not offered "Let qass handle it" again.
+#[gpui::test]
+fn a_remote_hand_goes_for_this_macs_qass(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    let remote = 0x8100_0001;
+    let mut rows = crate::state::tests::fixture().rows;
+    let r = rows.iter_mut().find(|r| r.terminal == remote).unwrap();
+    r.state = "blocked".into();
+    r.status = Some("blocked".into());
+    r.menu = Some(crate::state::tests::edit_menu(77));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    sent(&mut rx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let row = d.model.row(remote).cloned().unwrap();
+            assert_eq!(d.qass_reason(&row), None, "offered for a remote agent");
+            let qass = crate::state::Offer {
+                digit: None,
+                label: "Let qass handle it".into(),
+                detail: None,
+                pick: crate::state::Pick::Qass,
+            };
+            d.pick(remote, &qass, window, cx);
+            for hold in &mut d.holds.held {
+                hold.until = std::time::Instant::now();
+            }
+            d.fire();
+        })
+    });
+    let asked = request_of(&sent(&mut rx), |r| {
+        matches!(r, ControlRequest::HandToQass { .. })
+    })
+    .expect("handed");
+    let ControlRequest::HandToQass { id, hands } = asked else {
+        unreachable!()
+    };
+    assert_eq!(hands.len(), 1);
+    assert_eq!(hands[0].away.as_deref(), Some("testmac"));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Failed {
+            id,
+            reason: "qass_not_running".into(),
+        },
+    );
+    let (said, why) = desk.read_with(&vcx, |d, _| {
+        let row = d.model.row(remote).cloned().unwrap();
+        (
+            d.said.get(&crate::state::Slot::Agent(remote)).cloned(),
+            d.qass_reason(&row),
+        )
+    });
+    assert!(
+        matches!(&said, Some(crate::question::Said::Refused(w)) if w.contains("too old")),
+        "{said:?}"
+    );
+    assert_eq!(
+        why.as_deref(),
+        Some("qoop on staging is too old to hand questions to qass")
+    );
+}
+
 /// Every sidebar link takes the ring: from the window's own focus, Tab once reaches Home, twice
 /// Schedules, three times Settings, each focused with a key as the last input (what
 /// `focus_visible` draws the ring on), and Space opens the link that has it.
