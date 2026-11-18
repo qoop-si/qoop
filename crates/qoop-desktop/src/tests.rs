@@ -393,6 +393,52 @@ fn a_field_made_before_a_theme_switch_takes_the_new_theme(cx: &mut TestAppContex
     }
 }
 
+/// A click on a control half in view focuses it and leaves its list where it is: only the
+/// keyboard's focus scrolls, so the button never moves away under the pointer mid-click.
+#[gpui::test]
+fn a_click_at_a_lists_edge_never_scrolls_it(cx: &mut TestAppContext) {
+    use gpui::{Context, Render, Role, Window, div, prelude::*, px};
+
+    /// A 100 px list of five 40 px buttons: the third shows only its top half.
+    struct List;
+    impl Render for List {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            crate::ui::scroll(
+                div()
+                    .id("list")
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children((0..5usize).map(|i| {
+                        crate::ui::control(("item", i), Role::Button, "item", &crate::theme::DARK)
+                            .flex_none()
+                            .h(px(40.))
+                            .debug_selector(move || format!("item-{i}"))
+                            .on_click(|_, _, _| {})
+                    })),
+            )
+        }
+    }
+
+    let window = cx.add_window(|_, _| List);
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    vcx.run_until_parked();
+    let before = vcx.debug_bounds("item-2").expect("the third button");
+    let at = gpui::point(before.center().x, before.top() + px(10.));
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| window.focused(cx).is_some()),
+        "the click focused it"
+    );
+    assert_eq!(
+        vcx.debug_bounds("item-2").expect("the third button").top(),
+        before.top(),
+        "the list stayed under the pointer"
+    );
+}
+
 /// A Tab stop below the fold scrolls its list into view: the settings list on a short window,
 /// Tab until its last switch has the focus, and it is on screen.
 #[gpui::test]
@@ -1014,13 +1060,52 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
 /// remote one, by the machine's name.
 #[gpui::test]
 fn a_stale_answer_says_what_it_waits_for(cx: &mut TestAppContext) {
-    let (desk, vcx, _rx) = open(cx);
+    let (desk, mut vcx, _rx) = open(cx);
     let (local, remote) = desk.read_with(&vcx, |d, _| {
         let reason = |terminal: u32| d.stale_reason(d.model.row(terminal).expect("the row"));
         (reason(2), reason(0x8100_0001))
     });
     assert_eq!(local, "Answering opens again when the daemon is back");
     assert_eq!(remote, "Answering opens again when staging is reached");
+    // This Mac's daemon lost: every machine waits for it, staging's card included.
+    let remote = vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.lost_at = Some(d.now);
+            d.stale_reason(d.model.row(0x8100_0001).expect("the row"))
+        })
+    });
+    assert_eq!(remote, "Answering opens again when the daemon is back");
+}
+
+/// The Inbox counts what needs the owner once, the same in its header and its badge: the agents
+/// that ask, and a qass card about none of them; a card about an asking agent is not a second.
+#[gpui::test]
+fn the_inbox_and_its_badge_count_qass_cards_once(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let card = |id: &str, terminal: u32| -> qoop_runtime::control::AskInfo {
+        serde_json::from_value(serde_json::json!({
+            "card": id, "terminal": terminal, "status": "open", "opened_at": 1000,
+            "body": {
+                "handle": "soak", "urgency": "later", "doing": "running the soak test",
+                "why": "the migration touches billing", "asks": "Run the migration?",
+                "options": [
+                    {"key": "a", "label": "Run it", "reason": "it passed", "words": "run it"},
+                    {"key": "b", "label": "Wait", "reason": "after the release", "words": "wait"},
+                ],
+            },
+        }))
+        .expect("card")
+    };
+    let counts = |vcx: &VisualTestContext| desk.read_with(vcx, |d, _| (d.needs_you(), d.badge()));
+    assert_eq!(counts(&vcx), (1, 1), "one agent asks");
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.asks = vec![card("E1", 2)]));
+    assert_eq!(
+        counts(&vcx),
+        (1, 1),
+        "a card about the asking agent is not a second"
+    );
+    vcx.update(|_, cx| desk.update(cx, |d, _| d.asks.push(card("E2", 1))));
+    assert_eq!(counts(&vcx), (2, 2), "a card about a working agent counts");
 }
 
 /// A question from a machine not reached is the last one seen: neutral, with when it was seen,

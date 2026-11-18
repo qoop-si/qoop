@@ -318,19 +318,19 @@ impl Model {
             .count()
     }
 
-    /// The agents that need the owner: the Inbox's "N needs you" and the Needs you part of its
-    /// badge, one count. A qass card about one of them is not a second one.
-    pub fn needs_you(&self) -> usize {
-        self.live().filter(|r| Kind::of(r).needs_you()).count()
+    /// The terminals of the agents that need the owner.
+    pub fn asking(&self) -> Vec<u32> {
+        self.live()
+            .filter(|r| Kind::of(r).needs_you())
+            .map(|r| r.terminal)
+            .collect()
     }
 
-    /// The Inbox badge: Needs you plus Failed, nothing at zero.
-    pub fn badge(&self) -> usize {
-        self.needs_you()
-            + self
-                .live()
-                .filter(|r| Kind::of(r) == Kind::Status(Status::Failed))
-                .count()
+    /// The agents that failed: the rest of the Inbox badge.
+    pub fn failed(&self) -> usize {
+        self.live()
+            .filter(|r| Kind::of(r) == Kind::Status(Status::Failed))
+            .count()
     }
 
     /// "7 in 3 spaces on 2 machines".
@@ -2228,18 +2228,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn badge_is_needs_you_plus_failed() {
+    fn the_asking_and_the_failed_are_counted_apart() {
         let mut m = fixture();
-        assert_eq!((m.needs_you(), m.badge()), (1, 1));
+        assert_eq!((m.asking().len(), m.failed()), (1, 0));
         m.rows[0].status = Some("failed".into());
-        assert_eq!(
-            (m.needs_you(), m.badge()),
-            (1, 2),
-            "the Inbox and the badge agree"
-        );
+        assert_eq!((m.asking().len(), m.failed()), (1, 1));
         m.rows
             .retain(|r| !matches!(r.status.as_deref(), Some("failed" | "blocked")));
-        assert_eq!(m.badge(), 0);
+        assert_eq!((m.asking().len(), m.failed()), (0, 0));
     }
 
     #[test]

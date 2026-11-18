@@ -12,6 +12,24 @@ use crate::theme::{Theme, c, ca};
 use crate::ui::{self, Icon};
 
 impl Desk {
+    /// What needs the owner, one count for the Inbox's "N needs you" and its badge: the agents
+    /// that ask, and every open qass card that is not about one of them (a card about a working
+    /// agent, or about none).
+    pub(crate) fn needs_you(&self) -> usize {
+        let asking = self.model.asking();
+        let cards = self
+            .asks
+            .iter()
+            .filter(|a| a.status == "open" && !a.terminal.is_some_and(|t| asking.contains(&t)))
+            .count();
+        asking.len() + cards
+    }
+
+    /// The Inbox badge: what needs the owner plus the agents that failed, nothing at zero.
+    pub(crate) fn badge(&self) -> usize {
+        self.needs_you() + self.model.failed()
+    }
+
     /// The agents the Inbox lists: Needs you, then Failed, then Done, as home ranks them.
     fn inbox_rows(&self) -> Vec<&AgentRow> {
         let mut rows: Vec<&AgentRow> = self
@@ -108,7 +126,7 @@ impl Desk {
                             .text_color(c(t.t2))
                             .child(format!(
                                 "{} needs you, {} unread",
-                                self.model.needs_you(),
+                                self.needs_you(),
                                 unread.len()
                             )),
                     )
