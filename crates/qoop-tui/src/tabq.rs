@@ -87,10 +87,16 @@ pub struct Paint<'a> {
 /// The cards `terminal`'s agent waits on: open, not handed to qass or answered. What the rail
 /// and the sidebar's count both read.
 pub fn open_cards(cards: &[AskInfo], terminal: u32) -> Vec<&AskInfo> {
-    cards
-        .iter()
-        .filter(|c| c.status == "open" && c.terminal == Some(terminal))
-        .collect()
+    cards.iter().filter(|c| waits(c, terminal)).collect()
+}
+
+/// How many of them there are.
+pub fn open_count(cards: &[AskInfo], terminal: u32) -> usize {
+    cards.iter().filter(|c| waits(c, terminal)).count()
+}
+
+fn waits(card: &AskInfo, terminal: u32) -> bool {
+    card.status == "open" && card.terminal == Some(terminal)
 }
 
 /// A stage in a word that fits the wide rail.

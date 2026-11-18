@@ -26756,17 +26756,11 @@ mod tests {
             type Change = Box<dyn Fn(&mut State)>;
             // Cards about no agent of the column: an agent's own count beside its name is the
             // owner's asked change (left-sidebar.md, 2026-11-18); here only the panes move.
-            fn loose(n: u32, handle: &str) -> qoop_runtime::control::AskInfo {
-                qoop_runtime::control::AskInfo {
-                    terminal: None,
-                    ..ask_card(n, handle)
-                }
-            }
             let variants: Vec<(&str, Change)> = vec![
                 (
                     "a card brought up beside the board",
                     Box::new(|s| {
-                        s.asks.take(vec![loose(1, "korea")], Vec::new());
+                        s.asks.take(vec![ask_about_nothing(1, "korea")], Vec::new());
                         s.asks.raised = true;
                     }),
                 ),
@@ -26774,7 +26768,11 @@ mod tests {
                     "three waiting on the rail",
                     Box::new(|s| {
                         s.asks.take(
-                            vec![loose(1, "a"), loose(2, "b"), loose(3, "c")],
+                            vec![
+                                ask_about_nothing(1, "a"),
+                                ask_about_nothing(2, "b"),
+                                ask_about_nothing(3, "c"),
+                            ],
                             Vec::new(),
                         );
                     }),
