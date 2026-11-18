@@ -1421,7 +1421,7 @@ impl Desk {
 
     fn top_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let (title, sub) = self.title();
-        let badge = self.model.badge();
+        let badge = self.badge();
         div()
             .id("top")
             .role(Role::Banner)

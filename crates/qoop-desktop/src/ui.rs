@@ -266,10 +266,10 @@ pub fn control(
     )
 }
 
-/// A focusable element that knows when it gains the focus and asks the scrolling list or
-/// page around it ([`scroll`]) to bring it into view, so a Tab stop below the fold is never
-/// focused out of sight. It focuses by its own handle, kept from frame to frame, or by the
-/// one given with [`Control::track_focus`].
+/// A focusable element that knows when the keyboard brings the focus to it and asks the
+/// scrolling list or page around it ([`scroll`]) to bring it into view, so a Tab stop below
+/// the fold is never focused out of sight. It focuses by its own handle, kept from frame to
+/// frame, or by the one given with [`Control::track_focus`].
 pub struct Control {
     div: Option<Stateful<Div>>,
     focus: Option<FocusHandle>,
@@ -346,7 +346,7 @@ impl Element for Control {
     type PrepaintState = Option<Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
-        self.div.as_ref().and_then(|d| Element::id(d))
+        self.div.as_ref().and_then(Element::id)
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -354,7 +354,7 @@ impl Element for Control {
     }
 
     fn a11y_role(&self) -> Option<Role> {
-        self.div.as_ref().and_then(|d| Element::a11y_role(d))
+        self.div.as_ref().and_then(Element::a11y_role)
     }
 
     fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
@@ -416,7 +416,9 @@ impl Element for Control {
                 kept.focused = now;
                 (gained, kept)
             });
-            if gained {
+            // By the keyboard only: a mouse down focuses too, and a list moving under the
+            // pointer before the button comes up would lose the click.
+            if gained && window.last_input_was_keyboard() {
                 window.request_autoscroll(bounds);
             }
         }
@@ -481,7 +483,7 @@ impl Element for Scroll {
     type PrepaintState = Option<Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
-        self.div.as_ref().and_then(|d| Element::id(d))
+        self.div.as_ref().and_then(Element::id)
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -489,7 +491,7 @@ impl Element for Scroll {
     }
 
     fn a11y_role(&self) -> Option<Role> {
-        self.div.as_ref().and_then(|d| Element::a11y_role(d))
+        self.div.as_ref().and_then(Element::a11y_role)
     }
 
     fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {

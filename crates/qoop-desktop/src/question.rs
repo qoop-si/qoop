@@ -53,10 +53,11 @@ impl Desk {
             .map_or_else(|| "This Mac".to_string(), state::machine_name)
     }
 
-    /// Why `row`'s answers are closed while its machine is not reached: this Mac's daemon, or
-    /// the link to the machine it runs on.
+    /// Why `row`'s answers are closed while its machine is not reached, by the cause: this Mac's
+    /// daemon when it is lost (every machine is reached through it), else the link to the
+    /// machine the row runs on.
     pub(crate) fn stale_reason(&self, row: &AgentRow) -> String {
-        if state::machine_of(row.workspace) == 0 {
+        if self.lost_at.is_some() || state::machine_of(row.workspace) == 0 {
             state::stale_reason(None)
         } else {
             state::stale_reason(Some(&self.machine_of_row(row)))
