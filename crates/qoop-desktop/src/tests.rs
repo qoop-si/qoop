@@ -2312,3 +2312,185 @@ fn a_down_machine_reads_by_name_and_retries_at_once(cx: &mut TestAppContext) {
     vcx.update(|_, cx| desk.update(cx, |d, _| d.retry_away()));
     assert_eq!(asked(&mut rx), 1, "the window back asks it too");
 }
+
+/// A question card `id` of the agent in `terminal`, `status` as the daemon lists it.
+fn tab_card(id: &str, terminal: u32, status: &str) -> qoop_runtime::control::AskInfo {
+    serde_json::from_value(serde_json::json!({
+        "card": id, "terminal": terminal, "status": status, "opened_at": 1000,
+        "body": {
+            "handle": "soak", "urgency": "later", "doing": "running the soak test",
+            "why": "the migration touches billing", "asks": format!("{id}: run the migration?"),
+            "options": [
+                {"key": "a", "label": "Run it", "reason": "the test passed", "words": "run it"},
+                {"key": "b", "label": "Wait", "reason": "after the release", "words": "wait"},
+            ],
+        },
+    }))
+    .expect("card")
+}
+
+/// The count beside an agent on Home (the sidebar's, off Home, in the next test): its open cards only, nothing at zero,
+/// and never on a remote agent whose number matches a card's (a card names this Mac's
+/// terminal; the mux numbers a remote's its own way).
+#[gpui::test]
+fn an_agent_row_counts_its_open_question_cards(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks = vec![
+                tab_card("Q1", 1, "open"),
+                tab_card("Q2", 1, "open"),
+                tab_card("Q3", 1, "passed"),
+                tab_card("Q4", 0x8100_0001, "open"),
+            ];
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("home-cards-1").is_some(), "Home counts");
+    assert!(
+        vcx.debug_bounds("home-cards-3").is_none(),
+        "nothing at zero"
+    );
+    assert!(
+        vcx.debug_bounds("home-cards-2164260865").is_none(),
+        "not a remote agent's"
+    );
+    desk.read_with(&vcx, |d, _| {
+        assert_eq!(d.cards_of(1, 1).len(), 2, "a passed card is not counted");
+        assert!(d.cards_of(0x8100_0001, 1 << 40 | 1).is_empty());
+    });
+}
+
+/// The Session page shows its agent's cards and no other's: the oldest opened in place, the
+/// rest one row each; a click on a row opens that one. A waiting agent with no card says so,
+/// and before the task is read its progress comes from the agent's row.
+#[gpui::test]
+fn the_session_page_lists_its_agents_cards(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks = vec![
+                tab_card("Q1", 1, "open"),
+                tab_card("Q2", 1, "open"),
+                tab_card("Q9", 5, "open"),
+            ];
+            d.open(Page::Session(1), window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("card-Q1").is_some(), "the oldest opened");
+    assert!(
+        vcx.debug_bounds("tree-cards-1").is_some(),
+        "the sidebar counts, off Home"
+    );
+    assert!(
+        vcx.debug_bounds("card-row-Q2").is_some(),
+        "the other folded"
+    );
+    assert!(vcx.debug_bounds("card-row-Q9").is_none() && vcx.debug_bounds("card-Q9").is_none());
+    let at = vcx.debug_bounds("card-row-Q2").expect("a row").center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(vcx.debug_bounds("card-Q2").is_some() && vcx.debug_bounds("card-row-Q1").is_some());
+
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks.clear();
+            d.strip = None;
+            let row = d.model.rows.iter_mut().find(|r| r.terminal == 1).unwrap();
+            row.task = Some(qoop_runtime::control::TaskRef {
+                id: 12,
+                goal: "ship the soak test".into(),
+                stage: "waiting-human".into(),
+                claimed: false,
+                item: Some(3),
+                steps_done: 2,
+                steps_total: 4,
+            });
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("tab-questions").is_some(), "says it waits");
+    assert!(
+        vcx.debug_bounds("task-progress").is_some(),
+        "2 of 4 from the row"
+    );
+}
+
+/// The owner's own words and the hand-off on a card are held like any answer, then written:
+/// the words as text, the hand-off as `to_qass` with no option and no words, which the card
+/// then calls handed to qass.
+#[gpui::test]
+fn a_cards_own_words_and_hand_off_are_written_after_the_hold(cx: &mut TestAppContext) {
+    use qoop_runtime::control::AskOp;
+    let (desk, mut vcx, mut rx) = open(cx);
+    let written =
+        |desk: &Entity<Desk>, vcx: &mut VisualTestContext, rx: &mut UnboundedReceiver<Up>| {
+            vcx.update(|_, cx| {
+                desk.update(cx, |d, _| {
+                    for hold in &mut d.holds.held {
+                        hold.until = std::time::Instant::now();
+                    }
+                    d.fire();
+                })
+            });
+            let asked = request_of(&sent(rx), |r| matches!(r, ControlRequest::AskWrite { .. }))
+                .expect("written after the hold");
+            let ControlRequest::AskWrite { id, action, .. } = asked else {
+                unreachable!()
+            };
+            (id, action)
+        };
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.asks = vec![tab_card("Q1", 1, "open")];
+            d.open(Page::Session(1), window, cx);
+            d.open_own(1, Some("Q1".into()), window, cx);
+            let own = d.own.as_ref().expect("the field").field.clone();
+            own.update(cx, |f, _| f.text = "  only after the release ".into());
+        })
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| desk.update(cx, |d, cx| assert!(d.own_enter(window, cx))));
+    sent(&mut rx);
+    let (_, action) = written(&desk, &mut vcx, &mut rx);
+    assert_eq!(
+        action,
+        AskOp::Answer {
+            card: "Q1".into(),
+            option: None,
+            text: Some("only after the release".into()),
+            seen: None,
+            to_qass: false,
+        }
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.card_to_qass("Q1", window, cx)));
+    let (id, action) = written(&desk, &mut vcx, &mut rx);
+    assert_eq!(
+        action,
+        AskOp::Answer {
+            card: "Q1".into(),
+            option: None,
+            text: None,
+            seen: None,
+            to_qass: true,
+        }
+    );
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::AskWritten {
+            id,
+            card: "Q1".into(),
+            result: qoop_runtime::control::AskResult::Passed,
+        },
+    );
+    let said = desk.read_with(&vcx, |d, _| {
+        d.said.get(&crate::state::Slot::Card("Q1".into())).cloned()
+    });
+    assert!(
+        matches!(&said, Some(crate::question::Said::Sent { label, .. }) if label == "Handed to qass"),
+        "{said:?}"
+    );
+}

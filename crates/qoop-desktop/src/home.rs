@@ -245,6 +245,7 @@ impl Desk {
                             .when(needs, |d| d.child(ui::icon(Icon::Chevron, 10., c(t.t2)))),
                     ),
             )
+            .when_some(self.card_count(entry, "home", t), |d, n| d.child(n))
             .child(
                 div()
                     .w(px(82.))
