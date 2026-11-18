@@ -5,9 +5,9 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AnyElement, AnyView, App, AssetSource, BoxShadow, Context, Div, ElementId, FontWeight, Hsla,
-    Render, Role, SharedString, Stateful, StyleRefinement, Svg, Toggled, Window, div, point,
-    prelude::*, px, svg,
+    AnyElement, AnyView, App, AssetSource, BoxShadow, Context, Div, ElementId, FocusHandle,
+    FontWeight, Hsla, Render, Role, SharedString, Stateful, StyleRefinement, Svg, Toggled, Window,
+    div, point, prelude::*, px, svg,
 };
 use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
@@ -214,6 +214,12 @@ pub fn paint<S: Styled>(s: S, pair: Pair) -> S {
     s.bg(ca(pair.fill)).text_color(c(pair.text))
 }
 
+/// A picked chip, radio or day: the picked pair and its outline, so the pick never rests on a
+/// tint alone. The element carries a 1 px border at rest (a `control` does), so nothing moves.
+pub fn picked<S: Styled>(s: S, t: &Theme) -> S {
+    paint(s, t.picked()).border_color(c(t.picked_edge()))
+}
+
 /// A key cap: `ctrl-a c`.
 pub fn kbd(keys: &str, t: &Theme) -> Div {
     paint(div(), t.key())
@@ -332,7 +338,7 @@ pub fn chip(
         .rounded_full()
         .text_size(px(12.5))
         .text_color(c(t.t2))
-        .when(on, |d| paint(d, t.picked()))
+        .when(on, |d| picked(d, t))
         .when_some(kind, |d, kind| d.child(mark(kind, t, 9.)))
         .child(label.to_string())
         .when_some(count, |d, n| {
@@ -444,6 +450,23 @@ pub fn tip(text: &'static str, t: Theme) -> impl Fn(&mut Window, &mut App) -> An
             t,
         })
         .into()
+    }
+}
+
+/// Tab (`back`: Shift-Tab) inside a sheet whose frame tracks `frame`: the window's own order,
+/// gone round until the focus is in the frame again, so a stop behind the scrim is never
+/// reached and the last stop wraps to the first.
+/// ponytail: walks the window's whole order, a few dozen stops; bounded so it always ends.
+pub fn trap_tab(frame: &FocusHandle, back: bool, window: &mut Window, cx: &mut App) {
+    for _ in 0..512 {
+        if back {
+            window.focus_prev(cx);
+        } else {
+            window.focus_next(cx);
+        }
+        if frame.contains_focused(window, cx) {
+            return;
+        }
     }
 }
 

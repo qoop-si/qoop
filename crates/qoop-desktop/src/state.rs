@@ -847,6 +847,15 @@ pub fn day_long(day: i64) -> String {
     )
 }
 
+/// "1 schedule, 1 on", "3 schedules, 2 on": Home's Next runs card and the Schedules top bar.
+pub fn schedules_line(schedules: &[ScheduleInfo]) -> String {
+    let on = schedules.iter().filter(|s| !s.paused).count();
+    match schedules.len() {
+        1 => format!("1 schedule, {on} on"),
+        n => format!("{n} schedules, {on} on"),
+    }
+}
+
 /// The slots the schedules will run at from `from` up to `until`, soonest first: each one's
 /// `next_at`, then its cron slots after it, on the wall clock of `zone` (so a 02:00 cron stays
 /// at 02:00 across a change of summer time). A watch or a one-off has only its `next_at`.
@@ -1688,10 +1697,17 @@ pub fn short_span(secs: i64) -> String {
 /// A path with the home folder as `~`.
 pub fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
-            format!("~{}", &path[home.len()..])
-        }
+        Ok(home) if !home.is_empty() => tilde_in(path, &home),
         _ => path.to_string(),
+    }
+}
+
+/// `home` matched as whole path components: `/Users/usx` is not under `/Users/us`.
+fn tilde_in(path: &str, home: &str) -> String {
+    match std::path::Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
     }
 }
 
@@ -2471,6 +2487,28 @@ pub(crate) mod tests {
             "next_at": next_at, "when": "every 2h",
         }))
         .expect("schedule")
+    }
+
+    #[test]
+    fn tilde_takes_home_only_as_whole_folders() {
+        assert_eq!(tilde_in("/Users/us/code/a", "/Users/us"), "~/code/a");
+        assert_eq!(tilde_in("/Users/us", "/Users/us"), "~");
+        assert_eq!(tilde_in("/Users/us/", "/Users/us/"), "~");
+        assert_eq!(tilde_in("/Users/usx/a", "/Users/us"), "/Users/usx/a");
+        assert_eq!(tilde_in("/srv/a", "/Users/us"), "/srv/a");
+    }
+
+    #[test]
+    fn the_schedules_line_says_one_schedule() {
+        let mut paused = schedule("deps-weekly", Some("0 9 * * 1"), None);
+        paused.paused = true;
+        let nightly = schedule("nightly", Some("0 2 * * *"), None);
+        assert_eq!(schedules_line(&[]), "0 schedules, 0 on");
+        assert_eq!(
+            schedules_line(std::slice::from_ref(&nightly)),
+            "1 schedule, 1 on"
+        );
+        assert_eq!(schedules_line(&[nightly, paused]), "2 schedules, 1 on");
     }
 
     #[test]

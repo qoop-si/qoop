@@ -98,6 +98,8 @@ pub struct Desk {
     pub inbox: bool,
     pub chip: Chip,
     pub sheet: Option<NewWork>,
+    /// New work closed with a task typed in it, given back on the next open.
+    pub work_draft: Option<NewWork>,
     /// The terminal the keys go to, and the other panes of its tab, read only.
     pub term: Option<Term>,
     pub others: Vec<Term>,
@@ -222,6 +224,7 @@ impl Desk {
             inbox: false,
             chip: Chip::All,
             sheet: None,
+            work_draft: None,
             term: None,
             others: Vec::new(),
             strip: None,
@@ -376,7 +379,7 @@ impl Desk {
 
     fn answer(&mut self, answer: ControlResponse, window: &mut Window, cx: &mut Context<Self>) {
         if self.answer_reply(&answer, cx)
-            || self.report_came(&answer)
+            || self.report_came(&answer, window, cx)
             || self.remote_setting_came(&answer)
         {
             return;
@@ -656,7 +659,32 @@ impl Desk {
             self.sheet_key(event, window, cx);
             return;
         }
+        if self.schedule_sheet_key(event, window, cx) {
+            return;
+        }
+        // Escape closes the Inbox before the terminal hears it: an Escape typed into an agent
+        // interrupts its turn.
+        if self.inbox && keys::typed(k) == "escape" {
+            self.inbox = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         self.answer_key(event, window, cx);
+    }
+
+    /// Focus back on the control that opened a sheet while it is still drawn, else on the
+    /// window (WEB-06).
+    pub(crate) fn focus_back(
+        &self,
+        back: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let to = back
+            .filter(|b| self.focus.contains(b, window))
+            .unwrap_or_else(|| self.focus.clone());
+        window.focus(&to, cx);
     }
 
     /// While a question card is on screen: a digit picks its answer, `u` undoes the pick,
@@ -746,10 +774,6 @@ impl Desk {
             "escape" if self.page == Page::Settings && self.close_find(window, cx) => {}
             "/" if self.page == Page::Settings && self.settings.find.is_none() => {
                 self.open_find(window, cx)
-            }
-            "escape" if self.inbox => {
-                self.inbox = false;
-                cx.notify();
             }
             _ => {}
         }
@@ -1380,11 +1404,10 @@ impl Desk {
                 )
             }
             Page::Qass => ("qass".into(), None),
-            Page::Schedules => {
-                let on = self.model.schedules.iter().filter(|s| !s.paused).count();
-                let n = self.model.schedules.len();
-                ("Schedules".into(), Some(format!("{n} schedules, {on} on")))
-            }
+            Page::Schedules => (
+                "Schedules".into(),
+                Some(state::schedules_line(&self.model.schedules)),
+            ),
             // Another machine's settings: its name, never This Mac's file.
             Page::Settings => (
                 "Settings".into(),

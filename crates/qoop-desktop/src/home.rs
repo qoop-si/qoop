@@ -294,7 +294,6 @@ impl Desk {
     fn next_runs(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let schedules = &self.model.schedules;
         let runs = state::next_runs(schedules, &self.model.rows, self.zone, 4);
-        let on = schedules.iter().filter(|s| !s.paused).count();
         let clock = |at: i64| state::clock_at(at, self.now, self.zone);
         let now_line = div()
             .flex()
@@ -385,7 +384,7 @@ impl Desk {
                                 div()
                                     .flex_1()
                                     .text_color(c(t.t2))
-                                    .child(format!("{} schedules, {on} on", schedules.len())),
+                                    .child(state::schedules_line(schedules)),
                             )
                             .child(
                                 ui::link_button("to-schedules", "Schedules", t)

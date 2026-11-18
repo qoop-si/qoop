@@ -216,6 +216,12 @@ impl Theme {
         }
     }
 
+    /// The outline a picked chip, radio or day wears over its fill (DECISION's `.tq.on`): the
+    /// tint alone is about 1.1:1 against an unpicked neighbour, the outline 3:1 at least.
+    pub fn picked_edge(&self) -> u32 {
+        self.t3
+    }
+
     /// A switch that is on, the sheet's Start: the selected ground and the ink on it.
     pub fn on(&self) -> Pair {
         Pair {
@@ -352,11 +358,9 @@ mod tests {
                     );
                 }
             }
-            // The badge's figure on Needs you.
-            assert!(
-                contrast(t.badge_fg, t.needs) >= 3.0,
-                "an 11 px semibold figure"
-            );
+            // The badge's figure on Needs you: 11 px semibold is not large text, so 4.5:1.
+            let badge = contrast(t.badge_fg, t.needs);
+            assert!(badge >= 4.5, "the badge's figure: {badge:.2}");
         }
     }
 
@@ -404,6 +408,17 @@ mod tests {
             for &ground in &grounds {
                 let ring = contrast(t.focus, ground);
                 assert!(ring >= 3.0, "{theme} ring on #{ground:06x}: {ring:.2}");
+                // A pick is told from its unpicked neighbours by its outline, never the tint
+                // alone: 3:1 against the ground beside it and against its own fill.
+                let edge = t.picked_edge();
+                let picked = over(t.picked().fill, ground);
+                for (what, next) in [("ground", ground), ("own fill", picked)] {
+                    let ratio = contrast(edge, next);
+                    assert!(
+                        ratio >= 3.0,
+                        "{theme} picked edge on its {what} #{next:06x}: {ratio:.2}"
+                    );
+                }
             }
         }
     }
