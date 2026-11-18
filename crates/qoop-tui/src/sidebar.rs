@@ -3018,7 +3018,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
         .map_or(0, |text| crate::width::width(text) + 2);
     // A blank and the crossed eye ahead of the cup and the close, while qass leaves it alone.
     let eye_w = if agent.qass_skip { EYE_W } else { 0 };
-    let asks = asks_mark(c, agent);
+    let asks = asks_mark(c, agent.terminal);
     let asks_w = asks
         .as_ref()
         .map_or(0, |text| crate::width::width(text) + 1);
@@ -3041,14 +3041,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     if !stale {
         runs.push((lead, crate::width::width(&name), ink));
     }
-    if let Some(asks) = asks {
-        runs.push((
-            crate::width::width(&text) + 1,
-            crate::width::width(&asks),
-            crate::theme::Role::Blocked,
-        ));
-        text = format!("{text} {asks}");
-    }
+    put_asks(&mut text, asks, stale, &mut runs);
     if let Some(cost) = cost {
         let at = c.width - crate::width::width(&cost) - LIVE_TAIL - eye_w;
         text = format!("{}{cost}", fit_to(&text, at));
@@ -3106,9 +3099,30 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
 
 /// How many question cards the agent waits on, after its name (`⠔2`), the count its tab's rail
 /// shows; `None` at none, so a row with nothing waiting is as it always was.
-fn asks_mark(c: &Column, agent: &AgentRow) -> Option<String> {
-    let waiting = crate::tabq::open_cards(c.cards, agent.terminal).len();
+fn asks_mark(c: &Column, terminal: u32) -> Option<String> {
+    let waiting = crate::tabq::open_count(c.cards, terminal);
     (waiting > 0).then(|| format!("\u{2814}{waiting}"))
+}
+
+/// The count after `head`, a blank between, in the needs-you ink; a stale row's count stays in
+/// the row's own faded ink, as its name does.
+fn put_asks(
+    head: &mut String,
+    asks: Option<String>,
+    stale: bool,
+    runs: &mut Vec<(usize, usize, crate::theme::Role)>,
+) {
+    let Some(asks) = asks else {
+        return;
+    };
+    if !stale {
+        runs.push((
+            crate::width::width(head) + 1,
+            crate::width::width(&asks),
+            crate::theme::Role::Blocked,
+        ));
+    }
+    *head = format!("{head} {asks}");
 }
 
 /// The columns the close at the end of an agent's row takes: a blank and the `x`.
@@ -3198,13 +3212,24 @@ fn sleeping_line(c: &Column, tab: &SleepingTab, space: &WorkspaceRow) -> Line {
     } else {
         cell_mark(crate::theme::Role::Sleeping, false, 0)
     };
-    let room = c.width.saturating_sub(crate::width::width(&lead) + CLOSE_W);
-    let (text, close) = with_close(&format!("{lead}{}", shorten_middle(&text, room)), c.width);
+    // An agent asleep with questions waiting still says how many.
+    let asks = asks_mark(c, tab.terminal);
+    let asks_w = asks
+        .as_ref()
+        .map_or(0, |text| crate::width::width(text) + 1);
+    let room = c
+        .width
+        .saturating_sub(crate::width::width(&lead) + CLOSE_W + asks_w);
+    let mut head = format!("{lead}{}", shorten_middle(&text, room));
+    let mut runs = Vec::new();
+    put_asks(&mut head, asks, false, &mut runs);
+    let (text, close) = with_close(&head, c.width);
+    runs.push(close);
     Line {
         text,
         colour: Some(crate::theme::space_calm_in(c.spaces, space.id)),
         indicator: Some((0, 2, crate::theme::Role::Sleeping)),
-        runs: vec![close],
+        runs,
         ..Line::default()
     }
 }
@@ -3244,7 +3269,7 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
     let space_w = crate::width::width(&space);
     // The dot and its two spaces, the name, a gap, the space and a trailing space.
     let right = if space.is_empty() { 0 } else { space_w + 2 };
-    let asks = asks_mark(c, agent);
+    let asks = asks_mark(c, agent.terminal);
     let asks_w = asks
         .as_ref()
         .map_or(0, |text| crate::width::width(text) + 1);
@@ -3252,14 +3277,7 @@ fn flat_line(c: &Column, agent: &AgentRow) -> Line {
     let name = shorten_middle(&session_name(agent), room);
     let mut head = format!("{}{}{name}", " ".repeat(DOT_AT), mark_of(c, agent, role));
     let mut runs = Vec::new();
-    if let Some(asks) = asks {
-        runs.push((
-            crate::width::width(&head) + 1,
-            crate::width::width(&asks),
-            crate::theme::Role::Blocked,
-        ));
-        head = format!("{head} {asks}");
-    }
+    put_asks(&mut head, asks, stale, &mut runs);
     let left = fit_to(&head, c.width.saturating_sub(right));
     let (text, accent) = if space.is_empty() {
         (left, None)
@@ -4493,18 +4511,199 @@ mod tests {
         .expect("a card")
     }
 
-    /// An agent waiting on two cards says so after its name, `⠔2` in the needs-you ink, on its
-    /// tree row and its flat row, and the row keeps its width. Cards handed to qass, answered or
-    /// another terminal's are not counted, and with none waiting the row is the row it was,
-    /// to the byte.
+    /// Terminal 7's cards with `open` of them waiting, and the ones that never count: handed to
+    /// qass, answered, another terminal's.
+    fn cards_for(open: u32) -> Vec<AskInfo> {
+        let mut out: Vec<AskInfo> = (1..=open).map(|n| card(n, 7, "open")).collect();
+        out.extend([
+            card(90, 7, "passed"),
+            card(91, 7, "answered"),
+            card(92, 8, "open"),
+        ]);
+        out
+    }
+
+    /// What a row keeps whatever its count: its width, its last `tail` columns (the cost, the
+    /// eye, the sleep mark, the cup and the close; a flat row's space) cell for cell and ink
+    /// for ink, its dot and its space's accent.
+    fn kept(before: &Line, after: &Line, tail: usize, what: &str) {
+        let w = crate::width::width(&before.text);
+        assert_eq!(crate::width::width(&after.text), w, "{what}: width");
+        let end = |l: &Line| l.text.chars().rev().take(tail).collect::<String>();
+        assert_eq!(end(after), end(before), "{what}: tail");
+        let inks = |l: &Line| {
+            l.runs
+                .iter()
+                .filter(|(at, _, _)| *at >= w - tail)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inks(after), inks(before), "{what}: tail inks");
+        assert_eq!(after.accent, before.accent, "{what}: accent");
+        assert_eq!(after.indicator, before.indicator, "{what}: dot");
+    }
+
+    /// Where `⠔N` stands in a row, by column, with a blank before it.
+    fn mark_at(line: &Line, open: u32) -> usize {
+        let mark = format!(" \u{2814}{open}");
+        let at = line.text.find(&mark).expect(&line.text);
+        crate::width::width(&line.text[..at]) + 1
+    }
+
+    /// An agent waiting on cards says how many after its name, `⠔N` in the needs-you ink, on
+    /// its tree row and its flat row: a long name gives up the columns, a wide one too, ten and
+    /// more fit, and the cost, qass's eye, the cup, the close and the flat row's space stay where
+    /// they were. Cards handed to qass, answered or another terminal's are not counted, and
+    /// with none waiting the row is the row it was, to the byte.
     #[test]
     fn an_agent_row_counts_the_cards_it_waits_on() {
         let spaces = [space(1, "app")];
-        let agents = [agent(7, 1, "claude", "blocked")];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let mut usage = Usage::new();
+        usage.insert(
+            7,
+            Cost {
+                cpu_percent: Some(4),
+                rss: 212 << 20,
+            },
+        );
+        let cost_w = crate::width::width(&cost_text(usage[&7]));
+        let named = |name: &str| {
+            let mut row = agent(7, 1, "claude", "blocked");
+            row.name = Some(name.to_string());
+            row
+        };
+        let mut skipped = agent(7, 1, "claude", "blocked");
+        skipped.qass_skip = true;
+        let rows = [
+            ("plain", agent(7, 1, "claude", "blocked")),
+            (
+                "long",
+                named("the-very-long-session-name-shortened-in-its-middle"),
+            ),
+            (
+                "wide",
+                named(
+                    "\u{30a8}\u{30fc}\u{30b8}\u{30a7}\u{30f3}\u{30c8}\u{306e}\u{540d}\u{524d}\u{3067}\u{3059}\u{3088}",
+                ),
+            ),
+            ("eye", skipped),
+        ];
+        type RowLine = fn(&Column, &AgentRow) -> Line;
+        let lines: [(&str, RowLine); 2] = [("tree", tree_line), ("flat", flat_line)];
+        for (what, row) in &rows {
+            let agents = [row.clone()];
+            let base = column(
+                &spaces,
+                &agents,
+                1,
+                0,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                0,
+                WIDTH,
+                &shut,
+            );
+            let costed = Column {
+                usage: Some(&usage),
+                ..base
+            };
+            for (priced, plain) in [(false, base), (true, costed)] {
+                let none = cards_for(0);
+                let quiet = Column {
+                    cards: &none,
+                    ..plain
+                };
+                for open in [2u32, 12] {
+                    let cards = cards_for(open);
+                    let waiting = Column {
+                        cards: &cards,
+                        ..plain
+                    };
+                    for (kind, line) in lines {
+                        let what = format!("{kind} {what} {open} cost {priced}");
+                        let (before, after) = (line(&plain, row), line(&waiting, row));
+                        assert_eq!(line(&quiet, row), before, "{what}: nothing waits");
+                        let tail = match kind {
+                            "tree" => {
+                                LIVE_TAIL
+                                    + if row.qass_skip { EYE_W } else { 0 }
+                                    + if priced { cost_w } else { 0 }
+                            }
+                            _ => "app".len() + 2,
+                        };
+                        kept(&before, &after, tail, &what);
+                        let mark_w = crate::width::width(&format!("\u{2814}{open}"));
+                        assert!(
+                            after.runs.contains(&(
+                                mark_at(&after, open),
+                                mark_w,
+                                crate::theme::Role::Blocked
+                            )),
+                            "{what}: {:?}",
+                            after.runs
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A row gone quiet keeps its count in its own faded ink, as its name: no bright mark on a
+    /// faded row.
+    #[test]
+    fn a_stale_rows_count_stays_quiet() {
+        let spaces = [space(1, "app")];
+        let mut idle = agent(7, 1, "claude", "idle");
+        idle.last_active_at_unix = Some(0);
+        let agents = [idle];
+        let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
+        let cards = cards_for(3);
+        let c = Column {
+            cards: &cards,
+            ..column(
+                &spaces,
+                &agents,
+                1,
+                0,
+                0,
+                View::Tree,
+                &seen,
+                &unseen,
+                90 * 86_400,
+                WIDTH,
+                &shut,
+            )
+        };
+        for line in [tree_line(&c, &agents[0]), flat_line(&c, &agents[0])] {
+            assert_eq!(line.colour, Some(crate::theme::Role::Faint), "stale");
+            assert!(line.text.contains(" \u{2814}3"), "{}", line.text);
+            assert!(
+                line.runs
+                    .iter()
+                    .all(|(_, _, role)| *role != crate::theme::Role::Blocked),
+                "{:?}",
+                line.runs
+            );
+        }
+    }
+
+    /// A sleeping agent with questions waiting still says how many after its name, and with none
+    /// its row is as it was.
+    #[test]
+    fn a_sleeping_agents_row_counts_its_cards_too() {
+        let space_row = space(1, "app");
+        let tab: SleepingTab = serde_json::from_value(serde_json::json!({
+            "terminal": 7, "cwd": "/tmp/app", "agent": "claude",
+        }))
+        .expect("a sleeping tab");
+        let spaces = [space_row.clone()];
         let (seen, unseen, shut) = (Seen::new(), Unseen::new(), Shut::new());
         let plain = column(
             &spaces,
-            &agents,
+            &[],
             1,
             0,
             0,
@@ -4515,39 +4714,26 @@ mod tests {
             WIDTH,
             &shut,
         );
-        let two = [
-            card(1, 7, "open"),
-            card(2, 7, "passed"),
-            card(3, 7, "open"),
-            card(4, 7, "answered"),
-            card(5, 8, "open"),
-        ];
-        let none = [card(2, 7, "passed"), card(5, 8, "open")];
-        let waiting = Column {
-            cards: &two,
-            ..plain
-        };
+        let (none, two) = (cards_for(0), cards_for(2));
+        let before = sleeping_line(&plain, &tab, &space_row);
         let quiet = Column {
             cards: &none,
             ..plain
         };
-        let lines: [fn(&Column, &AgentRow) -> Line; 2] = [tree_line, flat_line];
-        for (what, line) in ["tree", "flat"].into_iter().zip(lines) {
-            let (before, after) = (line(&plain, &agents[0]), line(&waiting, &agents[0]));
-            assert_eq!(line(&quiet, &agents[0]), before, "{what}: nothing waits");
-            assert_eq!(
-                crate::width::width(&after.text),
-                crate::width::width(&before.text),
-                "{what}"
-            );
-            let at = after.text.find("claude \u{2814}2").expect(&after.text);
-            let col = crate::width::width(&after.text[..at]) + "claude ".len();
-            assert!(
-                after.runs.contains(&(col, 2, crate::theme::Role::Blocked)),
-                "{what}: {:?}",
-                after.runs
-            );
-        }
+        assert_eq!(sleeping_line(&quiet, &tab, &space_row), before);
+        let waiting = Column {
+            cards: &two,
+            ..plain
+        };
+        let after = sleeping_line(&waiting, &tab, &space_row);
+        kept(&before, &after, CLOSE_W, "asleep");
+        assert!(
+            after
+                .runs
+                .contains(&(mark_at(&after, 2), 2, crate::theme::Role::Blocked)),
+            "{:?}",
+            after.runs
+        );
     }
 
     /// A landing rule opens inside the list and costs its last row: the column keeps its
