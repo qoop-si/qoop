@@ -23,6 +23,9 @@ use crate::state::{self, Hold, Kind, Offer, Pick, Slot};
 use crate::theme::{MONO_FONT, Theme, c, ca};
 use crate::ui::{self, Icon};
 
+/// The label of a hand qass took: its card then reads "With qass, handed 17:59".
+const HANDED: &str = "Handed to qass";
+
 /// What became of a pick after its hold, as the card says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Said {
@@ -66,20 +69,18 @@ impl Desk {
         }
     }
 
-    /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. A remote
-    /// agent's qass is asked; its refusal says so.
+    /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can: the one rule
+    /// (`Model::qass_reason`), This Mac's qass taking remote agents' questions too.
     pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
-        if row.qass_skip {
-            return Some("qass leaves this agent alone".into());
+        self.model.qass_reason(row)
+    }
+
+    /// This Mac's hand id, made the first time a remote agent's question is handed.
+    fn hand_id(&mut self) -> Option<String> {
+        if self.model.hand_id.is_none() {
+            self.model.hand_id = qoop_runtime::paths::hand_id().ok();
         }
-        if state::machine_of(row.workspace) != 0 {
-            return None;
-        }
-        match self.model.qass_line().as_str() {
-            "not running" => Some("qass is not running".into()),
-            "not watching" => Some("qass is not watching".into()),
-            _ => None,
-        }
+        self.model.hand_id.clone()
     }
 
     /// Whether `row` takes typed answers: its machine has not refused them as too old.
@@ -326,8 +327,11 @@ impl Desk {
                 _ => self.send_one(hold, false),
             }
         }
-        for (_, held) in hands {
+        for (machine, held) in hands {
             let id = link::fresh_id("hand");
+            // Another machine's agent: for This Mac's qass, named by this Mac's hand id. With no
+            // id (no home folder) it goes as before and that machine answers for itself.
+            let away = (machine != 0).then(|| self.hand_id()).flatten();
             self.ask(ControlRequest::HandToQass {
                 id: id.clone(),
                 hands: held
@@ -337,6 +341,7 @@ impl Desk {
                             terminal: h.terminal()?,
                             generation: h.generation,
                             seal: (h.seal != 0).then_some(h.seal),
+                            away: away.clone(),
                         })
                     })
                     .collect(),
@@ -474,7 +479,7 @@ impl Desk {
                     if terminal.is_some_and(|t| taken.contains(&t)) =>
                 {
                     Said::Sent {
-                        label: "Handed to qass".into(),
+                        label: HANDED.into(),
                         at: now,
                     }
                 }
@@ -496,13 +501,30 @@ impl Desk {
                     continue;
                 }
                 ControlResponse::Failed { reason, .. } => {
-                    if reason.contains("unknown variant")
-                        && matches!(hold.pick, Pick::Text { .. })
-                        && let Some(row) = terminal.and_then(|t| self.model.row(t))
+                    let m = terminal
+                        .and_then(|t| self.model.row(t))
+                        .map_or(0, |r| state::machine_of(r.workspace));
+                    if reason.contains("unknown variant") && matches!(hold.pick, Pick::Text { .. })
                     {
-                        self.too_old.insert(state::machine_of(row.workspace));
+                        self.too_old.insert(m);
                     }
-                    Said::Refused(state::refusal_words(reason, &machine, &hold.pick))
+                    // A hand for This Mac's qass that the other machine answered as if it were
+                    // for its own: its qoop predates such hands. Not offered there again.
+                    let older = hold.pick == Pick::Qass
+                        && m != 0
+                        && (reason == "qass_not_running"
+                            || reason == "not_watching"
+                            || reason.contains("unknown variant"));
+                    if older {
+                        self.model.no_hands.insert(m);
+                        Said::Refused(state::refusal_words(
+                            "unknown variant",
+                            &machine,
+                            &hold.pick,
+                        ))
+                    } else {
+                        Said::Refused(state::refusal_words(reason, &machine, &hold.pick))
+                    }
                 }
                 _ => continue,
             };
@@ -773,15 +795,20 @@ impl Desk {
             Slot::Agent(t) => self.model.row(*t),
             Slot::Card(_) => None,
         };
-        let text = match self.said.get(slot) {
-            Some(Said::Sending { .. }) => "Sending".to_string(),
-            Some(Said::Sent { label, at }) => {
+        // One name for a handed question, as the sidebar row says it.
+        let qass = row.and_then(|r| self.model.qass_words(r));
+        let text = match (self.said.get(slot), qass) {
+            (Some(Said::Sending { .. }), _) => "Sending".to_string(),
+            (Some(Said::Sent { label, at }), Some(qass)) if label == HANDED => {
+                format!("{qass}, handed {}", state::clock(*at, self.zone))
+            }
+            (Some(Said::Sent { label, at }), _) => {
                 format!("Sent: {label}, {}", state::clock(*at, self.zone))
             }
-            Some(Said::Refused(why)) => why.clone(),
-            None if row.is_some_and(|r| r.with_qass) => "With qass".into(),
-            None if row.is_some_and(|r| r.qass_missed) => "qass did not take it".into(),
-            None => return None,
+            (Some(Said::Refused(why)), _) => why.clone(),
+            (None, Some(qass)) => qass,
+            (None, None) if row.is_some_and(|r| r.qass_missed) => "qass did not take it".into(),
+            (None, None) => return None,
         };
         Some(
             div()

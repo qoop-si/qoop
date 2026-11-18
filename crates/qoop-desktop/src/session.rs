@@ -112,7 +112,10 @@ impl Desk {
             .chain(&self.others)
             .map(|t| t.terminal)
             .collect();
-        if let Some(t) = self.model.turned_needs(before, &on_screen) {
+        // No note while the Inbox is open: its card already shows the question.
+        if !self.inbox
+            && let Some(t) = self.model.turned_needs(before, &on_screen)
+        {
             self.note = Some(t);
         }
         let needs = |t: TerminalStream| self.model.row(t).is_some_and(|r| Kind::of(r).needs_you());

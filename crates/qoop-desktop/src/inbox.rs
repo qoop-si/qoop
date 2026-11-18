@@ -14,13 +14,16 @@ use crate::ui::{self, Icon};
 impl Desk {
     /// What needs the owner, one count for the Inbox's "N needs you" and its badge: the agents
     /// that ask, and every open qass card that is not about one of them (a card about a working
-    /// agent, or about none).
+    /// agent, or about none). A card finds its agent by its terminal here or by its key on
+    /// another machine (`staging/T2`), so a remote question with a card counts once.
     pub(crate) fn needs_you(&self) -> usize {
         let asking = self.model.asking();
         let cards = self
             .asks
             .iter()
-            .filter(|a| a.status == "open" && !a.terminal.is_some_and(|t| asking.contains(&t)))
+            .filter(|a| {
+                a.status == "open" && !self.model.card_row(a).is_some_and(|t| asking.contains(&t))
+            })
             .count();
         asking.len() + cards
     }
@@ -80,7 +83,9 @@ impl Desk {
             .collect();
         let handable: Vec<TerminalStream> = needs
             .iter()
-            .filter(|r| r.menu.is_some() && !r.with_qass && self.qass_reason(r).is_none())
+            .filter(|r| {
+                r.menu.is_some() && !self.model.with_qass(r) && self.qass_reason(r).is_none()
+            })
             .map(|r| r.terminal)
             .collect();
         let handing = self
@@ -125,17 +130,16 @@ impl Desk {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Inbox"),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.))
-                            .text_color(c(t.t2))
-                            .child(format!(
-                                "{} needs you, {} unread",
+                    .child(div().flex_1().text_size(px(13.)).text_color(c(t.t2)).child(
+                        match self.model.handed() {
+                            0 => format!("{} needs you, {} unread", self.needs_you(), unread.len()),
+                            n => format!(
+                                "{} needs you, {n} with qass, {} unread",
                                 self.needs_you(),
                                 unread.len()
-                            )),
-                    )
+                            ),
+                        },
+                    ))
                     .when(!unread.is_empty(), |d| {
                         let all = unread.clone();
                         d.child(
