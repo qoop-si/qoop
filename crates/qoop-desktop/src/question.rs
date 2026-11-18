@@ -512,6 +512,8 @@ impl Desk {
                     // for its own: its qoop predates such hands. Not offered there again.
                     let older = hold.pick == Pick::Qass
                         && m != 0
+                        // Only a hand that went with this Mac's id (`away`) says the far qoop is older.
+                        && self.model.hand_id.is_some()
                         && (reason == "qass_not_running"
                             || reason == "not_watching"
                             || reason.contains("unknown variant"));

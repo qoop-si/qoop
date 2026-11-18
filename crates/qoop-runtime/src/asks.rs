@@ -1950,6 +1950,10 @@ pub(crate) async fn hand(
     }
     {
         let mut book = agents.hands.lock().unwrap();
+        // qass is here now: an absence seen long ago is no head start on ending these.
+        if qass.is_some() {
+            book.qass_gone_since = None;
+        }
         for (hand, seal) in &taken {
             book.missed.remove(&hand.terminal);
             let handed = Handed {
@@ -1960,7 +1964,13 @@ pub(crate) async fn hand(
                 told: hand.away.is_some(),
                 away: hand.away.clone(),
             };
-            if hand.away.is_some() {
+            // A new hand for another machine's qass replaces any; so does a hand for the qass
+            // here over one for another machine's, which nobody here would ever type.
+            let away_held = book
+                .live
+                .get(&hand.terminal)
+                .is_some_and(|h| h.away.is_some());
+            if hand.away.is_some() || away_held {
                 book.live.insert(hand.terminal, handed);
             } else {
                 book.live.entry(hand.terminal).or_insert(handed);

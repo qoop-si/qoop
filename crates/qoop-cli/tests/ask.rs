@@ -2072,6 +2072,22 @@ fn an_away_hand_is_kept_here_and_told_to_no_qass_here() {
         stack.log("qass")
     );
 
+    // A hand for the qass here over the away one replaces it, and the qass here is told.
+    let mine = hand_to_qass(&rt, &mut ui, "h5", &[away]);
+    assert!(matches!(mine, ControlResponse::Handed { .. }), "{mine:?}");
+    assert_eq!(row_of(&rt, &mut ui, away).qass_away, None);
+    let told_away = || {
+        stack
+            .log("qass")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == tab)
+    };
+    assert!(
+        stack.wait(told_away) || stack.wait(told_away),
+        "the qass here was never told: {:?}",
+        stack.log("qass")
+    );
+
     // Its question moves on: the hand ends, and not as missed.
     let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
     ui.forget_events();
