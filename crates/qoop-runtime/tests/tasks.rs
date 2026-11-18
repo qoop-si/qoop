@@ -332,6 +332,72 @@ async fn a_begin_opens_once_and_is_heard_once() {
     );
 }
 
+/// A step ticked on the item an agent's task is linked to is heard on that agent's row, and the
+/// row then carries the new count: what the tab's rail shows.
+#[tokio::test]
+async fn a_step_ticked_on_the_linked_item_is_heard_on_the_row() {
+    let d = TestDaemon::start().await;
+    let terminal = d.terminals().streams()[0];
+    let workspace = d.terminals().workspace_of(terminal).expect("a space");
+    let token = d
+        .agents_arc()
+        .token_of(terminal)
+        .expect("a token")
+        .as_str()
+        .to_string();
+    let (index, mut inbuf) = client::connect(d.socket(), "qoop-watch")
+        .await
+        .expect("connect");
+    let (mut rd, _wr) = index.into_split();
+    let mut c = d.attach("qoop-task").await;
+    let item = add(&mut c, workspace, "the item").await;
+    let steps = ["a", "b", "c", "d"].map(String::from).to_vec();
+    write(&mut c, None, None, Some(item), TaskOp::Steps { steps }).await;
+    let me = (Some(terminal), Some(token));
+    let linked = write(&mut c, me.0, me.1.clone(), None, TaskOp::Link { item }).await;
+    assert!(
+        matches!(linked, ControlResponse::TaskWritten { .. }),
+        "{linked:?}"
+    );
+    while changed(&mut rd, &mut inbuf, terminal, Duration::from_millis(500)).await {}
+    let before = task_of(&mut c, terminal).await;
+    assert_eq!(
+        (before.item, before.steps_done, before.steps_total),
+        (Some(item), 0, 4)
+    );
+
+    let ticked = write(
+        &mut c,
+        me.0,
+        me.1.clone(),
+        None,
+        TaskOp::Check { n: 1, done: true },
+    )
+    .await;
+    assert!(
+        matches!(ticked, ControlResponse::TaskWritten { .. }),
+        "{ticked:?}"
+    );
+    assert!(
+        changed(&mut rd, &mut inbuf, terminal, PATIENCE).await,
+        "a tick is heard on the agent's row"
+    );
+    let after = task_of(&mut c, terminal).await;
+    assert_eq!((after.steps_done, after.steps_total), (1, 4));
+}
+
+/// The task `terminal`'s row carries, read as a client keeping the index reads it.
+async fn task_of(c: &mut TestClient, terminal: u32) -> qoop_runtime::control::TaskRef {
+    let request = ControlRequest::AgentRows {
+        id: "rows".into(),
+        terminals: vec![terminal],
+    };
+    match ask(c, request).await {
+        ControlResponse::Agents { agents, .. } => agents[0].task.clone().expect("a task"),
+        other => panic!("no rows: {other:?}"),
+    }
+}
+
 /// Whether a client hears, within `wait`, that the board changed.
 async fn board_changed(
     rd: &mut tokio::net::unix::OwnedReadHalf,

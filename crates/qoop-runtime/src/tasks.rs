@@ -1018,11 +1018,16 @@ pub(crate) async fn read(
     }
 }
 
-/// The agents listing's view of the open tasks, by terminal.
-pub(crate) fn refs(open: Vec<TaskRow>) -> std::collections::BTreeMap<u32, TaskRef> {
+/// The agents listing's view of the open tasks, by terminal. `steps`: each linked task's item
+/// and its steps done and all (`Store::linked_steps`), read with `open`.
+pub(crate) fn refs(
+    open: Vec<TaskRow>,
+    steps: &BTreeMap<i64, (i64, usize, usize)>,
+) -> BTreeMap<u32, TaskRef> {
     open.into_iter()
         .filter_map(|t| {
             let terminal = u32::try_from(t.terminal?).ok()?;
+            let linked = steps.get(&t.id).copied();
             Some((
                 terminal,
                 TaskRef {
@@ -1030,6 +1035,9 @@ pub(crate) fn refs(open: Vec<TaskRow>) -> std::collections::BTreeMap<u32, TaskRe
                     goal: t.goal.chars().take(TASK_REF_GOAL).collect(),
                     stage: t.stage,
                     claimed: t.claimed_at.is_some(),
+                    item: linked.map(|(item, _, _)| item),
+                    steps_done: linked.map_or(0, |(_, done, _)| done),
+                    steps_total: linked.map_or(0, |(_, _, all)| all),
                 },
             ))
         })
@@ -1039,6 +1047,56 @@ pub(crate) fn refs(open: Vec<TaskRow>) -> std::collections::BTreeMap<u32, TaskRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row's task carries its item's steps as the board counts them: 2 of 4, a plan grown to
+    /// 6 keeping its ticks, the same numbers the item's own row (what `qoop task show` prints)
+    /// gives; a task on no item carries its stage alone.
+    #[test]
+    fn a_rows_task_counts_its_items_steps() {
+        let mut s = qoop_store::Store::in_memory().expect("store");
+        let ws = s.create_workspace("work", 1).unwrap();
+        s.create_terminal(1, ws, "/tmp", "/bin/sh", 1).unwrap();
+        s.create_terminal(2, ws, "/tmp", "/bin/sh", 1).unwrap();
+        let linked = s.open_task(1, "linked", false, 1).unwrap();
+        let alone = s.open_task(2, "alone", false, 1).unwrap();
+        let (item, _) = s.add_item(ws, "the item", "", None, 1).unwrap();
+        let four: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+        s.set_steps(item, &four, 2).unwrap();
+        s.check_step(item, 1, true, 3).unwrap();
+        s.check_step(item, 2, true, 3).unwrap();
+        s.link_task(linked, item, 4).unwrap();
+        let read = |s: &qoop_store::Store| refs(s.open_tasks().unwrap(), &s.linked_steps().unwrap());
+
+        let now = read(&s);
+        let task = &now[&1];
+        assert_eq!(
+            (task.id, task.item, task.steps_done, task.steps_total),
+            (linked, Some(item), 2, 4)
+        );
+        let shown = s.item_row(item, 5).unwrap();
+        assert_eq!(
+            (task.steps_done, task.steps_total),
+            (shown.steps_done, shown.steps_total),
+            "the numbers qoop task show prints"
+        );
+        let bare = &now[&2];
+        assert_eq!(
+            (bare.id, bare.item, bare.steps_done, bare.steps_total),
+            (alone, None, 0, 0)
+        );
+        assert_eq!(bare.stage, "investigating");
+
+        // A plan rewritten longer keeps its ticks and counts the new steps; a phase header is
+        // not a step.
+        let six: Vec<String> = ["a", "b", "## later", "c", "d", "e", "f"]
+            .map(String::from)
+            .to_vec();
+        s.set_steps(item, &six, 6).unwrap();
+        let task = &read(&s)[&1];
+        assert_eq!((task.steps_done, task.steps_total), (2, 6));
+        let shown = s.item_row(item, 7).unwrap();
+        assert_eq!((shown.steps_done, shown.steps_total), (2, 6));
+    }
 
     /// A link from a terminal begins its task first; where a begin opens nothing it is refused
     /// with the reason and leaves no task behind: qass's own space, and a space whose name was

@@ -174,6 +174,8 @@ pub struct Chrome<'a> {
     pub fold: Option<FoldPaint>,
     /// A plugin's agent view, the agents it shows in its order (`sidebar::Column::order`).
     pub agent_order: Option<&'a crate::plugins::AgentView>,
+    /// The questions rail of the agent's tab on screen, right of its panes (`crate::tabq`).
+    pub tab_rail: Option<crate::tabq::Paint<'a>>,
 }
 
 /// qass's rail, in pane cells: its tabs start at (`x`, `y`) and are `w` wide, one row per pane in
@@ -269,6 +271,7 @@ impl Default for Chrome<'_> {
             questions_handle: None,
             fold: None,
             agent_order: None,
+            tab_rail: None,
         }
     }
 }
@@ -627,7 +630,8 @@ fn tiled(frame: &Frame) -> bool {
 }
 
 /// The size a lone pane's terminal is given in a window of `cols` by `lines`: the pane inside
-/// the frame every pane stands in.
+/// the frame every pane stands in. A shell's: an agent's tab also gives its questions rail its
+/// columns (`crate::tabq`).
 pub fn lone_pane_size(cols: u16, lines: u16) -> (u16, u16) {
     let (pane_cols, pane_rows) = pane_size(cols, lines);
     let framed = layout::framed(layout::Rect {
@@ -946,7 +950,8 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
     if !tiled(frame) {
         return Vec::new();
     }
-    let mut edges = pane_edges(&frame.tiles, frame.rows, focus_ink(frame), cols, rows);
+    let rail = frame.chrome.tab_rail.map(|rail| rail.rect);
+    let mut edges = pane_edges(&frame.tiles, rail, frame.rows, focus_ink(frame), cols, rows);
     if let Some(fold) = frame.chrome.fold {
         put_fold_titles(&mut edges, &frame.tiles, frame.rows, fold);
     }
@@ -1370,6 +1375,15 @@ pub fn paint(frame: &Frame) -> String {
         .chrome
         .rail
         .map(|rail| rail_rows_of(frame, &rail, spotlight));
+    // The agent tab's questions rail: its rows, over the cells its tab left for it.
+    let tab_rail_rows = frame.chrome.tab_rail.map(|rail| {
+        let task = frame
+            .rows
+            .iter()
+            .find(|r| r.terminal == rail.terminal)
+            .and_then(|r| r.task.as_ref());
+        crate::tabq::rows(&rail, task, spotlight)
+    });
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
         .rows
@@ -1610,6 +1624,12 @@ pub fn paint(frame: &Frame) -> String {
                 && let Some(row) = pane_row.checked_sub(rail.y).and_then(|at| rows.get(at))
             {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.x));
+                out.push_str(row);
+            }
+            if let (Some(rail), Some(rows)) = (frame.chrome.tab_rail, &tab_rail_rows)
+                && let Some(row) = pane_row.checked_sub(rail.rect.y).and_then(|at| rows.get(at))
+            {
+                out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.rect.x));
                 out.push_str(row);
             }
         }
@@ -3892,6 +3912,7 @@ enum EdgeInk {
 /// runs into it, so a line there is noise, the owner's word, 2026-10-28.
 fn pane_edges(
     tiles: &[Tile],
+    rail: Option<layout::Rect>,
     agents: &[AgentRow],
     focus: theme::Role,
     cols: usize,
@@ -3903,14 +3924,21 @@ fn pane_edges(
     const RIGHT: u8 = 8;
     let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; cols]; rows];
     // The ways a frame's line leaves each cell, from every pane's frame, so a shared side is
-    // one line and its ends are joints; and the cells of the focused pane's frame.
+    // one line and its ends are joints; and the cells of the focused pane's frame. A tab's
+    // questions rail is framed like one more pane, so a pane beside it is never alone.
     let mut ways = vec![vec![0u8; cols]; rows];
     let mut lit = vec![vec![false; cols]; rows];
-    for tile in tiles
+    let framed: Vec<(layout::Rect, bool)> = tiles
         .iter()
-        .filter(|t| tiles.len() >= 2 && t.rect.cols > 0 && t.rect.rows > 0)
+        .map(|t| (t.rect, t.focused))
+        .chain(rail.map(|r| (r, false)))
+        .collect();
+    let alone = framed.len() < 2;
+    for (r, focused) in framed
+        .iter()
+        .copied()
+        .filter(|(r, _)| !alone && r.cols > 0 && r.rows > 0)
     {
-        let r = tile.rect;
         // A tile against the area's edge (an area too small for the frame) has none.
         let (Some(left), Some(top)) = (r.x.checked_sub(1), r.y.checked_sub(1)) else {
             continue;
@@ -3923,15 +3951,15 @@ fn pane_edges(
             let way = if x > left { LEFT } else { 0 } | if x < right { RIGHT } else { 0 };
             ways[top][x] |= way;
             ways[bottom][x] |= way;
-            lit[top][x] |= tile.focused;
-            lit[bottom][x] |= tile.focused;
+            lit[top][x] |= focused;
+            lit[bottom][x] |= focused;
         }
         for y in top..=bottom {
             let way = if y > top { UP } else { 0 } | if y < bottom { DOWN } else { 0 };
             ways[y][left] |= way;
             ways[y][right] |= way;
-            lit[y][left] |= tile.focused;
-            lit[y][right] |= tile.focused;
+            lit[y][left] |= focused;
+            lit[y][right] |= focused;
         }
     }
     for (y, row) in ways.iter().enumerate() {
@@ -3964,7 +3992,7 @@ fn pane_edges(
     }
     // Each pane's name on its top edge, two cells in from its corner: one pane alone is
     // named on the tab bar already.
-    for tile in tiles.iter().filter(|_| tiles.len() >= 2) {
+    for tile in tiles.iter().filter(|_| !alone) {
         let r = tile.rect;
         let Some(top) = r.y.checked_sub(1) else {
             continue;
@@ -8788,7 +8816,7 @@ mod tests {
             })
             .collect();
         let ink = theme::Role::Space(2);
-        let grid = pane_edges(&tiles, &rows, ink, 40, 10);
+        let grid = pane_edges(&tiles, None, &rows, ink, 40, 10);
         let text =
             |y: usize| -> String { grid[y].iter().map(|c| c.map_or(' ', |(c, _)| c)).collect() };
         let left = tiles[0].rect;

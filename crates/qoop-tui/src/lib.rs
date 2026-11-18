@@ -33,6 +33,7 @@ pub mod screen;
 pub mod seen;
 pub mod selection;
 pub mod sidebar;
+pub mod tabq;
 pub mod tabs;
 pub mod theme;
 pub mod width;

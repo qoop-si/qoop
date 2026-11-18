@@ -1631,6 +1631,7 @@ impl State {
                 questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
                 agent_order: self.agent_view.as_ref(),
+                tab_rail: self.tab_rail_paint(),
                 chat_refused: self.chat.is_refused(self.focused),
                 shut: &self.shut,
                 doze_open: &self.doze_open,
@@ -3509,8 +3510,97 @@ impl State {
         crate::qass_screen::edge_handle(x, y, rows)
     }
 
-    /// The area `tree`'s panes are laid out in: the pane, less qass's header over its split.
+    /// The area `tree`'s panes are laid out in: its tab's, less the questions rail at its right
+    /// when it has one. Every tile, size, click and drag of the tab measures from here.
     fn tree_area(&self, tree: &Layout) -> layout::Rect {
+        let tab = self.tab_area(tree);
+        crate::tabq::carve(tab, self.rail_in(tab, tree))
+    }
+
+    /// The questions rail of a tab whose area is `tab`: on a tab with a local agent in it (the
+    /// focused pane when it is one, else the first that is), while the daemon keeps question
+    /// cards. Never on a shell-only tab, another machine's, or qass's. Its width is a property of
+    /// the tab and its panes, never of the focus, so moving the keyboard in the tab resizes
+    /// nothing.
+    fn rail_in(&self, tab: layout::Rect, tree: &Layout) -> Option<crate::tabq::Rail> {
+        if self.asks.count().is_none() || self.band_over(tree) > 0 {
+            return None;
+        }
+        let qass = sidebar::qass_space(&self.spaces);
+        let leaves = tree.leaves();
+        let rows: Vec<&AgentRow> = leaves
+            .iter()
+            .filter_map(|t| self.rows.iter().find(|r| r.terminal == *t))
+            .collect();
+        if rows.iter().any(|r| Some(r.workspace) == qass) {
+            return None;
+        }
+        let agents: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))
+            .map(|r| r.terminal)
+            .collect();
+        let terminal = agents
+            .iter()
+            .copied()
+            .find(|t| *t == tree.focus)
+            .or_else(|| agents.first().copied())?;
+        let wide = crate::tabq::Rail {
+            terminal,
+            w: crate::tabq::WIDE,
+        };
+        let narrowest = tree
+            .tile_rects(crate::tabq::carve(tab, Some(wide)))
+            .into_iter()
+            .map(|(_, r)| r.cols)
+            .min();
+        let w = crate::tabq::width(tab, narrowest)?;
+        Some(crate::tabq::Rail { terminal, w })
+    }
+
+    /// A terminal outside any tree as it is drawn (a tab before its tree): the whole pane, less
+    /// its rail when it is an agent's, in the frame every pane stands in.
+    fn lone_rect(&self, terminal: u32) -> layout::Rect {
+        let tree = Layout::single(terminal);
+        layout::framed(self.tree_area(&tree))
+    }
+
+    /// The rail of the tab on screen, as the frame paints it.
+    fn tab_rail_paint(&self) -> Option<crate::tabq::Paint<'_>> {
+        if self.focused == 0 || self.on_qass_screen() {
+            return None;
+        }
+        let tree = self
+            .space
+            .and_then(|space| self.drawn_tree(space))
+            .unwrap_or_else(|| Layout::single(self.focused));
+        let tab = self.tab_area(&tree);
+        let rail = self.rail_in(tab, &tree)?;
+        Some(crate::tabq::Paint {
+            rect: crate::tabq::rect(tab, rail),
+            terminal: rail.terminal,
+            cards: &self.asks.live,
+        })
+    }
+
+    /// Whether a one based screen position is on the rail of the tab on screen.
+    fn tab_rail_at(&self, row: u16, col: u16) -> bool {
+        let Some(rail) = self.tab_rail_paint() else {
+            return false;
+        };
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        let (Some(x), Some(y)) = (
+            (col as usize).checked_sub(left + 1),
+            (row as usize).checked_sub(screen::TABS + 1),
+        ) else {
+            return false;
+        };
+        let r = rail.rect;
+        x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows
+    }
+
+    /// The area `tree`'s tab takes: the pane, less qass's header over its split.
+    fn tab_area(&self, tree: &Layout) -> layout::Rect {
         let (cols, rows) =
             screen::pane_size_for(self.cols, self.lines, self.collapsed, 0, self.sidebar_width);
         // Under qass's header.
@@ -9818,6 +9908,14 @@ where
                                     dirty = true;
                                     continue;
                                 }
+                                // The agent tab's questions rail is its own: a press there
+                                // reaches no pane and puts down a selection.
+                                if !shift && state.tab_rail_at(row, col) {
+                                    if state.selection.take().is_some() {
+                                        dirty = true;
+                                    }
+                                    continue;
+                                }
                                 // A pane's name on the top edge of the panes is its handle: held,
                                 // it carries the pane like a row of the column (to the tab bar
                                 // for a tab of its own); let go where it went down, it is a click
@@ -12969,21 +13067,10 @@ fn palette_key(state: &mut State, bytes: &[u8]) -> PaletteOutcome {
 /// The pane area in its own cells, shared by every tile rect of the space on screen: under
 /// qass's header when that space's tree is qass's split ([`State::tree_area`]).
 fn pane_area(state: &State) -> layout::Rect {
-    let (cols, rows) = screen::pane_size_for(
-        state.cols,
-        state.lines,
-        state.collapsed,
-        0,
-        state.sidebar_width,
-    );
     match state.space.and_then(|space| state.layouts.get(&space)) {
         Some(tree) => state.tree_area(tree),
-        None => layout::Rect {
-            x: 0,
-            y: 0,
-            cols: cols as usize,
-            rows: rows as usize,
-        },
+        // No tree yet: the focused terminal's tab as it will be, its rail too.
+        None => state.tree_area(&Layout::single(state.focused)),
     }
 }
 
@@ -13912,20 +13999,7 @@ fn size_terminals(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    // The whole pane, for a tab outside any tree; a tree's panes by its own area.
-    let (cols, rows) = screen::pane_size_for(
-        state.cols,
-        state.lines,
-        state.collapsed,
-        0,
-        state.sidebar_width,
-    );
-    let area = layout::Rect {
-        x: 0,
-        y: 0,
-        cols: cols as usize,
-        rows: rows as usize,
-    };
+    // The whole pane (less its rail), for a tab outside any tree; a tree's panes by its own area.
     let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
     let asleep: std::collections::BTreeSet<u32> = state
         .rows
@@ -13938,7 +14012,7 @@ fn size_terminals(
         .iter()
         .filter(|row| !asleep.contains(&row.terminal))
         // Sized as it will be drawn: inside the frame every pane on screen has.
-        .map(|row| (row.terminal, size(layout::framed(area))))
+        .map(|row| (row.terminal, size(state.lone_rect(row.terminal))))
         .collect();
     let mut zoomed_away = std::collections::BTreeSet::new();
     // Parked first, so the tree on screen is what a terminal in both is sized by.
@@ -30376,5 +30450,288 @@ mod tests {
         assert!(s.chat.has_view(2) && s.chat.wants_digest(2));
         assert!(asked_chat(&mut s).is_empty(), "nothing asked for the blink");
         assert!(plain(&screen::paint(&s.frame())).contains("on it"));
+    }
+
+    /// An agent's tab of its own, `cols` by `lines`, its task on step 2 of 4 of its item, the
+    /// cards read (so the daemon keeps them).
+    fn agent_tab(cols: u16, lines: u16) -> State {
+        let mut s = bare_state();
+        (s.cols, s.lines) = (cols, lines);
+        s.spaces = vec![space(1, "app")];
+        s.space = Some(1);
+        let mut claude = agent(1, 1, "claude", "working");
+        claude.task = Some(qoop_runtime::control::TaskRef {
+            id: 12,
+            goal: "g".to_string(),
+            stage: "implementing".to_string(),
+            claimed: false,
+            item: Some(3),
+            steps_done: 2,
+            steps_total: 4,
+        });
+        s.rows = vec![claude];
+        s.focused = 1;
+        s.layouts.insert(1, Layout::single(1));
+        s.asks.take(Vec::new(), Vec::new());
+        s
+    }
+
+    /// A shell (2) and an agent (1) side by side at 170 by 46, the shell's pane the wider, the
+    /// keyboard in the shell.
+    fn shell_beside_agent() -> State {
+        let mut s = agent_tab(170, 46);
+        let mut zsh = agent(2, 1, "zsh", "idle");
+        zsh.agent = false;
+        s.rows.push(zsh);
+        let leaf = |t| Box::new(crate::layout::Node::Leaf { terminal: Some(t) });
+        let tree = Layout {
+            root: crate::layout::Node::Split {
+                dir: crate::layout::Dir::V,
+                ratio: 0.53,
+                first: leaf(2),
+                second: leaf(1),
+            },
+            focus: 2,
+            ..Layout::single(2)
+        };
+        s.layouts.insert(1, tree);
+        s.focused = 2;
+        s
+    }
+
+    /// The rail's cells as painted, one string per pane row it covers, trailing blanks off.
+    fn rail_cells(s: &State) -> Vec<String> {
+        let rail = s.tab_rail_paint().expect("a rail").rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let grid = cells_of(&screen::paint(&s.frame()), s.cols as usize, s.lines as usize);
+        (0..rail.rows)
+            .map(|y| {
+                grid[screen::TABS + rail.y + y][left + rail.x..left + rail.x + rail.cols]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// At 170 by 46 an agent's tab keeps a 6 column rail and the line it shares with the pane:
+    /// Claude keeps 122 columns. Nothing waits: a quiet `⠄0` on top, and at the foot a rule, the
+    /// task's `2/4` and its stage word. The pane and the rail are framed together.
+    #[test]
+    fn an_agent_tab_keeps_a_quiet_rail_at_170_by_46() {
+        let s = agent_tab(170, 46);
+        let tile = focused_rect(&s);
+        assert_eq!((tile.cols, tile.rows), (122, 40));
+        let rail = s.tab_rail_paint().expect("a rail");
+        assert_eq!(
+            (rail.rect, rail.terminal),
+            (
+                layout::Rect {
+                    x: 124,
+                    y: 1,
+                    cols: 6,
+                    rows: 40
+                },
+                1
+            )
+        );
+        let cells = rail_cells(&s);
+        assert_eq!(cells[0], " \u{2804}0");
+        assert_eq!(cells[36], "\u{2500}".repeat(6));
+        assert_eq!(cells[37], " 2/4");
+        assert_eq!(cells[38], " build");
+        assert!(
+            cells[1..36].iter().chain(&cells[39..]).all(String::is_empty),
+            "{cells:?}"
+        );
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let grid = cells_of(&screen::paint(&s.frame()), 170, 46);
+        let (top, bottom) = (&grid[screen::TABS], &grid[screen::TABS + 41]);
+        assert_eq!(
+            (top[left + 123], top[left + 130], bottom[left + 123], bottom[left + 130]),
+            ('\u{252c}', '\u{256e}', '\u{2534}', '\u{256f}'),
+            "one frame round the pane and the rail, joined"
+        );
+        let shared = grid[screen::TABS + 10][left + 123];
+        assert_eq!(shared, '\u{2502}');
+    }
+
+    /// At 80 by 24 the rail is 4 columns (Claude keeps 34): the count stays, the stage word drops.
+    #[test]
+    fn the_rail_narrows_at_80_by_24() {
+        let s = agent_tab(80, 24);
+        assert_eq!(focused_rect(&s).cols, 34);
+        let cells = rail_cells(&s);
+        assert_eq!(cells.len(), 18);
+        assert_eq!(cells[0], "\u{2804}0");
+        assert_eq!(&cells[14..], ["\u{2500}".repeat(4), "2/4".into(), String::new(), String::new()]);
+    }
+
+    /// Beside a shell, an agent pane under 60 columns takes the narrow rail. The rail speaks for
+    /// the agent while the keyboard is in the shell, and the shell is never cut.
+    #[test]
+    fn a_60_column_split_keeps_the_rail_with_the_agent() {
+        let s = shell_beside_agent();
+        let rail = s.tab_rail_paint().expect("a rail");
+        assert_eq!((rail.rect.cols, rail.terminal), (4, 1));
+        let tree = s.drawn_tree(1).unwrap();
+        let tiles = tree.tile_rects(pane_area(&s));
+        let (shell, claude) = (tiles[0].1, tiles[1].1);
+        assert!(claude.cols < 60 && shell.cols > claude.cols, "{tiles:?}");
+        assert_eq!(claude.x + claude.cols + 1, rail.rect.x, "the rail right of the agent");
+        assert_eq!(rail_cells(&s)[0], "\u{2804}0");
+    }
+
+    /// Without colour the rail reads the same: its words and marks carry it, and none of its
+    /// rows asks for a colour.
+    #[test]
+    fn the_rail_reads_the_same_without_colour() {
+        use crate::colorlevel::{Level, TEST_LEVEL};
+        let mut s = agent_tab(170, 46);
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
+        let colour = rail_cells(&s);
+        TEST_LEVEL.with(|c| c.set(Some(Level::Mono)));
+        let mono = rail_cells(&s);
+        let paint = s.tab_rail_paint().unwrap();
+        let rows = crate::tabq::rows(&paint, s.rows[0].task.as_ref(), false);
+        TEST_LEVEL.with(|c| c.set(None));
+        assert_eq!(mono, colour);
+        assert_eq!((mono[0].as_str(), mono[2].as_str()), (" \u{2814}1", " \u{2814}Q8"));
+        assert!(rows.iter().all(|r| !r.contains("38;5")), "{rows:?}");
+    }
+
+    /// No rail on a tab with no local agent in it, on qass's tabs, or while the daemon keeps no
+    /// cards (not read yet, or too old): the pane keeps its whole width.
+    #[test]
+    fn a_tab_with_no_local_agent_has_no_rail() {
+        let whole = |s: &State| {
+            assert!(s.tab_rail_paint().is_none());
+            focused_rect(s).cols
+        };
+        let mut shell = agent_tab(170, 46);
+        shell.rows[0].agent = false;
+        assert_eq!(whole(&shell), 129, "a shell-only tab");
+
+        let mut remote = agent_tab(170, 46);
+        let far = crate::mux::REMOTE_TERMINAL | 1;
+        remote.rows[0].terminal = far;
+        remote.focused = far;
+        remote.layouts.insert(1, Layout::single(far));
+        assert_eq!(whole(&remote), 129, "another machine's agent");
+
+        let mut qass = agent_tab(170, 46);
+        qass.spaces = vec![space(1, sidebar::QASS_SPACE)];
+        assert_eq!(qass.tree_area(&qass.layouts[&1]).cols, 131, "qass's tab");
+
+        let mut unread = agent_tab(170, 46);
+        unread.asks = Default::default();
+        assert_eq!(whole(&unread), 129, "cards not read yet");
+        let mut old = agent_tab(170, 46);
+        old.asks.unsupported = true;
+        assert_eq!(whole(&old), 129, "a daemon without cards");
+
+        let shells_only = {
+            let mut s = shell_beside_agent();
+            s.rows[0].agent = false;
+            s
+        };
+        assert!(shells_only.tab_rail_paint().is_none(), "two shells");
+    }
+
+    /// The rail takes its columns once, when it first applies; folded, a card arriving or
+    /// answered and a step ticked change its rows and never the agent's size.
+    #[test]
+    fn the_agents_size_holds_while_the_rail_is_folded() {
+        let mut s = agent_tab(170, 46);
+        s.asks = Default::default();
+        let mut seqs = std::collections::BTreeMap::new();
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
+        assert_eq!(s.sized.get(&1), Some(&(129, 40)));
+        s.asks.take(Vec::new(), Vec::new());
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some(), "once");
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "a card arrives");
+        s.rows[0].task.as_mut().unwrap().steps_done = 3;
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "a step ticked");
+        s.asks.take(Vec::new(), Vec::new());
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none(), "the card answered");
+        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+    }
+
+    /// The keyboard moving between the shell and the agent of one tab resizes neither.
+    #[test]
+    fn focus_moving_inside_a_tab_resizes_nothing() {
+        let mut s = shell_beside_agent();
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let before = s.sized.clone();
+        s.layouts.get_mut(&1).unwrap().focus_terminal(1);
+        s.focused = 1;
+        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
+        assert_eq!(s.sized, before);
+        assert_eq!(s.tab_rail_paint().unwrap().rect.cols, 4);
+    }
+
+    /// The rail follows the row it reads: a step ticked moves its count, a card arriving puts
+    /// its mark under the count, the next frame.
+    #[test]
+    fn a_tick_or_a_card_refreshes_the_rail() {
+        let mut s = agent_tab(170, 46);
+        assert_eq!(rail_cells(&s)[37], " 2/4");
+        s.rows[0].task.as_mut().unwrap().steps_done = 3;
+        assert_eq!(rail_cells(&s)[37], " 3/4");
+        s.rows[0].task.as_mut().unwrap().steps_total = 6;
+        assert_eq!(rail_cells(&s)[37], " 3/6", "a plan grown to six steps");
+        let mut card = ask_card(1, "claude");
+        card.card = "Q8".to_string();
+        s.asks.take(vec![card], Vec::new());
+        let cells = rail_cells(&s);
+        assert_eq!((cells[0].as_str(), cells[2].as_str()), (" \u{2814}1", " \u{2814}Q8"));
+        // A task on no item: its stage word alone under the rule.
+        let task = s.rows[0].task.as_mut().unwrap();
+        (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
+        task.stage = "waiting-human".to_string();
+        let cells = rail_cells(&s);
+        assert_eq!((cells[36].as_str(), cells[37].as_str()), ("\u{2500}".repeat(6).as_str(), " waits"));
+    }
+
+    /// A press on the rail is the rail's: no pane is under it.
+    #[test]
+    fn a_press_on_the_rail_reaches_no_pane() {
+        let s = agent_tab(170, 46);
+        let rail = s.tab_rail_paint().unwrap().rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + rail.y + 3) as u16,
+            (left + 1 + rail.x + 2) as u16,
+        );
+        assert!(s.tab_rail_at(row, col));
+        assert!(s.tile_at_screen(row, col).is_none());
+        let pane = (left + 1 + 10) as u16;
+        assert!(!s.tab_rail_at(row, pane));
+        assert_eq!(s.tile_at_screen(row, pane).map(|hit| hit.0), Some(1));
+    }
+
+    /// The rail never touches the left sidebar: its cells, characters and inks, are the same
+    /// with the rail and without it.
+    #[test]
+    fn the_rail_leaves_the_sidebar_as_it_is() {
+        for (cols, lines) in [(170u16, 46u16), (80, 24)] {
+            let with = agent_tab(cols, lines);
+            let mut without = agent_tab(cols, lines);
+            without.asks = Default::default();
+            assert!(with.tab_rail_paint().is_some() && without.tab_rail_paint().is_none());
+            let left = screen::left_for(cols, false, sidebar::WIDTH);
+            let bytes = |s: &State| {
+                sidebar_bytes(&screen::paint(&s.frame()), cols as usize, lines as usize, left)
+            };
+            assert_eq!(bytes(&with), bytes(&without), "at {cols}x{lines}");
+        }
     }
 }

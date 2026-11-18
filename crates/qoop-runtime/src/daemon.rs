@@ -5199,7 +5199,7 @@ async fn handle_control(
                 tokio::join!(
                     store.layout_order(),
                     store.workspaces(),
-                    store.run(|s| s.open_tasks()),
+                    store.run(|s| Ok((s.open_tasks()?, s.linked_steps()?))),
                     store.run(|s| s.open_ask_terminals())
                 )
             }));
@@ -5208,10 +5208,11 @@ async fn handle_control(
             let (order, spaces, open_tasks, asking) = places.unwrap_or((
                 Ok(Vec::new()),
                 Ok(Vec::new()),
-                Ok(Vec::new()),
+                Ok(Default::default()),
                 Ok(BTreeSet::new()),
             ));
-            let mut task_refs = crate::tasks::refs(open_tasks.unwrap_or_default());
+            let (open_tasks, steps) = open_tasks.unwrap_or_default();
+            let mut task_refs = crate::tasks::refs(open_tasks, &steps);
             // The terminals with a question card open: what waits on the owner.
             let asking = asking.unwrap_or_default();
             let spaces = spaces.unwrap_or_default();
@@ -7611,9 +7612,9 @@ fn spawn_task_terminals(
         // task write passes.
         let mut held: BTreeMap<u32, crate::control::TaskRef> = BTreeMap::new();
         loop {
-            match store.run(|s| s.open_tasks()).await {
-                Ok(open) => {
-                    let now = crate::tasks::refs(open);
+            match store.run(|s| Ok((s.open_tasks()?, s.linked_steps()?))).await {
+                Ok((open, steps)) => {
+                    let now = crate::tasks::refs(open, &steps);
                     agents.set_task_terminals(now.keys().copied().collect());
                     let moved: BTreeSet<u32> = held
                         .keys()

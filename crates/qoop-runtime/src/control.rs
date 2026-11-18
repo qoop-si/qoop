@@ -1928,6 +1928,20 @@ pub struct TaskRef {
     /// The agent said it is done and nothing has moved it since.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claimed: bool,
+    /// The board item the task is linked to, `None` when it is on none, and from a daemon that
+    /// predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<i64>,
+    /// That item's steps ticked and all of them, the numbers `qoop task show` prints. Zero
+    /// without an item.
+    #[serde(default, skip_serializing_if = "is_zero_steps")]
+    pub steps_done: usize,
+    #[serde(default, skip_serializing_if = "is_zero_steps")]
+    pub steps_total: usize,
+}
+
+fn is_zero_steps(n: &usize) -> bool {
+    *n == 0
 }
 
 /// How much of a goal an agents row carries.
@@ -3748,9 +3762,32 @@ mod tests {
                 id: 3,
                 goal: "g".into(),
                 stage: "planning".into(),
-                claimed: true
+                claimed: true,
+                item: None,
+                steps_done: 0,
+                steps_total: 0,
             })
         );
+    }
+
+    /// A task's item and its step counts cross old daemons both ways: absent from an older
+    /// daemon's row (no item, no steps), kept from a newer one's, and written only when there.
+    #[test]
+    fn a_task_refs_steps_parse_both_ways() {
+        let old: TaskRef =
+            serde_json::from_str(r#"{"id":3,"goal":"g","stage":"planning"}"#).expect("decode");
+        assert_eq!((old.item, old.steps_done, old.steps_total), (None, 0, 0));
+        let bare = serde_json::to_string(&old).unwrap();
+        assert!(!bare.contains("item") && !bare.contains("steps"), "{bare}");
+        let linked = TaskRef {
+            item: Some(7),
+            steps_done: 2,
+            steps_total: 4,
+            ..old
+        };
+        let back: TaskRef =
+            serde_json::from_str(&serde_json::to_string(&linked).unwrap()).expect("decode");
+        assert_eq!(back, linked);
     }
 
     /// A row's stop crosses old daemons both ways, as the task does.
