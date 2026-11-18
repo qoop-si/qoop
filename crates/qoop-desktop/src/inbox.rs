@@ -219,7 +219,7 @@ impl Desk {
                         cards
                             .iter()
                             .enumerate()
-                            .map(|(i, a)| self.card_block(i, a, t, cx)),
+                            .map(|(i, a)| self.card_block(i, a, false, t, cx)),
                     )
                     .children(
                         rows.iter()
@@ -343,11 +343,14 @@ impl Desk {
     }
 
     /// A card qass wrote: what the agent does, why it asks, the options with their reasons, and
-    /// which qass would pick, as text: nothing is picked for the owner.
-    fn card_block(
+    /// which qass would pick, as text: nothing is picked for the owner. On the agent's own
+    /// Session page (`in_tab`) it is titled by its id, and takes the owner's own words and the
+    /// hand-off to qass beside the options.
+    pub(crate) fn card_block(
         &self,
         index: usize,
         card: &AskInfo,
+        in_tab: bool,
         t: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -362,7 +365,27 @@ impl Desk {
             format!("qass would pick {n}: {}", p.reason)
         });
         let dismiss = id.clone();
+        let (head, by) = if in_tab {
+            (
+                id.clone(),
+                Some(state::short_span(
+                    self.now.saturating_sub(card.opened_at).max(0),
+                )),
+            )
+        } else {
+            ("qass asks".to_string(), card.agent.clone())
+        };
+        let own = self
+            .own
+            .as_ref()
+            .filter(|o| o.card.as_deref() == Some(id.as_str()))
+            .map(|o| o.field.clone());
+        let terminal = card.terminal.unwrap_or_default();
         div()
+            .debug_selector({
+                let id = id.clone();
+                move || format!("card-{id}")
+            })
             .flex()
             .flex_col()
             .gap(px(4.))
@@ -370,17 +393,15 @@ impl Desk {
             .rounded(px(12.))
             .bg(c(t.card))
             .border_1()
-            .border_color(ca(t.hair))
+            .border_color(ca(if in_tab { t.needs_line } else { t.hair }))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
                     .text_size(px(12.5))
-                    .child(div().text_color(c(t.needs_text)).child("qass asks"))
-                    .when_some(card.agent.clone(), |d, a| {
-                        d.child(div().text_color(c(t.t2)).child(a))
-                    }),
+                    .child(div().text_color(c(t.needs_text)).child(head))
+                    .when_some(by, |d, a| d.child(div().text_color(c(t.t2)).child(a))),
             )
             .child(div().text_size(px(13.5)).child(body.asks.clone()))
             .child(
@@ -435,6 +456,44 @@ impl Desk {
                     cx.listener(move |this, _, window, cx| this.pick_card(&info, &key, window, cx)),
                 )
             }))
+            // In the agent's tab: his own words, and the card handed to qass to decide.
+            .when(in_tab, |d| {
+                let words = id.clone();
+                let qass = id.clone();
+                d.child(match own {
+                    Some(field) => div().id(("card-own", index as u64)).child(field),
+                    None => div().id(("card-own", index as u64)).child(
+                        ui::link_button(
+                            ("card-own-open", index as u64),
+                            "Something else? Type your own answer",
+                            t,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.open_own(terminal, Some(words.clone()), window, cx)
+                            },
+                        )),
+                    ),
+                })
+                .child(
+                    ui::pill(("card-qass", index as u64), "Hand to qass", t)
+                        .debug_selector(move || format!("card-qass-{qass}"))
+                        .child(ui::icon(Icon::Eye, 14., c(t.t1)))
+                        .child("Hand to qass")
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(c(t.t2))
+                                .child("qass answers it for you"),
+                        )
+                        .on_click({
+                            let card = id.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.card_to_qass(&card, window, cx)
+                            })
+                        }),
+                )
+            })
             .when_some(self.said_line(&Slot::Card(id.clone()), t, cx), |d, line| {
                 d.child(line)
             })

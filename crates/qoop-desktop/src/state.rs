@@ -609,6 +609,10 @@ pub enum Pick {
     Qass,
     /// An option of one of qass's cards (`AskWrite` `Answer`), which qass types to the agent.
     Card { card: String, option: String },
+    /// The owner's own words for a card (`AskWrite` `Answer` with text).
+    CardText { card: String, text: String },
+    /// A card handed to qass to decide (`AskWrite` `Answer` with `to_qass`).
+    CardQass { card: String },
 }
 
 /// What a pick is about: an agent's menu, or one of qass's cards.
@@ -820,7 +824,9 @@ pub fn refusal_words(reason: &str, machine: &str, pick: &Pick) -> String {
         "not_watching" => "qass is not watching, so it cannot take this.".into(),
         "skipped" => "qass leaves this agent alone, so it cannot take this.".into(),
         r if r.contains("unknown variant") => match pick {
-            Pick::Qass => format!("qoop on {machine} is too old to hand questions to qass."),
+            Pick::Qass | Pick::CardQass { .. } => {
+                format!("qoop on {machine} is too old to hand questions to qass.")
+            }
             Pick::Text { .. } => format!("qoop on {machine} is too old for typed answers."),
             _ => format!("qoop on {machine} is too old for this answer."),
         },

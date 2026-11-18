@@ -452,7 +452,25 @@ impl Desk {
                         .child(self.task_column(t, cx)),
                 )
                 .into_any_element(),
-            (None, None) => self.task_column(t, cx).into_any_element(),
+            (None, None) => match self.questions(term.terminal, t, cx) {
+                // The agent's question cards over its task.
+                Some(questions) => div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(questions)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.task_column(t, cx)),
+                    )
+                    .into_any_element(),
+                None => self.task_column(t, cx).into_any_element(),
+            },
         };
         div()
             .size_full()
@@ -810,6 +828,103 @@ impl Desk {
             .into_any_element()
     }
 
+    /// The agent's open question cards over its task: each folded to a row, one opened in place
+    /// (the oldest until another is clicked). A waiting agent with no card says so. `None` when
+    /// there is nothing to say.
+    fn questions(
+        &self,
+        terminal: TerminalStream,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let row = self.model.row(terminal)?;
+        let cards = self.cards_of(terminal, row.workspace);
+        let frame = || {
+            div()
+                .id("tab-questions")
+                .debug_selector(|| "tab-questions".to_string())
+                .role(Role::Region)
+                .aria_label("Questions")
+                .flex_none()
+                .max_h(px(520.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+        };
+        if cards.is_empty() {
+            let waits = row
+                .task
+                .as_ref()
+                .is_some_and(|k| k.stage == "waiting-human");
+            return waits.then(|| {
+                frame()
+                    .p(px(14.))
+                    .rounded(px(14.))
+                    .bg(c(t.card))
+                    .border_1()
+                    .border_color(ca(t.needs_line))
+                    .child(quiet(
+                        "Waiting on you, no question card: its last message says what.",
+                        t,
+                    ))
+                    .into_any_element()
+            });
+        }
+        let open = self
+            .card_open
+            .as_ref()
+            .filter(|id| cards.iter().any(|c| c.card == **id))
+            .cloned()
+            .unwrap_or_else(|| cards[0].card.clone());
+        let body = frame()
+            .child(section("Questions", Some(cards.len().to_string()), t))
+            .children(cards.iter().enumerate().map(|(i, card)| {
+                if card.card == open {
+                    return self.card_block(i, card, true, t, cx);
+                }
+                let id = card.card.clone();
+                ui::control(
+                    ("card-row", i as u64),
+                    Role::Button,
+                    format!("{}: {}", card.card, card.body.asks),
+                    t,
+                )
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("card-row-{id}")
+                })
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .min_h(px(28.))
+                .px(px(8.))
+                .rounded(px(8.))
+                .text_size(px(12.5))
+                .map(|d| ui::paint(d, t.rest()))
+                .hover(|s| ui::paint(s, t.pressed()))
+                .child(div().text_color(c(t.needs_text)).child(card.card.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(card.body.asks.clone()),
+                )
+                .child(div().text_color(c(t.t2)).child(state::short_span(
+                    self.now.saturating_sub(card.opened_at).max(0),
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.card_open = Some(id.clone());
+                    cx.notify();
+                }))
+                .into_any_element()
+            }));
+        Some(ui::scroll(body).into_any_element())
+    }
+
     /// The task strip: the tab's open task, its plan steps with their times (or the vertical
     /// timeline), and the evidence as recorded.
     fn task_column(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -820,7 +935,41 @@ impl Desk {
         let needs = row.is_some_and(|r| Kind::of(r).needs_you());
         let body = div().flex().flex_col().gap(px(10.));
         let body = match &self.strip {
-            None => body.child(quiet("Reading the task.", t)),
+            // Not read yet: what the agent row already says, its task and how far it is.
+            None => match row.and_then(|r| r.task.as_ref()) {
+                Some(task) => body
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_size(px(13.5))
+                                    .child(format!("Task #{}", task.id)),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "task-progress".to_string())
+                                    .text_size(px(12.))
+                                    .text_color(c(t.t2))
+                                    .child(if task.steps_total > 0 {
+                                        format!("{} of {} done", task.steps_done, task.steps_total)
+                                    } else {
+                                        task.stage.clone()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(c(t.t1))
+                            .child(task.goal.clone()),
+                    )
+                    .child(quiet("Reading the task.", t)),
+                None => body.child(quiet("Reading the task.", t)),
+            },
             Some(strip) => match strip.heading() {
                 None => body.child(quiet("No task for this terminal.", t)),
                 Some((title, progress)) => {

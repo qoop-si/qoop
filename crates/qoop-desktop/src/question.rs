@@ -39,9 +39,11 @@ pub enum Said {
     Refused(String),
 }
 
-/// The owner's own words for an agent's answer field, while its card is open.
+/// The owner's own words for an agent's answer field, while its card is open: for the agent's
+/// menu, or for one of its question cards (`card`).
 pub struct OwnAnswer {
     pub terminal: TerminalStream,
+    pub card: Option<String>,
     pub field: Entity<Field>,
 }
 
@@ -137,18 +139,76 @@ impl Desk {
             .iter()
             .find(|o| o.key == option)
             .map_or_else(|| option.to_string(), |o| o.label.clone());
+        let pick = Pick::Card {
+            card: card.card.clone(),
+            option: option.to_string(),
+        };
+        self.hold_card(&card.card, pick, label, window, cx);
+    }
+
+    /// Hand card `card` to qass to decide: held for 3 s like any answer, then written.
+    pub(crate) fn card_to_qass(&mut self, card: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lost_at.is_some() {
+            return;
+        }
+        let pick = Pick::CardQass {
+            card: card.to_string(),
+        };
+        self.hold_card(card, pick, "Hand to qass".into(), window, cx);
+    }
+
+    /// A pick on card `card`, held under the card.
+    fn hold_card(
+        &mut self,
+        card: &str,
+        pick: Pick,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let hold = Hold {
-            slot: Slot::Card(card.card.clone()),
+            slot: Slot::Card(card.to_string()),
             generation: None,
             seal: 0,
-            pick: Pick::Card {
-                card: card.card.clone(),
-                option: option.to_string(),
-            },
+            pick,
             label,
             until: Instant::now() + state::HOLD,
         };
         self.hold(hold, window, cx);
+    }
+
+    /// The open question cards of the agent in `terminal`, oldest first. None for a remote
+    /// agent: a card names this Mac's terminal, and the mux numbers a remote's terminals its
+    /// own way, so a number that matches is not the same agent.
+    pub(crate) fn cards_of(&self, terminal: TerminalStream, workspace: i64) -> Vec<&AskInfo> {
+        if state::machine_of(workspace) != 0 {
+            return Vec::new();
+        }
+        qoop_tui::tabq::open_cards(&self.asks, terminal)
+    }
+
+    /// How many question cards `entry`'s agent waits on, beside its name; nothing at zero.
+    pub(crate) fn card_count(
+        &self,
+        entry: state::Entry<'_>,
+        place: &'static str,
+        t: &Theme,
+    ) -> Option<AnyElement> {
+        let terminal = entry.terminal();
+        let n = self.cards_of(terminal, entry.workspace()).len();
+        (n > 0).then(|| {
+            div()
+                .debug_selector(move || format!("{place}-cards-{terminal}"))
+                .flex_none()
+                .px(px(6.))
+                .rounded(px(8.))
+                .bg(ca(t.needs_bg))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(c(t.needs_text))
+                .child(n.to_string())
+                .into_any_element()
+        })
     }
 
     fn hold(&mut self, hold: Hold, _: &mut Window, cx: &mut Context<Self>) {
@@ -320,6 +380,30 @@ impl Desk {
                     to_qass: false,
                 },
             },
+            Pick::CardText { card, text } => ControlRequest::AskWrite {
+                id: id.clone(),
+                terminal: None,
+                token: None,
+                action: AskOp::Answer {
+                    card: card.clone(),
+                    option: None,
+                    text: Some(text.clone()),
+                    seen: None,
+                    to_qass: false,
+                },
+            },
+            Pick::CardQass { card } => ControlRequest::AskWrite {
+                id: id.clone(),
+                terminal: None,
+                token: None,
+                action: AskOp::Answer {
+                    card: card.clone(),
+                    option: None,
+                    text: None,
+                    seen: None,
+                    to_qass: true,
+                },
+            },
             Pick::Qass => return,
         };
         self.ask(request);
@@ -367,6 +451,14 @@ impl Desk {
                 .and_then(|t| self.model.row(t))
                 .map_or_else(|| "This Mac".to_string(), |r| self.machine_of_row(r));
             let said = match reply {
+                ControlResponse::AskWritten { .. }
+                    if matches!(hold.pick, Pick::CardQass { .. }) =>
+                {
+                    Said::Sent {
+                        label: "Handed to qass".into(),
+                        at: now,
+                    }
+                }
                 ControlResponse::MenuAnswered { .. } | ControlResponse::AskWritten { .. } => {
                     Said::Sent {
                         label: hold.label.clone(),
@@ -430,12 +522,17 @@ impl Desk {
             });
             self.said.insert(hold.slot.clone(), Said::Refused(said));
         }
-        // An answer field for an agent that no longer asks closes.
-        let gone = self.own.as_ref().is_some_and(|own| {
-            !self
+        // An answer field for an agent that no longer asks closes; for a card, once the card
+        // is no longer open.
+        let gone = self.own.as_ref().is_some_and(|own| match &own.card {
+            Some(card) => !self
+                .asks
+                .iter()
+                .any(|a| a.card == *card && a.status == "open"),
+            None => !self
                 .model
                 .row(own.terminal)
-                .is_some_and(|r| r.menu.is_some())
+                .is_some_and(|r| r.menu.is_some()),
         });
         if gone {
             self.own = None;
@@ -468,13 +565,23 @@ impl Desk {
         Some((terminal, state::offers(menu), menu.seal))
     }
 
-    /// Open the field for the owner's own answer to `terminal`'s menu.
-    fn open_own(&mut self, terminal: TerminalStream, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the field for the owner's own answer to `terminal`'s menu, or to its card `card`.
+    pub(crate) fn open_own(
+        &mut self,
+        terminal: TerminalStream,
+        card: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let field = cx.new(|cx| Field::new("Type your own answer", cx));
         let focus = field.read(cx).focus.clone();
         cx.observe(&field, |_, _, cx| cx.notify()).detach();
         window.focus(&focus, cx);
-        self.own = Some(OwnAnswer { terminal, field });
+        self.own = Some(OwnAnswer {
+            terminal,
+            card,
+            field,
+        });
         cx.notify();
     }
 
@@ -488,6 +595,25 @@ impl Desk {
         }
         let terminal = own.terminal;
         let text = own.field.read(cx).text.trim().to_string();
+        // A card's own words: held under the card; the daemon says when they are too long.
+        if let Some(card) = own.card.clone() {
+            if !text.is_empty() {
+                let label = format!("\"{}\"", short(&text, 40));
+                self.own = None;
+                self.hold_card(
+                    &card,
+                    Pick::CardText {
+                        card: card.clone(),
+                        text,
+                    },
+                    label,
+                    window,
+                    cx,
+                );
+                window.focus(&self.term_focus, cx);
+            }
+            return true;
+        }
         let key = self
             .model
             .row(terminal)
@@ -755,7 +881,7 @@ impl Desk {
         let own_open = self
             .own
             .as_ref()
-            .filter(|o| o.terminal == terminal && !stale);
+            .filter(|o| o.terminal == terminal && o.card.is_none() && !stale);
         let kind = if stale {
             Kind::Status(qoop_domain::status::Status::Unknown)
         } else {
@@ -845,7 +971,7 @@ impl Desk {
                 None => d.child(
                     ui::link_button("own-open", "Something else? Type your own answer", t)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_own(terminal, window, cx)
+                            this.open_own(terminal, None, window, cx)
                         })),
                 ),
             })

@@ -119,6 +119,8 @@ pub struct Desk {
     pub(crate) too_old: BTreeSet<usize>,
     /// The owner's own words for an agent's answer field, while it is open.
     pub(crate) own: Option<OwnAnswer>,
+    /// The question card opened in place on the Session page; `None` opens the oldest.
+    pub(crate) card_open: Option<String>,
     /// qass's cards waiting on the owner, and what qass did on its own today.
     pub asks: Vec<AskInfo>,
     pub acts: Vec<QassAct>,
@@ -237,6 +239,7 @@ impl Desk {
             said: HashMap::new(),
             too_old: BTreeSet::new(),
             own: None,
+            card_open: None,
             asks: Vec::new(),
             acts: Vec::new(),
             lessons: None,
@@ -1197,6 +1200,7 @@ impl Desk {
                                 .text_ellipsis()
                                 .child(entry.title()),
                         )
+                        .when_some(self.card_count(entry, "tree", t), |d, n| d.child(n))
                         .when_some(entry.age(self.now), |d, age| {
                             d.child(div().text_size(px(11.5)).text_color(c(t.t2)).child(age))
                         })
