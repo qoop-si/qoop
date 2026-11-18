@@ -20,7 +20,7 @@ pub const NARROW: usize = 4;
 /// A tab under this many columns, or a pane in it under [`PANE_MIN`] beside the wide rail,
 /// takes the narrow one.
 const WIDE_TAB: usize = 120;
-const PANE_MIN: usize = 60;
+pub const PANE_MIN: usize = 60;
 
 /// A tab smaller than this gets no rail at all: the agent needs the room more.
 const TAB_MIN: (usize, usize) = (40, 8);
@@ -82,6 +82,252 @@ pub struct Paint<'a> {
     pub rect: Rect,
     pub terminal: u32,
     pub cards: &'a [AskInfo],
+    /// The rail unfolded to its pane, beside the agent or over its tile.
+    pub open: Option<Open<'a>>,
+}
+
+/// The pane's columns beside the agent, the line it shares with the panes left out.
+pub const OPEN: usize = 52;
+
+/// The unfolded pane as a frame paints it: the cells it covers, frame lines included, the
+/// questions and the task read for it.
+#[derive(Clone, Copy, Debug)]
+pub struct Open<'a> {
+    pub rect: Rect,
+    /// Over the agent's tile, which keeps its size, rather than beside it.
+    pub over: bool,
+    pub asks: &'a crate::asks::Pane,
+    pub focus: bool,
+    pub read: Option<&'a TaskRead>,
+    /// `s` folded or opened the task part by hand; `None` leaves it to the room.
+    pub task_open: Option<bool>,
+}
+
+/// What a read of the task said beyond its row: its plan's steps (done or not) and the newest
+/// evidence, with when.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskRead {
+    pub steps: Vec<(bool, String)>,
+    pub evidence: Option<(i64, String)>,
+}
+
+impl TaskRead {
+    /// From a `TaskRead` answer about `task`: the item's steps (phase headers left out) and the
+    /// task's newest evidence, from the item's activity or else the task's own events.
+    pub fn of(task: i64, response: &qoop_runtime::control::ControlResponse) -> Option<TaskRead> {
+        let qoop_runtime::control::ControlResponse::Tasks { events, item, .. } = response else {
+            return None;
+        };
+        let steps = item
+            .as_ref()
+            .map(|card| {
+                card.steps
+                    .iter()
+                    .filter(|s| !s.text.starts_with("## "))
+                    .map(|s| (s.done_at.is_some(), format!("{}. {}", s.n, s.text)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let from_item = item.as_ref().and_then(|card| {
+            card.activity
+                .iter()
+                .filter(|e| e.task == task && e.kind == "evidence")
+                .max_by_key(|e| e.at)
+                .map(|e| (e.at, e.body.clone()))
+        });
+        let evidence = from_item.or_else(|| {
+            events
+                .iter()
+                .filter(|e| e.kind == "evidence")
+                .max_by_key(|e| e.at)
+                .map(|e| (e.at, e.body.clone()))
+        });
+        Some(TaskRead { steps, evidence })
+    }
+}
+
+/// What a read of the task is kept by: the task, its stage and its step counts. Any of them
+/// moving reads it again.
+pub fn read_key(task: &TaskRef) -> (i64, String, u32, u32) {
+    (
+        task.id,
+        task.stage.clone(),
+        task.steps_done,
+        task.steps_total,
+    )
+}
+
+/// The task under the cards, `cw` columns wide: a rule, the goal, the stage with the steps,
+/// the steps (`[x]` done, the first undone `now`, `[ ]`) and the newest evidence; folded, one
+/// line (`task #12 · waits · 2/4`).
+pub(crate) fn task_rows(
+    task: Option<&TaskRef>,
+    read: Option<&TaskRead>,
+    cw: usize,
+    folded: bool,
+    now: i64,
+) -> Vec<Vec<crate::qass_screen::Seg>> {
+    use crate::qass_screen::seg;
+    let Some(task) = task else {
+        return Vec::new();
+    };
+    let count = (task.steps_total > 0).then(|| format!("{}/{}", task.steps_done, task.steps_total));
+    // `── head ───`, `cols` wide.
+    let rule = |head: &str, cols: usize| {
+        let rest = cols.saturating_sub(3 + width::width(head) + 1);
+        vec![
+            seg(Role::Rule, "\u{2500}\u{2500} "),
+            seg(Role::FaintText, head.to_string()),
+            seg(Role::Rule, format!(" {}", "\u{2500}".repeat(rest))),
+        ]
+    };
+    if folded {
+        let mut head = format!("task #{} \u{b7} {}", task.id, stage_word(&task.stage));
+        if let Some(count) = &count {
+            head = format!("{head} \u{b7} {count}");
+        }
+        let opens = " s opens";
+        let mut row = rule(&head, cw.saturating_sub(opens.len()));
+        row.push(seg(Role::FaintText, opens));
+        return vec![blank_row(), row];
+    }
+    let mut out = vec![blank_row(), rule("task", cw)];
+    for line in wrap(&format!("#{} {}", task.id, task.goal), cw, 2) {
+        out.push(vec![seg(Role::Text, line)]);
+    }
+    let steps = count.map_or_else(
+        || "no plan steps".to_string(),
+        |count| format!("steps {count}"),
+    );
+    out.push(vec![seg(
+        Role::Detail,
+        format!("{} \u{b7} {steps}", task.stage),
+    )]);
+    let Some(read) = read else {
+        return out;
+    };
+    if !read.steps.is_empty() {
+        out.push(blank_row());
+        let now_at = read.steps.iter().position(|(done, _)| !done);
+        for (at, (done, text)) in read.steps.iter().enumerate() {
+            let mark = if *done { "[x] " } else { "[ ] " };
+            if now_at == Some(at) {
+                let room = cw.saturating_sub(4 + 4);
+                out.push(vec![
+                    seg(
+                        Role::Text,
+                        format!("{mark}{}", width::fit(&cut(text, room), room)),
+                    ),
+                    seg(Role::Brand, " now"),
+                ]);
+            } else {
+                let role = if *done { Role::FaintText } else { Role::Text };
+                out.push(vec![seg(
+                    role,
+                    format!("{mark}{}", cut(text, cw.saturating_sub(4))),
+                )]);
+            }
+        }
+    }
+    if let Some((at, text)) = &read.evidence {
+        out.push(blank_row());
+        out.push(vec![seg(
+            Role::FaintText,
+            format!("last evidence, {}", crate::asks::age_short(now - at)),
+        )]);
+        for line in wrap(text, cw, 2) {
+            out.push(vec![seg(Role::Detail, line)]);
+        }
+    }
+    out
+}
+
+fn blank_row() -> Vec<crate::qass_screen::Seg> {
+    Vec::new()
+}
+
+/// `text` cut to `cols` columns, an ellipsis where it was cut.
+fn cut(text: &str, cols: usize) -> String {
+    if width::width(text) <= cols {
+        return text.to_string();
+    }
+    format!(
+        "{}\u{2026}",
+        width::fit(text, cols.saturating_sub(1)).trim_end()
+    )
+}
+
+/// `text` on whole words in rows of `cols`, at most `max` rows, the last cut when more remains.
+fn wrap(text: &str, cols: usize, max: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        let wide = width::width(&row) + usize::from(!row.is_empty()) + width::width(word);
+        if wide > cols && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str(word);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.len() > max {
+        let rest = rows.split_off(max - 1).join(" ");
+        rows.push(cut(&rest, cols));
+    }
+    rows.into_iter().map(|r| cut(&r, cols)).collect()
+}
+
+/// The unfolded pane's rows and where a click lands: the questions of the tab's agent, titled
+/// `questions · <agent>  ⠔ N`, its task under them. The paint and a click read the same view.
+pub fn pane_view(
+    paint: &Paint,
+    open: &Open,
+    rows: &[qoop_runtime::control::AgentRow],
+    spaces: &[qoop_runtime::control::WorkspaceRow],
+    now: i64,
+    fade: bool,
+) -> crate::asks::View {
+    let agent = rows.iter().find(|r| r.terminal == paint.terminal);
+    let name = agent.map(crate::sidebar::session_name).unwrap_or_default();
+    let task = agent.and_then(|r| r.task.as_ref());
+    let title = format!(
+        "questions \u{b7} {name}  \u{2814} {}",
+        open_count(paint.cards, paint.terminal)
+    );
+    let empty = if task.is_some_and(|t| t.stage == "waiting-human") {
+        "waiting on you, no question card: its last message says what"
+    } else {
+        "nothing waits on you here"
+    };
+    // The task folds to its line when an opened card needs the rows, unless `s` said otherwise.
+    let folded = open
+        .task_open
+        .map_or(open.asks.is_open() && open.rect.rows < 40, |shown| !shown);
+    let under = task_rows(
+        task,
+        open.read,
+        open.rect.cols.saturating_sub(4),
+        folded,
+        now,
+    );
+    let ctx = crate::asks::Ctx {
+        rows,
+        spaces,
+        now_unix: now,
+        fade,
+        board_above: false,
+        tab: Some(crate::asks::InTab {
+            title: &title,
+            empty,
+            under: &under,
+            focus: open.focus,
+        }),
+    };
+    crate::asks::view(open.asks, &ctx, open.rect.cols, open.rect.rows)
 }
 
 /// The cards `terminal`'s agent waits on: open, not handed to qass or answered. What the rail
@@ -250,6 +496,7 @@ mod tests {
             },
             terminal: 7,
             cards,
+            open: None,
         }
     }
 
