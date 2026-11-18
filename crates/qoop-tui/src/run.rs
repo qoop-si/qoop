@@ -15818,6 +15818,11 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // A name given at start, put on the conversation unasked: nobody pressed anything,
         // so a refusal (a remote too old to name a session) is not said. The tab keeps it.
         ControlResponse::Failed { id, .. } if id.starts_with("title-") => {}
+        // A question's answer refused, or the pane's task read: the questions pane says what
+        // became of it, where the next answer replaces it. Not on the status row as well, where
+        // an old refusal would outlive the answer that went.
+        ControlResponse::Failed { id, .. }
+            if id.starts_with(crate::asks::WRITE_ID) || id.starts_with(TABQ_READ) => {}
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -31321,6 +31326,60 @@ mod tests {
             "{}",
             pane_text(&s)
         );
+    }
+
+    /// A hand-off refused (no qass), then one that went: each answer reaches the pane and the
+    /// rest of the interface as the loop gives it, and the refusal never stands on the status row
+    /// once the pane says the card was handed.
+    #[test]
+    fn a_refused_hand_off_leaves_no_stale_status_after_one_that_went() {
+        use qoop_runtime::control::{AskResult, ControlResponse};
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let answer = |s: &mut State, response: ControlResponse| {
+            s.asks.answered(&response);
+            let mut dirty = false;
+            apply(s, response, &mut 0, &mut dirty);
+        };
+        let write = |s: &mut State| {
+            tabq_keys(s, b"q", 0x01);
+            let (sent, _) = s.asks.tick(std::time::Instant::now());
+            let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
+                panic!("one write: {sent:?}");
+            };
+            id.clone()
+        };
+        let id = write(&mut s);
+        answer(
+            &mut s,
+            ControlResponse::Failed {
+                id,
+                reason: "qass has no tab to hand this to".into(),
+            },
+        );
+        assert!(pane_text(&s).contains("not sent: qass has no tab"));
+        assert_eq!(s.message, None, "said in the pane, not twice");
+        let id = write(&mut s);
+        answer(
+            &mut s,
+            ControlResponse::AskWritten {
+                id,
+                card: "Q1".into(),
+                result: AskResult::Passed,
+            },
+        );
+        let painted: String = cells_of(
+            &screen::paint(&s.frame()),
+            s.cols as usize,
+            s.lines as usize,
+        )
+        .iter()
+        .map(|row| row.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(painted.contains("handed to qass: Q1"), "{painted}");
+        assert!(!painted.contains("no tab to hand this to"), "{painted}");
     }
 
     /// The opened card offers the hand-off on its own row under the answers, and it is no
