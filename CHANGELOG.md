@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/qoop-si/qoop/compare/v0.19.0...v0.19.1) (2026-11-18)
+
+
+### Fixed
+
+* **tui:** mouse selection keeps every row across a scroll ([700b49f](https://github.com/qoop-si/qoop/commit/700b49f7fff1e0f782df30e65c2ac0ab3f5edc1e))
+
 ## [0.19.0](https://github.com/qoop-si/qoop/compare/v0.18.1...v0.19.0) (2026-11-18)
 
 
