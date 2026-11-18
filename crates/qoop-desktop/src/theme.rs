@@ -138,6 +138,15 @@ pub const LIGHT: Theme = Theme {
     spaces: [0x8700d7, 0x5f5f00, 0x005f5f, 0xaf005f, 0x005f87, 0x875f00],
 };
 
+/// The theme the window draws in, set by its view on every frame it changes, so a view of
+/// its own (a text field) made before a switch draws in the new theme too.
+impl gpui::Global for Theme {}
+
+/// The theme the window draws in now; dark before the window set one.
+pub fn current(cx: &gpui::App) -> Theme {
+    cx.try_global::<Theme>().copied().unwrap_or(DARK)
+}
+
 /// The terminal's own ground and ink, the same in both themes. Whatever is drawn on it takes
 /// `DARK`'s tokens, a control included.
 pub const TERMINAL_BG: u32 = 0x0f0f11;
@@ -216,9 +225,9 @@ impl Theme {
         }
     }
 
-    /// The outline a picked chip, radio or day, and the current page, tab, row or run, wear
-    /// over their fill (DECISION's `.tq.on`): a tint alone is about 1.1:1 against an unpicked
-    /// neighbour, the outline 3:1 at least.
+    /// The outline a picked chip, radio or day, the current page, tab, row or run, and a text
+    /// field wear (DECISION's `.tq.on`): a tint alone is about 1.1:1 against an unpicked
+    /// neighbour, the outline 3:1 at least, and a field with no edge shows only its caret.
     pub fn picked_edge(&self) -> u32 {
         self.t3
     }
@@ -240,11 +249,20 @@ impl Theme {
         }
     }
 
-    /// A key cap (`ctrl-a c`), drawn inside a control in any of the states above.
+    /// A key cap (`ctrl-a c`), drawn inside a control in any of the states above but on.
     pub fn key(&self) -> Pair {
         Pair {
             fill: self.fill,
             text: self.t1,
+        }
+    }
+
+    /// A key cap inside a control that is on (Start's `enter`): the on ground's own ink, on a
+    /// tint of it.
+    pub fn key_on(&self) -> Pair {
+        Pair {
+            fill: (self.on_sel << 8) | 0x1f,
+            text: self.on_sel,
         }
     }
 
@@ -371,7 +389,7 @@ mod tests {
     /// over one (a segmented control, a machine tile). The focus ring reads at 3:1 (WCAG
     /// 1.4.11) against what is outside it (a ground, or a state fill another control sits on)
     /// and against `bg`, its inner band, whatever the control's own fill. A key cap reads
-    /// inside a control in every state but on.
+    /// inside a control in every state, in `key_on` when the control is on.
     #[test]
     fn every_state_label_reads_on_its_fill_and_the_ring_on_its_neighbours() {
         for t in [DARK, LIGHT] {
@@ -388,8 +406,13 @@ mod tests {
                         "{theme} {name}: #{:06x} on #{fill:06x}: {ratio:.2}",
                         pair.text
                     );
-                    // `on` is the selected ground of one control, never under another.
+                    // `on` is the selected ground of one control, never under another; a key
+                    // cap in it takes its own pair.
                     if name == "on" {
+                        let key = t.key_on();
+                        let cap = over(key.fill, fill);
+                        let ratio = contrast(key.text, cap);
+                        assert!(ratio >= 4.5, "{theme} key cap in on #{cap:06x}: {ratio:.2}");
                         continue;
                     }
                     let ring = contrast(t.focus, fill);

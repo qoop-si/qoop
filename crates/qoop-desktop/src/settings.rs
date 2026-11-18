@@ -11,7 +11,7 @@ use qoop_runtime::control::{ControlRequest, ControlResponse};
 use qoop_tui::config::Read;
 
 use crate::app::Desk;
-use crate::field::{Field, FieldColors};
+use crate::field::Field;
 use crate::link;
 use crate::state::{self, SETTINGS, Setting, SettingKind};
 use crate::theme::{MONO_FONT, Theme, c, ca};
@@ -121,14 +121,7 @@ impl Desk {
         let field = match self.settings.find.clone() {
             Some(field) => field,
             None => {
-                let t = self.theme();
-                let colors = FieldColors {
-                    text: c(t.ink).into(),
-                    placeholder: c(t.t2).into(),
-                    caret: c(t.ink).into(),
-                    selection: ca(t.fill2).into(),
-                };
-                let field = cx.new(|cx| Field::new("Find a setting", colors, cx));
+                let field = cx.new(|cx| Field::new("Find a setting", cx));
                 cx.observe(&field, |_, _, cx| cx.notify()).detach();
                 self.settings.find = Some(field.clone());
                 field
@@ -311,7 +304,7 @@ impl Desk {
                     .min_h_0()
                     .flex()
                     .gap(px(12.))
-                    .child(
+                    .child(ui::scroll(
                         div()
                             .id("settings-list")
                             .flex_none()
@@ -321,16 +314,7 @@ impl Desk {
                             .flex()
                             .flex_col()
                             .gap(px(6.))
-                            .when_some(self.settings.find.clone(), |d, field| {
-                                d.child(
-                                    div()
-                                        .p(px(6.))
-                                        .rounded(px(8.))
-                                        .border_1()
-                                        .border_color(ca(t.line))
-                                        .child(field),
-                                )
-                            })
+                            .when_some(self.settings.find.clone(), |d, field| d.child(field))
                             .children(groups.into_iter().map(|group| {
                                 div()
                                     .flex()
@@ -378,7 +362,7 @@ impl Desk {
                                 )
                             })
                             .child(self.pet_panel(t, cx)),
-                    )
+                    ))
                     .child(self.file_view(read)),
             )
             .into_any_element()
@@ -646,7 +630,10 @@ impl Desk {
                             div()
                                 .id("pet-held")
                                 .role(Role::Status)
-                                .aria_label(format!("Your new pet, saved in {left} seconds"))
+                                .aria_label(format!(
+                                    "Your new pet, saved in {}",
+                                    state::count(left as usize, "second")
+                                ))
                                 .flex_1()
                                 .text_size(px(12.5))
                                 .child(format!("Your new pet: saved in {left} s")),

@@ -1131,7 +1131,7 @@ impl Desk {
                 Page::Settings,
                 cx,
             ))
-            .child(
+            .child(ui::scroll(
                 div()
                     .id("tree")
                     .flex_1()
@@ -1139,7 +1139,7 @@ impl Desk {
                     .overflow_y_scroll()
                     .mt(px(8.))
                     .when(self.page != Page::Home, |d| d.child(self.tree(t, cx))),
-            )
+            ))
             .child(self.tiles(t, cx))
     }
 
@@ -1663,11 +1663,25 @@ impl Desk {
             .right(px(right))
             .bottom(px(26.));
         match self.page {
-            Page::Home => body.overflow_y_scroll().child(self.home(t, cx)),
-            Page::Session(_) => body.p(px(12.)).child(self.session(t, focused, cx)),
-            Page::Qass => body.p(px(12.)).child(self.qass_page(t, focused, cx)),
-            Page::Schedules => body.p(px(12.)).child(self.schedules_page(t, cx)),
-            Page::Settings => body.p(px(12.)).child(self.settings_page(t, cx)),
+            Page::Home => {
+                ui::scroll(body.overflow_y_scroll().child(self.home(t, cx))).into_any_element()
+            }
+            Page::Session(_) => body
+                .p(px(12.))
+                .child(self.session(t, focused, cx))
+                .into_any_element(),
+            Page::Qass => body
+                .p(px(12.))
+                .child(self.qass_page(t, focused, cx))
+                .into_any_element(),
+            Page::Schedules => body
+                .p(px(12.))
+                .child(self.schedules_page(t, cx))
+                .into_any_element(),
+            Page::Settings => body
+                .p(px(12.))
+                .child(self.settings_page(t, cx))
+                .into_any_element(),
         }
     }
 }
@@ -1789,6 +1803,10 @@ impl Focusable for Desk {
 impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme();
+        // Every view drawn after this one (the text fields) reads the theme from here.
+        if cx.try_global::<Theme>() != Some(&t) {
+            cx.set_global(t);
+        }
         let focused = self.term_focus.is_focused(window);
         let mut root = div()
             .id("desk")

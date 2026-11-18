@@ -318,11 +318,19 @@ impl Model {
             .count()
     }
 
+    /// The agents that need the owner: the Inbox's "N needs you" and the Needs you part of its
+    /// badge, one count. A qass card about one of them is not a second one.
+    pub fn needs_you(&self) -> usize {
+        self.live().filter(|r| Kind::of(r).needs_you()).count()
+    }
+
     /// The Inbox badge: Needs you plus Failed, nothing at zero.
     pub fn badge(&self) -> usize {
-        self.live()
-            .filter(|r| matches!(Kind::of(r), Kind::Status(Status::Blocked | Status::Failed)))
-            .count()
+        self.needs_you()
+            + self
+                .live()
+                .filter(|r| Kind::of(r) == Kind::Status(Status::Failed))
+                .count()
     }
 
     /// "7 in 3 spaces on 2 machines".
@@ -330,14 +338,11 @@ impl Model {
         let agents = self.agents();
         let spaces: BTreeSet<i64> = agents.iter().map(|e| e.workspace()).collect();
         let machines: BTreeSet<usize> = spaces.iter().map(|w| machine_of(*w)).collect();
-        let n = |count: usize, one: &str, many: &str| {
-            format!("{count} {}", if count == 1 { one } else { many })
-        };
         format!(
             "{} in {} on {}",
             agents.len(),
-            n(spaces.len(), "space", "spaces"),
-            n(machines.len(), "machine", "machines")
+            count(spaces.len(), "space"),
+            count(machines.len(), "machine")
         )
     }
 
@@ -847,13 +852,19 @@ pub fn day_long(day: i64) -> String {
     )
 }
 
+/// A count and its word: "1 run", "2 runs", "0 runs". Every counted word in the window is
+/// one that takes an `s`.
+pub fn count(n: usize, one: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {one}s"),
+    }
+}
+
 /// "1 schedule, 1 on", "3 schedules, 2 on": Home's Next runs card and the Schedules top bar.
 pub fn schedules_line(schedules: &[ScheduleInfo]) -> String {
     let on = schedules.iter().filter(|s| !s.paused).count();
-    match schedules.len() {
-        1 => format!("1 schedule, {on} on"),
-        n => format!("{n} schedules, {on} on"),
-    }
+    format!("{}, {on} on", count(schedules.len(), "schedule"))
 }
 
 /// The slots the schedules will run at from `from` up to `until`, soonest first: each one's
@@ -973,12 +984,14 @@ pub fn took(run: &ScheduleRun) -> Option<String> {
 }
 
 /// Home's "Last:" line for this machine's schedules: the newest run that started, as
-/// "Last: nightly-tests, Fri 02:00, Done, tab 11".
+/// "Last: nightly-tests, Fri 02:00, Done, tab 11". `words` says how the run reads, by the rule
+/// its report reads by (Needs you while its agent asks).
 pub fn last_run_line(
     schedules: &[ScheduleInfo],
     runs: &[ScheduleRun],
     now: i64,
     zone: Zone,
+    words: impl Fn(&ScheduleRun) -> String,
 ) -> Option<String> {
     let run = runs
         .iter()
@@ -989,7 +1002,7 @@ pub fn last_run_line(
         .find(|s| s.id == run.schedule)?
         .name
         .clone();
-    let (_, word) = run_words(run);
+    let word = words(run);
     let mut line = format!(
         "Last: {name}, {}, {word}",
         clock_at(run.started_at, now, zone)
@@ -2211,9 +2224,13 @@ pub(crate) mod tests {
     #[test]
     fn badge_is_needs_you_plus_failed() {
         let mut m = fixture();
-        assert_eq!(m.badge(), 1);
+        assert_eq!((m.needs_you(), m.badge()), (1, 1));
         m.rows[0].status = Some("failed".into());
-        assert_eq!(m.badge(), 2);
+        assert_eq!(
+            (m.needs_you(), m.badge()),
+            (1, 2),
+            "the Inbox and the badge agree"
+        );
         m.rows
             .retain(|r| !matches!(r.status.as_deref(), Some("failed" | "blocked")));
         assert_eq!(m.badge(), 0);
@@ -2509,6 +2526,9 @@ pub(crate) mod tests {
             "1 schedule, 1 on"
         );
         assert_eq!(schedules_line(&[nightly, paused]), "2 schedules, 1 on");
+        // The day card's "1 run", never "1 runs".
+        let runs: Vec<String> = [0, 1, 2].map(|n| count(n, "run")).to_vec();
+        assert_eq!(runs, ["0 runs", "1 run", "2 runs"]);
     }
 
     #[test]
@@ -2887,7 +2907,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn schedule_info(id: i64, name: &str, cron: &str, next_at: i64) -> ScheduleInfo {
+    pub fn schedule_info(id: i64, name: &str, cron: &str, next_at: i64) -> ScheduleInfo {
         serde_json::from_value(serde_json::json!({
             "id": id, "name": name, "cron": cron, "agent": "claude", "cwd": "/srv/acme-web",
             "prompt": "go", "paused": false, "created_at": 0, "when": "every day 09:00",
@@ -2972,7 +2992,14 @@ pub(crate) mod tests {
             schedule_info(2, "soak", "0 */2 * * *", today * day),
         ];
         assert_eq!(
-            last_run_line(&schedules, &runs[..2], (today - 1) * day + 7200, zone).as_deref(),
+            last_run_line(
+                &schedules,
+                &runs[..2],
+                (today - 1) * day + 7200,
+                zone,
+                |r| { run_words(r).1 }
+            )
+            .as_deref(),
             Some("Last: nightly-tests, 02:00, Failed:, tab 11")
         );
         assert_eq!(

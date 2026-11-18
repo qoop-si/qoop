@@ -108,15 +108,7 @@ impl Desk {
                             .text_color(c(t.t2))
                             .child(format!(
                                 "{} needs you, {} unread",
-                                needs.len()
-                                    + cards
-                                        .iter()
-                                        .filter(|a| {
-                                            !a.terminal.is_some_and(|t| {
-                                                needs.iter().any(|r| r.terminal == t)
-                                            })
-                                        })
-                                        .count(),
+                                self.model.needs_you(),
                                 unread.len()
                             )),
                     )
@@ -186,7 +178,7 @@ impl Desk {
                         ),
                 )
             })
-            .child(
+            .child(ui::scroll(
                 div()
                     .id("inbox-body")
                     .flex_1()
@@ -239,7 +231,7 @@ impl Desk {
                                 .child(div().flex_1().text_color(c(t.t1)).child(a.text.clone()))
                         }))
                     }),
-            )
+            ))
     }
 
     /// One agent's row: it opens the agent.
