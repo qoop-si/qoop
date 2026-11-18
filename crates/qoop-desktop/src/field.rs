@@ -28,6 +28,9 @@ pub struct Field {
     /// The text and caret before the last edit, for one undo.
     undo: Option<(String, usize)>,
     pub placeholder: SharedString,
+    /// The field's name to a screen reader, apart from its hint: "Folder", not an example
+    /// path. The hint names it when there is none.
+    pub label: Option<SharedString>,
     pub focus: FocusHandle,
     /// Painted geometry, for the input method's candidate window and for clicks.
     line: Option<ShapedLine>,
@@ -64,10 +67,21 @@ impl Field {
             marked: None,
             undo: None,
             placeholder: placeholder.to_string().into(),
+            label: None,
             focus: cx.focus_handle(),
             line: None,
             bounds: None,
         }
+    }
+
+    /// Put `text` in the field with the caret after it, as a field filled for editing reads:
+    /// typing then adds to the end, never in front of what is there.
+    pub fn set_text(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.anchor = self.text.len();
+        self.head = self.text.len();
+        self.marked = None;
+        self.undo = None;
     }
 
     pub fn selection(&self) -> Range<usize> {
@@ -371,7 +385,11 @@ impl Render for Field {
             div()
                 .id("field")
                 .role(Role::TextInput)
-                .aria_label(self.placeholder.clone())
+                .aria_label(
+                    self.label
+                        .clone()
+                        .unwrap_or_else(|| self.placeholder.clone()),
+                )
                 .aria_placeholder(self.placeholder.clone())
                 .aria_value(self.text.clone())
                 .key_context("Field")

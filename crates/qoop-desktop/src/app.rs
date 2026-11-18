@@ -196,6 +196,9 @@ pub struct Desk {
     pub(crate) cells: Cells,
     /// The agents New work offers: (name, command).
     pub offers: Vec<(String, String)>,
+    /// The agents a scheduled run or qass can start, qass's own first, as the TUI's form lists
+    /// them (`qoop_tui::schedules::agents`): the schedule sheet and "qass runs on" read it.
+    pub(crate) agent_names: Vec<String>,
     /// New work asked for: the create's id, the line its terminal gets, and the space. Kept
     /// here, not on the sheet, so a sheet closed while it starts still gets its line.
     pub pending: Option<(String, String, Option<i64>)>,
@@ -300,6 +303,7 @@ impl Desk {
             my_pet: qoop_runtime::avatar::load(),
             cells: cells(cx, 12.),
             offers: state::worktree_agents(&offered),
+            agent_names: qoop_tui::schedules::agents(&config.agents, &config.qass_agent),
             pending: None,
         }
     }
@@ -604,6 +608,7 @@ impl Desk {
 
     /// What `config.toml` changes in the window now: the prefix and the theme.
     pub(crate) fn reconfigure(&mut self, read: &qoop_tui::config::Read) {
+        self.agent_names = qoop_tui::schedules::agents(&read.agents, &read.qass_agent);
         self.prefix = read.config.prefix;
         self.theme_pref = read.config.theme;
         self.dark = dark_for(self.theme_pref, self.appearance);
@@ -747,10 +752,16 @@ impl Desk {
     /// The keys' resting place: an open sheet's first stop, else the terminal on screen, else
     /// the window. Where focus goes when its control leaves the frame or a panel closes.
     pub(crate) fn focus_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let to = match &self.sheet {
-            Some(sheet) => sheet.stops[0].clone(),
-            None if self.term_drawn() => self.term_focus.clone(),
-            None => self.focus.clone(),
+        let schedule_sheet = self
+            .schedule_page
+            .sheet
+            .as_ref()
+            .filter(|_| self.page == Page::Schedules);
+        let to = match (&self.sheet, schedule_sheet) {
+            (Some(sheet), _) => sheet.stops[0].clone(),
+            (None, Some(sheet)) => sheet.name.read(cx).focus.clone(),
+            (None, None) if self.term_drawn() => self.term_focus.clone(),
+            (None, None) => self.focus.clone(),
         };
         window.focus(&to, cx);
         cx.notify();

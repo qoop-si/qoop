@@ -396,27 +396,45 @@ impl Desk {
                     }))
                     .into_any_element()
             }
-            SettingKind::Choice(words) => div()
-                .flex()
-                .flex_wrap()
-                .justify_end()
-                .gap(px(3.))
-                .children(words.iter().enumerate().map(|(n, word)| {
-                    let word = *word;
-                    ui::chip(
-                        ("setting-choice", key_id(s.key) * 16 + n as u64),
-                        word,
-                        None,
-                        None,
-                        word == value,
-                        t,
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_setting(&setting, word, cx)),
-                    )
-                }))
-                .into_any_element(),
+            SettingKind::Choice(words) => {
+                // qass's agent: the list every agent pick reads (an `[agents]` name too), with
+                // the file's value picked even when it is none of them (C-16).
+                let mut words: Vec<String> = match s.key {
+                    "qass.agent" => self.agent_names.clone(),
+                    _ => words.iter().map(|w| w.to_string()).collect(),
+                };
+                if s.key == "qass.agent" && !value.is_empty() && !words.contains(&value) {
+                    words.push(value.clone());
+                }
+                div()
+                    .id(("setting-group", key_id(s.key)))
+                    .role(Role::RadioGroup)
+                    .aria_label(s.label)
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap(px(3.))
+                    .children(words.into_iter().enumerate().map(|(n, word)| {
+                        ui::chip(
+                            ("setting-choice", key_id(s.key) * 16 + n as u64),
+                            &word,
+                            None,
+                            None,
+                            word == value,
+                            t,
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_setting(&setting, &word, cx)
+                            }),
+                        )
+                    }))
+                    .into_any_element()
+            }
             SettingKind::Minutes => div()
+                .id(("setting-group", key_id(s.key)))
+                .role(Role::RadioGroup)
+                .aria_label(s.label)
                 .flex()
                 .flex_wrap()
                 .justify_end()

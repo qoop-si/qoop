@@ -2070,7 +2070,11 @@ pub fn branch_problem(branch: &str) -> Option<&'static str> {
 }
 
 fn program_of(command: &str) -> &str {
-    let first = command.split_whitespace().next().unwrap_or("");
+    // Past any `NAME=value` in front, as the TUI's schedule form reads a launcher.
+    let first = command
+        .split_whitespace()
+        .find(|w| !w.contains('='))
+        .unwrap_or("");
     first.rsplit('/').next().unwrap_or("")
 }
 
@@ -2809,6 +2813,10 @@ pub(crate) mod tests {
             Ok("qoop worktree new b -- gemini -i go && exit")
         );
         assert!(takes_prompt("/opt/homebrew/bin/codex") && !takes_prompt("aider"));
+        assert!(
+            takes_prompt("CLAUDE_CONFIG_DIR=/tmp/c claude"),
+            "past an env assignment"
+        );
     }
 
     fn schedule(name: &str, cron: Option<&str>, next_at: Option<i64>) -> ScheduleInfo {

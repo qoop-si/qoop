@@ -324,7 +324,16 @@ impl Desk {
     fn needs_block(&self, row: &AgentRow, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let terminal = row.terminal;
         let menu = row.menu.as_ref();
+        // Its answers grouped under the question and the agent, so "1, Yes" is never heard on
+        // its own five times (A11Y-13), as the session card does.
+        let group = match menu.filter(|m| !m.question.is_empty()) {
+            Some(m) => format!("{}, {}", m.question, self.model.agent_name(row)),
+            None => self.model.agent_name(row),
+        };
         div()
+            .id(("inbox-question", u64::from(terminal)))
+            .role(Role::Group)
+            .aria_label(group)
             .flex()
             .flex_col()
             .gap(px(4.))

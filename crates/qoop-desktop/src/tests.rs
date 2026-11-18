@@ -1921,6 +1921,74 @@ fn an_open_run_reads_as_its_tab(cx: &mut TestAppContext) {
     );
 }
 
+/// A schedule that never ran opens from All schedules: what it is, when it runs, and the same
+/// Edit, Pause and Run now as a report. A run's report lists only runs earlier than it, and a
+/// run with no message that waits on the owner says so.
+#[gpui::test]
+fn a_schedule_that_never_ran_opens_and_earlier_runs_are_earlier(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            d.model.schedules = vec![crate::state::tests::schedule_info(
+                1,
+                "review-pr",
+                "0 9 * * *",
+                0,
+            )];
+            d.open(Page::Schedules, window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    let at = vcx
+        .debug_bounds("schedule-row-1")
+        .expect("the row is a control");
+    vcx.simulate_click(at.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        desk.read_with(&vcx, |d, _| d.schedule_page.open),
+        Some((1, None))
+    );
+    assert!(
+        vcx.debug_bounds("unrun-report").is_some(),
+        "the schedule alone"
+    );
+
+    let run = |id: i64, started_at: i64| -> qoop_runtime::control::ScheduleRun {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "schedule": 1, "slot": started_at, "started_at": started_at,
+            "terminal": 2, "result": "started",
+        }))
+        .expect("run")
+    };
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.schedule_page
+                .runs
+                .insert((0, 1), vec![run(9, 1900), run(8, 1000), run(7, 900)]);
+            d.schedule_page.open = Some((1, Some(8)));
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("earlier-7").is_some(), "the earlier run");
+    assert!(vcx.debug_bounds("earlier-9").is_none(), "not the newer one");
+}
+
+/// A field filled for editing puts the caret after its text, so typing adds to the end.
+#[gpui::test]
+fn a_filled_field_types_at_its_end(cx: &mut TestAppContext) {
+    let (_desk, mut vcx, _rx) = open(cx);
+    let at = vcx.update(|_, cx| {
+        let field = cx.new(|cx| {
+            let mut f = crate::field::Field::new("Prompt", cx);
+            f.set_text("Review the open PR");
+            f
+        });
+        field.read(cx).selection()
+    });
+    assert_eq!(at, 18..18);
+}
+
 /// The theme follows `config.toml` while the window runs: read on opening Settings, turned at
 /// once by a write from Settings, and again when the file changes under the window.
 #[gpui::test]

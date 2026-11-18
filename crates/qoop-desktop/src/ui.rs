@@ -641,6 +641,7 @@ pub fn pill(id: impl Into<ElementId>, label: &str, t: &Theme) -> Control {
 /// its text still readable (no opacity over it).
 pub fn pill_off(id: impl Into<ElementId>, label: &str, t: &Theme) -> Control {
     pill_frame(id, label, t, t.off())
+        .border_color(ca(t.line))
         .tab_stop(false)
         .cursor_default()
 }
