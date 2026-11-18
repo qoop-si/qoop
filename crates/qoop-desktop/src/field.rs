@@ -14,6 +14,9 @@ use gpui::{
     div, fill, point, prelude::*, px, relative, size,
 };
 
+use crate::theme::{self, c, ca};
+use crate::ui::{self, Control};
+
 /// The field's text and where the caret and selection are, as byte offsets into `text`.
 pub struct Field {
     pub text: String,
@@ -29,19 +32,31 @@ pub struct Field {
     /// Painted geometry, for the input method's candidate window and for clicks.
     line: Option<ShapedLine>,
     bounds: Option<Bounds<Pixels>>,
-    pub colors: FieldColors,
 }
 
-#[derive(Clone, Copy)]
-pub struct FieldColors {
-    pub text: Hsla,
-    pub placeholder: Hsla,
-    pub caret: Hsla,
-    pub selection: Hsla,
+/// The field's inks, from the theme the window draws in now (never kept: a field made before
+/// a switch to light would keep dark's ink).
+struct Inks {
+    text: Hsla,
+    placeholder: Hsla,
+    caret: Hsla,
+    selection: Hsla,
+}
+
+impl Inks {
+    fn now(cx: &App) -> Self {
+        let t = theme::current(cx);
+        Inks {
+            text: c(t.ink).into(),
+            placeholder: c(t.t2).into(),
+            caret: c(t.ink).into(),
+            selection: ca(t.fill2).into(),
+        }
+    }
 }
 
 impl Field {
-    pub fn new(placeholder: &str, colors: FieldColors, cx: &mut Context<Self>) -> Self {
+    pub fn new(placeholder: &str, cx: &mut Context<Self>) -> Self {
         Field {
             text: String::new(),
             anchor: 0,
@@ -52,7 +67,6 @@ impl Field {
             focus: cx.focus_handle(),
             line: None,
             bounds: None,
-            colors,
         }
     }
 
@@ -350,20 +364,30 @@ impl Focusable for Field {
 
 impl Render for Field {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A text field to a screen reader: its name, its hint and what is typed in it.
-        div()
-            .id("field")
-            .role(Role::TextInput)
-            .aria_label(self.placeholder.clone())
-            .aria_placeholder(self.placeholder.clone())
-            .aria_value(self.text.clone())
-            .track_focus(&self.focus)
-            .key_context("Field")
-            .on_key_down(cx.listener(Self::key))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::click))
-            .w_full()
-            .h(px(22.))
-            .child(FieldText(cx.entity()))
+        let t = theme::current(cx);
+        // A text field to a screen reader: its name, its hint and what is typed in it. Its
+        // edge shows where to type (3:1 on any ground), the focus ring when the caret is in it.
+        Control::new(
+            div()
+                .id("field")
+                .role(Role::TextInput)
+                .aria_label(self.placeholder.clone())
+                .aria_placeholder(self.placeholder.clone())
+                .aria_value(self.text.clone())
+                .key_context("Field")
+                .on_key_down(cx.listener(Self::key))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::click))
+                .w_full()
+                .px(px(9.))
+                .py(px(5.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(c(t.picked_edge()))
+                .cursor_text()
+                .focus(move |s| ui::focus_ring(s, &t))
+                .child(FieldText(cx.entity())),
+        )
+        .track_focus(&self.focus)
     }
 }
 
@@ -417,13 +441,14 @@ impl Element for FieldText {
         window: &mut Window,
         cx: &mut App,
     ) -> Laid {
+        let inks = Inks::now(cx);
         let field = self.0.read(cx);
         let style = window.text_style();
         let empty = field.text.is_empty();
         let (text, color): (SharedString, Hsla) = if empty {
-            (field.placeholder.clone(), field.colors.placeholder)
+            (field.placeholder.clone(), inks.placeholder)
         } else {
-            (field.text.clone().into(), field.colors.text)
+            (field.text.clone().into(), inks.text)
         };
         let run = |len: usize, underline: bool| TextRun {
             len,
@@ -485,7 +510,7 @@ impl Element for FieldText {
     ) {
         let (focus, colors) = {
             let field = self.0.read(cx);
-            (field.focus.clone(), field.colors)
+            (field.focus.clone(), Inks::now(cx))
         };
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
         if let Some(sel) = laid.selection {

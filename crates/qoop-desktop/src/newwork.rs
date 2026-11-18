@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use crate::app::Desk;
-use crate::field::{Field, FieldColors};
+use crate::field::Field;
 use crate::link::fresh_id;
 use crate::state;
 use crate::theme::{MONO_FONT, Theme, c, ca};
@@ -28,8 +28,8 @@ pub struct NewWork {
     pub opened: i64,
     /// Why the last start did not go.
     pub refused: Option<String>,
-    /// The sheet's own stops, in Tab order: task, agent, space, Start, Close.
-    pub stops: [FocusHandle; 5],
+    /// The sheet's own stops, in Tab order: task, agent, space, Cancel, Start, Close.
+    pub stops: [FocusHandle; 6],
     /// What had the focus when the sheet opened: it gets it back on close.
     pub back: Option<FocusHandle>,
 }
@@ -55,14 +55,7 @@ impl Desk {
             cx.notify();
             return;
         }
-        let t = self.theme();
-        let colors = FieldColors {
-            text: c(t.ink).into(),
-            placeholder: c(t.t2).into(),
-            caret: c(t.ink).into(),
-            selection: ca(t.fill2).into(),
-        };
-        let task = cx.new(|cx| Field::new("What should the agent do?", colors, cx));
+        let task = cx.new(|cx| Field::new("What should the agent do?", cx));
         let field_focus = task.read(cx).focus.clone();
         let space = space.or_else(|| self.spaces_for_work().first().map(|w| w.id));
         window.focus(&field_focus, cx);
@@ -76,6 +69,7 @@ impl Desk {
             refused: None,
             stops: [
                 field_focus,
+                cx.focus_handle(),
                 cx.focus_handle(),
                 cx.focus_handle(),
                 cx.focus_handle(),
@@ -96,14 +90,7 @@ impl Desk {
         if self.first_run.is_some() {
             return;
         }
-        let t = self.theme();
-        let colors = FieldColors {
-            text: c(t.ink).into(),
-            placeholder: c(t.t2).into(),
-            caret: c(t.ink).into(),
-            selection: ca(t.fill2).into(),
-        };
-        let field = cx.new(|cx| Field::new("What should an agent work on?", colors, cx));
+        let field = cx.new(|cx| Field::new("What should an agent work on?", cx));
         cx.observe(&field, |_, _, cx| cx.notify()).detach();
         self.first_run = Some(field);
     }
@@ -313,17 +300,7 @@ impl Desk {
                 .child(text.to_string())
         };
         let ring = *t;
-        let field_row = div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .px(px(12.))
-            .h(px(40.))
-            .rounded(px(10.))
-            .map(|d| ui::paint(d, t.rest()))
-            .border_1()
-            .border_color(ca(t.line))
-            .child(sheet.task.clone());
+        let field_row = div().text_size(px(14.)).child(sheet.task.clone());
         let agents = div()
             .id("agent")
             .role(Role::RadioGroup)
@@ -456,7 +433,7 @@ impl Desk {
                 Some(why) if !ok => format!("Start, unavailable: {why}"),
                 _ => "Start".to_string(),
             })
-            .track_focus(&sheet.stops[3])
+            .track_focus(&sheet.stops[4])
             .flex()
             .items_center()
             .gap(px(8.))
@@ -475,11 +452,17 @@ impl Desk {
             } else {
                 "Start"
             })
-            .child(ui::kbd("enter", t))
+            .child(ui::kbd_in("enter", if ok { t.key_on() } else { t.key() }))
             .on_click(cx.listener(|this, _, _, cx| this.start(cx)));
+        // The way out by mouse, as the schedule sheet's: Cancel drops the task, Close keeps it.
+        let cancel = ui::pill("sheet-cancel", "Cancel", t)
+            .debug_selector(|| "sheet-cancel".into())
+            .track_focus(&sheet.stops[3])
+            .child("Cancel")
+            .on_click(cx.listener(|this, _, window, cx| this.close_sheet(false, window, cx)));
         let close = ui::control("sheet-close", Role::Button, "Close New work", t)
             .debug_selector(|| "sheet-close".into())
-            .track_focus(&sheet.stops[4])
+            .track_focus(&sheet.stops[5])
             .size(px(24.))
             .flex()
             .items_center()
@@ -567,6 +550,7 @@ impl Desk {
                             .debug_selector(|| "new-work-note".into())
                             .child(reason.filter(|_| !ok).unwrap_or(note)),
                     )
+                    .child(cancel)
                     .child(start),
             );
         ui::sheet("new-work-sheet", "New work", t, body.into_any_element()).into_any_element()

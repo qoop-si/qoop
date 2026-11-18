@@ -357,6 +357,71 @@ fn new_work_keeps_its_draft_and_gives_the_focus_back(cx: &mut TestAppContext) {
         .center();
     vcx.simulate_click(at, gpui::Modifiers::none());
     assert!(desk.read_with(&vcx, |d, _| d.sheet.is_none() && d.work_draft.is_some()));
+    // Cancel, as on the schedule sheet, drops it.
+    vcx.simulate_keystrokes("ctrl-a c");
+    let at = vcx
+        .debug_bounds("sheet-cancel")
+        .expect("the Cancel button")
+        .center();
+    vcx.simulate_click(at, gpui::Modifiers::none());
+    assert!(
+        desk.read_with(&vcx, |d, _| d.sheet.is_none() && d.work_draft.is_none()),
+        "Cancel keeps no draft"
+    );
+}
+
+/// A field made before a live theme switch draws in the new theme: fields read the theme the
+/// window draws in now, never one kept from when they were made.
+#[gpui::test]
+fn a_field_made_before_a_theme_switch_takes_the_new_theme(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    assert!(desk.read_with(&vcx, |d, _| d.sheet.is_some()));
+    for dark in [false, true] {
+        vcx.update(|_, cx| {
+            desk.update(cx, |d, cx| {
+                d.dark = dark;
+                cx.notify();
+            })
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.update(|_, cx| crate::theme::current(cx)),
+            crate::theme::Theme::pick(dark),
+            "the field's theme after a switch to dark: {dark}"
+        );
+    }
+}
+
+/// A Tab stop below the fold scrolls its list into view: the settings list on a short window,
+/// Tab until its last switch has the focus, and it is on screen.
+#[gpui::test]
+fn tab_scrolls_a_stop_below_the_fold_into_view(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_resize(gpui::size(gpui::px(1100.), gpui::px(480.)));
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Settings, window, cx)));
+    vcx.run_until_parked();
+    let height = vcx.update(|window, _| window.viewport_size().height);
+    let last = |vcx: &mut VisualTestContext| {
+        vcx.debug_bounds("setting-telemetry")
+            .expect("the Usage counts switch")
+    };
+    assert!(
+        last(&mut vcx).top() > height,
+        "below the fold at first: {:?} in {height:?}",
+        last(&mut vcx)
+    );
+    let mut shown = false;
+    for _ in 0..120 {
+        vcx.simulate_keystrokes("tab");
+        vcx.run_until_parked();
+        let at = last(&mut vcx);
+        if at.top() >= gpui::px(0.) && at.bottom() <= height {
+            shown = true;
+            break;
+        }
+    }
+    assert!(shown, "Tab brought it into view: {:?}", last(&mut vcx));
 }
 
 /// Escape with the Inbox open closes it and never reaches the agent in the terminal: an
@@ -1412,7 +1477,7 @@ fn settings_write_in_place_find_and_refuse_a_broken_file(cx: &mut TestAppContext
 /// is not listed keeps its own word.
 #[gpui::test]
 fn an_open_run_reads_as_its_tab(cx: &mut TestAppContext) {
-    let (desk, vcx, _rx) = open(cx);
+    let (desk, mut vcx, _rx) = open(cx);
     let run = |terminal: i64| -> qoop_runtime::control::ScheduleRun {
         serde_json::from_value(serde_json::json!({
             "id": 8, "schedule": 1, "slot": 1000, "started_at": 1000,
@@ -1430,6 +1495,24 @@ fn an_open_run_reads_as_its_tab(cx: &mut TestAppContext) {
     assert_eq!(words, "Needs you");
     let (_, words) = desk.read_with(&vcx, |d, _| d.run_words(&run(99)));
     assert_eq!(words, "Working");
+    // Home's "Last:" line reads the run by the same rule, never a bare Working.
+    let last = vcx.update(|_, cx| {
+        desk.update(cx, |d, _| {
+            d.model.schedules = vec![crate::state::tests::schedule_info(
+                1,
+                "review-pr",
+                "0 9 * * *",
+                0,
+            )];
+            d.schedule_page.runs.insert((0, 1), vec![run(2)]);
+            d.last_line()
+        })
+    });
+    let last = last.expect("the Last line");
+    assert!(
+        last.contains("review-pr") && last.contains("Needs you"),
+        "{last}"
+    );
 }
 
 /// The theme follows `config.toml` while the window runs: read on opening Settings, turned at

@@ -15,7 +15,7 @@ use qoop_runtime::control::{ControlRequest, ScheduleInfo, ScheduleOp, ScheduleRu
 use qoop_tui::schedules::{Preset, Timing};
 
 use crate::app::{Desk, Page};
-use crate::field::{Field, FieldColors};
+use crate::field::Field;
 use crate::link::{self, Up};
 use crate::state;
 use crate::theme::{MONO_FONT, Theme, c, ca};
@@ -182,6 +182,17 @@ impl Desk {
             .filter(|((m, _), _)| *m == 0)
             .flat_map(|(_, runs)| runs.iter().cloned())
             .collect()
+    }
+
+    /// Home's "Last:" line: this Mac's newest run, read as its report reads it.
+    pub(crate) fn last_line(&self) -> Option<String> {
+        state::last_run_line(
+            &self.model.schedules,
+            &self.local_runs(),
+            self.now,
+            self.zone,
+            |run| self.run_words(run).1,
+        )
     }
 
     /// A request to the machine shown: through `Via` for another machine.
@@ -472,15 +483,8 @@ impl Desk {
     }
 
     fn field(&self, placeholder: &str, text: &str, cx: &mut Context<Self>) -> Entity<Field> {
-        let t = self.theme();
-        let colors = FieldColors {
-            text: c(t.ink).into(),
-            placeholder: c(t.t2).into(),
-            caret: c(t.ink).into(),
-            selection: ca(t.fill2).into(),
-        };
         let field = cx.new(|cx| {
-            let mut f = Field::new(placeholder, colors, cx);
+            let mut f = Field::new(placeholder, cx);
             f.text = text.to_string();
             // A stop in the window's Tab order, which the sheet's trap goes round.
             f.focus = f.focus.clone().tab_stop(true);
@@ -805,7 +809,7 @@ impl Desk {
             .size_full()
             .flex()
             .gap(px(12.))
-            .child(
+            .child(ui::scroll(
                 div()
                     .id("schedules-left")
                     .flex_none()
@@ -840,8 +844,8 @@ impl Desk {
                     })
                     .child(self.day_runs(day, today, &runs, &coming, t, cx))
                     .child(self.all_schedules(t, cx)),
-            )
-            .child(
+            ))
+            .child(ui::scroll(
                 div()
                     .id("report")
                     .flex_1()
@@ -849,7 +853,7 @@ impl Desk {
                     .h_full()
                     .overflow_y_scroll()
                     .child(self.report(&runs, t, cx)),
-            )
+            ))
             .when(self.schedule_page.sheet.is_some(), |d| {
                 d.child(self.schedule_sheet(t, cx))
             })
@@ -903,7 +907,7 @@ impl Desk {
                 let count = match (d.runs, d.coming) {
                     (0, 0) => String::new(),
                     (0, n) => format!("{n} next"),
-                    (n, _) => format!("{n} runs"),
+                    (n, _) => state::count(n, "run"),
                 };
                 let label = format!(
                     "{}{}, {}",
@@ -1048,9 +1052,10 @@ impl Desk {
                             ("cal-day", d as u64),
                             Role::Button,
                             format!(
-                                "{}{}, {runs_here} runs",
+                                "{}{}, {}",
                                 state::day_label(d),
-                                if d == today { ", today" } else { "" }
+                                if d == today { ", today" } else { "" },
+                                state::count(runs_here, "run")
                             ),
                             t,
                         )
@@ -1125,8 +1130,8 @@ impl Desk {
                     )
                     .child(div().text_color(c(t.t2)).child(match (here.len(), failed) {
                         (0, _) if day >= today => format!("{} next", next.len()),
-                        (n, 0) => format!("{n} runs"),
-                        (n, f) => format!("{n} runs, {f} failed"),
+                        (n, 0) => state::count(n, "run"),
+                        (n, f) => format!("{}, {f} failed", state::count(n, "run")),
                     })),
             )
             .children(here.into_iter().take(60).map(|r| {
@@ -1700,15 +1705,7 @@ impl Desk {
                         .text_color(c(t.t2))
                         .child(label.to_string()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .p(px(6.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(ca(t.line))
-                        .child(field.clone()),
-                )
+                .child(div().flex_1().child(field.clone()))
         };
         let preset = sheet.preset;
         let title = if sheet.editing.is_some() {

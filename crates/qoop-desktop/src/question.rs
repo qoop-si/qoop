@@ -17,7 +17,7 @@ use qoop_runtime::control::{
 };
 
 use crate::app::{Desk, Page};
-use crate::field::{Field, FieldColors};
+use crate::field::Field;
 use crate::link;
 use crate::state::{self, Hold, Kind, Offer, Pick, Slot};
 use crate::theme::{MONO_FONT, Theme, c, ca};
@@ -458,14 +458,7 @@ impl Desk {
 
     /// Open the field for the owner's own answer to `terminal`'s menu.
     fn open_own(&mut self, terminal: TerminalStream, window: &mut Window, cx: &mut Context<Self>) {
-        let t = self.theme();
-        let colors = FieldColors {
-            text: c(t.ink).into(),
-            placeholder: c(t.t2).into(),
-            caret: c(t.ink).into(),
-            selection: ca(t.fill2).into(),
-        };
-        let field = cx.new(|cx| Field::new("Type your own answer", colors, cx));
+        let field = cx.new(|cx| Field::new("Type your own answer", cx));
         let focus = field.read(cx).focus.clone();
         cx.observe(&field, |_, _, cx| cx.notify()).detach();
         window.focus(&focus, cx);
@@ -611,7 +604,11 @@ impl Desk {
                         div()
                             .id(("held", number))
                             .role(Role::Status)
-                            .aria_label(format!("{}: sends in {left} seconds", hold.label))
+                            .aria_label(format!(
+                                "{}: sends in {}",
+                                hold.label,
+                                state::count(left as usize, "second")
+                            ))
                             .flex_1()
                             .text_color(c(t.t1))
                             .child(format!("{}: sends in {left} s", hold.label)),
@@ -813,15 +810,7 @@ impl Desk {
                     .map(|(n, o)| self.offer_button(terminal, o, ("card", n), t, cx)),
             )
             .when(words && !offers.is_empty(), |d| match own_open {
-                Some(own) => d.child(
-                    div()
-                        .id("own-answer")
-                        .p(px(6.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(ca(t.line))
-                        .child(own.field.clone()),
-                ),
+                Some(own) => d.child(div().id("own-answer").child(own.field.clone())),
                 None if stale => d.child(
                     ui::control(
                         "own-open",

@@ -5,9 +5,10 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AnyElement, AnyView, App, AssetSource, BoxShadow, Context, Div, ElementId, FocusHandle,
-    FontWeight, Hsla, Render, Role, SharedString, Stateful, StyleRefinement, Svg, Toggled, Window,
-    div, point, prelude::*, px, svg,
+    A11ySubtreeBuilder, AnyElement, AnyView, App, AssetSource, Bounds, BoxShadow, Context, Div,
+    DivFrameState, ElementId, FocusHandle, FontWeight, GlobalElementId, Hitbox, Hsla,
+    InspectorElementId, Interactivity, LayoutId, Pixels, Render, Role, ScrollHandle, SharedString,
+    Stateful, StyleRefinement, Svg, Toggled, Window, div, point, prelude::*, px, svg,
 };
 use qoop_domain::status::Status;
 use qoop_runtime::avatar::{self, Avatar};
@@ -228,7 +229,12 @@ pub fn current<S: Styled>(s: S, t: &Theme) -> S {
 
 /// A key cap: `ctrl-a c`.
 pub fn kbd(keys: &str, t: &Theme) -> Div {
-    paint(div(), t.key())
+    kbd_in(keys, t.key())
+}
+
+/// A key cap in its own pair: `Theme::key_on` inside a control that is on (Start).
+pub fn kbd_in(keys: &str, pair: Pair) -> Div {
+    paint(div(), pair)
         .flex_none()
         .px(px(6.))
         .py(px(3.))
@@ -246,18 +252,362 @@ pub fn control(
     role: Role,
     label: impl Into<SharedString>,
     t: &Theme,
-) -> Stateful<Div> {
+) -> Control {
     let ring = *t;
-    div()
-        .id(id)
-        .role(role)
-        .aria_label(label)
-        .focusable()
-        .tab_stop(true)
-        .cursor_pointer()
-        .border_1()
-        .border_color(gpui::transparent_black())
-        .focus_visible(move |s| focus_ring(s, &ring))
+    Control::new(
+        div()
+            .id(id)
+            .role(role)
+            .aria_label(label)
+            .cursor_pointer()
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .focus_visible(move |s| focus_ring(s, &ring)),
+    )
+}
+
+/// A focusable element that knows when it gains the focus and asks the scrolling list or
+/// page around it ([`scroll`]) to bring it into view, so a Tab stop below the fold is never
+/// focused out of sight. It focuses by its own handle, kept from frame to frame, or by the
+/// one given with [`Control::track_focus`].
+pub struct Control {
+    div: Option<Stateful<Div>>,
+    focus: Option<FocusHandle>,
+    tab_stop: bool,
+}
+
+/// What a control keeps between frames: its own focus handle, and whether it had the focus.
+#[derive(Default)]
+struct Kept {
+    own: Option<FocusHandle>,
+    focused: bool,
+}
+
+impl Control {
+    /// `div` as a control: a Tab stop with a handle of its own.
+    pub fn new(div: Stateful<Div>) -> Self {
+        Control {
+            div: Some(div.focusable()),
+            focus: None,
+            tab_stop: true,
+        }
+    }
+
+    fn div(&mut self) -> &mut Stateful<Div> {
+        self.div
+            .as_mut()
+            .expect("a control holds its div until it is drawn")
+    }
+
+    /// Focus by `focus` (a sheet's stop, a field's) instead of a handle of its own; its Tab
+    /// stop is then the handle's.
+    pub fn track_focus(mut self, focus: &FocusHandle) -> Self {
+        self.focus = Some(focus.clone());
+        self
+    }
+
+    /// Whether Tab stops here (its own handle only).
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.tab_stop = tab_stop;
+        self
+    }
+}
+
+impl Styled for Control {
+    fn style(&mut self) -> &mut StyleRefinement {
+        Styled::style(self.div())
+    }
+}
+
+impl InteractiveElement for Control {
+    fn interactivity(&mut self) -> &mut Interactivity {
+        self.div().interactivity()
+    }
+}
+
+impl StatefulInteractiveElement for Control {}
+
+impl ParentElement for Control {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.div().extend(elements)
+    }
+}
+
+impl IntoElement for Control {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Control {
+    type RequestLayoutState = DivFrameState;
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        self.div.as_ref().and_then(|d| Element::id(d))
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        self.div.as_ref().and_then(|d| Element::source_location(d))
+    }
+
+    fn a11y_role(&self) -> Option<Role> {
+        self.div.as_ref().and_then(|d| Element::a11y_role(d))
+    }
+
+    fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
+        if let Some(d) = self.div.as_ref() {
+            Element::write_a11y_info(d, node);
+        }
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Option<Hitbox>,
+        builder: &mut A11ySubtreeBuilder,
+    ) {
+        Element::a11y_synthetic_children(self.div(), prepaint, builder);
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, DivFrameState) {
+        let focus = match (self.focus.clone(), id) {
+            (Some(given), _) => Some(given),
+            (None, Some(id)) => {
+                let own = window.with_element_state(id, |kept: Option<Kept>, _| {
+                    let mut kept = kept.unwrap_or_default();
+                    let own = kept.own.get_or_insert_with(|| cx.focus_handle()).clone();
+                    (own, kept)
+                });
+                Some(own.tab_stop(self.tab_stop))
+            }
+            (None, None) => None,
+        };
+        if let Some(focus) = focus {
+            let div = self.div.take().expect("a control's div");
+            self.div = Some(div.track_focus(&focus));
+            self.focus = Some(focus);
+        }
+        Element::request_layout(self.div(), id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut DivFrameState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
+        let hitbox = Element::prepaint(self.div(), id, inspector_id, bounds, state, window, cx);
+        if let (Some(id), Some(focus)) = (id, self.focus.as_ref()) {
+            let now = focus.is_focused(window);
+            let gained = window.with_element_state(id, |kept: Option<Kept>, _| {
+                let mut kept = kept.unwrap_or_default();
+                let gained = now && !kept.focused;
+                kept.focused = now;
+                (gained, kept)
+            });
+            if gained {
+                window.request_autoscroll(bounds);
+            }
+        }
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut DivFrameState,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Element::paint(
+            self.div(),
+            id,
+            inspector_id,
+            bounds,
+            state,
+            hitbox,
+            window,
+            cx,
+        );
+    }
+}
+
+/// `div` (scrolling on its own) as a list or page that scrolls a control gaining the focus
+/// inside it into view: the innermost one around the control that can, by the least.
+pub fn scroll(div: Stateful<Div>) -> Scroll {
+    Scroll {
+        div: Some(div),
+        handle: None,
+    }
+}
+
+pub struct Scroll {
+    div: Option<Stateful<Div>>,
+    handle: Option<ScrollHandle>,
+}
+
+impl Scroll {
+    fn div(&mut self) -> &mut Stateful<Div> {
+        self.div
+            .as_mut()
+            .expect("a scroll holds its div until it is drawn")
+    }
+}
+
+impl IntoElement for Scroll {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Scroll {
+    type RequestLayoutState = DivFrameState;
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        self.div.as_ref().and_then(|d| Element::id(d))
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        self.div.as_ref().and_then(|d| Element::source_location(d))
+    }
+
+    fn a11y_role(&self) -> Option<Role> {
+        self.div.as_ref().and_then(|d| Element::a11y_role(d))
+    }
+
+    fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
+        if let Some(d) = self.div.as_ref() {
+            Element::write_a11y_info(d, node);
+        }
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Option<Hitbox>,
+        builder: &mut A11ySubtreeBuilder,
+    ) {
+        Element::a11y_synthetic_children(self.div(), prepaint, builder);
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, DivFrameState) {
+        if let Some(id) = id {
+            let handle = window.with_element_state(id, |kept: Option<ScrollHandle>, _| {
+                let handle = kept.unwrap_or_default();
+                (handle.clone(), handle)
+            });
+            let div = self.div.take().expect("a scroll's div");
+            self.div = Some(div.track_scroll(&handle));
+            self.handle = Some(handle);
+        }
+        Element::request_layout(self.div(), id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut DivFrameState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
+        // A request made before this list (a control beside it) is the page's to answer.
+        let before = window.take_autoscroll();
+        let hitbox = Element::prepaint(self.div(), id, inspector_id, bounds, state, window, cx);
+        let inside = window.take_autoscroll();
+        let up = match (inside, self.handle.as_ref()) {
+            (Some(want), Some(handle)) => match reveal(handle, bounds, want) {
+                Reveal::Shown => None,
+                Reveal::Moved => {
+                    // The children are placed for this frame already: draw the next.
+                    window.defer(cx, |window, _| window.refresh());
+                    None
+                }
+                Reveal::Cannot => Some(want),
+            },
+            (inside, _) => inside,
+        };
+        if let Some(want) = up.or(before) {
+            window.request_autoscroll(want);
+        }
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut DivFrameState,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        Element::paint(
+            self.div(),
+            id,
+            inspector_id,
+            bounds,
+            state,
+            hitbox,
+            window,
+            cx,
+        );
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Reveal {
+    /// In view already.
+    Shown,
+    /// Scrolled to show it.
+    Moved,
+    /// This list cannot move it closer: the one around it may.
+    Cannot,
+}
+
+/// Scroll `handle`'s list (on screen at `view`) by the least that shows `want`, with a little
+/// room so the focus ring is not cut; its top first when it is taller than the list.
+fn reveal(handle: &ScrollHandle, view: Bounds<Pixels>, want: Bounds<Pixels>) -> Reveal {
+    let room = px(8.);
+    let to_top = view.top() + room - want.top();
+    let dy = if want.top() < view.top() {
+        to_top
+    } else if want.bottom() > view.bottom() {
+        (view.bottom() - room - want.bottom()).max(to_top)
+    } else {
+        return Reveal::Shown;
+    };
+    let offset = handle.offset();
+    let y = (offset.y + dy).min(px(0.)).max(-handle.max_offset().y);
+    if y == offset.y {
+        return Reveal::Cannot;
+    }
+    handle.set_offset(point(offset.x, y));
+    Reveal::Moved
 }
 
 /// The keyboard's ring: a 2 px band in the focus ink just inside the control's edge and a
@@ -280,20 +630,20 @@ pub fn focus_ring(s: StyleRefinement, t: &Theme) -> StyleRefinement {
 }
 
 /// A pill button with an outline: `+ New work ctrl-a c`.
-pub fn pill(id: impl Into<ElementId>, label: &str, t: &Theme) -> Stateful<Div> {
+pub fn pill(id: impl Into<ElementId>, label: &str, t: &Theme) -> Control {
     let pressed = t.pressed();
     pill_frame(id, label, t, t.rest()).hover(move |s| paint(s, pressed))
 }
 
 /// A pill that cannot be pressed now: its reason in the label, out of the tab order, and
 /// its text still readable (no opacity over it).
-pub fn pill_off(id: impl Into<ElementId>, label: &str, t: &Theme) -> Stateful<Div> {
+pub fn pill_off(id: impl Into<ElementId>, label: &str, t: &Theme) -> Control {
     pill_frame(id, label, t, t.off())
         .tab_stop(false)
         .cursor_default()
 }
 
-fn pill_frame(id: impl Into<ElementId>, label: &str, t: &Theme, pair: Pair) -> Stateful<Div> {
+fn pill_frame(id: impl Into<ElementId>, label: &str, t: &Theme, pair: Pair) -> Control {
     paint(control(id, Role::Button, label.to_string(), t), pair)
         .flex()
         .items_center()
@@ -307,7 +657,7 @@ fn pill_frame(id: impl Into<ElementId>, label: &str, t: &Theme, pair: Pair) -> S
 }
 
 /// A small outlined text button: `Schedules >`, `Mark all read`.
-pub fn link_button(id: impl Into<ElementId>, label: &str, t: &Theme) -> Stateful<Div> {
+pub fn link_button(id: impl Into<ElementId>, label: &str, t: &Theme) -> Control {
     control(id, Role::Link, label.to_string(), t)
         .flex()
         .items_center()
@@ -329,7 +679,7 @@ pub fn chip(
     kind: Option<Kind>,
     on: bool,
     t: &Theme,
-) -> Stateful<Div> {
+) -> Control {
     let said = match count {
         Some(n) => format!("{label}, {n}"),
         None => label.to_string(),
@@ -359,26 +709,20 @@ pub fn chip(
 
 /// An on and off switch, 36 by 20, its state said to a screen reader. The caller adds
 /// `on_click`.
-pub fn switch(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Stateful<Div> {
+pub fn switch(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Control {
     switch_frame(id, label, on, t, if on { t.on() } else { t.pressed() })
 }
 
 /// A switch that cannot be turned now: the off pair on either side, its knob still showing
 /// which, out of the tab order.
-pub fn switch_off(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Stateful<Div> {
+pub fn switch_off(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme) -> Control {
     switch_frame(id, label, on, t, t.off())
         .tab_stop(false)
         .cursor_default()
 }
 
 /// The knob is the text drawn on the track.
-fn switch_frame(
-    id: impl Into<ElementId>,
-    label: &str,
-    on: bool,
-    t: &Theme,
-    pair: Pair,
-) -> Stateful<Div> {
+fn switch_frame(id: impl Into<ElementId>, label: &str, on: bool, t: &Theme, pair: Pair) -> Control {
     paint(control(id, Role::Switch, label.to_string(), t), pair)
         .aria_toggled(toggled(on))
         .flex_none()

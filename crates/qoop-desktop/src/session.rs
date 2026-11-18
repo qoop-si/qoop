@@ -908,20 +908,22 @@ impl Desk {
                 }
             },
         };
-        div()
-            .id("task-strip")
-            .debug_selector(|| "task-strip".to_string())
-            .role(Role::Complementary)
-            .aria_label("Task")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p(px(14.))
-            .rounded(px(14.))
-            .bg(c(t.card))
-            .border_1()
-            .border_color(ca(t.hair))
-            .child(body)
+        ui::scroll(
+            div()
+                .id("task-strip")
+                .debug_selector(|| "task-strip".to_string())
+                .role(Role::Complementary)
+                .aria_label("Task")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(14.))
+                .rounded(px(14.))
+                .bg(c(t.card))
+                .border_1()
+                .border_color(ca(t.hair))
+                .child(body),
+        )
     }
 
     /// The corner note: another agent turned Needs you while this session is open. Shown once;
@@ -1121,8 +1123,8 @@ impl Desk {
                 .child(section(
                     "Changes",
                     Some(format!(
-                        "{} files, +{added} -{removed}, against {}",
-                        changes.files.len(),
+                        "{}, +{added} -{removed}, against {}",
+                        state::count(changes.files.len(), "file"),
                         changes.base
                     )),
                     t,
@@ -1226,14 +1228,14 @@ impl Desk {
             .border_1()
             .border_color(ca(t.hair))
             .child(head)
-            .child(
+            .child(ui::scroll(
                 div()
                     .id("review-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(body),
-            )
+            ))
             .when_some(review.said.clone(), |d, said| d.child(quiet(&said, t)))
             .child(
                 div()

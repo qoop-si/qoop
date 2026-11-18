@@ -49,12 +49,6 @@ impl Desk {
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .px(px(12.))
-                            .h(px(44.))
-                            .rounded(px(12.))
-                            .bg(c(t.card))
-                            .border_1()
-                            .border_color(ca(t.line))
                             .child(div().flex_1().min_w_0().text_size(px(14.)).child(field))
                             .child(ui::kbd("enter", t)),
                     )
@@ -111,10 +105,7 @@ impl Desk {
         let folded = self.model.folded.contains(&id);
         let local = state::machine_of(id) == 0;
         let machine = state::machine_name(space);
-        let agents = match g.count {
-            1 => "1 agent".to_string(),
-            n => format!("{n} agents"),
-        };
+        let agents = state::count(g.count, "agent");
         ui::card(t)
             .mb(px(10.))
             .px(px(6.))
@@ -397,25 +388,17 @@ impl Desk {
                     .children(runs[..running].iter().map(line))
                     .child(now_line)
                     .children(runs[running..].iter().map(line))
-                    .when_some(
-                        state::last_run_line(
-                            &self.model.schedules,
-                            &self.local_runs(),
-                            self.now,
-                            self.zone,
-                        ),
-                        |d, last| {
-                            d.child(
-                                div()
-                                    .py(px(6.))
-                                    .border_t_1()
-                                    .border_color(ca(t.hair))
-                                    .text_size(px(12.5))
-                                    .text_color(c(t.t2))
-                                    .child(last),
-                            )
-                        },
-                    ),
+                    .when_some(self.last_line(), |d, last| {
+                        d.child(
+                            div()
+                                .py(px(6.))
+                                .border_t_1()
+                                .border_color(ca(t.hair))
+                                .text_size(px(12.5))
+                                .text_color(c(t.t2))
+                                .child(last),
+                        )
+                    }),
             )
         })
     }

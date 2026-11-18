@@ -250,7 +250,7 @@ impl Desk {
                     .child(body)
                     .when(self.term.is_some(), |d| d.child(self.qass_chips(t, cx))),
             )
-            .child(
+            .child(ui::scroll(
                 div()
                     .id("qass-side")
                     .flex_none()
@@ -263,7 +263,7 @@ impl Desk {
                     .child(self.handled_card(t))
                     .child(self.watch_card(watching, t, cx))
                     .child(self.rules_card(t)),
-            )
+            ))
             .into_any_element()
     }
 
@@ -486,10 +486,7 @@ impl Desk {
                     } else {
                         "Left alone: its questions come to you"
                     },
-                    Some(match agents.len() {
-                        1 => "1 agent".to_string(),
-                        n => format!("{n} agents"),
-                    }),
+                    Some(state::count(agents.len(), "agent")),
                     on,
                     watching,
                     t,
@@ -540,10 +537,7 @@ impl Desk {
                 .child(div().flex_1().child(text))
         };
         let lessons = self.lessons.unwrap_or_default();
-        let count = |n: usize, one: &str| match n {
-            1 => format!("1 {one}"),
-            n => format!("{n} {one}s"),
-        };
+        let count = state::count;
         side_card("Its rules", None, t)
             .child(rule(
                 "Always yours",
