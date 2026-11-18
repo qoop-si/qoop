@@ -1973,3 +1973,56 @@ fn a_card_handed_to_qass_goes_to_qass_even_with_its_worker_at_rest() {
     );
     assert_eq!(stack.card_status("E1"), "passed");
 }
+
+/// A live hand goes back when nobody is left to take it: watching turned off ends it at the
+/// next look, and qass's tab closed ends it once qass stayed gone for a while (well inside the
+/// hand's own life). Either way the row says `qass_missed` for a while, so a client offers it
+/// again, as it does for a hand that ran out.
+#[test]
+fn a_hand_goes_back_when_qass_stops_watching_or_running() {
+    use qoop_runtime::control::ControlResponse;
+    let stack = Stack::start_with(&[("QOOP_HAND_SECS", "60")]);
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let qass = stack.agent("qass", "qass", None);
+    let worker = stack.agent("work", "worker", None);
+    stack.send(&worker, "MENU");
+    assert!(stack.wait(|| stack.state_of(&worker) == "blocked"));
+    let worker = worker.parse::<u32>().expect("a terminal number");
+    let handed = |ui: &mut qoop_testkit::TestClient, id: &str| {
+        let taken = hand_to_qass(&rt, ui, id, &[worker]);
+        assert!(
+            matches!(&taken, ControlResponse::Handed { taken, .. } if *taken == [worker]),
+            "{taken:?}"
+        );
+    };
+
+    ui.forget_events();
+    handed(&mut ui, "h1");
+    assert!(row_of(&rt, &mut ui, worker).with_qass);
+    let (ok, out, err) = stack.run(&["qass", "watch", "off"]);
+    assert!(ok && out.trim() == "watching off", "{out} {err}");
+    assert!(
+        on_change_until(&rt, &mut ui, worker, |r| !r.with_qass && r.qass_missed),
+        "watching off left it with qass: {:?}",
+        row_of(&rt, &mut ui, worker)
+    );
+
+    let (ok, out, err) = stack.run(&["qass", "watch", "on"]);
+    assert!(ok, "{out} {err}");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    ui.forget_events();
+    handed(&mut ui, "h2");
+    let started = Instant::now();
+    let (ok, _, err) = stack.run(&["close", &qass]);
+    assert!(ok, "{err}");
+    assert!(
+        on_change_until(&rt, &mut ui, worker, |r| !r.with_qass && r.qass_missed),
+        "qass gone left it with qass: {:?}",
+        row_of(&rt, &mut ui, worker)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(40),
+        "it went with qass, not with the hand's own life"
+    );
+}
