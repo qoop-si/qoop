@@ -929,9 +929,13 @@ impl Desk {
             }
             None => reading(),
         };
+        let own_qass = self
+            .settings
+            .via
+            .is_some_and(|w| self.model.runs_qass(state::machine_of(w)));
         let qass = match remote.qass {
             Some(on) => {
-                let switch = ui::switch("remote-qass", "qass watches the agents", on, t);
+                let switch = ui::switch("remote-qass", "qass watching", on, t);
                 if off {
                     switch.tab_stop(false).into_any_element()
                 } else {
@@ -976,7 +980,7 @@ impl Desk {
             })
             .child(row(
                 "Sleep idle tabs",
-                "Minutes a tab idles before it sleeps; never keeps them awake",
+                "Minutes a tab idles before it sleeps; never leaves them awake",
                 minutes,
             ))
             .child(row(
@@ -984,11 +988,24 @@ impl Desk {
                 "qoop's daemon ends once nothing is awake",
                 exit,
             ))
-            .child(row(
-                "qass watches the agents",
-                "qass answers what it can and asks you the rest",
-                qass,
-            ))
+            // This Mac's qass takes this machine's questions, whatever its own switch says;
+            // the switch is only for a qass of its own (C-5).
+            .map(|d| match own_qass {
+                true => d.child(row(
+                    "qass watching",
+                    "qass answers what it can and asks you the rest",
+                    qass,
+                )),
+                false => d.child(
+                    div()
+                        .py(px(6.))
+                        .border_t_1()
+                        .border_color(ca(t.hair))
+                        .text_size(px(12.5))
+                        .text_color(c(t.t2))
+                        .child(format!("qass on This Mac watches {machine}'s agents.")),
+                ),
+            })
             .child(
                 div()
                     .pt(px(8.))

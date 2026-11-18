@@ -12937,7 +12937,7 @@ fn note(state: &mut State, row: &AgentRow, runtime: AgentRuntimeState) -> bool {
             generation,
             label: sidebar::label(row),
             what: match push.reason {
-                qoop_attention::Reason::AgentBlocked => "is blocked",
+                qoop_attention::Reason::AgentBlocked => "needs you",
                 qoop_attention::Reason::AgentFailed => "failed",
                 _ => "finished",
             },
@@ -22073,7 +22073,7 @@ mod tests {
         );
         let mut out = Vec::new();
         fire_notes(&mut state, &mut out).expect("fire");
-        assert_eq!(out, b"\x1b]9;codex is blocked\x1b\\".to_vec());
+        assert_eq!(out, b"\x1b]9;codex needs you\x1b\\".to_vec());
         assert_eq!(state.notes.len(), 1, "the later one is still held");
         assert!(
             state.notes_due.is_some(),
@@ -22115,7 +22115,7 @@ mod tests {
         fire_notes(&mut state, &mut out).expect("fire");
         assert_eq!(
             out,
-            b"\x1b]9;codex is blocked, aider finished\x1b\\".to_vec()
+            b"\x1b]9;codex needs you, aider finished\x1b\\".to_vec()
         );
         assert!(
             state.notes.is_empty() && state.notes_due.is_none(),
@@ -22525,7 +22525,7 @@ mod tests {
         let text = said(&mut state);
         assert!(text.contains("claude failed in api"), "{text:?}");
         assert!(!text.contains("Which region"), "{text:?}");
-        state.notes = vec![note(&blocked, "is blocked")];
+        state.notes = vec![note(&blocked, "needs you")];
         let text = said(&mut state);
         assert!(text.contains("claude: Which region first?"), "{text:?}");
     }
@@ -22538,7 +22538,7 @@ mod tests {
             state: "blocked".into(),
             generation: 0,
             label: "claude".into(),
-            what: "is blocked",
+            what: "needs you",
             space: String::new(),
             urgent: true,
             question: None,

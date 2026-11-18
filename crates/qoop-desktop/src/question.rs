@@ -1085,7 +1085,7 @@ impl Desk {
                         .into_any_element()
                 }
                 None => text(
-                    "qass has not looked at this one. 5 hands it over: it answers if its rules \
+                    "qass has not looked at this one. Let qass handle it: it answers if its rules \
                      allow, otherwise it comes back here."
                         .into(),
                 )

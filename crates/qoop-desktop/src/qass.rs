@@ -207,7 +207,7 @@ impl Desk {
                 .into_any_element(),
             (None, true) => self
                 .qass_state(
-                    "qass is asleep.",
+                    "qass is sleeping.",
                     ("wake-qass", "Wake it"),
                     true,
                     cx.listener(|this, _, _, cx| this.wake_qass(cx)),

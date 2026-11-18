@@ -2266,7 +2266,7 @@ fn prompt_refusal(row: &qoop_runtime::control::AgentRow) -> Option<String> {
     }
     if row.state == "blocked" {
         return Some(format!(
-            "agent {who} is blocked and requires interactive input"
+            "agent {who} is waiting on an answer to its question and requires interactive input"
         ));
     }
     if row.state == "sleeping" {

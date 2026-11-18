@@ -454,6 +454,18 @@ impl Model {
             .find(|r| spaces.contains(&r.workspace) && r.agent)
     }
 
+    /// Whether machine `m` runs a qass of its own: an agent in its space named qass.
+    pub fn runs_qass(&self, m: usize) -> bool {
+        let spaces: Vec<i64> = self
+            .qass_spaces()
+            .into_iter()
+            .filter(|id| machine_of(*id) == m)
+            .collect();
+        self.rows
+            .iter()
+            .any(|r| spaces.contains(&r.workspace) && r.agent)
+    }
+
     /// qass's pill: not running, not watching, or "watching 6 of 7".
     pub fn qass_line(&self) -> String {
         if self.qass_row().is_none() {
@@ -1280,7 +1292,7 @@ pub const SETTINGS: [Setting; 21] = [
     Setting {
         key: "sleep.idle_minutes",
         label: "Sleep idle tabs",
-        help: "Minutes a tab idles before it sleeps; never keeps them awake",
+        help: "Minutes a tab idles before it sleeps; never leaves them awake",
         kind: SettingKind::Minutes,
         group: "Sleep",
     },

@@ -555,7 +555,7 @@ pub(crate) fn may_show(mute: qoop_runtime::config::Mute) -> (bool, &'static str)
 pub(crate) fn refusal_code(said: &str) -> &'static str {
     if said.contains("no such terminal") {
         "pane_not_found"
-    } else if said.contains("is blocked") {
+    } else if said.contains("waiting on an answer to its question") || said.contains("is blocked") {
         "agent_blocked"
     } else if said.contains("trust prompt") || said.contains("is sleeping") {
         "agent_not_ready"
@@ -3228,6 +3228,13 @@ mod tests {
     #[test]
     fn a_refusal_gets_herdrs_code() {
         assert_eq!(refusal_code("no such terminal: 4"), "pane_not_found");
+        assert_eq!(
+            refusal_code(
+                "agent 3 is waiting on an answer to its question and requires interactive input"
+            ),
+            "agent_blocked"
+        );
+        // An older qoop's words.
         assert_eq!(
             refusal_code("agent 3 is blocked and requires interactive input"),
             "agent_blocked"

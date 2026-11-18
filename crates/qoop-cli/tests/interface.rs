@@ -1299,8 +1299,9 @@ fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
         ui.tab_bar()
     );
     // And said out loud, so a person who is looking at another terminal still finds out.
+    // The note says "needs you"; the bell's hint row says the state word.
     assert!(
-        ui.saw("is blocked"),
+        ui.saw("needs you") || ui.saw("is blocked"),
         "the interface never said anything about it"
     );
     // Coloured, because a column of identical grey rows is a column nobody scans. This
