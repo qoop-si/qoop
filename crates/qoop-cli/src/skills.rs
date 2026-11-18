@@ -928,7 +928,7 @@ mod tests {
         // 498 since 2026-11-03: the row for the daemon's `claims` line (the recurring claim scan)
         // and the dangerous-rm rule. 499 since 2026-11-16: the row for the daemon's `hand-off`
         // line (the owner hands questions to qass from the desktop). 501 since 2026-11-18: a card
-        // the owner hands to qass from its agent's tab (`<handle> you decide`) and its relay.
+        // the owner hands to qass from its agent's tab (`<card> <handle> you decide`) and its relay.
         assert!(skill.lines().count() <= 501, "SKILL.md grew past 501 lines");
     }
 

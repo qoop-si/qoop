@@ -538,6 +538,9 @@ impl Pane {
             return false;
         };
         let card = card.card.clone();
+        // His words in the box stay his: the hand-off sends none of them, and should the card
+        // go they reach the lost words, as any kept draft does.
+        let words = std::mem::take(&mut self.text);
         self.write(
             AskOp::Answer {
                 card: card.clone(),
@@ -549,6 +552,7 @@ impl Pane {
             card,
             String::new(),
         );
+        self.text = words;
         true
     }
 
@@ -3760,6 +3764,31 @@ mod tests {
             reason: "unknown variant `AskRead`, expected one of `X`".into(),
         }));
         assert!(old.unsupported);
+    }
+
+    /// A hand-off sends none of his words and keeps them in the box: typed, then `q` from the
+    /// tab, the write carries no text and the words are still there.
+    #[test]
+    fn a_hand_off_keeps_his_unsent_words() {
+        let mut p = Pane::default();
+        p.take(vec![card(1, "migrations", "open")], Vec::new());
+        p.key(b"r", 0x01);
+        p.key(b"wait", 0x01);
+        p.key(b"\x1b", 0x01);
+        assert_eq!(p.text, "wait");
+        assert!(p.hand_to_qass());
+        assert!(matches!(
+            &p.outbox[..],
+            [ControlRequest::AskWrite {
+                action: AskOp::Answer {
+                    text: None,
+                    to_qass: true,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert_eq!(p.text, "wait", "kept");
     }
 
     /// Stood in an agent's tab, the pane shows, moves over and answers that terminal's cards
