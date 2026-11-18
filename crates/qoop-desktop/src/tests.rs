@@ -917,6 +917,95 @@ fn ctrl_a_a_takes_the_keys_off_the_terminal(cx: &mut TestAppContext) {
         !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
         "nothing typed into the agent"
     );
+    // Again: the keys are the terminal's once more.
+    vcx.simulate_keystrokes("ctrl-a a");
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    // Off again, then Escape with nothing open gives them back too.
+    vcx.simulate_keystrokes("ctrl-a a tab escape");
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "the Escape never reached the agent"
+    );
+}
+
+/// The focused control leaves the frame (here the Inbox, closed by a click elsewhere): the
+/// keys come back to the terminal on screen instead of dying above the desk (WEB-09), and
+/// the prefix works at once.
+#[gpui::test]
+fn focus_on_a_control_that_goes_comes_back_to_the_terminal(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a i");
+    assert!(vcx.update(|window, cx| desk.read(cx).inbox_focus.is_focused(window)));
+    vcx.update(|_, cx| {
+        desk.update(cx, |d, cx| {
+            d.inbox = false;
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)),
+        "the terminal has the keys again"
+    );
+    vcx.simulate_keystrokes("ctrl-a i");
+    assert!(
+        desk.read_with(&vcx, |d, _| d.inbox),
+        "the prefix still works"
+    );
+}
+
+/// `ctrl-a i` puts the keys in the Inbox: Tab moves inside the window and types nothing into
+/// the agent; Escape closes it and the terminal has them again.
+#[gpui::test]
+fn ctrl_a_i_puts_the_keys_in_the_inbox(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    vcx.simulate_keystrokes("ctrl-a i tab tab");
+    assert!(!vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    assert!(
+        !sent(&mut rx).iter().any(|u| matches!(u, Up::Input(..))),
+        "no Tab typed into the agent"
+    );
+    vcx.simulate_keystrokes("escape");
+    assert!(desk.read_with(&vcx, |d, _| !d.inbox));
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+}
+
+/// A pick on the session's card gives the keys back to its terminal, wherever the focus was,
+/// so the next question's digit works with no Tab walk.
+#[gpui::test]
+fn a_pick_on_the_card_gives_the_keys_to_the_terminal(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    let mut rows = crate::state::tests::fixture().rows;
+    rows[1].menu = Some(crate::state::tests::edit_menu(77));
+    answer(
+        &desk,
+        &mut vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("ctrl-a a");
+    assert!(!vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let (terminal, offers, _) = d.card_offers().expect("a card");
+            d.pick(terminal, &offers[0], window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    assert!(desk.read_with(&vcx, |d, _| !d.holds.held.is_empty()));
+    assert!(vcx.update(|window, cx| desk.read(cx).term_focus.is_focused(window)));
 }
 
 /// Every sidebar link takes the ring: from the window's own focus, Tab once reaches Home, twice

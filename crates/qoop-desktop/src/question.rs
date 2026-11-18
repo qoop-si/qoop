@@ -119,6 +119,11 @@ impl Desk {
             until: Instant::now() + state::HOLD,
         };
         self.hold(hold, window, cx);
+        // Picked on the session's card: the keys go back to its terminal, as after a typed
+        // answer, so the next question's digit works and `u` still undoes.
+        if !self.inbox && self.term_drawn() {
+            window.focus(&self.term_focus, cx);
+        }
     }
 
     /// Pick option `option` of qass's card: held for 3 s like any answer, then written.

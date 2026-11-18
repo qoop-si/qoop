@@ -114,7 +114,13 @@ impl Desk {
                     .items_center()
                     .gap(px(8.))
                     .child(
+                        // Where `ctrl-a i` puts the keys: not a Tab stop, so Tab goes on to the
+                        // panel's first control (WEB-05).
                         div()
+                            .id("inbox-heading")
+                            .role(Role::Heading)
+                            .aria_label("Inbox")
+                            .track_focus(&self.inbox_focus)
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Inbox"),
