@@ -495,9 +495,15 @@ async fn a_hand_ends_when_the_same_question_is_asked_again() {
     let first = row(&mut ui, terminal).await;
     assert!(first.with_qass, "{first:?}");
 
-    // The same question again: a new turn, and the hand is over.
-    owner.input_to(terminal, b"x").await;
-    assert!(owner.wait_for_text_on(terminal, "key:x", PATIENCE).await);
+    // The owner answers it on the card, and the agent asks the same again: a new turn (the
+    // answer clears the menu, so the next one up counts as one), and the hand is over. Keys
+    // typed back to back with no answer would be one turn: the screen never showed it gone.
+    let answered = answer(&mut ui, terminal, generation, &shown).await;
+    assert!(
+        matches!(answered, Some(ControlResponse::MenuAnswered { .. })),
+        "{answered:?}"
+    );
+    assert!(owner.wait_for_text_on(terminal, "key:1", PATIENCE).await);
     owner.input_to(terminal, b"M").await;
     let _ = blocked_menu(&mut owner, &mut ui, terminal, &token, None).await;
     let deadline = tokio::time::Instant::now() + PATIENCE;
