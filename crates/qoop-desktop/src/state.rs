@@ -1497,10 +1497,10 @@ pub fn request_machine(request: &qoop_runtime::control::ControlRequest) -> usize
         .map_or(0, machine_of)
 }
 
-/// A machine's state in the words its tile and the banner both use.
+/// A machine's state in the words its sidebar line and the banner both use.
 pub fn reach_words(state: MachineState, zone: Zone) -> String {
     match state {
-        MachineState::Live => "connected".into(),
+        MachineState::Live => "online".into(),
         MachineState::Parked => "parked".into(),
         MachineState::Retrying => "retrying".into(),
         MachineState::Stale { as_of } => format!("not reached, as of {}", clock(as_of, zone)),
@@ -1508,7 +1508,7 @@ pub fn reach_words(state: MachineState, zone: Zone) -> String {
     }
 }
 
-/// The banner over the page: every machine not reached, in its tile's words.
+/// The banner over the page: every machine not reached, in its sidebar line's words.
 pub fn reach_banner(machines: &[(String, MachineState)], zone: Zone) -> Option<String> {
     let stale: Vec<String> = machines
         .iter()
@@ -3067,8 +3067,8 @@ pub(crate) mod tests {
     }
 
     /// A remote silent 15 s goes stale as of when it went quiet; back, it is live again.
-    /// This Mac's daemon gone makes every machine stale. The tile and the banner say it in the
-    /// same words.
+    /// This Mac's daemon gone makes every machine stale. The sidebar line and the banner say it
+    /// in the same words.
     #[test]
     fn a_silent_machine_goes_stale_after_fifteen_seconds() {
         let zone = utc();

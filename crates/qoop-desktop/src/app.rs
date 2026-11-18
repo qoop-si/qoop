@@ -886,7 +886,7 @@ impl Desk {
                 .is_some_and(|r| self.as_of(r.workspace).is_some())
     }
 
-    /// The banner: each machine not reached, in its tile's words.
+    /// The banner: each machine not reached, in its sidebar line's words.
     pub(crate) fn banner(&self) -> Option<String> {
         let machines: Vec<(String, state::MachineState)> = state::machines(&self.model.spaces)
             .into_iter()
@@ -895,7 +895,7 @@ impl Desk {
         state::reach_banner(&machines, self.zone)
     }
 
-    /// A machine's pet for its tile: this Mac's own, another's as its daemon drew it.
+    /// A machine's pet for its sidebar line: this Mac's own, another's as its daemon drew it.
     pub(crate) fn pet_of(&self, m: usize) -> Option<gpui::Div> {
         if m == 0 {
             return self.my_pet.as_ref().map(|pet| ui::pet(pet, 0.8));
@@ -907,8 +907,8 @@ impl Desk {
     }
 
     /// Ask each other machine whose link is up for a word from its daemon, every
-    /// [`state::PING_EVERY`]: its pet, which also draws its tile. A link can stay up while
-    /// the daemon behind it says nothing; the answers are what [`state::Reach`] counts.
+    /// [`state::PING_EVERY`]: its pet, which also draws its sidebar line. A link can stay up
+    /// while the daemon behind it says nothing; the answers are what [`state::Reach`] counts.
     /// A parked machine is not asked, since asking wakes it.
     fn ping_machines(&mut self) {
         for (m, _, via) in state::machines(&self.model.spaces) {
@@ -1108,69 +1108,120 @@ impl Desk {
                             .child("qoop"),
                     ),
             )
-            .child(nav("nav-home", Icon::Home, "Home", Page::Home, cx))
-            .child(
-                nav(
-                    "nav-schedules",
-                    Icon::Clock,
-                    "Schedules",
-                    Page::Schedules,
-                    cx,
-                )
-                .when_some(next, |d, next| {
-                    d.child(
-                        div()
-                            .ml_auto()
-                            .text_size(px(11.5))
-                            .text_color(c(t.t2))
-                            .child(next),
-                    )
-                }),
-            )
-            .child(nav(
-                "nav-settings",
-                Icon::Gear,
-                "Settings",
-                Page::Settings,
-                cx,
-            ))
+            // The links, the spaces and the phone line scroll as one list, and a Tab stop
+            // below the fold scrolls into view.
             .child(ui::scroll(
                 div()
-                    .id("tree")
+                    .id("sidebar-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .mt(px(8.))
-                    .when(self.page != Page::Home, |d| d.child(self.tree(t, cx))),
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(nav("nav-home", Icon::Home, "Home", Page::Home, cx))
+                    .child(
+                        nav(
+                            "nav-schedules",
+                            Icon::Clock,
+                            "Schedules",
+                            Page::Schedules,
+                            cx,
+                        )
+                        .when_some(next, |d, next| {
+                            d.child(
+                                div()
+                                    .ml_auto()
+                                    .text_size(px(11.5))
+                                    .text_color(c(t.t2))
+                                    .child(next),
+                            )
+                        }),
+                    )
+                    .child(nav(
+                        "nav-settings",
+                        Icon::Gear,
+                        "Settings",
+                        Page::Settings,
+                        cx,
+                    ))
+                    .child(div().mt(px(8.)).child(self.tree(t, cx)))
+                    .when(self.model.phone_here(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .pt(px(12.))
+                                .px(px(10.))
+                                .text_size(px(12.))
+                                .text_color(c(t.t2))
+                                .child(ui::icon(Icon::Phone, 14., c(t.t2)))
+                                .child("iPhone, seen now"),
+                        )
+                    }),
             ))
-            .child(self.tiles(t, cx))
     }
 
-    /// The spaces with their agents, on every page but Home.
+    /// The spaces with their agents, on every page. A space of another machine names it and
+    /// how it is reached; a machine with no agent in any space gets one quiet line at the end.
     fn tree(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.term.as_ref().map(|term| term.terminal);
+        let groups = self.model.groups(Chip::All);
+        let empty: Vec<(usize, String)> = state::machines(&self.model.spaces)
+            .into_iter()
+            .filter(|(m, _, _)| {
+                *m != 0 && !groups.iter().any(|g| state::machine_of(g.space.id) == *m)
+            })
+            .map(|(m, name, _)| (m, name))
+            .collect();
         div()
             .flex()
             .flex_col()
             .gap(px(1.))
-            .children(self.model.groups(Chip::All).into_iter().map(|g| {
+            .children(groups.into_iter().map(|g| {
                 let slot = state::space_slot(g.space);
+                let id = g.space.id;
+                let m = state::machine_of(id);
+                let (name, label) = if m == 0 {
+                    (g.space.name.clone(), g.space.name.clone())
+                } else {
+                    let name = state::short_space(g.space);
+                    let machine = state::machine_name(g.space);
+                    let word = state::reach_words(self.machine_state(m), self.zone);
+                    let label = format!("{name}, on {machine}, {word}");
+                    (name, label)
+                };
+                // The machine's line sits beside the heading, not in it: its Retry now is a
+                // button of its own.
+                let reach =
+                    (m != 0).then(|| self.reach_line(m, state::machine_name(g.space), "", t, cx));
+                // Its own id: a machine's line under each of its spaces stays apart.
                 div()
+                    .id(("side-group", id as u64))
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
+                            .id(("side-space", id as u64))
+                            .debug_selector(move || format!("side-space-{id}"))
+                            .role(Role::Heading)
+                            .aria_level(2)
+                            .aria_label(label)
                             .pt(px(10.))
                             .pb(px(3.))
                             .px(px(10.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_size(px(12.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.space(slot))
-                            .child(g.space.name.clone()),
+                            .child(name),
                     )
+                    .when_some(reach, |d, reach| {
+                        d.child(div().px(px(10.)).pb(px(3.)).child(reach))
+                    })
                     .children(g.rows.into_iter().map(|entry| {
                         let kind = self.shown_kind(entry);
                         let terminal = entry.terminal();
@@ -1291,105 +1342,96 @@ impl Desk {
                             .into_any_element()
                     }))
             }))
+            // ponytail: one line per machine with no agent, in the space list itself; Settings'
+            // machine chips stay as they are.
+            .children(empty.into_iter().map(|(m, name)| {
+                div()
+                    .id(("side-machine", m as u64))
+                    .debug_selector(move || format!("side-machine-{m}"))
+                    .role(Role::Group)
+                    .aria_label(format!(
+                        "{name}, {}, no agents",
+                        state::reach_words(self.machine_state(m), self.zone)
+                    ))
+                    .pt(px(10.))
+                    .px(px(10.))
+                    .child(self.reach_line(m, name, ", no agents", t, cx))
+            }))
     }
 
-    /// One tile per machine at the bottom left, naming it and how it is reached, in the words
-    /// the banner uses; and the phone line while a phone has an agent open.
-    fn tiles(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let machines = state::machines(&self.model.spaces);
+    /// Machine `m` and how it is reached, in the words the banner uses, as a dot and its word:
+    /// green online, grey parked or retrying, amber not reached with Retry now beside it. Why
+    /// its link is down (the ssh error) is in the tooltip. `tail` follows the word.
+    fn reach_line(
+        &self,
+        m: usize,
+        name: String,
+        tail: &'static str,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let reach = self.machine_state(m);
+        let up = reach == state::MachineState::Live;
+        let away = matches!(
+            reach,
+            state::MachineState::Stale { .. } | state::MachineState::NeverReached
+        );
+        let retrying = reach == state::MachineState::Retrying;
+        let (dot, ink) = if up {
+            (t.done, t.done_text)
+        } else if away {
+            (t.needs, t.needs_text)
+        } else {
+            (t.t3, t.t2)
+        };
+        let word = state::reach_words(reach, self.zone);
+        let reason = self.link_reasons.get(&m).cloned();
         div()
+            .id(("reach", m as u64))
+            .debug_selector(move || format!("machine-{m}"))
+            .when_some(reason.filter(|_| !up), |d, why| {
+                d.tooltip(ui::tip_text(why, *t))
+            })
             .flex()
-            .flex_col()
-            .pt(px(10.))
-            .border_t_1()
-            .border_color(ca(t.hair))
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(6.))
+            .min_h(px(22.))
+            .text_size(px(11.5))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .children(machines.into_iter().map(|(m, name, _)| {
-                        let reach = self.machine_state(m);
-                        let up = reach == state::MachineState::Live;
-                        let word = state::reach_words(reach, self.zone);
-                        let away = m != 0
-                            && matches!(
-                                reach,
-                                state::MachineState::Retrying
-                                    | state::MachineState::Stale { .. }
-                                    | state::MachineState::NeverReached
-                            );
-                        let reason = self.link_reasons.get(&m).cloned();
-                        div()
-                            .id(("tile", m as u64))
-                            .when_some(reason.filter(|_| !up), |d, why| {
-                                d.tooltip(ui::tip_text(why, *t))
-                            })
-                            .debug_selector(move || format!("tile-{m}"))
-                            .role(Role::Group)
-                            .aria_label(format!("{name}, {word}"))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .px(px(8.))
-                            .py(px(5.))
-                            .rounded(px(9.))
-                            .map(|d| ui::paint(d, t.rest()))
-                            .text_size(px(11.5))
-                            .child(
-                                div()
-                                    .size(px(7.))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .when(up, |d| d.bg(c(t.done)))
-                                    .when(!up, |d| d.border_1().border_color(c(t.t3))),
-                            )
-                            .when_some(self.pet_of(m), |d, pet| d.child(pet))
-                            .child(div().text_color(c(t.t1)).child(name.clone()))
-                            // The whole state, wrapped under itself when the sidebar is narrow:
-                            // "not reached, as of 23:03" is what the tile is for.
-                            .child(div().flex_1().min_w_0().text_color(c(t.t2)).child(word))
-                            .when(away, |d| {
-                                d.child(
-                                    ui::control(
-                                        ("retry", m as u64),
-                                        Role::Button,
-                                        format!("Retry now, {name}"),
-                                        t,
-                                    )
-                                    .debug_selector(move || format!("retry-{m}"))
-                                    .flex_none()
-                                    .whitespace_nowrap()
-                                    .px(px(6.))
-                                    .h(px(22.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(6.))
-                                    .text_color(c(t.t1))
-                                    .hover(|s| ui::paint(s, t.pressed()))
-                                    .child("Retry now")
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.retry_machine(m);
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                            })
-                    })),
+                    .size(px(7.))
+                    .flex_none()
+                    .rounded_full()
+                    .when(up || away, |d| d.bg(c(dot)))
+                    .when(!up && !away, |d| d.border_1().border_color(c(dot))),
             )
-            .when(self.model.phone_here(), |d| {
+            .when_some(self.pet_of(m), |d, pet| d.child(pet))
+            .child(div().text_color(c(t.t1)).child(name.clone()))
+            .child(div().text_color(c(ink)).child(format!("{word}{tail}")))
+            .when(away || retrying, |d| {
                 d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(7.))
-                        .pt(px(8.))
-                        .px(px(6.))
-                        .text_size(px(12.))
-                        .text_color(c(t.t2))
-                        .child(ui::icon(Icon::Phone, 14., c(t.t2)))
-                        .child("iPhone, seen now"),
+                    ui::control(
+                        ("retry", m as u64),
+                        Role::Button,
+                        format!("Retry now, {name}"),
+                        t,
+                    )
+                    .debug_selector(move || format!("retry-{m}"))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .px(px(6.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
+                    .text_color(c(t.t1))
+                    .hover(|s| ui::paint(s, t.pressed()))
+                    .child("Retry now")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.retry_machine(m);
+                        cx.notify();
+                    })),
                 )
             })
     }
