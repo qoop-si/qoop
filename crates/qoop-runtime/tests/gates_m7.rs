@@ -267,6 +267,7 @@ fn every_request_against(terminal: u32) -> Vec<ControlRequest> {
                 terminal,
                 generation: None,
                 seal: None,
+                away: None,
             }],
         },
         // A read of the store and qass's own log.

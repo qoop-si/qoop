@@ -684,6 +684,7 @@ async fn answers_and_hands_reach_the_remote(tui: &mut Tui, terminal: u32) {
         terminal,
         generation: None,
         seal: None,
+        away: None,
     };
     let asks = [
         (

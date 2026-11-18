@@ -16972,6 +16972,8 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         }
     }
 

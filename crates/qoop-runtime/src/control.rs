@@ -2985,6 +2985,25 @@ pub struct AgentRow {
     /// qass did not take it. False from a daemon that predates it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub qass_missed: bool,
+    /// The hand is for the qass of another machine, whose window handed it (`Hand::away`):
+    /// when, and that machine's hand id. Only that machine's qass watcher says it; this
+    /// machine's own qass is never told. Absent for a hand to this machine's qass, and from a
+    /// daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qass_away: Option<AwayHand>,
+    /// The seal of the menu up while the agent is blocked (`AgentMenu::seal`): a number, no
+    /// screen text, so on every row. `qoop send --seal` refuses once another menu is up.
+    /// Absent with no menu qoop reads, and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_seal: Option<u64>,
+}
+
+/// A hand for another machine's qass: when it was handed (unix seconds, a new one on every
+/// hand) and the hand id of the machine that handed it (`paths::hand_id`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwayHand {
+    pub at: i64,
+    pub by: String,
 }
 
 /// Who answered a menu: the option's label, the kind of connection it came from (`computer`,
@@ -3005,6 +3024,11 @@ pub struct Hand {
     pub generation: Option<u64>,
     #[serde(default)]
     pub seal: Option<u64>,
+    /// Handed from another machine's window, for that machine's qass: its hand id
+    /// (`paths::hand_id`). The daemon here keeps the hand without a qass of its own and never
+    /// types it to one. Ignored by a daemon that predates it, which answers as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away: Option<String>,
 }
 
 /// One thing qass did on its own: `wrote` to an agent, `closed` a card, `verified` a task.
@@ -3720,9 +3744,51 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         };
         let encoded = serde_json::to_string(&live).expect("encode");
         assert!(!encoded.contains("slept_at_unix"), "{encoded}");
+        assert!(
+            !encoded.contains("qass_away") && !encoded.contains("menu_seal"),
+            "{encoded}"
+        );
+    }
+
+    /// A hand for another machine's qass and a menu's seal cross both ways: absent from an
+    /// older daemon or client, kept when sent, and ignored by an older reader.
+    #[test]
+    fn an_away_hand_and_a_menu_seal_parse_both_ways() {
+        let old: AgentRow =
+            serde_json::from_str(r#"{"terminal":1,"workspace":1,"state":"blocked"}"#)
+                .expect("decode");
+        assert_eq!((old.qass_away, old.menu_seal), (None, None));
+        let new: AgentRow = serde_json::from_str(
+            r#"{"terminal":2,"workspace":1,"state":"blocked","with_qass":true,
+                "qass_away":{"at":1750000000,"by":"ab12"},"menu_seal":812}"#,
+        )
+        .expect("decode");
+        assert_eq!(
+            new.qass_away,
+            Some(AwayHand {
+                at: 1_750_000_000,
+                by: "ab12".into()
+            })
+        );
+        assert_eq!(new.menu_seal, Some(812));
+        let back = serde_json::to_string(&new).expect("encode");
+        assert!(
+            back.contains(r#""qass_away":{"at":1750000000,"by":"ab12"}"#),
+            "{back}"
+        );
+
+        let old_hand: Hand =
+            serde_json::from_str(r#"{"terminal":3,"generation":2,"seal":9}"#).expect("decode");
+        assert_eq!(old_hand.away, None);
+        let local = serde_json::to_string(&old_hand).expect("encode");
+        assert!(!local.contains("away"), "{local}");
+        let away: Hand = serde_json::from_str(r#"{"terminal":3,"away":"ab12"}"#).expect("decode");
+        assert_eq!(away.away.as_deref(), Some("ab12"));
     }
 
     /// G8: activity and place fields cross old daemons both ways. A row from

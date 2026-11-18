@@ -264,6 +264,33 @@ pub fn qass_data_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("qass"))
 }
 
+/// This machine's hand id, in qass's folder: what a window here puts on a hand for another
+/// machine's agent (`Hand::away`), and what this machine's qass watcher looks for on that
+/// machine's rows (`qass_away.by`), so only the qass of the machine that handed it is told.
+pub const HAND_ID_FILE: &str = "hand-id";
+
+/// This machine's hand id ([`HAND_ID_FILE`]), made on first use with [`random_hex`].
+pub fn hand_id() -> std::io::Result<String> {
+    let dir = qass_data_dir().ok_or_else(|| std::io::Error::other("no home folder"))?;
+    hand_id_in(&dir)
+}
+
+fn hand_id_in(dir: &Path) -> std::io::Result<String> {
+    let file = dir.join(HAND_ID_FILE);
+    if let Ok(id) = std::fs::read_to_string(&file)
+        && !id.trim().is_empty()
+    {
+        return Ok(id.trim().to_string());
+    }
+    std::fs::create_dir_all(dir)?;
+    let id = random_hex()?;
+    // Written whole under another name first: the watcher never reads half an id.
+    let part = dir.join(format!("{HAND_ID_FILE}.{}", std::process::id()));
+    std::fs::write(&part, format!("{id}\n"))?;
+    std::fs::rename(&part, &file)?;
+    Ok(id)
+}
+
 /// Where `qoop qass` writes which program it last started qass on, in qass's folder: also how
 /// the interface knows qass ever ran on this machine.
 pub const QASS_LAST_AGENT: &str = "last-agent";
@@ -1306,6 +1333,19 @@ mod tests {
             config_dir_from(None, None),
             std::env::temp_dir().join("qoop")
         );
+    }
+
+    /// The hand id is made once, in the folder qass's watcher reads, and the same after.
+    #[test]
+    fn the_hand_id_is_made_once_and_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("qass");
+        let first = hand_id_in(&dir).expect("made");
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(hand_id_in(&dir).expect("read"), first);
+        let on_disk = std::fs::read_to_string(dir.join(HAND_ID_FILE)).unwrap();
+        assert_eq!(on_disk.trim(), first);
     }
 
     #[test]
