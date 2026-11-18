@@ -73,6 +73,9 @@ pub struct Pane {
     pub unsupported: bool,
     /// The read is owed: a change event came, or the first read has not been asked.
     pub stale: bool,
+    /// The terminal whose tab the pane stands in, its cards alone on show; `None` on qass's
+    /// screen, every card.
+    pub scope: Option<u32>,
     selected: usize,
     /// The selected card is opened in place (enter); the others stay folded.
     expanded: bool,
@@ -144,8 +147,44 @@ impl Pane {
 
     /// The selected card, the one a key answers.
     pub fn open_card(&self) -> Option<&AskInfo> {
-        self.live
-            .get(self.selected.min(self.live.len().saturating_sub(1)))
+        self.sel().map(|at| &self.live[at])
+    }
+
+    /// The cards on show, by their place in `live`: every one, or while the pane stands in an
+    /// agent's tab ([`Pane::scope`]) that terminal's alone. Every move, key and click reads the
+    /// list through this, so nothing reaches a card not on show.
+    pub fn visible(&self) -> Vec<usize> {
+        (0..self.live.len())
+            .filter(|at| {
+                self.scope
+                    .is_none_or(|t| self.live[*at].terminal == Some(t))
+            })
+            .collect()
+    }
+
+    /// The selected card's place in `live`: the selected one when it is on show, else the next
+    /// on show, else the last.
+    fn sel(&self) -> Option<usize> {
+        let shown = self.visible();
+        shown
+            .iter()
+            .copied()
+            .find(|at| *at >= self.selected)
+            .or(shown.last().copied())
+    }
+
+    /// Stand the pane in `terminal`'s tab (its cards alone), or back over every card.
+    pub fn set_scope(&mut self, scope: Option<u32>) {
+        if self.scope == scope {
+            return;
+        }
+        let from = self.open_card().map(|c| c.card.clone());
+        self.scope = scope;
+        self.expanded = false;
+        self.whole = false;
+        if !self.typing {
+            self.swap_draft(from);
+        }
     }
 
     /// Take a fresh read: the open card stays the open card when it is still there.
@@ -504,7 +543,7 @@ impl Pane {
 
     /// Open card number `at` of the list.
     pub fn select(&mut self, at: usize) {
-        if at < self.live.len() {
+        if self.visible().contains(&at) {
             // The words in the box are for the card typed into, else for the open one.
             let from = match (&self.typing_for, self.typing) {
                 (Some((card, _)), true) => Some(card.clone()),
@@ -535,16 +574,21 @@ impl Pane {
         }
     }
 
-    /// Move the open card by one.
+    /// Move the open card by one, among the cards on show.
     fn step(&mut self, down: bool) {
-        let last = self.live.len().saturating_sub(1);
-        let at = self.selected.min(last);
+        let shown = self.visible();
+        let Some(at) = self
+            .sel()
+            .and_then(|sel| shown.iter().position(|at| *at == sel))
+        else {
+            return;
+        };
         let to = if down {
-            (at + 1).min(last)
+            (at + 1).min(shown.len() - 1)
         } else {
             at.saturating_sub(1)
         };
-        self.select(to);
+        self.select(shown[to]);
     }
 
     /// A key, or the bytes of several. `prefix` is the interface's prefix byte, which with a
@@ -710,7 +754,7 @@ impl Pane {
     /// A click on something the view drew.
     pub fn click(&mut self, hit: Hit) -> Out {
         match hit {
-            Hit::Card(at) if at == self.selected && self.open_card().is_some() => {
+            Hit::Card(at) if self.sel() == Some(at) => {
                 self.expanded = !self.expanded;
             }
             Hit::Card(at) => {
@@ -721,13 +765,13 @@ impl Pane {
                 self.press_option(at);
             }
             Hit::Answer(card, at) => {
-                if card != self.selected {
+                if self.sel() != Some(card) {
                     self.select(card);
                 }
                 self.press_option(at);
             }
             Hit::Reply(card) => {
-                if card != self.selected {
+                if self.sel() != Some(card) {
                     self.select(card);
                 }
                 self.start_typing();
@@ -1428,23 +1472,27 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         out.push(wrap(&[seg(Role::Detail, "restart qoop for the questions")]));
     } else if !pane.loaded {
         out.push(wrap(&[seg(Role::FaintText, "reading the questions")]));
-    } else if pane.live.is_empty() && !pane.typing {
+    } else if pane.visible().is_empty() && !pane.typing {
         out.push(blank());
         out.push(wrap(&[seg(Role::Detail, "Nothing waits for you.")]));
     }
 
     if let Some(card) = pane.open_card() {
-        let sel = pane.selected.min(pane.live.len() - 1);
+        // The cards on show, the open one's place in `live` and among them.
+        let shown = pane.visible();
+        let sel = pane.sel().unwrap_or_default();
+        let pos = shown.iter().position(|at| *at == sel).unwrap_or_default();
         let h = folded_h(cw);
         if !pane.is_open() {
             // Every card folded: as many as the rows hold around the selected one, then what he
             // already handled in the rows left.
             let room = inner_rows.saturating_sub(3);
-            let n = (room / h).clamp(1, pane.live.len());
-            let first = sel
+            let n = (room / h).clamp(1, shown.len());
+            let first = pos
                 .saturating_sub((n - 1) / 2)
-                .min(pane.live.len().saturating_sub(n));
-            for (at, c) in pane.live.iter().enumerate().skip(first).take(n) {
+                .min(shown.len().saturating_sub(n));
+            for &at in shown.iter().skip(first).take(n) {
+                let c = &pane.live[at];
                 // A card alone in the pane shows its whole question and every answer.
                 let alone = (n == 1).then_some(room);
                 let drawn = folded(
@@ -1520,17 +1568,17 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             };
             let b = budget(
                 inner_rows,
-                pane.live.len() - 1,
+                shown.len() - 1,
                 h,
                 pane.typing || !pane.text.is_empty(),
                 &lens,
             );
             let side = b.side;
             // The other cards stay folded around the open one: before it first.
-            let below_all = pane.live.len() - 1 - sel;
-            let mut above = sel.min(b.others.div_ceil(2));
+            let below_all = shown.len() - 1 - pos;
+            let mut above = pos.min(b.others.div_ceil(2));
             let below = below_all.min(b.others - above);
-            above = sel.min(b.others - below);
+            above = pos.min(b.others - below);
             let folded_at = |at: usize, out: &mut Vec<String>, targets: &mut Vec<Target>| {
                 folded(
                     &pane.live[at],
@@ -1544,7 +1592,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                     targets,
                 );
             };
-            for at in sel - above..sel {
+            for &at in &shown[pos - above..pos] {
                 folded_at(at, &mut out, &mut targets);
             }
 
@@ -1704,7 +1752,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                 cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
                 out.extend(rows);
             }
-            for at in sel + 1..sel + 1 + below {
+            for &at in &shown[pos + 1..pos + 1 + below] {
                 folded_at(at, &mut out, &mut targets);
             }
 
@@ -1800,7 +1848,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     shown.dedup();
     // On a folded card, the answers still in sight after the clip, in order: a number key
     // never sends one the pane had no room to draw.
-    let sel = pane.selected.min(pane.live.len().saturating_sub(1));
+    let sel = pane.sel().unwrap_or_default();
     let reach = reach.map(|_| {
         (0..)
             .take_while(|i| targets.iter().any(|t| t.hit == Hit::Answer(sel, *i)))
@@ -3605,6 +3653,50 @@ mod tests {
             reason: "unknown variant `AskRead`, expected one of `X`".into(),
         }));
         assert!(old.unsupported);
+    }
+
+    /// Stood in an agent's tab, the pane shows, moves over and answers that terminal's cards
+    /// alone: `j` skips another agent's card, a number answers the open one of this tab, a click
+    /// on a card not on show does nothing, and the view never draws another agent's question.
+    /// Back on qass's screen every card is on show again.
+    #[test]
+    fn a_scoped_pane_reaches_only_its_terminals_cards() {
+        let mut p = Pane::default();
+        let mut other = card(2, "web-app", "open");
+        other.body.asks = "Another agent's question?".to_string();
+        let mut third = card(1, "migrations", "open");
+        third.card = "E3".to_string();
+        p.take(
+            vec![card(1, "migrations", "open"), other, third],
+            Vec::new(),
+        );
+        p.set_scope(Some(1));
+        assert_eq!(p.visible(), vec![0, 2]);
+        assert_eq!(p.open_card().unwrap().card, "E1");
+        p.key(b"j", 0x01);
+        assert_eq!(
+            p.open_card().unwrap().card,
+            "E3",
+            "the other agent's card skipped"
+        );
+        p.key(b"j", 0x01);
+        assert_eq!(p.open_card().unwrap().card, "E3", "the last on show");
+        p.click(Hit::Card(1));
+        assert_eq!(p.open_card().unwrap().card, "E3", "not on show, not opened");
+        p.key(b"1", 0x01);
+        assert_eq!(p.outbox.len(), 1);
+        assert!(
+            matches!(&p.outbox[0], ControlRequest::AskWrite { action: AskOp::Answer { card, .. }, .. } if card == "E3")
+        );
+        let (rows, spaces) = (Vec::new(), Vec::new());
+        let drawn: String = view(&p, &ctx(&rows, &spaces), 52, 30)
+            .rows
+            .iter()
+            .map(|r| strip(r))
+            .collect();
+        assert!(!drawn.contains("Another agent"), "{drawn}");
+        p.set_scope(None);
+        assert_eq!(p.visible(), vec![0, 1, 2]);
     }
 
     /// A read that fails for any other reason is asked again, and the daemon still keeps cards:
