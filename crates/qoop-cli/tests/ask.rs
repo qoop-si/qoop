@@ -2101,6 +2101,45 @@ fn an_away_hand_is_kept_here_and_told_to_no_qass_here() {
     assert!(!row_of(&rt, &mut ui, away).qass_missed);
 }
 
+/// The same question asked again carries another `menu_seal`, so `qoop send --seal` with the
+/// first one's never answers the second; the right one sends.
+#[test]
+fn the_same_question_asked_again_has_another_seal() {
+    let stack = Stack::start();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let agent = stack.agent("work", "asker", None);
+    let t = agent.parse::<u32>().expect("a terminal number");
+    let seal_when_blocked = |ui: &mut qoop_testkit::TestClient| {
+        assert!(stack.wait(|| stack.state_of(&agent) == "blocked"));
+        let mut seal = None;
+        assert!(stack.wait(|| {
+            seal = row_of(&rt, ui, t).menu_seal;
+            seal.is_some()
+        }));
+        seal.expect("a seal")
+    };
+    stack.send(&agent, "MENU");
+    let first = seal_when_blocked(&mut ui);
+    stack.send(&agent, "FREE");
+    assert!(stack.wait(|| stack.state_of(&agent) != "blocked"));
+    assert!(stack.wait(|| row_of(&rt, &mut ui, t).menu_seal.is_none()));
+    stack.send(&agent, "MENU");
+    let second = seal_when_blocked(&mut ui);
+    assert_ne!(first, second, "the same menu, a new turn");
+    let (ok, _, err) = stack.run(&["send", &agent, "--key", "esc", "--seal", &first.to_string()]);
+    assert!(!ok && err.contains("another question"), "{err}");
+    let (ok, _, err) = stack.run(&[
+        "send",
+        &agent,
+        "--key",
+        "esc",
+        "--seal",
+        &second.to_string(),
+    ]);
+    assert!(ok, "{err}");
+}
+
 /// A live hand goes back when nobody is left to take it: watching turned off ends it at the
 /// next look, and qass's tab closed ends it once qass stayed gone for a while (well inside the
 /// hand's own life). Either way the row says `qass_missed` for a while, so a client offers it

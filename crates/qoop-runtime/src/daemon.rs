@@ -812,6 +812,35 @@ pub struct TerminalHandle {
     /// The agent's own menu on its screen, as of the task's last read of it (`crate::menu`).
     /// Written by the terminal's own task, read by the index for a person's rows.
     pub menu: Arc<std::sync::Mutex<Option<crate::control::AgentMenu>>>,
+    /// How many times a menu came up on this screen: one more each time one appears where
+    /// none was or another was, so the same question asked again is a new turn. Part of the
+    /// seal a program answers with (`TerminalHandle::answer_seal`).
+    pub menu_turn: Arc<AtomicU64>,
+}
+
+impl TerminalHandle {
+    /// Set the menu the screen shows now, counting a new turn when one comes up.
+    pub(crate) fn set_menu(&self, menu: Option<crate::control::AgentMenu>) {
+        let mut slot = self.menu.lock().unwrap();
+        let was = slot.as_ref().map(|m| m.seal);
+        if let Some(now) = menu.as_ref().map(|m| m.seal)
+            && was != Some(now)
+        {
+            self.menu_turn.fetch_add(1, Ordering::Relaxed);
+        }
+        *slot = menu;
+    }
+
+    /// The seal of the menu up now and of this turn of it (`AgentRow::menu_seal`, `qoop send
+    /// --seal`): the same question asked again reads another, so a late answer to the first
+    /// never lands on the second.
+    pub(crate) fn answer_seal(&self) -> Option<u64> {
+        let seal = self.menu.lock().unwrap().as_ref().map(|m| m.seal)?;
+        Some(crate::menu::turn_seal(
+            seal,
+            self.menu_turn.load(Ordering::Relaxed),
+        ))
+    }
 }
 
 /// A fresh [`TerminalHandle::incarnation`], never repeated within a daemon.
@@ -5360,11 +5389,12 @@ async fn handle_control(
                         .flatten();
                     let (with_qass, qass_missed, qass_away) =
                         agents.hands.lock().unwrap().of(terminal);
-                    // The seal alone, no screen text: on every row, for `qoop send --seal`.
+                    // The seal of this turn of the menu alone, no screen text: on every row, for
+                    // `qoop send --seal`.
                     let menu_seal = terminals
                         .get(terminal)
                         .filter(|_| state == "blocked")
-                        .and_then(|handle| handle.menu.lock().unwrap().as_ref().map(|m| m.seal));
+                        .and_then(|handle| handle.answer_seal());
                     crate::control::AgentRow {
                         news: status == Some(qoop_domain::Status::Done),
                         status: status.map(|s| s.token().to_string()),
@@ -7431,6 +7461,7 @@ fn open_terminal_with(
         incarnation: next_incarnation(),
         watchers: Arc::default(),
         menu: Arc::default(),
+        menu_turn: Arc::default(),
     };
     terminals.insert(stream, handle.clone());
     if let Some((session, said)) = adopt.as_ref().and_then(|a| a.session.clone()) {
@@ -12630,7 +12661,7 @@ async fn terminal_task(
                             let Ok(sent) = sent else { continue };
                             // Answered: the row shows no menu until the screen is read again.
                             if let Some(handle) = terminals.get(stream) {
-                                *handle.menu.lock().unwrap() = None;
+                                handle.set_menu(None);
                             }
                             let bytes = sent.keys.into_bytes();
                             agents.note_person(stream, &bytes, false, kind, crate::agents::now_unix());
@@ -13188,10 +13219,12 @@ async fn terminal_task(
                         // An agent's own menu, for a person's row. Not a plain shell's: a
                         // `select` list there is no agent waiting on anyone.
                         if let Some(handle) = terminals.get(stream) {
-                            *handle.menu.lock().unwrap() = (program != "generic")
-                                .then(|| crate::menu::menu_of(&screen, None))
-                                .flatten()
-                                .map(|m| m.view());
+                            handle.set_menu(
+                                (program != "generic")
+                                    .then(|| crate::menu::menu_of(&screen, None))
+                                    .flatten()
+                                    .map(|m| m.view()),
+                            );
                         }
                         if program == "claude"
                             && let Some(at) = note_agent_view(
@@ -13297,7 +13330,7 @@ async fn terminal_task(
                         }
                     } else if let Some(handle) = terminals.get(stream) {
                         // Nothing reads this screen any more (the agent left): no menu on its row.
-                        *handle.menu.lock().unwrap() = None;
+                        handle.set_menu(None);
                     }
                 }
                 writable = afd.writable(), if want_write => {

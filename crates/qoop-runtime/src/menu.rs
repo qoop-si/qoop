@@ -717,6 +717,14 @@ pub fn seal(menu: &Menu) -> u64 {
     h.finish() & ((1 << 53) - 1)
 }
 
+/// A menu's seal for one turn of it (`TerminalHandle::menu_turn`), below 2^53 like the seal:
+/// what a program answers with, so the same question asked again is not the same answer.
+pub fn turn_seal(seal: u64, turn: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    (seal, turn).hash(&mut h);
+    h.finish() & ((1 << 53) - 1)
+}
+
 /// The mode Claude Code's footer states under its prompt box (`⏵⏵ accept edits on (shift+tab
 /// to cycle)`, `⏸ plan mode on`, `⏵⏵ bypass permissions on · 1 shell`): its words, `accept
 /// edits`. `None` when the footer states none, which is the default mode. Only the first line
@@ -2116,6 +2124,15 @@ mod tests {
     /// Two long commands that end alike are one menu to the phone's `sameMenu`, which only reads
     /// the rows just above; what an answer approves is all of the prompt, and the rows under
     /// each option (the scope of a standing permission).
+    /// A turn's seal is the menu's and the turn's: the same question asked again differs, and
+    /// it stays below 2^53 for a phone's number.
+    #[test]
+    fn a_turn_seal_differs_by_turn() {
+        assert_ne!(turn_seal(5, 1), turn_seal(5, 2));
+        assert_eq!(turn_seal(5, 1), turn_seal(5, 1));
+        assert!(turn_seal(u64::MAX, u64::MAX) < 1 << 53);
+    }
+
     #[test]
     fn the_seal_binds_the_whole_prompt_and_the_rows_under_each_option() {
         let long = |first: &str| {
