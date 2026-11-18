@@ -248,7 +248,7 @@ how important the question feels.
 | Says it is done or verified, but its screen and transcript show no real proof (a run, its output, a log line, a measured number) | prompt it to run the change end to end and show the output |
 | Its line ends `:claimed`, it finished with its task open, or it closed while on a board item (at Start too: each Doing item whose agents all ended, and each task the board lists as claimed done with no terminal, oldest first) | "Done, checked" above; a claim with no terminal has no worker to do a missing step: close it failed with that step (`qoop task close <id> --failed '<missing>'`). An item back in Todo after its only agents were abandoned (tab closed, nothing claimed): name it in the summary when its branch holds commits; pickup never restarts it by itself. Unclear: the step its goal still lacks (the rows below), a card only when none is reversible. Closing is yours or the owner's by convention; nothing checks who closes; the next summary says what each such item is: closed verified, or the step it misses |
 | A `claims <ids>: ...` line (the daemon, every 4 h while watching is on: done claims over a day old with no check, card or prompt since) | "Done, checked" above for each listed task, as for a `:claimed` line; never a close on that line alone |
-| A `hand-off T<n>, ...: ...` line (the daemon: the owner handed you those tabs' questions) | the owner asks you to handle them: apply this table to each; the Menu row's basis rules hold; anything you may not answer: a card now |
+| A `hand-off T<n> seal:<S>, ...: ...` line (the daemon: the owner handed you those tabs' questions), or a remote line `ubox/T2 ... handed->blocked ... seal:<S>` (the owner handed you that remote tab's question from this Mac) | the owner asks you to handle them: apply this table to each, a remote one through `on.sh`; the Menu row's basis rules hold; each key carries its `--seal`; anything you may not answer: a card now |
 | Its task closed verified | when the brief says own repo, `qoop close <n>` (a tab on this Mac only; never while a card about it is open, nor close its task then); else leave the tab |
 | Before you prompt another review round: the brief says `Not now: another review round` (its rounds reached the workflow's limit) | a card, never another round |
 | Its task stage is `waiting-human` (with `:claimed` too: the question comes first; the daemon sets it when a turn ended asking them and they did not answer in 2 minutes) | read the question from its screen first: a reversible step its rules allow (the question row below): close its `W<n>` first (`escalate.sh done W<n> qass`), then prompt that step (refused: write the card now); anything else a card now. Never close its task, or prompt it except with their words, that answer or the meanwhile prompt (next row), while a `W<n>` card for it is live. A `W<n>` card for that agent is the daemon's draft (their own words go straight to it): leave it, or write your own card for that agent to give options. A `Q<n>` card is the agent's own (`qoop task ask`, with its options): leave it, and let the agent work on; it is no reason to hold back a prompt. On a working agent of a kind with no prompt hook (cursor, amp, goose) that stage is stale: prompt it to set its stage (`qoop task stage <stage>`) |
@@ -272,8 +272,14 @@ how important the question feels.
 
 ```
 qoop prompt <n> --generation <G> -- '<one line>'
-qoop send <n> --key down --key enter --generation <G>
+qoop send <n> --key down --key enter --seal <S> --generation <G>
 ```
+
+Every key that answers a question carries the `seal:<S>` of its line (or of the `hand-off`
+line): qoop refuses it once another question is up, so it never answers the next one. A line
+with no `seal:`, or a remote whose qoop refuses `--seal` as an unknown flag: read the screen
+(`qoop context <n>`, `on.sh <m> context <n>`) right before the key, and send nothing when the
+question shown is not the one you were told of.
 
 A prompt is one line, a scoped instruction (never a bare "yes", "ok" or "continue"), ending in exactly:
 

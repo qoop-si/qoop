@@ -854,6 +854,8 @@ pub fn bar_tabs(
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         });
     }
     tabs
@@ -4644,6 +4646,8 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         }
     }
 
@@ -7600,6 +7604,8 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         }
     }
 
@@ -8270,6 +8276,8 @@ mod tests {
                 answered: None,
                 with_qass: false,
                 qass_missed: false,
+                qass_away: None,
+                menu_seal: None,
             })
             .collect();
         // Nothing scrolls: all nine agents draw their row under the space's rule, and

@@ -3164,6 +3164,7 @@ mod tests {
             terminal,
             generation: Some(2),
             seal: Some(9),
+            away: None,
         };
         let asks = |terminal: u32, hands: Vec<Hand>| {
             [

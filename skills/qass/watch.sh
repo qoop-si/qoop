@@ -137,6 +137,8 @@ def line($r; $from):
   # Claude flagged a dangerous rm on this menu: a hint, the screen decides (SKILL.md, Menu row).
   # Before the task, so a line still ends `task:<id>:<stage>[:claimed]`.
   + (if $r.rule == "dangerous_rm_dialog" then " menu:dangerous" else "" end)
+  # The question on screen, for `qoop send --seal`: an answer meant for it never lands on the next.
+  + (if ($r.menu_seal | type) == "number" then " seal:\($r.menu_seal)" else "" end)
   + " stop:" + ($r.stop // "" | clean | if . == "" then "?" else . end)
   # Work still running in the background (shells, monitors, subagents), as the row is now.
   + (if ($r.background // 0) > 0 then " bg:\($r.background)" else "" end) + ($r | task);
@@ -145,11 +147,22 @@ def line($r; $from):
 # alone, so `rows` drops them: a skipped tab going idle, blocked, failed or away says nothing, and
 # a flag set mid-work is not a close, nor a flag cleared a new tab. (skips_of builds it.)
 
+# A remote agent whose question the owner handed, from this Mac's window, to this Mac's qass:
+# its row's `qass_away` names this Mac's hand id ($me) with a time $o's did not have. Said once
+# per hand, as `handed`; a hand to that machine's own qass, or from another Mac, says nothing.
+handed='
+def handed($r; $o):
+  $at != "" and $me != "" and ($r.state | waits)
+  and (($r.qass_away.by? // "") == $me)
+  and (($r.qass_away.at? // null) != ($o.qass_away.at? // null));
+'
+
 # $a and $b are row arrays; prints the lines for what changed from $a to $b.
-diff="$defs"'
+diff="$defs$handed"'
 ($a | rows) as $old | ($b | rows) as $new
 | ($new | to_entries[] | .value as $r | $old[.key] as $o
-   | if $o == null then (if ($r.state | waits) then line($r; "new") else empty end)
+   | if handed($r; $o) then line($r; "handed")
+     elif $o == null then (if ($r.state | waits) then line($r; "new") else empty end)
      elif $o.generation != $r.generation then
        (if ($r.state | waits) then line($r; "restarted") else empty end)
      elif $o.state != $r.state and ($r.state | waits) then line($r; $o.state)
@@ -165,6 +178,13 @@ diff="$defs"'
    | . as $r | ($sleeping | index($r.terminal)) as $asleep
    | line($r + {state: (if $asleep != null then "sleeping" else "closed" end)}; $r.state))
 '
+# The `handed` lines alone, for the first snapshot after watching came back on (W5): the rest
+# of it is the base qass sums up itself, but a hand is a question put to this qass.
+handed_only="$defs$handed"'
+($a | rows) as $old | ($b | rows) as $new
+| $new | to_entries[] | .value as $r | $old[.key] as $o
+| select(handed($r; $o)) | line($r; "handed")'
+
 # Whether a row of $a is gone from $b: only then is `qoop ls` worth asking.
 vanished="$defs"'(($a | rows | keys) - ($b | rows | keys)) | length > 0'
 
@@ -212,6 +232,9 @@ watch_unseen() {
     [ "${w:-}" = resume ] && [ -n "${t:-}" ] && [ "$t" != "$(cat "$dir/watch-seen" 2>/dev/null)" ] && echo "$t"
 }
 base_file() { if [ -z "$1" ]; then echo "$dir/base"; else echo "$dir/base-$1"; fi; }
+# This Mac's hand id, read on every snapshot (W6): a window writes it with the first hand it
+# makes for a remote agent, which may come after this watcher started. Letters and digits only.
+hand_id() { local id; id="$(head -n 1 "$dir/hand-id" 2>/dev/null || true)"; printf '%s' "${id//[^A-Za-z0-9]/}"; }
 # Says `$1` and ends, once: a second stop asked for meanwhile says nothing more.
 # One line in watch.log (qass's folder, beside the switch's own turns that the daemon writes there)
 # a start, a line it ends on, and an exit (its code): a start with no exit before the next start
@@ -1090,9 +1113,16 @@ follow() {
         # On again after an off: qass sums the fleet up itself, so the first snapshot a
         # machine sends is the base and nothing is said of it, nor of its link or daemon then.
         if [ "$snap" != "[]" ] && [ -e "$(base_file "$label")" ]; then
+            # A hand made before this watcher started is still a question put to this qass.
+            out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
+                --argjson skip "$(skips_of "$prev" "$snap")" --arg at "$at" --arg me "$(hand_id)" \
+                "$handed_only" 2>/dev/null || true)"
             prev="$snap"
             printf '%s\n' "$snap" > "$file.tmp" && mv "$file.tmp" "$file"
             rm -f "$(base_file "$label")" "$gone" "$dir/down-$label" "$dir/down-$label.said"
+            if [ -n "$out" ] && ! watch_off; then
+                if [ "$quiet" = 1 ]; then settle_locked flush "$out"; else say "$(tagged "$out")"; fi
+            fi
             continue
         fi
         # Quiet saves the snapshot before its lines are held: a stop in between would lose
@@ -1141,7 +1171,8 @@ follow() {
                 sleeping="$(sleeping_on "$label")"
             fi
             out="$(jq -rn --argjson a "$prev" --argjson b "$snap" --argjson self "$self" \
-                --argjson skip "$skip" --arg at "$at" --argjson sleeping "$sleeping" "$diff" 2>/dev/null)" || { step_end; continue; }
+                --argjson skip "$skip" --arg at "$at" --argjson sleeping "$sleeping" \
+                --arg me "$(hand_id)" "$diff" 2>/dev/null)" || { step_end; continue; }
             # Off: the snapshot is kept, and nothing of it is said or held.
             ! watch_off || out=""
             # Quiet checks held lines against the saved snapshot: save this one first, so a

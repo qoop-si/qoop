@@ -32,13 +32,18 @@ esac
 "#;
 
 const ON: &str = r#"#!/bin/bash
-# A stand-in for on.sh: the remote's snapshots from $STUB/remote-snaps.
+# A stand-in for on.sh: the remote's snapshots from $STUB/remote-snaps; a `put <file> <word>`
+# line writes that file between two of them.
 [ "$1" != --master ] || shift
 shift
 case "$*" in
     "agents --watch --json")
         while IFS= read -r l; do
-            case "$l" in "sleep "*) sleep "${l#sleep }" ;; *) printf '%s\n' "$l" ;; esac
+            case "$l" in
+                "sleep "*) sleep "${l#sleep }" ;;
+                "put "*) read -r _ f v <<< "$l"; printf '%s\n' "$v" > "$f" ;;
+                *) printf '%s\n' "$l" ;;
+            esac
         done < "$STUB/remote-snaps"
         sleep "${REMOTE_HOLD:-1}" ;;
     --version) echo "qoop 1" ;;
@@ -336,6 +341,133 @@ fn a_remote_line_is_unknown_and_its_stream_never_holds_the_block() {
     );
     assert_eq!(w.calls(), ["5"]);
     assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+/// A remote row blocked on menu 812, handed to the qass of the Mac with hand id `by` at `at`
+/// (no hand with `at` 0).
+fn away_row(t: u32, by: &str, at: i64) -> String {
+    let hand = if at == 0 {
+        String::new()
+    } else {
+        format!(r#","with_qass":true,"qass_away":{{"at":{at},"by":"{by}"}}"#)
+    };
+    row(t, "blocked", &format!(r#","menu_seal":812{hand}"#))
+}
+
+/// Runs the watcher on one remote, `ubox`, whose stream sends `remote` (snapshots, `sleep` and
+/// `put` lines) after the saved `last` one (none: no file), with `id` as this Mac's hand id
+/// (none: no file). The lines said about `ubox/T2`.
+fn remote_lines(w: &Watch, last: Option<&str>, remote: &[String], id: Option<&str>) -> Vec<String> {
+    w.put("stub/remotes", "ubox\n");
+    if let Some(last) = last {
+        w.put("data/last-ubox.json", last);
+    }
+    if let Some(id) = id {
+        w.put("data/hand-id", &format!("{id}\n"));
+    }
+    w.put("stub/remote-snaps", &(remote.join("\n") + "\n"));
+    w.snaps(&["sleep 2".into(), rows(&[qass_row("idle", now())])]);
+    let (lines, _) = w.run(1, &[("REMOTE_HOLD", "20")]);
+    lines
+        .into_iter()
+        .filter(|l| l.starts_with("ubox/T2 "))
+        .collect()
+}
+
+/// A remote question handed from this Mac's window to this Mac's qass is said once, as
+/// `handed`, with the seal its answer carries; a hand from another Mac, a hand seen before
+/// (a watcher started again on the same snapshot) and a local row with a hand say nothing; a new
+/// hand for the same tab (after a qass restart) is said again; a row first seen with a hand is
+/// `handed`, not `new`.
+#[test]
+fn a_remote_hand_from_this_mac_is_said_once_as_handed() {
+    let handed = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("ubox/T2 g1 claude handed->blocked "))
+            .count()
+    };
+    let plain = rows(&[away_row(2, "", 0)]);
+
+    let w = Watch::new();
+    let lines = remote_lines(
+        &w,
+        Some(&plain),
+        &[rows(&[away_row(2, "me1", 100)])],
+        Some("me1"),
+    );
+    assert_eq!(handed(&lines), 1, "{lines:?}");
+    assert!(lines[0].contains(" seal:812 "), "{lines:?}");
+
+    let w = Watch::new();
+    let lines = remote_lines(
+        &w,
+        Some(&plain),
+        &[rows(&[away_row(2, "other", 100)])],
+        Some("me1"),
+    );
+    assert!(lines.is_empty(), "another Mac's hand: {lines:?}");
+
+    let w = Watch::new();
+    let seen = rows(&[away_row(2, "me1", 100)]);
+    let lines = remote_lines(&w, Some(&seen), &[seen.clone()], Some("me1"));
+    assert!(lines.is_empty(), "said before the restart: {lines:?}");
+
+    let w = Watch::new();
+    let lines = remote_lines(
+        &w,
+        Some(&seen),
+        &[rows(&[away_row(2, "me1", 200)])],
+        Some("me1"),
+    );
+    assert_eq!(handed(&lines), 1, "a new hand: {lines:?}");
+
+    let w = Watch::new();
+    let lines = remote_lines(&w, None, &[rows(&[away_row(2, "me1", 100)])], Some("me1"));
+    assert_eq!(handed(&lines), 1, "first seen: {lines:?}");
+    assert!(!lines.iter().any(|l| l.contains(" new->")), "{lines:?}");
+
+    // On this Mac a hand is typed by the daemon: the watcher says nothing of it.
+    let w = Watch::new();
+    w.put("data/hand-id", "me1\n");
+    w.put("data/last.json", &rows(&[away_row(5, "", 0)]));
+    w.snaps(&["sleep 1".into(), rows(&[away_row(5, "me1", 100)])]);
+    let (lines, _) = w.run(1, &[]);
+    assert!(of(&lines, 5).is_empty(), "{lines:?}");
+}
+
+/// Watching off and on: the first snapshot is the base and says nothing (qass sums the fleet
+/// up itself), except a hand made before this watcher started, which is still put to it (W5).
+#[test]
+fn a_hand_in_the_base_snapshot_is_still_said() {
+    let w = Watch::new();
+    w.put("data/base-ubox", "");
+    let before = rows(&[away_row(2, "", 0), row(3, "working", "")]);
+    let after = rows(&[away_row(2, "me1", 100), row(3, "idle", "")]);
+    let lines = remote_lines(&w, Some(&before), &[after], Some("me1"));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("ubox/T2 g1 claude handed->blocked "),
+        "{lines:?}"
+    );
+}
+
+/// The hand id is read on every snapshot (W6): the first hand a window makes writes it, after
+/// this watcher started, and that hand is said.
+#[test]
+fn the_first_hand_is_said_though_its_id_came_after_the_start() {
+    let w = Watch::new();
+    let plain = rows(&[away_row(2, "", 0)]);
+    let id = w.path("data/hand-id").display().to_string();
+    let remote = [
+        plain.clone(),
+        "sleep 1".into(),
+        format!("put {id} me1"),
+        rows(&[away_row(2, "me1", 100)]),
+    ];
+    let lines = remote_lines(&w, Some(&plain), &remote, None);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(" handed->blocked "), "{lines:?}");
 }
 
 /// A brief that says the owner is at the tab until `until` once, and nobody after.

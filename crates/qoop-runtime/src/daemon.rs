@@ -5358,7 +5358,13 @@ async fn handle_control(
                             crate::menu::answered_on(agents, terminal, up)
                         })
                         .flatten();
-                    let (with_qass, qass_missed) = agents.hands.lock().unwrap().of(terminal);
+                    let (with_qass, qass_missed, qass_away) =
+                        agents.hands.lock().unwrap().of(terminal);
+                    // The seal alone, no screen text: on every row, for `qoop send --seal`.
+                    let menu_seal = terminals
+                        .get(terminal)
+                        .filter(|_| state == "blocked")
+                        .and_then(|handle| handle.menu.lock().unwrap().as_ref().map(|m| m.seal));
                     crate::control::AgentRow {
                         news: status == Some(qoop_domain::Status::Done),
                         status: status.map(|s| s.token().to_string()),
@@ -5414,6 +5420,8 @@ async fn handle_control(
                         answered,
                         with_qass,
                         qass_missed,
+                        qass_away,
+                        menu_seal,
                         // Present once anything was thrown away, so the ordinary row
                         // does not grow by a block of zeros.
                         discards: terminals

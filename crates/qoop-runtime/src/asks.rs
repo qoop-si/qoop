@@ -1844,13 +1844,15 @@ fn qass_gone_for() -> Duration {
 
 /// One question handed to qass: the menu it was (`None` for one qoop cannot read), when it was
 /// handed (on both clocks: the store's cards are stamped in unix seconds), and whether qass was
-/// told of it yet.
+/// told of it yet. `away`: the hand id of the machine whose qass takes it (`Hand::away`); such a
+/// hand is never typed here and is booked as told.
 pub(crate) struct Handed {
     generation: Option<u64>,
     seal: Option<u64>,
     at: Instant,
     at_unix: i64,
     told: bool,
+    away: Option<String>,
 }
 
 /// The hands that live, and the terminals whose hand ran out untold, said for a while.
@@ -1863,12 +1865,17 @@ pub(crate) struct HandBook {
 }
 
 impl HandBook {
-    /// What a row says of `terminal`: handed to qass, and a hand that ran out untold.
-    pub(crate) fn of(&self, terminal: u32) -> (bool, bool) {
-        (
-            self.live.contains_key(&terminal),
-            self.missed.contains(&terminal),
-        )
+    /// What a row says of `terminal`: handed to qass, a hand that ran out untold, and the
+    /// hand for another machine's qass.
+    pub(crate) fn of(&self, terminal: u32) -> (bool, bool, Option<crate::control::AwayHand>) {
+        let live = self.live.get(&terminal);
+        let away = live.and_then(|h| {
+            h.away.as_ref().map(|by| crate::control::AwayHand {
+                at: h.at_unix,
+                by: by.clone(),
+            })
+        });
+        (live.is_some(), self.missed.contains(&terminal), away)
     }
 }
 
@@ -1900,17 +1907,28 @@ fn still_asking(
 /// Hand questions to qass (`HandToQass`, from a person): each one still asked, on a tab qass
 /// does not leave alone, is kept and its row says so; the flusher types one line for all of
 /// them once qass takes words. `skipped`: the terminals qass leaves alone.
+///
+/// A hand with `away` is for the qass of the machine whose window handed it: kept with no qass
+/// here and never typed to one, booked as told (only that machine's watcher says it), and a
+/// new one for the same tab replaces the old, so its row's `qass_away.at` is new and said again.
 pub(crate) async fn hand(
     id: String,
-    hands: Vec<crate::control::Hand>,
+    mut hands: Vec<crate::control::Hand>,
     skipped: &[u32],
     (terminals, agents, connections, store): Hands<'_>,
 ) -> ControlResponse {
-    let Some(qass) = qass_terminal(terminals, agents, store).await else {
-        return failed(id, QASS_NOT_RUNNING);
-    };
-    if !crate::paths::qass_watching() {
-        return failed(id, NOT_WATCHING);
+    // A hand id is a name from a person's client, said on every row: plain and short or none.
+    for h in &mut hands {
+        h.away = h.away.take().filter(|a| hand_id_ok(a));
+    }
+    let qass = qass_terminal(terminals, agents, store).await;
+    if hands.iter().any(|h| h.away.is_none()) {
+        if qass.is_none() {
+            return failed(id, QASS_NOT_RUNNING);
+        }
+        if !crate::paths::qass_watching() {
+            return failed(id, NOT_WATCHING);
+        }
     }
     // The menu each hand is about, as it is now: a hand that named none takes the one there.
     let asked: Vec<(crate::control::Hand, Option<u64>)> = hands
@@ -1925,7 +1943,7 @@ pub(crate) async fn hand(
     }
     let taken: Vec<(crate::control::Hand, Option<u64>)> = asked
         .into_iter()
-        .filter(|(h, _)| !skipped.contains(&h.terminal) && h.terminal != qass)
+        .filter(|(h, _)| !skipped.contains(&h.terminal) && Some(h.terminal) != qass)
         .collect();
     if taken.is_empty() {
         return failed(id, SKIPPED);
@@ -1934,13 +1952,19 @@ pub(crate) async fn hand(
         let mut book = agents.hands.lock().unwrap();
         for (hand, seal) in &taken {
             book.missed.remove(&hand.terminal);
-            book.live.entry(hand.terminal).or_insert(Handed {
+            let handed = Handed {
                 generation: hand.generation,
                 seal: *seal,
                 at: Instant::now(),
                 at_unix: now(),
-                told: false,
-            });
+                told: hand.away.is_some(),
+                away: hand.away.clone(),
+            };
+            if hand.away.is_some() {
+                book.live.insert(hand.terminal, handed);
+            } else {
+                book.live.entry(hand.terminal).or_insert(handed);
+            }
         }
     }
     for (hand, _) in &taken {
@@ -1953,15 +1977,27 @@ pub(crate) async fn hand(
     }
 }
 
+/// Whether `id` can be a hand id (`paths::hand_id`): 1 to 64 letters and digits.
+fn hand_id_ok(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Whether any hand still lives: the flusher keeps looking while one does.
 fn hands_live(agents: &AgentRegistry) -> bool {
     !agents.hands.lock().unwrap().live.is_empty()
 }
 
-/// The line qass is told for hands: tab numbers and fixed words only, since a tab's name is
-/// written by any connection.
-fn hand_line(terminals: &[u32]) -> String {
-    let tabs: Vec<String> = terminals.iter().map(|t| format!("T{t}")).collect();
+/// The line qass is told for hands: tab numbers, menu seals and fixed words only, since a tab's
+/// name is written by any connection. A tab's seal (`T2 seal:812`) goes on its `qoop send
+/// --seal`, so a key meant for this question never lands on the next one.
+fn hand_line(terminals: &[(u32, Option<u64>)]) -> String {
+    let tabs: Vec<String> = terminals
+        .iter()
+        .map(|(t, seal)| match seal {
+            Some(seal) => format!("T{t} seal:{seal}"),
+            None => format!("T{t}"),
+        })
+        .collect();
     format!(
         "hand-off {}: the owner handed you these tabs' questions. Answer each if your rules \
          allow; otherwise write a card for it now.",
@@ -2010,6 +2046,7 @@ async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
                     terminal: *terminal,
                     generation: h.generation,
                     seal: h.seal,
+                    away: h.away.clone(),
                 };
                 (hand, h.at, h.at_unix, h.told)
             })
@@ -2023,11 +2060,13 @@ async fn sweep_hands((terminals, agents, _, store): Hands<'_>) {
             .iter()
             .any(|(t, opened)| *t == i64::from(hand.terminal) && *opened >= at_unix);
         let out = at.elapsed() >= hand_life();
-        if asking && !carded && !out && !qass_gone {
+        // A hand for another machine's qass does not depend on the qass here.
+        let gone = qass_gone && hand.away.is_none();
+        if asking && !carded && !out && !gone {
             continue;
         }
         ended.push(hand.terminal);
-        if asking && !carded && (qass_gone || (out && !told)) {
+        if asking && !carded && (gone || (out && !told)) {
             missed.push(hand.terminal);
         }
     }
@@ -2074,15 +2113,15 @@ async fn flush_hands(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
     {
         return;
     }
-    let told: Vec<u32> = {
+    let told: Vec<(u32, Option<u64>)> = {
         let mut book = agents.hands.lock().unwrap();
-        let mut told: Vec<u32> = book
+        let mut told: Vec<(u32, Option<u64>)> = book
             .live
             .iter_mut()
             .filter(|(_, h)| !h.told)
             .map(|(t, h)| {
                 h.told = true;
-                *t
+                (*t, h.seal)
             })
             .collect();
         told.sort_unstable();
@@ -2091,7 +2130,7 @@ async fn flush_hands(seen: &HashSet<u32>, sent: &mut HashMap<u32, Instant>, hand
     sent.insert(qass, Instant::now());
     if type_into(terminals, qass, &hand_line(&told)).await.is_err() {
         let mut book = agents.hands.lock().unwrap();
-        for t in &told {
+        for (t, _) in &told {
             if let Some(h) = book.live.get_mut(t) {
                 h.told = false;
             }

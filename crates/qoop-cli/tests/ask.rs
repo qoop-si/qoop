@@ -346,11 +346,33 @@ fn hand_to_qass(
                 .find(|r| r.terminal == *t)
                 .and_then(|r| r.generation),
             seal: None,
+            away: None,
         })
         .collect();
     let asked = qoop_runtime::control::ControlRequest::HandToQass {
         id: id.into(),
         hands,
+    };
+    rt.block_on(client.control(&asked, qoop_testkit::PATIENCE))
+        .expect("an answer")
+}
+
+/// Hand `terminal`'s question to the qass of another machine, whose hand id is `by`.
+fn hand_away(
+    rt: &tokio::runtime::Runtime,
+    client: &mut qoop_testkit::TestClient,
+    id: &str,
+    terminal: u32,
+    by: &str,
+) -> qoop_runtime::control::ControlResponse {
+    let asked = qoop_runtime::control::ControlRequest::HandToQass {
+        id: id.into(),
+        hands: vec![qoop_runtime::control::Hand {
+            terminal,
+            generation: None,
+            seal: None,
+            away: Some(by.into()),
+        }],
     };
     rt.block_on(client.control(&asked, qoop_testkit::PATIENCE))
         .expect("an answer")
@@ -1826,9 +1848,18 @@ fn questions_handed_to_qass_go_as_one_line_and_end_with_their_question() {
     );
     assert!(row_of(&rt, &mut ui, first).with_qass);
     assert!(row_of(&rt, &mut ui, second).with_qass);
+    // Each tab with the seal of its question, for qass's `send --seal`.
+    let mut tab = |t: u32| {
+        let seal = row_of(&rt, &mut ui, t)
+            .menu_seal
+            .expect("a menu qoop reads");
+        format!("T{t} seal:{seal}")
+    };
     let line = format!(
-        "hand-off T{first}, T{second}: the owner handed you these tabs' questions. Answer each if \
-         your rules allow; otherwise write a card for it now."
+        "hand-off {}, {}: the owner handed you these tabs' questions. Answer each if your rules \
+         allow; otherwise write a card for it now.",
+        tab(first),
+        tab(second)
     );
     let told = || stack.log("qass").contains(&line);
     assert!(
@@ -1972,6 +2003,86 @@ fn a_card_handed_to_qass_goes_to_qass_even_with_its_worker_at_rest() {
         stack.log("korea")
     );
     assert_eq!(stack.card_status("E1"), "passed");
+}
+
+/// A hand for another machine's qass (`Hand::away`): taken with no qass here, said on the row
+/// with when and by whom, never typed to the qass here (a local hand next to it is), replaced
+/// by a new hand for the same tab, and ended with its question, never as missed.
+#[test]
+fn an_away_hand_is_kept_here_and_told_to_no_qass_here() {
+    use qoop_runtime::control::ControlResponse;
+    let stack = Stack::start();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    let number = |t: String| t.parse::<u32>().expect("a terminal number");
+    let (local, away) = (
+        stack.agent("work", "local", None),
+        stack.agent("work", "away", None),
+    );
+    stack.send(&local, "MENU");
+    stack.send(&away, "MENU");
+    assert!(
+        stack.wait(|| stack.state_of(&local) == "blocked" && stack.state_of(&away) == "blocked")
+    );
+    let (local, away) = (number(local), number(away));
+
+    // No qass here: a hand for this machine's qass is refused, one for another's is kept.
+    assert_eq!(
+        refusal(&hand_to_qass(&rt, &mut ui, "h1", &[local])),
+        "qass_not_running"
+    );
+    let taken = hand_away(&rt, &mut ui, "h2", away, "abc123");
+    assert!(
+        matches!(&taken, ControlResponse::Handed { taken, .. } if *taken == [away]),
+        "{taken:?}"
+    );
+    let row = row_of(&rt, &mut ui, away);
+    assert!(row.with_qass && !row.qass_missed);
+    let first = row.qass_away.expect("said on the row");
+    assert_eq!(first.by, "abc123");
+
+    // Handed again, by another machine: the new hand replaces it.
+    std::thread::sleep(Duration::from_millis(1100));
+    let again = hand_away(&rt, &mut ui, "h3", away, "def456");
+    assert!(matches!(again, ControlResponse::Handed { .. }), "{again:?}");
+    let second = row_of(&rt, &mut ui, away).qass_away.expect("still said");
+    assert_eq!(second.by, "def456");
+    assert!(second.at > first.at, "{first:?} then {second:?}");
+
+    // With a qass here, a local hand is typed to it and the away one never is.
+    let _qass = stack.agent("qass", "qass", None);
+    let local_taken = hand_to_qass(&rt, &mut ui, "h4", &[local]);
+    assert!(
+        matches!(local_taken, ControlResponse::Handed { .. }),
+        "{local_taken:?}"
+    );
+    let told = || stack.log("qass").contains(&format!("hand-off T{local}"));
+    assert!(
+        stack.wait(told) || stack.wait(told),
+        "qass was never told: {:?}",
+        stack.log("qass")
+    );
+    let tab = format!("T{away}");
+    assert!(
+        !stack
+            .log("qass")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == tab),
+        "the away hand reached the qass here: {:?}",
+        stack.log("qass")
+    );
+
+    // Its question moves on: the hand ends, and not as missed.
+    let mut ui = stack.connect(&rt, qoop_proto::INTERFACE_ID);
+    ui.forget_events();
+    stack.send(&away.to_string(), "FREE");
+    assert!(
+        on_change_until(&rt, &mut ui, away, |r| !r.with_qass
+            && r.qass_away.is_none()),
+        "still with qass: {:?}",
+        row_of(&rt, &mut ui, away)
+    );
+    assert!(!row_of(&rt, &mut ui, away).qass_missed);
 }
 
 /// A live hand goes back when nobody is left to take it: watching turned off ends it at the

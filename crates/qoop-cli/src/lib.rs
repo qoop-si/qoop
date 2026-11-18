@@ -318,6 +318,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 agent took the turn and stopped\n\
                   \x20                 send, prompt and close take --generation G: refused\n\
                   \x20                 when the process is no longer the one that was read\n\
+                  \x20                 send takes --seal S too: refused once another question\n\
+                  \x20                 is up than the one with that seal\n\
                   \x20 qoop wait [target...] [--until STATE,...] [--match TEXT] [--timeout SECS] [--json]\n\
                   \x20                 block until a terminal reaches a state, or TEXT is on\n\
                   \x20                 its live screen; exits 124 on timeout\n\
@@ -1751,7 +1753,7 @@ fn skips_any() -> bool {
 /// write method. Same-user processes could already reach any terminal this
 /// way; this only gives that path a name plus an existence check.
 fn run_send(args: &[String]) -> std::io::Result<()> {
-    let help = "usage: qoop send <terminal> [--enter] [--paste] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--generation G]";
+    let help = "usage: qoop send <terminal> [--enter] [--paste] [--seal S] [--generation G] [--] <text...>\n       qoop send <terminal> --key NAME [--key NAME...] [--seal S] [--generation G]";
     let terminal: u32 = args
         .get(2)
         .and_then(|v| v.parse().ok())
@@ -1761,10 +1763,17 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
     let mut parts = Vec::new();
     let mut keys = Vec::new();
     let mut args = args.to_vec();
-    let generation = supervise::take_generation(&mut args);
+    let mut generation = supervise::take_generation(&mut args);
+    // The question the write answers (`AgentRow::menu_seal`): refused once another is up.
+    let mut seal = None;
     let mut rest = args.iter().skip(3);
+    let number = |v: Option<&String>| v.and_then(|v| v.parse::<u64>().ok());
     while let Some(arg) = rest.next() {
-        if arg == "--enter" {
+        if arg == "--seal" {
+            seal = Some(number(rest.next()).ok_or_else(|| usage(help))?);
+        } else if arg == "--generation" && generation.is_none() {
+            generation = Some(number(rest.next()).ok_or_else(|| usage(help))?);
+        } else if arg == "--enter" {
             enter = true;
         } else if arg == "--paste" {
             paste = true;
@@ -1785,7 +1794,7 @@ fn run_send(args: &[String]) -> std::io::Result<()> {
             "send either text or --key, not both; {help}"
         )));
     }
-    supervise::check_generation(terminal, generation)?;
+    supervise::check_turn(terminal, generation, seal)?;
     if !keys.is_empty() {
         send_keys_to(terminal, &keys, None)?;
         println!("sent to terminal {terminal}");
@@ -4066,6 +4075,8 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         }
     }
 

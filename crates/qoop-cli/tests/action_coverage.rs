@@ -505,6 +505,7 @@ fn actions() -> Vec<Action> {
                         terminal: 1,
                         generation: None,
                         seal: None,
+                        away: None,
                     }],
                 })
             },

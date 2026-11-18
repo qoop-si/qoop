@@ -69,6 +69,8 @@ fn agent(terminal: u32, workspace: i64, program: &str, state: &str) -> AgentRow 
         answered: None,
         with_qass: false,
         qass_missed: false,
+        qass_away: None,
+        menu_seal: None,
     }
 }
 

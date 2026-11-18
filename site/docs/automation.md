@@ -24,6 +24,8 @@ qoop send 3 --key esc --key enter           named keys
 
 `--generation G` on `send`, `prompt` and `close` refuses the write when terminal 3 no longer
 runs the process you read, so a message never lands on the agent that replaced it.
+`--seal S` on `send` refuses it when the question on screen is no longer the one you read
+(`menu_seal` in `qoop agents --json`), so an answer never lands on the next question.
 
 ## Wait
 

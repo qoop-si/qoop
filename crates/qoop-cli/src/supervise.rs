@@ -739,18 +739,44 @@ pub(crate) fn take_generation(args: &mut Vec<String>) -> Option<u64> {
     Some(value)
 }
 
-/// Refuse a write whose generation moved, over a connection of its own.
+/// Why an answer must not go to this terminal under this menu seal (`AgentRow::menu_seal`), if
+/// not: the question it was meant for is no longer the one up, so the key would answer another.
+pub(crate) fn seal_refusal(rows: &[AgentRow], terminal: u32, want: u64) -> Option<String> {
+    let Some(row) = rows.iter().find(|r| r.terminal == terminal) else {
+        return Some(format!("no such terminal: {terminal}"));
+    };
+    match row.menu_seal {
+        Some(s) if s == want => None,
+        Some(s) => Some(format!(
+            "terminal {terminal} shows another question now (seal {s}, not {want}): read it again before answering"
+        )),
+        None => Some(format!(
+            "terminal {terminal} has no question up now, not seal {want}: read it again before answering"
+        )),
+    }
+}
+
+/// Refuse a write whose generation moved, or whose question is no longer the one up, over a
+/// connection of its own: one read for both.
 ///
 /// For `send` and `prompt`, which predate this and open their own. Nothing
-/// is asked when no generation was given.
-pub(crate) fn check_generation(terminal: u32, want: Option<u64>) -> std::io::Result<()> {
-    let Some(want) = want else {
+/// is asked when neither was given. The read comes just before the write, so two writers in
+/// the same few milliseconds can both pass; anything later is refused.
+pub(crate) fn check_turn(
+    terminal: u32,
+    generation: Option<u64>,
+    seal: Option<u64>,
+) -> std::io::Result<()> {
+    if generation.is_none() && seal.is_none() {
         return Ok(());
-    };
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let (rows, _) = Link::open("qoop-generation").await?.agents().await?;
-        match generation_refusal(&rows, terminal, want) {
+        let refused = generation
+            .and_then(|g| generation_refusal(&rows, terminal, g))
+            .or_else(|| seal.and_then(|s| seal_refusal(&rows, terminal, s)));
+        match refused {
             Some(reason) => Err(std::io::Error::other(reason)),
             None => Ok(()),
         }
@@ -2265,6 +2291,19 @@ mod tests {
         );
     }
 
+    /// `--seal`: a key goes only while the question it was meant for is the one up.
+    #[test]
+    fn a_send_with_a_seal_is_refused_once_another_question_is_up() {
+        let mut r = row(1, None, Some("claude"));
+        let said = |rows: &[AgentRow]| seal_refusal(rows, 1, 7).unwrap_or_default();
+        assert!(said(&[r.clone()]).contains("no question up"));
+        r.menu_seal = Some(7);
+        assert_eq!(seal_refusal(&[r.clone()], 1, 7), None);
+        r.menu_seal = Some(8);
+        assert!(said(&[r]).contains("another question"));
+        assert!(said(&[]).contains("no such terminal"));
+    }
+
     fn row(terminal: u32, name: Option<&str>, program: Option<&str>) -> AgentRow {
         AgentRow {
             command: None,
@@ -2304,6 +2343,8 @@ mod tests {
             answered: None,
             with_qass: false,
             qass_missed: false,
+            qass_away: None,
+            menu_seal: None,
         }
     }
 
