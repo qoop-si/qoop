@@ -608,8 +608,8 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
         Idle,
     );
     // Linux draws the note's mark as `●`, not `⏺`. Measured on a Linux remote, Claude Code
-    // with its update notice, 2026-11-18: a sent-looking `devam et` sat unsent for 80 minutes
-    // while the tab read working.
+    // with its update notice, 2026-11-18: a draft sat unsent for 80 minutes while the tab
+    // read working.
     assert_rule(
         "claude",
         &[
@@ -618,7 +618,7 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
             "● Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json",
             "                                                                  ✔ Update installed · Restart to update",
             RULE,
-            "❯ devam et",
+            "❯ go on",
             RULE,
             footer,
         ],
@@ -641,7 +641,7 @@ fn a_draft_under_the_end_of_a_turn_is_idle() {
     );
 }
 
-/// Any other draft is a turn that may still be running: weak working, never visible idle.
+/// Any other draft is weak idle evidence, never visible: a running turn keeps it outranked.
 #[test]
 fn a_draft_alone_is_not_visible_idle() {
     let screen = [
@@ -654,7 +654,7 @@ fn a_draft_alone_is_not_visible_idle() {
     ];
     let v = verdict("claude", &screen).expect("a verdict");
     assert_eq!(v.rule, "composer_draft", "{v:?}");
-    assert_eq!(v.state, Working);
+    assert_eq!(v.state, Idle);
     assert!(!v.visible_idle && !v.visible_working, "{v:?}");
     assert_not_rule("claude", COMPOSER, "composer_draft");
 }

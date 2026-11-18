@@ -3110,6 +3110,90 @@ mod tests {
         assert_eq!(r.stop_of(1), None, "the new turn ends the finish");
     }
 
+    /// A Linux remote, 2026-11-18: the turn ended by its hook, then Claude compacted the idle
+    /// session (its spinner reopened a turn on the screen) and left a draft unsent under the
+    /// compaction's note. The draft is no work: the tab reads idle again, not working for good.
+    /// The screens are written for the case, with a line under the note so only the draft
+    /// rule reads the composer.
+    #[test]
+    fn a_draft_left_after_an_idle_compaction_reads_idle() {
+        use AgentRuntimeState as S;
+        let r = registry();
+        let token = mint_token(1);
+        let id = TerminalId::new("1");
+        r.register(1, id.clone(), token.clone());
+        r.observe_hook_event(1, &id, &token, S::Working, false, false, NOW, Some("user"))
+            .expect("admitted");
+        r.observe_hook_event(1, &id, &token, S::Idle, false, false, NOW + 1, Some("done"))
+            .expect("admitted");
+        let claude = qoop_detect::for_program("claude").expect("claude's manifest");
+        let rule = "─".repeat(60);
+        let read = |lines: &[&str]| {
+            let screen: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
+            claude.evaluate(&screen).expect("a verdict")
+        };
+        let compacting = read(&[
+            "✻ Crunched for 26s · done 12:27 AM",
+            "",
+            "✻ Compacting conversation… (8s)",
+            &rule,
+            "❯ go on",
+            &rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]);
+        assert_eq!(
+            (compacting.rule.as_str(), compacting.turn_line),
+            ("spinner_row", true),
+            "{compacting:?}"
+        );
+        r.observe_screen(1, "claude", &compacting, NOW + 5);
+        assert_eq!(r.agent(1).expect("agent").belief.state, S::Working);
+        // A frame of the running turn with no spinner row over the draft: its busy title
+        // still holds the turn, so a screen-held turn does not flicker to idle.
+        let screen: Vec<String> = [
+            "  The piano began around 1700 in Florence, and its hammers",
+            &rule,
+            "❯ go on",
+            &rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect();
+        let busy = claude
+            .evaluate_with_osc(
+                &screen,
+                &qoop_detect::OscContext {
+                    title: "◐ Claude Code",
+                },
+            )
+            .expect("a verdict");
+        assert_eq!(busy.rule, "title_busy", "{busy:?}");
+        r.observe_screen(1, "claude", &busy, NOW + 5);
+        assert_eq!(r.agent(1).expect("agent").belief.state, S::Working);
+        let after = read(&[
+            "● Compacted while idle, before the prompt cache expired · turn off with \"idleCompaction\": false in settings.json",
+            "                       ✔ Update installed · Restart to update",
+            "",
+            "Wrote the handoff note.",
+            &rule,
+            "❯ go on",
+            &rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]);
+        assert_eq!(
+            (after.rule.as_str(), after.visible_idle),
+            ("composer_draft", false),
+            "{after:?}"
+        );
+        r.observe_screen(1, "claude", &after, NOW + 6);
+        assert_eq!(
+            r.agent(1).expect("agent").belief.state,
+            S::Idle,
+            "{after:?}"
+        );
+    }
+
     /// A turn that ends while its sub-agents run is still working on what was asked (Claude
     /// reads "Waiting for 2 background agents to finish"); once they end with no new turn, it is
     /// a finish nobody has seen.

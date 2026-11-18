@@ -289,12 +289,17 @@ region = "bottom_non_empty_lines(12)"
 visible_idle = true
 regex = '(?m)^(?:[·✢✳✶✻✽*] \S+ for [^\n]*|\s*⎿\s+Interrupted · What should Claude do instead\?|[⏺●] Compacted while idle[^\n]*)\s*\n(?:[ \t]{2,}\S[^\n]*\n)*─{3,}[^\n]*\n[❯>!][^\n]*\n(?:[^─\n][^\n]*\n)*─{3,}'
 
-# Any other draft. Real sessions draw a draft under a streaming answer with no spinner and
-# no interrupt hint for most frames, so a draft alone is no sign that the turn is over:
-# this reads it as work still going, and only as weak evidence, never visible.
+# Any other draft. What was typed is no work, so it reads idle; but real sessions draw a
+# draft under a streaming answer with no spinner and no interrupt hint for most frames, so
+# only as weak evidence, never visible: a hook's working outranks it, and a turn's busy
+# title (`title_busy`) outranks it on the same screen, as it did in every frame without a
+# spinner row of a measured turn (Claude Code 2.1.326, 2026-11-18). It does replace a
+# working the screen itself read: read as working, a draft kept a tab working for good after
+# an idle compaction's spinner reopened a turn no hook would close (a Linux remote,
+# 2026-11-18).
 [[rules]]
 id = "composer_draft"
-state = "working"
+state = "idle"
 priority = 90
 region = "prompt_box_body"
 line_regex = '^[❯>!]\s+\S'
