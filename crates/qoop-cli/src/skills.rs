@@ -927,8 +927,9 @@ mod tests {
         // 2026-11-01: every wake reads plans.md (the next new Todo item, a ready plan to approve).
         // 498 since 2026-11-03: the row for the daemon's `claims` line (the recurring claim scan)
         // and the dangerous-rm rule. 499 since 2026-11-16: the row for the daemon's `hand-off`
-        // line (the owner hands questions to qass from the desktop).
-        assert!(skill.lines().count() <= 499, "SKILL.md grew past 499 lines");
+        // line (the owner hands questions to qass from the desktop). 501 since 2026-11-18: a card
+        // the owner hands to qass from its agent's tab (`<handle> you decide`) and its relay.
+        assert!(skill.lines().count() <= 501, "SKILL.md grew past 501 lines");
     }
 
     /// The setup a fresh install starts with: SKILL.md sends a first start there, and its text

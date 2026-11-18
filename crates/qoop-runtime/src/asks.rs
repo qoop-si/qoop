@@ -993,15 +993,22 @@ pub(crate) async fn write(
             option,
             text,
             seen,
+            to_qass,
         } => {
             if caller.terminal.is_some() {
                 return failed(id, "a card is answered by the owner, not from a terminal");
             }
+            // Handed to qass: his answer is the line qass decides on, no option of his.
+            let (option, text) = match to_qass {
+                true => (None, Some(HANDED_WORDS.to_string())),
+                false => (option, text),
+            };
             match answer(
                 &card,
                 option,
                 text,
                 seen,
+                to_qass,
                 (terminals, agents, connections, store),
             )
             .await
@@ -2094,6 +2101,12 @@ pub(crate) async fn type_into(
     Ok(())
 }
 
+/// The claim note of a card the owner handed to qass: kept while it is queued, so the route
+/// recomputed when it is typed still goes to qass. A reopen clears it.
+const HANDED_NOTE: &str = "to qass";
+/// What qass reads after the card's handle for a hand-off: `<handle> you decide`.
+const HANDED_WORDS: &str = "you decide";
+
 /// Where an answer goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -2113,7 +2126,9 @@ pub(crate) fn route(row: &AskRow, worker: Option<&(u32, Standing)>, qass: Option
     // A dialog's draft (a `W` card with no task): only qass answers a dialog, and once it is
     // gone his words would be a prompt about nothing.
     let dialog = row.card.starts_with('W') && row.task.is_none();
-    if let Some((terminal, s)) = worker.filter(|_| !dialog)
+    // Handed to qass by the owner: qass decides, never the worker.
+    let handed = row.note.as_deref() == Some(HANDED_NOTE);
+    if let Some((terminal, s)) = worker.filter(|_| !dialog && !handed)
         && row.session.is_some()
         && s.session == row.session
         && s.coming_to_rest()
@@ -2144,6 +2159,7 @@ async fn answer(
     option: Option<String>,
     text: Option<String>,
     seen: Option<String>,
+    to_qass: bool,
     hands: Hands<'_>,
 ) -> Result<AskResult, String> {
     let (terminals, agents, connections, store) = hands;
@@ -2186,7 +2202,8 @@ async fn answer(
     // words are the answer, the option only says which he looked at.
     let key = chosen.filter(|_| text.is_none()).map(|o| o.key.clone());
 
-    let worker = worker_of(&row, agents, terminals);
+    // A hand-off never goes to the worker (the claim's note keeps it so when it is typed).
+    let worker = worker_of(&row, agents, terminals).filter(|_| !to_qass);
     let qass = qass_terminal(terminals, agents, store).await;
     let result = match route(&row, worker.as_ref(), qass) {
         Route::Worker(_) => AskResult::Answered,
@@ -2195,17 +2212,9 @@ async fn answer(
     };
     let said = text.clone().or_else(|| key.clone()).unwrap_or_default();
     let (wanted, option_key) = (card.to_string(), key);
+    let note = if to_qass { HANDED_NOTE } else { "queued" };
     let claimed = store
-        .run(move |s| {
-            s.claim_ask(
-                &wanted,
-                "queued",
-                option_key.as_deref(),
-                &said,
-                "queued",
-                now(),
-            )
-        })
+        .run(move |s| s.claim_ask(&wanted, "queued", option_key.as_deref(), &said, note, now()))
         .await
         .map_err(why)?;
     // Rewritten between the read and the claim: the words he read are not the ones in the
@@ -2949,6 +2958,50 @@ mod tests {
         assert_eq!(route(&card(Some("s1")), None, Some(9)), Route::Qass(9));
         // Nobody to take it: refused, never "busy".
         assert_eq!(route(&card(None), None, None), Route::NoQass);
+    }
+
+    /// A card the owner handed to qass is claimed as the answer does it: no longer open, and
+    /// when it is typed (the route worked out again from the stored row, as `flush_card` does)
+    /// it goes to qass even though its worker is the same conversation and at rest, typed as
+    /// exactly `<handle> you decide`; with no qass it is refused. Given back (`reopen_ask`
+    /// clears the note), it routes as any card until he hands it again.
+    #[test]
+    fn a_card_handed_to_qass_goes_to_qass_until_it_is_reopened() {
+        let s = qoop_store::Store::in_memory().expect("store");
+        let body = r#"{"handle":"billing","urgency":"now","doing":"d","why":"w","asks":"a","options":[{"key":"a","label":"A","reason":"r","words":"go"}]}"#;
+        s.add_ask("Q5", None, Some(5), Some("s1"), body, 1).unwrap();
+        s.claim_ask("Q5", "queued", None, HANDED_WORDS, HANDED_NOTE, 2)
+            .unwrap();
+        let row = s.ask("Q5").unwrap().unwrap();
+        assert_eq!(row.status, "queued", "no longer open");
+        let worker = Some((5, at("idle", Some("s1"))));
+        assert_eq!(route(&row, worker.as_ref(), Some(9)), Route::Qass(9));
+        assert_eq!(
+            line_for(&row, Route::Qass(9)).as_deref(),
+            Some("billing you decide")
+        );
+        assert_eq!(route(&row, worker.as_ref(), None), Route::NoQass);
+        s.reopen_ask("Q5", None).unwrap();
+        let row = s.ask("Q5").unwrap().unwrap();
+        assert_eq!(row.status, "open");
+        assert_eq!(route(&row, worker.as_ref(), Some(9)), Route::Worker(5));
+        // A reopen after a failed delivery leaves its reason as the note, not the hand-off.
+        s.claim_ask("Q5", "queued", None, HANDED_WORDS, HANDED_NOTE, 3)
+            .unwrap();
+        s.reopen_ask("Q5", Some("not delivered: qass has no tab"))
+            .unwrap();
+        let row = s.ask("Q5").unwrap().unwrap();
+        assert_eq!(route(&row, worker.as_ref(), Some(9)), Route::Worker(5));
+    }
+
+    /// An answer frame from before the hand-off reads as no hand-off, and none is written
+    /// when it is off.
+    #[test]
+    fn an_answer_frame_without_to_qass_reads_as_none() {
+        let old = r#"{"kind":"answer","card":"Q3","option":"a"}"#;
+        let op: AskOp = serde_json::from_str(old).unwrap();
+        assert!(matches!(&op, AskOp::Answer { to_qass: false, .. }));
+        assert!(!serde_json::to_string(&op).unwrap().contains("to_qass"));
     }
 
     #[test]
