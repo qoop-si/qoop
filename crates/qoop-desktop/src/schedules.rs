@@ -45,8 +45,8 @@ pub struct SchedulePage {
     pub runs: HashMap<(usize, i64), Vec<ScheduleRun>>,
     pub(crate) asked: HashMap<String, (usize, i64)>,
     pub day: Option<i64>,
-    /// The run whose report is open: (schedule, run).
-    pub open: Option<(i64, i64)>,
+    /// The report open: (schedule, run), with no run for a schedule that has not run yet.
+    pub open: Option<(i64, Option<i64>)>,
     pub calendar: bool,
     /// The month the calendar shows, as days since 1970 of its first day.
     pub(crate) month: Option<i64>,
@@ -311,6 +311,8 @@ impl Desk {
         use qoop_runtime::control::ControlResponse as R;
         let id = reply.request_id().to_string();
         let machine = self.machine_shown_name();
+        // A past event with its clock, as "Sent: Yes, 16:04" is, not a state that stays (C-11).
+        let started = format!("Run started, {}.", state::clock(self.now, self.zone));
         let page = &mut self.schedule_page;
         match reply {
             R::Tasks {
@@ -358,7 +360,7 @@ impl Desk {
             R::ScheduleWritten { .. } if page.writes.contains_key(&id) => {
                 if let Some((schedule, write)) = page.writes.remove(&id) {
                     match write {
-                        Write::Run => page.said.insert(schedule, "A run started.".into()),
+                        Write::Run => page.said.insert(schedule, started),
                         _ => page.said.remove(&schedule),
                     };
                 }
@@ -390,7 +392,7 @@ impl Desk {
     /// Open a run's report: its task read, and for the newest run of a schedule on this Mac
     /// what is in its folder now.
     fn open_run(&mut self, schedule: i64, run: &ScheduleRun, cx: &mut Context<Self>) {
-        self.schedule_page.open = Some((schedule, run.id));
+        self.schedule_page.open = Some((schedule, Some(run.id)));
         self.schedule_page.task = None;
         self.schedule_page.produced = None;
         let here = self.schedule_page.via.is_none();
@@ -428,6 +430,24 @@ impl Desk {
             let _ = self.up.send(Up::Changes { id, terminal, cwd });
         }
         cx.notify();
+    }
+
+    /// Open a schedule from All schedules: its newest run's report, else the schedule alone.
+    fn open_schedule(&mut self, schedule: i64, cx: &mut Context<Self>) {
+        let newest = self
+            .shown_runs()
+            .into_iter()
+            .filter(|r| r.schedule == schedule)
+            .max_by_key(|r| r.started_at);
+        match newest {
+            Some(run) => self.open_run(schedule, &run, cx),
+            None => {
+                self.schedule_page.open = Some((schedule, None));
+                self.schedule_page.task = None;
+                self.schedule_page.produced = None;
+                cx.notify();
+            }
+        }
     }
 
     /// The machine shown, as its tile names it.
@@ -482,10 +502,19 @@ impl Desk {
         id
     }
 
-    fn field(&self, placeholder: &str, text: &str, cx: &mut Context<Self>) -> Entity<Field> {
+    /// A sheet field named `label` to a screen reader, `hint` while empty, filled with `text`
+    /// with the caret after it.
+    fn field(
+        &self,
+        label: &'static str,
+        hint: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<Field> {
         let field = cx.new(|cx| {
-            let mut f = Field::new(placeholder, cx);
-            f.text = text.to_string();
+            let mut f = Field::new(hint, cx);
+            f.label = Some(label.into());
+            f.set_text(text);
             // A stop in the window's Tab order, which the sheet's trap goes round.
             f.focus = f.focus.clone().tab_stop(true);
             f
@@ -540,22 +569,31 @@ impl Desk {
         };
         let agent = editing.map_or_else(
             || {
-                self.offers
+                self.agent_names
                     .first()
-                    .map_or_else(|| "claude".to_string(), |(name, _)| name.clone())
+                    .cloned()
+                    .unwrap_or_else(|| "claude".to_string())
             },
             |s| s.agent.clone(),
         );
         let first_timing = (preset, time.clone(), cron.clone());
-        let name = self.field("nightly-tests", editing.map_or("", |s| s.name.as_str()), cx);
-        let time = self.field("09:00", &time, cx);
-        let cron = self.field("0 2 * * 1-5, or the command to check", &cron, cx);
+        // Hints say what goes in, never a value that reads as filled (C-8).
+        let name = self.field(
+            "Name",
+            "Schedule name",
+            editing.map_or("", |s| s.name.as_str()),
+            cx,
+        );
+        let time = self.field("Time", "09:00", &time, cx);
+        let cron = self.field("Cron", "0 2 * * 1-5, or the command to check", &cron, cx);
         let folder = self.field(
-            "~/code/acme-web",
+            "Folder",
+            "Folder the agent runs in",
             editing.map_or("", |s| s.cwd.as_str()),
             cx,
         );
         let prompt = self.field(
+            "Prompt",
             "What the agent does each run",
             editing.map_or("", |s| s.prompt.as_str()),
             cx,
@@ -906,7 +944,7 @@ impl Desk {
                 let on = this_day == day;
                 let count = match (d.runs, d.coming) {
                     (0, 0) => String::new(),
-                    (0, n) => format!("{n} next"),
+                    (0, n) => format!("{n} coming"),
                     (n, _) => state::count(n, "run"),
                 };
                 let label = format!(
@@ -1129,7 +1167,9 @@ impl Desk {
                             .child(state::day_long(day)),
                     )
                     .child(div().text_color(c(t.t2)).child(match (here.len(), failed) {
-                        (0, _) if day >= today => format!("{} next", next.len()),
+                        (0, _) if day >= today => {
+                            format!("{} coming", state::count(next.len(), "run"))
+                        }
                         (n, 0) => state::count(n, "run"),
                         (n, f) => format!("{}, {f} failed", state::count(n, "run")),
                     })),
@@ -1138,7 +1178,7 @@ impl Desk {
                 let (kind, words) = self.run_words(r);
                 let schedule = r.schedule;
                 let run = r.clone();
-                let on = open == Some((schedule, r.id));
+                let on = open == Some((schedule, Some(r.id)));
                 let failed = state::run_failed(r);
                 ui::control(
                     ("run", r.id as u64),
@@ -1263,36 +1303,46 @@ impl Desk {
                     .px(px(8.))
                     .py(px(6.))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .font_family(MONO_FONT)
-                                            .text_size(px(12.5))
-                                            .child(s.name.clone()),
+                        // The row opens the schedule, run or not: its newest report, else
+                        // what it is and when it runs, with Edit, Pause and Run now.
+                        ui::control(
+                            ("schedule-row", schedule as u64),
+                            Role::Button,
+                            format!("{}, {}, open it", s.name, s.when),
+                            t,
+                        )
+                        .debug_selector(move || format!("schedule-row-{schedule}"))
+                        .rounded(px(6.))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .hover(|st| ui::paint(st, t.hover()))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.open_schedule(schedule, cx)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .font_family(MONO_FONT)
+                                        .text_size(px(12.5))
+                                        .child(s.name.clone()),
+                                )
+                                .when_some(s.space.clone(), |d, space| {
+                                    d.child(
+                                        div().text_size(px(12.)).text_color(c(t.t2)).child(space),
                                     )
-                                    .when_some(s.space.clone(), |d, space| {
-                                        d.child(
-                                            div()
-                                                .text_size(px(12.))
-                                                .text_color(c(t.t2))
-                                                .child(space),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(c(t.t2))
-                                    .child(format!("{}, {}", s.when, s.agent)),
-                            ),
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(c(t.t2))
+                                .child(format!("{}, {}", s.when, s.agent)),
+                        ),
                     )
                     .child(div().text_size(px(11.5)).text_color(c(t.t2)).child(next))
                     .child(
@@ -1326,6 +1376,9 @@ impl Desk {
         };
         let Some(s) = self.shown_schedules().iter().find(|s| s.id == schedule) else {
             return div().into_any_element();
+        };
+        let Some(run_id) = run_id else {
+            return self.unrun_report(s, runs, t, cx);
         };
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
             return div().into_any_element();
@@ -1370,14 +1423,20 @@ impl Desk {
                     d.child(div().font_weight(FontWeight::NORMAL).child(n))
                 })
         };
+        // Earlier than the one open, as the heading says, newest first (C-1).
         let mut earlier: Vec<&ScheduleRun> = runs
             .iter()
-            .filter(|r| r.schedule == schedule && r.id != run_id)
+            .filter(|r| r.schedule == schedule && r.id != run_id && r.started_at < run.started_at)
             .collect();
         earlier.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-        let paused = s.paused;
-        let can_run = self.can_run(schedule, runs);
-        let edited = s.clone();
+        // A run with no message yet, in what it is doing (C-7).
+        let still = if kind.is_some_and(|k| k.needs_you()) {
+            "It is waiting on you."
+        } else if tab.is_some() {
+            "It has not finished. Its terminal is open."
+        } else {
+            "It has not finished."
+        };
         div()
             .p(px(16.))
             .rounded(px(14.))
@@ -1463,7 +1522,7 @@ impl Desk {
             .child(section("Summary", Some("its last message")))
             .child(div().text_size(px(13.)).text_color(c(t.t1)).child(
                 run.summary.clone().unwrap_or_else(|| match run.ended_at {
-                    None => "It is still running.".into(),
+                    None => still.into(),
                     Some(_) => "It left no message.".into(),
                 }),
             ))
@@ -1559,15 +1618,106 @@ impl Desk {
                                     .text_ellipsis()
                                     .child(line),
                             )
-                            .child(
-                                ui::link_button(("earlier", r.id as u64), "Report", t).on_click(
-                                    cx.listener(move |this, _, _, cx| {
+                            .child({
+                                let id = r.id;
+                                ui::link_button(("earlier", id as u64), "Report", t)
+                                    .debug_selector(move || format!("earlier-{id}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_run(schedule, &run, cx)
-                                    }),
-                                ),
-                            )
+                                    }))
+                            })
                     }))
             })
+            .child(self.report_footer(s, runs, t, cx))
+            .into_any_element()
+    }
+
+    /// A schedule that has not run yet, opened from All schedules: what it is and when it
+    /// runs, with the same Edit, Pause and Run now as a run's report.
+    fn unrun_report(
+        &self,
+        s: &ScheduleInfo,
+        runs: &[ScheduleRun],
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let kv = |key: &str, value: String| {
+            div()
+                .flex()
+                .gap(px(5.))
+                .text_size(px(12.5))
+                .child(div().text_color(c(t.t2)).child(key.to_string()))
+                .child(value)
+        };
+        let when = match (s.paused, s.next_at) {
+            (true, _) => "Not run yet. It is paused.".to_string(),
+            (false, Some(at)) => format!(
+                "Not run yet. Runs at {}.",
+                state::clock_at(at, self.now, self.zone)
+            ),
+            (false, None) => "Not run yet.".to_string(),
+        };
+        div()
+            .id("unrun-report")
+            .debug_selector(|| "unrun-report".into())
+            .p(px(16.))
+            .rounded(px(14.))
+            .bg(c(t.card))
+            .border_1()
+            .border_color(ca(t.hair))
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .font_family(MONO_FONT)
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(s.name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(14.))
+                    .child(kv("agent", s.agent.clone()))
+                    .when_some(s.space.clone(), |d, space| d.child(kv("space", space)))
+                    .child(kv("folder", state::tilde(&s.cwd)))
+                    .child(kv(
+                        if s.cron.is_some() { "cron" } else { "when" },
+                        s.cron.clone().unwrap_or_else(|| s.when.clone()),
+                    )),
+            )
+            .child(
+                div()
+                    .id("unrun-when")
+                    .role(Role::Status)
+                    .aria_label(when.clone())
+                    .text_size(px(13.))
+                    .text_color(c(t.t1))
+                    .child(when),
+            )
+            .child(self.report_footer(s, runs, t, cx))
+            .into_any_element()
+    }
+
+    /// Edit, Pause and Run now under a report, what the last press said, and why Run now is
+    /// off while it is.
+    fn report_footer(
+        &self,
+        s: &ScheduleInfo,
+        runs: &[ScheduleRun],
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let schedule = s.id;
+        let paused = s.paused;
+        let can_run = self.can_run(schedule, runs);
+        let edited = s.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
             .child(
                 div()
                     .flex()
@@ -1615,6 +1765,10 @@ impl Desk {
                         .child("Run now"),
                     }),
             )
+            // Off says why where it is seen, not only to a screen reader (STATE-30).
+            .when(!can_run, |d| {
+                d.child(quiet(&write_refusal("still_running", ""), t))
+            })
             .when_some(
                 self.schedule_page.said.get(&schedule).cloned(),
                 |d, said| {
@@ -1630,7 +1784,6 @@ impl Desk {
                 },
             )
             .child(quiet("A missed run is caught up once, within 7 days.", t))
-            .into_any_element()
     }
 
     fn report_task(&self, strip: &state::Strip, t: &Theme) -> impl IntoElement {
@@ -1685,7 +1838,16 @@ impl Desk {
         };
         let first = match self.sheet_timing(sheet, cx) {
             Ok(timing) => match qoop_tui::schedules::first_run(&timing, self.now, self.zone) {
-                Some(at) => format!("First run: {}", state::clock_at(at, self.now, self.zone)),
+                // A schedule that ran already runs next, not first (C-9).
+                Some(at) => format!(
+                    "{}: {}",
+                    if sheet.editing.is_some() {
+                        "Next run"
+                    } else {
+                        "First run"
+                    },
+                    state::clock_at(at, self.now, self.zone)
+                ),
                 None => "A watch: its first check notes what is there, then new lines start a run."
                     .to_string(),
             },
@@ -1798,32 +1960,35 @@ impl Desk {
                             .text_color(c(t.t2))
                             .child("Agent"),
                     )
-                    .child(
-                        ui::pill("sheet-agent", &format!("Agent, {agent}"), t)
-                            .h(px(28.))
-                            .child(agent.clone())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                // A scheduled run starts with its prompt, so only agents that take one.
-                                let mut names: Vec<String> = this
-                                    .offers
-                                    .iter()
-                                    .filter(|(_, command)| state::takes_prompt(command))
-                                    .map(|(name, _)| name.clone())
-                                    .collect();
-                                if let Some(s) = this.schedule_page.sheet.as_mut() {
-                                    if let Some(own) = s.original.as_ref().map(|o| o.agent.clone())
-                                        && !names.contains(&own)
-                                    {
-                                        names.push(own);
-                                    }
-                                    let at = names.iter().position(|n| *n == s.agent).unwrap_or(0);
-                                    if let Some(next) = names.get((at + 1) % names.len().max(1)) {
-                                        s.agent = next.clone();
-                                    }
-                                }
-                                cx.notify();
-                            })),
-                    ),
+                    .child({
+                        // The agents a scheduled run can start, as the TUI's form lists them
+                        // (one list for every place that picks an agent), and this schedule's
+                        // own when it is none of them; shown, not cycled (C-16).
+                        let mut names = self.agent_names.clone();
+                        if let Some(own) = sheet.original.as_ref().map(|o| o.agent.clone())
+                            && !names.contains(&own)
+                        {
+                            names.push(own);
+                        }
+                        div()
+                            .id("sheet-agents")
+                            .role(Role::RadioGroup)
+                            .aria_label("Agent")
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(4.))
+                            .children(names.into_iter().enumerate().map(|(n, name)| {
+                                let on = name == agent;
+                                ui::chip(("sheet-agent", n as u64), &name, None, None, on, t)
+                                    .debug_selector(move || format!("sheet-agent-{n}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(s) = this.schedule_page.sheet.as_mut() {
+                                            s.agent = name.clone();
+                                        }
+                                        cx.notify();
+                                    }))
+                            }))
+                    }),
             )
             .child(row("Folder", &sheet.folder))
             .child(row("Prompt", &sheet.prompt))

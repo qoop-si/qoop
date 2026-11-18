@@ -241,10 +241,11 @@ impl Theme {
     }
 
     /// A control that cannot be used now (Start with nothing to start, Run now while a run
-    /// works). Its label still reads at 4.5:1: no opacity over it.
+    /// works). Its label still reads at 4.5:1: no opacity over it. No fill, so it differs from
+    /// a live control by more than its text tone; a pill draws a hairline edge instead.
     pub fn off(&self) -> Pair {
         Pair {
-            fill: self.fill,
+            fill: 0,
             text: self.t2,
         }
     }
