@@ -7612,7 +7612,10 @@ fn spawn_task_terminals(
         // task write passes.
         let mut held: BTreeMap<u32, crate::control::TaskRef> = BTreeMap::new();
         loop {
-            match store.run(|s| Ok((s.open_tasks()?, s.linked_steps()?))).await {
+            match store
+                .run(|s| Ok((s.open_tasks()?, s.linked_steps()?)))
+                .await
+            {
                 Ok((open, steps)) => {
                     let now = crate::tasks::refs(open, &steps);
                     agents.set_task_terminals(now.keys().copied().collect());

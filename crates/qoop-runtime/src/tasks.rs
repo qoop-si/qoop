@@ -1022,7 +1022,7 @@ pub(crate) async fn read(
 /// and its steps done and all (`Store::linked_steps`), read with `open`.
 pub(crate) fn refs(
     open: Vec<TaskRow>,
-    steps: &BTreeMap<i64, (i64, usize, usize)>,
+    steps: &BTreeMap<i64, (i64, u32, u32)>,
 ) -> BTreeMap<u32, TaskRef> {
     open.into_iter()
         .filter_map(|t| {
@@ -1065,7 +1065,8 @@ mod tests {
         s.check_step(item, 1, true, 3).unwrap();
         s.check_step(item, 2, true, 3).unwrap();
         s.link_task(linked, item, 4).unwrap();
-        let read = |s: &qoop_store::Store| refs(s.open_tasks().unwrap(), &s.linked_steps().unwrap());
+        let read =
+            |s: &qoop_store::Store| refs(s.open_tasks().unwrap(), &s.linked_steps().unwrap());
 
         let now = read(&s);
         let task = &now[&1];
@@ -1076,7 +1077,7 @@ mod tests {
         let shown = s.item_row(item, 5).unwrap();
         assert_eq!(
             (task.steps_done, task.steps_total),
-            (shown.steps_done, shown.steps_total),
+            (shown.steps_done as u32, shown.steps_total as u32),
             "the numbers qoop task show prints"
         );
         let bare = &now[&2];
