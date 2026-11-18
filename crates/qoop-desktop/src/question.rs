@@ -53,6 +53,16 @@ impl Desk {
             .map_or_else(|| "This Mac".to_string(), state::machine_name)
     }
 
+    /// Why `row`'s answers are closed while its machine is not reached: this Mac's daemon, or
+    /// the link to the machine it runs on.
+    pub(crate) fn stale_reason(&self, row: &AgentRow) -> String {
+        if state::machine_of(row.workspace) == 0 {
+            state::stale_reason(None)
+        } else {
+            state::stale_reason(Some(&self.machine_of_row(row)))
+        }
+    }
+
     /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. A remote
     /// agent's qass is asked; its refusal says so.
     pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
@@ -514,8 +524,8 @@ impl Desk {
     ) -> AnyElement {
         let row = self.model.row(terminal);
         let stale = row
-            .and_then(|r| self.as_of(r.workspace))
-            .map(|_| state::STALE_REASON.to_string());
+            .filter(|r| self.as_of(r.workspace).is_some())
+            .map(|r| self.stale_reason(r));
         let reason = stale.or_else(|| match (&offer.pick, row) {
             (Pick::Qass, Some(r)) => self.qass_reason(r),
             (Pick::Text { .. }, Some(r)) if !self.takes_words(r) => Some(state::refusal_words(
@@ -817,7 +827,7 @@ impl Desk {
                         Role::Link,
                         format!(
                             "Something else? Type your own answer, unavailable: {}",
-                            state::STALE_REASON
+                            self.stale_reason(row)
                         ),
                         t,
                     )

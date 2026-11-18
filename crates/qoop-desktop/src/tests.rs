@@ -1010,6 +1010,19 @@ fn the_question_card_holds_a_digit_and_sends_it(cx: &mut TestAppContext) {
     );
 }
 
+/// A closed answer says what it waits for: this Mac's daemon for a local agent, the link for a
+/// remote one, by the machine's name.
+#[gpui::test]
+fn a_stale_answer_says_what_it_waits_for(cx: &mut TestAppContext) {
+    let (desk, vcx, _rx) = open(cx);
+    let (local, remote) = desk.read_with(&vcx, |d, _| {
+        let reason = |terminal: u32| d.stale_reason(d.model.row(terminal).expect("the row"));
+        (reason(2), reason(0x8100_0001))
+    });
+    assert_eq!(local, "Answering opens again when the daemon is back");
+    assert_eq!(remote, "Answering opens again when staging is reached");
+}
+
 /// A question from a machine not reached is the last one seen: neutral, with when it was seen,
 /// and its own answer field cannot be opened.
 #[gpui::test]
