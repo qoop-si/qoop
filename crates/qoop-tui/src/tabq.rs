@@ -146,11 +146,15 @@ impl TaskRead {
     }
 }
 
-/// What a read of the task is kept by: the task, its stage and its step counts. Any of them
-/// moving reads it again.
-pub fn read_key(task: &TaskRef) -> (i64, String, u32, u32) {
+/// What a read of the task is kept by: the task, the item it is on, its stage and its step
+/// counts. Any of them moving reads it again.
+pub type ReadKey = (i64, Option<i64>, String, u32, u32);
+
+/// The [`ReadKey`] of `task`.
+pub fn read_key(task: &TaskRef) -> ReadKey {
     (
         task.id,
+        task.item,
         task.stage.clone(),
         task.steps_done,
         task.steps_total,
@@ -187,6 +191,11 @@ pub(crate) fn task_rows(
             head = format!("{head} \u{b7} {count}");
         }
         let opens = " s opens";
+        // Narrow, the rule gives way so the key that opens it stays in sight.
+        if 3 + width::width(&head) + 2 + opens.len() > cw {
+            let row = cut(&format!("{head} \u{b7}{opens}"), cw);
+            return vec![blank_row(), vec![seg(Role::FaintText, row)]];
+        }
         let mut row = rule(&head, cw.saturating_sub(opens.len()));
         row.push(seg(Role::FaintText, opens));
         return vec![blank_row(), row];
@@ -282,7 +291,8 @@ fn wrap(text: &str, cols: usize, max: usize) -> Vec<String> {
 }
 
 /// The unfolded pane's rows and where a click lands: the questions of the tab's agent, titled
-/// `questions · <agent>  ⠔ N`, its task under them. The paint and a click read the same view.
+/// `questions · <agent>  ⠔ N`, its task under them. The paint and a click read the same view;
+/// with it, whether the task part is shown whole (`s` flips that).
 pub fn pane_view(
     paint: &Paint,
     open: &Open,
@@ -290,7 +300,7 @@ pub fn pane_view(
     spaces: &[qoop_runtime::control::WorkspaceRow],
     now: i64,
     fade: bool,
-) -> crate::asks::View {
+) -> (crate::asks::View, bool) {
     let agent = rows.iter().find(|r| r.terminal == paint.terminal);
     let name = agent.map(crate::sidebar::session_name).unwrap_or_default();
     let task = agent.and_then(|r| r.task.as_ref());
@@ -303,31 +313,45 @@ pub fn pane_view(
     } else {
         "nothing waits on you here"
     };
-    // The task folds to its line when an opened card needs the rows, unless `s` said otherwise.
-    let folded = open
-        .task_open
-        .map_or(open.asks.is_open() && open.rect.rows < 40, |shown| !shown);
-    let under = task_rows(
-        task,
-        open.read,
-        open.rect.cols.saturating_sub(4),
-        folded,
-        now,
-    );
-    let ctx = crate::asks::Ctx {
-        rows,
-        spaces,
-        now_unix: now,
-        fade,
-        board_above: false,
-        tab: Some(crate::asks::InTab {
-            title: &title,
-            empty,
-            under: &under,
-            focus: open.focus,
-        }),
+    let under = |folded| {
+        task_rows(
+            task,
+            open.read,
+            open.rect.cols.saturating_sub(4),
+            folded,
+            now,
+        )
     };
-    crate::asks::view(open.asks, &ctx, open.rect.cols, open.rect.rows)
+    let view = |under: &[Vec<crate::qass_screen::Seg>]| {
+        let ctx = crate::asks::Ctx {
+            rows,
+            spaces,
+            now_unix: now,
+            fade,
+            board_above: false,
+            tab: Some(crate::asks::InTab {
+                title: &title,
+                empty,
+                under,
+                focus: open.focus,
+            }),
+        };
+        crate::asks::view(open.asks, &ctx, open.rect.cols, open.rect.rows)
+    };
+    let (line, mut whole) = (under(true), under(false));
+    // Whole when `s` said so, else when it fits in the rows the cards leave with it folded:
+    // measured, so an opened card never gives up its rows to the task.
+    let short = view(&line);
+    let fits = whole.len() <= line.len() + short.spare;
+    match (open.task_open.unwrap_or(fits), fits) {
+        // Opened by hand where it does not fit: half the rows at most, the cards keep the rest.
+        (true, false) => {
+            whole.truncate(line.len().max(open.rect.rows.saturating_sub(2) / 2));
+            (view(&whole), true)
+        }
+        (true, _) => (view(&whole), true),
+        (false, _) => (short, false),
+    }
 }
 
 /// The cards `terminal`'s agent waits on: open, not handed to qass or answered. What the rail

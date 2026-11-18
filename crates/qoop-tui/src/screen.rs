@@ -1416,7 +1416,7 @@ pub fn paint(frame: &Frame) -> String {
         });
     let tab_pane = frame.chrome.tab_rail.and_then(|rail| {
         let open = rail.open?;
-        let view = crate::tabq::pane_view(
+        let (view, _) = crate::tabq::pane_view(
             &rail,
             &open,
             frame.rows,

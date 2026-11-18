@@ -1256,14 +1256,15 @@ struct State {
     /// The agent terminal whose tab has its questions rail unfolded to the pane (`ctrl-a T`, a
     /// click on the rail): the one state the rail's width follows (`crate::tabq`).
     tabq: Option<u32>,
-    /// The keyboard is in that pane.
-    tabq_focus: bool,
+    /// The keyboard is in that pane, given while this leaf had the focus: the focus moving to
+    /// another leaf (a shell beside the agent) takes it back.
+    tabq_focus: Option<u32>,
     /// `s` folded or opened the pane's task part by hand.
     tabq_task: Option<bool>,
-    /// The pane's task read, by what it was read for ([`crate::tabq::read_key`]), and the key
-    /// of a read on its way.
-    tabq_read: Option<((i64, String, u32, u32), crate::tabq::TaskRead)>,
-    tabq_asked: Option<(i64, String, u32, u32)>,
+    /// The pane's task read, by what it was read for ([`crate::tabq::read_key`]), and the
+    /// request id and key of a read on its way: an answer under another id is an old one.
+    tabq_read: Option<(crate::tabq::ReadKey, crate::tabq::TaskRead)>,
+    tabq_asked: Option<(String, crate::tabq::ReadKey)>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -3567,10 +3568,12 @@ impl State {
             .filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))
             .map(|r| r.terminal)
             .collect();
-        let terminal = agents
-            .iter()
-            .copied()
-            .find(|t| *t == tree.focus)
+        // The agent whose pane is unfolded keeps the rail while it is in the tab, so a move of
+        // the keyboard to another agent never folds the pane nor resizes the tiles.
+        let terminal = self
+            .tabq
+            .filter(|t| agents.contains(t))
+            .or_else(|| agents.iter().copied().find(|t| *t == tree.focus))
             .or_else(|| agents.first().copied())?;
         let wide = crate::tabq::Rail {
             terminal,
@@ -3641,7 +3644,7 @@ impl State {
                 rect: framed(cells),
                 over,
                 asks: &self.asks,
-                focus: self.tabq_focus,
+                focus: self.tabq_focus == Some(self.focused),
                 read: self
                     .tabq_read
                     .as_ref()
@@ -3674,7 +3677,7 @@ impl State {
             self.tabq_fold();
         } else {
             self.tabq = Some(terminal);
-            self.tabq_focus = true;
+            self.tabq_focus = Some(self.focused);
             self.tabq_task = None;
             self.asks.set_scope(Some(terminal));
         }
@@ -3697,7 +3700,7 @@ impl State {
         if let Some(open) = rail.open
             && inside(open.rect)
         {
-            let view = crate::tabq::pane_view(
+            let (view, _) = crate::tabq::pane_view(
                 &rail,
                 &open,
                 &self.rows,
@@ -3706,7 +3709,7 @@ impl State {
                 false,
             );
             let hit = crate::asks::hit_at(&view, open.rect, y?, x?);
-            self.tabq_focus = true;
+            self.tabq_focus = Some(self.focused);
             if let Some(hit) = hit {
                 self.asks.click(hit);
             }
@@ -3716,14 +3719,14 @@ impl State {
             self.tabq_toggle();
             return Some(true);
         }
-        self.tabq_focus = false;
+        self.tabq_focus = None;
         None
     }
 
     /// Fold the pane to its rail; the keyboard goes back to the agent.
     fn tabq_fold(&mut self) {
         self.tabq = None;
-        self.tabq_focus = false;
+        self.tabq_focus = None;
         self.asks.set_scope(None);
     }
 
@@ -3732,28 +3735,52 @@ impl State {
         self.tab_rail_paint().and_then(|rail| rail.open)
     }
 
+    /// Whether the open pane shows its task part whole, as it is drawn now.
+    fn tabq_task_shown(&self) -> bool {
+        self.tab_rail_paint().is_some_and(|rail| {
+            rail.open.is_some_and(|open| {
+                crate::tabq::pane_view(
+                    &rail,
+                    &open,
+                    &self.rows,
+                    &self.spaces,
+                    sidebar::now_unix(),
+                    false,
+                )
+                .1
+            })
+        })
+    }
+
     /// Whether the keyboard is in the open pane of the agent tab on screen.
     fn tabq_focused(&self) -> bool {
-        self.tabq_focus && self.tabq_open().is_some()
+        self.tabq_focus == Some(self.focused) && self.tabq_open().is_some()
     }
 
     /// The pane stands in the tab it is open on: the cards it reaches are that agent's while it
-    /// is on screen, and every card's on qass's screen; off screen it has no keyboard.
-    fn tabq_settle(&mut self) {
+    /// is on screen, and every card's on qass's screen; off screen, or once the focus moved to
+    /// another leaf, it has no keyboard. True when that changed what is drawn.
+    fn tabq_settle(&mut self) -> bool {
         let shown = self
             .tab_rail_paint()
             .filter(|rail| rail.open.is_some())
             .map(|rail| rail.terminal);
+        let moved = self.asks.scope != shown;
         self.asks.set_scope(shown);
-        if shown.is_none() {
-            self.tabq_focus = false;
-        }
+        let focus = self
+            .tabq_focus
+            .filter(|leaf| shown.is_some() && *leaf == self.focused);
+        let lost = focus != self.tabq_focus;
+        self.tabq_focus = focus;
+        moved || lost
     }
 
-    /// The task read the open pane wants and has not asked for: by the item's id when the task
-    /// is on one, else the task's own (its evidence).
+    /// The task read the open pane wants and has not asked for: the terminal's own read, which
+    /// carries its open task's events and the card of the item it is on (the steps), and never
+    /// takes the task's id for an item's. Its id names the key it is for.
     fn tabq_read_request(&mut self) -> Option<ControlRequest> {
         let rail = self.tab_rail_paint().filter(|rail| rail.open.is_some())?;
+        let terminal = rail.terminal;
         let task = self
             .rows
             .iter()
@@ -3761,27 +3788,41 @@ impl State {
             .and_then(|r| r.task.clone())?;
         let key = crate::tabq::read_key(&task);
         if self.tabq_read.as_ref().is_some_and(|(k, _)| *k == key)
-            || self.tabq_asked.as_ref() == Some(&key)
+            || self.tabq_asked.as_ref().is_some_and(|(_, k)| *k == key)
         {
             return None;
         }
-        self.tabq_asked = Some(key);
+        let id = format!(
+            "{TABQ_READ}-{}-{}-{}-{}-{}",
+            key.0,
+            key.1.unwrap_or(0),
+            key.2,
+            key.3,
+            key.4
+        );
+        self.tabq_asked = Some((id.clone(), key));
         Some(ControlRequest::TaskRead {
-            id: TABQ_READ.to_string(),
+            id,
             board: false,
-            task: Some(task.item.unwrap_or(task.id)),
-            terminal: None,
+            task: None,
+            terminal: Some(terminal),
             token: None,
             before: None,
         })
     }
 
-    /// The answer to the pane's task read, kept by what it was asked for.
+    /// The answer to the pane's task read, kept by what it was asked for; an older read's
+    /// answer is dropped.
     fn tabq_answered(&mut self, response: &ControlResponse) -> bool {
-        if response.request_id() != TABQ_READ {
+        let id = response.request_id();
+        if !id.starts_with(TABQ_READ) {
             return false;
         }
-        let Some(key) = self.tabq_asked.take() else {
+        let Some(key) = self
+            .tabq_asked
+            .take_if(|(asked, _)| asked.as_str() == id)
+            .map(|(_, key)| key)
+        else {
             return true;
         };
         // A failed read is kept empty, so it is not asked again until the task moves.
@@ -8615,7 +8656,7 @@ where
         drawer: None,
         list_scroll: None,
         tabq: None,
-        tabq_focus: false,
+        tabq_focus: None,
         tabq_task: None,
         tabq_read: None,
         tabq_asked: None,
@@ -9063,6 +9104,14 @@ where
             if !state.in_qass() {
                 state.last.keep(state.focused);
             }
+            // The questions pane of the tab on screen, settled before the paint, so the frame and a
+            // click read the cards it stands over.
+            if state.tabq_settle() {
+                dirty = true;
+            }
+            if let Some(read) = state.tabq_read_request() {
+                wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
+            }
             if dirty && presented.elapsed() >= FRAME {
                 // Once per change and at most once a frame, so fast switching is told once; with
                 // the cells a tab is laid out in, which plugin layouts are drawn in.
@@ -9300,7 +9349,6 @@ where
             {
                 wr.write_all(&resize).await?;
             }
-            state.tabq_settle();
             if state.pending_focus.is_some() {
                 drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
             }
@@ -11745,6 +11793,8 @@ where
                                 if matches!(message, Incoming::Event(EventMessage::Resync)) {
                                     state.asks.stale = true;
                                     state.clock.stale = true;
+                                    // A task read lost with the link is asked again.
+                                    state.tabq_asked = None;
                                 }
                                 // What changed is not in the message on purpose, so the
                                 // answer comes from the one place that has it. A resync
@@ -12000,9 +12050,6 @@ where
                     // The inbox, when something said it moved: a card, or the terminal of one.
                     state.asks.note_gone(&state.rows, &state.spaces);
                     if let Some(read) = state.asks.read_request() {
-                        wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
-                    }
-                    if let Some(read) = state.tabq_read_request() {
                         wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
                     }
                     if let Some(read) = state.clock.read_request() {
@@ -14597,11 +14644,7 @@ fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     if !state.asks.typing() {
         match bytes {
             b"s" => {
-                let shown = state.tabq_open().is_some_and(|open| {
-                    open.task_open
-                        .unwrap_or(!(open.asks.is_open() && open.rect.rows < 40))
-                });
-                state.tabq_task = Some(!shown);
+                state.tabq_task = Some(!state.tabq_task_shown());
                 return taken;
             }
             b"q" => {
@@ -14614,7 +14657,7 @@ fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
                 if state.tabq_open().is_some_and(|open| open.over) {
                     state.tabq_fold();
                 } else {
-                    state.tabq_focus = false;
+                    state.tabq_focus = None;
                 }
                 taken.jump = agent;
                 return taken;
@@ -14629,7 +14672,7 @@ fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
             taken.jump = agent;
         }
         Out::Jump(_) => {
-            state.tabq_focus = false;
+            state.tabq_focus = None;
             taken.jump = agent;
         }
         Out::Pass(bytes) => taken.feed = Some(bytes),
@@ -18596,7 +18639,7 @@ mod tests {
             drawer: None,
             list_scroll: None,
             tabq: None,
-            tabq_focus: false,
+            tabq_focus: None,
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
@@ -20148,7 +20191,7 @@ mod tests {
             drawer: None,
             list_scroll: None,
             tabq: None,
-            tabq_focus: false,
+            tabq_focus: None,
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
@@ -20176,7 +20219,7 @@ mod tests {
             drawer: None,
             list_scroll: None,
             tabq: None,
-            tabq_focus: false,
+            tabq_focus: None,
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
@@ -31326,40 +31369,54 @@ mod tests {
         );
     }
 
-    /// The task part reads the item once per task, stage and count: its steps ticked, the
-    /// first undone `now`, and the newest evidence.
+    /// The terminal's task read as the daemon answers it: the item's card with `steps` plan
+    /// steps (the first two done, its activity cleared as a terminal's read has it) when
+    /// `item`, and the task's own events with one evidence.
+    fn task_read_answer(id: &str, steps: u32, item: bool) -> ControlResponse {
+        let steps: Vec<_> = (1..=steps)
+            .map(|n| {
+                let text = match n {
+                    3 => "runs on staging".to_string(),
+                    _ => format!("step number {n}"),
+                };
+                match n {
+                    1 | 2 => serde_json::json!({"n": n, "text": text, "done_at": n}),
+                    _ => serde_json::json!({"n": n, "text": text}),
+                }
+            })
+            .collect();
+        let card = item.then(|| {
+            serde_json::json!({
+                "id": 3, "key": "APP-1", "title": "t", "state": "doing",
+                "steps_done": 2, "steps_total": steps.len(), "agents": [], "updated_at": 0,
+                "description": "", "steps": steps, "activity": []
+            })
+        });
+        serde_json::from_value(serde_json::json!({
+            "op": "Tasks", "id": id, "tasks": [],
+            "events": [{"id": 1, "at": 5, "kind": "evidence", "body": "cargo test: ok"}],
+            "item": card,
+        }))
+        .expect("a tasks answer")
+    }
+
+    /// The task part is the terminal's own read, asked once per task, item, stage and count:
+    /// its item's steps ticked, the first undone `now`, and the task's newest evidence.
     #[test]
     fn the_pane_shows_the_task_read_from_its_item() {
-        use qoop_runtime::control::ControlResponse;
         let mut s = agent_tab(170, 46);
         assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead { task, id, .. }) = s.tabq_read_request() else {
+        let Some(ControlRequest::TaskRead {
+            task, terminal, id, ..
+        }) = s.tabq_read_request()
+        else {
             panic!("a read");
         };
-        assert_eq!(task, Some(3), "the item");
+        assert_eq!((task, terminal), (None, Some(1)), "the terminal's read");
         assert!(s.tabq_read_request().is_none(), "asked once");
-        let response: ControlResponse = serde_json::from_value(serde_json::json!({
-            "op": "Tasks", "id": id, "tasks": [],
-            "events": [],
-            "item": {
-                "id": 3, "key": "APP-1", "title": "t", "state": "doing",
-                "steps_done": 2, "steps_total": 4, "agents": [], "updated_at": 0,
-                "description": "",
-                "steps": [
-                    {"n": 1, "text": "described", "done_at": 1},
-                    {"n": 2, "text": "fed back", "done_at": 2},
-                    {"n": 3, "text": "runs on staging"},
-                    {"n": 4, "text": "handed over"}
-                ],
-                "activity": [
-                    {"task": 12, "at": 5, "kind": "evidence", "body": "cargo test: ok"}
-                ]
-            }
-        }))
-        .expect("a tasks answer");
-        assert!(s.tabq_answered(&response));
+        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
         let text = pane_text(&s);
-        assert!(text.contains("[x] 1. described"), "{text}");
+        assert!(text.contains("[x] 1. step number 1"), "{text}");
         assert!(text.contains("[ ] 3. runs on staging"), "{text}");
         assert!(text.contains("staging now"), "{text}");
         assert!(text.contains("cargo test: ok"), "{text}");
@@ -31371,9 +31428,164 @@ mod tests {
             "{folded}"
         );
         tabq_keys(&mut s, b"s", 0x01);
-        assert!(pane_text(&s).contains("[x] 1. described"));
+        assert!(pane_text(&s).contains("[x] 1. step number 1"));
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
         assert!(s.tabq_read_request().is_some(), "a tick reads it again");
+    }
+
+    /// A task on no item is read by its terminal, never with its own id taken for an item's:
+    /// it shows its goal and stage, no plan steps, and its own evidence.
+    #[test]
+    fn a_task_on_no_item_shows_no_steps_of_another() {
+        let mut s = agent_tab(170, 46);
+        s.rows[0].task.as_mut().unwrap().item = None;
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead {
+            task, terminal, id, ..
+        }) = s.tabq_read_request()
+        else {
+            panic!("a read");
+        };
+        assert_eq!((task, terminal), (None, Some(1)));
+        assert!(s.tabq_answered(&task_read_answer(&id, 0, false)));
+        let text = pane_text(&s);
+        assert!(text.contains("implementing"), "{text}");
+        assert!(!text.contains("[x]") && !text.contains("[ ]"), "{text}");
+        assert!(text.contains("cargo test: ok"), "{text}");
+    }
+
+    /// A read asked for one key and answered after the task moved on is dropped: only the
+    /// answer to the read for the key now is kept.
+    #[test]
+    fn an_old_task_read_never_lands_under_a_new_key() {
+        let mut s = agent_tab(170, 46);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id: old, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        s.rows[0].task.as_mut().unwrap().steps_done = 3;
+        let Some(ControlRequest::TaskRead { id: new, .. }) = s.tabq_read_request() else {
+            panic!("a read for the new key");
+        };
+        assert_ne!(old, new);
+        assert!(s.tabq_answered(&task_read_answer(&old, 4, true)));
+        assert!(s.tabq_read.is_none(), "the old answer dropped");
+        assert!(s.tabq_answered(&task_read_answer(&new, 4, true)));
+        let key = crate::tabq::read_key(s.rows[0].task.as_ref().unwrap());
+        assert_eq!(s.tabq_read.as_ref().map(|(k, _)| k), Some(&key));
+    }
+
+    /// The task part never takes the cards' rows or the key line: at 80 by 24 a plan of twelve
+    /// steps leaves the open card and the keys in sight, and at 170 by 46 it folds to its line
+    /// when the opened card needs the rows, stands whole when they fit.
+    #[test]
+    fn the_task_part_leaves_the_cards_and_the_keys_their_rows() {
+        for (cols, lines) in [(80u16, 24u16), (170, 46)] {
+            let mut s = agent_tab(cols, lines);
+            tab_cards(&mut s, 2);
+            assert!(fold_key(&mut s));
+            tabq_keys(&mut s, b"\r", 0x01);
+            let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+                panic!("a read");
+            };
+            assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
+            let text = pane_text(&s);
+            assert!(text.contains("pick a"), "{cols}x{lines}: {text}");
+            assert!(
+                text.contains("1-9 answer"),
+                "the key line, {cols}x{lines}: {text}"
+            );
+            assert!(text.contains("s opens"), "folded, {cols}x{lines}: {text}");
+            assert_eq!(
+                s.tabq_open().map(|o| o.rect.rows),
+                Some(
+                    crate::tabq::pane_view(
+                        &s.tab_rail_paint().unwrap(),
+                        &s.tabq_open().unwrap(),
+                        &s.rows,
+                        &s.spaces,
+                        0,
+                        false
+                    )
+                    .0
+                    .rows
+                    .len()
+                ),
+                "every row drawn, the bottom edge too"
+            );
+        }
+        // Four steps and one card open fit at 170 by 46: the task stands whole.
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
+        let text = pane_text(&s);
+        assert!(text.contains("pick a") && text.contains("[x] 1."), "{text}");
+    }
+
+    /// The pane gives the keyboard back once the focus moves to another leaf of its tab: a
+    /// shell beside the agent gets its keys, and coming back to that leaf does not take them
+    /// again.
+    #[test]
+    fn the_pane_lets_go_of_the_keys_when_the_focus_moves() {
+        let mut s = shell_beside_agent();
+        assert!(fold_key(&mut s));
+        assert!(s.tabq_focused());
+        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (1, 1);
+        assert!(!s.tabq_focused(), "the keys follow the focus");
+        assert!(s.tabq_settle(), "drawn again");
+        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+        assert!(!s.tabq_focused() && s.tabq_open().is_some());
+    }
+
+    /// The scope follows the screen before it is painted: away from the tab it is gone and a
+    /// repaint is owed, once.
+    #[test]
+    fn the_scope_settles_with_the_screen() {
+        let mut s = agent_tab(170, 46);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        assert!(!s.tabq_settle(), "settled already");
+        // Another space, a shell in its tab: no rail there.
+        s.spaces.push(space(2, "other"));
+        let mut zsh = agent(5, 2, "zsh", "idle");
+        zsh.agent = false;
+        s.rows.push(zsh);
+        s.layouts.insert(2, Layout::single(5));
+        (s.space, s.focused) = (Some(2), 5);
+        assert!(s.tabq_settle());
+        assert!(s.asks.scope.is_none() && !s.tabq_focused());
+        assert!(!s.tabq_settle());
+        (s.space, s.focused) = (Some(1), 1);
+        assert!(s.tabq_settle());
+        assert_eq!(s.asks.scope, Some(1));
+    }
+
+    /// Two agents in one tab: the keyboard moving between them never resizes a tile, folded
+    /// or with the pane open; the open pane stays with its agent.
+    #[test]
+    fn a_focus_move_between_two_agents_resizes_nothing() {
+        let mut s = shell_beside_agent();
+        s.rows[1].agent = true;
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let mut to = |s: &mut State, t: u32| {
+            (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (t, t);
+            s.tabq_settle();
+            size_terminals(s, &mut seqs).unwrap()
+        };
+        assert!(to(&mut s, 1).is_none() && to(&mut s, 2).is_none(), "folded");
+        assert!(fold_key(&mut s));
+        let open = s.tab_rail_paint().unwrap().terminal;
+        assert_eq!(open, 2);
+        to(&mut s, 2);
+        assert!(to(&mut s, 1).is_none(), "open, to the other agent");
+        assert_eq!(s.tab_rail_paint().unwrap().terminal, open);
+        assert!(s.tabq_open().is_some() && !s.tabq_focused());
+        assert!(to(&mut s, 2).is_none(), "and back");
     }
 
     /// The rail never touches the left sidebar: its cells, characters and inks, are the same

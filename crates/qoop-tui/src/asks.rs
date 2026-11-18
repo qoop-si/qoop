@@ -889,6 +889,8 @@ pub struct View {
     pub targets: Vec<Target>,
     /// Where typing goes, relative to the inbox: its row and column, while the box has the keys.
     pub cursor: Option<(usize, usize)>,
+    /// Content rows left blank under the cards: what more the task part could take.
+    pub spare: usize,
 }
 
 pub(crate) fn age_short(secs: i64) -> String {
@@ -1477,8 +1479,23 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             rows: out,
             targets: Vec::new(),
             cursor: None,
+            spare: 0,
         };
     }
+
+    // In an agent's tab its task stands under the cards: its rows come off the cards' room, and
+    // never all of it, so a card and the key line always show (`crate::tabq` measures the rest).
+    let under: Vec<String> = ctx
+        .tab
+        .map(|tab| {
+            tab.under
+                .iter()
+                .take(inner_rows.saturating_sub(3))
+                .map(|segs| wrap(segs))
+                .collect()
+        })
+        .unwrap_or_default();
+    let inner_rows = inner_rows.saturating_sub(under.len());
 
     // The tabs, but in an agent's tab, whose title is on the top edge.
     if ctx.tab.is_none() {
@@ -1878,12 +1895,9 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
     } else if foot.is_empty() {
         foot.push(wrap(&bottom_line(pane, ctx.tab, cw, cut)));
     }
-    // In an agent's tab, its task under the cards and over the key line.
-    let under: Vec<String> = ctx
-        .tab
-        .map(|tab| tab.under.iter().map(|segs| wrap(segs)).collect())
-        .unwrap_or_default();
-    let content = inner_rows.saturating_sub(foot.len() + under.len());
+    let content = inner_rows.saturating_sub(foot.len());
+    // The rows the cards left blank.
+    let spare = (1 + content).saturating_sub(out.len());
     out.truncate(1 + content);
     while out.len() < 1 + content {
         out.push(blank());
@@ -1915,6 +1929,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         rows: out,
         targets,
         cursor: cursor.filter(|(r, _)| *r <= content),
+        spare,
     }
 }
 
