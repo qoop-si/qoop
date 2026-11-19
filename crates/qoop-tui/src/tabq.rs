@@ -81,8 +81,26 @@ pub struct Paint<'a> {
     pub open: Option<Open<'a>>,
 }
 
-/// The pane's columns beside the agent, the line it shares with the panes left out.
+/// The pane's columns beside the agent, the line it shares with the panes left out: the width
+/// it unfolds to until its edge is dragged or `<` `>` step it.
 pub const OPEN: usize = 52;
+/// The narrowest a dragged pane goes.
+pub const OPEN_MIN: usize = 40;
+/// The columns `<` and `>` take off or add.
+pub const OPEN_STEP: usize = 4;
+
+/// The unfolded pane's width in `tile`, whose folded rail is `folded` wide, from the width he
+/// chose: at least [`OPEN_MIN`], at most the agent's whole cells.
+pub fn open_width(tile: Rect, folded: usize, want: usize) -> usize {
+    let most = tile.cols.saturating_sub(folded + 1);
+    want.clamp(OPEN_MIN.min(most), most)
+}
+
+/// Whether a pane `w` wide stands beside the agent in `tile`: the agent keeps [`PANE_MIN`]
+/// columns. Else it opens over the agent's cells, which keep their size.
+pub fn beside(tile: Rect, w: usize) -> bool {
+    tile.cols >= w + 1 + PANE_MIN
+}
 
 /// The unfolded pane as a frame paints it: the cells it covers, frame lines included, the
 /// questions and the task read for it.

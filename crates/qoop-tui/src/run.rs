@@ -1268,6 +1268,9 @@ struct State {
     /// Where that agent stood when its pane unfolded ([`State::tab_home`]): the pane folds once
     /// the agent is gone or stands anywhere else.
     tabq_home: Option<TabHome>,
+    /// The unfolded pane's width as he dragged its edge or stepped it with `<` `>`, kept for the
+    /// session and never saved, like qass's rail; `None` for [`crate::tabq::OPEN`].
+    tabq_w: Option<usize>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -1517,6 +1520,8 @@ enum Grab {
     Questions,
     /// The edge line of qass's rail: its width, kept for the session and never saved.
     Rail,
+    /// The left frame line of an agent pane's unfolded questions pane: its width, the same.
+    Tabq,
 }
 
 #[derive(Default)]
@@ -2065,6 +2070,11 @@ impl State {
             return false;
         }
         let (x, y) = self.pane_cell(row, col);
+        // An agent pane's unfolded questions pane: its left edge drags its width.
+        if self.on_tabq_edge(x, y) {
+            self.modes.split_drag = Some(Grab::Tabq);
+            return true;
+        }
         // The rail's edge first, also with a pane folded (that is when there is one): it is
         // a line of its own, and a stacked tab's divider runs under it.
         let rail = self.on_rail_edge(x, y);
@@ -2132,6 +2142,7 @@ impl State {
             }
             Grab::Questions => self.questions_to(space, |layout| layout.gap_at(area, x)),
             Grab::Rail => self.rail_to(x),
+            Grab::Tabq => self.tabq_to(x),
         }
     }
 
@@ -3569,11 +3580,19 @@ impl State {
             return None;
         }
         let w = crate::tabq::width(tile)?;
-        let open = crate::tabq::OPEN;
-        if self.tabq == Some(terminal) && tile.cols >= open + 1 + crate::tabq::PANE_MIN {
-            return Some(crate::tabq::Rail { terminal, w: open });
+        if self.tabq == Some(terminal) {
+            let open = self.tabq_width(tile, w);
+            if crate::tabq::beside(tile, open) {
+                return Some(crate::tabq::Rail { terminal, w: open });
+            }
         }
         Some(crate::tabq::Rail { terminal, w })
+    }
+
+    /// The unfolded pane's width in `tile`, whose folded rail is `folded` wide: the one he
+    /// chose this session, else [`crate::tabq::OPEN`], as the tile allows.
+    fn tabq_width(&self, tile: layout::Rect, folded: usize) -> usize {
+        crate::tabq::open_width(tile, folded, self.tabq_w.unwrap_or(crate::tabq::OPEN))
     }
 
     /// Where `terminal` is drawn and sized in its tile `tile` of `tree`: the tile, less the rail
@@ -3637,9 +3656,21 @@ impl State {
             rows: r.rows + 2,
         };
         let open = (self.tabq == Some(rail.terminal)).then(|| {
-            let over = rail.w != crate::tabq::OPEN;
+            // Folded beside the pane, the rail kept its own width: the pane is over the agent,
+            // at its width against the rail.
+            let over = rail.w < crate::tabq::OPEN_MIN;
+            let cells = if over {
+                let w = self.tabq_width(tile, rail.w).min(term.cols);
+                layout::Rect {
+                    x: term.x + term.cols - w,
+                    cols: w,
+                    ..term
+                }
+            } else {
+                rect
+            };
             crate::tabq::Open {
-                rect: framed(if over { term } else { rect }),
+                rect: framed(cells),
                 over,
                 asks: &self.asks,
                 focus: self.tabq_focus == Some(self.focused),
@@ -3802,6 +3833,68 @@ impl State {
                     || (rail.open.is_none_or(|open| open.over) && inside_rect(rail.rect, x, y))
             })
             .map(|rail| rail.terminal)
+    }
+
+    /// Whether a pane cell is on the unfolded pane's left frame line, the one that drags its
+    /// width.
+    fn on_tabq_edge(&self, x: usize, y: usize) -> bool {
+        self.tabq_open().is_some_and(|open| {
+            let r = open.rect;
+            x == r.x && y >= r.y && y < r.y + r.rows
+        })
+    }
+
+    /// The tile of the agent whose pane is unfolded, in the tab on screen.
+    fn tabq_tile(&self) -> Option<layout::Rect> {
+        let terminal = self.tabq?;
+        let tree = self
+            .space
+            .and_then(|space| self.drawn_tree(space))
+            .unwrap_or_else(|| Layout::single(self.focused));
+        tree.tile_rects(self.tree_area(&tree))
+            .into_iter()
+            .find(|(t, _)| *t == terminal)
+            .map(|(_, tile)| tile)
+    }
+
+    /// Give the unfolded pane `w` columns, as its tile allows. True when its width changed.
+    fn tabq_resize_to(&mut self, w: usize) -> bool {
+        let Some(tile) = self.tabq_tile() else {
+            return false;
+        };
+        let Some(folded) = crate::tabq::width(tile) else {
+            return false;
+        };
+        let before = self.tabq_width(tile, folded);
+        let w = crate::tabq::open_width(tile, folded, w);
+        self.tabq_w = Some(w);
+        w != before
+    }
+
+    /// The unfolded pane's left edge dragged to pane column `x`: its right edge stays, its
+    /// width follows. True when it changed.
+    fn tabq_to(&mut self, x: usize) -> bool {
+        let Some(open) = self.tabq_open().map(|open| open.rect) else {
+            return false;
+        };
+        let right = open.x + open.cols - 1;
+        self.tabq_resize_to(right.saturating_sub(x + 1))
+    }
+
+    /// `<` and `>` in the unfolded pane: a step narrower or wider. True when it changed.
+    fn tabq_step(&mut self, wider: bool) -> bool {
+        let Some(now) = self
+            .tabq_open()
+            .map(|open| open.rect.cols.saturating_sub(2))
+        else {
+            return false;
+        };
+        let step = crate::tabq::OPEN_STEP;
+        self.tabq_resize_to(if wider {
+            now + step
+        } else {
+            now.saturating_sub(step)
+        })
     }
 
     /// A one based screen position in pane cells, column then row, `None` left of or above
@@ -8750,6 +8843,7 @@ where
         tabq_read: None,
         tabq_asked: None,
         tabq_home: None,
+        tabq_w: None,
         closing: None,
         close_begun: false,
         rows: Vec::new(),
@@ -11009,8 +11103,8 @@ where
                                     continue;
                                 }
                                 if let Some(grab) = state.modes.split_drag.take() {
-                                    // The rail's width is this session's: nothing is written.
-                                    if let Some(space) = state.space.filter(|_| grab != Grab::Rail) {
+                                    // A rail's or a pane's width is this session's: nothing is written.
+                                    if let Some(space) = state.space.filter(|_| !matches!(grab, Grab::Rail | Grab::Tabq)) {
                                         state.save_split(space);
                                     }
                                     dirty = true;
@@ -14471,6 +14565,12 @@ fn tabq_press(
     control_seq: &mut u32,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<(bool, Option<BytesMut>)>> {
+    // The open pane's left edge is held to drag its width ([`State::split_press`]).
+    if let (Some(x), Some(y)) = state.pane_xy(row, col)
+        && state.on_tabq_edge(x, y)
+    {
+        return Ok(None);
+    }
     let moved = match state.tabq_at(row, col) {
         Some(agent) if agent != state.focused => focus(state, agent, control_seq, seqs)?,
         _ => None,
@@ -14744,11 +14844,11 @@ struct AskKeys {
     paste: Option<(u32, String)>,
 }
 
-/// Keys typed while an agent tab's open pane has the keyboard: the inbox's own (1-9, enter,
+/// Keys typed while an agent pane's open pane has the keyboard: the inbox's own (1-9, enter,
 /// j k, r, m, x), `s` folds or opens the task part, `esc` folds the pane and gives the keyboard
 /// back to the agent, `g` gives it back with the pane left open beside it (folded when it is
-/// over the agent's tile), `q` hands the open card to qass to decide. Tab and `o` (qass's chat)
-/// are not the tab's.
+/// over the agent's tile), `q` hands the open card to qass to decide, `<` `>` narrow and widen the
+/// pane. Tab and `o` (qass's chat) are not the tab's.
 fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     use crate::asks::Out;
     let mut taken = AskKeys::default();
@@ -14761,6 +14861,11 @@ fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
             }
             b"q" => {
                 state.asks.hand_to_qass();
+                return taken;
+            }
+            // A step narrower or wider, the agent beside it sized again.
+            b"<" | b">" => {
+                taken.resize = state.tabq_step(bytes == b">");
                 return taken;
             }
             b"o" | b"\t" => return taken,
@@ -18763,6 +18868,7 @@ mod tests {
             tabq_read: None,
             tabq_asked: None,
             tabq_home: None,
+            tabq_w: None,
         }
     }
 
@@ -20316,6 +20422,7 @@ mod tests {
             tabq_read: None,
             tabq_asked: None,
             tabq_home: None,
+            tabq_w: None,
         }
     }
 
@@ -20345,6 +20452,7 @@ mod tests {
             tabq_read: None,
             tabq_asked: None,
             tabq_home: None,
+            tabq_w: None,
             closing: None,
             close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
@@ -31222,6 +31330,75 @@ mod tests {
             (tiles[1].1.cols - crate::tabq::OPEN - 1) as u16
         );
         assert!(pane_text(&s).contains("questions \u{b7} claude \u{2814} 2"));
+    }
+
+    /// `<` and `>` in the unfolded pane take 4 columns off or add them, the agent beside it
+    /// sized again; never under 40. Its left edge drags its width; past what leaves the agent 60
+    /// columns the pane stands over the agent at that width and the agent keeps its folded
+    /// size. The width holds through a fold for the session.
+    #[test]
+    fn the_unfolded_pane_takes_the_width_he_gives_it() {
+        let mut s = two_agents(300, 46);
+        let mut seqs = std::collections::BTreeMap::new();
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let folded = s.sized[&1];
+        let other = s.sized[&2];
+        let tile = tiles_of(&s)[0].1;
+        assert!(fold_key(&mut s));
+        let width = |s: &State| s.tabq_open().unwrap().rect.cols - 2;
+        assert_eq!(width(&s), crate::tabq::OPEN);
+        let agent = |s: &mut State, seqs: &mut std::collections::BTreeMap<u32, u32>| {
+            size_terminals(s, seqs).unwrap();
+            s.sized[&1].0 as usize
+        };
+        assert_eq!(agent(&mut s, &mut seqs), tile.cols - 53);
+        assert!(tabq_keys(&mut s, b">", 0x01).resize);
+        assert_eq!(width(&s), 56);
+        assert_eq!(
+            agent(&mut s, &mut seqs),
+            tile.cols - 57,
+            "the agent narrows"
+        );
+        assert_eq!(s.sized[&2], other, "the other agent is never touched");
+        for _ in 0..10 {
+            tabq_keys(&mut s, b"<", 0x01);
+        }
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN, "never under 40");
+        assert!(
+            !tabq_keys(&mut s, b"<", 0x01).resize,
+            "nothing left to take"
+        );
+
+        // The left edge, held and dragged ten columns left: ten columns wider.
+        let open = s.tabq_open().unwrap().rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let (row, col) = (
+            (screen::TABS + 1 + open.y + 5) as u16,
+            (left + 1 + open.x) as u16,
+        );
+        let mut control_seq = 0;
+        assert!(
+            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+                .unwrap()
+                .is_none(),
+            "the edge is not the pane's"
+        );
+        assert!(s.split_press(col, row));
+        assert_eq!(s.modes.split_drag, Some(Grab::Tabq));
+        assert!(s.split_motion(col - 10, row));
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 10);
+        // Far left, past the agent's 60 columns: over the agent, at that width.
+        assert!(s.split_motion(col - 60, row));
+        let (over, open_x) = s.tabq_open().map(|o| (o.over, o.rect.x)).unwrap();
+        assert!(over);
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
+        assert_eq!(agent(&mut s, &mut seqs), folded.0 as usize, "folded size");
+        assert!(open_x > tile.x, "the agent's left part stays in sight");
+        s.modes.split_drag = None;
+        // Folded and unfolded again, the width he chose holds.
+        assert!(fold_key(&mut s));
+        assert!(fold_key(&mut s));
+        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
     }
 
     /// Where the agent would keep under 60 columns, its pane opens over its own tile: nothing

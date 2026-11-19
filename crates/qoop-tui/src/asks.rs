@@ -2538,6 +2538,9 @@ fn bottom_line(pane: &Pane, tab: Option<InTab>, cw: usize, cut: bool) -> Vec<Seg
             true => pick_keys(
                 cw,
                 &[
+                    &format!(
+                        "1-9 answer  {enter}  r reply  q qass  s task  j k move  < > width  esc back"
+                    ),
                     &format!("1-9 answer  {enter}  r reply  q qass  s task  j k move  esc back"),
                     &format!("1-9 answer  {enter}  r reply  q qass  s task"),
                     &format!("1-9 answer  {enter}  q qass  esc"),
