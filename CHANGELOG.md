@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.21.0](https://github.com/qoop-si/qoop/compare/v0.20.0...v0.21.0) (2026-11-19)
+
+
+### New
+
+* **desktop:** spaces in the sidebar on every page with machine state ([68df636](https://github.com/qoop-si/qoop/commit/68df63675c4203f0dc291ef08f3ba198663501b8))
+* **qass:** This Mac's qass takes remote agents' questions ([81fe1ed](https://github.com/qoop-si/qoop/commit/81fe1ed5a854d9c948126acf4ecbcf5f95e14317))
+
+
+### Fixed
+
+* **desktop:** a qass card's hand-off follows the one qass rule ([fdc02a7](https://github.com/qoop-si/qoop/commit/fdc02a7622c6ec3326d914025dd6b40cf0714b28))
+* **desktop:** a sheet's Cancel and Save stay in view ([16f3b6a](https://github.com/qoop-si/qoop/commit/16f3b6add4d94f5bceea284e34afa68a1f79c3cd))
+* **desktop:** hand rules per machine, focus stays in the Inbox ([3390e36](https://github.com/qoop-si/qoop/commit/3390e3616b95083c24b766e20a6c5a27a013e339))
+* **desktop:** keys never die and come back to the terminal ([cabc2df](https://github.com/qoop-si/qoop/commit/cabc2df07e5f0f5b3b5d510a850ddf510a330348))
+* **desktop:** one qass rule and one needs count ([cbf4768](https://github.com/qoop-si/qoop/commit/cbf476851e6b436d1fb6cd7a7201af57c42a2180))
+* **desktop:** qass page, empty first open and daemon down have a next step ([31f784c](https://github.com/qoop-si/qoop/commit/31f784c8385602bb6f53a094e9ad452a4d20ddcc))
+* **desktop:** schedules open without a run, fields and lists ([1e45516](https://github.com/qoop-si/qoop/commit/1e45516c7669907e5c2682bb0fc59c36d706f0fe))
+* **desktop:** what the re-check found ([792f48c](https://github.com/qoop-si/qoop/commit/792f48c23374d7e1bc8bd59ddba19197a63c1941))
+* **runtime:** a hand is for the turn it was given on ([9da007d](https://github.com/qoop-si/qoop/commit/9da007db51c7313757aa7b6b26001bd002564a00))
+* **runtime:** hand-offs end when qass stops or stops watching ([7d1cf01](https://github.com/qoop-si/qoop/commit/7d1cf01020fbd943455a49bd62194733e1ab775f))
+* **runtime:** the same question asked again has another seal ([1de8d3d](https://github.com/qoop-si/qoop/commit/1de8d3dbfe2b20867a4a98874d501099f08a060a))
+* words the review found ([7c66ea7](https://github.com/qoop-si/qoop/commit/7c66ea7b1bddde4c89ef37e05d910844efe8bc54))
+
 ## [0.20.0](https://github.com/qoop-si/qoop/compare/v0.19.1...v0.20.0) (2026-11-18)
 
 
