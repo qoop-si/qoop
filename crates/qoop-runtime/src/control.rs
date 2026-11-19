@@ -1208,12 +1208,14 @@ pub enum AskResult {
     Ended,
 }
 
-/// The longest one value of a card may be, in characters.
-pub const ASK_FIELD_MAX: usize = 200;
+/// The longest one value of a card may be, in characters: a safety cap only, far over what any
+/// screen needs, since every screen wraps a value whole.
+pub const ASK_FIELD_MAX: usize = 4000;
 
 /// The longest a card's question may be: the whole question an agent closed its turn with,
-/// which the card shows folded to three lines and whole when opened.
-pub const ASK_QUESTION_MAX: usize = 600;
+/// which the card shows folded to three lines and whole when opened. A safety cap, like
+/// [`ASK_FIELD_MAX`].
+pub const ASK_QUESTION_MAX: usize = 4000;
 
 /// One option of a card: what a tap sends and why it is offered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

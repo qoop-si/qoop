@@ -156,12 +156,12 @@ def paragraph_of(text):
 
 def said_of(text):
     """The closing words of the turn for the card of the owner: the paragraph before the last
-    (what it just did, at most 200 characters) and the last (its question, at most 600), a
+    (what it just did, at most 4000 characters) and the last (its question, at most 4000), a
     blank line between. Cut at a word, never in the middle."""
     parts = paragraphs_of(text, 2)
     if not parts:
         return ""
-    limits = [200, 600][-len(parts):]
+    limits = [4000, 4000][-len(parts):]
     # Code ticks off too, emphasis is already: the card shows plain words, and a file name
     # such as __init__.py keeps its marks.
     plain = [p.replace(chr(96), "") for p in parts]
