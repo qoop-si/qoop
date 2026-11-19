@@ -370,9 +370,11 @@ impl Desk {
                 self.reach.forget_links();
                 // A New work asked for before the connection dropped: asked again, under its id.
                 self.ask_pending();
-                // A new connection, maybe a new daemon: say the size again.
-                for term in self.term.iter().chain(&self.others) {
+                // A new connection, maybe a new daemon: say the size again. A `Scrollback` out
+                // went with the old one and is never answered: the next wheel step asks again.
+                for term in self.panes_mut() {
                     term.sent.set((0, 0));
+                    term.asked = None;
                 }
                 self.ask_strip();
                 self.ask_inbox();
@@ -530,11 +532,11 @@ impl Desk {
             }
             ControlResponse::Scrollback {
                 id,
-                terminal,
                 from,
                 total,
                 lines,
-            } => self.scrolled_back(terminal, &id, from, total, lines),
+                ..
+            } => self.scrolled_back(&id, from, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => {
                 self.link_reasons = state::link_reasons(&workspaces);
                 let back = self.reach.note(&workspaces, self.now);
