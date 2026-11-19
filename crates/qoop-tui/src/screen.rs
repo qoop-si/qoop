@@ -970,11 +970,11 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
     if !tiled(frame) {
         return Vec::new();
     }
-    let rails: Vec<layout::Rect> = frame
+    let rails: Vec<(layout::Rect, bool)> = frame
         .chrome
         .tab_rails
         .iter()
-        .map(|rail| rail.rect)
+        .map(|rail| (rail.rect, rail.terminal == frame.focused))
         .collect();
     let mut edges = pane_edges(
         &frame.tiles,
@@ -3976,7 +3976,7 @@ enum EdgeInk {
 /// runs into it, so a line there is noise, the owner's word, 2026-10-28.
 fn pane_edges(
     tiles: &[Tile],
-    rails: &[layout::Rect],
+    rails: &[(layout::Rect, bool)],
     agents: &[AgentRow],
     focus: theme::Role,
     cols: usize,
@@ -3989,14 +3989,15 @@ fn pane_edges(
     let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; cols]; rows];
     // The ways a frame's line leaves each cell, from every pane's frame, so a shared side is
     // one line and its ends are joints; and the cells of the focused pane's frame. An agent
-    // pane's questions rail is framed like one more pane, inside the agent's tile, so the line
-    // between them is one rule and a pane beside one is never alone.
+    // pane's questions rail is framed like one more pane inside the agent's tile, lit with it
+    // when it is focused, so the line between them is one rule, the lit frame runs round the
+    // whole tile, and a pane beside one is never alone.
     let mut ways = vec![vec![0u8; cols]; rows];
     let mut lit = vec![vec![false; cols]; rows];
     let framed: Vec<(layout::Rect, bool)> = tiles
         .iter()
         .map(|t| (t.rect, t.focused))
-        .chain(rails.iter().map(|r| (*r, false)))
+        .chain(rails.iter().copied())
         .collect();
     let alone = framed.len() < 2;
     for (r, focused) in framed
@@ -8952,6 +8953,48 @@ mod tests {
         assert_eq!(grid[0][at + 1].map(|(_, ink)| ink), Some(EdgeInk::Title));
         // Nothing drawn inside a pane.
         assert!(grid[4][left.x + 2].is_none());
+    }
+
+    /// Two agents split, each with its rail inside its tile: the focused agent's lit frame runs
+    /// round its whole tile, its rail included, and the other agent's tile stays quiet.
+    #[test]
+    fn the_focused_agents_lit_frame_runs_round_its_rail() {
+        let rows = [row(1, "claude", "working"), row(2, "claude", "working")];
+        let area = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            cols: 100,
+            rows: 12,
+        };
+        let mut layout = crate::layout::Layout::single(1);
+        assert!(layout.split_placeholder(1, crate::layout::Dir::V, area));
+        assert!(layout.bind_placeholder(2));
+        let mut tiles = Vec::new();
+        let mut rails = Vec::new();
+        for (terminal, tile) in layout.tile_rects(area) {
+            let rail = crate::tabq::Rail { terminal, w: 4 };
+            let (term, cells) = crate::tabq::split(tile, rail);
+            tiles.push(Tile {
+                terminal,
+                rect: term,
+                snapshot: None,
+                focused: terminal == 2,
+            });
+            rails.push((cells, terminal == 2));
+        }
+        let ink = theme::Role::Space(2);
+        let grid = pane_edges(&tiles, &rails, &rows, ink, 100, 12);
+        let lit = Some(EdgeInk::Frame(ink));
+        let ink_at = |y: usize, x: usize| grid[y][x].map(|(_, ink)| ink);
+        let (first, second) = (rails[0].0, rails[1].0);
+        // The focused tile: over its rail, its right edge and its rule, all lit.
+        assert_eq!(ink_at(0, second.x + 1), lit, "the top over its rail");
+        assert_eq!(ink_at(11, second.x + 1), lit, "the bottom under it");
+        assert_eq!(ink_at(5, second.x + second.cols), lit, "its right edge");
+        assert_eq!(ink_at(5, second.x - 1), lit, "the rule");
+        // The other agent's rail is quiet.
+        assert_eq!(ink_at(0, first.x + 1), Some(EdgeInk::Line));
+        assert_eq!(ink_at(5, first.x - 1), Some(EdgeInk::Line));
     }
 
     #[test]

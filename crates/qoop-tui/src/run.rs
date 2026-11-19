@@ -1265,6 +1265,9 @@ struct State {
     /// request id and key of a read on its way: an answer under another id is an old one.
     tabq_read: Option<(crate::tabq::ReadKey, crate::tabq::TaskRead)>,
     tabq_asked: Option<(String, crate::tabq::ReadKey)>,
+    /// Where that agent stood when its pane unfolded ([`State::tab_home`]): the pane folds once
+    /// the agent is gone or stands anywhere else.
+    tabq_home: Option<TabHome>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -1415,6 +1418,15 @@ struct Toast {
 /// Which tile a screen position lands in: its terminal, the pane-global cell,
 /// and the tile-local cell. Divider cells answer `None`.
 type TileHit = (u32, (usize, usize), (usize, usize));
+
+/// Where a terminal stands ([`State::tab_home`]): its space, its tab's first leaf, and the
+/// other panes of its tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabHome {
+    space: i64,
+    tab: u32,
+    others: Vec<u32>,
+}
 
 /// An agent row under a held button. `name` is whether the press landed on the row that
 /// names the agent rather than the one under it.
@@ -3688,10 +3700,53 @@ impl State {
             self.tabq_fold();
         } else {
             self.tabq = Some(terminal);
+            self.tabq_home = self.tab_home(terminal);
             self.tabq_focus = Some(self.focused);
             self.tabq_task = None;
             self.asks.set_scope(Some(terminal));
         }
+    }
+
+    /// Where `terminal` stands: its space, the first leaf of its tab (the tab's own terminal)
+    /// and the other panes beside it. `None` once it is gone.
+    fn tab_home(&self, terminal: u32) -> Option<TabHome> {
+        let space = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
+        let leaves = self
+            .trees()
+            .map(Layout::leaves)
+            .find(|leaves| leaves.contains(&terminal))
+            .unwrap_or_else(|| vec![terminal]);
+        let others = leaves.iter().copied().filter(|t| *t != terminal).collect();
+        Some(TabHome {
+            space,
+            tab: leaves[0],
+            others,
+        })
+    }
+
+    /// The unfolded pane folds once its agent is gone or left the tab it unfolded in: moved to
+    /// another tab or space, or split out to a tab of its own. A pane closing beside it, or a
+    /// new one split in, leaves it open. True when it folded.
+    fn tabq_home_lost(&mut self) -> bool {
+        let Some(terminal) = self.tabq else {
+            return false;
+        };
+        let alive = |t: u32| self.rows.iter().any(|r| r.terminal == t);
+        let held = match (&self.tabq_home, self.tab_home(terminal)) {
+            (Some(was), Some(now)) => {
+                now.space == was.space
+                    && (now.tab == was.tab || !alive(was.tab))
+                    && was
+                        .others
+                        .iter()
+                        .all(|t| now.others.contains(t) || !alive(*t))
+            }
+            _ => false,
+        };
+        if !held {
+            self.tabq_fold();
+        }
+        !held
     }
 
     /// A press at a one based screen position, when it is a rail's or the open pane's: in the
@@ -3699,13 +3754,8 @@ impl State {
     /// agent's pane unfolds. `Some(true)` when the panes must be sized again; `None` for a press
     /// elsewhere, which takes the keyboard out of the pane.
     fn tabq_click(&mut self, row: u16, col: u16) -> Option<bool> {
-        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
-        let x = (col as usize).checked_sub(left + 1);
-        let y = (row as usize).checked_sub(screen::TABS + 1);
-        let inside = |r: layout::Rect| {
-            x.zip(y)
-                .is_some_and(|(x, y)| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows)
-        };
+        let (x, y) = self.pane_xy(row, col);
+        let inside = |r: layout::Rect| inside_rect(r, x, y);
         let rails = self.tab_rails();
         if rails.is_empty() {
             return None;
@@ -3742,9 +3792,32 @@ impl State {
         None
     }
 
+    /// The agent whose folded rail, or whose unfolded pane, is at a one based screen position.
+    fn tabq_at(&self, row: u16, col: u16) -> Option<u32> {
+        let (x, y) = self.pane_xy(row, col);
+        self.tab_rails()
+            .iter()
+            .find(|rail| {
+                rail.open.is_some_and(|open| inside_rect(open.rect, x, y))
+                    || (rail.open.is_none_or(|open| open.over) && inside_rect(rail.rect, x, y))
+            })
+            .map(|rail| rail.terminal)
+    }
+
+    /// A one based screen position in pane cells, column then row, `None` left of or above
+    /// the pane.
+    fn pane_xy(&self, row: u16, col: u16) -> (Option<usize>, Option<usize>) {
+        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
+        (
+            (col as usize).checked_sub(left + 1),
+            (row as usize).checked_sub(screen::TABS + 1),
+        )
+    }
+
     /// Fold the pane to its rail; the keyboard goes back to the agent.
     fn tabq_fold(&mut self) {
         self.tabq = None;
+        self.tabq_home = None;
         self.tabq_focus = None;
         self.asks.set_scope(None);
     }
@@ -3780,6 +3853,7 @@ impl State {
     /// is on screen, and every card's on qass's screen; off screen, or once the focus moved to
     /// another leaf, it has no keyboard. True when that changed what is drawn.
     fn tabq_settle(&mut self) -> bool {
+        let folded = self.tabq_home_lost();
         let shown = self
             .tab_rail_paint()
             .filter(|rail| rail.open.is_some())
@@ -3791,7 +3865,7 @@ impl State {
             .filter(|leaf| shown.is_some() && *leaf == self.focused);
         let lost = focus != self.tabq_focus;
         self.tabq_focus = focus;
-        moved || lost
+        folded || moved || lost
     }
 
     /// The task read the open pane wants and has not asked for: the terminal's own read, which
@@ -8675,6 +8749,7 @@ where
         tabq_task: None,
         tabq_read: None,
         tabq_asked: None,
+        tabq_home: None,
         closing: None,
         close_begun: false,
         rows: Vec::new(),
@@ -10192,7 +10267,10 @@ where
                                 // The agent tab's questions rail and its open pane are their own: a
                                 // press there reaches no pane and puts down a selection; on the
                                 // rail it unfolds the pane, in the pane it answers what it hit.
-                                if !shift && let Some(resize) = state.tabq_click(row, col) {
+                                if !shift && let Some((resize, moved)) = tabq_press(&mut state, row, col, &mut control_seq, &mut seqs)? {
+                                    if let Some(bytes) = moved {
+                                        wr.write_all(&bytes).await?;
+                                    }
                                     if state.selection.take().is_some() {
                                         dirty = true;
                                     }
@@ -14284,6 +14362,8 @@ fn size_terminals(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
+    // A pane unfolded for an agent that left its tab folds first, so it is sized as it is drawn.
+    state.tabq_home_lost();
     // The whole pane (less its rail), for a tab outside any tree; a tree's panes by its own area.
     let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
     let asleep: std::collections::BTreeSet<u32> = state
@@ -14373,6 +14453,29 @@ fn size_terminals(
         .retain(|t, _| want.contains_key(t) || zoomed_away.contains(t) || later.contains(t));
     state.sized.extend(want);
     Ok((!out.is_empty()).then_some(out))
+}
+
+/// Whether pane cell (`x`, `y`) is inside `r`; `None` (off the pane) is not.
+fn inside_rect(r: layout::Rect, x: Option<usize>, y: Option<usize>) -> bool {
+    x.zip(y)
+        .is_some_and(|(x, y)| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows)
+}
+
+/// A press on a questions rail or the open pane ([`State::tabq_click`]), the keyboard moved
+/// first to the agent it belongs to, so the lit frame, the keys and `g` all speak for the pane
+/// that unfolds: its answer, and what moving the focus writes. `None` for a press elsewhere.
+fn tabq_press(
+    state: &mut State,
+    row: u16,
+    col: u16,
+    control_seq: &mut u32,
+    seqs: &mut std::collections::BTreeMap<u32, u32>,
+) -> io::Result<Option<(bool, Option<BytesMut>)>> {
+    let moved = match state.tabq_at(row, col) {
+        Some(agent) if agent != state.focused => focus(state, agent, control_seq, seqs)?,
+        _ => None,
+    };
+    Ok(state.tabq_click(row, col).map(|resize| (resize, moved)))
 }
 
 fn focus(
@@ -18659,6 +18762,7 @@ mod tests {
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
+            tabq_home: None,
         }
     }
 
@@ -20211,6 +20315,7 @@ mod tests {
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
+            tabq_home: None,
         }
     }
 
@@ -20239,6 +20344,7 @@ mod tests {
             tabq_task: None,
             tabq_read: None,
             tabq_asked: None,
+            tabq_home: None,
             closing: None,
             close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
@@ -31147,6 +31253,109 @@ mod tests {
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
             "still none"
         );
+    }
+
+    /// A press on the other agent's rail moves the keyboard there first, then unfolds its pane:
+    /// the lit frame, the pane's keys and `g` all speak for that agent. A press in its open pane
+    /// from the first agent brings the keyboard back the same way.
+    #[test]
+    fn a_press_on_another_agents_rail_moves_the_focus_there_first() {
+        let mut s = two_agents(170, 46);
+        let (mut control_seq, mut seqs) = (0, std::collections::BTreeMap::new());
+        size_terminals(&mut s, &mut seqs).unwrap();
+        let rail = s.tab_rails()[1].rect;
+        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
+        let at = |r: layout::Rect, dy: usize, dx: usize| {
+            (
+                (screen::TABS + 1 + r.y + dy) as u16,
+                (left + 1 + r.x + dx) as u16,
+            )
+        };
+        let (row, col) = at(rail, 2, 1);
+        assert_eq!(s.tabq_at(row, col), Some(2));
+        let (resize, _) = tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+            .unwrap()
+            .expect("the rail's");
+        assert!(resize);
+        assert_eq!((s.focused, s.layouts[&1].focus, s.tabq), (2, 2, Some(2)));
+        assert!(s.tabq_focused(), "the pane has the keys");
+        assert!(s.frame().tiles.iter().any(|t| t.focused && t.terminal == 2));
+        // The keyboard back in the first agent, then a press in the second's open pane.
+        focus(&mut s, 1, &mut control_seq, &mut seqs).unwrap();
+        s.tabq_settle();
+        assert!(!s.tabq_focused() && s.tabq_open().is_some());
+        let (row, col) = at(s.tabq_open().unwrap().rect, 3, 4);
+        assert_eq!(
+            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
+                .unwrap()
+                .map(|(resize, _)| resize),
+            Some(false)
+        );
+        assert_eq!(s.focused, 2);
+        assert!(s.tabq_focused());
+        // `g` gives the keyboard to the agent whose pane it was (over its tile, the pane folds).
+        assert_eq!(tabq_keys(&mut s, b"g", 0x01).jump, Some(2));
+    }
+
+    /// The unfolded pane folds once its agent closes, is split out to a tab of its own, or moves
+    /// to another space, so it never arrives unfolded anywhere else; a pane closing beside it or
+    /// a new one split in leaves it open.
+    #[test]
+    fn the_unfolded_pane_folds_once_its_agent_leaves_its_tab() {
+        let unfolded = || {
+            let mut s = two_agents(300, 46);
+            assert!(fold_key(&mut s));
+            assert_eq!(s.tabq, Some(1));
+            s
+        };
+        let mut seqs = std::collections::BTreeMap::new();
+
+        let mut closed = unfolded();
+        closed.rows.retain(|r| r.terminal != 1);
+        closed.layouts.insert(1, Layout::single(2));
+        (closed.focused, closed.layouts.get_mut(&1).unwrap().focus) = (2, 2);
+        assert!(closed.tabq_settle());
+        assert_eq!(closed.tabq, None, "closed");
+
+        let mut split_out = unfolded();
+        split_out.layouts.insert(1, Layout::single(2));
+        split_out.parked.insert(1, vec![Layout::single(1)]);
+        size_terminals(&mut split_out, &mut seqs).unwrap();
+        assert_eq!(split_out.tabq, None, "a tab of its own");
+        assert_eq!(
+            split_out.sized[&1].0 as usize,
+            split_out.lone_rect(1).cols,
+            "sized folded"
+        );
+
+        let mut moved = unfolded();
+        moved.spaces.push(space(2, "other"));
+        moved.rows[0].workspace = 2;
+        moved.layouts.insert(1, Layout::single(2));
+        moved.layouts.insert(2, Layout::single(1));
+        assert!(moved.tabq_settle());
+        assert_eq!(moved.tabq, None, "another space");
+        (moved.space, moved.focused) = (Some(2), 1);
+        assert!(moved.tab_rails().iter().all(|r| r.open.is_none()));
+
+        let mut beside_closed = unfolded();
+        beside_closed.rows.retain(|r| r.terminal != 2);
+        beside_closed.layouts.insert(1, Layout::single(1));
+        beside_closed.tabq_settle();
+        assert_eq!(beside_closed.tabq, Some(1), "the other pane closed");
+
+        let mut split_in = unfolded();
+        split_in.rows.push(agent(3, 1, "zsh", "idle"));
+        let leaf = |t| Box::new(crate::layout::Node::Leaf { terminal: Some(t) });
+        let tree = split_in.layouts.get_mut(&1).unwrap();
+        tree.root = crate::layout::Node::Split {
+            dir: crate::layout::Dir::H,
+            ratio: 0.5,
+            first: Box::new(tree.root.clone()),
+            second: leaf(3),
+        };
+        split_in.tabq_settle();
+        assert_eq!(split_in.tabq, Some(1), "a new pane split in");
     }
 
     /// Without colour the rail reads the same: its words and marks carry it, and none of its
