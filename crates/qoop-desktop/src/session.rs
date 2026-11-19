@@ -16,7 +16,7 @@ use gpui::{
     Window, div, prelude::*, px, relative,
 };
 use qoop_runtime::control::{ControlRequest, Pane, SplitDir, TerminalStream};
-use qoop_runtime::daemon::{ModesWire, SnapshotWire};
+use qoop_runtime::daemon::{MAX_SCROLLBACK_ROWS, ModesWire, SnapshotWire};
 
 use crate::app::{Desk, Page, Term};
 use crate::element::TerminalElement;
@@ -156,32 +156,33 @@ impl Desk {
         });
     }
 
-    fn pane_mut(&mut self, terminal: TerminalStream) -> Option<&mut Term> {
-        self.term
-            .iter_mut()
-            .chain(self.others.iter_mut())
-            .find(|t| t.terminal == terminal)
+    pub(crate) fn panes_mut(&mut self) -> impl Iterator<Item = &mut Term> {
+        self.term.iter_mut().chain(self.others.iter_mut())
     }
 
-    /// A page of scrollback came: shown in place of the live screen while scrolled back.
+    fn pane_mut(&mut self, terminal: TerminalStream) -> Option<&mut Term> {
+        self.panes_mut().find(|t| t.terminal == terminal)
+    }
+
+    /// Rows of scrollback came: held by the pane that asked, unless a newer ask replaced it.
     pub(crate) fn scrolled_back(
         &mut self,
         terminal: TerminalStream,
+        id: &str,
+        from: u64,
         total: u64,
         lines: Vec<String>,
     ) {
-        let Some(term) = self.pane_mut(terminal).filter(|t| t.scroll > 0) else {
-            return;
-        };
-        term.total = total;
-        let (cols, rows) = term.sent.get();
-        let most = (total as usize).saturating_sub(usize::from(rows));
-        term.scroll = term.scroll.min(most.max(1));
-        term.back = Some(Rc::new(page_of(lines, cols, rows)));
+        let next = self
+            .pane_mut(terminal)
+            .and_then(|t| t.came(id, from, total, lines));
+        if let Some(next) = next {
+            self.ask(next);
+        }
     }
 
-    /// The wheel over a pane: `rows` up (positive) or down, through `Scrollback`. A full screen
-    /// program has no scrollback of its own here.
+    /// The wheel over a pane: `rows` up (positive) or down. A full screen program has no
+    /// scrollback of its own here.
     fn wheel(&mut self, terminal: TerminalStream, rows: i64) {
         let Some(term) = self.pane_mut(terminal) else {
             return;
@@ -189,35 +190,15 @@ impl Desk {
         if term.screen.as_ref().is_some_and(|s| s.modes.alt_screen) {
             return;
         }
-        let height = usize::from(term.sent.get().1.max(1));
-        let most = match term.total {
-            0 => i64::MAX,
-            total => (total as usize).saturating_sub(height) as i64,
-        };
-        let scroll = (term.scroll as i64 + rows).clamp(0, most.max(0)) as usize;
-        if scroll == term.scroll {
-            return;
+        if let Some(ask) = term.wheel(rows) {
+            self.ask(ask);
         }
-        term.scroll = scroll;
-        term.selection = None;
-        if scroll == 0 {
-            term.back = None;
-            return;
-        }
-        self.ask(ControlRequest::Scrollback {
-            id: link::fresh_id("back"),
-            terminal,
-            up: scroll + height,
-            rows: height,
-        });
     }
 
     /// Back to the live screen, as typing does.
     pub(crate) fn back_to_live(&mut self) {
         if let Some(term) = self.term.as_mut() {
-            term.scroll = 0;
-            term.back = None;
-            term.selection = None;
+            term.live();
         }
     }
 
@@ -803,7 +784,8 @@ impl Desk {
                             return;
                         };
                         let rows = wheel_rows(event.delta, height, &mut term.wheel_left);
-                        if rows != 0 {
+                        // Scrolled back, part of a row moves the page too.
+                        if rows != 0 || term.scroll > 0 {
                             this.wheel(terminal, rows);
                             cx.notify();
                         }
@@ -826,6 +808,7 @@ impl Desk {
                         input: is_focus.then(|| (self.term_focus.clone(), cx.entity())),
                         selection: term.selection,
                         area: Some(term.area.clone()),
+                        lift: self.cells.height * term.lift,
                     }),
             )
             .into_any_element()
@@ -1590,16 +1573,152 @@ fn step_row(
     }
 }
 
+/// The scrollback of a pane: a block of about three screens is asked for once and the view is
+/// cut from it on every wheel step, so a step inside it paints in the next frame. The next
+/// block is asked for while half a screen is still held past the view.
+impl Term {
+    fn height(&self) -> usize {
+        usize::from(self.sent.get().1.max(1))
+    }
+
+    /// The number of the first row on screen while scrolled back.
+    fn top(&self) -> u64 {
+        let back = (self.scroll + self.height()) as u64;
+        self.total.saturating_sub(back).max(self.floor)
+    }
+
+    /// Move the view `rows` up (positive) or down, and draw the part of a row in `wheel_left`;
+    /// the `Scrollback` to send when the rows held run short. 0 is the live screen.
+    pub(crate) fn wheel(&mut self, rows: i64) -> Option<ControlRequest> {
+        let most = match self.total {
+            0 => i64::MAX,
+            total => {
+                (total.saturating_sub(self.floor) as usize).saturating_sub(self.height()) as i64
+            }
+        };
+        let want = self.scroll as i64 + rows;
+        let scroll = want.clamp(0, most.max(0)) as usize;
+        if scroll as i64 != want {
+            // Past an end: what was left over of a row moves nothing.
+            self.wheel_left = 0.;
+        }
+        let was = (self.scroll, self.lift);
+        self.scroll = scroll;
+        if scroll == 0 {
+            if was.0 > 0 {
+                self.live();
+            }
+            return None;
+        }
+        self.show();
+        if (self.scroll, self.lift) != was {
+            self.selection = None;
+        }
+        self.fetch()
+    }
+
+    /// An answer to a `Scrollback`: held when it answers the one out, else dropped, so a late
+    /// answer for an older place never jumps the view back.
+    pub(crate) fn came(
+        &mut self,
+        id: &str,
+        from: u64,
+        total: u64,
+        lines: Vec<String>,
+    ) -> Option<ControlRequest> {
+        if !self.asked_is(id) {
+            return None;
+        }
+        let (_, up) = self.asked.take()?;
+        // Rows written since the last answer: the view keeps the rows it shows.
+        if self.block.is_some() {
+            self.scroll += total.saturating_sub(self.total) as usize;
+        }
+        self.total = total;
+        // Answered from below the row asked for: the older rows are gone.
+        if from > total.saturating_sub(up as u64) {
+            self.floor = from;
+        }
+        let most = (total.saturating_sub(self.floor) as usize).saturating_sub(self.height());
+        self.scroll = self.scroll.min(most.max(1));
+        self.block = Some((from, lines));
+        self.show();
+        self.fetch()
+    }
+
+    pub(crate) fn asked_is(&self, id: &str) -> bool {
+        self.asked.as_ref().is_some_and(|(asked, _)| asked == id)
+    }
+
+    /// Back to the live screen: the rows held go, and an answer still out is dropped.
+    pub(crate) fn live(&mut self) {
+        self.scroll = 0;
+        self.back = None;
+        self.lift = 0.;
+        self.block = None;
+        self.asked = None;
+        self.selection = None;
+    }
+
+    /// The view cut from the block, when the block holds all of it (or all there is).
+    fn show(&mut self) {
+        let Some((from, lines)) = &self.block else {
+            return;
+        };
+        let (top, height) = (self.top(), self.height());
+        let end = from + lines.len() as u64;
+        if top < *from || (top + height as u64 > end && end < self.total) {
+            return;
+        }
+        // Part of a row moved: the row above comes in too, and the page is drawn up by the rest.
+        let early = usize::from(top > *from && self.wheel_left > 0.);
+        let start = ((top - from) as usize - early).min(lines.len());
+        let rows = lines[start..(start + height + early).min(lines.len())].to_vec();
+        let (cols, screen) = self.sent.get();
+        self.back = Some(Rc::new(page_of(rows, cols, screen + early as u16)));
+        self.lift = if early == 1 { 1. - self.wheel_left } else { 0. };
+    }
+
+    /// A `Scrollback` for three screens around the view, when none is out and the view is
+    /// within half a screen of the block's edge, or outside it.
+    fn fetch(&mut self) -> Option<ControlRequest> {
+        if self.asked.is_some() {
+            return None;
+        }
+        let height = self.height();
+        if let Some((from, lines)) = &self.block {
+            let (top, margin) = (self.top(), (height / 2) as u64);
+            let end = from + lines.len() as u64;
+            let above = *from > self.floor && top < from + margin;
+            let below = end < self.total && top + height as u64 + margin > end;
+            if !above && !below {
+                return None;
+            }
+        }
+        let rows = (3 * height).min(MAX_SCROLLBACK_ROWS);
+        let up = self.scroll + height + rows.saturating_sub(height) / 2;
+        let id = link::fresh_id("back");
+        self.asked = Some((id.clone(), up));
+        Some(ControlRequest::Scrollback {
+            id,
+            terminal: self.terminal,
+            up,
+            rows,
+        })
+    }
+}
+
 /// Whole rows to scroll for one wheel event: a notch (`Lines`) is `WHEEL_ROWS` rows, a
 /// trackpad's pixels are counted by the row height. What does not make a whole row yet is
-/// kept in `left` for the next event, so a slow swipe still scrolls.
+/// kept in `left` (0 up to 1: a move down borrows a row) for the next event, so a slow swipe
+/// still scrolls.
 fn wheel_rows(delta: ScrollDelta, row: Pixels, left: &mut f32) -> i64 {
     let rows = match delta {
         ScrollDelta::Lines(lines) => lines.y * WHEEL_ROWS,
         ScrollDelta::Pixels(pixels) => pixels.y / row,
     };
     let total = *left + rows;
-    let whole = total.trunc();
+    let whole = total.floor();
     *left = total - whole;
     whole as i64
 }
@@ -1648,5 +1767,132 @@ mod tests {
             .collect();
         assert_eq!(rows, [0, 0, 1, 0, 0, 1], "6 px at a time of 16 px rows");
         assert_eq!(rows.iter().sum::<i64>(), 2, "36 px is two rows and a bit");
+    }
+
+    /// Rows `from..to` of a history, each named by its number.
+    fn rows(from: u64, to: u64) -> Vec<String> {
+        (from..to).map(|n| format!("r{n}")).collect()
+    }
+
+    /// A pane of 10 rows over a history of `total` rows, scrolled back 3 with its block in.
+    fn scrolled(total: u64) -> Term {
+        let mut term = Term::new(1);
+        term.sent.set((80, 10));
+        let (id, up, asked) = ask(term.wheel(3));
+        assert_eq!((up, asked), (23, 30), "three screens, one above the view");
+        let from = total - up as u64;
+        assert_eq!(term.came(&id, from, total, rows(from, total)), None);
+        term
+    }
+
+    fn ask(request: Option<ControlRequest>) -> (String, usize, usize) {
+        match request {
+            Some(ControlRequest::Scrollback { id, up, rows, .. }) => (id, up, rows),
+            other => panic!("not a Scrollback: {other:?}"),
+        }
+    }
+
+    fn first(term: &Term) -> &str {
+        &term.back.as_ref().expect("a page of scrollback").lines[0]
+    }
+
+    /// Steps inside the block are cut from it with no round trip; half a screen from its edge
+    /// the next block is asked for, once, whatever the wheel does meanwhile.
+    #[test]
+    fn wheel_steps_inside_the_block_ask_nothing() {
+        let mut term = scrolled(1000);
+        assert_eq!(first(&term), "r987");
+        for top in (982..987).rev() {
+            assert_eq!(term.wheel(1), None, "row {top} is held");
+            assert_eq!(first(&term), format!("r{top}"));
+        }
+        let (id, up, _) = ask(term.wheel(1));
+        assert_eq!(up, 29);
+        assert_eq!(first(&term), "r981", "still cut from the held rows");
+        assert_eq!(term.wheel(3), None, "one ask out at a time");
+        assert_eq!(term.came(&id, 971, 1000, rows(971, 1000)), None);
+        assert_eq!(first(&term), "r978");
+    }
+
+    /// An answer that is not to the ask out (an older one, or one out when the view went back
+    /// to the live screen) is dropped and never moves the view.
+    #[test]
+    fn a_stale_answer_is_dropped() {
+        let mut term = scrolled(1000);
+        for _ in 0..6 {
+            term.wheel(1);
+        }
+        let (id, _) = term.asked.clone().expect("an ask out");
+        assert_eq!(term.came("older", 500, 1000, rows(500, 530)), None);
+        assert_eq!(first(&term), "r981");
+        assert_eq!(term.wheel(-9), None);
+        assert_eq!(term.scroll, 0, "back to the live screen");
+        assert_eq!(term.came(&id, 971, 1000, rows(971, 1000)), None);
+        assert!(term.back.is_none(), "the live screen stays");
+        assert_eq!(term.scroll, 0);
+    }
+
+    /// Output that keeps coming while scrolled back does not move the rows on screen.
+    #[test]
+    fn new_output_keeps_the_view_still() {
+        let mut term = scrolled(1000);
+        for _ in 0..6 {
+            term.wheel(1);
+        }
+        let (id, up) = term.asked.clone().expect("an ask out");
+        assert_eq!(up, 29);
+        // 4 rows were written before the daemon read: its block starts 4 rows later.
+        assert_eq!(term.came(&id, 975, 1004, rows(975, 1004)), None);
+        assert_eq!(term.scroll, 13);
+        assert_eq!(first(&term), "r981");
+    }
+
+    /// Part of a row moves the page by pixels: the row above comes in, the page is drawn up by
+    /// the rest of a row, and a selection made on the old place goes.
+    #[test]
+    fn part_of_a_row_lifts_the_page() {
+        let mut term = scrolled(1000);
+        term.selection = Some(((1, 0), (2, 4)));
+        term.wheel_left = 0.25;
+        assert_eq!(term.wheel(0), None);
+        assert_eq!(first(&term), "r986");
+        assert_eq!(
+            term.back.as_ref().map(|b| (b.rows, b.lines.len())),
+            Some((11, 11))
+        );
+        assert_eq!(term.lift, 0.75);
+        assert_eq!(term.selection, None);
+        // Down past a row boundary: a whole row back and the leftover still drawn.
+        let mut left = term.wheel_left;
+        let rows = wheel_rows(
+            ScrollDelta::Pixels(point(px(0.), px(-8.))),
+            px(16.),
+            &mut left,
+        );
+        term.wheel_left = left;
+        assert_eq!((rows, left), (-1, 0.75));
+        term.wheel(rows);
+        assert_eq!((term.scroll, first(&term), term.lift), (2, "r987", 0.25));
+        // Back on the live screen nothing is lifted.
+        term.wheel(-2);
+        assert_eq!((term.scroll, term.lift), (0, 0.));
+        assert!(term.back.is_none());
+    }
+
+    /// Once the daemon answers from its oldest kept row, the wheel stops there.
+    #[test]
+    fn the_oldest_kept_row_is_the_top() {
+        let mut term = Term::new(1);
+        term.sent.set((80, 10));
+        let (id, up, _) = ask(term.wheel(30));
+        assert_eq!(up, 50);
+        // A history of 30 rows that kept only its last 25.
+        assert_eq!(term.came(&id, 5, 30, rows(5, 30)), None);
+        assert_eq!((term.floor, term.scroll), (5, 15));
+        assert_eq!(first(&term), "r5");
+        assert_eq!(term.wheel(1), None, "nothing older to ask for");
+        assert_eq!(term.scroll, 15);
+        assert_eq!(term.wheel(-2), None);
+        assert_eq!(first(&term), "r7");
     }
 }

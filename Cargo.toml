@@ -46,3 +46,9 @@ agentparse = { git = "https://github.com/qoop-si/agentparse", rev = "76670fbae83
 
 [profile.release]
 debug = 1
+
+# Dependencies optimized in debug builds too, as Zed does: GPUI's layout, text and hashing at
+# opt-level 0 draw the desktop window at a fraction of the display's rate, and the CI bundle is
+# a debug build. The workspace's own crates stay at 0 and compile as fast as before.
+[profile.dev.package."*"]
+opt-level = 3
