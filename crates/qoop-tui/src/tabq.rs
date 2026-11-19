@@ -175,8 +175,8 @@ pub fn read_key(task: &TaskRef) -> ReadKey {
 }
 
 /// The task under the cards, `cw` columns wide: a rule, the goal, the stage with the steps,
-/// the steps (`[x]` done, the first undone `now`, `[ ]`) and the newest evidence; folded, one
-/// line (`task #12 · waits · 2/4`).
+/// the steps (`[x]` done, the first undone `now`, `[ ]`) and the newest evidence, every word
+/// wrapped, never cut; folded, one line (`task #12 · waits · 2/4`), wrapped too when narrow.
 pub(crate) fn task_rows(
     task: Option<&TaskRef>,
     read: Option<&TaskRead>,
@@ -184,6 +184,7 @@ pub(crate) fn task_rows(
     folded: bool,
     now: i64,
 ) -> Vec<Vec<crate::qass_screen::Seg>> {
+    use crate::asks::wrap_whole;
     use crate::qass_screen::seg;
     let Some(task) = task else {
         return Vec::new();
@@ -204,27 +205,29 @@ pub(crate) fn task_rows(
             head = format!("{head} \u{b7} {count}");
         }
         let opens = " s opens";
-        // Narrow, the rule gives way so the key that opens it stays in sight.
+        // Narrow, the rule gives way and the words wrap, the key that opens it last.
         if 3 + width::width(&head) + 2 + opens.len() > cw {
-            let row = cut(&format!("{head} \u{b7}{opens}"), cw);
-            return vec![blank_row(), vec![seg(Role::FaintText, row)]];
+            let mut rows = vec![blank_row()];
+            for line in wrap_whole(&format!("{head} \u{b7}{opens}"), cw) {
+                rows.push(vec![seg(Role::FaintText, line)]);
+            }
+            return rows;
         }
         let mut row = rule(&head, cw.saturating_sub(opens.len()));
         row.push(seg(Role::FaintText, opens));
         return vec![blank_row(), row];
     }
     let mut out = vec![blank_row(), rule("task", cw)];
-    for line in wrap(&format!("#{} {}", task.id, task.goal), cw, 2) {
+    for line in wrap_whole(&format!("#{} {}", task.id, task.goal), cw) {
         out.push(vec![seg(Role::Text, line)]);
     }
     let steps = count.map_or_else(
         || "no plan steps".to_string(),
         |count| format!("steps {count}"),
     );
-    out.push(vec![seg(
-        Role::Detail,
-        format!("{} \u{b7} {steps}", task.stage),
-    )]);
+    for line in wrap_whole(&format!("{} \u{b7} {steps}", task.stage), cw) {
+        out.push(vec![seg(Role::Detail, line)]);
+    }
     let Some(read) = read else {
         return out;
     };
@@ -233,21 +236,21 @@ pub(crate) fn task_rows(
         let now_at = read.steps.iter().position(|(done, _)| !done);
         for (at, (done, text)) in read.steps.iter().enumerate() {
             let mark = if *done { "[x] " } else { "[ ] " };
-            if now_at == Some(at) {
-                let room = cw.saturating_sub(4 + 4);
-                out.push(vec![
-                    seg(
-                        Role::Text,
-                        format!("{mark}{}", width::fit(&cut(text, room), room)),
-                    ),
-                    seg(Role::Brand, " now"),
-                ]);
-            } else {
-                let role = if *done { Role::FaintText } else { Role::Text };
-                out.push(vec![seg(
-                    role,
-                    format!("{mark}{}", cut(text, cw.saturating_sub(4))),
-                )]);
+            let is_now = now_at == Some(at);
+            let role = if *done { Role::FaintText } else { Role::Text };
+            // The step's later rows under its words; the first undone one keeps ` now` at the
+            // end of its first row.
+            let room = cw.saturating_sub(if is_now { 4 + 4 } else { 4 });
+            for (n, line) in wrap_whole(text, room).into_iter().enumerate() {
+                let lead = if n == 0 { mark } else { "    " };
+                if is_now && n == 0 {
+                    out.push(vec![
+                        seg(role, format!("{lead}{}", width::fit(&line, room))),
+                        seg(Role::Brand, " now"),
+                    ]);
+                } else {
+                    out.push(vec![seg(role, format!("{lead}{line}"))]);
+                }
             }
         }
     }
@@ -257,7 +260,7 @@ pub(crate) fn task_rows(
             Role::FaintText,
             format!("last evidence, {}", crate::asks::age_short(now - at)),
         )]);
-        for line in wrap(text, cw, 2) {
+        for line in wrap_whole(text, cw) {
             out.push(vec![seg(Role::Detail, line)]);
         }
     }
@@ -266,41 +269,6 @@ pub(crate) fn task_rows(
 
 fn blank_row() -> Vec<crate::qass_screen::Seg> {
     Vec::new()
-}
-
-/// `text` cut to `cols` columns, an ellipsis where it was cut.
-fn cut(text: &str, cols: usize) -> String {
-    if width::width(text) <= cols {
-        return text.to_string();
-    }
-    format!(
-        "{}\u{2026}",
-        width::fit(text, cols.saturating_sub(1)).trim_end()
-    )
-}
-
-/// `text` on whole words in rows of `cols`, at most `max` rows, the last cut when more remains.
-fn wrap(text: &str, cols: usize, max: usize) -> Vec<String> {
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
-    for word in text.split_whitespace() {
-        let wide = width::width(&row) + usize::from(!row.is_empty()) + width::width(word);
-        if wide > cols && !row.is_empty() {
-            rows.push(std::mem::take(&mut row));
-        }
-        if !row.is_empty() {
-            row.push(' ');
-        }
-        row.push_str(word);
-    }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    if rows.len() > max {
-        let rest = rows.split_off(max - 1).join(" ");
-        rows.push(cut(&rest, cols));
-    }
-    rows.into_iter().map(|r| cut(&r, cols)).collect()
 }
 
 /// The unfolded pane's rows and where a click lands: the questions of the tab's agent, titled
@@ -335,7 +303,7 @@ pub fn pane_view(
             now,
         )
     };
-    let view = |under: &[Vec<crate::qass_screen::Seg>]| {
+    let view = |under: &[Vec<crate::qass_screen::Seg>], scroll: bool| {
         let ctx = crate::asks::Ctx {
             rows,
             spaces,
@@ -347,22 +315,21 @@ pub fn pane_view(
                 empty,
                 under,
                 focus: open.focus,
+                scroll,
             }),
         };
         crate::asks::view(open.asks, &ctx, open.rect.cols, open.rect.rows)
     };
-    let (line, mut whole) = (under(true), under(false));
+    let (line, whole) = (under(true), under(false));
     // Whole when `s` said so, else when it fits in the rows the cards leave with it folded:
     // measured, so an opened card never gives up its rows to the task.
-    let short = view(&line);
+    let short = view(&line, false);
     let fits = whole.len() <= line.len() + short.spare;
     match (open.task_open.unwrap_or(fits), fits) {
-        // Opened by hand where it does not fit: half the rows at most, the cards keep the rest.
-        (true, false) => {
-            whole.truncate(line.len().max(open.rect.rows.saturating_sub(2) / 2));
-            (view(&whole), true)
-        }
-        (true, _) => (view(&whole), true),
+        // Opened by hand where it does not fit: the card and the task under it read whole,
+        // scrolled with `j k`, never cut.
+        (true, false) => (view(&whole, true), true),
+        (true, _) => (view(&whole, false), true),
         (false, _) => (short, false),
     }
 }
@@ -662,5 +629,55 @@ mod tests {
         assert_eq!(text[4], "+7");
         assert_eq!(text[6], "\u{2500}".repeat(4));
         assert_eq!(text[7], "0/3");
+    }
+
+    /// The task part never cuts a word: a long goal, a long step (the first undone one with its
+    /// `now`), the newest evidence and, narrow, the folded line all wrap whole.
+    #[test]
+    fn the_task_part_wraps_every_word() {
+        let words = |n: usize| {
+            (1..=n)
+                .map(|i| format!("w{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut t = task("implementing", 1, 3);
+        t.goal = words(30);
+        let read = TaskRead {
+            steps: vec![
+                (true, format!("1. {}", words(12))),
+                (false, format!("2. {}", words(20))),
+                (false, "3. short".into()),
+            ],
+            evidence: Some((0, words(25))),
+        };
+        let flat = |rows: &[Vec<crate::qass_screen::Seg>]| {
+            rows.iter()
+                .map(|r| r.iter().map(|s| s.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let open = task_rows(Some(&t), Some(&read), 30, false, 10);
+        let text = flat(&open);
+        assert!(!text.contains('\u{2026}'), "{text}");
+        let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(joined.contains(&format!("#12 {}", words(30))), "{joined}");
+        // The step's words in order, ` now` closing its first row.
+        assert!(joined.replace(" now", "").contains(&words(20)), "{joined}");
+        assert!(joined.contains(&words(25)), "{joined}");
+        let now = open
+            .iter()
+            .find(|r| r.iter().any(|s| s.text == " now"))
+            .expect("now");
+        assert!(flat(std::slice::from_ref(now)).starts_with("[ ] 2. w01"));
+        for row in &open {
+            let w: usize = row.iter().map(|s| width::width(&s.text)).sum();
+            assert!(w <= 30, "{w}: {}", flat(std::slice::from_ref(row)));
+        }
+        let folded = flat(&task_rows(Some(&t), None, 14, true, 0));
+        assert!(
+            !folded.contains('\u{2026}') && folded.contains("s opens"),
+            "{folded}"
+        );
     }
 }

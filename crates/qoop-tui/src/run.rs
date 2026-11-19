@@ -32167,6 +32167,37 @@ mod tests {
         assert!(text.contains("pick a") && text.contains("[x] 1."), "{text}");
     }
 
+    /// The task opened by hand where it does not fit: the card and every step of the task are
+    /// read whole, scrolled with `j`, nothing cut and the pane its exact size.
+    #[test]
+    fn a_task_too_tall_for_the_pane_scrolls_whole_with_the_card() {
+        let mut s = agent_tab(80, 24);
+        tab_cards(&mut s, 1);
+        assert!(fold_key(&mut s));
+        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
+            panic!("a read");
+        };
+        assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
+        assert!(!s.tabq_task_shown(), "folded: it does not fit");
+        tabq_keys(&mut s, b"s", 0x01);
+        assert!(s.tabq_task_shown());
+        let mut seen = String::new();
+        for _ in 0..80 {
+            let t = pane_text(&s);
+            assert!(!t.contains('\u{2026}'), "{t}");
+            seen.push_str(&t);
+            seen.push(' ');
+            tabq_keys(&mut s, b"j", 0x01);
+        }
+        for n in 4..=12 {
+            assert!(
+                seen.contains(&format!("{n}. step number {n}")),
+                "step {n}: {seen}"
+            );
+        }
+        assert!(seen.contains("A long question") && seen.contains("cargo test: ok"));
+    }
+
     /// The pane gives the keyboard back once the focus moves to another leaf of its tab: a
     /// shell beside the agent gets its keys, and coming back to that leaf does not take them
     /// again.

@@ -682,9 +682,7 @@ impl Pane {
                 Out::Stay
             }
             Key::Esc => Out::Closed,
-            Key::Char(b'j' | b'k') | Key::Down | Key::Up
-                if self.whole || (self.overflow.get() && self.is_open()) =>
-            {
+            Key::Char(b'j' | b'k') | Key::Down | Key::Up if self.whole || self.overflow.get() => {
                 let down = matches!(key, Key::Char(b'j') | Key::Down);
                 self.whole_at = if down {
                     (self.whole_at + 1).min(self.whole_end.get())
@@ -891,6 +889,9 @@ pub(crate) struct InTab<'a> {
     pub under: &'a [Vec<Seg>],
     /// The keyboard is in the pane.
     pub focus: bool,
+    /// The task part was opened where it does not fit: the card and the task are read whole,
+    /// scrolled ([`read_whole`]).
+    pub scroll: bool,
 }
 
 /// The inbox painted: one string per row, each exactly as wide as asked, and where a click
@@ -1031,6 +1032,8 @@ struct Lens {
     reasons: Vec<usize>,
     becauses: Vec<usize>,
     sends: Vec<usize>,
+    /// The rows the text box takes, its edges and its words.
+    boxed: usize,
     /// The card has a row under its title (a tag such as `asleep`, or its item): it is kept.
     tag: bool,
 }
@@ -1088,7 +1091,7 @@ fn budget(inner_rows: usize, others: usize, folded: usize, words: bool, lens: &L
             + rows(b.because, &lens.becauses)
             + rows(b.sends, &lens.sends)
             + usize::from(b.gap_box)
-            + 3 * usize::from(b.text_box);
+            + lens.boxed * usize::from(b.text_box);
         let handled = if b.handled > 0 { b.handled + 2 } else { 0 };
         // tabs, rule, the other cards, the open one, what was handled, the key line.
         2 + b.others * folded + detail + handled + 1
@@ -1434,7 +1437,7 @@ fn read_whole(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize, overflow: bool) 
     // The box stands under the card while it is typed in or holds words.
     let (box_rows, caret) = if overflow && (pane.typing || !pane.text.is_empty()) {
         let (rows, caret) = text_box(pane, cw, passed, &wrap);
-        (rows.to_vec(), caret)
+        (rows, caret)
     } else {
         (Vec::new(), None)
     };
@@ -1515,6 +1518,10 @@ fn read_whole(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize, overflow: bool) 
             lines.push((vec![seg(Role::Detail, format!("{lead}{row}"))], None));
         }
     }
+    // In an agent's tab, its task under the card, read whole too.
+    for segs in ctx.tab.map_or(&[][..], |tab| tab.under) {
+        lines.push((segs.clone(), None));
+    }
     let end = lines.len().saturating_sub(content);
     pane.whole_end.set(end);
     let first = pane.whole_at.min(end);
@@ -1541,10 +1548,10 @@ fn read_whole(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize, overflow: bool) 
     while out.len() < 1 + content {
         out.push(wrap(&[]));
     }
-    let cursor = caret.map(|col| (out.len() + 1, col));
-    if !box_rows.is_empty() {
+    let cursor = caret.map(|(row, col)| (out.len() + 1 + row, col));
+    for at in 1..box_rows.len().saturating_sub(1) {
         targets.push(Target {
-            row: out.len() + 1,
+            row: out.len() + at,
             x0: 2,
             x1: 2 + cw,
             hit: Hit::Box,
@@ -1608,6 +1615,9 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
 
     if pane.whole && (pane.open_card().is_some() || !pane.lost.is_empty()) {
         return read_whole(pane, ctx, cols, rows, false);
+    }
+    if ctx.tab.is_some_and(|tab| tab.scroll) {
+        return read_whole(pane, ctx, cols, rows, true);
     }
 
     out.push(edge(
@@ -1818,6 +1828,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
                     .map(|o| wrap_whole(&o.words, cw.saturating_sub(11)).len())
                     .collect(),
                 tag: tag_of(card, ctx).is_some() || card.item.is_some(),
+                boxed: box_height(pane, cw, card.status != "open"),
             };
             // In an agent's tab, an open card offers the hand-off to qass on a row of its own.
             let handoff = ctx.tab.is_some() && card.status == "open";
@@ -2002,14 +2013,18 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
             }
             // The one text box.
             if b.text_box {
-                targets.push(Target {
-                    row: out.len() + 1,
-                    x0: 2,
-                    x1: 2 + cw,
-                    hit: Hit::Box,
-                });
                 let (rows, caret) = text_box(pane, cw, passed, &wrap);
-                cursor = caret.map(|col| (out.len() + 1, col)).or(cursor);
+                for at in 1..rows.len() - 1 {
+                    targets.push(Target {
+                        row: out.len() + at,
+                        x0: 2,
+                        x1: 2 + cw,
+                        hit: Hit::Box,
+                    });
+                }
+                cursor = caret
+                    .map(|(row, col)| (out.len() + 1 + row, col))
+                    .or(cursor);
                 out.extend(rows);
             }
             for &at in &shown[pos + 1..pos + 1 + below] {
@@ -2033,7 +2048,7 @@ pub fn view(pane: &Pane, ctx: &Ctx, cols: usize, rows: usize) -> View {
         out.push(blank());
         if pane.typing {
             let (rows, caret) = text_box(pane, cw, false, &wrap);
-            cursor = caret.map(|col| (out.len() + 1, col));
+            cursor = caret.map(|(row, col)| (out.len() + 1 + row, col));
             out.extend(rows);
             out.push(blank());
         }
@@ -2143,14 +2158,41 @@ fn because(card: &AskInfo, key: &str) -> Option<String> {
     Some(format!("because {reason}"))
 }
 
-/// The one text box, as its three rows, and the caret's column in its middle row while he
-/// types.
+/// The most rows of words the text box grows to; past them it shows the last ones, its caret
+/// with them.
+const BOX_ROWS: usize = 4;
+
+/// `text` in rows of `cols` cells, broken on any character and every space kept, so what is
+/// typed stands where it was typed and the caret after it.
+fn box_lines(text: &str, cols: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars().filter(|c| width::drawn(*c)) {
+        let w = width::columns(c);
+        if w > cols {
+            continue;
+        }
+        if used + w > cols {
+            rows.push(String::new());
+            used = 0;
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push(c);
+        }
+        used += w;
+    }
+    rows
+}
+
+/// The one text box: its top edge, a row for each row of words (one, growing to
+/// [`BOX_ROWS`] as the words wrap, then the last of them), its bottom edge; and while he types
+/// the caret's row among the words and its column. Nothing typed is cut.
 fn text_box(
     pane: &Pane,
     cw: usize,
     passed: bool,
     wrap: &impl Fn(&[Seg]) -> String,
-) -> ([String; 3], Option<usize>) {
+) -> (Vec<String>, Option<(usize, usize)>) {
     let box_w = cw;
     // The longest title that fits the box whole: the column may be dragged as narrow as the
     // questions go.
@@ -2166,29 +2208,14 @@ fn text_box(
     } else {
         Role::Rule
     };
-    let top = wrap(&[seg(box_ink, top)]);
     let inside = box_w.saturating_sub(4);
-    let shown_text = if pane.typing {
-        // The tail of what is typed, by cells (a wide letter takes two), with room for the
-        // caret.
-        let mut room = inside.saturating_sub(1);
-        let mut tail: Vec<char> = pane
-            .text
-            .chars()
-            .rev()
-            .take_while(|c| {
-                let fits = width::columns(*c) <= room;
-                room = room.saturating_sub(width::columns(*c));
-                fits
-            })
-            .collect();
-        tail.reverse();
-        format!("{}\u{2588}", tail.into_iter().collect::<String>())
+    let words = if pane.typing {
+        format!("{}\u{2588}", pane.text)
     } else if passed {
         "waiting for qass".to_string()
     } else if !pane.text.is_empty() {
         // The answer typed and kept, faint until `r` takes it up again.
-        cut_dots(&pane.text, inside)
+        pane.text.clone()
     } else {
         "r to reply".to_string()
     };
@@ -2197,22 +2224,36 @@ fn text_box(
     } else {
         Role::FaintText
     };
-    let caret = pane
-        .typing
-        .then(|| 2 + 2 + width::width(&shown_text).saturating_sub(1));
-    let middle = wrap(&[
-        seg(box_ink, "\u{2502} "),
-        seg(text_role, width::fit(&shown_text, inside)),
-        seg(box_ink, " \u{2502}"),
-    ]);
-    let bottom = wrap(&[seg(
+    let mut lines = box_lines(&words, inside);
+    let skip = lines.len().saturating_sub(BOX_ROWS);
+    lines.drain(..skip);
+    let caret = pane.typing.then(|| {
+        let last = lines.last().map_or(0, |l| width::width(l));
+        (lines.len() - 1, 2 + 2 + last.saturating_sub(1))
+    });
+    let mut rows = vec![wrap(&[seg(box_ink, top)])];
+    for line in lines {
+        rows.push(wrap(&[
+            seg(box_ink, "\u{2502} "),
+            seg(text_role, width::fit(&line, inside)),
+            seg(box_ink, " \u{2502}"),
+        ]));
+    }
+    rows.push(wrap(&[seg(
         box_ink,
         format!(
             "\u{2570}{}\u{256f}",
             "\u{2500}".repeat(box_w.saturating_sub(2))
         ),
-    )]);
-    ([top, middle, bottom], caret)
+    )]));
+    (rows, caret)
+}
+
+/// How many rows [`text_box`] takes.
+fn box_height(pane: &Pane, cw: usize, passed: bool) -> usize {
+    text_box(pane, cw, passed, &|_: &[Seg]| String::new())
+        .0
+        .len()
 }
 
 /// One card he already handled: who asked, the question, and how it ended with when, at the
@@ -2628,7 +2669,7 @@ fn wrap_dots(text: &str, cols: usize, max: usize) -> Vec<String> {
 
 /// `text` wrapped on words into rows of `cols` columns, every word kept: what the questions pane
 /// draws a card's words with, so none is ever cut.
-fn wrap_whole(text: &str, cols: usize) -> Vec<String> {
+pub(crate) fn wrap_whole(text: &str, cols: usize) -> Vec<String> {
     wrap_dots(text, cols, usize::MAX)
 }
 
@@ -3073,6 +3114,45 @@ mod tests {
             t.contains("run it after the backup") && !t.contains("r to reply"),
             "{t}"
         );
+    }
+
+    /// The box grows a row at a time as the words wrap, to four rows, then shows the last four
+    /// with the caret after them: a kept answer is never cut, and the caret stands where the
+    /// next letter goes.
+    #[test]
+    fn the_box_grows_with_its_words_then_scrolls() {
+        let mut p = pane(1);
+        p.focus = true;
+        p.expanded = true;
+        let inside = 40 - 4 - 4;
+        let rows_of = |p: &Pane| text_box(p, 36, false, &|_: &[Seg]| String::new()).0.len();
+        assert_eq!(rows_of(&p), 3, "r to reply, one row");
+        for (len, rows) in [
+            (inside, 3),
+            (inside + 1, 4),
+            (inside * 3, 5),
+            (inside * 4, 6),
+        ] {
+            p.text = "x".repeat(len);
+            assert_eq!(rows_of(&p), rows, "{len} letters kept");
+        }
+        p.text = (1..=60)
+            .map(|n| format!("k{n:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rows_of(&p), 6, "four rows of words at most");
+        let t = text(&view(&p, &ctx(&[], &[]), 40, 50));
+        assert!(!body(&t).contains('\u{2026}') && t.contains("k60"), "{t}");
+        // Typing: the caret after the last letter, a space typed moves it on.
+        p.key(b"r", 1);
+        p.key(b" ", 1);
+        let v = view(&p, &ctx(&[], &[]), 40, 50);
+        let (row, col) = v.cursor.expect("the caret");
+        let line = strip(&v.rows[row]);
+        let before: String = line.chars().take(col).collect();
+        assert!(before.trim_end().ends_with("k60"), "{line:?} at {col}");
+        assert_eq!(line.chars().nth(col), Some('\u{2588}'));
+        assert!(line.chars().nth(col - 1) == Some(' '), "the space stands");
     }
 
     /// Words typed for a card wait for it while another card is open (by key, by click or
