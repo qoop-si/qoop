@@ -537,24 +537,29 @@ impl Desk {
                                 branch
                             }),
                     ),
-            )
+            );
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .pt(px(4.))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .pt(px(4.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.5))
-                            .text_color(c(t.t2))
-                            .debug_selector(|| "new-work-note".into())
-                            .child(reason.filter(|_| !ok).unwrap_or(note)),
-                    )
-                    .child(cancel)
-                    .child(start),
-            );
-        ui::sheet("new-work-sheet", "New work", t, body.into_any_element()).into_any_element()
+                    .flex_1()
+                    .text_size(px(12.5))
+                    .text_color(c(t.t2))
+                    .debug_selector(|| "new-work-note".into())
+                    .child(reason.filter(|_| !ok).unwrap_or(note)),
+            )
+            .child(cancel)
+            .child(start);
+        ui::sheet(
+            "new-work-sheet",
+            "New work",
+            t,
+            body.into_any_element(),
+            footer.into_any_element(),
+        )
+        .into_any_element()
     }
 }

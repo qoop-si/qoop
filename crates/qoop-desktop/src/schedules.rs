@@ -2030,31 +2030,34 @@ impl Desk {
                         .text_color(c(t.fail_text))
                         .child(why),
                 )
-            })
+            });
+        let footer = div()
+            .flex()
+            .gap(px(8.))
+            .child(div().flex_1())
             .child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(div().flex_1())
-                    .child(
-                        ui::pill("schedule-sheet-cancel", "Cancel", t)
-                            .debug_selector(|| "schedule-sheet-cancel".into())
-                            .h(px(30.))
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_schedule_sheet(false, window, cx)
-                            })),
-                    )
-                    .child(
-                        ui::pill("sheet-save", "Save", t)
-                            .h(px(30.))
-                            .child("Save")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.save_sheet(window, cx)),
-                            ),
-                    ),
+                ui::pill("schedule-sheet-cancel", "Cancel", t)
+                    .debug_selector(|| "schedule-sheet-cancel".into())
+                    .h(px(30.))
+                    .child("Cancel")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_schedule_sheet(false, window, cx)
+                    })),
+            )
+            .child(
+                ui::pill("sheet-save", "Save", t)
+                    .h(px(30.))
+                    .child("Save")
+                    .on_click(cx.listener(|this, _, window, cx| this.save_sheet(window, cx))),
             );
-        ui::sheet("schedule-sheet", "Schedule", t, body.into_any_element()).into_any_element()
+        ui::sheet(
+            "schedule-sheet",
+            "Schedule",
+            t,
+            body.into_any_element(),
+            footer.into_any_element(),
+        )
+        .into_any_element()
     }
 }
 
