@@ -513,8 +513,19 @@ impl Desk {
                         )),
                     ),
                 })
-                .child(
-                    ui::pill(("card-qass", index as u64), "Hand to qass", t)
+                // The one qass rule: a card goes to This Mac's qass only while it runs and
+                // watches, as an agent's question does.
+                .child(match self.model.qass_off() {
+                    Some(why) => ui::pill_off(
+                        ("card-qass", index as u64),
+                        &format!("Hand to qass, unavailable: {why}"),
+                        t,
+                    )
+                    .debug_selector(move || format!("card-qass-{qass}"))
+                    .child(ui::icon(Icon::Eye, 14., c(t.t2)))
+                    .child("Hand to qass")
+                    .child(div().text_size(px(12.)).child(why)),
+                    None => ui::pill(("card-qass", index as u64), "Hand to qass", t)
                         .debug_selector(move || format!("card-qass-{qass}"))
                         .child(ui::icon(Icon::Eye, 14., c(t.t1)))
                         .child("Hand to qass")
@@ -530,7 +541,7 @@ impl Desk {
                                 this.card_to_qass(&card, window, cx)
                             })
                         }),
-                )
+                })
             })
             .when_some(self.said_line(&Slot::Card(id.clone()), t, cx), |d, line| {
                 d.child(line)

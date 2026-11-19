@@ -154,7 +154,7 @@ impl Desk {
 
     /// Hand card `card` to qass to decide: held for 3 s like any answer, then written.
     pub(crate) fn card_to_qass(&mut self, card: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.lost_at.is_some() {
+        if self.lost_at.is_some() || self.model.qass_off().is_some() {
             return;
         }
         let pick = Pick::CardQass {
@@ -465,7 +465,7 @@ impl Desk {
                     if matches!(hold.pick, Pick::CardQass { .. }) =>
                 {
                     Said::Sent {
-                        label: "Handed to qass".into(),
+                        label: HANDED.into(),
                         at: now,
                     }
                 }
@@ -808,7 +808,7 @@ impl Desk {
             // standing over a question that waits on the owner again. A moment after the send
             // the row may not say it is with qass yet.
             (Some(Said::Sent { label, at }), None)
-                if label == HANDED && !row.is_some_and(|r| r.with_qass) && self.now - *at > 5 =>
+                if label == HANDED && row.is_some_and(|r| !r.with_qass) && self.now - *at > 5 =>
             {
                 if row.is_some_and(|r| r.qass_missed) {
                     "qass did not take it".into()
