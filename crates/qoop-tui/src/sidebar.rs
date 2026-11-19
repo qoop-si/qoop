@@ -797,7 +797,7 @@ pub struct Column<'a> {
     /// order; nothing else follows it.
     pub order: Option<&'a crate::plugins::AgentView>,
     /// The question cards as this client last read them: an agent's row counts its open ones
-    /// (`⠔2` after its name), the count its tab's rail shows.
+    /// (`⠔2` after its name), the count its pane's rail shows.
     pub cards: &'a [AskInfo],
 }
 
@@ -3097,7 +3097,7 @@ fn tree_line(c: &Column, agent: &AgentRow) -> Line {
     }
 }
 
-/// How many question cards the agent waits on, after its name (`⠔2`), the count its tab's rail
+/// How many question cards the agent waits on, after its name (`⠔2`), the count its pane's rail
 /// shows; `None` at none, so a row with nothing waiting is as it always was.
 fn asks_mark(c: &Column, terminal: u32) -> Option<String> {
     let waiting = crate::tabq::open_count(c.cards, terminal);

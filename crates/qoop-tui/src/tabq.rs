@@ -1,10 +1,11 @@
-//! The questions rail of an agent's tab: a thin column at the right of the tab's panes that
-//! says, without opening anything, how many question cards the tab's agent waits on, which, and
-//! how far its task is (`2/4` steps and a stage word).
+//! The questions rail of an agent's pane: a thin column at the right of the pane's tile that
+//! says, without opening anything, how many question cards that agent waits on, which, and how
+//! far its task is (`2/4` steps and a stage word).
 //!
-//! Every tab with a local agent in it keeps one, folded, whether or not a card waits, so a card
-//! arriving or answered changes the rail's rows and never the agent's columns. Pure functions of
-//! the cards and the row the caller read, so a test reads the rail instead of looking at one.
+//! Every pane of a local agent keeps one, folded, whether or not a card waits, so a card
+//! arriving or answered changes the rail's rows and never the agent's columns. Two agents split
+//! in one tab each carry their own. Pure functions of the cards and the row the caller read, so
+//! a test reads the rail instead of looking at one.
 
 use qoop_runtime::control::{AskInfo, TaskRef};
 
@@ -12,23 +13,24 @@ use crate::layout::Rect;
 use crate::theme::{self, Role};
 use crate::width;
 
-/// The rail's columns, the line it shares with the panes left out: wide in a roomy tab, narrow
-/// (count only, no stage word) in a small one or beside a narrow pane.
+/// The rail's columns, the line it shares with its agent left out: wide in a roomy tile, narrow
+/// (count only, no stage word) in a smaller one.
 pub const WIDE: usize = 6;
 pub const NARROW: usize = 4;
 
-/// A tab under this many columns, or a pane in it under [`PANE_MIN`] beside the wide rail,
-/// takes the narrow one.
-const WIDE_TAB: usize = 120;
+/// A tile under this many columns, frame included, takes the narrow rail. The agent beside the
+/// wide one then keeps well over [`PANE_MIN`].
+const WIDE_TILE: usize = 120;
+/// The columns an agent keeps beside its unfolded pane; with fewer the pane opens over its tile.
 pub const PANE_MIN: usize = 60;
 
-/// A tab smaller than this gets no rail at all: the agent needs the room more.
-const TAB_MIN: (usize, usize) = (40, 8);
+/// A tile smaller than this, frame included, gets no rail at all: the agent needs the room more.
+const TILE_MIN: (usize, usize) = (40, 8);
 
 /// The rows under the cards: the rule, the count, the stage word and a blank.
 const FOOT: usize = 4;
 
-/// A tab's rail: the agent terminal it speaks for and its width.
+/// An agent pane's rail: the agent terminal it speaks for and its width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rail {
     pub terminal: u32,
@@ -36,43 +38,36 @@ pub struct Rail {
 }
 
 impl Rail {
-    /// The columns it takes from the tab: its own and the line it draws between it and the panes.
+    /// The columns it takes from its tile: its own and the line between it and the agent.
     pub fn cols(self) -> usize {
         self.w + 1
     }
 }
 
-/// How wide a tab's rail is, from the tab's columns and its narrowest pane beside the wide rail;
-/// `None` for a tab too small to give any.
-pub fn width(tab: Rect, narrowest: Option<usize>) -> Option<usize> {
-    if tab.cols < TAB_MIN.0 || tab.rows < TAB_MIN.1 {
+/// How wide the rail of a pane whose tile (its cells, inside the frame) is `tile`; `None` for a
+/// tile too small to give any. Measured with the frame's two lines, so a tab of one pane keeps
+/// the rail it always had.
+pub fn width(tile: Rect) -> Option<usize> {
+    let (cols, rows) = (tile.cols + 2, tile.rows + 2);
+    if cols < TILE_MIN.0 || rows < TILE_MIN.1 {
         return None;
     }
-    let wide = tab.cols >= WIDE_TAB && narrowest.is_none_or(|cols| cols >= PANE_MIN);
-    Some(if wide { WIDE } else { NARROW })
+    Some(if cols >= WIDE_TILE { WIDE } else { NARROW })
 }
 
-/// The tab's area once the rail took its columns at the right: what its panes are laid out in.
-pub fn carve(tab: Rect, rail: Option<Rail>) -> Rect {
-    match rail {
-        Some(rail) => Rect {
-            cols: tab.cols.saturating_sub(rail.cols()),
-            ..tab
-        },
-        None => tab,
-    }
-}
-
-/// Where the rail's own cells are in the pane: right of the carved area, inside the frame's top
-/// and bottom lines, as a pane's tile is.
-pub fn rect(tab: Rect, rail: Rail) -> Rect {
-    let panes = carve(tab, Some(rail));
-    Rect {
-        x: panes.x + panes.cols,
-        y: tab.y + 1,
+/// A tile cut for its rail: the agent's cells at the left, then the line, then the rail's cells
+/// at the right edge, as tall as the tile.
+pub fn split(tile: Rect, rail: Rail) -> (Rect, Rect) {
+    let term = Rect {
+        cols: tile.cols.saturating_sub(rail.cols()),
+        ..tile
+    };
+    let cells = Rect {
+        x: tile.x + term.cols + 1,
         cols: rail.w,
-        rows: tab.rows.saturating_sub(2),
-    }
+        ..tile
+    };
+    (term, cells)
 }
 
 /// The rail as a frame paints it: its cells in the pane, its terminal, and every live card (the
@@ -524,29 +519,29 @@ mod tests {
         }
     }
 
-    /// Wide in a roomy tab, narrow under 120 columns or beside a pane under 60, none in a tab
-    /// too small to spare it.
+    /// Wide in a roomy tile, narrow under 120 columns with its frame, none in a tile too small
+    /// to spare it; the tile splits into the agent's cells, the line and the rail's.
     #[test]
-    fn the_rail_is_as_wide_as_the_tab_allows() {
-        let tab = |cols, rows| Rect {
-            x: 0,
-            y: 0,
+    fn the_rail_is_as_wide_as_the_tile_allows() {
+        let tile = |cols, rows| Rect {
+            x: 1,
+            y: 1,
             cols,
             rows,
         };
-        assert_eq!(width(tab(131, 41), Some(122)), Some(WIDE));
-        assert_eq!(width(tab(131, 41), Some(58)), Some(NARROW));
-        assert_eq!(width(tab(119, 41), None), Some(NARROW));
-        assert_eq!(width(tab(41, 19), Some(34)), Some(NARROW));
-        assert_eq!(width(tab(39, 19), None), None);
-        assert_eq!(width(tab(80, 7), None), None);
+        assert_eq!(width(tile(129, 39)), Some(WIDE));
+        assert_eq!(width(tile(117, 39)), Some(NARROW));
+        assert_eq!(width(tile(39, 17)), Some(NARROW));
+        assert_eq!(width(tile(37, 17)), None);
+        assert_eq!(width(tile(78, 5)), None);
         let rail = Rail {
             terminal: 1,
             w: WIDE,
         };
-        assert_eq!(carve(tab(131, 41), Some(rail)).cols, 124);
+        let (term, cells) = split(tile(129, 39), rail);
+        assert_eq!(term, tile(122, 39));
         assert_eq!(
-            rect(tab(131, 41), rail),
+            cells,
             Rect {
                 x: 124,
                 y: 1,
