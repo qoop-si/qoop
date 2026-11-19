@@ -164,17 +164,12 @@ impl Desk {
         self.panes_mut().find(|t| t.terminal == terminal)
     }
 
-    /// Rows of scrollback came: held by the pane that asked, unless a newer ask replaced it.
-    pub(crate) fn scrolled_back(
-        &mut self,
-        terminal: TerminalStream,
-        id: &str,
-        from: u64,
-        total: u64,
-        lines: Vec<String>,
-    ) {
+    /// Rows of scrollback came: held by the pane whose ask they answer; any other answer is
+    /// stale and dropped.
+    pub(crate) fn scrolled_back(&mut self, id: &str, from: u64, total: u64, lines: Vec<String>) {
         let next = self
-            .pane_mut(terminal)
+            .panes_mut()
+            .find(|t| t.asked_is(id))
             .and_then(|t| t.came(id, from, total, lines));
         if let Some(next) = next {
             self.ask(next);
@@ -1640,10 +1635,36 @@ impl Term {
             self.floor = from;
         }
         let most = (total.saturating_sub(self.floor) as usize).saturating_sub(self.height());
+        let anchored = self.scroll;
         self.scroll = self.scroll.min(most.max(1));
-        self.block = Some((from, lines));
+        if self.scroll != anchored {
+            // Rows trimmed under the view moved it: a selection would name other text.
+            self.selection = None;
+        }
+        // `up` was counted from the total the last answer had, so with output coming in the
+        // block can land off the view. Rows are numbered for good, so the held block stays
+        // right then, and the next ask is counted from the total just learnt.
+        if self.block.is_none() || self.holds(from, lines.len()) {
+            self.block = Some((from, lines));
+        }
         self.show();
         self.fetch()
+    }
+
+    /// The rows one ask brings, about three screens, and how many of them lie on each side of
+    /// the view.
+    fn span(&self) -> (usize, usize) {
+        let height = self.height();
+        let rows = (3 * height).min(MAX_SCROLLBACK_ROWS);
+        (rows, rows.saturating_sub(height) / 2)
+    }
+
+    /// A block of `len` rows from row `from` holds the view: all of it, or as much as one ask
+    /// can bring, or every row up to the newest.
+    fn holds(&self, from: u64, len: usize) -> bool {
+        let (top, end) = (self.top(), from + len as u64);
+        let seen = self.height().min(self.span().0) as u64;
+        top >= from && (top + seen <= end || end >= self.total)
     }
 
     pub(crate) fn asked_is(&self, id: &str) -> bool {
@@ -1655,6 +1676,7 @@ impl Term {
         self.scroll = 0;
         self.back = None;
         self.lift = 0.;
+        self.wheel_left = 0.;
         self.block = None;
         self.asked = None;
         self.selection = None;
@@ -1665,11 +1687,10 @@ impl Term {
         let Some((from, lines)) = &self.block else {
             return;
         };
-        let (top, height) = (self.top(), self.height());
-        let end = from + lines.len() as u64;
-        if top < *from || (top + height as u64 > end && end < self.total) {
+        if !self.holds(*from, lines.len()) {
             return;
         }
+        let (top, height) = (self.top(), self.height());
         // Part of a row moved: the row above comes in too, and the page is drawn up by the rest.
         let early = usize::from(top > *from && self.wheel_left > 0.);
         let start = ((top - from) as usize - early).min(lines.len());
@@ -1680,23 +1701,26 @@ impl Term {
     }
 
     /// A `Scrollback` for three screens around the view, when none is out and the view is
-    /// within half a screen of the block's edge, or outside it.
+    /// within half of what the block holds past it (half a screen), or outside it, so an
+    /// answer never asks again by itself, a tall pane's neither.
     fn fetch(&mut self) -> Option<ControlRequest> {
         if self.asked.is_some() {
             return None;
         }
         let height = self.height();
+        let (rows, spare) = self.span();
         if let Some((from, lines)) = &self.block {
-            let (top, margin) = (self.top(), (height / 2) as u64);
+            let top = self.top();
+            let margin = (spare / 2) as u64;
+            let seen = height.min(rows) as u64;
             let end = from + lines.len() as u64;
             let above = *from > self.floor && top < from + margin;
-            let below = end < self.total && top + height as u64 + margin > end;
+            let below = end < self.total && top + seen + margin > end;
             if !above && !below {
                 return None;
             }
         }
-        let rows = (3 * height).min(MAX_SCROLLBACK_ROWS);
-        let up = self.scroll + height + rows.saturating_sub(height) / 2;
+        let up = self.scroll + height + spare;
         let id = link::fresh_id("back");
         self.asked = Some((id.clone(), up));
         Some(ControlRequest::Scrollback {
@@ -1845,6 +1869,44 @@ mod tests {
         assert_eq!(term.came(&id, 975, 1004, rows(975, 1004)), None);
         assert_eq!(term.scroll, 13);
         assert_eq!(first(&term), "r981");
+    }
+
+    /// Much output between two answers lands the new block off the view (`up` was counted from
+    /// the older total): the held block stays, the view with it, and the ask goes again from
+    /// the new total.
+    #[test]
+    fn a_block_that_misses_the_view_is_not_kept() {
+        let mut term = scrolled(1000);
+        for _ in 0..6 {
+            term.wheel(1);
+        }
+        let (id, _) = term.asked.clone().expect("an ask out");
+        let (_, up, _) = ask(term.came(&id, 1471, 1500, rows(1471, 1500)));
+        assert_eq!(
+            term.block.as_ref().map(|b| b.0),
+            Some(977),
+            "the held block stays"
+        );
+        assert_eq!((term.scroll, first(&term)), (509, "r981"));
+        assert_eq!(up, 529, "asked from the total just learnt");
+    }
+
+    /// A pane taller than a third of what one ask brings: the answer holds the view and does
+    /// not ask again by itself. Past one ask's rows the page shows what one ask brings, and
+    /// only a step out of it asks.
+    #[test]
+    fn a_tall_pane_does_not_ask_again_and_again() {
+        for (height, up, step_held) in [(300u16, 403usize, true), (600, 603, false)] {
+            let mut term = Term::new(1);
+            term.sent.set((80, height));
+            let (id, asked_up, asked) = ask(term.wheel(3));
+            assert_eq!((asked_up, asked), (up, MAX_SCROLLBACK_ROWS));
+            let from = 10_000 - up as u64;
+            let block = rows(from, (from + asked as u64).min(10_000));
+            assert_eq!(term.came(&id, from, 10_000, block), None, "{height} rows");
+            assert_eq!(first(&term), format!("r{}", 10_000 - 3 - u64::from(height)));
+            assert_eq!(term.wheel(1).is_none(), step_held, "{height} rows");
+        }
     }
 
     /// Part of a row moves the page by pixels: the row above comes in, the page is drawn up by

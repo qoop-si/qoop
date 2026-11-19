@@ -150,6 +150,24 @@ fn ctrl_a_c_opens_new_work_and_ctrl_a_i_the_inbox(cx: &mut TestAppContext) {
     );
 }
 
+/// A `Scrollback` out when the connection drops is never answered: a new connection forgets
+/// it, so the next wheel step asks again instead of waiting for it.
+#[gpui::test]
+fn a_new_connection_forgets_the_scrollback_ask_out(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        desk.update(cx, |d, cx| {
+            let term = d.term.as_mut().expect("the session's terminal");
+            term.asked = Some(("lost".into(), 23));
+            d.apply(Down::Connected, window, cx);
+        })
+    });
+    let asked = desk.read_with(&vcx, |d, _| d.term.as_ref().map(|t| t.asked.clone()));
+    assert_eq!(asked, Some(None));
+}
+
 #[gpui::test]
 fn the_prefix_twice_sends_it_to_the_terminal(cx: &mut TestAppContext) {
     let (desk, mut vcx, mut rx) = open(cx);
