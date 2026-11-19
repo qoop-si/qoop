@@ -60,9 +60,20 @@ pub struct Term {
     /// then (`Scrollback`); 0 is the live screen.
     pub(crate) scroll: usize,
     pub(crate) back: Option<Rc<SnapshotWire>>,
+    /// The rows there were at the last answer: `scroll` counts back from there.
     pub(crate) total: u64,
-    /// The part of a row the wheel moved that has not scrolled yet.
+    /// Rows of scrollback held around the view, by the number of the first, so a wheel step
+    /// inside them is drawn in the next frame with no round trip.
+    pub(crate) block: Option<(u64, Vec<String>)>,
+    /// The oldest row the daemon still keeps, once an answer showed it.
+    pub(crate) floor: u64,
+    /// The one `Scrollback` out, by id, and the `up` it asked: any other answer is stale.
+    pub(crate) asked: Option<(String, usize)>,
+    /// The part of a row the wheel moved that has not scrolled yet, from 0 up to 1.
     pub(crate) wheel_left: f32,
+    /// The rows `back` is drawn up by, under one: it then starts a row early, so the part of a
+    /// row the wheel moved shows as pixels.
+    pub(crate) lift: f32,
     /// Cells selected with the mouse, anchor then end, as (row, column) of what is shown.
     pub(crate) selection: Option<((usize, usize), (usize, usize))>,
 }
@@ -78,7 +89,11 @@ impl Term {
             scroll: 0,
             back: None,
             total: 0,
+            block: None,
+            floor: 0,
+            asked: None,
             wheel_left: 0.,
+            lift: 0.,
             selection: None,
         }
     }
@@ -514,11 +529,12 @@ impl Desk {
                 }
             }
             ControlResponse::Scrollback {
+                id,
                 terminal,
+                from,
                 total,
                 lines,
-                ..
-            } => self.scrolled_back(terminal, total, lines),
+            } => self.scrolled_back(terminal, &id, from, total, lines),
             ControlResponse::Workspaces { workspaces, .. } => {
                 self.link_reasons = state::link_reasons(&workspaces);
                 let back = self.reach.note(&workspaces, self.now);
@@ -561,6 +577,9 @@ impl Desk {
                 } else if self.strip_ask.as_deref() == Some(id.as_str()) {
                     // A daemon from before a window could read a tab's task: no strip.
                     self.strip = Some(state::Strip::default());
+                } else if let Some(term) = self.panes_mut().find(|t| t.asked_is(&id)) {
+                    // The next wheel step asks again.
+                    term.asked = None;
                 } else {
                     self.refused(&id, reason);
                 }
@@ -1909,6 +1928,7 @@ impl Desk {
                 input: Some((self.term_focus.clone(), cx.entity())),
                 selection: None,
                 area: None,
+                lift: px(0.),
             })
     }
 

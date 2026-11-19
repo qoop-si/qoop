@@ -92,6 +92,9 @@ pub struct TerminalElement<V: 'static> {
     pub selection: Option<((usize, usize), (usize, usize))>,
     /// Told where the grid was drawn, for a mouse position to a cell.
     pub area: Option<Rc<Cell<Bounds<Pixels>>>>,
+    /// How far up the grid is drawn, under a row high: a page of scrollback moved part of a
+    /// row carries the row above as its first, drawn partly under the pane's top edge.
+    pub lift: Pixels,
 }
 
 impl<V: EntityInputHandler> IntoElement for TerminalElement<V> {
@@ -156,11 +159,16 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
         _cx: &mut App,
     ) -> Painted {
         let mut frame = probe::Frame::start();
-        let bounds = on_device_pixels(bounds, window.scale_factor());
+        let scale = window.scale_factor();
+        let bounds = on_device_pixels(bounds, scale);
+        let fit = self.cells.fit((bounds.size.width, bounds.size.height));
+        // Lifted by whole device pixels, so the glyphs stay on them. The mouse is read against
+        // the same origin, so a cell under it is a row of what is drawn.
+        let lift = (self.lift * scale).round() / scale;
+        let bounds = Bounds::new(point(bounds.origin.x, bounds.origin.y - lift), bounds.size);
         if let Some(area) = &self.area {
             area.set(bounds);
         }
-        let fit = self.cells.fit((bounds.size.width, bounds.size.height));
         if let Some(terminal) = self.terminal
             && fit != self.sent.get()
         {
@@ -178,7 +186,8 @@ impl<V: EntityInputHandler> Element for TerminalElement<V> {
         if let Some(screen) = self.screen.clone() {
             // A grid bigger than the pane (another client owns its size) is shown through a
             // window that follows the cursor, never wrapped: ADR-007.
-            let view = viewport_for(&screen, self.viewport.get(), fit.0, fit.1);
+            let rows = fit.1 + u16::from(lift > px(0.));
+            let view = viewport_for(&screen, self.viewport.get(), fit.0, rows);
             self.viewport.set(Some(view));
             layout(&screen, view, &self.cells, &mut painted, window);
         }
@@ -700,6 +709,7 @@ mod tests {
             input: None,
             selection: None,
             area: None,
+            lift: px(0.),
         }
     }
 
@@ -752,5 +762,26 @@ mod tests {
             .as_ref()
             .expect("the cursor row is on screen");
         assert_eq!(cursor.origin.y, px(16.) * 9., "the last of ten rows");
+    }
+
+    /// A page drawn up by part of a row shows one row more than the pane holds, its first
+    /// partly above the top, and the mouse is read against that same lifted origin.
+    #[gpui::test]
+    fn a_lifted_page_draws_a_row_more(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_empty_window();
+        let lines: Vec<String> = (0..11).map(|i| format!("r{i}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let snap = screen(&lines, (0, 0), 80, 11);
+        let area = Rc::new(Cell::new(Bounds::default()));
+        let mut e = element(snap, Asked::default(), Rc::new(Cell::new((0, 0))));
+        e.area = Some(area.clone());
+        e.lift = px(6.);
+        let (_, painted) = window.draw(point(px(0.), px(0.)), size(px(640.), px(160.)), |_, _| e);
+        assert_eq!(area.get().origin.y, px(-6.));
+        assert_eq!(
+            painted.glyphs.len(),
+            10 * 2 + 3,
+            "r0 to r9, and r10 below them"
+        );
     }
 }
