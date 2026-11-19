@@ -513,16 +513,24 @@ impl Model {
         self.listed_machines = self.rows.iter().map(|r| machine_of(r.workspace)).collect();
     }
 
+    /// Why This Mac's qass takes nothing now: it is not running, or not watching. The part of
+    /// the one rule an agent's question and a qass card's hand-off share.
+    pub fn qass_off(&self) -> Option<String> {
+        match self.qass_line().as_str() {
+            "not running" => Some("qass is not running".into()),
+            "not watching" => Some("qass is not watching".into()),
+            _ => None,
+        }
+    }
+
     /// Why "Let qass handle it" cannot be pressed for `row`, or `None` when it can. One rule
     /// for every place that offers it: This Mac's qass takes every machine's questions.
     pub fn qass_reason(&self, row: &AgentRow) -> Option<String> {
         if row.qass_skip {
             return Some("qass leaves this agent alone".into());
         }
-        match self.qass_line().as_str() {
-            "not running" => return Some("qass is not running".into()),
-            "not watching" => return Some("qass is not watching".into()),
-            _ => {}
+        if let Some(why) = self.qass_off() {
+            return Some(why);
         }
         let m = machine_of(row.workspace);
         (m != 0 && self.no_hands.contains(&m)).then(|| {
@@ -2564,6 +2572,8 @@ pub(crate) mod tests {
         assert_eq!(m.qass_line(), "watching 5 of 6");
         m.qass_watch = Some(false);
         assert_eq!(m.qass_line(), "not watching");
+        // The one rule a qass card's hand-off shares with an agent's question.
+        assert_eq!(m.qass_off().as_deref(), Some("qass is not watching"));
         m.rows.retain(|r| r.workspace != 3);
         assert_eq!(m.qass_line(), "not running");
     }
