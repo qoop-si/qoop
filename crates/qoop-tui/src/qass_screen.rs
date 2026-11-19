@@ -727,6 +727,7 @@ pub fn pet_for(pet: &Avatar, asleep: bool) -> Avatar {
 }
 
 /// A piece of a line: its words and the ink they wear.
+#[derive(Clone)]
 pub(crate) struct Seg {
     pub(crate) role: Role,
     pub(crate) bold: bool,
