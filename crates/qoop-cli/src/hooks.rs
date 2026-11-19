@@ -2169,7 +2169,8 @@ mod tests {
             whole.ends_with("mi?"),
             "whole, never cut in the middle: {whole}"
         );
-        let cut = format!("{}?", "word ".repeat(200));
+        // Past the 4000 character safety cap only, a question is cut at a word.
+        let cut = format!("{}?", "word ".repeat(1000));
         let said = stop("", Some(&cut));
         let whole = said
             .split("--said|")
@@ -2177,8 +2178,21 @@ mod tests {
             .and_then(|l| l.split('|').next())
             .unwrap_or_default();
         assert!(
-            whole.chars().count() <= 600 && whole.ends_with("word\u{2026}"),
+            whole.chars().count() <= 4000 && whole.ends_with("word\u{2026}"),
             "cut at a word: {whole}"
+        );
+        // Under it, a long question arrives whole.
+        let long_question = format!("{}?", "word ".repeat(200));
+        let said = stop("", Some(&long_question));
+        let whole = said
+            .split("--said|")
+            .nth(1)
+            .and_then(|l| l.split('|').next())
+            .unwrap_or_default();
+        assert_eq!(
+            whole,
+            long_question.trim_end(),
+            "a 1000 character question stays whole"
         );
         // A 300 character question keeps the file it names on the card, with no markdown.
         let named = format!(
