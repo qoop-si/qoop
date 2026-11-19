@@ -823,8 +823,19 @@ pub fn trap_tab(frame: &FocusHandle, back: bool, window: &mut Window, cx: &mut A
     }
 }
 
-/// The sheet's frame: a scrim over the window and a card in its middle, holding `body`.
-pub fn sheet(id: &'static str, label: &str, t: &Theme, body: AnyElement) -> Stateful<Div> {
+/// The sheet's frame: a scrim over the window and a card in its middle, holding `body` and,
+/// under it, `footer` (its Cancel and Save or Start).
+///
+/// A sheet taller than the room it opens in never runs off the window: the body scrolls
+/// inside the card, its top always in view, and the footer stays under it, so the way out
+/// and the way on are always on screen (a remote's schedule sheet carries a line more).
+pub fn sheet(
+    id: &'static str,
+    label: &str,
+    t: &Theme,
+    body: AnyElement,
+    footer: AnyElement,
+) -> Stateful<Div> {
     div()
         .id("scrim")
         .absolute()
@@ -833,10 +844,8 @@ pub fn sheet(id: &'static str, label: &str, t: &Theme, body: AnyElement) -> Stat
         .items_center()
         .justify_center()
         .bg(ca(if t.dark { 0x000000a0 } else { 0x26262640 }))
-        // A sheet taller than the room it opens in scrolls inside it, its top never above
-        // the window: a remote's schedule sheet carries a line more than This Mac's.
         .p(px(12.))
-        .child(scroll(
+        .child(
             div()
                 .id(id)
                 .debug_selector(move || id.to_string())
@@ -844,14 +853,24 @@ pub fn sheet(id: &'static str, label: &str, t: &Theme, body: AnyElement) -> Stat
                 .aria_label(label.to_string())
                 .w(px(560.))
                 .max_h_full()
-                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
                 .p(px(20.))
                 .rounded(px(18.))
                 .bg(c(t.pop))
                 .border_1()
                 .border_color(ca(t.line))
-                .child(body),
-        ))
+                .child(scroll(
+                    div()
+                        .id((id, 1u64))
+                        .flex_shrink(1.)
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(body),
+                ))
+                .child(div().flex_none().child(footer)),
+        )
 }
 
 #[cfg(test)]
