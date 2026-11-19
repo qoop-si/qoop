@@ -325,7 +325,7 @@ END
 The terminal: the agent it is about while its tab is open, asleep too (the card then ends with it,
 and no draft doubles it); `-` only when no tab is. A card that takes over older open ones under
 other handles adds a `replaces: E351 E387` line: they end as superseded (a kept answer stays).
-One `key: value` line each, any order, a value at most 200 characters. `doing`, `why`, `asks` and
+One `key: value` line each, any order, a value at most 4000 characters. `doing`, `why`, `asks` and
 every label, reason and words are required; `asked` and `pick` optional. Two to four options `A:` to
 `D:`, plainly different, no "something else" (the pane has their own box), never one that drops or
 parks a bug they reported (not reproduced: the worker reads the code for its cause). The words are their

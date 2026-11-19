@@ -2097,8 +2097,9 @@ impl AgentRegistry {
     /// Keep a turn end's closing words for `stream`, masked; none forgets the last ones.
     pub fn set_said(&self, stream: u32, said: Option<&str>) {
         let mut all = self.said.lock().unwrap();
-        // Cut before masking, as a label is: the hook sends at most 800 characters.
-        let cut = said.map(|s| s.chars().take(1200).collect::<String>());
+        // Cut before masking, as a label is: the hook sends at most 8002 characters (two
+        // paragraphs of 4000 and the blank line between).
+        let cut = said.map(|s| s.chars().take(8002).collect::<String>());
         match cut
             .as_deref()
             .map(qoop_parsed::redact)

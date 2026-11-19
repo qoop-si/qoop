@@ -34,7 +34,7 @@ const FORMAT: &str = "a card is `key: value` lines, one line each, any order:
   (C and D optional; two to four options, A first, in order)
   pick: <A to D> | <why>                                 (optional)
   replaces: E<n> E<m>                                    (optional: older open cards this one ends)
-every value is one line of at most 200 characters, and label, reason and words are not empty";
+every value is one line of at most 4000 characters, and label, reason and words are not empty";
 
 /// How long standard input may stay open with no end: a forgotten heredoc must not hang.
 const STDIN_WAIT: Duration = Duration::from_secs(5);
@@ -534,15 +534,15 @@ pick: B | a column drop cannot be undone
 
     #[test]
     fn limits_and_empty_values_are_refused_never_cut() {
-        let long = "x".repeat(201);
+        let long = "x".repeat(4001);
         let text = format!("doing: {long}\nwhy: w\nasks: q\nA: a |  | words\nB: b | r | w");
         let problems = parse(&text, "h", "now").unwrap_err().join("\n");
         assert!(
-            problems.contains("doing is 201 characters, over the 200 limit"),
+            problems.contains("doing is 4001 characters, over the 4000 limit"),
             "{problems}"
         );
         assert!(problems.contains("option a reason is empty"), "{problems}");
-        let at_limit = "x".repeat(200);
+        let at_limit = "x".repeat(4000);
         let ok = format!("doing: {at_limit}\nwhy: w\nasks: q\nA: a | r | w\nB: b | r | w");
         assert!(parse(&ok, "h", "now").is_ok());
     }

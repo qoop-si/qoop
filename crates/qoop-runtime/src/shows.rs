@@ -17,7 +17,7 @@ use qoop_store::ShowRow;
 
 use crate::agents::AgentRegistry;
 use crate::asks::failed;
-use crate::control::{ASK_FIELD_MAX, ControlResponse, SHOW_CHUNK, SHOW_MOST, ShowInfo};
+use crate::control::{ControlResponse, SHOW_CHUNK, SHOW_MOST, ShowInfo};
 use crate::daemon::{ConnectionRegistry, PROBE_DEADLINE, TerminalRegistry};
 use crate::store::{StoreHandle, now};
 
@@ -26,6 +26,9 @@ const SHOWN: usize = 50;
 
 /// The longest url kept.
 const URL_MOST: usize = 2048;
+
+/// The longest a show's note may be, in characters: one line on the phone.
+const NOTE_MAX: usize = 200;
 
 /// What a fetch says when the recorded path holds no file now.
 const GONE: &str = "the file is gone";
@@ -236,7 +239,7 @@ pub(crate) async fn write(
         .map(|n| {
             qoop_store::task::one_line(&n)
                 .chars()
-                .take(ASK_FIELD_MAX)
+                .take(NOTE_MAX)
                 .collect::<String>()
         })
         .filter(|n| !n.is_empty());
