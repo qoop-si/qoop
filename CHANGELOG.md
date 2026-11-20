@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.21.1](https://github.com/qoop-si/qoop/compare/v0.21.0...v0.21.1) (2026-11-20)
+
+
+### Fixed
+
+* **desktop:** keep terminal scrollback asking after drops and bursts ([32bcddc](https://github.com/qoop-si/qoop/commit/32bcddc109f111ee212cc2528360c8329a1bc2e4))
+* **desktop:** smooth scrolling in debug builds and the terminal ([0061bde](https://github.com/qoop-si/qoop/commit/0061bde1672b66f35eb82a7e44c1c8afc7f783ee))
+* **tui:** a pane's rail follows its agent's focus and tab ([ce452af](https://github.com/qoop-si/qoop/commit/ce452af2b33eccf1b1b9cd224ddcd75e762172da))
+* **tui:** drag or step an agent pane's questions pane to its width ([d079c90](https://github.com/qoop-si/qoop/commit/d079c906af6f2f9dfd9d4376d56cac75c65caf1e))
+* **tui:** each agent pane carries its own questions rail ([f02c5e8](https://github.com/qoop-si/qoop/commit/f02c5e8c6e8f51505cfe09c283775944a594e759))
+* **tui:** the questions pane never cuts a card's words ([7cf9ad4](https://github.com/qoop-si/qoop/commit/7cf9ad4c052b6fa497bb42555c9b3ed5569dd035))
+* **tui:** the task part and the reply box never cut their words ([c1eddf5](https://github.com/qoop-si/qoop/commit/c1eddf5968db39ddb7c28e527886c449927f8e65))
+
 ## [0.21.0](https://github.com/qoop-si/qoop/compare/v0.20.0...v0.21.0) (2026-11-19)
 
 
