@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use qoop_testkit::{PATIENCE, TestDaemon};
 
-/// G10.1: a mobile-sized client attaching never changes any pty winsize.
+/// G10.1: a mobile-sized client attaching never changes any pty winsize. (A key pressed in
+/// the TUI or the desktop app is another event: it takes the size, ADR-007.)
 ///
 /// Asserted as an absence after a fresh marker proves the screen has been updated since,
 /// because the earlier `stty size` output is still on the screen and "the old size is

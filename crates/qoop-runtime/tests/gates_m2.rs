@@ -792,7 +792,8 @@ async fn an_owner_that_stops_showing_a_terminal_yields_it_to_the_window_that_doe
 }
 
 /// G2.4: a small client sees a window onto a large terminal, and the terminal does not
-/// shrink to fit it.
+/// shrink to fit it, until a person presses a key in it when it is the TUI or the desktop app
+/// (ADR-007).
 ///
 /// Two halves, and only both together are the property. The child's winsize must stay at
 /// the owner's size, because a terminal that shrinks when a phone attaches is a terminal

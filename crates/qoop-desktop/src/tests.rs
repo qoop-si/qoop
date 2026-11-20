@@ -278,6 +278,108 @@ fn the_field_marks_then_commits_what_the_input_method_composes(cx: &mut TestAppC
     field.read_with(&vcx, |f, _| assert_eq!(f.text, ""));
 }
 
+/// A field wraps what is typed in it to its width and grows a line at a time, up to six lines;
+/// past them it scrolls, keeping the caret's line in view. Nothing runs past its edge.
+#[gpui::test]
+fn the_field_wraps_and_grows_to_six_lines(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    let field = desk.read_with(&vcx, |d, _| d.sheet.as_ref().expect("open").task.clone());
+    let fill = |vcx: &mut VisualTestContext, text: &str| {
+        vcx.update(|_, cx| {
+            field.update(cx, |f, cx| {
+                f.set_text(text);
+                cx.notify();
+            })
+        });
+        vcx.run_until_parked();
+        field.read_with(vcx, |f, _| {
+            let bounds = f.drawn().expect("painted");
+            (
+                f.rows,
+                f.top,
+                bounds.size.height / f.line_height().expect("painted"),
+            )
+        })
+    };
+    // Empty (the hint), one word, and a word longer than the field.
+    assert_eq!(fill(&mut vcx, ""), (1, 0, 1.));
+    assert_eq!(fill(&mut vcx, "Fix the login"), (1, 0, 1.));
+    let (rows, _, shown) = fill(&mut vcx, &"x".repeat(400));
+    assert!(
+        rows > 1 && shown == rows.min(6) as f32,
+        "broken at the edge: {rows} {shown}"
+    );
+    // A long prompt: wrapped, two to six lines high.
+    let words = "Check why the login test fails on CI but not here, then fix it ";
+    let (rows, top, shown) = fill(&mut vcx, &words.repeat(3));
+    assert!(
+        (2..=6).contains(&rows) && top == 0 && shown == rows as f32,
+        "{rows} {shown}"
+    );
+    // Past six lines: six high, scrolled so the caret (at the end) is on the last one shown.
+    let (rows, top, shown) = fill(&mut vcx, &words.repeat(40));
+    assert!(rows > 6, "{rows}");
+    assert_eq!((shown, top), (6., rows - 6));
+}
+
+/// Option moves and deletes by word, Cmd+Backspace deletes to the start, Shift extends.
+#[gpui::test]
+fn the_field_moves_and_deletes_by_word(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    let field = desk.read_with(&vcx, |d, _| d.sheet.as_ref().expect("open").task.clone());
+    vcx.update(|_, cx| field.update(cx, |f, _| f.set_text("fix the-login test")));
+    let state =
+        |vcx: &mut VisualTestContext| field.read_with(vcx, |f, _| (f.text.clone(), f.selection()));
+    vcx.simulate_keystrokes("alt-left");
+    assert_eq!(state(&mut vcx).1, 14..14, "before `test`");
+    vcx.simulate_keystrokes("alt-left");
+    assert_eq!(state(&mut vcx).1, 8..8, "before `login`");
+    vcx.simulate_keystrokes("alt-left alt-left");
+    assert_eq!(state(&mut vcx).1, 0..0);
+    vcx.simulate_keystrokes("alt-right");
+    assert_eq!(state(&mut vcx).1, 3..3, "after `fix`");
+    vcx.simulate_keystrokes("alt-shift-right");
+    assert_eq!(state(&mut vcx).1, 3..7, "`the` selected");
+    vcx.simulate_keystrokes("cmd-right alt-backspace");
+    assert_eq!(state(&mut vcx).0, "fix the-login ");
+    vcx.simulate_keystrokes("alt-backspace");
+    assert_eq!(state(&mut vcx).0, "fix the-");
+    vcx.simulate_keystrokes("cmd-backspace");
+    assert_eq!(state(&mut vcx), (String::new(), 0..0));
+    vcx.simulate_keystrokes("cmd-z");
+    assert_eq!(state(&mut vcx).0, "fix the-", "undone");
+}
+
+/// A click on a wrapped field's second line puts the caret on that line.
+#[gpui::test]
+fn a_click_on_a_wrapped_line_puts_the_caret_there(cx: &mut TestAppContext) {
+    let (desk, mut vcx, _rx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-a c");
+    let field = desk.read_with(&vcx, |d, _| d.sheet.as_ref().expect("open").task.clone());
+    let text = "Check why the login test fails on CI but not here ".repeat(4);
+    vcx.update(|_, cx| {
+        field.update(cx, |f, cx| {
+            f.set_text(&text);
+            cx.notify();
+        })
+    });
+    vcx.run_until_parked();
+    let (bounds, line) =
+        field.read_with(&vcx, |f, _| (f.drawn().unwrap(), f.line_height().unwrap()));
+    vcx.simulate_click(
+        gpui::point(bounds.left() + gpui::px(2.), bounds.top() + line * 1.5),
+        gpui::Modifiers::default(),
+    );
+    let (at, rows) = field.read_with(&vcx, |f, _| (f.selection().start, f.rows));
+    assert!(rows > 1, "{rows}");
+    assert!(
+        at > 0 && at < text.len() / 2,
+        "the second line's start, not the first: {at}"
+    );
+}
+
 /// New work offers the `[agents]` names of the config too; one qoop cannot hand the task to
 /// starts as typed, and the sheet says so.
 #[gpui::test]
@@ -815,6 +917,34 @@ fn cmd_v_pastes_into_the_tab(cx: &mut TestAppContext) {
         .into_iter()
         .any(|u| matches!(u, Up::Paste(1, bytes) if bytes == b"cargo test\n"));
     assert!(pasted, "pasted, not typed");
+}
+
+/// The macOS word and line keys reach the agent as Ghostty and iTerm2 send them, each whole in
+/// one message: an Esc split from its letter would reach the agent as an Escape.
+#[gpui::test]
+fn the_mac_word_and_line_keys_reach_the_tab(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    for (keys, bytes) in [
+        ("alt-left", &b"\x1bb"[..]),
+        ("alt-right", b"\x1bf"),
+        ("alt-backspace", b"\x1b\x7f"),
+        ("cmd-left", b"\x01"),
+        ("cmd-right", b"\x05"),
+        ("cmd-backspace", b"\x15"),
+    ] {
+        vcx.simulate_keystrokes(keys);
+        let typed: Vec<Vec<u8>> = sent(&mut rx)
+            .into_iter()
+            .filter_map(|u| match u {
+                Up::Input(1, bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typed, [bytes.to_vec()], "{keys}");
+    }
 }
 
 /// d-review by keyboard only: from the terminal, `ctrl-a D` reads the tab's checkout in this

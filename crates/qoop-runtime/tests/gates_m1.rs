@@ -942,6 +942,108 @@ async fn ending_a_connection_really_closes_its_socket() {
     );
 }
 
+/// ADR-007 as amended: a person's key in the interface (the TUI or the desktop app) that was
+/// refused the size takes it, and a key in the other takes it back, as tmux's
+/// `window-size latest`. A message typed there then wraps at that interface's own width.
+#[tokio::test]
+async fn a_person_typing_in_the_refused_interface_takes_the_size() {
+    let d = TestDaemon::start().await;
+    let mut desk = d.attach(qoop_proto::INTERFACE_ID).await;
+    desk.resize(132, 43).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut tui = d.attach(qoop_proto::INTERFACE_ID).await;
+    tui.resize(90, 30).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tui.input(b"stty size\n").await;
+    assert!(
+        tui.wait_for_text("30 90", PATIENCE).await,
+        "the interface typed in kept the other's size"
+    );
+    desk.forget_seen();
+    desk.input(b"stty size\n").await;
+    assert!(
+        desk.wait_for_text("43 132", PATIENCE).await,
+        "a key in the first interface did not take its size back"
+    );
+}
+
+/// What an interface sends with no key pressed (focus reports here), and every client that is
+/// not an interface (`qoop attach`, a program typing), never moves the size.
+#[tokio::test]
+async fn only_a_key_in_an_interface_takes_the_size() {
+    let d = TestDaemon::start().await;
+    let mut desk = d.attach(qoop_proto::INTERFACE_ID).await;
+    desk.resize(132, 43).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut tui = d.attach(qoop_proto::INTERFACE_ID).await;
+    tui.resize(90, 30).await;
+    let mut attach = d.attach(qoop_runtime::client::ATTACH_ID).await;
+    attach.resize(50, 20).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tui.input(b"\x1b[I").await;
+    tui.input(b"\x1b[O").await;
+    // `^U` clears whatever the focus reports left on the shell's line.
+    attach.input(b"\x15stty size\n").await;
+    assert!(
+        attach.wait_for_text("43 132", PATIENCE).await,
+        "a focus report or `qoop attach` took the size"
+    );
+}
+
+/// The rules of the take, without a PTY: only a waiting watcher that is not the owner takes
+/// it, and the owner it leaves waits first with the size it had.
+#[test]
+fn the_take_on_typing_rules() {
+    use qoop_runtime::daemon::take_on_typing;
+    use std::collections::BTreeSet;
+    let (desk, tui, other) = (
+        ClientId::new("desk"),
+        ClientId::new("tui"),
+        ClientId::new("other"),
+    );
+    let watchers: BTreeSet<ClientId> = [desk.clone(), tui.clone()].into();
+    let big = size(132, 43);
+    let mut policy = SizePolicy::Owner(desk.clone());
+    let mut waiting = vec![(tui.clone(), size(90, 30))];
+    // The owner itself, a client that never asked a size, one that does not show it: nothing.
+    assert_eq!(
+        take_on_typing(&mut policy, &mut waiting, &watchers, &desk, big),
+        None
+    );
+    assert_eq!(
+        take_on_typing(&mut policy, &mut waiting, &watchers, &other, big),
+        None
+    );
+    let shown: BTreeSet<ClientId> = [desk.clone()].into();
+    assert_eq!(
+        take_on_typing(&mut policy, &mut waiting, &shown, &tui, big),
+        None
+    );
+    assert_eq!(policy, SizePolicy::Owner(desk.clone()));
+    // The waiting watcher takes it with its size; the owner waits with its own.
+    assert_eq!(
+        take_on_typing(&mut policy, &mut waiting, &watchers, &tui, big),
+        Some(size(90, 30))
+    );
+    assert_eq!(policy, SizePolicy::Owner(tui.clone()));
+    assert_eq!(waiting, [(desk.clone(), big)]);
+    // And back.
+    assert_eq!(
+        take_on_typing(&mut policy, &mut waiting, &watchers, &desk, size(90, 30)),
+        Some(big)
+    );
+    assert_eq!(policy, SizePolicy::Owner(desk));
+    // A pinned or unowned size is never taken.
+    for mut pinned in [SizePolicy::Fixed(big), SizePolicy::Unowned] {
+        let before = pinned.clone();
+        assert_eq!(
+            take_on_typing(&mut pinned, &mut waiting, &watchers, &tui, big),
+            None
+        );
+        assert_eq!(pinned, before);
+    }
+}
+
 /// When the owner leaves, a client that asked for a size and was refused gets the geometry
 /// and its size at once, without asking again (ADR-007: ownership passes to the
 /// longest-attached writable client). A second window otherwise sat at the first one's
