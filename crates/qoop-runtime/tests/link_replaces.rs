@@ -100,18 +100,21 @@ async fn another_link_or_none_ends_nothing() {
     let d = TestDaemon::start().await;
     let mut old = stale_owner(&d, Some("link-a")).await;
 
-    let mut other = takes_size(&d, Some("link-b")).await;
+    let _other = takes_size(&d, Some("link-b")).await;
     let mut keyless = linked(&d, None).await;
     assert!(
         !closed(&mut old, Duration::from_secs(2)).await,
         "a connection of another link ended this one"
     );
-    // Asked well after the refused size reached the terminal: still the owner's.
-    other.forget_seen();
-    other.input(b"stty size\n").await;
+    // Asked well after the refused size reached the terminal, by a witness that never sizes
+    // (a key in `other` would take the size, ADR-007), in a line seen nowhere before: still the
+    // owner's.
+    let mut witness = d.attach("witness-2").await;
+    witness.forget_seen();
+    witness.input(b"stty size | sed s/^/size=/\n").await;
     assert!(
-        other.wait_for_text("43 132", PATIENCE).await,
-        "another link took the size from a live owner (ADR-007)"
+        witness.wait_for_text("size=43 132", PATIENCE).await,
+        "another link's resize took the size from a live owner (ADR-007)"
     );
     assert!(
         !closed(&mut keyless, Duration::from_millis(500)).await,
