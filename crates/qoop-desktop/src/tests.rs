@@ -817,6 +817,34 @@ fn cmd_v_pastes_into_the_tab(cx: &mut TestAppContext) {
     assert!(pasted, "pasted, not typed");
 }
 
+/// The macOS word and line keys reach the agent as Ghostty and iTerm2 send them, each whole in
+/// one message: an Esc split from its letter would reach the agent as an Escape.
+#[gpui::test]
+fn the_mac_word_and_line_keys_reach_the_tab(cx: &mut TestAppContext) {
+    let (desk, mut vcx, mut rx) = open(cx);
+    vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(1), window, cx)));
+    vcx.run_until_parked();
+    sent(&mut rx);
+    for (keys, bytes) in [
+        ("alt-left", &b"\x1bb"[..]),
+        ("alt-right", b"\x1bf"),
+        ("alt-backspace", b"\x1b\x7f"),
+        ("cmd-left", b"\x01"),
+        ("cmd-right", b"\x05"),
+        ("cmd-backspace", b"\x15"),
+    ] {
+        vcx.simulate_keystrokes(keys);
+        let typed: Vec<Vec<u8>> = sent(&mut rx)
+            .into_iter()
+            .filter_map(|u| match u {
+                Up::Input(1, bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typed, [bytes.to_vec()], "{keys}");
+    }
+}
+
 /// d-review by keyboard only: from the terminal, `ctrl-a D` reads the tab's checkout in this
 /// process, `n` opens the next file, `x` marks the finish read for its stop, Escape closes it
 /// and gives the terminal the keys back; a remote tab has no review.
