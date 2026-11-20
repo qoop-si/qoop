@@ -90,6 +90,12 @@ pub enum ClientCommand {
         from: ClientId,
         to: ClientId,
     },
+    /// A person pressed a key or pasted in the TUI or the desktop app (`from`) on this
+    /// terminal: an interface that was refused its size takes it (ADR-007). Sent just ahead
+    /// of the input it came with. Internal only, like `Refresh`.
+    Typed {
+        from: ClientId,
+    },
     /// Stop reading and writing, say where the terminal stands, and wait. A daemon moving
     /// onto a new binary asks every tab this, then becomes that binary with the masters
     /// open. The terminal carries on as it was when `go` is dropped, which is what a move
@@ -3279,6 +3285,24 @@ async fn serve_client(
                     // Taken above, before the terminal is looked up.
                     ClientWire::Audio { .. } => continue,
                 };
+                // A person's key or paste in the TUI or the desktop takes the terminal's size
+                // for that interface (ADR-007), ahead of the input on the same queue. Never a
+                // focus or mouse report, a terminal's reply, the phone, `qoop attach` or a
+                // program typing.
+                let typed = person == Some("computer")
+                    && match &cmd {
+                        ClientCommand::Paste { .. } => true,
+                        ClientCommand::Input { bytes, .. } => crate::agents::person_key(bytes),
+                        _ => false,
+                    };
+                if typed {
+                    let _ = handle
+                        .commands
+                        .send(ClientCommand::Typed {
+                            from: client.clone(),
+                        })
+                        .await;
+                }
                 // A terminal whose task has ended is one stale address, not the end of
                 // this read: breaking here left every later frame of the read in the
                 // buffer until the peer happened to send more.
@@ -12403,12 +12427,82 @@ pub fn yield_unseen(
     if watchers.contains(owner) {
         return None;
     }
-    let at = waiting.iter().position(|(c, _)| watchers.contains(c))?;
-    let (next, size) = waiting.remove(at);
-    let previous = std::mem::replace(owner, next);
+    let next = waiting
+        .iter()
+        .find(|(c, _)| watchers.contains(c))?
+        .0
+        .clone();
+    hand_to(policy, waiting, next, canonical)
+}
+
+/// ADR-007: a person's key in an interface that shows this terminal and was refused its size
+/// takes it, as tmux's `window-size latest` has it; the owner waits in its turn with the size
+/// it had, and takes it back the same way. Answers the size to take.
+pub fn take_on_typing(
+    policy: &mut SizePolicy,
+    waiting: &mut Vec<(ClientId, PtySize)>,
+    watchers: &BTreeSet<ClientId>,
+    from: &ClientId,
+    canonical: PtySize,
+) -> Option<PtySize> {
+    let SizePolicy::Owner(owner) = policy else {
+        return None;
+    };
+    if owner == from || !watchers.contains(from) || !waiting.iter().any(|(c, _)| c == from) {
+        return None;
+    }
+    hand_to(policy, waiting, from.clone(), canonical)
+}
+
+/// The geometry to `to`: the owner it leaves waits first in line with the size it had, and
+/// `to` stops waiting. Answers the size `to` waited with, the one to take.
+fn hand_to(
+    policy: &mut SizePolicy,
+    waiting: &mut Vec<(ClientId, PtySize)>,
+    to: ClientId,
+    canonical: PtySize,
+) -> Option<PtySize> {
+    let SizePolicy::Owner(owner) = policy else {
+        return None;
+    };
+    let asked = waiting
+        .iter()
+        .position(|(c, _)| *c == to)
+        .map(|at| waiting.remove(at).1);
+    let previous = std::mem::replace(owner, to);
     waiting.retain(|(c, _)| *c != previous);
     waiting.insert(0, (previous, canonical));
-    Some(size)
+    asked
+}
+
+#[cfg(test)]
+mod hand_to_tests {
+    use super::*;
+
+    /// A grant hands the geometry over the way a take does: the old owner waits first with
+    /// its size, the new one stops waiting and its size is the one to take; a client that
+    /// never asked a size gets the geometry at the size it has.
+    #[test]
+    fn a_hand_over_queues_the_old_owner() {
+        let (a, b) = (ClientId::new("a"), ClientId::new("b"));
+        let big = PtySize {
+            cols: 132,
+            rows: 43,
+        };
+        let small = PtySize { cols: 90, rows: 30 };
+        let mut policy = SizePolicy::Owner(a.clone());
+        let mut waiting = vec![(b.clone(), small)];
+        assert_eq!(
+            hand_to(&mut policy, &mut waiting, b.clone(), big),
+            Some(small)
+        );
+        assert_eq!(policy, SizePolicy::Owner(b.clone()));
+        assert_eq!(waiting, [(a.clone(), big)]);
+        let c = ClientId::new("c");
+        assert_eq!(hand_to(&mut policy, &mut waiting, c.clone(), small), None);
+        assert_eq!(policy, SizePolicy::Owner(c));
+        assert_eq!(waiting, [(b, small), (a, big)]);
+    }
 }
 
 /// The size every terminal is born with: the PTY, the engine and the tracked
@@ -12829,9 +12923,25 @@ async fn terminal_task(
                         // Only the owner can give it away, and it is checked here rather
                         // than at the control channel, because this is the one place that
                         // holds the policy.
+                        // The old owner waits with the size it had, so a key there takes it
+                        // back; the new owner's waiting size applies.
                         if policy == SizePolicy::Owner(from) {
-                            policy = policy
-                                .apply(OwnershipEvent::OwnerAgreedTransfer(to), None);
+                            let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
+                            if let Some(size) = hand_to(&mut policy, &mut waiting, to, canonical) {
+                                take_waited_size!(size);
+                            }
+                        }
+                    }
+                    ClientCommand::Typed { from } => {
+                        let watchers = terminals
+                            .get(stream)
+                            .map(|h| h.watchers.lock().unwrap().clone())
+                            .unwrap_or_default();
+                        let canonical = nudge_restore.map_or(current_size, |(s, _)| s);
+                        if let Some(size) =
+                            take_on_typing(&mut policy, &mut waiting, &watchers, &from, canonical)
+                        {
+                            take_waited_size!(size);
                         }
                     }
                         ClientCommand::Pause { reply, go } => {
