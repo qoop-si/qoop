@@ -4,7 +4,9 @@
 //! application cursor keys), modified keys as `CSI 1;m A`, Ctrl folding a letter to its
 //! control byte. Option composes characters, as in Terminal.app: on German, Turkish and
 //! most European Mac layouts it is how `@ [ ] { } | ~` are typed. Only when a person asks
-//! for it is Option Meta, an ESC prefix. The kitty keyboard protocol needs a flag the
+//! for it is Option Meta, an ESC prefix. Option and Cmd with the arrows and Backspace are the
+//! macOS word and line keys (`ESC b`, `ESC f`, `ESC DEL`, `^A`, `^E`, `^U`), as Ghostty and
+//! iTerm2 send them. The kitty keyboard protocol needs a flag the
 //! snapshot does not carry yet, so Shift+Enter is a plain carriage return here.
 
 /// The key as GPUI reports it, without GPUI's types, so the encoder tests run anywhere.
@@ -33,8 +35,28 @@ pub fn typed(k: &gpui::Keystroke) -> &str {
 /// The bytes for one press, or `None` for a press the terminal does not get (Cmd chords
 /// belong to the app).
 pub fn encode(p: Press<'_>, app_cursor: bool) -> Option<Vec<u8>> {
+    // The macOS word and line keys, as Ghostty's defaults and iTerm2's Natural Text Editing send
+    // them: readline, zsh, Claude Code and Codex all read these, and shells do not read the
+    // modified CSI (`CSI 1;3D`) xterm would send. Option composes nothing on these keys.
+    let plain = !p.ctrl && !p.shift;
+    if p.cmd && plain && !p.alt {
+        return match p.key {
+            "left" => Some(vec![0x01]),
+            "right" => Some(vec![0x05]),
+            "backspace" => Some(vec![0x15]),
+            _ => None,
+        };
+    }
     if p.cmd {
         return None;
+    }
+    if p.alt && plain && !p.option_is_meta {
+        match p.key {
+            "left" => return Some(b"\x1bb".to_vec()),
+            "right" => return Some(b"\x1bf".to_vec()),
+            "backspace" => return Some(b"\x1b\x7f".to_vec()),
+            _ => {}
+        }
     }
     let modifier = 1 + u8::from(p.shift) + 2 * u8::from(p.alt) + 4 * u8::from(p.ctrl);
     let cursor = |end: char| -> Vec<u8> {
@@ -237,6 +259,34 @@ mod tests {
         assert_eq!(typed(&stroke("x", Some("\u{03c7}"))), "x");
         assert_eq!(typed(&stroke("tab", Some("\t"))), "tab");
         assert_eq!(typed(&stroke("escape", None)), "escape");
+    }
+
+    /// Option and Cmd with the arrows and Backspace, as Ghostty's macOS defaults and iTerm2's
+    /// Natural Text Editing send them: shells read these, not a modified CSI.
+    #[test]
+    fn mac_word_and_line_keys() {
+        let alt = |k| Press {
+            alt: true,
+            ..key(k)
+        };
+        let cmd = |k| Press {
+            cmd: true,
+            ..key(k)
+        };
+        assert_eq!(encode(alt("left"), false), Some(b"\x1bb".to_vec()));
+        assert_eq!(encode(alt("right"), true), Some(b"\x1bf".to_vec()));
+        assert_eq!(encode(alt("backspace"), false), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(encode(cmd("left"), false), Some(vec![0x01]));
+        assert_eq!(encode(cmd("right"), false), Some(vec![0x05]));
+        assert_eq!(encode(cmd("backspace"), false), Some(vec![0x15]));
+        // Shift and Ctrl keep xterm's modified keys; other Cmd chords stay with the app.
+        let alt_shift = Press {
+            shift: true,
+            ..alt("left")
+        };
+        assert_eq!(encode(alt_shift, false), Some(b"\x1b[1;4D".to_vec()));
+        let cmd_up = cmd("up");
+        assert_eq!(encode(cmd_up, false), None);
     }
 
     #[test]
