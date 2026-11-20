@@ -1,18 +1,33 @@
-//! The one-line text field: typing through the input method (dead keys, IME, the marked text
-//! drawn underlined until it commits), a caret, a selection, copy, cut, paste, and undo of the
-//! last edit. No multi-line editing anywhere in the app.
+//! The text field: one paragraph, wrapped to the field's width so nothing runs past its edge,
+//! growing a line at a time up to [`MAX_LINES`] and scrolling past them to keep the caret's
+//! line in view. Typing goes through the input method (dead keys, IME, the marked text drawn
+//! underlined until it commits); a caret, a selection, word moves, copy, cut, paste, and undo
+//! of the last edit.
 //!
 //! Enter and Escape are left to the field's owner, which listens for them around it.
 
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, Pixels, Point, Render, Role,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
-    div, fill, point, prelude::*, px, relative, size,
+    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, Font, GlobalElementId,
+    Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    Pixels, Point, Render, Role, SharedString, Style, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, div, fill, point, prelude::*, px, relative, size,
 };
+
+/// The most lines a field grows to; past them it scrolls inside, so a long paste never pushes
+/// a sheet's buttons off the window.
+pub const MAX_LINES: usize = 6;
+
+/// How the field's text was last shaped, to find a point or a character again between frames.
+#[derive(Clone)]
+struct Shape {
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+}
 
 use crate::theme::{self, c, ca};
 use crate::ui::{self, Control};
@@ -33,8 +48,11 @@ pub struct Field {
     pub label: Option<SharedString>,
     pub focus: FocusHandle,
     /// Painted geometry, for the input method's candidate window and for clicks.
-    line: Option<ShapedLine>,
-    bounds: Option<Bounds<Pixels>>,
+    shape: Option<Shape>,
+    /// How many lines the text wraps to, and the first one shown when there are more than
+    /// [`MAX_LINES`].
+    pub rows: usize,
+    pub top: usize,
 }
 
 /// The field's inks, from the theme the window draws in now (never kept: a field made before
@@ -69,9 +87,49 @@ impl Field {
             placeholder: placeholder.to_string().into(),
             label: None,
             focus: cx.focus_handle(),
-            line: None,
-            bounds: None,
+            shape: None,
+            rows: 1,
+            top: 0,
         }
+    }
+
+    /// Where the field was last painted, and its line height: what the tests measure.
+    #[cfg(test)]
+    pub fn drawn(&self) -> Option<Bounds<Pixels>> {
+        self.shape.as_ref().map(|s| s.bounds)
+    }
+
+    #[cfg(test)]
+    pub fn line_height(&self) -> Option<Pixels> {
+        self.shape.as_ref().map(|s| s.line_height)
+    }
+
+    /// The text wrapped as it was last painted, for a point or a character's place.
+    fn wrapped(&self, window: &Window) -> Option<(WrappedLine, &Shape)> {
+        let shape = self.shape.as_ref()?;
+        let runs = [plain_run(
+            self.text.len(),
+            shape.font.clone(),
+            Hsla::default(),
+        )];
+        let line = wrap(
+            window,
+            self.text.clone().into(),
+            shape.font_size,
+            &runs,
+            shape.bounds.size.width,
+        );
+        Some((line, shape))
+    }
+
+    /// A point in the window, as a byte of `text`.
+    fn index_at(&self, at: Point<Pixels>, window: &Window) -> Option<usize> {
+        let (line, shape) = self.wrapped(window)?;
+        let local = at - shape.bounds.origin + point(px(0.), shape.line_height * self.top);
+        let i = line
+            .closest_index_for_position(local, shape.line_height)
+            .unwrap_or_else(|i| i);
+        Some(i.min(self.text.len()))
     }
 
     /// Put `text` in the field with the caret after it, as a field filled for editing reads:
@@ -116,6 +174,35 @@ impl Field {
             .map_or(at, |c| at + c.len_utf8())
     }
 
+    /// The start of the word before `at`, as Option+Left finds it: past the spaces and
+    /// punctuation, then back over the letters and digits.
+    fn word_before(&self, at: usize) -> usize {
+        let mut i = at;
+        let mut word = false;
+        for (j, c) in self.text[..at].char_indices().rev() {
+            if c.is_alphanumeric() {
+                word = true;
+            } else if word {
+                break;
+            }
+            i = j;
+        }
+        i
+    }
+
+    /// The end of the word after `at`, as Option+Right finds it.
+    fn word_after(&self, at: usize) -> usize {
+        let mut word = false;
+        for (j, c) in self.text[at..].char_indices() {
+            if c.is_alphanumeric() {
+                word = true;
+            } else if word {
+                return at + j;
+            }
+        }
+        self.text.len()
+    }
+
     fn move_to(&mut self, at: usize, extend: bool) {
         self.head = at;
         if !extend {
@@ -128,6 +215,22 @@ impl Field {
         let m = &k.modifiers;
         let sel = self.selection();
         let handled = match (k.key.as_str(), m.platform, m.shift) {
+            // Option deletes the word before, Cmd everything before the caret.
+            ("backspace", cmd, _) if (cmd || m.alt) && sel.is_empty() => {
+                let from = if cmd { 0 } else { self.word_before(self.head) };
+                if from < self.head {
+                    self.replace(from..self.head, "");
+                }
+                true
+            }
+            ("left", false, extend) if m.alt => {
+                self.move_to(self.word_before(self.head), extend);
+                true
+            }
+            ("right", false, extend) if m.alt => {
+                self.move_to(self.word_after(self.head), extend);
+                true
+            }
             ("backspace", _, _) => {
                 let range = if sel.is_empty() {
                     self.prev(self.head)..self.head
@@ -194,7 +297,7 @@ impl Field {
             }
             ("v", true, false) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    // One line: a pasted line end would be a second line nobody sees.
+                    // One paragraph: a pasted line end becomes a space, Enter belongs to the owner.
                     let one: String = text
                         .chars()
                         .map(|c| if c.is_control() { ' ' } else { c })
@@ -222,9 +325,8 @@ impl Field {
 
     fn click(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        if let (Some(line), Some(bounds)) = (&self.line, self.bounds) {
-            let at = line.closest_index_for_x(event.position.x - bounds.left());
-            self.move_to(at.min(self.text.len()), event.modifiers.shift);
+        if let Some(at) = self.index_at(event.position, window) {
+            self.move_to(at, event.modifiers.shift);
         }
         cx.notify();
     }
@@ -347,25 +449,33 @@ impl EntityInputHandler for Field {
         &mut self,
         range: Range<usize>,
         bounds: Bounds<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // The candidate window sits under the range's first line.
         let bytes = self.bytes_of(range);
-        let line = self.line.as_ref()?;
+        let (line, shape) = self.wrapped(window)?;
+        let lh = shape.line_height;
+        let scrolled = point(px(0.), lh * self.top);
+        let start = line.position_for_index(bytes.start, lh)? - scrolled;
+        let end = line
+            .position_for_index(bytes.end, lh)
+            .map(|p| p - scrolled)
+            .filter(|p| p.y == start.y)
+            .map_or(bounds.size.width, |p| p.x);
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(bytes.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(bytes.end), bounds.bottom()),
+            bounds.origin + start,
+            bounds.origin + point(end, start.y + lh),
         ))
     }
 
     fn character_index_for_point(
         &mut self,
         at: Point<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let (line, bounds) = (self.line.as_ref()?, self.bounds?);
-        let at = line.closest_index_for_x(at.x - bounds.left());
+        let at = self.index_at(at, window)?;
         Some(units_at(&self.text, at))
     }
 }
@@ -409,7 +519,48 @@ impl Render for Field {
     }
 }
 
-/// The painted line: text, selection, caret, the marked text underlined.
+/// One run of `len` bytes in `font` and `color`, underlined or not.
+fn plain_run(len: usize, font: Font, color: Hsla) -> TextRun {
+    TextRun {
+        len,
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+/// `text` shaped and wrapped to `width`: one paragraph, so one wrapped line.
+fn wrap(
+    window: &Window,
+    text: SharedString,
+    font_size: Pixels,
+    runs: &[TextRun],
+    width: Pixels,
+) -> WrappedLine {
+    window
+        .text_system()
+        .shape_text(text, font_size, runs, Some(width), None)
+        .ok()
+        .and_then(|mut lines| lines.pop())
+        .unwrap_or_default()
+}
+
+/// How many lines `line` wraps to.
+fn rows_of(line: &WrappedLine) -> usize {
+    line.wrap_boundaries().len() + 1
+}
+
+/// The first line to show so the caret's line is in view, moving `top` no more than it must.
+fn top_for(top: usize, caret_row: usize, rows: usize) -> usize {
+    let top = top
+        .min(caret_row)
+        .max((caret_row + 1).saturating_sub(MAX_LINES));
+    top.min(rows.saturating_sub(MAX_LINES))
+}
+
+/// The painted text: wrapped, with the selection, the caret, the marked text underlined.
 struct FieldText(Entity<Field>);
 
 impl IntoElement for FieldText {
@@ -420,9 +571,27 @@ impl IntoElement for FieldText {
 }
 
 struct Laid {
-    line: ShapedLine,
-    selection: Option<Bounds<Pixels>>,
+    line: WrappedLine,
+    shape: Shape,
+    /// Where the first shown line is drawn: above the field's top when it is scrolled.
+    origin: Point<Pixels>,
+    top: usize,
+    rows: usize,
+    selection: Vec<Bounds<Pixels>>,
     caret: Option<Bounds<Pixels>>,
+}
+
+impl FieldText {
+    /// What is drawn (the text, or the hint when there is none) and its ink.
+    fn text(&self, cx: &App) -> (SharedString, Hsla, bool) {
+        let inks = Inks::now(cx);
+        let field = self.0.read(cx);
+        if field.text.is_empty() {
+            (field.placeholder.clone(), inks.placeholder, true)
+        } else {
+            (field.text.clone().into(), inks.text, false)
+        }
+    }
 }
 
 impl Element for FieldText {
@@ -444,10 +613,26 @@ impl Element for FieldText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
+        // As wide as the field, as high as the lines the text wraps to there, up to the cap.
+        let (text, _, _) = self.text(cx);
+        let style = window.text_style();
+        let font = style.font();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let mut layout = Style::default();
+        layout.size.width = relative(1.).into();
+        let id = window.request_measured_layout(layout, move |known, available, window, _| {
+            let width = known.width.or(match available.width {
+                AvailableSpace::Definite(width) => Some(width),
+                _ => None,
+            });
+            let rows = width.map_or(1, |width| {
+                let runs = [plain_run(text.len(), font.clone(), Hsla::default())];
+                rows_of(&wrap(window, text.clone(), font_size, &runs, width))
+            });
+            size(width.unwrap_or_default(), line_height * rows.min(MAX_LINES))
+        });
+        (id, ())
     }
 
     fn prepaint(
@@ -459,28 +644,20 @@ impl Element for FieldText {
         window: &mut Window,
         cx: &mut App,
     ) -> Laid {
-        let inks = Inks::now(cx);
+        let (text, color, empty) = self.text(cx);
         let field = self.0.read(cx);
         let style = window.text_style();
-        let empty = field.text.is_empty();
-        let (text, color): (SharedString, Hsla) = if empty {
-            (field.placeholder.clone(), inks.placeholder)
-        } else {
-            (field.text.clone().into(), inks.text)
-        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let lh = window.line_height();
         let run = |len: usize, underline: bool| TextRun {
-            len,
-            font: style.font(),
-            color,
-            background_color: None,
             underline: underline.then_some(UnderlineStyle {
                 thickness: px(1.),
                 color: Some(color),
                 wavy: false,
             }),
-            strikethrough: None,
+            ..plain_run(len, style.font(), color)
         };
-        let runs = match field.marked.clone().filter(|_| !empty) {
+        let runs: Vec<TextRun> = match field.marked.clone().filter(|_| !empty) {
             Some(m) => [
                 run(m.start, false),
                 run(m.len(), true),
@@ -491,26 +668,49 @@ impl Element for FieldText {
             .collect(),
             None => vec![run(text.len(), false)],
         };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(text, font_size, &runs, None);
+        let line = wrap(window, text, font_size, &runs, bounds.size.width);
+        let rows = rows_of(&line);
+        let at = |i: usize| {
+            if empty {
+                Point::default()
+            } else {
+                line.position_for_index(i, lh).unwrap_or_default()
+            }
+        };
+        let row = |p: Point<Pixels>| (p.y / lh).round() as usize;
+        let top = top_for(field.top, row(at(field.head)), rows);
+        let origin = bounds.origin - point(px(0.), lh * top);
         let sel = field.selection();
-        let x = |i: usize| bounds.left() + if empty { px(0.) } else { line.x_for_index(i) };
-        let selection = (!sel.is_empty()).then(|| {
-            Bounds::from_corners(
-                point(x(sel.start), bounds.top()),
-                point(x(sel.end), bounds.bottom()),
-            )
-        });
-        let caret = (sel.is_empty() && field.focus.is_focused(window)).then(|| {
-            Bounds::new(
-                point(x(field.head), bounds.top()),
-                size(px(1.5), bounds.size.height),
-            )
-        });
+        // A selection over wrapped lines: its first line from where it starts, whole lines
+        // between, its last line to where it ends.
+        let mut selection = Vec::new();
+        if !sel.is_empty() {
+            let (a, b) = (at(sel.start), at(sel.end));
+            let right = bounds.size.width;
+            let mut y = a.y;
+            while y <= b.y {
+                let from = if y == a.y { a.x } else { px(0.) };
+                let to = if y == b.y { b.x } else { right };
+                selection.push(Bounds::from_corners(
+                    origin + point(from, y),
+                    origin + point(to, y + lh),
+                ));
+                y += lh;
+            }
+        }
+        let caret = (sel.is_empty() && field.focus.is_focused(window))
+            .then(|| Bounds::new(origin + at(field.head), size(px(1.5), lh)));
         Laid {
             line,
+            shape: Shape {
+                font: style.font(),
+                font_size,
+                line_height: lh,
+                bounds,
+            },
+            origin,
+            top,
+            rows,
             selection,
             caret,
         }
@@ -531,31 +731,44 @@ impl Element for FieldText {
             (field.focus.clone(), Inks::now(cx))
         };
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.0.clone()), cx);
-        if let Some(sel) = laid.selection {
-            window.paint_quad(fill(sel, colors.selection));
-        }
-        let _ = laid.line.paint(
-            bounds.origin,
-            window.line_height(),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
-        if let Some(caret) = laid.caret {
-            window.paint_quad(fill(caret, colors.caret));
-        }
-        let line = laid.line.clone();
+        let lh = laid.shape.line_height;
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for sel in &laid.selection {
+                window.paint_quad(fill(*sel, colors.selection));
+            }
+            let _ = laid
+                .line
+                .paint(laid.origin, lh, TextAlign::Left, None, window, cx);
+            if let Some(caret) = laid.caret {
+                window.paint_quad(fill(caret, colors.caret));
+            }
+        });
+        let (shape, top, rows) = (laid.shape.clone(), laid.top, laid.rows);
         self.0.update(cx, |field, _| {
-            field.line = Some(line);
-            field.bounds = Some(bounds);
+            field.shape = Some(shape);
+            field.top = top;
+            field.rows = rows;
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_at, units_at};
+    use super::{byte_at, top_for, units_at};
+
+    /// The shown lines follow the caret and move no more than they must.
+    #[test]
+    fn the_shown_lines_follow_the_caret() {
+        assert_eq!(top_for(0, 3, 4), 0, "fits: never scrolled");
+        assert_eq!(top_for(0, 9, 10), 4, "the caret on the last line shown");
+        assert_eq!(top_for(4, 6, 10), 4, "still in view: unmoved");
+        assert_eq!(top_for(4, 2, 10), 2, "above: its line first");
+        assert_eq!(
+            top_for(4, 3, 5),
+            0,
+            "text got shorter: no empty lines below"
+        );
+    }
 
     /// `a`, a two-byte letter, a four-byte emoji (two UTF-16 units), `b`.
     const TEXT: &str = "a\u{e9}\u{1f600}b";
