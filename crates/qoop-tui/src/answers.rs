@@ -108,7 +108,7 @@ pub fn standing(label: &str) -> bool {
 
 /// The card's answers: the agent's own options (its field for an answer of one's own is the
 /// card's text field, not an option), then "Explain this in more detail" when the menu takes
-/// words, then "Let qass handle it"; digits in that order, skipping standing permissions. A
+/// words, then "Hand to qass"; digits in that order, skipping standing permissions. A
 /// multiple choice menu offers nothing here: the card says the question and Open.
 pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
     if menu.multi {
@@ -138,7 +138,7 @@ pub fn offers(menu: &AgentMenu) -> Vec<Offer> {
     }
     out.push(Offer {
         digit: None,
-        label: "Let qass handle it".into(),
+        label: "Hand to qass".into(),
         detail: None,
         pick: Pick::Qass,
     });
@@ -166,7 +166,13 @@ pub fn text_key(menu: &AgentMenu) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hold {
     pub slot: Slot,
+    /// The agent's process when the pick was held: a new one is another agent.
     pub generation: Option<u64>,
+    /// The seal of this turn of the menu (`AgentRow::menu_seal`), which changes every time a
+    /// menu comes up, the same question asked again included. `None` from a daemon that sends
+    /// none, and for what is not a menu's pick.
+    pub menu_seal: Option<u64>,
+    /// The seal of the menu's text, which the same question asked again shares.
     pub seal: u64,
     pub pick: Pick,
     /// What the card says it sends: "Yes".
@@ -189,7 +195,8 @@ impl Hold {
 #[derive(Clone, Debug, Default)]
 pub struct Holds {
     pub held: Vec<Hold>,
-    seen: HashMap<u32, (u64, Instant)>,
+    /// Each menu's text seal and turn seal, and when that menu was first seen.
+    seen: HashMap<u32, ((u64, Option<u64>), Instant)>,
 }
 
 impl Holds {
@@ -202,19 +209,43 @@ impl Holds {
             .iter()
             .filter_map(|r| Some((r.terminal, r.menu.as_ref()?.seal)))
             .collect();
+        // The menu's turn and its agent's process, which a menu asked again over the same text
+        // does not share with the one an answer was held for.
+        let turn: HashMap<u32, (Option<u64>, Option<u64>)> = rows
+            .iter()
+            .filter(|r| r.menu.is_some())
+            .map(|r| (r.terminal, (r.menu_seal, r.generation)))
+            .collect();
         let waiting: HashMap<u32, (Option<u64>, Option<String>)> = rows
             .iter()
             .filter(|r| Kind::of(r).needs_you() && r.menu.is_none())
             .map(|r| (r.terminal, (r.generation, r.stop.clone())))
             .collect();
-        self.seen.retain(|t, (seal, _)| shown.get(t) == Some(seal));
-        for (&t, &seal) in &shown {
-            self.seen.entry(t).or_insert((seal, now));
+        // A menu asked again over the same text is a new menu: its arming starts over.
+        let menu_key = |t: &u32| Some((*shown.get(t)?, turn.get(t)?.0));
+        self.seen.retain(|t, (key, _)| menu_key(t) == Some(*key));
+        for &t in shown.keys() {
+            if let Some(key) = menu_key(&t) {
+                self.seen.entry(t).or_insert((key, now));
+            }
         }
         let (kept, dropped): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.held)
             .into_iter()
             .partition(|h| match (&h.pick, h.terminal()) {
-                (Pick::Key(_) | Pick::Text { .. }, Some(t)) => shown.get(&t) == Some(&h.seal),
+                // A hand-off held on a menu (its seal is the menu's) goes the same way; one held
+                // on no menu keeps its hold.
+                (Pick::Key(_) | Pick::Text { .. } | Pick::Qass, Some(t))
+                    if !matches!(h.pick, Pick::Qass) || h.seal != 0 =>
+                {
+                    let same_turn = turn.get(&t).is_some_and(|(seal, generation)| {
+                        *generation == h.generation
+                            && match (h.menu_seal, seal) {
+                                (Some(held), Some(now)) => held == *now,
+                                _ => true,
+                            }
+                    });
+                    shown.get(&t) == Some(&h.seal) && same_turn
+                }
                 (Pick::Reply { turn, .. }, Some(t)) => {
                     waiting.get(&t) == Some(&(h.generation, turn.clone()))
                 }
@@ -224,11 +255,12 @@ impl Holds {
         dropped
     }
 
-    /// Whether the menu `seal` of `terminal` takes a digit yet.
-    pub fn armed(&self, terminal: u32, seal: u64, now: Instant) -> bool {
+    /// Whether the menu of `terminal` with text seal `seal` and turn seal `menu_seal` takes a
+    /// digit yet.
+    pub fn armed(&self, terminal: u32, seal: u64, menu_seal: Option<u64>, now: Instant) -> bool {
         self.seen
             .get(&terminal)
-            .is_some_and(|&(s, at)| s == seal && now.duration_since(at) >= ARMING)
+            .is_some_and(|&(key, at)| key == (seal, menu_seal) && now.duration_since(at) >= ARMING)
     }
 
     /// Hold `hold`, in place of any other pick for the same agent or card.
@@ -881,7 +913,7 @@ mod tests {
                 (None, "Yes"),
                 (Some(3), "No"),
                 (Some(4), "Explain this in more detail"),
-                (Some(5), "Let qass handle it"),
+                (Some(5), "Hand to qass"),
             ]
         );
         assert_eq!(text_key(&menu).as_deref(), Some("4"));
@@ -896,6 +928,7 @@ mod tests {
         Hold {
             slot: Slot::Agent(terminal),
             generation: Some(1),
+            menu_seal: None,
             seal,
             pick: Pick::Key("1".into()),
             label: "Yes".into(),
@@ -912,8 +945,8 @@ mod tests {
         rows[1].menu = Some(edit_menu(7));
         let mut holds = Holds::default();
         assert!(holds.menus(&rows, t0).is_empty());
-        assert!(!holds.armed(2, 7, t0 + Duration::from_millis(499)));
-        assert!(holds.armed(2, 7, t0 + ARMING));
+        assert!(!holds.armed(2, 7, None, t0 + Duration::from_millis(499)));
+        assert!(holds.armed(2, 7, None, t0 + ARMING));
 
         holds.start(held(2, 7, t0 + HOLD));
         assert!(holds.due(t0 + Duration::from_millis(2999)).is_empty());
@@ -928,7 +961,7 @@ mod tests {
         let dropped = holds.menus(&rows, t0 + Duration::from_secs(1));
         assert_eq!(dropped.len(), 1, "another menu drops the pick");
         assert!(
-            !holds.armed(2, 8, t0 + Duration::from_secs(1)),
+            !holds.armed(2, 8, None, t0 + Duration::from_secs(1)),
             "and arms anew"
         );
 
@@ -948,6 +981,92 @@ mod tests {
         assert!(holds.undo_hand_off());
         let left: Vec<Option<u32>> = holds.held.iter().map(Hold::terminal).collect();
         assert_eq!(left, [Some(2)]);
+    }
+
+    /// The same question asked again has the same text seal and a new turn: the answer held
+    /// for the first is dropped and not sent. Another process drops it too; a daemon that sends
+    /// no turn seal on either side keeps the answer.
+    #[test]
+    fn a_menu_asked_again_over_the_same_text_drops_the_held_answer() {
+        let t0 = Instant::now();
+        let mut rows = vec![row(2, 1, "blocked")];
+        rows[0].menu = Some(edit_menu(7));
+        rows[0].menu_seal = Some(100);
+        let mut holds = Holds::default();
+        let mut hold = held(2, 7, t0 + HOLD);
+        hold.menu_seal = Some(100);
+        holds.start(hold.clone());
+        assert!(holds.menus(&rows, t0).is_empty(), "the same turn keeps it");
+
+        rows[0].menu_seal = Some(101);
+        let dropped = holds.menus(&rows, t0 + Duration::from_secs(1));
+        assert_eq!(dropped.len(), 1, "a new turn of the same question");
+        assert!(holds.due(t0 + HOLD).is_empty(), "nothing is sent");
+
+        rows[0].menu_seal = Some(100);
+        rows[0].generation = Some(2);
+        holds.start(hold.clone());
+        assert_eq!(holds.menus(&rows, t0).len(), 1, "a new process");
+
+        rows[0].generation = Some(1);
+        rows[0].menu_seal = None;
+        holds.start(hold);
+        assert!(
+            holds.menus(&rows, t0).is_empty(),
+            "no turn seal now: not told apart"
+        );
+    }
+
+    /// A hand-off to qass held on a menu goes the way an answer does when the menu is asked
+    /// again; one held on no menu stays.
+    #[test]
+    fn a_hand_off_held_on_a_menu_is_dropped_when_the_turn_changes() {
+        let t0 = Instant::now();
+        let mut rows = vec![row(2, 1, "blocked")];
+        rows[0].menu = Some(edit_menu(7));
+        rows[0].menu_seal = Some(100);
+        let hand = |terminal, seal| Hold {
+            pick: Pick::Qass,
+            menu_seal: Some(100),
+            ..held(terminal, seal, t0 + HOLD)
+        };
+        let mut holds = Holds::default();
+        holds.start(hand(2, 7));
+        assert!(holds.menus(&rows, t0).is_empty(), "the same turn keeps it");
+        rows[0].menu_seal = Some(101);
+        assert_eq!(holds.menus(&rows, t0).len(), 1, "a new turn");
+        assert!(holds.due(t0 + HOLD).is_empty());
+
+        rows[0].menu_seal = Some(100);
+        rows[0].generation = Some(2);
+        holds.start(hand(2, 7));
+        assert_eq!(holds.menus(&rows, t0).len(), 1, "a new process");
+
+        // Held on no menu (seal 0): nothing to tell apart.
+        holds.start(hand(2, 0));
+        assert!(holds.menus(&rows, t0).is_empty());
+    }
+
+    /// The 500 ms guard starts over when the same question comes up again, though its text
+    /// seal is the same: a digit meant for the screen before it is not taken.
+    #[test]
+    fn the_arming_starts_over_for_a_menu_asked_again() {
+        let t0 = Instant::now();
+        let mut rows = vec![row(2, 1, "blocked")];
+        rows[0].menu = Some(edit_menu(7));
+        rows[0].menu_seal = Some(100);
+        let mut holds = Holds::default();
+        holds.menus(&rows, t0);
+        assert!(holds.armed(2, 7, Some(100), t0 + ARMING));
+        let later = t0 + Duration::from_secs(5);
+        rows[0].menu_seal = Some(101);
+        holds.menus(&rows, later);
+        assert!(!holds.armed(2, 7, Some(101), later + Duration::from_millis(100)));
+        assert!(holds.armed(2, 7, Some(101), later + ARMING));
+        assert!(
+            !holds.armed(2, 7, Some(100), later + ARMING),
+            "not the old turn's"
+        );
     }
 
     /// Claude Code's Bash question: its "don't ask again" answer is a standing permission,
@@ -1159,6 +1278,7 @@ mod tests {
         Hold {
             slot: Slot::Agent(terminal),
             generation: Some(1),
+            menu_seal: None,
             seal: 0,
             pick: Pick::Reply {
                 text: "xheron".into(),

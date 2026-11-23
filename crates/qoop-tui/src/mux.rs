@@ -3021,6 +3021,7 @@ mod tests {
         pane.holds.start(Hold {
             slot: Slot::Agent(there),
             generation: Some(1),
+            menu_seal: None,
             seal: 4,
             pick: Pick::Text {
                 key: "9".into(),
