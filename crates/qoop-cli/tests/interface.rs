@@ -206,11 +206,10 @@ impl Drop for Interface {
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// The screen row the column's title is drawn on: under the inbox's tab row and its list
-/// rows, which are there whether or not anybody waits. Taken from the interface rather than
-/// written as a number, so this test cannot disagree with the layout the next time the layout
-/// changes. The tab bar is over the pane, not over this column, so the column starts at the
-/// very top.
+/// The screen row the column's title is drawn on: the first row of the column, nothing above
+/// it. Taken from the interface rather than written as a number, so this test cannot disagree
+/// with the layout the next time the layout changes. The tab bar is over the pane, not over
+/// this column, so the column starts at the very top.
 const SPACES_TITLE_ROW: usize = qoop_tui::screen::SIDEBAR_TOP + qoop_tui::sidebar::TITLE_ROW;
 
 /// The screen row the tab names are on, one based: the bar's top row. The folders run on
@@ -358,6 +357,33 @@ impl Interface {
             painted: String::new(),
             screen: Screen::new(cols, rows),
         }
+    }
+
+    /// Put the left column in its tree. A fresh interface lists the priority list, the home;
+    /// the gates that read spaces and their rules ask for the tree the way a person does,
+    /// with `ctrl-a g`.
+    fn show_tree(&mut self) {
+        assert!(
+            self.wait_for_panel(
+                SPACES_TITLE_ROW,
+                |line| line.trim_end().ends_with("priority +"),
+                Duration::from_secs(20),
+            )
+            .is_some(),
+            "the column never opened on its priority list:\n{}",
+            self.painted
+        );
+        self.type_in(&[0x01, b'g']);
+        assert!(
+            self.wait_for_panel(
+                SPACES_TITLE_ROW,
+                |line| line.trim_end().ends_with("tree +"),
+                Duration::from_secs(10),
+            )
+            .is_some(),
+            "ctrl-a g did not show the tree:\n{}",
+            self.painted
+        );
     }
 
     /// Kill only the client, leaving the daemon and its terminals: the
@@ -972,6 +998,7 @@ impl Interface {
 #[test]
 fn g12_1_the_interface_paints_spaces_agents_tabs_a_terminal_and_a_status_line() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(
         ui.wait_for("detach", Duration::from_secs(20)).is_some(),
         "the key list never appeared:\n{}",
@@ -1248,6 +1275,7 @@ fn g12_6_detaching_restores_the_terminal_and_leaves_the_shell_running() {
 #[test]
 fn g12_7_an_agent_waiting_for_an_answer_is_visible_in_the_panel() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -1376,6 +1404,7 @@ fn g12_8_the_close_on_the_focused_tab_ends_that_terminal() {
 #[test]
 fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.create_terminal("");
     assert!(
@@ -1478,6 +1507,7 @@ fn g12_8_a_click_on_a_tab_moves_to_it_and_a_click_on_a_title_moves_to_nothing() 
 #[test]
 fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.type_in(b"echo IN_THE_FIRST_SPACE\n");
     assert!(
@@ -1570,6 +1600,7 @@ fn g12_9_a_new_space_is_reachable_and_carries_its_own_tabs() {
 #[test]
 fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -1631,6 +1662,7 @@ fn g12_10_a_terminal_behind_a_namespace_is_on_the_panel_as_the_wrapper() {
 #[test]
 fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
     ui.type_in(b"echo BEFORE_THE_MOVE\n");
     assert!(
@@ -1731,6 +1763,7 @@ fn g12_11_an_empty_space_does_not_leave_the_keyboard_in_the_space_it_left() {
 #[test]
 fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // Two, asked for back to back with no wait between them and both left unnamed, so both
@@ -1770,6 +1803,7 @@ fn g12_12_two_spaces_made_at_once_get_two_names_and_two_terminals() {
 #[test]
 fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // A stand in agent in a second space, so there is a row in the panel to click. A shell
@@ -1866,6 +1900,7 @@ fn g12_13_clicking_an_agent_in_another_space_brings_its_space_with_it() {
 #[test]
 fn g12_14_a_digit_picks_the_tab_at_that_position_in_this_space() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     // A space of its own with three terminals in it, so that a client counting the daemon's
@@ -2147,6 +2182,7 @@ fn g12_16_ctrl_c_interrupts_a_foreground_process_for_a_backgrounded_daemon() {
 #[test]
 fn g12_16_an_agent_behind_a_wrapper_script_is_on_the_panel() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -2237,41 +2273,24 @@ fn g12_20_a_fresh_attach_sizes_the_adopted_terminal_to_its_pane() {
 }
 
 #[test]
-fn g12_21_clicking_the_order_word_flips_tree_and_priority() {
+fn g12_21_clicking_the_order_word_flips_priority_and_tree() {
     let mut ui = Interface::start();
-    let title = ui
-        .wait_for_panel(
-            FIRST_SPACE_ROW,
-            |line| line.contains("default"),
-            Duration::from_secs(15),
-        )
-        .and_then(|_| {
-            agents_title_row(&ui.screen).and_then(|row| {
-                ui.wait_for_panel(
-                    row,
-                    |line| line.trim_end().ends_with("tree +"),
-                    Duration::from_secs(15),
-                )
-                .map(|_| row)
-            })
-        })
-        .unwrap_or_else(|| panic!("the title never said tree:\n{}", ui.painted));
-    // The order word flips the view, like `ctrl-a g`: the same agents, urgency first. The
-    // word ends two columns short of the edge, before the space and the `+`, and both
-    // words cover the column clicked here.
-    let word = index_width() as u16 - 3;
-    ui.click(word, title as u16);
+    // A fresh interface opens on the priority list, the home.
+    let title = SPACES_TITLE_ROW;
     assert!(
         ui.wait_for_panel(
             title,
             |line| line.trim_end().ends_with("priority +"),
-            Duration::from_secs(10)
+            Duration::from_secs(20),
         )
         .is_some(),
-        "a click on tree did not flip to priority:\n{}",
+        "the title never said priority:\n{}",
         ui.painted
     );
-    // And back again with a second click.
+    // The order word flips the view, like `ctrl-a g`: the same agents, grouped by space. The
+    // word ends two columns short of the edge, before the space and the `+`, and both
+    // words cover the column clicked here.
+    let word = index_width() as u16 - 3;
     ui.click(word, title as u16);
     assert!(
         ui.wait_for_panel(
@@ -2280,17 +2299,91 @@ fn g12_21_clicking_the_order_word_flips_tree_and_priority() {
             Duration::from_secs(10)
         )
         .is_some(),
-        "a click on priority did not flip back to tree:\n{}",
+        "a click on priority did not flip to the tree:\n{}",
         ui.painted
     );
-    // The `spaces` word itself is nothing: a click there leaves the view alone.
+    assert!(
+        ui.wait_for_panel(
+            FIRST_SPACE_ROW,
+            |line| line.contains("default"),
+            Duration::from_secs(15),
+        )
+        .is_some(),
+        "the tree never listed the daemon's own space:\n{}",
+        ui.painted
+    );
+    // And back again with a second click.
+    ui.click(word, title as u16);
+    assert!(
+        ui.wait_for_panel(
+            title,
+            |line| line.trim_end().ends_with("priority +"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "a click on tree did not flip back to priority:\n{}",
+        ui.painted
+    );
+    // The `agents` word itself is nothing: a click there leaves the view alone.
     ui.click(5, title as u16);
     let _ = ui.wait_for("never appears", Duration::from_secs(2));
     assert!(
         ui.panel_line(title)
-            .is_some_and(|line| line.trim_end().ends_with("tree +")),
-        "a click on the spaces word moved the view:\n{}",
+            .is_some_and(|line| line.trim_end().ends_with("priority +")),
+        "a click on the agents word moved the view:\n{}",
         ui.painted
+    );
+}
+
+/// The left column has no inbox strip: the title is its first row, no row of it says
+/// "nothing needs you" or draws the seven tabs' counts, and a first run lists This Mac and
+/// nothing else on its computers line. Asked of the real interface on a real screen.
+#[test]
+fn the_column_opens_on_its_title_with_no_strip_and_lists_this_mac() {
+    // The constant the other gates read their rows from is the title's own row.
+    assert_eq!(qoop_tui::sidebar::TITLE_ROW, 0);
+    assert_eq!(SPACES_TITLE_ROW, qoop_tui::screen::SIDEBAR_TOP);
+    let mut ui = Interface::start();
+    assert!(
+        ui.wait_for_panel(
+            SPACES_TITLE_ROW,
+            |line| line.starts_with(" agents") && line.trim_end().ends_with("priority +"),
+            Duration::from_secs(20),
+        )
+        .is_some(),
+        "the title is not the column's first row:\n{}",
+        ui.painted
+    );
+    assert!(
+        ui.wait_for("This Mac", Duration::from_secs(10)).is_some(),
+        "the computers line never named This Mac:\n{}",
+        ui.painted
+    );
+    let column: Vec<String> = (SPACES_TITLE_ROW - 1..=ROWS as usize - qoop_tui::screen::STATUS)
+        .filter_map(|row| ui.panel_line(row))
+        .collect();
+    let all = column.join("\n");
+    for gone in ["nothing needs you", "inbox", "wants", "saved"] {
+        assert!(
+            !all.contains(gone),
+            "the strip's {gone:?} is still drawn:\n{all}"
+        );
+    }
+    // The strip's tab counts were braille marks with a number on the first column row.
+    assert!(
+        !column
+            .first()
+            .is_some_and(|row| row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))),
+        "the row over the title is the old strip:\n{all}"
+    );
+    let computers = column
+        .iter()
+        .find(|line| line.contains("computers"))
+        .unwrap_or_else(|| panic!("no computers line:\n{all}"));
+    assert_eq!(
+        computers.trim_end(),
+        " computers  This Mac \u{25cf}",
+        "a first run lists This Mac only"
     );
 }
 
@@ -2376,6 +2469,7 @@ fn g12_22_a_hidden_child_cursor_stays_hidden_between_repaints() {
 #[test]
 fn radar_tree_order_holds_creation_order() {
     let mut ui = Interface::start();
+    ui.show_tree();
     assert!(ui.wait_for_tab(1, Duration::from_secs(20)));
 
     let dir = ui.runtime_dir().join("bin");
@@ -2738,7 +2832,8 @@ fn the_icon_font_a_start_writes_is_drawn_from_the_next_start() {
             .filter(|(_, g)| ui.painted.contains(*g))
             .count()
     };
-    let more = icons::MORE.to_string();
+    // The cog on the foot: drawn whichever list the column shows.
+    let more = icons::SETTINGS.to_string();
 
     let mut first = open();
     assert!(
@@ -2902,8 +2997,9 @@ fn inbox_over_a_blocked_agent_sized(cols: u16, rows: u16) -> (Interface, std::pa
     );
     // From the agent's own tab, the keyboard in its pane.
     ui.type_in(b"\x01i");
+    // The Inbox's own key row: the column's "needs you 1" is there before it opens.
     assert!(
-        ui.wait_on_screen("needs you 1", Duration::from_secs(10)),
+        ui.wait_on_screen("inbox:", Duration::from_secs(10)) && ui.on_screen("needs you 1"),
         "ctrl-a i did not open the Inbox:\n{}",
         ui.screen
     );
@@ -3104,7 +3200,7 @@ fn at_80_columns_the_inbox_folds_the_column_and_esc_brings_it_back() {
         ui.screen
     );
     assert!(
-        !ui.on_screen("tree +"),
+        !ui.on_screen("priority +"),
         "the column stayed wide under the cards:\n{}",
         ui.screen
     );
@@ -3114,7 +3210,7 @@ fn at_80_columns_the_inbox_folds_the_column_and_esc_brings_it_back() {
     }
     ui.type_in(b"\x1b");
     assert!(
-        ui.wait_on_screen("tree +", Duration::from_secs(5)),
+        ui.wait_on_screen("priority +", Duration::from_secs(5)),
         "esc did not bring the column back:\n{}",
         ui.screen
     );
@@ -3130,7 +3226,7 @@ fn the_inbox_at_100_columns_keeps_the_column() {
         ui.screen
     );
     assert!(
-        ui.on_screen("tree +"),
+        ui.on_screen("priority +"),
         "the column folded at 100 columns:\n{}",
         ui.screen
     );

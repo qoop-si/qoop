@@ -147,8 +147,6 @@ pub struct Chrome<'a> {
     pub mode: Option<(&'static str, &'static [(&'static str, &'static str)])>,
     /// The first column row the wheel moved the list to, `None` while it follows the keys.
     pub list_scroll: Option<usize>,
-    /// The inbox at the top of the column, as this client left it.
-    pub inbox: sidebar::Inbox,
     /// A row held by the mouse and moving, drawn while it is carried.
     pub drag: Option<&'a DragPaint>,
     /// The keyboard's hold on the column: its filter and the row it stands on.
@@ -174,11 +172,10 @@ pub struct Chrome<'a> {
     pub fold: Option<FoldPaint>,
     /// A plugin's agent view, the agents it shows in its order (`sidebar::Column::order`).
     pub agent_order: Option<&'a crate::plugins::AgentView>,
-    /// The questions rails of the tab on screen, one at the right of each agent pane's tile
-    /// (`crate::tabq`); at most one of them unfolded.
-    pub tab_rails: Vec<crate::tabq::Paint<'a>>,
-    /// The question cards as this client last read them, for the column's counts.
-    pub cards: &'a [qoop_runtime::control::AskInfo],
+    /// The reserved lines of the tab on screen, one under each agent pane (`crate::tabq`).
+    pub tab_lines: Vec<crate::tabq::Paint>,
+    /// The Inbox the column's groups and count are read from.
+    pub list: &'a crate::inbox::Inbox,
     /// What `ctrl-a tab` goes to next: the first of what the Inbox counts after the agent the
     /// keyboard is on. `None` when nothing waits.
     pub next: Option<Next>,
@@ -193,10 +190,12 @@ pub struct Chrome<'a> {
 /// The next thing that needs the person, as the status line names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Next {
-    /// "space/agent".
+    /// The agent as the column names it: "space session".
     pub who: String,
-    /// What it is doing: "blocked", "failed", "asking".
-    pub word: &'static str,
+    /// The agent as the Inbox's cards name it, shorter: "space / agent".
+    pub short: String,
+    /// What it is doing, as a whole predicate: "is blocked", "has failed", "is asking".
+    pub says: &'static str,
     /// Failed, so the line wears the failed ink.
     pub failed: bool,
 }
@@ -265,6 +264,13 @@ pub struct DragPaint {
 /// Nothing folded and nothing sampled, for a frame built without a client behind it.
 static NO_SHUT: sidebar::Shut = sidebar::Shut::new();
 static NO_USAGE: sidebar::Usage = sidebar::Usage::new();
+static NO_LIST: crate::inbox::Inbox = crate::inbox::Inbox {
+    items: Vec::new(),
+    count: 0,
+    with_qass: Vec::new(),
+    finished: Vec::new(),
+    answered: Vec::new(),
+};
 
 impl Default for Chrome<'_> {
     fn default() -> Self {
@@ -282,7 +288,6 @@ impl Default for Chrome<'_> {
             closing: None,
             mode: None,
             list_scroll: None,
-            inbox: sidebar::Inbox::default(),
             drag: None,
             nav: None,
             qass: None,
@@ -294,8 +299,8 @@ impl Default for Chrome<'_> {
             questions_handle: None,
             fold: None,
             agent_order: None,
-            tab_rails: Vec::new(),
-            cards: &[],
+            tab_lines: Vec::new(),
+            list: &NO_LIST,
             next: None,
             hand: false,
             holding: false,
@@ -344,11 +349,10 @@ impl Frame<'_> {
             doze_open: self.chrome.doze_open,
             usage: Some(self.chrome.usage),
             scroll: self.chrome.list_scroll,
-            inbox: self.chrome.inbox,
             icons: crate::icons::on(),
             nav: self.chrome.nav,
             order: self.chrome.agent_order,
-            cards: self.chrome.cards,
+            list: self.chrome.list,
         }
     }
 }
@@ -365,8 +369,6 @@ pub enum KeyContext {
     Prefix,
     /// qass's tab with the board: its titles fold their panes, and the keys that fold.
     Qass,
-    /// An agent tab's questions pane has the keyboard (`crate::tabq`): its own keys.
-    Questions,
     /// The Inbox is open over the pane: its own keys.
     Inbox,
 }
@@ -424,16 +426,6 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("f", Some("from qass"), 4),
             ("j k", Some("move"), 5),
             ("esc", Some("back"), 0),
-        ],
-        KeyContext::Questions => &[
-            ("questions:", None, 0),
-            ("1-9", Some("answer"), 1),
-            ("enter", Some("open"), 2),
-            ("r", Some("reply"), 2),
-            ("q", Some("hand to qass"), 3),
-            ("s", Some("task"), 4),
-            ("j k", Some("move"), 5),
-            ("esc", Some("back to the agent"), 0),
         ],
         // Grouped as the keys box groups them, under the same names, so the row and the
         // box teach one vocabulary. Within a group the most used comes first.
@@ -699,8 +691,8 @@ fn tiled(frame: &Frame) -> bool {
 }
 
 /// The size a lone pane's terminal is given in a window of `cols` by `lines`: the pane inside
-/// the frame every pane stands in. A shell's: an agent's tab also gives its questions rail its
-/// columns (`crate::tabq`).
+/// the frame every pane stands in. A shell's: an agent's tab also gives its reserved line two
+/// rows (`crate::tabq`).
 pub fn lone_pane_size(cols: u16, lines: u16) -> (u16, u16) {
     let (pane_cols, pane_rows) = pane_size(cols, lines);
     let framed = layout::framed(layout::Rect {
@@ -1024,9 +1016,9 @@ fn edge_grid(frame: &Frame, cols: usize, rows: usize) -> Vec<Vec<Option<(char, E
     }
     let rails: Vec<(layout::Rect, bool)> = frame
         .chrome
-        .tab_rails
+        .tab_lines
         .iter()
-        .map(|rail| (rail.rect, rail.terminal == frame.focused))
+        .map(|line| (line.rect, line.terminal == frame.focused))
         .collect();
     let mut edges = pane_edges(
         &frame.tiles,
@@ -1200,13 +1192,6 @@ pub(crate) fn pane_cursor(frame: &Frame, snapshot: &SnapshotWire) -> Option<(usi
     if frame.chrome.asks.is_some_and(|asks| asks.focus)
         && qass_plan(frame).is_some_and(|p| p.side.is_some())
     {
-        return None;
-    }
-    // The same for an agent pane's open pane, and the agent's own under the pane over its tile.
-    if frame.chrome.tab_rails.iter().any(|rail| {
-        rail.open
-            .is_some_and(|open| open.focus || (open.over && rail.terminal == frame.focused))
-    }) {
         return None;
     }
     // The same for the schedules: their form draws its own caret.
@@ -1466,33 +1451,20 @@ pub fn paint(frame: &Frame) -> String {
         .chrome
         .rail
         .map(|rail| rail_rows_of(frame, &rail, spotlight));
-    // Each agent pane's questions rail: its rows, over the cells its tile left for it.
-    let tab_rail_rows: Vec<(layout::Rect, Vec<String>)> = frame
+    // Each agent pane's reserved line: its row, over the cells its tile left for it.
+    let tab_line_rows: Vec<(layout::Rect, String)> = frame
         .chrome
-        .tab_rails
+        .tab_lines
         .iter()
-        .filter(|rail| rail.open.is_none_or(|open| open.over))
-        .map(|rail| {
+        .map(|line| {
             let task = frame
                 .rows
                 .iter()
-                .find(|r| r.terminal == rail.terminal)
+                .find(|r| r.terminal == line.terminal)
                 .and_then(|r| r.task.as_ref());
-            (rail.rect, crate::tabq::rows(rail, task, spotlight))
+            (line.rect, crate::tabq::row(line, task, spotlight))
         })
         .collect();
-    let tab_pane = frame.chrome.tab_rails.iter().find_map(|rail| {
-        let open = rail.open?;
-        let (view, _) = crate::tabq::pane_view(
-            rail,
-            &open,
-            frame.rows,
-            frame.spaces,
-            frame.now_unix,
-            spotlight,
-        );
-        Some((open.rect, view.rows))
-    });
     // The space of the focused tab when that tab runs no agent, and so draws no row.
     let shell_space = frame
         .rows
@@ -1567,8 +1539,7 @@ pub fn paint(frame: &Frame) -> String {
                     | sidebar::Hit::Foot
                     | sidebar::Hit::Pet(_)
                     | sidebar::Hit::Eye(_)
-                    | sidebar::Hit::Next(_)
-                    | sidebar::Hit::Tabs,
+                    | sidebar::Hit::Inbox,
                 )
                 | None => false,
             };
@@ -1735,18 +1706,11 @@ pub fn paint(frame: &Frame) -> String {
                 out.push_str(&at(pane_row + TABS + 1, left + 1 + rail.x));
                 out.push_str(row);
             }
-            for (rect, rows) in &tab_rail_rows {
-                if let Some(row) = pane_row.checked_sub(rect.y).and_then(|at| rows.get(at)) {
+            for (rect, row) in &tab_line_rows {
+                if pane_row == rect.y {
                     out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
                     out.push_str(row);
                 }
-            }
-            // The rail unfolded: its pane over its own cells, beside the agent or over its tile.
-            if let Some((rect, rows)) = &tab_pane
-                && let Some(row) = pane_row.checked_sub(rect.y).and_then(|at| rows.get(at))
-            {
-                out.push_str(&at(pane_row + TABS + 1, left + 1 + rect.x));
-                out.push_str(row);
             }
         }
     }
@@ -1792,6 +1756,13 @@ pub fn paint(frame: &Frame) -> String {
     // is. Never empty: a blank row is a row that has to be explained.
     // qass's own idling and finishing is not the owner's to see to: only what he watches.
     let (_, watched) = sidebar::shown(frame.spaces, frame.rows);
+    // The room the notice has: the row less the park label that opens it, when it does.
+    let notice_room = match &park {
+        Some((_, ParkSpot::Notice(_, label))) => {
+            (frame.cols as usize).saturating_sub(width::width(label))
+        }
+        _ => frame.cols as usize,
+    };
     let (notice, notice_role) = match (message, triage(frame.chrome.next.as_ref())) {
         (Some(message), _) => (message.to_string(), waiting(frame.chrome.next.as_ref())),
         // Being somewhere other than the bottom wins over what needs a person, because it
@@ -1812,13 +1783,17 @@ pub fn paint(frame: &Frame) -> String {
         }
         // A zoom is said after what waits, and in place of the calm line: it hides the other
         // panes, which nothing else on screen tells.
-        (None, Some(next)) => (
-            match frame.chrome.zoomed {
-                true => format!("{next}  \u{b7}  {}", zoomed_note()),
-                false => next,
-            },
-            waiting(frame.chrome.next.as_ref()),
-        ),
+        (None, Some(candidates)) => {
+            let said = |c: &String| match frame.chrome.zoomed {
+                true => format!("{c}  \u{b7}  {}", zoomed_note()),
+                false => c.clone(),
+            };
+            let lines: Vec<String> = candidates.iter().map(said).collect();
+            (
+                first_fitting(&lines, notice_room),
+                waiting(frame.chrome.next.as_ref()),
+            )
+        }
         (None, None) => match frame.hint {
             Some(hint) => (hint.to_string(), None),
             None if frame.chrome.zoomed => (zoomed_note(), None),
@@ -2064,12 +2039,36 @@ pub fn paint(frame: &Frame) -> String {
 /// line, the key and the Inbox name the same one. Finished work nobody read is not in it.
 /// `None` when nothing waits, and then the status line carries the key list instead, which is
 /// how a person finds out they are done.
-fn triage(next: Option<&Next>) -> Option<String> {
+///
+/// The line comes as whole candidates, the fullest first, and the painter takes the first that
+/// fits: the agent as the column names it, then as the cards do, then "an agent", then no one.
+/// Nothing is cut and the key is always the last words. The line is never parsed back, so a
+/// name with a colon or the key's own letters in it is only ever text.
+fn triage(next: Option<&Next>) -> Option<Vec<String>> {
+    triage_with(next, &crate::keys::prefix_name())
+}
+
+/// The first of `lines` that fits `room` whole; the last, the shortest, when none does.
+fn first_fitting(lines: &[String], room: usize) -> String {
+    lines
+        .iter()
+        .find(|l| width::width(l) <= room)
+        .or(lines.last())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn triage_with(next: Option<&Next>, prefix: &str) -> Option<Vec<String>> {
     let next = next?;
-    Some(crate::keys::named(&format!(
-        "next: {} is {}  ctrl-a tab",
-        next.who, next.word
-    )))
+    let mut out: Vec<String> = Vec::new();
+    for who in [next.who.as_str(), next.short.as_str(), "an agent"] {
+        let line = format!("next: {who} {}  {prefix} tab", next.says);
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+    out.push(format!("next waiting  {prefix} tab"));
+    Some(out)
 }
 
 /// The notice in `room` columns. One that ends on the key to press (`…: ctrl-a Q`) keeps the
@@ -4011,7 +4010,7 @@ fn pane_edges(
     let mut grid: Vec<Vec<Option<(char, EdgeInk)>>> = vec![vec![None; cols]; rows];
     // The ways a frame's line leaves each cell, from every pane's frame, so a shared side is
     // one line and its ends are joints; and the cells of the focused pane's frame. An agent
-    // pane's questions rail is framed like one more pane inside the agent's tile, lit with it
+    // pane's reserved line is framed like one more pane inside the agent's tile, lit with it
     // when it is focused, so the line between them is one rule, the lit frame runs round the
     // whole tile, and a pane beside one is never alone.
     let mut ways = vec![vec![0u8; cols]; rows];
@@ -5837,6 +5836,48 @@ mod tests {
         TEST_LEVEL.with(|c| c.set(None));
     }
 
+    /// The next line is whole at any width: the column's name, then the cards' name, then
+    /// "an agent", then no one, each ending on the key as the prefix is set (ctrl-b too), and
+    /// never cut, however many colons or key-like words the name holds.
+    #[test]
+    fn the_next_line_is_one_whole_candidate_at_any_width_and_any_prefix() {
+        let next = Next {
+            who: "qoop Fix the flaky login test on CI: it times out on the second retry, ctrl-a it"
+                .to_string(),
+            short: "qoop / claude".to_string(),
+            says: "has failed",
+            failed: true,
+        };
+        for prefix in ["ctrl-a", "ctrl-b"] {
+            let all = triage_with(Some(&next), prefix).expect("one waits");
+            assert_eq!(all.len(), 4, "{all:?}");
+            for room in [24, 30, 40, 60, 70, 120] {
+                let said = first_fitting(&all, room);
+                assert!(
+                    all.contains(&said),
+                    "{prefix} at {room}: not a candidate: {said:?}"
+                );
+                assert!(!said.contains('\u{2026}'), "{said:?}");
+                assert!(said.ends_with(&format!("  {prefix} tab")), "{said:?}");
+                assert!(width::width(&said) <= room, "{prefix} at {room}: {said:?}");
+            }
+            // The fullest that fits wins.
+            assert!(first_fitting(&all, 200).contains("on the second retry"));
+            assert_eq!(
+                first_fitting(&all, 60),
+                format!("next: qoop / claude has failed  {prefix} tab")
+            );
+            assert_eq!(
+                first_fitting(&all, 40),
+                format!("next: an agent has failed  {prefix} tab")
+            );
+            assert_eq!(
+                first_fitting(&all, 30),
+                format!("next waiting  {prefix} tab")
+            );
+        }
+    }
+
     /// A notice that ends on its key keeps the key when the row is short: the words go first.
     #[test]
     fn a_short_notice_row_keeps_the_key() {
@@ -6763,23 +6804,6 @@ mod tests {
             "the key row did not say how to read"
         );
     }
-    /// An agent tab's questions pane with the keyboard: the row names its own keys, and on a
-    /// short row the way back to the agent stays.
-    #[test]
-    fn the_key_row_names_the_questions_panes_keys() {
-        let row = |cols| strip(&key_row(KeyContext::Questions, Place::default(), cols));
-        assert_eq!(
-            row(200).trim_end(),
-            " questions: [1-9\u{2192}answer] [enter\u{2192}open] [r\u{2192}reply] \
-             [q\u{2192}hand to qass] [s\u{2192}task] [j k\u{2192}move] [esc\u{2192}back to the agent]"
-        );
-        let short = row(60);
-        assert_eq!(width::width(&short), 60);
-        assert!(
-            short.contains("[esc\u{2192}back to the agent]") && short.contains("[1-9"),
-            "{short:?}"
-        );
-    }
 
     /// The key row follows the keyboard: the prefix commands in the pane, what the column
     /// answers to after a click in it, every command while `ctrl-a` waits. Each drops its
@@ -7701,15 +7725,19 @@ mod tests {
     #[test]
     fn the_status_line_words_and_colour_name_the_same_agent() {
         let failed = Next {
-            who: "work/claude".to_string(),
-            word: "failed",
+            who: "work claude".to_string(),
+            short: "work / claude".to_string(),
+            says: "has failed",
             failed: true,
         };
-        let words = triage(Some(&failed)).expect("one waits");
-        assert!(words.contains("work/claude is failed"), "{words}");
+        let words = triage(Some(&failed)).expect("one waits")[0].clone();
+        assert!(
+            words.contains("next: work claude has failed  ctrl-a tab"),
+            "{words}"
+        );
         assert_eq!(waiting(Some(&failed)), Some(theme::Role::Failed));
         let blocked = Next {
-            word: "blocked",
+            says: "is blocked",
             failed: false,
             ..failed
         };
@@ -7763,15 +7791,16 @@ mod tests {
             toast: None,
             chrome: Chrome {
                 next: Some(Next {
-                    who: "app/codex".to_string(),
-                    word: "blocked",
+                    who: "app codex".to_string(),
+                    short: "app / codex".to_string(),
+                    says: "is blocked",
                     failed: false,
                 }),
                 ..Default::default()
             },
         });
         assert!(
-            painted.contains("next: app/codex is blocked"),
+            painted.contains("next: app codex is blocked"),
             "{painted:?}"
         );
         assert!(painted.contains("ctrl-a tab"), "{painted:?}");
@@ -8387,9 +8416,9 @@ mod tests {
         // the title names the order.
         let shut = sidebar::Shut::new();
         let (seen, unseen) = (sidebar::Seen::new(), sidebar::Unseen::new());
+        let list = crate::inbox::Inbox::default();
         let lines = sidebar::render_folded(
             &sidebar::Column {
-                inbox: sidebar::Inbox::default(),
                 armed: None,
                 drawer: None,
                 spaces: &spaces,
@@ -8409,7 +8438,7 @@ mod tests {
                 icons: false,
                 nav: None,
                 order: None,
-                cards: &[],
+                list: &list,
             },
             44,
         );
@@ -9045,10 +9074,10 @@ mod tests {
         assert!(grid[4][left.x + 2].is_none());
     }
 
-    /// Two agents split, each with its rail inside its tile: the focused agent's lit frame runs
-    /// round its whole tile, its rail included, and the other agent's tile stays quiet.
+    /// Two agents split, each with its line inside its tile: the focused agent's lit frame runs
+    /// round its whole tile, its line included, and the other agent's tile stays quiet.
     #[test]
-    fn the_focused_agents_lit_frame_runs_round_its_rail() {
+    fn the_focused_agents_lit_frame_runs_round_its_line() {
         let rows = [row(1, "claude", "working"), row(2, "claude", "working")];
         let area = crate::layout::Rect {
             x: 0,
@@ -9062,8 +9091,7 @@ mod tests {
         let mut tiles = Vec::new();
         let mut rails = Vec::new();
         for (terminal, tile) in layout.tile_rects(area) {
-            let rail = crate::tabq::Rail { terminal, w: 4 };
-            let (term, cells) = crate::tabq::split(tile, rail);
+            let (term, cells) = crate::tabq::split(tile);
             tiles.push(Tile {
                 terminal,
                 rect: term,
@@ -9077,14 +9105,27 @@ mod tests {
         let lit = Some(EdgeInk::Frame(ink));
         let ink_at = |y: usize, x: usize| grid[y][x].map(|(_, ink)| ink);
         let (first, second) = (rails[0].0, rails[1].0);
-        // The focused tile: over its rail, its right edge and its rule, all lit.
-        assert_eq!(ink_at(0, second.x + 1), lit, "the top over its rail");
-        assert_eq!(ink_at(11, second.x + 1), lit, "the bottom under it");
-        assert_eq!(ink_at(5, second.x + second.cols), lit, "its right edge");
-        assert_eq!(ink_at(5, second.x - 1), lit, "the rule");
-        // The other agent's rail is quiet.
-        assert_eq!(ink_at(0, first.x + 1), Some(EdgeInk::Line));
-        assert_eq!(ink_at(5, first.x - 1), Some(EdgeInk::Line));
+        // The focused tile: over its pane, its right edge, its bottom and the rule above its
+        // line, all lit.
+        assert_eq!(
+            ink_at(0, second.x + second.cols - 1),
+            lit,
+            "the top over its pane"
+        );
+        assert_eq!(
+            ink_at(second.y + 1, second.x + 1),
+            lit,
+            "the bottom under its line"
+        );
+        assert_eq!(
+            ink_at(second.y, second.x + second.cols),
+            lit,
+            "its right edge"
+        );
+        assert_eq!(ink_at(second.y - 1, second.x + 1), lit, "the rule");
+        // The other agent's line is quiet.
+        assert_eq!(ink_at(0, first.x + first.cols - 1), Some(EdgeInk::Line));
+        assert_eq!(ink_at(first.y - 1, first.x + 1), Some(EdgeInk::Line));
     }
 
     #[test]

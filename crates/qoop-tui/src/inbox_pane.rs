@@ -267,6 +267,11 @@ pub struct Pane {
     /// input.
     pub no_hands: BTreeSet<usize>,
     notice: Option<(String, Instant)>,
+    /// The card a "sent to ..." notice is about, so a new turn of that agent's menu can take it
+    /// down: it must not stand under the same question asked again.
+    notice_slot: Option<Slot>,
+    /// The last text seal and turn seal each agent's menu was seen with.
+    turns: BTreeMap<u32, (u64, Option<u64>)>,
     /// The first body row shown, and the most it can be; whether the view follows the
     /// selection (a key moved it) or the wheel has taken it.
     offset: Cell<usize>,
@@ -367,6 +372,7 @@ impl Pane {
     }
 
     fn say(&mut self, what: impl Into<String>, env: &Env) {
+        self.notice_slot = None;
         self.notice = Some((what.into(), env.now + NOTICE));
     }
 
@@ -498,12 +504,13 @@ impl Pane {
                 };
                 // A menu that has only just appeared takes no digit: a key meant for the
                 // screen before it.
-                if !self.holds.armed(*t, menu.seal, env.now) {
+                if !self.holds.armed(*t, menu.seal, row.menu_seal, env.now) {
                     return Out::Stay;
                 }
                 Hold {
                     slot: item.slot.clone(),
                     generation: row.generation,
+                    menu_seal: row.menu_seal,
                     seal: menu.seal,
                     pick,
                     label: opt.label,
@@ -526,6 +533,7 @@ impl Pane {
                 Hold {
                     slot: item.slot.clone(),
                     generation: None,
+                    menu_seal: None,
                     seal: 0,
                     pick,
                     label: opt.label,
@@ -567,6 +575,7 @@ impl Pane {
                 Hold {
                     slot: item.slot.clone(),
                     generation: row.generation,
+                    menu_seal: row.menu_seal,
                     seal: row.menu.as_ref().map_or(0, |m| m.seal),
                     pick: Pick::Qass,
                     label: "Hand to qass".into(),
@@ -576,6 +585,7 @@ impl Pane {
             Slot::Card(id) => Hold {
                 slot: item.slot.clone(),
                 generation: None,
+                menu_seal: None,
                 seal: 0,
                 pick: Pick::CardQass { card: id.clone() },
                 label: "Hand to qass".into(),
@@ -628,6 +638,7 @@ impl Pane {
                 Hold {
                     slot: slot.clone(),
                     generation: row.generation,
+                    menu_seal: row.menu_seal,
                     seal: row.menu.as_ref().map_or(0, |m| m.seal),
                     pick: Pick::Text { key, text },
                     label: "your words".into(),
@@ -641,6 +652,7 @@ impl Pane {
                 Hold {
                     slot: slot.clone(),
                     generation: row.generation,
+                    menu_seal: None,
                     seal: 0,
                     pick: Pick::Reply {
                         text,
@@ -653,6 +665,7 @@ impl Pane {
             (Slot::Card(id), _) => Hold {
                 slot: slot.clone(),
                 generation: None,
+                menu_seal: None,
                 seal: 0,
                 pick: Pick::CardText {
                     card: id.clone(),
@@ -693,6 +706,7 @@ impl Pane {
         self.start_hold(Hold {
             slot: item.slot.clone(),
             generation: None,
+            menu_seal: None,
             seal: 0,
             pick: Pick::PutAway { card: card.clone() },
             label: "Put away".into(),
@@ -839,7 +853,9 @@ impl Pane {
         self.said.remove(&hold.slot);
         let item_who = env.who_slot(&hold.slot);
         let said = match &hold.pick {
-            Pick::Qass | Pick::CardQass { .. } => format!("handed to qass: {item_who}"),
+            Pick::Qass | Pick::CardQass { .. } => {
+                format!("handed to qass, {}: {item_who}", clock(env.now_unix))
+            }
             _ => format!("sent to {item_who}: {}", hold.label),
         };
         if matches!(hold.pick, Pick::PutAway { .. }) {
@@ -847,6 +863,7 @@ impl Pane {
             return;
         }
         self.say(said, env);
+        self.notice_slot = Some(hold.slot.clone());
         self.own.push(OwnAnswer {
             at: env.now_unix,
             label: hold.label.clone(),
@@ -891,11 +908,13 @@ impl Pane {
             // The menu it was for changed or is gone: what happened to it is not said under
             // whatever the agent asks now.
             let moved_on = hold.seal != 0
-                && hold
-                    .terminal()
-                    .and_then(|t| env.row(t))
-                    .and_then(|r| r.menu.as_ref())
-                    .is_none_or(|m| m.seal != hold.seal);
+                && hold.terminal().and_then(|t| env.row(t)).is_none_or(|r| {
+                    // The same question asked again is another menu: another turn seal, or
+                    // another process.
+                    r.menu.as_ref().is_none_or(|m| m.seal != hold.seal)
+                        || r.generation != hold.generation
+                        || matches!((hold.menu_seal, r.menu_seal), (Some(a), Some(b)) if a != b)
+                });
             if moved_on {
                 self.said.remove(&hold.slot);
                 continue;
@@ -948,6 +967,27 @@ impl Pane {
     /// who answered; the digits of a new menu wait out their arming. Called whenever the rows
     /// change, open or not.
     pub fn rows_changed(&mut self, env: &Env) {
+        // A menu that comes up with another seal or turn than the last one seen for its agent,
+        // the same text asked again included, is a new question: what was said of the answer to
+        // the old one (a refusal, "sent to ...") does not stand under it.
+        for row in env.rows.iter().filter(|r| r.menu.is_some()) {
+            let Some(menu) = row.menu.as_ref() else {
+                continue;
+            };
+            let key = (menu.seal, row.menu_seal);
+            if self
+                .turns
+                .insert(row.terminal, key)
+                .is_some_and(|old| old != key)
+            {
+                let slot = Slot::Agent(row.terminal);
+                self.said.remove(&slot);
+                if self.notice_slot.as_ref() == Some(&slot) {
+                    self.notice = None;
+                    self.notice_slot = None;
+                }
+            }
+        }
         for hold in self.holds.menus(env.rows, env.now) {
             let by = hold
                 .terminal()
@@ -1052,10 +1092,12 @@ impl Pane {
         let hold = self.holds.held.last()?;
         let left = hold.until.saturating_duration_since(env.now);
         Some(crate::keys::named(&format!(
-            "sending in {} s: {} to {}  ctrl-a i then u undoes",
-            left.as_secs_f64().ceil().max(1.0) as u64,
-            hold.label,
-            env.who_slot(&hold.slot)
+            "{}  ctrl-a i then u undoes",
+            hold_words(
+                hold,
+                left.as_secs_f64().ceil().max(1.0) as u64,
+                &env.who_slot(&hold.slot)
+            )
         )))
     }
 
@@ -1360,15 +1402,44 @@ fn refused_by(reason: &str, hold: &Hold) -> bool {
     qoop_runtime::control::too_old_for(reason, Some(variant(hold)))
 }
 
-/// Whom the next item to go to is about, and what it is doing, for the status line: the one
-/// label ("space / agent") every place names an agent by.
-pub fn next_words(item: &Item, env: &Env) -> (String, &'static str) {
-    let word = match item.kind {
-        ItemKind::Failed => "failed",
-        ItemKind::Menu | ItemKind::Reply | ItemKind::Dialog | ItemKind::Open => "blocked",
-        ItemKind::Qass | ItemKind::Agent | ItemKind::Plan => "asking",
+/// What a hold says while it waits, as the phone says it: a hand-off "handing to qass: agent,
+/// sending in 3 s", any other answer "sending in 3 s: Yes to agent".
+fn hold_words(hold: &Hold, secs: u64, who: &str) -> String {
+    match hold.pick {
+        Pick::Qass | Pick::CardQass { .. } => {
+            format!("handing to qass: {who}, sending in {secs} s")
+        }
+        _ => format!("sending in {secs} s: {} to {who}", hold.label),
+    }
+}
+
+/// The person's local wall clock at `unix`, "16:04".
+fn clock(unix: i64) -> String {
+    let at = (qoop_runtime::schedule::system_zone().local)(unix);
+    format!("{:02}:{:02}", at.hour, at.minute)
+}
+
+/// Whom the next item to go to is about, and what it is doing as a whole predicate, for the
+/// status line ("who has failed"): the agent is named as the agents column names it, its
+/// space and its session, so one agent reads the same in both places.
+pub fn next_words(item: &Item, env: &Env) -> (String, String, &'static str) {
+    let says = match item.kind {
+        ItemKind::Failed => "has failed",
+        ItemKind::Menu | ItemKind::Reply | ItemKind::Dialog | ItemKind::Open => "is blocked",
+        ItemKind::Qass | ItemKind::Agent | ItemKind::Plan => "is asking",
     };
-    (env.who(item), word)
+    let who = item
+        .terminal
+        .and_then(|t| env.row(t))
+        .map(|row| {
+            format!(
+                "{} {}",
+                env.space_name(row.workspace),
+                crate::sidebar::session_name(row)
+            )
+        })
+        .unwrap_or_else(|| env.who(item));
+    (who, env.who(item), says)
 }
 
 /// What the client knows about qass and the hands to it, read off its lists: This Mac's qass
@@ -2140,11 +2211,7 @@ impl Pane {
                 Unit {
                     role: Role::Blocked,
                     bold: true,
-                    text: format!(
-                        "sending in {secs} s: {} to {}",
-                        hold.label,
-                        env.who_slot(slot)
-                    ),
+                    text: hold_words(hold, secs, &env.who_slot(slot)),
                     hit: None,
                 },
                 unit(Role::Text, "u undo", Some(Hit::Undo(slot.clone()))),
@@ -2461,6 +2528,73 @@ mod tests {
         assert!(pane.take().is_empty());
     }
 
+    /// Claude asks the same question again: the text's seal is the same, the turn's is not. The
+    /// answer held for the first goes to nobody, and a new process is another agent.
+    #[test]
+    fn the_same_question_asked_again_never_takes_the_held_answer() {
+        for change in ["a new turn of the menu", "a new process"] {
+            let mut w = world("normal");
+            let row = w.rows.iter_mut().find(|r| r.terminal == 2).expect("row");
+            (row.menu_seal, row.generation) = (Some(10), Some(1));
+            let (mut pane, ready) = armed(&w, Instant::now());
+            pane.select(menu_slot());
+            press(&mut pane, &w, ready, b"1");
+            let held = pane.holds.of(&menu_slot()).expect("held");
+            assert_eq!((held.menu_seal, held.generation), (Some(10), Some(1)));
+            let row = w.rows.iter_mut().find(|r| r.terminal == 2).expect("row");
+            if change == "a new process" {
+                row.generation = Some(2);
+            } else {
+                row.menu_seal = Some(11);
+            }
+            assert_eq!(
+                row.menu.as_ref().expect("menu").seal,
+                held.seal,
+                "the same text"
+            );
+            pane.rows_changed(&env(&w, ready + Duration::from_secs(1)));
+            assert!(pane.holds.held.is_empty(), "{change}: kept the old answer");
+            pane.tick(&env(&w, ready + Duration::from_secs(10)));
+            assert!(pane.take().is_empty(), "{change}: an answer was sent");
+        }
+    }
+
+    /// The same question comes up again while a digit is typed: the first half second takes no
+    /// digit, whatever the text's seal says; and a hand-off held on the old one goes nowhere.
+    #[test]
+    fn a_digit_right_after_the_same_question_comes_up_again_goes_nowhere() {
+        let mut w = world("normal");
+        let row = w.rows.iter_mut().find(|r| r.terminal == 2).expect("row");
+        (row.menu_seal, row.generation) = (Some(10), Some(1));
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(menu_slot());
+        press(&mut pane, &w, ready, b"h");
+        assert!(
+            pane.holds.of(&menu_slot()).is_some(),
+            "the hand-off is held"
+        );
+        let again = ready + Duration::from_secs(1);
+        w.rows
+            .iter_mut()
+            .find(|r| r.terminal == 2)
+            .expect("row")
+            .menu_seal = Some(11);
+        pane.rows_changed(&env(&w, again));
+        assert!(
+            pane.holds.held.is_empty(),
+            "the hand-off was for the old menu"
+        );
+        pane.tick(&env(&w, again + HOLD));
+        assert!(pane.take().is_empty(), "a hand-off was sent");
+        press(&mut pane, &w, again + Duration::from_millis(100), b"1");
+        assert!(
+            pane.holds.held.is_empty(),
+            "a key meant for the screen before it"
+        );
+        press(&mut pane, &w, again + Duration::from_millis(600), b"1");
+        assert!(pane.holds.of(&menu_slot()).is_some(), "armed again");
+    }
+
     #[test]
     fn hand_to_qass_is_held_like_any_answer_and_goes_as_a_hand() {
         let w = world("normal");
@@ -2485,6 +2619,61 @@ mod tests {
         pane.select(menu_slot());
         press(&mut pane, &w, ready, b"q");
         assert!(pane.holds.of(&menu_slot()).is_some());
+    }
+
+    /// The hand-off says what the phone says: "handing to qass: agent" while it waits, "handed
+    /// to qass, 16:04: agent" once it went, and the offer is "Hand to qass".
+    #[test]
+    fn a_hand_off_says_what_the_phone_says() {
+        let w = world("normal");
+        let (mut pane, ready) = armed(&w, Instant::now());
+        pane.select(menu_slot());
+        let menu = w
+            .rows
+            .iter()
+            .find(|r| r.terminal == 2)
+            .and_then(|r| r.menu.as_ref())
+            .expect("menu");
+        let labels: Vec<String> = crate::answers::offers(menu)
+            .into_iter()
+            .map(|o| o.label)
+            .collect();
+        assert_eq!(
+            labels.last().map(String::as_str),
+            Some("Hand to qass"),
+            "{labels:?}"
+        );
+        press(&mut pane, &w, ready, b"h");
+        let shown = pane.view(&env(&w, ready), 80, 40).plain.join("\n");
+        assert!(shown.contains("handing to qass: "), "{shown}");
+        assert!(shown.contains(", sending in 3 s"), "{shown}");
+        let line = pane.held_line(&env(&w, ready)).expect("a held line");
+        assert!(line.starts_with("handing to qass: "), "{line}");
+        pane.tick(&env(&w, ready + HOLD));
+        let sends = pane.take();
+        let [ControlRequest::HandToQass { id, .. }] = &sends.requests[..] else {
+            panic!("{sends:?}");
+        };
+        pane.answered(
+            &ControlResponse::Handed {
+                id: id.clone(),
+                taken: vec![2],
+            },
+            &env(&w, ready + HOLD),
+        );
+        let said = pane
+            .notice
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .expect("a notice");
+        let rest = said
+            .strip_prefix("handed to qass, ")
+            .unwrap_or_else(|| panic!("{said}"));
+        let clock = rest.get(..5).unwrap_or(rest);
+        assert!(rest[5..].starts_with(": "), "who follows the time: {said}");
+        let ok = clock.as_bytes()[2] == b':'
+            && clock.chars().filter(|c| c.is_ascii_digit()).count() == 4;
+        assert!(ok, "{said}");
     }
 
     #[test]
@@ -2763,6 +2952,62 @@ mod tests {
         );
         let inbox = pane.inbox(&env(&w, ready + HOLD));
         assert!(inbox.answered.iter().any(|a| a.own), "{:?}", inbox.answered);
+    }
+
+    /// An answer has gone and the same question comes up again (same text seal, new turn): it
+    /// takes a digit once its guard is up, and nothing said about the old answer stands under
+    /// it, whether the daemon's answer came before the new menu or after it.
+    #[test]
+    fn the_same_question_after_a_sent_answer_is_answerable_with_no_stale_line() {
+        for answer_late in [false, true] {
+            let mut w = world("normal");
+            let row = w.rows.iter_mut().find(|r| r.terminal == 2).expect("row");
+            (row.menu_seal, row.generation) = (Some(10), Some(1));
+            let (mut pane, ready) = armed(&w, Instant::now());
+            pane.select(menu_slot());
+            press(&mut pane, &w, ready, b"1");
+            pane.tick(&env(&w, ready + HOLD));
+            let sends = pane.take();
+            let [ControlRequest::AnswerMenu { id, .. }] = &sends.requests[..] else {
+                panic!("{sends:?}");
+            };
+            let answered = ControlResponse::MenuAnswered {
+                id: id.clone(),
+                answers: true,
+            };
+            if !answer_late {
+                pane.answered(&answered, &env(&w, ready + HOLD));
+                assert!(
+                    pane.notice
+                        .as_ref()
+                        .is_some_and(|(s, _)| s.starts_with("sent to"))
+                );
+            }
+            // The same question again: the same text, another turn.
+            let again = ready + HOLD + Duration::from_secs(1);
+            w.rows
+                .iter_mut()
+                .find(|r| r.terminal == 2)
+                .expect("row")
+                .menu_seal = Some(11);
+            pane.rows_changed(&env(&w, again));
+            if answer_late {
+                pane.answered(&answered, &env(&w, again));
+            }
+            assert!(
+                pane.notice.is_none() && !pane.said.contains_key(&menu_slot()),
+                "late {answer_late}: a stale line: {:?} {:?}",
+                pane.notice,
+                pane.said
+            );
+            let shown = pane.view(&env(&w, again), 80, 40).plain.join("\n");
+            assert!(!shown.contains("sent to"), "{shown}");
+            press(&mut pane, &w, again + ARMING, b"1");
+            assert!(
+                pane.holds.of(&menu_slot()).is_some(),
+                "late {answer_late}: the new question took no digit"
+            );
+        }
     }
 
     #[test]

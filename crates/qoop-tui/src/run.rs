@@ -258,9 +258,6 @@ const QASS_OPENING: &str = "opening qass";
 /// What a second press says while that `qoop qass` is still running.
 const QASS_ON_ITS_WAY: &str = "qass is on its way";
 
-/// The request id of the open pane's task read (`crate::tabq`).
-const TABQ_READ: &str = "tabq-task";
-
 /// What ctrl-a U says: whether a newer release is waiting, and how it gets installed.
 ///
 /// Said, not fetched: the interface never touches the network, it only reads the notice
@@ -1155,12 +1152,9 @@ struct State {
     creating: usize,
     /// How the column orders its agents: the tree of spaces, or flat by urgency.
     view: sidebar::View,
-    /// The inbox at the top of the column: its list, its height, folded or not. Client-local
-    /// like `view`.
-    inbox: sidebar::Inbox,
-    /// The title row held by the mouse to drag the inbox's edge: the screen row the press
-    /// landed on and the list rows the inbox had then.
-    inbox_drag: Option<(u16, usize)>,
+    /// The Inbox as it stood when the rows or the cards last moved: the left column's groups
+    /// and its one count are read from it, so no screen says a number the Inbox does not.
+    ibx_list: crate::inbox::Inbox,
     /// The spaces folded away under their rule. Client-local like `view`: the daemon
     /// never knows, and a space that goes away leaves this set with the next index.
     shut: sidebar::Shut,
@@ -1265,24 +1259,6 @@ struct State {
     /// first list row. A move of the keyboard to another terminal lets the list follow it
     /// again, so a scroll never hides where the keys went.
     list_scroll: Option<(u32, usize)>,
-    /// The agent terminal whose tab has its questions rail unfolded to the pane (`ctrl-a T`, a
-    /// click on the rail): the one state the rail's width follows (`crate::tabq`).
-    tabq: Option<u32>,
-    /// The keyboard is in that pane, given while this leaf had the focus: the focus moving to
-    /// another leaf (a shell beside the agent) takes it back.
-    tabq_focus: Option<u32>,
-    /// `s` folded or opened the pane's task part by hand.
-    tabq_task: Option<bool>,
-    /// The pane's task read, by what it was read for ([`crate::tabq::read_key`]), and the
-    /// request id and key of a read on its way: an answer under another id is an old one.
-    tabq_read: Option<(crate::tabq::ReadKey, crate::tabq::TaskRead)>,
-    tabq_asked: Option<(String, crate::tabq::ReadKey)>,
-    /// Where that agent stood when its pane unfolded ([`State::tab_home`]): the pane folds once
-    /// the agent is gone or stands anywhere else.
-    tabq_home: Option<TabHome>,
-    /// The unfolded pane's width as he dragged its edge or stepped it with `<` `>`, kept for the
-    /// session and never saved, like qass's rail; `None` for [`crate::tabq::OPEN`].
-    tabq_w: Option<usize>,
     /// The panel width the focused child was last sized to.
     ///
     /// Drag motions repaint every frame but reflow at most once per frame:
@@ -1434,15 +1410,6 @@ struct Toast {
 /// and the tile-local cell. Divider cells answer `None`.
 type TileHit = (u32, (usize, usize), (usize, usize));
 
-/// Where a terminal stands ([`State::tab_home`]): its space, its tab's first leaf, and the
-/// other panes of its tab.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TabHome {
-    space: i64,
-    tab: u32,
-    others: Vec<u32>,
-}
-
 /// An agent row under a held button. `name` is whether the press landed on the row that
 /// names the agent rather than the one under it.
 #[derive(Clone, Copy, Debug)]
@@ -1532,8 +1499,6 @@ enum Grab {
     Questions,
     /// The edge line of qass's rail: its width, kept for the session and never saved.
     Rail,
-    /// The left frame line of an agent pane's unfolded questions pane: its width, the same.
-    Tabq,
 }
 
 #[derive(Default)]
@@ -1620,7 +1585,9 @@ impl State {
         self.ibx_ctx =
             crate::inbox_pane::context(&self.spaces, day, crate::mux::machines_without_menus());
         let env = ibx_env!(self);
+        let list = self.ibx.inbox(&env);
         self.ibx_held = self.ibx.held_line(&env);
+        self.ibx_list = list;
     }
 
     /// A new agent list: the hands are noted, the held answers whose menu changed are dropped.
@@ -1771,8 +1738,8 @@ impl State {
                 questions_handle: self.qass_split().then(|| self.questions_handle()).flatten(),
                 fold: self.qass_split().then(|| self.fold_paint()).flatten(),
                 agent_order: self.agent_view.as_ref(),
-                tab_rails: self.tab_rails(),
-                cards: &self.asks.live,
+                tab_lines: self.tab_lines(),
+                list: &self.ibx_list,
                 next: self.next_waiting(),
                 hand: self.hand.qass_off().is_none(),
                 holding: !self.ibx.holds.held.is_empty(),
@@ -1785,7 +1752,6 @@ impl State {
                 answer: self.answer.is_some(),
                 dim: self.dim_tab().unwrap_or(0),
                 list_scroll: self.list_scroll(),
-                inbox: self.inbox,
                 nav: self.modes.side.as_ref(),
                 keys_query: self.keys_query.as_deref(),
                 keys_page: self.keys_page,
@@ -1836,8 +1802,6 @@ impl State {
                     screen::KeyContext::Sidebar
                 } else if self.ibx.open {
                     screen::KeyContext::Inbox
-                } else if self.tabq_focused() {
-                    screen::KeyContext::Questions
                 } else if self.qass_split() && fold_leaves(self).is_some() {
                     screen::KeyContext::Qass
                 } else {
@@ -1958,26 +1922,19 @@ impl State {
             let local = (within - inner.y, x - inner.x);
             return Some((self.focused, local, local));
         }
-        // The pane open over the agent's tile has its cells: no terminal is under them.
-        if self.tabq_open().is_some_and(|open| {
-            let r = open.rect;
-            open.over && x >= r.x && x < r.x + r.cols && within >= r.y && within < r.y + r.rows
-        }) {
-            return None;
-        }
         if let Some(space) = self.space
             && let Some(layout) = self.drawn_tree(space)
         {
             let hit = layout.hit(self.tree_area(&layout), x, within)?;
-            // An agent's rail and the line before it are not its terminal's cells.
+            // An agent's reserved line is not its terminal's cells.
             let rect = self.term_rect_in(&layout, hit)?;
-            if x >= rect.x + rect.cols {
+            if within >= rect.y + rect.rows {
                 return None;
             }
             return Some((hit, (within, x), (within - rect.y, x - rect.x)));
         }
         // No tree yet: the pane stands in its frame as it is drawn (`frame`), and the frame's
-        // own cells are not the terminal's, nor its rail's.
+        // own cells are not the terminal's, nor its reserved line's.
         let r = self.lone_rect(self.focused);
         if within < r.y || within >= r.y + r.rows || x < r.x || x >= r.x + r.cols {
             return None;
@@ -2153,6 +2110,21 @@ impl State {
         )
     }
 
+    /// Whether a click lands on the reserved line of an agent that waits: its words say
+    /// `ctrl-a i answers`, and the click is that key.
+    fn line_hit(&self, row: u16, col: u16, left: usize) -> bool {
+        let (Some(x), Some(y)) = (
+            (col as usize).checked_sub(left + 1),
+            (row as usize).checked_sub(screen::TABS + 1),
+        ) else {
+            return false;
+        };
+        self.tab_lines().iter().any(|line| {
+            let r = line.rect;
+            line.waiting && y == r.y && (r.x..r.x + r.cols).contains(&x)
+        })
+    }
+
     /// The park control a click lands on, as the paint drew it (`screen::park_spot`).
     fn park_hit(&self, row: u16, col: u16, left: usize) -> Option<u32> {
         // Cheap first: no control, nothing to build a frame for.
@@ -2186,11 +2158,6 @@ impl State {
             return false;
         }
         let (x, y) = self.pane_cell(row, col);
-        // An agent pane's unfolded questions pane: its left edge drags its width.
-        if self.on_tabq_edge(x, y) {
-            self.modes.split_drag = Some(Grab::Tabq);
-            return true;
-        }
         // The rail's edge first, also with a pane folded (that is when there is one): it is
         // a line of its own, and a stacked tab's divider runs under it.
         let rail = self.on_rail_edge(x, y);
@@ -2258,7 +2225,6 @@ impl State {
             }
             Grab::Questions => self.questions_to(space, |layout| layout.gap_at(area, x)),
             Grab::Rail => self.rail_to(x),
-            Grab::Tabq => self.tabq_to(x),
         }
     }
 
@@ -2282,6 +2248,9 @@ impl State {
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         if let Some(terminal) = self.park_hit(row, col, left) {
             return Some(Clicked::Park(terminal));
+        }
+        if self.line_hit(row, col, left) {
+            return Some(Clicked::Inbox);
         }
         // Right of the column, which is the pane and the bar above it.
         if left == 0 || col as usize > left {
@@ -2353,8 +2322,7 @@ impl State {
             sidebar::Act::Collapse => Some(Clicked::Collapse),
             sidebar::Act::Qass => Some(Clicked::Qass),
             sidebar::Act::QassWatch => Some(Clicked::QassWatch),
-            sidebar::Act::InboxTab(tab) => Some(Clicked::InboxTab(tab)),
-            sidebar::Act::InboxFold => Some(Clicked::InboxFold),
+            sidebar::Act::Inbox => Some(Clicked::Inbox),
             sidebar::Act::Search => Some(Clicked::Search),
         }
     }
@@ -2417,7 +2385,11 @@ impl State {
     /// The space a column row belongs to: its rule's, or its tab's, asleep or not.
     fn space_of_hit(&self, hit: sidebar::Hit) -> Option<i64> {
         match hit {
-            sidebar::Hit::Space(space) | sidebar::Hit::Doze(space) => Some(space),
+            sidebar::Hit::Space(space) | sidebar::Hit::Doze(space)
+                if space != sidebar::IDLE_FOLD =>
+            {
+                Some(space)
+            }
             sidebar::Hit::Terminal(t) => self
                 .rows
                 .iter()
@@ -3000,7 +2972,7 @@ impl State {
         {
             return None;
         }
-        // Measured in the tab as the drop leaves it: the pane landing brings its rail with it.
+        // Measured in the tab as the drop leaves it: the pane landing brings its line with it.
         let rect = self.term_rect_in(&tree, terminal)?;
         let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
         Some((
@@ -3027,15 +2999,6 @@ impl State {
             .map(|(_, at)| at)
     }
 
-    /// The most list rows the inbox's edge may be dragged to in this window.
-    fn inbox_room(&self) -> usize {
-        sidebar::inbox_room(
-            &self.column(self.paint_now, 0),
-            screen::column_rows(self.lines as usize),
-            sidebar::current_avatar().as_ref(),
-        )
-    }
-
     /// The pieces the left column is drawn from, at a given clock and animation frame.
     fn column(&self, now_unix: i64, tick: u64) -> sidebar::Column<'_> {
         let (spaces, agents) = self.shown();
@@ -3056,11 +3019,10 @@ impl State {
             drawer: self.drawer_view(),
             usage: Some(&self.usage),
             scroll: self.list_scroll(),
-            inbox: self.inbox,
             icons: crate::icons::on(),
             nav: self.modes.side.as_ref(),
             order: self.agent_view.as_ref(),
-            cards: &self.asks.live,
+            list: &self.ibx_list,
         }
     }
 
@@ -3087,10 +3049,11 @@ impl State {
     fn next_waiting(&self) -> Option<screen::Next> {
         let item = self.up_next()?;
         let env = ibx_env!(self);
-        let (who, word) = crate::inbox_pane::next_words(&item, &env);
+        let (who, short, says) = crate::inbox_pane::next_words(&item, &env);
         Some(screen::Next {
             who,
-            word,
+            short,
+            says,
             failed: item.kind == crate::inbox::ItemKind::Failed,
         })
     }
@@ -3677,63 +3640,48 @@ impl State {
     }
 
     /// The area `tree`'s panes are laid out in: its tab's. Every tile, size, click and drag of
-    /// the tab measures from here; an agent's tile then gives its rail's columns to the rail
-    /// ([`State::term_rect`]).
+    /// the tab measures from here; an agent's tile then gives its last row to the reserved
+    /// line ([`State::term_rect`]).
     fn tree_area(&self, tree: &Layout) -> layout::Rect {
         self.tab_area(tree)
     }
 
-    /// The questions rail at the right of `terminal`'s tile `tile` in `tree`: on a local agent's
-    /// pane, while the daemon keeps question cards. Never on a shell, another machine's terminal
-    /// or qass's tab, nor in a tile too small to spare it. Each agent pane carries its own, sized
-    /// by its own tile and never by the focus, so moving the keyboard resizes nothing. Unfolded,
-    /// its pane takes the columns beside the agent while the agent keeps 60; else the pane opens
-    /// over the agent's cells and the rail keeps its width.
-    fn rail_of(
-        &self,
-        tree: &Layout,
-        terminal: u32,
-        tile: layout::Rect,
-    ) -> Option<crate::tabq::Rail> {
-        if self.asks.unsupported || self.band_over(tree) > 0 {
-            return None;
+    /// Whether `terminal`'s pane in `tile` of `tree` keeps the reserved line under it: on a
+    /// local agent's pane. Never on a shell, another machine's terminal or qass's tab, nor in
+    /// a tile too small to spare the row. The line does not wait on the daemon's question
+    /// cards: the Inbox lists what needs the person from the rows alone. Every
+    /// agent pane has it whether or not anything is said there, sized by its own tile and
+    /// never by the focus, so a question arriving or answered, or the keyboard moving, resizes
+    /// nothing.
+    fn has_line(&self, tree: &Layout, terminal: u32, tile: layout::Rect) -> bool {
+        if self.band_over(tree) > 0 {
+            return false;
         }
         let row = |t: u32| self.rows.iter().find(|r| r.terminal == t);
-        row(terminal).filter(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal))?;
+        if !row(terminal).is_some_and(|r| r.agent && !crate::mux::is_remote_terminal(r.terminal)) {
+            return false;
+        }
         let qass = sidebar::qass_space(&self.spaces);
-        if tree
+        !tree
             .leaves()
             .into_iter()
             .filter_map(row)
             .any(|r| Some(r.workspace) == qass)
-        {
-            return None;
-        }
-        let w = crate::tabq::width(tile)?;
-        if self.tabq == Some(terminal) {
-            let open = self.tabq_width(tile, w);
-            if crate::tabq::beside(tile, open) {
-                return Some(crate::tabq::Rail { terminal, w: open });
-            }
-        }
-        Some(crate::tabq::Rail { terminal, w })
+            && crate::tabq::fits(tile)
     }
 
-    /// The unfolded pane's width in `tile`, whose folded rail is `folded` wide: the one he
-    /// chose this session, else [`crate::tabq::OPEN`], as the tile allows.
-    fn tabq_width(&self, tile: layout::Rect, folded: usize) -> usize {
-        crate::tabq::open_width(tile, folded, self.tabq_w.unwrap_or(crate::tabq::OPEN))
-    }
-
-    /// Where `terminal` is drawn and sized in its tile `tile` of `tree`: the tile, less the rail
-    /// at its right when it carries one. The one place a terminal's cells are measured, so its
-    /// size, paint, cursor, clicks and drags agree.
+    /// Where `terminal` is drawn and sized in its tile `tile` of `tree`: the tile, less the
+    /// reserved line at its foot when it carries one. The one place a terminal's cells are
+    /// measured, so its size, paint, cursor, clicks and drags agree.
     fn term_rect(&self, tree: &Layout, terminal: u32, tile: layout::Rect) -> layout::Rect {
-        self.rail_of(tree, terminal, tile)
-            .map_or(tile, |rail| crate::tabq::split(tile, rail).0)
+        if self.has_line(tree, terminal, tile) {
+            crate::tabq::split(tile).0
+        } else {
+            tile
+        }
     }
 
-    /// `tree`'s terminals and their cells, each tile less its rail.
+    /// `tree`'s terminals and their cells, each tile less its line.
     fn term_rects(&self, tree: &Layout) -> Vec<(u32, layout::Rect)> {
         tree.tile_rects(self.tree_area(tree))
             .into_iter()
@@ -3750,14 +3698,14 @@ impl State {
     }
 
     /// A terminal outside any tree as it is drawn (a tab before its tree): the whole pane in the
-    /// frame every pane stands in, less its rail when it is an agent's.
+    /// frame every pane stands in, less its line when it is an agent's.
     fn lone_rect(&self, terminal: u32) -> layout::Rect {
         let tree = Layout::single(terminal);
         self.term_rect(&tree, terminal, layout::framed(self.tree_area(&tree)))
     }
 
-    /// The rails of the tab on screen, one per agent pane, as the frame paints them.
-    fn tab_rails(&self) -> Vec<crate::tabq::Paint<'_>> {
+    /// The reserved lines of the tab on screen, one per agent pane, as the frame paints them.
+    fn tab_lines(&self) -> Vec<crate::tabq::Paint> {
         if self.focused == 0 || self.on_qass_screen() {
             return Vec::new();
         }
@@ -3767,384 +3715,18 @@ impl State {
             .unwrap_or_else(|| Layout::single(self.focused));
         tree.tile_rects(self.tree_area(&tree))
             .into_iter()
-            .filter_map(|(terminal, tile)| {
-                let rail = self.rail_of(&tree, terminal, tile)?;
-                Some(self.rail_paint_of(rail, tile))
+            .filter(|(terminal, tile)| self.has_line(&tree, *terminal, *tile))
+            .map(|(terminal, tile)| crate::tabq::Paint {
+                rect: crate::tabq::split(tile).1,
+                terminal,
+                // Whatever the Inbox counts about this agent: the line says where to answer.
+                waiting: self
+                    .ibx_list
+                    .items
+                    .iter()
+                    .any(|item| item.terminal == Some(terminal)),
             })
             .collect()
-    }
-
-    /// One agent pane's rail in its tile, and its pane when it is the one unfolded.
-    fn rail_paint_of(&self, rail: crate::tabq::Rail, tile: layout::Rect) -> crate::tabq::Paint<'_> {
-        let (term, rect) = crate::tabq::split(tile, rail);
-        // The pane covers its own frame's lines: beside the agent the rail's, over it the
-        // agent's cells'.
-        let framed = |r: layout::Rect| layout::Rect {
-            x: r.x - 1,
-            y: r.y - 1,
-            cols: r.cols + 2,
-            rows: r.rows + 2,
-        };
-        let open = (self.tabq == Some(rail.terminal)).then(|| {
-            // Folded beside the pane, the rail kept its own width: the pane is over the agent,
-            // at its width against the rail.
-            let over = rail.w < crate::tabq::OPEN_MIN;
-            let cells = if over {
-                let w = self.tabq_width(tile, rail.w).min(term.cols);
-                layout::Rect {
-                    x: term.x + term.cols - w,
-                    cols: w,
-                    ..term
-                }
-            } else {
-                rect
-            };
-            crate::tabq::Open {
-                rect: framed(cells),
-                over,
-                asks: &self.asks,
-                focus: self.tabq_focus == Some(self.focused),
-                read: self
-                    .tabq_read
-                    .as_ref()
-                    .filter(|(key, _)| {
-                        self.rows
-                            .iter()
-                            .find(|r| r.terminal == rail.terminal)
-                            .and_then(|r| r.task.as_ref())
-                            .is_some_and(|t| crate::tabq::read_key(t) == *key)
-                    })
-                    .map(|(_, read)| read),
-                task_open: self.tabq_task,
-            }
-        });
-        crate::tabq::Paint {
-            rect,
-            terminal: rail.terminal,
-            cards: &self.asks.live,
-            open,
-        }
-    }
-
-    /// The rail of the tab on screen the pane keys speak to: the unfolded one, else the focused
-    /// pane's, else (the keyboard in a shell) the tab's first agent's.
-    fn tab_rail_paint(&self) -> Option<crate::tabq::Paint<'_>> {
-        let rails = self.tab_rails();
-        let at = rails
-            .iter()
-            .position(|rail| rail.open.is_some())
-            .or_else(|| rails.iter().position(|rail| rail.terminal == self.focused))
-            .unwrap_or(0);
-        rails.into_iter().nth(at)
-    }
-
-    /// `ctrl-a T`: unfold the focused agent pane's rail to its pane with the keyboard in it
-    /// (another unfolded one folds), or fold it back. From a shell, the pane unfolded folds,
-    /// else the tab's first agent's unfolds. False with no rail.
-    fn tabq_toggle(&mut self) -> bool {
-        let focused = self
-            .tab_rails()
-            .iter()
-            .any(|rail| rail.terminal == self.focused)
-            .then_some(self.focused);
-        let Some(terminal) = focused.or_else(|| self.tab_rail_paint().map(|rail| rail.terminal))
-        else {
-            return false;
-        };
-        self.tabq_flip(terminal);
-        true
-    }
-
-    /// Unfold `terminal`'s pane, folding any other, or fold it when it is the one open.
-    fn tabq_flip(&mut self, terminal: u32) {
-        if self.tabq == Some(terminal) {
-            self.tabq_fold();
-        } else {
-            self.tabq = Some(terminal);
-            self.tabq_home = self.tab_home(terminal);
-            self.tabq_focus = Some(self.focused);
-            self.tabq_task = None;
-            self.asks.set_scope(Some(terminal));
-        }
-    }
-
-    /// Where `terminal` stands: its space, the first leaf of its tab (the tab's own terminal)
-    /// and the other panes beside it. `None` once it is gone.
-    fn tab_home(&self, terminal: u32) -> Option<TabHome> {
-        let space = self.rows.iter().find(|r| r.terminal == terminal)?.workspace;
-        let leaves = self
-            .trees()
-            .map(Layout::leaves)
-            .find(|leaves| leaves.contains(&terminal))
-            .unwrap_or_else(|| vec![terminal]);
-        let others = leaves.iter().copied().filter(|t| *t != terminal).collect();
-        Some(TabHome {
-            space,
-            tab: leaves[0],
-            others,
-        })
-    }
-
-    /// The unfolded pane folds once its agent is gone or left the tab it unfolded in: moved to
-    /// another tab or space, or split out to a tab of its own. A pane closing beside it, or a
-    /// new one split in, leaves it open. True when it folded.
-    fn tabq_home_lost(&mut self) -> bool {
-        let Some(terminal) = self.tabq else {
-            return false;
-        };
-        let alive = |t: u32| self.rows.iter().any(|r| r.terminal == t);
-        let held = match (&self.tabq_home, self.tab_home(terminal)) {
-            (Some(was), Some(now)) => {
-                now.space == was.space
-                    && (now.tab == was.tab || !alive(was.tab))
-                    && was
-                        .others
-                        .iter()
-                        .all(|t| now.others.contains(t) || !alive(*t))
-            }
-            _ => false,
-        };
-        if !held {
-            self.tabq_fold();
-        }
-        !held
-    }
-
-    /// A press at a one based screen position, when it is a rail's or the open pane's: in the
-    /// pane, what it hit is answered and the pane has the keyboard; on a folded rail, that
-    /// agent's pane unfolds. `Some(true)` when the panes must be sized again; `None` for a press
-    /// elsewhere, which takes the keyboard out of the pane.
-    fn tabq_click(&mut self, row: u16, col: u16) -> Option<bool> {
-        let (x, y) = self.pane_xy(row, col);
-        let inside = |r: layout::Rect| inside_rect(r, x, y);
-        let rails = self.tab_rails();
-        if rails.is_empty() {
-            return None;
-        }
-        if let Some((rail, open)) = rails
-            .iter()
-            .find_map(|rail| rail.open.map(|open| (rail, open)))
-            && inside(open.rect)
-        {
-            let (view, _) = crate::tabq::pane_view(
-                rail,
-                &open,
-                &self.rows,
-                &self.spaces,
-                sidebar::now_unix(),
-                false,
-            );
-            let hit = crate::asks::hit_at(&view, open.rect, y?, x?);
-            self.tabq_focus = Some(self.focused);
-            if let Some(hit) = hit {
-                self.asks.click(hit);
-            }
-            return Some(false);
-        }
-        if let Some(terminal) = rails
-            .iter()
-            .find(|rail| rail.open.is_none_or(|open| open.over) && inside(rail.rect))
-            .map(|rail| rail.terminal)
-        {
-            self.tabq_flip(terminal);
-            return Some(true);
-        }
-        self.tabq_focus = None;
-        None
-    }
-
-    /// The agent whose folded rail, or whose unfolded pane, is at a one based screen position.
-    fn tabq_at(&self, row: u16, col: u16) -> Option<u32> {
-        let (x, y) = self.pane_xy(row, col);
-        self.tab_rails()
-            .iter()
-            .find(|rail| {
-                rail.open.is_some_and(|open| inside_rect(open.rect, x, y))
-                    || (rail.open.is_none_or(|open| open.over) && inside_rect(rail.rect, x, y))
-            })
-            .map(|rail| rail.terminal)
-    }
-
-    /// Whether a pane cell is on the unfolded pane's left frame line, the one that drags its
-    /// width.
-    fn on_tabq_edge(&self, x: usize, y: usize) -> bool {
-        self.tabq_open().is_some_and(|open| {
-            let r = open.rect;
-            x == r.x && y >= r.y && y < r.y + r.rows
-        })
-    }
-
-    /// The tile of the agent whose pane is unfolded, in the tab on screen.
-    fn tabq_tile(&self) -> Option<layout::Rect> {
-        let terminal = self.tabq?;
-        let tree = self
-            .space
-            .and_then(|space| self.drawn_tree(space))
-            .unwrap_or_else(|| Layout::single(self.focused));
-        tree.tile_rects(self.tree_area(&tree))
-            .into_iter()
-            .find(|(t, _)| *t == terminal)
-            .map(|(_, tile)| tile)
-    }
-
-    /// Give the unfolded pane `w` columns, as its tile allows. True when its width changed.
-    fn tabq_resize_to(&mut self, w: usize) -> bool {
-        let Some(tile) = self.tabq_tile() else {
-            return false;
-        };
-        let Some(folded) = crate::tabq::width(tile) else {
-            return false;
-        };
-        let before = self.tabq_width(tile, folded);
-        let w = crate::tabq::open_width(tile, folded, w);
-        self.tabq_w = Some(w);
-        w != before
-    }
-
-    /// The unfolded pane's left edge dragged to pane column `x`: its right edge stays, its
-    /// width follows. True when it changed.
-    fn tabq_to(&mut self, x: usize) -> bool {
-        let Some(open) = self.tabq_open().map(|open| open.rect) else {
-            return false;
-        };
-        let right = open.x + open.cols - 1;
-        self.tabq_resize_to(right.saturating_sub(x + 1))
-    }
-
-    /// `<` and `>` in the unfolded pane: a step narrower or wider. True when it changed.
-    fn tabq_step(&mut self, wider: bool) -> bool {
-        let Some(now) = self
-            .tabq_open()
-            .map(|open| open.rect.cols.saturating_sub(2))
-        else {
-            return false;
-        };
-        let step = crate::tabq::OPEN_STEP;
-        self.tabq_resize_to(if wider {
-            now + step
-        } else {
-            now.saturating_sub(step)
-        })
-    }
-
-    /// A one based screen position in pane cells, column then row, `None` left of or above
-    /// the pane.
-    fn pane_xy(&self, row: u16, col: u16) -> (Option<usize>, Option<usize>) {
-        let left = screen::left_for(self.cols, self.collapsed, self.sidebar_width);
-        (
-            (col as usize).checked_sub(left + 1),
-            (row as usize).checked_sub(screen::TABS + 1),
-        )
-    }
-
-    /// Fold the pane to its rail; the keyboard goes back to the agent.
-    fn tabq_fold(&mut self) {
-        self.tabq = None;
-        self.tabq_home = None;
-        self.tabq_focus = None;
-        self.asks.set_scope(None);
-    }
-
-    /// The open pane of the agent tab on screen.
-    fn tabq_open(&self) -> Option<crate::tabq::Open<'_>> {
-        self.tab_rail_paint().and_then(|rail| rail.open)
-    }
-
-    /// Whether the open pane shows its task part whole, as it is drawn now.
-    fn tabq_task_shown(&self) -> bool {
-        self.tab_rail_paint().is_some_and(|rail| {
-            rail.open.is_some_and(|open| {
-                crate::tabq::pane_view(
-                    &rail,
-                    &open,
-                    &self.rows,
-                    &self.spaces,
-                    sidebar::now_unix(),
-                    false,
-                )
-                .1
-            })
-        })
-    }
-
-    /// Whether the keyboard is in the open pane of the agent tab on screen.
-    fn tabq_focused(&self) -> bool {
-        self.tabq_focus == Some(self.focused) && self.tabq_open().is_some()
-    }
-
-    /// The pane stands in the tab it is open on: the cards it reaches are that agent's while it
-    /// is on screen, and every card's on qass's screen; off screen, or once the focus moved to
-    /// another leaf, it has no keyboard. True when that changed what is drawn.
-    fn tabq_settle(&mut self) -> bool {
-        let folded = self.tabq_home_lost();
-        let shown = self
-            .tab_rail_paint()
-            .filter(|rail| rail.open.is_some())
-            .map(|rail| rail.terminal);
-        let moved = self.asks.scope != shown;
-        self.asks.set_scope(shown);
-        let focus = self
-            .tabq_focus
-            .filter(|leaf| shown.is_some() && *leaf == self.focused);
-        let lost = focus != self.tabq_focus;
-        self.tabq_focus = focus;
-        folded || moved || lost
-    }
-
-    /// The task read the open pane wants and has not asked for: the terminal's own read, which
-    /// carries its open task's events and the card of the item it is on (the steps), and never
-    /// takes the task's id for an item's. Its id names the key it is for.
-    fn tabq_read_request(&mut self) -> Option<ControlRequest> {
-        let rail = self.tab_rail_paint().filter(|rail| rail.open.is_some())?;
-        let terminal = rail.terminal;
-        let task = self
-            .rows
-            .iter()
-            .find(|r| r.terminal == rail.terminal)
-            .and_then(|r| r.task.clone())?;
-        let key = crate::tabq::read_key(&task);
-        if self.tabq_read.as_ref().is_some_and(|(k, _)| *k == key)
-            || self.tabq_asked.as_ref().is_some_and(|(_, k)| *k == key)
-        {
-            return None;
-        }
-        let id = format!(
-            "{TABQ_READ}-{}-{}-{}-{}-{}",
-            key.0,
-            key.1.unwrap_or(0),
-            key.2,
-            key.3,
-            key.4
-        );
-        self.tabq_asked = Some((id.clone(), key));
-        Some(ControlRequest::TaskRead {
-            id,
-            board: false,
-            task: None,
-            terminal: Some(terminal),
-            token: None,
-            before: None,
-        })
-    }
-
-    /// The answer to the pane's task read, kept by what it was asked for; an older read's
-    /// answer is dropped.
-    fn tabq_answered(&mut self, response: &ControlResponse) -> bool {
-        let id = response.request_id();
-        if !id.starts_with(TABQ_READ) {
-            return false;
-        }
-        let Some(key) = self
-            .tabq_asked
-            .take_if(|(asked, _)| asked.as_str() == id)
-            .map(|(_, key)| key)
-        else {
-            return true;
-        };
-        // A failed read is kept empty, so it is not asked again until the task moves.
-        let read = crate::tabq::TaskRead::of(key.0, response).unwrap_or_default();
-        self.tabq_read = Some((key, read));
-        true
     }
 
     /// The area `tree`'s tab takes: the pane, less qass's header over its split.
@@ -6376,26 +5958,6 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     }
     let column_rows = screen::column_rows(state.lines as usize);
     let column = state.column(state.paint_now, 0);
-    // Over the inbox the wheel is the inbox's: its list scrolls, its tab row walks the tabs.
-    match state.column_hit(row).map(|(hit, _)| hit) {
-        Some(sidebar::Hit::Next(_)) => {
-            let at = sidebar::inbox_wheeled(
-                &column,
-                column_rows,
-                sidebar::current_avatar().as_ref(),
-                up,
-            );
-            let moved = at != state.inbox.scroll;
-            state.inbox.scroll = at;
-            return moved;
-        }
-        Some(sidebar::Hit::Tabs) if !state.inbox.folded => {
-            state.inbox.tab = state.inbox.tab.step(up);
-            state.inbox.scroll = 0;
-            return true;
-        }
-        _ => {}
-    }
     let at = sidebar::wheeled(
         &column,
         column_rows,
@@ -6407,21 +5969,6 @@ fn wheel_list(state: &mut State, row: u16, col: u16, up: bool) -> bool {
     let moved = next != state.list_scroll;
     state.list_scroll = next;
     moved
-}
-
-/// Where the wheel leaves the column's list once a click puts the keyboard on `picked`. A row
-/// of the tree was on screen to be clicked, so the list stays where the wheel left it; an
-/// inbox item names an agent whose row may be scrolled out, so the wheel's place is let go
-/// and the list follows it there.
-fn clicked_scroll(
-    scroll: Option<(u32, usize)>,
-    picked: u32,
-    hit: Option<sidebar::Hit>,
-) -> Option<(u32, usize)> {
-    match (scroll, hit) {
-        (Some((_, at)), Some(sidebar::Hit::Terminal(_))) => Some((picked, at)),
-        _ => None,
-    }
 }
 
 fn scroll_focus(state: &mut State, up: bool, step: usize) {
@@ -7618,7 +7165,9 @@ fn toggle_doze(state: &mut State, space: i64) {
 /// The space a row of the column belongs to.
 fn side_space(state: &State, pick: sidebar::Pick) -> Option<i64> {
     match pick {
-        sidebar::Pick::Space(id) | sidebar::Pick::Doze(id) => Some(id),
+        sidebar::Pick::Space(id) => Some(id),
+        sidebar::Pick::Doze(id) if id != sidebar::IDLE_FOLD => Some(id),
+        sidebar::Pick::Doze(_) => None,
         sidebar::Pick::Terminal(t) => state
             .rows
             .iter()
@@ -7829,6 +7378,9 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
                 }
             }
             Some(sidebar::Pick::Space(id)) => sleep_space(state, id, request),
+            Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)) => {
+                state.message = Some("enter lists the idle and the asleep".to_string());
+            }
             Some(sidebar::Pick::Doze(_)) => {
                 state.message = Some("already asleep, enter lists them".to_string());
             }
@@ -7837,6 +7389,9 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         ModeKey::Byte(b'w') => match (pick, space) {
             (Some(sidebar::Pick::Terminal(t)), Some(space)) if state.is_asleep(t) => {
                 wake(state, space, t, request);
+            }
+            (Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)), _) => {
+                state.message = Some("enter lists the idle and the asleep".to_string());
             }
             (Some(sidebar::Pick::Space(id) | sidebar::Pick::Doze(id)), _) => {
                 wake_space(state, id, request)
@@ -7857,6 +7412,22 @@ fn side_command(state: &mut State, key: ModeKey, request: &mut u64) {
         ModeKey::Byte(b'N') => {
             state.menu_kind = MenuKind::Plus;
             state.menu = Some(0);
+        }
+        // The priority list has no space to fold: `h` and `l` close and open its one fold, and
+        // the keys that fold a space say where the spaces are.
+        ModeKey::Byte(b'f' | b' ') if state.view == sidebar::View::Priority => {
+            state.message = Some("ctrl-a g shows the tree to fold a space".to_string());
+        }
+        ModeKey::Byte(b'h') | ModeKey::Left if state.view == sidebar::View::Priority => {
+            if state.doze_open.remove(&sidebar::IDLE_FOLD) {
+                let items = side_items(state);
+                side_stand(state, &items, Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)));
+            } else {
+                state.message = Some("ctrl-a g shows the tree to fold a space".to_string());
+            }
+        }
+        ModeKey::Byte(b'l') | ModeKey::Right if state.view == sidebar::View::Priority => {
+            state.doze_open.insert(sidebar::IDLE_FOLD);
         }
         ModeKey::Byte(b'f' | b' ') => {
             if let Some(space) = space
@@ -8776,10 +8347,8 @@ enum Clicked {
     App,
     /// The foot's `offline`: the news that the hub is not reached.
     HubDown,
-    /// A tab of the inbox, or a count on its folded row.
-    InboxTab(sidebar::InboxTab),
-    /// The inbox's caret.
-    InboxFold,
+    /// The Needs you header of the column, or a question that names no agent: the Inbox.
+    Inbox,
     Fold(i64),
     /// The row a space's sleeping agents fold to: list them, or fold them again.
     Doze(i64),
@@ -8973,13 +8542,6 @@ where
         armed: None,
         drawer: None,
         list_scroll: None,
-        tabq: None,
-        tabq_focus: None,
-        tabq_task: None,
-        tabq_read: None,
-        tabq_asked: None,
-        tabq_home: None,
-        tabq_w: None,
         closing: None,
         close_begun: false,
         rows: Vec::new(),
@@ -9053,8 +8615,7 @@ where
         done: false,
 
         view: sidebar::View::default(),
-        inbox: sidebar::Inbox::default(),
-        inbox_drag: None,
+        ibx_list: crate::inbox::Inbox::default(),
 
         shut: sidebar::Shut::new(),
         doze_open: sidebar::Shut::new(),
@@ -9429,14 +8990,6 @@ where
             // A restart comes back where the owner works, never inside qass.
             if !state.in_qass() {
                 state.last.keep(state.focused);
-            }
-            // The questions pane of the tab on screen, settled before the paint, so the frame and a
-            // click read the cards it stands over.
-            if state.tabq_settle() {
-                dirty = true;
-            }
-            if let Some(read) = state.tabq_read_request() {
-                wr.write_all(&client::encode_control_seq(&read, &mut control_seq)?).await?;
             }
             if dirty && presented.elapsed() >= FRAME {
                 // Once per change and at most once a frame, so fast switching is told once; with
@@ -10191,27 +9744,6 @@ where
                                 feed = Some(rest);
                             }
                         }
-                    } else if state.tabq_focused()
-                        && !keys.prefix_pending()
-                        && !keys.mouse_pending()
-                        && !is_report_head(&bytes)
-                    {
-                        // An agent tab's open pane owns the keyboard while it is given it, and
-                        // hands back the prefix, the mouse and what is not its own.
-                        dirty = true;
-                        let taken = tabq_keys(&mut state, &bytes, keys.prefix());
-                        if taken.resize
-                            && let Some(resize) = size_terminals(&mut state, &mut seqs)?
-                        {
-                            wr.write_all(&resize).await?;
-                        }
-                        if let Some(terminal) = taken.jump
-                            && let Some(bytes) =
-                                focus(&mut state, terminal, &mut control_seq, &mut seqs)?
-                        {
-                            wr.write_all(&bytes).await?;
-                        }
-                        feed = taken.feed;
                     } else if state.asks_focused()
                         && !keys.prefix_pending()
                         && !keys.mouse_pending()
@@ -10435,7 +9967,6 @@ where
                                 drain_board_owed(&mut state, &mut seqs, &mut wr).await?;
                                 drop_carry(&mut state);
                                 state.row_press = None;
-                                state.inbox_drag = None;
                                 // A click lands on the live pane, never on the
                                 // list: the list closes under it and the press
                                 // itself runs the ordinary path below.
@@ -10539,22 +10070,6 @@ where
                                         wr.write_all(&resize).await?;
                                     }
                                     drain_pending_focus(&mut state, &mut control_seq, &mut seqs, &mut wr, &mut dirty).await?;
-                                    dirty = true;
-                                    continue;
-                                }
-                                // The agent tab's questions rail and its open pane are their own: a
-                                // press there reaches no pane and puts down a selection; on the
-                                // rail it unfolds the pane, in the pane it answers what it hit.
-                                if !shift && let Some((resize, moved)) = tabq_press(&mut state, row, col, &mut control_seq, &mut seqs)? {
-                                    if let Some(bytes) = moved {
-                                        wr.write_all(&bytes).await?;
-                                    }
-                                    if state.selection.take().is_some() {
-                                        dirty = true;
-                                    }
-                                    if resize && let Some(resize) = size_terminals(&mut state, &mut seqs)? {
-                                        wr.write_all(&resize).await?;
-                                    }
                                     dirty = true;
                                     continue;
                                 }
@@ -10721,11 +10236,10 @@ where
                                     // let go where it went down it is a click, moved
                                     // first it is a drag to another space or a pane.
                                     Some(Clicked::Terminal(picked)) if in_column => {
-                                        state.list_scroll = clicked_scroll(
-                                            state.list_scroll,
-                                            picked,
-                                            state.column_hit(row).map(|(hit, _)| hit),
-                                        );
+                                        // The row was on screen to be clicked, so the list
+                                        // stays where the wheel left it.
+                                        state.list_scroll =
+                                            state.list_scroll.map(|(_, at)| (picked, at));
                                         let name = matches!(
                                             state.column_hit(row),
                                             Some((sidebar::Hit::Terminal(_), true))
@@ -11014,32 +10528,11 @@ where
                                         }
                                         dirty = true;
                                     }
-                                    Some(Clicked::InboxTab(tab)) => {
-                                        state.inbox.tab = state.inbox.picked(tab);
-                                        state.inbox.scroll = 0;
-                                        state.inbox.folded = false;
+                                    Some(Clicked::Inbox) => {
+                                        open_inbox(&mut state);
                                         dirty = true;
                                     }
-                                    Some(Clicked::InboxFold) => {
-                                        state.inbox.folded = !state.inbox.folded;
-                                        dirty = true;
-                                    }
-                                    // The title away from its words is the inbox's edge:
-                                    // held, it drags the inbox taller or shorter.
-                                    None => {
-                                        if in_column
-                                            && !state.collapsed
-                                            && !state.inbox.folded
-                                            && state.inbox_room() > 0
-                                            && matches!(
-                                                state.column_hit(row),
-                                                Some((sidebar::Hit::Title, _))
-                                            )
-                                        {
-                                            let rows = state.inbox.rows.min(state.inbox_room());
-                                            state.inbox_drag = Some((row, rows));
-                                        }
-                                    }
+                                    None => {}
                                 }
                             }
                             Action::Drag { row, col, shift } => {
@@ -11074,17 +10567,6 @@ where
                                         let source = press.source;
                                         let drop = state.drop_target(source, row, col);
                                         state.message = Some(drop_hint(&state, source, drop));
-                                        dirty = true;
-                                    }
-                                    continue;
-                                }
-                                // The held title moves the inbox's edge with the pointer.
-                                if let Some((from, rows)) = state.inbox_drag {
-                                    let want = (rows as i64 + i64::from(row) - i64::from(from))
-                                        .clamp(1, state.inbox_room().max(1) as i64)
-                                        as usize;
-                                    if want != state.inbox.rows {
-                                        state.inbox.rows = want;
                                         dirty = true;
                                     }
                                     continue;
@@ -11155,10 +10637,6 @@ where
                                 if state.focus {
                                     close_focus(&mut state);
                                     dirty = true;
-                                }
-                                // The inbox's edge is let go where it is.
-                                if state.inbox_drag.take().is_some() {
-                                    continue;
                                 }
                                 // A held row comes up: a drop where it went, or the click it
                                 // was. A click on the name of the agent already under the
@@ -11288,7 +10766,7 @@ where
                                 }
                                 if let Some(grab) = state.modes.split_drag.take() {
                                     // A rail's or a pane's width is this session's: nothing is written.
-                                    if let Some(space) = state.space.filter(|_| !matches!(grab, Grab::Rail | Grab::Tabq)) {
+                                    if let Some(space) = state.space.filter(|_| !matches!(grab, Grab::Rail)) {
                                         state.save_split(space);
                                     }
                                     dirty = true;
@@ -12169,8 +11647,6 @@ where
                                 if matches!(message, Incoming::Event(EventMessage::Resync)) {
                                     state.asks.stale = true;
                                     state.clock.stale = true;
-                                    // A task read lost with the link is asked again.
-                                    state.tabq_asked = None;
                                 }
                                 // What changed is not in the message on purpose, so the
                                 // answer comes from the one place that has it. A resync
@@ -12251,9 +11727,6 @@ where
                                     if let Some(resize) = size_terminals(&mut state, &mut seqs)? {
                                         wr.write_all(&resize).await?;
                                     }
-                                }
-                                if state.tabq_answered(&response) {
-                                    dirty = true;
                                 }
                                 // What the Inbox asked: its answers, and the cards read again
                                 // once one was written.
@@ -14676,9 +14149,7 @@ fn size_terminals(
     state: &mut State,
     seqs: &mut std::collections::BTreeMap<u32, u32>,
 ) -> io::Result<Option<BytesMut>> {
-    // A pane unfolded for an agent that left its tab folds first, so it is sized as it is drawn.
-    state.tabq_home_lost();
-    // The whole pane (less its rail), for a tab outside any tree; a tree's panes by its own area.
+    // The whole pane (less its line), for a tab outside any tree; a tree's panes by its own area.
     let size = |r: layout::Rect| (r.cols as u16, r.rows as u16);
     let asleep: std::collections::BTreeSet<u32> = state
         .rows
@@ -14767,35 +14238,6 @@ fn size_terminals(
         .retain(|t, _| want.contains_key(t) || zoomed_away.contains(t) || later.contains(t));
     state.sized.extend(want);
     Ok((!out.is_empty()).then_some(out))
-}
-
-/// Whether pane cell (`x`, `y`) is inside `r`; `None` (off the pane) is not.
-fn inside_rect(r: layout::Rect, x: Option<usize>, y: Option<usize>) -> bool {
-    x.zip(y)
-        .is_some_and(|(x, y)| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows)
-}
-
-/// A press on a questions rail or the open pane ([`State::tabq_click`]), the keyboard moved
-/// first to the agent it belongs to, so the lit frame, the keys and `g` all speak for the pane
-/// that unfolds: its answer, and what moving the focus writes. `None` for a press elsewhere.
-fn tabq_press(
-    state: &mut State,
-    row: u16,
-    col: u16,
-    control_seq: &mut u32,
-    seqs: &mut std::collections::BTreeMap<u32, u32>,
-) -> io::Result<Option<(bool, Option<BytesMut>)>> {
-    // The open pane's left edge is held to drag its width ([`State::split_press`]).
-    if let (Some(x), Some(y)) = state.pane_xy(row, col)
-        && state.on_tabq_edge(x, y)
-    {
-        return Ok(None);
-    }
-    let moved = match state.tabq_at(row, col) {
-        Some(agent) if agent != state.focused => focus(state, agent, control_seq, seqs)?,
-        _ => None,
-    };
-    Ok(state.tabq_click(row, col).map(|resize| (resize, moved)))
 }
 
 fn focus(
@@ -15075,60 +14517,6 @@ struct AskKeys {
     paste: Option<(u32, String)>,
 }
 
-/// Keys typed while an agent pane's open pane has the keyboard: the inbox's own (1-9, enter,
-/// j k, r, m, x), `s` folds or opens the task part, `esc` folds the pane and gives the keyboard
-/// back to the agent, `g` gives it back with the pane left open beside it (folded when it is
-/// over the agent's tile), `q` hands the open card to qass to decide, `<` `>` narrow and widen the
-/// pane. Tab and `o` (qass's chat) are not the tab's.
-fn tabq_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
-    use crate::asks::Out;
-    let mut taken = AskKeys::default();
-    let agent = state.tab_rail_paint().map(|rail| rail.terminal);
-    if !state.asks.typing() {
-        match bytes {
-            b"s" => {
-                state.tabq_task = Some(!state.tabq_task_shown());
-                return taken;
-            }
-            b"q" => {
-                state.asks.hand_to_qass();
-                return taken;
-            }
-            // A step narrower or wider, the agent beside it sized again.
-            b"<" | b">" => {
-                taken.resize = state.tabq_step(bytes == b">");
-                return taken;
-            }
-            b"o" | b"\t" => return taken,
-            b"g" => {
-                // Over the agent's tile the pane folds, or the keys would go to a hidden agent.
-                if state.tabq_open().is_some_and(|open| open.over) {
-                    state.tabq_fold();
-                } else {
-                    state.tabq_focus = None;
-                }
-                taken.jump = agent;
-                return taken;
-            }
-            _ => {}
-        }
-    }
-    match state.asks.key(bytes, prefix) {
-        Out::Closed => {
-            state.tabq_fold();
-            taken.resize = true;
-            taken.jump = agent;
-        }
-        Out::Jump(_) => {
-            state.tabq_focus = None;
-            taken.jump = agent;
-        }
-        Out::Pass(bytes) => taken.feed = Some(bytes),
-        Out::Stay | Out::ToChat | Out::ToQass(_) | Out::Talk(_) => {}
-    }
-    taken
-}
-
 /// Keys typed while the inbox has the keyboard.
 fn asks_keys(state: &mut State, bytes: &[u8], prefix: u8) -> AskKeys {
     use crate::asks::Out;
@@ -15400,7 +14788,6 @@ fn open_inbox(state: &mut State) {
     // One thing has the keyboard at a time.
     state.asks.release();
     state.clock.release();
-    state.tabq_focus = None;
     state.answer = None;
     if state.focus {
         close_focus(state);
@@ -15480,7 +14867,6 @@ fn inbox_mouse(state: &mut State, action: &Action) -> Option<InboxKeys> {
         Action::Drag { row, col, .. } | Action::Release { row, col, .. } => {
             if state.row_press.is_some()
                 || state.sidebar_drag.is_some()
-                || state.inbox_drag.is_some()
                 || state.modes.split_drag.is_some()
             {
                 return None;
@@ -15700,10 +15086,6 @@ fn fold_leaves(state: &State) -> Option<(u32, u32)> {
 /// is; else the pane with the keyboard folds (the questions as `ctrl-a i` puts them away).
 /// True when the layout changed.
 fn fold_key(state: &mut State) -> bool {
-    // On an agent's tab, its questions rail unfolds and folds.
-    if state.tabq_toggle() {
-        return true;
-    }
     let Some((board, qass)) = fold_leaves(state) else {
         state.message = Some(crate::keys::named(
             "the board is on qass's screen: ctrl-a Q",
@@ -16305,7 +15687,10 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
             // with it, so a later space reusing the id does not start folded.
             let live: sidebar::Shut = state.spaces.iter().map(|s| s.id).collect();
             state.shut.retain(|id| live.contains(id));
-            state.doze_open.retain(|id| live.contains(id));
+            // The priority list's own fold is kept under a key no space has.
+            state
+                .doze_open
+                .retain(|id| *id == sidebar::IDLE_FOLD || live.contains(id));
             // The space on screen went to sleep: the screen moves on to the next awake
             // space and the keyboard to its first tab. With none awake anywhere there is
             // nothing to move to, and the interface detaches instead.
@@ -16463,13 +15848,11 @@ fn apply(state: &mut State, response: ControlResponse, request: &mut u64, dirty:
         // A name given at start, put on the conversation unasked: nobody pressed anything,
         // so a refusal (a remote too old to name a session) is not said. The tab keeps it.
         ControlResponse::Failed { id, .. } if id.starts_with("title-") => {}
-        // A question's answer refused, or the pane's task read: the questions pane says what
-        // became of it, where the next answer replaces it. Not on the status row as well, where
-        // an old refusal would outlive the answer that went.
+        // A question's answer refused: the Inbox says what became of it, where the next answer
+        // replaces it. Not on the status row as well, where an old refusal would outlive the
+        // answer that went.
         ControlResponse::Failed { id, .. }
-            if id.starts_with(crate::asks::WRITE_ID)
-                || id.starts_with(crate::inbox_pane::ID)
-                || id.starts_with(TABQ_READ) => {}
+            if id.starts_with(crate::asks::WRITE_ID) || id.starts_with(crate::inbox_pane::ID) => {}
         ControlResponse::Failed { id, reason }
             if id.starts_with("sleep-") || id.starts_with("wake-") =>
         {
@@ -18020,6 +17403,8 @@ mod tests {
     fn the_priority_list_drops_into_a_space_not_a_place() {
         let mut s = drag_state();
         s.view = sidebar::View::Priority;
+        // The idle ones are folded to one row until it is opened.
+        s.doze_open.insert(sidebar::IDLE_FOLD);
         let rows = s.column_rows_now();
         let at = rows
             .iter()
@@ -18030,6 +17415,159 @@ mod tests {
             s.drop_target(Source::Agent(4), row, 3),
             Some(RowDrop::Space(1))
         );
+    }
+
+    /// The priority list's fold row ("N idle") opens by a click and by enter under the keyboard,
+    /// survives a new list of spaces, and is nobody's space: no key acts on it as on a rule.
+    #[test]
+    fn the_priority_fold_opens_by_a_click_and_by_enter_and_is_nobodys_space() {
+        use sidebar::Hit;
+        let mut s = drag_state();
+        s.view = sidebar::View::Priority;
+        let mut request = 0u64;
+        let shown = |s: &State| {
+            s.column_rows_now()
+                .iter()
+                .any(|(_, h)| *h == Some(Hit::Terminal(4)))
+        };
+        assert!(!shown(&s), "the idle agent is folded away");
+        let fold = row_of(&s, Hit::Doze(sidebar::IDLE_FOLD), false);
+        let row = (fold + screen::SIDEBAR_TOP) as u16;
+        assert!(matches!(
+            s.clicked(row, 3),
+            Some(Clicked::Doze(sidebar::IDLE_FOLD))
+        ));
+        assert_eq!(s.space_of_hit(Hit::Doze(sidebar::IDLE_FOLD)), None);
+        toggle_doze(&mut s, sidebar::IDLE_FOLD);
+        assert!(shown(&s), "a click lists the idle");
+        // A new list of spaces (the same ones) keeps it open.
+        let spaces = s.spaces.clone();
+        let mut dirty = false;
+        apply(
+            &mut s,
+            ControlResponse::Workspaces {
+                id: "spaces".into(),
+                workspaces: spaces,
+            },
+            &mut request,
+            &mut dirty,
+        );
+        assert!(s.doze_open.contains(&sidebar::IDLE_FOLD) && shown(&s));
+        toggle_doze(&mut s, sidebar::IDLE_FOLD);
+        assert!(!shown(&s));
+        // The keyboard stands on it like on any row; enter lists, and nothing of a space's own
+        // keys reaches the daemon from it.
+        enter_side(&mut s, false);
+        let items = side_items(&s);
+        side_stand(
+            &mut s,
+            &items,
+            Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)),
+        );
+        for key in [&b"s"[..], b"w", b"n", b"x"] {
+            mode_input(&mut s, key, 0x01, &mut request);
+            assert!(
+                s.modes.outbox.is_empty(),
+                "{key:?} sent {:?}",
+                s.modes.outbox
+            );
+            let items = side_items(&s);
+            side_stand(
+                &mut s,
+                &items,
+                Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)),
+            );
+        }
+        mode_input(&mut s, b"\r", 0x01, &mut request);
+        assert!(
+            shown(&s) && s.modes.side.is_some(),
+            "enter lists them and stays"
+        );
+    }
+
+    /// A menu and a card on one agent, with another agent between them: the keyboard in the
+    /// column steps through every row once with `j` and never loops back.
+    #[test]
+    fn j_reaches_every_pick_of_the_priority_list_once() {
+        let mut s = state();
+        s.view = sidebar::View::Priority;
+        let menu = || {
+            serde_json::from_value(serde_json::json!({
+                "question": "Go on?", "seal": 1,
+                "options": [{"key": "1", "label": "Yes"}, {"key": "2", "label": "No"}],
+            }))
+            .expect("menu")
+        };
+        let mut rows = vec![
+            waiting_row(1, 1, "blocked", 100),
+            waiting_row(2, 1, "blocked", 150),
+            waiting_row(3, 1, "working", 50),
+            waiting_row(4, 1, "idle", 20),
+        ];
+        rows[0].menu = Some(menu());
+        rows[1].menu = Some(menu());
+        let mut card = ask_card(1, "claude");
+        card.card = "Q1".to_string();
+        s.rows = rows;
+        s.ibx_cards = vec![card];
+        s.refresh_ibx();
+        assert_eq!(
+            s.inbox_now().items.len(),
+            3,
+            "the menu, the other menu, the card"
+        );
+        let mut request = 0;
+        enter_side(&mut s, false);
+        let items = side_items(&s);
+        assert_eq!(
+            items,
+            [
+                sidebar::Pick::Terminal(1),
+                sidebar::Pick::Terminal(2),
+                sidebar::Pick::Terminal(3),
+                sidebar::Pick::Doze(sidebar::IDLE_FOLD),
+            ]
+        );
+        side_stand(&mut s, &items, items.first().copied());
+        let mut seen = vec![side_pick(&s).unwrap()];
+        for _ in 0..items.len() + 2 {
+            mode_input(&mut s, b"j", 0x01, &mut request);
+            let at = side_pick(&s).unwrap();
+            if seen.last() != Some(&at) {
+                seen.push(at);
+            }
+        }
+        assert_eq!(seen, items, "every pick once, in order, ending on the last");
+    }
+
+    /// In the priority list there is no space to fold: `l` and `h` open and close its one fold,
+    /// `h` with the fold closed and `f` on an agent say where the spaces are, and nothing is sent.
+    #[test]
+    fn h_and_l_close_and_open_the_priority_fold_and_f_points_to_the_tree() {
+        let mut s = drag_state();
+        s.view = sidebar::View::Priority;
+        let mut request = 0;
+        enter_side(&mut s, false);
+        let items = side_items(&s);
+        side_stand(&mut s, &items, Some(sidebar::Pick::Terminal(2)));
+        mode_input(&mut s, b"f", 0x01, &mut request);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("ctrl-a g shows the tree to fold a space")
+        );
+        s.message = None;
+        mode_input(&mut s, b"h", 0x01, &mut request);
+        assert_eq!(
+            s.message.as_deref(),
+            Some("ctrl-a g shows the tree to fold a space"),
+            "closed already"
+        );
+        mode_input(&mut s, b"l", 0x01, &mut request);
+        assert!(s.doze_open.contains(&sidebar::IDLE_FOLD));
+        mode_input(&mut s, b"h", 0x01, &mut request);
+        assert!(!s.doze_open.contains(&sidebar::IDLE_FOLD));
+        assert_eq!(side_pick(&s), Some(sidebar::Pick::Doze(sidebar::IDLE_FOLD)));
+        assert!(s.shut.is_empty() && s.modes.outbox.is_empty());
     }
 
     /// A carried row paints: its rows dim, its chip follows the pointer, and the place it
@@ -19203,9 +18741,10 @@ mod tests {
             creating: 0,
             done: false,
 
-            view: sidebar::View::default(),
-            inbox: sidebar::Inbox::default(),
-            inbox_drag: None,
+            // The tests of the tree and of its keys read the tree; the priority list, the
+            // default of a real client, has tests of its own.
+            view: sidebar::View::Tree,
+            ibx_list: crate::inbox::Inbox::default(),
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -19313,13 +18852,6 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
-            tabq: None,
-            tabq_focus: None,
-            tabq_task: None,
-            tabq_read: None,
-            tabq_asked: None,
-            tabq_home: None,
-            tabq_w: None,
         }
     }
 
@@ -20788,9 +20320,10 @@ mod tests {
             reading: None,
             creating: 0,
 
-            view: sidebar::View::default(),
-            inbox: sidebar::Inbox::default(),
-            inbox_drag: None,
+            // The tests of the tree and of its keys read the tree; the priority list, the
+            // default of a real client, has tests of its own.
+            view: sidebar::View::Tree,
+            ibx_list: crate::inbox::Inbox::default(),
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -20873,13 +20406,6 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
-            tabq: None,
-            tabq_focus: None,
-            tabq_task: None,
-            tabq_read: None,
-            tabq_asked: None,
-            tabq_home: None,
-            tabq_w: None,
         }
     }
 
@@ -20903,13 +20429,6 @@ mod tests {
             armed: None,
             drawer: None,
             list_scroll: None,
-            tabq: None,
-            tabq_focus: None,
-            tabq_task: None,
-            tabq_read: None,
-            tabq_asked: None,
-            tabq_home: None,
-            tabq_w: None,
             closing: None,
             close_begun: false,
             rows: vec![agent(1, 1, "zsh", "idle"), agent(2, 1, "claude", "working")],
@@ -20976,9 +20495,10 @@ mod tests {
             focus_fetch: false,
             reading: None,
 
-            view: sidebar::View::default(),
-            inbox: sidebar::Inbox::default(),
-            inbox_drag: None,
+            // The tests of the tree and of its keys read the tree; the priority list, the
+            // default of a real client, has tests of its own.
+            view: sidebar::View::Tree,
+            ibx_list: crate::inbox::Inbox::default(),
 
             shut: sidebar::Shut::new(),
             doze_open: sidebar::Shut::new(),
@@ -23813,27 +23333,6 @@ mod tests {
         }
     }
 
-    /// A click on a tree row keeps the wheel's place; a click on an inbox item lets the list
-    /// follow the agent it opens, whose row may be scrolled out of the window.
-    #[test]
-    fn an_inbox_click_lets_the_list_follow_the_agent_it_opens() {
-        let wheeled = Some((1, 12));
-        assert_eq!(
-            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Terminal(7))),
-            Some((7, 12))
-        );
-        // Let go, not kept for the agent it was on: back there, the list follows the keys.
-        assert_eq!(
-            clicked_scroll(wheeled, 7, Some(sidebar::Hit::Next(Some(7)))),
-            None,
-            "the list follows the opened agent"
-        );
-        assert_eq!(
-            clicked_scroll(None, 7, Some(sidebar::Hit::Terminal(7))),
-            None
-        );
-    }
-
     #[test]
     fn the_focus_list_scrolls_with_arrows_and_j_k() {
         let mut state = bare_state();
@@ -24434,7 +23933,7 @@ mod tests {
     #[test]
     fn a_divider_drag_sizes_both_tiles_once_per_frame() {
         let mut state = tiled_state();
-        // Room for nine columns off a pane; the wider one grows a rail of its own.
+        // Room for nine columns off a pane.
         state.cols = 100;
         let rect = focused_rect(&state);
         let left = screen::left_for(state.cols, state.collapsed, state.sidebar_width);
@@ -24462,7 +23961,7 @@ mod tests {
         seqs.iter().map(|(t, n)| (*t, *n)).collect()
     }
 
-    /// Where `terminal` is drawn and sized in space 1's tab: its tile less its rail.
+    /// Where `terminal` is drawn and sized in space 1's tab: its tile less its line.
     fn layout_rect(state: &State, terminal: u32) -> layout::Rect {
         state
             .term_rect_in(&state.layouts[&1], terminal)
@@ -24729,9 +24228,11 @@ mod tests {
             panic!("a lone pane carries the label in its corner");
         };
         let pane = layout::framed(pane_area(&s));
+        // The agent's screen ends two rows above the pane's foot: its reserved line and the
+        // rule above it stand below it.
         assert_eq!(
             (x, y),
-            (pane.x + 2, pane.y + pane.rows),
+            (pane.x + 2, pane.y + pane.rows - 2),
             "after the bottom left corner"
         );
         assert!(label.contains("save"), "{label:?}");
@@ -26064,7 +25565,13 @@ mod tests {
             &mut s,
             ControlResponse::Agents {
                 id: "index".into(),
-                agents: vec![agent(5, 2, "claude", "done"), agent(7, 4, "claude", "idle")],
+                agents: vec![
+                    AgentRow {
+                        status: Some("done".into()),
+                        ..agent(5, 2, "claude", "done")
+                    },
+                    agent(7, 4, "claude", "idle"),
+                ],
                 splits: Vec::new(),
                 qass_checks: None,
             },
@@ -26085,11 +25592,16 @@ mod tests {
         s.focused = 7;
         s.space = Some(4);
         s.seen_done.clear();
-        let full = sidebar::queue(&s.rows, 7, &s.seen_done, &s.unseen_finished);
-        assert!(
-            full.iter().any(|r| r.terminal == 5),
-            "qass's finish is unread"
+        let unfiltered = crate::inbox::Inbox::build(
+            &s.rows,
+            &[],
+            &s.hand,
+            &crate::inbox::Context::default(),
+            &[],
         );
+        assert!(unfiltered.finished.contains(&5), "qass's finish is unread");
+        s.refresh_ibx();
+        assert!(!s.inbox_now().finished.contains(&5), "and not the owner's");
         assert_eq!(s.up_next(), None);
         s.news_sent = None;
         match news_request(&mut s, &mut request) {
@@ -27528,9 +27040,9 @@ mod tests {
             state.sized.get(&5),
             Some(&(inner.cols as u16, inner.rows as u16))
         );
-        // The owner's agents: the pane inside its frame, less each agent pane's rail.
-        let rail = (crate::tabq::WIDE + 1) as u16;
-        let framed = (cols - 2 - rail, rows - 2);
+        // The owner's agents: the pane inside its frame, less each agent pane's line and the
+        // frame's rule above it.
+        let framed = (cols - 2, rows - 2 - 2);
         assert_eq!(state.sized.get(&1), Some(&framed));
         assert_eq!(state.sized.get(&3), Some(&framed));
         assert!(inner.rows < rows as usize && inner.cols < cols as usize);
@@ -27866,10 +27378,6 @@ mod tests {
                     "zoomed",
                     Box::new(|s| s.layouts.get_mut(&9).unwrap().zoomed = Some(5)),
                 ),
-                (
-                    "the agents' tabs without their rails",
-                    Box::new(|s| s.asks.unsupported = true),
-                ),
             ];
             for (what, apply) in variants {
                 let mut state = qass_wide();
@@ -28052,113 +27560,113 @@ mod tests {
         }
     }
 
-    /// The left sidebar is the owner's and frozen: its cells, characters and inks both, are
-    /// pinned to the bytes recorded at d4a3518 (origin/main before the 2026-10-27 overhaul) for
-    /// qass's page and a terminal page, open and folded, at four sizes, dark, light and without
-    /// colour. A palette change that reaches the sidebar fails here even when it moves every
-    /// frame alike, which the test above cannot see. Its rule is left out since 2026-10-28, when
-    /// it became the panes' left side too; the hashes were taken again from the code before that
-    /// change, so they still pin the d4a3518 bytes of every other column.
+    /// The left sidebar is frozen: its cells, characters and inks both, are pinned to recorded
+    /// bytes for qass's page and a terminal page, open and folded, at four sizes, dark, light and
+    /// without colour. A palette change that reaches the sidebar fails here even when it moves
+    /// every frame alike, which the test above cannot see. Its rule is left out since
+    /// 2026-10-28, when it became the panes' left side too. The hashes were recorded again on
+    /// 2026-11-23 for the redesign (QOOP-71, round 3): the inbox strip above the title went, the
+    /// computers line came above the foot; the tree rows themselves are the bytes they were.
     #[test]
     fn the_left_sidebar_keeps_the_bytes_it_had_at_d4a3518() {
         use crate::colorlevel::{Level, TEST_LEVEL};
         use crate::theme::TEST_LIGHT;
         const PINNED: &[(&str, u64)] = &[
-            ("qass 200x60 open dark", 0x039e53c74e224f44),
+            ("qass 200x60 open dark", 0xa4caf6f274a2633a),
             ("qass 200x60 folded dark", 0x5c63fce590019b7d),
-            ("qass 120x40 open dark", 0x9d5430d406a003c0),
+            ("qass 120x40 open dark", 0x4e7f5d8db91b3dd6),
             ("qass 120x40 folded dark", 0xb8819bd326634501),
-            ("qass 80x24 open dark", 0x89abb9002c8359dc),
+            ("qass 80x24 open dark", 0x5af115194fe33ce6),
             ("qass 80x24 folded dark", 0xe7ce5b51b3ba2c11),
-            ("qass 60x24 open dark", 0xf74d831d17e345f0),
+            ("qass 60x24 open dark", 0x7e6a68d946b23d06),
             ("qass 60x24 folded dark", 0xe7ce5b51b3ba2c11),
-            ("terminal 200x60 open dark", 0x7326d162f429bd9e),
+            ("terminal 200x60 open dark", 0x6fe332952fae76a0),
             ("terminal 200x60 folded dark", 0x8ba592bd24d453b8),
-            ("terminal 120x40 open dark", 0xff60084cb5b94ffa),
+            ("terminal 120x40 open dark", 0x2f4bc58b5490364c),
             ("terminal 120x40 folded dark", 0xf5f8876c8e0e6d94),
-            ("terminal 80x24 open dark", 0x374de3e8d1134472),
+            ("terminal 80x24 open dark", 0x6f9f115871e244dc),
             ("terminal 80x24 folded dark", 0x6a480b3714ea7124),
-            ("terminal 60x24 open dark", 0x03663f54ee2de29e),
+            ("terminal 60x24 open dark", 0xd66d12526b1e331c),
             ("terminal 60x24 folded dark", 0x6a480b3714ea7124),
-            ("agent picked 200x60 open dark", 0x74a67686bf790738),
+            ("agent picked 200x60 open dark", 0x70826a21d9db3c16),
             ("agent picked 200x60 folded dark", 0x8d6531bd9fb67418),
-            ("agent picked 120x40 open dark", 0xdc5f15cde15d40a4),
+            ("agent picked 120x40 open dark", 0x5c919e322cf96eb2),
             ("agent picked 120x40 folded dark", 0xecdde9f98d5e0f74),
-            ("agent picked 80x24 open dark", 0xa6bbeb2904414fae),
+            ("agent picked 80x24 open dark", 0xd85c5d2dd8834ec2),
             ("agent picked 80x24 folded dark", 0x91a55b02a39e2c84),
-            ("agent picked 60x24 open dark", 0xc9d5bb9e62ddaa4a),
+            ("agent picked 60x24 open dark", 0x6349e4de2f0cec65),
             ("agent picked 60x24 folded dark", 0x91a55b02a39e2c84),
-            ("space picked 200x60 open dark", 0x352640cca90eaef5),
+            ("space picked 200x60 open dark", 0x2b0ca29c8bce5bfb),
             ("space picked 200x60 folded dark", 0xfc99f80d50e88753),
-            ("space picked 120x40 open dark", 0x31958585ab54a679),
+            ("space picked 120x40 open dark", 0x3d0a7809b14cdbdf),
             ("space picked 120x40 folded dark", 0xba166e8e16f56b27),
-            ("space picked 80x24 open dark", 0x1e9139d1df7b6524),
+            ("space picked 80x24 open dark", 0xf5be3bcde6d89a2f),
             ("space picked 80x24 folded dark", 0x015cc0c105b41377),
-            ("space picked 60x24 open dark", 0x12788dda150f00a0),
+            ("space picked 60x24 open dark", 0xa13cae312cf5771c),
             ("space picked 60x24 folded dark", 0x015cc0c105b41377),
-            ("qass 200x60 open light", 0xa9009fc44565ca38),
+            ("qass 200x60 open light", 0xf17a4856ef7cdf90),
             ("qass 200x60 folded light", 0x1d2020dcc648fc8f),
-            ("qass 120x40 open light", 0x8785c6454ba5c954),
+            ("qass 120x40 open light", 0xdbc08ef67a9efda4),
             ("qass 120x40 folded light", 0xe66c49ccec4ab8db),
-            ("qass 80x24 open light", 0x3cd310dc60733a0c),
+            ("qass 80x24 open light", 0x5ce89a39982b04b4),
             ("qass 80x24 folded light", 0x00d64a2dea52b3eb),
-            ("qass 60x24 open light", 0x07c19183717a3b43),
+            ("qass 60x24 open light", 0x6d51c646a212d134),
             ("qass 60x24 folded light", 0x00d64a2dea52b3eb),
-            ("terminal 200x60 open light", 0x337dd1aeabcb52fa),
+            ("terminal 200x60 open light", 0x15aed2be5442c15e),
             ("terminal 200x60 folded light", 0x31d4b2babfe93908),
-            ("terminal 120x40 open light", 0x0fb0377f37e41436),
+            ("terminal 120x40 open light", 0x0e5a7677a02a0c02),
             ("terminal 120x40 folded light", 0x0ccce3e8da7523d4),
-            ("terminal 80x24 open light", 0x55cfab3707775082),
+            ("terminal 80x24 open light", 0xa81be7cba4dc7c52),
             ("terminal 80x24 folded light", 0x8a0faf03218351e4),
-            ("terminal 60x24 open light", 0x5762d37e50ec0c35),
+            ("terminal 60x24 open light", 0x8830423eae2b7572),
             ("terminal 60x24 folded light", 0x8a0faf03218351e4),
-            ("agent picked 200x60 open light", 0x7d23c8b1019530c0),
+            ("agent picked 200x60 open light", 0x4b0dc47e75db04f8),
             ("agent picked 200x60 folded light", 0xc99b486581a8c8cc),
-            ("agent picked 120x40 open light", 0xc85216a2063ea114),
+            ("agent picked 120x40 open light", 0xf3155fe5455ebfd4),
             ("agent picked 120x40 folded light", 0xbacda406c67c0a68),
-            ("agent picked 80x24 open light", 0xcfac3cbb1665ad21),
+            ("agent picked 80x24 open light", 0xcfaef844b4bbd3e4),
             ("agent picked 80x24 folded light", 0x700467d267c1fb78),
-            ("agent picked 60x24 open light", 0xff094d28b749ddb0),
+            ("agent picked 60x24 open light", 0x65b7e5235a894b5b),
             ("agent picked 60x24 folded light", 0x700467d267c1fb78),
-            ("space picked 200x60 open light", 0xcaaf9cdf9274cefa),
+            ("space picked 200x60 open light", 0x4bd4c1128bc0d4d6),
             ("space picked 200x60 folded light", 0x7c7cd2ebecd64a81),
-            ("space picked 120x40 open light", 0x0dea1fddeae8881e),
+            ("space picked 120x40 open light", 0x9c1c152669870ac2),
             ("space picked 120x40 folded light", 0x096b50c0cb57e43d),
-            ("space picked 80x24 open light", 0x238bbb5d7b724af2),
+            ("space picked 80x24 open light", 0xdbb995df7163ea92),
             ("space picked 80x24 folded light", 0x80ba3cc76ac764cd),
-            ("space picked 60x24 open light", 0xf2bec938fc142a1d),
+            ("space picked 60x24 open light", 0x8c14b3ecc64a2a89),
             ("space picked 60x24 folded light", 0x80ba3cc76ac764cd),
-            ("qass 200x60 open mono", 0xe060f7003fe214af),
+            ("qass 200x60 open mono", 0xa04dc68f360afbc2),
             ("qass 200x60 folded mono", 0x919634c62394fde7),
-            ("qass 120x40 open mono", 0xd25845b8dfc33d0f),
+            ("qass 120x40 open mono", 0x34519105549021e2),
             ("qass 120x40 folded mono", 0x03d75c6ef8ce33d7),
-            ("qass 80x24 open mono", 0xb85b48e6507c3a09),
+            ("qass 80x24 open mono", 0xfb98154def0d0b62),
             ("qass 80x24 folded mono", 0x215e5d58874fa097),
-            ("qass 60x24 open mono", 0x1975c71f6740daf9),
+            ("qass 60x24 open mono", 0xacc7755b9e3ae102),
             ("qass 60x24 folded mono", 0x215e5d58874fa097),
-            ("terminal 200x60 open mono", 0x620576d91e588f0f),
+            ("terminal 200x60 open mono", 0x39f811bd4686f672),
             ("terminal 200x60 folded mono", 0x7af61d9696861c5b),
-            ("terminal 120x40 open mono", 0xaafb9f2157f57fef),
+            ("terminal 120x40 open mono", 0xfb93ded47b693512),
             ("terminal 120x40 folded mono", 0xb82597383e9999ab),
-            ("terminal 80x24 open mono", 0x7b2115052bb12061),
+            ("terminal 80x24 open mono", 0x1d935bb8bbcde092),
             ("terminal 80x24 folded mono", 0xfea98da227c87feb),
-            ("terminal 60x24 open mono", 0x45f3591c02d29811),
+            ("terminal 60x24 open mono", 0xb3ceda66fc9a9772),
             ("terminal 60x24 folded mono", 0xfea98da227c87feb),
-            ("agent picked 200x60 open mono", 0x9dfd9e2ee592beb4),
+            ("agent picked 200x60 open mono", 0xede517cf7568c8ed),
             ("agent picked 200x60 folded mono", 0x9a9152dd338edf33),
-            ("agent picked 120x40 open mono", 0xc8a42df41ae19294),
+            ("agent picked 120x40 open mono", 0x49914c04953e78cd),
             ("agent picked 120x40 folded mono", 0x9599a6e9f6f94043),
-            ("agent picked 80x24 open mono", 0x801a5252adc60a2d),
+            ("agent picked 80x24 open mono", 0x1f9a2669aad1ca4d),
             ("agent picked 80x24 folded mono", 0xd9f4c883dea2c183),
-            ("agent picked 60x24 open mono", 0x67e70e48fab3265d),
+            ("agent picked 60x24 open mono", 0xe07351acbf995383),
             ("agent picked 60x24 folded mono", 0xd9f4c883dea2c183),
-            ("space picked 200x60 open mono", 0xa5efa9ae4a0538d4),
+            ("space picked 200x60 open mono", 0x672bf483d9e9cb8d),
             ("space picked 200x60 folded mono", 0xe0b93aaef4109dd7),
-            ("space picked 120x40 open mono", 0xfbbae7a0308ebd34),
+            ("space picked 120x40 open mono", 0xee557eeb8db9d76d),
             ("space picked 120x40 folded mono", 0x163f25aa224f5087),
-            ("space picked 80x24 open mono", 0x4b4e4c0aa0c274b3),
+            ("space picked 80x24 open mono", 0xd850c78d2b6816ed),
             ("space picked 80x24 folded mono", 0x4bd4f41aaa6bae47),
-            ("space picked 60x24 open mono", 0xac03590f40a6a683),
+            ("space picked 60x24 open mono", 0xeb7423387a5259e3),
             ("space picked 60x24 folded mono", 0x4bd4f41aaa6bae47),
         ];
         let mut got = Vec::new();
@@ -31580,128 +31088,135 @@ mod tests {
         s
     }
 
-    /// The rail's cells as painted, one string per pane row it covers, trailing blanks off.
-    fn rail_cells(s: &State) -> Vec<String> {
-        cells_in(s, s.tab_rail_paint().expect("a rail").rect)
+    /// An Inbox item about `terminal`, so its line says what to do.
+    fn waits(s: &mut State, terminal: u32) {
+        s.ibx_list = crate::inbox::Inbox {
+            items: vec![crate::inbox::Item {
+                slot: crate::answers::Slot::Agent(terminal),
+                kind: crate::inbox::ItemKind::Menu,
+                terminal: Some(terminal),
+                since: Some(100),
+                hand_to_qass: false,
+                lost: false,
+            }],
+            count: 1,
+            ..crate::inbox::Inbox::default()
+        };
     }
 
-    /// The cells of `rail` as painted, one string per pane row it covers, trailing blanks off.
-    fn cells_in(s: &State, rail: layout::Rect) -> Vec<String> {
+    /// The line's text as painted, one string, trailing blanks off.
+    fn line_text(s: &State, line: &crate::tabq::Paint) -> String {
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let grid = cells_of(
             &screen::paint(&s.frame()),
             s.cols as usize,
             s.lines as usize,
         );
-        (0..rail.rows)
-            .map(|y| {
-                grid[screen::TABS + rail.y + y][left + rail.x..left + rail.x + rail.cols]
-                    .iter()
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        grid[screen::TABS + line.rect.y][left + line.rect.x..left + line.rect.x + line.rect.cols]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
-    /// At 170 by 46 an agent's tab keeps a 6 column rail and the line it shares with the pane:
-    /// Claude keeps 122 columns. Nothing waits: a quiet `⠄0` on top, and at the foot a rule, the
-    /// task's `2/4` and its stage word. The pane and the rail are framed together.
+    /// The line of the one agent (terminal 1) of a tab, as painted.
+    fn line_of_1(s: &State) -> String {
+        let lines = s.tab_lines();
+        let line = lines.iter().find(|l| l.terminal == 1).expect("a line");
+        line_text(s, line)
+    }
+
+    /// At 170 by 46 an agent's tab keeps all 129 columns of its tile, and under the agent the
+    /// frame's rule and one line of its own, framed with it. Nothing waits: the task's progress
+    /// stands alone at the right end.
     #[test]
-    fn an_agent_tab_keeps_a_quiet_rail_at_170_by_46() {
+    fn an_agent_tab_keeps_every_column_and_one_framed_line_at_170_by_46() {
         let s = agent_tab(170, 46);
-        let tile = focused_rect(&s);
-        assert_eq!((tile.cols, tile.rows), (122, 40));
-        let rail = s.tab_rail_paint().expect("a rail");
+        let tile = tiles_of(&s)[0].1;
+        let term = focused_rect(&s);
+        assert_eq!((term.cols, term.rows), (129, tile.rows - 2));
+        assert_eq!((tile.cols, tile.rows), (129, 40));
+        let lines = s.tab_lines();
+        assert_eq!(lines.len(), 1);
+        let line = lines[0];
+        assert_eq!(line.terminal, 1);
         assert_eq!(
-            (rail.rect, rail.terminal),
-            (
-                layout::Rect {
-                    x: 124,
-                    y: 1,
-                    cols: 6,
-                    rows: 40
-                },
-                1
-            )
+            (line.rect.x, line.rect.y, line.rect.cols, line.rect.rows),
+            (tile.x, tile.y + tile.rows - 1, 129, 1)
         );
-        let cells = rail_cells(&s);
-        assert_eq!(cells[0], " \u{2804}0");
-        assert_eq!(cells[36], "\u{2500}".repeat(6));
-        assert_eq!(cells[37], " 2/4");
-        assert_eq!(cells[38], " build");
+        let text = line_of_1(&s);
         assert!(
-            cells[1..36]
-                .iter()
-                .chain(&cells[39..])
-                .all(String::is_empty),
-            "{cells:?}"
+            text.ends_with("2/4 implementing") && !text.contains("needs you"),
+            "{text:?}"
         );
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let grid = cells_of(&screen::paint(&s.frame()), 170, 46);
-        let (top, bottom) = (&grid[screen::TABS], &grid[screen::TABS + 41]);
+        let at = |y: usize, x: usize| grid[screen::TABS + y][left + x];
+        let (rule, bottom, right) = (
+            tile.y + tile.rows - 2,
+            tile.y + tile.rows,
+            tile.x + tile.cols,
+        );
         assert_eq!(
             (
-                top[left + 123],
-                top[left + 130],
-                bottom[left + 123],
-                bottom[left + 130]
+                at(rule, tile.x + 5),
+                at(rule, right),
+                at(bottom, tile.x + 5),
+                at(bottom, right)
             ),
-            ('\u{252c}', '\u{256e}', '\u{2534}', '\u{256f}'),
-            "one frame round the pane and the rail, joined"
-        );
-        let shared = grid[screen::TABS + 10][left + 123];
-        assert_eq!(shared, '\u{2502}');
-    }
-
-    /// At 80 by 24 the rail is 4 columns (Claude keeps 34): the count stays, the stage word drops.
-    #[test]
-    fn the_rail_narrows_at_80_by_24() {
-        let s = agent_tab(80, 24);
-        assert_eq!(focused_rect(&s).cols, 34);
-        let cells = rail_cells(&s);
-        assert_eq!(cells.len(), 18);
-        assert_eq!(cells[0], "\u{2804}0");
-        assert_eq!(
-            &cells[14..],
-            [
-                "\u{2500}".repeat(4),
-                "2/4".into(),
-                String::new(),
-                String::new()
-            ]
+            ('\u{2500}', '\u{2524}', '\u{2500}', '\u{256f}'),
+            "one frame round the pane and its line, joined by a rule"
         );
     }
 
-    /// Beside a shell, an agent pane under 60 columns takes the narrow rail. The rail speaks for
-    /// the agent while the keyboard is in the shell, and the shell is never cut.
+    /// At 80 by 24 the agent keeps the whole width of its tile, the words stay whole and the
+    /// stage word gives way before the count does.
     #[test]
-    fn a_60_column_split_keeps_the_rail_with_the_agent() {
+    fn the_line_keeps_its_words_whole_and_drops_the_stage_first_at_80_by_24() {
+        let mut s = agent_tab(80, 24);
+        let tile = tiles_of(&s)[0].1;
+        assert_eq!(focused_rect(&s).cols, tile.cols, "no columns go to a rail");
+        assert!(tile.cols < 46, "{tile:?}");
+        assert!(
+            line_of_1(&s).ends_with("2/4 implementing"),
+            "{:?}",
+            line_of_1(&s)
+        );
+        waits(&mut s, 1);
+        let text = line_of_1(&s);
+        assert!(text.starts_with(" needs you: ctrl-a i answers"), "{text:?}");
+        assert!(
+            text.ends_with("2/4") && !text.contains("implementing"),
+            "{text:?}"
+        );
+    }
+
+    /// Beside a shell, the agent's pane keeps its own line and the shell has none; the line
+    /// speaks for the agent while the keyboard is in the shell.
+    #[test]
+    fn a_split_keeps_the_line_with_the_agent_only() {
         let s = shell_beside_agent();
-        let rail = s.tab_rail_paint().expect("a rail");
-        assert_eq!((rail.rect.cols, rail.terminal), (4, 1));
+        let lines = s.tab_lines();
+        assert_eq!(lines.len(), 1, "the shell carries none");
+        assert_eq!(lines[0].terminal, 1);
         let tree = s.drawn_tree(1).unwrap();
         let tiles = tree.tile_rects(pane_area(&s));
         let terms = s.term_rects(&tree);
-        let (shell, claude) = (terms[0].1, terms[1].1);
-        assert!(claude.cols < 60 && shell.cols > claude.cols, "{terms:?}");
-        assert_eq!(shell, tiles[0].1, "the shell keeps its whole tile");
+        assert_eq!(terms[0].1, tiles[0].1, "the shell keeps its whole tile");
         assert_eq!(
-            claude.x + claude.cols + 1,
-            rail.rect.x,
-            "the rail right of the agent"
+            terms[1].1.cols, tiles[1].1.cols,
+            "the agent keeps every column"
         );
-        assert_eq!(
-            rail.rect.x + rail.rect.cols,
-            tiles[1].1.x + tiles[1].1.cols,
-            "inside the agent's own tile"
+        assert_eq!(terms[1].1.rows + 2, tiles[1].1.rows);
+        assert_eq!(lines[0].rect.cols, tiles[1].1.cols);
+        assert!(
+            line_of_1(&s).ends_with("2/4 implementing"),
+            "{:?}",
+            line_of_1(&s)
         );
-        assert_eq!(rail_cells(&s)[0], "\u{2804}0");
-        assert_eq!(s.tab_rails().len(), 1, "the shell carries none");
     }
 
-    /// Two Claude panes (1 and 2) side by side in one tab, the keyboard in the first; 1 waits on
-    /// Q1, 2 on Q2 and Q3.
+    /// Two Claude panes (1 and 2) side by side in one tab, the keyboard in the first.
     fn two_agents(cols: u16, lines: u16) -> State {
         let mut s = agent_tab(cols, lines);
         let mut second = s.rows[0].clone();
@@ -31720,53 +31235,46 @@ mod tests {
             ..Layout::single(1)
         };
         s.layouts.insert(1, tree);
-        let card = |terminal: u32, name: &str| {
-            let mut c = ask_card(terminal, "claude");
-            c.card = name.to_string();
-            c
-        };
-        s.asks.take(
-            vec![card(1, "Q1"), card(2, "Q2"), card(2, "Q3")],
-            Vec::new(),
-        );
         s
     }
 
-    /// The tiles of space 1's tab as laid out, before any rail is cut from them.
+    /// The tiles of space 1's tab as laid out, before any line is cut from them.
     fn tiles_of(s: &State) -> Vec<(u32, layout::Rect)> {
         s.layouts[&1].tile_rects(pane_area(s))
     }
 
-    /// Each of two agents split in one tab carries its own rail at the right of its own tile,
-    /// with its own count and cards, read the same without colour; each one's terminal is its
-    /// tile less its rail, and that is what its PTY is sized to.
+    /// Each of two agents split in one tab carries its own line at the foot of its own tile,
+    /// with its own task and words, read the same without colour; each one's terminal is its
+    /// tile less its line, and that is what its PTY is sized to.
     #[test]
-    fn two_agents_side_by_side_each_carry_their_own_rail() {
+    fn two_agents_side_by_side_each_carry_their_own_line() {
         use crate::colorlevel::{Level, TEST_LEVEL};
-        let s = two_agents(170, 46);
-        let rails = s.tab_rails();
-        assert_eq!(rails.iter().map(|r| r.terminal).collect::<Vec<_>>(), [1, 2]);
+        let mut s = two_agents(170, 46);
+        waits(&mut s, 2);
+        let lines = s.tab_lines();
+        assert_eq!(lines.iter().map(|l| l.terminal).collect::<Vec<_>>(), [1, 2]);
         let tiles = tiles_of(&s);
-        for (rail, (t, tile)) in rails.iter().zip(&tiles) {
-            assert_eq!(rail.terminal, *t);
-            assert_eq!(rail.rect.cols, crate::tabq::NARROW, "a tile under 120");
-            assert_eq!(rail.rect.x + rail.rect.cols, tile.x + tile.cols, "{t}");
-            assert_eq!((rail.rect.y, rail.rect.rows), (tile.y, tile.rows));
+        for (line, (t, tile)) in lines.iter().zip(&tiles) {
+            assert_eq!(line.terminal, *t);
+            assert_eq!(
+                (line.rect.x, line.rect.y + 1, line.rect.cols),
+                (tile.x, tile.y + tile.rows, tile.cols),
+                "{t}"
+            );
         }
-        let first = cells_in(&s, rails[0].rect);
-        let second = cells_in(&s, rails[1].rect);
-        assert_eq!(
-            (first[0].as_str(), first[2].as_str(), first[3].as_str()),
-            ("\u{2814}1", "\u{2814}Q1", "")
+        let first = line_text(&s, &lines[0]);
+        let second = line_text(&s, &lines[1]);
+        assert!(
+            !first.contains("needs you") && first.ends_with("2/4 implementing"),
+            "{first:?}"
         );
-        assert_eq!(
-            (second[0].as_str(), second[2].as_str(), second[3].as_str()),
-            ("\u{2814}2", "\u{2814}Q2", "\u{2814}Q3")
+        assert!(
+            second.starts_with(" needs you: ctrl-a i answers"),
+            "{second:?}"
         );
-        // Each foot is its own agent's task.
-        assert_eq!((first[37].as_str(), second[37].as_str()), ("2/4", "1/4"));
+        assert!(second.ends_with("1/4 implementing"), "{second:?}");
         TEST_LEVEL.with(|c| c.set(Some(Level::Mono)));
-        let mono = (cells_in(&s, rails[0].rect), cells_in(&s, rails[1].rect));
+        let mono = (line_text(&s, &lines[0]), line_text(&s, &lines[1]));
         TEST_LEVEL.with(|c| c.set(None));
         assert_eq!(mono, (first, second), "the same without colour");
 
@@ -31774,351 +31282,89 @@ mod tests {
         let mut seqs = std::collections::BTreeMap::new();
         size_terminals(&mut s, &mut seqs).unwrap();
         for (t, tile) in tiles_of(&s) {
-            let cols = (tile.cols - crate::tabq::NARROW - 1) as u16;
-            assert_eq!(s.sized[&t], (cols, tile.rows as u16), "{t}");
+            assert_eq!(
+                s.sized[&t],
+                (tile.cols as u16, (tile.rows - 2) as u16),
+                "{t}"
+            );
         }
         // The focus moving between them resizes nothing.
         (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (2, 2);
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
     }
 
-    /// Unfolded, one agent's pane narrows that agent only; the other keeps its size and its
-    /// folded rail. A click on the second pane's rail unfolds that one and folds the first.
+    /// No line on a tab with no local agent in it or on qass's tabs: the pane keeps its whole
+    /// height. A daemon that keeps no cards still has the line: the Inbox does not need them.
     #[test]
-    fn unfolding_one_agent_narrows_only_its_pane() {
-        let mut s = two_agents(300, 46);
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        let before = s.sized.clone();
-        let tiles = tiles_of(&s);
-        assert!(tiles.iter().all(|(_, t)| t.cols >= 118), "{tiles:?}");
-        assert!(fold_key(&mut s));
-        assert_eq!(s.tabq, Some(1));
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
-        let open = (tiles[0].1.cols - crate::tabq::OPEN - 1) as u16;
-        assert_eq!(s.sized[&1].0, open, "the first narrows");
-        assert_eq!(s.sized[&2], before[&2], "the second keeps its size");
-        let rails = s.tab_rails();
-        assert!(rails[0].open.is_some_and(|o| !o.over));
-        assert_eq!((rails[1].open.is_none(), rails[1].rect.cols), (true, 6));
-        assert!(pane_text(&s).contains("questions \u{b7} claude \u{2814} 1"));
-
-        let rail = rails[1].rect;
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let (row, col) = (
-            (screen::TABS + 1 + rail.y + 3) as u16,
-            (left + 1 + rail.x + 2) as u16,
-        );
-        assert!(
-            s.tile_at_screen(row, col).is_none(),
-            "the rail is no terminal"
-        );
-        assert_eq!(s.tabq_click(row, col), Some(true));
-        assert_eq!(s.tabq, Some(2), "the second unfolds, the first folds");
-        size_terminals(&mut s, &mut seqs).unwrap();
-        assert_eq!(s.sized[&1], before[&1]);
-        assert_eq!(
-            s.sized[&2].0,
-            (tiles[1].1.cols - crate::tabq::OPEN - 1) as u16
-        );
-        assert!(pane_text(&s).contains("questions \u{b7} claude \u{2814} 2"));
-    }
-
-    /// `<` and `>` in the unfolded pane take 4 columns off or add them, the agent beside it
-    /// sized again; never under 40. Its left edge drags its width; past what leaves the agent 60
-    /// columns the pane stands over the agent at that width and the agent keeps its folded
-    /// size. The width holds through a fold for the session.
-    #[test]
-    fn the_unfolded_pane_takes_the_width_he_gives_it() {
-        let mut s = two_agents(300, 46);
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        let folded = s.sized[&1];
-        let other = s.sized[&2];
-        let tile = tiles_of(&s)[0].1;
-        assert!(fold_key(&mut s));
-        let width = |s: &State| s.tabq_open().unwrap().rect.cols - 2;
-        assert_eq!(width(&s), crate::tabq::OPEN);
-        let agent = |s: &mut State, seqs: &mut std::collections::BTreeMap<u32, u32>| {
-            size_terminals(s, seqs).unwrap();
-            s.sized[&1].0 as usize
-        };
-        assert_eq!(agent(&mut s, &mut seqs), tile.cols - 53);
-        assert!(tabq_keys(&mut s, b">", 0x01).resize);
-        assert_eq!(width(&s), 56);
-        assert_eq!(
-            agent(&mut s, &mut seqs),
-            tile.cols - 57,
-            "the agent narrows"
-        );
-        assert_eq!(s.sized[&2], other, "the other agent is never touched");
-        for _ in 0..10 {
-            tabq_keys(&mut s, b"<", 0x01);
-        }
-        assert_eq!(width(&s), crate::tabq::OPEN_MIN, "never under 40");
-        assert!(
-            !tabq_keys(&mut s, b"<", 0x01).resize,
-            "nothing left to take"
-        );
-
-        // The left edge, held and dragged ten columns left: ten columns wider.
-        let open = s.tabq_open().unwrap().rect;
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let (row, col) = (
-            (screen::TABS + 1 + open.y + 5) as u16,
-            (left + 1 + open.x) as u16,
-        );
-        let mut control_seq = 0;
-        assert!(
-            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
-                .unwrap()
-                .is_none(),
-            "the edge is not the pane's"
-        );
-        assert!(s.split_press(col, row));
-        assert_eq!(s.modes.split_drag, Some(Grab::Tabq));
-        assert!(s.split_motion(col - 10, row));
-        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 10);
-        // Far left, past the agent's 60 columns: over the agent, at that width.
-        assert!(s.split_motion(col - 60, row));
-        let (over, open_x) = s.tabq_open().map(|o| (o.over, o.rect.x)).unwrap();
-        assert!(over);
-        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
-        assert_eq!(agent(&mut s, &mut seqs), folded.0 as usize, "folded size");
-        assert!(open_x > tile.x, "the agent's left part stays in sight");
-        s.modes.split_drag = None;
-        // Folded and unfolded again, the width he chose holds.
-        assert!(fold_key(&mut s));
-        assert!(fold_key(&mut s));
-        assert_eq!(width(&s), crate::tabq::OPEN_MIN + 60);
-    }
-
-    /// Where the agent would keep under 60 columns, its pane opens over its own tile: nothing
-    /// is resized, the other agent's rail stays folded, and a click on that rail unfolds it.
-    #[test]
-    fn a_narrow_split_opens_the_pane_over_its_own_tile() {
-        let mut s = two_agents(170, 46);
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        assert!(fold_key(&mut s));
-        let open = s.tabq_open().unwrap();
-        assert!(open.over);
-        let tiles = tiles_of(&s);
-        assert!(open.rect.x + open.rect.cols <= tiles[0].1.x + tiles[0].1.cols);
-        assert!(
-            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "no resize"
-        );
-        let rail = s.tab_rails()[1].rect;
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let (row, col) = (
-            (screen::TABS + 1 + rail.y + 2) as u16,
-            (left + 1 + rail.x + 1) as u16,
-        );
-        assert_eq!(s.tabq_click(row, col), Some(true));
-        assert_eq!(s.tabq, Some(2));
-        assert!(s.tabq_open().is_some_and(|o| o.over));
-        assert!(
-            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "still none"
-        );
-    }
-
-    /// A press on the other agent's rail moves the keyboard there first, then unfolds its pane:
-    /// the lit frame, the pane's keys and `g` all speak for that agent. A press in its open pane
-    /// from the first agent brings the keyboard back the same way.
-    #[test]
-    fn a_press_on_another_agents_rail_moves_the_focus_there_first() {
-        let mut s = two_agents(170, 46);
-        let (mut control_seq, mut seqs) = (0, std::collections::BTreeMap::new());
-        size_terminals(&mut s, &mut seqs).unwrap();
-        let rail = s.tab_rails()[1].rect;
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let at = |r: layout::Rect, dy: usize, dx: usize| {
-            (
-                (screen::TABS + 1 + r.y + dy) as u16,
-                (left + 1 + r.x + dx) as u16,
-            )
-        };
-        let (row, col) = at(rail, 2, 1);
-        assert_eq!(s.tabq_at(row, col), Some(2));
-        let (resize, _) = tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
-            .unwrap()
-            .expect("the rail's");
-        assert!(resize);
-        assert_eq!((s.focused, s.layouts[&1].focus, s.tabq), (2, 2, Some(2)));
-        assert!(s.tabq_focused(), "the pane has the keys");
-        assert!(s.frame().tiles.iter().any(|t| t.focused && t.terminal == 2));
-        // The keyboard back in the first agent, then a press in the second's open pane.
-        focus(&mut s, 1, &mut control_seq, &mut seqs).unwrap();
-        s.tabq_settle();
-        assert!(!s.tabq_focused() && s.tabq_open().is_some());
-        let (row, col) = at(s.tabq_open().unwrap().rect, 3, 4);
-        assert_eq!(
-            tabq_press(&mut s, row, col, &mut control_seq, &mut seqs)
-                .unwrap()
-                .map(|(resize, _)| resize),
-            Some(false)
-        );
-        assert_eq!(s.focused, 2);
-        assert!(s.tabq_focused());
-        // `g` gives the keyboard to the agent whose pane it was (over its tile, the pane folds).
-        assert_eq!(tabq_keys(&mut s, b"g", 0x01).jump, Some(2));
-    }
-
-    /// The unfolded pane folds once its agent closes, is split out to a tab of its own, or moves
-    /// to another space, so it never arrives unfolded anywhere else; a pane closing beside it or
-    /// a new one split in leaves it open.
-    #[test]
-    fn the_unfolded_pane_folds_once_its_agent_leaves_its_tab() {
-        let unfolded = || {
-            let mut s = two_agents(300, 46);
-            assert!(fold_key(&mut s));
-            assert_eq!(s.tabq, Some(1));
-            s
-        };
-        let mut seqs = std::collections::BTreeMap::new();
-
-        let mut closed = unfolded();
-        closed.rows.retain(|r| r.terminal != 1);
-        closed.layouts.insert(1, Layout::single(2));
-        (closed.focused, closed.layouts.get_mut(&1).unwrap().focus) = (2, 2);
-        assert!(closed.tabq_settle());
-        assert_eq!(closed.tabq, None, "closed");
-
-        let mut split_out = unfolded();
-        split_out.layouts.insert(1, Layout::single(2));
-        split_out.parked.insert(1, vec![Layout::single(1)]);
-        size_terminals(&mut split_out, &mut seqs).unwrap();
-        assert_eq!(split_out.tabq, None, "a tab of its own");
-        assert_eq!(
-            split_out.sized[&1].0 as usize,
-            split_out.lone_rect(1).cols,
-            "sized folded"
-        );
-
-        let mut moved = unfolded();
-        moved.spaces.push(space(2, "other"));
-        moved.rows[0].workspace = 2;
-        moved.layouts.insert(1, Layout::single(2));
-        moved.layouts.insert(2, Layout::single(1));
-        assert!(moved.tabq_settle());
-        assert_eq!(moved.tabq, None, "another space");
-        (moved.space, moved.focused) = (Some(2), 1);
-        assert!(moved.tab_rails().iter().all(|r| r.open.is_none()));
-
-        let mut beside_closed = unfolded();
-        beside_closed.rows.retain(|r| r.terminal != 2);
-        beside_closed.layouts.insert(1, Layout::single(1));
-        beside_closed.tabq_settle();
-        assert_eq!(beside_closed.tabq, Some(1), "the other pane closed");
-
-        let mut split_in = unfolded();
-        split_in.rows.push(agent(3, 1, "zsh", "idle"));
-        let leaf = |t| Box::new(crate::layout::Node::Leaf { terminal: Some(t) });
-        let tree = split_in.layouts.get_mut(&1).unwrap();
-        tree.root = crate::layout::Node::Split {
-            dir: crate::layout::Dir::H,
-            ratio: 0.5,
-            first: Box::new(tree.root.clone()),
-            second: leaf(3),
-        };
-        split_in.tabq_settle();
-        assert_eq!(split_in.tabq, Some(1), "a new pane split in");
-    }
-
-    /// Without colour the rail reads the same: its words and marks carry it, and none of its
-    /// rows asks for a colour.
-    #[test]
-    fn the_rail_reads_the_same_without_colour() {
-        use crate::colorlevel::{Level, TEST_LEVEL};
-        let mut s = agent_tab(170, 46);
-        let mut card = ask_card(1, "claude");
-        card.card = "Q8".to_string();
-        s.asks.take(vec![card], Vec::new());
-        let colour = rail_cells(&s);
-        TEST_LEVEL.with(|c| c.set(Some(Level::Mono)));
-        let mono = rail_cells(&s);
-        let paint = s.tab_rail_paint().unwrap();
-        let rows = crate::tabq::rows(&paint, s.rows[0].task.as_ref(), false);
-        TEST_LEVEL.with(|c| c.set(None));
-        assert_eq!(mono, colour);
-        assert_eq!(
-            (mono[0].as_str(), mono[2].as_str()),
-            (" \u{2814}1", " \u{2814}Q8")
-        );
-        assert!(rows.iter().all(|r| !r.contains("38;5")), "{rows:?}");
-    }
-
-    /// No rail on a tab with no local agent in it, on qass's tabs, or while the daemon keeps no
-    /// cards (not read yet, or too old): the pane keeps its whole width.
-    #[test]
-    fn a_tab_with_no_local_agent_has_no_rail() {
+    fn a_tab_with_no_local_agent_has_no_line() {
         let whole = |s: &State| {
-            assert!(s.tab_rail_paint().is_none());
-            focused_rect(s).cols
+            assert!(s.tab_lines().is_empty());
+            focused_rect(s).rows
         };
         let mut shell = agent_tab(170, 46);
         shell.rows[0].agent = false;
-        assert_eq!(whole(&shell), 129, "a shell-only tab");
+        assert_eq!(whole(&shell), 40, "a shell-only tab");
 
         let mut remote = agent_tab(170, 46);
         let far = crate::mux::REMOTE_TERMINAL | 1;
         remote.rows[0].terminal = far;
         remote.focused = far;
         remote.layouts.insert(1, Layout::single(far));
-        assert_eq!(whole(&remote), 129, "another machine's agent");
+        assert_eq!(whole(&remote), 40, "another machine's agent");
 
         let mut qass = agent_tab(170, 46);
         qass.spaces = vec![space(1, sidebar::QASS_SPACE)];
-        assert_eq!(qass.tree_area(&qass.layouts[&1]).cols, 131, "qass's tab");
+        assert!(qass.tab_lines().is_empty(), "qass's tab");
 
         let mut old = agent_tab(170, 46);
         old.asks.unsupported = true;
-        assert_eq!(whole(&old), 129, "a daemon without cards");
+        assert_eq!(
+            old.tab_lines().len(),
+            1,
+            "a daemon without cards still has it"
+        );
+        assert_eq!(focused_rect(&old).rows, 38);
 
         let shells_only = {
             let mut s = shell_beside_agent();
             s.rows[0].agent = false;
             s
         };
-        assert!(shells_only.tab_rail_paint().is_none(), "two shells");
+        assert!(shells_only.tab_lines().is_empty(), "two shells");
     }
 
-    /// The rail is there from the first size, before any card is read, so an attach sizes the
-    /// agent once; folded, the first read, a card arriving or answered and a step ticked change
-    /// its rows and never the agent's size.
+    /// The line is there from the first size, before any card is read, so an attach sizes the
+    /// agent once; a question arriving or answered, a step ticked and the first read change
+    /// the line's words and never the agent's size.
     #[test]
-    fn the_agents_size_holds_while_the_rail_is_folded() {
+    fn the_agents_size_holds_while_the_lines_words_change() {
         let mut s = agent_tab(170, 46);
         s.asks = crate::asks::Pane::new();
-        assert!(s.tab_rail_paint().is_some(), "no read needed");
+        assert!(!s.tab_lines().is_empty(), "no read needed");
         let mut seqs = std::collections::BTreeMap::new();
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some());
-        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+        assert_eq!(s.sized.get(&1), Some(&(129, 38)));
         s.asks.take(Vec::new(), Vec::new());
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
             "the first read"
         );
-        let mut card = ask_card(1, "claude");
-        card.card = "Q8".to_string();
-        s.asks.take(vec![card], Vec::new());
+        waits(&mut s, 1);
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "a card arrives"
+            "a question arrives"
         );
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
             "a step ticked"
         );
-        s.asks.take(Vec::new(), Vec::new());
+        s.ibx_list = crate::inbox::Inbox::default();
         assert!(
             size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "the card answered"
+            "answered"
         );
-        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
+        assert_eq!(s.sized.get(&1), Some(&(129, 38)));
     }
 
     /// The keyboard moving between the shell and the agent of one tab resizes neither.
@@ -32132,660 +31378,62 @@ mod tests {
         s.focused = 1;
         assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
         assert_eq!(s.sized, before);
-        assert_eq!(s.tab_rail_paint().unwrap().rect.cols, 4);
+        assert_eq!(s.tab_lines().len(), 1);
     }
 
-    /// The rail follows the row it reads: a step ticked moves its count, a card arriving puts
-    /// its mark under the count, the next frame.
+    /// The line follows the row it reads: a step ticked moves its count, an Inbox item puts its
+    /// words in front, the next frame; a task on no item says its stage alone.
     #[test]
-    fn a_tick_or_a_card_refreshes_the_rail() {
+    fn a_tick_or_an_inbox_item_refreshes_the_line() {
         let mut s = agent_tab(170, 46);
-        assert_eq!(rail_cells(&s)[37], " 2/4");
+        assert!(line_of_1(&s).ends_with("2/4 implementing"));
         s.rows[0].task.as_mut().unwrap().steps_done = 3;
-        assert_eq!(rail_cells(&s)[37], " 3/4");
+        assert!(line_of_1(&s).ends_with("3/4 implementing"));
         s.rows[0].task.as_mut().unwrap().steps_total = 6;
-        assert_eq!(rail_cells(&s)[37], " 3/6", "a plan grown to six steps");
-        let mut card = ask_card(1, "claude");
-        card.card = "Q8".to_string();
-        s.asks.take(vec![card], Vec::new());
-        let cells = rail_cells(&s);
-        assert_eq!(
-            (cells[0].as_str(), cells[2].as_str()),
-            (" \u{2814}1", " \u{2814}Q8")
+        assert!(
+            line_of_1(&s).ends_with("3/6 implementing"),
+            "a plan grown to six steps"
         );
-        // The agent's row in the column counts it too.
-        assert!(plain(&screen::paint(&s.frame())).contains("claude \u{2814}1"));
-        // A task on no item: its stage word alone under the rule.
+        waits(&mut s, 1);
+        assert!(line_of_1(&s).starts_with(" needs you: ctrl-a i answers"));
+        // The agent's row in the column carries no card mark any more.
+        assert!(!plain(&screen::paint(&s.frame())).contains("claude \u{2814}"));
         let task = s.rows[0].task.as_mut().unwrap();
         (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
         task.stage = "waiting-human".to_string();
-        let cells = rail_cells(&s);
-        assert_eq!(
-            (cells[36].as_str(), cells[37].as_str()),
-            ("\u{2500}".repeat(6).as_str(), " waits")
+        assert!(
+            line_of_1(&s).ends_with("waiting human"),
+            "{:?}",
+            line_of_1(&s)
         );
     }
 
-    /// A press on the rail is the rail's: no pane is under it, and it unfolds the pane; a press on
-    /// the agent's tile is the agent's.
+    /// A press on the line is the line's: no pane is under it, and while its agent waits it is
+    /// `ctrl-a i`; a press on the agent's tile is the agent's.
     #[test]
-    fn a_press_on_the_rail_reaches_no_pane() {
+    fn a_press_on_the_line_reaches_no_pane() {
         let mut s = agent_tab(170, 46);
-        let rail = s.tab_rail_paint().unwrap().rect;
+        let line = s.tab_lines()[0].rect;
         let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
         let (row, col) = (
-            (screen::TABS + 1 + rail.y + 3) as u16,
-            (left + 1 + rail.x + 2) as u16,
+            (screen::TABS + 1 + line.y) as u16,
+            (left + 1 + line.x + 2) as u16,
         );
         assert!(s.tile_at_screen(row, col).is_none());
+        assert!(
+            s.clicked(row, col).is_none(),
+            "nothing waits: no key to press"
+        );
+        waits(&mut s, 1);
+        assert!(matches!(s.clicked(row, col), Some(Clicked::Inbox)));
         let pane = (left + 1 + 10) as u16;
-        assert_eq!(s.tile_at_screen(row, pane).map(|hit| hit.0), Some(1));
-        assert_eq!(s.tabq_click(row, pane), None, "the agent's");
-        assert_eq!(s.tabq_click(row, col), Some(true), "unfolds");
-        assert!(s.tabq_focused());
-    }
-
-    /// `n` cards on the tab's agent (terminal 1), the first with a long question, and one of
-    /// another agent's (terminal 2).
-    fn tab_cards(s: &mut State, n: u32) {
-        let mut cards: Vec<_> = (1..=n)
-            .map(|at| {
-                let mut c = ask_card(1, "claude");
-                c.card = format!("Q{at}");
-                c.body.asks = format!("Question {at} of the tab?");
-                c
-            })
-            .collect();
-        if let Some(first) = cards.first_mut() {
-            first.body.asks = "A long question that runs past one row of the pane, so it is read \
-                               whole: does the migration run tonight on staging, or wait?"
-                .to_string();
-        }
-        let mut other = ask_card(2, "web-app");
-        other.body.asks = "Another agent's question?".to_string();
-        cards.push(other);
-        s.asks.take(cards, Vec::new());
-    }
-
-    /// The open pane as painted, its cells row by row with its side lines taken out and its
-    /// words joined by single blanks.
-    fn pane_text(s: &State) -> String {
-        let rect = s.tabq_open().expect("an open pane").rect;
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let grid = cells_of(
-            &screen::paint(&s.frame()),
-            s.cols as usize,
-            s.lines as usize,
-        );
-        let cells: String = (0..rect.rows)
-            .map(|y| {
-                grid[screen::TABS + rect.y + y][left + rect.x..left + rect.x + rect.cols]
-                    .iter()
-                    .map(|c| if *c == '\u{2502}' { ' ' } else { *c })
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        cells.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    /// `ctrl-a T` unfolds the pane to 52 columns beside the agent, the tiles narrowing once, and
-    /// folds it back the same once; titled with the agent and its count, the keyboard in it.
-    #[test]
-    fn the_pane_unfolds_beside_the_agent_and_folds_back() {
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 1);
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
-        assert!(fold_key(&mut s));
-        assert!(s.tabq_focused());
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_some(), "once");
-        assert_eq!(s.sized.get(&1), Some(&(76, 40)));
-        let open = s.tabq_open().unwrap();
-        assert!(!open.over);
-        assert_eq!(open.rect.cols, crate::tabq::OPEN + 2);
-        let text = pane_text(&s);
+        assert_eq!(s.tile_at_screen(row - 3, pane).map(|hit| hit.0), Some(1));
         assert!(
-            text.contains("questions \u{b7} claude \u{2814} 1"),
-            "{text}"
-        );
-        assert!(!text.contains("Another agent"), "{text}");
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
-        assert!(fold_key(&mut s));
-        assert!(!s.tabq_focused() && s.asks.scope.is_none());
-        assert!(
-            size_terminals(&mut s, &mut seqs).unwrap().is_some(),
-            "once back"
-        );
-        assert_eq!(s.sized.get(&1), Some(&(122, 40)));
-    }
-
-    /// Where the agent would keep under 60 columns (80 by 24), the pane opens over its tile:
-    /// nothing is resized, and the tile under the pane takes no click.
-    #[test]
-    fn a_narrow_tab_opens_the_pane_over_the_agent() {
-        let mut s = agent_tab(80, 24);
-        tab_cards(&mut s, 2);
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        assert!(fold_key(&mut s));
-        let (over, rect) = s.tabq_open().map(|o| (o.over, o.rect)).unwrap();
-        assert!(over);
-        assert!(
-            size_terminals(&mut s, &mut seqs).unwrap().is_none(),
-            "no resize"
-        );
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let (row, col) = (
-            (screen::TABS + 1 + rect.y + 3) as u16,
-            (left + 1 + rect.x + 4) as u16,
-        );
-        assert!(s.tile_at_screen(row, col).is_none());
-        assert!(pane_text(&s).contains("questions \u{b7} claude"));
-        assert!(fold_key(&mut s));
-        assert!(size_terminals(&mut s, &mut seqs).unwrap().is_none());
-        // `g` over the tile folds the pane: the keys never go to a hidden agent.
-        assert!(fold_key(&mut s));
-        assert_eq!(tabq_keys(&mut s, b"g", 0x01).jump, Some(1));
-        assert!(s.tabq_open().is_none() && !s.tabq_focused());
-    }
-
-    /// In the pane: `1` answers the open card of this agent and no other; `s` and `r` stay
-    /// in the pane, never reaching the agent; a card arriving while one is open leaves it open;
-    /// esc folds the pane, sizes the tiles back and gives the keyboard to the agent.
-    #[test]
-    fn the_panes_keys_answer_this_agents_card_and_esc_folds() {
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 2);
-        assert!(fold_key(&mut s));
-        for key in [&b"s"[..], b"s"] {
-            assert!(tabq_keys(&mut s, key, 0x01).feed.is_none());
-        }
-        assert!(tabq_keys(&mut s, b"\r", 0x01).feed.is_none());
-        let open = s.asks.open_card().unwrap().card.clone();
-        assert_eq!(open, "Q1");
-        let mut cards = s.asks.live.clone();
-        let mut new = ask_card(1, "claude");
-        new.card = "Q9".to_string();
-        cards.insert(0, new);
-        s.asks.take(cards, Vec::new());
-        assert_eq!(s.asks.open_card().unwrap().card, "Q1", "focus not stolen");
-        assert!(s.tabq_focused(), "the keyboard stays in the pane");
-        assert!(tabq_keys(&mut s, b"1", 0x01).feed.is_none());
-        let (sent, _) = s.asks.tick(std::time::Instant::now());
-        assert!(
-            matches!(&sent[..], [ControlRequest::AskWrite { action: qoop_runtime::control::AskOp::Answer { card, .. }, .. }] if card == "Q1"),
-            "{sent:?}"
-        );
-        assert!(tabq_keys(&mut s, b"r", 0x01).feed.is_none());
-        assert!(s.asks.typing(), "r types in the pane");
-        tabq_keys(&mut s, b"\x1b", 0x01);
-        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Questions);
-        let esc = tabq_keys(&mut s, b"\x1b", 0x01);
-        assert_eq!(s.frame().chrome.keys, screen::KeyContext::Pane);
-        assert!(esc.resize && esc.jump == Some(1));
-        assert!(s.tabq.is_none() && !s.tabq_focused() && s.asks.scope.is_none());
-        // Open again, a press on the agent takes the keyboard out of the pane: the router hands
-        // r, q and s to the agent then, and the pane keeps showing.
-        assert!(fold_key(&mut s));
-        let left = screen::left_for(s.cols, s.collapsed, s.sidebar_width);
-        let (row, col) = ((screen::TABS + 4) as u16, (left + 10) as u16);
-        assert_eq!(s.tile_at_screen(row, col).map(|hit| hit.0), Some(1));
-        assert_eq!(s.tabq_click(row, col), None);
-        assert!(!s.tabq_focused() && s.tabq_open().is_some());
-    }
-
-    /// `q` hands the open card of this agent to qass, with no option and no words, and never
-    /// reaches the agent; the pane then says `handed to qass: Q1`. With no qass the refusal is
-    /// said in the pane.
-    #[test]
-    fn q_hands_the_open_card_to_qass() {
-        use qoop_runtime::control::{AskOp, AskResult, ControlResponse};
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 2);
-        assert!(fold_key(&mut s));
-        assert!(tabq_keys(&mut s, b"q", 0x01).feed.is_none());
-        let (sent, _) = s.asks.tick(std::time::Instant::now());
-        let [ControlRequest::AskWrite { id, action, .. }] = &sent[..] else {
-            panic!("one write: {sent:?}");
-        };
-        assert_eq!(
-            action,
-            &AskOp::Answer {
-                card: "Q1".into(),
-                option: None,
-                text: None,
-                seen: None,
-                to_qass: true,
-            }
-        );
-        assert!(s.asks.answered(&ControlResponse::AskWritten {
-            id: id.clone(),
-            card: "Q1".into(),
-            result: AskResult::Passed,
-        }));
-        assert!(pane_text(&s).contains("handed to qass: Q1"));
-        // No qass to hand it to: the daemon refuses, and the pane says why.
-        tabq_keys(&mut s, b"q", 0x01);
-        let (sent, _) = s.asks.tick(std::time::Instant::now());
-        let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
-            panic!("one write: {sent:?}");
-        };
-        assert!(s.asks.answered(&ControlResponse::Failed {
-            id: id.clone(),
-            reason: "qass has no tab to hand this to".into(),
-        }));
-        assert!(
-            pane_text(&s).contains("not sent: qass has no tab to hand this to"),
-            "{}",
-            pane_text(&s)
+            s.clicked(row - 3, pane).is_none(),
+            "the agent's own cells stay the agent's"
         );
     }
 
-    /// A hand-off refused (no qass), then one that went: each answer reaches the pane and the
-    /// rest of the interface as the loop gives it, and the refusal never stands on the status row
-    /// once the pane says the card was handed.
-    #[test]
-    fn a_refused_hand_off_leaves_no_stale_status_after_one_that_went() {
-        use qoop_runtime::control::{AskResult, ControlResponse};
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 1);
-        assert!(fold_key(&mut s));
-        let answer = |s: &mut State, response: ControlResponse| {
-            s.asks.answered(&response);
-            let mut dirty = false;
-            apply(s, response, &mut 0, &mut dirty);
-        };
-        let write = |s: &mut State| {
-            tabq_keys(s, b"q", 0x01);
-            let (sent, _) = s.asks.tick(std::time::Instant::now());
-            let [ControlRequest::AskWrite { id, .. }] = &sent[..] else {
-                panic!("one write: {sent:?}");
-            };
-            id.clone()
-        };
-        let id = write(&mut s);
-        answer(
-            &mut s,
-            ControlResponse::Failed {
-                id,
-                reason: "qass has no tab to hand this to".into(),
-            },
-        );
-        assert!(pane_text(&s).contains("not sent: qass has no tab"));
-        assert_eq!(s.message, None, "said in the pane, not twice");
-        let id = write(&mut s);
-        answer(
-            &mut s,
-            ControlResponse::AskWritten {
-                id,
-                card: "Q1".into(),
-                result: AskResult::Passed,
-            },
-        );
-        let painted: String = cells_of(
-            &screen::paint(&s.frame()),
-            s.cols as usize,
-            s.lines as usize,
-        )
-        .iter()
-        .map(|row| row.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-        assert!(painted.contains("handed to qass: Q1"), "{painted}");
-        assert!(!painted.contains("no tab to hand this to"), "{painted}");
-    }
-
-    /// The opened card offers the hand-off on its own row under the answers, and it is no
-    /// numbered answer: the number after the last answer sends nothing.
-    #[test]
-    fn the_opened_card_offers_the_hand_off_on_its_own_row() {
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 1);
-        assert!(fold_key(&mut s));
-        tabq_keys(&mut s, b"\r", 0x01);
-        let text = pane_text(&s);
-        assert!(
-            text.contains("[2] pick b")
-                && text.contains("[q] hand to qass qass answers it for you"),
-            "{text}"
-        );
-        assert!(!text.contains("[3]"), "{text}");
-        tabq_keys(&mut s, b"3", 0x01);
-        assert!(s.asks.tick(std::time::Instant::now()).0.is_empty());
-    }
-
-    /// Opened in place, a card shows its whole question and its answers while the other card
-    /// stays one folded row: an accordion of two, one open.
-    #[test]
-    fn the_pane_is_an_accordion_with_the_question_whole() {
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 2);
-        assert!(fold_key(&mut s));
-        tabq_keys(&mut s, b"\r", 0x01);
-        let text = pane_text(&s);
-        assert!(text.contains("pick a"), "the open card's answers: {text}");
-        assert!(text.contains("Question 2"), "the other card folded: {text}");
-        let whole: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            whole.contains("does the migration run tonight on staging, or wait?"),
-            "{whole}"
-        );
-    }
-
-    /// A tab waiting on the owner with no card says so, and `g` gives the keyboard to the agent;
-    /// its rail reads `⠄0` and `waits`.
-    #[test]
-    fn a_waiting_tab_with_no_card_says_so() {
-        let mut s = agent_tab(170, 46);
-        let task = s.rows[0].task.as_mut().unwrap();
-        (task.item, task.steps_done, task.steps_total) = (None, 0, 0);
-        task.stage = "waiting-human".to_string();
-        let cells = rail_cells(&s);
-        assert_eq!(
-            (cells[0].as_str(), cells[37].as_str()),
-            (" \u{2804}0", " waits")
-        );
-        assert!(fold_key(&mut s));
-        let text: String = pane_text(&s)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(text.contains("waiting on you, no question card"), "{text}");
-        assert!(text.contains("g to the agent"), "{text}");
-        let g = tabq_keys(&mut s, b"g", 0x01);
-        assert_eq!(g.jump, Some(1));
-        assert!(
-            !s.tabq_focused() && s.tabq_open().is_some(),
-            "the pane stays open"
-        );
-    }
-
-    /// The terminal's task read as the daemon answers it: the item's card with `steps` plan
-    /// steps (the first two done, its activity cleared as a terminal's read has it) when
-    /// `item`, and the task's own events with one evidence.
-    fn task_read_answer(id: &str, steps: u32, item: bool) -> ControlResponse {
-        let steps: Vec<_> = (1..=steps)
-            .map(|n| {
-                let text = match n {
-                    3 => "runs on staging".to_string(),
-                    _ => format!("step number {n}"),
-                };
-                match n {
-                    1 | 2 => serde_json::json!({"n": n, "text": text, "done_at": n}),
-                    _ => serde_json::json!({"n": n, "text": text}),
-                }
-            })
-            .collect();
-        let card = item.then(|| {
-            serde_json::json!({
-                "id": 3, "key": "APP-1", "title": "t", "state": "doing",
-                "steps_done": 2, "steps_total": steps.len(), "agents": [], "updated_at": 0,
-                "description": "", "steps": steps, "activity": []
-            })
-        });
-        serde_json::from_value(serde_json::json!({
-            "op": "Tasks", "id": id, "tasks": [],
-            "events": [{"id": 1, "at": 5, "kind": "evidence", "body": "cargo test: ok"}],
-            "item": card,
-        }))
-        .expect("a tasks answer")
-    }
-
-    /// The task part is the terminal's own read, asked once per task, item, stage and count:
-    /// its item's steps ticked, the first undone `now`, and the task's newest evidence.
-    #[test]
-    fn the_pane_shows_the_task_read_from_its_item() {
-        let mut s = agent_tab(170, 46);
-        assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead {
-            task, terminal, id, ..
-        }) = s.tabq_read_request()
-        else {
-            panic!("a read");
-        };
-        assert_eq!((task, terminal), (None, Some(1)), "the terminal's read");
-        assert!(s.tabq_read_request().is_none(), "asked once");
-        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
-        let text = pane_text(&s);
-        assert!(text.contains("[x] 1. step number 1"), "{text}");
-        assert!(text.contains("[ ] 3. runs on staging"), "{text}");
-        assert!(text.contains("staging now"), "{text}");
-        assert!(text.contains("cargo test: ok"), "{text}");
-        // `s` folds the task to its line and opens it again.
-        assert!(tabq_keys(&mut s, b"s", 0x01).feed.is_none());
-        let folded = pane_text(&s);
-        assert!(
-            folded.contains("s opens") && !folded.contains("[x] 1."),
-            "{folded}"
-        );
-        tabq_keys(&mut s, b"s", 0x01);
-        assert!(pane_text(&s).contains("[x] 1. step number 1"));
-        s.rows[0].task.as_mut().unwrap().steps_done = 3;
-        assert!(s.tabq_read_request().is_some(), "a tick reads it again");
-    }
-
-    /// A task on no item is read by its terminal, never with its own id taken for an item's:
-    /// it shows its goal and stage, no plan steps, and its own evidence.
-    #[test]
-    fn a_task_on_no_item_shows_no_steps_of_another() {
-        let mut s = agent_tab(170, 46);
-        s.rows[0].task.as_mut().unwrap().item = None;
-        assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead {
-            task, terminal, id, ..
-        }) = s.tabq_read_request()
-        else {
-            panic!("a read");
-        };
-        assert_eq!((task, terminal), (None, Some(1)));
-        assert!(s.tabq_answered(&task_read_answer(&id, 0, false)));
-        let text = pane_text(&s);
-        assert!(text.contains("implementing"), "{text}");
-        assert!(!text.contains("[x]") && !text.contains("[ ]"), "{text}");
-        assert!(text.contains("cargo test: ok"), "{text}");
-    }
-
-    /// A read asked for one key and answered after the task moved on is dropped: only the
-    /// answer to the read for the key now is kept.
-    #[test]
-    fn an_old_task_read_never_lands_under_a_new_key() {
-        let mut s = agent_tab(170, 46);
-        assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead { id: old, .. }) = s.tabq_read_request() else {
-            panic!("a read");
-        };
-        s.rows[0].task.as_mut().unwrap().steps_done = 3;
-        let Some(ControlRequest::TaskRead { id: new, .. }) = s.tabq_read_request() else {
-            panic!("a read for the new key");
-        };
-        assert_ne!(old, new);
-        assert!(s.tabq_answered(&task_read_answer(&old, 4, true)));
-        assert!(s.tabq_read.is_none(), "the old answer dropped");
-        assert!(s.tabq_answered(&task_read_answer(&new, 4, true)));
-        let key = crate::tabq::read_key(s.rows[0].task.as_ref().unwrap());
-        assert_eq!(s.tabq_read.as_ref().map(|(k, _)| k), Some(&key));
-    }
-
-    /// The task part never takes the cards' rows or the key line: at 80 by 24 a plan of twelve
-    /// steps leaves the open card and the keys in sight, and at 170 by 46 it folds to its line
-    /// when the opened card needs the rows, stands whole when they fit.
-    #[test]
-    fn the_task_part_leaves_the_cards_and_the_keys_their_rows() {
-        for (cols, lines) in [(80u16, 24u16), (170, 46)] {
-            let mut s = agent_tab(cols, lines);
-            tab_cards(&mut s, 2);
-            assert!(fold_key(&mut s));
-            tabq_keys(&mut s, b"\r", 0x01);
-            let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
-                panic!("a read");
-            };
-            assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
-            let text = pane_text(&s);
-            assert!(text.contains("pick a"), "{cols}x{lines}: {text}");
-            assert!(
-                text.contains("1-9 answer"),
-                "the key line, {cols}x{lines}: {text}"
-            );
-            assert!(text.contains("s opens"), "folded, {cols}x{lines}: {text}");
-            assert_eq!(
-                s.tabq_open().map(|o| o.rect.rows),
-                Some(
-                    crate::tabq::pane_view(
-                        &s.tab_rail_paint().unwrap(),
-                        &s.tabq_open().unwrap(),
-                        &s.rows,
-                        &s.spaces,
-                        0,
-                        false
-                    )
-                    .0
-                    .rows
-                    .len()
-                ),
-                "every row drawn, the bottom edge too"
-            );
-        }
-        // Four steps and one card open fit at 170 by 46: the task stands whole.
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 1);
-        assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
-            panic!("a read");
-        };
-        assert!(s.tabq_answered(&task_read_answer(&id, 4, true)));
-        let text = pane_text(&s);
-        assert!(text.contains("pick a") && text.contains("[x] 1."), "{text}");
-    }
-
-    /// The task opened by hand where it does not fit: the card and every step of the task are
-    /// read whole, scrolled with `j`, nothing cut and the pane its exact size.
-    #[test]
-    fn a_task_too_tall_for_the_pane_scrolls_whole_with_the_card() {
-        let mut s = agent_tab(80, 24);
-        tab_cards(&mut s, 1);
-        assert!(fold_key(&mut s));
-        let Some(ControlRequest::TaskRead { id, .. }) = s.tabq_read_request() else {
-            panic!("a read");
-        };
-        assert!(s.tabq_answered(&task_read_answer(&id, 12, true)));
-        assert!(!s.tabq_task_shown(), "folded: it does not fit");
-        tabq_keys(&mut s, b"s", 0x01);
-        assert!(s.tabq_task_shown());
-        let mut seen = String::new();
-        for _ in 0..80 {
-            let t = pane_text(&s);
-            assert!(!t.contains('\u{2026}'), "{t}");
-            seen.push_str(&t);
-            seen.push(' ');
-            tabq_keys(&mut s, b"j", 0x01);
-        }
-        for n in 4..=12 {
-            assert!(
-                seen.contains(&format!("{n}. step number {n}")),
-                "step {n}: {seen}"
-            );
-        }
-        assert!(seen.contains("A long question") && seen.contains("cargo test: ok"));
-    }
-
-    /// The pane gives the keyboard back once the focus moves to another leaf of its tab: a
-    /// shell beside the agent gets its keys, and coming back to that leaf does not take them
-    /// again.
-    #[test]
-    fn the_pane_lets_go_of_the_keys_when_the_focus_moves() {
-        let mut s = shell_beside_agent();
-        assert!(fold_key(&mut s));
-        assert!(s.tabq_focused());
-        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (1, 1);
-        assert!(!s.tabq_focused(), "the keys follow the focus");
-        assert!(s.tabq_settle(), "drawn again");
-        (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (2, 2);
-        assert!(!s.tabq_focused() && s.tabq_open().is_some());
-    }
-
-    /// The scope follows the screen before it is painted: away from the tab it is gone and a
-    /// repaint is owed, once.
-    #[test]
-    fn the_scope_settles_with_the_screen() {
-        let mut s = agent_tab(170, 46);
-        tab_cards(&mut s, 1);
-        assert!(fold_key(&mut s));
-        assert!(!s.tabq_settle(), "settled already");
-        // Another space, a shell in its tab: no rail there.
-        s.spaces.push(space(2, "other"));
-        let mut zsh = agent(5, 2, "zsh", "idle");
-        zsh.agent = false;
-        s.rows.push(zsh);
-        s.layouts.insert(2, Layout::single(5));
-        (s.space, s.focused) = (Some(2), 5);
-        assert!(s.tabq_settle());
-        assert!(s.asks.scope.is_none() && !s.tabq_focused());
-        assert!(!s.tabq_settle());
-        (s.space, s.focused) = (Some(1), 1);
-        assert!(s.tabq_settle());
-        assert_eq!(s.asks.scope, Some(1));
-    }
-
-    /// Two agents in one tab: the keyboard moving between them never resizes a tile, folded
-    /// or with the pane open; the open pane stays with its agent.
-    #[test]
-    fn a_focus_move_between_two_agents_resizes_nothing() {
-        let mut s = shell_beside_agent();
-        s.rows[1].agent = true;
-        let mut seqs = std::collections::BTreeMap::new();
-        size_terminals(&mut s, &mut seqs).unwrap();
-        let mut to = |s: &mut State, t: u32| {
-            (s.focused, s.layouts.get_mut(&1).unwrap().focus) = (t, t);
-            s.tabq_settle();
-            size_terminals(s, &mut seqs).unwrap()
-        };
-        assert!(to(&mut s, 1).is_none() && to(&mut s, 2).is_none(), "folded");
-        assert!(fold_key(&mut s));
-        let open = s.tab_rail_paint().unwrap().terminal;
-        assert_eq!(open, 2);
-        to(&mut s, 2);
-        assert!(to(&mut s, 1).is_none(), "open, to the other agent");
-        assert_eq!(s.tab_rail_paint().unwrap().terminal, open);
-        assert!(s.tabq_open().is_some() && !s.tabq_focused());
-        assert!(to(&mut s, 2).is_none(), "and back");
-    }
-
-    /// The rail never touches the left sidebar: its cells, characters and inks, are the same
-    /// with the rails and without them, one agent or two split with one unfolded.
-    #[test]
-    fn the_rail_leaves_the_sidebar_as_it_is() {
-        type Tab = fn(u16, u16) -> State;
-        let tabs: [(u16, u16, Tab); 4] = [
-            (170, 46, agent_tab),
-            (80, 24, agent_tab),
-            (170, 46, two_agents),
-            (300, 46, two_agents),
-        ];
-        for (cols, lines, tab) in tabs {
-            let mut with = tab(cols, lines);
-            let mut without = tab(cols, lines);
-            without.asks.unsupported = true;
-            if with.layouts[&1].leaf_count() > 1 {
-                // One of the two unfolded too, beside or over its tile.
-                (with.focused, with.layouts.get_mut(&1).unwrap().focus) = (2, 2);
-                (without.focused, without.layouts.get_mut(&1).unwrap().focus) = (2, 2);
-                assert!(fold_key(&mut with));
-            }
-            assert!(with.tab_rail_paint().is_some() && without.tab_rail_paint().is_none());
-            let left = screen::left_for(cols, false, sidebar::WIDTH);
-            let bytes = |s: &State| {
-                sidebar_bytes(
-                    &screen::paint(&s.frame()),
-                    cols as usize,
-                    lines as usize,
-                    left,
-                )
-            };
-            assert_eq!(bytes(&with), bytes(&without), "at {cols}x{lines}");
-        }
-    }
     // The Inbox (round 2) -------------------------------------------------------------------
 
     /// A row as the daemon sends it now: with the status it decided, and since when it waits.
@@ -32812,6 +31460,36 @@ mod tests {
         s.palette = None;
         s.refresh_ibx();
         s
+    }
+
+    /// The status line says whole predicates ("has failed", "is blocked") and names an agent as
+    /// the agents column does, its space and its session.
+    #[test]
+    fn the_status_line_names_the_agent_as_the_column_does_and_says_a_whole_predicate() {
+        let mut s = inbox_state();
+        s.view = sidebar::View::Priority;
+        let column: Vec<String> = s
+            .column_rows_now()
+            .iter()
+            .map(|(l, _)| l.text.clone())
+            .collect();
+        let next = s.next_waiting().expect("one waits");
+        assert_eq!((next.who.as_str(), next.says), ("app claude", "is blocked"));
+        assert!(
+            column.iter().any(|l| l.contains("app claude")),
+            "{column:?}"
+        );
+        s.focused = 1;
+        let next = s.next_waiting().expect("the failed one");
+        assert_eq!(
+            (next.who.as_str(), next.says),
+            ("webshop claude", "has failed")
+        );
+        assert!(
+            column.iter().any(|l| l.contains("webshop claude")),
+            "{column:?}"
+        );
+        assert_eq!(next.short, "webshop / claude");
     }
 
     #[test]
@@ -32842,8 +31520,8 @@ mod tests {
         let mut s = inbox_state();
         s.focused = 1;
         let next = s.next_waiting().expect("one waits");
-        assert_eq!(next.who, "webshop / claude");
-        assert!(next.failed && next.word == "failed");
+        assert_eq!(next.who, "webshop claude");
+        assert!(next.failed && next.says == "has failed");
     }
 
     #[test]
@@ -32942,6 +31620,7 @@ mod tests {
         s.ibx.holds.start(Hold {
             slot: Slot::Agent(1),
             generation: None,
+            menu_seal: None,
             seal: 4,
             pick: Pick::Key("1".into()),
             label: "Yes".into(),
