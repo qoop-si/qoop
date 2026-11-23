@@ -701,6 +701,50 @@ pub(crate) fn run_focus(terminal: u32) -> std::io::Result<Vec<u32>> {
     })
 }
 
+/// `qoop park [--off]`: the agent in this terminal sets itself aside to answer later, or takes
+/// that back. Run inside its own turn: the row reads working until the turn ends, then parked.
+pub(crate) fn run_park(args: &[String]) -> std::io::Result<()> {
+    let help = "usage: qoop park [--off]";
+    let mut on = true;
+    for arg in args.iter().skip(2) {
+        if arg == "--off" {
+            on = false;
+        } else {
+            return Err(super::usage(format!("unknown flag {arg}; {help}")));
+        }
+    }
+    let terminal = own_terminal().ok_or_else(|| {
+        std::io::Error::other("qoop park runs inside a qoop terminal (QOOP_TERMINAL is not set)")
+    })?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let mut link = Link::open("qoop-park").await?;
+        match link
+            .ask(&ControlRequest::SetParked {
+                id: super::request_id("park"),
+                terminal,
+                on,
+            })
+            .await?
+            .0
+        {
+            ControlResponse::Renamed { .. } => {
+                println!(
+                    "{}",
+                    if on {
+                        "parked: it reads parked once this turn ends"
+                    } else {
+                        "no longer parked"
+                    }
+                );
+                Ok(())
+            }
+            ControlResponse::Failed { reason, .. } => Err(std::io::Error::other(reason)),
+            _ => Err(std::io::Error::other("unexpected answer to park")),
+        }
+    })
+}
+
 /// Why a write must not go to this terminal under this generation, if not.
 ///
 /// The generation is the process, not the state: a write checked against

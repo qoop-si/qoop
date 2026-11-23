@@ -682,7 +682,7 @@ impl AgentRegistry {
             .lock()
             .unwrap()
             .get(&stream)
-            .is_some_and(|t| *t >= at && now - *t <= ANSWER_WINDOW_SECS);
+            .is_some_and(|t| *t > at && now - *t <= ANSWER_WINDOW_SECS);
         if working && typed {
             let mut parked = self.parked.lock().unwrap();
             // The same park still: one made again in between is not this answer's.
@@ -694,20 +694,13 @@ impl AgentRegistry {
         }
     }
 
-    /// Park this terminal's agent at `at`, or take it back, and say so. Refused, false, while
-    /// it works or starts: a park is for a reply that waits on a person, and taking it only
-    /// from a settled agent means an answer's turn to working always comes after the park.
+    /// Park this terminal's agent at `at`, or take it back, and say so. A working agent can be
+    /// parked: `qoop park` runs inside the agent's own turn, and the row reads working until
+    /// the turn ends (`qoop_domain::status::of`). A park ends only on a line a person sent
+    /// strictly after it ([`Self::unpark_if_answered`]), so the Enter that approved the park's
+    /// own command is no answer. Known edges: a later Enter in the same turn (another dialog),
+    /// or a `qoop send` line, ends it as a person's line does. Always taken, so true.
     pub fn set_parked(&self, stream: u32, on: bool, at: i64) -> bool {
-        let terminals = self.terminals.lock().unwrap();
-        let busy = terminals.get(&stream).is_some_and(|a| {
-            matches!(
-                a.belief.state,
-                AgentRuntimeState::Working | AgentRuntimeState::Starting
-            )
-        });
-        if on && busy {
-            return false;
-        }
         let mut parked = self.parked.lock().unwrap();
         if on {
             parked.insert(stream, at);
@@ -715,9 +708,23 @@ impl AgentRegistry {
             parked.remove(&stream);
         }
         drop(parked);
-        drop(terminals);
         self.announce(stream);
         true
+    }
+
+    /// Whether `stream` holds an agent, as the agents listing's `agent` flag says it: a known
+    /// agent program, or one behind a wrapper the daemon cannot see into.
+    pub fn is_agent(&self, stream: u32) -> bool {
+        self.agent(stream).is_some_and(|a| {
+            matches!(
+                a.identity,
+                AgentIdentity::Known { agent: true, .. }
+                    | AgentIdentity::Unavailable {
+                        boundary: qoop_domain::Boundary::Namespace { .. },
+                        ..
+                    }
+            )
+        })
     }
 
     pub fn is_parked(&self, stream: u32) -> bool {
@@ -3339,9 +3346,6 @@ mod tests {
         );
     }
 
-    /// A park ends only on an answer: a person sent a line to the agent after the park and
-    /// it works again. Working without a line sent (a resume, a background wake) keeps it,
-    /// keys that send nothing keep it, and a working agent cannot be parked at all.
     /// What says a person answered in a tab: a key or a line from them, the latest; a kitty
     /// Enter sends a line as a return does, and a focus report is no input.
     #[test]
@@ -3362,6 +3366,37 @@ mod tests {
         assert_eq!(r.input_at(2), None, "another tab");
     }
 
+    /// A park made while the agent works, as `qoop park` does inside its turn, holds: the Enter
+    /// that approved the command, sent in the same second, is not an answer to it.
+    #[test]
+    fn a_park_made_while_working_holds_through_the_enter_that_approved_it() {
+        use AgentRuntimeState::{Idle, Working};
+        let now = now_unix();
+        let r = registry();
+        let token = mint_token(1);
+        r.register(1, TerminalId::new("1"), token.clone());
+        let report = |state, now| {
+            r.observe_hook(1, &TerminalId::new("1"), &token, state, false, false, now)
+                .expect("an admitted report applies")
+        };
+        report(Working, now);
+        // The Enter that approved the permission dialog of `qoop park`, in the same second.
+        r.note_sent(1, b"\r", now);
+        assert!(r.set_parked(1, true, now), "a working agent can be parked");
+        assert!(r.is_parked(1), "the approving Enter is not an answer");
+        report(Idle, now);
+        assert!(r.is_parked(1), "settled, it reads parked");
+        assert!(r.take_unparked().is_empty());
+        // A line after the park that starts work is the answer.
+        r.note_sent(1, b"\r", now + 1);
+        report(Working, now + 1);
+        assert!(!r.is_parked(1));
+        assert_eq!(r.take_unparked(), [1], "and the store is told");
+    }
+
+    /// A park ends only on an answer: a person sent a line to the agent after the park and
+    /// it works again. Working without a line sent (a resume, a background wake) keeps it, and
+    /// keys that send nothing keep it.
     #[test]
     fn a_park_ends_when_an_answer_makes_the_agent_work_and_not_otherwise() {
         use AgentRuntimeState::{Idle, Working};
@@ -3375,8 +3410,6 @@ mod tests {
                 .expect("an admitted report applies")
         };
         report(Working, now);
-        assert!(!r.set_parked(1, true, now), "a working agent is not parked");
-        assert!(!r.is_parked(1));
         report(Idle, now);
         // Sent before the park: not an answer to it.
         r.note_sent(1, b"x\r", now - 5);
