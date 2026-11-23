@@ -5023,15 +5023,17 @@ async fn handle_control(
                 Some(guard) => guard,
                 None => books.lock_of(workspace).lock_owned().await,
             };
-            let at = crate::agents::now_unix();
-            // The registry first: it refuses a working agent under the same lock its state
-            // changes under. The store after, and the registry put back if the store fails.
-            if !agents.set_parked(terminal, on, at) {
+            // A park in a plain shell would be stored, outlive a restart and keep the tab
+            // awake; taking one back is never refused, it clears what a gone agent left.
+            if on && !agents.is_agent(terminal) {
                 return ControlResponse::Failed {
                     id,
-                    reason: "it is working: park it once it has answered".into(),
+                    reason: "only an agent can be saved".into(),
                 };
             }
+            let at = crate::agents::now_unix();
+            // The registry first, the store after, and the registry put back if the store fails.
+            agents.set_parked(terminal, on, at);
             match store.set_parked(terminal, on, at).await {
                 Ok(true) => ControlResponse::Renamed { id },
                 Ok(false) => {

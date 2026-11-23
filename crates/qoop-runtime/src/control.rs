@@ -311,7 +311,8 @@ pub enum ControlRequest {
         on: bool,
     },
     /// Park a terminal's agent to answer later, or take it back: a person read its reply and
-    /// set it aside. Refused while the agent works. Answered `Renamed`, like keep awake; the
+    /// set it aside, or the agent itself (`qoop park`, inside its own turn: the row reads parked once
+    /// the turn ends). Refused for a terminal that is no agent. Answered `Renamed`, like keep awake; the
     /// change is announced, so every client and the phone redraw the row.
     SetParked {
         id: String,

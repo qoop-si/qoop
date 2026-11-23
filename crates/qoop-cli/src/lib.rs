@@ -226,6 +226,7 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
         Some("messages") => messages::run(&args),
         Some("agents") => run_agents(&args),
         Some("focus") => run_focus(&args),
+        Some("park") => supervise::run_park(&args),
         Some("notch") => notch::run(&args),
         Some("wait") => supervise::run_wait(&args),
         Some("new") => supervise::run_new(&args),
@@ -380,6 +381,8 @@ fn run(phone: Option<Phone>) -> std::io::Result<()> {
                   \x20                 the way it does: state, authority, matched rule\n\
                   \x20 qoop focus <terminal> [--json]  show that terminal in every\n\
                   \x20                 attached interface\n\
+                  \x20 qoop park [--off]  this terminal's agent sets itself aside to answer later\n\
+                  \x20                 (run it inside the agent's turn); --off takes that back\n\
                  \x20 qoop reload-manifests  re-read agent-detection overrides\n\
                   \x20 qoop hooks ...  install an agent's own hook, so it says what it is\n\
                   \x20                 doing and which conversation it is having\n\

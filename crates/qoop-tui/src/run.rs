@@ -6810,8 +6810,8 @@ fn sleep_toggle(state: &mut State, request: &mut u64) {
 }
 
 /// Park an agent to answer later, or take it back: on when it was off, as the last list
-/// said, and sent with the value rather than as a toggle, like keep awake. The daemon refuses
-/// one that is working, and says why.
+/// said, and sent with the value rather than as a toggle, like keep awake. Saving one that is
+/// working is refused here and says why; taking a save back is never refused.
 fn park(state: &mut State, terminal: u32, request: &mut u64) {
     let Some(row) = state
         .rows
@@ -6822,6 +6822,12 @@ fn park(state: &mut State, terminal: u32, request: &mut u64) {
         return;
     };
     let on = !row.parked;
+    // The daemon takes a park from a working agent (`qoop park` runs inside its turn); the
+    // person's own control stays for an agent that has answered.
+    if on && matches!(crate::sidebar::shown_state(row), "working" | "starting") {
+        state.message = Some("it is working: save it once it has answered".to_string());
+        return;
+    }
     *request += 1;
     state.message = Some(
         if on {
@@ -24190,6 +24196,11 @@ mod tests {
     fn a_park_asks_for_the_opposite_of_what_the_list_said() {
         let mut state = tiled_state();
         let mut request = 0;
+        // The button is for an agent that has answered.
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.state = "idle".into();
+            row.status = None;
+        }
         park(&mut state, 2, &mut request);
         assert!(matches!(
             state.modes.outbox.pop(),
@@ -24211,6 +24222,30 @@ mod tests {
                 ..
             })
         ));
+        // A park made through `qoop park` while it works can still be taken back.
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.state = "working".into();
+            row.status = None;
+        }
+        park(&mut state, 2, &mut request);
+        assert!(matches!(
+            state.modes.outbox.pop(),
+            Some(ControlRequest::SetParked {
+                terminal: 2,
+                on: false,
+                ..
+            })
+        ));
+        // The button's own rule stays: a working agent that is not parked is not saved here.
+        if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
+            row.parked = false;
+        }
+        park(&mut state, 2, &mut request);
+        assert!(state.modes.outbox.is_empty(), "not while it works");
+        assert_eq!(
+            state.message.as_deref(),
+            Some("it is working: save it once it has answered")
+        );
         if let Some(row) = state.rows.iter_mut().find(|r| r.terminal == 2) {
             row.agent = false;
         }
