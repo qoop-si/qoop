@@ -91,18 +91,16 @@ fn copied(text: &str, via: crate::selection::CopyVia) -> String {
     }
 }
 
-/// The short form of what was copied: a line count, or the text itself cut to
-/// the notice row.
+/// The short form of what was copied: a line count, the text itself while it is short, or how
+/// many characters it was. Never the text cut: past 40 columns the count says what was taken.
 fn short_copied(text: &str) -> String {
     let lines = text.lines().count();
     if lines > 1 {
         return format!("{lines} lines");
     }
     let one = text.trim();
-    // Shown, so a person can see they got the right thing, and cut so a long line does not
-    // push the rest of the notice off the row.
     if crate::width::width(one) > 40 {
-        format!("{}\u{2026}", crate::selection::in_columns(one, 0..39))
+        format!("{} characters", one.chars().count())
     } else {
         one.to_string()
     }
@@ -2260,8 +2258,14 @@ impl State {
                 return Some(Clicked::QassSkipAgent(terminal));
             }
         }
+        // The rows a long space name wraps onto carry no controls: a click there is a click on
+        // the name, whatever column it lands in.
+        let act_col = match hit {
+            sidebar::Hit::Space(_) if !first => 0,
+            _ => col as usize,
+        };
         // A row that does two things answers with the row; the column decides which.
-        match sidebar::act(hit, col as usize, &column, self.collapsed)? {
+        match sidebar::act(hit, act_col, &column, self.collapsed)? {
             sidebar::Act::Space(space) => Some(Clicked::Space(space)),
             sidebar::Act::Fold(space) => Some(Clicked::Fold(space)),
             sidebar::Act::Doze(space) => Some(Clicked::Doze(space)),
@@ -2891,7 +2895,7 @@ impl State {
             chip: (
                 "\u{25be}".to_string(),
                 crate::theme::space_in(&self.spaces, space),
-                format!("{} ({count})", sidebar::chip_name(&row.name)),
+                format!("{} ({count})", row.name),
             ),
             pointer,
             rule,
@@ -3613,13 +3617,9 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
         } => agents
             .iter()
             .map(|a| {
-                // A long command is cut, so the box stays a box and not the width of the
-                // screen: the name already says which line it is.
+                // The command is whole: the menu wraps a long one inside its box.
                 let right = if a.command == a.name {
                     String::new()
-                } else if crate::width::width(&a.command) > MENU_COMMAND {
-                    let cut = crate::width::text(&a.command, MENU_COMMAND - 1);
-                    format!("{}\u{2026}", cut.trim_end())
                 } else {
                     a.command.clone()
                 };
@@ -3628,14 +3628,7 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
             .chain([("other command".to_string(), String::new())])
             .chain(earlier.iter().map(|row| {
                 let title = row.title.as_deref().unwrap_or("untitled");
-                let title = if crate::width::width(title) > MENU_TITLE {
-                    format!(
-                        "{}\u{2026}",
-                        crate::width::text(title, MENU_TITLE - 1).trim_end()
-                    )
-                } else {
-                    title.to_string()
-                };
+                let title = title.to_string();
                 let at = row.updated_at.or(row.started_at).unwrap_or(0) / 1000;
                 let age = crate::asks::age_short(crate::sidebar::now_unix() - at);
                 (title, format!("{} {age}", row.agent))
@@ -3660,10 +3653,6 @@ pub fn menu_rows(kind: &MenuKind) -> Vec<(String, String)> {
     }
 }
 
-/// The most columns an `[agents]` command takes on the right of the agents list.
-const MENU_COMMAND: usize = 30;
-/// The most columns an earlier conversation's title takes in the agents list.
-const MENU_TITLE: usize = 44;
 /// Earlier conversations the agents list offers at most; a list longer than the window
 /// scrolls with the pick.
 const EARLIER: usize = 50;
@@ -15549,6 +15538,17 @@ mod tests {
         assert_eq!(drag.rule, Some((foot2, 1)));
     }
 
+    /// What was copied is said whole while it is short and as a count past 40 columns: the text
+    /// is never cut to an ellipsis.
+    #[test]
+    fn a_long_copy_says_how_many_characters_and_never_cuts_the_text() {
+        assert_eq!(short_copied("hello"), "hello");
+        assert_eq!(short_copied("a\nb\nc"), "3 lines");
+        let long = "word ".repeat(12);
+        assert_eq!(short_copied(&long), "59 characters");
+        assert!(!short_copied(&long).contains('\u{2026}'));
+    }
+
     /// Saying something shows it on the notice row and as the small box, until the
     /// box's clock runs out.
     #[test]
@@ -27260,6 +27260,130 @@ mod tests {
                 out.replace(version, &"#".repeat(version.len()))
             })
             .collect()
+    }
+
+    /// The tree never cuts a name (QOOP-71, round 5b). At the three sizes the interface is checked
+    /// at, a long space name, title, worktree and activity wrap whole in the column with no
+    /// ellipsis, and every row a name wrapped onto answers a click as the name's first row does:
+    /// the controls and the close are on the first row only.
+    #[test]
+    fn the_tree_wraps_long_names_whole_at_three_sizes_and_every_row_answers_alike() {
+        let space_name = "alpha-bravo-charlie-delta-echo-foxtrot-golf-hotel-india-juliet-kilo-lima";
+        let title = "Implement OAuth scopes and refresh the dispatcher before the release";
+        for (cols, lines) in [(80u16, 24u16), (104, 30), (220, 60)] {
+            let mut state = qass_state();
+            (state.palette, state.menu) = (None, None);
+            (state.cols, state.lines, state.collapsed) = (cols, lines, false);
+            state.view = sidebar::View::Tree;
+            state.sidebar_width = sidebar::opening_width(cols);
+            state.spaces[0].name = space_name.into();
+            state.rows[0].agent_title = Some(title.into());
+            state.rows[0].cwd = Some("/home/u/a-very-long-worktree-name-that-keeps-going".into());
+            state.rows[0].state = "idle".into();
+            let left = screen::left_for(cols, false, state.sidebar_width);
+            let rows = sidebar_bytes(
+                &screen::paint(&state.frame()),
+                cols as usize,
+                lines as usize,
+                left,
+            );
+            // Without the ink marks: what a person reads.
+            let plain: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    let mut out = String::new();
+                    let mut mark = false;
+                    for ch in row.chars() {
+                        match ch {
+                            '<' => mark = true,
+                            '>' if mark => mark = false,
+                            _ if !mark => out.push(ch),
+                            _ => {}
+                        }
+                    }
+                    out
+                })
+                .collect();
+            assert!(
+                plain.iter().all(|row| !row.contains('\u{2026}')),
+                "{cols}x{lines}: an ellipsis in the tree:\n{}",
+                plain.join("\n")
+            );
+            let letters: String = plain
+                .iter()
+                .flat_map(|row| row.chars())
+                .filter(|c| c.is_alphabetic())
+                .collect();
+            assert!(
+                letters.contains(&space_name.replace('-', "")),
+                "{cols}x{lines}: the space name was cut:\n{}",
+                plain.join("\n")
+            );
+            for word in title.split(' ') {
+                assert!(
+                    plain.iter().any(|row| row.contains(word)),
+                    "{cols}x{lines}: {word:?} lost:\n{}",
+                    plain.join("\n")
+                );
+            }
+            // The click on every row of the space's rule and of the agent's name: the controls
+            // answer on the first row only.
+            let screen_rows = |hit: sidebar::Hit| -> Vec<u16> {
+                (1..=lines)
+                    .filter(|row| {
+                        state
+                            .column_hit_with(*row, None)
+                            .is_some_and(|(h, _)| h == hit)
+                    })
+                    .collect()
+            };
+            let rule_rows = screen_rows(sidebar::Hit::Space(1));
+            assert!(
+                rule_rows.len() >= 2,
+                "{cols}x{lines}: the name did not wrap"
+            );
+            // Every hyphen of the name is on screen: the letters check above cannot see one.
+            let hyphens: usize = rule_rows
+                .iter()
+                .map(|row| plain[*row as usize - 1].matches('-').count())
+                .sum();
+            assert_eq!(hyphens, space_name.matches('-').count(), "{cols}x{lines}");
+            {
+                for row in &rule_rows[1..] {
+                    assert!(
+                        !state
+                            .column_hit_with(*row, None)
+                            .is_some_and(|(_, first)| first)
+                    );
+                    for col in 1..=left as u16 {
+                        assert!(
+                            !matches!(
+                                state.clicked_with(*row, col, None),
+                                Some(Clicked::New(_) | Clicked::Close(_) | Clicked::Drawer(_))
+                            ),
+                            "{cols}x{lines}: row {row} col {col} reached a control"
+                        );
+                    }
+                }
+            }
+            let agent_rows = screen_rows(sidebar::Hit::Terminal(1));
+            assert!(agent_rows.len() >= 3, "{cols}x{lines}: {agent_rows:?}");
+            for row in agent_rows.iter().filter(|row| {
+                state
+                    .column_hit_with(**row, None)
+                    .is_some_and(|(_, first)| !first)
+            }) {
+                for col in 1..=left as u16 {
+                    assert!(
+                        matches!(
+                            state.clicked_with(*row, col, None),
+                            Some(Clicked::Terminal(1)) | None
+                        ),
+                        "{cols}x{lines}: row {row} col {col} reached a control"
+                    );
+                }
+            }
+        }
     }
 
     /// The left sidebar is frozen: its cells, characters and inks both, are pinned to recorded

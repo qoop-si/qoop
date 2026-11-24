@@ -49,8 +49,10 @@ pub(crate) fn ink(role: Role, fade: bool) -> String {
     theme::fg(if fade { Role::Unobserved } else { role })
 }
 
-/// `segs` painted into exactly `cols` columns. Words cut at the edge end the line, in an
-/// ellipsis.
+/// `segs` painted into exactly `cols` columns. Every row is built whole and wrapped to its
+/// columns by its caller, so nothing reaches the edge. A row that still does is held at the edge
+/// with no mark of its own, and in a debug build (every test) it panics, so a row built too wide
+/// fails the tests at the sizes the interface is checked at instead of being cut silently.
 pub(crate) fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -59,24 +61,42 @@ pub(crate) fn line(segs: &[Seg], cols: usize, fade: bool) -> String {
             break;
         }
         let all = cut(&s.text, usize::MAX);
-        let cut_off = width::width(&all) > cols - used;
-        let text = match (cut_off, all.trim().is_empty()) {
-            (false, _) => all,
-            (true, true) => cut(&all, cols - used),
-            (true, false) => crate::asks::cut_dots(&all, cols - used),
-        };
+        debug_assert!(
+            width::width(&all) <= cols - used || all.trim().is_empty(),
+            "segs::line cut {all:?} at {cols} columns"
+        );
+        let text = cut(&all, cols - used);
         used += width::width(&text);
         out.push_str(&ink(s.role, fade));
         if s.bold && !fade {
             out.push_str("\x1b[1m");
         }
         out.push_str(&text);
-        // Nothing after a cut: the ellipsis is the line's end.
-        if cut_off {
-            break;
-        }
     }
     out.push_str(theme::RESET);
     out.push_str(&" ".repeat(cols.saturating_sub(used)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_that_fits_is_painted_whole_and_padded() {
+        let painted = line(&[seg(Role::Text, "ab"), seg(Role::Text, "cd")], 6, false);
+        assert!(
+            painted.contains("ab") && painted.contains("cd"),
+            "{painted:?}"
+        );
+    }
+
+    /// A row built wider than its columns is a bug in the row's own wrap: it panics in a debug
+    /// build, where every test runs, rather than being cut without a mark.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "segs::line cut")]
+    fn a_row_wider_than_its_columns_fails_the_tests() {
+        line(&[seg(Role::Text, "abcdefgh")], 4, false);
+    }
 }

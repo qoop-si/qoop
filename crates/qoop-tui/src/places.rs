@@ -17,6 +17,15 @@ use crate::ledger::Ledger;
 use crate::mux::machine_of;
 use crate::theme::Role;
 
+/// "last seen running at 17:02", or "not seen running since this window opened" with no time:
+/// how the ledger, the Inbox's header and the desktop say qass is not running.
+pub fn seen_running(at: Option<&str>) -> String {
+    match at {
+        Some(at) => format!("last seen running at {at}"),
+        None => "not seen running since this window opened".to_string(),
+    }
+}
+
 /// The key qass's own record is kept under in [`Reach`]: no machine has this number.
 pub const QASS: usize = usize::MAX;
 
@@ -51,6 +60,11 @@ impl Reach {
     /// The time a machine (or qass) was last seen reached, "16:58".
     pub fn last(&self, key: usize) -> Option<String> {
         self.seen.get(&key).map(|at| clock(*at))
+    }
+
+    /// When qass was last seen running, in the one phrase every surface uses.
+    pub fn qass_seen(&self) -> String {
+        seen_running(self.last(QASS).as_deref())
     }
 
     /// "not reached since 16:58", or since this window opened when it was never seen reached.

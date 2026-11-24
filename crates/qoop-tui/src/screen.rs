@@ -361,7 +361,11 @@ fn all_hints(context: KeyContext) -> &'static [Hint] {
             ("r", Some("reply"), 3),
             ("f", Some("from qass"), 4),
             ("tab", Some("board"), 4),
+            ("g", Some("go to agent"), 5),
             ("n", Some("new agent"), 5),
+            ("o", Some("talk it through"), 6),
+            ("m", Some("read whole"), 6),
+            ("x", Some("put away"), 7),
             ("j k", Some("move"), 6),
             ("esc", Some("back"), 0),
         ],
@@ -1545,6 +1549,18 @@ pub fn paint(frame: &Frame) -> String {
             None => (calm(frame, watched), None),
         },
     };
+    // A transient notice with no whole wording that fits its row takes the hints row under it as
+    // well, wrapped whole, until the next key clears it.
+    let wrapped: Option<Vec<String>> = (message.is_some()
+        && frame.chrome.mode.is_none()
+        && !spotlight
+        && !frame.chrome.answer
+        && !notice_fits(&notice, notice_room))
+    .then(|| crate::asks::wrap_whole(&notice, notice_room.max(1)));
+    let notice = match &wrapped {
+        Some(rows) => rows.first().cloned().unwrap_or_default(),
+        None => notice,
+    };
     // `mode` is never set while a close is asked, so the two never meet.
     match frame.chrome.mode {
         Some((word, keys)) => {
@@ -1597,6 +1613,18 @@ pub fn paint(frame: &Frame) -> String {
     match mode {
         // Written with ctrl-a and named on the way out, like the keys box.
         Some(keys) => out.push_str(&width::fit(&crate::keys::named(keys), frame.cols as usize)),
+        // The rest of a wrapped notice, in its own ink, where the keys would be.
+        None if wrapped.as_ref().is_some_and(|rows| rows.len() > 1) => {
+            let rest = wrapped
+                .as_ref()
+                .map(|rows| rows[1..].join(" "))
+                .unwrap_or_default();
+            out.push_str(&match notice_role {
+                Some(role) => theme::status_in(role),
+                None => theme::status(),
+            });
+            out.push_str(&width::fit(&rest, frame.cols as usize));
+        }
         None => out.push_str(&crate::keys::named(&key_row(
             frame.chrome.keys,
             Place {
@@ -1725,20 +1753,17 @@ pub fn paint(frame: &Frame) -> String {
         // At the end of the query, inside the box, wherever the box ended up.
         let w = palette_width(frame.cols);
         let left = (frame.cols as usize).saturating_sub(w) / 2;
-        let rows = palette
-            .items(
-                frame.rows,
-                frame.spaces,
-                frame.focused,
-                frame.seen,
-                frame.unseen,
-            )
-            .len()
-            .max(1);
-        let row = palette_query_row(frame.lines, rows + count_headers(frame, palette));
+        let inner = w.saturating_sub(2);
+        let entries = palette.items(
+            frame.rows,
+            frame.spaces,
+            frame.focused,
+            frame.seen,
+            frame.unseen,
+        );
+        let row = palette_query_row(frame.lines, palette_rows(&entries, inner));
         // Past the border and the prompt marker, at the end of what has been typed, and
         // never on the filters beside it.
-        let inner = w.saturating_sub(2);
         let chips = chips_width(&palette_chips(palette.filter, &palette.query, inner));
         let col = (left + 4 + width::width(&palette.query))
             .min(left + 3 + inner.saturating_sub(3 + chips).max(1));
@@ -1807,17 +1832,32 @@ fn triage_with(next: Option<&Next>, prefix: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// The notice in `room` columns. One that ends on the key to press (`…: ctrl-a Q`) keeps the
-/// key and gives up the words before it.
+/// The notice in `room` columns, whole. One that ends on the key to press (`...: ctrl-a Q`)
+/// that does not fit gives up its words and keeps the key: two whole candidates, the fullest
+/// first, as the next line has, and never a cut with an ellipsis. A transient notice with no
+/// whole wording that fits does not come here: it wraps over the notice row and the hints row
+/// under it (`wrapped_notice`).
 fn fit_notice(notice: &str, room: usize) -> String {
-    match notice.rsplit_once(": ") {
-        Some((words, key)) if width::width(notice) > room && width::width(key) <= 12 => {
-            let left = room.saturating_sub(width::width(key) + 3);
-            let words = width::text(words, left);
-            width::fit(&format!("{}\u{2026}: {key}", words.trim_end()), room)
-        }
-        _ => width::fit(notice, room),
-    }
+    width::fit(&first_fitting(&notice_candidates(notice), room), room)
+}
+
+/// The whole wordings a notice can take, the fullest first: itself, then the key it ends on.
+fn notice_candidates(notice: &str) -> Vec<String> {
+    let prefix = crate::keys::prefix_name();
+    let key = notice
+        .rsplit_once(": ")
+        .map(|(_, key)| key)
+        .filter(|key| key.starts_with(&prefix) && width::width(key) <= 12);
+    std::iter::once(notice.to_string())
+        .chain(key.map(str::to_string))
+        .collect()
+}
+
+/// Whether a whole wording of the notice fits `room`.
+fn notice_fits(notice: &str, room: usize) -> bool {
+    notice_candidates(notice)
+        .iter()
+        .any(|c| width::width(c) <= room)
 }
 
 /// What the notice row says while a pane is zoomed: that it is, and the key that shows every
@@ -1912,15 +1952,19 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
         frame.seen,
         frame.unseen,
     );
-    let w = palette_width(frame.cols);
-    let left = cols.saturating_sub(w) / 2;
     // What each row is, so the painter can put the same colours on it that the column puts
     // on the same things: a header, a row and which entry it came from.
     enum Kind<'a> {
         Header(&'a str),
-        Row(&'a crate::palette::Entry),
+        /// An entry's row: the entry, and which of its wrapped rows this is.
+        Row(&'a crate::palette::Entry, usize),
         Empty,
     }
+    let w = palette_width(frame.cols);
+    let left = cols.saturating_sub(w) / 2;
+    let inner = w.saturating_sub(2);
+    // The rows the list is made of. An entry that does not fit one row wraps whole onto more,
+    // and every row of it is selected with it.
     let mut display: Vec<(Kind<'_>, bool)> = Vec::new();
     let mut section = "";
     for (at, entry) in entries.iter().enumerate() {
@@ -1928,7 +1972,9 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
             section = entry.section;
             display.push((Kind::Header(section), false));
         }
-        display.push((Kind::Row(entry), at == palette.selected));
+        for piece in 0..palette_pieces(entry, inner).1.len() {
+            display.push((Kind::Row(entry, piece), at == palette.selected));
+        }
     }
     if display.is_empty() {
         display.push((Kind::Empty, false));
@@ -1941,12 +1987,18 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     let first = if display.len() <= budget {
         0
     } else {
-        let selected_at = display
+        // The selected entry's rows stay on screen together while they fit, its last row
+        // first and its first row at the latest.
+        let start = display
             .iter()
             .position(|(_, selected)| *selected)
             .unwrap_or(0);
-        selected_at
-            .saturating_sub(budget.saturating_sub(1))
+        let end = display
+            .iter()
+            .rposition(|(_, selected)| *selected)
+            .unwrap_or(0);
+        end.saturating_sub(budget.saturating_sub(1))
+            .min(start)
             .min(display.len() - budget)
     };
     // Centred down the screen as well as across it. Pinned near the top it sat in the
@@ -1954,7 +2006,6 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
     // open rather than something waiting to be typed into.
     let height = budget + chrome;
     let top = (lines.saturating_sub(height)) / 2;
-    let inner = w.saturating_sub(2);
 
     // The query, with the prompt in the colour the pane's own prompts are not, so the box
     // says where typing goes. The filters sit at its right, the one in force bright.
@@ -1989,7 +2040,7 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                 line.push_str(&theme::fg(theme::Role::FaintText));
                 line.push_str(&width::fit(" no match", inner));
             }
-            Kind::Row(entry) => {
+            Kind::Row(entry, piece) => {
                 // The same three colours the column uses, for the same three things: the
                 // space in its own, the state in its own, and everything else plain. A row
                 // that arrives here grey is a row a person has to read to place.
@@ -2000,41 +2051,52 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                 };
                 let state_ink = entry.state.as_deref().map(theme::of);
                 let space_ink = entry.space.map(|id| theme::space_in(frame.spaces, id));
-                // Cut to the box: on the narrowest windows a state word alone is wider
-                // than the room beside its two spaces, and the row ran off the screen.
-                let sub = width::text(
-                    &entry.sub,
-                    width::width(&entry.sub).min(inner.saturating_sub(3)),
-                );
+                let (sub, pieces) = palette_pieces(entry, inner);
                 let room = inner.saturating_sub(width::width(&sub) + 3);
-                // Too long for the row, the space's name gives way first, behind a `…`:
-                // what follows it is a tab's own name, and two tabs of one long named space
-                // must still read apart. Whatever is still too long ends in a `…` too.
-                let (space, rest) = split_cols(&entry.text, entry.space_len);
-                let space = if width::width(&entry.text) > room {
-                    let keep = room.saturating_sub(width::width(rest));
-                    sidebar::shorten_middle(space, keep.max(entry.space_len.min(PALETTE_SPACE)))
-                } else {
-                    space.to_string()
-                };
-                let len = width::width(&space);
+                // The words of the space's name in the rows before this one, so its colour
+                // carries on over a name that wrapped.
+                let spent: usize = pieces[..*piece]
+                    .iter()
+                    .map(|p| p.chars().filter(|c| !c.is_whitespace()).count())
+                    .sum();
+                let named = split_cols(&entry.text, entry.space_len)
+                    .0
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .count();
                 // Composed text, so every space in it is meant: the grid fitter would drop
                 // the one after a wide character.
-                let head = width::text(
-                    &sidebar::shorten_middle(&format!("{space}{rest}"), room),
-                    room,
-                );
+                let head = width::text(&pieces[*piece], room);
                 line.push_str(&base);
-                line.push(if *selected { PICK_MARK } else { ' ' });
+                line.push(if *piece == 0 && *selected {
+                    PICK_MARK
+                } else {
+                    ' '
+                });
                 line.push(' ');
+                let inked = named.saturating_sub(spent);
                 match space_ink {
-                    Some(ink) if len > 0 && len <= width::width(&head) => {
+                    Some(ink) if inked > 0 => {
+                        // The characters of the name, spaces between its words included.
+                        let mut left_to_ink = inked;
+                        let cut_at = head
+                            .char_indices()
+                            .find(|(_, c)| {
+                                if left_to_ink == 0 {
+                                    return true;
+                                }
+                                if !c.is_whitespace() {
+                                    left_to_ink -= 1;
+                                }
+                                false
+                            })
+                            .map_or(head.len(), |(i, _)| i);
+                        let (lead, tail) = head.split_at(cut_at);
                         line.push_str(&if *selected {
                             picked(theme::selected_in(ink))
                         } else {
                             theme::fg(ink)
                         });
-                        let (lead, tail) = split_cols(&head, len);
                         line.push_str(lead);
                         line.push_str(&base);
                         line.push_str(tail);
@@ -2042,13 +2104,17 @@ fn paint_palette(frame: &Frame, palette: &Palette, out: &mut String) {
                     _ => line.push_str(&head),
                 }
                 line.push(' ');
-                line.push_str(&match (state_ink, *selected) {
-                    (Some(ink), true) => picked(theme::selected_in(ink)),
-                    (Some(ink), false) => theme::fg(ink),
-                    (None, true) => picked(theme::selected()),
-                    (None, false) => theme::fg(theme::Role::FaintText),
-                });
-                line.push_str(&sub);
+                if *piece == 0 {
+                    line.push_str(&match (state_ink, *selected) {
+                        (Some(ink), true) => picked(theme::selected_in(ink)),
+                        (Some(ink), false) => theme::fg(ink),
+                        (None, true) => picked(theme::selected()),
+                        (None, false) => theme::fg(theme::Role::FaintText),
+                    });
+                    line.push_str(&sub);
+                } else {
+                    line.push_str(&" ".repeat(width::width(&sub)));
+                }
                 line.push_str(&base);
             }
         }
@@ -2074,8 +2140,32 @@ fn picked(escape: String) -> String {
     escape + "\x1b[1m"
 }
 
-/// The columns a cut space name keeps on a palette row however long the tab's name after it.
-const PALETTE_SPACE: usize = 12;
+/// What a palette entry's row is made of: its state word, cut to the box (a state is one short
+/// word; only a window a few columns wide cuts it), and its words, the space's name and what
+/// follows, wrapped whole into the room beside it. Never cut: a long name takes more rows.
+fn palette_pieces(entry: &crate::palette::Entry, inner: usize) -> (String, Vec<String>) {
+    let sub = width::text(
+        &entry.sub,
+        width::width(&entry.sub).min(inner.saturating_sub(3)),
+    );
+    let room = inner.saturating_sub(width::width(&sub) + 3);
+    let pieces = crate::asks::wrap_whole(&entry.text, room);
+    (sub, pieces)
+}
+
+/// How many rows the palette's list takes: a header per section, and an entry's rows.
+fn palette_rows(entries: &[crate::palette::Entry], inner: usize) -> usize {
+    let mut section = "";
+    let mut rows = 0;
+    for entry in entries {
+        if entry.section != section {
+            section = entry.section;
+            rows += 1;
+        }
+        rows += palette_pieces(entry, inner).1.len();
+    }
+    rows.max(1)
+}
 
 /// `text` split where its columns reach `cols`, not after `cols` characters: counted in
 /// characters, a wide space name lost text and pulled the right border two columns in.
@@ -2117,26 +2207,6 @@ fn chips_width(chips: &[Filter]) -> usize {
         return 0;
     }
     chips.iter().map(|c| c.name().len()).sum::<usize>() + 2 * (chips.len() - 1) + 1
-}
-
-/// How many section headers the palette will draw, which take rows like anything else.
-fn count_headers(frame: &Frame, palette: &Palette) -> usize {
-    let entries = palette.items(
-        frame.rows,
-        frame.spaces,
-        frame.focused,
-        frame.seen,
-        frame.unseen,
-    );
-    let mut sections = 0;
-    let mut section = "";
-    for entry in &entries {
-        if entry.section != section {
-            section = entry.section;
-            sections += 1;
-        }
-    }
-    sections
 }
 
 /// Where the palette's query line is drawn, so the cursor can be put at the end of it.
@@ -2699,19 +2769,88 @@ pub(crate) fn menu_rect(
         };
         (n.max(width::width(name)), k.max(keypart))
     });
-    // The marker's column and a space before every name, so the picked row never shifts.
+    // The marker's column and a space before every name, so the picked row never shifts. A row
+    // longer than the box wraps whole inside it (the name under itself), so the box stays a box
+    // and not the width of the screen.
     let inner = (2 + max_name + 1 + max_key)
+        .min(MENU_INNER_MAX)
+        .min(cols.saturating_sub(4))
         // The title is cut to the box when painted, so it never keeps the menu from showing.
         .max((width::width(title.trim()) + 4).min(cols.saturating_sub(4)))
         .max(footer_width(MENU_HINT));
     let w = inner + 2;
-    let height = menu_shown(lines, menu_drawn(lines, rows).len()) + 3;
+    let shown_lines = menu_display(lines, rows, inner).len();
+    let height = menu_shown(lines, shown_lines) + 3;
     if cols < w + 2 || lines < height + 2 {
         return None;
     }
     let left = cols.saturating_sub(w) / 2;
     let top = lines.saturating_sub(height) / 2;
     Some((left, top, w, height))
+}
+
+/// The most columns a menu's rows take before they wrap.
+const MENU_INNER_MAX: usize = 58;
+
+/// One line of the menu as drawn: the row it belongs to, its words, what stands at its right.
+pub(crate) struct MenuLine {
+    pub(crate) row: usize,
+    pub(crate) name: String,
+    pub(crate) right: String,
+    pub(crate) first: bool,
+}
+
+/// What a row says in a box `inner` columns wide, as lines: the name wrapped whole, the right
+/// part (a key, a state, a command) on the first line when it takes at most half the box, else
+/// wrapped whole under the name.
+fn menu_wrap(name: &str, right: &str, inner: usize) -> Vec<(String, String)> {
+    let room = inner.saturating_sub(2);
+    let right_w = width::width(right);
+    if right.is_empty() || right_w * 2 <= inner {
+        let name_room = if right.is_empty() {
+            room
+        } else {
+            room.saturating_sub(right_w + 1)
+        };
+        let mut lines: Vec<(String, String)> = crate::asks::wrap_whole(name, name_room.max(1))
+            .into_iter()
+            .map(|piece| (piece, String::new()))
+            .collect();
+        if let Some(first) = lines.first_mut() {
+            first.1 = right.to_string();
+        }
+        return lines;
+    }
+    let mut lines: Vec<(String, String)> = crate::asks::wrap_whole(name, room.max(1))
+        .into_iter()
+        .map(|piece| (piece, String::new()))
+        .collect();
+    // Indented under the name, in the room that is left after the indent.
+    lines.extend(
+        crate::asks::wrap_whole(right, room.saturating_sub(2).max(1))
+            .into_iter()
+            .map(|piece| (format!("  {piece}"), String::new())),
+    );
+    lines
+}
+
+/// The lines the menu draws, in order: each drawn row as the lines it wraps to.
+pub(crate) fn menu_display(lines: usize, rows: &[(String, String)], inner: usize) -> Vec<MenuLine> {
+    menu_drawn(lines, rows)
+        .into_iter()
+        .flat_map(|row| {
+            let (name, right) = &rows[row];
+            menu_wrap(name, right, inner)
+                .into_iter()
+                .enumerate()
+                .map(move |(at, (name, right))| MenuLine {
+                    row,
+                    name,
+                    right,
+                    first: at == 0,
+                })
+        })
+        .collect()
 }
 
 /// Which menu row a one based screen position lands on, if it lands on one, with
@@ -2732,10 +2871,16 @@ pub(crate) fn menu_row_at(
     }
     let shown = height - 3;
     let line = r.checked_sub(top + BOX_FIRST_ROW)?;
-    let drawn = menu_drawn(lines as usize, rows);
-    let pick = drawn.iter().position(|&i| i == selected).unwrap_or(0);
-    let at = menu_first(drawn.len(), shown, pick) + line;
-    drawn.get(at).copied().filter(|_| line < shown)
+    let display = menu_display(lines as usize, rows, w - 2);
+    let pick = menu_pick(&display, selected);
+    let at = menu_first(display.len(), shown, pick) + line;
+    display.get(at).map(|l| l.row).filter(|_| line < shown)
+}
+
+/// The line the scroll keeps in view for the picked row: its last, so a wrapped row shows whole
+/// while it fits.
+fn menu_pick(display: &[MenuLine], selected: usize) -> usize {
+    display.iter().rposition(|l| l.row == selected).unwrap_or(0)
 }
 
 /// The menu's keys, said once for the box and for the width it needs.
@@ -2756,23 +2901,24 @@ fn paint_menu(frame: &Frame, selected: usize, kind: &crate::run::MenuKind, out: 
     };
     let inner = w.saturating_sub(2);
     let shown = height - 3;
-    let drawn = menu_drawn(frame.lines as usize, &rows);
-    let pick = drawn.iter().position(|&i| i == selected).unwrap_or(0);
-    let mut body: Vec<String> = drawn
+    let display = menu_display(frame.lines as usize, &rows, inner);
+    let pick = menu_pick(&display, selected);
+    let mut body: Vec<String> = display
         .iter()
-        .skip(menu_first(drawn.len(), shown, pick))
+        .skip(menu_first(display.len(), shown, pick))
         .take(shown)
-        .map(|&i| {
-            let (name, keypart) = &rows[i];
-            let (ink, lead) = if i == selected {
+        .map(|l| {
+            let (ink, lead) = if l.row == selected && l.first {
                 (picked(theme::selected()), PICK_MARK)
+            } else if l.row == selected {
+                (picked(theme::selected()), ' ')
             } else {
                 (theme::fg(theme::Role::Text), ' ')
             };
             // The name on the left, its key or its state on the right: the main menu
             // teaches the shortcut each row replaces, so the next visit skips it.
-            let gap = inner.saturating_sub(2 + width::width(name) + width::width(keypart));
-            let cell = format!("{lead} {name}{}{keypart}", " ".repeat(gap));
+            let gap = inner.saturating_sub(2 + width::width(&l.name) + width::width(&l.right));
+            let cell = format!("{lead} {}{}{}", l.name, " ".repeat(gap), l.right);
             format!("{ink}{}", width::fit(&cell, inner))
         })
         .collect();
@@ -3233,6 +3379,16 @@ fn confirm_fits(frame: &Frame, terminal: u32) -> bool {
         && frame.rows.iter().any(|r| r.terminal == terminal)
 }
 
+/// What a drag chip says after its mark: the name whole, or, when the name is wider than the
+/// screen, only the count of panes riding along (`(+2)`), so a name is never drawn in part.
+fn chip_name(mark: &str, name: &str, cols: usize) -> String {
+    if 1 + width::width(mark) + width::width(name) < cols {
+        return name.to_string();
+    }
+    name.rfind(" (")
+        .map_or_else(String::new, |at| name[at + 1..].to_string())
+}
+
 /// A carried row: the rectangle it would take over a pane, then its chip beside the pointer.
 ///
 /// The chip sits two columns right of the pointer so the pointer never hides its mark, and
@@ -3260,6 +3416,7 @@ fn paint_drag(frame: &Frame, drag: &DragPaint, out: &mut String) {
     if name.is_empty() {
         return;
     }
+    let name = &chip_name(mark, name, cols);
     let text_cols = 1 + width::width(mark) + width::width(name) + 1;
     if text_cols > cols || lines <= STATUS {
         return;
@@ -5376,12 +5533,27 @@ mod tests {
         }
     }
 
-    /// A notice that ends on its key keeps the key when the row is short: the words go first.
+    /// A notice that ends on its key keeps the key when the row is short: the words go first,
+    /// whole, and nothing is cut with an ellipsis; the notice stays whole while it fits.
     #[test]
-    fn a_short_notice_row_keeps_the_key() {
-        let said = fit_notice("the questions are on qass's screen: ctrl-a Q", 40);
-        assert!(said.trim_end().ends_with("\u{2026}: ctrl-a Q"), "{said:?}");
-        assert!(width::width(&said) <= 40);
+    fn a_short_notice_row_keeps_the_key_and_cuts_nothing() {
+        let notice = "the questions are in the Inbox: ctrl-a i";
+        let said = fit_notice(notice, 30);
+        assert_eq!(said.trim_end(), "ctrl-a i", "{said:?}");
+        assert_eq!(width::width(&said), 30);
+        assert!(!said.contains('\u{2026}'));
+        for room in 8..=60 {
+            let said = fit_notice(notice, room);
+            assert!(said.trim_end().ends_with("ctrl-a i"), "{room}: {said:?}");
+            assert!(!said.contains('\u{2026}'), "{room}: {said:?}");
+            assert_eq!(width::width(&said), room);
+        }
+        assert_eq!(fit_notice(notice, 60).trim_end(), notice);
+        // A reason after a colon is not a key: it is never taken for one and dropped to.
+        assert_eq!(
+            fit_notice("could not start claude: not found", 80).trim_end(),
+            "could not start claude: not found"
+        );
         assert_eq!(
             fit_notice("short: ctrl-a Q", 40).trim_end(),
             "short: ctrl-a Q"
@@ -5500,6 +5672,48 @@ mod tests {
         );
         assert_eq!(
             menu_row_at(80, 24, &rows, " list", 0, (first_line, col)),
+            Some(0)
+        );
+    }
+
+    /// A row longer than the box wraps whole inside it: the name under itself, the right part
+    /// on the first line, and a click on any of its lines takes the row.
+    #[test]
+    fn a_long_menu_row_wraps_whole_and_every_line_of_it_is_the_row() {
+        let title =
+            "Implement OAuth scopes and refresh the dispatcher before the release candidate";
+        let command = "claude --model sonnet --dangerously-skip-permissions --add-dir /tmp/a-very-long-folder";
+        let rows = vec![
+            (title.to_string(), "claude 3d".to_string()),
+            ("other command".to_string(), String::new()),
+            ("claudes".to_string(), command.to_string()),
+        ];
+        let Some((left, top, w, _)) = menu_rect(80, 40, &rows, " earlier") else {
+            panic!("the menu draws");
+        };
+        let display = menu_display(40, &rows, w - 2);
+        let of =
+            |row: usize| -> Vec<&MenuLine> { display.iter().filter(|l| l.row == row).collect() };
+        // The title: every word, in order, the right part only on its first line.
+        let said: Vec<&str> = of(0).iter().map(|l| l.name.as_str()).collect();
+        assert!(said.len() >= 2, "{said:?}");
+        assert_eq!(said.join(" "), title);
+        assert_eq!(of(0)[0].right, "claude 3d");
+        assert!(of(0)[1..].iter().all(|l| l.right.is_empty()));
+        // A command wider than half the box takes lines of its own, whole.
+        let command_said: String = of(2)
+            .iter()
+            .skip(1)
+            .map(|l| l.name.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(command_said, command);
+        assert!(display.iter().all(|l| !l.name.contains('\u{2026}')));
+        // A click on the second line of the first row is the first row.
+        let col = (left + 3 + 1) as u16;
+        let second = (top + BOX_FIRST_ROW + 2) as u16;
+        assert_eq!(
+            menu_row_at(80, 40, &rows, " earlier", 0, (second, col)),
             Some(0)
         );
     }
@@ -5625,6 +5839,58 @@ mod tests {
             chrome: Default::default(),
         });
         assert!(painted.contains("starting a terminal"));
+    }
+
+    /// A transient notice wider than its row, with no key to fall back to, is wrapped whole over
+    /// the notice row and the hints row under it, so every word is on screen until the next key.
+    #[test]
+    fn a_long_notice_takes_the_hints_row_and_loses_no_word() {
+        let said = "could not start the agent in this folder because it asked for a login first";
+        let rows = [row(1, "zsh", "starting")];
+        let paint_at = |message: Option<&str>| {
+            strip(&paint(&Frame {
+                armed: None,
+                drawer: None,
+                rows: &rows,
+                spaces: &spaces(),
+                panes: std::collections::BTreeMap::new(),
+                space: Some(1),
+                focused: 1,
+                snapshot: None,
+                cols: 50,
+                lines: 8,
+                message,
+                hint: None,
+                palette: None,
+                prompt: None,
+                menu: None,
+                collapsed: false,
+                reading: None,
+                selection: None,
+                scroll: 0,
+                tick: 0,
+                now_unix: TEST_NOW,
+                sidebar_width: sidebar::WIDTH,
+                view: sidebar::View::Tree,
+                seen: &sidebar::Seen::new(),
+                unseen: &sidebar::Unseen::new(),
+                anchor: 0,
+                rows_back: 0,
+                tiles: Vec::new(),
+                behind: &crate::run::Behind::default(),
+                image_notice: None,
+                toast: None,
+                chrome: Default::default(),
+            }))
+        };
+        let long = paint_at(Some(said));
+        for word in said.split(' ') {
+            assert!(long.contains(word), "{word:?} lost: {long:?}");
+        }
+        assert!(!long.contains("find"), "the hints gave way: {long:?}");
+        // With no notice, or a short one, the hints are back.
+        assert!(paint_at(None).contains("find"));
+        assert!(paint_at(Some("short")).contains("find"));
     }
 
     #[test]
@@ -6054,6 +6320,16 @@ mod tests {
         assert!(painted.ends_with("\x1b[?25h"), "{painted:?}");
     }
 
+    /// A name wider than the screen is never drawn in part: the chip keeps the mark and the count
+    /// of panes riding along.
+    #[test]
+    fn a_drag_chip_wider_than_the_screen_keeps_only_its_count() {
+        let long = format!("{} (+2)", "n".repeat(100));
+        assert_eq!(chip_name("..", &long, 80), "(+2)");
+        assert_eq!(chip_name("..", "short (+2)", 80), "short (+2)");
+        assert_eq!(chip_name("..", &"n".repeat(100), 80), "");
+    }
+
     /// A carried row paints its chip beside the pointer, the rectangle it would take over
     /// the pane, and its own row dimmed in place.
     #[test]
@@ -6326,6 +6602,16 @@ mod tests {
         }
         // The Inbox's own `f` is its filter, whether or not a space can fold.
         assert!(idle.contains("[f\u{2192}from qass]"), "{idle:?}");
+        // Every key the Inbox has is named when the row has room: go to the agent, talk it
+        // through, read the card whole, put it away.
+        for key in [
+            "[g\u{2192}go to agent]",
+            "[o\u{2192}talk it through]",
+            "[m\u{2192}read whole]",
+            "[x\u{2192}put away]",
+        ] {
+            assert!(idle.contains(key), "{key} missing: {idle:?}");
+        }
         let holding = row(Place {
             holding: true,
             ..Place::default()
@@ -7350,11 +7636,14 @@ mod tests {
         assert!(shown.contains("中文ab codex"), "{shown:?}");
         let long = space("mobile app with a long space name that will not fit");
         let shown = painted(&[named(1, "expo"), named(2, "metro")], &long);
+        // Never cut: the name wraps onto a second row, and the tab's own name is read whole.
+        assert!(!shown.contains('\u{2026}'), "{shown}");
+        assert!(
+            shown.contains("mobile app with a long space name that will not"),
+            "{shown}"
+        );
         for tab in ["expo", "metro"] {
-            assert!(
-                shown.contains(&format!("\u{2026} {tab} ")),
-                "{tab}: {shown}"
-            );
+            assert!(shown.contains(tab), "{tab}: {shown}");
         }
     }
 

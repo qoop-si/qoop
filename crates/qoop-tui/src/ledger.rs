@@ -111,10 +111,7 @@ pub fn said(stand: &Stand, env: &Env) -> String {
         Stand::Asleep => "asleep: it sleeps when idle. s wakes it".to_string(),
         Stand::Paused => "paused: it wakes only when you write to it".to_string(),
         Stand::Stopped => {
-            let when = match env.beside.reach.last(crate::places::QASS) {
-                Some(at) => format!("last seen running at {at}"),
-                None => "not seen running since this window opened".to_string(),
-            };
+            let when = env.beside.reach.qass_seen();
             format!(
                 "stopped, {when}. What it held is back in your Inbox, and new questions come straight to you"
             )

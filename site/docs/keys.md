@@ -17,8 +17,8 @@ program.
 | `ctrl-a w` | new space |
 | `ctrl-a s`, `ctrl-a S` | next, previous space |
 | `ctrl-a R` | the space's settings: its name and colour |
-| `ctrl-a Q` | qass's ledger over the pane, or put away: how qass stands with `p` to pause or resume it (`s` starts it when it is stopped, and opens its terminal), a link to the questions it asked you (`i` opens them in the Inbox), what it holds, what it did today as the daemon recorded it, its schedules (add or change them with `qoop schedule`), its rules as a count, and a line to ask it (`a`, then `enter`). `t` opens qass's own terminal, `esc` goes back. A click on the pet in the column's foot does the same |
-| `ctrl-a i` | Inbox: from any tab, everything that needs you as one list, oldest first, one card each, with the count in its title. Below 100 columns it folds the agents column while it is open. In it `j` `k` move, `1` to `9` answer with the option of that number (the answer waits 3 seconds, `u` takes it back, `enter` sends it now), `h` hands the question to qass to decide, `r` types your own words, `g` goes to that agent's tab, `o` talks it through with the agent, `m` reads the whole card, `x` puts it away, `f` shows only what qass asked (again to clear), `tab` shows the Board in place of the list (read only: waiting on you, doing, todo and done; with other computers connected `c` turns to the next computer's board; `tab` again goes back), `n` starts a new agent in a new worktree (what to do, which space and agent, the branch; `tab` moves between them, `enter` starts it), `esc` closes it. A click on the `needs you` title of the agents column opens it too |
+| `ctrl-a Q` | qass's ledger over the pane, or put away: how qass stands with `p` to pause or resume it (`s` starts it when it is stopped, and opens its terminal), a link to the questions it asked you (`i` opens them in the Inbox), what it holds, what it did today as the daemon recorded it, its schedules (add or change them with `qoop schedule`), its rules as a count, and a line to ask it (`a`, then `enter`). `j` `k` scroll it, `t` opens qass's own terminal, `esc` goes back. A click on the pet in the column's foot does the same |
+| `ctrl-a i` | Inbox: from any tab, everything that needs you as one list, oldest first, one card each, with the count in its title. Below 100 columns it folds the agents column while it is open. In it `j` `k` move, `1` to `9` answer with the option of that number (the answer waits 3 seconds, `u` takes it back, `enter` sends it now), `h` (or `q`) hands the question to qass to decide, `r` types your own words, `g` goes to that agent's tab, `o` talks it through with the agent, `m` reads the whole card, `x` puts it away, `f` shows only what qass asked (again to clear), `tab` shows the Board in place of the list (read only: waiting on you, doing, todo and done; with other computers connected `c` turns to the next computer's board; `tab` again goes back), `n` starts a new agent in a new worktree (what to do, which space and agent, the branch; `tab` moves between them, `enter` starts it), `esc` closes it. A click on the `needs you` title of the agents column opens it too |
 | `ctrl-a W` | close the space when it is empty |
 | `ctrl-a Z` | sleep, wake: put the tab the keyboard is in to sleep, or wake the sleeping tab it rests on |
 | `ctrl-a f` | fold: the focused space's agents fold under its rule, or open again |
@@ -59,6 +59,25 @@ program.
 | `ctrl-a d`, `ctrl-q` | detach, leaving everything running |
 | `ctrl-a U` | whether an update is waiting, and how it installs |
 | `ctrl-a l` | repaint |
+
+## The desktop app
+
+The same prefix, then a key, works in the desktop window, and so do the app's own chords. A
+digit, `u` and `esc` act on the Inbox or on a question's card while nothing is being typed.
+
+| Key | Does |
+|---|---|
+| `⌘J`, `ctrl-a tab` | the agent that needs you next, from any page |
+| `⌘N`, `ctrl-a c` | New agent: what to do, which space and agent, the branch |
+| `ctrl-a i` | the Inbox, and back to the page you came from |
+| `ctrl-a a` | the keyboard off the terminal and onto the window's controls (`tab` goes round them), and back |
+| `ctrl-a D` | what the agent's checkout changed, file by file with its counts, or closed |
+| `ctrl-a x` | put away the card of a question that closed |
+| `1` .. `9` | answer the focused card with the option of that number (the answer waits 3 seconds) |
+| `u` | take back the answer that is waiting |
+| `esc` | leave the Inbox for the page before it |
+| `⌘C`, `⌘V` | copy and paste in the terminal |
+| `⌘Q` | quit; an answer that is waiting is sent first |
 
 ## Mouse
 
