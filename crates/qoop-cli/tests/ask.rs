@@ -1317,9 +1317,9 @@ fn the_json_listing_holds_every_ended_card_and_the_plain_one_the_last_five() {
 }
 
 /// A question dialog still up after the wait drafts one card, "a question on its screen",
-/// with no options; the next tool closes it. One answered before the wait gets none, a second
-/// dialog on the same task gets a second card, and neither a permission menu nor qass's own
-/// tab gets one.
+/// with qass's two options for it; the next tool closes it. One answered before the wait gets
+/// none, a second dialog on the same task gets a second card, and neither a permission menu
+/// nor qass's own tab gets one.
 #[test]
 fn a_question_dialog_still_up_after_the_wait_drafts_one_card_and_a_tool_closes_it() {
     let stack = Stack::start();
@@ -1341,7 +1341,10 @@ fn a_question_dialog_still_up_after_the_wait_drafts_one_card_and_a_tool_closes_i
         "{first}"
     );
     assert_eq!(first["body"]["doing"], "ship the login fix");
-    assert_eq!(first["body"]["options"], serde_json::json!([]));
+    assert_eq!(
+        labels(&first),
+        ["Answer it as you judge best", "Close it without answering"]
+    );
     let handle = first["body"]["handle"].as_str().unwrap().to_string();
     assert!(
         handle.starts_with("korea") && handle[5..].bytes().all(|b| b.is_ascii_digit()),
@@ -1475,6 +1478,7 @@ fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
         draft["body"]["asks"],
         "Logo fixed. Istersen bunu ayri bir is olarak guncellerim."
     );
+    assert_eq!(labels(&draft), ["Yes", "No"]);
     assert_eq!(stage(&stack, &link), "waiting-human");
     // The watch said it although the state held: the row carries the task.
     std::thread::sleep(Duration::from_millis(500));
@@ -1520,20 +1524,46 @@ fn a_question_left_in_a_turns_last_words_waits_on_him_and_drafts_a_card() {
     assert_eq!(stage(&stack, &link), began);
     assert!(stack.drafts(&qass).is_empty(), "qass's own tab");
 
-    // Waiting by its own word, its last line no question: the card says what it waits on,
-    // never that line.
+    // A line that only says how to go on later asks nothing: no card, no wait (W1578).
+    std::thread::sleep(Duration::from_millis(1100));
+    stack.send(
+        &link,
+        "DONE Devam etmek istediğinde \"seo bloglara devam\" demen yeterli.",
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        stack.drafts(&link).len(),
+        1,
+        "a tell-me-when line opened a card"
+    );
+    assert_eq!(
+        stage(&stack, &link),
+        began,
+        "a tell-me-when line waits on him"
+    );
+    // Waiting by its own word, its last line no question: no card either, only the stage.
     stack.send(&link, "WAIT");
     stack.send(&link, "DONE Merged and deployed.");
-    assert!(stack.wait(|| stack.drafts(&link).len() == 2));
-    assert_eq!(
-        stack.drafts(&link)[1]["body"]["asks"],
-        "link waits on you: ship the login fix"
-    );
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(stack.drafts(&link).len(), 1, "a status line opened a card");
+    assert_eq!(stage(&stack, &link), "waiting-human");
+}
+
+/// The option labels of a card.
+fn labels(card: &serde_json::Value) -> Vec<String> {
+    card["body"]["options"]
+        .as_array()
+        .map(|o| {
+            o.iter()
+                .filter_map(|o| o["label"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A task opened by an edit has the owner's own prompt for a goal: the draft of its wait shows
-/// neither as the question nor as what it does, and a prompt that reaches the agent after the
-/// wait began closes the draft and keeps the next turn end from filing another.
+/// neither as the question nor as what it does, a tool closes the draft, and a turn end that
+/// asks nothing files no other.
 #[test]
 fn a_draft_never_shows_the_owners_prompt_and_closes_when_the_agent_works_again() {
     let stack = Stack::start();
@@ -1544,7 +1574,7 @@ fn a_draft_never_shows_the_owners_prompt_and_closes_when_the_agent_works_again()
     stack.send(&link, "EDIT");
     assert!(stack.wait(|| !stage(&stack, &link).is_empty()));
     stack.send(&link, "WAIT");
-    stack.send(&link, "DONE Merged and deployed.");
+    stack.send(&link, "DONE Merge it now?");
     assert!(
         stack.wait(|| stack.drafts(&link).len() == 1),
         "no draft: {:?}",
@@ -1552,7 +1582,8 @@ fn a_draft_never_shows_the_owners_prompt_and_closes_when_the_agent_works_again()
     );
     let draft = stack.drafts(&link).remove(0);
     assert!(!draft["body"].to_string().contains("idiot"), "{draft}");
-    assert_eq!(draft["body"]["asks"], "link waits on you");
+    assert_eq!(draft["body"]["asks"], "Merge it now?");
+    assert_eq!(labels(&draft), ["Yes", "No"]);
     let card = draft["card"].as_str().unwrap().to_string();
 
     // A tool: the agent works again, the draft ends.

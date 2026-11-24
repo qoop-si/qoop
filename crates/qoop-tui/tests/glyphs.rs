@@ -39,7 +39,8 @@ const MATCHED: &[(&str, &str)] = &[
         "qoop-runtime/src/menu.rs",
         "\u{276f}\u{2610}\u{2612}\u{2611}\u{2714}\u{23bf}\u{23f5}\u{23f8}",
     ),
-    ("qoop-runtime/src/asks.rs", "üı\u{307}ö\u{201d}"),
+    // A turn's closing words read for an offer or a quoted answer: compared, never drawn.
+    ("qoop-runtime/src/asks.rs", "üı\u{307}öğç\u{201c}\u{201d}"),
     (
         "qoop-store/src/task.rs",
         "\u{200b}\u{200f}\u{202a}\u{202e}\u{2060}\u{206f}\u{feff}\u{e0000}\u{e007f}",
