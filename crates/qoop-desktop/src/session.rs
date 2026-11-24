@@ -407,6 +407,14 @@ impl Desk {
             Some(_) => None,
             None => self.questions(term.terminal, inbox, t, cx),
         };
+        // A pick's line in the card takes its own room: the room under the terminal grows by it.
+        let slot = state::Slot::Agent(term.terminal);
+        let said_room = match asking {
+            Some(_) if self.holds.of(&slot).is_some() || self.said.contains_key(&slot) => {
+                crate::question::SAID_ROOM
+            }
+            _ => 0.,
+        };
         let below = asking.is_some()
             || cards.is_some()
             || self
@@ -473,7 +481,7 @@ impl Desk {
                                         .id("agent-below")
                                         .debug_selector(|| "agent-below".to_string())
                                         .flex_none()
-                                        .max_h(px(self.win_h * 0.6))
+                                        .max_h(px(self.win_h * 0.6 + said_room))
                                         .overflow_y_scroll()
                                         .flex()
                                         .flex_col()

@@ -424,6 +424,7 @@ impl Desk {
             .child(ui::scroll(
                 div()
                     .id("inbox-body")
+                    .debug_selector(|| "inbox-body".to_string())
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -689,6 +690,12 @@ impl Desk {
         .cursor_default()
         .aria_selected(focused)
         .debug_selector(move || format!("inbox-card-{}", slot_name(&slot)))
+        .relative()
+        // A pick just held on this card: the hold bar takes the list's bottom, and the list
+        // scrolls the card back into view above it.
+        .when(self.reveal_once(&item.slot), |d| {
+            d.child(ui::bring_into_view())
+        })
         .flex()
         .flex_col()
         .gap(px(8.))

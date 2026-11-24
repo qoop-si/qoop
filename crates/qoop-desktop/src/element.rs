@@ -119,9 +119,9 @@ pub fn pane_heights(tree: &qoop_runtime::control::Pane, total: f32) -> Vec<(Term
 pub type Size2 = (Pixels, Pixels);
 
 /// The window of a grid to show in `cols` by `rows` cells. While room under the terminal is
-/// `reserved` (a card covers the grid's last rows) it starts at the grid's bottom rows, where
-/// the cursor and a menu sit, and a hidden cursor leaves it there; otherwise it follows the
-/// cursor from where it was (ADR-007).
+/// `reserved` (a card covers the grid's last rows) it ends at the last row that matters (the
+/// last one with text, or the cursor's when it is shown), where a menu sits, and then follows
+/// the cursor; otherwise it follows the cursor from where it was (ADR-007).
 pub fn view_for(
     snap: &SnapshotWire,
     previous: Option<Viewport>,
@@ -136,18 +136,34 @@ pub fn view_for(
         cols: snap.cols as u16,
         rows: snap.rows as u16,
     };
-    // A window of another height is not the one kept for this room: start from the bottom.
-    let start = previous
-        .filter(|v| v.rows == rows.min(grid.rows))
-        .unwrap_or(Viewport {
-            col: 0,
-            row: u16::MAX,
+    let shown = snap.modes.cursor_visible;
+    // Ending at the grid's bottom instead showed a screen drawn from the top (a fresh terminal,
+    // a menu in the first rows) as empty rows with the cursor alone on the first, once the room
+    // changed height (a pick's hold line on the card).
+    let last = snap
+        .lines
+        .iter()
+        .rposition(|l| !l.trim_end().is_empty())
+        .into_iter()
+        .chain(shown.then_some(snap.cursor.0))
+        .max()
+        .unwrap_or(0) as u16;
+    let at_last = last.saturating_add(1).saturating_sub(rows);
+    // A window of another height is not the one kept for this room, and a hidden cursor gives
+    // nothing to follow: start from the last row.
+    let kept = previous.filter(|v| v.rows == rows.min(grid.rows));
+    let start = match kept {
+        Some(v) if shown => v,
+        _ => Viewport {
+            col: kept.map_or(0, |v| v.col),
+            row: at_last,
             cols,
             rows,
-        });
+        },
+    };
     let base = Viewport::new(grid, start.col, start.row, cols, rows);
-    if !snap.modes.cursor_visible {
-        return Viewport::new(grid, base.col, u16::MAX, cols, rows);
+    if !shown {
+        return base;
     }
     base.follow(grid, snap.cursor.1 as u16, snap.cursor.0 as u16)
 }
@@ -904,9 +920,9 @@ mod tests {
         );
     }
 
-    /// A grid taller than its room, with the cursor shown or hidden.
+    /// A grid taller than its room, text on every row, with the cursor shown or hidden.
     fn tall(cursor: (usize, usize), shown: bool) -> Rc<SnapshotWire> {
-        let lines: Vec<String> = (0..40).map(|_| String::new()).collect();
+        let lines: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         let mut screen = screen(&lines, cursor, 80, 40);
         Rc::get_mut(&mut screen)
@@ -916,8 +932,9 @@ mod tests {
         screen
     }
 
-    /// With room reserved under the terminal the window starts at the grid's bottom rows and then
-    /// follows the cursor; a hidden cursor leaves it there; with none reserved it is as before.
+    /// With room reserved under the terminal the window starts at the last rows with text (here
+    /// the grid's bottom) and then follows the cursor; a hidden cursor leaves it there; with none
+    /// reserved it is as before.
     #[test]
     fn room_reserved_keeps_the_bottom_rows_in_view() {
         // 40 rows, 30 shown, the cursor on the last row: the window starts at row 10.
@@ -951,6 +968,93 @@ mod tests {
         assert_eq!(
             view_for(&tall((3, 0), true), Some(at_bottom), 80, 30, true).row,
             3
+        );
+    }
+
+    /// A screen drawn from the top (a fresh terminal, a program that draws its menu in its first
+    /// rows) keeps its rows in view when the room under the terminal changes height, as when a
+    /// pick on the card adds its hold line: the window ends at the last row that has something
+    /// or the cursor, never at the grid's empty bottom with the cursor alone on its top row.
+    #[test]
+    fn a_screen_drawn_from_the_top_stays_in_view_when_the_room_changes() {
+        // The stand-in's billing menu on a 158 x 48 grid: seven rows, the cursor under them.
+        let menu: Vec<String> = (0..7).map(|i| format!("menu line {i}")).collect();
+        let lines: Vec<&str> = menu.iter().map(String::as_str).collect();
+        let shown = |cursor: (usize, usize), visible: bool| {
+            let mut s = screen(&lines, cursor, 158, 48);
+            Rc::get_mut(&mut s).expect("one owner").modes.cursor_visible = visible;
+            s
+        };
+        // No hold: 23 rows of room, the window at the top as the page drew it.
+        let before = Viewport {
+            col: 0,
+            row: 0,
+            cols: 158,
+            rows: 23,
+        };
+        // The hold line takes two rows: 21 rows, a window of another height.
+        for visible in [true, false] {
+            let view = view_for(&shown((7, 0), visible), Some(before), 158, 21, true);
+            assert_eq!(
+                view.row, 0,
+                "the menu stays in view (cursor shown: {visible})"
+            );
+            assert_eq!(
+                view.crop(lines.iter().copied())[0],
+                "menu line 0",
+                "the first row drawn is the menu's"
+            );
+            // Opened with the card already there: the same.
+            assert_eq!(
+                view_for(&shown((7, 0), visible), None, 158, 21, true).row,
+                0
+            );
+        }
+        // A fresh terminal: nothing on it, the cursor at the top.
+        let fresh = screen(&[], (0, 0), 158, 48);
+        assert_eq!(view_for(&fresh, Some(before), 158, 21, true).row, 0);
+        // Content further down than the room: the window ends at its last row.
+        let long: Vec<String> = (0..30).map(|i| format!("out {i}")).collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        let s = screen(&long, (30, 0), 158, 48);
+        assert_eq!(view_for(&s, Some(before), 158, 21, true).row, 10);
+    }
+
+    /// The same, drawn: the terminal is painted with no card hold, then with the hold line taking
+    /// two rows of its room. Its menu is painted both times, and the size told stays the same.
+    #[gpui::test]
+    fn the_hold_line_does_not_blank_the_terminal(cx: &mut gpui::TestAppContext) {
+        use qoop_runtime::control::Pane;
+        let asked = Asked::default();
+        let sent = Rc::new(Cell::new((0, 0)));
+        let window = cx.add_empty_window();
+        let menu: Vec<String> = (0..7).map(|i| format!("menu{i}")).collect();
+        let lines: Vec<&str> = menu.iter().map(String::as_str).collect();
+        let snap = screen(&lines, (7, 0), 80, 48);
+        let gauge = Rc::new(Gauge::default());
+        *gauge.tree.borrow_mut() = Some(Pane::Leaf { terminal: 7 });
+        gauge.column.set(px(16. * 48.));
+        let viewport = Rc::new(Cell::new(None));
+        for room in [23., 21.] {
+            gauge.slot.set(px(16. * room));
+            let mut e = element(snap.clone(), asked.clone(), sent.clone());
+            e.gauge = Some(gauge.clone());
+            e.viewport = viewport.clone();
+            let (_, painted) = window.draw(
+                point(px(0.), px(0.)),
+                size(px(640.), px(16. * room)),
+                |_, _| e,
+            );
+            assert_eq!(
+                painted.glyphs.len(),
+                7 * 5,
+                "the seven menu rows are painted with {room} rows of room"
+            );
+        }
+        assert_eq!(
+            asked.borrow().as_slice(),
+            &[(7, 80, 48)],
+            "told its whole height once: the card never changes the agent's size (ADR-007)"
         );
     }
 
