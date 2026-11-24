@@ -164,6 +164,9 @@ pub struct Desk {
     /// Picks waiting out their 3 s, and what became of each sent one, per agent.
     pub holds: state::Holds,
     pub said: HashMap<state::Slot, Said>,
+    /// The pick just held: where it is drawn, the list or room around it scrolls it into view,
+    /// once (`Desk::reveal_once`).
+    pub(crate) reveal: std::cell::RefCell<Option<state::Slot>>,
     /// Machines whose qoop refused a typed answer as unknown: no typed answers there.
     pub(crate) too_old: BTreeSet<usize>,
     /// The owner's own words for an agent's answer field, while it is open.
@@ -349,6 +352,7 @@ impl Desk {
             review_focus: cx.focus_handle(),
             holds: state::Holds::default(),
             said: HashMap::new(),
+            reveal: Default::default(),
             too_old: BTreeSet::new(),
             own: None,
             card_open: None,

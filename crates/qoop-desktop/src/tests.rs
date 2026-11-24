@@ -5378,3 +5378,213 @@ fn settings_hold_what_qass_watches_and_schedules(cx: &mut TestAppContext) {
     click(&mut vcx, "nav-schedules");
     assert_eq!(desk.read_with(&vcx, |d, _| d.page), Page::Schedules);
 }
+
+/// A permission question as Claude Code draws it: the command over `lines` rows of context,
+/// each `wide` characters or so (the daemon keeps at most 12 rows of 200).
+fn bash_menu(seal: u64, lines: usize, wide: usize) -> qoop_runtime::control::AgentMenu {
+    let context: Vec<String> = (0..lines)
+        .map(|i| format!("Bash(git push origin main) step {i} {}", "x".repeat(wide)))
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "question": "Do you want to proceed?",
+        "seal": seal,
+        "context": context,
+        "options": [
+            {"key": "1", "label": "Yes"},
+            {"key": "2", "label": "Yes, and don't ask again for this command"},
+            {"key": "3", "label": "No, and tell Claude what to do differently (esc)", "tell": true},
+        ],
+    }))
+    .expect("menu")
+}
+
+/// Agents 2 and 3 ask `menus` (agent 3 is blocked for it); the others as the fixture has them.
+fn ask(
+    desk: &Entity<Desk>,
+    vcx: &mut VisualTestContext,
+    menus: [Option<qoop_runtime::control::AgentMenu>; 2],
+) {
+    let mut rows = crate::state::tests::fixture().rows;
+    let [two, three] = menus;
+    rows[1].menu = two;
+    if three.is_some() {
+        rows[2] = crate::state::tests::row(3, 1, "blocked", "claude", "Coupon tests");
+        rows[2].menu = three;
+    }
+    answer(
+        desk,
+        vcx,
+        ControlResponse::Agents {
+            id: "agents".into(),
+            agents: rows,
+            splits: Vec::new(),
+            qass_checks: None,
+        },
+    );
+}
+
+/// `inner` lies whole inside `outer`, top to bottom.
+fn whole_in(outer: gpui::Bounds<gpui::Pixels>, inner: gpui::Bounds<gpui::Pixels>) -> bool {
+    inner.top() >= outer.top() && inner.bottom() <= outer.bottom()
+}
+
+/// The card's last answer on an agent's page: the highest digit drawn.
+fn last_option(vcx: &mut VisualTestContext) -> gpui::Bounds<gpui::Pixels> {
+    (1..=9)
+        .rev()
+        .find_map(|d| vcx.debug_bounds(Box::leak(format!("card-2-{d}").into_boxed_str())))
+        .expect("an option with a digit")
+}
+
+/// A pick on the agent page's card: its hold line has its own room. A card that fit whole
+/// still fits whole with the line (the room grows by it); a card taller than its room scrolls
+/// to the line, so the last answer and the line are both in sight. After `u` the line says
+/// "Undone, nothing was sent" for a few seconds, and nothing goes to the agent.
+#[gpui::test]
+fn the_hold_line_takes_its_own_room_on_the_agent_page(cx: &mut TestAppContext) {
+    for (w, h) in [(1280., 800.), (1100., 800.)] {
+        let (desk, mut vcx, mut rx) = open(cx);
+        vcx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+        vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Session(2), window, cx)));
+        // The most context that leaves the card whole in its room, and the most there is: 12
+        // rows that wrap, taller than the room before any pick.
+        let fits = (0..=12)
+            .rev()
+            .find(|&n| {
+                ask(
+                    &desk,
+                    &mut vcx,
+                    [Some(bash_menu(100 + n as u64, n, 0)), None],
+                );
+                let below = vcx.debug_bounds("agent-below").expect("the room");
+                whole_in(below, vcx.debug_bounds("question-card").expect("the card"))
+            })
+            .expect("a card that fits");
+        ask(&desk, &mut vcx, [Some(bash_menu(150, 12, 170)), None]);
+        assert!(
+            !whole_in(
+                vcx.debug_bounds("agent-below").expect("the room"),
+                vcx.debug_bounds("question-card").expect("the card")
+            ),
+            "the tall card is taller than its room at {w}x{h}"
+        );
+        for (n, wide) in [(fits, 0), (12, 170)] {
+            ask(
+                &desk,
+                &mut vcx,
+                [Some(bash_menu(200 + n as u64, n, wide)), None],
+            );
+            std::thread::sleep(qoop_tui::answers::ARMING);
+            vcx.simulate_keystrokes("1");
+            assert!(
+                desk.read_with(&vcx, |d, _| d
+                    .holds
+                    .of(&crate::state::Slot::Agent(2))
+                    .is_some()),
+                "held"
+            );
+            vcx.run_until_parked();
+            let below = vcx.debug_bounds("agent-below").expect("the room");
+            let line = vcx.debug_bounds("held-line").expect("the hold line");
+            let window = gpui::Bounds::new(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(w), gpui::px(h)),
+            );
+            assert!(
+                whole_in(below, line) && whole_in(window, below),
+                "the hold line in sight at {w}x{h}, {n} rows: {line:?} in {below:?}"
+            );
+            assert!(
+                whole_in(below, last_option(&mut vcx)),
+                "the last answer in sight at {w}x{h}, {n} rows"
+            );
+            if wide == 0 {
+                assert!(
+                    whole_in(below, vcx.debug_bounds("question-card").expect("the card")),
+                    "a card that fit whole still does with its line, at {w}x{h}"
+                );
+            }
+            sent(&mut rx);
+            vcx.simulate_keystrokes("u");
+            assert!(
+                desk.read_with(&vcx, |d, _| d.holds.held.is_empty()),
+                "undone"
+            );
+            assert!(
+                request_of(&sent(&mut rx), |r| matches!(
+                    r,
+                    ControlRequest::AnswerMenu { .. }
+                ))
+                .is_none(),
+                "nothing sent"
+            );
+            assert!(
+                desk.read_with(&vcx, |d, _| matches!(
+                    d.said.get(&crate::state::Slot::Agent(2)),
+                    Some(crate::question::Said::Undone(_))
+                )),
+                "said as undone"
+            );
+            let word = vcx.debug_bounds("said-line").expect("the undone word");
+            assert!(
+                whole_in(vcx.debug_bounds("agent-below").expect("the room"), word),
+                "where the hold line was"
+            );
+            vcx.executor().advance_clock(crate::question::UNDONE_FOR);
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("said-line").is_none(),
+                "gone after a few seconds"
+            );
+        }
+    }
+}
+
+/// A pick on the Inbox: the hold bar takes the bottom of the page, and the card with the ring
+/// is scrolled back above it, its last answer and the bar both whole in the window.
+#[gpui::test]
+fn the_hold_bar_never_covers_the_card_it_holds(cx: &mut TestAppContext) {
+    for (w, h) in [(1280., 800.), (1100., 800.)] {
+        let (desk, mut vcx, _rx) = open(cx);
+        vcx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+        ask(
+            &desk,
+            &mut vcx,
+            [Some(bash_menu(300, 3, 0)), Some(bash_menu(301, 3, 0))],
+        );
+        vcx.update(|window, cx| desk.update(cx, |d, cx| d.open(Page::Inbox, window, cx)));
+        vcx.run_until_parked();
+        // The ring to the second card, by the keyboard: the list scrolls it into view, its bottom
+        // at the list's bottom edge.
+        let ringed = desk.read_with(&vcx, |d, _| d.inbox_cursor.clone());
+        vcx.simulate_keystrokes("cmd-j");
+        vcx.run_until_parked();
+        let ring = desk
+            .read_with(&vcx, |d, _| d.inbox_cursor.clone())
+            .expect("a ring");
+        assert_ne!(Some(ring.clone()), ringed, "the ring moved");
+        let name = match &ring {
+            crate::state::Slot::Agent(t) => format!("inbox-card-t{t}"),
+            crate::state::Slot::Card(c) => format!("inbox-card-{c}"),
+        };
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        std::thread::sleep(qoop_tui::answers::ARMING);
+        vcx.simulate_keystrokes("1");
+        assert!(
+            desk.read_with(&vcx, |d, _| d.holds.of(&ring).is_some()),
+            "held"
+        );
+        vcx.run_until_parked();
+        let body = vcx.debug_bounds("inbox-body").expect("the list");
+        let card = vcx.debug_bounds(name).expect("the card");
+        let bar = vcx.debug_bounds("hold-bar").expect("the hold bar");
+        assert!(
+            whole_in(body, card),
+            "the held card whole above the bar at {w}x{h}: {card:?} in {body:?}"
+        );
+        assert!(
+            bar.top() >= body.bottom() && bar.bottom() <= gpui::px(h),
+            "the bar in its own room at {w}x{h}: {bar:?}"
+        );
+    }
+}

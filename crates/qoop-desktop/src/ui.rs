@@ -456,6 +456,17 @@ impl Element for Control {
     }
 }
 
+/// A layer over its parent that asks the scrolling list around it ([`scroll`]) to bring the
+/// parent into view in the frame it is drawn: for what just grew or moved out of sight.
+pub fn bring_into_view() -> impl IntoElement {
+    gpui::canvas(
+        |bounds, window, _| window.request_autoscroll(bounds),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 /// `div` (scrolling on its own) as a list or page that scrolls a control gaining the focus
 /// inside it into view: the innermost one around the control that can, by the least.
 pub fn scroll(div: Stateful<Div>) -> Scroll {

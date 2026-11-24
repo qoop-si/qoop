@@ -42,7 +42,16 @@ pub enum Said {
         at: i64,
     },
     Refused(String),
+    /// Undone at this moment: "Undone, nothing was sent" for [`UNDONE_FOR`].
+    Undone(Instant),
 }
+
+/// How long the word for an undone pick stays where its hold line was.
+pub(crate) const UNDONE_FOR: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The room a pick's line takes in the card: its 26 px Undo and the card's 6 px gap. The room
+/// under the terminal grows by it, so a card that fit whole still does with the line.
+pub(crate) const SAID_ROOM: f32 = 32.;
 
 /// The owner's own words for an agent's answer field, while its card is open: for the agent's
 /// menu, or for one of its question cards (`card`).
@@ -229,6 +238,7 @@ impl Desk {
 
     fn hold(&mut self, hold: Hold, _: &mut Window, cx: &mut Context<Self>) {
         self.said.remove(&hold.slot);
+        *self.reveal.borrow_mut() = Some(hold.slot.clone());
         self.holds.start(hold);
         self.after_hold(cx);
         cx.notify();
@@ -297,13 +307,39 @@ impl Desk {
         }
     }
 
-    /// Undo `slot`'s pick, or the newest one (with every pick held together with it).
+    /// Undo `slot`'s pick, or the newest one (with every pick held together with it). Where its
+    /// hold line was, "Undone, nothing was sent" stays a few seconds, as on the phone.
     pub(crate) fn undo(&mut self, slot: Option<&Slot>, cx: &mut Context<Self>) -> bool {
-        let undone = self.holds.undo(slot);
-        if undone {
-            cx.notify();
+        // Taken out of the holds, never sent.
+        let undone = self.holds.send_now(slot);
+        if undone.is_empty() {
+            return false;
         }
-        undone
+        let at = Instant::now();
+        for hold in undone {
+            self.said.insert(hold.slot, Said::Undone(at));
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(UNDONE_FOR).await;
+            let _ = this.update(cx, |d, cx| {
+                d.said.retain(|_, s| *s != Said::Undone(at));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+        true
+    }
+
+    /// Whether `slot`'s pick was just held: drawn now, the room around it scrolls it into view,
+    /// and only this once, so the person can scroll away during the hold.
+    pub(crate) fn reveal_once(&self, slot: &Slot) -> bool {
+        let mut reveal = self.reveal.borrow_mut();
+        let hit = reveal.as_ref() == Some(slot);
+        if hit {
+            *reveal = None;
+        }
+        hit
     }
 
     fn send(&mut self, holds: Vec<Hold>) {
@@ -943,10 +979,13 @@ impl Desk {
                 .max(1.);
             return Some(
                 div()
+                    .debug_selector(|| "held-line".to_string())
+                    .relative()
                     .flex()
                     .items_center()
                     .gap(px(8.))
                     .text_size(px(12.5))
+                    .when(self.reveal_once(slot), |d| d.child(ui::bring_into_view()))
                     .child(
                         div()
                             .id(("held", number))
@@ -1000,6 +1039,7 @@ impl Desk {
                 format!("Sent: {label}, {}", state::clock(*at, self.zone))
             }
             (Some(Said::Refused(why)), _) => why.clone(),
+            (Some(Said::Undone(_)), _) => "Undone, nothing was sent".into(),
             (None, Some(qass)) => qass,
             (None, None) if row.is_some_and(|r| r.qass_missed) => "qass did not take it".into(),
             (None, None) => return None,
@@ -1007,6 +1047,7 @@ impl Desk {
         Some(
             div()
                 .id(("said", number))
+                .debug_selector(|| "said-line".to_string())
                 .role(Role::Status)
                 .aria_label(text.clone())
                 .text_size(px(12.5))
